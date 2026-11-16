@@ -212,6 +212,22 @@ describe("renderVegaLiteChart confinement", () => {
       /remote file/,
     ],
     [
+      "a url() color escaped across a CRLF",
+      { ...BAR_SPEC, mark: { type: "bar", color: "\\75\r\nrl(https://e.test/p.svg#g)" } },
+      /url/,
+    ],
+    [
+      "a CRLF-escaped url() color an expression builds",
+      {
+        ...BAR_SPEC,
+        mark: {
+          type: "bar",
+          color: { expr: "'\\\\75' + '\\r\\n' + 'rl(https://e.test/p.svg#g)'" },
+        },
+      },
+      /remote file/,
+    ],
+    [
       "a url() color an expression wraps in an array",
       {
         data: { values: [{ x: 1 }] },
@@ -368,7 +384,8 @@ describe("renderVegaLiteChart confinement", () => {
 
   it("drops a spec background that would load a file, on the page and in exports", async () => {
     const container = mountContainer();
-    const spec = { ...BAR_SPEC, background: { expr: "'ur' + 'l(https://e.test/p.svg#g)'" } };
+    const escapedAcrossCrlf = "'\\\\75' + '\\r\\n' + 'rl(https://e.test/p.svg#g)'";
+    const spec = { ...BAR_SPEC, background: { expr: escapedAcrossCrlf } };
     const chart = await renderVegaLiteChart(container, spec, () => COLORS);
 
     const svg = await (await chart.toBlob("svg")).text();
@@ -421,6 +438,11 @@ describe("renderVegaLiteChart confinement", () => {
 
 describe("clearRemoteSceneValues", () => {
   it("clears paints and cursors that load files and keeps the chart's own references", () => {
+    const crlfEscaped = {
+      fill: "\\75\r\nrl(https://e.test/p.svg#g)",
+      stroke: "\\55\r\nrl(https://e.test/s.svg)",
+    };
+    const looksLocal = { fill: "url(\u00a0#g)", stroke: "src(https://e.test/s.svg)" };
     const item = {
       fill: ["URL(https://e.test/p.svg#g)"],
       stroke: "\\55rl('//e.test/s.svg')",
@@ -438,10 +460,14 @@ describe("clearRemoteSceneValues", () => {
       cursor: "pointer",
       blend: "multiply",
     };
-    const scene = { items: [{ items: [{ items: [item, remoteGradient, kept] }] }] };
+    const scene = {
+      items: [{ items: [{ items: [item, remoteGradient, crlfEscaped, looksLocal, kept] }] }],
+    };
 
     clearRemoteSceneValues(scene);
 
+    expect(crlfEscaped).toEqual({ fill: null, stroke: null });
+    expect(looksLocal).toEqual({ fill: null, stroke: null });
     expect(item).toEqual({ fill: null, stroke: null, cursor: null, blend: null });
     expect(remoteGradient).toEqual({ fill: null, stroke: null });
     expect(kept).toEqual({

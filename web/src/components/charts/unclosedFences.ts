@@ -1,83 +1,93 @@
 // Marks code blocks whose fence never closed, so a chart draws only after its
-// closing fence. Streamdown reports an open fence only while text streams.
+// closing fence. Streamdown reports an open fence only while text streams, so
+// the Markdown parser's own verdict is recorded instead.
+
+interface MdastNode {
+  type: string;
+  data?: Record<string, unknown>;
+  children?: MdastNode[];
+  position?: { start: { offset?: number } };
+}
 
 interface HastNode {
   type: string;
   tagName?: string;
   properties?: Record<string, unknown>;
   children?: HastNode[];
-  position?: { start: { offset?: number }; end: { offset?: number } };
+  position?: { start: { offset?: number } };
+}
+
+interface ParseContext {
+  stack: MdastNode[];
+}
+
+interface MarkdownFile {
+  data: Record<string, unknown>;
 }
 
 /** Prop a code block's `pre` receives when its fence never closed. */
 export const UNCLOSED_FENCE_PROP = "data-unclosed-fence";
 
-const OPENING_FENCE = /^([ \t]*)(`{3,}|~{3,})/;
-const CLOSING_FENCE = /^(`{3,}|~{3,})[ \t]*$/;
-const QUOTE_MARKER = /^[ \t]{0,3}>[ \t]?/;
-
-/** Columns *text* spans, with tabs to the next multiple of 4. */
-function columnWidth(text: string): number {
-  let width = 0;
-  for (const char of text) width = char === "\t" ? width + 4 - (width % 4) : width + 1;
-  return width;
-}
-
-/** *line* without *depth* blockquote markers, or null when it has fewer. */
-function withoutQuoteMarkers(line: string, depth: number): string | null {
-  let rest = line;
-  for (let level = 0; level < depth; level += 1) {
-    const marker = rest.match(QUOTE_MARKER)?.[0];
-    if (marker === undefined) return null;
-    rest = rest.slice(marker.length);
-  }
-  return rest;
-}
+// Where, in the parsed text, each fenced code block that never closed starts.
+const UNCLOSED_FENCE_STARTS = "omnigentUnclosedFenceStarts";
 
 /**
- * Whether a fenced code block's source (from its opening fence to its last line)
- * ends with a closing fence: the opening character, at least as many times,
- * indented at most 3 columns past the block's container. Indented code has no
- * fence and counts as closed.
- *
- * :param blockSource: The block's Markdown, e.g. ``"```vega-lite\n{}\n```"``.
- * :param linePrefix: Text before the opening fence on its line, such as a list
- *   marker (``"1. "``) or blockquote marker (``"> "``).
+ * Parser extension that counts each fenced code block's fences: the opening
+ * fence, and the closing one when the parser found it.
  */
-export function isFenceClosed(blockSource: string, linePrefix = ""): boolean {
-  const lines = blockSource.trimEnd().split(/\r?\n/);
-  const opening = lines[0].match(OPENING_FENCE);
-  if (!opening) return true;
-  if (lines.length < 2) return false;
-  const quoteDepth = linePrefix.split(">").length - 1;
-  const container = withoutQuoteMarkers(linePrefix, quoteDepth) ?? "";
-  const maxIndent = columnWidth(container) + columnWidth(opening[1]) + 3;
-  const lastLine = withoutQuoteMarkers(lines[lines.length - 1], quoteDepth);
-  if (lastLine === null) return false;
-  const indent = lastLine.match(/^[ \t]*/)![0];
-  if (columnWidth(indent) > maxIndent) return false;
-  const closer = lastLine.slice(indent.length).match(CLOSING_FENCE)?.[1];
-  const opener = opening[2];
-  return closer !== undefined && closer[0] === opener[0] && closer.length >= opener.length;
+const COUNT_FENCES = {
+  enter: {
+    codeFencedFence(this: ParseContext) {
+      for (let index = this.stack.length - 1; index >= 0; index -= 1) {
+        const node = this.stack[index];
+        if (node.type !== "code") continue;
+        node.data = { ...node.data, fences: Number(node.data?.fences ?? 0) + 1 };
+        return;
+      }
+    },
+  },
+};
+
+/**
+ * Remark plugin that records where each fenced code block whose closing fence
+ * the parser never found starts, for {@link rehypeMarkUnclosedFences}. It takes
+ * CommonMark's verdict, so list items, blockquotes, tabs and indentation follow
+ * the parser exactly.
+ */
+export function remarkFindUnclosedFences(this: { data: () => object }) {
+  const data = this.data() as Record<string, unknown>;
+  const extensions = (data.fromMarkdownExtensions ??= []) as unknown[];
+  extensions.push(COUNT_FENCES);
+  return (tree: MdastNode, file: MarkdownFile) => {
+    const starts = new Set<number>();
+    const pending = [tree];
+    while (pending.length > 0) {
+      const node = pending.pop()!;
+      const start = node.position?.start.offset;
+      // Indented code has no fences; a fenced block that never closed has one.
+      if (node.type === "code" && node.data?.fences === 1 && start !== undefined) {
+        starts.add(start);
+      }
+      for (const child of node.children ?? []) pending.push(child);
+    }
+    file.data[UNCLOSED_FENCE_STARTS] = starts;
+  };
 }
 
 /**
  * Rehype plugin that sets {@link UNCLOSED_FENCE_PROP} on each `pre` whose fence
- * never closed, judged from the Markdown source the parser saw. Works whether
- * or not the text is streaming, and inside lists and blockquotes.
+ * {@link remarkFindUnclosedFences} found unclosed. It runs after sanitizing, so
+ * the property reaches the code block component.
  */
 export function rehypeMarkUnclosedFences() {
-  return (tree: HastNode, file: { value?: unknown }) => {
-    if (typeof file.value !== "string") return;
-    const source = file.value;
-    const pending: HastNode[] = [tree];
+  return (tree: HastNode, file: MarkdownFile) => {
+    const starts = file.data[UNCLOSED_FENCE_STARTS];
+    if (!(starts instanceof Set) || starts.size === 0) return;
+    const pending = [tree];
     while (pending.length > 0) {
       const node = pending.pop()!;
-      const start = node.position?.start.offset;
-      const end = node.position?.end.offset;
-      if (node.tagName === "pre" && start !== undefined && end !== undefined) {
-        const lineStart = source.lastIndexOf("\n", start - 1) + 1;
-        if (!isFenceClosed(source.slice(start, end), source.slice(lineStart, start))) {
+      if (node.tagName === "pre") {
+        if (starts.has(node.position?.start.offset)) {
           node.properties = { ...node.properties, dataUnclosedFence: true };
         }
         continue;

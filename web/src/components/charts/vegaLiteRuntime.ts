@@ -220,13 +220,25 @@ export const CONTAINED_EVENTS = {
 
 const CSS_KEYWORD = /^[a-z-]+$/i;
 
-/** *text* with CSS escapes (e.g. ``\72`` for ``r``) decoded. */
+/**
+ * *text* as CSS reads it: newlines normalized (CRLF, CR and form feed become LF,
+ * so CRLF after a hex escape counts as one whitespace) and escapes decoded
+ * (e.g. ``\72`` for ``r``; an escaped newline becomes a space).
+ */
 function decodeCssEscapes(text: string): string {
-  return text.replace(/\\([0-9a-f]{1,6})\s?|\\(.)/gi, (_match, hex?: string, char?: string) => {
-    if (char !== undefined) return char;
-    const codePoint = Number.parseInt(hex!, 16);
-    return codePoint > 0 && codePoint <= 0x10ffff ? String.fromCodePoint(codePoint) : "\ufffd";
-  });
+  return text
+    .replace(/\r\n|[\r\f]/g, "\n")
+    .replaceAll("\u0000", "\ufffd")
+    .replace(
+      /\\([0-9a-f]{1,6})[ \t\n]?|\\\n|\\([\s\S])/gi,
+      (_match, hex?: string, char?: string) => {
+        if (char !== undefined) return char;
+        // An escaped newline: CSS keeps a stray token there, which still splits words.
+        if (hex === undefined) return " ";
+        const codePoint = Number.parseInt(hex, 16);
+        return codePoint > 0 && codePoint <= 0x10ffff ? String.fromCodePoint(codePoint) : "\ufffd";
+      },
+    );
 }
 
 function isKeywordCursor(cursor: unknown): boolean {
@@ -249,7 +261,7 @@ export function unsafeCompiledReason(spec: unknown): string | null {
   while (pending.length > 0) {
     const [key, node] = pending.pop()!;
     if (typeof node === "string") {
-      if (/url\(/i.test(decodeCssEscapes(node))) {
+      if (/\b(?:url|src)\(/i.test(decodeCssEscapes(node))) {
         return "Chart text can't contain url(...), which would load a remote file.";
       }
       continue;
@@ -275,8 +287,9 @@ export function unsafeCompiledReason(spec: unknown): string | null {
   return null;
 }
 
-// `url(` that isn't a reference to one of the chart's own gradients or clip paths.
-const REMOTE_CSS_URL = /url\((?!\s*['"]?#)/i;
+// `url(` (or CSS's newer `src(`) that isn't a reference to one of the chart's own
+// gradients or clip paths. Only CSS whitespace may come before the `#`.
+const REMOTE_CSS_URL = /\b(?:url|src)\((?![ \t\n]*['"]?#)/i;
 
 /** Whether *value*, written out as Vega writes it, would load a file. */
 export function loadsRemoteFile(value: unknown): boolean {

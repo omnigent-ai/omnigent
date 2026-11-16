@@ -782,6 +782,8 @@ describe("MessageResponse vega-lite charts", () => {
     ["a fence on a list marker", `1. \`\`\`vega-lite\n   ${spec}\n   \`\`\`\n`],
     ["a fence in a blockquote", `> \`\`\`vega-lite\n> ${spec}\n> \`\`\`\n`],
     ["a longer closing fence", `\`\`\`vega-lite\n${spec}\n\`\`\`\`\n`],
+    ["a blockquote in a wide list item", `10. > \`\`\`vega-lite\n    > ${spec}\n    > \`\`\`\n`],
+    ["a task-list fence", `- [ ] todo\n  \`\`\`vega-lite\n  ${spec}\n  \`\`\`\n`],
   ])("draws %s once it closes", async (_label, text) => {
     render(response(text, { mode: "static" }));
 
@@ -792,15 +794,38 @@ describe("MessageResponse vega-lite charts", () => {
     ["a tilde fence", `~~~vega-lite\n${spec}\n`],
     ["a fence on a list marker", `1. \`\`\`vega-lite\n   ${spec}\n`],
     ["a fence in a blockquote", `> \`\`\`vega-lite\n> ${spec}\n`],
+    ["an indented fence whose closer is indented 4", ` \`\`\`vega-lite\n${spec}\n    \`\`\`\n`],
+    [
+      "a task-list fence whose closer is 4 past the item",
+      `- [ ] todo\n  \`\`\`vega-lite\n  ${spec}\n      \`\`\`\n`,
+    ],
+    [
+      "a blockquoted fence whose closer follows a tab",
+      `>\t\`\`\`vega-lite\n> ${spec}\n>\t  \`\`\`\n`,
+    ],
+    ["a footnote's fence", `Note[^1]\n\n[^1]: \`\`\`vega-lite\n    ${spec}\n`],
   ])("keeps %s that never closed as code after streaming stops", async (_label, text) => {
-    const { container, rerender } = render(response(text, { isStreaming: true }));
+    const codeBlock = () => document.querySelector('[data-streamdown="code-block"]');
+    const { rerender, unmount } = render(response(text, { isStreaming: true }));
 
     rerender(response(text));
-
-    await waitFor(() =>
-      expect(container.querySelector('[data-streamdown="code-block"]')).toHaveTextContent('"team"'),
-    );
+    await waitFor(() => expect(codeBlock()).toHaveTextContent('"team"'));
     expect(screen.queryByTestId("vega-lite-chart")).toBeNull();
+    unmount();
+
+    // Finished text renders in static mode, as BlockRenderer does.
+    render(response(text, { mode: "static" }));
+    await waitFor(() => expect(codeBlock()).toHaveTextContent('"team"'));
+    expect(screen.queryByTestId("vega-lite-chart")).toBeNull();
+  });
+
+  it("keeps GitHub-flavored Markdown on chart surfaces", () => {
+    const markdown = "| a |\n| - |\n| 1 |\n\n~~old~~ and https://example.com";
+    const { container } = render(response(markdown, { mode: "static" }));
+
+    expect(container.querySelector("table")).not.toBeNull();
+    expect(container.querySelector("del")).toHaveTextContent("old");
+    expect(container.querySelector("a")).toHaveTextContent("https://example.com");
   });
 });
 

@@ -13,7 +13,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { RenderItem } from "@/lib/renderItems";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
-import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { ConversationScrollLockContext } from "@/components/ai-elements/conversation";
 import { FileViewerContext } from "@/shell/FileViewerContext";
 import { normalizeExplicitMathDelimiters } from "@/components/ai-elements/mathMarkdown";
@@ -54,7 +53,7 @@ describe("BlockRenderer dispatch", () => {
       '{"data":{"values":[{"a":1}]},"mark":"point","encoding":{"x":{"field":"a","type":"quantitative"}}}';
     render(
       <CapabilitiesProvider
-        info={{ ...FALLBACK_SERVER_INFO, features: { vega_lite_charts: true } }}
+        info={{ ...SERVER_INFO_OFFLINE_FALLBACK, features: { vega_lite_charts: true } }}
       >
         <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
           <BlockRenderer

@@ -1,74 +1,83 @@
 import { describe, expect, it } from "vitest";
-import { isFenceClosed, rehypeMarkUnclosedFences } from "./unclosedFences";
+import { rehypeMarkUnclosedFences, remarkFindUnclosedFences } from "./unclosedFences";
 
-describe("isFenceClosed", () => {
-  it.each([
-    ["a backtick fence", "```vega-lite\n{}\n```", true],
-    ["a tilde fence", "~~~vega-lite\n{}\n~~~", true],
-    ["a longer closing fence", "```\n{}\n`````", true],
-    ["a closing fence with trailing spaces and CRLF", "```\r\n{}\r\n```  \r\n", true],
-    ["an indented closing fence", "```\n   {}\n   ```", true],
-    ["indented code, which has no fence", "    {}", true],
-    ["a fence with no closing line", "```vega-lite\n{}", false],
-    ["an opener alone", "```vega-lite", false],
-    ["a shorter closing run", "````\n{}\n```", false],
-    ["the other fence character", "~~~\n{}\n```", false],
-    ["a closing run followed by text", "```\n{}\n``` x", false],
-    ["a closer indented 4 spaces, which is content", "```\n{}\n    ```", false],
-    ["a tab-indented closer, which is content", "```\n{}\n\t```", false],
-    ["a blockquoted line inside a top-level fence", "```\n{}\n> ```", false],
-  ])("%s → %s", (_label, source, closed) => {
-    expect(isFenceClosed(source)).toBe(closed);
+interface Node {
+  type: string;
+  data?: Record<string, unknown>;
+  children?: Node[];
+  position?: { start: { offset: number } };
+}
+
+type FenceHandler = (this: { stack: Node[] }) => void;
+
+/** Install the remark plugin on a fake processor; returns its fence counter and transformer. */
+function installRemarkPlugin() {
+  const data: Record<string, unknown> = {};
+  const transform = remarkFindUnclosedFences.call({ data: () => data });
+  const [extension] = data.fromMarkdownExtensions as { enter: { codeFencedFence: FenceHandler } }[];
+  return { countFence: extension.enter.codeFencedFence, transform };
+}
+
+const code = (offset: number, fences?: number): Node => ({
+  type: "code",
+  data: fences === undefined ? undefined : { fences },
+  position: { start: { offset } },
+});
+
+describe("remarkFindUnclosedFences", () => {
+  it("counts each fence on the innermost code block being parsed", () => {
+    const { countFence } = installRemarkPlugin();
+    const block = code(0);
+    const contentBuffer = { type: "fragment" };
+
+    // The code block is on top at the opening fence, and its content buffer at the closing one.
+    countFence.call({ stack: [{ type: "root" }, block] });
+    countFence.call({ stack: [{ type: "root" }, block, contentBuffer] });
+
+    expect(block.data).toEqual({ fences: 2 });
   });
 
-  it.each([
-    ["a blockquote", "> ", "```\n> {}\n> ```", true],
-    ["a nested blockquote", "> > ", "```\n> > {}\n> > ```", true],
-    ["a blockquote the closer left", "> ", "```\n> {}\n```", false],
-    ["a list item", "1. ", "```\n   {}\n   ```", true],
-    ["a list item, closer past its indent", "1. ", "```\n   {}\n       ```", false],
-  ])("inside %s", (_label, prefix, source, closed) => {
-    expect(isFenceClosed(source, prefix)).toBe(closed);
+  it("records the starts of fenced blocks with only an opening fence", () => {
+    const { transform } = installRemarkPlugin();
+    const tree: Node = {
+      type: "root",
+      children: [
+        code(0, 2),
+        { type: "list", children: [{ type: "listItem", children: [code(20, 1)] }] },
+        code(40),
+      ],
+    };
+    const file = { data: {} as Record<string, unknown> };
+
+    transform(tree, file);
+
+    expect([...(file.data.omnigentUnclosedFenceStarts as Set<number>)]).toEqual([20]);
   });
 });
 
 describe("rehypeMarkUnclosedFences", () => {
-  const markdown = "```js\na\n```\n\n```vega-lite\n{}\n";
-  const pre = (start: number, end: number) => ({
+  const pre = (offset: number) => ({
     type: "element",
     tagName: "pre",
     properties: {} as Record<string, unknown>,
-    position: { start: { offset: start }, end: { offset: end } },
+    position: { start: { offset } },
   });
 
-  it("marks only the pre whose fence never closed", () => {
-    const closed = pre(0, 11);
-    const unclosed = pre(13, markdown.length);
-    const tree = { type: "root", children: [closed, unclosed] };
+  it("marks only the pre whose fence the parser found unclosed", () => {
+    const closed = pre(0);
+    const unclosed = pre(20);
+    const file = { data: { omnigentUnclosedFenceStarts: new Set([20]) } };
 
-    rehypeMarkUnclosedFences()(tree, { value: markdown });
+    rehypeMarkUnclosedFences()({ type: "root", children: [closed, unclosed] }, file);
 
     expect(closed.properties).toEqual({});
     expect(unclosed.properties).toEqual({ dataUnclosedFence: true });
   });
 
-  it("leaves the tree alone without positions or source text", () => {
-    const unpositioned = { type: "element", tagName: "pre", properties: {} };
-    const unsourced = pre(13, markdown.length);
+  it("leaves the tree alone when the remark plugin didn't run", () => {
+    const node = pre(0);
 
-    rehypeMarkUnclosedFences()({ type: "root", children: [unpositioned] }, { value: markdown });
-    rehypeMarkUnclosedFences()({ type: "root", children: [unsourced] }, {});
-
-    expect(unpositioned.properties).toEqual({});
-    expect(unsourced.properties).toEqual({});
-  });
-
-  it("reads the list marker before a fence as its container", () => {
-    // Indented 2 past the list item's content, which only the marker makes valid.
-    const listed = "1. ```vega-lite\n   {}\n     ```\n";
-    const node = pre(3, listed.trimEnd().length);
-
-    rehypeMarkUnclosedFences()({ type: "root", children: [node] }, { value: listed });
+    rehypeMarkUnclosedFences()({ type: "root", children: [node] }, { data: {} });
 
     expect(node.properties).toEqual({});
   });

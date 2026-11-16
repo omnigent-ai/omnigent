@@ -39,11 +39,16 @@ import {
   type BlockProps,
   type ControlsConfig,
   type StreamdownProps,
+  defaultRemarkPlugins,
 } from "streamdown";
 
 import { VegaLiteChart } from "@/components/charts/VegaLiteChart";
 import { isVegaLiteLanguage } from "@/components/charts/vegaLiteSpec";
-import { rehypeMarkUnclosedFences, UNCLOSED_FENCE_PROP } from "@/components/charts/unclosedFences";
+import {
+  rehypeMarkUnclosedFences,
+  remarkFindUnclosedFences,
+  UNCLOSED_FENCE_PROP,
+} from "@/components/charts/unclosedFences";
 import { isFeatureEnabled } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { MarkdownErrorBoundary } from "./MarkdownErrorBoundary";
@@ -811,10 +816,22 @@ export const MessageResponse = memo(
     else if (markFileLinks) securePlugins = FILE_LINK_STREAMDOWN_REHYPE_PLUGINS;
     else if (allowGitHubAttachmentImages)
       securePlugins = GITHUB_ATTACHMENT_STREAMDOWN_REHYPE_PLUGINS;
-    // Chart fences need to know whether they closed, whatever the streaming state.
+    // Chart fences need the parser's word on whether they closed, whatever the
+    // streaming state. Like Streamdown, extend its default remark plugins.
     const rehypePlugins = useMemo(
       () => (allowCharts ? [...securePlugins, rehypeMarkUnclosedFences] : securePlugins),
       [allowCharts, securePlugins],
+    );
+    const requestedRemarkPlugins = props.remarkPlugins;
+    const remarkPlugins = useMemo(
+      () =>
+        allowCharts
+          ? [
+              ...(requestedRemarkPlugins ?? Object.values(defaultRemarkPlugins)),
+              remarkFindUnclosedFences,
+            ]
+          : requestedRemarkPlugins,
+      [allowCharts, requestedRemarkPlugins],
     );
 
     return (
@@ -841,6 +858,7 @@ export const MessageResponse = memo(
                   components={messageComponents}
                   controls={messageControls}
                   mermaid={mermaidOptions}
+                  remarkPlugins={remarkPlugins}
                   // Block remote image fetches that can exfiltrate data through URLs.
                   rehypePlugins={rehypePlugins}
                 />
