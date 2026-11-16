@@ -4443,6 +4443,7 @@ def create_app(
         # Event-driven: `register` resolves the wait the instant the runner
         # reconnects here. A non-positive grace collapses to an immediate
         # registry check, matching the sleep(0) behavior tests pin.
+        interrupted_at = reference_stamp if reference_stamp is not None else int(time.time())
         reconnected = await tunnel_registry.wait_for_runner(
             runner_id, timeout_s=RUNNER_DISCONNECT_GRACE_S
         )
@@ -4593,6 +4594,7 @@ def create_app(
             conversation_store,
             disconnect_evidence=drop_attributes(evidence, hold_s=hold_s, hold_outcome=hold),
             host_session_recoverer=host_session_recoverer,
+            interrupted_at=interrupted_at,
         )
         if relaunch_host_id is not None:
             # Settlement must still own the old binding before a launch rotates it.
@@ -4959,6 +4961,7 @@ def create_app(
             conversation_store,
             fail_idle_top_level=not runner_ran,
             host_session_recoverer=host_session_recoverer,
+            interrupted_at=int(time.time()),
         )
 
     async def _on_runner_connect(runner_id: str, connection: RunnerSession) -> None:

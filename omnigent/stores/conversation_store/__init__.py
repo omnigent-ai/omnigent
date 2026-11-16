@@ -595,9 +595,11 @@ class ConversationStore(ABC):
         conversation_id: str,
         expected: SessionRecovery | None,
         recovery: SessionRecovery | None,
+        *,
+        expected_conversation: Conversation | None = None,
     ) -> bool:
         """Compare and replace recovery intent under the conversation input lock."""
-        del conversation_id, expected, recovery
+        del conversation_id, expected, recovery, expected_conversation
         return False
 
     def list_host_conversation_ids(

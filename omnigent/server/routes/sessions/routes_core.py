@@ -3999,6 +3999,9 @@ def register_core_routes(
             # claims the session meanwhile keeps its claim.
             if body.runner_id == "":
                 try:
+                    recoverer = getattr(request.app.state, "host_session_recoverer", None)
+                    if recoverer is not None:
+                        await asyncio.to_thread(recoverer.stop_recovery, conv, only_pending=True)
                     if profile_catalog is not None:
                         await asyncio.to_thread(
                             profile_catalog.reassign_runner,
@@ -4076,6 +4079,9 @@ def register_core_routes(
                             host_id=runner_hosts[0] if len(runner_hosts) == 1 else None,
                             host_type="external",
                         )
+                    recoverer = getattr(request.app.state, "host_session_recoverer", None)
+                    if recoverer is not None and runner_id != conv.runner_id:
+                        await asyncio.to_thread(recoverer.stop_recovery, conv, only_pending=True)
                     handled = profile_catalog is not None and await asyncio.to_thread(
                         profile_catalog.reassign_runner,
                         conv,

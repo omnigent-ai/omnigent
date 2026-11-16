@@ -4679,6 +4679,7 @@ async def _mark_runner_sessions_offline_impl(
     fail_idle_top_level: bool = False,
     disconnect_evidence: Mapping[str, str] | None = None,
     host_session_recoverer: HostSessionRecoverer | None = None,
+    interrupted_at: int | None = None,
 ) -> None:
     """
     Fail the sessions a departed runner actually interrupted, with the cause.
@@ -4728,6 +4729,7 @@ async def _mark_runner_sessions_offline_impl(
             fail_idle_top_level=fail_idle_top_level,
             disconnect_evidence=disconnect_evidence,
             host_session_recoverer=host_session_recoverer,
+            interrupted_at=interrupted_at,
             swept_at=swept_at,
         )
         if not pending:
@@ -4772,6 +4774,7 @@ async def _mark_runner_sessions_offline_once(
     disconnect_evidence: Mapping[str, str] | None = None,
     swept_at: int,
     host_session_recoverer: HostSessionRecoverer | None = None,
+    interrupted_at: int | None = None,
 ) -> list[Conversation]:
     """Reconcile each session once and return the ones blocked by metadata errors."""
     retry: list[Conversation] = []
@@ -4848,7 +4851,9 @@ async def _mark_runner_sessions_offline_once(
         if host_session_recoverer is not None and await asyncio.to_thread(
             host_session_recoverer.enabled, conv.host_id
         ):
-            await asyncio.to_thread(host_session_recoverer.record_interruption, conv)
+            await asyncio.to_thread(
+                host_session_recoverer.record_interruption, conv, interrupted_at=interrupted_at
+            )
             recovery = await asyncio.to_thread(conversation_store.get_session_recovery, conv.id)
         decision_status = _session_status_cache.get(conv.id)
         binding_unavailable = False
