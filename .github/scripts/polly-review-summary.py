@@ -328,10 +328,15 @@ def linked_issues(pull_request: str) -> dict | None:
     return {"issues": issues, "omitted": omitted}
 
 
-# How the Codex executor logs a tool result, after the log redactor has run over it:
-# "Codex dynamic tool result: ... tool=sys_read_inbox status=success result={...}".
-_TOOL_RESULT_LOG = "Codex dynamic tool result: "
-_INBOX_READ_LOG = "tool=sys_read_inbox status=success result="
+# The Codex executor's tool-result record, from the start of its log line, e.g.
+# "INFO  11-16 07:56:43.234 inner.codex_executor  run_turn  | Codex dynamic tool result: ...".
+# Anchoring it keeps text quoted inside another record, such as a logged final answer,
+# from passing for one.
+_TOOL_RESULT_RECORD = re.compile(
+    r"[A-Z]+ +\d\d-\d\d \d\d:\d\d:\d\d\.\d+ inner\.codex_executor +\S+ +\| "
+    r"Codex dynamic tool result: turn_id=\S+ call_id=\S+ "
+    r"tool=(?P<tool>\S+) status=(?P<status>\S+) result="
+)
 _INBOX_RESULT_PREFIX = '{"result": "'
 _EMPTY_INBOX = "Inbox is empty"
 _JSON_ESCAPE = re.compile(r'\\(["\\/bfnrt]|u[0-9a-fA-F]{4})')
@@ -395,11 +400,13 @@ def inbox_reads(logs: Path) -> tuple[list[str], bool]:
     for log in sorted(logs.rglob("*.log")):
         # Records end at LF; results keep other line breaks, such as U+2028, as written.
         for line in log.read_text(encoding="utf-8", errors="replace").split("\n"):
-            codex_logs = codex_logs or _TOOL_RESULT_LOG in line
-            position = line.find(_INBOX_READ_LOG)
-            if position < 0:
+            record = _TOOL_RESULT_RECORD.match(line)
+            if record is None:
                 continue
-            text = _inbox_text(line[position + len(_INBOX_READ_LOG) :].rstrip("\r"))
+            codex_logs = True
+            if (record["tool"], record["status"]) != ("sys_read_inbox", "success"):
+                continue
+            text = _inbox_text(line[record.end() :].rstrip("\r"))
             if text and not text.startswith(_EMPTY_INBOX) and text not in reads:
                 reads.append(text)
     return reads, codex_logs
@@ -429,7 +436,8 @@ def partial_review(reads: list[str], secrets: list[str]) -> str:
     sections = [_PARTIAL_INTRO]
     for index, read in enumerate(reads):
         read = _INBOX_TRUNCATION.sub(
-            r"\n…[\1 more characters are in this run's diagnostics artifact]",
+            # The runner shortens long results before delivering them to Polly.
+            r"\n…[\1 more characters weren't delivered to Polly]",
             _redact(read, secrets),
         ).replace("<!--", "&lt;!--")
         # Budget the escaped text, leaving room for a fence longer than three backticks.
