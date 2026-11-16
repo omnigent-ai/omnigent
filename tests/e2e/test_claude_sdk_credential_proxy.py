@@ -16,6 +16,9 @@ from pathlib import Path
 import httpx
 import pytest
 
+from tests._helpers.https_server import enable_https
+from tests._helpers.operator_agents import operator_agent_store
+from tests._helpers.server_runner import server_runner
 from tests.e2e.conftest import (
     configure_mock_llm,
     create_runner_bound_session,
@@ -70,31 +73,89 @@ def credential_upstream(
     worker = threading.Thread(target=server.serve_forever, daemon=True)
     worker.start()
     try:
-        yield f"http://localhost:{server.server_port}/probe", captured
+        yield f"http://127.0.0.1:{server.server_port}/probe", captured
     finally:
         server.shutdown()
         server.server_close()
         worker.join(timeout=5)
 
 
+@pytest.fixture
+def credential_runner(
+    tmp_path: Path, mock_llm_server_url: str
+) -> Iterator[tuple[httpx.Client, str, str]]:
+    """Give the real runner a verified TLS model upstream and private CA state."""
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_POST(self) -> None:
+            response = httpx.post(
+                f"{mock_llm_server_url}{self.path}",
+                content=self.rfile.read(int(self.headers["Content-Length"])),
+                headers={"Content-Type": "application/json"},
+                timeout=30,
+                trust_env=False,
+            )
+            self.send_response(response.status_code)
+            self.send_header("Content-Type", response.headers["Content-Type"])
+            self.send_header("Content-Length", str(len(response.content)))
+            self.end_headers()
+            self.wfile.write(response.content)
+
+        def log_message(self, format: str, *args: object) -> None:
+            pass
+
+    with server_runner(tmp_path / "stack", workspace=tmp_path / "workspace") as stack:
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        enable_https(server, stack.runner_home / ".cache/omnigent-egress")
+        worker = threading.Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        try:
+            # Translate only the fake provider's dial port; TLS and L7 checks stay active.
+            shim = tmp_path / "provider-shim"
+            shim.mkdir()
+            (shim / "sitecustomize.py").write_text(f"""
+from omnigent.inner.claude_model_access import _ClaudeRelay
+original_init = _ClaudeRelay.__init__
+def local_provider(self, **kwargs):
+    original_init(self, **kwargs)
+    self._provider_port = {server.server_port}
+_ClaudeRelay.__init__ = local_provider
+""")
+            stack.start_runner(env={"PYTHONPATH": str(shim)})
+            with (
+                operator_agent_store(stack.base_url, stack.database_uri, stack.artifact_location),
+                httpx.Client(
+                    base_url=stack.base_url,
+                    timeout=30,
+                    trust_env=False,
+                    headers={"x-omnigent-background-session-titles": "off"},
+                ) as client,
+            ):
+                yield client, stack.runner_id, "https://localhost"
+        finally:
+            server.shutdown()
+            server.server_close()
+            worker.join(timeout=5)
+
+
 @pytest.mark.timeout(300)
 def test_claude_sdk_credential_proxy_survives_transport_and_renews(
-    http_client: httpx.Client,
-    live_runner_id: str,
+    credential_runner: tuple[httpx.Client, str, str],
     mock_llm_server_url: str,
     credential_upstream: tuple[str, list[str | None]],
     credential_source: tuple[Path, tuple[str, str]],
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Refresh credentials within one real SDK shell call without exposing the source."""
     assert shutil.which("claude"), "Install the Claude CLI to exercise the real SDK harness"
     assert shutil.which("curl"), "Install curl to exercise the sandbox's outbound request"
     assert shutil.which("bwrap"), "Install bubblewrap to exercise the Linux sandbox"
-    monkeypatch.setitem(http_client.headers, "x-omnigent-background-session-titles", "off")
+    http_client, live_runner_id, model_endpoint = credential_runner
 
     workspace = tmp_path / "workspace"
-    workspace.mkdir()
+    workspace.mkdir(exist_ok=True)
     source, secrets = credential_source
     upstream_url, captured = credential_upstream
     model = f"mock-credential-proxy-{uuid.uuid4().hex}"
@@ -112,7 +173,7 @@ def test_claude_sdk_credential_proxy_survives_transport_and_renews(
         model=model,
         profile="",
         prompt="Execute the requested shell probe, then report completion.",
-        mock_llm_base_url=mock_llm_server_url,
+        mock_llm_base_url=model_endpoint,
         extra_config={
             "os_env": {
                 "type": "caller_process",
@@ -126,7 +187,7 @@ def test_claude_sdk_credential_proxy_survives_transport_and_renews(
                     "credential_proxy": [
                         {
                             "type": "https_bearer",
-                            "target": "localhost",
+                            "target": "127.0.0.1",
                             "env": "CREDENTIAL_TEST_TOKEN",
                             "source": {
                                 "file": str(source),
