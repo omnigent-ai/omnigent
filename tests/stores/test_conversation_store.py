@@ -10599,6 +10599,13 @@ def test_list_conversations_filters_by_host_and_runner_liveness(
         return {c.id for c in store.list_conversations(limit=1, **filters).data}
 
     assert listed(runner_seen_since=1_500) == {live.id}
+    tunnelled = {
+        c.id
+        for c in store.list_conversations(
+            limit=10, runner_seen_since=1_500, live_runner_ids=["runner-stale"]
+        ).data
+    }
+    assert tunnelled == {live.id, stale.id}
     assert listed(host_id=host) == {stale.id}
     assert listed(host_id=host, runner_seen_since=1_500) == set()
     assert len(store.list_conversations(limit=10).data) == 3

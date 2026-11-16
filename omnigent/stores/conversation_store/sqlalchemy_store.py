@@ -3785,6 +3785,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         title: str | None = None,
         host_id: str | None = None,
         runner_seen_since: int | None = None,
+        live_runner_ids: list[str] | None = None,
     ) -> PagedList[Conversation]:
         """
         List conversations with cursor-based pagination.
@@ -3997,7 +3998,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             if runner_seen_since is not None:
                 meta_filters += [
                     SqlConversationMetadata.runner_id.is_not(None),
-                    SqlConversationMetadata.runner_last_seen >= runner_seen_since,
+                    or_(
+                        SqlConversationMetadata.runner_last_seen >= runner_seen_since,
+                        SqlConversationMetadata.runner_id.in_(live_runner_ids or []),
+                    ),
                 ]
             if meta_filters:
                 bound = select(SqlConversationMetadata.id).where(

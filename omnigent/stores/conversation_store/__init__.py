@@ -1005,6 +1005,7 @@ class ConversationStore(ABC):
         title: str | None = None,
         host_id: str | None = None,
         runner_seen_since: int | None = None,
+        live_runner_ids: list[str] | None = None,
     ) -> PagedList[Conversation]:
         """
         List conversations with cursor-based pagination.
@@ -1128,7 +1129,11 @@ class ConversationStore(ABC):
             this host. ``None`` disables the filter.
         :param runner_seen_since: When set, only return conversations
             bound to a runner whose ``runner_last_seen`` is at or after
-            this Unix time in seconds. ``None`` disables the filter.
+            this Unix time in seconds, or to one of ``live_runner_ids``.
+            ``None`` disables the filter.
+        :param live_runner_ids: Runner ids known to be connected (this
+            replica's tunnels), counted live whatever their
+            ``runner_last_seen``. Used only with ``runner_seen_since``.
         :returns: A :class:`PagedList` of :class:`Conversation`
             objects.
         :raises omnigent.errors.StaleCursorError: If the ``after``/``before``

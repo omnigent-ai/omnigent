@@ -2612,8 +2612,8 @@ def register_core_routes(
             sessions, matching the legacy behaviour. ``include_archived``
             adds archived rows to ``"mine"``, ``"shared"`` and ``"all"``.
         :param connected: When ``True``, only return sessions whose runner
-            was seen within ``RUNNER_LIVENESS_TTL_S``. Applied before
-            pagination.
+            is tunnelled to this replica or was seen within
+            ``RUNNER_LIVENESS_TTL_S``. Applied before pagination.
         :param host_id: When set, only return sessions bound to this host.
             Applied before pagination.
         :returns: A :class:`PaginatedList` of
@@ -2683,6 +2683,10 @@ def register_core_routes(
             include_archived_param = include_archived
             archived_only_param = False
 
+        local_runner_ids = (
+            request.app.state.tunnel_registry.online_runner_ids() if connected else None
+        )
+
         def _read_page() -> _SessionPageReads:
             # One read-only burst over a single pool checkout per engine: the
             # page query, family projection and every per-row enrichment read
@@ -2716,6 +2720,7 @@ def register_core_routes(
                     runner_seen_since=(
                         int(time.time()) - RUNNER_LIVENESS_TTL_S if connected else None
                     ),
+                    live_runner_ids=local_runner_ids,
                 )
                 # Side chats surface only as Workspace-rail tabs, so drop any
                 # side-chat-labeled fork from the sidebar list (it is still a
