@@ -1803,6 +1803,26 @@ describe("SettingsPage", () => {
     ).toBe("settings-default-base-branch-label");
   });
 
+  it("renders the Appearance theme rows from their Settings catalog entries", () => {
+    renderPage("/settings/appearance");
+    for (const id of ["theme-mode", "terminal-theme", "color-theme"]) {
+      expect(document.querySelector(`[data-settings-item="${id}"]`)).not.toBeNull();
+    }
+    expect(
+      document
+        .querySelector('[data-settings-control="theme-mode"]')
+        ?.getAttribute("aria-labelledby"),
+    ).toBe("settings-theme-mode-label");
+    expect(
+      document
+        .querySelector('[data-settings-control="color-theme:accent"]')
+        ?.getAttribute("aria-label"),
+    ).toMatch(/^Accent: #/);
+    expect(
+      document.querySelector('[data-settings-control="color-theme:translucentSidebars"]'),
+    ).toHaveAttribute("aria-label", "Translucent sidebars");
+  });
+
   it("renders the Sandbox Integrations rows from their Settings catalog entries", async () => {
     mocks.enabledConnections = ["github", "databricks"];
     renderPage("/settings/integrations");

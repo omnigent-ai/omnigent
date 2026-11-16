@@ -101,10 +101,16 @@ import {
 } from "@/pages/settings/search/catalog/archived";
 import {
   SettingsDataRegion,
+  SettingsOwner,
   settingsOverlayProps,
   settingsRowOverlayProps,
   settingsRuntimeChoiceProps,
 } from "@/pages/settings/search/settingsOwnership";
+import {
+  COLOR_THEME_ENTRY,
+  TERMINAL_THEME_ENTRY,
+  THEME_MODE_ENTRY,
+} from "@/pages/settings/search/catalog/appearance";
 import { MCP_SERVICES_ENTRY } from "@/pages/settings/search/catalog/mcp";
 import {
   ACCOUNT_PASSWORD_ENTRY,
@@ -549,18 +555,25 @@ function iconButtonBody(Icon: ComponentType<{ className?: string }>, label: stri
 /** A labeled Appearance subsection: heading + one-line helper + its control. */
 function ThemeSubsection({
   labelId,
+  descriptionId,
   title,
   helper,
   children,
 }: {
   labelId: string;
+  descriptionId?: string;
   title: string;
   helper: string;
   children: ReactNode;
 }) {
   return (
     <div className="flex flex-col gap-3">
-      <SettingsLabel label={title} labelId={labelId} description={helper} />
+      <SettingsLabel
+        label={title}
+        labelId={labelId}
+        descriptionId={descriptionId}
+        description={helper}
+      />
       {children}
     </div>
   );
@@ -572,21 +585,16 @@ function ModeControl() {
   const mode = normalizeThemeMode(theme);
   const followsHost = useHostTheme() !== undefined;
   const themeSettingsUrl = followsHost ? getOmnigentThemeSettingsUrl() : undefined;
-  const labelId = useId();
   return (
-    <div className="flex items-center justify-between gap-4">
+    <SettingsItem entry={THEME_MODE_ENTRY} className="flex items-center justify-between gap-4">
       <div className="flex-1">
-        <SettingsLabel
-          label="Mode"
-          labelId={labelId}
-          description={
-            followsHost
-              ? "Follow Databricks, or force light or dark."
-              : "Follow your system, or force light or dark."
-          }
+        <SettingsEntryLabel
+          entry={THEME_MODE_ENTRY}
+          description={followsHost ? "Follow Databricks, or force light or dark." : undefined}
         />
         {themeSettingsUrl && (
           <a
+            {...settingsControlProps(THEME_MODE_ENTRY, "databricksSettings")}
             href={themeSettingsUrl}
             target="_blank"
             rel="noreferrer"
@@ -596,51 +604,49 @@ function ModeControl() {
           </a>
         )}
       </div>
-      <IconSegmentedControl<ThemeMode>
-        labelledBy={labelId}
-        value={mode}
-        onSelect={(next) => setTheme(next)}
-        componentId="settings.appearance.theme_mode"
-        items={themeCards.map((card) => ({
-          value: card.mode,
-          testId: `theme-${card.mode}`,
-          label: card.mode === "system" && followsHost ? "Use Databricks setting" : card.label,
-          icon: card.icon,
-        }))}
-      />
-    </div>
+      <SettingsOwner entry={THEME_MODE_ENTRY}>
+        <IconSegmentedControl<ThemeMode>
+          labelledBy={settingsLabelId(THEME_MODE_ENTRY)}
+          value={mode}
+          onSelect={(next) => setTheme(next)}
+          componentId="settings.appearance.theme_mode"
+          items={themeCards.map((card) => ({
+            value: card.mode,
+            testId: `theme-${card.mode}`,
+            label: card.mode === "system" && followsHost ? "Use Databricks setting" : card.label,
+            icon: card.icon,
+          }))}
+        />
+      </SettingsOwner>
+    </SettingsItem>
   );
 }
 
 /** Terminal light/dark/match-app theme — its own section. */
 function TerminalThemeControl() {
   const [mode, setMode] = useState(() => readTerminalThemeMode());
-  const labelId = useId();
   const choose = useCallback((next: TerminalThemeMode) => {
     setMode(next);
     writeTerminalThemeMode(next);
   }, []);
   return (
-    <div className="flex items-center justify-between gap-4">
-      <SettingsLabel
-        label="Terminal theme"
-        labelId={labelId}
-        description="Use a light or dark terminal, or match the app."
-        className="flex-1"
-      />
-      <IconSegmentedControl<TerminalThemeMode>
-        labelledBy={labelId}
-        value={mode}
-        onSelect={choose}
-        componentId="settings.appearance.terminal_theme"
-        items={terminalThemeCards.map((card) => ({
-          value: card.mode,
-          testId: `terminal-theme-${card.mode}`,
-          label: card.label,
-          icon: card.icon,
-        }))}
-      />
-    </div>
+    <SettingsItem entry={TERMINAL_THEME_ENTRY} className="flex items-center justify-between gap-4">
+      <SettingsEntryLabel entry={TERMINAL_THEME_ENTRY} className="flex-1" />
+      <SettingsOwner entry={TERMINAL_THEME_ENTRY}>
+        <IconSegmentedControl<TerminalThemeMode>
+          labelledBy={settingsLabelId(TERMINAL_THEME_ENTRY)}
+          value={mode}
+          onSelect={choose}
+          componentId="settings.appearance.terminal_theme"
+          items={terminalThemeCards.map((card) => ({
+            value: card.mode,
+            testId: `terminal-theme-${card.mode}`,
+            label: card.label,
+            icon: card.icon,
+          }))}
+        />
+      </SettingsOwner>
+    </SettingsItem>
   );
 }
 
@@ -829,7 +835,6 @@ function ColorThemeControl() {
   const isDark = useResolvedThemeMode() === "dark";
   const [selection, setSelection] = useState<ThemeSelection>(() => readThemePalette());
   const [customTheme, setCustomTheme] = useState<CustomTheme>(() => readCustomTheme());
-  const labelId = useId();
 
   const choose = useCallback(
     (next: ThemeSelection) => {
@@ -883,116 +888,128 @@ function ColorThemeControl() {
       : selectedPalette?.blurb;
 
   return (
-    <ThemeSubsection
-      labelId={labelId}
-      title="Color theme"
-      helper="Choose a preset, then tune it across light and dark mode."
-    >
-      <div
-        data-testid="color-theme-editor"
-        className="overflow-hidden rounded-xl border bg-transparent"
+    <SettingsItem entry={COLOR_THEME_ENTRY}>
+      <ThemeSubsection
+        labelId={settingsLabelId(COLOR_THEME_ENTRY)}
+        descriptionId={settingsDescriptionId(COLOR_THEME_ENTRY)}
+        title="Color theme"
+        helper="Choose a preset, then tune it across light and dark mode."
       >
-        <div className="flex flex-col gap-3 border-b bg-muted/30 p-4 sm:flex-row sm:items-center sm:justify-between">
-          <div className="flex min-w-0 items-center gap-3">
-            <div className="w-28 shrink-0 overflow-hidden rounded-lg shadow-sm">
-              <PaletteSwatchPreview swatch={isDark ? selected.dark : selected.light} />
-            </div>
-            <SettingsLabel
-              label="Theme palette"
-              description={paletteDescription}
-              descriptionClassName="truncate"
-            />
-          </div>
-          <Select
-            value={selection}
-            onValueChange={(next) => {
-              if (isThemeSelection(next)) choose(next);
-            }}
-            componentId="settings.appearance.color_theme"
-            valueHasNoPii
-          >
-            <SelectTrigger
-              aria-labelledby={labelId}
-              data-testid="color-theme-select"
-              className="w-full gap-2 sm:w-48"
-            >
-              <SelectValue>
-                <PaletteChip swatch={isDark ? selected.dark : selected.light} />
-                <span>{selected.label}</span>
-              </SelectValue>
-            </SelectTrigger>
-            <SelectContent>
-              {PALETTES.map((palette) => (
-                <SelectItem
-                  key={palette.id}
-                  value={palette.id}
-                  data-testid={`palette-${palette.id}`}
-                >
-                  <PaletteChip swatch={isDark ? palette.dark : palette.light} />
-                  <span>{palette.label}</span>
-                </SelectItem>
-              ))}
-              <SelectItem value="custom" data-testid="palette-custom">
-                <PaletteChip swatch={isDark ? customSwatches.dark : customSwatches.light} />
-                <span>Custom</span>
-              </SelectItem>
-            </SelectContent>
-          </Select>
-        </div>
-
-        <div className="px-4">
-          <ThemeColorPicker
-            label="Accent"
-            value={isDark ? editableTheme.darkAccent : editableTheme.accent}
-            testId="custom-theme-accent"
-            onChange={(accent) => updateCustomTheme(isDark ? { darkAccent: accent } : { accent })}
-          />
-          <ThemeColorPicker
-            label="Background tint"
-            value={isDark ? editableTheme.darkTint : editableTheme.tint}
-            testId="custom-theme-tint"
-            onChange={(tint) => updateCustomTheme(isDark ? { darkTint: tint } : { tint })}
-          />
-          <div className="flex items-center justify-between gap-4 border-b border-border/70 py-4">
-            <SettingsLabel label="Contrast" description="Separates text, borders, and surfaces." />
-            <div className="flex w-52 items-center gap-3">
-              <input
-                id="custom-theme-contrast"
-                type="range"
-                min="0"
-                max="100"
-                value={editableTheme.contrast}
-                aria-label="Theme contrast"
-                data-testid="custom-theme-contrast"
-                onChange={(event) => updateCustomTheme({ contrast: Number(event.target.value) })}
-                className="theme-contrast-range min-w-0 flex-1 cursor-pointer"
-                style={{ "--range-progress": `${editableTheme.contrast}%` } as CSSProperties}
+        <div
+          data-testid="color-theme-editor"
+          className="overflow-hidden rounded-xl border bg-transparent"
+        >
+          <div className="flex flex-col gap-3 border-b bg-muted/30 p-4 sm:flex-row sm:items-center sm:justify-between">
+            <div className="flex min-w-0 items-center gap-3">
+              <div className="w-28 shrink-0 overflow-hidden rounded-lg shadow-sm">
+                <PaletteSwatchPreview swatch={isDark ? selected.dark : selected.light} />
+              </div>
+              <SettingsLabel
+                label="Theme palette"
+                description={paletteDescription}
+                descriptionClassName="truncate"
               />
-              <output
-                htmlFor="custom-theme-contrast"
-                data-testid="custom-theme-contrast-value"
-                className="w-7 text-right text-sm font-medium tabular-nums"
+            </div>
+            <Select
+              value={selection}
+              onValueChange={(next) => {
+                if (isThemeSelection(next)) choose(next);
+              }}
+              componentId="settings.appearance.color_theme"
+              valueHasNoPii
+            >
+              <SelectTrigger
+                {...settingsControlProps(COLOR_THEME_ENTRY)}
+                data-testid="color-theme-select"
+                className="w-full gap-2 sm:w-48"
               >
-                {editableTheme.contrast}
-              </output>
+                <SelectValue>
+                  <PaletteChip swatch={isDark ? selected.dark : selected.light} />
+                  <span>{selected.label}</span>
+                </SelectValue>
+              </SelectTrigger>
+              <SelectContent {...settingsOverlayProps(COLOR_THEME_ENTRY)}>
+                {PALETTES.map((palette) => (
+                  <SelectItem
+                    key={palette.id}
+                    value={palette.id}
+                    data-testid={`palette-${palette.id}`}
+                  >
+                    <PaletteChip swatch={isDark ? palette.dark : palette.light} />
+                    <span>{palette.label}</span>
+                  </SelectItem>
+                ))}
+                <SelectItem value="custom" data-testid="palette-custom">
+                  <PaletteChip swatch={isDark ? customSwatches.dark : customSwatches.light} />
+                  <span>Custom</span>
+                </SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+
+          <div className="px-4">
+            <SettingsOwner entry={COLOR_THEME_ENTRY} part="accent">
+              <ThemeColorPicker
+                label="Accent"
+                value={isDark ? editableTheme.darkAccent : editableTheme.accent}
+                testId="custom-theme-accent"
+                onChange={(accent) =>
+                  updateCustomTheme(isDark ? { darkAccent: accent } : { accent })
+                }
+              />
+            </SettingsOwner>
+            <SettingsOwner entry={COLOR_THEME_ENTRY} part="tint">
+              <ThemeColorPicker
+                label="Background tint"
+                value={isDark ? editableTheme.darkTint : editableTheme.tint}
+                testId="custom-theme-tint"
+                onChange={(tint) => updateCustomTheme(isDark ? { darkTint: tint } : { tint })}
+              />
+            </SettingsOwner>
+            <div className="flex items-center justify-between gap-4 border-b border-border/70 py-4">
+              <SettingsLabel
+                label="Contrast"
+                description="Separates text, borders, and surfaces."
+              />
+              <div className="flex w-52 items-center gap-3">
+                <input
+                  id="custom-theme-contrast"
+                  type="range"
+                  min="0"
+                  max="100"
+                  value={editableTheme.contrast}
+                  {...settingsControlProps(COLOR_THEME_ENTRY, "contrast")}
+                  data-testid="custom-theme-contrast"
+                  onChange={(event) => updateCustomTheme({ contrast: Number(event.target.value) })}
+                  className="theme-contrast-range min-w-0 flex-1 cursor-pointer"
+                  style={{ "--range-progress": `${editableTheme.contrast}%` } as CSSProperties}
+                />
+                <output
+                  htmlFor="custom-theme-contrast"
+                  data-testid="custom-theme-contrast-value"
+                  className="w-7 text-right text-sm font-medium tabular-nums"
+                >
+                  {editableTheme.contrast}
+                </output>
+              </div>
+            </div>
+            <div className="flex items-center justify-between gap-4 py-4">
+              <SettingsLabel
+                label="Translucent sidebars"
+                description="Show the canvas through the conversation and Workspace sidebars."
+              />
+              <Switch
+                {...settingsControlProps(COLOR_THEME_ENTRY, "translucentSidebars")}
+                checked={editableTheme.translucentSidebar}
+                onCheckedChange={(translucentSidebar) => updateCustomTheme({ translucentSidebar })}
+                data-testid="custom-theme-translucent-sidebar"
+                componentId="settings.appearance.translucent_sidebar"
+              />
             </div>
           </div>
-          <div className="flex items-center justify-between gap-4 py-4">
-            <SettingsLabel
-              label="Translucent sidebars"
-              description="Show the canvas through the conversation and Workspace sidebars."
-            />
-            <Switch
-              aria-label="Translucent sidebars"
-              checked={editableTheme.translucentSidebar}
-              onCheckedChange={(translucentSidebar) => updateCustomTheme({ translucentSidebar })}
-              data-testid="custom-theme-translucent-sidebar"
-              componentId="settings.appearance.translucent_sidebar"
-            />
-          </div>
         </div>
-      </div>
-    </ThemeSubsection>
+      </ThemeSubsection>
+    </SettingsItem>
   );
 }
 

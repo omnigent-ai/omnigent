@@ -3,6 +3,7 @@ import { type ComponentType, useRef } from "react";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { cn } from "@/lib/utils";
+import { useSettingsOwnership } from "@/pages/settings/search/settingsOwnership";
 
 interface IconSegmentedOption<T extends string> {
   value: T;
@@ -27,6 +28,8 @@ export function IconSegmentedControl<T extends string>({
 }) {
   const { trackValueChange } = useOmnigentAnalytics();
   const refs = useRef(new Map<T, HTMLButtonElement | null>());
+  // Under a Settings owner the group is that row's control, and each radio one of its choices.
+  const owned = useSettingsOwnership();
   const select = (next: T) => {
     if (componentId) {
       trackValueChange(componentId, "select", next, { valueHasNoPii: true });
@@ -38,7 +41,7 @@ export function IconSegmentedControl<T extends string>({
     <TooltipProvider>
       <div
         role="radiogroup"
-        aria-labelledby={labelledBy}
+        {...owned.control({ outside: { "aria-labelledby": labelledBy } })}
         className="inline-flex shrink-0 gap-0.5 rounded-lg bg-muted p-0.5"
       >
         {items.map((item, index) => {
