@@ -592,6 +592,45 @@ describe("Harness page catalog rows", () => {
   });
 });
 
+describe("Harness plugin and skill catalog rows", () => {
+  it("lists a plugin row in its region and names the plugin page's tabs", () => {
+    hosts = [ONLINE];
+    renderHarnesses("claude-native");
+
+    selectTab("Plugins · 1");
+    const pluginRow = screen.getByTestId("catalog-row-toolkit").closest("li");
+    expect(pluginRow).toHaveAttribute("data-settings-region-row");
+    expect(
+      pluginRow?.closest('[data-settings-region="harness-claude-native-detail:plugins"]'),
+    ).not.toBeNull();
+
+    fireEvent.click(screen.getByTestId("catalog-row-toolkit"));
+    expect(screen.getByRole("tablist", { name: "Plugin view" })).toHaveAttribute(
+      "data-settings-control",
+      "harness-claude-native-plugin:tab",
+    );
+    expect(
+      document.querySelector('[data-settings-item="harness-claude-native-plugin"]'),
+    ).toContainElement(screen.getByRole("heading", { name: "toolkit" }));
+  });
+
+  it("lists a skill row in its region and names the skill page's document", () => {
+    hosts = [ONLINE];
+    renderHarnesses("claude-native");
+
+    selectTab("Skills · 1");
+    const skillRow = screen.getByTestId("catalog-row-review").closest("li");
+    expect(
+      skillRow?.closest('[data-settings-region="harness-claude-native-detail:skills"]'),
+    ).not.toBeNull();
+
+    fireEvent.click(screen.getByTestId("catalog-row-review"));
+    expect(
+      document.querySelector('[data-settings-content="harness-claude-native-skill:skill"]'),
+    ).toContainElement(screen.getByRole("heading", { name: "Instructions" }));
+  });
+});
+
 describe("Harness card navigation", () => {
   const selected = (name: string) =>
     screen.getByRole("tab", { name }).getAttribute("aria-selected");

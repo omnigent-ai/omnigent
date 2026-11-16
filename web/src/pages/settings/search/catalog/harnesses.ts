@@ -115,23 +115,41 @@ function inventoryFamilyOf(harness: NativeHarnessId): InventoryHarness | undefin
   return INVENTORY_HARNESSES.find((family) => INVENTORY_HARNESS_IDS[family] === harness);
 }
 
+/** A harness's plugin page, reached from its Plugins tab: its own Skills and MCPs tabs. */
+export type HarnessPluginEntry = SettingsEntry & {
+  readonly parts: Readonly<Record<"tab", string>>;
+};
+
+/** A harness's skill page, reached from its Skills tab or from a plugin: the skill's document. */
+export type HarnessSkillEntry = SettingsEntry;
+
+/** The entries of one inventory harness's pages; only the families with skill contents have `skill`. */
+export interface InventoryPageEntries {
+  readonly family: InventoryHarness;
+  readonly detail: InventoryHarnessDetailEntry;
+  readonly plugin: HarnessPluginEntry;
+  readonly skill?: HarnessSkillEntry;
+}
+
 /**
- * The inventory a harness's page lists, by its family, with the page's entry, which has the tab
- * list. A harness without an inventory has no such page.
+ * The inventory a harness's page lists, with its entries. A harness without an inventory has
+ * none of these pages.
  */
-export function harnessInventoryPage(
-  harness: NativeHarnessId,
-): { family: InventoryHarness; detail: InventoryHarnessDetailEntry } | undefined {
+export function harnessInventoryPage(harness: NativeHarnessId): InventoryPageEntries | undefined {
   const family = inventoryFamilyOf(harness);
   if (family === undefined) return undefined;
-  // Only the inventory pages' builds add the tab list, so this is the one place that names it.
   return {
     family,
+    // Only the inventory pages' builds add the tab list, so this is the one place that names it.
     detail: HARNESS_DETAIL_ENTRIES.entry(harness) as InventoryHarnessDetailEntry,
+    plugin: HARNESS_PLUGIN_ENTRIES.entry(harness),
+    skill: hasSkillPage(family) ? HARNESS_SKILL_ENTRIES.entry(harness) : undefined,
   };
 }
 
 const INVENTORY_KINDS = ["MCP servers", "Skills", "Plugins"] as const;
+// A list whose rows each open a page, named by the row's own data, so none of it is searchable.
+const OPENS_BY_NAME = { rowActions: { open: { dataName: true } } } as const;
 
 /**
  * Each harness's own page, named by its title. Its setup warning's button is "Set up", or, by
@@ -173,6 +191,8 @@ export const HARNESS_DETAIL_ENTRIES = settingsEntryFamily({
         ),
       },
       presence: { ...page.presence, tab: { states: ["lists its inventory"] } },
+      // Each plugin and skill row opens its own page.
+      regions: { plugins: OPENS_BY_NAME, skills: OPENS_BY_NAME },
     }) as InventoryHarnessDetailEntry;
   },
 });
@@ -200,9 +220,72 @@ export const HARNESS_CREDENTIAL_ENTRIES = settingsEntryFamily({
     }),
 });
 
+/** The families whose skills open a page of their own, which also show their contents. */
+export const SKILL_PAGE_FAMILIES = [
+  "claude",
+  "codex",
+  "cursor",
+] as const satisfies readonly InventoryHarness[];
+
+function hasSkillPage(family: InventoryHarness): boolean {
+  return (SKILL_PAGE_FAMILIES as readonly InventoryHarness[]).includes(family);
+}
+
+const INVENTORY_NATIVE_IDS = NATIVE_HARNESS_IDS.filter(
+  (harness) => inventoryFamilyOf(harness) !== undefined,
+);
+const SKILL_PAGE_NATIVE_IDS = INVENTORY_NATIVE_IDS.filter((harness) =>
+  hasSkillPage(inventoryFamilyOf(harness)!),
+);
+
+const PLUGIN_KINDS = ["Skills", "MCPs"] as const;
+
+/** Each inventory harness's plugin page, named by its own tabs; a link to it lands on the Plugins tab. */
+export const HARNESS_PLUGIN_ENTRIES = settingsEntryFamily({
+  key: "harness-plugins",
+  members: INVENTORY_NATIVE_IDS,
+  build: (harness): HarnessPluginEntry =>
+    settingsEntry({
+      id: `harness-${harness}-plugin`,
+      section: "harnesses",
+      harness,
+      label: "Plugin",
+      description: `A plugin's skills and MCP servers in ${harnessName(harness)}.`,
+      keywords: ["plugin", "skills", "mcp"],
+      parts: { tab: "Plugin view" },
+      partChoices: { tab: [...PLUGIN_KINDS] },
+      choiceTemplates: {
+        tab: Object.fromEntries(
+          PLUGIN_KINDS.map((kind) => [kind, { before: `${kind} · `, count: true }]),
+        ),
+      },
+      regions: { skills: OPENS_BY_NAME },
+      revealedBy: { entry: `harness-${harness}-detail`, part: "tab", choice: "Plugins" },
+    }),
+});
+
+/** Each skill-page family's skill page: the skill's own document, whose links are its content. */
+export const HARNESS_SKILL_ENTRIES = settingsEntryFamily({
+  key: "harness-skills",
+  members: SKILL_PAGE_NATIVE_IDS,
+  build: (harness): HarnessSkillEntry =>
+    settingsEntry({
+      id: `harness-${harness}-skill`,
+      section: "harnesses",
+      harness,
+      label: "Skill",
+      description: `A skill's own instructions in ${harnessName(harness)}.`,
+      keywords: ["skill", "instructions"],
+      contentAreas: ["skill"],
+      revealedBy: { entry: `harness-${harness}-detail`, part: "tab", choice: "Skills" },
+    }),
+});
+
 export const HARNESS_SETTINGS: readonly SettingsEntry[] = [
   HARNESSES_GRID_ENTRY,
   ...HARNESS_CARD_ENTRIES.entries,
   ...HARNESS_DETAIL_ENTRIES.entries,
   ...HARNESS_CREDENTIAL_ENTRIES.entries,
+  ...HARNESS_PLUGIN_ENTRIES.entries,
+  ...HARNESS_SKILL_ENTRIES.entries,
 ];
