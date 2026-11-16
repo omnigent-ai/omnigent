@@ -724,13 +724,16 @@ def test_endpoint_uds_variant_shape() -> None:
     assert ep.base_url == "http://harness.local"
 
 
-def test_endpoint_tcp_variant_shape() -> None:
+@pytest.mark.parametrize(
+    "host, authority", [("127.0.0.1", "127.0.0.1:54321"), ("::1", "[::1]:54321")]
+)
+def test_endpoint_tcp_variant_shape(host: str, authority: str) -> None:
     from omnigent.runtime.harnesses.process_manager import _HarnessEndpoint
 
-    ep = _HarnessEndpoint(host="127.0.0.1", port=54321)
+    ep = _HarnessEndpoint(host=host, port=54321)
     assert ep.is_uds is False
-    assert ep.spawn_args() == ["--bind", "127.0.0.1:54321"]
-    assert ep.base_url == "http://127.0.0.1:54321"
+    assert ep.spawn_args() == ["--bind", authority]
+    assert ep.base_url == f"http://{authority}"
 
 
 def test_endpoint_create_picks_platform_transport() -> None:

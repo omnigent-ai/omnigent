@@ -7,7 +7,7 @@ import { PageLoading } from "@/components/PageLoading";
 import { Spinner } from "@/components/ui/spinner";
 import { ChunkLoadErrorBoundary } from "@/components/ChunkLoadErrorBoundary";
 import { RenderErrorBoundary } from "@/components/RenderErrorBoundary";
-import { useLocation, useNavigate } from "@/lib/routing";
+import { Outlet, useLocation, useNavigate } from "@/lib/routing";
 import { isFeatureEnabled, type FeatureKey } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { AppShell } from "@/shell/AppShell";
@@ -65,6 +65,14 @@ const UsagePage = withPageView(
 const TaskDetailPage = withPageView(
   "tasks.detail",
   lazy(() => import("@/pages/TaskDetailPage").then((m) => ({ default: m.TaskDetailPage }))),
+);
+const WorkflowsPage = withPageView(
+  "workflows",
+  lazy(() => import("@/pages/WorkflowsPage").then((m) => ({ default: m.WorkflowsPage }))),
+);
+const WorkflowDetailPage = withPageView(
+  "workflows.detail",
+  lazy(() => import("@/pages/WorkflowDetailPage").then((m) => ({ default: m.WorkflowDetailPage }))),
 );
 const SettingsPage = lazy(() =>
   import("@/pages/SettingsPage").then((m) => ({ default: m.SettingsPage })),
@@ -206,16 +214,44 @@ function AppRoutes({ basename }: AppProps) {
               </FeatureGatedPage>
             }
           />
-          <Route path={`${prefix}/tasks`} element={<TasksPage />} />
           <Route
-            path={`${prefix}/tasks/templates`}
-            element={<TasksPage key="templates" templatesOnly />}
+            element={
+              info === "loading" ? (
+                <PageLoading />
+              ) : info.automations_enabled === false ? (
+                <NotFoundPage />
+              ) : (
+                <Outlet />
+              )
+            }
+          >
+            <Route path={`${prefix}/tasks`} element={<TasksPage />} />
+            <Route
+              path={`${prefix}/tasks/templates`}
+              element={<TasksPage key="templates" templatesOnly />}
+            />
+            <Route
+              path={`${prefix}/tasks/:taskId`}
+              element={
+                <FeatureGatedPage feature="automations_v2">
+                  <TaskDetailPage />
+                </FeatureGatedPage>
+              }
+            />
+          </Route>
+          <Route
+            path={`${prefix}/workflows`}
+            element={
+              <FeatureGatedPage feature="workflows">
+                <WorkflowsPage />
+              </FeatureGatedPage>
+            }
           />
           <Route
-            path={`${prefix}/tasks/:taskId`}
+            path={`${prefix}/workflows/:workflowId`}
             element={
-              <FeatureGatedPage feature="automations_v2">
-                <TaskDetailPage />
+              <FeatureGatedPage feature="workflows">
+                <WorkflowDetailPage />
               </FeatureGatedPage>
             }
           />

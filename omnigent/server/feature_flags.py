@@ -43,9 +43,12 @@ class Feature(StrEnum):
     CLAUDE_OSC_STATUS = "claude_osc_status"
     WORKSPACE_CONTENT_SEARCH = "workspace_content_search"
     GRID_SESSIONS_DISPLAY_UI = "grid_sessions_display_ui"
+    AUTOMATIONS = "automations"
     AUTOMATIONS_V2 = "automations_v2"
+    ONE_TIME_AUTOMATIONS = "one_time_automations"
     SPLITTABLE_TERMINAL_VIEW_UI = "splittable_terminal_view_ui"
     SIDEBAR_WINDOWED_ROWS = "sidebar_windowed_rows"
+    WORKFLOWS = "workflows"
     SESSION_OVERVIEW = "session_overview"
     PROJECT_REPOSITORY_CREATION = "project_repository_creation"
     WORKSPACE_DIRECT_ACCESS = "workspace_direct_access"
@@ -114,6 +117,14 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         default_enabled=True,
     ),
     FeatureDefinition(
+        feature=Feature.AUTOMATIONS,
+        description="Automations across the API, UI, agent tools and background schedulers",
+        owner="server",
+        review_by_release="0.27.0",
+        frontend_visible=False,
+        default_enabled=True,
+    ),
+    FeatureDefinition(
         feature=Feature.AUTOMATIONS_V2,
         description=(
             "Automation improvements across scheduling, run management, execution targets and UI"
@@ -121,6 +132,17 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         owner="server",
         review_by_release="0.20.0",
         default_enabled=True,
+    ),
+    FeatureDefinition(
+        feature=Feature.ONE_TIME_AUTOMATIONS,
+        description=(
+            "Create one-time (COUNT=1) automations, including sys_reminder_set reminders. "
+            "Every database scheduler sharing the database must already accept them; "
+            "an older one pauses them as invalid"
+        ),
+        owner="server",
+        review_by_release="0.24.0",
+        frontend_visible=False,
     ),
     FeatureDefinition(
         feature=Feature.GRID_SESSIONS_DISPLAY_UI,
@@ -215,6 +237,12 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         review_by_release="0.24.0",
     ),
     FeatureDefinition(
+        feature=Feature.WORKFLOWS,
+        description="Workflows and session journals across the API, UI and agent tools",
+        owner="server",
+        review_by_release="0.24.0",
+    ),
+    FeatureDefinition(
         feature=Feature.SESSION_OVERVIEW,
         description="Session cost sidebar beside chat, toggled from a header cost chip",
         owner="web",
@@ -230,19 +258,19 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
     FeatureDefinition(
         feature=Feature.WORKSPACE_DIRECT_ACCESS,
         description=(
-            "Owners read a session's workspace straight from its host's local socket; "
-            "the server and the host must both enable it"
+            "Owners read a session's workspace straight from its host's socket, "
+            "with a short-lived token this server issues"
         ),
         owner="server",
         review_by_release="0.27.0",
-        frontend_visible=False,
+        frontend_visible=True,
     ),
     FeatureDefinition(
         feature=Feature.WORKSPACE_API_SERVER_ACCESS,
         description="Serve the workspace API through the server, answered by the session's host",
         owner="server",
         review_by_release="0.27.0",
-        frontend_visible=False,
+        frontend_visible=True,
     ),
     FeatureDefinition(
         feature=Feature.PROACTIVE_AGENT,

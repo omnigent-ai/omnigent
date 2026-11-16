@@ -51,6 +51,7 @@ const {
   createBrowserPermissionStore,
 } = require("./browserPermissions");
 const { createBrowserPermissionPrompt } = require("./browserPermissionPrompt");
+const { attachSecurityKeyNotice } = require("./browserSecurityKeyNotice");
 const {
   normalizeUrl,
   normalizeRecentServers,
@@ -131,6 +132,9 @@ const {
   sanitizeDesktopCommandState,
 } = require("./desktopCommands");
 const omnigentCli = require("./omnigent_cli");
+const { workspaceSocketRequest } = require("./workspaceSocket");
+const { createWorkspaceSshForwards } = require("./workspaceSshForwards");
+const { createSshHostStore } = require("./sshHosts");
 
 const serverManager = require("./server_manager");
 const { diagnostics } = require("./diagnostics");
@@ -307,6 +311,10 @@ const ERR_BLOCKED_BY_CLIENT = -20;
  */
 const POPUP_PRELOAD = path.join(__dirname, "popup_preload.js");
 
+/** Reports embedded-browser WebAuthn requests; Windows draws its own WebAuthn dialog. */
+const BROWSER_VIEW_PRELOAD =
+  process.platform === "win32" ? undefined : path.join(__dirname, "browser_view_preload.js");
+
 /** Absolute path to the app icon (PNG works for the macOS dock at runtime). */
 const ICON_PNG = path.join(__dirname, "..", "icons", "icon.png");
 
@@ -349,6 +357,9 @@ function databricksInternalFeaturesEnabled() {
  * while one is in flight re-focuses the console and shares its outcome.
  */
 const arcaIdentities = createArcaIdentityStore();
+// Hosts this desktop connected over SSH, and the connections that reach their workspace sockets.
+const sshHosts = createSshHostStore(() => path.join(app.getPath("userData"), "ssh-hosts.json"));
+const workspaceSshForwards = createWorkspaceSshForwards();
 
 function startArcaHostConnect(serverUrl, deps) {
   const finish = arcaIdentities.begin(serverUrl);
@@ -4269,12 +4280,26 @@ function createBrowserRegistryForWindow(win) {
     registry.get(registry.activeConversationId())?.view.webContents === wc;
   const registry = createBrowserViewRegistry({
     WebContentsViewCtor: (opts) => {
+      if (BROWSER_VIEW_PRELOAD) opts.webPreferences.preload = BROWSER_VIEW_PRELOAD;
       // Install before construction: Electron otherwise auto-grants requests.
       const policy = hardenAgentPartition(opts.webPreferences.partition, win, canPrompt, () =>
         view.getBounds(),
       );
       const view = new WebContentsView(opts);
       policy.attach(view.webContents);
+      if (BROWSER_VIEW_PRELOAD) {
+        attachSecurityKeyNotice(view.webContents, {
+          canPrompt,
+          showPrompt: (options) =>
+            browserPermissionPrompt.show({
+              parent: win,
+              getAnchorBounds: () => view.getBounds(),
+              ...options,
+            }),
+          openExternal: (url) => shell.openExternal(url),
+          cookieImport: process.platform === "darwin",
+        });
+      }
       guardAgentPartitionRequests(opts.webPreferences.partition, registry);
       return view;
     },
@@ -5359,6 +5384,19 @@ function registerIpc() {
     };
   });
 
+  // SPA → a workspace API call on a session host's local socket. The socket and
+  // call shape are checked in workspaceSocket.js; the host checks the token.
+  ipcMain.handle("omnigent:workspace-socket-request", (event, request) => {
+    if (!isPinnedOriginSender(event)) {
+      throw new Error("workspace-socket-request is only available to a connected server page");
+    }
+    const serverUrl = senderServerUrl(event);
+    return workspaceSocketRequest(request, {
+      sshDestination: (hostId) => (serverUrl ? sshHosts.destination(serverUrl, hostId) : null),
+      forwards: workspaceSshForwards,
+    });
+  });
+
   // SPA → connect a machine over SSH as a host. Requires the window's pinned origin
   // and revalidates the destination before the shell-owned console asks consent.
   ipcMain.handle("omnigent:ssh-connect", async (event, destination) => {
@@ -5389,7 +5427,20 @@ function registerIpc() {
         error: `${target} can't reach a server on this computer (${new URL(serverUrl).host}). Connect this window to a server ${target} can reach, or, if ${target} runs this server itself, run "omnigent host" there.`,
       };
     }
-    return sshConnectFlow.run(BrowserWindow.fromWebContents(event.sender), serverUrl, target);
+    const result = await sshConnectFlow.run(
+      BrowserWindow.fromWebContents(event.sender),
+      serverUrl,
+      target,
+    );
+    // Lets the file viewer read this host's workspace over SSH.
+    if (result?.ok && result.identity) {
+      try {
+        sshHosts.record(serverUrl, result.identity.hostId, target);
+      } catch (error) {
+        console.warn("[omnigent] couldn't record the SSH host:", error);
+      }
+    }
+    return result;
   });
 
   // SPA → connect the user's Arca instance to the window's server as a host,
@@ -6170,7 +6221,10 @@ if (!gotLock) {
     });
   });
 
-  app.on("will-quit", () => globalShortcut.unregisterAll());
+  app.on("will-quit", () => {
+    globalShortcut.unregisterAll();
+    workspaceSshForwards.closeAll();
+  });
   app.on("window-all-closed", () => {
     // macOS apps typically stay alive until Cmd-Q.
     if (process.platform !== "darwin") app.quit();
@@ -6205,6 +6259,8 @@ if (!gotLock) {
   app.on("quit", clearQuitForceExitTimer);
   app.on("before-quit", (event) => {
     quitConfirmation.quitStarted();
+    // Forced exits below skip will-quit, so SSH connections are torn down here first.
+    workspaceSshForwards.closeAll();
     if (quitCleanupDone) return;
     // A second quit (e.g. Cmd-Q again during the SIGKILL grace window) must not
     // re-enter shutdown() concurrently — just keep deferring until the first

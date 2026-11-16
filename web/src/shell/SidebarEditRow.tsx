@@ -71,7 +71,7 @@ export function SidebarEditRow({
         onKeyDown={handleKeyDown}
         onBlur={handleBlur}
         data-testid="rename-conversation-input"
-        className="min-w-0 flex-1 truncate rounded bg-transparent px-1 py-0.5 outline-none md:select-text"
+        className="sidebar-compact-text min-w-0 flex-1 truncate rounded bg-transparent px-1 py-0.5 outline-none md:select-text"
       />
       <Button
         type="button"

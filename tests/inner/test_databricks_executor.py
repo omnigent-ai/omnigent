@@ -3080,6 +3080,70 @@ def test_reused_token_source_re_resolves_when_cached_auth_goes_stale(
     assert len(cfgs) == (2 if credentials_repaired else 3)
 
 
+@pytest.mark.parametrize(
+    ("initial_host", "next_host"),
+    [
+        (None, "https://workspace.example.test"),
+        ("https://old.example.test", "https://workspace.example.test"),
+        ("https://old.example.test", None),
+    ],
+    ids=["paired", "repaired", "removed"],
+)
+@pytest.mark.parametrize("available", [True, False], ids=["available", "unavailable"])
+def test_reused_token_source_follows_saved_workspace_changes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: _Path,
+    initial_host: str | None,
+    next_host: str | None,
+    available: bool,
+) -> None:
+    """Re-login changes the source even when the SDK config file is unchanged."""
+    from omnigent import cli_auth
+    from omnigent.inner.databricks_executor import (
+        DatabricksAuthError,
+        _DatabricksBearerAuth,
+        _ReusedDatabricksTokenSource,
+    )
+
+    monkeypatch.setattr(cli_auth, "_token_file_path", lambda: tmp_path / "auth_tokens.json")
+    server = "https://server.example.test"
+    if initial_host is not None:
+        cli_auth.store_databricks_auth(server, initial_host)
+
+    class _Cfg:
+        def __init__(self, token: str) -> None:
+            self.token = token
+
+        def authenticate(self) -> dict[str, str]:
+            return {"Authorization": f"Bearer {self.token}"}
+
+    resolutions: list[str | None] = []
+
+    def _resolve(profile=None, *, host=None):
+        assert profile is None
+        resolutions.append(host)
+        if len(resolutions) > 1 and not available:
+            raise DatabricksAuthError("workspace credentials unavailable")
+        return _DatabricksBearerAuth(_Cfg(f"token-{len(resolutions)}")), host
+
+    monkeypatch.setattr("omnigent.inner.databricks_executor._resolve_databricks_auth", _resolve)
+    source = _ReusedDatabricksTokenSource(server)
+    assert source.current_token() == "token-1"
+    assert source.current_token() == "token-1"
+    assert resolutions == [initial_host]
+
+    if next_host is None:
+        cli_auth.clear_token(server)
+    else:
+        cli_auth.store_databricks_auth(server, next_host)
+
+    assert source.current_token() == ("token-2" if available else None)
+    assert resolutions == [initial_host, next_host]
+    if available:
+        assert source.current_token() == "token-2"
+        assert len(resolutions) == 2
+
+
 def test_reused_token_source_retries_resolution_after_failure(monkeypatch):
     """A failed resolution is retried on the next mint."""
     from omnigent.inner.databricks_executor import (
@@ -3314,6 +3378,48 @@ def test_reused_token_source_adopt_keeps_the_resolution_time_config_file(
     assert source._cached is not None and source._cached[0] is current, (
         "auth adopted from the current file must be reused"
     )
+
+
+def test_reused_token_source_adopt_keeps_resolution_time_workspace(
+    tmp_path: _Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Auth verified before re-login cannot be adopted for the new workspace."""
+    from omnigent import cli_auth
+    from omnigent.inner.databricks_executor import (
+        _DatabricksBearerAuth,
+        _resolve_databricks_auth,
+        _ReusedDatabricksTokenSource,
+    )
+
+    monkeypatch.setattr(cli_auth, "_token_file_path", lambda: tmp_path / "auth_tokens.json")
+    server = "https://server.example.test"
+    old_host = "https://old.example.test"
+    new_host = "https://workspace.example.test"
+
+    class _Cfg:
+        def __init__(self, token: str) -> None:
+            self.token = token
+
+        def authenticate(self) -> dict[str, str]:
+            return {"Authorization": f"Bearer {self.token}"}
+
+    def _discover(profile=None, *, host=None, workspace_id=None):
+        token = "old-token" if host == old_host else "new-token"
+        return _DatabricksBearerAuth(_Cfg(token)), host
+
+    monkeypatch.setattr("omnigent.inner.databricks_executor._discover_databricks_auth", _discover)
+    cli_auth.store_databricks_auth(server, old_host)
+    verified, _ = _resolve_databricks_auth(host=old_host)
+    cli_auth.store_databricks_auth(server, new_host)
+
+    source = _ReusedDatabricksTokenSource(server)
+    source.adopt(verified)
+    assert source.current_token() == "new-token"
+
+    current, _ = _resolve_databricks_auth(host=new_host)
+    source.adopt(current)
+    assert source.current_token() == "new-token"
+    assert source._cached is not None and source._cached[0] is current
 
 
 def test_reused_token_source_re_resolves_adopted_auth_without_provenance(

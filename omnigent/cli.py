@@ -4759,6 +4759,10 @@ def server(
         # below is the server path for the bare ``server`` group.
         return
 
+    # Socket binds use bare IPv6 addresses; URLs use brackets.
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
+
     # --base-path is sugar for OMNIGENT_WEB_BASE_PATH, which create_app reads.
     # An env var (not a create_app kwarg) so the same toggle reaches every
     # startup path (Docker entrypoint, canonical local server, e2e harness)
@@ -5077,19 +5081,9 @@ def server(
 
             databricks_store = DatabricksConnectionStore(db_uri, dbx_cipher)
 
-    from omnigent.server.mcp_registry import McpRegistry, McpRegistryConfig
+    from omnigent.server.mcp_registry import build_mcp_registry_from_env
 
-    mcp_registry = None
-    registry_config = McpRegistryConfig.from_env()
-    if registry_config is not None:
-        from omnigent.stores.credential_store import build_secret_cipher
-        from omnigent.stores.credential_store.sqlalchemy_store import CredentialStore
-
-        registry_cipher = build_secret_cipher()
-        mcp_registry = McpRegistry(
-            registry_config,
-            CredentialStore(db_uri, registry_cipher) if registry_cipher else None,
-        )
+    mcp_registry = build_mcp_registry_from_env(db_uri)
 
     # Accounts mode ergonomics: when accounts mode is selected
     # (OMNIGENT_AUTH_ENABLED=1 without OIDC config, or an explicit
@@ -5115,7 +5109,11 @@ def server(
             "OMNIGENT_ACCOUNTS_COOKIE_SECRET",
             load_or_generate_cookie_secret(art_loc),
         )
-        os.environ.setdefault("OMNIGENT_ACCOUNTS_BASE_URL", f"http://{host}:{port}")
+        from omnigent.util.server_url import format_host_port
+
+        os.environ.setdefault(
+            "OMNIGENT_ACCOUNTS_BASE_URL", f"http://{format_host_port(host, port)}"
+        )
 
     auth_provider = create_auth_provider()
 

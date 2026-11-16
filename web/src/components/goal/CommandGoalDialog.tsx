@@ -63,7 +63,8 @@ export function CommandGoalDialog({
             </DialogDescription>
           </DialogHeader>
 
-          <div className="min-h-0 space-y-1.5 overflow-y-auto">
+          {/* Leave room for the field's focus ring inside the scrollable region. */}
+          <div className="-m-1 min-h-0 space-y-1.5 overflow-y-auto p-1">
             <label className="text-sm font-medium text-muted-foreground" htmlFor="goal-condition">
               Completion condition
             </label>

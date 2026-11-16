@@ -68,9 +68,12 @@ export type FeatureKey =
   | "automations_v2"
   | "splittable_terminal_view_ui"
   | "sidebar_windowed_rows"
+  | "session_orchestration"
+  | "workflows"
   | "session_overview"
   | "project_repository_creation"
-  | "session_orchestration";
+  | "workspace_direct_access"
+  | "workspace_api_server_access";
 
 /** Deployment-wide release-feature values advertised by the server. */
 export type FeatureValues = Record<string, boolean>;
@@ -327,6 +330,16 @@ export interface ServerInfo {
   /** Session comments preserve PR revision and line anchors; absent on older servers. */
   comment_anchor_metadata?: boolean;
   /**
+   * True when the server keeps session journals (``/v1/sessions/{id}/journal`` and
+   * ``session.journal.appended``), which the Tasks tab shows; absent on older servers (off).
+   */
+  session_journal?: boolean;
+  /**
+   * True when the server keeps each user's saved workflows (``/v1/workflows``), which
+   * Run a workflow offers; absent on older servers (off).
+   */
+  workflows?: boolean;
+  /**
    * True when the server stores each user's session title instructions
    * (``/v1/settings/session-title-instructions``); absent on older servers (off).
    */
@@ -340,6 +353,11 @@ export interface ServerInfo {
   scheduled_task_projects?: boolean;
   /** Latest sessionless automation failures can be listed for Inbox. */
   scheduled_task_inbox?: boolean;
+  /**
+   * Owners can share automations (``/v1/scheduled-tasks/{id}/permissions``);
+   * absent on older servers (off).
+   */
+  scheduled_task_sharing?: boolean;
   /** Scheduled permissions support native harnesses beyond Claude Code. */
   scheduled_task_harness_settings?: boolean;
   /** Automations accept modes that skip approval; older servers may reject them. */
@@ -688,12 +706,15 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           session_claude_sdk_clear: data.session_claude_sdk_clear === true,
           session_rewind: data.session_rewind === true,
           session_pull_requests: data.session_pull_requests === true,
+          session_journal: data.session_journal === true,
+          workflows: data.workflows === true,
           session_title_instructions: data.session_title_instructions === true,
           admin_view: data.admin_view === true,
           comment_anchor_metadata: data.comment_anchor_metadata === true,
           filesystem_attachments: parseFilesystemAttachments(data.filesystem_attachments),
           scheduled_task_projects: data.scheduled_task_projects === true,
           scheduled_task_inbox: data.scheduled_task_inbox === true,
+          scheduled_task_sharing: data.scheduled_task_sharing === true,
           scheduled_task_harness_settings: data.scheduled_task_harness_settings === true,
           scheduled_task_approval_skipping_modes:
             data.scheduled_task_approval_skipping_modes === true,
@@ -735,6 +756,14 @@ export function getCachedServerInfo(): ServerInfo | null {
  */
 export function isSingleUserMode(info: ServerInfo | "loading"): boolean {
   return info !== "loading" && info.single_user;
+}
+
+/** Why Share controls are disabled while the server turns sharing off. */
+export const SHARING_OFF_REASON = "Sharing has been disabled for this Omnigent server.";
+
+/** Whether the server turns sharing off; `false` while the probe loads (fail open). */
+export function isSharingOff(info: ServerInfo | "loading"): boolean {
+  return info !== "loading" && info.sharing_mode === "off";
 }
 
 /**
