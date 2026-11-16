@@ -6,6 +6,8 @@ interface Props {
   children: ReactNode;
   name: string;
   resetKey?: string;
+  /** Shown instead of the alert; `null` hides a part whose absence is fine. */
+  fallback?: ReactNode;
 }
 
 interface State {
@@ -33,6 +35,7 @@ export class RenderErrorBoundary extends Component<Props, State> {
 
   override render() {
     if (!this.state.failed) return this.props.children;
+    if (this.props.fallback !== undefined) return this.props.fallback;
     return (
       <div
         role="alert"

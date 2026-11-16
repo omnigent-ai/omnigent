@@ -612,6 +612,16 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
     return () => ipcRenderer.removeListener("browser-nav-state", listener);
   },
 
+  // Annotate and Draw (designTools.js): open and stop a tool's overlay on a view, and its
+  // page operations and captures.
+  browserDesignTools: (args) => ipcRenderer.invoke("omnigent:browser-design-tools", args),
+  /** Main ended a view's opening (its page went): `{ viewId, type: "ended", session, reason }`. */
+  onBrowserDesignToolsEvent: (callback) => {
+    const listener = (_event, payload) => callback(payload);
+    ipcRenderer.on("browser-design-tools-event", listener);
+    return () => ipcRenderer.removeListener("browser-design-tools-event", listener);
+  },
+
   // ── Design mode (point-and-prompt) ─────────────────────────────────────
   // Toggle the in-page picker + popup. On Send, the SPA gets the submit via
   // onBrowserElementPromptSubmit, routes it as a normal chat message (no backend

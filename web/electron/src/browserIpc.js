@@ -21,6 +21,7 @@ const {
 } = require("./agentDeadline");
 const { routedGate, viewElsewhere } = require("./browserTabs");
 const { buildDesignModeScript } = require("./designModeScript");
+const { registerDesignToolsIpc, sharedDesignTools } = require("./designTools");
 
 const { SESSION_HOST_PROTOCOL } = require("./hostIdentity");
 
@@ -589,7 +590,11 @@ function registerBrowserIpc({
     const viewId = g.registry.activeConversationId();
     if (viewId === null) return null;
     try {
-      return g.registry.get(viewId)?.view.webContents.isFocused() ? viewId : null;
+      // The design tools' overlay over the page takes its keys while a tool is open.
+      const entry = g.registry.get(viewId);
+      return entry?.view.webContents.isFocused() || sharedDesignTools().overlayFocused(entry)
+        ? viewId
+        : null;
     } catch {
       return null;
     }
@@ -795,6 +800,9 @@ function registerBrowserIpc({
       return { ok: false, error: e && e.message ? e.message : String(e) };
     }
   });
+
+  // Annotate and Draw on a view (designTools.js).
+  registerDesignToolsIpc({ ipcMain, gateRegistry });
 
   // ── Design mode (point-and-prompt) ───────────────────────────────────────
   // Enable/disable the in-page picker and signal a submit result back to the

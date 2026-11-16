@@ -82,6 +82,7 @@ import {
 import { conversationRegistry } from "@/store/conversationRegistry";
 import { RunnerStartingIndicator, SandboxActionBanner } from "@/pages/ChatIndicators";
 import { QueuedMessagesStrip } from "@/pages/QueuedMessagesStrip";
+import { DesignOutboxStrip } from "@/components/BrowserPane/designTools/LazyDesignOutboxStrip";
 import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import { shouldQueueSend } from "@/lib/messageQueue";
 import { attachmentAccept, clipboardFiles, validateAttachments } from "@/lib/attachments";
@@ -1366,6 +1367,8 @@ function SideChatComposer({
           {commandNotice}
         </ComposerFeedbackRow>
       )}
+      {/* Its design tool requests still on their way (none yet for a chat not started). */}
+      {!pending && <DesignOutboxStrip conversationId={childId} widthClassName="mx-3 w-auto" />}
       {queues && (
         <TooltipProvider>
           <QueuedMessagesStrip

@@ -548,6 +548,22 @@ export function getCurrentUserId(): string | null {
 }
 
 /**
+ * Ask the server who is signed in now, bypassing the cache (another window can sign in
+ * as someone else). Null when signed out; undefined when the server can't say.
+ */
+export async function fetchSignedInUserId(): Promise<string | null | undefined> {
+  try {
+    const res = await hostFetch("/v1/me", undefined, { hostless: true });
+    if (res.status === 401) return null;
+    if (!res.ok) return undefined;
+    const data = (await res.json()) as { user_id?: string | null };
+    return data.user_id ?? null;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * Whether the current user has admin access enabled in this browser.
  * Mode-agnostic — usable to gate admin chrome under header, accounts,
  * AND OIDC. Returns false before `resolveIdentity` completes.
