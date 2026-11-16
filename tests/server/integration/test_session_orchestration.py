@@ -2,6 +2,7 @@
 
 import json
 from contextvars import ContextVar
+from unittest.mock import Mock
 from uuid import uuid4
 
 import pytest
@@ -9,7 +10,7 @@ import pytest
 from omnigent.native.permission_modes import PERMISSION_LAUNCH_ARGS
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER, RUNNER_TUNNEL_TOKEN_HEADER
 from omnigent.runner.tool_dispatch import execute_tool
-from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ
+from omnigent.server.auth import LEVEL_EDIT, LEVEL_OWNER, LEVEL_READ
 from omnigent.server.feature_flags import (
     FEATURES_ENV_VAR,
     Feature,
@@ -20,6 +21,8 @@ from omnigent.server.sharing_settings import write_peer_session_messaging_overri
 from omnigent.stores.conversation_store import (
     CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
     CREATED_BY_SESSION_LABEL_KEY,
+    SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY,
+    SCHEDULED_TASK_LAUNCH_LABEL_KEY,
     SCHEDULED_TASK_ORIGIN_LABEL_KEY,
     SIDE_CHAT_SOURCE_LABEL_KEY,
 )
@@ -822,6 +825,141 @@ async def test_worker_started_before_a_legacy_run_is_recorded_uses_the_automatio
     assert len(workers) == 1 and workers[0].get("conversation_id"), workers
     worker = conversations.get_conversation(workers[0]["conversation_id"])
     assert worker.terminal_launch_args == PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"]
+
+
+def _shared_automation(auth_app, db_uri, monkeypatch, agent_id, grantees):
+    """Alice's automation, shared at Read with *grantees*, with managed launches stubbed."""
+    from omnigent.server.routes.sessions import routes_core
+    from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
+
+    schedules = SqlAlchemyScheduledTaskStore(db_uri)
+    task = schedules.create(
+        scheduled_task_id=uuid4().hex,
+        name="Shared watcher",
+        prompt="Start a worker for each new item",
+        rrule="FREQ=HOURLY",
+        user_id="alice",
+        agent_id=agent_id,
+        timezone="UTC",
+        execution_target="managed_sandbox",
+    )
+    monkeypatch.setattr(auth_app.state, "scheduled_task_store", schedules)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    for grantee in grantees:
+        permissions.ensure_user(grantee)
+        permissions.grant_for_scheduled_task(grantee, task.id, LEVEL_READ)
+
+    async def launch(**kwargs):
+        pass
+
+    monkeypatch.setattr(routes_core, "_run_managed_launch", launch)
+    return task
+
+
+def _run_labels(task):
+    """The labels a run stamps on the session it creates."""
+    return {SCHEDULED_TASK_ORIGIN_LABEL_KEY: task.id, SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY: "run"}
+
+
+async def _launch_worker(auth_client, agent_id, launcher_id):
+    return json.loads(
+        await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"agent_id": agent_id, "placement": "managed"}),
+            server_client=auth_client,
+            conversation_id=launcher_id,
+        )
+    )
+
+
+def _session_levels(db_uri, session_id):
+    grants, _ = SqlAlchemyPermissionStore(db_uri).list_for_session(session_id)
+    return {grant.user_id: grant.level for grant in grants}
+
+
+@pytest.mark.parametrize("siblings_enabled", [True, False], ids=["sibling", "independent"])
+async def test_launches_from_a_run_tree_are_shared_with_the_automation_grantees(
+    auth_client, auth_app, peers, db_uri, monkeypatch, siblings_enabled
+):
+    source, _target, _captured = peers
+    if not siblings_enabled:
+        auth_app.state.feature_flags = FeatureFlags(
+            auth_app.state.feature_flags.enabled_features - {Feature.SIBLING_SESSIONS}
+        )
+    task = _shared_automation(auth_app, db_uri, monkeypatch, source["agent_id"], ["bob", "carol"])
+    conversations = SqlAlchemyConversationStore(db_uri)
+    conversations.set_labels(source["id"], _run_labels(task))
+
+    launcher = source["id"]
+    # From the run's session, then a session it launched, then a child of the next one.
+    for depth in range(3):
+        result = await _launch_worker(auth_client, source["agent_id"], launcher)
+        assert result.get("conversation_id"), result
+        worker = conversations.get_conversation(result["conversation_id"])
+        assert worker.labels[SCHEDULED_TASK_LAUNCH_LABEL_KEY] == task.id
+        assert _session_levels(db_uri, worker.id) == {
+            "alice": LEVEL_OWNER,
+            "bob": LEVEL_READ,
+            "carol": LEVEL_READ,
+        }
+        assert worker.parent_conversation_id is None
+        if siblings_enabled:
+            assert worker.family_id == source["id"]
+        else:
+            assert worker.labels[CREATED_BY_SESSION_LABEL_KEY] == launcher
+        auth_client.headers.update(_bind_runner(db_uri, worker.id))
+        launcher = worker.id
+        if depth == 1:
+            response = await auth_client.post(
+                "/v1/sessions",
+                json={"agent_id": source["agent_id"], "parent_session_id": worker.id},
+            )
+            assert response.status_code == 201, response.text
+            launcher = response.json()["id"]
+
+    for value in (task.id, ""):
+        labels = {SCHEDULED_TASK_LAUNCH_LABEL_KEY: value}
+        response = await auth_client.post(
+            "/v1/sessions", json={"agent_id": source["agent_id"], "labels": labels}
+        )
+        assert response.status_code == 400, response.text
+        response = await auth_client.patch(f"/v1/sessions/{worker.id}", json={"labels": labels})
+        assert response.status_code == 400, response.text
+    assert conversations.get_conversation(worker.id).labels[SCHEDULED_TASK_LAUNCH_LABEL_KEY] == (
+        task.id
+    )
+
+
+@pytest.mark.parametrize("case", ["no_automation", "unshared", "grant_read_fails"])
+async def test_a_launch_the_automation_shares_with_no_one_stays_private(
+    auth_client, auth_app, peers, db_uri, monkeypatch, case
+):
+    source, _target, _captured = peers
+    task = _shared_automation(
+        auth_app,
+        db_uri,
+        monkeypatch,
+        source["agent_id"],
+        [] if case == "unshared" else ["bob"],
+    )
+    if case != "no_automation":
+        SqlAlchemyConversationStore(db_uri).set_labels(source["id"], _run_labels(task))
+    if case == "grant_read_fails":
+        monkeypatch.setattr(
+            SqlAlchemyPermissionStore,
+            "list_for_scheduled_task",
+            Mock(side_effect=RuntimeError("automation grants unavailable")),
+        )
+
+    result = await _launch_worker(auth_client, source["agent_id"], source["id"])
+
+    assert result.get("conversation_id"), result
+    worker = SqlAlchemyConversationStore(db_uri).get_conversation(result["conversation_id"])
+    assert _session_levels(db_uri, worker.id) == {"alice": LEVEL_OWNER}
+    # The launch still joins the automation it came from.
+    assert worker.labels.get(SCHEDULED_TASK_LAUNCH_LABEL_KEY) == (
+        None if case == "no_automation" else task.id
+    )
 
 
 @pytest.mark.parametrize("placement", ["same_host", "managed"])

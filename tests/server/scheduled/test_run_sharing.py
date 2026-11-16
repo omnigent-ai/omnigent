@@ -27,11 +27,18 @@ from omnigent.server.auth import (
 )
 from omnigent.server.scheduled import run_sharing
 from omnigent.server.scheduled.run_sharing import (
+    launching_automation,
+    share_launched_session,
     share_new_run_session,
     sync_continued_session,
     sync_task_session,
 )
 from omnigent.stores import permission_store as permission_store_module
+from omnigent.stores.conversation_store import (
+    SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY,
+    SCHEDULED_TASK_LAUNCH_LABEL_KEY,
+    SCHEDULED_TASK_ORIGIN_LABEL_KEY,
+)
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
 from tests.server.scheduled.test_fire import (
@@ -124,6 +131,108 @@ async def test_the_sharing_policy_decides_whether_a_run_session_is_shared(
         dict.fromkeys(GRANTEES, LEVEL_READ) if shared else {}
     )
     assert announced == ([(grantee, session.id) for grantee in GRANTEES] if shared else [])
+
+
+@pytest.mark.parametrize(
+    "managed,execution_target,shared",
+    [(True, "connected_host", True), (False, "managed_sandbox", False)],
+)
+async def test_a_launch_without_a_workspace_is_shared_only_as_a_new_sandbox(
+    permissions, task, announced, managed, execution_target, shared
+) -> None:
+    """The launched session's own placement decides, not the automation's target."""
+    session = replace(_session(permissions), host_id=None, workspace=None)
+
+    await share_launched_session(
+        replace(task, execution_target=execution_target),
+        session,
+        managed=managed,
+        permission_store=permissions,
+        app_state=SimpleNamespace(sharing_mode=lambda: SharingMode.RESTRICTED_READ_ONLY),
+        host_registry=None,
+    )
+
+    assert _levels(permissions, session.id) == (
+        dict.fromkeys(GRANTEES, LEVEL_READ) if shared else {}
+    )
+    assert len(announced) == (len(GRANTEES) if shared else 0)
+
+
+def _recording(read: Any, reads: list[str]) -> Any:
+    """*read*, recording each key it is called with in *reads*."""
+
+    def recorded(key: str) -> Any:
+        reads.append(key)
+        return read(key)
+
+    return recorded
+
+
+@pytest.mark.parametrize(
+    "case,resolves",
+    [
+        ("run_session", True),
+        ("child_of_run_session", True),
+        ("launched_session", True),
+        ("child_of_launched_session", True),
+        # A continue task's kept session counts even without the first run's label.
+        ("kept_session", True),
+        # A fork keeps the origin label but not the run's.
+        ("fork", False),
+        ("no_automation", False),
+        ("another_owner", False),
+        ("deleted_automation", False),
+        ("unreadable_automation", False),
+        # A server without automations reads nothing.
+        ("child_of_run_session_without_automations", False),
+    ],
+)
+def test_a_launch_resolves_to_the_automation_whose_run_tree_it_is_in(
+    db_uri, task, monkeypatch, case, resolves
+) -> None:
+    run_labels = {
+        SCHEDULED_TASK_ORIGIN_LABEL_KEY: task.id,
+        SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY: uuid.uuid4().hex,
+    }
+    launched_labels = {SCHEDULED_TASK_LAUNCH_LABEL_KEY: task.id}
+    labels = {
+        "launched_session": launched_labels,
+        "child_of_launched_session": launched_labels,
+        "kept_session": {SCHEDULED_TASK_ORIGIN_LABEL_KEY: task.id},
+        "fork": {SCHEDULED_TASK_ORIGIN_LABEL_KEY: task.id},
+        "no_automation": {},
+    }.get(case, run_labels)
+    root = _FakeConversation(id=uuid.uuid4().hex, agent_id="ag_1", labels=labels)
+    child = _FakeConversation(
+        id=uuid.uuid4().hex,
+        agent_id="ag_1",
+        parent_conversation_id=root.id,
+        root_conversation_id=root.id,
+    )
+    source = child if case.startswith("child_of") else root
+    tasks = SqlAlchemyScheduledTaskStore(db_uri)
+    if case == "kept_session":
+        tasks.update(task.id, session_mode="continue", session_id=root.id)
+    elif case == "deleted_automation":
+        tasks.update(task.id, state="deleted")
+    elif case == "unreadable_automation":
+        monkeypatch.setattr(tasks, "get", Mock(side_effect=RuntimeError("store unavailable")))
+    conversations = _ExistingConversationStore(root, child)
+    reads: list[str] = []
+    for store, method in ((conversations, "get_conversation"), (tasks, "get")):
+        monkeypatch.setattr(store, method, _recording(getattr(store, method), reads))
+
+    found = launching_automation(
+        source,
+        user_id="mallory@example.com" if case == "another_owner" else RESERVED_USER_LOCAL,
+        conversation_store=conversations,
+        scheduled_task_store=None if case.endswith("without_automations") else tasks,
+    )
+
+    assert (found.id if found is not None else None) == (task.id if resolves else None)
+    # The root, unless the source is one, then only the automation the root names.
+    expected_reads = [root.id] * (source is child) + [task.id] * bool(labels)
+    assert reads == ([] if case.endswith("without_automations") else expected_reads)
 
 
 async def test_a_store_without_automation_grants_changes_no_session(
