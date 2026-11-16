@@ -10281,6 +10281,7 @@ def _daemon_session_request_params(
     connected_only: bool,
     after: str | None,
     kind: Literal["default", "sub_agent"] = "default",
+    host_id: str | None = None,
 ) -> dict[str, str | int]:
     """
     Build query parameters for one sessions page.
@@ -10290,6 +10291,8 @@ def _daemon_session_request_params(
     :param after: Optional cursor from the prior page, e.g.
         ``"conv_abc123"``.
     :param kind: Session kind to fetch; the server omits sub-agents by default.
+    :param host_id: When set, ask the server for the sessions whose root is
+        on this host only.
     :returns: Query parameters for ``GET /v1/sessions``.
     """
     params: dict[str, str | int] = {
@@ -10301,6 +10304,8 @@ def _daemon_session_request_params(
         params["kind"] = kind
     if connected_only:
         params["connected"] = "true"
+    if host_id is not None:
+        params["host_id"] = host_id
     if after is not None:
         params["after"] = after
     return params
@@ -10364,6 +10369,7 @@ def _fetch_session_pages(
     base_url: str,
     connected_only: bool,
     kind: Literal["default", "sub_agent"] = "default",
+    host_id: str | None = None,
 ) -> _SessionPagesResult:
     """
     Fetch every available session page from a server.
@@ -10373,6 +10379,7 @@ def _fetch_session_pages(
     :param connected_only: When ``True``, ask the server for connected
         sessions only.
     :param kind: Session kind to fetch, e.g. ``"sub_agent"``.
+    :param host_id: When set, ask the server for this host's sessions only.
     :returns: Accumulated sessions result. ``error`` is ``None`` on success.
     """
     after: str | None = None
@@ -10386,6 +10393,7 @@ def _fetch_session_pages(
                 connected_only=connected_only,
                 after=after,
                 kind=kind,
+                host_id=host_id,
             ),
         )
         page = _decode_sessions_page(page_result)
@@ -10503,6 +10511,7 @@ def _sessions_for_daemon(
     pages = _fetch_session_pages(
         base_url=base_url,
         connected_only=connected_only,
+        host_id=host_id,
     )
     if pages.error is not None:
         return _DaemonSessionsResult(
@@ -10517,6 +10526,7 @@ def _sessions_for_daemon(
             base_url=base_url,
             connected_only=connected_only,
             kind="sub_agent",
+            host_id=host_id,
         )
         if children.error is not None:
             # The root listing succeeded, so a child-list failure is not proof

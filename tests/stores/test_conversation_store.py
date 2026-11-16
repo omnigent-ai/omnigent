@@ -10607,5 +10607,9 @@ def test_list_conversations_filters_by_host_and_runner_liveness(
     }
     assert tunnelled == {live.id, stale.id}
     assert listed(host_id=host) == {stale.id}
+    child = store.create_conversation(kind="sub_agent", parent_conversation_id=stale.id)
+    grandchild = store.create_conversation(kind="sub_agent", parent_conversation_id=child.id)
+    hosted_tree = store.list_conversations(limit=10, kind=None, host_id=host).data
+    assert {c.id for c in hosted_tree} == {stale.id, child.id, grandchild.id}
     assert listed(host_id=host, runner_seen_since=1_500) == set()
     assert len(store.list_conversations(limit=10).data) == 3

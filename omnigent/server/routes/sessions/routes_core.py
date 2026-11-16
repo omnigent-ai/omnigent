@@ -2614,8 +2614,9 @@ def register_core_routes(
         :param connected: When ``True``, only return sessions whose runner
             is tunnelled to this replica or was seen within
             ``RUNNER_LIVENESS_TTL_S``. Applied before pagination.
-        :param host_id: When set, only return sessions bound to this host.
-            Applied before pagination.
+        :param host_id: When set, only return sessions whose root session
+            is bound to this host, sub-agents included. Applied before
+            pagination.
         :returns: A :class:`PaginatedList` of
             :class:`SessionListItem`.
         """

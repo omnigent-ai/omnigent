@@ -67,3 +67,34 @@ async def test_connected_keeps_a_tunnelled_runner_with_stale_last_seen(
     monkeypatch.setitem(app.state.tunnel_registry._sessions, "runner-tunnelled", object())
 
     assert await _ids(client, "visibility=all&connected=true") == {tunnelled}
+
+
+async def test_host_id_keeps_the_host_tree_with_nested_sub_agents(
+    client: httpx.AsyncClient, db_uri: str
+) -> None:
+    agent = await create_test_agent(client, sub_agents=[{"name": "worker"}])
+    store = SqlAlchemyConversationStore(db_uri)
+    trees = {}
+    for host in (uuid.uuid4().hex, uuid.uuid4().hex):
+        root = (await client.post("/v1/sessions", json={"agent_id": agent["id"]})).json()["id"]
+        store.set_host_id(root, host, workspace="/w")
+        parent, children = root, []
+        for _ in range(2):
+            parent = (
+                await client.post(
+                    "/v1/sessions",
+                    json={
+                        "agent_id": agent["id"],
+                        "parent_session_id": parent,
+                        "sub_agent_name": "worker",
+                        "title": "worker:native",
+                    },
+                )
+            ).json()["id"]
+            children.append(parent)
+        trees[host] = (root, set(children))
+    (host_a, (root_a, children_a)), (_, (root_b, _)) = trees.items()
+
+    assert await _ids(client, f"visibility=all&host_id={host_a}") == {root_a}
+    assert await _ids(client, f"visibility=all&kind=sub_agent&host_id={host_a}") == children_a
+    assert root_b in await _ids(client, "visibility=all")

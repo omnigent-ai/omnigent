@@ -1125,8 +1125,9 @@ class ConversationStore(ABC):
             Powers the ``(agent, title)`` child-session lookup in
             ``sys_session_send`` so the server can resolve the target
             in a single indexed query instead of fetching all children.
-        :param host_id: When set, only return conversations bound to
-            this host. ``None`` disables the filter.
+        :param host_id: When set, only return conversations whose root
+            conversation is bound to this host, so a host's sub-agents
+            match although they carry no host. ``None`` disables the filter.
         :param runner_seen_since: When set, only return conversations
             bound to a runner whose ``runner_last_seen`` is at or after
             this Unix time in seconds, or to one of ``live_runner_ids``.
