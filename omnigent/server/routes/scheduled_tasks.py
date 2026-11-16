@@ -1324,6 +1324,7 @@ def create_scheduled_tasks_router(
         latest_plans = await asyncio.to_thread(
             journal.run_latest_plans, [plan for _, plan in found]
         )
+        revisions = await asyncio.to_thread(journal.plan_graph_revisions, latest_plans)
         statuses = await asyncio.to_thread(journal.plan_step_statuses, latest_plans)
         current_plans = await asyncio.to_thread(
             journal.current_run_plan_ids, [plan for _, plan in found]
@@ -1336,8 +1337,7 @@ def create_scheduled_tasks_router(
                 {
                     "run_id": run.id,
                     "plan_id": plan.id,
-                    "plan_graph_revision": latest_plan.content.get("graph_revision")
-                    or latest_plan.position,
+                    "plan_graph_revision": revision,
                     "workflow_id": plan.workflow_id,
                     "plan_name": plan.content.get("name"),
                     "is_current": (
@@ -1352,8 +1352,8 @@ def create_scheduled_tasks_router(
                         for entry in step_statuses.values()
                     ],
                 }
-                for (run, plan), latest_plan, step_statuses in zip(
-                    found, latest_plans, statuses, strict=True
+                for (run, plan), latest_plan, revision, step_statuses in zip(
+                    found, latest_plans, revisions, statuses, strict=True
                 )
             ],
             "next_cursor": next_cursor,

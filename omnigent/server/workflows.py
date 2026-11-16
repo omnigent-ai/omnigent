@@ -353,10 +353,13 @@ def create_workflows_router(
             and _readable(user_id, sessions[plan.conversation_id])
         ]
         latest_plans = journal.run_latest_plans(readable)
+        revisions = journal.plan_graph_revisions(latest_plans)
         statuses = journal.plan_step_statuses(latest_plans)
         current_plans = journal.current_run_plan_ids(readable)
         runs = []
-        for plan, latest_plan, step_statuses in zip(readable, latest_plans, statuses, strict=True):
+        for plan, latest_plan, revision, step_statuses in zip(
+            readable, latest_plans, revisions, statuses, strict=True
+        ):
             session = sessions[plan.conversation_id]
             is_current = (
                 plan.id in current_plans
@@ -365,8 +368,7 @@ def create_workflows_router(
             runs.append(
                 WorkflowRun(
                     id=plan.id,
-                    plan_graph_revision=latest_plan.content.get("graph_revision")
-                    or latest_plan.position,
+                    plan_graph_revision=revision,
                     session_id=plan.conversation_id,
                     title=session.title or "",
                     started_at=plan.created_at,

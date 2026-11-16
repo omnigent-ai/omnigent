@@ -775,6 +775,60 @@ def test_a_workflows_runs_page_newest_first_across_sessions(
         assert deep_cost <= baseline_cost + 100, (baseline_cost, deep_cost)
 
 
+@pytest.mark.parametrize("encrypted", [False, True])
+def test_legacy_graph_revisions_ignore_saves_and_isolate_replans_and_invocations(
+    journal: SessionJournalStore, monkeypatch: pytest.MonkeyPatch, encrypted: bool
+) -> None:
+    if encrypted:
+        journal = _SealedJournal(journal.storage_location)
+    monkeypatch.setattr(session_journal_store, "JOURNAL_COPY_BATCH", 2)
+    first = journal.append(SESSION, "plan", _plan("a", "b"), idempotency_key="first").entry
+    for index in range(3):
+        saved = journal.append(
+            SESSION,
+            "plan",
+            {**_plan("b", "a"), "name": f"Renamed {index}"},
+            idempotency_key=f"save:{index}",
+            workflow_id=WORKFLOW,
+            start_run=False,
+        ).entry
+    changed_content = {
+        "name": "Changed dependencies",
+        "steps": [
+            {"id": "a", "name": "A"},
+            {"id": "b", "name": "B", "depends_on": ["a"]},
+        ],
+    }
+    changed = journal.append(SESSION, "plan", changed_content, idempotency_key="changed").entry
+    renamed = journal.append(
+        SESSION, "plan", {**changed_content, "name": "Renamed"}, idempotency_key="renamed"
+    ).entry
+    next_run = journal.append(
+        SESSION, "plan", changed_content, idempotency_key="next-run", workflow_id=WORKFLOW
+    ).entry
+    latest = journal.append(SESSION, "plan", changed_content, idempotency_key="latest").entry
+    assert journal.plan_graph_revisions([saved, renamed, latest]) == [
+        entry.content["graph_revision"] for entry in (first, changed, next_run)
+    ]
+
+    # Old journals lack revision IDs, including across later saves and invocations.
+    plans = journal.list_entries(SESSION, kind="plan").entries
+    with sa.create_engine(journal.storage_location).begin() as connection:
+        for plan in plans:
+            content = {
+                key: value for key, value in plan.content.items() if key != "graph_revision"
+            }
+            connection.execute(
+                sa.update(SqlSessionJournalEntry)
+                .where(SqlSessionJournalEntry.id == plan.id)
+                .values(content=journal._stored_contents([content])[0])
+            )
+    legacy = {entry.id: entry for entry in journal.list_entries(SESSION, kind="plan").entries}
+    assert journal.plan_graph_revisions(
+        [legacy[entry.id] for entry in (saved, renamed, latest, first)]
+    ) == [first.position, changed.position, next_run.position, first.position]
+
+
 @pytest.mark.parametrize("next_workflow", [None, WORKFLOW, OTHER_WORKFLOW])
 def test_plan_step_statuses_reads_each_steps_newest_status(
     journal: SessionJournalStore, next_workflow: str | None

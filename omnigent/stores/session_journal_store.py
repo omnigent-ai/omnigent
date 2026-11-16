@@ -149,6 +149,10 @@ def _parse_run_cursor(cursor: str) -> tuple[int, str, int]:
         raise ValueError("before must be a cursor from a previous page") from exc
 
 
+def _plan_graph(content: Mapping[str, Any]) -> dict[str, set[str]]:
+    return {step["id"]: set(step["depends_on"]) for step in content["steps"]}
+
+
 class SessionJournalStore:
     """SQLAlchemy-backed store of each session's journal."""
 
@@ -474,11 +478,7 @@ class SessionJournalStore:
                 version = 1 if previous_content is None else previous_content["version"] + 1
                 graph_revision = uuid.uuid4().hex
                 if previous_content is not None and not starts_run:
-                    previous_graph = {
-                        item["id"]: set(item["depends_on"]) for item in previous_content["steps"]
-                    }
-                    graph = {item["id"]: set(item["depends_on"]) for item in fields["steps"]}
-                    if graph == previous_graph:
+                    if _plan_graph(fields) == _plan_graph(previous_content):
                         graph_revision = previous_content.get("graph_revision")
                 entry_content = {"version": version, **fields, "graph_revision": graph_revision}
                 encoded = self._stored_contents(
@@ -726,6 +726,55 @@ class SessionJournalStore:
         return [
             plan if row is None else next(found) for plan, row in zip(plans, rows, strict=True)
         ]
+
+    def plan_graph_revisions(self, plans: Sequence[JournalEntry]) -> list[str | int]:
+        """Stable graph IDs, or the earliest unchanged legacy graph's position.
+
+        Legacy history is read in bounded batches and stops at a changed graph
+        or invocation boundary. Metadata-only saves don't reopen completed work.
+        """
+        entries = SqlSessionJournalEntry
+        revisions: list[str | int] = []
+        with self._session("read_plan_graph_revisions") as session:
+            for plan in plans:
+                revision = plan.content.get("graph_revision")
+                if isinstance(revision, str):
+                    revisions.append(revision)
+                    continue
+                boundary = self._newest_kind_row(
+                    session, plan.conversation_id, _PLAN_STATUS_KIND, before_position=plan.position
+                )
+                graph = _plan_graph(plan.content)
+                position = plan.position
+                while True:
+                    rows = list(
+                        session.execute(
+                            _using(
+                                select(entries)
+                                .prefix_with("/*+ MAX_EXECUTION_TIME(1000) */", dialect="mysql")
+                                .where(
+                                    entries.workspace_id == current_workspace_id(),
+                                    entries.conversation_id == plan.conversation_id,
+                                    entries.kind == _PLAN_KIND,
+                                    entries.position < position,
+                                    entries.position > (boundary.position if boundary else -1),
+                                )
+                                .order_by(entries.position.desc())
+                                .limit(JOURNAL_COPY_BATCH),
+                                "ix_session_journal_entries_kind",
+                            )
+                        ).scalars()
+                    )
+                    for previous in self._entries(rows):
+                        if _plan_graph(previous.content) != graph:
+                            break
+                        position = previous.position
+                    else:
+                        if len(rows) == JOURNAL_COPY_BATCH:
+                            continue
+                    break
+                revisions.append(position)
+        return revisions
 
     def current_run_plan_ids(self, plans: Sequence[JournalEntry]) -> set[str]:
         """Which plans belong to their session's latest run, including its replans.

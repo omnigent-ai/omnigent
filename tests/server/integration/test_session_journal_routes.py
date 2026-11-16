@@ -1301,6 +1301,16 @@ async def test_a_workflows_runs_list_the_sessions_that_ran_it(
     legacy_runs = (await client.get(url, headers=_headers(ALICE))).json()["data"]
     legacy_run = next(run for run in legacy_runs if run["id"] == first_plan.id)
     assert legacy_run["plan_graph_revision"] == first_plan.position
+    SessionJournalStore(db_uri).append(
+        first,
+        "plan",
+        {**plan, "name": "Renamed triage"},
+        idempotency_key="legacy-save",
+        start_run=False,
+    )
+    legacy_runs = (await client.get(url, headers=_headers(ALICE))).json()["data"]
+    legacy_run = next(run for run in legacy_runs if run["id"] == first_plan.id)
+    assert legacy_run["plan_graph_revision"] == first_plan.position
 
     conversations = SqlAlchemyConversationStore(db_uri)
     child = _session(db_uri, parent_conversation_id=first)
