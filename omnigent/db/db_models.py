@@ -1602,6 +1602,10 @@ class SqlScheduledTask(OmnigentBase):
     prompt: Mapped[str] = mapped_column(CompressedText, nullable=False)
     # RFC 5545 recurrence rule, e.g. "FREQ=DAILY;BYHOUR=9;BYMINUTE=0".
     rrule: Mapped[str] = mapped_column(String(512), nullable=False)
+    # JSON a trigger automation's prompt and rrule were compiled from, e.g.
+    # {"provider": "slack", ...}. NULL for a task that runs its own prompt. Read
+    # and written whole, never filtered in SQL.
+    trigger_config: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
     # Session-owner identity: the spawned run's LEVEL_OWNER grant is written
     # for this user. Nullable — None in single-user/OSS mode (the fire path
     # resolves null to the reserved "local" user). String(128) to match

@@ -2360,6 +2360,7 @@
             "title": "Project Id"
           },
           "prompt": {
+            "default": "",
             "title": "Prompt",
             "type": "string"
           },
@@ -2375,6 +2376,7 @@
             "title": "Reasoning Effort"
           },
           "rrule": {
+            "default": "",
             "title": "Rrule",
             "type": "string"
           },
@@ -2416,6 +2418,16 @@
             "title": "Timezone",
             "type": "string"
           },
+          "trigger_config": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SlackTriggerConfig"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "workspace": {
             "anyOf": [
               {
@@ -2431,8 +2443,6 @@
         },
         "required": [
           "name",
-          "prompt",
-          "rrule",
           "agent_id"
         ],
         "title": "CreateScheduledTaskRequest",
@@ -7498,6 +7508,11 @@
           "scheduled_task_sharing": {
             "default": false,
             "title": "Scheduled Task Sharing",
+            "type": "boolean"
+          },
+          "scheduled_task_slack_triggers": {
+            "default": false,
+            "title": "Scheduled Task Slack Triggers",
             "type": "boolean"
           },
           "scheduled_task_source_sessions": {
@@ -14161,6 +14176,92 @@
         "title": "SkillsResponse",
         "type": "object"
       },
+      "SlackTriggerCondition": {
+        "additionalProperties": false,
+        "description": "One filter a message must pass, like a condition row in the web form.",
+        "properties": {
+          "field": {
+            "enum": [
+              "text",
+              "topic",
+              "author"
+            ],
+            "title": "Field",
+            "type": "string"
+          },
+          "operator": {
+            "enum": [
+              "contains",
+              "not_contains",
+              "about",
+              "is",
+              "is_not"
+            ],
+            "title": "Operator",
+            "type": "string"
+          },
+          "value": {
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Value",
+            "type": "string"
+          }
+        },
+        "required": [
+          "field",
+          "operator",
+          "value"
+        ],
+        "title": "SlackTriggerCondition",
+        "type": "object"
+      },
+      "SlackTriggerConfig": {
+        "additionalProperties": false,
+        "description": "New top-level messages in some channels, and what each one's session does.",
+        "properties": {
+          "channels": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 20,
+            "minItems": 1,
+            "title": "Channels",
+            "type": "array"
+          },
+          "conditions": {
+            "items": {
+              "$ref": "#/components/schemas/SlackTriggerCondition"
+            },
+            "maxItems": 10,
+            "title": "Conditions",
+            "type": "array"
+          },
+          "event": {
+            "const": "posted",
+            "title": "Event",
+            "type": "string"
+          },
+          "instructions": {
+            "maxLength": 2000,
+            "minLength": 1,
+            "title": "Instructions",
+            "type": "string"
+          },
+          "provider": {
+            "const": "slack",
+            "title": "Provider",
+            "type": "string"
+          }
+        },
+        "required": [
+          "provider",
+          "event",
+          "channels",
+          "instructions"
+        ],
+        "title": "SlackTriggerConfig",
+        "type": "object"
+      },
       "SlashCommandData": {
         "description": "Data payload for a slash-command invocation observed in a\nharness transcript (today: Claude Code's embedded TUI).\n\nListed in `NON_CONTENT_ITEM_TYPES` so the agent loop's\nhistory filter skips it \u2014 a downstream LLM never sees this as a\nphantom tool call. Field names mirror `function_call` so the\nweb renderer can reuse the tool-card layout.\n\n**Parameters**\n\n- `agent` \u2014 Harness/agent name, e.g. `\"claude-native-ui\"`. Serialized as `\"model\"` for parity with other items.",
         "properties": {
@@ -14969,6 +15070,16 @@
               }
             ],
             "title": "Timezone"
+          },
+          "trigger_config": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SlackTriggerConfig"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "workspace": {
             "anyOf": [

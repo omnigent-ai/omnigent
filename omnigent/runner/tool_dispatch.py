@@ -5145,6 +5145,7 @@ _SCHEDULED_TASK_CREATE_FIELDS = (
     "name",
     "prompt",
     "rrule",
+    "trigger_config",
     "agent_id",
     "timezone",
     "model_override",
@@ -5164,6 +5165,7 @@ _SCHEDULED_TASK_UPDATE_FIELDS = (
     "name",
     "prompt",
     "rrule",
+    "trigger_config",
     "agent_id",
     "timezone",
     "model_override",
@@ -5195,6 +5197,11 @@ _SCHEDULED_TASK_GATED_FIELDS = (
         ("mcp_services",),
         "scheduled_task_mcp_services",
         "does not support mcp_services; omit it to start runs without MCP services",
+    ),
+    (
+        ("trigger_config",),
+        "scheduled_task_slack_triggers",
+        "does not support trigger_config for Slack",
     ),
 )
 

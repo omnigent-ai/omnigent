@@ -99,6 +99,7 @@ def test_scheduled_tasks_columns(db_engine: Engine) -> None:
     assert columns["source_session_id"]["nullable"] is True
     assert columns["mcp_services"]["nullable"] is True
     assert columns["kind"]["nullable"] is False
+    assert columns["trigger_config"]["nullable"] is True
     cols = set(columns)
     assert cols == {
         "workspace_id",
@@ -131,6 +132,7 @@ def test_scheduled_tasks_columns(db_engine: Engine) -> None:
         "session_id",
         "source_session_id",
         "kind",
+        "trigger_config",
     }
 
 

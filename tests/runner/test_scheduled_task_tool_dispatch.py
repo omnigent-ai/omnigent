@@ -282,6 +282,68 @@ async def test_mcp_services_are_refused_before_an_older_server_sees_them(
     assert "does not support mcp_services" in json.loads(out)["error"]
 
 
+_SLACK_TRIGGER = {
+    "provider": "slack",
+    "event": "posted",
+    "channels": ["eng-support"],
+    "instructions": "Answer the question in the thread.",
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("supported", [True, False])
+async def test_trigger_config_reaches_only_a_server_that_supports_it(supported: bool) -> None:
+    """An older server would reject the field with a bare 422."""
+    client = _RecordingClient(info=_Resp(body={"scheduled_task_slack_triggers": supported}))
+    out = await _execute_scheduled_task_tool(
+        "sys_scheduled_task_create",
+        json.dumps(
+            {
+                "name": "n",
+                "agent_id": "ag_1",
+                "permission_mode": None,
+                "trigger_config": _SLACK_TRIGGER,
+            }
+        ),
+        server_client=client,
+    )
+
+    if supported:
+        assert client.calls[-1] == (
+            "POST",
+            "/v1/scheduled-tasks",
+            {
+                "name": "n",
+                "agent_id": "ag_1",
+                "permission_mode": None,
+                "trigger_config": _SLACK_TRIGGER,
+            },
+        )
+    else:
+        assert [url for _, url, _ in client.calls] == ["/v1/info"]
+        assert "does not support trigger_config" in json.loads(out)["error"]
+
+
+@pytest.mark.asyncio
+async def test_trigger_review_needs_its_instructions_not_a_prompt() -> None:
+    client = _RecordingClient()
+    out = await _execute_scheduled_task_tool(
+        "sys_scheduled_task_create",
+        json.dumps(
+            {
+                "name": "n",
+                "agent_id": "ag_1",
+                "permission_mode": None,
+                "trigger_config": {**_SLACK_TRIGGER, "instructions": " "},
+            }
+        ),
+        server_client=client,
+    )
+
+    assert "instructions must be a non-empty string" in json.loads(out)["error"]
+    assert client.calls == []
+
+
 @pytest.mark.asyncio
 async def test_mcp_services_reach_a_server_that_supports_them() -> None:
     client = _RecordingClient(
@@ -662,13 +724,9 @@ def test_create_tool_schema_makes_workspace_and_host_optional() -> None:
     assert "base_branch" not in properties
     assert "workspace" not in schema["required"]
     assert "host_id" not in schema["required"]
-    assert set(schema["required"]) == {
-        "name",
-        "prompt",
-        "rrule",
-        "agent_id",
-        "permission_mode",
-    }
+    # prompt and rrule are required unless trigger_config replaces them.
+    assert set(schema["required"]) == {"name", "agent_id", "permission_mode"}
+    assert "trigger_config" in properties
 
 
 def test_update_tool_schema_allows_connected_host_changes() -> None:
@@ -680,7 +738,8 @@ def test_update_tool_schema_allows_connected_host_changes() -> None:
     assert "host_id" in properties
     # Switching which agent/harness a task runs is part of the update surface.
     assert "agent_id" in properties
-    assert set(schema["required"]) == {"scheduled_task_id", "prompt", "permission_mode"}
+    # The review check requires prompt, or trigger_config for a trigger.
+    assert set(schema["required"]) == {"scheduled_task_id", "permission_mode"}
 
 
 def test_tools_in_dispatch_and_relay_sets() -> None:

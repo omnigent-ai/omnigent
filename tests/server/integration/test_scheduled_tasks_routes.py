@@ -1667,6 +1667,110 @@ async def test_update_changes_fields_and_validates_rrule(
     assert deleted_state.status_code == 422, deleted_state.text
 
 
+_SLACK_TRIGGER = {
+    "provider": "slack",
+    "event": "posted",
+    "channels": ["#eng-support"],
+    "instructions": "Answer the question in the thread.",
+}
+
+
+def _trigger_body(**overrides: object) -> dict[str, object]:
+    body = _create_body(trigger_config=_SLACK_TRIGGER)
+    del body["prompt"], body["rrule"]
+    body.update(overrides)
+    return body
+
+
+async def test_slack_trigger_saves_the_prompt_and_schedule_it_compiles_to(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    _make_user(db_uri)
+    with capture_debug_rows("server") as rows:
+        created = await auth_client.post(
+            "/v1/scheduled-tasks", json=_trigger_body(), headers=_headers()
+        )
+    assert created.status_code == 200, created.text
+    task = created.json()
+    assert task["trigger_config"] == {
+        **_SLACK_TRIGGER,
+        "channels": ["eng-support"],
+        "conditions": [],
+    }
+    assert task["rrule"] == "FREQ=MINUTELY;INTERVAL=10"
+    assert task["session_mode"] == "continue"
+    assert task["prompt"].startswith(
+        "This automation watches Slack and starts one Omnigent session"
+    )
+    assert "Watch: new Slack messages in #eng-support\n" in task["prompt"]
+    assert "\nAnswer the question in the thread.\n" in task["prompt"]
+    [event] = [row for row in rows if row["event_name"] == "scheduled_task_created"]
+    assert event["attributes"]["template_id"] == "slack"
+    url = f"/v1/scheduled-tasks/{task['id']}"
+    assert (await auth_client.get(url, headers=_headers())).json() == task
+
+    # Changing the trigger, or a setting its prompt names, compiles the prompt again.
+    patched = await auth_client.patch(
+        url,
+        json={
+            "trigger_config": {**_SLACK_TRIGGER, "channels": ["bugs"]},
+            "reasoning_effort": "high",
+        },
+        headers=_headers(),
+    )
+    assert patched.status_code == 200, patched.text
+    assert patched.json()["trigger_config"]["channels"] == ["bugs"]
+    assert "Watch: new Slack messages in #bugs\n" in patched.json()["prompt"]
+    assert 'reasoning_effort "high"' in patched.json()["prompt"]
+    # Resending what the server compiled is no change; changing it is refused.
+    unchanged = {"prompt": patched.json()["prompt"], "rrule": patched.json()["rrule"]}
+    resent = await auth_client.patch(url, json=unchanged, headers=_headers())
+    assert resent.status_code == 200, resent.text
+    # Clearing the session still starts a new polling session on the next run.
+    reset = await auth_client.patch(url, json={"session_id": None}, headers=_headers())
+    assert reset.status_code == 200, reset.text
+    for change in ({"prompt": "Do something else."}, {"rrule": "FREQ=HOURLY"}):
+        refused = await auth_client.patch(url, json=change, headers=_headers())
+        assert refused.status_code == 400, refused.text
+        assert "change trigger_config instead" in refused.text
+    removed = await auth_client.patch(url, json={"trigger_config": None}, headers=_headers())
+    assert removed.status_code == 422, removed.text
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        _trigger_body(rrule=_VALID_RRULE),
+        _trigger_body(prompt="triage the queue"),
+        _trigger_body(session_mode="continue"),
+        {**_trigger_body(), "trigger_config": {**_SLACK_TRIGGER, "channels": ["a b"]}},
+        {key: value for key, value in _create_body().items() if key != "prompt"},
+    ],
+    ids=["rrule", "prompt", "session-mode", "bad-channel", "no-prompt-or-trigger"],
+)
+async def test_create_takes_either_a_trigger_or_a_prompt_and_rrule(
+    auth_client: httpx.AsyncClient, db_uri: str, body: dict[str, object]
+) -> None:
+    _make_user(db_uri)
+    response = await auth_client.post("/v1/scheduled-tasks", json=body, headers=_headers())
+    assert response.status_code == 422, response.text
+
+
+async def test_a_scheduled_task_cannot_become_a_trigger(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    _make_user(db_uri)
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+    response = await auth_client.patch(
+        f"/v1/scheduled-tasks/{created['id']}",
+        json={"trigger_config": _SLACK_TRIGGER},
+        headers=_headers(),
+    )
+    assert response.status_code == 400, response.text
+
+
 async def test_update_switches_the_bound_agent(
     auth_client: httpx.AsyncClient, db_uri: str
 ) -> None:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import builtins
+import json
 import logging
 import uuid
 from collections.abc import Callable
@@ -157,6 +158,7 @@ def _to_entity(row: SqlScheduledTask) -> ScheduledTask:
         next_run_at=row.next_run_at,
         project_id=row.project_id,
         delegation_ref=row.delegation_ref,
+        trigger_config=json.loads(row.trigger_config) if row.trigger_config else None,
     )
 
 
@@ -268,6 +270,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         delegation_ref: str | None = None,
         first_run_at: int | None = None,
         kind: str = "automation",
+        trigger_config: dict[str, Any] | None = None,
     ) -> ScheduledTask:
         """Insert a new scheduled task with a required recurring ``rrule``."""
         encoded_kind = encode_scheduled_task_kind(kind)
@@ -296,6 +299,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 name=name,
                 prompt=prompt,
                 rrule=rrule,
+                trigger_config=json.dumps(trigger_config) if trigger_config is not None else None,
                 user_id=user_id,
                 agent_id=agent_id,
                 timezone=timezone,
@@ -435,6 +439,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         state: str | None = None,
         last_run_at: int | None = None,
         last_run_conversation_id: str | None = _UNSET,
+        trigger_config: dict[str, Any] | None = None,
         expected_schedule: ScheduledTask | None = None,
         guard: Callable[[ScheduledTask], None] | None = None,
     ) -> ScheduledTask | None:
@@ -515,6 +520,11 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             if rrule is not None and row.rrule != rrule:
                 row.rrule = rrule
                 changed = True
+            if trigger_config is not None:
+                encoded_trigger = json.dumps(trigger_config)
+                if row.trigger_config != encoded_trigger:
+                    row.trigger_config = encoded_trigger
+                    changed = True
             if agent_id is not None and row.agent_id != agent_id:
                 row.agent_id = agent_id
                 changed = True

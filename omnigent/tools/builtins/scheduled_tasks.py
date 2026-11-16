@@ -45,6 +45,52 @@ _RRULE_DESC = (
     "(e.g. 'FREQ=MINUTELY;INTERVAL=10'). New sandbox sessions, or servers "
     "without sub-hour support, require 1 hour."
 )
+_TRIGGER_CONFIG = {
+    "type": "object",
+    "properties": {
+        "provider": {"type": "string", "enum": ["slack"]},
+        "event": {
+            "type": "string",
+            "enum": ["posted"],
+            "description": "A new top-level message in one of the channels.",
+        },
+        "channels": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Slack channel names or IDs, e.g. ['eng-support', 'C0123ABCD'].",
+        },
+        "conditions": {
+            "type": "array",
+            "description": (
+                "Optional filters every message must pass: text 'contains' or "
+                "'not_contains' a string, topic 'about' a description (e.g. 'a bug "
+                "report'), or author 'is' or 'is_not' a person."
+            ),
+            "items": {
+                "type": "object",
+                "properties": {
+                    "field": {"type": "string", "enum": ["text", "topic", "author"]},
+                    "operator": {
+                        "type": "string",
+                        "enum": ["contains", "not_contains", "about", "is", "is_not"],
+                    },
+                    "value": {"type": "string"},
+                },
+                "required": ["field", "operator", "value"],
+                "additionalProperties": False,
+            },
+        },
+        "instructions": {
+            "type": "string",
+            "description": (
+                "What the session started for each matching message does, e.g. 'Answer "
+                "the question, or investigate the reported bug.' At most 2000 characters."
+            ),
+        },
+    },
+    "required": ["provider", "event", "channels", "instructions"],
+    "additionalProperties": False,
+}
 
 
 class SysScheduledTaskCreateTool(Tool):
@@ -67,7 +113,10 @@ class SysScheduledTaskCreateTool(Tool):
             "connected_host, optionally pin a host and/or a workspace on it; with no "
             "pinned host it runs on your live host at fire time (the owner must have an online "
             "host then, else the run is recorded as failed). The task fires "
-            "automatically on its schedule until deleted."
+            "automatically on its schedule until deleted. To act on new Slack messages "
+            "instead, pass trigger_config in place of prompt and rrule: the server writes "
+            "the prompt and checks Slack every few minutes, starting one session per match. "
+            "Include the owner's Slack MCP service in mcp_services."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -87,10 +136,15 @@ class SysScheduledTaskCreateTool(Tool):
                         "prompt": {
                             "type": "string",
                             "description": (
-                                "The instruction dispatched to the agent on each firing."
+                                "The instruction dispatched to the agent on each firing. "
+                                "Omit with trigger_config."
                             ),
                         },
-                        "rrule": {"type": "string", "description": _RRULE_DESC},
+                        "rrule": {
+                            "type": "string",
+                            "description": f"{_RRULE_DESC} Omit with trigger_config.",
+                        },
+                        "trigger_config": _TRIGGER_CONFIG,
                         "agent_id": {
                             "type": "string",
                             "description": (
@@ -216,13 +270,7 @@ class SysScheduledTaskCreateTool(Tool):
                             ),
                         },
                     },
-                    "required": [
-                        "name",
-                        "prompt",
-                        "rrule",
-                        "agent_id",
-                        "permission_mode",
-                    ],
+                    "required": ["name", "agent_id", "permission_mode"],
                     "additionalProperties": False,
                 },
             },
@@ -274,6 +322,8 @@ class SysScheduledTaskUpdateTool(Tool):
             "Update a scheduled task's mutable fields. Only the fields you pass "
             "change, except prompt and permission_mode: first list the task and "
             "resend those complete review fields even when they are unchanged. "
+            "For a task with a trigger_config, resend its trigger_config instead of "
+            "prompt; the server rewrites that task's prompt and rrule. "
             "Pass agent_id to switch which agent/harness "
             "it runs. Pass state='paused' to stop it firing without deleting it, "
             "or state='active' to resume. A 'completed' task has no remaining "
@@ -297,6 +347,10 @@ class SysScheduledTaskUpdateTool(Tool):
                         "name": {"type": "string", "description": "New task name."},
                         "prompt": {"type": "string", "description": "New prompt."},
                         "rrule": {"type": "string", "description": _RRULE_DESC},
+                        "trigger_config": {
+                            **_TRIGGER_CONFIG,
+                            "description": "Replaces a trigger's whole trigger_config.",
+                        },
                         "agent_id": {
                             "type": "string",
                             "description": (
@@ -398,7 +452,7 @@ class SysScheduledTaskUpdateTool(Tool):
                             ),
                         },
                     },
-                    "required": ["scheduled_task_id", "prompt", "permission_mode"],
+                    "required": ["scheduled_task_id", "permission_mode"],
                     "additionalProperties": False,
                 },
             },
