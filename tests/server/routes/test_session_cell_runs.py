@@ -20,10 +20,11 @@ import pytest
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from omnigent.errors import ElicitationDeclinedError, OmnigentError
+from omnigent.errors import ElicitationDeclinedError, ErrorCode, OmnigentError, WrongReplicaError
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.os_env import create_os_environment
 from omnigent.policies.types import EvaluationContext, PolicyResult
+from omnigent.runner.routing import RoutedRunner
 from omnigent.runtime import _globals, set_runner_client, set_runner_router
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ, UnifiedAuthProvider
 from omnigent.server.feature_flags import Feature, FeatureFlags
@@ -182,16 +183,35 @@ class _McpRunnerClient:
         )
 
 
+class _RunnerRouter:
+    """Routes the session to *client*, or fails the lookup with *error* when set."""
+
+    def __init__(self, client: _McpRunnerClient) -> None:
+        self.client = client
+        self.error: OmnigentError | None = None
+
+    def client_for_session_resources(self, conversation_id: str, **kwargs: Any) -> RoutedRunner:
+        del conversation_id, kwargs
+        if self.error is not None:
+            raise self.error
+        return RoutedRunner(runner_id="runner_cells", client=self.client)  # type: ignore[arg-type]
+
+
 @pytest.fixture
-def runner_client() -> Iterator[_McpRunnerClient]:
+def runner_router() -> Iterator[_RunnerRouter]:
     prior_client = _globals._runner_client
     prior_router = _globals._runner_router
-    client = _McpRunnerClient()
-    set_runner_router(None)
-    set_runner_client(client)  # type: ignore[arg-type]
-    yield client
+    router = _RunnerRouter(_McpRunnerClient())
+    set_runner_client(None)
+    set_runner_router(router)  # type: ignore[arg-type]
+    yield router
     set_runner_client(prior_client)
     set_runner_router(prior_router)
+
+
+@pytest.fixture
+def runner_client(runner_router: _RunnerRouter) -> _McpRunnerClient:
+    return runner_router.client
 
 
 @pytest.fixture
@@ -202,8 +222,7 @@ def conv_store() -> _StubConversationStore:
 
 
 @pytest.fixture
-def app(conv_store: _StubConversationStore, runner_client: _McpRunnerClient) -> FastAPI:
-    del runner_client
+def app(conv_store: _StubConversationStore, runner_router: _RunnerRouter) -> FastAPI:
     perm_store = _StubPermissionStore()
     perm_store.add_grant("editor@example.com", "conv_share", LEVEL_EDIT)
     perm_store.add_grant("viewer@example.com", "conv_share", LEVEL_READ)
@@ -213,7 +232,10 @@ def app(conv_store: _StubConversationStore, runner_client: _McpRunnerClient) -> 
     @application.exception_handler(OmnigentError)
     async def _handle(request: Request, exc: OmnigentError) -> JSONResponse:
         del request
-        return JSONResponse(status_code=exc.http_status, content={"error": exc.message})
+        return JSONResponse(
+            status_code=exc.http_status,
+            content={"error": {"code": exc.code, "message": exc.message}},
+        )
 
     application.include_router(
         create_sessions_router(
@@ -221,6 +243,7 @@ def app(conv_store: _StubConversationStore, runner_client: _McpRunnerClient) -> 
             _StubAgentStore(),  # type: ignore[arg-type]
             auth_provider=UnifiedAuthProvider(source="header", local_single_user=False),
             permission_store=perm_store,  # type: ignore[arg-type]
+            runner_router=runner_router,  # type: ignore[arg-type]
         ),
         prefix="/v1",
     )
@@ -366,6 +389,43 @@ _ASK = PolicyResult(
     set_labels={"reviewed": "yes"},
     data={"command": "python3 - <<'X'\nprint('reviewed')\nX\n", "timeout": 60},
 )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("routing_error", "expected_status", "expected_code"),
+    [
+        (
+            WrongReplicaError("runner is on another replica", host_id="host_elsewhere"),
+            400,
+            ErrorCode.WRONG_REPLICA,
+        ),
+        (OmnigentError("not bound to a runner", code=ErrorCode.CONFLICT), 409, None),
+    ],
+)
+async def test_an_unreachable_runner_is_refused_before_policy_or_approval(
+    client: httpx.AsyncClient,
+    runner_router: _RunnerRouter,
+    monkeypatch: pytest.MonkeyPatch,
+    routing_error: OmnigentError,
+    expected_status: int,
+    expected_code: str | None,
+) -> None:
+    """The client re-addresses a wrong-replica miss, so nothing may be asked or run first."""
+    engine = _use_policy(monkeypatch, _ASK)
+    gate_calls = _record_ask_gate(monkeypatch, True)
+    runner_router.error = routing_error
+
+    response = await _run(client)
+
+    assert response.status_code == expected_status, response.text
+    if expected_code is None:
+        assert "No runner bound" in response.json()["detail"]
+    else:
+        assert response.json()["error"]["code"] == expected_code
+    assert engine.contexts == []
+    assert gate_calls == []
+    assert runner_router.client.posts == []
 
 
 @pytest.mark.asyncio

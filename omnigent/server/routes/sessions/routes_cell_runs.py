@@ -14,9 +14,12 @@ import json
 import time
 from typing import Any, Literal
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
 
+from omnigent.entities import Conversation
+from omnigent.errors import OmnigentError, WrongReplicaError
 from omnigent.runner.routing import RunnerRouter
 from omnigent.server.auth import LEVEL_EDIT, AuthProvider
 from omnigent.server.feature_flags import Feature, FeatureFlags
@@ -24,7 +27,11 @@ from omnigent.server.routes._auth_helpers import require_access as _require_acce
 from omnigent.server.routes._auth_helpers import require_user as _require_user
 from omnigent.server.routes._content_type import require_json_content_type
 from omnigent.server.routes._sessions.common import _logger
-from omnigent.server.routes._sessions.helpers import _build_actor
+from omnigent.server.routes._sessions.helpers import (
+    _build_actor,
+    _get_runner_client_for_resource_access,
+    _runner_lookup_error_must_surface,
+)
 from omnigent.server.routes._sessions.orchestration import (
     MCP_TOOL_CALL_DECLINED_MESSAGE,
     MCP_TOOL_CALL_NOT_APPROVED_MESSAGE,
@@ -175,6 +182,30 @@ def _refusal_status(message: str) -> int:
     return 502
 
 
+async def _require_runner_on_this_replica(session_id: str, conversation: Conversation) -> None:
+    """
+    Refuse a run whose runner this replica can't reach, before any policy work.
+
+    A runner on another replica raises the typed wrong-replica error the
+    client re-addresses on; nothing has been asked or run at that point.
+
+    :param session_id: The session to run in, e.g. ``"conv_abc123"``.
+    :param conversation: The session's already-loaded conversation row.
+    :raises WrongReplicaError: When the runner is live on another replica.
+    :raises HTTPException: 409 when the session has no reachable runner.
+    """
+    try:
+        runner = await _get_runner_client_for_resource_access(
+            session_id, conversation=conversation
+        )
+    except (LookupError, httpx.HTTPError, OmnigentError) as exc:
+        if isinstance(exc, WrongReplicaError) or _runner_lookup_error_must_surface(exc):
+            raise
+        runner = None
+    if runner is None:
+        raise HTTPException(status_code=409, detail=f"No runner bound for session {session_id!r}")
+
+
 def register_cell_run_routes(
     router: APIRouter,
     *,
@@ -223,6 +254,8 @@ def register_cell_run_routes(
             command = python_cell_command(body.code)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        # The MCP handler resolves the runner again at dispatch, after any approval.
+        await _require_runner_on_this_replica(session_id, conv)
 
         started = time.monotonic()
         rpc_response = await _handle_mcp_tools_call(

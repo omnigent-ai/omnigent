@@ -5974,6 +5974,20 @@ async def _get_runner_client(*args: Any, **kwargs: Any) -> httpx.AsyncClient | N
     return await _facade._get_runner_client(*args, **kwargs)
 
 
+def _runner_lookup_error_must_surface(exc: Exception) -> bool:
+    """
+    Whether a runner-lookup failure is a typed error, not "no runner bound".
+
+    :param exc: The failure raised while resolving a session's runner.
+    :returns: ``True`` for runtime-support and capability-mismatch errors.
+    """
+    from omnigent.server.runtime_compatibility import RuntimeSupportError
+
+    return isinstance(exc, RuntimeSupportError) or (
+        isinstance(exc, OmnigentError) and exc.code == ErrorCode.RUNNER_CAPABILITY_MISMATCH
+    )
+
+
 async def _get_runner_client_impl(
     session_id: str,
     runner_router: RunnerRouter | None,
@@ -5997,7 +6011,6 @@ async def _get_runner_client_impl(
         or ``None`` if no runner is available.
     """
     from omnigent.runtime import get_runner_client
-    from omnigent.server.runtime_compatibility import RuntimeSupportError
 
     if runner_router is not None:
         try:
@@ -6012,9 +6025,7 @@ async def _get_runner_client_impl(
                 routed = await asyncio.to_thread(resolve, session_id, conversation=conversation)
             return routed.client
         except (LookupError, httpx.HTTPError, OmnigentError) as exc:
-            if isinstance(exc, RuntimeSupportError) or (
-                isinstance(exc, OmnigentError) and exc.code == ErrorCode.RUNNER_CAPABILITY_MISMATCH
-            ):
+            if _runner_lookup_error_must_surface(exc):
                 raise
             _logger.debug(
                 "No runner bound for session=%s",
