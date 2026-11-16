@@ -6,12 +6,7 @@ import type React from "react";
 import { defaultFilter } from "cmdk";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import {
-  ChevronRightIcon,
-  CornerDownRightIcon,
-  FolderIcon,
-  XIcon,
-} from "lucide-react";
+import { ChevronRightIcon, CornerDownRightIcon, FolderIcon, XIcon } from "lucide-react";
 import { useNavigate } from "@/lib/routing";
 import {
   type ConversationsPage,
