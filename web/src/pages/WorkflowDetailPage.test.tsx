@@ -29,6 +29,7 @@ import { sessionJournalKey, type JournalEntry, type StepProgress } from "@/lib/s
 import { getSession, sendUserMessage } from "@/lib/sessionsApi";
 import { taskActionMessage } from "@/lib/workflow";
 import type * as SessionsApi from "@/lib/sessionsApi";
+import { useChatStore } from "@/store/chatStore";
 import { openTasksTab } from "@/store/sessionTasksActions";
 import type * as TasksActions from "@/store/sessionTasksActions";
 import type { WorkflowStep } from "@/lib/workflowGraphLayout";
@@ -334,7 +335,7 @@ describe("WorkflowDetailPage", () => {
       cleanup();
       renderPage();
       await screen.findByTestId("workflow-detail-title");
-      fireEvent.click(screen.getByRole("button", { name: "Edit workflow" }));
+      fireEvent.click(screen.getByRole("button", { name: "Edit plan with agent" }));
       expect(screen.getByTestId("planning-chat")).toHaveAttribute("data-session", planner);
       expect(screen.getByTestId("workflow-detail-run")).toBeEnabled();
       const edited = [
@@ -393,6 +394,33 @@ describe("WorkflowDetailPage", () => {
     }
   });
 
+  it("opens the planning chat ready to type, and flashes it when pressed while open", () => {
+    const planner = "e".repeat(32);
+    mockWorkflow({ data: { ...WORKFLOW, planning_session_id: planner } });
+    mockRuns([]);
+    vi.useFakeTimers();
+    try {
+      renderPage();
+      const edit = screen.getByRole("button", { name: "Edit plan with agent" });
+
+      fireEvent.click(edit);
+      expect(screen.getByTestId("planning-chat")).toHaveAttribute("data-session", planner);
+      expect(useChatStore.getState().sideChatComposers[planner]?.autoFocus).toBe(true);
+      expect(screen.queryByTestId("workflow-planning-chat-flash")).toBeNull();
+
+      // The real composer drops the request as it takes focus.
+      useChatStore.getState().clearSideChatComposer(planner);
+      fireEvent.click(edit);
+      expect(useChatStore.getState().sideChatComposers[planner]?.autoFocus).toBe(true);
+      expect(screen.getByTestId("workflow-planning-chat-flash")).toBeInTheDocument();
+      act(() => vi.runOnlyPendingTimers());
+      expect(screen.queryByTestId("workflow-planning-chat-flash")).toBeNull();
+    } finally {
+      useChatStore.getState().clearSideChatComposer(planner);
+      vi.useRealTimers();
+    }
+  });
+
   it("shows the workflow, its steps, and the sessions that ran it", () => {
     mockWorkflow({});
     mockRuns([
@@ -446,7 +474,7 @@ describe("WorkflowDetailPage", () => {
       vi.useFakeTimers({ shouldAdvanceTime: true });
       try {
         renderPage(client);
-        fireEvent.click(screen.getByRole("button", { name: "Edit workflow" }));
+        fireEvent.click(screen.getByRole("button", { name: "Edit plan with agent" }));
         await act(async () =>
           vi.advanceTimersByTimeAsync(journalHooks.JOURNAL_FALLBACK_REFETCH_MS * 2),
         );
@@ -849,7 +877,7 @@ describe("WorkflowDetailPage", () => {
         fireEvent.click(screen.getByTestId("workflow-detail-create-automation"));
         expect(screen.getByTestId("new-automation-dialog")).toHaveTextContent("Triage flaky tests");
       }
-      fireEvent.click(screen.getByRole("button", { name: "Edit workflow" }));
+      fireEvent.click(screen.getByRole("button", { name: "Edit plan with agent" }));
       expect(screen.getByTestId("planning-chat")).toBeInTheDocument();
 
       // A capability refresh can disable an already-open creation dialog.

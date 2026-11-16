@@ -3,7 +3,7 @@
  * Drafts become runnable when the user saves the agent's proposed plan.
  */
 
-import { useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   ChevronDownIcon,
   ChevronLeftIcon,
@@ -16,6 +16,7 @@ import {
   WorkflowIcon,
 } from "lucide-react";
 
+import { KeyboardShortcutTooltip } from "@/components/KeyboardShortcut";
 import { PageScroll } from "@/components/PageScroll";
 import { CreateScheduledTaskDialog } from "@/components/scheduled/CreateScheduledTaskDialog";
 import { DeleteWorkflowDialog } from "@/components/workflows/DeleteWorkflowDialog";
@@ -66,6 +67,10 @@ import {
   type WorkflowRunState,
 } from "@/lib/workflowRuns";
 import { StepGlyph } from "@/shell/TasksPanel";
+import { useChatStore } from "@/store/chatStore";
+
+// The planning chat's outline flash lasts as long as `.animate-user-msg-flash`.
+const PLANNING_CHAT_FLASH_MS = 800;
 
 export function WorkflowDetailPage() {
   const { workflowId = "" } = useParams<{ workflowId: string }>();
@@ -87,6 +92,8 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
   const [automationOpen, setAutomationOpen] = useState(false);
   const [plannerOpen, setPlannerOpen] = useState<boolean | null>(null);
   const [plannerExpanded, setPlannerExpanded] = useState(false);
+  // Non-zero while the open planning chat flashes; each press restarts it.
+  const [plannerFlash, setPlannerFlash] = useState(0);
   const showPlanner = plannerOpen ?? workflow?.is_draft ?? false;
   const isMobile = useIsMobileViewport();
   const { session: planningSession, error: planningSessionError } = useSession(
@@ -101,6 +108,11 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
     canReadProposal,
   );
   const savePlan = useSaveWorkflowPlan(workflowId);
+  useEffect(() => {
+    if (plannerFlash === 0) return;
+    const timer = setTimeout(() => setPlannerFlash(0), PLANNING_CHAT_FLASH_MS);
+    return () => clearTimeout(timer);
+  }, [plannerFlash]);
 
   if (isLoading) {
     return (
@@ -163,6 +175,12 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
     setPlannerOpen(false);
     setPlannerExpanded(false);
   };
+  // Opens the planning chat ready to type, or flashes it when it's already open.
+  const openPlanner = () => {
+    if (showPlanner) setPlannerFlash((count) => count + 1);
+    setPlannerOpen(true);
+    if (canReadProposal) useChatStore.getState().requestSideChatFocus(planningSession.id);
+  };
 
   return (
     <div className="relative flex h-full min-h-0 flex-1 overflow-hidden">
@@ -188,15 +206,17 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
             )}
           </div>
           <div className="flex flex-wrap items-center gap-2">
-            <Button
-              variant="ghost"
-              size="icon-sm"
-              aria-label="Edit workflow"
-              data-testid="workflow-detail-edit"
-              onClick={() => setPlannerOpen(true)}
-            >
-              <PencilIcon className="size-4" />
-            </Button>
+            <KeyboardShortcutTooltip label="Edit plan with agent">
+              <Button
+                variant="ghost"
+                size="icon-sm"
+                aria-label="Edit plan with agent"
+                data-testid="workflow-detail-edit"
+                onClick={openPlanner}
+              >
+                <PencilIcon className="size-4" />
+              </Button>
+            </KeyboardShortcutTooltip>
             <Button
               variant="ghost"
               size="icon-sm"
@@ -282,7 +302,7 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
                 Your proposed steps will appear here.
               </p>
               {!showPlanner && (
-                <Button variant="outline" size="sm" onClick={() => setPlannerOpen(true)}>
+                <Button variant="outline" size="sm" onClick={openPlanner}>
                   Create plan
                 </Button>
               )}
@@ -394,12 +414,22 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
                 plannerFillsPage ? "absolute inset-0" : "h-full border-l border-border",
               )}
             >
-              <WorkflowPlanningChat
-                workflow={workflow}
-                expanded={plannerFillsPage}
-                onExpandedChange={setPlannerExpanded}
-                onClose={closePlanner}
-              />
+              <div className="relative h-full">
+                <WorkflowPlanningChat
+                  workflow={workflow}
+                  expanded={plannerFillsPage}
+                  onExpandedChange={setPlannerExpanded}
+                  onClose={closePlanner}
+                />
+                {plannerFlash > 0 && (
+                  <span
+                    key={plannerFlash}
+                    aria-hidden="true"
+                    data-testid="workflow-planning-chat-flash"
+                    className="pointer-events-none absolute inset-1 z-10 animate-user-msg-flash"
+                  />
+                )}
+              </div>
             </div>
           </aside>
         ))}
