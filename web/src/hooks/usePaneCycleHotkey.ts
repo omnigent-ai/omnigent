@@ -3,22 +3,17 @@
 
 import { useEffect, useRef } from "react";
 
-import { hasCommandModifier, isFocusInDialogOrMenu, isMacPlatform } from "@/lib/hotkeys";
+import { isFocusInDialogOrMenu, isMacPlatform } from "@/lib/hotkeys";
+import { matchesShortcut } from "@/lib/shortcuts/registry";
 
 /** -1 for Cmd/Ctrl+Alt+Shift+[, 1 for Cmd/Ctrl+Alt+Shift+], 0 for anything else. */
 export function paneCycleHotkeyStep(
   event: globalThis.KeyboardEvent,
   isMac = isMacPlatform(),
 ): -1 | 0 | 1 {
-  if (!hasCommandModifier(event, isMac) || !event.altKey || !event.shiftKey || event.isComposing) {
-    return 0;
-  }
-  if (typeof event.getModifierState === "function" && event.getModifierState("AltGraph")) {
-    return 0;
-  }
-  // Match the physical key: Alt and Shift change the produced character.
-  if (event.code === "BracketRight") return 1;
-  if (event.code === "BracketLeft") return -1;
+  if (event.isComposing) return 0;
+  if (matchesShortcut(event, "pane.next", { mac: isMac })) return 1;
+  if (matchesShortcut(event, "pane.previous", { mac: isMac })) return -1;
   return 0;
 }
 

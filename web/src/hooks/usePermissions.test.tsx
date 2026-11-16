@@ -32,9 +32,12 @@ vi.mock("@/lib/permissionsApi", async (importOriginal) => ({
   ...(await importOriginal<typeof PermissionsApiModule>()),
   grantPermission: vi.fn().mockResolvedValue({}),
   revokePermission: vi.fn().mockResolvedValue(undefined),
+  grantSharePermission: vi.fn().mockResolvedValue({}),
+  revokeSharePermission: vi.fn().mockResolvedValue(undefined),
 }));
 
 import { PINNED_CONVERSATIONS_KEY, useConversations } from "./useConversations";
+import { grantSharePermission, revokeSharePermission } from "@/lib/permissionsApi";
 import { useSession } from "./useSession";
 import {
   useCanEdit,
@@ -192,14 +195,45 @@ describe("share mutations refresh the session lists", () => {
   ];
 
   it("grant invalidates the grants and every session list", async () => {
-    const { invalidate, result } = renderWithClient(() => useGrantPermission("conv_1"));
+    const { invalidate, result } = renderWithClient(() =>
+      useGrantPermission({ kind: "session", id: "conv_1" }),
+    );
     await act(() => result.current.mutateAsync({ userId: "bob", level: 1 }));
     expect(invalidate.mock.calls.map(([filters]) => filters?.queryKey)).toEqual(expectedKeys);
   });
 
   it("revoke invalidates the grants and every session list", async () => {
-    const { invalidate, result } = renderWithClient(() => useRevokePermission("conv_1"));
+    const { invalidate, result } = renderWithClient(() =>
+      useRevokePermission({ kind: "session", id: "conv_1" }),
+    );
     await act(() => result.current.mutateAsync("bob"));
     expect(invalidate.mock.calls.map(([filters]) => filters?.queryKey)).toEqual(expectedKeys);
+  });
+
+  // The server shares a continued session at once, which can also change
+  // whether the automation manages that session's sharing.
+  const automationKeys = [
+    ["automation-permissions", "st_1"],
+    ["permissions"],
+    ["conversations"],
+    ["project-sessions"],
+    PINNED_CONVERSATIONS_KEY,
+  ];
+
+  it("an automation share change also refreshes session grants and managers", async () => {
+    const target = { kind: "automation", id: "st_1" } as const;
+    const grant = renderWithClient(() => useGrantPermission(target));
+    await act(() => grant.result.current.mutateAsync({ userId: "bob", level: 1 }));
+    expect(grantSharePermission).toHaveBeenCalledWith(target, "bob", 1);
+    expect(grant.invalidate.mock.calls.map(([filters]) => filters?.queryKey)).toEqual(
+      automationKeys,
+    );
+
+    const revoke = renderWithClient(() => useRevokePermission(target));
+    await act(() => revoke.result.current.mutateAsync("bob"));
+    expect(revokeSharePermission).toHaveBeenCalledWith(target, "bob");
+    expect(revoke.invalidate.mock.calls.map(([filters]) => filters?.queryKey)).toEqual(
+      automationKeys,
+    );
   });
 });
