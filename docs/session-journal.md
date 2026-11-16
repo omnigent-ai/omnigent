@@ -123,12 +123,13 @@ reconnects, returns the entry the first attempt wrote instead of adding another.
 
 Pick **Run a workflow** from the composer's **+** menu, in a session or when
 starting one, describe the work, and choose **Run workflow**. The workflow goes
-straight to the chat. The agent always explores first, in a task whose name
-starts with "Explore", without changing anything, deeply enough to plan the
-work as specific steps. **Review the plan
-before work starts**, on by default, adds your review right after the
-exploration: the agent waits for your approval before any of the work, and if
-you ask for changes, it explores again, updates the steps and asks again. You can also type `/workflow` and a
+straight to the chat. The agent adds discovery when the run needs new
+information, such as which PRs to review or the cause of current failures.
+An already understood procedure does not need a generic exploration task.
+**Review the plan before work starts**, on by default, adds your review before
+the work requiring approval, after any read-only discovery needed to form the
+plan. If you ask for changes, the agent investigates what the revision needs,
+updates the steps and asks again. You can also type `/workflow` and a
 description in the composer, for example:
 
 ```
@@ -186,6 +187,15 @@ confirmation. An explicit request to draft, review or try it before saving
 still controls that order. Creating a workflow does not run its steps.
 In the workflow page's planning chat, the agent publishes proposals only;
 **Save plan** applies them to the workflow that already exists.
+
+Authoring reads the referenced SOPs, runbooks and relevant linked procedures
+before proposing execution steps. The plan carries forward their actions,
+constraints and useful references; learning the procedure is not saved as work
+for every future run. Discovery that depends on changing inputs, such as today's
+source revision or failing tests, remains part of execution. An unavailable
+source is reported as a planning gap rather than hidden in a future research
+step. The execution agent uses current instructions and replans when new
+evidence warrants it.
 
 Once you have saved workflows, **Run a workflow** lists them, with a search
 field and **New workflow** below them. Pick one, add this run's
