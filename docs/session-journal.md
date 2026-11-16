@@ -414,7 +414,9 @@ it ran.
   workflow is 404.
 - `PATCH /v1/workflows/{id}`: any of `name`, `description` and `steps`; fields
   left out keep their values. With `expected_description`, the new description
-  applies only while the stored one is still that text.
+  applies only while the stored one is still that text. `description_source`
+  names the planning-chat proposal the description comes from; the workflow
+  returns it until the description is written without one.
 - `DELETE /v1/workflows/{id}`: deletes it.
 
 Workflows live in `workflows`, keyed by workspace and ID, with encoded JSON

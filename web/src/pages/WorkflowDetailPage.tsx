@@ -163,11 +163,11 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
   const proposal = canReadProposal ? currentPlan(journal.entries) : null;
   const proposedSteps = proposal ? planSteps(proposal) : null;
   // A proposal replaces the description only if it's newer than where the description came
-  // from, so an edit made since stands: the proposal it was saved from, by journal order, or
-  // else the workflow's last write, in whole seconds, where a tie keeps the description.
-  const savedFrom = journal.entries.findLast(
-    (entry) => entry.kind === "plan" && planDescription(entry) === workflow.description,
-  );
+  // from, so an edit made since stands: the proposal Save plan took it from, by journal order,
+  // or else the workflow's last write, in whole seconds, where a tie keeps the description.
+  const savedFrom = workflow.description_source
+    ? journal.entries.find((entry) => entry.id === workflow.description_source)
+    : undefined;
   const proposalIsNewer =
     proposal !== null &&
     (savedFrom
@@ -294,13 +294,17 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
                 disabled={savePlan.isPending}
                 loading={savePlan.isPending}
                 onClick={() => {
-                  if (!proposedSteps) return;
+                  if (!proposal || !proposedSteps) return;
                   setPlannerOpen(showPlanner);
                   // The server keeps a description another client changed after this page loaded it.
                   const description =
                     newDescription === null
                       ? {}
-                      : { description: newDescription, expected_description: workflow.description };
+                      : {
+                          description: newDescription,
+                          expected_description: workflow.description,
+                          description_source: proposal.id,
+                        };
                   savePlan.mutate(
                     { steps: proposedSteps, ...description },
                     { onSuccess: () => showToast("Plan saved") },

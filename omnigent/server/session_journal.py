@@ -41,6 +41,7 @@ from omnigent.entities.session_journal import (
     JournalEntryTooLargeError,
     JournalFullError,
     StepNotReadyError,
+    normalize_description,
     normalize_status,
     normalize_step_id,
 )
@@ -230,12 +231,19 @@ async def load_workflow_for_run(
 
 
 def _check_proposed_description(conversation_store: ConversationStore, description: str) -> None:
-    """Refuse a proposed description its workflow couldn't store, so Save plan can save it."""
+    """Refuse a proposed description its workflow couldn't store, so Save plan can save it.
+
+    Text the journal itself refuses, such as a lone surrogate, is left for it to report.
+    """
+    try:
+        text = normalize_description(description)
+    except InvalidJournalEntryError:
+        return
     workflows = open_workflow_store(conversation_store)
     if workflows is None:
         return
     try:
-        workflows.check_description(description)
+        workflows.check_description(text)
     except InvalidWorkflowError as exc:
         raise OmnigentError(f"invalid_entry: {exc}", code=ErrorCode.INVALID_INPUT) from exc
 

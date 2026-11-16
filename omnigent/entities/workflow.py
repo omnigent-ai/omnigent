@@ -43,6 +43,8 @@ class Workflow:
     :param updated_at: Unix epoch seconds of the last write.
     :param steps: The saved steps in the journal plan's format; empty for a draft.
     :param planning_session_id: The owner's conversation for iterating on the plan.
+    :param description_source: The journal entry ID of the planning-chat proposal
+        Save plan took the description from; ``None`` once it's written otherwise.
     """
 
     id: str
@@ -53,6 +55,7 @@ class Workflow:
     updated_at: int
     steps: list[dict[str, Any]]
     planning_session_id: str | None = None
+    description_source: str | None = None
 
 
 def normalize_workflow(

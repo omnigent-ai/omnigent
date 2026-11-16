@@ -15760,6 +15760,18 @@
             "description": "A new description, subject to the same character and stored-byte limits as creation.",
             "title": "Description"
           },
+          "description_source": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The journal entry ID of the planning-chat proposal `description` comes from; a description written without one clears it.",
+            "title": "Description Source"
+          },
           "expected_description": {
             "anyOf": [
               {
@@ -16200,6 +16212,18 @@
           "description": {
             "title": "Description",
             "type": "string"
+          },
+          "description_source": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The planning conversation's journal entry for the proposal the description was saved from, until the description is written otherwise.",
+            "title": "Description Source"
           },
           "id": {
             "title": "Id",

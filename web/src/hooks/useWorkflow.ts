@@ -13,6 +13,8 @@ export interface WorkflowDetail extends SavedWorkflow {
   planning_session_id?: string | null;
   /** Epoch seconds of its last write. */
   updated_at?: number;
+  /** The planning chat's proposal the description was saved from, until written otherwise. */
+  description_source?: string | null;
 }
 
 /** The workflow doesn't exist, or isn't the user's. */
@@ -68,7 +70,7 @@ async function writeWorkflow(path: string, method: string, body: object): Promis
   return savedWorkflow(await sendWorkflow(path, method, body));
 }
 
-/** Whether a server from before `expected_description` refused it as an unknown field. */
+/** Whether a server from before conditional descriptions refused their fields as unknown. */
 async function refusesExpectedDescription(res: Response): Promise<boolean> {
   if (res.status !== 422) return false;
   const body = (await res
@@ -81,7 +83,7 @@ async function refusesExpectedDescription(res: Response): Promise<boolean> {
       (issue: { type?: unknown; loc?: unknown }) =>
         issue?.type === "extra_forbidden" &&
         Array.isArray(issue.loc) &&
-        issue.loc.at(-1) === "expected_description",
+        ["expected_description", "description_source"].includes(issue.loc.at(-1)),
     )
   );
 }
@@ -148,6 +150,7 @@ export function useSaveWorkflowPlan(workflowId: string) {
       steps: WorkflowStep[];
       description?: string;
       expected_description?: string;
+      description_source?: string;
     }) => {
       const path = workflowPath(workflowId);
       const res = await sendWorkflow(path, "PATCH", proposal);

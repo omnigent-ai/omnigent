@@ -463,10 +463,15 @@ describe("WorkflowDetailPage", () => {
         const body = JSON.parse(String(options.body));
         patches.push(body);
         now += 100;
+        // As the server does, a description keeps the source it was saved with.
         stored = {
           ...stored,
           steps: body.steps,
           description: body.description ?? stored.description,
+          description_source:
+            body.description === undefined
+              ? stored.description_source
+              : (body.description_source ?? null),
           is_draft: false,
           updated_at: now,
         };
@@ -483,15 +488,16 @@ describe("WorkflowDetailPage", () => {
       kind: "plan",
       content: { steps: WORKFLOW.steps, description: WORKFLOW.description },
     };
-    vi.mocked(useSessionJournal).mockReturnValue({
-      entries: [proposal],
+    let entries = [proposal];
+    vi.mocked(useSessionJournal).mockImplementation(() => ({
+      entries,
       isLoading: false,
       error: null,
       hasOlder: false,
       loadingOlder: false,
       loadOlder: vi.fn(),
       retry: vi.fn(),
-    });
+    }));
     const description = () => screen.getByTestId("workflow-detail-description").textContent;
     const saveAndReload = async () => {
       fireEvent.click(screen.getByRole("button", { name: "Save plan" }));
@@ -512,14 +518,21 @@ describe("WorkflowDetailPage", () => {
         steps: WORKFLOW.steps,
         description: WORKFLOW.description,
         expected_description: "Pull the board's open tickets and group them",
+        description_source: "proposal",
       },
     ]);
     expect(description()).toBe(WORKFLOW.description);
     expect(screen.getByRole("status")).toHaveTextContent("Saved plan");
 
     // A newer proposal can revise the description alone.
-    proposal.created_at = 250;
-    proposal.content = { steps: WORKFLOW.steps, description: "Fixes one flaky test." };
+    const revision = {
+      ...proposal,
+      id: "revision",
+      position: 2,
+      created_at: 250,
+      content: { steps: WORKFLOW.steps, description: "Fixes one flaky test." },
+    };
+    entries = [proposal, revision];
     cleanup();
     renderPage();
     await screen.findByTestId("workflow-detail-title");
@@ -530,6 +543,7 @@ describe("WorkflowDetailPage", () => {
       steps: WORKFLOW.steps,
       description: "Fixes one flaky test.",
       expected_description: WORKFLOW.description,
+      description_source: "revision",
     });
 
     // An edit in the same second as the newest proposal stands; Save plan applies only its steps.
@@ -537,10 +551,24 @@ describe("WorkflowDetailPage", () => {
       ...WORKFLOW.steps,
       { id: "report", name: "Report", goal: null, depends_on: [] },
     ];
-    proposal.created_at = 400;
-    proposal.content = { steps: edited, description: "Fixes flaky tests and reports them." };
+    entries = [
+      proposal,
+      revision,
+      {
+        ...proposal,
+        id: "report",
+        position: 3,
+        created_at: 400,
+        content: { steps: edited, description: "Fixes flaky tests and reports them." },
+      },
+    ];
     now = 400;
-    stored = { ...stored, description: "Edited by hand", updated_at: now };
+    stored = {
+      ...stored,
+      description: "Edited by hand",
+      description_source: null,
+      updated_at: now,
+    };
     cleanup();
     renderPage();
     await screen.findByTestId("workflow-detail-title");
@@ -576,6 +604,10 @@ describe("WorkflowDetailPage", () => {
           ...stored,
           steps: body.steps,
           description: body.description ?? stored.description,
+          description_source:
+            body.description === undefined
+              ? stored.description_source
+              : (body.description_source ?? null),
           is_draft: false,
           updated_at: 300 + patches.length,
         };
@@ -640,12 +672,130 @@ describe("WorkflowDetailPage", () => {
     ]);
 
     // Another client's description from the same second as that save stands after a refetch.
-    stored = { ...stored, description: "Edited elsewhere." };
+    stored = { ...stored, description: "Edited elsewhere.", description_source: null };
     cleanup();
     renderPage();
     await screen.findByTestId("workflow-detail-title");
     expect(description()).toBe("Edited elsewhere.");
     expect(screen.getByRole("status")).toHaveTextContent("Saved plan");
+  });
+
+  describe("with a description saved from an older proposal", () => {
+    const saved: JournalEntry = {
+      id: "saved",
+      position: 1,
+      created_at: 150,
+      scheduled_task_run_id: null,
+      step: null,
+      author: { type: "agent" },
+      kind: "plan",
+      content: { steps: WORKFLOW.steps, description: "Fixes one flaky test." },
+    };
+    const edited = [
+      ...WORKFLOW.steps,
+      { id: "report", name: "Report", goal: null, depends_on: [] },
+    ];
+    const description = () => screen.getByTestId("workflow-detail-description").textContent;
+
+    async function renderWith(newer: JournalEntry, stored: () => WorkflowDetail) {
+      const actual = await vi.importActual<typeof WorkflowHooks>("@/hooks/useWorkflow");
+      vi.mocked(useWorkflow).mockImplementation(actual.useWorkflow);
+      mockRuns([]);
+      vi.mocked(useSessionJournal).mockReturnValue({
+        entries: [saved, newer],
+        isLoading: false,
+        error: null,
+        hasOlder: false,
+        loadingOlder: false,
+        loadOlder: vi.fn(),
+        retry: vi.fn(),
+      });
+      vi.mocked(authenticatedFetch).mockImplementation(
+        async () => new Response(JSON.stringify(stored())),
+      );
+      renderPage();
+      await screen.findByTestId("workflow-detail-title");
+    }
+
+    it("keeps that wording when the user restores it by hand over a newer proposal", async () => {
+      let stored: WorkflowDetail = {
+        ...WORKFLOW,
+        description: "Fixes one flaky test.",
+        description_source: "saved",
+        planning_session_id: "a".repeat(32),
+        updated_at: 200,
+      };
+      const newer = {
+        ...saved,
+        id: "newer",
+        position: 2,
+        created_at: 250,
+        content: { steps: WORKFLOW.steps, description: "Fixes flaky tests." },
+      };
+      await renderWith(newer, () => stored);
+      vi.mocked(authenticatedFetch).mockImplementation(async (_path, options) => {
+        if (options?.method === "PATCH") {
+          // The editor writes the description alone, which clears its source on the server.
+          const body = JSON.parse(String(options.body));
+          stored = {
+            ...stored,
+            description: body.description,
+            description_source: null,
+            updated_at: 300,
+          };
+        }
+        return new Response(JSON.stringify(stored));
+      });
+      expect(description()).toBe("Fixes flaky tests.");
+
+      fireEvent.click(screen.getByRole("button", { name: "Edit description" }));
+      fireEvent.change(screen.getByRole("textbox", { name: "Workflow description" }), {
+        target: { value: "Fixes one flaky test." },
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Save" }));
+      await waitFor(() => expect(description()).toBe("Fixes one flaky test."));
+      expect(screen.getByRole("status")).toHaveTextContent("Saved plan");
+      cleanup();
+      renderPage();
+      await screen.findByTestId("workflow-detail-title");
+      expect(description()).toBe("Fixes one flaky test.");
+      expect(screen.getByRole("status")).toHaveTextContent("Saved plan");
+    });
+
+    it("leaves the workflow runnable when an older server saves only the steps", async () => {
+      // An older server returns no description source and refuses the conditional fields.
+      let stored: WorkflowDetail = {
+        ...WORKFLOW,
+        description: "Fixes one flaky test.",
+        planning_session_id: "a".repeat(32),
+        updated_at: 200,
+      };
+      const newer = {
+        ...saved,
+        id: "newer",
+        position: 2,
+        created_at: 250,
+        content: { steps: edited, description: "Fixes flaky tests." },
+      };
+      await renderWith(newer, () => stored);
+      vi.mocked(authenticatedFetch).mockImplementation(async (_path, options) => {
+        if (options?.method === "PATCH") {
+          const body = JSON.parse(String(options.body));
+          if ("expected_description" in body) {
+            const detail = [{ type: "extra_forbidden", loc: ["body", "expected_description"] }];
+            return new Response(JSON.stringify({ detail }), { status: 422 });
+          }
+          stored = { ...stored, steps: body.steps, updated_at: 300 };
+        }
+        return new Response(JSON.stringify(stored));
+      });
+      expect(screen.getByTestId("workflow-detail-run")).toBeDisabled();
+
+      fireEvent.click(screen.getByRole("button", { name: "Save plan" }));
+      await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent("Saved plan"));
+      expect(screen.getByTestId("workflow-detail-run")).toBeEnabled();
+      expect(description()).toBe("Fixes one flaky test.");
+    });
   });
 
   it("shows the workflow, its steps, and the sessions that ran it", () => {

@@ -614,6 +614,23 @@ async def test_invalid_entries_are_refused_without_writing(
     assert (await client.get(url, headers=_headers())).json()["data"] == []
 
 
+async def test_a_proposed_description_that_isnt_unicode_is_refused_without_writing(
+    client: httpx.AsyncClient, db_uri: str
+) -> None:
+    session_id = _session(db_uri)
+    url = f"/v1/sessions/{session_id}/journal"
+    plan = {"name": "A", "steps": [{"id": "a", "name": "A"}], "description": "\ud800"}
+    # ASCII JSON can carry an escaped lone surrogate that no UTF-8 text holds.
+    resp = await client.post(
+        url,
+        content=json.dumps(_write("plan", plan, "k")).encode("ascii"),
+        headers={**_runner(session_id), "content-type": "application/json"},
+    )
+    assert resp.status_code == 400, resp.text
+    assert "description must be valid Unicode text" in resp.text
+    assert (await client.get(url, headers=_headers())).json()["data"] == []
+
+
 async def test_a_missing_session_is_not_found(client: httpx.AsyncClient) -> None:
     session_id = uuid.uuid4().hex
     url = f"/v1/sessions/{session_id}/journal"

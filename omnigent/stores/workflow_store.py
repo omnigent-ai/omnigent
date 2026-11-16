@@ -85,9 +85,12 @@ def _is_name_conflict(error: IntegrityError) -> bool:
     )
 
 
-def _plan_text(steps: list[dict[str, Any]]) -> str:
-    """Serialize the plan before applying the deployment's storage codec."""
-    return json.dumps({"steps": steps}, ensure_ascii=False, separators=(",", ":"))
+def _plan_text(steps: list[dict[str, Any]], description_source: str | None = None) -> str:
+    """Serialize the plan, and the proposal its description came from, before the codec."""
+    plan: dict[str, Any] = {"steps": steps}
+    if description_source is not None:
+        plan["description_source"] = description_source
+    return json.dumps(plan, ensure_ascii=False, separators=(",", ":"))
 
 
 class WorkflowStore:
@@ -150,21 +153,25 @@ class WorkflowStore:
             else []
         )
         pairs = zip(texts[::2], texts[1::2], strict=True)
-        return [
-            Workflow(
-                id=row.id,
-                user_id=row.user_id,
-                name=row.name,
-                description=description.decode("utf-8")
-                if isinstance(description, bytes)
-                else description,
-                created_at=row.created_at,
-                updated_at=row.updated_at,
-                steps=json.loads(plan)["steps"],
-                planning_session_id=row.planning_session_id,
+        workflows = []
+        for row, (description, plan) in zip(rows, pairs, strict=True):
+            saved = json.loads(plan)
+            workflows.append(
+                Workflow(
+                    id=row.id,
+                    user_id=row.user_id,
+                    name=row.name,
+                    description=description.decode("utf-8")
+                    if isinstance(description, bytes)
+                    else description,
+                    created_at=row.created_at,
+                    updated_at=row.updated_at,
+                    steps=saved["steps"],
+                    planning_session_id=row.planning_session_id,
+                    description_source=saved.get("description_source"),
+                )
             )
-            for row, (description, plan) in zip(rows, pairs, strict=True)
-        ]
+        return workflows
 
     def create(
         self, *, user_id: str | None, name: object, description: object, steps: object
@@ -299,6 +306,7 @@ class WorkflowStore:
         name: object = None,
         description: object = None,
         expected_description: str | None = None,
+        description_source: str | None = None,
         steps: object = None,
         planning_session_id: str | None = None,
     ) -> Workflow | None:
@@ -310,6 +318,8 @@ class WorkflowStore:
         :param description: A new description, or ``None`` to keep it.
         :param expected_description: Apply *description* only while the stored
             description is still this text, so a newer one written meanwhile stays.
+        :param description_source: The journal entry ID of the planning-chat proposal
+            *description* comes from; a description written without one clears it.
         :param steps: New steps replacing the old ones, or ``None`` to keep them.
         :param planning_session_id: An owner-checked planning session, or ``None`` to keep it.
         :returns: The updated workflow, or ``None`` if the owner has no such workflow.
@@ -334,20 +344,24 @@ class WorkflowStore:
             stale = (
                 expected_description is not None and expected_description != current.description
             )
+            describes = description is not None and not stale
+            source = description_source if describes else current.description_source
             workflow_name, text, workflow_steps = normalize_workflow(
                 name=row.name if name is None else name,
-                description=current.description if description is None or stale else description,
+                description=description if describes else current.description,
                 steps=current.steps if steps is None else steps,
             )
+            # The plan keeps the description's source, so a new source rewrites it.
+            rewrites_plan = steps is not None or source != current.description_source
             stored = self._stored_texts(
-                text, None if steps is None else _plan_text(workflow_steps)
+                text, _plan_text(workflow_steps, source) if rewrites_plan else None
             )
             values: dict[str, Any] = {
                 "name": workflow_name,
                 "description": stored[0],
                 "updated_at": now_epoch(),
             }
-            if steps is not None:
+            if rewrites_plan:
                 values["plan"] = stored[1]
             if planning_session_id is not None:
                 values["planning_session_id"] = planning_session_id
@@ -370,6 +384,7 @@ class WorkflowStore:
                 updated_at=values["updated_at"],
                 steps=workflow_steps,
                 planning_session_id=values.get("planning_session_id", row.planning_session_id),
+                description_source=source,
             )
 
         try:
