@@ -225,29 +225,38 @@ def test_grant_if_absent_writes_only_a_missing_grant(
     assert store.resolve_access("erin@test.com", conv_id).user_grant_level == expected
 
 
+@pytest.mark.parametrize(
+    ("committed", "requested"),
+    [(LEVEL_EDIT, LEVEL_READ), (LEVEL_READ, LEVEL_MANAGE)],
+    ids=["stronger-committed", "weaker-committed"],
+)
 def test_grant_if_absent_keeps_a_grant_committed_after_its_check(
-    store: SqlAlchemyPermissionStore, db_uri: str, monkeypatch: pytest.MonkeyPatch
+    store: SqlAlchemyPermissionStore,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    committed: int,
+    requested: int,
 ) -> None:
-    """The insert keeps a row a concurrent writer committed after the existence check."""
+    """The insert leaves a row a concurrent writer committed after the existence check."""
     if store._engine.dialect.name in ("sqlite", "mysql"):
         pytest.skip("SQLite's write lock and MySQL's gap lock block the concurrent grant")
-    _ensure_user(store, "erin@test.com")
+    _ensure_user(store, "erin@example.com")
     conv_id = _create_conversation(db_uri)
     build_insert = permission_module._upsert_grant
 
     def grant_by_hand_first(*args: object, **kwargs: object) -> object:
         monkeypatch.setattr(permission_module, "_upsert_grant", build_insert)
         # Commits on its own connection while the call's transaction is open.
-        SqlAlchemyPermissionStore(db_uri).grant("erin@test.com", conv_id, LEVEL_EDIT)
+        SqlAlchemyPermissionStore(db_uri).grant("erin@example.com", conv_id, committed)
         return build_insert(*args, **kwargs)
 
     monkeypatch.setattr(permission_module, "_upsert_grant", grant_by_hand_first)
     # Without account checks, as under external auth, no account lock orders the writers.
     with account_checks_scope(False):
-        store.grant_if_absent("erin@test.com", conv_id, LEVEL_READ)
+        store.grant_if_absent("erin@example.com", conv_id, requested)
 
-    assert store.get("erin@test.com", conv_id) == SessionPermission(
-        "erin@test.com", conv_id, LEVEL_EDIT
+    assert store.get("erin@example.com", conv_id) == SessionPermission(
+        "erin@example.com", conv_id, committed
     )
 
 

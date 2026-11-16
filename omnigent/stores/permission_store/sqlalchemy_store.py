@@ -539,11 +539,12 @@ class SqlAlchemyPermissionStore(PermissionStore):
     def grant_if_absent(self, user_id: str, conversation_id: str, level: int) -> bool:
         """Insert a grant unless the grantee holds one. See base class for contract.
 
-        The insert itself keeps an existing row, so a stored level never changes. An
-        insert's row count isn't reliable on every backend, so a locking read decides
-        the result. On MySQL its gap lock and on SQLite the write lock hold off a
-        concurrent insert. On PostgreSQL and CockroachDB, a grant committed between the
-        read and the insert is kept, though the call still returns ``True``.
+        The insert leaves an existing row unchanged, so a stored grant never changes.
+        An insert's row count isn't reliable on every backend, so a locking read
+        decides the result. On MySQL its gap lock and on SQLite the write lock hold
+        off a concurrent insert. On PostgreSQL and CockroachDB, a grant committed
+        between the read and the insert is kept, though the call still returns
+        ``True``.
         """
 
         def write(session: Session) -> bool:
