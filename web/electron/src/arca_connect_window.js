@@ -1,7 +1,7 @@
 "use strict";
 
 /**
- * The connect console: a non-modal window owned by the shell, used in place of
+ * The remote-host connect console: a non-modal shell window, used in place of
  * a native consent dialog. It shows the exact `arca ssh` command that will run
  * and, after the user confirms, streams its live stdout/stderr into an embedded
  * terminal pane.
@@ -12,8 +12,7 @@
  * click here carries the same authority the native dialog had (see
  * confirmHostEnrollment for why consent must live outside the server's page).
  * Confirm/cancel messages are accepted only from this window's own webContents.
- * It isn't modal, so the app stays usable during a slow start; that changes
- * nothing about consent, since only this window's own clicks count.
+ * Being non-modal doesn't widen consent: only this window's own clicks count.
  *
  * All Electron surfaces are injected so the flow is unit-testable.
  */
@@ -190,6 +189,18 @@ function createArcaConnectFlow({
         }
       };
 
+      const closeWindow = () => {
+        try {
+          if (!win.isDestroyed()) win.close();
+        } catch {
+          // Already closing.
+        }
+      };
+      // Nothing is left to read after a success, so the window gets out of the way.
+      const closeSoon = () => {
+        setTimeout(closeWindow, closeDelayMs).unref?.();
+      };
+
       const runCommand = (login = false) => {
         phase = "running";
         connect = login
@@ -223,18 +234,6 @@ function createArcaConnectFlow({
         });
       };
 
-      // Nothing is left to read after a success, so the window gets out of the way.
-      const closeSoon = () => {
-        const timer = setTimeout(() => {
-          try {
-            if (!win.isDestroyed()) win.close();
-          } catch {
-            // Already closing.
-          }
-        }, closeDelayMs);
-        timer.unref?.();
-      };
-
       consoles.set(consoleId, {
         win,
         phase: () => phase,
@@ -246,11 +245,7 @@ function createArcaConnectFlow({
         onCancel: () => {
           // Cancel button (or Close after a run) — just close; the close
           // handler owns settling so both paths behave identically.
-          try {
-            win.close();
-          } catch {
-            // Already closing.
-          }
+          closeWindow();
         },
       });
 

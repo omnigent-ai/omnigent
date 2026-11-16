@@ -104,6 +104,18 @@ for (const copy of [
 }
 
 /** A fake Electron world: BrowserWindow + ipcMain + a controllable connect. */
+/** Lets every timer that is already due run. */
+const flushTimers = () =>
+  new Promise((resolve) => {
+    setTimeout(resolve, 0);
+  });
+/** Resolves when `win` closes. */
+const whenClosed = (win) =>
+  new Promise((resolve) => {
+    win.once("closed", resolve);
+  });
+
+// The default delay is long enough that the success close never fires unless a test asks.
 function flowHarness({ closeDelayMs = 60_000 } = {}) {
   const world = {
     windows: [],
@@ -197,6 +209,10 @@ function flowHarness({ closeDelayMs = 60_000 } = {}) {
   /** Emit a preload→main message as if it came from `win`'s webContents. */
   world.sendFrom = (win, channel, payload) =>
     world.ipc.emit(channel, { sender: { id: win.webContents.id } }, payload);
+  // The console's confirm and cancel channels, found among the listeners it registered.
+  const channel = (suffix) => world.ipc.eventNames().find((name) => String(name).endsWith(suffix));
+  world.confirm = (win) => world.sendFrom(win, channel(":confirm"));
+  world.cancel = (win) => world.sendFrom(win, channel(":cancel"));
   return { world, flow };
 }
 
@@ -301,10 +317,7 @@ describe("arca connect console flow", () => {
     assert.deepEqual(done[1], { ok: true, error: null });
     // Still open when the result arrives, then closed once the short delay passes.
     assert.equal(win.destroyed, false);
-    await new Promise((resolve) => {
-      setTimeout(resolve, 0);
-    });
-    assert.equal(win.destroyed, true);
+    await whenClosed(win);
   });
 
   it("opens the console without blocking its parent window", () => {
@@ -313,6 +326,57 @@ describe("arca connect console flow", () => {
     void flow.run(parent, "https://srv.example.com");
     assert.equal(world.windows[0].options.parent, parent);
     assert.equal(world.windows[0].options.modal, false);
+  });
+
+  it("closes once after a sign-in and the retried connect succeed", async () => {
+    const { world, flow } = flowHarness({ closeDelayMs: 0 });
+    const resultPromise = flow.run(null, "https://srv.example.com");
+    const win = world.windows[0];
+    let closes = 0;
+    win.on("closed", () => {
+      closes += 1;
+    });
+    world.confirm(win);
+    world.connects[0].finish({ ok: false, authError: true });
+    await flushTimers();
+    assert.equal(win.destroyed, false);
+    world.logins[0].finish({ ok: true });
+    await flushTimers();
+    assert.equal(win.destroyed, false);
+    world.connects[1].finish({ ok: true });
+    assert.equal((await resultPromise).ok, true);
+    await whenClosed(win);
+    await flushTimers();
+    assert.equal(closes, 1);
+  });
+
+  it("leaves nothing to close when Close is clicked during the success delay", async () => {
+    const { world, flow } = flowHarness({ closeDelayMs: 0 });
+    const resultPromise = flow.run(null, "https://srv.example.com");
+    const win = world.windows[0];
+    let closes = 0;
+    win.on("closed", () => {
+      closes += 1;
+    });
+    world.confirm(win);
+    world.connects[0].finish({ ok: true });
+    await resultPromise;
+    world.cancel(win);
+    await flushTimers();
+    assert.equal(closes, 1);
+  });
+
+  it("keeps a new console open while the previous one closes after success", async () => {
+    const { world, flow } = flowHarness({ closeDelayMs: 0 });
+    const first = flow.run(null, "https://srv.example.com");
+    world.confirm(world.windows[0]);
+    world.connects[0].finish({ ok: true });
+    await first;
+    void flow.run(null, "https://srv.example.com");
+    assert.equal(world.windows.length, 2);
+    await flushTimers();
+    assert.equal(world.windows[0].destroyed, true);
+    assert.equal(world.windows[1].destroyed, false);
   });
 
   it("labels preview recovery as a reconnect before asking consent", () => {
@@ -386,7 +450,7 @@ describe("arca connect console flow", () => {
     assert.match(result.error, /wasn't approved/);
   });
 
-  it("flags a failed run as already shown in the console", async () => {
+  it("flags a failed run as already shown and keeps the console open", async () => {
     const { world, flow } = flowHarness({ closeDelayMs: 0 });
     const resultPromise = flow.run(null, "https://srv.example.com");
     world.sendFrom(world.windows[0], "arca-connect:confirm");
@@ -395,9 +459,7 @@ describe("arca connect console flow", () => {
     assert.equal(result.ok, false);
     assert.equal(result.shownInConsole, true);
     // A failure stays on screen so its output can be read.
-    await new Promise((resolve) => {
-      setTimeout(resolve, 0);
-    });
+    await flushTimers();
     assert.equal(world.windows[0].destroyed, false);
   });
 
