@@ -312,7 +312,9 @@ segment of the strip for a card with that task's status and its **⋯** menu, or
 click it to jump to the task. In
 a plan, the strip links two neighboring tasks when one waits on the other, so a
 gap between them means they can run at the same time; hovering a task's segment
-arcs it to the tasks it waits on and the tasks that wait on it. When the agent replans, the new
+arcs it to the tasks it waits on and the tasks that wait on it. To see a plan's
+parallel branches, the graph button beside "Updated …" opens the plan's graph
+full screen, as a run's row does, with each task's state and **⋯** menu. When the agent replans, the new
 tasks simply appear. A task's chevron opens what it waits on, its goal and its
 history: each status, oldest first. Tasks from the agent's own list show only
 their name and state.
