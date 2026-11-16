@@ -11,6 +11,14 @@ function classOf(query: string, text: string): number | undefined {
 }
 
 describe("matchField", () => {
+  it("treats any non-word character as a word start, in substrings and subsequences alike", () => {
+    expect(classOf("rec", "Open (recent)")).toBe(MatchClass.boundarySubstring);
+    expect(match("or", "Open (recent")?.penalty).toBe(match("or", "Open  recent")?.penalty);
+    expect(match("or", "Open (recent)")!.penalty).toBeLessThan(
+      match("or", "Open xrecent")!.penalty,
+    );
+  });
+
   it("classifies exact, prefix, boundary substring, substring, and subsequence matches", () => {
     expect(classOf("open", "Open")).toBe(MatchClass.exact);
     expect(classOf("ope", "Open settings")).toBe(MatchClass.prefix);
