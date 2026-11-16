@@ -14,9 +14,12 @@ import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import type * as RoutingModule from "@/lib/routing";
 
 import { WorkflowsPage } from "./WorkflowsPage";
-import { useCreateWorkflowDraft } from "@/hooks/useWorkflow";
+import { useCloneWorkflow, useCreateWorkflowDraft } from "@/hooks/useWorkflow";
 
-vi.mock("@/hooks/useWorkflow", () => ({ useCreateWorkflowDraft: vi.fn() }));
+vi.mock("@/hooks/useWorkflow", () => ({
+  useCloneWorkflow: vi.fn(),
+  useCreateWorkflowDraft: vi.fn(),
+}));
 
 vi.mock("@/hooks/useSavedWorkflows", () => ({
   useSavedWorkflows: vi.fn(),
@@ -77,6 +80,7 @@ function mockWorkflows(state: Partial<ReturnType<typeof useSavedWorkflows>>) {
 
 const deleteWorkflow = vi.fn();
 const createDraft = vi.fn();
+const cloneWorkflow = vi.fn();
 const rows = () => screen.queryAllByTestId("workflow-row");
 const openMenu = (row: HTMLElement) =>
   fireEvent.pointerDown(within(row).getByTestId("workflow-row-menu"), { button: 0 });
@@ -86,6 +90,11 @@ describe("WorkflowsPage", () => {
     vi.mocked(showToast).mockClear();
     navigate.mockClear();
     deleteWorkflow.mockClear();
+    cloneWorkflow.mockClear();
+    vi.mocked(useCloneWorkflow).mockReturnValue({
+      mutate: cloneWorkflow,
+      isPending: false,
+    } as unknown as ReturnType<typeof useCloneWorkflow>);
     createDraft.mockReset().mockResolvedValue({ id: "draft-id" });
     vi.mocked(useCreateWorkflowDraft).mockReturnValue({
       mutateAsync: createDraft,
@@ -151,6 +160,20 @@ describe("WorkflowsPage", () => {
       kind: "run",
       workflow: WORKFLOWS[1],
     });
+  });
+
+  it("opens the cloned workflow and reports cloning errors", () => {
+    mockWorkflows({ workflows: WORKFLOWS });
+    render(<WorkflowsPage />);
+
+    openMenu(rows()[0]!);
+    fireEvent.click(screen.getByTestId("workflow-clone"));
+    expect(cloneWorkflow).toHaveBeenCalledWith("fix-flaky-tests", expect.anything());
+    const { onSuccess, onError } = cloneWorkflow.mock.calls[0]![1];
+    onSuccess({ id: "copy-id" });
+    expect(navigate).toHaveBeenCalledWith("/workflows/copy-id");
+    onError(new Error("Request failed"));
+    expect(showToast).toHaveBeenCalledWith("Couldn’t clone workflow. Request failed");
   });
 
   it.each(["loading", false, true, undefined] as const)(

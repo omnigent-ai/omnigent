@@ -139,6 +139,21 @@ describe("mutations invalidate the list", () => {
     expect(spy).not.toHaveBeenCalledWith({ queryKey: ["conversations"] });
   });
 
+  // Either can stop the automation managing its session's sharing, which the
+  // session's grants list reports.
+  it("update and delete refresh every session's grants", async () => {
+    const { queryClient, wrapper } = makeWrapper();
+    const spy = vi.spyOn(queryClient, "invalidateQueries");
+    const update = renderHook(() => useUpdateScheduledTask(), { wrapper });
+    await update.result.current.mutateAsync({ id: "st_1", input: { sessionMode: "new" } });
+    expect(spy).toHaveBeenCalledWith({ queryKey: ["permissions"] });
+
+    spy.mockClear();
+    const remove = renderHook(() => useDeleteScheduledTask(), { wrapper });
+    await remove.result.current.mutateAsync("st_1");
+    expect(spy).toHaveBeenCalledWith({ queryKey: ["permissions"] });
+  });
+
   it("deleting an automation that runs from a session refreshes the cached sessions", async () => {
     const { queryClient, wrapper } = makeWrapper();
     queryClient.setQueryData(SCHEDULED_TASKS_KEY, [{ ...TASK, sourceSessionId: "conv_copy" }]);

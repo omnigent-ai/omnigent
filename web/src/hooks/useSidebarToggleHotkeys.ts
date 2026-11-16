@@ -13,8 +13,9 @@
 
 import { useEffect, useRef } from "react";
 
-import { hasCommandModifier, isMacPlatform } from "@/lib/hotkeys";
+import { isMacPlatform } from "@/lib/hotkeys";
 import { isNativeShell } from "@/lib/nativeBridge";
+import { matchesShortcut } from "@/lib/shortcuts/registry";
 
 export interface SidebarToggleHandlers {
   /** Flip the left (Conversations) sidebar. */
@@ -32,27 +33,26 @@ export function sidebarToggleSide(
   isMac = isMacPlatform(),
   native = isNativeShell(),
 ): "left" | "right" | null {
-  if (!hasCommandModifier(e, isMac)) return null;
-  // AltGr often reports as Ctrl+Alt; ignore it so intl-layout typing doesn't
-  // accidentally toggle sidebars while focused in an editor/composer. Guard
-  // the call: not every environment implements getModifierState.
-  if (typeof e.getModifierState === "function" && e.getModifierState("AltGraph")) return null;
+  // AltGr often reports as Ctrl+Alt; the chords ignore it so intl-layout typing
+  // doesn't toggle sidebars while focused in an editor or composer.
+  const environment = { mac: isMac, native };
+  const side = matchesShortcut(e, "sidebar.left", environment)
+    ? "left"
+    : matchesShortcut(e, "sidebar.right", environment)
+      ? "right"
+      : null;
+  if (side === null) return null;
   const focused = document.activeElement;
   if (native) {
-    if (e.altKey || e.key.toLowerCase() !== "b") return null;
-    if (e.shiftKey) return "right";
+    if (side === "right") return side;
     if (focused?.closest(RICH_TEXT_SELECTOR)) return null;
     // Ctrl+B is the tmux prefix in a terminal off macOS.
     if (!isMac && focused?.closest(".xterm")) return null;
-    return "left";
+    return side;
   }
-  // The ⌘⌥ chord without Shift, which is the ⌘⌥⇧ pane-cycle chord.
-  if (!e.altKey || e.shiftKey) return null;
   // Monaco folds with ⌘⌥[ / ⌘⌥] on macOS (Ctrl+Shift elsewhere).
   if (isMac && focused?.closest(".monaco-editor")) return null;
-  // Match the physical key, not the character: ⌥ turns "[" / "]" into "“" /
-  // "‘" on macOS, but e.code is stable across layouts and modifiers.
-  return e.code === "BracketLeft" ? "left" : e.code === "BracketRight" ? "right" : null;
+  return side;
 }
 
 export function useSidebarToggleHotkeys(
