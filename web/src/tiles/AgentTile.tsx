@@ -6,6 +6,7 @@ import {
   ExternalLinkIcon,
   FolderIcon,
   GitBranchIcon,
+  LayersIcon,
   RadioTowerIcon,
   StarIcon,
 } from "lucide-react";
@@ -36,6 +37,8 @@ interface AgentTileProps {
   starred?: boolean;
   starDisabled?: boolean;
   onToggleStar?: (conversation: Conversation) => void;
+  /** Moves the tile to the Stack. */
+  onPark?: (sessionId: string) => void;
 }
 
 function projectName(workspace: string | null | undefined): string | null {
@@ -76,6 +79,7 @@ function AgentTileComponent({
   starred = false,
   starDisabled = false,
   onToggleStar,
+  onPark,
 }: AgentTileProps) {
   const title = conversation.title || conversationDisplayLabel(conversation);
   const state = getSessionState(conversation);
@@ -138,6 +142,17 @@ function AgentTileComponent({
             onClick={() => onToggleStar(conversation)}
           >
             <StarIcon className={cn("size-3.5", starred && "fill-amber-400 text-amber-500")} />
+          </Button>
+        )}
+        {onPark && (
+          <Button
+            variant="ghost"
+            size="icon-xs"
+            aria-label={`Move ${title} to the Stack`}
+            title="Move to the Stack"
+            onClick={() => onPark(conversation.id)}
+          >
+            <LayersIcon className="size-3.5" />
           </Button>
         )}
         <Button
