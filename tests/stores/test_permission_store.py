@@ -1864,3 +1864,27 @@ def test_direct_session_reads_default_to_the_stores_reads() -> None:
         ("list", "conv", 5, None),
     ]
     assert store.public_grantees() == frozenset({RESERVED_USER_PUBLIC})
+
+
+def test_conditional_write_defaults_check_only_the_sessions_own_grant() -> None:
+    """Access through a group or admin rights neither blocks a grant nor is revoked."""
+    effective = SessionPermission("alice@example.com", "conv", LEVEL_READ)
+    writes: list[tuple[str, ...]] = []
+
+    def grant(self: PermissionStore, user_id: str, conversation_id: str, level: int) -> None:
+        writes.append(("grant", user_id, conversation_id))
+
+    def revoke(self: PermissionStore, user_id: str, conversation_id: str) -> bool:
+        writes.append(("revoke", user_id, conversation_id))
+        return True
+
+    store = _minimal_store(
+        get=lambda self, user_id, conversation_id: effective,
+        get_direct=lambda self, user_id, conversation_id: None,
+        grant=grant,
+        revoke=revoke,
+    )
+
+    assert store.grant_if_absent("alice@example.com", "conv", LEVEL_READ) is True
+    assert store.revoke_if_level("alice@example.com", "conv", LEVEL_READ) is False
+    assert writes == [("grant", "alice@example.com", "conv")]

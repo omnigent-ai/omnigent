@@ -105,7 +105,7 @@ class PermissionStore(ABC):
         ...
 
     def grant_if_absent(self, user_id: str, conversation_id: str, level: int) -> bool:
-        """Grant *level* only when *user_id* holds no grant on the session.
+        """Grant *level* only when *user_id* holds no grant on the session itself.
 
         Unlike :meth:`grant`, never changes an existing grant, so adding someone can't
         lower access they were given meanwhile. As for :meth:`grant`, the caller
@@ -118,7 +118,7 @@ class PermissionStore(ABC):
         :param level: Numeric permission level for a new grant.
         :returns: ``True`` if a grant was written, ``False`` if one already existed.
         """
-        if self.get(user_id, conversation_id) is not None:
+        if self.get_direct(user_id, conversation_id) is not None:
             return False
         self.grant(user_id, conversation_id, level)
         return True
@@ -151,7 +151,7 @@ class PermissionStore(ABC):
         :param level: The level the grant must still hold.
         :returns: ``True`` if a grant was removed, ``False`` if none was at *level*.
         """
-        held = self.get(user_id, conversation_id)
+        held = self.get_direct(user_id, conversation_id)
         if held is None or held.level != level:
             return False
         return self.revoke(user_id, conversation_id)
