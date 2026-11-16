@@ -161,6 +161,40 @@ describe("copying a selection from an agent reply", () => {
     );
   });
 
+  it("numbers a partly selected list that the selection runs past", async () => {
+    const section = await renderReply(
+      "1. one\n2. two [guide](https://example.com/guide)\n3. three\n\nAfter.",
+    );
+    select(section, "two", "After.");
+
+    expect(copy(section).flavors["text/html"]!.replace(/>\s+</g, "><")).toBe(
+      '<ol start="2"><li>two <a href="https://example.com/guide">guide</a></li><li>three</li></ol><p>After.</p>',
+    );
+  });
+
+  it("counts earlier words across block breaks the way the browser copies them", async () => {
+    const section = await renderReply(
+      "| a | b |\n| --- | --- |\n| foo | bar |\n\nSee [foo bar](https://example.com/fb).",
+    );
+    select(section, "a", "foo bar");
+    // Browsers separate table cells with tabs, which Range.toString omits.
+    vi.spyOn(Selection.prototype, "toString").mockReturnValue("a\tb\nfoo\tbar\n\nSee foo bar");
+
+    expect(copy(section).flavors["text/plain"]).toBe(
+      "a\tb\nfoo\tbar\n\nSee [foo bar](<https://example.com/fb>)",
+    );
+  });
+
+  it("stops linking at a link whose text the plain copy lacks", async () => {
+    const section = await renderReply(
+      "Use [alpha](https://example.com/a) then [beta](https://example.com/b).",
+    );
+    select(section, "Use", "beta");
+    vi.spyOn(Selection.prototype, "toString").mockReturnValue("Use ALPHA then beta");
+
+    expect(copy(section).flavors["text/plain"]).toBe("Use ALPHA then beta");
+  });
+
   it("ignores a link the selection only touches at its edge", async () => {
     const section = await renderReply("First paragraph.\n\n[Next](https://example.com) paragraph.");
     const range = document.createRange();

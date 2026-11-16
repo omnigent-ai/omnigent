@@ -143,17 +143,88 @@ function needsContainer(content: Node, tag: string): boolean {
   });
 }
 
-/** A shallow copy of `ancestor` to wrap copied content, numbering an `ol` from the first selected item. */
+/** Numbers the copy of ordered list `list` from its first item that `range` selects. */
+function numberFromSelection(copy: Element, list: Element, range: Range): void {
+  const items = Array.from(list.children).filter((child) => child.localName === "li");
+  const firstSelected = items.findIndex((item) => range.intersectsNode(item));
+  const start = Number.parseInt(list.getAttribute("start") ?? "1", 10);
+  if (firstSelected > 0 && Number.isFinite(start)) {
+    copy.setAttribute("start", String(start + firstSelected));
+  }
+}
+
+/**
+ * Renumbers ordered lists that the selection starts inside. `cloneContents`
+ * copies the elements around the start point as the first child at each level.
+ */
+function numberPartialLists(content: DocumentFragment, range: Range): void {
+  const startPath: Element[] = [];
+  for (
+    let node: Node | null = range.startContainer;
+    node && node !== range.commonAncestorContainer;
+    node = node.parentNode
+  ) {
+    if (node instanceof Element) startPath.unshift(node);
+  }
+  let copy = content.firstChild;
+  for (const original of startPath) {
+    if (!(copy instanceof Element)) return;
+    if (original.localName === "ol") numberFromSelection(copy, original, range);
+    copy = copy.firstChild;
+  }
+}
+
+/** A shallow copy of `ancestor` to wrap copied content. */
 function wrapperFor(ancestor: Element, range: Range): Element {
   const wrapper = ancestor.cloneNode(false) as Element;
-  if (ancestor.localName !== "ol") return wrapper;
-  const items = Array.from(ancestor.children).filter((child) => child.localName === "li");
-  const firstSelected = items.findIndex((item) => range.intersectsNode(item));
-  const start = Number.parseInt(ancestor.getAttribute("start") ?? "1", 10);
-  if (firstSelected > 0 && Number.isFinite(start)) {
-    wrapper.setAttribute("start", String(start + firstSelected));
-  }
+  if (ancestor.localName === "ol") numberFromSelection(wrapper, ancestor, range);
   return wrapper;
+}
+
+// Elements whose text the browser's plain-text copy separates with a line break.
+const BLOCK_TAGS = new Set(["div", "p", "pre", "blockquote", "ul", "ol", "li", "table", "tr"]);
+for (const tag of ["td", "th", "h1", "h2", "h3", "h4", "h5", "h6"]) BLOCK_TAGS.add(tag);
+
+const UNCOPIED_TEXT_TAGS = new Set(["script", "style", "template"]);
+
+/** Whether the browser leaves `node`'s text out of a plain-text copy. */
+function isUncopiedText(node: Node, root: Element): boolean {
+  for (let element = node.parentElement; element; element = element.parentElement) {
+    if (UNCOPIED_TEXT_TAGS.has(element.localName)) return true;
+    const style = window.getComputedStyle(element);
+    if (style.display === "none" || style.userSelect === "none") return true;
+    if (element === root) return false;
+  }
+  return false;
+}
+
+function blockOf(node: Node, root: Element): Element {
+  let element = node.parentElement;
+  while (element && element !== root && !BLOCK_TAGS.has(element.localName)) {
+    element = element.parentElement;
+  }
+  return element ?? root;
+}
+
+/**
+ * The text of `range` as the browser's plain-text copy shows it, near enough
+ * to count words: unselectable text is skipped and blocks end with a line break.
+ */
+function visibleText(range: Range, root: Element): string {
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  let text = "";
+  let previousBlock: Element | null = null;
+  for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+    if (!range.intersectsNode(node) || isUncopiedText(node, root)) continue;
+    const data = (node as Text).data;
+    const from = node === range.startContainer ? range.startOffset : 0;
+    const to = node === range.endContainer ? range.endOffset : data.length;
+    const block = blockOf(node, root);
+    if (previousBlock && block !== previousBlock) text += "\n";
+    previousBlock = block;
+    text += data.slice(from, to);
+  }
+  return text;
 }
 
 function escapeRegExp(text: string): string {
@@ -196,7 +267,8 @@ interface SelectedLink {
 
 /**
  * Rewrites each selected link's visible text in `plainText` as a markdown link.
- * Links are matched in document order, skipping plain occurrences of the same words.
+ * Links are matched in document order, skipping plain occurrences of the same
+ * words. Stops at a link it cannot find, since later counts assume it was found.
  */
 function linkifyPlainText(plainText: string, links: SelectedLink[]): string {
   let output = "";
@@ -208,7 +280,7 @@ function linkifyPlainText(plainText: string, links: SelectedLink[]): string {
     for (let skipped = 0; match && skipped < earlierMatches; skipped++) {
       match = matcher.exec(plainText);
     }
-    if (!match) continue;
+    if (!match) break;
     output += plainText.slice(cursor, match.index) + markdownLink(match[0], href);
     cursor = match.index + match[0].length;
   }
@@ -237,14 +309,17 @@ export function selectionToLinkedPayload(
     // A selection edge can touch a link without selecting any of its text.
     if (!label.trim()) continue;
     gap.setEnd(part.startContainer, part.startOffset);
-    links.push({ label, href, earlierMatches: countMatches(gap.toString(), labelPattern(label)) });
+    const earlierMatches = countMatches(visibleText(gap, root), labelPattern(label));
+    links.push({ label, href, earlierMatches });
     gap.setStart(part.endContainer, part.endOffset);
   }
   if (!links.length) return null;
 
   // cloneContents keeps elements the range only partly covers, but not the
   // common ancestor itself or the elements above it, so re-add the ones that matter.
-  let content: Node = range.cloneContents();
+  const copied = range.cloneContents();
+  numberPartialLists(copied, range);
+  let content: Node = copied;
   const common = range.commonAncestorContainer;
   for (
     let ancestor = common instanceof Element ? common : common.parentElement;
