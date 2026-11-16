@@ -98,6 +98,7 @@ def _build_app(
     local_single_user: bool = False,
     projects: bool = True,
     automations: bool | Callable[[], bool] | None = None,
+    automations_feature: bool = True,
     session_mcp_selection: object | None = None,
     workflows: bool = False,
 ) -> FastAPI:
@@ -124,6 +125,7 @@ def _build_app(
             {
                 "OMNIGENT_FEATURES": (
                     ("automations_v2" if persistent else "-automations_v2")
+                    + ("" if automations_feature else ",-automations")
                     + (",one_time_automations" if one_time else "")
                     + (",workflows" if workflows else "")
                 )
@@ -414,6 +416,7 @@ async def test_automations_gate_is_checked_per_request(
         async def enabled_in_info() -> bool:
             info = (await client.get("/v1/info", headers=_headers())).json()
             assert info["scheduled_task_inbox"] == info["automations_enabled"]
+            assert info["scheduled_task_projects"] == info["automations_enabled"]
             # The runner reads the same gate off its bundle download to hide the tools.
             bundle = await client.get(
                 f"/v1/sessions/{session_id}/agent/contents", headers=_headers()
@@ -450,6 +453,65 @@ async def test_automations_gate_is_checked_per_request(
         got = await client.get(task_url, headers=_headers())
         assert got.status_code == 200, got.text
         assert await enabled_in_info() is True
+
+
+@pytest.mark.parametrize("persistent", [False, True])
+@pytest.mark.parametrize("automations", [True, lambda: True], ids=["static", "callable"])
+async def test_automations_feature_disables_access_and_scheduling(
+    runtime_init: None,
+    db_uri: str,
+    tmp_path: Path,
+    mock_llm: ControllableMockClient,
+    persistent: bool,
+    automations: bool | Callable[[], bool],
+) -> None:
+    app = _build_app(
+        db_uri,
+        tmp_path,
+        persistent=persistent,
+        automations=automations,
+        automations_feature=False,
+    )
+    _make_user(db_uri)
+    session_id = _owned_session(db_uri)
+    store = app.state.scheduled_task_store
+    task = store.create(
+        scheduled_task_id=uuid.uuid4().hex, user_id="alice@example.com", **_create_body()
+    )
+    task_url = f"/v1/scheduled-tasks/{task.id}"
+
+    async with _serve(app, mock_llm, tmp_path) as client:
+        assert getattr(app.state, "scheduled_task_scheduler", None) is None
+        info = (await client.get("/v1/info", headers=_headers())).json()
+        assert info["automations_enabled"] is False
+        assert info["scheduled_task_projects"] is False
+        assert info["scheduled_task_inbox"] is False
+        assert info["scheduled_task_one_time"] is False
+        bundle = await client.get(f"/v1/sessions/{session_id}/agent/contents", headers=_headers())
+        assert bundle.status_code == 200, bundle.text
+        assert bundle.headers[AUTOMATIONS_HEADER] == "0"
+
+        for method, url in (
+            ("GET", "/v1/scheduled-tasks"),
+            ("GET", "/v1/scheduled-tasks/inbox"),
+            ("POST", "/v1/scheduled-tasks"),
+            ("GET", task_url),
+            ("PATCH", task_url),
+            ("POST", f"{task_url}/run"),
+            ("GET", f"{task_url}/runs"),
+            ("DELETE", task_url),
+        ):
+            body = _create_body() if method == "POST" else {} if method == "PATCH" else None
+            response = await client.request(method, url, json=body, headers=_headers())
+            assert response.status_code == 404, (method, url, response.text)
+
+    assert store.get(task.id) == task
+    enabled_app = _build_app(db_uri, tmp_path, persistent=persistent, automations=automations)
+    async with _serve(enabled_app, mock_llm, tmp_path) as client:
+        assert enabled_app.state.scheduled_task_scheduler.is_started
+        restored = await client.get(task_url, headers=_headers())
+        assert restored.status_code == 200, restored.text
+        assert restored.json()["state"] == "active"
 
 
 async def test_create_no_workspace_task_persists_null_host_and_workspace(
