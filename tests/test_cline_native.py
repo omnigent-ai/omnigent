@@ -22,6 +22,7 @@ from omnigent.harnesses.cline_native.serve import (
     resolve_cline_provider_settings,
     token_fingerprint,
 )
+from tests._helpers.polling import poll_until_async
 
 
 def _event(name: str, payload: dict | None = None, session_id: str = "s1") -> dict:
@@ -153,42 +154,6 @@ class TestProviderSettings:
         assert fp != token_fingerprint("other-token")
         assert len(fp) == 8
         assert token_fingerprint("") == "none"
-
-
-class TestClineAuthConfigured:
-    def test_configured_with_auth_settings(self, tmp_path: Path) -> None:
-        from omnigent.onboarding.cline_auth import cline_auth_configured
-
-        _write_providers(
-            tmp_path,
-            {
-                "lastUsedProvider": "cline-pass",
-                "providers": {"cline-pass": {"settings": {"auth": {"accessToken": "t"}}}},
-            },
-        )
-        assert cline_auth_configured(tmp_path) is True
-
-    def test_configured_with_api_key(self, tmp_path: Path) -> None:
-        from omnigent.onboarding.cline_auth import cline_auth_configured
-
-        _write_providers(
-            tmp_path,
-            {
-                "lastUsedProvider": "openrouter",
-                "providers": {"openrouter": {"settings": {"apiKey": "k"}}},
-            },
-        )
-        assert cline_auth_configured(tmp_path) is True
-
-    def test_not_configured_without_credentials(self, tmp_path: Path) -> None:
-        from omnigent.onboarding.cline_auth import cline_auth_configured
-
-        assert cline_auth_configured(tmp_path) is False
-        _write_providers(
-            tmp_path,
-            {"lastUsedProvider": "p", "providers": {"p": {"settings": {}}}},
-        )
-        assert cline_auth_configured(tmp_path) is False
 
 
 class TestItems:
@@ -339,7 +304,7 @@ class TestHubClientCommands:
         client, ws = _client_with_fake_ws()
         try:
             task = asyncio.ensure_future(client.command("session.list", {}, timeout_s=None))
-            await asyncio.sleep(0.05)
+            await poll_until_async(lambda: ws.sent, timeout_s=5)
             assert not task.done()
             ws.incoming.put_nowait(_reply("omni-1", {"sessions": []}))
             assert (await task) == {"sessions": []}
@@ -358,7 +323,7 @@ class TestHubClientCommands:
                     model="m-1",
                 )
             )
-            await asyncio.sleep(0.05)
+            await poll_until_async(lambda: ws.sent, timeout_s=5)
             frame = ws.sent[-1]
             payload = frame["envelope"]["payload"]
             assert frame["envelope"]["command"] == "session.create"
@@ -378,7 +343,7 @@ class TestHubClientCommands:
         client, ws = _client_with_fake_ws()
         try:
             attach = asyncio.ensure_future(client.session_attach("s-1"))
-            await asyncio.sleep(0.05)
+            await poll_until_async(lambda: ws.sent, timeout_s=5)
             frame = ws.sent[-1]
             assert frame["envelope"]["command"] == "session.attach"
             assert frame["envelope"]["payload"] == {"sessionId": "s-1"}
@@ -391,7 +356,7 @@ class TestHubClientCommands:
             assert (await attach)["status"] == "idle"
 
             get = asyncio.ensure_future(client.session_get("s-1"))
-            await asyncio.sleep(0.05)
+            await poll_until_async(lambda: len(ws.sent) >= 2, timeout_s=5)
             frame = ws.sent[-1]
             assert frame["envelope"]["command"] == "session.get"
             ws.incoming.put_nowait(
@@ -475,9 +440,7 @@ class TestForwarderRefresh:
         def _raise(**_kw):
             raise ClineHubStartError("nope")
 
-        monkeypatch.setattr(
-            "omnigent.harnesses.cline_native.serve.ensure_cline_hub", _raise
-        )
+        monkeypatch.setattr("omnigent.harnesses.cline_native.serve.ensure_cline_hub", _raise)
         result = await _refresh_hub_endpoint(
             cwd="/w", executable="", bridge_dir=tmp_path, session_id="sess-1"
         )

@@ -12,9 +12,11 @@ add/set-default/remove write paths surfaces here rather than silently.
 harness on a single compact row — the name on the left, then an aligned
 ``✓``/``✗`` status column — in 0.3 priority order: ``1=Claude``,
 ``2=Codex``, ``3=Cursor``, ``4=OpenCode``, ``5=Hermes``, ``6=Pi``,
-``7=Antigravity``, ``8=Qwen Code``, ``9=Goose``, ``10=Copilot``, ``11=Kiro``,
-``12=Kimi Code``, ``13=Cline``, ``14=Import from OpenClaw``,
-``15=Custom ACP agent``, ``16=Quit``. There is no "More" folding — every harness is visible at once —
+``7=Antigravity``, ``8=Qwen Code``, ``9=Goose``, ``10=Devin``, then the
+builtin ACP CLI rows sorted by id (``11=Cline``, ``12=Grok Build``,
+``13=Jcode``), ``14=Copilot``, ``15=Kiro``, ``16=Kimi Code``,
+``17=Import from OpenClaw``, ``18=Custom ACP agent``, ``19=Quit``.
+There is no "More" folding — every harness is visible at once —
 and the actionable hint (install command / next step)
 renders only for the highlighted row, as the selector's description line.
 Selecting a harness drills into level 2 — its configured credentials, then ``+ Add a
@@ -1799,12 +1801,12 @@ def test_overview_lists_all_harnesses_in_priority_order(isolated_config, monkeyp
         # the sole "Devin" row. The remaining builtin ACP CLI rows follow, sorted
         # by id, before the non-ACP harnesses.
         "Devin",
+        "Cline",
         "Grok Build",
         "Jcode",
         "Copilot",
         "Kiro",
         "Kimi Code",
-        "Cline",
         "Import from OpenClaw",
         "Custom ACP agent",
         "Quit",
@@ -1971,9 +1973,9 @@ def test_setup_imports_openclaw_agents(isolated_config) -> None:
         encoding="utf-8",
     )
 
-    # 16 is the OpenClaw import row: hiding Devin's builtin ACP row moved every
-    # row after it one lower (see the dispatch table's note).
-    stdin = "\n".join(["16", "", "", "q"]) + "\n"
+    # 17 is the OpenClaw import row: the Cline ACP row moved every row after
+    # position 11 one lower (see the dispatch table's note).
+    stdin = "\n".join(["17", "", "", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
 
     assert result.exit_code == 0, result.output
@@ -1995,7 +1997,7 @@ def test_setup_imports_openclaw_agents_from_user_selected_path(isolated_config) 
         encoding="utf-8",
     )
 
-    stdin = "\n".join(["16", "", str(selected), "", "q"]) + "\n"
+    stdin = "\n".join(["17", "", str(selected), "", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
 
     assert result.exit_code == 0, result.output
@@ -2012,7 +2014,7 @@ def test_setup_rejects_user_selected_unrelated_file(isolated_config) -> None:
     selected = isolated_config / "package.json"
     selected.write_text('{"name": "unrelated"}', encoding="utf-8")
 
-    stdin = "\n".join(["16", "", str(selected), "2", "q"]) + "\n"
+    stdin = "\n".join(["17", "", str(selected), "2", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
 
     assert result.exit_code == 0, result.output
@@ -2204,16 +2206,17 @@ def test_overview_truncates_long_status_for_narrow_terminal(isolated_config, mon
         ("8", "_manage_qwen_harness"),
         ("9", "_manage_goose_harness"),
         # 10 is Devin's NATIVE row (devin-native), in the slot its builtin ACP
-        # row used to hold. The ACP path is deprecated (not offered), so 11-12
-        # are the remaining builtin ACP CLI rows (Grok Build, Jcode; sorted by
-        # id); every row after them sits one lower.
+        # row used to hold. The ACP path is deprecated (not offered), so 11-13
+        # are the remaining builtin ACP CLI rows (Cline, Grok Build, Jcode;
+        # sorted by id); every row after them sits one lower.
         ("10", "_manage_devin_harness"),
         ("11", "_show_acp_cli_harness"),
         ("12", "_show_acp_cli_harness"),
-        ("13", "_manage_copilot_harness"),
-        ("14", "_manage_kiro_harness"),
-        ("15", "_manage_kimi_harness"),
-        ("17", "_add_acp_agent"),
+        ("13", "_show_acp_cli_harness"),
+        ("14", "_manage_copilot_harness"),
+        ("15", "_manage_kiro_harness"),
+        ("16", "_manage_kimi_harness"),
+        ("18", "_add_acp_agent"),
     ],
 )
 def test_overview_dispatches_to_correct_manager(
@@ -2271,7 +2274,7 @@ def test_overview_status_color_distinguishes_missing_from_unconfigured(
     assert "[red]✗ Not installed[/]" in codex
 
 
-@pytest.mark.parametrize("name", ["Kiro", "Kimi Code", "Cline"])
+@pytest.mark.parametrize("name", ["Kiro", "Kimi Code"])
 def test_installed_native_cli_auth_unknown_rows_are_not_configured(
     isolated_config, monkeypatch, name: str
 ) -> None:
@@ -2294,7 +2297,6 @@ def test_installed_native_cli_auth_unknown_rows_are_not_configured(
     # Kimi's row now consults a combined auth probe; force "not configured" so
     # the assertion is deterministic regardless of the dev machine.
     monkeypatch.setattr("omnigent.onboarding.kimi_auth.kimi_auth_configured", lambda: False)
-    monkeypatch.setattr("omnigent.onboarding.cline_auth.cline_auth_configured", lambda: False)
     options, selectable, descriptions, _compact, _max_visible = _capture_setup_overview(
         monkeypatch
     )
@@ -2320,27 +2322,6 @@ def test_overview_kimi_row_reflects_detected_login(isolated_config, monkeypatch)
         monkeypatch
     )
     row_index = _overview_row_names(options, selectable).index("Kimi Code")
-    assert "[green]✓ Signed in[/]" in options[row_index]
-    assert "[yellow]✗ Not configured[/]" not in options[row_index]
-    # A ready row carries no next-step hint.
-    assert descriptions[row_index] == ""
-
-
-def test_overview_cline_row_reflects_detected_login(isolated_config, monkeypatch) -> None:
-    """An installed cline with a provider credential renders green "Signed in".
-
-    The row consults the file-based probe ``cline_auth_configured`` (the same
-    ``~/.cline`` providers.json the hub harness reads) and renders ready when
-    a provider credential is present, mirroring the kimi row's split.
-    """
-    monkeypatch.setattr(
-        "omnigent.onboarding.harness_install.harness_cli_installed", lambda family: True
-    )
-    monkeypatch.setattr("omnigent.onboarding.cline_auth.cline_auth_configured", lambda: True)
-    options, selectable, descriptions, _compact, _max_visible = _capture_setup_overview(
-        monkeypatch
-    )
-    row_index = _overview_row_names(options, selectable).index("Cline")
     assert "[green]✓ Signed in[/]" in options[row_index]
     assert "[yellow]✗ Not configured[/]" not in options[row_index]
     # A ready row carries no next-step hint.
@@ -2374,7 +2355,6 @@ def test_overview_descriptions_map_to_their_rows(isolated_config, monkeypatch) -
     # Kimi's row consults a combined auth probe; force "not configured" so the
     # hint is asserted deterministically.
     monkeypatch.setattr("omnigent.onboarding.kimi_auth.kimi_auth_configured", lambda: False)
-    monkeypatch.setattr("omnigent.onboarding.cline_auth.cline_auth_configured", lambda: False)
     monkeypatch.setattr(
         "omnigent.onboarding.opencode_auth.opencode_auth_summary",
         lambda: OpenCodeAuthSummary(installed=True, stored_providers=(), env_providers=()),
@@ -2415,7 +2395,6 @@ def test_overview_descriptions_map_to_their_rows(isolated_config, monkeypatch) -
         == "Sign in with `kimi login`, or (pay-per-use) set a Kimi API key in"
         " `~/.kimi-code/config.toml`."
     )
-    assert desc_by_name["Cline"] == "Sign in with `cline auth`."
     assert desc_by_name["Quit"] == ""
 
 
