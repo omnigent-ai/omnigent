@@ -8085,7 +8085,19 @@ def create_runner_app(
             _interrupt_resp = await _native_interrupt_runner.interrupt(_harness, conversation_id)
             if _interrupt_resp is not None:
                 return _interrupt_resp
+            _had_turn = conversation_id in _active_turns
             await _cancel_inprocess_turn(conversation_id)
+            # No turn to stop: re-assert idle so Stop clears a persisted ``running``
+            # whose idle edge never reached the server.
+            if (
+                not _had_turn
+                and conversation_id not in _active_turns
+                and not (
+                    process_manager is not None
+                    and process_manager.has_active_turn(conversation_id)
+                )
+            ):
+                _publish_turn_status(conversation_id, "idle")
             return Response(status_code=204)
 
         if body_type == "external_session_status":

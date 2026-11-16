@@ -12001,6 +12001,48 @@ async def test_interrupt_cleanup_is_scoped_to_turn_generation(replacement: str) 
         app.state.active_turns.pop(conv, None)
 
 
+def _queued_statuses(app: FastAPI, conv: str) -> list[str]:
+    """Drain and return the ``session.status`` values queued for *conv*."""
+    queue = app.state.session_event_queues.get(conv)
+    statuses: list[str] = []
+    while queue is not None and not queue.empty():
+        event = queue.get_nowait()
+        if isinstance(event, dict) and event.get("type") == "session.status":
+            statuses.append(event["status"])
+    return statuses
+
+
+@pytest.mark.asyncio
+async def test_interrupt_without_a_turn_reasserts_idle() -> None:
+    """Stop on an idle session publishes ``idle`` so a stale server ``running`` clears."""
+    conv = "conv_interrupt_idle"
+    pm = _RecoveryFakeProcessManager(_RecoveryScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _recovery_runner_client(app) as http:
+        response = await http.post(f"/v1/sessions/{conv}/events", json={"type": "interrupt"})
+    assert response.status_code == 204, response.text
+    assert _queued_statuses(app, conv) == ["idle"]
+
+
+@pytest.mark.asyncio
+async def test_interrupt_leaves_an_in_flight_harness_turn_to_report_its_own_end() -> None:
+    """A harness response still in flight is not declared idle by the interrupt."""
+    conv = "conv_interrupt_in_flight"
+    pm = _RecoveryFakeProcessManager(_RecoveryScriptedHarnessClient([]))
+    pm.mark_in_flight(conv, "resp_live")
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _recovery_runner_client(app) as http:
+        response = await http.post(f"/v1/sessions/{conv}/events", json={"type": "interrupt"})
+    assert response.status_code == 204, response.text
+    assert _queued_statuses(app, conv) == []
+
+
 @pytest.mark.asyncio
 async def test_resync_ownership_gate_ignores_superseded_delivery_failure() -> None:
     """BLOCKING-2: a delayed verdict-delivery failure must not cancel a newer turn."""
