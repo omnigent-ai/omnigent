@@ -10579,3 +10579,26 @@ def test_family_membership_is_independent_of_labels(conversation_store) -> None:
         source.id,
         sibling.id,
     }
+
+
+@pytest.mark.parametrize("store_fixture", ["conversation_store", "split_db_conversation_store"])
+def test_list_conversations_filters_by_host_and_runner_liveness(
+    request: pytest.FixtureRequest, store_fixture: str
+) -> None:
+    """``host_id`` and ``runner_seen_since`` restrict rows before pagination."""
+    store: SqlAlchemyConversationStore = request.getfixturevalue(store_fixture)
+    live, stale, _ = (store.create_conversation() for _ in range(3))
+    host = uuid.uuid4().hex
+    store.set_runner_id(live.id, "runner-live")
+    store.set_runner_id(stale.id, "runner-stale")
+    store.touch_runner_liveness(["runner-live"], 2_000)
+    store.touch_runner_liveness(["runner-stale"], 1_000)
+    store.set_host_id(stale.id, host, workspace="/w")
+
+    def listed(**filters: object) -> set[str]:
+        return {c.id for c in store.list_conversations(limit=1, **filters).data}
+
+    assert listed(runner_seen_since=1_500) == {live.id}
+    assert listed(host_id=host) == {stale.id}
+    assert listed(host_id=host, runner_seen_since=1_500) == set()
+    assert len(store.list_conversations(limit=10).data) == 3
