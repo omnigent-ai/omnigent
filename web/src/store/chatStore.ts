@@ -3528,9 +3528,27 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       return;
     }
 
-    const entry = wasLive
-      ? conversationRegistry.acquire(conversationId)
-      : acquireConversationForBind(conversationId);
+    // Sends the server hasn't acknowledged, carried across the re-bind below.
+    let unsentOnRebind: PendingUserMessage[] = [];
+    if (!wasLive) {
+      // Cold hydration prepends its snapshot, so discard the retained window.
+      // Keep unsent bubbles: the server cannot replay messages it never received.
+      unsentOnRebind =
+        conversationRegistry
+          .peek(conversationId)
+          ?.getState()
+          .pendingUserMessages.filter((p) => p.posted !== true) ?? [];
+      conversationRegistry.release(conversationId);
+    }
+    const entry = conversationRegistry.acquire(conversationId);
+    if (!wasLive) {
+      // Wait for session-scoped configuration before painting the composer.
+      // Live entries skip the placeholder so returning to them paints instantly.
+      entry.setState({
+        loadingConversation: true,
+        ...(unsentOnRebind.length > 0 ? { pendingUserMessages: unsentOnRebind } : {}),
+      });
+    }
     // Paint whatever the entry already holds. For a live entry that is the
     // current transcript; for a fresh one it is the initial state.
     mirrorActiveEntry();
@@ -4348,23 +4366,6 @@ function isConversationStreamCurrent(id: string): boolean {
   if (entry === undefined || entry.disposed) return false;
   const state = entry.getState();
   return state.abortController !== null && state.conversationLoadError === null;
-}
-
-/** Start cold without stale transcript blocks, preserving unacknowledged sends. */
-function acquireConversationForBind(id: string): ConversationEntry {
-  const unsent =
-    conversationRegistry
-      .peek(id)
-      ?.getState()
-      .pendingUserMessages.filter((p) => p.posted !== true) ?? [];
-  // Cold hydration prepends its snapshot; a retained window would misorder it.
-  conversationRegistry.release(id);
-  const entry = conversationRegistry.acquire(id);
-  entry.setState({
-    loadingConversation: true,
-    ...(unsent.length > 0 ? { pendingUserMessages: unsent } : {}),
-  });
-  return entry;
 }
 
 /**
@@ -5267,6 +5268,9 @@ export async function retryConversationLoad(id: string): Promise<void> {
   await bindStream(id, entrySetter(entry), entryGetter(entry), true);
 }
 
+// Includes slot acquisition, before a bind publishes its controller.
+const conversationBindings = new WeakSet<ConversationEntry>();
+
 /**
  * Start the session SSE stream, kick off the pump in the background
  * once the stream connects, then fetch metadata plus the most recent
@@ -5281,7 +5285,15 @@ export async function retryConversationLoad(id: string): Promise<void> {
  * connecting. Dedupe by item id on merge so stream-delivered
  * persisted items don't double-render alongside hydrated ones.
  */
-async function bindStream(
+function bindStream(id: string, set: Setter, get: Getter, hydratePending = false): Promise<void> {
+  const entry = conversationRegistry.peek(id);
+  if (entry !== undefined) conversationBindings.add(entry);
+  return bindStreamAndHydrate(id, set, get, hydratePending).finally(() => {
+    if (entry !== undefined) conversationBindings.delete(entry);
+  });
+}
+
+async function bindStreamAndHydrate(
   id: string,
   set: Setter,
   get: Getter,
@@ -5349,7 +5361,9 @@ async function bindStream(
   // the stream unbinds (abort), so it never leaks across conversations.
   if (typeof document !== "undefined") {
     const onVisible = (): void => {
-      if (document.visibilityState === "visible") void reconcilePendingElicitations(id);
+      // The active chat's foreground snapshot also reconciles approval cards.
+      if (document.visibilityState === "visible" && useChatStore.getState().conversationId !== id)
+        void reconcilePendingElicitations(id);
     };
     document.addEventListener("visibilitychange", onVisible);
     controller.signal.addEventListener("abort", () => {
@@ -6391,12 +6405,13 @@ async function rehydrateWindowOnReconnect(
 /** A reconnect backfill's outcome; only a failed read leaves history owed. */
 type ReconnectBackfill = "applied" | "failed" | "skipped";
 
-interface ReconnectRead {
-  generation: number;
-  promise: Promise<ReconnectBackfill>;
-}
-const reconnectReconciles = new WeakMap<ConversationEntry, Set<ReconnectRead>>();
+// Only foreground recovery may reuse a status-settling read from this generation.
+const reconnectReconciles = new WeakMap<
+  ConversationEntry,
+  { generation: number; promise: Promise<ReconnectBackfill> }
+>();
 
+/** Stream recovery always starts a fresh read after subscribing. */
 function reconcileOnReconnect(
   id: string,
   set: Setter,
@@ -6405,34 +6420,20 @@ function reconcileOnReconnect(
   settleStatus = true,
 ): Promise<ReconnectBackfill> {
   const entry = conversationRegistry.peek(id);
-  if (entry === undefined || entry.disposed) return Promise.resolve("skipped");
   const generation = get().historyGeneration;
-  const pending = reconnectReconciles.get(entry) ?? new Set<ReconnectRead>();
-  // Foreground recovery joins an existing read; reconnects during it join too.
-  if (foregroundRecoveries.has(entry) && pending.size > 0) {
-    const current = [...pending].findLast((read) => read.generation === generation);
-    return Promise.all([...pending].map((read) => read.promise)).then(() =>
-      current !== undefined
-        ? current.promise
-        : reconcileOnReconnect(id, set, get, ignoredNativeMessageIds, settleStatus),
-    );
-  }
-  const read = {
-    generation,
-    promise: reconcileSnapshotOnReconnect(
-      id,
-      set,
-      get,
-      ignoredNativeMessageIds,
-      settleStatus,
-    ).finally(() => {
-      pending.delete(read);
-      if (pending.size === 0) reconnectReconciles.delete(entry);
-    }),
-  };
-  pending.add(read);
-  reconnectReconciles.set(entry, pending);
-  return read.promise;
+  const promise = reconcileSnapshotOnReconnect(
+    id,
+    set,
+    get,
+    ignoredNativeMessageIds,
+    settleStatus,
+  ).finally(() => {
+    if (entry !== undefined && reconnectReconciles.get(entry)?.promise === promise) {
+      reconnectReconciles.delete(entry);
+    }
+  });
+  if (entry !== undefined && settleStatus) reconnectReconciles.set(entry, { generation, promise });
+  return promise;
 }
 
 /**
@@ -6705,54 +6706,46 @@ function recycleStreamIfStale(): void {
   }
 }
 
-const foregroundRecoveries = new WeakSet<ConversationEntry>();
-const foregroundRecoveredAt = new WeakMap<ConversationEntry, number>();
-const FOREGROUND_COALESCE_MS = 1_000;
+let foregroundRecoveryArmed = true;
+
+function armForegroundRecovery(): void {
+  foregroundRecoveryArmed = true;
+}
 
 function reconcileForegroundConversation(): void {
-  if (typeof document !== "undefined" && document.hidden) return;
+  if (!foregroundRecoveryArmed || (typeof document !== "undefined" && document.hidden)) return;
   const id = useChatStore.getState().conversationId;
   if (id === null || isTempConvId(id)) return;
-  let entry = conversationRegistry.peek(id);
-  if (entry === undefined || entry.disposed || entry.getState().loadingConversation) return;
-  const now = Date.now();
-  // Browsers can report one return through several events, in separate tasks.
-  if (
-    foregroundRecoveries.has(entry) ||
-    now - (foregroundRecoveredAt.get(entry) ?? -Infinity) < FOREGROUND_COALESCE_MS
-  )
-    return;
-  const rebind = entry.getState().abortController === null;
-  if (rebind) entry = acquireConversationForBind(id);
-  foregroundRecoveredAt.set(entry, now);
-  foregroundRecoveries.add(entry);
-  const target = entry;
-  const controller = target.getState().abortController;
-  const recovery = rebind
-    ? bindStream(id, entrySetter(target), entryGetter(target), true)
+  const entry = conversationRegistry.peek(id);
+  if (entry === undefined || entry.disposed) return;
+  const { abortController, loadingConversation, historyGeneration } = entry.getState();
+  // A pending bind owns hydration; exited pumps wait for an explicit retry.
+  if (abortController === null || loadingConversation || conversationBindings.has(entry)) return;
+  foregroundRecoveryArmed = false;
+  const pending = reconnectReconciles.get(entry);
+  void (pending?.generation === historyGeneration
+    ? pending.promise
     : reconcileOnReconnect(
         id,
-        entrySetter(target),
-        entryGetter(target),
-        controller === null ? undefined : nativePreviewTombstonesByController.get(controller),
-      );
-  void recovery.finally(() => foregroundRecoveries.delete(target));
+        entrySetter(entry),
+        entryGetter(entry),
+        nativePreviewTombstonesByController.get(abortController),
+      ));
 }
 
 if (typeof document !== "undefined") {
   document.addEventListener("visibilitychange", () => {
     presenceIdle.handleVisibilityChange(document.hidden);
-    if (!document.hidden) {
-      recycleStreamIfStale();
-      reconcileForegroundConversation();
-    } else {
-      const id = useChatStore.getState().conversationId;
-      const entry = id === null ? undefined : conversationRegistry.peek(id);
-      if (entry !== undefined) foregroundRecoveredAt.delete(entry);
+    if (document.hidden) {
+      armForegroundRecovery();
+      return;
     }
+    recycleStreamIfStale();
+    reconcileForegroundConversation();
   });
 }
 if (typeof window !== "undefined") {
+  window.addEventListener("offline", armForegroundRecovery);
   window.addEventListener("online", () => {
     recycleStreamIfStale();
     reconcileForegroundConversation();

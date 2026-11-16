@@ -14362,14 +14362,24 @@ describe("chatStore — startStreamPump reconnect loop", () => {
   });
 
   describe("foreground transcript recovery", () => {
+    let pageHidden = false;
     beforeEach(() => {
-      const hidden = vi.spyOn(document, "hidden", "get").mockReturnValue(false);
+      const hidden = vi.spyOn(document, "hidden", "get").mockImplementation(() => pageHidden);
       onTestFinished(() => hidden.mockRestore());
+      setPageHidden(true);
+      setPageHidden(false);
     });
 
-    function foreground(event: "visibilitychange" | "pageshow" | "online"): void {
+    function setPageHidden(hidden: boolean): void {
+      pageHidden = hidden;
+      document.dispatchEvent(new Event("visibilitychange"));
+    }
+
+    function dispatchForegroundEvent(event: "visibilitychange" | "pageshow" | "online"): void {
       if (event === "visibilitychange") document.dispatchEvent(new Event(event));
-      else window.dispatchEvent(Object.assign(new Event(event), { persisted: true }));
+      else if (event === "pageshow")
+        window.dispatchEvent(Object.assign(new Event(event), { persisted: true }));
+      else window.dispatchEvent(new Event(event));
     }
 
     function itemReads(id: string): number {
@@ -14378,7 +14388,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       ).length;
     }
 
-    function liveStreams(): StreamSink[] {
+    function routeLiveStreams(): StreamSink[] {
       const sinks = routeStreamOpens();
       onTestFinished(() => {
         for (const sink of sinks) sink.close();
@@ -14391,7 +14401,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       async (event) => {
         const id = "conv_external_gap";
         seedSession(id, []);
-        const sinks = liveStreams();
+        const sinks = routeLiveStreams();
         await useChatStore.getState().switchTo(id);
         await drainAsync();
         const reply = assistantMessage("external_reply", "Reply written elsewhere");
@@ -14400,7 +14410,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
         expect(useChatStore.getState().blocks).toEqual([]);
         const reads = itemReads(id);
 
-        foreground(event);
+        dispatchForegroundEvent(event);
         await drainAsync();
 
         expect(useChatStore.getState().blocks.map((block) => block.ctx.itemId)).toEqual([reply.id]);
@@ -14409,10 +14419,70 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       },
     );
 
+    it.each(["transport drop", "stale recycle"])(
+      "reads committed items after the new subscription on a %s during foreground recovery",
+      async (cause) => {
+        const id = "conv_reconnect_gap";
+        seedSession(id, []);
+        const sinks: StreamSink[] = [];
+        let releaseStream: (() => void) | undefined;
+        let releaseItems: (() => void) | undefined;
+        let holdItems = false;
+        fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+          if (String(input) === `/v1/sessions/${id}/stream`) {
+            const sink = pushableStream();
+            sinks.push(sink);
+            init?.signal?.addEventListener("abort", () =>
+              sink.error(Object.assign(new Error("aborted"), { name: "AbortError" })),
+            );
+            const response = mockResponse(null, { bodyStream: sink.stream });
+            if (sinks.length === 2)
+              return new Promise<Response>((resolve) => {
+                releaseStream = () => resolve(response);
+              });
+            return response;
+          }
+          const response = defaultFetchHandler(input, init);
+          if (holdItems && String(input).startsWith(`/v1/sessions/${id}/items?`)) {
+            holdItems = false;
+            return new Promise<Response>((resolve) => {
+              releaseItems = () => resolve(response);
+            });
+          }
+          return response;
+        });
+        await useChatStore.getState().switchTo(id);
+        await drainAsync();
+        const entry = conversationRegistry.peek(id);
+        const controller = useChatStore.getState().abortController;
+        const reads = itemReads(id);
+        if (cause === "stale recycle") await vi.advanceTimersByTimeAsync(SSE_STALE_RECYCLE_MS + 1);
+        holdItems = true;
+        dispatchForegroundEvent("visibilitychange");
+        await drainAsync();
+        expect(releaseItems).toBeDefined();
+        if (cause === "transport drop") sinks[0]!.error();
+        await drainAsync();
+        expect(releaseStream).toBeDefined();
+        const reply = assistantMessage("gap_reply", "Committed before the new subscription");
+        seedSession(id, [reply]);
+        releaseStream!();
+        await drainAsync();
+        releaseItems!();
+        await drainAsync();
+
+        expect(useChatStore.getState().blocks.map((block) => block.ctx.itemId)).toEqual([reply.id]);
+        expect(itemReads(id)).toBe(reads + 2);
+        expect(sinks).toHaveLength(2);
+        expect(conversationRegistry.peek(id)).toBe(entry);
+        expect(useChatStore.getState().abortController).toBe(controller);
+      },
+    );
+
     it("coalesces foreground events and leaves retained background chats alone", async () => {
       seedSession("conv_background", []);
       seedSession("conv_active", []);
-      liveStreams();
+      routeLiveStreams();
       await useChatStore.getState().switchTo("conv_background");
       await useChatStore.getState().switchTo("conv_active");
       await drainAsync();
@@ -14422,11 +14492,11 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       seedSession("conv_active", [reply]);
       seedSession("conv_background", [assistantMessage("background_reply", "Background reply")]);
 
-      foreground("visibilitychange");
-      foreground("pageshow");
-      foreground("online");
+      dispatchForegroundEvent("visibilitychange");
+      dispatchForegroundEvent("pageshow");
+      dispatchForegroundEvent("online");
       await drainAsync();
-      foreground("pageshow");
+      dispatchForegroundEvent("pageshow");
       await drainAsync();
 
       expect(itemReads("conv_active")).toBe(activeReads + 1);
@@ -14435,10 +14505,101 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       expect(useChatStore.getState().blocks.map((block) => block.ctx.itemId)).toEqual([reply.id]);
     });
 
-    it("rebinds an active chat whose pump deliberately closed", async () => {
-      const id = "conv_closed";
-      const first = userMessage("closed_first", "First message");
-      seedSession(id, [first]);
+    it("coalesces a delayed online event until another hidden or offline edge", async () => {
+      const id = "conv_delayed_online";
+      seedSession(id, []);
+      routeLiveStreams();
+      await useChatStore.getState().switchTo(id);
+      await drainAsync();
+      const reads = itemReads(id);
+      const snapshots = () =>
+        fetchMock.mock.calls.filter(
+          ([input]) => String(input).split("?")[0] === `/v1/sessions/${id}`,
+        ).length;
+      const initialSnapshots = snapshots();
+      dispatchForegroundEvent("visibilitychange");
+      await drainAsync();
+      await vi.advanceTimersByTimeAsync(2_000);
+      dispatchForegroundEvent("online");
+      dispatchForegroundEvent("pageshow");
+      await drainAsync();
+      expect(itemReads(id)).toBe(reads + 1);
+      expect(snapshots()).toBe(initialSnapshots + 1);
+
+      window.dispatchEvent(new Event("offline"));
+      dispatchForegroundEvent("online");
+      await drainAsync();
+      expect(itemReads(id)).toBe(reads + 2);
+      setPageHidden(true);
+      setPageHidden(false);
+      await drainAsync();
+      expect(itemReads(id)).toBe(reads + 3);
+    });
+
+    it.each([401, 403, 404, "login", "done"] as const)(
+      "keeps the painted transcript and history after a terminal %s exit",
+      async (outcome) => {
+        const id = "conv_terminal";
+        const first = userMessage("terminal_first", "Already loaded");
+        seedSession(id, [first]);
+        let opens = 0;
+        let denySnapshot = false;
+        fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+          const url = String(input);
+          if (url === `/v1/sessions/${id}/stream`) {
+            opens += 1;
+            if (outcome === "login") return loginPageResponse();
+            if (outcome !== "done") return mockResponse({}, { ok: false, status: outcome });
+            const sink = pushableStream();
+            sink.push("data: [DONE]\n\n");
+            sink.close();
+            return mockResponse(null, { bodyStream: sink.stream });
+          }
+          if (denySnapshot && url.split("?")[0] === `/v1/sessions/${id}`)
+            return mockResponse({}, { ok: false, status: 401 });
+          return defaultFetchHandler(input, init);
+        });
+        const controller = new AbortController();
+        const bound = bindConversationForTest(id, {
+          abortController: controller,
+          blocks: itemsToBlocks([first]),
+          hasMoreHistory: true,
+          oldestItemId: first.id,
+        });
+        const loop = startStreamPump(id, controller, bound.set, bound.get);
+        await vi.advanceTimersByTimeAsync(180_000);
+        await loop;
+        expect(bound.get().abortController).toBeNull();
+        const entry = conversationRegistry.peek(id);
+        const before = bound.get();
+        const opensBefore = opens;
+        const reads = itemReads(id);
+        denySnapshot = true;
+
+        dispatchForegroundEvent("visibilitychange");
+        await drainAsync();
+        await vi.advanceTimersByTimeAsync(2_000);
+        dispatchForegroundEvent("online");
+        setPageHidden(true);
+        setPageHidden(false);
+        dispatchForegroundEvent("pageshow");
+        await vi.advanceTimersByTimeAsync(10_000);
+
+        expect(opens).toBe(opensBefore);
+        expect(itemReads(id)).toBe(reads);
+        expect(conversationRegistry.peek(id)).toBe(entry);
+        expect(bound.get().blocks).toBe(before.blocks);
+        expect(bound.get().blocks.some((block) => block.ctx.itemId === first.id)).toBe(true);
+        expect(bound.get().loadingConversation).toBe(false);
+        expect(bound.get().conversationLoadError).toBeNull();
+        expect(bound.get().hasMoreHistory).toBe(true);
+        expect(bound.get().oldestItemId).toBe(first.id);
+      },
+    );
+
+    it("leaves a send's pending stream-slot acquisition in charge of binding", async () => {
+      const id = "conv_binding";
+      seedSession(id, []);
       const closed = pushableStream();
       closed.push("data: [DONE]\n\n");
       closed.close();
@@ -14450,124 +14611,132 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       await useChatStore.getState().switchTo(id);
       await drainAsync();
       expect(useChatStore.getState().abortController).toBeNull();
-      const unsent: PendingUserMessage = {
-        tempId: "pending_unsent",
-        content: [{ type: "input_text", text: "Unsent message" }],
-      };
-      useChatStore.setState({
-        pendingUserMessages: [unsent, { ...unsent, tempId: "pending_posted", posted: true }],
+      const entry = conversationRegistry.peek(id);
+      const slots = makeFakeSlotManager();
+      let grantSlot: (() => void) | undefined;
+      const tryAcquire = vi.fn(
+        () =>
+          new Promise<StreamSlot | null>((resolve) => {
+            grantSlot = () => {
+              void slots.tryAcquire().then(resolve);
+            };
+          }),
+      );
+      setStreamSlotManagerForTest({ tryAcquire });
+      const sinks = routeLiveStreams();
+      const base = fetchMock.getMockImplementation()!;
+      let releaseHydration: (() => void) | undefined;
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const response = base(input, init);
+        if (String(input).startsWith(`/v1/sessions/${id}/items?`))
+          return new Promise<Response>((resolve) => {
+            releaseHydration = () => resolve(response);
+          });
+        return response;
       });
-      const reply = assistantMessage("closed_reply", "Written after stream closed");
-      seedSession(id, [first, reply]);
-      const sinks = liveStreams();
-
-      foreground("pageshow");
-      foreground("visibilitychange");
-      foreground("online");
+      const sending = useChatStore.getState().send("Continue", "agent_xyz");
       await drainAsync();
+      expect(grantSlot).toBeDefined();
+      expect(useChatStore.getState().abortController).toBeNull();
 
-      expect(sinks).toHaveLength(1);
-      expect(useChatStore.getState().pendingUserMessages).toEqual([unsent]);
+      dispatchForegroundEvent("visibilitychange");
+      dispatchForegroundEvent("online");
+      dispatchForegroundEvent("pageshow");
+      await drainAsync();
+      expect(tryAcquire).toHaveBeenCalledTimes(1);
+      expect(conversationRegistry.peek(id)).toBe(entry);
+      grantSlot!();
+      await drainAsync();
+      expect(releaseHydration).toBeDefined();
       expect(useChatStore.getState().abortController).not.toBeNull();
-      expect(useChatStore.getState().blocks.map((block) => block.ctx.itemId)).toEqual([
-        first.id,
-        reply.id,
-      ]);
+      const readsDuringBind = itemReads(id);
+      dispatchForegroundEvent("visibilitychange");
+      await drainAsync();
+      expect(itemReads(id)).toBe(readsDuringBind);
+      releaseHydration!();
+      await drainAsync();
+      await sending;
+      expect(sinks).toHaveLength(1);
+      expect(slots.heldByTab()).toBe(1);
+      useChatStore.getState().abortController?.abort();
+      sinks.pop()!.close();
+      await drainAsync();
+      expect(slots.heldByTab()).toBe(0);
     });
 
-    it.each([401, 403, "done"] as const)(
-      "attempts a terminal %s stream only once per foreground edge",
-      async (outcome) => {
-        const id = "conv_terminal";
-        seedSession(id, []);
-        let opens = 0;
-        fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
-          if (String(input) === `/v1/sessions/${id}/stream`) {
-            opens += 1;
-            if (outcome !== "done") return mockResponse({}, { ok: false, status: outcome });
-            const sink = pushableStream();
-            sink.push("data: [DONE]\n\n");
-            sink.close();
-            return mockResponse(null, { bodyStream: sink.stream });
-          }
-          return defaultFetchHandler(input, init);
-        });
-        await useChatStore.getState().switchTo(id);
-        await drainAsync();
-        expect(opens).toBe(1);
-        expect(useChatStore.getState().abortController).toBeNull();
-
-        foreground("visibilitychange");
-        foreground("pageshow");
-        foreground("online");
-        await drainAsync();
-        foreground("pageshow");
-        await vi.advanceTimersByTimeAsync(5_000);
-        expect(opens).toBe(2);
-        expect(useChatStore.getState().abortController).toBeNull();
-
-        vi.spyOn(document, "hidden", "get").mockReturnValue(true);
-        document.dispatchEvent(new Event("visibilitychange"));
-        vi.spyOn(document, "hidden", "get").mockReturnValue(false);
-        foreground("visibilitychange");
-        await drainAsync();
-        expect(opens).toBe(3);
-      },
-    );
-
-    it.each(["foreground", "revisit"] as const)(
-      "joins a slow %s reconcile and keeps it in its owning chat across a switch",
-      async (trigger) => {
-        seedSession("conv_slow", []);
-        const otherReply = assistantMessage("other_reply", "Other conversation");
-        seedSession("conv_other", [otherReply]);
-        liveStreams();
-        await useChatStore.getState().switchTo("conv_slow");
-        await drainAsync();
-        const reply = assistantMessage("slow_reply", "Delayed reply");
-        seedSession("conv_slow", [reply]);
-        const base = fetchMock.getMockImplementation()!;
-        let release: (() => void) | undefined;
-        fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
-          if (String(input).startsWith("/v1/sessions/conv_slow/items?")) {
-            const response = defaultFetchHandler(input, init);
-            return new Promise<Response>((resolve) => {
-              release = () => resolve(response);
-            });
-          }
-          return base(input, init);
-        });
-        const reads = itemReads("conv_slow");
-        if (trigger === "revisit") {
-          await useChatStore.getState().switchTo("conv_other");
-          await useChatStore.getState().switchTo("conv_slow");
+    it("keeps a slow foreground reconcile in its owning chat across a switch", async () => {
+      seedSession("conv_slow", []);
+      const otherReply = assistantMessage("other_reply", "Other conversation");
+      seedSession("conv_other", [otherReply]);
+      routeLiveStreams();
+      await useChatStore.getState().switchTo("conv_slow");
+      await drainAsync();
+      const reply = assistantMessage("slow_reply", "Delayed reply");
+      seedSession("conv_slow", [reply]);
+      const base = fetchMock.getMockImplementation()!;
+      let release: (() => void) | undefined;
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        if (String(input).startsWith("/v1/sessions/conv_slow/items?")) {
+          const response = defaultFetchHandler(input, init);
+          return new Promise<Response>((resolve) => {
+            release = () => resolve(response);
+          });
         }
-        foreground("visibilitychange");
-        await drainAsync();
-        expect(release).toBeDefined();
-        await vi.advanceTimersByTimeAsync(2_000);
-        foreground("online");
-        await drainAsync();
-        expect(itemReads("conv_slow")).toBe(reads + 1);
-        await useChatStore.getState().switchTo("conv_other");
-        await useChatStore.getState().switchTo("conv_slow");
-        await drainAsync();
-        expect(itemReads("conv_slow")).toBe(reads + 1);
-        await useChatStore.getState().switchTo("conv_other");
-        release!();
-        await drainAsync();
+        return base(input, init);
+      });
+      const reads = itemReads("conv_slow");
+      dispatchForegroundEvent("visibilitychange");
+      await drainAsync();
+      expect(release).toBeDefined();
+      await vi.advanceTimersByTimeAsync(2_000);
+      dispatchForegroundEvent("online");
+      await drainAsync();
+      expect(itemReads("conv_slow")).toBe(reads + 1);
+      await useChatStore.getState().switchTo("conv_other");
+      release!();
+      await drainAsync();
+      expect(useChatStore.getState().blocks.map((block) => block.ctx.itemId)).toEqual([
+        otherReply.id,
+      ]);
+      expect(
+        conversationRegistry
+          .peek("conv_slow")!
+          .getState()
+          .blocks.map((block) => block.ctx.itemId),
+      ).toEqual([reply.id]);
+    });
 
-        expect(useChatStore.getState().blocks.map((block) => block.ctx.itemId)).toEqual([
-          otherReply.id,
-        ]);
-        expect(
-          conversationRegistry
-            .peek("conv_slow")!
-            .getState()
-            .blocks.map((block) => block.ctx.itemId),
-        ).toEqual([reply.id]);
-      },
-    );
+    it("lets foreground recovery join a current-generation revisit read", async () => {
+      seedSession("conv_revisit", []);
+      seedSession("conv_other", []);
+      routeLiveStreams();
+      await useChatStore.getState().switchTo("conv_revisit");
+      await useChatStore.getState().switchTo("conv_other");
+      await drainAsync();
+      const reply = assistantMessage("revisit_reply", "Reply written elsewhere");
+      seedSession("conv_revisit", [reply]);
+      const base = fetchMock.getMockImplementation()!;
+      let release: (() => void) | undefined;
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        if (String(input).startsWith("/v1/sessions/conv_revisit/items?")) {
+          const response = defaultFetchHandler(input, init);
+          return new Promise<Response>((resolve) => {
+            release = () => resolve(response);
+          });
+        }
+        return base(input, init);
+      });
+      const reads = itemReads("conv_revisit");
+      await useChatStore.getState().switchTo("conv_revisit");
+      await drainAsync();
+      dispatchForegroundEvent("visibilitychange");
+      await drainAsync();
+      expect(itemReads("conv_revisit")).toBe(reads + 1);
+      expect(release).toBeDefined();
+      release!();
+      await drainAsync();
+      expect(useChatStore.getState().blocks.map((block) => block.ctx.itemId)).toEqual([reply.id]);
+    });
   });
 
   it("reopens the stream after a transport drop, then stops on [DONE]", async () => {
