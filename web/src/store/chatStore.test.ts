@@ -14364,8 +14364,8 @@ describe("chatStore — startStreamPump reconnect loop", () => {
   describe("foreground transcript recovery", () => {
     let pageHidden = false;
     beforeEach(() => {
-      const hidden = vi.spyOn(document, "hidden", "get").mockImplementation(() => pageHidden);
-      onTestFinished(() => hidden.mockRestore());
+      const hiddenSpy = vi.spyOn(document, "hidden", "get").mockImplementation(() => pageHidden);
+      onTestFinished(() => hiddenSpy.mockRestore());
       setPageHidden(true);
       setPageHidden(false);
     });
@@ -14418,6 +14418,170 @@ describe("chatStore — startStreamPump reconnect loop", () => {
         expect(sinks).toHaveLength(1);
       },
     );
+
+    it("skips a mid-turn edge without duplicating the reply or settling it early", async () => {
+      const id = "conv_mid_turn";
+      seedSession(id, []);
+      const sinks = routeLiveStreams();
+      await useChatStore.getState().switchTo(id);
+      await drainAsync();
+      sinks[0]!.push(
+        sse("response.created", { id: "resp_live", status: "in_progress", output: [] }),
+      );
+      sinks[0]!.push(sse("response.output_text.delta", { delta: "Hello there" }));
+      await vi.advanceTimersByTimeAsync(20);
+      const reply = assistantMessage("resp_live", "Hello there");
+      seedSession(id, [reply]);
+      setPageHidden(true);
+      setPageHidden(false);
+      await drainAsync();
+      expect(useChatStore.getState().activeResponse?.state).toBe("streaming");
+      sinks[0]!.push(sse("response.output_item.done", { item: reply }));
+      await vi.advanceTimersByTimeAsync(20);
+      const texts = useChatStore.getState().blocks.filter((block) => block.type === "text_done");
+      expect(texts.map((block) => block.fullText)).toEqual(["Hello there"]);
+      expect(texts[0]!.ctx.itemId).toBe(reply.id);
+    });
+
+    it("leaves a latched send in charge of its optimistic bubble", async () => {
+      const id = "conv_latched_edge";
+      seedSession(id, []);
+      routeLiveStreams();
+      await useChatStore.getState().switchTo(id);
+      await drainAsync();
+      const pending: PendingUserMessage = {
+        tempId: "pending_edge",
+        content: [{ type: "input_text", text: "Continue" }],
+        posted: true,
+      };
+      useChatStore.setState({ sendLatchedAt: Date.now(), pendingUserMessages: [pending] });
+      seedSessionItems(id, [userMessage("other_input", "Written elsewhere")]);
+      dispatchForegroundEvent("pageshow");
+      await drainAsync();
+      expect(useChatStore.getState().pendingUserMessages).toEqual([pending]);
+    });
+
+    it.each(["visibilitychange", "pageshow", "online"] as const)(
+      "reports recovered items once on %s and keeps a no-op blocks identity",
+      async (event) => {
+        const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+        onTestFinished(() => warning.mockRestore());
+        const id = "conv_recovery_diagnostic";
+        const first = assistantMessage("first", "Already delivered");
+        seedSession(id, [first]);
+        const sinks = routeLiveStreams();
+        await useChatStore.getState().switchTo(id);
+        await drainAsync();
+        const blocks = useChatStore.getState().blocks;
+        dispatchForegroundEvent(event);
+        await drainAsync();
+        expect(useChatStore.getState().blocks).toBe(blocks);
+        expect(warning).not.toHaveBeenCalled();
+        seedSessionItems(id, [first, assistantMessage("missing", "Private message content")]);
+        sinks[0]!.push(": heartbeat\n\n");
+        await vi.advanceTimersByTimeAsync(2_000);
+        window.dispatchEvent(new Event("offline"));
+        dispatchForegroundEvent(event);
+        await drainAsync();
+        dispatchForegroundEvent(event);
+        await drainAsync();
+        expect(warning).toHaveBeenCalledExactlyOnceWith("Foreground transcript recovery", {
+          trigger: event === "visibilitychange" ? "visible" : event,
+          recoveredItems: 1,
+          secondsSinceLastByte: 2,
+        });
+      },
+    );
+
+    it("retries a failed read on the next foreground event", async () => {
+      const id = "conv_failed_edge";
+      seedSession(id, []);
+      routeLiveStreams();
+      await useChatStore.getState().switchTo(id);
+      await drainAsync();
+      const base = fetchMock.getMockImplementation()!;
+      let failRead = true;
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        if (failRead && String(input).startsWith(`/v1/sessions/${id}/items?`))
+          return mockResponse({}, { ok: false, status: 503 });
+        return base(input, init);
+      });
+      const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+      onTestFinished(() => warning.mockRestore());
+      dispatchForegroundEvent("pageshow");
+      await drainAsync();
+      expect(warning).not.toHaveBeenCalled();
+      failRead = false;
+      const reply = assistantMessage("retry", "Recovered on retry");
+      seedSessionItems(id, [reply]);
+      dispatchForegroundEvent("online");
+      await drainAsync();
+      expect(useChatStore.getState().blocks.map((block) => block.ctx.itemId)).toEqual([reply.id]);
+    });
+
+    it.each(["loading", "disposed", "hidden"] as const)(
+      "skips foreground reads while the entry is %s",
+      async (guard) => {
+        const id = "conv_guarded_edge";
+        seedSession(id, []);
+        routeLiveStreams();
+        await useChatStore.getState().switchTo(id);
+        await drainAsync();
+        const entry = conversationRegistry.peek(id)!;
+        if (guard === "loading") entry.setState({ loadingConversation: true });
+        if (guard === "disposed") entry.disposed = true;
+        if (guard === "hidden") setPageHidden(true);
+        const reads = itemReads(id);
+        dispatchForegroundEvent("pageshow");
+        await drainAsync();
+        expect(itemReads(id)).toBe(reads);
+        if (guard === "disposed") entry.disposed = false;
+      },
+    );
+
+    it("settles snapshot session status on foreground recovery", async () => {
+      const id = "conv_status_edge";
+      seedSession(id, []);
+      routeLiveStreams();
+      await useChatStore.getState().switchTo(id);
+      await drainAsync();
+      useChatStore.setState({ sessionStatus: "running" });
+      dispatchForegroundEvent("pageshow");
+      await drainAsync();
+      expect(useChatStore.getState().sessionStatus).toBe("idle");
+    });
+
+    it("shares native completion tombstones with the live pump on foreground recovery", async () => {
+      const id = "conv_native_edge";
+      seedSession(id, []);
+      const sinks = routeLiveStreams();
+      await useChatStore.getState().switchTo(id);
+      await drainAsync();
+      sinks[0]!.push(
+        sse("response.output_text.delta", {
+          delta: "preview",
+          message_id: "message_edge",
+          index: 0,
+          final: true,
+        }),
+      );
+      await vi.advanceTimersByTimeAsync(20);
+      const reply = assistantMessage("native_edge", "Completed", "message_edge");
+      seedSessionItems(id, [reply]);
+      dispatchForegroundEvent("pageshow");
+      await drainAsync();
+      expect(useChatStore.getState().blocks.map((block) => block.ctx.itemId)).toEqual([reply.id]);
+      sinks[0]!.push(
+        sse("response.output_text.delta", {
+          delta: "late preview",
+          message_id: "message_edge",
+          index: 1,
+          final: true,
+        }),
+      );
+      await vi.advanceTimersByTimeAsync(20);
+      expect(useChatStore.getState().blocks.map((block) => block.ctx.itemId)).toEqual([reply.id]);
+    });
 
     it.each(["transport drop", "stale recycle"])(
       "reads committed items after the new subscription on a %s during foreground recovery",
@@ -14620,12 +14784,15 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       const sinks = routeLiveStreams();
       const base = fetchMock.getMockImplementation()!;
       let releaseHydration: (() => void) | undefined;
+      let holdHydration = true;
       fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
         const response = base(input, init);
-        if (String(input).startsWith(`/v1/sessions/${id}/items?`))
+        if (holdHydration && String(input).startsWith(`/v1/sessions/${id}/items?`)) {
+          holdHydration = false;
           return new Promise<Response>((resolve) => {
             releaseHydration = () => resolve(response);
           });
+        }
         return response;
       });
       const sending = useChatStore.getState().send("Continue", "agent_xyz");
@@ -14643,13 +14810,22 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       await drainAsync();
       expect(releaseHydration).toBeDefined();
       expect(useChatStore.getState().abortController).not.toBeNull();
+      useChatStore.setState({ sendLatchedAt: null });
+      seedSessionItems(id, [userMessage("other_writer", "External input")]);
+      const pending = useChatStore.getState().pendingUserMessages;
+      expect(pending.map((message) => message.content)).toEqual([
+        [{ type: "input_text", text: "Continue" }],
+      ]);
       const readsDuringBind = itemReads(id);
       dispatchForegroundEvent("visibilitychange");
       await drainAsync();
+      expect(useChatStore.getState().pendingUserMessages).toEqual(pending);
       expect(itemReads(id)).toBe(readsDuringBind);
       releaseHydration!();
       await drainAsync();
       await sending;
+      expect(useChatStore.getState().pendingUserMessages).toMatchObject(pending);
+      expect(useChatStore.getState().pendingUserMessages).toHaveLength(1);
       expect(sinks).toHaveLength(1);
       expect(slots.heldByTab()).toBe(1);
       useChatStore.getState().abortController?.abort();
