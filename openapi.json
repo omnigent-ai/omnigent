@@ -6257,6 +6257,11 @@
       "ProactiveAgentSettings": {
         "description": "The caller's view of the settings.",
         "properties": {
+          "agent_id": {
+            "description": "The proactive agent's id, which its Inbox items carry.",
+            "title": "Agent Id",
+            "type": "string"
+          },
           "can_manage_workspace": {
             "description": "Whether the caller may change the workspace setting.",
             "title": "Can Manage Workspace",
@@ -6282,7 +6287,8 @@
           "workspace_enabled",
           "user_enabled",
           "enabled",
-          "can_manage_workspace"
+          "can_manage_workspace",
+          "agent_id"
         ],
         "title": "ProactiveAgentSettings",
         "type": "object"
@@ -7855,6 +7861,11 @@
           },
           "harness_install_enabled": {
             "title": "Harness Install Enabled",
+            "type": "boolean"
+          },
+          "inbox_items_available": {
+            "default": false,
+            "title": "Inbox Items Available",
             "type": "boolean"
           },
           "installable_harnesses": {

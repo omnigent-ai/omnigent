@@ -313,6 +313,8 @@ class ServerInfoResponse(BaseModel):
     installable_harnesses: list[str]
     # Whether the scheduled-tasks routes are mounted and enabled for this caller.
     automations_enabled: bool = False
+    # Whether agents can post to this caller's Inbox (``/v1/inbox/items``).
+    inbox_items_available: bool = False
     # Whether the deployment offers the proactive agent to this caller; each
     # user's own on/off state is at ``GET /v1/proactive-agent/settings``.
     proactive_agent_available: bool = False
@@ -1909,6 +1911,7 @@ def create_app(
     scheduled_task_dispatch: ScheduledTaskDispatchHooks | None = None,
     scheduled_task_scheduler_config: ScheduledTaskSchedulerConfig | None = None,
     inbox_item_store: InboxItemStore | None = None,
+    user_inbox: DeploymentGate | None = None,
     proactive_agent: DeploymentGate | None = None,
     proactive_agent_settings_store: ProactiveAgentSettingsStore | None = None,
     session_mcp_selection: SessionMcpSelection | None = None,
@@ -1959,11 +1962,16 @@ def create_app(
         When off, the ``/v1/scheduled-tasks`` routes return 404 and ``GET /v1/info``
         reports ``automations_enabled`` false. Scheduling of existing tasks is not
         affected.
-    :param proactive_agent: Whether the deployment offers the proactive agent and
-        agent-posted Inbox items to this request's caller. A static bool or a
-        zero-arg callable resolved per request; ``None`` follows the
-        ``proactive_agent`` release feature (off by default). When off,
-        ``/v1/inbox/items`` and ``/v1/proactive-agent/settings`` return 404 and
+    :param user_inbox: Whether agents can post items to this request's caller's
+        Inbox. A static bool or a zero-arg callable resolved per request;
+        ``None`` follows the ``user_inbox`` release feature (on by default).
+        When off, ``/v1/inbox/items`` returns 404, runners drop the Inbox tools,
+        the proactive agent is off too, and ``GET /v1/info`` reports
+        ``inbox_items_available`` false.
+    :param proactive_agent: Whether the deployment offers the proactive agent to
+        this request's caller. A static bool or a zero-arg callable resolved per
+        request; ``None`` follows the ``proactive_agent`` release feature (off by
+        default). When off, ``/v1/proactive-agent/settings`` returns 404 and
         ``GET /v1/info`` reports ``proactive_agent_available`` false.
     :param proactive_agent_settings_store: The workspace and per-user on/off
         settings. Where the deployment offers the agent, a user gets it only when
@@ -2693,35 +2701,53 @@ def create_app(
         )
 
     app.state.automations_available = automations_available
+    user_inbox_gate: DeploymentGate = (
+        resolved_feature_flags.enabled(Feature.USER_INBOX) if user_inbox is None else user_inbox
+    )
     proactive_agent_gate: DeploymentGate = (
         resolved_feature_flags.enabled(Feature.PROACTIVE_AGENT)
         if proactive_agent is None
         else proactive_agent
     )
 
+    def inbox_items_available() -> bool:
+        """Whether agents can post to this request's caller's Inbox."""
+        return inbox_item_store is not None and deployment_gate_enabled(
+            user_inbox_gate, "user_inbox"
+        )
+
+    def inbox_items_enabled_for(_user_id: str) -> bool:
+        """Whether a user's sessions get the Inbox tools and their Inbox serves items.
+
+        There is no per-user setting: evaluate it in that user's request or
+        identity scope, since the deployment gate may read the current user.
+        """
+        return inbox_items_available()
+
     def proactive_agent_available() -> bool:
         """Whether the deployment offers the proactive agent to this request's caller.
 
-        Both stores are needed: the web client reads the settings before it
-        shows any Inbox item, so an offer without settings routes would never
-        be used.
+        The agent posts to the Inbox, so it needs agent Inbox items too, and
+        its settings routes, which the web client reads before showing its tab.
         """
         return (
-            inbox_item_store is not None
+            inbox_items_available()
             and proactive_agent_settings_store is not None
             and deployment_gate_enabled(proactive_agent_gate, "proactive_agent")
         )
 
     def proactive_agent_enabled_for(user_id: str) -> bool:
-        """Whether the agent and its Inbox items are on for *user_id*.
+        """Whether the proactive agent runs for *user_id*: the deployment gate and both settings.
 
-        Evaluated in that user's request or identity scope, since the
-        deployment gate may read the current user.
+        Other agents' Inbox items do not depend on it. Evaluated in that user's
+        request or identity scope, since the deployment gate may read the current user.
         """
         if not proactive_agent_available() or proactive_agent_settings_store is None:
             return False
         return all(proactive_agent_settings_store.read(user_id))
 
+    app.state.inbox_items_available = inbox_items_available
+    app.state.inbox_items_enabled_for = inbox_items_enabled_for
     app.state.proactive_agent_available = proactive_agent_available
     app.state.proactive_agent_enabled_for = proactive_agent_enabled_for
     app.state.scheduled_task_dispatch_enabled = automations_v2_enabled
@@ -4121,6 +4147,7 @@ def create_app(
                 "session_organize_source_checks": True,
                 "sibling_other_project_standalone": True,
                 "automations_enabled": automations_enabled,
+                "inbox_items_available": app.state.inbox_items_available(),
                 "proactive_agent_available": app.state.proactive_agent_available(),
                 "automation_trigger_poll_minutes": trigger_poll_minutes,
                 "branding": branding_snapshot.config(),
@@ -4403,7 +4430,7 @@ def create_app(
         app.include_router(
             create_inbox_items_router(
                 inbox_item_store,
-                enabled=proactive_agent_enabled_for,
+                enabled=inbox_items_enabled_for,
                 conversation_store=conversation_store,
                 agent_store=agent_store,
                 agent_cache=agent_cache,
