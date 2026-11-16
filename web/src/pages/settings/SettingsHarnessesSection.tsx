@@ -61,8 +61,11 @@ import {
   harnessInventoryPage,
   HARNESSES_GRID_ENTRY,
   type NativeHarnessId,
+  type FixOpener,
+  harnessFixOwner,
 } from "./search/catalog/harnesses";
 import { SettingsItem } from "./search/SettingsItem";
+import { SettingsOverlayOwner } from "./search/settingsOwnership";
 import {
   type SettingsControlProps,
   settingsControlId,
@@ -164,9 +167,14 @@ export const SettingsHarnessesSection = () => {
     entry: HarnessEntry;
     host: Host;
     mode: HarnessFixMode;
+    opener: FixOpener;
   } | null>(null);
-  const openFix = (entry: HarnessEntry, targetHost: Host, mode: HarnessFixMode) =>
-    setFixTarget({ entry, host: targetHost, mode });
+  const openFix = (
+    entry: HarnessEntry,
+    targetHost: Host,
+    mode: HarnessFixMode,
+    opener: FixOpener,
+  ) => setFixTarget({ entry, host: targetHost, mode, opener });
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -201,7 +209,7 @@ export const SettingsHarnessesSection = () => {
               ? readyNotice
               : null
           }
-          onFix={(mode) => selectedHost && openFix(detail, selectedHost, mode)}
+          onFix={(mode, opener) => selectedHost && openFix(detail, selectedHost, mode, opener)}
         />
       ) : (
         <>
@@ -268,47 +276,52 @@ export const SettingsHarnessesSection = () => {
                     ? credentialKinds[hostHarnessKey(selectedHost.host_id, entry.harness)]
                     : undefined
                 }
-                onFix={(mode) => selectedHost && openFix(entry, selectedHost, mode)}
+                onFix={(mode) => selectedHost && openFix(entry, selectedHost, mode, "setUp")}
               />
             ))}
           </div>
         </>
       )}
       {fixTarget && (
-        <HarnessFixDialog
-          open
-          onOpenChange={(open) => !open && setFixTarget(null)}
-          mode={fixTarget.mode}
-          host={fixTarget.host}
-          harness={fixTarget.entry.harness}
-          harnessLabel={fixTarget.entry.name}
-          onFixed={({
-            configuredHarnesses,
-            credentialKind,
-            version,
-            gatewayInference,
-            harnessAccounts,
-          }) => {
-            const { host: fixedHost, entry } = fixTarget;
-            applyHarnessFixResult(queryClient, fixedHost.host_id, {
+        <SettingsOverlayOwner
+          entry={harnessFixOwner(fixTarget.entry.harness, fixTarget.opener)}
+          opener={fixTarget.opener}
+        >
+          <HarnessFixDialog
+            open
+            onOpenChange={(open) => !open && setFixTarget(null)}
+            mode={fixTarget.mode}
+            host={fixTarget.host}
+            harness={fixTarget.entry.harness}
+            harnessLabel={fixTarget.entry.name}
+            onFixed={({
               configuredHarnesses,
-              harnessAccounts,
-              gatewayInference,
-            });
-            if (credentialKind) {
-              setCredentialKinds((current) => ({
-                ...current,
-                [hostHarnessKey(fixedHost.host_id, entry.harness)]: credentialKind,
-              }));
-            }
-            setReadyNotice({
-              harness: entry.harness,
-              hostId: fixedHost.host_id,
+              credentialKind,
               version,
-              account: harnessAccounts?.[harnessAccountKey(entry.harness)],
-            });
-          }}
-        />
+              gatewayInference,
+              harnessAccounts,
+            }) => {
+              const { host: fixedHost, entry } = fixTarget;
+              applyHarnessFixResult(queryClient, fixedHost.host_id, {
+                configuredHarnesses,
+                harnessAccounts,
+                gatewayInference,
+              });
+              if (credentialKind) {
+                setCredentialKinds((current) => ({
+                  ...current,
+                  [hostHarnessKey(fixedHost.host_id, entry.harness)]: credentialKind,
+                }));
+              }
+              setReadyNotice({
+                harness: entry.harness,
+                hostId: fixedHost.host_id,
+                version,
+                account: harnessAccounts?.[harnessAccountKey(entry.harness)],
+              });
+            }}
+          />
+        </SettingsOverlayOwner>
       )}
     </div>
   );
@@ -680,7 +693,7 @@ function HarnessDetail({
     version?: string;
     account?: HarnessAccount;
   } | null;
-  onFix: (mode: HarnessFixMode) => void;
+  onFix: (mode: HarnessFixMode, opener: FixOpener) => void;
 }) {
   const status = harnessStatus(entry.harness, host);
   const credentialProblem = isCredentialProblem(status.reason);
@@ -768,11 +781,14 @@ function HarnessDetail({
         }
         action={
           status.ready && canFix && canSwitchHarnessAccount(host, entry.harness)
-            ? { ...credentialAction("switch"), onClick: () => onFix("switch") }
+            ? { ...credentialAction("switch"), onClick: () => onFix("switch", "credentialAction") }
             : status.reason === "needs-auth" && account?.expired && canFix
-              ? { ...credentialAction("signInAgain"), onClick: () => onFix(mode) }
+              ? {
+                  ...credentialAction("signInAgain"),
+                  onClick: () => onFix(mode, "credentialAction"),
+                }
               : credentialProblem && canFix
-                ? { ...credentialAction(), onClick: () => onFix(mode) }
+                ? { ...credentialAction(), onClick: () => onFix(mode, "credentialAction") }
                 : undefined
         }
       />
@@ -795,7 +811,7 @@ function HarnessDetail({
           mode={mode}
           reason={status.reason}
           installable={installable}
-          onFix={onFix}
+          onFix={(fixMode) => onFix(fixMode, "fixAction")}
         />
       )}
       {credentialCard}
@@ -846,7 +862,7 @@ function HarnessDetail({
                 mode={mode}
                 reason={status.reason}
                 installable={installable}
-                onFix={onFix}
+                onFix={(fixMode) => onFix(fixMode, "fixAction")}
               />
             )}
             {credentialCard}

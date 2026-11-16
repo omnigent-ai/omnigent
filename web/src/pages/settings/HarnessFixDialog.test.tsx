@@ -7,6 +7,8 @@ import { showToast } from "@/components/ui/toast";
 import { copyText } from "@/lib/clipboard";
 import { authenticatedFetch } from "@/lib/identity";
 import { HarnessFixDialog, type HarnessFixDialogProps } from "./HarnessFixDialog";
+import { harnessFixOwner } from "./search/catalog/harnesses";
+import { SettingsOverlayOwner } from "./search/settingsOwnership";
 
 vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
 vi.mock("@/components/ui/toast", () => ({ showToast: vi.fn() }));
@@ -1696,5 +1698,47 @@ describe("HarnessFixDialog", () => {
     renderDialog({ harness: "native-codex", harnessLabel: "Codex" });
     expect(screen.getByRole("radio", { name: /Isaac/ })).toBeVisible();
     expect(screen.getByRole("radio", { name: /Personal subscription/ })).toBeVisible();
+  });
+});
+
+describe("HarnessFixDialog as a Settings overlay", () => {
+  it("names its controls as the parts of the control that opened it, with no tooltip", () => {
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={client}>
+        <SettingsOverlayOwner
+          entry={harnessFixOwner("cursor-native", "fixAction")}
+          opener="fixAction"
+        >
+          <HarnessFixDialog
+            {...baseProps}
+            mode="install"
+            harness="cursor-native"
+            harnessLabel="Cursor"
+          />
+        </SettingsOverlayOwner>
+      </QueryClientProvider>,
+    );
+
+    expect(screen.getByRole("dialog")).toHaveAttribute(
+      "data-settings-overlay-owner",
+      "harness-cursor-native-detail:fixAction",
+    );
+    const check = screen.getByRole("button", { name: "Check again" });
+    expect(check).toHaveAttribute(
+      "data-settings-control",
+      "harness-cursor-native-detail:checkAgain",
+    );
+    expect(check).toHaveAttribute("title", "");
+    expect(screen.getByRole("button", { name: "Copy omni setup" })).toHaveAttribute(
+      "data-settings-control",
+      "harness-cursor-native-detail:copyOmniSetup",
+    );
+    const footerClose = screen
+      .getAllByRole("button", { name: "Close" })
+      .find((button) => button.textContent === "Close");
+    expect(footerClose).toHaveAttribute("data-settings-dialog-action", "Close");
   });
 });

@@ -53,6 +53,40 @@ export const HARNESSES_GRID_ENTRY = settingsEntry({
   focus: "search",
 });
 
+/** The fix dialog's controls, by part. Each is shown inside the dialog that one of its openers opens. */
+export const FIX_DIALOG_PARTS = {
+  installAction: "Install",
+  authenticate: "Authenticate",
+  checkAgain: "Check again",
+  retry: "Try again",
+  credentialChoice: "Credential",
+  useCredentialForm: "Use an API key or gateway URL instead",
+  copySignInLink: "Copy sign-in link",
+  copyCode: "Copy one-time code",
+  copyLoginCommand: "Copy login command",
+  copyOmniSetup: "Copy omni setup",
+  copyTmuxInstall: "Copy brew install tmux",
+} as const;
+
+/** The controls that open the fix dialog: a card's Set up, a page's fix, and the Credential card's action. */
+export type FixOpener = "setUp" | "fixAction" | "credentialAction";
+
+const FIX_DIALOG_ALTERNATIVES = {
+  installAction: { update: "Update" },
+  authenticate: { install: "Install", checking: "Checking…" },
+  checkAgain: { checking: "Checking…" },
+} as const;
+
+/** The dialog's Cancel and Close only dismiss it, so they name it rather than being parts. */
+const FIX_DIALOG_OVERLAY = { dialogActions: ["Cancel", "Close"], captured: true } as const;
+
+/** Each fix dialog part is shown only inside the dialog `opener` opens. */
+function fixDialogPresence<const Opener extends FixOpener>(opener: Opener) {
+  return Object.fromEntries(
+    Object.keys(FIX_DIALOG_PARTS).map((part) => [part, { overlay: opener }]),
+  ) as { readonly [Part in keyof typeof FIX_DIALOG_PARTS]: { readonly overlay: Opener } };
+}
+
 /**
  * A harness's card on the Harnesses page. Its link is named by the card's content, which shows
  * the harness's status, so the link carries only its id, not a name of its own.
@@ -72,14 +106,18 @@ export const HARNESS_CARD_ENTRIES = settingsEntryFamily({
         open: name,
         settings: `${name} settings`,
         setUp: `Set up ${name}`,
+        ...FIX_DIALOG_PARTS,
       },
+      nameAlternatives: FIX_DIALOG_ALTERNATIVES,
       // A card opens its page only when the harness is ready or can be fixed from here; its
       // gear shows once it has settings to open; Set up only for a harness that can be installed.
       presence: {
         open: { states: ["opens its page"] },
         settings: { states: ["has settings"] },
         setUp: { states: ["can be installed"] },
+        ...fixDialogPresence("setUp"),
       },
+      overlays: { setUp: FIX_DIALOG_OVERLAY },
     });
   },
 });
@@ -168,7 +206,7 @@ export const HARNESS_DETAIL_ENTRIES = settingsEntryFamily({
       label: name,
       description: `${name} on a machine: its MCP servers, skills and plugins, and its setup.`,
       keywords: ["harness", "agent", "setup"],
-      parts: { fixAction: "Set up" },
+      parts: { fixAction: "Set up", ...FIX_DIALOG_PARTS },
       nameAlternatives: {
         fixAction: {
           install: "Install",
@@ -176,13 +214,15 @@ export const HARNESS_DETAIL_ENTRIES = settingsEntryFamily({
           reconfigure: "Reconfigure",
           tmux: "Set up tmux",
         },
+        ...FIX_DIALOG_ALTERNATIVES,
       },
-      presence: { fixAction: { states: ["needs setup"] } },
+      presence: { fixAction: { states: ["needs setup"] }, ...fixDialogPresence("fixAction") },
+      overlays: { fixAction: FIX_DIALOG_OVERLAY },
     };
     if (inventoryFamilyOf(harness) === undefined) return settingsEntry(page);
     return settingsEntry({
       ...page,
-      parts: { fixAction: "Set up", tab: `${name} view` },
+      parts: { ...page.parts, tab: `${name} view` },
       partChoices: { tab: [...INVENTORY_KINDS, "Settings"] },
       // While the inventory loads, a tab shows its plain name; once loaded, its count.
       choiceTemplates: {
@@ -212,11 +252,24 @@ export const HARNESS_CREDENTIAL_ENTRIES = settingsEntryFamily({
       label: "Credential",
       description: `How ${harnessName(harness)} signs in on a machine, and changing it.`,
       keywords: ["credential", "sign in", "account", "login", "api key"],
-      parts: { credentialAction: "Reconfigure" },
+      parts: {
+        credentialAction: "Reconfigure",
+        ...FIX_DIALOG_PARTS,
+        switchConfirm: "Sign out and switch",
+        accountHint: "Account to sign in with",
+      },
       nameAlternatives: {
         credentialAction: { switch: "Switch account", signInAgain: "Sign in again" },
+        ...FIX_DIALOG_ALTERNATIVES,
       },
-      presence: { credentialAction: { states: ["has a credential action"] } },
+      presence: {
+        credentialAction: { states: ["has a credential action"] },
+        ...fixDialogPresence("credentialAction"),
+        // Only switching an account confirms it, and only a credential action switches.
+        switchConfirm: { overlay: "credentialAction" },
+        accountHint: { overlay: "credentialAction" },
+      },
+      overlays: { credentialAction: FIX_DIALOG_OVERLAY },
     }),
 });
 
@@ -280,6 +333,13 @@ export const HARNESS_SKILL_ENTRIES = settingsEntryFamily({
       revealedBy: { entry: `harness-${harness}-detail`, part: "tab", choice: "Skills" },
     }),
 });
+
+/** The entry whose overlay is the fix dialog a harness opens from `opener`. */
+export function harnessFixOwner(harness: NativeHarnessId, opener: FixOpener): SettingsEntry {
+  if (opener === "setUp") return HARNESS_CARD_ENTRIES.entry(harness);
+  if (opener === "credentialAction") return HARNESS_CREDENTIAL_ENTRIES.entry(harness);
+  return HARNESS_DETAIL_ENTRIES.entry(harness);
+}
 
 export const HARNESS_SETTINGS: readonly SettingsEntry[] = [
   HARNESSES_GRID_ENTRY,

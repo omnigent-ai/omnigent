@@ -17,6 +17,7 @@ import { ApiError } from "@/lib/sessionsApi";
 import type { HarnessStartup, Host } from "@/hooks/useHosts";
 import { NATIVE_CODING_AGENTS } from "@/lib/nativeCodingAgents";
 import { SettingsHarnessesSection } from "./SettingsHarnessesSection";
+import { useSettingsOverlayParts } from "./search/settingsOwnership";
 
 vi.mock("sonner", () => ({ toast: { error: vi.fn(), success: vi.fn() } }));
 
@@ -201,12 +202,14 @@ vi.mock("./HarnessFixDialog", () => ({
     }) => void;
   }) => {
     fixDialogProps(props);
+    const parts = useSettingsOverlayParts();
     return props.open ? (
       <div
         data-testid="fix-dialog"
         data-harness={props.harness}
         data-host={props.host.host_id}
         data-mode={props.mode}
+        {...parts.overlay()}
       >
         <button
           type="button"
@@ -550,6 +553,44 @@ describe("Harnesses grid catalog rows", () => {
     expect(screen.getByRole("button", { name: "Set up Codex" })).toHaveAttribute(
       "data-settings-control",
       "harness-codex-native:setUp",
+    );
+  });
+});
+
+describe("Harness fix dialog catalog rows", () => {
+  it("is owned by the card's Set up control that opens it", () => {
+    hosts = [{ ...ONLINE, configured_harnesses: { "codex-native": "binary-missing" } }];
+    renderHarnesses();
+
+    fireEvent.click(screen.getByTestId("harness-action-codex-native"));
+
+    expect(screen.getByTestId("fix-dialog")).toHaveAttribute(
+      "data-settings-overlay-owner",
+      "harness-codex-native:setUp",
+    );
+  });
+
+  it("is owned by the page's fix button that opens it", () => {
+    hosts = [{ ...ONLINE, configured_harnesses: { "codex-native": "binary-missing" } }];
+    renderHarnesses("codex-native");
+
+    fireEvent.click(screen.getByRole("button", { name: "Install" }));
+
+    expect(screen.getByTestId("fix-dialog")).toHaveAttribute(
+      "data-settings-overlay-owner",
+      "harness-codex-native-detail:fixAction",
+    );
+  });
+
+  it("is owned by the Credential card's action that opens it", () => {
+    hosts = [ONLINE];
+    renderHarnesses("codex-native");
+
+    fireEvent.click(screen.getByRole("button", { name: "Reconfigure" }));
+
+    expect(screen.getByTestId("fix-dialog")).toHaveAttribute(
+      "data-settings-overlay-owner",
+      "harness-codex-native-credential:credentialAction",
     );
   });
 });
