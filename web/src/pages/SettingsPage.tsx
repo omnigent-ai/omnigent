@@ -89,7 +89,7 @@ import {
   UPDATE_MODE_ENTRY,
   UPDATE_MODE_LABELS,
 } from "@/pages/settings/search/catalog/updates";
-import { SettingsItem } from "@/pages/settings/search/SettingsItem";
+import { SettingsEntryLabel, SettingsItem } from "@/pages/settings/search/SettingsItem";
 import {
   settingsControlProps,
   settingsDescriptionId,
@@ -110,6 +110,15 @@ import {
   ACCOUNT_PASSWORD_ENTRY,
   ACCOUNT_SIGN_OUT_ENTRY,
 } from "@/pages/settings/search/catalog/account";
+import {
+  ALWAYS_USE_WORKTREE_ENTRY,
+  DEFAULT_BASE_BRANCH_ENTRY,
+  DELETE_WORKTREES_ON_ARCHIVE_ENTRY,
+} from "@/pages/settings/search/catalog/git";
+import {
+  DATABRICKS_CONNECTION_ENTRY,
+  GITHUB_CONNECTION_ENTRY,
+} from "@/pages/settings/search/catalog/integrations";
 import { SessionTitleInstructionsControl } from "@/components/SessionTitleInstructionsControl";
 import { McpRegistryConnections } from "@/components/McpRegistry";
 import { ThemeColorPicker } from "@/components/theme/ThemeColorPicker";
@@ -1552,7 +1561,7 @@ function GithubIntegrationControl() {
   }
 
   return (
-    <div className="flex flex-col gap-4">
+    <SettingsItem entry={GITHUB_CONNECTION_ENTRY} className="flex flex-col gap-4">
       {notice === "connected" && (
         <div
           role="status"
@@ -1571,8 +1580,8 @@ function GithubIntegrationControl() {
       )}
 
       <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
-        <SettingsLabel
-          label="GitHub"
+        <SettingsEntryLabel
+          entry={GITHUB_CONNECTION_ENTRY}
           labelClassName="text-sm"
           className="flex-1"
           description={
@@ -1587,6 +1596,7 @@ function GithubIntegrationControl() {
               variant="ghost"
               size="sm"
               className="h-9"
+              {...settingsControlProps(GITHUB_CONNECTION_ENTRY, "disconnect")}
               disabled={busy}
               data-testid="github-disconnect"
               onClick={() => void onDisconnect()}
@@ -1597,6 +1607,7 @@ function GithubIntegrationControl() {
             <Button
               size="sm"
               className="h-9 gap-2"
+              {...settingsControlProps(GITHUB_CONNECTION_ENTRY, "connect")}
               disabled={busy}
               data-testid="github-connect"
               onClick={() => beginGithubConnect(returnTo)}
@@ -1612,6 +1623,7 @@ function GithubIntegrationControl() {
         <p className="text-xs text-muted-foreground">
           The app may need to be installed on your repositories.{" "}
           <a
+            {...settingsControlProps(GITHUB_CONNECTION_ENTRY, "manageInstallation")}
             href={status.install_url}
             target="_blank"
             rel="noreferrer"
@@ -1622,7 +1634,7 @@ function GithubIntegrationControl() {
           .
         </p>
       )}
-    </div>
+    </SettingsItem>
   );
 }
 
@@ -1634,28 +1646,25 @@ function GithubIntegrationControl() {
  */
 function AlwaysUseWorktreeControl() {
   const [value, setValue] = useState(() => readAlwaysUseWorktree());
-  const labelId = useId();
   const toggle = useCallback((next: boolean) => {
     setValue(next);
     writeAlwaysUseWorktree(next);
   }, []);
   return (
-    <div className="flex items-start justify-between gap-6">
-      <SettingsLabel
-        label="Always use a random worktree"
-        labelId={labelId}
-        className="flex-1"
-        description="Use a fresh, randomly named worktree for new sessions in Git workspaces. Project settings override this default."
-      />
+    <SettingsItem
+      entry={ALWAYS_USE_WORKTREE_ENTRY}
+      className="flex items-start justify-between gap-6"
+    >
+      <SettingsEntryLabel entry={ALWAYS_USE_WORKTREE_ENTRY} className="flex-1" />
       <Switch
-        aria-labelledby={labelId}
+        {...settingsControlProps(ALWAYS_USE_WORKTREE_ENTRY)}
         checked={value}
         onCheckedChange={toggle}
         data-testid="settings-always-use-worktree-toggle"
         className="mt-0.5 shrink-0"
         componentId="settings.git.always_use_worktree"
       />
-    </div>
+    </SettingsItem>
   );
 }
 
@@ -1665,28 +1674,25 @@ function AlwaysUseWorktreeControl() {
  */
 function DeleteWorktreesOnArchiveControl() {
   const [value, setValue] = useState(() => readDeleteWorktreesOnArchive() === true);
-  const labelId = useId();
   const toggle = useCallback((next: boolean) => {
     setValue(next);
     writeDeleteWorktreesOnArchive(next);
   }, []);
   return (
-    <div className="flex items-start justify-between gap-6">
-      <SettingsLabel
-        label="Delete worktrees for archived sessions"
-        labelId={labelId}
-        className="flex-1"
-        description="Delete the session's worktree and any uncommitted changes when archived. The branch is kept."
-      />
+    <SettingsItem
+      entry={DELETE_WORKTREES_ON_ARCHIVE_ENTRY}
+      className="flex items-start justify-between gap-6"
+    >
+      <SettingsEntryLabel entry={DELETE_WORKTREES_ON_ARCHIVE_ENTRY} className="flex-1" />
       <Switch
-        aria-labelledby={labelId}
+        {...settingsControlProps(DELETE_WORKTREES_ON_ARCHIVE_ENTRY)}
         checked={value}
         onCheckedChange={toggle}
         data-testid="settings-delete-worktrees-on-archive-toggle"
         className="mt-0.5 shrink-0"
         componentId="settings.git.delete_worktrees_on_archive"
       />
-    </div>
+    </SettingsItem>
   );
 }
 
@@ -1748,7 +1754,7 @@ function DatabricksIntegrationControl() {
   }
 
   return (
-    <div className="flex flex-col gap-4">
+    <SettingsItem entry={DATABRICKS_CONNECTION_ENTRY} className="flex flex-col gap-4">
       {notice === "connected" && (
         <div
           role="status"
@@ -1767,8 +1773,8 @@ function DatabricksIntegrationControl() {
       )}
 
       <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
-        <SettingsLabel
-          label="Databricks"
+        <SettingsEntryLabel
+          entry={DATABRICKS_CONNECTION_ENTRY}
           labelClassName="text-sm"
           className="flex-1"
           description={
@@ -1783,6 +1789,7 @@ function DatabricksIntegrationControl() {
               variant="ghost"
               size="sm"
               className="h-9"
+              {...settingsControlProps(DATABRICKS_CONNECTION_ENTRY, "disconnect")}
               disabled={busy}
               data-testid="databricks-disconnect"
               onClick={() => void onDisconnect()}
@@ -1792,6 +1799,7 @@ function DatabricksIntegrationControl() {
           ) : (
             <>
               <Input
+                {...settingsControlProps(DATABRICKS_CONNECTION_ENTRY, "workspace")}
                 type="text"
                 inputMode="url"
                 placeholder="workspace-host.cloud.databricks.com"
@@ -1803,6 +1811,7 @@ function DatabricksIntegrationControl() {
               <Button
                 size="sm"
                 className="h-9"
+                {...settingsControlProps(DATABRICKS_CONNECTION_ENTRY, "connect")}
                 disabled={busy || workspace.trim() === ""}
                 data-testid="databricks-connect"
                 onClick={() => beginDatabricksConnect(workspace.trim(), returnTo)}
@@ -1813,7 +1822,7 @@ function DatabricksIntegrationControl() {
           )}
         </div>
       </div>
-    </div>
+    </SettingsItem>
   );
 }
 
@@ -2150,15 +2159,14 @@ function DefaultBaseBranchControl() {
   }, []);
 
   return (
-    <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
-      <SettingsLabel
-        label="Default base branch"
-        className="flex-1"
-        description="Prefill the base branch for new worktree branches. Leave blank for no prefill."
-      />
+    <SettingsItem
+      entry={DEFAULT_BASE_BRANCH_ENTRY}
+      className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3"
+    >
+      <SettingsEntryLabel entry={DEFAULT_BASE_BRANCH_ENTRY} className="flex-1" />
       <Input
+        {...settingsControlProps(DEFAULT_BASE_BRANCH_ENTRY)}
         type="text"
-        aria-label="Default base branch"
         data-testid="settings-default-base-branch-input"
         placeholder="e.g. main"
         spellCheck={false}
@@ -2169,7 +2177,7 @@ function DefaultBaseBranchControl() {
         onChange={(e) => update(e.target.value)}
         componentId="settings.git.default_branch"
       />
-    </div>
+    </SettingsItem>
   );
 }
 

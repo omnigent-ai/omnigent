@@ -6,7 +6,9 @@ import type { SettingsSectionId } from "@/shell/settingsNav";
 import { ACCOUNT_SETTINGS } from "./account";
 import { ARCHIVED_SETTINGS } from "./archived";
 import { CLI_SETTINGS } from "./cli";
+import { GIT_SETTINGS } from "./git";
 import { IMPORT_SETTINGS } from "./import";
+import { INTEGRATION_SETTINGS } from "./integrations";
 import { MCP_SETTINGS } from "./mcp";
 import type { SettingsEntry } from "./types";
 import { UPDATES_SETTINGS } from "./updates";
@@ -16,8 +18,8 @@ export const SECTION_CATALOGS: Readonly<Record<SettingsSectionId, readonly Setti
   harnesses: [],
   "custom-agents": [],
   general: [],
-  git: [],
-  integrations: [],
+  git: GIT_SETTINGS,
+  integrations: INTEGRATION_SETTINGS,
   mcp: MCP_SETTINGS,
   shortcuts: [],
   import: IMPORT_SETTINGS,

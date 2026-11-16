@@ -97,6 +97,21 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
           session_title_instructions: mocks.sessionTitleInstructions,
         },
 }));
+vi.mock("@/lib/githubIntegration", () => ({
+  fetchGithubStatus: vi.fn(async () => ({ connected: false, login: null, install_url: null })),
+  beginGithubConnect: vi.fn(),
+  disconnectGithub: vi.fn(),
+}));
+vi.mock("@/lib/databricksIntegration", () => ({
+  fetchDatabricksStatus: vi.fn(async () => ({
+    enabled: true,
+    connected: false,
+    workspace_host: null,
+    databricks_user: null,
+  })),
+  beginDatabricksConnect: vi.fn(),
+  disconnectDatabricks: vi.fn(),
+}));
 vi.mock("@/components/SessionTitleInstructionsControl", () => ({
   SessionTitleInstructionsControl: () => <div data-testid="mock-session-title-instructions" />,
 }));
@@ -1773,6 +1788,30 @@ describe("SettingsPage", () => {
     ).not.toBeNull();
     expect(
       document.querySelector('[data-settings-control="account-password:submit"]'),
+    ).not.toBeNull();
+  });
+
+  it("renders the Git rows from their Settings catalog entries", () => {
+    renderPage("/settings/git");
+    for (const id of ["always-use-worktree", "default-base-branch"]) {
+      expect(document.querySelector(`[data-settings-item="${id}"]`)).not.toBeNull();
+    }
+    expect(
+      document
+        .querySelector('[data-settings-control="default-base-branch"]')
+        ?.getAttribute("aria-labelledby"),
+    ).toBe("settings-default-base-branch-label");
+  });
+
+  it("renders the Sandbox Integrations rows from their Settings catalog entries", async () => {
+    mocks.enabledConnections = ["github", "databricks"];
+    renderPage("/settings/integrations");
+    expect(await screen.findByTestId("github-connect")).toBeInTheDocument();
+    for (const id of ["github-connection", "databricks-connection"]) {
+      expect(document.querySelector(`[data-settings-item="${id}"]`)).not.toBeNull();
+    }
+    expect(
+      document.querySelector('[data-settings-control="databricks-connection:workspace"]'),
     ).not.toBeNull();
   });
 
