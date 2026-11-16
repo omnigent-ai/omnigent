@@ -287,6 +287,51 @@ describe("useSkills", () => {
     expect(fetchMock.mock.calls[1][0]).toBe("/v1/skills?session_id=session-a&refresh=true");
   });
 
+  it("keeps the loaded catalog when a rescan fails", async () => {
+    fetchMock.mockResolvedValueOnce(response());
+    const { result } = renderHook(() => useSkills({ target: { sessionId: "session-a" } }), {
+      wrapper,
+    });
+    await waitFor(() => expect(result.current.skills).toEqual(skills));
+    fetchMock.mockResolvedValueOnce(response([], 502));
+    await act(async () => {
+      await expect(result.current.reload()).rejects.toThrow();
+    });
+    expect(result.current.skills).toEqual(skills);
+  });
+
+  it("lets a scheduled refetch share an in-flight reload instead of racing it", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const added = [...skills, { name: "added", description: "Added on disk" }];
+    fetchMock.mockResolvedValueOnce(response());
+    const { result } = renderHook(() => useSkills({ target: { sessionId: "session-a" } }), {
+      wrapper,
+    });
+    await waitFor(() => expect(result.current.skills).toEqual(skills));
+    let finishRescan!: (value: Response) => void;
+    fetchMock.mockImplementationOnce(
+      () =>
+        new Promise<Response>((done) => {
+          finishRescan = done;
+        }),
+    );
+    let reloading!: Promise<void>;
+    act(() => {
+      reloading = result.current.reload();
+    });
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(60_000);
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    await act(async () => {
+      finishRescan(response(added));
+      await reloading;
+    });
+    await waitFor(() => expect(result.current.skills).toEqual(added));
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
   it("does not reload an unavailable catalog", async () => {
     const { result } = renderHook(() => useSkills({ target: null }), { wrapper });
     await act(async () => {

@@ -68,7 +68,11 @@ import {
 } from "@/components/composer/ComposerControls";
 import { DropdownMenuItem, DropdownMenuSeparator } from "@/components/ui/dropdown-menu";
 import { useAppName } from "@/lib/branding";
-import { hasPendingOwnElicitation, isPendingBlockingElicitation } from "@/lib/blocks";
+import {
+  hasPendingOwnElicitation,
+  isPendingBlockingElicitation,
+  type AnyBlock,
+} from "@/lib/blocks";
 import { cn } from "@/lib/utils";
 import { isInlineRenameFocused } from "@/lib/inlineRename";
 import { QueuedMessagesStrip } from "@/pages/QueuedMessagesStrip";
@@ -2303,6 +2307,16 @@ interface ComposerProps {
   onViewportShrinkPinScroll?: () => void;
 }
 
+/** Count the Claude Code ``/reload-skills`` and ``/reload-plugins`` runs in a transcript. */
+export function countReloadCommands(blocks: readonly AnyBlock[]): number {
+  return blocks.filter(
+    (block) =>
+      block.type === "slash_command" &&
+      block.kind === "command" &&
+      (block.name === "reload-skills" || block.name === "reload-plugins"),
+  ).length;
+}
+
 /**
  * Build the full slash-command map for the composer: built-ins
  * first (so they top the menu), then one entry per session skill
@@ -3199,6 +3213,17 @@ function ComposerImpl(
   // Claude Code built-ins that reload skills and plugins in place; they reach
   // the TUI as text, like /compact.
   const showReload = sessionHarness === "claude-native";
+  // Rescan the menu's skills once Claude has run each reload, so a reload that
+  // waited in the queue also sees skills created before it ran. On failure the
+  // menu keeps its catalog until the next poll.
+  const reloadCommandCount = useChatStore((s) => countReloadCommands(s.blocks));
+  const seenReloadsRef = useRef<{ conversationId: string | null; count: number } | null>(null);
+  useEffect(() => {
+    const seen = seenReloadsRef.current;
+    seenReloadsRef.current = { conversationId, count: reloadCommandCount };
+    if (!showReload || seen?.conversationId !== conversationId) return;
+    if (reloadCommandCount > seen.count) void reloadSkills().catch(() => undefined);
+  }, [conversationId, reloadCommandCount, reloadSkills, showReload]);
   const skillPrefix = skillInvocationPrefix(sessionHarness);
   // /side is a Codex Code CLI built-in (ephemeral fork side chat), so offer it
   // only on codex-native sessions. Selected/typed, it sends as plaintext to the
@@ -3735,9 +3760,6 @@ function ComposerImpl(
         const command = arg ? `${cmd} ${arg}` : cmd;
         appendEntry(command);
         onSend(command);
-        // Rescan now so new skills appear in this menu without waiting for the
-        // host cache; on failure the menu keeps its catalog until the next poll.
-        void reloadSkills().catch(() => undefined);
         return true;
       }
       case "/effort": {

@@ -94,9 +94,13 @@ export function useSkills({ target, enabled = true, starting = false }: SkillsOp
   const reload = useCallback(async () => {
     if (target === null || !available) return;
     const queryKey = skillsQueryKey(target);
+    // Cancel any stale fetch; later readers then share this rescan's request.
     await queryClient.cancelQueries({ queryKey });
-    const catalog = await fetchSkills(target, new AbortController().signal, { refresh: true });
-    queryClient.setQueryData(queryKey, catalog);
+    await queryClient.fetchQuery({
+      queryKey,
+      queryFn: ({ signal }) => fetchSkills(target, signal, { refresh: true }),
+      staleTime: 0,
+    });
   }, [available, queryClient, target]);
   return {
     skills: available ? (query.data?.skills ?? []) : [],

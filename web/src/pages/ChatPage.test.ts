@@ -1564,9 +1564,8 @@ describe("buildSlashCommandMap", () => {
       false,
       true,
     );
-    expect(Object.keys(buildSlashCommandMap([], true, true))).not.toEqual(
-      expect.arrayContaining([reloadNames[0]]),
-    );
+    const withoutReload = buildSlashCommandMap([], true, true);
+    for (const name of reloadNames) expect(withoutReload[name]).toBeUndefined();
     for (const name of reloadNames) expect(withReload[name]).toBe(BUILTIN_SLASH_COMMANDS[name]);
   });
 

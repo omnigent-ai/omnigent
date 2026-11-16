@@ -244,7 +244,7 @@ vi.mock("@/lib/goalApi", async (importOriginal) => ({
   ...(await importOriginal<typeof GoalApiModule>()),
   getGoal: vi.fn(),
 }));
-import type { ElicitationBlock, UserMessageBlock } from "@/lib/blocks";
+import type { AnyBlock, ElicitationBlock, UserMessageBlock } from "@/lib/blocks";
 import { getGoal } from "@/lib/goalApi";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { Composer, computeIsWorking } from "./ChatPage";
@@ -1449,15 +1449,24 @@ describe("Composer slash-command menu", () => {
       return props;
     };
 
+    const commandBlock = (name: string, itemId: string): AnyBlock => ({
+      type: "slash_command",
+      ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId: "", itemId },
+      kind: "command",
+      name,
+      arguments: "",
+      output: null,
+    });
+
     it.each(["/reload-skills", "/reload-plugins", "/reload-plugins --force"])(
-      "claude-native sends %s to the terminal and rescans skills",
+      "claude-native sends %s to the terminal without rescanning before it runs",
       (command) => {
         const props = renderForHarness("claude-native");
         fireEvent.change(textarea(), { target: { value: command } });
         fireEvent.keyDown(textarea(), { key: "Enter" });
         expect(textarea()).toHaveValue("");
         expect(props.onSend).toHaveBeenCalledExactlyOnceWith(command);
-        expect(skillsFixture.getState().reload).toHaveBeenCalledOnce();
+        expect(skillsFixture.getState().reload).not.toHaveBeenCalled();
       },
     );
 
@@ -1467,7 +1476,35 @@ describe("Composer slash-command menu", () => {
       expect(screen.getByTestId("slash-menu-item-reload-skills")).toBeVisible();
       fireEvent.click(screen.getByTestId(`slash-menu-item-${name}`));
       expect(props.onSend).toHaveBeenCalledExactlyOnceWith(`/${name}`);
-      expect(skillsFixture.getState().reload).toHaveBeenCalledOnce();
+    });
+
+    it("rescans skills each time Claude runs a reload command", () => {
+      const { conversationId, blocks } = useChatStore.getState();
+      onTestFinished(() => useChatStore.setState({ conversationId, blocks }));
+      useChatStore.setState({ conversationId: "conv_reload", blocks: [] });
+      renderForHarness("claude-native");
+      const reload = skillsFixture.getState().reload;
+      act(() => useChatStore.setState({ blocks: [commandBlock("effort", "item_effort")] }));
+      expect(reload).not.toHaveBeenCalled();
+      act(() =>
+        useChatStore.setState((state) => ({
+          blocks: [...state.blocks, commandBlock("reload-skills", "item_skills")],
+        })),
+      );
+      expect(reload).toHaveBeenCalledOnce();
+      act(() =>
+        useChatStore.setState((state) => ({
+          blocks: [...state.blocks, commandBlock("reload-plugins", "item_plugins")],
+        })),
+      );
+      expect(reload).toHaveBeenCalledTimes(2);
+      act(() =>
+        useChatStore.setState({
+          conversationId: "conv_other",
+          blocks: [commandBlock("reload-skills", "item_history")],
+        }),
+      );
+      expect(reload).toHaveBeenCalledTimes(2);
     });
 
     it.each([

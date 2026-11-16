@@ -51,9 +51,10 @@ def _pane_metadata(base_url: str, session_id: str) -> dict[str, Any] | None:
     return None if terminal is None else terminal["metadata"]
 
 
-def _tmux(meta: dict[str, Any], *args: str) -> str:
+def _tmux(meta: dict[str, Any], command: str, *args: str) -> str:
+    # tmux stops parsing options at the first positional, so -t precedes args.
     proc = subprocess.run(
-        ["tmux", "-S", meta["tmux_socket"], *args, "-t", meta["tmux_target"]],
+        ["tmux", "-S", meta["tmux_socket"], command, "-t", meta["tmux_target"], *args],
         check=False,
         capture_output=True,
         text=True,
@@ -65,7 +66,10 @@ def _tmux(meta: dict[str, Any], *args: str) -> str:
 def _pane_pid(base_url: str, session_id: str) -> str:
     """Process id of the process tmux started for the Claude TUI."""
     meta = _pane_metadata(base_url, session_id)
-    return "" if meta is None else _tmux(meta, "display-message", "-p", "#{pane_pid}").strip()
+    assert meta is not None, "session has no terminal resource"
+    pid = _tmux(meta, "display-message", "-p", "#{pane_pid}").strip()
+    assert pid.isdigit(), f"could not read the pane process id: {pid!r}"
+    return pid
 
 
 def _wait_tui_ready(base_url: str, session_id: str) -> str:
@@ -114,6 +118,12 @@ def _open_chat(page: Page, base_url: str, session_id: str, host_id: str) -> Any:
     return composer
 
 
+def _hold(page: Page, milliseconds: int) -> None:
+    """Pause on a verified state so a demo recording can be read; skipped otherwise."""
+    if os.environ.get("OMNIGENT_E2E_RECORD_DIR"):
+        page.wait_for_timeout(milliseconds)
+
+
 def _say_hello(page: Page, composer: Any) -> None:
     """Run one ordinary turn so later requests show whether the context survived."""
     composer.press_sequentially("hello", delay=40)
@@ -121,14 +131,14 @@ def _say_hello(page: Page, composer: Any) -> None:
     expect(page.locator(_ASSISTANT).filter(has_text=_FIRST_REPLY)).to_be_visible(
         timeout=_FIRST_TURN_TIMEOUT_MS
     )
-    page.wait_for_timeout(3_000)
+    _hold(page, 3_000)
 
 
 def _show_no_match(page: Page, composer: Any, query: str) -> None:
     composer.fill("")
     composer.press_sequentially(query, delay=60)
     expect(page.get_by_text("No matching skills")).to_be_visible(timeout=15_000)
-    page.wait_for_timeout(3_500)
+    _hold(page, 3_500)
     composer.fill("")
 
 
@@ -141,19 +151,19 @@ def _run_reload_from_menu(
     expect(row).to_be_visible(timeout=15_000)
     expect(page.get_by_test_id("slash-menu-item-reload-plugins")).to_be_visible()
     steps.mark("/reload menu lists both commands")
-    page.wait_for_timeout(3_000)
+    _hold(page, 3_000)
     row.click()
     steps.mark(f"{name} clicked")
     card = page.get_by_test_id("slash-command-card").filter(has_text=name)
     expect(card).to_be_visible(timeout=_TURN_TIMEOUT_MS)
     steps.mark(f"{name} card shown")
-    page.wait_for_timeout(2_000)
+    _hold(page, 2_000)
     card.click()
     output = page.get_by_text(expected).last
     expect(output).to_be_visible(timeout=15_000)
     output.scroll_into_view_if_needed()
     steps.mark(f"{name} output shown")
-    page.wait_for_timeout(4_500)
+    _hold(page, 4_500)
 
 
 def _run_skill_from_menu(
@@ -163,7 +173,7 @@ def _run_skill_from_menu(
     row = page.get_by_test_id(f"slash-menu-item-{skill}")
     expect(row).to_be_visible(timeout=30_000)
     steps.mark(f"{query} lists {skill}")
-    page.wait_for_timeout(3_000)
+    _hold(page, 3_000)
     row.click()
     if composer.input_value().strip():
         page.get_by_role("button", name="Send", exact=True).click()
@@ -173,7 +183,7 @@ def _run_skill_from_menu(
     )
     expect(page.locator(_ASSISTANT).filter(has_text=reply)).to_be_visible(timeout=_TURN_TIMEOUT_MS)
     steps.mark("skill reply shown")
-    page.wait_for_timeout(5_000)
+    _hold(page, 5_000)
 
 
 def _assert_same_conversation(mock_url: str, token: str) -> None:
@@ -281,6 +291,8 @@ def test_reload_skills_from_chat_loads_a_skill_added_during_the_session(
         _say_hello(page, composer)
         steps.mark("hello answered")
 
+        _show_no_match(page, composer, "/late")
+        steps.mark("/late shows no match")
         skill_dir = workspace / ".claude" / "skills" / "late-skill"
         skill_dir.mkdir(parents=True)
         (skill_dir / "SKILL.md").write_text(
@@ -288,8 +300,6 @@ def test_reload_skills_from_chat_loads_a_skill_added_during_the_session(
             f"Reply with the {token}.\n"
         )
         steps.mark("skill written to disk")
-        _show_no_match(page, composer, "/late")
-        steps.mark("/late shows no match")
         _run_reload_from_menu(page, composer, steps, "reload-skills", "(1 added)")
         _run_skill_from_menu(page, composer, steps, "/late", "late-skill", reply)
 
@@ -323,10 +333,10 @@ def test_reload_plugins_from_chat_activates_a_plugin_installed_during_the_sessio
         _say_hello(page, composer)
         steps.mark("hello answered")
 
-        _install_claude_plugin(claude_config_dir, tmp_path / "marketplace")
-        steps.mark("plugin installed with the claude CLI")
         _show_no_match(page, composer, f"/{_PLUGIN}")
         steps.mark(f"/{_PLUGIN} shows no match")
+        _install_claude_plugin(claude_config_dir, tmp_path / "marketplace")
+        steps.mark("plugin installed with the claude CLI")
         reloaded = re.compile(r"Reloaded: \d+ plugins? ·")
         _run_reload_from_menu(page, composer, steps, "reload-plugins", reloaded)
         _run_skill_from_menu(page, composer, steps, f"/{_PLUGIN}", f"{_PLUGIN}:simplify", reply)

@@ -3850,6 +3850,7 @@ def read_transcript_items_since_with_position(
     settled_response_id: str | None = None,
     pending_settled_response_id: str | None = None,
     pending_settled_at: float | None = None,
+    defer_reload_echo: bool = False,
 ) -> TranscriptReadResult:
     """
     Read transcript items from a line cursor and return byte position.
@@ -3873,6 +3874,8 @@ def read_transcript_items_since_with_position(
     :param pending_settled_response_id: Stopped turn awaiting transcript
         quiescence; used only to identify peer inputs that wake a new turn.
     :param pending_settled_at: Stop timestamp; earlier peer input belongs to the stopped turn.
+    :param defer_reload_echo: Live polls pass ``True`` to read a just-written
+        reload echo together with its result record.
     :returns: Parsed items plus line and byte cursors.
     """
     read_result = _read_complete_jsonl_records(
@@ -3881,6 +3884,8 @@ def read_transcript_items_since_with_position(
         start_line=0,
         emit_after_line=start_line,
     )
+    if defer_reload_echo:
+        read_result = _defer_trailing_reload_echo(read_result, transcript_path)
     items: list[ClaudeTranscriptItem] = []
     active_response_id = current_response_id
     active_settled_id = settled_response_id
@@ -4047,6 +4052,7 @@ def read_transcript_items_from_offset(
     pending_settled_at: float | None = None,
     include_sidechains: bool = False,
     legacy_agent_messages: bool = False,
+    defer_reload_echo: bool = False,
 ) -> TranscriptReadResult:
     """
     Read transcript items appended after a byte offset.
@@ -4080,6 +4086,8 @@ def read_transcript_items_from_offset(
         unchanged.
     :param legacy_agent_messages: Offline imports hide unproven historical
         team envelopes; preserve assistant response identity across them.
+    :param defer_reload_echo: Live polls pass ``True`` to read a just-written
+        reload echo together with its result record.
     :returns: Parsed items plus updated line and byte cursors.
     """
     read_result = _read_complete_jsonl_records(
@@ -4087,6 +4095,8 @@ def read_transcript_items_from_offset(
         byte_offset=byte_offset,
         start_line=start_line,
     )
+    if defer_reload_echo:
+        read_result = _defer_trailing_reload_echo(read_result, transcript_path)
     items: list[ClaudeTranscriptItem] = []
     active_response_id = current_response_id
     active_settled_id = settled_response_id
@@ -10598,8 +10608,8 @@ def _attach_reload_command_output(
     ``/reload-skills`` and ``/reload-plugins`` write their result
     ("Reloaded skills: …") as a standalone ``local_command`` record directly
     after the command echo, in the same write. Attaching it as the echo's
-    ``output`` lets the web card show what Claude reloaded. A result read in
-    a later batch stays hidden, leaving the card without output.
+    ``output`` lets the web card show what Claude reloaded. Live readers keep
+    both records in one batch with :func:`_defer_trailing_reload_echo`.
 
     :param entry: The transcript record being processed.
     :param record_items: Items of the records already processed in this batch.
@@ -10626,6 +10636,79 @@ def _attach_reload_command_output(
     with_output = replace(echo, data={**echo.data, "output": output_match.group(2).strip()})
     record_items[-1] = replace(previous, items=(with_output,))
     items[-1] = with_output
+
+
+# How long a live read leaves a trailing reload echo unread while Claude
+# writes its stdout record. Past this the card is shown without output.
+_RELOAD_OUTPUT_WAIT_S = 5.0
+
+
+def _is_pending_reload_echo(text: str) -> bool:
+    """
+    Whether a JSONL record is a reload command echo that carries no output.
+
+    :param text: Raw JSONL record text.
+    :returns: ``True`` for a ``/reload-skills`` or ``/reload-plugins`` echo.
+    """
+    try:
+        entry = json.loads(text)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(entry, dict):
+        return False
+    message = entry.get("message")
+    content = (
+        entry.get("content")
+        if entry.get("subtype") == "local_command"
+        else message.get("content")
+        if isinstance(message, dict)
+        else None
+    )
+    if not isinstance(content, str) or not _is_slash_command_echo(content):
+        return False
+    payload = _parse_slash_command_record(content)
+    return (
+        payload is not None
+        and payload.name in _CLAUDE_CLI_RELOAD_COMMANDS
+        and payload.output is None
+    )
+
+
+def _defer_trailing_reload_echo(
+    read_result: _JsonlReadResult, transcript_path: Path
+) -> _JsonlReadResult:
+    """
+    Leave a just-written reload echo unread until its stdout record follows.
+
+    Claude appends a reload command's echo and its result as two records, so a
+    poll can land between them. Rewinding the cursor to the echo lets the next
+    poll read both and attach the result to the card. The wait is bounded by
+    the transcript's modification time so a missing result cannot stall it.
+
+    :param read_result: Complete records read from *transcript_path*.
+    :param transcript_path: The transcript the records came from.
+    :returns: *read_result*, or a copy that stops before the trailing echo.
+    """
+    if not read_result.records:
+        return read_result
+    last = read_result.records[-1]
+    if (
+        last.next_byte_offset != read_result.byte_offset
+        or last.text is None
+        or not _is_pending_reload_echo(last.text)
+    ):
+        return read_result
+    try:
+        written_at = transcript_path.stat().st_mtime
+    except OSError:
+        return read_result
+    if time.time() - written_at >= _RELOAD_OUTPUT_WAIT_S:
+        return read_result
+    return _JsonlReadResult(
+        line_cursor=last.line_number - 1,
+        byte_offset=last.byte_offset,
+        records=read_result.records[:-1],
+    )
 
 
 def _compact_noop_stdout(content: str) -> str | None:

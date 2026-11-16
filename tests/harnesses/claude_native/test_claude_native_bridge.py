@@ -73,6 +73,7 @@ from omnigent.harnesses.claude_native.bridge import (
     read_seen_claude_session_ids,
     read_transcript_items_from_offset,
     read_transcript_items_since,
+    read_transcript_items_since_with_position,
     read_transcript_path,
     record_hook_event,
     start_tool_relay,
@@ -2035,14 +2036,22 @@ def test_read_transcript_items_shows_reload_command_with_its_output(
     )
 
 
-def test_reload_command_output_needs_the_stdout_record_in_the_same_batch(
-    tmp_path: Path,
+@pytest.mark.parametrize("first_reader", ["line_cursor", "byte_offset"])
+def test_live_read_waits_for_a_reload_result_written_after_the_echo(
+    tmp_path: Path, first_reader: str
 ) -> None:
     transcript_path = tmp_path / "session.jsonl"
     caveat, echo, stdout = _reload_command_records("reload-skills", "", "Reloaded skills: 1")
     transcript_path.write_text(json.dumps(caveat) + "\n" + json.dumps(echo) + "\n")
-    first = read_transcript_items_from_offset(
-        transcript_path, 0, start_line=0, agent_name="claude-native-ui"
+    echo_offset = len(json.dumps(caveat)) + 1
+    first = (
+        read_transcript_items_since_with_position(
+            transcript_path, 0, agent_name="claude-native-ui", defer_reload_echo=True
+        )
+        if first_reader == "line_cursor"
+        else read_transcript_items_from_offset(
+            transcript_path, 0, start_line=0, agent_name="claude-native-ui", defer_reload_echo=True
+        )
     )
     with transcript_path.open("a") as transcript:
         transcript.write(json.dumps(stdout) + "\n")
@@ -2051,11 +2060,30 @@ def test_reload_command_output_needs_the_stdout_record_in_the_same_batch(
         first.byte_offset,
         start_line=first.line_cursor,
         agent_name="claude-native-ui",
+        defer_reload_echo=True,
     )
 
-    assert [item.data["name"] for item in first.items] == ["reload-skills"]
-    assert "output" not in first.items[0].data
-    assert second.items == []
+    assert (first.items, first.byte_offset, first.line_cursor) == ([], echo_offset, 1)
+    assert [(item.data["name"], item.data.get("output")) for item in second.items] == [
+        ("reload-skills", "Reloaded skills: 1")
+    ]
+    assert second.byte_offset == transcript_path.stat().st_size
+
+
+def test_live_read_shows_a_reload_echo_whose_result_never_arrives(tmp_path: Path) -> None:
+    transcript_path = tmp_path / "session.jsonl"
+    caveat, echo, _stdout = _reload_command_records("reload-plugins", "", "unused")
+    transcript_path.write_text(json.dumps(caveat) + "\n" + json.dumps(echo) + "\n")
+    written_long_ago = time.time() - 60
+    os.utime(transcript_path, (written_long_ago, written_long_ago))
+
+    result = read_transcript_items_from_offset(
+        transcript_path, 0, start_line=0, agent_name="claude-native-ui", defer_reload_echo=True
+    )
+
+    assert [item.data["name"] for item in result.items] == ["reload-plugins"]
+    assert "output" not in result.items[0].data
+    assert result.byte_offset == transcript_path.stat().st_size
 
 
 def test_read_transcript_items_since_keeps_real_bash_local_command(tmp_path: Path) -> None:

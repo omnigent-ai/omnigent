@@ -206,12 +206,13 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   name the affected files).
 - `reload-commands`: in Claude Code native sessions, `/reload-skills` and
   `/reload-plugins [--force]` run in the session's Claude Code process, which
-  keeps running, then rescan the host's skill catalog so the `/` menu lists the
+  keeps running. When Claude Code has run one, including a reload that waited
+  in the queue, the host's skill catalog is rescanned so the `/` menu lists the
   new skills. The chat shows a **Command** card whose Output is Claude Code's
   result line. Other harnesses do not offer them; a typed command is sent as
   text. States: unexpected arguments (error under the composer), a Claude Code
-  build without the command (re-sent as plain text), output not yet in the
-  transcript (card without Output).
+  build without the command (re-sent as plain text), no result written within
+  a few seconds (card without Output).
 - `session-mcp-status`: selecting `/mcp` in a started session replaces the slash
   suggestions with the MCP servers enabled for that session and links to harness
   Settings with the session’s host preselected. Host-native entries are limited
@@ -441,6 +442,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   type `/rew` and click **/rewind**, or type `/rewind` and press Enter, then
   pick a prompt (search, or **Load older prompts** in a long session). The new
   chat opens with that prompt, and its attachments, in the composer.
+- In a Claude Code native session, type `/reload` and click **/reload-skills**
+  or **/reload-plugins**, or type either command (`/reload-plugins --force` is
+  accepted) and press Enter. Expand the **Command** card to read the result.
 
 **Desktop browser pointer** (open a session in the desktop app):
 
@@ -819,8 +823,9 @@ Other connection providers alone do not enable the managed MCP picker.
   from the `/reload` menu in a real Claude Code native session on the mock LLM,
   after adding a skill or installing a plugin mid-session, then runs the new
   skill and checks that the Claude process and earlier context survived.
-  Typed commands, argument errors and the harness gate are in
-  `web/src/pages/ChatPage.composer.test.tsx`; the Command card's Output in
+  Typed commands, argument errors, the harness gate and the rescan after each
+  reload card are in `web/src/pages/ChatPage.composer.test.tsx`; the Command
+  card's Output, including a result written after the echo was read, in
   `tests/harnesses/claude_native/test_claude_native_bridge.py`. Manually, add a
   skill under the workspace's `.claude/skills` during a native session, run
   `/reload-skills` from Chat, and pick the new skill from the `/` menu.
