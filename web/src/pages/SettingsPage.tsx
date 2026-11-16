@@ -95,6 +95,7 @@ import { SettingsEntryLabel, SettingsItem } from "@/pages/settings/search/Settin
 import {
   type SettingsControlProps,
   settingsControlProps,
+  settingsFileInputProps,
   settingsDescriptionId,
   settingsLabelId,
 } from "@/pages/settings/search/settingsControl";
@@ -110,6 +111,7 @@ import {
   settingsRuntimeChoiceProps,
 } from "@/pages/settings/search/settingsOwnership";
 import {
+  APPEARANCE_DATA_ENTRY,
   CODE_FONT_FAMILY_ENTRY,
   CODE_FONT_SIZE_ENTRY,
   CODE_FONT_WEIGHT_ENTRY,
@@ -1373,10 +1375,14 @@ function AppearanceSection() {
         </div>
 
         <SettingsGroup title="Settings data" testId="settings-group-data">
-          <div className="flex flex-col gap-2 md:flex-row md:flex-wrap md:items-center md:justify-end">
+          <SettingsItem
+            entry={APPEARANCE_DATA_ENTRY}
+            className="flex flex-col gap-2 md:flex-row md:flex-wrap md:items-center md:justify-end"
+          >
             <Button
               variant="outline"
               size="sm"
+              {...settingsControlProps(APPEARANCE_DATA_ENTRY, "export")}
               data-testid="export-settings-button"
               onClick={exportSettings}
             >
@@ -1386,6 +1392,7 @@ function AppearanceSection() {
             <Button
               variant="outline"
               size="sm"
+              {...settingsControlProps(APPEARANCE_DATA_ENTRY, "import")}
               data-testid="import-settings-button"
               onClick={() => {
                 setImportError(null);
@@ -1400,13 +1407,14 @@ function AppearanceSection() {
                 <Button
                   variant="outline"
                   size="sm"
+                  {...settingsControlProps(APPEARANCE_DATA_ENTRY, "reset")}
                   data-testid="reset-appearance-button"
                   componentId="settings.appearance.open_reset_dialog"
                 >
                   Reset to defaults
                 </Button>
               </DialogTrigger>
-              <DialogContent>
+              <DialogContent {...settingsOverlayProps(APPEARANCE_DATA_ENTRY, "reset")}>
                 <DialogHeader>
                   <DialogTitle>Reset appearance?</DialogTitle>
                   <DialogDescription>
@@ -1420,6 +1428,7 @@ function AppearanceSection() {
                   <Button
                     variant="default"
                     onClick={confirmResetAppearance}
+                    {...settingsControlProps(APPEARANCE_DATA_ENTRY, "confirmReset")}
                     data-testid="reset-appearance-confirm"
                     componentId="settings.appearance.reset"
                   >
@@ -1428,7 +1437,7 @@ function AppearanceSection() {
                 </DialogFooter>
               </DialogContent>
             </Dialog>
-          </div>
+          </SettingsItem>
         </SettingsGroup>
       </div>
 
@@ -1437,6 +1446,7 @@ function AppearanceSection() {
         type="file"
         accept=".json"
         className="hidden"
+        {...settingsFileInputProps(APPEARANCE_DATA_ENTRY, "chooseFile")}
         data-testid="import-settings-file-input"
         onChange={(e) => {
           const file = e.target.files?.[0];
@@ -1445,7 +1455,7 @@ function AppearanceSection() {
         }}
       />
       <Dialog open={isImportDialogOpen} onOpenChange={setIsImportDialogOpen}>
-        <DialogContent>
+        <DialogContent {...settingsOverlayProps(APPEARANCE_DATA_ENTRY, "import")}>
           <DialogHeader>
             <DialogTitle>Import settings</DialogTitle>
             <DialogDescription>
@@ -1467,6 +1477,7 @@ function AppearanceSection() {
             </DialogClose>
             <Button
               variant="default"
+              {...settingsControlProps(APPEARANCE_DATA_ENTRY, "chooseFile")}
               data-testid="import-settings-choose-file"
               onClick={() => fileInputRef.current?.click()}
             >
