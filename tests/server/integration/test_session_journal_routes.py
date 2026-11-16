@@ -380,7 +380,11 @@ async def test_the_runner_appends_and_people_page_the_journal(
     assert written[0]["content"]["version"] == 1
     assert written[0]["content"]["name"] == "Cut GET /orders p95 by 20%"
     assert written[0]["author"] == {"type": "agent"} and written[0]["step"] is None
-    assert written[2]["content"] == {"status": "done", "text": "p95 430 ms"}
+    assert written[2]["content"] == {
+        "status": "done",
+        "text": "p95 430 ms",
+        "graph_revision": written[0]["content"]["graph_revision"],
+    }
 
     retried = await client.post(
         url, json=_write("note", {"body": "again"}, "tool:4"), headers=_runner(session_id)
@@ -837,7 +841,13 @@ async def test_a_workflow_question_marks_its_task_and_returns_the_answer(
     # The task waits for the user, its status the question.
     entry = published[-1]["entry"]
     assert entry["step"] == "deploy"
-    assert entry["content"] == {"status": "needs_input", "text": "Approve the deploy to prod?"}
+    plan = session_journal_store.SessionJournalStore(db_uri).current_plan(session_id)
+    assert plan is not None
+    assert entry["content"] == {
+        "status": "needs_input",
+        "text": "Approve the deploy to prod?",
+        "graph_revision": plan.content["graph_revision"],
+    }
 
     while not pending_approvals.resolve(
         event["elicitation_id"], True, {"Approve the deploy to prod?": "Approve"}
