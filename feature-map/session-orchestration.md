@@ -44,7 +44,8 @@ MCP independent creation.
   Neither side can override a disable on the other. Child messaging and already
   accepted work continue; session creation keeps its separate orchestration gate.
 - `create`: `sys_session_create` retains child creation by default; `same_host`
-  and `managed` placements create independent, initially private sessions.
+  and `managed` placements create independent, initially private sessions,
+  except that a shared automation's run shares them (see `scheduled`).
   An optional `permission_mode` starts the session in a mode of its harness;
   modes that skip approval are refused, and on a server that doesn't advertise
   `session_create_permission_modes` the tool refuses the call before creating anything.
@@ -77,7 +78,14 @@ MCP independent creation.
   independent creates like any private session their owner owns, so an
   automation can message the owner's other sessions or start workers. The
   Automations page's Jira/Slack/GitHub trigger templates rely on this: their
-  kept session starts one worker per match (`docs/AUTOMATIONS.md`).
+  kept session starts one worker per match (`docs/AUTOMATIONS.md`). A worker
+  started from a run's session tree, or from a worker started that way, is
+  labeled `omnigent.scheduled_task_launch` with the automation and shared at
+  read access, before it starts, with the automation's current grantees who can
+  still see the session it was launched from; a fork of a run's session shares
+  nothing. Covered by
+  `tests/server/integration/test_session_orchestration.py::test_launches_from_a_run_tree_are_shared_with_the_automation_grantees`
+  and `tests/server/scheduled/test_run_sharing.py`.
 - `projects`: `sys_project_list` pages the owner's projects oldest first and
   their own sessions with each one's project, marking the calling session; a
   legacy label folder shows only as a session's project. It also forwards the

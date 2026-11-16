@@ -582,31 +582,36 @@ def test_every_advertised_field_is_forwarded(
 
 
 @pytest.mark.asyncio
-async def test_delete_by_id() -> None:
+@pytest.mark.parametrize(
+    ("task_id", "path_id"),
+    # A deployment may allocate IDs that are not UUIDs; those keep their case.
+    [
+        (_TASK_ID.upper(), _TASK_ID),
+        ("4611686018427387904", "4611686018427387904"),
+        ("Ab3_x-9", "Ab3_x-9"),
+    ],
+    ids=["uuid", "decimal", "mixed-case"],
+)
+async def test_delete_by_id(task_id: str, path_id: str) -> None:
     client = _RecordingClient(_Resp(body={"deleted": True, "id": "t1"}))
     await _execute_scheduled_task_tool(
         "sys_scheduled_task_delete",
-        json.dumps({"scheduled_task_id": _TASK_ID.upper()}),
+        json.dumps({"scheduled_task_id": task_id}),
         server_client=client,
     )
-    assert client.calls[0] == ("DELETE", f"/v1/scheduled-tasks/{_TASK_ID}", None)
+    assert client.calls[0] == ("DELETE", f"/v1/scheduled-tasks/{path_id}", None)
 
 
 @pytest.mark.asyncio
-async def test_update_rejects_path_confusion_task_id() -> None:
+@pytest.mark.parametrize("task_id", ["../0123456789abcdef0123456789abcdef", "..", "a/b", "a?b"])
+async def test_update_rejects_path_confusion_task_id(task_id: str) -> None:
     client = _RecordingClient()
     out = await _execute_scheduled_task_tool(
         "sys_scheduled_task_update",
-        json.dumps(
-            {
-                **_REVIEW_FIELDS,
-                "scheduled_task_id": "../0123456789abcdef0123456789abcdef",
-                "state": "paused",
-            }
-        ),
+        json.dumps({**_REVIEW_FIELDS, "scheduled_task_id": task_id, "state": "paused"}),
         server_client=client,
     )
-    assert "canonical 32-character hex" in json.loads(out)["error"]
+    assert "scheduled_task_id from sys_scheduled_task_list" in json.loads(out)["error"]
     assert client.calls == []
 
 
@@ -978,7 +983,7 @@ async def test_reminder_reports_a_wrong_schedule_it_could_not_delete(
 
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("_frozen_now")
-@pytest.mark.parametrize("task_id", [None, "../scheduled-tasks", "T1"])
+@pytest.mark.parametrize("task_id", [None, "../scheduled-tasks", ""])
 async def test_a_wrong_schedule_without_a_usable_id_is_reported_not_deleted(
     task_id: str | None,
 ) -> None:

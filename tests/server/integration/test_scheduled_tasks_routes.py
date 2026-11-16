@@ -8,6 +8,7 @@ validation (400s) and live-scheduler sync on every mutation.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import uuid
 from collections.abc import AsyncIterator, Callable, Iterator
@@ -3991,6 +3992,113 @@ async def test_a_failed_create_deletes_the_copy_with_its_file_rows(
     assert [stored.filename for stored in files.list(source_id).data] == kept
 
 
+@pytest.mark.parametrize("failure", [None, "missing source", "store create"])
+async def test_create_saves_the_store_allocated_id_and_releases_an_unsaved_one(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str | None,
+) -> None:
+    import threading
+
+    from omnigent.errors import ErrorCode, OmnigentError
+    from omnigent.stores.conversation_store import SCHEDULED_TASK_SOURCE_LABEL_KEY
+
+    # A deployment's own ID, in the UUID form the SQL store's columns hold.
+    allocated = uuid.uuid5(uuid.NAMESPACE_URL, "https://example.com/automations/1").hex
+    calls: list[tuple[str, object]] = []
+    # Both may reach an external service, so they run off the event loop.
+    threads: set[int] = set()
+
+    def _allocate(self: Any, *, user_id: str | None, name: str) -> str:
+        threads.add(threading.get_ident())
+        calls.append(("allocate", (user_id, name)))
+        return allocated
+
+    def _release(self: Any, scheduled_task_id: str) -> None:
+        threads.add(threading.get_ident())
+        calls.append(("release", scheduled_task_id))
+        # Best-effort: the client still gets the original error.
+        raise RuntimeError("release unavailable")
+
+    def _failing_create(*args: Any, **kwargs: Any) -> None:
+        raise OmnigentError("store unavailable", code=ErrorCode.INVALID_INPUT)
+
+    monkeypatch.setattr(SqlAlchemyScheduledTaskStore, "allocate_scheduled_task_id", _allocate)
+    monkeypatch.setattr(SqlAlchemyScheduledTaskStore, "release_scheduled_task_id", _release)
+    if failure == "store create":
+        monkeypatch.setattr(SqlAlchemyScheduledTaskStore, "create", _failing_create)
+    source_id = uuid.uuid4().hex if failure == "missing source" else _session_with_history(db_uri)
+
+    resp = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(source_session_id=source_id), headers=_headers()
+    )
+
+    allocation = ("allocate", ("alice@example.com", "nightly triage"))
+    assert threads and threading.get_ident() not in threads
+    if failure is not None:
+        assert resp.status_code == (404 if failure == "missing source" else 400), resp.text
+        assert calls == [allocation, ("release", allocated)]
+        return
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["id"] == allocated
+    copy = SqlAlchemyConversationStore(db_uri).get_conversation(resp.json()["source_session_id"])
+    assert copy is not None and copy.labels[SCHEDULED_TASK_SOURCE_LABEL_KEY] == allocated
+    assert calls == [allocation]
+
+
+@pytest.mark.parametrize("stage", ["allocate", "release"])
+async def test_a_cancelled_create_waits_to_release_its_id(
+    auth_client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch, stage: str
+) -> None:
+    import threading
+
+    loop = asyncio.get_running_loop()
+    entered = asyncio.Event()
+    unblock = threading.Event()
+    allocated = uuid.uuid5(uuid.NAMESPACE_URL, "https://example.com/automations/2").hex
+    released: list[str] = []
+
+    def _hold() -> None:
+        loop.call_soon_threadsafe(entered.set)
+        assert unblock.wait(5)
+
+    def _allocate(self: Any, *, user_id: str | None, name: str) -> str:
+        if stage == "allocate":
+            _hold()
+        return allocated
+
+    def _release(self: Any, scheduled_task_id: str) -> None:
+        if stage == "release":
+            _hold()
+        released.append(scheduled_task_id)
+
+    monkeypatch.setattr(SqlAlchemyScheduledTaskStore, "allocate_scheduled_task_id", _allocate)
+    monkeypatch.setattr(SqlAlchemyScheduledTaskStore, "release_scheduled_task_id", _release)
+    # A missing source fails the create after allocation, so its release runs.
+    source_id = uuid.uuid4().hex if stage == "release" else _session_with_history(db_uri)
+    pending = asyncio.create_task(
+        auth_client.post(
+            "/v1/scheduled-tasks",
+            json=_create_body(source_session_id=source_id),
+            headers=_headers(),
+        )
+    )
+    await asyncio.wait_for(entered.wait(), 5)
+    # A second cancellation must not interrupt the wait either.
+    for _ in range(2):
+        pending.cancel()
+        await asyncio.sleep(0)
+    done, _ = await asyncio.wait({pending}, timeout=0.2)
+    assert not done
+    unblock.set()
+    with contextlib.suppress(asyncio.CancelledError):
+        await asyncio.wait_for(pending, 5)
+
+    assert released == [allocated]
+    assert SqlAlchemyScheduledTaskStore(db_uri).get(allocated) is None
+
+
 async def test_a_copy_that_cannot_take_every_file_is_deleted(
     auth_client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -4050,6 +4158,12 @@ async def test_a_cancelled_create_deletes_the_copy_once_its_writes_settle(
 
         return held
 
+    released: list[str] = []
+    monkeypatch.setattr(
+        SqlAlchemyScheduledTaskStore,
+        "release_scheduled_task_id",
+        lambda self, scheduled_task_id: released.append(scheduled_task_id),
+    )
     if stage == "copy":
         monkeypatch.setattr(source_session, "copy_session", _held(source_session.copy_session))
     else:
@@ -4074,6 +4188,7 @@ async def test_a_cancelled_create_deletes_the_copy_once_its_writes_settle(
         await asyncio.wait_for(pending, 5)
 
     assert {conv.id for conv in conversations.list_conversations(limit=100).data} == before
+    assert len(released) == 1
 
 
 async def test_a_copy_takes_only_attachments_the_deployment_accepts(
@@ -4299,11 +4414,48 @@ async def test_automation_inbox_owner_scope_and_cursor(auth_client, db_uri):
     }
     other = await auth_client.get("/v1/scheduled-tasks/inbox", headers=_headers("bob@example.com"))
     assert other.status_code == 200 and other.json()["data"] == []
-    for params in ({"limit": 0}, {"limit": 101}, {"after": "bad"}, {"after": "-1:" + task_id}):
+    for params in (
+        {"limit": 0},
+        {"limit": 101},
+        {"after": "bad"},
+        {"after": "-1:" + task_id},
+        {"after": "100:"},
+    ):
         invalid = await auth_client.get(
             "/v1/scheduled-tasks/inbox", headers=_headers(), params=params
         )
         assert invalid.status_code == 422
+
+
+@pytest.mark.parametrize(
+    ("cursor_id", "store_id"),
+    [
+        ("01234567-89AB-CDEF-0123-456789ABCDEF", "0123456789abcdef0123456789abcdef"),
+        # An ID a deployment allocates in another form.
+        ("4611686018427387904", "4611686018427387904"),
+    ],
+    ids=["uuid", "decimal"],
+)
+async def test_automation_inbox_cursor_keeps_any_task_id_form(
+    auth_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    cursor_id: str,
+    store_id: str,
+) -> None:
+    cursors: list[object] = []
+
+    def _page(self: Any, **kwargs: Any) -> tuple[list[Any], tuple[int, str]]:
+        cursors.append(kwargs["after"])
+        return [], (50, store_id)
+
+    monkeypatch.setattr(SqlAlchemyScheduledTaskStore, "list_inbox_failures", _page)
+    response = await auth_client.get(
+        "/v1/scheduled-tasks/inbox", headers=_headers(), params={"after": f"100:{cursor_id}"}
+    )
+
+    assert response.status_code == 200, response.text
+    assert cursors == [(100, store_id)]
+    assert response.json()["next_cursor"] == f"50:{store_id}"
 
 
 async def test_automation_inbox_does_not_duplicate_a_deleted_session(auth_client, db_uri):

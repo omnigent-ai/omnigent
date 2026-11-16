@@ -5173,7 +5173,9 @@ _SCHEDULED_TASK_UPDATE_FIELDS = (
     "state",
     "project_id",
 )
-_SCHEDULED_TASK_ID_RE = re.compile(r"^[0-9a-fA-F]{32}$")
+_SCHEDULED_TASK_UUID_RE = re.compile(r"^[0-9a-fA-F]{32}$")
+# IDs a deployment allocates in another form, limited to characters safe in one path segment.
+_SCHEDULED_TASK_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 # Optional fields an older server forbids, the ``/v1/info`` flag that admits
 # them, and how to retry without them.
 _SCHEDULED_TASK_GATED_FIELDS = (
@@ -5216,10 +5218,12 @@ async def _scheduled_task_session_fields_refusal(
 
 
 def _scheduled_task_url(task_id: object) -> str | None:
-    """Return a safe scheduled-task URL path for a canonical id."""
+    """Return a safe scheduled-task URL path for a task id, lowercasing a hex UUID."""
     if not isinstance(task_id, str) or not _SCHEDULED_TASK_ID_RE.fullmatch(task_id):
         return None
-    return f"/v1/scheduled-tasks/{task_id.lower()}"
+    if _SCHEDULED_TASK_UUID_RE.fullmatch(task_id):
+        task_id = task_id.lower()
+    return f"/v1/scheduled-tasks/{task_id}"
 
 
 async def _project_id_for_name(
@@ -5503,7 +5507,7 @@ async def _read_triggered_task(
     task_url = _scheduled_task_url(task_id)
     if task_url is None:
         return json.dumps(
-            {"error": f"{tool_name} requires canonical 32-character hex triggered_task_id"}
+            {"error": f"{tool_name} requires a triggered_task_id from sys_triggered_task_list"}
         )
     response = await server_client.get(task_url, timeout=30.0)
     if response.status_code >= 400:
@@ -5870,7 +5874,10 @@ async def _execute_scheduled_task_tool(
             task_url = _scheduled_task_url(task_id)
             if task_url is None:
                 return json.dumps(
-                    {"error": f"{tool_name} requires canonical 32-character hex scheduled_task_id"}
+                    {
+                        "error": f"{tool_name} requires a scheduled_task_id "
+                        "from sys_scheduled_task_list"
+                    }
                 )
             if tool_name == "sys_scheduled_task_delete":
                 resp = await server_client.delete(task_url, timeout=30.0)
