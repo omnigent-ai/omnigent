@@ -44,6 +44,7 @@ from omnigent.harnesses.claude_native.bridge import (
     terminal_dialog_pending,
 )
 from omnigent.host.identity_env import in_managed_sandbox
+from omnigent.inner.async_utils import run_sync_cleanup
 from omnigent.inner.executor import (
     EnqueuedContent,
     Executor,
@@ -487,7 +488,8 @@ class ClaudeNativeExecutor(Executor):
                 exc_info=not clean_exit,
                 extra={"session_id": self._request_session_id},
             )
-            cleanup_error = self._reap_failed_turn()
+            async with self._inject_lock:
+                cleanup_error = await self._reap_failed_turn()
             message = describe_exception(exc)
             if cleanup_error is not None:
                 message = f"{message} Cleanup also failed: {cleanup_error}"
@@ -500,7 +502,8 @@ class ClaudeNativeExecutor(Executor):
             )
             # The pane is still alive here: this turn's error reports the close,
             # so the runner must not also report the pane's exit as a failure.
-            cleanup_error = self._reap_failed_turn(expected_close=True)
+            async with self._inject_lock:
+                cleanup_error = await self._reap_failed_turn(expected_close=True)
             message = describe_exception(exc)
             if cleanup_error is not None:
                 message = f"{message} Cleanup also failed: {cleanup_error}"
@@ -574,13 +577,20 @@ class ClaudeNativeExecutor(Executor):
                     await asyncio.shield(worker)
             with contextlib.suppress(Exception, asyncio.CancelledError):
                 worker.result()
-            self._reap_failed_turn()
+            await self._reap_failed_turn()
             raise
 
-    def _reap_failed_turn(self, *, expected_close: bool = False) -> str | None:
+    async def _reap_failed_turn(self, *, expected_close: bool = False) -> str | None:
         """Kill the Claude pane before a delivery timeout becomes ``failed``."""
         try:
-            kill_session(self._bridge_dir, timeout_s=1.0, expected_close=expected_close)
+            await run_sync_cleanup(
+                kill_session,
+                self._bridge_dir,
+                timeout_s=1.0,
+                expected_close=expected_close,
+                component="claude_native_failed_turn",
+                session_id=self._request_session_id,
+            )
         except TmuxSessionNotAdvertised:
             _logger.debug(
                 "claude-native: timed-out session already disappeared",

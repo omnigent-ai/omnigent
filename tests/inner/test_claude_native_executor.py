@@ -1755,38 +1755,71 @@ async def test_a_routed_first_message_switches_the_model_exactly_once(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_exited", [False, True], ids=["timeout", "exited"])
+@pytest.mark.parametrize("cancel_cleanup", [False, True], ids=["complete", "cancel"])
 async def test_run_turn_reaps_tmux_before_reporting_prompt_timeout(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    terminal_exited: bool,
+    cancel_cleanup: bool,
 ) -> None:
-    """A readiness timeout cannot leave a failed turn's pane alive."""
+    """Slow cleanup keeps dispatch responsive and owns the pane until it finishes."""
     bridge_dir = tmp_path / "bridge"
+    started = threading.Event()
+    release = threading.Event()
     killed: list[Path] = []
 
     def fail_inject(bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0) -> None:
         del bridge_dir_arg, content, timeout_s
+        if terminal_exited:
+            raise ClaudeTerminalExited("terminal exited", exit_status="1")
         raise ClaudePromptTimeout("terminal did not become ready")
 
+    def kill(bridge_dir_arg: Path, *, timeout_s: float, expected_close: bool = False) -> None:
+        started.set()
+        assert release.wait(5), "test did not release terminal cleanup"
+        killed.append(bridge_dir_arg)
+
     monkeypatch.setattr(claude_native_executor, "inject_user_message", fail_inject)
-    monkeypatch.setattr(
-        claude_native_executor,
-        "kill_session",
-        lambda bridge_dir_arg, *, timeout_s, expected_close=False: killed.append(bridge_dir_arg),
-    )
-
+    monkeypatch.setattr(claude_native_executor, "kill_session", kill)
     executor = ClaudeNativeExecutor(bridge_dir)
-    events = [
-        event
-        async for event in executor.run_turn(
-            messages=[{"role": "user", "content": "hi"}],
-            tools=[],
-            system_prompt="",
-        )
-    ]
 
-    assert killed == [bridge_dir]
-    assert len(events) == 1
-    assert isinstance(events[0], ExecutorError)
+    async def deliver():
+        return [
+            event
+            async for event in executor.run_turn(
+                messages=[{"role": "user", "content": "hi"}], tools=[], system_prompt=""
+            )
+        ]
+
+    guard = threading.Timer(3, release.set)
+    guard.start()
+    task = asyncio.create_task(deliver())
+    try:
+        assert await asyncio.to_thread(started.wait, 2)
+        assert not release.is_set(), "terminal cleanup blocked the runner event loop"
+        assert not task.done()
+        assert executor._inject_lock.locked()
+        if cancel_cleanup:
+            for _ in range(2):
+                task.cancel()
+                await asyncio.sleep(0)
+                assert not task.done()
+                assert executor._inject_lock.locked()
+        release.set()
+        if cancel_cleanup:
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            events = await task
+            assert len(events) == 1
+            assert isinstance(events[0], ExecutorError)
+        assert killed == [bridge_dir]
+        assert not executor._inject_lock.locked()
+    finally:
+        release.set()
+        guard.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 @pytest.mark.asyncio
@@ -2205,6 +2238,8 @@ async def test_cancelled_delivery_drains_worker_before_unlocking(
     started = threading.Event()
     release = threading.Event()
     finished = threading.Event()
+    reap_started = threading.Event()
+    release_reap = threading.Event()
     commands: list[tuple[str, ...]] = []
     reaped: list[Path] = []
 
@@ -2223,6 +2258,8 @@ async def test_cancelled_delivery_drains_worker_before_unlocking(
     def reap(bridge_dir: Path, *, timeout_s: float, expected_close: bool = False) -> None:
         assert finished.is_set()
         claude_bridge._check_injection_cancelled()
+        reap_started.set()
+        assert release_reap.wait(5), "test did not release terminal cleanup"
         reaped.append(bridge_dir)
 
     def run(cmd: list[str], **kwargs: Any) -> Any:
@@ -2251,6 +2288,8 @@ async def test_cancelled_delivery_drains_worker_before_unlocking(
                 ):
                     raise AssertionError("cancelled turn emitted a completion")
 
+    guard = threading.Timer(3, release_reap.set)
+    guard.start()
     task = asyncio.create_task(deliver())
     try:
         assert await asyncio.to_thread(started.wait, 2)
@@ -2267,6 +2306,16 @@ async def test_cancelled_delivery_drains_worker_before_unlocking(
             await asyncio.sleep(0)
             assert not task.done()
         release.set()
+        assert await asyncio.to_thread(reap_started.wait, 2)
+        assert not release_reap.is_set(), "terminal cleanup blocked the runner event loop"
+        assert not task.done()
+        assert executor._inject_lock.locked()
+        if not watchdog:
+            task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done()
+            assert executor._inject_lock.locked()
+        release_reap.set()
         await asyncio.wait({task}, timeout=2)
         assert task.done(), "cancelled delivery did not finish after its capture was released"
         with pytest.raises(TimeoutError if watchdog else asyncio.CancelledError):
@@ -2277,6 +2326,8 @@ async def test_cancelled_delivery_drains_worker_before_unlocking(
         assert commands == []
     finally:
         release.set()
+        release_reap.set()
+        guard.cancel()
         if not task.done():
             task.cancel()
         await asyncio.wait({task})
