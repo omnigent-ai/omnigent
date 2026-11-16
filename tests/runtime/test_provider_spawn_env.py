@@ -44,6 +44,7 @@ from omnigent.inner.datamodel import (
     OSEnvSpec,
 )
 from omnigent.onboarding import ambient, harness_install
+from omnigent.runtime.harnesses.process_manager import _build_harness_spawn_env
 from omnigent.runtime.workflow import (
     _apply_codex_provider_env,
     _bind_codex_gateway_credential,
@@ -574,6 +575,20 @@ def test_codex_tool_switches_reject_non_boolean_values(
 
     with pytest.raises(OmnigentError, match=rf"executor\.config\.{key} must be a boolean"):
         _build_codex_spawn_env(spec)
+
+
+def test_codex_permissive_switches_keep_operator_restrictions(
+    config_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HARNESS_CODEX_ENABLE_WEB_SEARCH", "false")
+    monkeypatch.setenv("HARNESS_CODEX_DISABLE_NATIVE_TOOLS", "true")
+    spec = _make_spec(harness="codex")
+    spec.executor.config.update({"web_search": True, "disable_native_tools": False})
+
+    env = _build_harness_spawn_env(_build_codex_spawn_env(spec))
+
+    assert env["HARNESS_CODEX_ENABLE_WEB_SEARCH"] == "false"
+    assert env["HARNESS_CODEX_DISABLE_NATIVE_TOOLS"] == "true"
 
 
 def _parse_bundle(directory: Path, config_yaml: str) -> AgentSpec:
