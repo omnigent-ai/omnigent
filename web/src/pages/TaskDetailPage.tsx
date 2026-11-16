@@ -701,7 +701,7 @@ function RunRow({
   run: ScheduledTaskRun;
   now: Date;
   highlighted: boolean;
-  /** The plan the run started with, independent of the automation's current prompt. */
+  /** The run's latest plan, independent of the automation's current prompt. */
   steps?: ScheduledTaskRunSteps;
 }) {
   const timestamp = formatRunTimestamp(run.firedAt ?? run.scheduledAt, now);
@@ -725,7 +725,7 @@ function RunRow({
   // Stop while the run's session works; play once it stopped with tasks left.
   const control =
     showTasks && steps?.isCurrent && steps.planId
-      ? planRunControl(progress, steps.statuses, sessionWorking)
+      ? planRunControl(progress, steps.statuses, sessionWorking, steps.planGraphRevision)
       : null;
   // What the run's buttons and task menus refresh once its session takes them.
   const refreshKeys = [

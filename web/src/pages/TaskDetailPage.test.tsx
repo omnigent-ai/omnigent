@@ -1434,6 +1434,7 @@ describe("runs of a saved workflow", () => {
   const STEPS: ScheduledTaskRunSteps = {
     runId: "run_1",
     planId: "plan_1",
+    planGraphRevision: "graph-0",
     isCurrent: true,
     workflowId: "9".repeat(32),
     planName: "Triage",
@@ -1450,7 +1451,7 @@ describe("runs of a saved workflow", () => {
         step: "explore",
         author: { type: "agent" },
         kind: "status",
-        content: { status: "done", text: "Found it" },
+        content: { status: "done", text: "Found it", graph_revision: "graph-0" },
       },
     ],
   };
@@ -1561,6 +1562,37 @@ describe("runs of a saved workflow", () => {
       expect(screen.getByTestId("workflow-graph-overlay")).toHaveTextContent("fix:stopped");
       fireEvent.click(screen.getByRole("button", { name: "Close graph" }));
     }
+
+    // A final result can finish the workflow without filling in every earlier status.
+    vi.mocked(hooks.useScheduledTaskRunSteps).mockReturnValue(
+      new Map([["run_1", { ...STEPS, statuses: [{ ...STEPS.statuses[0]!, step: "fix" }] }]]),
+    );
+    rerender(renderWorkflowPage());
+    expect(within(row).queryByTestId("plan-continue")).toBeNull();
+    expect(within(row).queryByTestId("plan-stop")).toBeNull();
+
+    vi.mocked(useOptionalLoadedConversations).mockReturnValue({
+      ...conversationPage([conversation("c_9", { background_work_running: true })]).data!,
+      pageParams: [undefined],
+    });
+    rerender(renderWorkflowPage());
+    expect(within(row).queryByTestId("plan-continue")).toBeNull();
+    expect(within(row).queryByTestId("plan-stop")).toBeNull();
+
+    vi.mocked(hooks.useScheduledTaskRunSteps).mockReturnValue(
+      new Map([
+        [
+          "run_1",
+          {
+            ...STEPS,
+            planGraphRevision: undefined,
+            statuses: [STEPS.statuses[0]!, { ...STEPS.statuses[0]!, id: "s2", step: "fix" }],
+          },
+        ],
+      ]),
+    );
+    rerender(renderWorkflowPage());
+    expect(within(row).getByRole("button", { name: "Stop" })).toBeInTheDocument();
   });
 
   it.each([false, true])(
