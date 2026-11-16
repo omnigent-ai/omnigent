@@ -268,6 +268,21 @@ ID. A run of an automation that starts from a session copies the session's
 history but not its journal, so the run plans its own work. See
 [Automations](AUTOMATIONS.md).
 
+## Check-ins
+
+While a run has work left, the workflow skill keeps one repeating check-in
+timer: `sys_timer_set` every ten minutes with the note `workflow check-in`,
+its `timer_id` recorded in a journal note. Each firing wakes the agent to read
+its journal, update statuses and continue ready steps, or end its turn quietly
+when everything left waits on someone. It cancels the timer when the workflow
+concludes or on Stop, and sets it again on Continue, Run or Retry; a message
+from the user doesn't cancel it. On a server with the `durable_timers` release
+feature, the server keeps the timer, so a check-in still comes after the
+runner stops or the server restarts, and it skips a firing while the session
+is busy or waiting on the user. A check-in names no automation run on the
+session, so the journal keeps the run's progress. See
+[Automations](AUTOMATIONS.md) for timers the server keeps.
+
 ## Tasks
 
 A session's work shows as one list of **tasks**, in two places that always
