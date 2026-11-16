@@ -448,6 +448,8 @@ describe("FolderTree directory search results", () => {
     // The ancestor was auto-expanded (its lazy child rendered); the target
     // itself stays collapsed, like clicking a folder in the tree.
     expect(subRow).toHaveAttribute("aria-expanded", "false");
+    // The reveal counts as the user's expansion, so a reload reopens it.
+    expect(readFilesTreeExpandedPaths("conv_reveal", "")).toEqual(["src"]);
   });
 
   it("flashes a deep revealed folder once its ancestors' lazy levels resolve", async () => {

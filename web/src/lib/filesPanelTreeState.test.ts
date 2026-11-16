@@ -137,6 +137,14 @@ describe("filesPanelTreeState", () => {
     expect(readFilesTreeBrowseLocation("conv_a")).toBe("/srv");
   });
 
+  it("drops only the newest session when nothing in it can be trimmed to fit", () => {
+    writeFilesTreeBrowseLocation("conv_other", "/srv");
+    writeFilesTreeBrowseLocation("conv_huge", `/${"z".repeat(MAX_STORE_CHARS)}`);
+
+    expect(readFilesTreeBrowseLocation("conv_other")).toBe("/srv");
+    expect(readFilesTreeBrowseLocation("conv_huge")).toBeNull();
+  });
+
   it("keeps navigation on this page when storage refuses the write", () => {
     const setItem = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
       throw new Error("quota exceeded");
@@ -172,6 +180,24 @@ describe("filesPanelTreeState", () => {
 
     writeFilesTreeExpandedPaths("conv_b", "", ["docs"]);
     expect(readFilesTreeBrowseLocation("conv_a")).toBe("/opt");
+  });
+
+  it("keeps this page's unsaved copy when another tab only evicts the session", () => {
+    localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify([{ id: "conv_a", state: { browseLocation: "/old", expanded: [] } }]),
+    );
+    const setItem = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new Error("quota exceeded");
+    });
+    writeFilesTreeBrowseLocation("conv_a", "/srv");
+    setItem.mockRestore();
+
+    saveFromAnotherTab([{ id: "conv_c", state: { browseLocation: "/opt", expanded: [] } }]);
+    expect(readFilesTreeBrowseLocation("conv_a")).toBe("/srv");
+
+    writeFilesTreeExpandedPaths("conv_b", "", ["docs"]);
+    expect(readFilesTreeBrowseLocation("conv_a")).toBe("/srv");
   });
 
   it("treats malformed storage as empty and recovers on the next write", () => {

@@ -88,6 +88,21 @@ describe("Files panel hidden-files preference", () => {
     expect(second.result.current).toBe(true);
   });
 
+  it("shows hidden files again even when storage can't remove the saved choice", () => {
+    writeFilesPanelShowHidden(false);
+    vi.spyOn(Storage.prototype, "removeItem").mockImplementation(() => {
+      throw new Error("access denied");
+    });
+    const first = renderHook(() => useFilesPanelShowHidden());
+    const second = renderHook(() => useFilesPanelShowHidden());
+    expect(first.result.current).toBe(false);
+
+    act(() => writeFilesPanelShowHidden(true));
+    expect(first.result.current).toBe(true);
+    expect(second.result.current).toBe(true);
+    expect(localStorage.getItem(FILES_PANEL_SHOW_HIDDEN_STORAGE_KEY)).toBe("false");
+  });
+
   it("lets another window's choice replace one storage refused here", () => {
     const setItem = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
       throw new Error("quota exceeded");

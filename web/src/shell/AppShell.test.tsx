@@ -44,6 +44,7 @@ import { clearOptimisticTitles, recordOptimisticTitle } from "@/lib/optimisticTi
 import { writeOpenLinksInApp } from "@/lib/linkOpenPreferences";
 import { maybeOpenLinkInApp } from "@/lib/openLinkInApp";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
+import { readFilesPanelShowHidden } from "@/lib/filesPanelPreferences";
 import { writeWorkspacePanelDefault } from "@/lib/workspacePanelPreferences";
 import { writePinnedWorkspaceTabs } from "@/lib/workspaceTabPreferences";
 
@@ -283,12 +284,29 @@ vi.mock("@/components/blocks/TerminalView", () => ({
   ),
 }));
 vi.mock("./FilesPanelDrawer", () => ({
-  FilesPanelDrawer: ({ open, flatView }: { open: boolean; flatView: boolean }) => (
+  FilesPanelDrawer: ({
+    open,
+    flatView,
+    showHidden,
+    onShowHiddenChange,
+  }: {
+    open: boolean;
+    flatView: boolean;
+    showHidden: boolean;
+    onShowHiddenChange: (showHidden: boolean) => void;
+  }) => (
     <div
       data-testid="files-panel-drawer"
       data-state={open ? "open" : "closed"}
       data-flat-view={String(flatView)}
-    />
+      data-show-hidden={String(showHidden)}
+    >
+      <button
+        type="button"
+        aria-label="drawer: toggle hidden"
+        onClick={() => onShowHiddenChange(!showHidden)}
+      />
+    </div>
   ),
 }));
 vi.mock("./TerminalsPanel", () => ({
@@ -5264,6 +5282,11 @@ describe("Mobile session menu", () => {
     const drawer = screen.getByTestId("files-panel-drawer");
     expect(drawer).toHaveAttribute("data-state", "open");
     expect(drawer).toHaveAttribute("data-flat-view", "false");
+
+    // Hiding hidden files from the drawer saves the same device-wide choice.
+    fireEvent.click(screen.getByRole("button", { name: "drawer: toggle hidden" }));
+    expect(drawer).toHaveAttribute("data-show-hidden", "false");
+    expect(readFilesPanelShowHidden()).toBe(false);
   });
 
   it("opens the files drawer in the changed-only list from the Changes entry", () => {

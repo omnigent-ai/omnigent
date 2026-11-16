@@ -99,7 +99,9 @@ if (typeof window !== "undefined") {
     const before = parseStore(event.oldValue);
     const after = parseStore(event.newValue);
     for (const id of [...unsavedSessions.keys()]) {
-      if (sessionSnapshot(before, id) !== sessionSnapshot(after, id)) unsavedSessions.delete(id);
+      // A session the other tab merely evicted keeps this page's copy.
+      const next = sessionSnapshot(after, id);
+      if (next !== undefined && next !== sessionSnapshot(before, id)) unsavedSessions.delete(id);
     }
   });
 }
@@ -119,7 +121,7 @@ function serializeWithinBudget(store: Store): string {
     if (newestFits && store.length > 1) store.shift();
     // A session too big on its own loses its oldest locations, which fall back to defaults.
     else if (newest.state.expanded.length > 0) newest.state.expanded.shift();
-    else store.splice(0);
+    else store.pop();
     json = JSON.stringify(store);
   }
   return json;

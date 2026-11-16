@@ -1838,7 +1838,7 @@ describe("FilesPanel browse location", () => {
     fireEvent.click(screen.getByTestId("stub-picker-confirm"));
     first.unmount();
 
-    renderPanel({
+    const other = renderPanel({
       conversationId: "conv_loc_other",
       files: [],
       workingDir: "/home/user/proj",
@@ -1846,6 +1846,16 @@ describe("FilesPanel browse location", () => {
     });
 
     expect(useAllFilesMock).toHaveBeenLastCalledWith("conv_loc_other", expect.anything(), "");
+
+    // Returning to the first conversation restores its own folder.
+    other.unmount();
+    renderPanel({
+      conversationId: "conv_loc_owner",
+      files: [],
+      workingDir: "/home/user/proj",
+      reachable: UNCONFINED,
+    });
+    expect(useAllFilesMock).toHaveBeenLastCalledWith("conv_loc_owner", expect.anything(), "/etc");
   });
 
   it("browses a folder revealed from chat, live and on its next mount", () => {
