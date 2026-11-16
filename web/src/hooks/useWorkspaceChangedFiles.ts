@@ -579,7 +579,7 @@ export interface WorkspaceFileSearchResult {
   unavailable: boolean;
 }
 
-async function fetchWorkspaceFileSearch(
+export async function fetchWorkspaceFileSearch(
   conversationId: string,
   query: string,
   include: string,
@@ -828,7 +828,7 @@ function hasUnsafeSegments(rel: string): boolean {
 }
 
 /** A bounded parent-directory listing and whether more entries remain. */
-interface DirListingPage {
+export interface DirListingPage {
   files: WorkspaceFile[];
   /** True when the listing was truncated (`has_more`), so a file missing
    * from `files` may simply live past the page limit — absence unproven. */
@@ -940,41 +940,67 @@ export function useWorkspaceFileExists(
 ): WorkspaceFileExistence {
   const serveable = useWorkspaceServeable(conversationId);
   const candidate = path && (trusted || looksLikeWorkspaceFilePath(path)) ? path : null;
-  // Parent of a root-level file (no slash) is "" — the workspace root
-  // listing. For an absolute candidate the parent keeps its leading slash
-  // ("/etc/hosts" → "/etc", "/foo" → "/") so the fetch routes via base=host.
-  const parentDir = candidate
-    ? candidate.startsWith("/")
-      ? candidate.slice(0, candidate.lastIndexOf("/")) || "/"
-      : candidate.includes("/")
-        ? candidate.slice(0, candidate.lastIndexOf("/"))
-        : ""
-    : null;
-  const query = useQuery({
-    // Distinct prefix from `useWorkspaceDirectory` ("workspace-dir") because
-    // this query tolerates 404 and that one throws — they must not share a
-    // cache entry with conflicting queryFns.
-    queryKey: ["workspace-dir-listing", conversationId, parentDir],
-    queryFn: () => fetchDirEntriesTolerant(conversationId!, parentDir!),
-    enabled: !!conversationId && parentDir !== null && serveable !== false,
-    // Longer TTL than the root/changed-files queries (5s): a referenced file's
-    // existence rarely changes mid-conversation, and this fires per inline
-    // path span, so a 30s cache keeps repeated mentions from re-listing.
-    staleTime: 30_000,
-  });
+  const parentDir = candidate ? workspaceParentDirectory(candidate) : null;
+  const query = useQuery(
+    workspaceDirListingQuery(
+      conversationId,
+      parentDir,
+      !!conversationId && parentDir !== null && serveable !== false,
+    ),
+  );
   // No candidate = the check was SKIPPED (not path-shaped and untrusted),
   // not run-and-found-nothing — it must never read as "verified absent".
   if (!candidate) return { exists: false, isDirectory: false, settled: false };
-  const listing = query.data ?? null;
-  const entry = listing?.files.find((e) => e.path === candidate);
-  // Only a listing that genuinely completed proves absence: errors and
-  // unavailable-runner responses (data === null) leave the answer open. A
-  // hit settles even a truncated page, but a miss on a truncated page
-  // doesn't — the file may simply live past the page limit.
+  return workspaceListingVerdict(query.isSuccess ? query.data : null, candidate);
+}
+
+/**
+ * Parent directory of a workspace-relative or host-absolute path: "" (the
+ * workspace root) for a root-level file, and a leading slash kept for an
+ * absolute one ("/etc/hosts" → "/etc", "/foo" → "/") so it lists via base=host.
+ */
+export function workspaceParentDirectory(path: string): string {
+  if (path.startsWith("/")) return path.slice(0, path.lastIndexOf("/")) || "/";
+  return path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "";
+}
+
+/**
+ * Query for the bounded listing of `parentDir`, shared by every existence
+ * check of a file in that directory through the React Query cache.
+ */
+export function workspaceDirListingQuery(
+  conversationId: string | undefined,
+  parentDir: string | null,
+  enabled: boolean,
+) {
+  return {
+    // Distinct prefix from `useWorkspaceDirectory` ("workspace-dir") because
+    // this query tolerates 404 and that one throws — they must not share a
+    // cache entry with conflicting queryFns.
+    queryKey: ["workspace-dir-listing", conversationId, parentDir] as const,
+    queryFn: () => fetchDirEntriesTolerant(conversationId!, parentDir!),
+    enabled: enabled && !!conversationId && parentDir !== null,
+    // A referenced file's existence rarely changes mid-conversation, and this
+    // fires per cited path, so a 30s cache keeps repeated mentions from re-listing.
+    staleTime: 30_000,
+  };
+}
+
+/**
+ * What a completed parent listing (or null while none has completed) says
+ * about `path`. Only a listing that genuinely completed proves absence: errors
+ * and unavailable-runner responses leave the answer open. A hit settles even
+ * a truncated page, but a miss on one doesn't — the file may lie past the limit.
+ */
+export function workspaceListingVerdict(
+  listing: DirListingPage | null | undefined,
+  path: string,
+): WorkspaceFileExistence {
+  const entry = listing?.files.find((e) => e.path === path);
   return {
     exists: entry?.type === "file",
     isDirectory: entry?.type === "directory",
-    settled: query.isSuccess && listing !== null && (!!entry || !listing.truncated),
+    settled: !!listing && (!!entry || !listing.truncated),
   };
 }
 
