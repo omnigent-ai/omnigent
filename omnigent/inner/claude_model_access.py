@@ -160,13 +160,12 @@ def _claude_managed_preferences_paths() -> tuple[Path, ...]:
         return ()
     import pwd
 
-    try:
-        username = pwd.getpwuid(os.geteuid()).pw_name
-    except (KeyError, OSError):
-        raise ValueError("cannot resolve managed Claude preferences account") from None
     root = Path("/Library/Managed Preferences")
     name = "com.anthropic.claudecode.plist"
-    return (root / username / name, root / name)
+    try:
+        return (root / pwd.getpwuid(os.geteuid()).pw_name / name, root / name)
+    except (KeyError, OSError):
+        raise ValueError("cannot resolve managed Claude preferences account") from None
 
 
 class _UniqueManagedDict(dict[str, object]):
