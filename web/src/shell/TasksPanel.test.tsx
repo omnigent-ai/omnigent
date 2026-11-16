@@ -31,15 +31,20 @@ import { conversation, conversationPage } from "@/test/sidebarMockHelpers";
 import { TasksPanel, type TaskMenuAction } from "./TasksPanel";
 
 // The graph has its own tests (React Flow runs out of memory in jsdom); here the
-// full-screen view lists where each task stands, and its ⋯ action.
+// full-screen view lists the steps it draws, where each task stands, and its ⋯ action.
 vi.mock("@/components/workflows/WorkflowStepsGraph", () => ({
   WorkflowGraphOverlay: (props: {
     title: string;
+    steps: readonly { id: string; depends_on: string[] }[];
     progress?: StepProgress[];
     menuActionFor?: (item: StepProgress) => TaskMenuAction | undefined;
     onClose: () => void;
   }) => (
-    <div data-testid="workflow-graph-overlay" data-title={props.title}>
+    <div
+      data-testid="workflow-graph-overlay"
+      data-title={props.title}
+      data-steps={props.steps.map((step) => `${step.id}<${step.depends_on.join("+")}`).join(" ")}
+    >
       {props.progress?.map((item) => `${item.step.id}:${item.state}`).join(" ")}
       {props.progress?.map((item) => {
         const menuAction = props.menuActionFor?.(item);
@@ -803,10 +808,11 @@ describe("TasksPanel", () => {
     const taskAction = vi.fn();
     const withdraw = registerTaskAction("conv", taskAction);
     try {
-      renderPanel();
+      const { rerender } = renderPanel();
       fireEvent.click(screen.getByTestId("tasks-plan-graph"));
       const overlay = await screen.findByTestId("workflow-graph-overlay");
       expect(overlay).toHaveAttribute("data-title", "The plan");
+      expect(overlay).toHaveAttribute("data-steps", "baseline< batch<baseline pool<baseline");
       expect(overlay).toHaveTextContent("baseline:done batch:failed pool:needs_input");
       fireEvent.click(within(overlay).getByRole("button", { name: "retry batch" }));
       expect(taskAction).toHaveBeenCalledWith("retry", "batch");
@@ -822,6 +828,22 @@ describe("TasksPanel", () => {
           name: "Close graph",
         }),
       );
+      expect(screen.queryByTestId("workflow-graph-overlay")).toBeNull();
+
+      // Leaving the session closes the graph, and coming back doesn't reopen it.
+      fireEvent.click(screen.getByTestId("tasks-plan-graph"));
+      await screen.findByTestId("workflow-graph-overlay");
+      const showSession = (conversationId: string) =>
+        rerender(
+          <>
+            <TasksPanel conversationId={conversationId} active />
+            <SearchProbe />
+          </>,
+        );
+      showSession("other");
+      expect(screen.queryByTestId("workflow-graph-overlay")).toBeNull();
+      showSession("conv");
+      expect(screen.getByTestId("tasks-plan-graph")).toBeTruthy();
       expect(screen.queryByTestId("workflow-graph-overlay")).toBeNull();
     } finally {
       act(withdraw);

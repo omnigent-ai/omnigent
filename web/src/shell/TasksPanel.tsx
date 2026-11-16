@@ -1230,14 +1230,19 @@ export function TasksPanel({
     // The rail or drawer may still be opening; its rows mount by the next frame.
     requestAnimationFrame(() => jumpToStep(taskToShow.stepId));
   }, [active, showPlan, taskToShow, conversationId, jumpToStep]);
-  // The session whose plan is open on the graph, so switching sessions closes it.
-  const [graphSessionId, setGraphSessionId] = useState<string | null>(null);
+  const [graphOpen, setGraphOpen] = useState(false);
+  // The panel stays mounted across sessions, so a switch closes the graph rather than hiding it.
+  const [graphConversationId, setGraphConversationId] = useState(conversationId);
+  if (graphConversationId !== conversationId) {
+    setGraphConversationId(conversationId);
+    setGraphOpen(false);
+  }
   const location = useLocation();
   const navigate = useNavigate();
   const showInChat = useCallback(
     (markerId: string) => {
       // The graph covers the chat it scrolls.
-      setGraphSessionId(null);
+      setGraphOpen(false);
       onShowInChat?.();
       const pathname = `/c/${encodeURIComponent(conversationId)}`;
       const search = messageDeepLinkParams(new URLSearchParams(location.search), markerId);
@@ -1351,7 +1356,7 @@ export function TasksPanel({
                   ? undefined
                   : stopActiveWork
               }
-              onOpenGraph={plan ? () => setGraphSessionId(conversationId) : undefined}
+              onOpenGraph={plan ? () => setGraphOpen(true) : undefined}
             />
             <TaskList
               progress={progress}
@@ -1362,14 +1367,14 @@ export function TasksPanel({
               menuActionFor={menuActionFor}
               nativeMarkerIds={nativeMarkerIds}
             />
-            {plan && graphSessionId === conversationId && (
+            {plan && graphOpen && (
               <Suspense fallback={null}>
                 <WorkflowGraphOverlay
                   title={planName(plan) ?? "Tasks"}
                   steps={progress.map((item) => item.step)}
                   progress={progress}
                   menuActionFor={menuActionFor}
-                  onClose={() => setGraphSessionId(null)}
+                  onClose={() => setGraphOpen(false)}
                 />
               </Suspense>
             )}
