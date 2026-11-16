@@ -107,6 +107,11 @@ function needsContainer(content: Node, tag: string): boolean {
 }
 
 // MathML annotations hold a formula's source, which browsers don't render.
+// Kept tags that a range boundary can touch without selecting their content.
+const BLOCK_TAGS = new Set(["p", "pre", "blockquote", "ul", "ol", "li", "table", "tr", "td", "th"]);
+for (const level of [1, 2, 3, 4, 5, 6]) BLOCK_TAGS.add(`h${level}`);
+for (const section of ["thead", "tbody", "tfoot"]) BLOCK_TAGS.add(section);
+
 const UNCOPIED_TEXT_TAGS = new Set(["script", "style", "template", "annotation"]);
 
 /** Whether the browser leaves text inside `element` out of a copy. */
@@ -225,8 +230,9 @@ function appendSelected(source: Node, target: Node, view: SelectionView): void {
       if (replacement) target.appendChild(document.createTextNode(replacement));
       continue;
     }
-    if (child.localName === "li" && !isSelected(child, view)) continue;
     const tag = pasteableHref(child) ? "a" : keptTag(child);
+    // A range edge at a block's start or end touches it without selecting it.
+    if (tag && BLOCK_TAGS.has(tag) && !isSelected(child, view)) continue;
     if (!tag) {
       appendSelected(child, target, view);
       continue;
@@ -388,7 +394,12 @@ export function copySelectionWithLinks(event: ClipboardEvent<HTMLElement>): void
     return;
   }
   if (!payload) return;
+  try {
+    event.clipboardData.setData("text/plain", payload.text);
+    event.clipboardData.setData("text/html", payload.html);
+  } catch {
+    return;
+  }
+  // Cancel the browser's copy only once both flavors are written.
   event.preventDefault();
-  event.clipboardData.setData("text/plain", payload.text);
-  event.clipboardData.setData("text/html", payload.html);
 }

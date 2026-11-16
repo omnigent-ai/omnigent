@@ -278,7 +278,8 @@ describe("copying a selection from an agent reply", () => {
 
   it("leaves code block controls out of the copied HTML", async () => {
     const section = await renderReply("See [docs](https://example.com).\n\n```sh\necho hi\n```");
-    select(section, "See", "echo hi");
+    // Highlighting can split "echo hi" across token spans.
+    select(section, "See", "hi");
 
     const { flavors } = copy(section);
 
@@ -315,6 +316,21 @@ describe("copying a selection from an agent reply", () => {
     expect(payload?.text).toBe("Open notes.md, see  and [docs](<https://example.com>)");
   });
 
+  it("copies only safe links and no attributes or scripts into the HTML", () => {
+    const root = document.body.appendChild(document.createElement("div"));
+    root.innerHTML =
+      '<p style="color: red" onclick="alert(1)">Go <a href="javascript:alert(1)">bad</a>, ' +
+      '<a href="https://example.com" onmouseover="alert(1)" class="x">good</a>' +
+      "<script>alert(1)</script><iframe></iframe></p>";
+    const range = document.createRange();
+    range.selectNodeContents(root);
+
+    const payload = selectionToLinkedPayload(range, root, "Go bad, good");
+    root.remove();
+
+    expect(payload?.html).toBe('<p>Go bad, <a href="https://example.com">good</a></p>');
+  });
+
   it("keeps the browser's copy for a selection without a pasteable link", async () => {
     const section = await renderReply("Plain **prose** and [a file](src/App.tsx) here.");
     select(section, "Plain", "here.");
@@ -335,6 +351,23 @@ describe("copying a selection from an agent reply", () => {
 
     expect(prevented).toBe(false);
     expect(flavors).toEqual({});
+  });
+
+  it("keeps the browser's copy when writing the clipboard fails", async () => {
+    const section = await renderReply("Read [docs](https://example.com) first.");
+    select(section, "Read", "first.");
+    const event = createEvent.copy(section);
+    Object.defineProperty(event, "clipboardData", {
+      value: {
+        setData: (type: string) => {
+          if (type === "text/html") throw new Error("write failed");
+        },
+      },
+    });
+
+    fireEvent(section, event);
+
+    expect(event.defaultPrevented).toBe(false);
   });
 
   it("keeps the browser's copy when the conversion fails", async () => {
@@ -366,6 +399,19 @@ describe("copying a selection from an agent reply", () => {
 
     expect(flavors["text/plain"]).toBe("Read [docs](<https://example.com/>) first.");
     expect(flavors["text/html"]).toContain('<a href="https://example.com/">docs</a>');
+  });
+
+  it("leaves out blocks the selection only touches at its edges", async () => {
+    const section = await renderReply("Before.\n\nRead [docs](https://example.com).\n\nAfter.");
+    const range = document.createRange();
+    range.setStart(textNodeContaining(section, "Before."), "Before.".length);
+    range.setEnd(textNodeContaining(section, "After."), 0);
+    window.getSelection()!.removeAllRanges();
+    window.getSelection()!.addRange(range);
+
+    expect(copy(section).flavors["text/html"]!.replace(/>\s+</g, "><")).toBe(
+      '<p>Read <a href="https://example.com/">docs</a>.</p>',
+    );
   });
 
   it("keeps the browser's copy for a selection that runs past the reply", async () => {
