@@ -19486,7 +19486,7 @@
             "schema": {
               "anyOf": [
                 {
-                  "maxLength": 64,
+                  "maxLength": 256,
                   "type": "string"
                 },
                 {

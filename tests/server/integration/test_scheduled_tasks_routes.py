@@ -8,6 +8,7 @@ validation (400s) and live-scheduler sync on every mutation.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import uuid
 from collections.abc import AsyncIterator, Callable, Iterator
@@ -3908,18 +3909,24 @@ async def test_create_saves_the_store_allocated_id_and_releases_an_unsaved_one(
     monkeypatch: pytest.MonkeyPatch,
     failure: str | None,
 ) -> None:
+    import threading
+
     from omnigent.errors import ErrorCode, OmnigentError
     from omnigent.stores.conversation_store import SCHEDULED_TASK_SOURCE_LABEL_KEY
 
     # A deployment's own ID, in the UUID form the SQL store's columns hold.
     allocated = uuid.uuid5(uuid.NAMESPACE_URL, "https://example.com/automations/1").hex
     calls: list[tuple[str, object]] = []
+    # Both may reach an external service, so they run off the event loop.
+    threads: set[int] = set()
 
     def _allocate(self: Any, *, user_id: str | None, name: str) -> str:
+        threads.add(threading.get_ident())
         calls.append(("allocate", (user_id, name)))
         return allocated
 
     def _release(self: Any, scheduled_task_id: str) -> None:
+        threads.add(threading.get_ident())
         calls.append(("release", scheduled_task_id))
         # Best-effort: the client still gets the original error.
         raise RuntimeError("release unavailable")
@@ -3938,6 +3945,7 @@ async def test_create_saves_the_store_allocated_id_and_releases_an_unsaved_one(
     )
 
     allocation = ("allocate", ("alice@example.com", "nightly triage"))
+    assert threads and threading.get_ident() not in threads
     if failure is not None:
         assert resp.status_code == (404 if failure == "missing source" else 400), resp.text
         assert calls == [allocation, ("release", allocated)]
@@ -3947,6 +3955,58 @@ async def test_create_saves_the_store_allocated_id_and_releases_an_unsaved_one(
     copy = SqlAlchemyConversationStore(db_uri).get_conversation(resp.json()["source_session_id"])
     assert copy is not None and copy.labels[SCHEDULED_TASK_SOURCE_LABEL_KEY] == allocated
     assert calls == [allocation]
+
+
+@pytest.mark.parametrize("stage", ["allocate", "release"])
+async def test_a_cancelled_create_waits_to_release_its_id(
+    auth_client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch, stage: str
+) -> None:
+    import threading
+
+    loop = asyncio.get_running_loop()
+    entered = asyncio.Event()
+    unblock = threading.Event()
+    allocated = uuid.uuid5(uuid.NAMESPACE_URL, "https://example.com/automations/2").hex
+    released: list[str] = []
+
+    def _hold() -> None:
+        loop.call_soon_threadsafe(entered.set)
+        assert unblock.wait(5)
+
+    def _allocate(self: Any, *, user_id: str | None, name: str) -> str:
+        if stage == "allocate":
+            _hold()
+        return allocated
+
+    def _release(self: Any, scheduled_task_id: str) -> None:
+        if stage == "release":
+            _hold()
+        released.append(scheduled_task_id)
+
+    monkeypatch.setattr(SqlAlchemyScheduledTaskStore, "allocate_scheduled_task_id", _allocate)
+    monkeypatch.setattr(SqlAlchemyScheduledTaskStore, "release_scheduled_task_id", _release)
+    # A missing source fails the create after allocation, so its release runs.
+    source_id = uuid.uuid4().hex if stage == "release" else _session_with_history(db_uri)
+    pending = asyncio.create_task(
+        auth_client.post(
+            "/v1/scheduled-tasks",
+            json=_create_body(source_session_id=source_id),
+            headers=_headers(),
+        )
+    )
+    await asyncio.wait_for(entered.wait(), 5)
+    # A second cancellation must not interrupt the wait either.
+    for _ in range(2):
+        pending.cancel()
+        await asyncio.sleep(0)
+    done, _ = await asyncio.wait({pending}, timeout=0.2)
+    assert not done
+    unblock.set()
+    with contextlib.suppress(asyncio.CancelledError):
+        await asyncio.wait_for(pending, 5)
+
+    assert released == [allocated]
+    assert SqlAlchemyScheduledTaskStore(db_uri).get(allocated) is None
 
 
 async def test_a_copy_that_cannot_take_every_file_is_deleted(

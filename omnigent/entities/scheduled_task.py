@@ -147,8 +147,8 @@ class ScheduledTaskRun:
     table.
 
     :param id: UUID primary key (bare 32-char hex string, no dashes).
-    :param scheduled_task_id: The task this run belongs to (a bare 32-char hex
-        UUID string).
+    :param scheduled_task_id: The ID of the task this run belongs to; by default a
+        bare 32-char hex UUID.
     :param status: Lifecycle state — one of ``"scheduled"``, ``"starting"``, ``"running"``,
         ``"succeeded"``, ``"failed"``, ``"skipped"``.
     :param scheduled_at: Unix epoch seconds. Persistent dispatch records the

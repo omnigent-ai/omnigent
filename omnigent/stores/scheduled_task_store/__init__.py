@@ -102,12 +102,15 @@ class ScheduledTaskStore(ABC):
         """
         Return the ID for a task the create route is about to save with :meth:`create`.
 
-        Called before the task exists, since the ID labels the task's source-session
-        copy and derives its sandbox host IDs. If creation then fails before the row
-        is written, the route calls :meth:`release_scheduled_task_id`. A deployment
-        that allocates IDs in another form, e.g. an external object's ID, must
-        translate them for the store's ID columns itself; the SQL store's are 16-byte
-        UUIDs.
+        Called in a worker thread before the task exists, since the ID labels the
+        task's source-session copy and derives its sandbox host IDs. If creation then
+        fails before the row is written, the route calls
+        :meth:`release_scheduled_task_id`. A deployment that allocates IDs in another
+        form, e.g. an external object's ID, must translate them for every ID column
+        itself: the SQL store keeps them as 16-byte UUIDs in ``scheduled_tasks.id``,
+        ``scheduled_task_runs.scheduled_task_id`` and
+        ``scheduled_task_shares.scheduled_task_id``. The runner's agent tools only
+        accept IDs matching ``[A-Za-z0-9_-]{1,128}``.
 
         :param user_id: The task's owner; ``None`` in single-user mode.
         :param name: The task's name, e.g. ``"nightly triage"``.
@@ -120,9 +123,11 @@ class ScheduledTaskStore(ABC):
         """
         Give back an ID from :meth:`allocate_scheduled_task_id` whose task was never saved.
 
-        Called at most once per ID, when :meth:`create` raised or was never reached;
-        never after a task is created. Best-effort: the route logs what this raises
-        and returns the original error. A no-op by default.
+        Called in a worker thread at most once per ID, when :meth:`create` raised or
+        was never reached; never after it returned. A ``create`` that raises after its
+        commit succeeded (a dropped connection, say) leaves a saved task with the ID,
+        so a deployment should first check that no saved task has it. Best-effort: the
+        route logs what this raises and returns the original error. A no-op by default.
 
         :param scheduled_task_id: The allocated ID.
         """

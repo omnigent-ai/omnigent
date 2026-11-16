@@ -19,7 +19,7 @@ import asyncio
 import contextlib
 import logging
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any, Literal
@@ -32,6 +32,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from omnigent.db.account_authority import account_generation, current_account_user
 from omnigent.entities import Agent, Conversation, ScheduledTask, ScheduledTaskRun
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.inner._subprocess_lifecycle import await_cleanup_task
 from omnigent.runner.identity import (
     ORCHESTRATION_SOURCE_HEADER,
     RUNNER_TUNNEL_TOKEN_HEADER,
@@ -924,22 +925,43 @@ def create_scheduled_tasks_router(
         except Exception:
             _logger.exception("could not delete the unused session copy %s", session_id)
 
-    @contextlib.contextmanager
-    def _allocated_task_id(owner_id: str | None, name: str) -> Iterator[str]:
+    @contextlib.asynccontextmanager
+    async def _allocated_task_id(owner_id: str | None, name: str) -> AsyncIterator[str]:
         """Allocate a new task's ID, releasing it if the block fails, cancellation included.
 
         The block must end once the store saves the task, so a saved task keeps its ID.
         """
-        task_id = store.allocate_scheduled_task_id(user_id=owner_id, name=name)
+        # An allocator may create an external object, which a cancel must not leak.
+        allocating = asyncio.create_task(
+            asyncio.to_thread(store.allocate_scheduled_task_id, user_id=owner_id, name=name)
+        )
+        try:
+            task_id = await asyncio.shield(allocating)
+        except asyncio.CancelledError:
+
+            async def settle_and_release() -> None:
+                # A failed allocation has no ID to release.
+                with contextlib.suppress(Exception):
+                    await _release_task_id_quietly(await allocating)
+
+            await await_cleanup_task(asyncio.create_task(settle_and_release()))
+            raise
         try:
             yield task_id
         except BaseException:
-            try:
-                store.release_scheduled_task_id(task_id)
-            except Exception:
-                # The original error still reaches the client.
-                _logger.exception("could not release the unused scheduled task ID %s", task_id)
+            await _release_task_id_quietly(task_id)
             raise
+
+    async def _release_task_id_quietly(task_id: str) -> None:
+        """Release an unused task ID, finishing through cancellations; failures are only logged."""
+        releasing = asyncio.create_task(
+            asyncio.to_thread(store.release_scheduled_task_id, task_id)
+        )
+        try:
+            await await_cleanup_task(releasing)
+        except Exception:
+            # The original error still reaches the client.
+            _logger.exception("could not release the unused scheduled task ID %s", task_id)
 
     async def _require_mode_fits_session(request: Request, task: ScheduledTask) -> None:
         """Reject a mode change that leaves *task*'s continued session unable to take prompts.
@@ -1007,7 +1029,7 @@ def create_scheduled_tasks_router(
         project_owner = _project_owner(owner)
         # Known before the task exists, since a sandbox session must run on the
         # sandbox host derived from it.
-        with _allocated_task_id(owner_id, body.name) as task_id:
+        async with _allocated_task_id(owner_id, body.name) as task_id:
             host_id = body.host_id
             source: Conversation | None = None
             source_up_to = ""
@@ -1066,6 +1088,7 @@ def create_scheduled_tasks_router(
                         project_id=project_id,
                         carry=carry,
                     )
+                # Synchronous, so a cancel can't land after the save and release the saved ID.
                 task = store.create(
                     scheduled_task_id=task_id,
                     name=body.name,

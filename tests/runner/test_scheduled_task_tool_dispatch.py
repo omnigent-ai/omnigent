@@ -566,8 +566,12 @@ def test_every_advertised_field_is_forwarded(
 @pytest.mark.parametrize(
     ("task_id", "path_id"),
     # A deployment may allocate IDs that are not UUIDs; those keep their case.
-    [(_TASK_ID.upper(), _TASK_ID), ("4611686018427387904", "4611686018427387904")],
-    ids=["uuid", "decimal"],
+    [
+        (_TASK_ID.upper(), _TASK_ID),
+        ("4611686018427387904", "4611686018427387904"),
+        ("Ab3_x-9", "Ab3_x-9"),
+    ],
+    ids=["uuid", "decimal", "mixed-case"],
 )
 async def test_delete_by_id(task_id: str, path_id: str) -> None:
     client = _RecordingClient(_Resp(body={"deleted": True, "id": "t1"}))
