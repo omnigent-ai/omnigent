@@ -136,6 +136,7 @@ interface RunsPage {
 
 interface RawRun {
   id: string;
+  plan_graph_revision?: string | number | null;
   session_id: string;
   title: string;
   started_at: number;
@@ -174,6 +175,7 @@ export function useWorkflowRuns(workflowId: string) {
       return {
         runs: (body.data ?? []).map((run) => ({
           id: run.id,
+          planGraphRevision: run.plan_graph_revision ?? undefined,
           sessionId: run.session_id,
           title: run.title,
           startedAt: run.started_at,

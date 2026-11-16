@@ -242,14 +242,14 @@ describe("runSavedWorkflowPrompt", () => {
 
   it("asks the workflow skill to run the saved workflow by ID", () => {
     expect(runSavedWorkflowPrompt(workflow)).toBe(
-      'Use the workflow skill to run the saved workflow "Triage flaky tests" (ID 0123456789abcdef0123456789abcdef).',
+      'Use the workflow skill to run the saved workflow "Triage flaky tests" (ID 0123456789abcdef0123456789abcdef).\n\nIf the session journal already contains this workflow\'s plan, continue that run without writing a second starting plan.',
     );
     expect(runSavedWorkflowPrompt(workflow, "  \n")).toBe(runSavedWorkflowPrompt(workflow));
   });
 
   it("adds the run's additional instructions as their own paragraph", () => {
     expect(runSavedWorkflowPrompt(workflow, "  Only the upload tests.\n")).toBe(
-      'Use the workflow skill to run the saved workflow "Triage flaky tests" (ID 0123456789abcdef0123456789abcdef).\n\nOnly the upload tests.',
+      `${runSavedWorkflowPrompt(workflow)}\n\nOnly the upload tests.`,
     );
   });
 });

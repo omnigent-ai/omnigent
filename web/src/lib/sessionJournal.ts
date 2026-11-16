@@ -126,6 +126,32 @@ export function currentPlan(entries: readonly JournalEntry[]): JournalEntry | nu
   return entries.findLast((entry) => entry.kind === "plan") ?? null;
 }
 
+/** The current graph's revision, preserved across saves that only change plan metadata. */
+export function planGraphRevision(entries: readonly JournalEntry[]): string | number | undefined {
+  const plan = currentPlan(entries);
+  if (!plan) return undefined;
+  const recorded = plan.content.graph_revision;
+  if (typeof recorded === "string" || typeof recorded === "number") return recorded;
+  const graphKey = (entry: JournalEntry) => {
+    const graph = planSteps(entry).map((step) => [step.id, [...step.depends_on].sort()] as const);
+    graph.sort(([left], [right]) => left.localeCompare(right));
+    return JSON.stringify(graph);
+  };
+  const key = graphKey(plan);
+  let position = plan.position;
+  let previousPosition = plan.position;
+  for (let index = entries.indexOf(plan) - 1; index >= 0; index -= 1) {
+    const entry = entries[index];
+    if (entry.position !== previousPosition - 1) break;
+    previousPosition = entry.position;
+    if (entry.kind === "plan_status") break;
+    if (entry.kind !== "plan") continue;
+    if (graphKey(entry) !== key) break;
+    position = entry.position;
+  }
+  return position;
+}
+
 /**
  * The saved workflow the current plan came from. Only the plan that starts a
  * run names it, so a replan that keeps one of that plan's steps came from it
@@ -290,6 +316,44 @@ export function planTally(progress: readonly StepProgress[]): Record<StepState, 
   return tally;
 }
 
+/** Completed final steps supersede older statuses; newer plans or statuses can add unfinished work. */
+export function isPlanComplete(
+  progress: readonly StepProgress[],
+  planRevision?: string | number,
+): boolean {
+  const dependencies = new Set(progress.flatMap((item) => item.step.depends_on));
+  const finalSteps = progress.filter((item) => !dependencies.has(item.step.id));
+  const byId = new Map(progress.map((item) => [item.step.id, item]));
+  return (
+    finalSteps.length > 0 &&
+    finalSteps.every((finalStep) => {
+      if (finalStep.state !== "done") return false;
+      const finalStatus = finalStep.status;
+      const graphChangedAfterCompletion =
+        finalStatus !== null &&
+        (typeof planRevision === "number"
+          ? planRevision > finalStatus.position
+          : planRevision !== undefined && planRevision !== finalStatus.content.graph_revision);
+      const pending = [...finalStep.step.depends_on];
+      const seen = new Set<string>();
+      for (let id = pending.pop(); id !== undefined; id = pending.pop()) {
+        if (seen.has(id)) continue;
+        seen.add(id);
+        const upstream = byId.get(id);
+        if (!upstream) continue;
+        if (
+          upstream.state !== "done" &&
+          (graphChangedAfterCompletion ||
+            (upstream.status && finalStatus && upstream.status.position > finalStatus.position))
+        )
+          return false;
+        pending.push(...upstream.step.depends_on);
+      }
+      return true;
+    })
+  );
+}
+
 /** How many tasks are finished: done or failed, since a failed task's work is over too. */
 export function finishedTaskCount(progress: readonly StepProgress[]): number {
   return progress.filter((item) => item.state === "done" || item.state === "failed").length;
@@ -377,8 +441,14 @@ export function pausedLabel(
   progress: readonly StepProgress[],
   entries: readonly JournalEntry[],
   sessionWorking: boolean,
+  planRevision = planGraphRevision(entries),
 ): PausedLabel | null {
-  if (sessionWorking || progress.some((item) => item.state === "needs_input")) return null;
+  if (
+    sessionWorking ||
+    (planRevision !== undefined && isPlanComplete(progress, planRevision)) ||
+    progress.some((item) => item.state === "needs_input")
+  )
+    return null;
   const runnable = progress.some(
     (item) =>
       item.state === "ready" ||
@@ -395,12 +465,20 @@ export function pausedLabel(
  * the list ended ("All done", or "Finished, 1 failed").
  *
  * @param paused - What an idle list says, from {@link pausedLabel}.
+ * @param planRevision - Graph revision ID or legacy position, to recognize new prerequisites.
  */
 export function taskPreviewText(
   progress: readonly StepProgress[],
   paused: PausedLabel | null = null,
+  planRevision?: string | number,
 ): string | null {
   if (progress.length === 0) return null;
+  const failedCount = progress.filter((item) => item.state === "failed").length;
+  const finished = failedCount === 0 ? "All done" : `Finished, ${failedCount} failed`;
+  const livePrompt = progress.some(
+    (item) => item.state === "needs_input" && item.status && statusOf(item.status) === "started",
+  );
+  if (!livePrompt && isPlanComplete(progress, planRevision)) return finished;
   const order: StepState[] = ["needs_input", "running", "stopped", "ready", "waiting"];
   for (const state of order) {
     const item = progress.find((candidate) => candidate.state === state);
@@ -416,6 +494,5 @@ export function taskPreviewText(
     }
     return paused ? `${paused} · Next: ${item.step.name}` : `Next: ${item.step.name}`;
   }
-  const failed = progress.filter((item) => item.state === "failed").length;
-  return failed === 0 ? "All done" : `Finished, ${failed} failed`;
+  return finished;
 }

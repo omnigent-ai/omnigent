@@ -1,7 +1,7 @@
 /**
  * Scheduled-task DETAIL page (`/tasks/:taskId`) — opened by clicking a task
- * card on the `/tasks` list. Shows the task's header (title + edit / delete /
- * Run now), a status line (pause-resume toggle + Active/Paused pill + the
+ * card on the `/tasks` list. Shows the task's header (title + share / edit /
+ * delete / Run now), a status line (pause-resume toggle + Active/Paused pill + the
  * human-readable schedule + relative next-run), the Prompt, a Configuration
  * block with saved launch settings, and the run history.
  *
@@ -20,10 +20,11 @@ import {
   Loader2Icon,
   PencilIcon,
   PlayIcon,
+  ShareIcon,
   Trash2Icon,
   TriangleAlertIcon,
 } from "lucide-react";
-import { Link, useNavigate, useParams, useRebasePath } from "@/lib/routing";
+import { Link, useNavigate, useParams, useRebasePath, useSearchParams } from "@/lib/routing";
 import { getShareableSessionLink } from "@/lib/shareLink";
 import { PageScroll } from "@/components/PageScroll";
 import { Button } from "@/components/ui/button";
@@ -32,6 +33,7 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/component
 import { showToast } from "@/components/ui/toast";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { CreateScheduledTaskDialog } from "@/components/scheduled/CreateScheduledTaskDialog";
+import { PermissionsModal } from "@/components/PermissionsModal";
 import {
   decodeTriggerPrompt,
   hasTriggerHeader,
@@ -65,6 +67,7 @@ import {
 } from "@/hooks/useUnseenConversations";
 import { useNow } from "@/hooks/useNow";
 import { useSession } from "@/hooks/useSession";
+import { useViewerId } from "@/hooks/useViewerId";
 import { useSessionWorking } from "@/hooks/useSessionWorking";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import { useHosts } from "@/hooks/useHosts";
@@ -82,7 +85,14 @@ import {
   formatRunTimestamp,
 } from "@/lib/scheduleText";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { isFeatureEnabled, sandboxOptionLabel } from "@/lib/capabilities";
+import { AUTOMATION_SHARE_PARAM } from "@/lib/automationFromSession";
+import {
+  isFeatureEnabled,
+  isSharingOff,
+  sandboxOptionLabel,
+  SHARING_OFF_REASON,
+} from "@/lib/capabilities";
+import { canShareAutomation } from "@/lib/permissionsApi";
 import { ScheduledTaskApiError } from "@/lib/scheduledTasksApi";
 import type { ScheduledTaskRun, ScheduledTaskRunSteps } from "@/lib/scheduledTasksApi";
 import { stepProgress } from "@/lib/sessionJournal";
@@ -134,6 +144,11 @@ function TaskDetail({ taskId }: { taskId: string }) {
   const runNowMutation = useRunScheduledTaskNow();
 
   const [editOpen, setEditOpen] = useState(false);
+  const viewerId = useViewerId();
+  const [shareOpen, setShareOpen] = useState(false);
+  // A session's share dialog links here with the share parameter to open this one.
+  const [searchParams, setSearchParams] = useSearchParams();
+  const shareRequested = searchParams.get(AUTOMATION_SHARE_PARAM) === "1";
 
   // Clear the awaiting flag and its safety timer (shared by the effect and
   // the timer callback so neither leaks).
@@ -324,6 +339,9 @@ function TaskDetail({ taskId }: { taskId: string }) {
       ? "Agent default"
       : (permissionOption?.label ?? task.permissionMode);
   const scheduleSummary = describeSchedule(task.rrule, task.timezone);
+  const canShare = canShareAutomation(info, viewerId, task.ownerUserId);
+  // As for sessions, sharing off disables Share rather than hiding it.
+  const sharingOff = isSharingOff(info);
   const nextRun = formatNextRunAt(task.nextRunAt, now);
   // A single per-task busy flag: the header actions disable while any of this
   // task's mutations are in flight.
@@ -372,6 +390,20 @@ function TaskDetail({ taskId }: { taskId: string }) {
     });
   }
 
+  function handleShareOpenChange(next: boolean) {
+    setShareOpen(next);
+    if (!next && shareRequested) {
+      setSearchParams(
+        (current) => {
+          const params = new URLSearchParams(current);
+          params.delete(AUTOMATION_SHARE_PARAM);
+          return params;
+        },
+        { replace: true },
+      );
+    }
+  }
+
   function handleDelete() {
     // Optimistic navigation: on success return to the list (the row is already
     // gone from the invalidated list cache).
@@ -390,6 +422,41 @@ function TaskDetail({ taskId }: { taskId: string }) {
           {task.name}
         </h1>
         <div className="flex shrink-0 items-center gap-2">
+          {canShare &&
+            (sharingOff ? (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  {/* Disabled buttons don't receive pointer events, so the wrapper
+                      owns hover/focus for the explanatory tooltip. */}
+                  <span
+                    tabIndex={0}
+                    aria-label={`Share automation disabled: ${SHARING_OFF_REASON}`}
+                    className="inline-flex"
+                  >
+                    <Button
+                      variant="ghost"
+                      size="icon-sm"
+                      aria-label="Share automation"
+                      data-testid="task-detail-share"
+                      disabled
+                    >
+                      <ShareIcon className="size-4" />
+                    </Button>
+                  </span>
+                </TooltipTrigger>
+                <TooltipContent>{SHARING_OFF_REASON}</TooltipContent>
+              </Tooltip>
+            ) : (
+              <Button
+                variant="ghost"
+                size="icon-sm"
+                aria-label="Share automation"
+                data-testid="task-detail-share"
+                onClick={() => setShareOpen(true)}
+              >
+                <ShareIcon className="size-4" />
+              </Button>
+            ))}
           <Button
             variant="ghost"
             size="icon-sm"
@@ -605,6 +672,13 @@ function TaskDetail({ taskId }: { taskId: string }) {
         editingTask={task}
         sessionLink={sessionLink}
       />
+      {canShare && !sharingOff && (
+        <PermissionsModal
+          automation={task}
+          open={shareOpen || shareRequested}
+          onOpenChange={handleShareOpenChange}
+        />
+      )}
     </PageScroll>
   );
 }
@@ -701,7 +775,7 @@ function RunRow({
   run: ScheduledTaskRun;
   now: Date;
   highlighted: boolean;
-  /** The plan the run started with, independent of the automation's current prompt. */
+  /** The run's latest plan, independent of the automation's current prompt. */
   steps?: ScheduledTaskRunSteps;
 }) {
   const timestamp = formatRunTimestamp(run.firedAt ?? run.scheduledAt, now);
@@ -725,7 +799,7 @@ function RunRow({
   // Stop while the run's session works; play once it stopped with tasks left.
   const control =
     showTasks && steps?.isCurrent && steps.planId
-      ? planRunControl(progress, steps.statuses, sessionWorking)
+      ? planRunControl(progress, steps.statuses, sessionWorking, steps.planGraphRevision)
       : null;
   // What the run's buttons and task menus refresh once its session takes them.
   const refreshKeys = [

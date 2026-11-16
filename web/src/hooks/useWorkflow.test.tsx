@@ -25,6 +25,7 @@ const COMPLETED_RUN = {
 const RUNNING_RUN = {
   ...COMPLETED_RUN,
   id: "run_new",
+  plan_graph_revision: "graph-3",
   session_id: "session_new",
   title: "New run",
   started_at: 2,
@@ -143,6 +144,7 @@ describe("useWorkflowRuns live refresh", () => {
         serverRuns.map((run) => run.id),
       );
       expect(result.current.data?.pages[0].runs[0].sessionStatus).toBe("running");
+      expect(result.current.data?.pages[0].runs[0].planGraphRevision).toBe("graph-3");
 
       serverRuns = [
         { ...RUNNING_RUN, session_status: "idle", background_work_running: true },

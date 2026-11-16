@@ -9,14 +9,19 @@ list at Read, with the owner's authority:
   with anyone: each run, and each change to the automation's grants, syncs that
   session to the list, revoking any grant not on it except the owner's and
   ``__public__``.
+* An independent or sibling session launched from a run's session tree, directly
+  or through other launches, is granted as it is created to each grantee who still
+  holds a grant on that tree's root. Child sessions need nothing: their access
+  resolves through their root.
 
 Both grant lists are read a page at a time, never whole. A grant is revoked only
 once the automation's share table confirms its holder isn't a grantee, so a read
 that fails part way revokes nothing unchecked. Grantees are added by exact ID, as the
 session share route adds them. Older run sessions are never updated. Callers run
 these as the task's owner: the fire path inside its owner scopes, a route in the
-owner's own request. Nothing here raises; a failure is logged so it never changes a
-run's outcome.
+owner's own request. Only :func:`revoke_from_task_session` raises, so the revoke
+route can keep the grant for a retry; everything else logs a failure so it never
+changes a run's outcome.
 """
 
 from __future__ import annotations
@@ -28,13 +33,18 @@ from typing import Any
 
 from omnigent.db.account_authority import target_account_scope
 from omnigent.entities import Conversation, ScheduledTask
-from omnigent.errors import OmnigentError
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.inner._subprocess_lifecycle import await_cleanup_task
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
 from omnigent.server.routes._sessions.helpers import _announce_session_added
 from omnigent.server.session_sharing import require_sharing_mode_allows_grant
 from omnigent.server.sharing_settings import host_is_managed_sandbox
 from omnigent.stores import permission_store as permission_store_module
+from omnigent.stores.conversation_store import (
+    SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY,
+    SCHEDULED_TASK_LAUNCH_LABEL_KEY,
+    SCHEDULED_TASK_ORIGIN_LABEL_KEY,
+)
 from omnigent.stores.permission_store import PermissionStore
 
 _logger = logging.getLogger(__name__)
@@ -67,16 +77,19 @@ def is_managed_run_session(
 
 
 def _require_run_sharing_allowed(
-    app_state: Any | None, task: ScheduledTask, session: Conversation, host_registry: Any | None
+    app_state: Any | None, session: Conversation, *, managed: bool, host_registry: Any | None
 ) -> None:
-    """Raise unless the server's sharing policy allows a Read grant on *session* now."""
+    """Raise unless the server's sharing policy allows a Read grant on *session* now.
+
+    :param managed: Whether *session* asked for a new server-provisioned sandbox.
+    """
     require_sharing_mode_allows_grant(
         app_state,
         level=LEVEL_READ,
         load_workspace=lambda: session.workspace,
         # Nothing rechecks the grants once a workspace is known, so fail closed. A sandbox
         # is exempt: the server picks its working directory in a disposable container.
-        allow_unknown_workspace=is_managed_run_session(task, session.host_id, host_registry),
+        allow_unknown_workspace=managed or host_is_managed_sandbox(host_registry, session.host_id),
     )
 
 
@@ -84,10 +97,12 @@ async def _apply_task_grants(
     task: ScheduledTask,
     session: Conversation,
     *,
+    managed: bool,
     permission_store: PermissionStore,
     app_state: Any | None,
     host_registry: Any | None,
     revocation: _Revocation,
+    visible_from: str | None,
 ) -> None:
     # Revocations first, so a sharing policy that refuses additions still revokes.
     if await _revocation_applies(task, session, permission_store, revocation):
@@ -95,9 +110,11 @@ async def _apply_task_grants(
     await _add_missing_grantees(
         task,
         session,
+        managed=managed,
         permission_store=permission_store,
         app_state=app_state,
         host_registry=host_registry,
+        visible_from=visible_from,
     )
 
 
@@ -179,14 +196,20 @@ async def _add_missing_grantees(
     task: ScheduledTask,
     session: Conversation,
     *,
+    managed: bool,
     permission_store: PermissionStore,
     app_state: Any | None,
     host_registry: Any | None,
+    visible_from: str | None,
 ) -> None:
     """Share *session* at Read with each of the automation's grantees who has no share.
 
     Reads the automation's grants a page at a time. The sharing policy is checked
     once, before the first write; a refusal or a failed read stops the pass.
+
+    :param visible_from: A session ID, or ``None``. When set, only grantees with a
+        direct grant on that session get *session*; one whose grant can't be read
+        is skipped.
     """
     policy_checked = False
     cursor: str | None = None
@@ -223,7 +246,11 @@ async def _add_missing_grantees(
             if not policy_checked:
                 try:
                     await asyncio.to_thread(
-                        _require_run_sharing_allowed, app_state, task, session, host_registry
+                        _require_run_sharing_allowed,
+                        app_state,
+                        session,
+                        managed=managed,
+                        host_registry=host_registry,
                     )
                 except OmnigentError as exc:
                     _logger.warning(
@@ -234,10 +261,28 @@ async def _add_missing_grantees(
                     )
                     return
                 policy_checked = True
-            if await _share_with_grantee(permission_store, task, session, grantee):
+            if await _share_with_grantee(
+                permission_store, task, session, grantee, visible_from=visible_from
+            ):
                 _announce_session_added(grantee, session.id)
         if cursor is None:
             return
+
+
+def _holds_grant(
+    permission_store: PermissionStore, task: ScheduledTask, user_id: str, session_id: str
+) -> bool:
+    """Whether *user_id* holds a direct grant on *session_id*; ``False`` when unreadable."""
+    try:
+        return permission_store.get(user_id, session_id) is not None
+    except Exception:
+        _logger.exception(
+            "automation %s: could not read %r's share of session %s; not sharing with them",
+            task.id,
+            user_id,
+            session_id,
+        )
+        return False
 
 
 def _held_under_the_stores_comparison(
@@ -265,7 +310,12 @@ def _held_under_the_stores_comparison(
 
 
 async def _share_with_grantee(
-    permission_store: PermissionStore, task: ScheduledTask, session: Conversation, grantee: str
+    permission_store: PermissionStore,
+    task: ScheduledTask,
+    session: Conversation,
+    grantee: str,
+    *,
+    visible_from: str | None,
 ) -> bool:
     """Run :func:`_share_and_confirm` in a thread, which a cancelled run waits for.
 
@@ -276,7 +326,14 @@ async def _share_with_grantee(
     :raises asyncio.CancelledError: When cancelled, once the thread has finished.
     """
     sharing = asyncio.ensure_future(
-        asyncio.to_thread(_share_and_confirm, permission_store, task, session, grantee)
+        asyncio.to_thread(
+            _share_and_confirm,
+            permission_store,
+            task,
+            session,
+            grantee,
+            visible_from=visible_from,
+        )
     )
     try:
         return await asyncio.shield(sharing)
@@ -286,15 +343,22 @@ async def _share_with_grantee(
 
 
 def _share_and_confirm(
-    permission_store: PermissionStore, task: ScheduledTask, session: Conversation, grantee: str
+    permission_store: PermissionStore,
+    task: ScheduledTask,
+    session: Conversation,
+    grantee: str,
+    *,
+    visible_from: str | None,
 ) -> bool:
     """Grant *grantee* Read on *session* if they still hold the automation's grant.
 
     Pins the grantee's account as the session share route does, so an account deleted
-    and registered again since the list was read is refused, not granted. The grant is
-    checked again after the write, and the share is taken back if it was revoked. Never
-    raises: a failure is logged.
+    and registered again since the list was read is refused, not granted. The grants
+    are checked again after the write, and the share is taken back if one was revoked.
+    Never raises: a failure is logged.
 
+    :param visible_from: A session ID, or ``None``. When set, *grantee* must also
+        hold a direct grant on it, both before and after the write.
     :returns: Whether a grant was written and kept.
     """
     try:
@@ -302,6 +366,10 @@ def _share_and_confirm(
         with target_account_scope(grantee, account.account_generation if account else None):
             # Checked after the pin: a replaced account no longer holds the grant.
             if permission_store.resolve_scheduled_task_access([grantee], task.id) is None:
+                return False
+            if visible_from is not None and not _holds_grant(
+                permission_store, task, grantee, visible_from
+            ):
                 return False
             permission_store.ensure_user(grantee)
             # Automations grant Read only (SCHEDULED_TASK_GRANT_LEVELS). A share made
@@ -312,8 +380,9 @@ def _share_and_confirm(
             "automation %s: could not share session %s with %r", task.id, session.id, grantee
         )
         return False
-    if not written or _held_under_the_stores_comparison(
-        permission_store, task, grantee, if_unknown=False
+    if not written or (
+        _held_under_the_stores_comparison(permission_store, task, grantee, if_unknown=False)
+        and (visible_from is None or _holds_grant(permission_store, task, grantee, visible_from))
     ):
         return written
     # Revoked since the check, perhaps after the revoke's own sync ran, or the recheck
@@ -334,10 +403,12 @@ async def _share_best_effort(
     task: ScheduledTask,
     session: Conversation,
     *,
+    managed: bool,
     permission_store: PermissionStore | None,
     app_state: Any | None,
     host_registry: Any | None,
     revocation: _Revocation,
+    visible_from: str | None = None,
 ) -> None:
     try:
         if permission_store is None or not permission_store.supports_scheduled_task_grants:
@@ -345,10 +416,12 @@ async def _share_best_effort(
         await _apply_task_grants(
             task,
             session,
+            managed=managed,
             permission_store=permission_store,
             app_state=app_state,
             host_registry=host_registry,
             revocation=revocation,
+            visible_from=visible_from,
         )
     except Exception:
         _logger.exception("automation %s: could not share session %s", task.id, session.id)
@@ -376,10 +449,99 @@ async def share_new_run_session(
     await _share_best_effort(
         task,
         session,
+        managed=task.execution_target == "managed_sandbox",
         permission_store=permission_store,
         app_state=app_state,
         host_registry=host_registry,
         revocation=_Revocation.NONE,
+    )
+
+
+def launching_automation(
+    source: Conversation,
+    *,
+    user_id: str | None,
+    conversation_store: Any,
+    scheduled_task_store: Any | None,
+) -> ScheduledTask | None:
+    """The automation whose run's session tree *source* is in, for a session it launches.
+
+    The tree is *source*'s root and the children reached through it. It belongs to an
+    automation when its root is one of the automation's run sessions, or a session
+    launched from one, which carries :data:`SCHEDULED_TASK_LAUNCH_LABEL_KEY`. A fork
+    keeps the origin label but not the run's, so it doesn't count. Reads the root,
+    unless *source* is one, and then the automation. Blocking. Never raises.
+
+    :param source: The session launching another, already authorized as *user_id*'s.
+    :param user_id: The launching user, who must own the automation.
+    :param conversation_store: Loads *source*'s root.
+    :param scheduled_task_store: Loads the automation; ``None`` finds none.
+    :returns: The automation, or ``None`` when the tree isn't one of its runs'.
+    """
+    if scheduled_task_store is None:
+        return None
+    try:
+        root = (
+            source
+            if source.root_conversation_id == source.id
+            else conversation_store.get_conversation(source.root_conversation_id)
+        )
+        if root is None:
+            return None
+        launched_by = root.labels.get(SCHEDULED_TASK_LAUNCH_LABEL_KEY)
+        task_id = launched_by or root.labels.get(SCHEDULED_TASK_ORIGIN_LABEL_KEY)
+        task = scheduled_task_store.get(task_id) if task_id else None
+    except Exception:
+        _logger.exception("could not find the automation session %s launches from", source.id)
+        return None
+    # ``get`` still returns a deleted automation, whose grants are gone.
+    if task is None or task.state == "deleted":
+        return None
+    if (task.user_id or RESERVED_USER_LOCAL) != (user_id or RESERVED_USER_LOCAL):
+        return None
+    if launched_by is None and not (
+        SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY in root.labels
+        or (task.continues_session and task.session_id == root.id)
+    ):
+        return None
+    return task
+
+
+async def share_launched_session(
+    task: ScheduledTask,
+    session: Conversation,
+    *,
+    launched_from_root: str,
+    managed: bool,
+    permission_store: PermissionStore | None,
+    app_state: Any | None,
+    host_registry: Any | None,
+) -> None:
+    """Share a session launched from *task*'s run tree at Read with its grantees who can see it.
+
+    Only grantees still holding a direct grant on the launching tree's root get it:
+    another automation that continues that session, or a hand revoke, may have
+    removed someone. Otherwise as :func:`share_new_run_session`, except that the
+    session's own placement, not the automation's, decides whether it is a sandbox.
+    Never raises.
+
+    :param task: The automation from :func:`launching_automation`.
+    :param session: The launched session, owned by *task*'s owner.
+    :param launched_from_root: The root of the session tree that launched *session*.
+    :param managed: Whether *session* asked for a new server-provisioned sandbox.
+    :param permission_store: The server's permission store; ``None`` does nothing.
+    :param app_state: ``app.state``, which carries the sharing policy.
+    :param host_registry: Live host connections, to recognize a sandbox session.
+    """
+    await _share_best_effort(
+        task,
+        session,
+        managed=managed,
+        permission_store=permission_store,
+        app_state=app_state,
+        host_registry=host_registry,
+        revocation=_Revocation.NONE,
+        visible_from=launched_from_root,
     )
 
 
@@ -411,6 +573,7 @@ async def sync_continued_session(
     await _share_best_effort(
         task,
         session,
+        managed=task.execution_target == "managed_sandbox",
         permission_store=permission_store,
         app_state=app_state,
         host_registry=host_registry,
@@ -428,8 +591,8 @@ async def sync_task_session(
 ) -> None:
     """Sync a continue-session automation's existing session right after its grants change.
 
-    For the automation's grant and revoke routes; the next run's sync is the
-    backstop. The sync is forced, so it revokes even when no grants are left. Does
+    For the automation's grant and revoke routes; after a grant, the next run's sync
+    is the backstop. The sync is forced, so it revokes even when no grants are left. Does
     nothing for an automation that starts a new session each run, or whose session
     is gone or no longer owned by the automation's owner. Never raises.
 
@@ -468,6 +631,55 @@ async def sync_task_session(
         app_state=app_state,
         host_registry=host_registry,
     )
+
+
+async def revoke_from_task_session(
+    task: ScheduledTask, user_id: str, *, permission_store: PermissionStore | None
+) -> None:
+    """Revoke a grantee from a continue-session automation's session, for the revoke route.
+
+    The route calls this before it deletes their automation grant, which stays as
+    the record that this revoke is owed: no run would make it once the automation
+    has no grants. It calls it again after the delete for a session recorded
+    meanwhile, putting the grant back if that fails. Leaves the owner's grant,
+    ``__public__`` and a session the automation's owner doesn't own alone, as the
+    sync does.
+
+    :param task: The automation the grantee is being removed from.
+    :param user_id: The grantee, e.g. ``"alice@example.com"``.
+    :param permission_store: The server's permission store; ``None`` does nothing.
+    :raises OmnigentError: ``INTERNAL_ERROR`` when the session's grants can't be
+        read or changed, so the caller keeps the automation grant for a retry.
+    """
+    owner = task.user_id or RESERVED_USER_LOCAL
+    if (
+        not task.continues_session
+        or permission_store is None
+        or not permission_store.supports_scheduled_task_grants
+        or user_id in (owner, RESERVED_USER_PUBLIC)
+    ):
+        return
+    assert task.session_id is not None
+    try:
+        if not await asyncio.to_thread(
+            permission_store.check_access, owner, task.session_id, LEVEL_OWNER
+        ):
+            return
+        grant = await asyncio.to_thread(permission_store.get, user_id, task.session_id)
+        if grant is not None and grant.level != LEVEL_OWNER:
+            await asyncio.to_thread(permission_store.revoke, user_id, task.session_id)
+    except Exception as exc:
+        _logger.exception(
+            "automation %s: could not revoke %r from session %s",
+            task.id,
+            user_id,
+            task.session_id,
+        )
+        raise OmnigentError(
+            "Could not remove them from the automation's session, so the automation is "
+            "still shared with them. Try again.",
+            code=ErrorCode.INTERNAL_ERROR,
+        ) from exc
 
 
 async def delete_task_grants(
