@@ -479,6 +479,11 @@ function WorkflowDescription({ workflowId, text }: { workflowId: string; text: s
     input.setSelectionRange(input.value.length, input.value.length);
   }, [editing]);
 
+  // Saving disables the editor, which drops its focus; a failed save hands it back.
+  useEffect(() => {
+    if (update.isError) editorRef.current?.querySelector("textarea")?.focus();
+  }, [update.isError]);
+
   const close = () => {
     setDraft(null);
     update.reset();

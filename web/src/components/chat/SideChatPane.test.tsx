@@ -609,6 +609,12 @@ describe("side chat opened from a + button", () => {
     expect(input).toHaveFocus();
     expect(input.selectionStart).toBe(draft.length);
     expect(input.selectionEnd).toBe(draft.length);
+
+    // Asked again while it already has focus, the input keeps the user's caret.
+    input.setSelectionRange(3, 3);
+    act(() => useChatStore.getState().requestSideChatFocus(childId));
+    expect(input).toHaveFocus();
+    expect(input.selectionStart).toBe(3);
   });
 
   it("leaves a text input that already had focus before the pane mounted alone", () => {

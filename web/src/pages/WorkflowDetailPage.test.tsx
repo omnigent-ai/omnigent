@@ -592,16 +592,17 @@ describe("WorkflowDetailPage", () => {
       expect(confirm).not.toHaveBeenCalled();
       expect(patches).toEqual([]);
       fireEvent.click(screen.getByRole("button", { name: "Save" }));
+      // Browsers blur a control as saving disables it; jsdom doesn't.
+      act(() => editor.blur());
       expect(await screen.findByRole("alert")).toHaveTextContent("Couldn’t save the description");
+      expect(editor).toHaveFocus();
       // Escape asks before discarding the edit.
-      fireEvent.keyDown(screen.getByRole("textbox", editorName), { key: "Escape" });
+      fireEvent.keyDown(editor, { key: "Escape" });
       expect(confirm).toHaveBeenCalledOnce();
-      expect(screen.getByRole("textbox", editorName)).toHaveValue(
-        "  Finds flaky tests and fixes the clear ones.  ",
-      );
+      expect(editor).toHaveValue("  Finds flaky tests and fixes the clear ones.  ");
 
       rejectSave = false;
-      fireEvent.click(screen.getByRole("button", { name: "Save" }));
+      fireEvent.keyDown(editor, { key: "Enter", metaKey: true });
       await waitFor(() => expect(screen.queryByRole("textbox", editorName)).toBeNull());
       expect(patches).toEqual([
         { description: "Finds flaky tests and fixes the clear ones." },
@@ -611,6 +612,19 @@ describe("WorkflowDetailPage", () => {
         "Finds flaky tests and fixes the clear ones.",
       );
       expect(screen.queryByRole("alert")).toBeNull();
+
+      // Cancel discards an edit once confirmed.
+      confirm.mockReturnValue(true);
+      fireEvent.click(screen.getByRole("button", { name: "Edit description" }));
+      fireEvent.change(screen.getByRole("textbox", editorName), {
+        target: { value: "Something else" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+      expect(screen.queryByRole("textbox", editorName)).toBeNull();
+      expect(screen.getByTestId("workflow-detail-description").textContent).toBe(
+        "Finds flaky tests and fixes the clear ones.",
+      );
+      expect(patches).toHaveLength(2);
     } finally {
       confirm.mockRestore();
     }
