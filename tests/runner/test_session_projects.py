@@ -5,11 +5,13 @@ import json
 import httpx
 import pytest
 
+from omnigent.runner import session_projects
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 from omnigent.runner.session_projects import (
     execute_project_list,
     execute_project_update,
     execute_session_update,
+    resolve_project_id,
 )
 
 pytestmark = pytest.mark.asyncio
@@ -867,3 +869,38 @@ async def test_project_rename_does_not_move_sessions_from_a_reused_old_name():
         f"/v1/projects/{PROJECT_ID}",
         f"/v1/sessions/{PARENT}",
     ]
+
+
+async def test_resolve_project_id_pages_to_an_existing_project():
+    requests: list[httpx.Request] = []
+    target = {"id": PROJECT_ID, "name": "factory workers"}
+    other = {"id": "1" * 32, "name": "Other"}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        assert request.method == "GET", "an existing project must not be created again"
+        assert request.url.params.get("limit"), "project lists must be paged"
+        if request.url.params.get("after") == other["id"]:
+            return httpx.Response(200, json={"data": [target], "has_more": False})
+        return httpx.Response(
+            200, json={"data": [other], "has_more": True, "last_id": other["id"]}
+        )
+
+    async with _client(handler) as client:
+        assert await resolve_project_id(client, " factory workers ") == (PROJECT_ID, False)
+    assert [r.url.params.get("after") for r in requests] == [None, other["id"]]
+
+
+async def test_resolve_project_id_stops_at_the_page_cap_without_creating():
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        assert request.method == "GET", "an unfinished search must not create a project"
+        row = {"id": f"{len(requests):032d}", "name": "Other"}
+        return httpx.Response(200, json={"data": [row], "has_more": True, "last_id": row["id"]})
+
+    async with _client(handler) as client:
+        with pytest.raises(ValueError, match="too many to search"):
+            await resolve_project_id(client, "factory workers")
+    assert len(requests) == session_projects._MAX_LOOKUP_PAGES

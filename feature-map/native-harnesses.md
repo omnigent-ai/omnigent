@@ -291,7 +291,7 @@ Real-provider history compatibility requires a separate live check.
 without a session ID to resume. `omnigent claude` and `omnigent codex` accept
 `--project NAME` to file the new session in that project when it is created,
 creating the project if none has that name; the launch directory stays the
-workspace. It cannot be combined with `--resume` or `--session-id`.
+workspace. It cannot be combined with `--resume` or the deprecated `--session`.
 
 **Picker visibility:** open Settings → Appearance → **Show in agent pickers**.
 The row summarizes what is shown ("Showing 15 of 17. Hidden: …"). Press

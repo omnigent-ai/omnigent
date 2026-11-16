@@ -385,11 +385,13 @@ class _ProjectsClient(_RecordingClient):
         self.projects = projects
         self.create_status = create_status
 
-    async def get(self, url: str, *, timeout: object = None) -> _Resp:
+    async def get(
+        self, url: str, *, params: dict[str, str] | None = None, timeout: object = None
+    ) -> _Resp:
         if url != "/v1/projects":
-            return await super().get(url, timeout=timeout)
-        self.calls.append(("GET", url, None))
-        return _Resp(body={"data": list(self.projects)})
+            return await super().get(url, params=params, timeout=timeout)
+        self.calls.append(("GET", url, params))
+        return _Resp(body={"data": list(self.projects), "has_more": False})
 
     async def post(
         self,

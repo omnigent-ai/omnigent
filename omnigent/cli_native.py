@@ -274,9 +274,9 @@ def register_native_commands(cli: click.Group) -> None:
                 "prefer --resume (--session is deprecated).",
             )
         resuming = choice.picker or choice.conversation_id is not None or session_id is not None
+        _reject_project_on_resume(project, resuming=resuming)
         if smart_routing:
             _reject_smart_routing_resume(resuming=resuming)
-        _reject_project_on_resume(project, resuming=resuming)
         startup_profiler.mark("arguments validated")
 
         # Ensure the host daemon (local when ``--server`` is omitted/empty,
@@ -441,9 +441,9 @@ def register_native_commands(cli: click.Group) -> None:
                 "prefer --resume (--session is deprecated).",
             )
         resuming = choice.picker or choice.conversation_id is not None or session_id is not None
+        _reject_project_on_resume(project, resuming=resuming)
         if smart_routing:
             _reject_smart_routing_resume(resuming=resuming)
-        _reject_project_on_resume(project, resuming=resuming)
         _reject_reserved_codex_transport_args(codex_args)
 
         from omnigent.harness_startup_config import resolve_harness_command

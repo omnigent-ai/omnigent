@@ -87,16 +87,27 @@ def test_a_missing_project_is_created_and_announced(
 
 @respx.mock
 @pytest.mark.parametrize(("command", "launcher"), _LAUNCHERS)
+@pytest.mark.parametrize(
+    ("listing", "detail"),
+    [
+        ({"return_value": httpx.Response(503, text="unavailable")}, "could not list projects"),
+        ({"side_effect": httpx.ConnectError("connection refused")}, "ConnectError"),
+    ],
+)
 def test_a_project_that_cannot_be_resolved_stops_the_launch(
-    command: str, launcher: str, launch_env: dict[str, Any]
+    command: str,
+    launcher: str,
+    listing: dict[str, Any],
+    detail: str,
+    launch_env: dict[str, Any],
 ) -> None:
-    respx.get(f"{_BASE}/v1/projects").mock(return_value=httpx.Response(503, text="unavailable"))
+    respx.get(f"{_BASE}/v1/projects").mock(**listing)
 
     result = CliRunner().invoke(cli, [command, "--project", "factory workers"])
 
     assert result.exit_code == 1, result.output
     assert "Could not use project 'factory workers'" in result.output
-    assert "could not list projects: unavailable" in result.output
+    assert detail in result.output
     assert launch_env == {}
 
 
@@ -112,27 +123,28 @@ def test_without_project_nothing_is_resolved(
 
 
 @pytest.mark.parametrize("command", ["claude", "codex"])
+@pytest.mark.parametrize("routing_args", [[], ["--smart-routing"]])
 @pytest.mark.parametrize(
-    ("extra_args", "message"),
-    [
-        (["--resume", "conv_old"], "cannot be combined with --resume"),
-        (["--resume"], "cannot be combined with --resume"),
-        (["--session", "conv_old"], "cannot be combined with --resume"),
-        (["-r", "conv_old"], "cannot be combined with --resume"),
-    ],
+    "resume_args",
+    [["--resume", "conv_old"], ["--resume"], ["--session", "conv_old"], ["-r", "conv_old"]],
 )
 def test_project_with_a_resume_is_rejected_before_the_backend(
-    command: str, extra_args: list[str], message: str, monkeypatch: pytest.MonkeyPatch
+    command: str,
+    routing_args: list[str],
+    resume_args: list[str],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
         "omnigent.cli._ensure_backend",
         lambda *_: pytest.fail("invalid args must not start the backend"),
     )
 
-    result = CliRunner().invoke(cli, [command, "--project", "factory workers", *extra_args])
+    result = CliRunner().invoke(
+        cli, [command, *routing_args, "--project", "factory workers", *resume_args]
+    )
 
     assert result.exit_code == 2, result.output
-    assert message in result.output
+    assert "--project files a new session, so it cannot be combined with --resume" in result.output
 
 
 @pytest.mark.parametrize("command", ["claude", "codex"])
@@ -159,8 +171,20 @@ def test_an_invalid_project_name_is_rejected_before_the_backend(
 
 @respx.mock
 @pytest.mark.parametrize(("command", "launcher"), _LAUNCHERS)
+@pytest.mark.parametrize(
+    ("arm_response", "launched_session"),
+    [
+        (httpx.Response(201, json={"id": "conv_routed"}), "conv_routed"),
+        # A rejected arm falls back to a fresh session, which must still be filed.
+        (httpx.Response(500, json={"detail": "routing unavailable"}), None),
+    ],
+)
 def test_smart_routing_files_the_armed_session_in_the_project(
-    command: str, launcher: str, launch_env: dict[str, Any]
+    command: str,
+    launcher: str,
+    arm_response: httpx.Response,
+    launched_session: str | None,
+    launch_env: dict[str, Any],
 ) -> None:
     respx.get(f"{_BASE}/v1/info").mock(
         return_value=httpx.Response(
@@ -177,9 +201,7 @@ def test_smart_routing_files_the_armed_session_in_the_project(
         )
     )
     _mock_projects({"id": _PROJECT_ID, "name": "factory workers"})
-    armed = respx.post(f"{_BASE}/v1/sessions").mock(
-        return_value=httpx.Response(201, json={"id": "conv_routed"})
-    )
+    armed = respx.post(f"{_BASE}/v1/sessions").mock(return_value=arm_response)
 
     result = CliRunner().invoke(cli, [command, "--smart-routing", "--project", "factory workers"])
 
@@ -189,6 +211,5 @@ def test_smart_routing_files_the_armed_session_in_the_project(
     # The launch cwd stays the workspace, so the project's folder defaults don't apply.
     assert payload["workspace"] == str(Path.cwd().resolve())
     assert payload["git"] is None
-    assert launch_env["session_id"] == "conv_routed"
-    # The launcher still gets the project for a fallback fresh session.
+    assert launch_env["session_id"] == launched_session
     assert launch_env["project_id"] == _PROJECT_ID
