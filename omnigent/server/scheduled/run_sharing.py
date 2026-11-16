@@ -22,7 +22,6 @@ run's outcome.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 from enum import Enum
 from typing import Any
@@ -30,6 +29,7 @@ from typing import Any
 from omnigent.db.account_authority import target_account_scope
 from omnigent.entities import Conversation, ScheduledTask
 from omnigent.errors import OmnigentError
+from omnigent.inner._subprocess_lifecycle import await_cleanup_task
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
 from omnigent.server.routes._sessions.helpers import _announce_session_added
 from omnigent.server.session_sharing import require_sharing_mode_allows_grant
@@ -281,9 +281,7 @@ async def _share_with_grantee(
     try:
         return await asyncio.shield(sharing)
     except asyncio.CancelledError:
-        while not sharing.done():
-            with contextlib.suppress(asyncio.CancelledError):
-                await asyncio.wait([sharing])
+        await await_cleanup_task(sharing)
         raise
 
 
