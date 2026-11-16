@@ -2748,6 +2748,25 @@ def test_inbox_failures_latest_run_and_session_dedup(store, state, latest_status
     assert store.list_inbox_failures(owner_user_id=task.user_id) == ([], None)
 
 
+def test_inbox_failures_leave_timers_out(store):
+    timer = _session_task(
+        store,
+        "inbox-timer",
+        session_mode="continue",
+        session_id=_uid("conv"),
+        kind="timer",
+    )
+    store.create_run(
+        run_id=_uid("timer-failure"),
+        scheduled_task_id=timer.id,
+        status="failed",
+        scheduled_at=100,
+        finished_at=101,
+        error_code="owner_identity_unavailable",
+    )
+    assert store.list_inbox_failures(owner_user_id=timer.user_id) == ([], None)
+
+
 def test_inbox_failures_pages_examined_tasks_and_scopes_owner_workspace_generation(store):
     from omnigent.db.account_authority import account_authority_scope
     from omnigent.db.db_models import SqlScheduledTask

@@ -911,6 +911,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 SqlScheduledTask.state,
                 SqlScheduledTask.account_generation,
                 SqlScheduledTask.user_id,
+                SqlScheduledTask.kind,
             ).where(
                 SqlScheduledTask.workspace_id == current_workspace_id(),
                 SqlScheduledTask.user_id == owner_user_id,
@@ -937,6 +938,8 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                     task.user_id != owner_user_id
                     or task.state == encode_scheduled_task_state("deleted")
                     or (check_generation and task.account_generation != generation)
+                    # A session's agent manages its timers; the Inbox has no use for them.
+                    or task.kind == encode_scheduled_task_kind("timer")
                 ):
                     continue
                 run = session.execute(
