@@ -113,7 +113,8 @@ so nothing in the run may wait for a person:
    question only under "Before asking or declaring a blocker". A finished
    plan does not block a new one.
    An explicit Stop still requires an explicit Continue for the stopped work.
-2. Write the plan with `sys_journal_write_plan` before executing its steps. Name
+2. Use the current run's plan if one is already in the journal. Otherwise,
+   write the plan with `sys_journal_write_plan` before executing its steps. Name
    the plan for its goal in a few words ("Cut GET /orders p95 by 20%"). Give
    each step a short, stable ID (`profile`, `opt-pool`), a name, and its
    dependencies. A new step needs an ID the journal hasn't used yet, since a
@@ -148,14 +149,21 @@ tests" (ID …)", or "run my triage workflow" in chat):
 
 - Do the plan's step 1 first: decide whether this resumes, extends or starts
   a run from the request and journal.
-- Load it with `sys_workflow_load`, by its ID when you have one, otherwise by
-  name. If they describe it without its exact name, or the load returns
+- A session created from the workflow's Run button already has its starting
+  plan in the journal. Continue that run using its saved snapshot and step IDs;
+  do not write another starting plan with `workflow_id`. Later edits to the
+  saved workflow do not replace this run's plan. Load the workflow only if you
+  need its description. An explicit request to run it again starts a new run.
+- If there is no starting plan, load it with `sys_workflow_load`, by its ID
+  when you have one, otherwise by name. If they describe it without its exact
+  name, or the load returns
   `workflow_not_found`, list their workflows with `sys_workflow_list` and pick
   the one whose description and context clearly fit. If the intended workflow
   still cannot be identified, follow "Before asking or declaring a blocker";
   don't choose an unrelated workflow just to avoid a question.
-- Its steps are your plan: write them with `sys_journal_write_plan`, named
-  after the workflow, keeping their IDs and dependencies, and with
+- If the run has no starting plan yet, its steps are your plan: write them
+  with `sys_journal_write_plan`, named after the workflow, keeping their IDs
+  and dependencies, and with
   `workflow_id` set to its ID, so the workflow's page lists this run. Put
   them in the order you'll work on them (see Plan), even if the saved order
   differs. Rename an ID only if this session's journal already used it. Fill

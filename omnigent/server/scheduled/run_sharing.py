@@ -15,8 +15,9 @@ once the automation's share table confirms its holder isn't a grantee, so a read
 that fails part way revokes nothing unchecked. Grantees are added by exact ID, as the
 session share route adds them. Older run sessions are never updated. Callers run
 these as the task's owner: the fire path inside its owner scopes, a route in the
-owner's own request. Nothing here raises; a failure is logged so it never changes a
-run's outcome.
+owner's own request. Only :func:`revoke_from_task_session` raises, so the revoke
+route can keep the grant for a retry; everything else logs a failure so it never
+changes a run's outcome.
 """
 
 from __future__ import annotations
@@ -28,7 +29,7 @@ from typing import Any
 
 from omnigent.db.account_authority import target_account_scope
 from omnigent.entities import Conversation, ScheduledTask
-from omnigent.errors import OmnigentError
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.inner._subprocess_lifecycle import await_cleanup_task
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
 from omnigent.server.routes._sessions.helpers import _announce_session_added
@@ -428,8 +429,8 @@ async def sync_task_session(
 ) -> None:
     """Sync a continue-session automation's existing session right after its grants change.
 
-    For the automation's grant and revoke routes; the next run's sync is the
-    backstop. The sync is forced, so it revokes even when no grants are left. Does
+    For the automation's grant and revoke routes; after a grant, the next run's sync
+    is the backstop. The sync is forced, so it revokes even when no grants are left. Does
     nothing for an automation that starts a new session each run, or whose session
     is gone or no longer owned by the automation's owner. Never raises.
 
@@ -468,6 +469,55 @@ async def sync_task_session(
         app_state=app_state,
         host_registry=host_registry,
     )
+
+
+async def revoke_from_task_session(
+    task: ScheduledTask, user_id: str, *, permission_store: PermissionStore | None
+) -> None:
+    """Revoke a grantee from a continue-session automation's session, for the revoke route.
+
+    The route calls this before it deletes their automation grant, which stays as
+    the record that this revoke is owed: no run would make it once the automation
+    has no grants. It calls it again after the delete for a session recorded
+    meanwhile, putting the grant back if that fails. Leaves the owner's grant,
+    ``__public__`` and a session the automation's owner doesn't own alone, as the
+    sync does.
+
+    :param task: The automation the grantee is being removed from.
+    :param user_id: The grantee, e.g. ``"alice@example.com"``.
+    :param permission_store: The server's permission store; ``None`` does nothing.
+    :raises OmnigentError: ``INTERNAL_ERROR`` when the session's grants can't be
+        read or changed, so the caller keeps the automation grant for a retry.
+    """
+    owner = task.user_id or RESERVED_USER_LOCAL
+    if (
+        not task.continues_session
+        or permission_store is None
+        or not permission_store.supports_scheduled_task_grants
+        or user_id in (owner, RESERVED_USER_PUBLIC)
+    ):
+        return
+    assert task.session_id is not None
+    try:
+        if not await asyncio.to_thread(
+            permission_store.check_access, owner, task.session_id, LEVEL_OWNER
+        ):
+            return
+        grant = await asyncio.to_thread(permission_store.get, user_id, task.session_id)
+        if grant is not None and grant.level != LEVEL_OWNER:
+            await asyncio.to_thread(permission_store.revoke, user_id, task.session_id)
+    except Exception as exc:
+        _logger.exception(
+            "automation %s: could not revoke %r from session %s",
+            task.id,
+            user_id,
+            task.session_id,
+        )
+        raise OmnigentError(
+            "Could not remove them from the automation's session, so the automation is "
+            "still shared with them. Try again.",
+            code=ErrorCode.INTERNAL_ERROR,
+        ) from exc
 
 
 async def delete_task_grants(

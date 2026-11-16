@@ -10,6 +10,7 @@ from __future__ import annotations
 import builtins
 import json
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -290,6 +291,7 @@ class ScheduledTaskStore(ABC):
         last_run_at: int | None = None,
         last_run_conversation_id: str | None = _UNSET,
         expected_schedule: ScheduledTask | None = None,
+        guard: Callable[[ScheduledTask], None] | None = None,
     ) -> ScheduledTask | None:
         """
         Update mutable fields of a task.
@@ -316,6 +318,10 @@ class ScheduledTaskStore(ABC):
         target, agent and MCP services read before validation. A mismatch raises
         a conflict before any changes are saved; callers must reload and
         revalidate before retrying.
+
+        ``guard`` is called with the task as locked for this update, before any
+        change. Whatever it raises aborts the update with nothing saved. It runs
+        while the task row is locked, so it should do bounded work.
 
         Returns ``None`` if the task does not exist.
 

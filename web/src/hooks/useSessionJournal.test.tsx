@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { authenticatedFetch } from "@/lib/identity";
 import {
+  planGraphRevision,
   planWorkflowId,
   sessionJournalKey,
   sessionTaskList,
@@ -82,6 +83,7 @@ describe("useSessionJournal", () => {
     });
     const origin = { ...journalPlan(1, ["a"], ["b"]), workflow_id: workflowId };
     const plan = journalPlan(3, ["a"], ["b"]);
+    plan.content.graph_revision = 3;
     const done = journalEntry(2, { kind: "status", step: "a", content: { status: "done" } });
     const busy = Array.from({ length: 1001 }, (_, index) =>
       journalEntry(index + 4, { kind: "status", step: "b", content: { status: "started" } }),
@@ -100,6 +102,7 @@ describe("useSessionJournal", () => {
       expect(result.current.entries.map((entry) => entry.position)).toEqual([0, 1, 2, 3, 1004]),
     );
     expect(planWorkflowId(result.current.entries)).toBe(workflowId);
+    expect(planGraphRevision(result.current.entries)).toBe(3);
     expect(result.current.hasOlder).toBe(true);
     expect(requestedQueries().map((query) => Object.fromEntries(query))).toEqual([
       { order: "desc", limit: "100" },
