@@ -1478,33 +1478,42 @@ describe("Composer slash-command menu", () => {
       expect(props.onSend).toHaveBeenCalledExactlyOnceWith(`/${name}`);
     });
 
-    it("rescans skills each time Claude runs a reload command", () => {
+    it("rescans skills each time Claude runs a reload sent from the composer", () => {
       const { conversationId, blocks } = useChatStore.getState();
       onTestFinished(() => useChatStore.setState({ conversationId, blocks }));
       useChatStore.setState({ conversationId: "conv_reload", blocks: [] });
       renderForHarness("claude-native");
       const reload = skillsFixture.getState().reload;
-      act(() => useChatStore.setState({ blocks: [commandBlock("effort", "item_effort")] }));
+      const appendBlock = (block: AnyBlock) =>
+        act(() => useChatStore.setState((state) => ({ blocks: [...state.blocks, block] })));
+      const send = (command: string) => {
+        fireEvent.change(textarea(), { target: { value: command } });
+        fireEvent.keyDown(textarea(), { key: "Enter" });
+      };
+      // A reload card from history or another client is not a rescan trigger.
+      appendBlock(commandBlock("reload-skills", "item_history"));
+      send("/reload-skills");
+      send("/reload-plugins");
+      appendBlock(commandBlock("effort", "item_effort"));
       expect(reload).not.toHaveBeenCalled();
-      act(() =>
-        useChatStore.setState((state) => ({
-          blocks: [...state.blocks, commandBlock("reload-skills", "item_skills")],
-        })),
-      );
+      appendBlock(commandBlock("reload-skills", "item_skills"));
       expect(reload).toHaveBeenCalledOnce();
-      act(() =>
-        useChatStore.setState((state) => ({
-          blocks: [...state.blocks, commandBlock("reload-plugins", "item_plugins")],
-        })),
-      );
+      appendBlock(commandBlock("reload-plugins", "item_plugins"));
       expect(reload).toHaveBeenCalledTimes(2);
-      act(() =>
-        useChatStore.setState({
-          conversationId: "conv_other",
-          blocks: [commandBlock("reload-skills", "item_history")],
-        }),
-      );
+      appendBlock(commandBlock("reload-skills", "item_late_history"));
       expect(reload).toHaveBeenCalledTimes(2);
+    });
+
+    it("does not rescan for reload cards loaded with another conversation", () => {
+      const { conversationId, blocks } = useChatStore.getState();
+      onTestFinished(() => useChatStore.setState({ conversationId, blocks }));
+      useChatStore.setState({ conversationId: "conv_reload", blocks: [] });
+      renderForHarness("claude-native");
+      fireEvent.change(textarea(), { target: { value: "/reload-skills" } });
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+      act(() => useChatStore.setState({ conversationId: "conv_other", blocks: [] }));
+      act(() => useChatStore.setState({ blocks: [commandBlock("reload-skills", "item_history")] }));
+      expect(skillsFixture.getState().reload).not.toHaveBeenCalled();
     });
 
     it.each([

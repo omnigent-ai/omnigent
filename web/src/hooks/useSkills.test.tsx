@@ -298,6 +298,7 @@ describe("useSkills", () => {
       await expect(result.current.reload()).rejects.toThrow();
     });
     expect(result.current.skills).toEqual(skills);
+    expect(result.current.skillsStatus).toBe("ready");
   });
 
   it("lets a scheduled refetch share an in-flight reload instead of racing it", async () => {

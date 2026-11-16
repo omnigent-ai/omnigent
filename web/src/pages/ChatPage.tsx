@@ -3213,17 +3213,25 @@ function ComposerImpl(
   // Claude Code built-ins that reload skills and plugins in place; they reach
   // the TUI as text, like /compact.
   const showReload = sessionHarness === "claude-native";
-  // Rescan the menu's skills once Claude has run each reload, so a reload that
-  // waited in the queue also sees skills created before it ran. On failure the
-  // menu keeps its catalog until the next poll.
-  const reloadCommandCount = useChatStore((s) => countReloadCommands(s.blocks));
+  // Rescan the menu's skills once Claude has run a reload sent from here, so a
+  // queued reload also sees skills created before it ran. Reload cards that
+  // arrive with loaded history only move the baseline.
+  const reloadCommandCount = useChatStore((s) => (showReload ? countReloadCommands(s.blocks) : 0));
+  const pendingReloadsRef = useRef(0);
   const seenReloadsRef = useRef<{ conversationId: string | null; count: number } | null>(null);
   useEffect(() => {
     const seen = seenReloadsRef.current;
     seenReloadsRef.current = { conversationId, count: reloadCommandCount };
-    if (!showReload || seen?.conversationId !== conversationId) return;
-    if (reloadCommandCount > seen.count) void reloadSkills().catch(() => undefined);
-  }, [conversationId, reloadCommandCount, reloadSkills, showReload]);
+    if (seen?.conversationId !== conversationId) {
+      // A first send may assign the id; only leaving a real conversation drops its reloads.
+      if (seen?.conversationId) pendingReloadsRef.current = 0;
+      return;
+    }
+    const ran = reloadCommandCount - seen.count;
+    if (ran <= 0 || pendingReloadsRef.current === 0) return;
+    pendingReloadsRef.current = Math.max(0, pendingReloadsRef.current - ran);
+    void reloadSkills().catch(() => undefined);
+  }, [conversationId, reloadCommandCount, reloadSkills]);
   const skillPrefix = skillInvocationPrefix(sessionHarness);
   // /side is a Codex Code CLI built-in (ephemeral fork side chat), so offer it
   // only on codex-native sessions. Selected/typed, it sends as plaintext to the
@@ -3758,6 +3766,7 @@ function ComposerImpl(
         setValue("");
         setCommandError(null);
         const command = arg ? `${cmd} ${arg}` : cmd;
+        pendingReloadsRef.current += 1;
         appendEntry(command);
         onSend(command);
         return true;

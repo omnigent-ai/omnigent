@@ -43,6 +43,9 @@ _ASSISTANT = '[data-testid="message-bubble"][data-role="assistant"]'
 _FIRST_REPLY = "Hello! Ready when you are."
 _FIRST_TURN_TIMEOUT_MS = 180_000
 _TURN_TIMEOUT_MS = 120_000
+# The running TUI picks up the install's settings.json edit a moment after the
+# CLI exits; a /reload-plugins sent sooner misses the new plugin.
+_PLUGIN_SETTINGS_SETTLE_MS = 3_000
 
 
 def _pane_metadata(base_url: str, session_id: str) -> dict[str, Any] | None:
@@ -337,6 +340,7 @@ def test_reload_plugins_from_chat_activates_a_plugin_installed_during_the_sessio
         steps.mark(f"/{_PLUGIN} shows no match")
         _install_claude_plugin(claude_config_dir, tmp_path / "marketplace")
         steps.mark("plugin installed with the claude CLI")
+        page.wait_for_timeout(_PLUGIN_SETTINGS_SETTLE_MS)
         reloaded = re.compile(r"Reloaded: \d+ plugins? ·")
         _run_reload_from_menu(page, composer, steps, "reload-plugins", reloaded)
         _run_skill_from_menu(page, composer, steps, f"/{_PLUGIN}", f"{_PLUGIN}:simplify", reply)

@@ -96,11 +96,18 @@ export function useSkills({ target, enabled = true, starting = false }: SkillsOp
     const queryKey = skillsQueryKey(target);
     // Cancel any stale fetch; later readers then share this rescan's request.
     await queryClient.cancelQueries({ queryKey });
-    await queryClient.fetchQuery({
-      queryKey,
-      queryFn: ({ signal }) => fetchSkills(target, signal, { refresh: true }),
-      staleTime: 0,
-    });
+    const previous = queryClient.getQueryData<SkillsCatalog>(queryKey);
+    try {
+      await queryClient.fetchQuery({
+        queryKey,
+        queryFn: ({ signal }) => fetchSkills(target, signal, { refresh: true }),
+        staleTime: 0,
+      });
+    } catch (error) {
+      // A failed rescan leaves the loaded catalog usable instead of an error state.
+      if (previous !== undefined) queryClient.setQueryData(queryKey, previous);
+      throw error;
+    }
   }, [available, queryClient, target]);
   return {
     skills: available ? (query.data?.skills ?? []) : [],

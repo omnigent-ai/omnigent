@@ -206,9 +206,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   name the affected files).
 - `reload-commands`: in Claude Code native sessions, `/reload-skills` and
   `/reload-plugins [--force]` run in the session's Claude Code process, which
-  keeps running. When Claude Code has run one, including a reload that waited
-  in the queue, the host's skill catalog is rescanned so the `/` menu lists the
-  new skills. The chat shows a **Command** card whose Output is Claude Code's
+  keeps running. When Claude Code has run one sent from the chat composer,
+  including a reload that waited in the queue, the host's skill catalog is
+  rescanned so the `/` menu lists the new skills. The chat shows a **Command** card whose Output is Claude Code's
   result line. Other harnesses do not offer them; a typed command is sent as
   text. States: unexpected arguments (error under the composer), a Claude Code
   build without the command (re-sent as plain text), no result written within
@@ -824,7 +824,7 @@ Other connection providers alone do not enable the managed MCP picker.
   after adding a skill or installing a plugin mid-session, then runs the new
   skill and checks that the Claude process and earlier context survived.
   Typed commands, argument errors, the harness gate and the rescan after each
-  reload card are in `web/src/pages/ChatPage.composer.test.tsx`; the Command
+  reload sent from the composer are in `web/src/pages/ChatPage.composer.test.tsx`; the Command
   card's Output, including a result written after the echo was read, in
   `tests/harnesses/claude_native/test_claude_native_bridge.py`. Manually, add a
   skill under the workspace's `.claude/skills` during a native session, run
