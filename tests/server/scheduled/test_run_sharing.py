@@ -161,11 +161,12 @@ async def _sync(
     )
 
 
-async def test_a_sync_reads_every_page_of_the_sessions_grants(
-    permissions, task, monkeypatch
-) -> None:
-    # Two grants a page puts Bob's Edit and Carol's hand-made share on the second.
+async def test_a_sync_reads_every_page_of_both_grant_lists(permissions, task, monkeypatch) -> None:
+    # Two grants a page puts Bob's Edit and Carol's hand-made share on the session's
+    # second page, and Zoe on the automation's.
     monkeypatch.setattr(permission_store_module, "MAX_GRANTS_PAGE_SIZE", 2)
+    permissions.ensure_user("zoe@example.com")
+    permissions.grant_for_scheduled_task("zoe@example.com", task.id, LEVEL_READ)
     session = _session(
         permissions,
         **{
@@ -182,26 +183,27 @@ async def test_a_sync_reads_every_page_of_the_sessions_grants(
     assert _levels(permissions, session.id) == {
         "alice@example.com": LEVEL_READ,
         "bob@example.com": LEVEL_EDIT,
+        "zoe@example.com": LEVEL_READ,
         RESERVED_USER_LOCAL: LEVEL_OWNER,
     }
 
 
 @pytest.mark.parametrize("level", [LEVEL_EDIT, LEVEL_MANAGE])
-async def test_a_share_made_after_the_sessions_grants_were_read_is_not_lowered(
+async def test_a_share_made_after_the_grantee_was_found_without_one_is_not_lowered(
     permissions, task, announced, monkeypatch, level
 ) -> None:
     session = _session(permissions, **{RESERVED_USER_LOCAL: LEVEL_OWNER})
-    list_page = permissions.list_for_session
+    get = permissions.get
 
-    def share_by_hand_once_read(session_id: str, **kwargs: Any) -> Any:
-        grants = list_page(session_id, **kwargs)
-        # The owner shares with Alice by hand after the sync has read the grants.
-        permissions.grant("alice@example.com", session_id, level)
-        return grants
+    def share_by_hand_once_looked_up(user_id: str, session_id: str) -> Any:
+        held = get(user_id, session_id)
+        if user_id == "alice@example.com":
+            # The owner shares with Alice by hand after the sync found she had no share.
+            permissions.grant(user_id, session_id, level)
+        return held
 
-    monkeypatch.setattr(permissions, "list_for_session", share_by_hand_once_read)
+    monkeypatch.setattr(permissions, "get", share_by_hand_once_looked_up)
     await _sync(permissions, task, session)
-    monkeypatch.setattr(permissions, "list_for_session", list_page)
 
     assert _levels(permissions, session.id) == {
         RESERVED_USER_LOCAL: LEVEL_OWNER,
@@ -369,29 +371,52 @@ async def test_a_sync_still_revokes_when_the_sharing_policy_refuses_grants(
     assert _levels(permissions, session.id) == {RESERVED_USER_LOCAL: LEVEL_OWNER}
 
 
-async def test_a_grant_list_that_fails_part_way_revokes_nothing(
-    permissions, task, monkeypatch
+@pytest.mark.parametrize("failing", ["shared_check", "second_session_page"])
+async def test_a_failed_grant_read_revokes_nothing_unchecked(
+    permissions, task, monkeypatch, failing
 ) -> None:
     monkeypatch.setattr(permission_store_module, "MAX_GRANTS_PAGE_SIZE", 1)
-    list_page = permissions.list_for_scheduled_task
+    if failing == "shared_check":
+        list_task_page = permissions.list_for_scheduled_task
+        failed = False
 
-    def fail_after_the_first_page(task_id: str, **kwargs: Any) -> Any:
-        if kwargs.get("after_user_id") is not None:
-            raise RuntimeError("second page failed")
-        return list_page(task_id, **kwargs)
+        def fail_the_first_read(task_id: str, **kwargs: Any) -> Any:
+            nonlocal failed
+            if not failed:
+                failed = True
+                raise RuntimeError("could not tell whether the automation is shared")
+            return list_task_page(task_id, **kwargs)
 
-    monkeypatch.setattr(permissions, "list_for_scheduled_task", fail_after_the_first_page)
-    grants = {
-        RESERVED_USER_LOCAL: LEVEL_OWNER,
-        "bob@example.com": LEVEL_READ,
-        "carol@example.com": LEVEL_READ,
-    }
-    session = _session(permissions, **grants)
+        monkeypatch.setattr(permissions, "list_for_scheduled_task", fail_the_first_read)
+    else:
+        list_session_page = permissions.list_for_session
+
+        def fail_after_the_first_page(session_id: str, **kwargs: Any) -> Any:
+            if kwargs.get("after_user_id") is not None:
+                raise RuntimeError("second page failed")
+            return list_session_page(session_id, **kwargs)
+
+        monkeypatch.setattr(permissions, "list_for_session", fail_after_the_first_page)
+    session = _session(
+        permissions,
+        **{
+            "amy@example.com": LEVEL_READ,
+            "carol@example.com": LEVEL_READ,
+            RESERVED_USER_LOCAL: LEVEL_OWNER,
+        },
+    )
 
     await _sync(permissions, task, session)
 
-    # Only Alice's page was read; Bob, who is on the list, and Carol both keep access.
-    assert _levels(permissions, session.id) == grants
+    # Amy, on the only page read, was checked and revoked; Carol was never checked.
+    amy = {"amy@example.com": LEVEL_READ} if failing == "shared_check" else {}
+    assert _levels(permissions, session.id) == {
+        **amy,
+        "carol@example.com": LEVEL_READ,
+        RESERVED_USER_LOCAL: LEVEL_OWNER,
+        # Grantees are still added.
+        **dict.fromkeys(GRANTEES, LEVEL_READ),
+    }
 
 
 @pytest.mark.parametrize(

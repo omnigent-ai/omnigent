@@ -616,13 +616,13 @@ async def test_a_grantee_replaced_during_a_run_is_not_given_the_session(
     monkeypatch.setattr(
         run_sharing, "_announce_session_added", lambda user_id, _: announced.append(user_id)
     )
-    # Alice's account is deleted and her name registered again: once the run has read
-    # the session's grants, or as it writes her account row after the recheck.
-    hooked = "list_for_session" if replaced == "before_the_recheck" else "ensure_user"
+    # Alice's account is deleted and her name registered again: as the run looks up her
+    # share of the session, or as it writes her account row after the recheck.
+    hooked = "get" if replaced == "before_the_recheck" else "ensure_user"
     original = getattr(permissions, hooked)
 
     def replace_alice_first(*args: Any, **kwargs: Any) -> Any:
-        if hooked == "list_for_session" or args[0] == "alice@example.com":
+        if args[0] == "alice@example.com":
             monkeypatch.setattr(permissions, hooked, original)
             assert accounts.delete_user("alice@example.com")
             accounts.create_user_with_password("alice@example.com", "second-hash")

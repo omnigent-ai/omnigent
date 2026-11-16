@@ -474,10 +474,14 @@ class FakePermissionStore:
         return None
 
     def grant_if_absent(self, user_id: str, conversation_id: str, level: int) -> bool:
-        if any(g[:2] == (user_id, conversation_id) for g in self.grants):
+        if self.get(user_id, conversation_id) is not None:
             return False
         self.grant(user_id, conversation_id, level)
         return True
+
+    def get(self, user_id: str, conversation_id: str) -> SessionPermission | None:
+        held = [g for g in self.grants if g[:2] == (user_id, conversation_id)]
+        return SessionPermission(*held[-1]) if held else None
 
     @property
     def supports_scheduled_task_grants(self) -> bool:

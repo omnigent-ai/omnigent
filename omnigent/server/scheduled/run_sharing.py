@@ -10,10 +10,13 @@ list at Read, with the owner's authority:
   session to the list, revoking any grant not on it except the owner's and
   ``__public__``.
 
-Grantees match by exact ID, as the session share route matches them. Older run
-sessions are never updated. Callers run these as the task's owner: the fire path
-inside its owner scopes, a route in the owner's own request. Nothing here raises;
-a failure is logged so it never changes a run's outcome.
+Both grant lists are read a page at a time, never whole. A grant is revoked only
+once the automation's share table confirms its holder isn't a grantee, so a read
+that fails part way revokes nothing unchecked. Grantees are added by exact ID, as the
+session share route adds them. Older run sessions are never updated. Callers run
+these as the task's owner: the fire path inside its owner scopes, a route in the
+owner's own request. Nothing here raises; a failure is logged so it never changes a
+run's outcome.
 """
 
 from __future__ import annotations
@@ -31,7 +34,8 @@ from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, RESERVED_USER_LOCAL, R
 from omnigent.server.routes._sessions.helpers import _announce_session_added
 from omnigent.server.session_sharing import require_sharing_mode_allows_grant
 from omnigent.server.sharing_settings import host_is_managed_sandbox
-from omnigent.stores.permission_store import PermissionStore, read_all_grants
+from omnigent.stores import permission_store as permission_store_module
+from omnigent.stores.permission_store import PermissionStore
 
 _logger = logging.getLogger(__name__)
 
@@ -85,23 +89,69 @@ async def _apply_task_grants(
     host_registry: Any | None,
     revocation: _Revocation,
 ) -> None:
+    # Revocations first, so a sharing policy that refuses additions still revokes.
+    if await _revocation_applies(task, session, permission_store, revocation):
+        await _revoke_unlisted_grants(task, session, permission_store)
+    await _add_missing_grantees(
+        task,
+        session,
+        permission_store=permission_store,
+        app_state=app_state,
+        host_registry=host_registry,
+    )
+
+
+async def _revocation_applies(
+    task: ScheduledTask,
+    session: Conversation,
+    permission_store: PermissionStore,
+    revocation: _Revocation,
+) -> bool:
+    """Whether this share revokes *session*'s grants that the automation's list lacks."""
+    if revocation is not _Revocation.WHILE_SHARED:
+        return revocation is _Revocation.ALWAYS
     try:
-        listed = await asyncio.to_thread(
-            read_all_grants, permission_store.list_for_scheduled_task, task.id
-        )
-        existing = await asyncio.to_thread(
-            read_all_grants, permission_store.list_for_session, session.id
+        grants, _ = await asyncio.to_thread(
+            permission_store.list_for_scheduled_task, task.id, limit=1
         )
     except Exception:
-        # A partial list must not drive revocations.
         _logger.exception(
-            "automation %s: could not read grants to share session %s", task.id, session.id
+            "automation %s: could not check whether it is shared; revoking nothing from "
+            "session %s",
+            task.id,
+            session.id,
         )
-        return
-    listed_ids = {grant.user_id for grant in listed}
-    if revocation is _Revocation.ALWAYS or (revocation is _Revocation.WHILE_SHARED and listed):
-        kept = {task.user_id or RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC, *listed_ids}
-        for grant in existing:
+        return False
+    return bool(grants)
+
+
+async def _revoke_unlisted_grants(
+    task: ScheduledTask, session: Conversation, permission_store: PermissionStore
+) -> None:
+    """Revoke each of *session*'s grants whose holder isn't one of the automation's grantees.
+
+    Keeps Owner grants, the automation's owner and ``__public__``. Reads a page at a
+    time and checks each holder on its own, so a failed read stops the pass without
+    revoking anyone unchecked.
+    """
+    kept = {task.user_id or RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC}
+    cursor: str | None = None
+    while True:
+        try:
+            page, cursor = await asyncio.to_thread(
+                permission_store.list_for_session,
+                session.id,
+                limit=permission_store_module.MAX_GRANTS_PAGE_SIZE,
+                after_user_id=cursor,
+            )
+        except Exception:
+            _logger.exception(
+                "automation %s: could not read the grants of session %s; revoking no more",
+                task.id,
+                session.id,
+            )
+            return
+        for grant in page:
             if grant.level == LEVEL_OWNER or grant.user_id in kept:
                 continue
             if await asyncio.to_thread(
@@ -121,26 +171,73 @@ async def _apply_task_grants(
                     grant.user_id,
                     session.id,
                 )
-    # Anyone with access already holds at least Read, so there is nothing to add for them.
-    holders = {grant.user_id for grant in existing}
-    missing = [grant for grant in listed if grant.user_id not in holders]
-    if not missing:
-        return
-    try:
-        await asyncio.to_thread(
-            _require_run_sharing_allowed, app_state, task, session, host_registry
-        )
-    except OmnigentError as exc:
-        _logger.warning(
-            "automation %s: not sharing session %s under the sharing policy: %s",
-            task.id,
-            session.id,
-            exc,
-        )
-        return
-    for grant in missing:
-        if await _share_with_grantee(permission_store, task, session, grant.user_id):
-            _announce_session_added(grant.user_id, session.id)
+        if cursor is None:
+            return
+
+
+async def _add_missing_grantees(
+    task: ScheduledTask,
+    session: Conversation,
+    *,
+    permission_store: PermissionStore,
+    app_state: Any | None,
+    host_registry: Any | None,
+) -> None:
+    """Share *session* at Read with each of the automation's grantees who has no share.
+
+    Reads the automation's grants a page at a time. The sharing policy is checked
+    once, before the first write; a refusal or a failed read stops the pass.
+    """
+    policy_checked = False
+    cursor: str | None = None
+    while True:
+        try:
+            page, cursor = await asyncio.to_thread(
+                permission_store.list_for_scheduled_task,
+                task.id,
+                limit=permission_store_module.MAX_GRANTS_PAGE_SIZE,
+                after_user_id=cursor,
+            )
+        except Exception:
+            _logger.exception(
+                "automation %s: could not read its grants to share session %s",
+                task.id,
+                session.id,
+            )
+            return
+        for grant in page:
+            grantee = grant.user_id
+            try:
+                # Anyone with access holds at least Read, so there is nothing to add for them.
+                held = await asyncio.to_thread(permission_store.get, grantee, session.id)
+            except Exception:
+                _logger.exception(
+                    "automation %s: could not read %r's share of session %s; not sharing it",
+                    task.id,
+                    grantee,
+                    session.id,
+                )
+                continue
+            if held is not None:
+                continue
+            if not policy_checked:
+                try:
+                    await asyncio.to_thread(
+                        _require_run_sharing_allowed, app_state, task, session, host_registry
+                    )
+                except OmnigentError as exc:
+                    _logger.warning(
+                        "automation %s: not sharing session %s under the sharing policy: %s",
+                        task.id,
+                        session.id,
+                        exc,
+                    )
+                    return
+                policy_checked = True
+            if await _share_with_grantee(permission_store, task, session, grantee):
+                _announce_session_added(grantee, session.id)
+        if cursor is None:
+            return
 
 
 def _held_under_the_stores_comparison(
@@ -148,8 +245,8 @@ def _held_under_the_stores_comparison(
 ) -> bool:
     """Whether the automation's share table matches *user_id* to one of its grantees.
 
-    Grantees otherwise match exactly. On MySQL the table's collation also matches a case
-    or accent variant, whose session grant would be revoked and re-added at Read.
+    On MySQL the table's collation also matches a case or accent variant, whose
+    session grant is then kept rather than revoked and re-added at Read.
 
     :param if_unknown: The answer when the check fails. Revocation passes ``True``, so
         a failed check never revokes a share.
@@ -210,7 +307,7 @@ def _share_and_confirm(
                 return False
             permission_store.ensure_user(grantee)
             # Automations grant Read only (SCHEDULED_TASK_GRANT_LEVELS). A share made
-            # since the session's grants were read is kept, never lowered.
+            # since the grantee was found without one is kept, never lowered.
             written = permission_store.grant_if_absent(grantee, session.id, LEVEL_READ)
     except Exception:
         _logger.exception(
