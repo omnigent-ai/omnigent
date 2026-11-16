@@ -16103,9 +16103,86 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       },
     );
 
-    it.each(["poll", "reconnect"] as const)(
-      "deduplicates a persisted terminal error against its live error on %s",
-      async (trigger) => {
+    it.each(["incremental", "rehydrate"] as const)(
+      "reconnect preserves committed error ordering on %s",
+      async (mode) => {
+        const error: ConversationItem = {
+          id: "err_order",
+          response_id: "resp_order",
+          type: "error",
+          status: "completed",
+          source: "harness",
+          code: "execution_failed",
+          message: "Turn failed",
+          created_at: 1040,
+        };
+        const errorBlock = itemsToBlocks([error])[0]!;
+        bound.set({
+          blocks: [
+            ...itemsToBlocks([before]),
+            {
+              ...errorBlock,
+              ctx: {
+                ...errorBlock.ctx,
+                itemId: null,
+                createdAtS: undefined,
+                clientCreatedAtS: 1040,
+              },
+            },
+          ],
+        });
+        const gap = Array.from({ length: mode === "rehydrate" ? 100 : 2 }, (_, index) => ({
+          ...assistantMessage(`resp_order_${index}`, "Committed"),
+          created_at: 1000 + index,
+        }));
+        const items = [before, ...gap.slice(0, 40), error, ...gap.slice(40)];
+        seedSessionItems(id, items);
+        sinks[0]!.error();
+        await drainAsync();
+        const expected = mode === "rehydrate" ? items.slice(-INITIAL_WINDOW_ITEMS) : items;
+        expect(
+          bound
+            .get()
+            .blocks.filter((b) => b.ctx.itemId)
+            .map((b) => b.ctx.itemId),
+        ).toEqual(expected.map((item) => item.id));
+      },
+    );
+
+    it("reconnect retains errors from distinct sources with the same text", async () => {
+      const errors: ConversationItem[] = ["llm", "harness"].map((source) => ({
+        id: `err_${source}`,
+        response_id: "resp_sources",
+        type: "error" as const,
+        status: "completed" as const,
+        source,
+        code: "execution_failed",
+        message: "Turn failed",
+      }));
+      const liveErrorBlock = itemsToBlocks(errors)[1]!;
+      bound.set({
+        blocks: [
+          ...itemsToBlocks([before]),
+          { ...liveErrorBlock, ctx: { ...liveErrorBlock.ctx, itemId: null } },
+        ],
+      });
+      seedSessionItems(id, [before, ...errors]);
+      sinks[0]!.error();
+      await drainAsync();
+      const persisted = bound
+        .get()
+        .blocks.filter(
+          (block): block is ErrorBlock => block.type === "error" && Boolean(block.ctx.itemId),
+        );
+      expect(persisted.map((b) => ({ id: b.ctx.itemId, source: b.source }))).toEqual([
+        { id: "err_llm", source: "llm" },
+        { id: "err_harness", source: "harness" },
+      ]);
+    });
+
+    it.each(["failed", "completed"] as const)(
+      "skips a persisted terminal error already rendered live on poll after %s status",
+      async (state) => {
         const error = { code: "execution_failed", message: "Turn failed" };
         sinks[0]!.push(
           sse("response.created", { id: "resp_failed", status: "in_progress", output: [] }),
@@ -16129,15 +16206,13 @@ describe("chatStore — startStreamPump reconnect loop", () => {
             ...error,
           },
         ]);
-        if (trigger === "poll") await advanceCheck();
-        else {
-          sinks[0]!.error();
-          await drainAsync();
-        }
+        bound.set({ activeResponse: { ...bound.get().activeResponse!, state } });
+        fetchMock.mockClear();
+        await advanceCheck();
+        await advanceCheck();
+        expect(itemReads()).toEqual(Array(2).fill(`/v1/sessions/${id}/items?limit=1&order=desc`));
         expect(bound.get().blocks.filter((block) => block.type === "error")).toHaveLength(1);
-        expect(bound.get().blocks.find((block) => block.type === "error")!.ctx.itemId).toBe(
-          "err_1",
-        );
+        expect(bound.get().blocks.find((block) => block.type === "error")!.ctx.itemId).toBeNull();
         expect(diagnostics()).toEqual([]);
       },
     );
@@ -16311,6 +16386,54 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       await advanceCheck();
       expect(itemReads()).toHaveLength(2);
       expect(bound.get().blocks.map((block) => block.ctx.itemId)).toEqual([before.id, reply.id]);
+    });
+
+    it("keeps a concurrent reconnect failure owed after a guarded poll is skipped", async () => {
+      await advanceWithHeartbeats(() => sinks.at(-1)!, 45_000);
+      sinks[0]!.push(sse("session.heartbeat", {}));
+      await vi.advanceTimersByTimeAsync(14_000);
+      seedSessionItems(id, [before, reply]);
+      const route = fetchMock.getMockImplementation()!;
+      const releases: ((failed: boolean) => void)[] = [];
+      fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+        if (
+          String(input).includes(`/items?limit=${SESSION_HISTORY_PAGE_SIZE}&`) &&
+          releases.length < 2
+        ) {
+          const failed = await new Promise<boolean>((resolve) => {
+            releases.push(resolve);
+          });
+          if (failed) return mockResponse({}, { ok: false, status: 503 });
+        }
+        return route(input, init);
+      });
+      sinks[0]!.error();
+      await drainAsync();
+      expect(releases).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(1_000);
+      await drainAsync();
+      expect(releases).toHaveLength(2);
+      sinks.at(-1)!.push(
+        sse("session.resource.deleted", {
+          session_id: id,
+          resource_type: "file",
+          resource_id: "file_1",
+        }),
+      );
+      await drainAsync();
+      releases[1]!(false);
+      await drainAsync();
+      releases[0]!(true);
+      await drainAsync();
+      expect(bound.get().blocks.map((block) => block.ctx.itemId)).toEqual([before.id]);
+      Object.defineProperty(document, "hidden", { configurable: true, value: true });
+      fetchMock.mockClear();
+      await advanceCheck();
+      expect(itemReads()).toEqual([
+        `/v1/sessions/${id}/items?limit=${SESSION_HISTORY_PAGE_SIZE}&order=desc`,
+      ]);
+      expect(bound.get().blocks.map((block) => block.ctx.itemId)).toEqual([before.id, reply.id]);
+      expect(diagnostics()).toEqual([]);
     });
 
     it("leaves reconnect catch-up ticks free of freshness probes", async () => {

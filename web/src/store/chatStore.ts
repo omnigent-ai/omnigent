@@ -6146,11 +6146,28 @@ async function reconcileActiveSessionStatus(
     return;
   }
   if (!canCheckItems()) return;
-  const newestId = newest.items[0]?.id;
+  const newestItem = newest.items[0];
+  const newestId = newestItem?.id;
   const newestRenderedId = get().blocks.findLast((block) => block.ctx.itemId)?.ctx.itemId;
   const reconciledId =
     recovery.reconciledItem?.generation === generation ? recovery.reconciledItem.itemId : null;
   if (newestId && newestId !== newestRenderedId && newestId !== reconciledId) {
+    const tail = get().blocks.findLast((block) => block.type !== "response_end");
+    // Live terminal errors have no item id. Avoid duplicating one just to assign its id.
+    if (
+      tail?.type === "error" &&
+      !tail.ctx.itemId &&
+      tail.ctx.responseId &&
+      tail.ctx.responseId === stateBeforeFetch.activeResponse?.responseId &&
+      newestItem.type === "error" &&
+      newestItem.response_id === tail.ctx.responseId &&
+      newestItem.source === tail.source &&
+      newestItem.code === tail.code &&
+      newestItem.message === tail.message
+    ) {
+      recovery.reconciledItem = { itemId: newestId, generation };
+      return;
+    }
     await recovery.backfill(false, { canApply: canCheckItems, newestItemId: newestId });
   }
 }
@@ -6405,7 +6422,7 @@ async function rehydrateWindowOnReconnect(
   set((s) => {
     const rid = s.activeResponse?.state === "streaming" ? s.activeResponse.responseId : null;
     const currentBlocks = withoutDeliveredSendFailureCards(
-      withoutNativePreviews(withPersistedErrorIds(s.blocks, freshBlocks), snapshotNativeMessageIds),
+      withoutNativePreviews(s.blocks, snapshotNativeMessageIds),
       freshItemIds,
       gapUserTexts,
       session,
@@ -6457,29 +6474,6 @@ async function rehydrateWindowOnReconnect(
 interface ReconnectSnapshotOptions {
   canApply?: () => boolean;
   onReconciled?: (recoveredItemCount: number) => void;
-}
-
-/** Match persisted terminal errors to their already-rendered live counterpart. */
-function withPersistedErrorIds(blocks: AnyBlock[], snapshot: AnyBlock[]): AnyBlock[] {
-  const claimed = new Set(blocks.map((block) => block.ctx.itemId));
-  let changed = false;
-  const updated = blocks.map((block) => {
-    if (block.type !== "error" || block.ctx.itemId || !block.ctx.responseId) return block;
-    const persisted = snapshot.find(
-      (candidate) =>
-        candidate.type === "error" &&
-        candidate.ctx.itemId &&
-        !claimed.has(candidate.ctx.itemId) &&
-        candidate.ctx.responseId === block.ctx.responseId &&
-        candidate.code === block.code &&
-        candidate.message === block.message,
-    );
-    if (!persisted) return block;
-    claimed.add(persisted.ctx.itemId);
-    changed = true;
-    return { ...block, ctx: { ...block.ctx, itemId: persisted.ctx.itemId } };
-  });
-  return changed ? updated : blocks;
 }
 
 function recoveredCommittedItemCount(
@@ -6642,10 +6636,7 @@ async function reconcileOnReconnect(
   const snapshotItemIds = new Set(items.map((it) => it.id));
   let recoveredItemCount = 0;
   set((s) => {
-    const currentBlocks = withoutNativePreviews(
-      withPersistedErrorIds(s.blocks, snapshotBlocks),
-      snapshotNativeMessageIds,
-    );
+    const currentBlocks = withoutNativePreviews(s.blocks, snapshotNativeMessageIds);
     recoveredItemCount = recoveredCommittedItemCount(
       snapshotBlocks,
       currentBlocks,

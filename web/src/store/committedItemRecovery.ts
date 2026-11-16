@@ -1,8 +1,9 @@
+import type { CommittedItemRecoveryTrigger } from "@/lib/host";
 import { emitOmnigentAnalytics } from "@/lib/analyticsEmit";
 
 /** Report recovered persisted items without transcript content or identity data. */
 export function reportRecoveredCommittedItems(
-  trigger: string,
+  trigger: CommittedItemRecoveryTrigger,
   count: number,
   secondsSinceLastByte: number | null,
 ): void {

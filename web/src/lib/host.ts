@@ -62,9 +62,12 @@ export type OmnigentInteractionKind =
 /** Terminal outcome of an interaction, set on the `complete` phase. */
 export type OmnigentInteractionStatus = "success" | "failure" | "cancelled" | "timed_out";
 
+/** Recovery entry points sharing the committed-item diagnostic. */
+export type CommittedItemRecoveryTrigger = "poll" | "foreground";
+
 /**
- * A product-analytics event forwarded to the host. Each carries a stable,
- * caller-chosen `componentId` / `pageId` so the host can attribute the action.
+ * A product-analytics event forwarded to the host. UI events carry a stable,
+ * caller-chosen `componentId` / `pageId`; recovery events carry content-free counts.
  *
  * PII: `value` on a value-change is only ever set when the emitting call site
  * explicitly declares the value PII-free (see `useOmnigentAnalytics` in
@@ -75,7 +78,7 @@ export type OmnigentInteractionStatus = "success" | "failure" | "cancelled" | "t
 export type OmnigentAnalyticsEvent =
   | {
       type: "committed_items_recovered";
-      trigger: string;
+      trigger: CommittedItemRecoveryTrigger;
       count: number;
       secondsSinceLastByte: number | null;
     }
