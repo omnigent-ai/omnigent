@@ -7,6 +7,7 @@ import { Card, CardAction, CardContent, CardHeader, CardTitle } from "@/componen
 import { Spinner } from "@/components/ui/spinner";
 import { formatSessionCostUsd } from "@/lib/formatCost";
 import { useChatStore } from "@/store/chatStore";
+import { SessionOverviewChanges } from "./SessionOverviewChanges";
 import { SessionOverviewSubagents } from "./SessionOverviewSubagents";
 
 // Tailwind's `xl` breakpoint: wide enough to dock the overview beside chat.
@@ -59,7 +60,14 @@ export function SessionCostButton({
 }
 
 /** Session cost and per-model token usage for the bound session. */
-export function SessionOverview({ onClose }: { onClose: () => void }) {
+export function SessionOverview({
+  onClose,
+  changesSessionId,
+}: {
+  onClose: () => void;
+  /** Session whose workspace changes to count; omitted when files aren't browsable. */
+  changesSessionId?: string;
+}) {
   const usageByModel = useChatStore((s) => s.sessionUsageByModel);
   return (
     <Card size="sm">
@@ -89,6 +97,7 @@ export function SessionOverview({ onClose }: { onClose: () => void }) {
         {usageByModel != null && Object.keys(usageByModel).length > 0 && (
           <ModelUsageBreakdown usageByModel={usageByModel} />
         )}
+        {changesSessionId && <SessionOverviewChanges sessionId={changesSessionId} />}
         <SessionOverviewSubagents />
       </CardContent>
     </Card>

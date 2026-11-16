@@ -53,6 +53,7 @@ from omnigent._wrapper_labels import (
 from omnigent._wrapper_labels import (
     WRAPPER_LABEL_KEY as _CLAUDE_NATIVE_WRAPPER_LABEL_KEY,
 )
+from omnigent.cli_auth import open_sdk_client
 from omnigent.cli_diagnostics import (
     SUPPRESS_RECOVERY_HINT_ATTR,
     printable,
@@ -84,7 +85,7 @@ from omnigent.process_logging import (
     process_log_dir_reference,
 )
 from omnigent.remote_launch import REMOTE_LAUNCH_MESSAGE
-from omnigent.session_host import get_session_host, route_session_request, set_session_host
+from omnigent.session_host import set_session_host
 from omnigent.spec import load as load_spec
 from omnigent.spec._omnigent_compat import OMNIGENT_EXECUTOR_TYPE
 from omnigent.spec.parser import discover_host_skills
@@ -706,7 +707,7 @@ def _remote_headers(
          (populated by ``omnigent login <apps-url>``) — mints a
          fresh workspace OAuth token via the SDK
       4. ambient Databricks CLI / ``~/.databrickscfg`` credentials
-         (the SDK's default resolution; no profile is threaded)
+         (only when no workspace pairing is stored for the server)
 
     This lets ``omnigent run --server <apps-url>`` work against
     Databricks Apps after a one-time ``omnigent login <apps-url>``,
@@ -749,10 +750,13 @@ def _remote_headers(
             if record_token:
                 headers["Authorization"] = f"Bearer {record_token}"
     if "Authorization" not in headers:
-        # 4. Ambient ~/.databrickscfg credentials.
-        creds = _read_databrickscfg(None)
-        if creds is not None and creds.token:
-            headers["Authorization"] = f"Bearer {creds.token}"
+        from omnigent.cli_auth import load_databricks_workspace_host
+
+        # A saved workspace stays authoritative when its credentials cannot mint.
+        if not server_url or load_databricks_workspace_host(server_url) is None:
+            creds = _read_databrickscfg(None)
+            if creds is not None and creds.token:
+                headers["Authorization"] = f"Bearer {creds.token}"
     # Workspace routing: when a ?o= selector was recorded at login, name the
     # workspace or the request routes to the account. Merged onto the result
     # because these ad-hoc requests carry no httpx Auth. ``host_id`` pins a
@@ -871,20 +875,12 @@ class _DatabricksTokenAuth(httpx.Auth):
          Databricks CLI near expiry (not on every request).
     """
 
-    def __init__(
-        self,
-        server_url: str | None = None,
-        *,
-        session_id: str | None = None,
-    ) -> None:
+    def __init__(self, server_url: str | None = None) -> None:
         """
         :param server_url: Remote server URL for looking up stored
             OIDC tokens, e.g. ``"http://localhost:6767"``.
-        :param session_id: Session whose traffic is pinned to its host replica.
-            Discovery requests use the default workspace routing.
         """
         self._server_url = server_url
-        self._session_id = session_id
         raw = os.environ.get(_REMOTE_AUTH_TOKEN_ENV)
         self._static_token = raw.strip() if raw else None
         # Lazily-resolved, then reused, SDK auth (one Config → one token
@@ -892,19 +888,6 @@ class _DatabricksTokenAuth(httpx.Auth):
         # the Databricks CLI (~0.5s) every time — a heavy tax on the
         # long-lived transcript-forwarder client that posts reply items.
         self._sdk_token_source = _shared_token_source(server_url)
-
-    def pin_session(self, session_id: str | None) -> None:
-        """Repoint this auth at a different session's host.
-
-        ``auth_flow`` reads ``get_session_host(self._session_id)`` per request,
-        so changing the pinned session id changes which host replica the slice
-        key routes to — without rebuilding the client. Used when a client
-        outlives the session it was built for (e.g. a ``--fork`` in the REPL
-        resumes under a new conversation id on a new host).
-
-        :param session_id: The session id to pin to, or ``None`` to unpin.
-        """
-        self._session_id = session_id
 
     def _sdk_token(self) -> str | None:
         """
@@ -966,18 +949,8 @@ class _DatabricksTokenAuth(httpx.Auth):
         if self._server_url:
             from omnigent.cli_auth import databricks_request_headers
 
-            session_path = f"{httpx.URL(self._server_url).path.rstrip('/')}/v1/sessions/"
-            session_host = (
-                get_session_host(self._session_id)
-                if self._session_id and request.url.path.startswith(session_path)
-                else None
-            )
-            request.headers.update(
-                databricks_request_headers(
-                    self._server_url,
-                    host_id=session_host,
-                )
-            )
+            # The default key; a session routing transport re-keys session requests.
+            request.headers.update(databricks_request_headers(self._server_url))
         if self._static_token:
             request.headers["Authorization"] = f"Bearer {self._static_token}"
         else:
@@ -1050,11 +1023,7 @@ def _server_headers(
     return client_identity_headers()
 
 
-def _server_auth(
-    server_url: str | None = None,
-    *,
-    session_id: str | None,
-) -> httpx.Auth | None:
+def _server_auth(server_url: str | None = None) -> httpx.Auth | None:
     """
     Build an httpx Auth for a remote Omnigent server client.
 
@@ -1066,29 +1035,21 @@ def _server_auth(
 
     :param server_url: Optional remote server URL for looking up
         stored OIDC tokens.
-    :param session_id: The single session this client drives, e.g.
-        ``"conv_abc123"``. When set, the auth pins every request to the
-        replica holding that session's runner tunnel (its host, looked up
-        in the session→host map). Required-keyword with no default so every
-        caller consciously decides: pass the session when known so its
-        traffic co-locates, or ``None`` before a session exists / for a
-        host-less client (the slice key then falls back to the runner-env
-        or CLI-own-host id inside ``databricks_request_headers``).
     :returns: Auth instance, or ``None``.
     """
     raw = os.environ.get(_REMOTE_AUTH_TOKEN_ENV)
     if raw and raw.strip():
-        return _DatabricksTokenAuth(server_url=server_url, session_id=session_id)
+        return _DatabricksTokenAuth(server_url=server_url)
     # Check stored `omnigent login` records: a session JWT or a
     # Databricks Apps pointer record.
     if server_url:
         from omnigent.cli_auth import load_databricks_workspace_host, load_token
 
         if load_token(server_url) or load_databricks_workspace_host(server_url):
-            return _DatabricksTokenAuth(server_url=server_url, session_id=session_id)
+            return _DatabricksTokenAuth(server_url=server_url)
     creds = _read_databrickscfg(None)
     if creds is not None and creds.token:
-        return _DatabricksTokenAuth(server_url=server_url, session_id=session_id)
+        return _DatabricksTokenAuth(server_url=server_url)
     return None
 
 
@@ -1946,8 +1907,6 @@ async def _prepare_chat_session_via_daemon(
     :raises click.ClickException: If the server is unreachable, or session
         create/fork or runner launch fails.
     """
-    from omnigent_client import OmnigentClient
-
     from omnigent._runner_startup import (
         STARTUP_PHASE_CONNECTING,
         STARTUP_PHASE_LAUNCHING_AGENT,
@@ -1966,7 +1925,7 @@ async def _prepare_chat_session_via_daemon(
         :returns: The session id and whether it was created just now.
         :raises click.ClickException: If the server rejects the create/fork.
         """
-        async with OmnigentClient(base_url=base_url, headers=headers, auth=auth) as sdk:
+        async with open_sdk_client(base_url, headers=headers, auth=auth) as sdk:
             try:
                 if fork_session_id is not None:
                     fork_result = await sdk.sessions.fork(fork_session_id)
@@ -2141,7 +2100,7 @@ def _chat_via_daemon(
             _await_accounts_first_run_setup(base_url, progress=progress)
 
             headers = _remote_headers(server_url=base_url, host_id=None)
-            auth = _server_auth(server_url=base_url, session_id=None)
+            auth = _server_auth(server_url=base_url)
             host_id = load_or_create_host_identity().host_id
             workspace = str(Path.cwd().resolve())
 
@@ -2599,11 +2558,10 @@ def _run_headless_prompt(
     """
 
     async def _main() -> None:
-        async with OmnigentClient(
-            base_url=base_url,
+        async with open_sdk_client(
+            base_url,
             headers=_server_headers(runner_id=runner_id),
-            auth=_server_auth(server_url=base_url, session_id=None),
-            request_hooks=[route_session_request],
+            auth=_server_auth(server_url=base_url),
         ) as client:
             # Both a local bundle and a remote registered agent go through
             # the sessions API; _query_sessions_once picks the create route
@@ -3274,7 +3232,7 @@ def _assert_resume_conversation_exists(
     """
 
     async def _lookup() -> None:
-        async with OmnigentClient(base_url=base_url, headers=headers) as client:
+        async with open_sdk_client(base_url, headers=headers) as client:
             await client.sessions.get(conversation_id)
 
     try:
@@ -3317,7 +3275,7 @@ def _run_picker(
     from omnigent.repl._resume_picker import pick_conversation_from_sdk
 
     async def _lookup() -> str | None:
-        async with OmnigentClient(base_url=base_url, headers=headers) as client:
+        async with open_sdk_client(base_url, headers=headers) as client:
             # Multipart ``omnigent run <yaml>`` uploads now create a
             # fresh session-scoped agent for every session so users who
             # choose the same YAML ``name:`` never share a bundle. Resume
@@ -3365,7 +3323,7 @@ def _resolve_latest_conversation_id(
     """
 
     async def _lookup() -> str | None:
-        async with OmnigentClient(base_url=base_url, headers=headers) as client:
+        async with open_sdk_client(base_url, headers=headers) as client:
             return await _resolve_latest_conversation_id_async(
                 client=client,
                 agent_name=agent_name,
@@ -4516,14 +4474,10 @@ def _run_repl(
         if attach_harness is not None:
             launch_harness = attach_harness
 
-        # Named so a --fork below can repoint it: the auth pins the slice key
-        # to whichever session it names, and a fork lands under a new id.
-        server_auth = _server_auth(server_url=base_url, session_id=resume_conversation_id)
-        async with OmnigentClient(
-            base_url=base_url,
+        async with open_sdk_client(
+            base_url,
             headers=_server_headers(runner_id=runner_id),
-            auth=server_auth,
-            request_hooks=[route_session_request],
+            auth=_server_auth(server_url=base_url),
         ) as client:
             # When --fork is set, call the fork endpoint before
             # entering the REPL so the user lands in the fork.
@@ -4534,17 +4488,13 @@ def _run_repl(
                 except Exception as exc:
                     raise click.ClickException(f"Fork failed: {exc}") from exc
                 effective_resume_id = fork_result["id"]
-                # The fork is a fresh session on (possibly) a different host.
-                # Record its host and repoint the auth from the source session
-                # to the fork, so this client's requests route to the fork's
-                # replica instead of the source's for the rest of the REPL.
+                # The fork is a fresh session on (possibly) a different host;
+                # recording it routes this client's fork requests there.
                 fork_host = fork_result.get("host_id")
                 set_session_host(
                     effective_resume_id,
                     fork_host if isinstance(fork_host, str) and fork_host else None,
                 )
-                if isinstance(server_auth, _DatabricksTokenAuth):
-                    server_auth.pin_session(effective_resume_id)
                 click.echo(
                     f"Conversation forked. To return to the previous "
                     f"conversation, run --resume {fork_session_id}",
@@ -4624,10 +4574,10 @@ def _run_one_shot(
 
     async def _main() -> None:
         """Run the one-shot SDK query inside an async client context."""
-        async with OmnigentClient(
-            base_url=base_url,
+        async with open_sdk_client(
+            base_url,
             headers=_server_headers(runner_id=runner_id),
-            auth=_server_auth(server_url=base_url, session_id=resume_conversation_id),
+            auth=_server_auth(server_url=base_url),
         ) as client:
             # Both a local bundle and a remote registered agent go through
             # the sessions API; _query_sessions_once picks the create route

@@ -47,12 +47,19 @@ describe("SessionOverviewSubagents", () => {
   it("lists each direct sub-agent with its cost, leaving an unknown cost empty", async () => {
     route(
       new Response(
-        JSON.stringify({ data: [child("conv_a", "codex:review"), child("conv_b", "worker:docs")] }),
+        JSON.stringify({
+          data: [
+            child("conv_a", "codex:review"),
+            child("conv_b", "worker:docs"),
+            child("conv_c", "Explore:scan"),
+          ],
+        }),
       ),
       [
         { id: "conv_root", cost_usd: 2 },
         { id: "conv_a", cost_usd: 0.5 },
         { id: "conv_b", cost_usd: null },
+        { id: "conv_c", cost_usd: null, estimated_cost_usd: 0.25 },
       ],
     );
     renderSection();
@@ -64,6 +71,7 @@ describe("SessionOverviewSubagents", () => {
     );
     expect(screen.getByRole("region", { name: "Sub-agents" })).toBeTruthy();
     expect(screen.getByTestId("session-overview-subagent-conv_b")).toHaveTextContent(/^docs$/);
+    expect(screen.getByTestId("session-overview-subagent-conv_c")).toHaveTextContent("scan~$0.25");
   });
 
   it("stays hidden without sub-agents", async () => {

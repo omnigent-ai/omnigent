@@ -1031,6 +1031,8 @@ describe("createSshSession", () => {
     await session.forwardLocal(8021);
     await session.cancelLocal(8021);
     await session.holdRemote(8020);
+    await session.forwardSocket("/tmp/s/w1.sock", "/tmp/omnigent-workspace-ab/workspace.sock");
+    await session.cancelSocket("/tmp/s/w1.sock", "/tmp/omnigent-workspace-ab/workspace.sock");
     await session.exec("true").promise;
 
     // The user's config reaches the connection and commands, but never its ControlMaster,
@@ -1058,6 +1060,20 @@ describe("createSshSession", () => {
       [...control, "forward", "-L", "localhost:8021:127.0.0.1:8021", "my-ec2"],
       [...control, "cancel", "-L", "localhost:8021:127.0.0.1:8021", "my-ec2"],
       [...control, "forward", "-R", "8020:127.0.0.1:9", "my-ec2"],
+      [
+        ...control,
+        "forward",
+        "-L",
+        "/tmp/s/w1.sock:/tmp/omnigent-workspace-ab/workspace.sock",
+        "my-ec2",
+      ],
+      [
+        ...control,
+        "cancel",
+        "-L",
+        "/tmp/s/w1.sock:/tmp/omnigent-workspace-ab/workspace.sock",
+        "my-ec2",
+      ],
       [
         "ssh",
         "-S",

@@ -19,7 +19,8 @@ firing:
    ``reasoning_effort``.
 #. **Grants ownership.** The spawned session gets a ``LEVEL_OWNER`` grant for the
    task's ``user_id`` — or :data:`RESERVED_USER_LOCAL` when it is NULL
-   (single-user / OSS). Without the grant the run is invisible.
+   (single-user / OSS). Without the grant the run is invisible. It is then shared
+   with the automation's grantees (:mod:`~omnigent.server.scheduled.run_sharing`).
 #. **Launches the runner and dispatches the prompt** so the agent actually runs
    (a seeded prompt with no launched runner would just sit as history). The
    message ends with :data:`UNATTENDED_RUN_NOTE`, since no one watches the run.
@@ -28,8 +29,9 @@ firing:
 
 A task with ``session_mode = "continue"`` skips host resolution and session
 creation once it has a ``session_id``: the prompt goes into that session
-instead, waking its runner the way a user message would. Its first firing
-creates the session as usual and records it as the task's ``session_id``.
+instead, waking its runner the way a user message would, after the session's
+sharing is synced to the automation's grantees. Its first firing creates the
+session as usual and records it as the task's ``session_id``.
 
 **Fire-and-forget.** The re-read + state guard run synchronously so an obviously
 dead fire costs nothing, but the session creation / launch is dispatched onto a
@@ -66,6 +68,7 @@ import logging
 import time
 import uuid
 from collections.abc import Awaitable, Callable
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Literal, Protocol
@@ -116,6 +119,13 @@ from omnigent.server.scheduled.harness_settings import (
     scheduled_agent_harness,
     validate_scheduled_permission_mode,
 )
+from omnigent.server.scheduled.rrule import is_one_time_rule
+from omnigent.server.scheduled.run_sharing import (
+    delete_task_grants,
+    is_managed_run_session,
+    share_new_run_session,
+    sync_continued_session,
+)
 from omnigent.server.scheduled.schedule import (
     continued_sandbox_host_id,
     is_trigger_automation,
@@ -145,7 +155,9 @@ from omnigent.server.schemas import SessionEventInput
 from omnigent.server.session_mcp_selection import SessionMcpSelection, session_mcp_selection
 from omnigent.stores.conversation_store import (
     CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
+    SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY,
     SCHEDULED_TASK_ORIGIN_LABEL_KEY,
+    SCHEDULED_TASK_RUN_LABEL_KEY,
     SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY,
     ConversationNotFoundError,
 )
@@ -154,6 +166,21 @@ if TYPE_CHECKING:
     from omnigent.server.managed_hosts import ManagedLaunch, ManagedLaunchTracker
 
 _logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _PromptSendProgress:
+    """Whether a continued run's dispatch has begun sending its prompt."""
+
+    started: bool = False
+
+
+# Set by a continued run around its dispatch; ``_send_prompt`` marks it just
+# before sending. A shared object rather than a flag, so a mark made in a
+# child task is still seen.
+_PROMPT_SEND_PROGRESS: ContextVar[_PromptSendProgress | None] = ContextVar(
+    "scheduled_prompt_send_progress", default=None
+)
 
 # How long to wait for a freshly launched runner to connect before giving up on
 # dispatching the prompt this fire. The session + grant are already persisted, so
@@ -298,6 +325,11 @@ class _FireRecorder(Protocol):
     """
 
     @property
+    def run_id(self) -> str:
+        """The run's ID, known before the run row exists for legacy timers."""
+        ...
+
+    @property
     def managed_host_id(self) -> str | None:
         """The sandbox host id this fire's managed session is created with and launched under."""
         ...
@@ -335,6 +367,8 @@ class _NewRunRecorder:
         self._deps = deps
         self._task = task
         self._scheduled_at = scheduled_at
+        # Chosen now so the session can name its run before the row is written.
+        self._run_id = _new_id()
         self._session_id: str | None = None
         # No run row carries an id, so a fresh managed fire chooses one here.
         self._fresh_host_id = uuid.uuid4().hex
@@ -346,6 +380,10 @@ class _NewRunRecorder:
         if self._task.session_mode == "continue":
             return continued_sandbox_host_id(self._task.id, self._task.workspace_id)
         return self._fresh_host_id
+
+    @property
+    def run_id(self) -> str:
+        return self._run_id
 
     async def check(self) -> None:
         return None
@@ -373,6 +411,7 @@ class _NewRunRecorder:
                 status=status,
                 error=error,
                 error_code=error_code,
+                run_id=self._run_id,
             )
         finally:
             self.release()
@@ -413,7 +452,8 @@ def _scheduled_session_title(task: ScheduledTask) -> str:
 # Follows the prompt in every message a fire sends. No one watches a run, so a
 # question or a permission request stalls it instead of reaching a person. Only
 # the sent message carries it: the task keeps the prompt its owner wrote, so the
-# automation pages never show it.
+# automation pages never show it. The chat hides it by exact text, so a change
+# here also goes in AUTOMATION_CONTEXT_NOTE in web/src/lib/systemMessage.ts.
 UNATTENDED_RUN_NOTE = (
     "<omnigent-automation-context>\n"
     "Note: an Omnigent automation sent this message, and no one is watching this run. "
@@ -427,9 +467,12 @@ UNATTENDED_RUN_NOTE = (
     "independent work that does not depend on those decisions. If an action is denied or "
     "requires unavailable approval, skip that action and explain the blocker. Continue "
     "independent work and permitted alternatives. Do not change permission settings to "
-    "get past the restriction. Lead your final reply with unresolved decisions and assumptions, "
-    "prioritizing those the user is most likely to want to change, then summarize what "
-    "you did and anything you couldn't do.\n"
+    "get past the restriction. If you have the sys_journal tools, start by reading your "
+    "journal with sys_journal_read; if the session has no plan, write one with "
+    "sys_journal_write_plan (one step is fine); and before your final reply, write a "
+    "status for each step you worked on with sys_journal_write_status. Lead your final "
+    "reply with unresolved decisions and assumptions, prioritizing those the user is most "
+    "likely to want to change, then summarize what you did and anything you couldn't do.\n"
     "</omnigent-automation-context>"
 )
 
@@ -728,7 +771,9 @@ async def _run_fire_for_task(
         )
         return
 
-    if task.continues_session:
+    if task.continues_session and not is_one_time_rule(task.rrule):
+        # A one-time task, such as a reminder, belongs to its session: with the
+        # session gone it fails instead of running in a new one without its context.
         task = await _release_replaceable_session(deps, task)
     if task.continues_session:
         await _continue_session(
@@ -811,9 +856,13 @@ async def _run_fire_for_task(
         conv = await _create_session(
             deps,
             effective,
-            labels=_session_labels(
-                task, session_mcp_selection(deps.app_state), recorder.managed_host_id
-            ),
+            labels={
+                **_session_labels(
+                    task, session_mcp_selection(deps.app_state), recorder.managed_host_id
+                ),
+                SCHEDULED_TASK_RUN_LABEL_KEY: recorder.run_id,
+                SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY: recorder.run_id,
+            },
         )
         log_session_created(conv.id)
     except _CannotLaunchScheduledFire as exc:
@@ -890,6 +939,15 @@ async def _run_fire_for_task(
             task.id,
             conv.id,
         )
+    # Before dispatch, so recipients can follow the run from its first turn.
+    start_fire_stage("session_sharing", session_id=conv.id)
+    await share_new_run_session(
+        effective,
+        conv,
+        permission_store=deps.permission_store,
+        app_state=deps.app_state,
+        host_registry=deps.host_registry,
+    )
 
     await recorder.check()
     try:
@@ -929,6 +987,7 @@ async def _disable_for_deleted_owner(
         task.user_id,
     )
     await asyncio.to_thread(deps.scheduled_task_store.update, task.id, state="deleted")
+    await delete_task_grants(deps.permission_store, task.id)
     await recorder.finish(
         "failed",
         error=f"owner {task.user_id!r} registration is no longer active; task disabled",
@@ -963,12 +1022,13 @@ async def _source_session_problem(deps: FireDeps, task: ScheduledTask) -> tuple[
 async def _release_replaceable_session(deps: FireDeps, task: ScheduledTask) -> ScheduledTask:
     """Drop a continued session that was deleted or never started, so this run starts a new one.
 
-    Only a session that no longer exists, or the task's sandbox session whose
-    first launch failed, is replaced: nothing ever ran in the latter. One the
-    owner archived or that no longer fits the task still fails the run, so a
-    change they made is never undone silently. The new session is recorded like a
-    first run's, and a managed sandbox is provisioned again when the earlier
-    session's workspace is gone (see :func:`_continued_host_binding`).
+    Not called for one-time (``COUNT=1``) tasks, which fail instead. Only a
+    session that no longer exists, or the task's sandbox session whose first
+    launch failed, is replaced: nothing ever ran in the latter. One the owner
+    archived or that no longer fits the task still fails the run, so a change
+    they made is never undone silently. The new session is recorded like a first
+    run's, and a managed sandbox is provisioned again when the earlier session's
+    workspace is gone (see :func:`_continued_host_binding`).
     """
     session_id = task.session_id
     assert session_id is not None  # guarded by the caller
@@ -1037,7 +1097,7 @@ async def _continue_session(
         reason, error_code = problem
         _logger.warning("scheduled fire: task %s cannot continue its session: %s", task.id, reason)
         await recorder.finish(
-            "failed", error=f"{reason}; {_NEW_SESSION_HINT}", error_code=error_code
+            "failed", error=f"{reason}; {_recovery_hint(task)}", error_code=error_code
         )
         return
     assert conv is not None
@@ -1079,14 +1139,42 @@ async def _continue_session(
             "failed",
             conversation_id=session_id,
             error="the session already has a cost cap this automation did not set; remove it "
-            f"from the session's policies, or {_NEW_SESSION_HINT}",
+            f"from the session's policies, or {_recovery_hint(task)}",
             error_code="continued_session_budget_conflict",
         )
         return
+    start_fire_stage("session_sharing", session_id=session_id)
+    await sync_continued_session(
+        task,
+        conv,
+        # A run changes the session's sharing only once the automation is shared.
+        forced=False,
+        permission_store=deps.permission_store,
+        app_state=deps.app_state,
+        host_registry=deps.host_registry,
+    )
+    progress = _PromptSendProgress()
+    progress_token = _PROMPT_SEND_PROGRESS.set(progress)
+    # Stamped before the prompt goes in, so the journal entries the session records
+    # are attributed to this run on any replica, even after a restart. A task, so
+    # a cancelled fire can still learn whether the write landed.
+    stamp = asyncio.ensure_future(
+        asyncio.to_thread(
+            deps.conversation_store.update_scheduled_run_label,
+            session_id,
+            recorder.run_id,
+            action="begin",
+        )
+    )
     try:
+        await asyncio.shield(stamp)
+        conv.labels[SCHEDULED_TASK_RUN_LABEL_KEY] = recorder.run_id
         start_fire_stage("runner_start", session_id=session_id)
         await dispatch(conv, task)
-    except Exception:
+    except BaseException as exc:
+        await _settle_run_label(deps, session_id, recorder.run_id, stamp, sent=progress.started)
+        if not isinstance(exc, Exception):
+            raise
         _logger.exception(
             "scheduled fire: dispatch into continued session %s failed for task %s",
             session_id,
@@ -1099,11 +1187,58 @@ async def _continue_session(
             error_code="launch_failed",
         )
         return
+    else:
+        await _settle_run_label(deps, session_id, recorder.run_id, stamp, sent=True)
+    finally:
+        _PROMPT_SEND_PROGRESS.reset(progress_token)
     await recorder.finish("succeeded", conversation_id=session_id)
     _logger.info("scheduled fire: task %s continued session %s", task.id, session_id)
 
 
+async def _settle_run_label(
+    deps: FireDeps,
+    session_id: str,
+    run_id: str,
+    stamp: asyncio.Future[None],
+    *,
+    sent: bool,
+) -> None:
+    """Settle tentative attribution after dispatch or a failure before sending.
+
+    Waits for an outstanding *stamp* first, and is shielded, so a cancelled
+    fire still settles the write. Once sending began, delivery is uncertain
+    and later failed attempts must be able to restore this run's label.
+    """
+
+    async def settle() -> None:
+        await asyncio.wait([stamp])
+        if stamp.cancelled() or stamp.exception() is not None:
+            return  # The stamp never landed.
+        try:
+            await asyncio.to_thread(
+                deps.conversation_store.update_scheduled_run_label,
+                session_id,
+                run_id,
+                action="commit" if sent else "rollback",
+            )
+        except Exception:
+            _logger.exception(
+                "scheduled fire: could not settle the run label on session %s",
+                session_id,
+            )
+
+    await asyncio.shield(asyncio.ensure_future(settle()))
+
+
 _NEW_SESSION_HINT = "edit the automation to start a new session on its next run"
+# A one-time task, such as a reminder, has no next run to change.
+_ONE_TIME_HINT = "it has no later run; set a new reminder or create a new automation"
+
+
+def _recovery_hint(task: ScheduledTask) -> str:
+    """What the owner can do about a continued run that failed."""
+    return _ONE_TIME_HINT if is_one_time_rule(task.rrule) else _NEW_SESSION_HINT
+
 
 UNATTENDED_PERMISSION_ERROR_CODE = "permission_mode_not_allowed"
 
@@ -1983,6 +2118,9 @@ async def _copy_source_session_for_run(
             copy_model_settings=False,
             # The copy's provider binding belongs to its agent; another agent resolves its own.
             copy_inference_snapshot=not agent_changed,
+            # The run plans and tracks its own work, as a run in a new session
+            # does; its copied history still shows the source's plan.
+            copy_journal=False,
             terminal_launch_args=launch_args,
             override_terminal_launch_args=True,
         )
@@ -2135,14 +2273,9 @@ async def _grant_default_public(deps: FireDeps, task: ScheduledTask, conversatio
     """
     if deps.permission_store is None or deps.app_state is None:
         return
-    from omnigent.server.sharing_settings import (
-        host_is_managed_sandbox,
-        new_session_starts_public,
-    )
+    from omnigent.server.sharing_settings import new_session_starts_public
 
-    managed = task.execution_target == "managed_sandbox" or host_is_managed_sandbox(
-        deps.host_registry, task.host_id
-    )
+    managed = is_managed_run_session(task, task.host_id, deps.host_registry)
     if not new_session_starts_public(deps.app_state, managed=managed, workspace=task.workspace):
         return
     await asyncio.to_thread(deps.permission_store.ensure_user, RESERVED_USER_PUBLIC)
@@ -2160,6 +2293,7 @@ async def _record_run(
     status: str,
     error: str | None = None,
     error_code: str | None = None,
+    run_id: str | None = None,
 ) -> None:
     """Stamp last_run_* on the task and write a scheduled_task_runs row."""
     await asyncio.to_thread(
@@ -2171,6 +2305,7 @@ async def _record_run(
         status,
         error=error,
         error_code=error_code,
+        run_id=run_id,
     )
 
 
@@ -2183,11 +2318,12 @@ def _record_run_sync(
     *,
     error: str | None = None,
     error_code: str | None = None,
+    run_id: str | None = None,
 ) -> None:
     """Synchronous run recording body for ``asyncio.to_thread`` callers."""
     now = _stamp_last_run_sync(deps, task, conversation_id)
     deps.scheduled_task_store.create_run(
-        _new_id(),
+        run_id or _new_id(),
         task.id,
         status,
         scheduled_at,
@@ -2485,6 +2621,10 @@ async def _send_prompt(
     with fire_stage("prompt_prepare", session_id=conv.id):
         agent_revision = await _agent_revision(deps, conv)
     with fire_stage("prompt_send", session_id=conv.id):
+        progress = _PROMPT_SEND_PROGRESS.get()
+        if progress is not None:
+            # From here a failure may come after the runner took the prompt.
+            progress.started = True
         dispatch_id = uuid.uuid4().hex
         log_delivery(
             "scheduled_run_prompt_dispatch_started", session_id=conv.id, dispatch_id=dispatch_id
@@ -2680,6 +2820,10 @@ class _ClaimedRunRecorder:
         self._task = task
         self._lease = lease
         self._registration_timeout_s = registration_timeout_s
+
+    @property
+    def run_id(self) -> str:
+        return self._lease.run.id
 
     @property
     def managed_host_id(self) -> str | None:
@@ -2952,7 +3096,12 @@ class ClaimedRunExecutor:
                 )
                 await recorder.finish(
                     "failed",
-                    error="Could not act as the automation's owner. The next run tries again.",
+                    error="Could not act as the automation's owner. "
+                    + (
+                        "It has no later run, so set it again."
+                        if is_one_time_rule(task.rrule)
+                        else "The next run tries again."
+                    ),
                     error_code="owner_identity_unavailable",
                 )
                 return

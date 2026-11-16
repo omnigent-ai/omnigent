@@ -1,10 +1,13 @@
-"""Regression coverage for turn boundaries in the shared E2E pollers."""
+"""Shared E2E session helpers preserve turn boundaries and failure evidence."""
 
 from __future__ import annotations
+
+import json
 
 import httpx
 import pytest
 
+from tests._helpers.native_session import _redacted_response_text, create_native_session
 from tests.e2e import conftest as helpers
 
 
@@ -151,3 +154,334 @@ def test_pending_tool_poll_waits_for_this_turn(monkeypatch, previous_call) -> No
             client, "input-new", session_id="session", timeout=1
         )
     assert [item["call_id"] for item in output] == ["new"]
+
+
+@pytest.mark.parametrize(
+    ("sensitive_fields", "credential_tails"),
+    [
+        pytest.param(
+            {"password": '"synthetic-password-tail'},
+            ("synthetic-password-tail",),
+            id="leading-quote",
+        ),
+        pytest.param(
+            {"password": 'prefix"synthetic-quote-tail\\\n\tend'},
+            ("synthetic-quote-tail",),
+            id="escaped-characters",
+        ),
+        pytest.param(
+            {
+                "details": [
+                    {"access_token": 'prefix"synthetic-nested-token-tail'},
+                    {"Authorization": 'Bearer "synthetic-authorization-tail'},
+                ]
+            },
+            ("synthetic-nested-token-tail", "synthetic-authorization-tail"),
+            id="nested-list",
+        ),
+        pytest.param(
+            {"password": {"value": '"synthetic-container-tail'}},
+            ("synthetic-container-tail",),
+            id="sensitive-object",
+        ),
+        pytest.param(
+            {
+                "passwd": "synthetic-passwd-tail",
+                "DATABASE_PASSWD": "synthetic-prefixed-passwd-tail",
+            },
+            ("synthetic-passwd-tail", "synthetic-prefixed-passwd-tail"),
+            id="passwd-label",
+        ),
+        pytest.param(
+            {
+                "credentials": {"value": "synthetic-credentials-tail"},
+                "providerCredentials": [{"value": "synthetic-credentials-list-tail"}],
+            },
+            ("synthetic-credentials-tail", "synthetic-credentials-list-tail"),
+            id="credentials-container",
+        ),
+        pytest.param(
+            {"password=synthetic-key-tail": "synthetic-key-value-tail"},
+            ("synthetic-key-tail", "synthetic-key-value-tail"),
+            id="credential-key",
+        ),
+        pytest.param(
+            {"credentials synthetic-key-tail": "synthetic-key-value-tail"},
+            ("synthetic-key-tail", "synthetic-key-value-tail"),
+            id="non-assignment-credentials-key",
+        ),
+        pytest.param(
+            {"password/synthetic-key-tail": "synthetic-key-value-tail"},
+            ("synthetic-key-tail", "synthetic-key-value-tail"),
+            id="non-assignment-password-key",
+        ),
+        pytest.param(
+            {
+                'password="\\"synthetic-escaped-key-tail"': {
+                    "value": "synthetic-escaped-key-value-tail"
+                }
+            },
+            ("synthetic-escaped-key-tail", "synthetic-escaped-key-value-tail"),
+            id="escaped-credential-key",
+        ),
+        pytest.param(
+            {"details": ['password="\\"synthetic-inline-escaped-tail"']},
+            ("synthetic-inline-escaped-tail",),
+            id="decoded-string",
+        ),
+        pytest.param(
+            {"details": "Bearer synthetic-bearer-tail"},
+            ("synthetic-bearer-tail",),
+            id="bearer-only-leaf",
+        ),
+        pytest.param(
+            {"detail": r'{"\u0070assphrase":"synthetic-encoded-json-tail"}'},
+            ("synthetic-encoded-json-tail",),
+            id="encoded-json-string",
+        ),
+        pytest.param(
+            {"details": [r'["\u0070assword", "synthetic-encoded-array-tail"]']},
+            ("synthetic-encoded-array-tail",),
+            id="encoded-json-array-string",
+        ),
+        pytest.param(
+            {"detail": json.dumps(r'{"\u0070assphrase":"synthetic-nested-encoded-tail"}')},
+            ("synthetic-nested-encoded-tail",),
+            id="multiply-encoded-json-string",
+        ),
+        *[
+            pytest.param(
+                {"details": f"{label}=synthetic-assignment-tail"}
+                if location == "leaf"
+                else {f"{label}=synthetic-assignment-tail": "synthetic-assignment-tail"},
+                ("synthetic-assignment-tail",),
+                id=f"{label}-assignment-{location}",
+            )
+            for label in ("passwd", "credentials", "api.key")
+            for location in ("key", "leaf")
+        ],
+        *[
+            pytest.param(
+                {
+                    label: "synthetic-direct-tail",
+                    "details": [
+                        {label: {"value": "synthetic-object-tail"}},
+                        {label: ["synthetic-list-tail"]},
+                        {label: 'prefix"synthetic-escaped-tail\\\n\tend'},
+                    ],
+                }
+                if location == "field"
+                else {
+                    "details": [
+                        f"{label}: session=synthetic-direct-tail",
+                        f'{label}: prefix"synthetic-escaped-tail\\\n\tend',
+                    ]
+                },
+                (
+                    "synthetic-direct-tail",
+                    "synthetic-object-tail",
+                    "synthetic-list-tail",
+                    "synthetic-escaped-tail",
+                )
+                if location == "field"
+                else ("synthetic-direct-tail", "synthetic-escaped-tail"),
+                id=f"{label}-direct-{location}",
+            )
+            for label in ("passphrase", "Cookie", "Set-Cookie", "private_key")
+            for location in ("field", "leaf")
+        ],
+    ],
+)
+def test_redacted_response_text_omits_credentials(
+    sensitive_fields: dict, credential_tails: tuple[str, ...]
+) -> None:
+    message = "host did not respond to workspace stat"
+    payload = {"error": {"code": "invalid_input", "message": message, **sensitive_fields}}
+    response = httpx.Response(400, json=payload)
+    original_content = response.content
+
+    diagnostic = _redacted_response_text(response)
+
+    assert "invalid_input" in diagnostic
+    assert message in diagnostic
+    assert "[REDACTED]" in diagnostic
+    assert all(tail not in diagnostic for tail in credential_tails)
+    assert response.content == original_content
+    assert response.json() == payload
+
+
+def test_redacted_response_text_keeps_distinct_redacted_fields() -> None:
+    payload = {
+        "password": "synthetic-first-tail",
+        "api_key": "synthetic-second-tail",
+        "[REDACTED]": "safe context",
+    }
+    response = httpx.Response(400, json=payload)
+
+    diagnostic = json.loads(_redacted_response_text(response))
+
+    assert len(diagnostic) == len(payload)
+    assert list(diagnostic.values()).count("[REDACTED]") == 2
+    assert "safe context" in diagnostic.values()
+    assert "synthetic-" not in json.dumps(diagnostic)
+    assert response.json() == payload
+
+
+def test_redacted_response_text_keeps_decoded_unicode_context() -> None:
+    payload = {"message": "Clôture complete — ready"}
+    response = httpx.Response(400, json=payload)
+
+    assert json.loads(_redacted_response_text(response)) == payload
+    assert response.json() == payload
+
+
+@pytest.mark.parametrize(
+    "failure_kind", ["long-api-key", "metadata-validation", "encoded-json-string"]
+)
+def test_native_create_failure_keeps_bounded_redacted_response(
+    failure_kind: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    message = "host did not respond to workspace stat"
+    credential_tails = ()
+    if failure_kind == "encoded-json-string":
+        credential_tails = ("synthetic-encoded-note-tail",)
+        message = r'{"\u0070assphrase":"synthetic-encoded-note-tail"}'
+    elif failure_kind == "metadata-validation":
+        from omnigent.errors import OmnigentError
+        from omnigent.server.routes._sessions.helpers import _parse_session_create_metadata
+
+        credential_tails = (
+            "synthetic-passphrase-tail",
+            "synthetic-cookie-tail",
+            "synthetic-private-key-tail",
+            "synthetic-object-tail",
+            "synthetic-list-tail",
+        )
+        with pytest.raises(OmnigentError) as validation:
+            _parse_session_create_metadata(
+                json.dumps(
+                    {
+                        "passphrase": credential_tails[0],
+                        "Cookie": credential_tails[1],
+                        "private_key": credential_tails[2],
+                        "settings": {"value": credential_tails[3]},
+                        "options": [credential_tails[4]],
+                    }
+                )
+            )
+        message = validation.value.message
+        assert "input_value" in message
+        assert all(tail in message for tail in credential_tails)
+    credential = "synthetic-credential-" * 200
+    payload = {
+        "error": {
+            "code": "invalid_input",
+            "message": message,
+            "api_key": credential,
+            "detail": "diagnostic-after-redaction",
+            "context": "x" * 3000 + "outside-diagnostic-limit",
+        }
+    }
+    response = httpx.Response(400, json=payload)
+    original_content = response.content
+    original_raise_for_status = response.raise_for_status
+    original_errors = []
+
+    def raise_for_status():
+        try:
+            original_raise_for_status()
+        except httpx.HTTPStatusError as error:
+            original_errors.append(error)
+            raise
+
+    monkeypatch.setattr(response, "raise_for_status", raise_for_status)
+    with httpx.Client(transport=httpx.MockTransport(lambda _: response)) as client:
+        with pytest.raises(httpx.HTTPStatusError) as raised:
+            create_native_session(client, "http://server.example.test", harness="codex")
+
+    error = raised.value
+    assert len(original_errors) == 1
+    assert error is original_errors[0]
+    assert error.response is response
+    assert error.request is response.request
+    assert error.response.status_code == 400
+    assert error.response.content == original_content
+    assert error.response.json() == payload
+    note = "\n".join(error.__notes__)
+    assert "invalid_input" in note
+    if failure_kind == "long-api-key":
+        assert message in note
+    assert "diagnostic-after-redaction" in note
+    assert "[REDACTED]" in note
+    assert "synthetic-credential-" not in note
+    assert all(tail not in note for tail in credential_tails)
+    assert "outside-diagnostic-limit" not in note
+    assert len(note) < 2200
+
+
+def _sized_json_response_body(size_bytes: int, character: str) -> str:
+    envelope_bytes = len(json.dumps({"message": ""}, ensure_ascii=False).encode("utf-8"))
+    count, remainder = divmod(size_bytes - envelope_bytes, len(character.encode("utf-8")))
+    return json.dumps({"message": character * count + "x" * remainder}, ensure_ascii=False)
+
+
+@pytest.mark.parametrize(
+    ("body", "expected_bytes", "omitted"),
+    [
+        pytest.param('upstream password="synthetic-omitted-tail', None, True, id="plain-text"),
+        pytest.param(
+            '{"password":"\\"synthetic-omitted-tail"} trailing', None, True, id="invalid-json"
+        ),
+        pytest.param(
+            "[" * 1100 + '"synthetic-omitted-tail"' + "]" * 1100, None, True, id="deep-json"
+        ),
+        *[
+            pytest.param(
+                _sized_json_response_body(size_bytes, character),
+                size_bytes,
+                size_bytes > 16_384,
+                id=f"{label}-{size_bytes}-bytes",
+            )
+            for label, character in (("ascii", "x"), ("multibyte", "é"))
+            for size_bytes in (16_384, 16_385)
+        ],
+    ],
+)
+def test_redacted_response_text_omits_unsafe_bodies(
+    body: str, expected_bytes: int | None, omitted: bool
+) -> None:
+    response = httpx.Response(502, content=body.encode("utf-8"))
+    original_content = response.content
+    original_payload = None
+    if expected_bytes is not None:
+        assert len(original_content) == expected_bytes
+        original_payload = response.json()
+
+    diagnostic = _redacted_response_text(response)
+
+    if omitted:
+        assert "Response body omitted" in diagnostic
+        assert "synthetic-omitted-tail" not in diagnostic
+    else:
+        assert json.loads(diagnostic) == original_payload
+    assert response.content == original_content
+    assert response.text == body
+    if expected_bytes is not None:
+        assert response.json() == original_payload
+
+
+def test_native_create_failure_keeps_http_error_when_diagnostic_body_is_omitted() -> None:
+    body = 'upstream password="synthetic-omitted-tail'
+    response = httpx.Response(502, content=body)
+    with httpx.Client(transport=httpx.MockTransport(lambda _: response)) as client:
+        with pytest.raises(httpx.HTTPStatusError) as raised:
+            create_native_session(client, "http://server.example.test", harness="codex")
+
+    error = raised.value
+    assert error.response is response
+    assert error.request is response.request
+    assert error.response.status_code == 502
+    assert error.response.text == body
+    note = "\n".join(error.__notes__)
+    assert "Response body omitted" in note
+    assert "synthetic-omitted-tail" not in note
