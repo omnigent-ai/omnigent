@@ -4503,6 +4503,15 @@ async def test_owner_shares_lists_and_revokes_an_automation(
         assert revoked.status_code == 204, revoked.text
     assert _task_grantees(db_uri, task_id) == ["carol@example.com", "dave@example.com"]
 
+    # An ID with a slash, which a grant accepts, can be removed too.
+    slashed = "team/member@example.com"
+    assert (await _share(auth_client, task_id, slashed)).status_code == 200
+    listed = await auth_client.get(_permissions_url(task_id), headers=_headers())
+    assert slashed in [p["user_id"] for p in listed.json()["permissions"]]
+    revoked = await auth_client.delete(_permissions_url(task_id, slashed), headers=_headers())
+    assert revoked.status_code == 204, revoked.text
+    assert _task_grantees(db_uri, task_id) == ["carol@example.com", "dave@example.com"]
+
 
 @_SHARING
 async def test_only_the_owner_reaches_an_automations_permissions(

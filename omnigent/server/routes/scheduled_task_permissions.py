@@ -474,7 +474,8 @@ def register_scheduled_task_permissions_routes(
         )
 
     @router.delete(
-        "/scheduled-tasks/{scheduled_task_id}/permissions/{target_user_id}",
+        # The rest of the path, since grantee IDs may contain slashes.
+        "/scheduled-tasks/{scheduled_task_id}/permissions/{target_user_id:path}",
         status_code=204,
         response_model=None,
     )
