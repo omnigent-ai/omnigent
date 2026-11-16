@@ -51,9 +51,10 @@ class RunnerSessionInitEnvelope(BaseModel):  # type: ignore[explicit-any]  # Pyd
     # message, so a recovery turn started from history would process it twice
     # (once from the recovery path, once from the buffered forward).
     suppress_recovery_turn: bool = False
-    # Resume an interrupted child task in its existing native session.
+    # Resume an interrupted task in its existing session.
     resume_interrupted_turn: bool = False
     recovery_id: str | None = None
+    recovery_prompt: str | None = None
     # The relay lets a pane-inferred status only annotate a running turn; an older
     # server would let it reopen one a hook just closed.
     accepts_inferred_status: bool = False
@@ -69,6 +70,7 @@ def build_runner_session_init_payload(
     suppress_recovery_turn: bool = False,
     resume_interrupted_turn: bool = False,
     recovery_id: str | None = None,
+    recovery_prompt: str | None = None,
 ) -> dict[str, object]:
     """Build the versioned initialization fields appended to the legacy body."""
     from omnigent.inference_config import snapshot_runtime_config
@@ -84,6 +86,7 @@ def build_runner_session_init_payload(
         suppress_recovery_turn=suppress_recovery_turn,
         resume_interrupted_turn=resume_interrupted_turn,
         recovery_id=(recovery_id or uuid4().hex) if resume_interrupted_turn else None,
+        recovery_prompt=recovery_prompt,
         accepts_inferred_status=True,
         accepts_input_only_failures=True,
         snapshot=RunnerSessionInitSnapshot(

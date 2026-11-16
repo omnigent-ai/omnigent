@@ -356,6 +356,7 @@ if TYPE_CHECKING:
     from concurrent.futures import Future
 
     from omnigent.inner.native_attachments import FilesystemAttachmentPolicy
+    from omnigent.server.host_session_recovery import HostSessionRecoverer
     from omnigent.session_recovery import SessionRecovery
 
 
@@ -5375,6 +5376,8 @@ def reconcile_orphaned_running_status(
     session_id: str,
     conversation_store: ConversationStore,
     stale_before: int,
+    *,
+    host_session_recoverer: HostSessionRecoverer | None = None,
 ) -> bool:
     """
     Settle a session that reads ``running`` but whose runner is
@@ -5400,13 +5403,24 @@ def reconcile_orphaned_running_status(
     :param stale_before: Runner stamps at or after this epoch are fresh.
     :returns: Whether this call performed the transition.
     """
-    from omnigent.server.host_session_recovery import record_interruption
-
-    interrupted = conversation_store.get_conversation(session_id)
+    interrupted = (
+        conversation_store.get_conversation(session_id)
+        if host_session_recoverer is not None
+        else None
+    )
     if not conversation_store.settle_orphaned_live_status(session_id, stale_before):
         return False
-    if interrupted is not None:
-        record_interruption(conversation_store, interrupted)
+    if interrupted is not None and host_session_recoverer is not None:
+        host_session_recoverer.record_interruption(interrupted)
+        if host_session_recoverer.enabled(interrupted.host_id):
+            recovery = conversation_store.get_session_recovery(session_id)
+            if (
+                recovery is not None
+                and recovery.host_id == interrupted.host_id
+                and recovery.runner_id == interrupted.runner_id
+                and recovery.phase in {"pending", "launching", "dispatching", "submitted"}
+            ):
+                return True
     _publish_status(
         session_id,
         "idle",

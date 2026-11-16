@@ -17,7 +17,7 @@ import secrets
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
-from typing import Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import httpx
 from fastapi import (
@@ -470,6 +470,9 @@ from omnigent.util.session_lifecycle import (
 )
 from omnigent.util.tmux_compat import MIN_TMUX_VERSION_HINT
 
+if TYPE_CHECKING:
+    from omnigent.server.host_session_recovery import HostSessionRecoverer
+
 
 def _harness_elicitation_request_fingerprint(params: ElicitationRequestParams) -> str:
     """
@@ -863,6 +866,8 @@ async def _stop_host_runner_intentionally(
     runner_id: str,
     host_registry: Any,
     conversation_store: ConversationStore,
+    *,
+    host_session_recoverer: HostSessionRecoverer | None = None,
 ) -> bool:
     """Carry stop intent to the active sessions sharing the terminated runner.
 
@@ -926,12 +931,11 @@ async def _stop_host_runner_intentionally(
                     completed_stop_relays[related_id] = (handle, handle.running_event_count)
                 handle.intentional_stop_turn_ended = False
 
-        from omnigent.server.host_session_recovery import stop_recovery
-
-        for related_id in stop_targets:
-            related = await asyncio.to_thread(conversation_store.get_conversation, related_id)
-            if related is not None:
-                await asyncio.to_thread(stop_recovery, conversation_store, related)
+        if host_session_recoverer is not None:
+            for related_id in stop_targets:
+                related = await asyncio.to_thread(conversation_store.get_conversation, related_id)
+                if related is not None:
+                    await asyncio.to_thread(host_session_recoverer.stop_recovery, related)
 
         acknowledged = False
         attempt = _HostRunnerStopAttempt()
@@ -990,6 +994,7 @@ async def _archive_stop(
     delete_worktree: bool = False,
     host_store: HostStore | None = None,
     sandbox_config: ManagedSandboxDeployment | None = None,
+    host_session_recoverer: HostSessionRecoverer | None = None,
 ) -> None:
     """
     Stop an archived session and tear down its host-launched runner.
@@ -1094,6 +1099,7 @@ async def _archive_stop(
                     conv.runner_id,
                     host_registry,
                     conversation_store,
+                    host_session_recoverer=host_session_recoverer,
                 )
         except Exception:  # noqa: BLE001
             _logger.debug(
@@ -1188,6 +1194,7 @@ def _spawn_archive_stop(
     delete_worktree: bool = False,
     host_store: HostStore | None = None,
     sandbox_config: ManagedSandboxDeployment | None = None,
+    host_session_recoverer: HostSessionRecoverer | None = None,
     after_turn: bool = False,
 ) -> None:
     """
@@ -1246,6 +1253,7 @@ def _spawn_archive_stop(
             delete_worktree=delete_worktree,
             host_store=host_store,
             sandbox_config=sandbox_config,
+            host_session_recoverer=host_session_recoverer,
         )
 
     task = asyncio.create_task(_stop_after_grace())
@@ -4733,6 +4741,7 @@ async def _mark_runner_sessions_offline_impl(
     *,
     fail_idle_top_level: bool = False,
     disconnect_evidence: Mapping[str, str] | None = None,
+    host_session_recoverer: HostSessionRecoverer | None = None,
 ) -> None:
     """
     Fail the sessions a departed runner actually interrupted, with the cause.
@@ -4781,6 +4790,7 @@ async def _mark_runner_sessions_offline_impl(
             conversation_store,
             fail_idle_top_level=fail_idle_top_level,
             disconnect_evidence=disconnect_evidence,
+            host_session_recoverer=host_session_recoverer,
             swept_at=swept_at,
         )
         if not pending:
@@ -4824,6 +4834,7 @@ async def _mark_runner_sessions_offline_once(
     fail_idle_top_level: bool,
     disconnect_evidence: Mapping[str, str] | None = None,
     swept_at: int,
+    host_session_recoverer: HostSessionRecoverer | None = None,
 ) -> list[Conversation]:
     """Reconcile each session once and return the ones blocked by metadata errors."""
     retry: list[Conversation] = []
@@ -4896,6 +4907,12 @@ async def _mark_runner_sessions_offline_once(
             error_code=error.code,
         ):
             continue
+        recovery = None
+        if host_session_recoverer is not None and await asyncio.to_thread(
+            host_session_recoverer.enabled, conv.host_id
+        ):
+            await asyncio.to_thread(host_session_recoverer.record_interruption, conv)
+            recovery = await asyncio.to_thread(conversation_store.get_session_recovery, conv.id)
         decision_status = _session_status_cache.get(conv.id)
         binding_unavailable = False
         try:
@@ -4933,9 +4950,12 @@ async def _mark_runner_sessions_offline_once(
                 conv.id,
             )
             continue
-        from omnigent.server.host_session_recovery import record_interruption
-
-        await asyncio.to_thread(record_interruption, conversation_store, conv)
+        if (
+            recovery is not None
+            and recovery.host_id == conv.host_id
+            and recovery.runner_id == conv.runner_id
+        ):
+            continue
         _publish_status(
             conv.id,
             "failed",
@@ -9429,6 +9449,7 @@ async def _settle_orphaned_running_rows(
     liveness_lookup: Callable[[list[str]], dict[str, SessionLiveness]] | None,
     host_store: HostStore | None,
     may_settle: Callable[[Conversation], bool],
+    host_session_recoverer: HostSessionRecoverer | None = None,
 ) -> None:
     """
     Settle rows whose persisted ``running`` outlived their runner, before a read.
@@ -9487,6 +9508,7 @@ async def _settle_orphaned_running_rows(
             conv.id,
             conversation_store,
             now - RUNNER_LIVENESS_TTL_S,
+            host_session_recoverer=host_session_recoverer,
         )
 
 

@@ -2832,6 +2832,22 @@ def create_app(
         if _owner_credentials:
             sandbox_config = _dc_replace(sandbox_config, owner_credentials=_owner_credentials)
             app.state.sandbox_config = sandbox_config
+    from omnigent.server.host_session_recovery import HostSessionRecoverer
+
+    host_session_recoverer = (
+        HostSessionRecoverer(
+            conversation_store,
+            host_registry,
+            host_store,
+            runner_router,
+            runner_session_initializer,
+            sandbox_config=sandbox_config,
+        )
+        if host_store is not None
+        else None
+    )
+    app.state.host_session_recoverer = host_session_recoverer
+
     from omnigent.server.sandbox_profiles import SandboxProfileCatalog
 
     sandbox_profiles = (
@@ -4809,6 +4825,7 @@ def create_app(
             error,
             conversation_store,
             disconnect_evidence=drop_attributes(evidence, hold_s=hold_s, hold_outcome=hold),
+            host_session_recoverer=host_session_recoverer,
         )
         if relaunch_host_id is not None:
             # Settlement must still own the old binding before a launch rotates it.
@@ -4854,6 +4871,12 @@ def create_app(
             return
         for conv in roots:
             try:
+                if (
+                    host_session_recoverer is not None
+                    and host_conn.hello.recover_interrupted_sessions
+                    and await asyncio.to_thread(host_session_recoverer.enabled, host_id)
+                ):
+                    continue
                 fresh = await asyncio.to_thread(conversation_store.get_conversation, conv.id)
                 last_error = _last_task_error_from_labels(fresh.labels) if fresh else None
                 if (
@@ -5151,6 +5174,7 @@ def create_app(
             ErrorDetail(code=failure_code, message=error),
             conversation_store,
             fail_idle_top_level=not runner_ran,
+            host_session_recoverer=host_session_recoverer,
         )
 
     async def _on_runner_connect(runner_id: str, connection: RunnerSession) -> None:
@@ -5431,18 +5455,14 @@ def create_app(
                             store_slots=store_slots,
                             trigger="runner_connect",
                             suppress_recovery_turn=bool(
-                                conversation_store.supports_session_recovery
-                                and conv.host_id
-                                and (
-                                    (
-                                        (recovering_host := host_registry.get(conv.host_id))
-                                        and recovering_host.hello.recover_interrupted_sessions
-                                    )
-                                    or await asyncio.to_thread(
-                                        conversation_store.get_session_recovery, conv.id
-                                    )
-                                    is not None
+                                host_session_recoverer is not None
+                                and await asyncio.to_thread(
+                                    host_session_recoverer.enabled, conv.host_id
                                 )
+                                and await asyncio.to_thread(
+                                    conversation_store.get_session_recovery, conv.id
+                                )
+                                is not None
                             ),
                         )
                         # A removed agent was already logged as expected.
@@ -5567,7 +5587,6 @@ def create_app(
     # except (a hidden failure). No host_store = host support is simply
     # not enabled (host connects get 404), rather than silently broken.
     if host_store is not None:
-        from omnigent.server.host_session_recovery import HostSessionRecoverer
         from omnigent.server.routes.harness_startup import create_harness_startup_router
         from omnigent.server.routes.host_tunnel import create_host_tunnel_router
         from omnigent.server.routes.hosts import create_hosts_router
@@ -5577,13 +5596,7 @@ def create_app(
         from omnigent.server.routes.skill_content import create_skill_content_router
         from omnigent.server.routes.skills import create_skills_router
 
-        host_session_recoverer = HostSessionRecoverer(
-            conversation_store,
-            host_registry,
-            host_store,
-            runner_router,
-            runner_session_initializer,
-        )
+        assert host_session_recoverer is not None
 
         async def _on_hosts_changed(_host_id: str, owner: str | None) -> None:
             announce_hosts_changed(owner)
