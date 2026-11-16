@@ -176,6 +176,32 @@ async def test_session_catalog_needs_no_runner_and_allows_shared_editors(
     assert not conn.pending_skills
 
 
+@pytest.mark.parametrize("params,refresh", [({}, False), ({"refresh": "true"}, True)])
+async def test_session_catalog_forwards_refresh_to_the_host(
+    skills_app, params: dict[str, str], refresh: bool
+) -> None:
+    app, _, conn, conv, _, _ = skills_app
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        task = asyncio.create_task(
+            client.get(
+                "/v1/skills",
+                params={"session_id": conv.id, **params},
+                headers={"x-test-user": "owner"},
+            )
+        )
+        frame = decode_host_frame(
+            (await asyncio.wait_for(conn.outbound_queue.get(), budget(2))).data
+        )
+        assert isinstance(frame, HostSkillsFrame)
+        assert frame.refresh is refresh
+        conn.pending_skills[frame.request_id].set_result(
+            HostSkillsResultFrame(frame.request_id, "ok", session_id=conv.id)
+        )
+        assert (await task).status_code == 200
+
+
 @pytest.mark.parametrize("user,status", [("reader", 403), ("stranger", 404), (None, 401)])
 async def test_unauthorized_session_does_not_send_discovery(
     skills_app, user: str | None, status: int

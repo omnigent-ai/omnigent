@@ -49,6 +49,7 @@ from omnigent.harnesses.claude_native.bridge import (
     _is_box_rule,
     _JsonlRecord,
     _occupying_surface,
+    _passthrough_slash_command_name,
     augment_claude_args,
     claude_global_config_path,
     count_hook_events,
@@ -1968,6 +1969,93 @@ def test_read_transcript_items_since_flags_compact_noop(tmp_path: Path, stdout: 
     )
     record_items = [item for record in byte_result.record_items for item in record.items]
     assert record_items == byte_result.items
+
+
+def _reload_command_records(name: str, arguments: str, stdout: str) -> list[dict[str, Any]]:
+    """The caveat, echo, and stdout records Claude Code writes for a reload command."""
+    return [
+        {
+            "type": "user",
+            "uuid": f"{name}-caveat",
+            "isMeta": True,
+            "message": {
+                "role": "user",
+                "content": "<local-command-caveat>Caveat</local-command-caveat>",
+            },
+        },
+        {
+            "type": "user",
+            "uuid": f"{name}-cmd",
+            "message": {
+                "role": "user",
+                "content": (
+                    f"<command-name>/{name}</command-name>\n"
+                    f"            <command-message>{name}</command-message>\n"
+                    f"            <command-args>{arguments}</command-args>"
+                ),
+            },
+        },
+        {
+            "type": "system",
+            "subtype": "local_command",
+            "uuid": f"{name}-stdout",
+            "isMeta": False,
+            "content": f"<local-command-stdout>{stdout}</local-command-stdout>",
+        },
+    ]
+
+
+@pytest.mark.parametrize(
+    ("name", "arguments", "stdout"),
+    [
+        ("reload-skills", "", "Reloaded skills: 13 skills available (1 added)"),
+        ("reload-plugins", "--force", "Reloaded: 0 plugins · 0 skills · 6 agents · 0 hooks"),
+    ],
+)
+def test_read_transcript_items_shows_reload_command_with_its_output(
+    tmp_path: Path, name: str, arguments: str, stdout: str
+) -> None:
+    transcript_path = tmp_path / "session.jsonl"
+    records = _reload_command_records(name, arguments, stdout)
+    transcript_path.write_text("".join(json.dumps(record) + "\n" for record in records))
+
+    _cursor, _response_id, items = read_transcript_items_since(
+        transcript_path, 0, agent_name="claude-native-ui"
+    )
+    byte_result = read_transcript_items_from_offset(
+        transcript_path, 0, start_line=0, agent_name="claude-native-ui"
+    )
+
+    expected = {"kind": "command", "name": name, "arguments": arguments, "output": stdout}
+    for parsed in (items, byte_result.items):
+        assert [item.item_type for item in parsed] == ["slash_command"]
+        assert {key: parsed[0].data[key] for key in expected} == expected
+    assert [item for record in byte_result.record_items for item in record.items] == (
+        byte_result.items
+    )
+
+
+def test_reload_command_output_needs_the_stdout_record_in_the_same_batch(
+    tmp_path: Path,
+) -> None:
+    transcript_path = tmp_path / "session.jsonl"
+    caveat, echo, stdout = _reload_command_records("reload-skills", "", "Reloaded skills: 1")
+    transcript_path.write_text(json.dumps(caveat) + "\n" + json.dumps(echo) + "\n")
+    first = read_transcript_items_from_offset(
+        transcript_path, 0, start_line=0, agent_name="claude-native-ui"
+    )
+    with transcript_path.open("a") as transcript:
+        transcript.write(json.dumps(stdout) + "\n")
+    second = read_transcript_items_from_offset(
+        transcript_path,
+        first.byte_offset,
+        start_line=first.line_cursor,
+        agent_name="claude-native-ui",
+    )
+
+    assert [item.data["name"] for item in first.items] == ["reload-skills"]
+    assert "output" not in first.items[0].data
+    assert second.items == []
 
 
 def test_read_transcript_items_since_keeps_real_bash_local_command(tmp_path: Path) -> None:
@@ -5572,6 +5660,8 @@ def test_paste_file_is_removed_when_payload_write_fails(
         ("/branch", "/branch"),
         ("/fork", "/fork"),
         ("/my-skill some args", "/my-skill some args"),
+        ("/reload-skills", "/reload-skills"),
+        ("/reload-plugins --force", "/reload-plugins --force"),
     ],
 )
 def test_escape_unsupported_slash_command(content: str, expected: str) -> None:
@@ -5580,6 +5670,11 @@ def test_escape_unsupported_slash_command(content: str, expected: str) -> None:
     supported commands and skills are left untouched.
     """
     assert _escape_unsupported_slash_command(content) == expected
+
+
+@pytest.mark.parametrize("content", ["/reload-skills", "/reload-plugins --force"])
+def test_reload_commands_fall_back_to_text_on_cli_builds_without_them(content: str) -> None:
+    assert _passthrough_slash_command_name(content) == content.split()[0].removeprefix("/")
 
 
 @pytest.mark.parametrize("content", ["/help", "/exit now", "/not-a-real-skill hello"])

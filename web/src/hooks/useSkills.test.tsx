@@ -271,6 +271,30 @@ describe("useSkills", () => {
     },
   );
 
+  it("reloads with a host rescan and replaces the cached catalog", async () => {
+    const added = [...skills, { name: "added", description: "Added on disk" }];
+    fetchMock.mockResolvedValueOnce(response());
+    const { result } = renderHook(() => useSkills({ target: { sessionId: "session-a" } }), {
+      wrapper,
+    });
+    await waitFor(() => expect(result.current.skills).toEqual(skills));
+    fetchMock.mockResolvedValueOnce(response(added));
+    await act(async () => {
+      await result.current.reload();
+    });
+    await waitFor(() => expect(result.current.skills).toEqual(added));
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls[1][0]).toBe("/v1/skills?session_id=session-a&refresh=true");
+  });
+
+  it("does not reload an unavailable catalog", async () => {
+    const { result } = renderHook(() => useSkills({ target: null }), { wrapper });
+    await act(async () => {
+      await result.current.reload();
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("rejects malformed catalogs", async () => {
     fetchMock.mockResolvedValue(new Response(JSON.stringify({})));
     const { result } = renderHook(() => useSkills({ target }), { wrapper });

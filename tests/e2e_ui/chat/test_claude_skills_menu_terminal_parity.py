@@ -158,7 +158,7 @@ def _install_claude_plugin(claude_config_dir: Path, marketplace: Path) -> None:
         "---\ndescription: Review the current diff.\n---\nReview the working-tree diff.\n"
     )
     _seed_skill(plugin / "skills", "simplify", "Simplify the selected code.")
-    claude_config_dir.mkdir(parents=True)
+    claude_config_dir.mkdir(parents=True, exist_ok=True)
     env = {
         **os.environ,
         "CLAUDE_CONFIG_DIR": str(claude_config_dir),

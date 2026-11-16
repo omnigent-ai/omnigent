@@ -2317,6 +2317,8 @@ interface ComposerProps {
  *     the call site).
  * :param showPermissions: Whether to include ``/permissions``, which opens
  *     the codex-native approval-mode control in place of Codex's own popup.
+ * :param showReload: Whether to include Claude Code's ``/reload-skills`` and
+ *     ``/reload-plugins``.
  * :returns: Merged ``Record<command, description>``.
  */
 export function buildSlashCommandMap(
@@ -2333,6 +2335,7 @@ export function buildSlashCommandMap(
   showPermissions = false,
   showRewind = false,
   showGoal = false,
+  showReload = false,
 ): Record<string, string> {
   const m: Record<string, string> = {};
   for (const [name, description] of Object.entries(BUILTIN_SLASH_COMMANDS)) {
@@ -2344,6 +2347,7 @@ export function buildSlashCommandMap(
     if (name === "/permissions" && !showPermissions) continue;
     if (name === "/rewind" && !showRewind) continue;
     if (name === "/goal" && !showGoal) continue;
+    if ((name === "/reload-skills" || name === "/reload-plugins") && !showReload) continue;
     // /btw is a Claude Code CLI built-in — only offer it on claude-native.
     if (name === "/btw" && !showBtw) continue;
     // /side is a Codex CLI built-in (ephemeral fork) — only offer it on codex-native.
@@ -3144,6 +3148,7 @@ function ComposerImpl(
     skillsWarnings,
     skillsStatus,
     refetch: refreshSkills,
+    reload: reloadSkills,
   } = useSkills({
     target:
       composerSession?.id && composerSession.hostId && composerSession.workspace
@@ -3191,6 +3196,9 @@ function ComposerImpl(
   // claude-native sessions. Selected/typed, it sends as plaintext to the
   // vendor TUI (see submit) — the forwarder relays its answer to the overlay.
   const showBtw = sessionHarness === "claude-native";
+  // Claude Code built-ins that reload skills and plugins in place; they reach
+  // the TUI as text, like /compact.
+  const showReload = sessionHarness === "claude-native";
   const skillPrefix = skillInvocationPrefix(sessionHarness);
   // /side is a Codex Code CLI built-in (ephemeral fork side chat), so offer it
   // only on codex-native sessions. Selected/typed, it sends as plaintext to the
@@ -3270,6 +3278,7 @@ function ComposerImpl(
         showCodexApprovalMode,
         showRewind,
         showGoal,
+        showReload,
       ),
     [
       showEffort,
@@ -3284,6 +3293,7 @@ function ComposerImpl(
       showCodexApprovalMode,
       showRewind,
       showGoal,
+      showReload,
     ],
   );
   const goalBuiltinNames = useMemo(() => new Set(showGoal ? ["/goal"] : []), [showGoal]);
@@ -3703,6 +3713,31 @@ function ComposerImpl(
           .catch((err: unknown) => {
             setCommandError(err instanceof Error ? err.message : "Compact failed");
           });
+        return true;
+      }
+      case "/reload-skills":
+      case "/reload-plugins": {
+        if (!showReload) {
+          setCommandError(`${cmd} is not supported for this agent type`);
+          return true;
+        }
+        if (cmd === "/reload-skills" && arg) {
+          setCommandError("/reload-skills does not accept arguments");
+          return true;
+        }
+        if (cmd === "/reload-plugins" && arg && arg !== "--force") {
+          setCommandError("Usage: /reload-plugins [--force]");
+          return true;
+        }
+        dirtyRef.current = true;
+        setValue("");
+        setCommandError(null);
+        const command = arg ? `${cmd} ${arg}` : cmd;
+        appendEntry(command);
+        onSend(command);
+        // Rescan now so new skills appear in this menu without waiting for the
+        // host cache; on failure the menu keeps its catalog until the next poll.
+        void reloadSkills().catch(() => undefined);
         return true;
       }
       case "/effort": {
@@ -4299,7 +4334,9 @@ function ComposerImpl(
         runCommand(() =>
           executeSlashCommand(
             cmd,
-            cmd === "/compact" ? trimmed.slice(parts[0].length).trim() : arg,
+            cmd === "/compact" || cmd === "/reload-skills" || cmd === "/reload-plugins"
+              ? trimmed.slice(parts[0].length).trim()
+              : arg,
           ),
         );
         return;

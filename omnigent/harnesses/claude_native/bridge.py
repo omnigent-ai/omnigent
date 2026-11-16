@@ -57,7 +57,7 @@ import unicodedata
 import urllib.parse
 from collections.abc import Awaitable, Callable, Collection, Iterator, Mapping, Sequence
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from http import HTTPStatus
 from http.client import HTTPConnection, HTTPException
@@ -3934,6 +3934,7 @@ def read_transcript_items_since_with_position(
         custom_title = _custom_title_from_transcript_entry(entry)
         if custom_title is not None:
             latest_custom_title = custom_title
+        _attach_reload_command_output(entry, record_items, items)
         record_items.append(
             TranscriptRecordItems(
                 next_byte_offset=record.next_byte_offset,
@@ -4144,6 +4145,7 @@ def read_transcript_items_from_offset(
         custom_title = _custom_title_from_transcript_entry(entry)
         if custom_title is not None:
             latest_custom_title = custom_title
+        _attach_reload_command_output(entry, record_items, items)
         record_items.append(
             TranscriptRecordItems(
                 next_byte_offset=record.next_byte_offset,
@@ -10580,6 +10582,52 @@ def _dedupe_compact_noop_echo(
     ]
 
 
+_LOCAL_COMMAND_OUTPUT_RE = re.compile(
+    r"<local-command-(stdout|stderr)>(.*?)</local-command-\1>", re.DOTALL
+)
+
+
+def _attach_reload_command_output(
+    entry: _JsonObject,
+    record_items: list[TranscriptRecordItems],
+    items: list[ClaudeTranscriptItem],
+) -> None:
+    """
+    Copy a reload command's stdout record onto the echo item just before it.
+
+    ``/reload-skills`` and ``/reload-plugins`` write their result
+    ("Reloaded skills: …") as a standalone ``local_command`` record directly
+    after the command echo, in the same write. Attaching it as the echo's
+    ``output`` lets the web card show what Claude reloaded. A result read in
+    a later batch stays hidden, leaving the card without output.
+
+    :param entry: The transcript record being processed.
+    :param record_items: Items of the records already processed in this batch.
+    :param items: Flat items already parsed in this batch; its last element
+        must be the last item of ``record_items[-1]``.
+    """
+    if entry.get("subtype") != "local_command" or not record_items or not items:
+        return
+    content = entry.get("content")
+    if not isinstance(content, str):
+        return
+    output_match = _LOCAL_COMMAND_OUTPUT_RE.fullmatch(content.strip())
+    previous = record_items[-1]
+    if output_match is None or len(previous.items) != 1:
+        return
+    echo = previous.items[0]
+    if (
+        echo is not items[-1]
+        or echo.item_type != "slash_command"
+        or echo.data.get("name") not in _CLAUDE_CLI_RELOAD_COMMANDS
+        or "output" in echo.data
+    ):
+        return
+    with_output = replace(echo, data={**echo.data, "output": output_match.group(2).strip()})
+    record_items[-1] = replace(previous, items=(with_output,))
+    items[-1] = with_output
+
+
 def _compact_noop_stdout(content: str) -> str | None:
     """
     Return the ``/compact`` "nothing to compact" refusal text, if this is one.
@@ -10676,6 +10724,10 @@ _CLAUDE_CLI_SURFACED_COMMANDS: frozenset[str] = frozenset(
         "ultrareview",
     }
 )
+# Surfaced commands whose result is a separate stdout record written right
+# after the echo. They stay out of the allowed set below so older Claude Code
+# builds that reject them still fall back to plain text.
+_CLAUDE_CLI_RELOAD_COMMANDS: frozenset[str] = frozenset({"reload-plugins", "reload-skills"})
 
 # Slash commands that Omnigent lets a user type directly into the native
 # Claude Code terminal. Anything not in this set or not a skill is sent
@@ -10866,7 +10918,9 @@ def _slash_command_item_from_echo(
         return None
     data: _JsonObject = {
         "agent": agent_name,
-        "kind": "command" if payload.name in _CLAUDE_CLI_SURFACED_COMMANDS else "skill",
+        "kind": "command"
+        if payload.name in _CLAUDE_CLI_SURFACED_COMMANDS | _CLAUDE_CLI_RELOAD_COMMANDS
+        else "skill",
         "name": payload.name,
         "arguments": payload.arguments,
     }

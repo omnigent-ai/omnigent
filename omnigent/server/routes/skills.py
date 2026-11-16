@@ -61,6 +61,7 @@ def create_skills_router(
         harness: str | None = Query(None, min_length=1),
         path: str | None = Query(None, min_length=1),
         agent_id: str | None = Query(None, min_length=1),
+        refresh: bool = Query(False),
     ) -> SkillsResponse:
         """Discover skills using a session or an explicit host, harness, and directory.
 
@@ -71,7 +72,8 @@ def create_skills_router(
         and bundled skills, with the same access check as session creation.
         The two forms cannot be combined. ``warnings`` names sources the host
         could not read, so an incomplete catalog is distinguishable from an
-        empty one.
+        empty one. ``refresh`` asks the host to rescan disk instead of serving
+        its cached catalog; hosts that predate it ignore the flag.
         """
         user_id = require_user(request, auth_provider)
         agent_version = sub_agent_name = None
@@ -156,6 +158,7 @@ def create_skills_router(
             sub_agent_name=sub_agent_name,
             skills_filter=spec.skills_filter if spec is not None else "all",
             workflows_enabled=workflows_enabled,
+            refresh=refresh,
         )
         if result.status != "ok":
             raise HTTPException(
@@ -206,6 +209,7 @@ async def request_host_skills(
     sub_agent_name: str | None = None,
     skills_filter: str | list[str] = "all",
     workflows_enabled: bool = False,
+    refresh: bool = False,
 ) -> HostSkillsResultFrame:
     """Request skill metadata over the host tunnel, with bounded waiting and cleanup."""
     request_id = secrets.token_hex(8)
@@ -225,6 +229,7 @@ async def request_host_skills(
                     sub_agent_name=sub_agent_name,
                     skills_filter=skills_filter,
                     workflows_enabled=workflows_enabled,
+                    refresh=refresh,
                 )
             ),
         )

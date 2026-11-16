@@ -1439,6 +1439,60 @@ describe("Composer slash-command menu", () => {
     expect(textarea()).toHaveValue(command);
   });
 
+  describe("Claude Code reload commands", () => {
+    const renderForHarness = (harness: string) => {
+      const { sessionHarness } = useChatStore.getState();
+      onTestFinished(() => useChatStore.setState({ sessionHarness }));
+      useChatStore.setState({ sessionHarness: harness });
+      const props = composerProps({ isNativeWrapper: true });
+      render(<Composer {...props} />);
+      return props;
+    };
+
+    it.each(["/reload-skills", "/reload-plugins", "/reload-plugins --force"])(
+      "claude-native sends %s to the terminal and rescans skills",
+      (command) => {
+        const props = renderForHarness("claude-native");
+        fireEvent.change(textarea(), { target: { value: command } });
+        fireEvent.keyDown(textarea(), { key: "Enter" });
+        expect(textarea()).toHaveValue("");
+        expect(props.onSend).toHaveBeenCalledExactlyOnceWith(command);
+        expect(skillsFixture.getState().reload).toHaveBeenCalledOnce();
+      },
+    );
+
+    it.each(["reload-skills", "reload-plugins"])("runs %s when picked from the menu", (name) => {
+      const props = renderForHarness("claude-native");
+      fireEvent.change(textarea(), { target: { value: "/reload" } });
+      expect(screen.getByTestId("slash-menu-item-reload-skills")).toBeVisible();
+      fireEvent.click(screen.getByTestId(`slash-menu-item-${name}`));
+      expect(props.onSend).toHaveBeenCalledExactlyOnceWith(`/${name}`);
+      expect(skillsFixture.getState().reload).toHaveBeenCalledOnce();
+    });
+
+    it.each([
+      ["/reload-skills now", "/reload-skills does not accept arguments"],
+      ["/reload-plugins --all", "Usage: /reload-plugins [--force]"],
+    ])("rejects %s without sending", (command, message) => {
+      const props = renderForHarness("claude-native");
+      fireEvent.change(textarea(), { target: { value: command } });
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+      expect(screen.getByText(message)).toBeVisible();
+      expect(props.onSend).not.toHaveBeenCalled();
+      expect(skillsFixture.getState().reload).not.toHaveBeenCalled();
+    });
+
+    it("leaves reload commands to other harnesses as plain text", () => {
+      const props = renderForHarness("codex-native");
+      fireEvent.change(textarea(), { target: { value: "/reload" } });
+      expect(screen.queryByTestId("slash-menu-item-reload-skills")).toBeNull();
+      fireEvent.change(textarea(), { target: { value: "/reload-skills now" } });
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+      expect(props.onSend).toHaveBeenCalledExactlyOnceWith("/reload-skills now", undefined);
+      expect(skillsFixture.getState().reload).not.toHaveBeenCalled();
+    });
+  });
+
   it.each(["Enter", "click"])("shows a toast for busy Codex /compact via %s", (submit) => {
     const { sessionHarness, status, sessionStatus, queuedMessages } = useChatStore.getState();
     onTestFinished(() =>
@@ -9477,7 +9531,8 @@ const skillsFixture = create<{
   skills: SkillSummary[];
   skillsStatus: SkillsStatus | null;
   refetch: ReturnType<typeof vi.fn>;
-}>(() => ({ skills: [], skillsStatus: null, refetch: vi.fn() }));
+  reload: ReturnType<typeof vi.fn>;
+}>(() => ({ skills: [], skillsStatus: null, refetch: vi.fn(), reload: vi.fn() }));
 
 vi.mock("@/hooks/useSkills", () => ({
   useSkills: ({ starting }: { starting: boolean }) => {
@@ -9490,7 +9545,14 @@ vi.mock("@/hooks/useSkills", () => ({
   },
 }));
 
-beforeEach(() => skillsFixture.setState({ skills: [], skillsStatus: null, refetch: vi.fn() }));
+beforeEach(() =>
+  skillsFixture.setState({
+    skills: [],
+    skillsStatus: null,
+    refetch: vi.fn(),
+    reload: vi.fn().mockResolvedValue(undefined),
+  }),
+);
 
 function setComposerState(
   patch: Partial<ChatState> & { skills?: SkillSummary[]; skillsStatus?: SkillsStatus | null },

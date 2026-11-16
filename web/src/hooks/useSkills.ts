@@ -1,4 +1,5 @@
-import { skipToken, useQuery } from "@tanstack/react-query";
+import { skipToken, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useCallback } from "react";
 import { authenticatedFetch } from "@/lib/identity";
 import { ApiError } from "@/lib/sessionsApi";
 import type { Session, SkillsCatalog, SkillSummary, SkillsStatus } from "@/lib/types";
@@ -22,16 +23,21 @@ export type SkillsTarget =
       scope?: never;
     };
 
-/** Both composers receive catalogs directly from host-backed requests. */
+/**
+ * Both composers receive catalogs directly from host-backed requests.
+ * `refresh` makes the host rescan disk instead of serving its cached catalog.
+ */
 export async function fetchSkills(
   target: SkillsTarget,
   signal: AbortSignal,
+  { refresh = false }: { refresh?: boolean } = {},
 ): Promise<SkillsCatalog> {
   const params =
     target.sessionId !== undefined
       ? new URLSearchParams({ session_id: target.sessionId })
       : new URLSearchParams({ host_id: target.hostId, harness: target.harness, path: target.path });
   if (target.agentId !== undefined) params.set("agent_id", target.agentId);
+  if (refresh) params.set("refresh", "true");
   const response = await authenticatedFetch(`/v1/skills?${params}`, { signal });
   if (!response.ok) {
     throw new ApiError(`${response.status} ${response.statusText}`, response.status, null);
@@ -63,6 +69,7 @@ interface SkillsOptions {
 /** Discover composer skills, with optional session authorization and agent scope. */
 export function useSkills({ target, enabled = true, starting = false }: SkillsOptions) {
   const available = enabled && target !== null;
+  const queryClient = useQueryClient();
   const query = useQuery({
     queryKey: skillsQueryKey(target),
     queryFn: available ? ({ signal }) => fetchSkills(target, signal) : skipToken,
@@ -83,10 +90,19 @@ export function useSkills({ target, enabled = true, starting = false }: SkillsOp
       : query.isError
         ? "error"
         : "ready";
+  /** Replace the catalog with a fresh disk scan, e.g. after `/reload-skills`. */
+  const reload = useCallback(async () => {
+    if (target === null || !available) return;
+    const queryKey = skillsQueryKey(target);
+    await queryClient.cancelQueries({ queryKey });
+    const catalog = await fetchSkills(target, new AbortController().signal, { refresh: true });
+    queryClient.setQueryData(queryKey, catalog);
+  }, [available, queryClient, target]);
   return {
     skills: available ? (query.data?.skills ?? []) : [],
     skillsWarnings: available ? (query.data?.warnings ?? []) : [],
     skillsStatus,
     refetch: query.refetch,
+    reload,
   };
 }

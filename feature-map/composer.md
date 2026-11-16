@@ -204,6 +204,14 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   attachment that could not be restored (a warning asks the user to attach it
   again, including missing files and failed server lookups; failed downloads
   name the affected files).
+- `reload-commands`: in Claude Code native sessions, `/reload-skills` and
+  `/reload-plugins [--force]` run in the session's Claude Code process, which
+  keeps running, then rescan the host's skill catalog so the `/` menu lists the
+  new skills. The chat shows a **Command** card whose Output is Claude Code's
+  result line. Other harnesses do not offer them; a typed command is sent as
+  text. States: unexpected arguments (error under the composer), a Claude Code
+  build without the command (re-sent as plain text), output not yet in the
+  transcript (card without Output).
 - `session-mcp-status`: selecting `/mcp` in a started session replaces the slash
   suggestions with the MCP servers enabled for that session and links to harness
   Settings with the session’s host preselected. Host-native entries are limited
@@ -806,6 +814,16 @@ Other connection providers alone do not enable the managed MCP picker.
   with an attachment. Each `/clear` moves the view to an empty chat on the
   same machine, and the original chat ends with a notice linking to it. The
   capability gate is also in `web/src/pages/ChatPage.composer.test.tsx`.
+- **`reload-commands`:**
+  `tests/e2e_ui/chat/test_claude_native_reload_commands.py` picks each command
+  from the `/reload` menu in a real Claude Code native session on the mock LLM,
+  after adding a skill or installing a plugin mid-session, then runs the new
+  skill and checks that the Claude process and earlier context survived.
+  Typed commands, argument errors and the harness gate are in
+  `web/src/pages/ChatPage.composer.test.tsx`; the Command card's Output in
+  `tests/harnesses/claude_native/test_claude_native_bridge.py`. Manually, add a
+  skill under the workspace's `.claude/skills` during a native session, run
+  `/reload-skills` from Chat, and pick the new skill from the `/` menu.
 - **`slash-menu`:**
   `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_tracks_real_focus_and_wrapping_keyboard_navigation`,
   `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_shows_full_skill_description`,

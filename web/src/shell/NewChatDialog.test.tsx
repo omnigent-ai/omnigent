@@ -1340,6 +1340,7 @@ function setupLandingMocks() {
         skillsWarnings: [],
         skillsStatus: target && enabled ? "ready" : starting ? "loading" : "unavailable",
         refetch: vi.fn(),
+        reload: vi.fn(),
       }) as ReturnType<typeof useSkills>,
   );
   useAvailableAgentsMock.mockReset();
