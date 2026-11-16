@@ -4268,8 +4268,23 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     expect(screen.getByTestId("task-trigger-untrusted-note")).toBeInTheDocument();
   });
 
+  function mockLaptop(longSessionMessagesSupported: boolean) {
+    vi.mocked(hostsHook.useHosts).mockReturnValue({
+      data: [
+        {
+          host_id: "host_1",
+          name: "laptop",
+          owner: "me",
+          status: "online",
+          long_session_messages_supported: longSessionMessagesSupported,
+        },
+      ],
+    } as unknown as ReturnType<typeof hostsHook.useHosts>);
+  }
+
   it("keeps submit disabled until the scope, every condition and the instructions are filled", () => {
-    renderTrigger("jira");
+    mockLaptop(true);
+    renderTrigger("jira", { session_message_max_chars: 32_000 });
     const submit = screen.getByTestId("create-scheduled-task-submit");
     expect(submit).toBeDisabled();
     expect(screen.queryByTestId("task-trigger-preview")).toBeNull();
@@ -4305,10 +4320,13 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     expect(submit).toBeEnabled();
 
     // Over-long instructions would crowd the item out of a worker's first message.
-    type("task-trigger-instructions", "x".repeat(2001));
+    type("task-trigger-instructions", "x".repeat(16_000));
+    expect(submit).toBeEnabled();
+    expect(screen.queryByTestId("task-trigger-too-long")).toBeNull();
+    type("task-trigger-instructions", "x".repeat(16_001));
     expect(submit).toBeDisabled();
     expect(screen.getByTestId("task-trigger-too-long")).toHaveTextContent(
-      "Keep instructions to 2,000 characters or fewer",
+      "Keep instructions to 16,000 characters or fewer",
     );
     // The Instructions panel is hidden behind the Trigger tab, so the reason stays visible here.
     expect(screen.getByRole("tab", { name: "Trigger" })).toHaveAttribute("aria-selected", "true");
@@ -4316,7 +4334,7 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     expect(screen.getByTestId("task-trigger-instructions-invalid")).toBeInTheDocument();
     expect(screen.getByTestId("task-trigger-instructions-too-long-notice")).toBeVisible();
     expect(screen.getByTestId("task-trigger-instructions-too-long-notice")).toHaveTextContent(
-      "Keep instructions to 2,000 characters or fewer",
+      "Keep instructions to 16,000 characters or fewer",
     );
     fireEvent.click(screen.getByRole("button", { name: "Edit instructions" }));
     expect(screen.getByRole("tab", { name: "Instructions" })).toHaveAttribute(
@@ -4325,6 +4343,243 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     );
     expect(screen.getByTestId("task-trigger-too-long")).toBeVisible();
     expect(screen.queryByTestId("task-trigger-instructions-too-long-notice")).toBeNull();
+  });
+
+  it.each([
+    [
+      "an older host",
+      { session_message_max_chars: 32_000 },
+      false,
+      'Update Omnigent on "laptop" and keep it online to allow up to 16,000.',
+    ],
+    ["an older server", {}, true, "Update the Omnigent server to allow up to 16,000."],
+  ])(
+    "keeps the 2,000-character instructions limit on %s",
+    async (_case, extraInfo, hostSupported, upgradeHint) => {
+      mockLaptop(hostSupported);
+      renderTrigger("jira", extraInfo);
+      const submit = screen.getByTestId("create-scheduled-task-submit");
+      fillJira();
+
+      // Its runner or server would refuse each worker message over 8,000 characters.
+      type("task-trigger-instructions", "x".repeat(9_000));
+      expect(submit).toBeDisabled();
+      expect(screen.getByTestId("task-trigger-instructions-too-long-notice")).toHaveTextContent(
+        "Keep instructions to 2,000 characters or fewer so each session's first message has " +
+          `room for the item. ${upgradeHint}`,
+      );
+
+      type("task-trigger-instructions", "x".repeat(2_000));
+      expect(submit).toBeEnabled();
+      const prompt = await submittedPrompt();
+      expect(prompt).toContain("and a message under 8000 characters.");
+      expect(prompt).not.toContain("32000");
+    },
+  );
+
+  function mockLaptopAndOldBox() {
+    vi.mocked(hostsHook.useHosts).mockReturnValue({
+      data: [
+        {
+          host_id: "host_1",
+          name: "laptop",
+          owner: "me",
+          status: "online",
+          long_session_messages_supported: true,
+        },
+        {
+          host_id: "host_2",
+          name: "old-box",
+          owner: "me",
+          status: "online",
+          long_session_messages_supported: false,
+        },
+      ],
+    } as unknown as ReturnType<typeof hostsHook.useHosts>);
+  }
+
+  /** Pick a host by name, or the managed sandbox. */
+  async function pickTarget(name: string | "sandbox") {
+    const hostTrigger = screen.getByTestId("task-host-trigger");
+    fireEvent.pointerDown(hostTrigger, new MouseEvent("pointerdown", { bubbles: true, button: 0 }));
+    fireEvent.click(hostTrigger);
+    fireEvent.click(
+      name === "sandbox"
+        ? screen.getByTestId("task-host-sandbox-option")
+        : await screen.findByRole("option", { name }),
+    );
+  }
+
+  const longInstructions = "x".repeat(12_000);
+  const longTriggerTask = scheduledTask({
+    prompt: encodeTriggerPrompt(
+      {
+        source: "jira",
+        ...emptyTriggerFields("jira"),
+        scope: "ES",
+        instructions: longInstructions,
+        worker: {
+          placement: "same_host",
+          agentId: null,
+          model: "",
+          effort: "",
+          permissionMode: "",
+        },
+      },
+      { sessionLink: "https://example.test/c/CONVERSATION_ID" },
+    ),
+    sessionMode: "continue",
+    sessionId: "poller",
+    hostId: "host_1",
+  });
+
+  it.each([
+    ["is loading", "loading" as const],
+    ["is the boot fallback", SERVER_INFO_OFFLINE_FALLBACK],
+  ])("doesn't flag a saved trigger's long instructions while server info %s", (_case, info) => {
+    mockLaptop(false);
+    const dialog = (
+      <CreateScheduledTaskDialog open onOpenChange={vi.fn()} editingTask={longTriggerTask} />
+    );
+    const { rerender } = render(<CapabilitiesProvider info={info}>{dialog}</CapabilitiesProvider>);
+    const submit = screen.getByTestId("create-scheduled-task-submit");
+    expect(screen.getByTestId("task-trigger-instructions")).toHaveValue(longInstructions);
+    expect(screen.queryByTestId("task-trigger-instructions-too-long-notice")).toBeNull();
+    expect(screen.queryByText(/Update the Omnigent server/)).toBeNull();
+    expect(submit).toBeDisabled();
+
+    rerender(
+      <CapabilitiesProvider
+        info={{
+          ...SERVER_INFO_OFFLINE_FALLBACK,
+          scheduled_task_session_modes: true,
+          scheduled_task_trigger_headers: true,
+          session_message_max_chars: 32_000,
+        }}
+      >
+        {dialog}
+      </CapabilitiesProvider>,
+    );
+    expect(submit).toBeEnabled();
+    expect(screen.queryByTestId("task-trigger-instructions-too-long-notice")).toBeNull();
+  });
+
+  it("keeps a saved trigger's long instructions on its own target only", async () => {
+    // The saved host reads as unsupported, e.g. offline or on another replica.
+    mockLaptopAndOldBox();
+    vi.mocked(sandboxModelsHook.useSandboxModelOptions).mockReturnValue({
+      data: { models: [], configured: false, status: "ready" },
+    } as unknown as ReturnType<typeof sandboxModelsHook.useSandboxModelOptions>);
+    render(
+      <CapabilitiesProvider
+        info={{
+          ...SERVER_INFO_OFFLINE_FALLBACK,
+          scheduled_task_session_modes: true,
+          scheduled_task_trigger_headers: true,
+          session_message_max_chars: 32_000,
+          managed_sandboxes_enabled: true,
+          sandbox_provider: "modal",
+          sandbox_provider_capabilities: { modal: { default_models: true } },
+        }}
+      >
+        <CreateScheduledTaskDialog
+          open
+          onOpenChange={vi.fn()}
+          editingTask={{ ...longTriggerTask, hostId: "host_2" }}
+        />
+      </CapabilitiesProvider>,
+    );
+    const submit = screen.getByTestId("create-scheduled-task-submit");
+    const notice = () => screen.queryByTestId("task-trigger-instructions-too-long-notice");
+    expect(screen.getByTestId("task-trigger-instructions")).toHaveValue(longInstructions);
+    expect(notice()).toBeNull();
+
+    await pickTarget("sandbox");
+    expect(submit).toBeDisabled();
+    expect(notice()).toHaveTextContent("Run it on a host with the current Omnigent");
+    await pickTarget("laptop");
+    expect(submit).toBeEnabled();
+    expect(notice()).toBeNull();
+    await pickTarget("old-box");
+    expect(notice()).toBeNull();
+    expect(screen.getByTestId("task-trigger-instructions")).toHaveValue(longInstructions);
+
+    type("task-trigger-instructions", `${longInstructions} Then triage it.`);
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    const prompt = updateMutateAsync.mock.calls[0][0].input.prompt;
+    expect(prompt).toContain("and a message under 32000 characters.");
+    expect(prompt).toContain(`${longInstructions} Then triage it.`);
+  });
+
+  it("keeps a sandbox trigger saved under the older limit at that limit on an unrelated edit", async () => {
+    vi.mocked(sandboxModelsHook.useSandboxModelOptions).mockReturnValue({
+      data: { models: [], configured: false, status: "ready" },
+    } as unknown as ReturnType<typeof sandboxModelsHook.useSandboxModelOptions>);
+    const saved = encodeTriggerPrompt(
+      {
+        source: "jira",
+        ...emptyTriggerFields("jira"),
+        scope: "ES",
+        instructions: "Triage it.",
+        worker: {
+          placement: "same_host",
+          agentId: null,
+          model: "",
+          effort: "",
+          permissionMode: "",
+        },
+      },
+      { sessionLink: "https://example.test/c/CONVERSATION_ID", messageMaxChars: 8000 },
+    );
+    const task = scheduledTask({
+      prompt: saved,
+      sessionMode: "continue",
+      sessionId: "poller",
+      executionTarget: "managed_sandbox",
+    });
+    render(
+      <CapabilitiesProvider
+        info={{
+          ...SERVER_INFO_OFFLINE_FALLBACK,
+          scheduled_task_session_modes: true,
+          scheduled_task_trigger_headers: true,
+          session_message_max_chars: 32_000,
+          managed_sandboxes_enabled: true,
+          sandbox_provider: "modal",
+          sandbox_provider_capabilities: { modal: { default_models: true } },
+        }}
+      >
+        <CreateScheduledTaskDialog open onOpenChange={vi.fn()} editingTask={task} />
+      </CapabilitiesProvider>,
+    );
+    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "Renamed" } });
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    const prompt = updateMutateAsync.mock.calls[0][0].input.prompt;
+    expect(prompt).toContain("and a message under 8000 characters.");
+    expect(prompt).not.toContain("32000");
+  });
+
+  it("checks instructions against the host picked, keeping them across a switch", async () => {
+    mockLaptopAndOldBox();
+    renderTrigger("jira", { session_message_max_chars: 32_000 });
+    const submit = screen.getByTestId("create-scheduled-task-submit");
+    fillJira();
+    type("task-trigger-instructions", "x".repeat(9_000));
+    expect(submit).toBeEnabled();
+
+    await pickTarget("old-box");
+    expect(submit).toBeDisabled();
+    expect(screen.getByTestId("task-trigger-instructions-too-long-notice")).toHaveTextContent(
+      'Update Omnigent on "old-box" and keep it online to allow up to 16,000.',
+    );
+    expect(screen.getByTestId("task-trigger-instructions")).toHaveValue("x".repeat(9_000));
+
+    await pickTarget("laptop");
+    expect(submit).toBeEnabled();
+    expect(screen.queryByTestId("task-trigger-instructions-too-long-notice")).toBeNull();
+    expect(await submittedPrompt()).toContain("and a message under 32000 characters.");
   });
 
   it("compiles the builder rows into the saved hourly continue-mode task", async () => {

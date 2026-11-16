@@ -114,6 +114,12 @@ vi.mock("@/components/scheduled/CreateScheduledTaskDialog", () => ({
   CreateScheduledTaskDialog: (props: { open: boolean; lockedWorkflow?: SavedWorkflow | null }) =>
     props.open ? <div data-testid="new-automation-dialog">{props.lockedWorkflow?.name}</div> : null,
 }));
+// The automations list has its own tests; here it names the workflow it lists.
+vi.mock("@/components/workflows/WorkflowAutomations", () => ({
+  WorkflowAutomations: ({ workflowId }: { workflowId: string }) => (
+    <div data-testid="workflow-automations-section" data-workflow={workflowId} />
+  ),
+}));
 const navigate = vi.fn();
 vi.mock("@/lib/routing", async (importOriginal) => {
   const actual = await importOriginal<typeof RoutingModule>();
@@ -294,6 +300,7 @@ describe("WorkflowDetailPage", () => {
       expect(screen.getByTestId("planning-chat")).toHaveAttribute("data-session", planner);
       expect(screen.getByTestId("workflow-detail-run")).toBeDisabled();
       expect(screen.getByTestId("workflow-detail-create-automation")).toBeDisabled();
+      expect(screen.queryByTestId("workflow-automations-section")).toBeNull();
       if (mobile) {
         fireEvent.click(screen.getByRole("button", { name: "Close planning chat" }));
         expect(screen.queryByTestId("planning-chat")).toBeNull();
@@ -310,6 +317,10 @@ describe("WorkflowDetailPage", () => {
       else expect(screen.getByTestId("planning-chat")).toBeInTheDocument();
       expect(screen.queryByText("Draft")).toBeNull();
       expect(screen.getByRole("status")).toHaveTextContent("Saved plan");
+      expect(screen.getByTestId("workflow-automations-section")).toHaveAttribute(
+        "data-workflow",
+        WORKFLOW.id,
+      );
 
       cleanup();
       renderPage();
@@ -775,7 +786,12 @@ describe("WorkflowDetailPage", () => {
       if (automations === "loading" || automations === false) {
         expect(screen.queryByTestId("workflow-detail-create-automation")).toBeNull();
         expect(screen.queryByTestId("new-automation-dialog")).toBeNull();
+        expect(screen.queryByTestId("workflow-automations-section")).toBeNull();
       } else {
+        expect(screen.getByTestId("workflow-automations-section")).toHaveAttribute(
+          "data-workflow",
+          WORKFLOW.id,
+        );
         fireEvent.click(screen.getByTestId("workflow-detail-create-automation"));
         expect(screen.getByTestId("new-automation-dialog")).toHaveTextContent("Triage flaky tests");
       }
@@ -789,6 +805,7 @@ describe("WorkflowDetailPage", () => {
       });
       rerender(<WorkflowDetailPage />);
       expect(screen.queryByTestId("new-automation-dialog")).toBeNull();
+      expect(screen.queryByTestId("workflow-automations-section")).toBeNull();
 
       fireEvent.click(screen.getByRole("button", { name: "Delete workflow" }));
       expect(deleteWorkflow).not.toHaveBeenCalled();

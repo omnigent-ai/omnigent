@@ -204,3 +204,13 @@ export function parseSavedWorkflowMessage(
   if (!match) return null;
   return { id: match[2], name: match[1], details: (match[3] ?? "").trim() };
 }
+
+/** The automations whose prompt runs the saved workflow *workflowId*, in list order. */
+export function automationsUsingWorkflow<T extends { prompt: string }>(
+  automations: readonly T[],
+  workflowId: string,
+): T[] {
+  return automations.filter(
+    (automation) => parseSavedWorkflowMessage(automation.prompt)?.id === workflowId,
+  );
+}
