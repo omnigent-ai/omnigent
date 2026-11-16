@@ -299,9 +299,14 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
     }
     return connectToServer(url);
   };
+  // Held while Continue locally probes the install, so no other landing action
+  // can start a connect that the probe's result would then override.
+  const checkingLocal = useRef(false);
+  const [localCheckPending, setLocalCheckPending] = useState(false);
   // MDM landing: a new user picks a runner first where the server offers one;
   // any other server, or a returning user, just opens it.
   const joinFromLanding = async (url: string) => {
+    if (checkingLocal.current) return;
     if (!returning && (await pickRunnerFor(url))) return;
     setLandingError(undefined);
     const result = await connect(url, "landing");
@@ -309,8 +314,17 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
   };
   // A running local install opens directly; a stopped one starts in the terminal step.
   const continueLocally = async (url: string) => {
+    if (connecting.current || checkingLocal.current) return;
+    checkingLocal.current = true;
+    setLocalCheckPending(true);
     setLandingError(undefined);
-    const check = await setup.onCheckServer(url).catch(() => ({ status: "unreachable" as const }));
+    const check = await setup
+      .onCheckServer(url)
+      .catch(() => ({ status: "unreachable" as const }))
+      .finally(() => {
+        checkingLocal.current = false;
+        setLocalCheckPending(false);
+      });
     const result =
       check.status === "unreachable" ? await connect(url, "landing") : await connectToServer(url);
     if (result.error) setLandingError(result.error);
@@ -453,6 +467,7 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
             recentServers={setup.recentServers}
             error={landingError}
             connection={connection}
+            busy={localCheckPending}
             onCancelConnect={cancelConnect}
             onGetStarted={() => setStep("local")}
             onContinueLocally={

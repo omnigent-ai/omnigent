@@ -39,6 +39,7 @@ export function LandingStep({
   recentServers,
   error,
   connection = null,
+  busy = false,
   onCancelConnect,
   onGetStarted,
   onContinueLocally,
@@ -58,6 +59,8 @@ export function LandingStep({
   error?: string;
   /** Progress of an in-flight join (dropdown landings only; null when idle). */
   connection?: ConnectProgress | null;
+  /** A landing action is in progress before any connect starts (e.g. the local probe). */
+  busy?: boolean;
   onCancelConnect?: () => void;
   onGetStarted: () => void;
   /** Open the local install. Without presets, replaces "Get started locally"
@@ -76,7 +79,7 @@ export function LandingStep({
   // The menu spans the whole split button, not just its chevron trigger.
   const ctaRef = useRef<HTMLDivElement>(null);
   const [menuWidth, setMenuWidth] = useState<number>();
-  const connecting = connection !== null;
+  const connecting = connection !== null || busy;
   useEffect(() => {
     if (connecting) setMenuOpen(false);
   }, [connecting]);
