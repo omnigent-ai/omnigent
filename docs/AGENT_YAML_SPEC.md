@@ -136,6 +136,29 @@ executor:
     api_key: ${GEMINI_API_KEY}     # or ANTIGRAVITY_API_KEY
 ```
 
+### Codex tool switches
+
+With `harness: codex`, `web_search: false` turns off Codex's built-in web
+search and `disable_native_tools: true` turns off its native shell tools, so
+shell commands use Omnigent tools and policies. For a directory bundle using
+`config.yaml`, place them in `executor.config`:
+
+```yaml
+spec_version: 1
+name: codex-worker
+executor:
+  type: omnigent
+  config:
+    harness: codex
+    web_search: false
+    disable_native_tools: true
+```
+
+The values must be YAML booleans. They apply on every Codex route, including
+ChatGPT login, API-key providers and brokered gateways. They only restrict
+tools: `web_search: true` and `disable_native_tools: false` do not re-enable
+tools that the runner's operator turned off.
+
 ### Pi context files
 
 With `harness: pi` or `pi-native`, Pi automatically appends context files such
