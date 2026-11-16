@@ -81,7 +81,7 @@ def shared(
 
     Respawns the shared runner first if a prior test in the shard killed
     it (``test_stale_stream``) — otherwise the runner-bind ``PATCH`` below
-    400s ("runner is not registered"). The strided shard split
+    400s ("runner is not registered"). Shard assignment
     (``conftest.pytest_collection_modifyitems``) can place the
     runner-killing test before this one in the same shard, so this fixture
     must be order-independent like the conftest session fixtures. Any

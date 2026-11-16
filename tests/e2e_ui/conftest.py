@@ -80,6 +80,7 @@ from tests.codex_parity.sidecar_harness import (
     build_sidecar_bin,
     start_codex_responses_sidecar,
 )
+from tests.e2e_ui import sharding
 from tests.helpers import ui_timings as timings
 from tests.helpers.ui_configuration import (
     _ALLOW_DEV_BASE_URL_ENV,
@@ -377,22 +378,7 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         ),
     )
     timings.pytest_addoption(parser)
-    # Round-robin shard split for the e2e-ui CI matrix. We roll our own
-    # (rather than pull in pytest-shard / pytest-split) so the partition
-    # is a dependency-free strided slice -- see pytest_collection_modifyitems
-    # below for why striding beats hash-bucketing for wall-clock balance.
-    parser.addoption(
-        "--splits",
-        type=int,
-        default=None,
-        help="Total number of shards to split the UI suite into (CI matrix).",
-    )
-    parser.addoption(
-        "--group",
-        type=int,
-        default=None,
-        help="1-indexed shard this run executes (requires --splits).",
-    )
+    sharding.pytest_addoption(parser)
 
 
 @pytest.fixture(scope="session")
@@ -456,19 +442,11 @@ def pytest_collection_modifyitems(
     config: pytest.Config,
     items: list[pytest.Item],
 ) -> None:
-    """Round-robin the collected UI tests across the CI shard matrix.
+    """Select sidecar tests, then assign each remaining test to one shard.
 
-    pytest-shard hash-buckets node IDs, which is blind to per-test
-    wall-clock and left one shard at ~5min while siblings finished in
-    ~2min. A *strided* slice -- ``items[group-1::splits]`` -- deals tests
-    out like cards instead, so a heavy file (whose cases collect
-    adjacently) scatters one-per-shard rather than landing in a single
-    bucket. That averages cost across shards without maintaining a
-    durations file.
-
-    Optional sidecar selection precedes the split and includes indirect fixture
-    consumers. ``trylast`` lets repo-wide known-failure marking tag items first;
-    markers travel with the items the slice keeps.
+    Sidecar selection includes indirect fixture consumers and runs before the
+    split. ``trylast`` lets repo-wide known-failure marking tag items first;
+    markers travel with the items the split keeps.
     """
     dependency = config.getoption("--ui-dependency-smoke")
     if config.getoption("--ui-codex-sidecar-only") or dependency:
@@ -483,17 +461,7 @@ def pytest_collection_modifyitems(
         config.hook.pytest_deselected(items=[item for item in items if item not in selected])
         items[:] = selected
 
-    splits = config.getoption("--splits")
-    group = config.getoption("--group")
-    if splits is None and group is None:
-        return
-    if splits is None or group is None:
-        raise pytest.UsageError("--splits and --group must be passed together")
-    if splits < 1:
-        raise pytest.UsageError("--splits must be >= 1")
-    if not 1 <= group <= splits:
-        raise pytest.UsageError(f"--group must be between 1 and {splits}")
-    items[:] = items[group - 1 :: splits]
+    sharding.apply_shard(config, items)
 
 
 def _register_agent_yaml(
