@@ -61,6 +61,23 @@ def test_remote_prompt_is_separate_from_persistent_launch_args(
     assert captured["prompt"] == "review the last commit"
 
 
+def test_remote_project_is_separate_from_persistent_launch_args(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A launch project reaches the remote path without joining the reusable args."""
+    captured = _capture_remote(monkeypatch)
+
+    claude_native.run_claude_native(
+        server="https://example.com/",
+        session_id=None,
+        extra_args=("--verbose",),
+        project_id="proj_factory",
+    )
+
+    assert captured["claude_args"] == ("--verbose",)
+    assert captured["project_id"] == "proj_factory"
+
+
 def test_prompt_precedes_variadic_value_flags(monkeypatch: pytest.MonkeyPatch) -> None:
     """A trailing variadic value flag must not be able to swallow the prompt.
 

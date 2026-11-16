@@ -450,6 +450,7 @@ def test_run_with_remote_server_routes_through_daemon(
         resume_picker=False,
         claude_args=("--dangerously-skip-permissions",),
         prompt=prompt,
+        project_id="proj_factory",
     )
 
     # Daemon start is now _ensure_backend's responsibility (called from
@@ -460,6 +461,7 @@ def test_run_with_remote_server_routes_through_daemon(
     assert captured["workspace"] == str(tmp_path.resolve())
     assert captured["claude_args"] == ("--dangerously-skip-permissions",)
     assert captured["session_id"] == session_id
+    assert captured["project_id"] == "proj_factory"
     assert "prompt" not in captured
     assert messages == (
         [
