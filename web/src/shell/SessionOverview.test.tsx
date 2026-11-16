@@ -1,5 +1,6 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import type { ModelUsage } from "@/lib/types";
 import { useChatStore } from "@/store/chatStore";
 import { SessionCostButton, SessionOverview } from "./SessionOverview";
@@ -41,6 +42,7 @@ describe("SessionOverview", () => {
         <SessionOverview onClose={() => {}} />
         <SessionCostButton docked open onOpenChange={() => {}} />
       </>,
+      { wrapper: TooltipProvider },
     );
 
     for (const [element, text] of [
@@ -88,7 +90,7 @@ describe("SessionOverview", () => {
         overview card
       </SessionCostButton>
     );
-    const { rerender } = render(button(false));
+    const { rerender } = render(button(false), { wrapper: TooltipProvider });
     const chip = () => screen.getByTestId("header-session-cost");
     expect(chip()).not.toHaveAttribute("title");
 
@@ -114,7 +116,7 @@ describe("SessionOverview", () => {
         <button type="button">Hide session overview</button>
       </SessionCostButton>
     );
-    const { rerender } = render(button(true));
+    const { rerender } = render(button(true), { wrapper: TooltipProvider });
     const popover = screen.getByRole("dialog", { name: "Session overview" });
 
     fireEvent.keyDown(popover, { key: "Escape" });
@@ -132,7 +134,7 @@ describe("SessionOverview", () => {
     const button = (docked: boolean) => (
       <SessionCostButton docked={docked} open={false} onOpenChange={() => {}} />
     );
-    const { rerender } = render(button(true));
+    const { rerender } = render(button(true), { wrapper: TooltipProvider });
     screen.getByTestId("header-session-cost").focus();
 
     rerender(button(false));

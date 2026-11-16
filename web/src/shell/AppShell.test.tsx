@@ -3133,13 +3133,15 @@ describe("Session overview", () => {
     expect(docked()).toBeNull();
   });
 
-  it("docks beneath the rightmost header chip and keeps each placement's choice", async () => {
+  it("docks beside the right-panel toggle and keeps each placement's choice", async () => {
     setWideViewport(true);
     await renderOverviewShell(true, "collapsed");
     const chip = () => screen.getByTestId("header-session-cost");
     const header = document.querySelector<HTMLElement>("header.chat-header")!;
 
-    expect(within(header).getAllByRole("button").at(-1)).toBe(chip());
+    const headerButtons = within(header).getAllByRole("button");
+    expect(headerButtons.at(-2)).toBe(chip());
+    expect(headerButtons.at(-1)).toHaveAccessibleName("Expand right panel");
     expect(chip()).toHaveAttribute("aria-expanded", "true");
     expect(docked()).toBeInTheDocument();
     expect(screen.getByRole("main")).not.toContainElement(docked());

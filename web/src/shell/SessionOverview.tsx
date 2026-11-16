@@ -5,7 +5,9 @@ import { XIcon } from "lucide-react";
 import { Card, CardAction, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Spinner } from "@/components/ui/spinner";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { formatSessionCostUsd, formatTokenCount } from "@/lib/formatCost";
+import { cn } from "@/lib/utils";
 import { useChatStore } from "@/store/chatStore";
 import { SessionOverviewChanges } from "./SessionOverviewChanges";
 import { SessionOverviewSubagents } from "./SessionOverviewSubagents";
@@ -51,21 +53,36 @@ export function SessionCostButton({
   onOpenChange: (open: boolean) => void;
   children?: ReactNode;
 }) {
+  const action = open ? "Hide session overview" : "Show session overview";
   // One trigger for both placements keeps the chip mounted, and focused, when the
   // layout switches between them; only the popover content depends on placement.
   return (
     <Popover open={open} onOpenChange={onOpenChange}>
-      <PopoverTrigger asChild>
-        <button
-          type="button"
-          aria-haspopup={docked ? undefined : "dialog"}
-          data-testid="header-session-cost"
-          className="hidden h-6 shrink-0 items-center rounded-[6px] px-2 font-mono text-xs tabular-nums text-muted-foreground hover:bg-muted hover:text-foreground aria-expanded:bg-muted aria-expanded:text-foreground md:inline-flex"
-        >
-          <SessionCostValue unavailable="—" />
-          <span className="sr-only"> Session overview</span>
-        </button>
-      </PopoverTrigger>
+      <Tooltip>
+        {/* The span anchors the tooltip; nested in the popover trigger it never positions. */}
+        <TooltipTrigger asChild>
+          <span className="hidden md:inline-flex">
+            <PopoverTrigger asChild>
+              <button
+                type="button"
+                aria-haspopup={docked ? undefined : "dialog"}
+                data-testid="header-session-cost"
+                // Shown cards get the view toggle's selected look, so open never reads as hover.
+                className={cn(
+                  "hidden h-6 shrink-0 items-center rounded-[6px] border px-2 font-mono text-xs tabular-nums md:inline-flex",
+                  open
+                    ? "border-border bg-background text-foreground shadow-sm dark:border-transparent dark:bg-[var(--segmented-active-bg)]"
+                    : "border-transparent text-muted-foreground hover:bg-muted hover:text-foreground",
+                )}
+              >
+                <SessionCostValue unavailable="—" />
+                <span className="sr-only"> Session overview</span>
+              </button>
+            </PopoverTrigger>
+          </span>
+        </TooltipTrigger>
+        <TooltipContent>{action}</TooltipContent>
+      </Tooltip>
       {!docked && (
         <PopoverContent
           align="end"

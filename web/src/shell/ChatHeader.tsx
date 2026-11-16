@@ -852,6 +852,8 @@ export function ChatHeader({
             Share
           </Button>
         ) : null}
+        {/* Beside the right-panel toggle: both show or hide a panel on the right. */}
+        {!pending && conversationId && sessionOverviewControl}
         {conversationId && hasRailContent && (
           <Tooltip>
             <TooltipTrigger asChild>
@@ -877,8 +879,6 @@ export function ChatHeader({
             </TooltipContent>
           </Tooltip>
         )}
-        {/* Rightmost on desktop, so the docked session overview sits beneath it. */}
-        {!pending && conversationId && sessionOverviewControl}
         {/* Mobile-only session-actions kebab, rightmost in the cluster. Same
             menu the desktop breadcrumb hangs off its title. */}
         {isMobile && conversationMenu}
