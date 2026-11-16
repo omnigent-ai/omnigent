@@ -8517,16 +8517,40 @@ def test_clone_claude_transcript_repairs_stale_image_duplication(
         },
         "toolUseResult": claude_native._json_safe_tool_use_result(pdf_string),
     }
+    b64_native_pdf = base64.b64encode(b"%PDF-1.7\n" + b"1" * 3000).decode()
+    native_pdf_blocks = [
+        {"type": "text", "text": "PDF file read: notes.pdf"},
+        {
+            "type": "document",
+            "source": {"type": "base64", "media_type": "application/pdf", "data": b64_native_pdf},
+        },
+    ]
+    native_pdf = {
+        "type": "user",
+        "cwd": str(source_workspace.resolve()),
+        "sessionId": source_uuid,
+        "uuid": "u5",
+        "parentUuid": "u4",
+        "message": {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_5", "content": native_pdf_blocks}
+            ],
+        },
+        # Claude Code's own Read metadata repeats the payload.
+        "toolUseResult": {"type": "pdf", "file": {"base64": b64_native_pdf, "originalSize": 3009}},
+    }
     source_path.write_text(
         "".join(
             json.dumps(record) + "\n"
-            for record in (stale_structured, stale_mixed, plain_result, stale_pdf)
+            for record in (stale_structured, stale_mixed, plain_result, stale_pdf, native_pdf)
         ),
         encoding="utf-8",
     )
     source_text = source_path.read_text(encoding="utf-8")
     assert source_text.count(b64_structured) == 2, "pre-fix wedged state"
     assert source_text.count(b64_mcp) == 2, "pre-fix wedged state"
+    assert source_text.count(b64_native_pdf) == 2
     monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects_dir)
 
     result = claude_native._clone_claude_transcript(
@@ -8562,6 +8586,9 @@ def test_clone_claude_transcript_repairs_stale_image_duplication(
     # A PDF replayed as a raw string becomes a document block, kept once.
     assert records[3]["message"]["content"][0]["content"] == pdf_blocks
     assert text.count(b64_pdf) == 1
+    assert records[4]["message"]["content"][0]["content"] == native_pdf_blocks
+    assert text.count(b64_native_pdf) == 1
+    assert "application/pdf" in records[4]["toolUseResult"]
     # The fork must not mutate the source session's transcript.
     assert source_path.read_text(encoding="utf-8") == source_text
 
