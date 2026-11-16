@@ -1,4 +1,5 @@
 import {
+  isPlanComplete,
   type JournalEntry,
   type JournalPlanStep,
   type StepProgress,
@@ -56,8 +57,8 @@ export type WorkflowRunState =
   | { kind: "stopped"; label: string };
 
 /**
- * Where a run stands, for its row. A question for the user comes first, then
- * a finished run; a running session shows its progress; otherwise a failed
+ * Where a run stands, for its row. A finished run comes first, then a question
+ * for the user; a running session shows its progress; otherwise a failed
  * step or session says so, and a run that stopped partway shows its count.
  */
 export function describeWorkflowRun(
@@ -66,8 +67,9 @@ export function describeWorkflowRun(
 ): WorkflowRunState {
   const { total, done, needsInput, failed } = run.progress;
   const count = `${done} of ${total} done`;
+  if (isPlanComplete(runStepProgress(run, sessionWorking)) || (total > 0 && done === total))
+    return { kind: "done", label: "Done" };
   if (needsInput > 0) return { kind: "waiting", label: "Waiting for you" };
-  if (total > 0 && done === total) return { kind: "done", label: "Done" };
   if (run.isCurrent && sessionWorking) return { kind: "running", label: count };
   if (failed > 0) return { kind: "failed", label: `Failed · ${count}` };
   if (run.isCurrent && run.sessionStatus === "failed")

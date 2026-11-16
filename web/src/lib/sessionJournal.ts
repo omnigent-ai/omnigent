@@ -290,6 +290,13 @@ export function planTally(progress: readonly StepProgress[]): Record<StepState, 
   return tally;
 }
 
+/** A plan finishes when every graph end is done, even with stale upstream statuses. */
+export function isPlanComplete(progress: readonly StepProgress[]): boolean {
+  const dependencies = new Set(progress.flatMap((item) => item.step.depends_on));
+  const finalSteps = progress.filter((item) => !dependencies.has(item.step.id));
+  return finalSteps.length > 0 && finalSteps.every((item) => item.state === "done");
+}
+
 /** How many tasks are finished: done or failed, since a failed task's work is over too. */
 export function finishedTaskCount(progress: readonly StepProgress[]): number {
   return progress.filter((item) => item.state === "done" || item.state === "failed").length;
@@ -378,7 +385,12 @@ export function pausedLabel(
   entries: readonly JournalEntry[],
   sessionWorking: boolean,
 ): PausedLabel | null {
-  if (sessionWorking || progress.some((item) => item.state === "needs_input")) return null;
+  if (
+    sessionWorking ||
+    isPlanComplete(progress) ||
+    progress.some((item) => item.state === "needs_input")
+  )
+    return null;
   const runnable = progress.some(
     (item) =>
       item.state === "ready" ||

@@ -1,7 +1,12 @@
 import { PlayIcon, SquareIcon } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
-import { type JournalEntry, pausedLabel, type StepProgress } from "@/lib/sessionJournal";
+import {
+  isPlanComplete,
+  type JournalEntry,
+  pausedLabel,
+  type StepProgress,
+} from "@/lib/sessionJournal";
 import { cn } from "@/lib/utils";
 
 /** What a plan's run button asks of its main agent: stop or continue the work. */
@@ -10,13 +15,14 @@ export type PlanRunControl = "play" | "stop";
 /**
  * The run button a plan shows: stop while its session works, play once the
  * agent stopped with tasks it could run and none waiting for the user, and
- * none otherwise.
+ * none once the plan is complete.
  */
 export function planRunControl(
   progress: readonly StepProgress[],
   entries: readonly JournalEntry[],
   sessionWorking: boolean,
 ): PlanRunControl | null {
+  if (isPlanComplete(progress)) return null;
   if (sessionWorking) return "stop";
   return pausedLabel(progress, entries, false) ? "play" : null;
 }

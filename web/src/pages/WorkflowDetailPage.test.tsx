@@ -468,6 +468,27 @@ describe("WorkflowDetailPage", () => {
     expect(within(finished!).queryByTestId("plan-stop")).toBeNull();
   });
 
+  it("finishes a run when its final step is done despite earlier statuses and session activity", () => {
+    mockWorkflow({});
+    mockRuns([
+      {
+        ...run("a".repeat(32), "Finished run", { done: 1, needsInput: 1 }, [
+          status("explore", "needs_input"),
+          status("fix", "done"),
+        ]),
+        sessionStatus: "running",
+        backgroundWorkRunning: true,
+      },
+    ]);
+    renderPage();
+    const row = screen.getByTestId("workflow-run");
+    expect(row).toHaveAttribute("data-run-state", "done");
+    expect(within(row).getByTestId("workflow-run-state")).toHaveTextContent("Done");
+    expect(within(row).queryByTestId("plan-continue")).toBeNull();
+    expect(within(row).queryByTestId("plan-stop")).toBeNull();
+    expect(screen.getByTestId("workflow-detail-run")).toBeEnabled();
+  });
+
   it.each([
     { source: "background work", activity: { background_work_running: true } },
     { source: "child activity", activity: { status: "running" as const } },

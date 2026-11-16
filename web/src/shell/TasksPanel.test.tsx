@@ -684,6 +684,30 @@ describe("TasksPanel", () => {
     }
   });
 
+  it("hides run controls after the final step finishes, even with unfinished earlier steps", () => {
+    showJournal([
+      journalPlan(0, ["explore"], ["work", ["explore"]], ["report", ["work"]]),
+      status(1, "explore", "done"),
+      status(2, "report", "done"),
+    ]);
+    const withdrawContinue = registerContinuePlan("conv", vi.fn());
+    const withdrawStop = registerStopWork("conv", vi.fn());
+    try {
+      setSession({ sessionStatus: "running" });
+      renderPanel();
+      expect(screen.queryByTestId("plan-stop")).toBeNull();
+      expect(screen.queryByTestId("plan-continue")).toBeNull();
+
+      setSession({ sessionStatus: "idle" });
+      expect(screen.queryByTestId("plan-stop")).toBeNull();
+      expect(screen.queryByTestId("plan-continue")).toBeNull();
+      expect(screen.queryByTestId("tasks-paused")).toBeNull();
+    } finally {
+      act(withdrawContinue);
+      act(withdrawStop);
+    }
+  });
+
   it("heads the list with the plan's name", () => {
     const named = journalPlan(0, ["baseline"]);
     named.content.name = "Cut GET /orders p95 by 20%";

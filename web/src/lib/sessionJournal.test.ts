@@ -4,6 +4,7 @@ import {
   currentPlan,
   failedUpstream,
   finishedTaskCount,
+  isPlanComplete,
   isRestart,
   mergeJournalEntries,
   nativeTaskProgress,
@@ -242,6 +243,61 @@ describe("stepProgress", () => {
   });
 });
 
+describe("isPlanComplete", () => {
+  // Deliberately out of order: the dependency graph identifies the final step.
+  const steps = planSteps(plan(0, ["report", ["work"]], ["explore"], ["work", ["explore"]]));
+
+  it.each([undefined, "started", "needs_input", "failed", "done"])(
+    "uses the final step's newest status (%s), regardless of earlier statuses",
+    (finalStatus) => {
+      const entries = finalStatus ? [status(1, "report", finalStatus)] : [];
+      const progress = stepProgress(steps, entries, true);
+      expect(isPlanComplete(progress)).toBe(finalStatus === "done");
+    },
+  );
+
+  it("requires every independent branch to finish", () => {
+    const branches = planSteps(plan(0, ["explore"], ["code", ["explore"]], ["docs", ["explore"]]));
+    const entries = [status(1, "docs", "done")];
+    expect(isPlanComplete(stepProgress(branches, entries, false))).toBe(false);
+    entries.push(status(2, "code", "done"));
+    expect(isPlanComplete(stepProgress(branches, entries, false))).toBe(true);
+    expect(isPlanComplete([])).toBe(false);
+  });
+
+  it("reopens after a restart, new invocation, or replan with another final step", () => {
+    const entries = [status(1, "report", "done")];
+    expect(isPlanComplete(stepProgress(steps, entries, false))).toBe(true);
+    for (const next of [
+      status(2, "report", "started"),
+      journalEntry(2, { kind: "plan_status", content: { status: "started" } }),
+    ]) {
+      expect(isPlanComplete(stepProgress(steps, [...entries, next], true))).toBe(false);
+    }
+    const replanned = [
+      ...steps,
+      { id: "publish", name: "Publish", goal: null, depends_on: ["report"] },
+    ];
+    expect(isPlanComplete(stepProgress(replanned, entries, false))).toBe(false);
+  });
+
+  it("requires every native task to be done", () => {
+    const tasks: NativeTask[] = [
+      { content: "Work", status: "pending", activeForm: "Working" },
+      { content: "Report", status: "completed", activeForm: "Reporting" },
+    ];
+    expect(isPlanComplete(nativeTaskProgress(tasks, true))).toBe(false);
+    expect(
+      isPlanComplete(
+        nativeTaskProgress(
+          tasks.map((task) => ({ ...task, status: "completed" })),
+          true,
+        ),
+      ),
+    ).toBe(true);
+  });
+});
+
 describe("pausedLabel", () => {
   const chain = plan(0, ["a"], ["b", ["a"]]);
   const label = (entries: JournalEntry[], working = false) =>
@@ -259,6 +315,11 @@ describe("pausedLabel", () => {
   it("says nothing once only tasks waiting for the user are left", () => {
     expect(label([chain, status(1, "a", "done"), status(2, "b", "needs_input")])).toBeNull();
     expect(label([chain, status(1, "a", "done"), status(2, "b", "done")])).toBeNull();
+  });
+
+  it("does not offer to resume earlier steps after the final step is done", () => {
+    expect(label([chain, status(1, "b", "done")])).toBeNull();
+    expect(label([chain, status(1, "b", "done", { scheduled_task_run_id: RUN })])).toBeNull();
   });
 });
 

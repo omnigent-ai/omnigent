@@ -1561,6 +1561,22 @@ describe("runs of a saved workflow", () => {
       expect(screen.getByTestId("workflow-graph-overlay")).toHaveTextContent("fix:stopped");
       fireEvent.click(screen.getByRole("button", { name: "Close graph" }));
     }
+
+    // A final result can finish the workflow without filling in every earlier status.
+    vi.mocked(hooks.useScheduledTaskRunSteps).mockReturnValue(
+      new Map([["run_1", { ...STEPS, statuses: [{ ...STEPS.statuses[0]!, step: "fix" }] }]]),
+    );
+    rerender(renderWorkflowPage());
+    expect(within(row).queryByTestId("plan-continue")).toBeNull();
+    expect(within(row).queryByTestId("plan-stop")).toBeNull();
+
+    vi.mocked(useOptionalLoadedConversations).mockReturnValue({
+      ...conversationPage([conversation("c_9", { background_work_running: true })]).data!,
+      pageParams: [undefined],
+    });
+    rerender(renderWorkflowPage());
+    expect(within(row).queryByTestId("plan-continue")).toBeNull();
+    expect(within(row).queryByTestId("plan-stop")).toBeNull();
   });
 
   it.each([false, true])(
