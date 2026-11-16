@@ -102,6 +102,7 @@ import { describeSendFailure } from "@/lib/sendFailure";
 import { isRetryableRequestError, queryRetryDelay } from "@/lib/queryRetry";
 import { conversationRegistry, type ConversationEntry } from "./conversationRegistry";
 import { createInitialConversationState, isConversationStateKey } from "./conversationState";
+import { reportRecoveredCommittedItems } from "./committedItemRecovery";
 import { fetchConversationSnapshot } from "./conversationSnapshot";
 import { getStreamSlotManager, type StreamSlot } from "./streamSlots";
 import {
@@ -5986,8 +5987,13 @@ interface MissedEventRecovery {
   recycledTurnKeys: Set<string>;
   /** The latest reconnect backfill failed a read, so status reconciles retry it. */
   backfillOwed: boolean;
+  /** Newest item covered by a successful poll backfill, including non-rendering items. */
+  reconciledItem: { itemId: string; generation: number } | null;
   /** Guarded polls retry on their next probe; reconnects record `backfillOwed`. */
-  backfill: (settleStatus: boolean, canApply?: () => boolean) => Promise<void>;
+  backfill: (
+    settleStatus: boolean,
+    poll?: { canApply: () => boolean; newestItemId: string },
+  ) => Promise<void>;
 }
 
 /**
@@ -6011,7 +6017,6 @@ async function reconcileActiveSessionStatus(
 ): Promise<void> {
   if (
     queryClient === null ||
-    document.hidden ||
     controller.signal.aborted ||
     conversationRegistry.getActive()?.id !== id ||
     get().abortController !== controller
@@ -6042,7 +6047,6 @@ async function reconcileActiveSessionStatus(
   const current = get();
   if (
     controller.signal.aborted ||
-    document.hidden ||
     current.historyGeneration !== generation ||
     isConversationDisposed(id) ||
     conversationRegistry.getActive()?.id !== id ||
@@ -6116,7 +6120,7 @@ async function reconcileActiveSessionStatus(
     const state = get();
     return (
       !controller.signal.aborted &&
-      !document.hidden &&
+      !(typeof document !== "undefined" && document.hidden) &&
       !isConversationDisposed(id) &&
       conversationRegistry.getActive()?.id === id &&
       state.abortController === controller &&
@@ -6144,8 +6148,10 @@ async function reconcileActiveSessionStatus(
   if (!canCheckItems()) return;
   const newestId = newest.items[0]?.id;
   const newestRenderedId = get().blocks.findLast((block) => block.ctx.itemId)?.ctx.itemId;
-  if (newestId && newestId !== newestRenderedId) {
-    await recovery.backfill(false, canCheckItems);
+  const reconciledId =
+    recovery.reconciledItem?.generation === generation ? recovery.reconciledItem.itemId : null;
+  if (newestId && newestId !== newestRenderedId && newestId !== reconciledId) {
+    await recovery.backfill(false, { canApply: canCheckItems, newestItemId: newestId });
   }
 }
 
@@ -6369,7 +6375,7 @@ async function rehydrateWindowOnReconnect(
   get: Getter,
   ignoredNativeMessageIds: Set<string>,
   statusPatchFor: (s: ChatState) => Partial<ChatState>,
-  canApply?: () => boolean,
+  options: ReconnectSnapshotOptions = {},
 ): Promise<ReconnectBackfill> {
   // Pinned at entry (still the caller's generation — its guards just passed).
   const generation = get().historyGeneration;
@@ -6384,7 +6390,7 @@ async function rehydrateWindowOnReconnect(
   if (
     isConversationDisposed(id) ||
     get().historyGeneration !== generation ||
-    canApply?.() === false
+    options.canApply?.() === false
   )
     return "skipped";
   const snapshotNativeMessageIds = nativeCompletedMessageIds(fresh.items);
@@ -6395,14 +6401,16 @@ async function rehydrateWindowOnReconnect(
   const gapUserTexts = committedUserTextsOf(
     freshBlocks.filter((b) => b.ctx.itemId && !preGapIds.has(b.ctx.itemId)),
   );
+  let recoveredItemCount = 0;
   set((s) => {
     const rid = s.activeResponse?.state === "streaming" ? s.activeResponse.responseId : null;
     const currentBlocks = withoutDeliveredSendFailureCards(
-      withoutNativePreviews(s.blocks, snapshotNativeMessageIds),
+      withoutNativePreviews(withPersistedErrorIds(s.blocks, freshBlocks), snapshotNativeMessageIds),
       freshItemIds,
       gapUserTexts,
       session,
     );
+    recoveredItemCount = recoveredCommittedItemCount(freshBlocks, currentBlocks, freshItemIds);
     const tail = currentBlocks.filter((b) => {
       if (b.ctx.itemId) return !preGapIds.has(b.ctx.itemId);
       // Elicitation/error blocks aren't items, so the fresh fetch can't recreate them.
@@ -6441,8 +6449,50 @@ async function rehydrateWindowOnReconnect(
       historyGeneration: s.historyGeneration + 1,
     };
   });
+  options.onReconciled?.(recoveredItemCount);
   queueAnsweredElicitationRechecks(id, snapshotPending, get().blocks);
   return "applied";
+}
+
+interface ReconnectSnapshotOptions {
+  canApply?: () => boolean;
+  onReconciled?: (recoveredItemCount: number) => void;
+}
+
+/** Match persisted terminal errors to their already-rendered live counterpart. */
+function withPersistedErrorIds(blocks: AnyBlock[], snapshot: AnyBlock[]): AnyBlock[] {
+  const claimed = new Set(blocks.map((block) => block.ctx.itemId));
+  let changed = false;
+  const updated = blocks.map((block) => {
+    if (block.type !== "error" || block.ctx.itemId || !block.ctx.responseId) return block;
+    const persisted = snapshot.find(
+      (candidate) =>
+        candidate.type === "error" &&
+        candidate.ctx.itemId &&
+        !claimed.has(candidate.ctx.itemId) &&
+        candidate.ctx.responseId === block.ctx.responseId &&
+        candidate.code === block.code &&
+        candidate.message === block.message,
+    );
+    if (!persisted) return block;
+    claimed.add(persisted.ctx.itemId);
+    changed = true;
+    return { ...block, ctx: { ...block.ctx, itemId: persisted.ctx.itemId } };
+  });
+  return changed ? updated : blocks;
+}
+
+function recoveredCommittedItemCount(
+  snapshot: AnyBlock[],
+  current: AnyBlock[],
+  persistedIds: Set<string>,
+): number {
+  const seen = new Set(current.map((block) => block.ctx.itemId));
+  return new Set(
+    snapshot
+      .map((block) => block.ctx.itemId)
+      .filter((itemId) => itemId && persistedIds.has(itemId) && !seen.has(itemId)),
+  ).size;
 }
 
 /** A reconnect backfill's outcome; only a failed read leaves history owed. */
@@ -6482,7 +6532,7 @@ async function reconcileOnReconnect(
   get: Getter,
   ignoredNativeMessageIds: Set<string> = new Set<string>(),
   settleStatus = true,
-  canApply?: () => boolean,
+  options: ReconnectSnapshotOptions = {},
 ): Promise<ReconnectBackfill> {
   if (queryClient === null) return "skipped";
   const stateBeforeFetch = get();
@@ -6504,7 +6554,9 @@ async function reconcileOnReconnect(
   // A window reset mid-fetch (A→B→A revisit, rebind) defeats the id check alone.
   const generation = get().historyGeneration;
   const stale = (): boolean =>
-    isConversationDisposed(id) || get().historyGeneration !== generation || canApply?.() === false;
+    isConversationDisposed(id) ||
+    get().historyGeneration !== generation ||
+    options.canApply?.() === false;
   let session: Session;
   let page: SessionItemsPage;
   const client = queryClient;
@@ -6581,15 +6633,24 @@ async function reconcileOnReconnect(
       get,
       ignoredNativeMessageIds,
       statusPatchFor,
-      canApply,
+      options,
     );
   }
 
   const snapshotBlocks = itemsToBlocks(items);
   const snapshotPending = pendingElicitationBlocksFromSnapshot(session);
   const snapshotItemIds = new Set(items.map((it) => it.id));
+  let recoveredItemCount = 0;
   set((s) => {
-    const currentBlocks = withoutNativePreviews(s.blocks, snapshotNativeMessageIds);
+    const currentBlocks = withoutNativePreviews(
+      withPersistedErrorIds(s.blocks, snapshotBlocks),
+      snapshotNativeMessageIds,
+    );
+    recoveredItemCount = recoveredCommittedItemCount(
+      snapshotBlocks,
+      currentBlocks,
+      snapshotItemIds,
+    );
     const seen = new Set(
       currentBlocks.map((b) => b.ctx.itemId).filter((iid): iid is string => Boolean(iid)),
     );
@@ -6661,6 +6722,7 @@ async function reconcileOnReconnect(
     if (nextBlocks !== s.blocks) patch.blocks = nextBlocks;
     return patch;
   });
+  options.onReconciled?.(recoveredItemCount);
   queueAnsweredElicitationRechecks(id, snapshotPending, get().blocks);
   return "applied";
 }
@@ -6778,44 +6840,36 @@ export async function startStreamPump(
     revealedPendingIds: new Set<string>(),
     recycledTurnKeys: new Set<string>(),
     backfillOwed: false,
-    backfill: async (settleStatus, canApply) => {
-      let recoveredCount = 0;
-      const backfillSet: Setter = canApply
-        ? (partial) =>
-            set((state) => {
-              const patch = typeof partial === "function" ? partial(state) : partial;
-              if (patch.blocks) {
-                const seen = new Set(state.blocks.map((block) => block.ctx.itemId));
-                recoveredCount = new Set(
-                  patch.blocks
-                    .map((block) => block.ctx.itemId)
-                    .filter((itemId) => itemId && !seen.has(itemId)),
-                ).size;
-              }
-              return patch;
-            })
-        : set;
-      backfillRuns += 1;
-      const run = backfillRuns;
+    reconciledItem: null,
+    backfill: async (settleStatus, poll) => {
+      const run = poll ? backfillRuns : ++backfillRuns;
       const outcome = await reconcileOnReconnect(
         id,
-        backfillSet,
+        set,
         get,
         ignoredNativeMessageIds,
         settleStatus,
-        canApply,
+        {
+          canApply: poll?.canApply,
+          onReconciled: poll
+            ? (count) => {
+                missedEventRecovery.reconciledItem = {
+                  itemId: poll.newestItemId,
+                  generation: get().historyGeneration,
+                };
+                const lastByteAt =
+                  liveAttempt === null ? undefined : streamAttemptActivity.get(liveAttempt);
+                reportRecoveredCommittedItems(
+                  "poll",
+                  count,
+                  lastByteAt === undefined ? null : (Date.now() - lastByteAt) / 1000,
+                );
+              }
+            : undefined,
+        },
       );
-      // A slower earlier run must not overwrite the latest run's outcome.
-      if (run === backfillRuns && !canApply)
-        missedEventRecovery.backfillOwed = outcome === "failed";
-      if (outcome === "applied" && recoveredCount > 0) {
-        const lastByteAt =
-          liveAttempt === null ? undefined : streamAttemptActivity.get(liveAttempt);
-        console.warn("Recovered committed items missing from the stream", {
-          count: recoveredCount,
-          secondsSinceLastByte: lastByteAt === undefined ? null : (Date.now() - lastByteAt) / 1000,
-        });
-      }
+      // A slower earlier reconnect must not overwrite the latest reconnect's outcome.
+      if (run === backfillRuns && !poll) missedEventRecovery.backfillOwed = outcome === "failed";
     },
   };
   // Shared by the periodic reconcile and the post-reconnect catch-up burst so

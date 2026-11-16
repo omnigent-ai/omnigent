@@ -73,6 +73,12 @@ export type OmnigentInteractionStatus = "success" | "failure" | "cancelled" | "t
  * from a fixed set), never user content.
  */
 export type OmnigentAnalyticsEvent =
+  | {
+      type: "committed_items_recovered";
+      trigger: string;
+      count: number;
+      secondsSinceLastByte: number | null;
+    }
   | { type: "click"; componentId: string; componentKind?: OmnigentComponentKind }
   | {
       type: "value_change";
