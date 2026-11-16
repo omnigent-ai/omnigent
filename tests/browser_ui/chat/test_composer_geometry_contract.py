@@ -658,7 +658,7 @@ def test_workspace_tray_aligns_with_the_card(
     "native_radio_css",
     [
         "",
-        # Reproduces the reported layout: an engine that reserves space around native radios.
+        # Simulates an engine that reserves margin around native radios.
         'input[type="radio"] { margin: 0 7px 6px 0 !important; }',
     ],
     ids=["default", "native-radio-spacing"],
