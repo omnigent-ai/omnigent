@@ -9,7 +9,8 @@ one affected session produced ~2.17M tokens against Claude's 1M-token maximum.
 Handles text, single or mixed MCP image blocks, newline-joined results, error
 prefixes, and malformed or store-truncated images. Valid images are preserved;
 unsafe partial payloads become bounded placeholders. Image container validation
-loads Pillow lazily for recognized managed MCP envelopes.
+loads Pillow lazily for recognized managed MCP envelopes. Base64 PDF document
+blocks, as Claude Code's Read returns them, are rehydrated the same way.
 """
 
 from __future__ import annotations
@@ -54,7 +55,17 @@ def image_omitted_placeholder(media_type: str | None) -> str:
     :param media_type: Image MIME type when known, e.g. ``"image/png"``.
     :returns: Human/agent-readable placeholder naming how to recover it.
     """
-    label = f"{media_type} image" if isinstance(media_type, str) and media_type else "image"
+    return _omitted_placeholder(media_type, "image")
+
+
+def _omitted_placeholder(media_type: object, kind: str) -> str:
+    """Return the placeholder text for a stripped inline payload.
+
+    :param media_type: MIME type when known, e.g. ``"application/pdf"``.
+    :param kind: What was stripped, e.g. ``"image"`` or ``"document"``.
+    :returns: Human/agent-readable placeholder naming how to recover it.
+    """
+    label = f"{media_type} {kind}" if isinstance(media_type, str) and media_type else kind
     return (
         f"[{label} omitted from history to save context — "
         "re-run the tool call above (e.g. Read the same path) to view it again]"
@@ -192,8 +203,9 @@ def _rehydrate_tool_result_shape(output: str) -> RehydratedContent:
     text, ~250K tokens per screenshot instead of ~1.5K. Four shapes are
     recognized — a tagged image envelope, a JSON block array, a lone MCP
     ``ImageContent`` object, and newline-joined mixed text + image-object lines.
-    Only ``text``/``image`` blocks are rehydrated, since those are what the API accepts inside a
-    ``tool_result``. Anything else stays a raw string.
+    Only ``text``, ``image`` and base64 PDF ``document`` blocks are rehydrated,
+    since the API accepts those inside a ``tool_result``. Anything else stays a
+    raw string.
 
     Called (not recursed into) by :func:`tool_result_content_blocks`, so
     that retry strips at most one error prefix.
@@ -289,8 +301,9 @@ def blocks_from_parsed_list(parsed: list[object]) -> RehydratedContent:
     :param parsed: Decoded JSON list, e.g.
         ``[{"type": "image", "data": "...", "mimeType": "image/png"}]``.
     :returns: A :class:`RehydratedContent` carrying canonical Claude
-        blocks, or ``blocks=None`` when any entry is not a
-        ``text``/``image`` block dict (caller keeps the raw string).
+        blocks, or ``blocks=None`` when any entry is not a ``text``,
+        ``image`` or base64 PDF ``document`` block dict (caller keeps the
+        raw string).
     """
     if not parsed:
         return RehydratedContent(None)
@@ -317,6 +330,12 @@ def blocks_from_parsed_list(parsed: list[object]) -> RehydratedContent:
                 dropped = True
                 continue
             blocks.append(image_block)
+            continue
+        if block_type == "document":
+            document_block = _document_block_from_object(block)
+            if document_block is None:
+                return RehydratedContent(None)
+            blocks.append(document_block)
             continue
         return RehydratedContent(None)
     return RehydratedContent(blocks, dropped_oversized_image=dropped)
@@ -386,6 +405,43 @@ def _whitespace_normalized_base64(data: str) -> str | None:
     except (binascii.Error, ValueError):
         return None
     return padded
+
+
+def _canonical_base64(data: object) -> str | None:
+    """
+    Return *data* as strictly decodable base64 without whitespace.
+
+    :param data: Candidate base64 payload.
+    :returns: The canonical spelling, or ``None`` when *data* is not base64.
+    """
+    if not isinstance(data, str) or not data:
+        return None
+    canonical = _whitespace_normalized_base64(data) or data
+    try:
+        base64.b64decode(canonical, validate=True)
+    except (binascii.Error, ValueError):
+        return None
+    return canonical
+
+
+def _document_block_from_object(block: JsonObject) -> JsonObject | None:
+    """
+    Return a base64 PDF document block carrying canonical base64.
+
+    :param block: A parsed ``{"type": "document", ...}`` block.
+    :returns: The block with a canonical payload, or ``None`` for any other
+        document shape or a payload that does not decode, so callers keep
+        the raw string rather than emit an API-invalid block.
+    """
+    source = _json_object(block.get("source"))
+    if source is None or source.get("type") != "base64":
+        return None
+    if source.get("media_type") != "application/pdf":
+        return None
+    data = _canonical_base64(source.get("data"))
+    if data is None:
+        return None
+    return {**block, "source": {**source, "data": data}}
 
 
 def _image_block_from_object(value: object) -> JsonObject | None:
@@ -550,15 +606,15 @@ def _image_block_has_valid_payload(block: JsonObject) -> bool:
 
 
 def sanitize_replayed_image_blocks(content: object) -> object:
-    """Downgrade image blocks whose persisted payload is no longer usable.
+    """Downgrade image and document blocks whose persisted payload is unusable.
 
-    A compaction snapshot replaces each image block's base64 with a short marker
-    (``[image/png content omitted from the compaction snapshot]``). Replayed
-    verbatim into a ``--resume`` transcript that marker reaches the provider as
-    ``source.data`` or ``input_image.image_url`` and the whole request is
-    rejected. Affected blocks become omitted-image text placeholders; a
-    still-valid base64 image is canonicalized so a wrapped or unpadded spelling
-    cannot fail the resume either.
+    A compaction snapshot replaces each image or document block's base64 with a
+    short marker (``[image/png content omitted from the compaction snapshot]``).
+    Replayed verbatim into a ``--resume`` transcript that marker reaches the
+    provider as ``source.data`` or ``input_image.image_url`` and the whole
+    request is rejected. Affected blocks become omitted-payload text
+    placeholders; a still-valid base64 payload is canonicalized so a wrapped or
+    unpadded spelling cannot fail the resume either.
 
     Traversal is deliberately narrow — a message content list and, within it, a
     ``tool_result``'s ``content`` list. It does not descend into a
@@ -588,6 +644,8 @@ def _sanitize_replayed_block(block: object) -> object:
     block_type = parsed.get("type")
     if block_type == "image":
         return _sanitize_image_block(parsed)
+    if block_type == "document":
+        return _sanitize_document_block(parsed)
     if block_type == "input_image":
         image_url = parsed.get("image_url")
         marker = _COMPACTION_MARKER_RE.fullmatch(image_url) if isinstance(image_url, str) else None
@@ -624,9 +682,29 @@ def _sanitize_image_block(block: JsonObject) -> JsonObject:
     return {"type": "text", "text": image_omitted_placeholder(_image_block_media_type(block))}
 
 
+def _sanitize_document_block(block: JsonObject) -> JsonObject:
+    """Canonicalize a usable document block, else downgrade it to a placeholder.
+
+    Sources that carry no base64 (``text``, ``url``, ``file``) are preserved.
+
+    :param block: A block whose ``type`` is ``"document"``.
+    :returns: The canonical document block, the original block, or an
+        omitted-document text block.
+    """
+    source = _json_object(block.get("source"))
+    if source is None:
+        return block
+    source_type = source.get("type")
+    if isinstance(source_type, str) and source_type != "base64":
+        return block
+    if _canonical_base64(source.get("data")) is not None:
+        return _document_block_from_object(block) or block
+    return {"type": "text", "text": _omitted_placeholder(source.get("media_type"), "document")}
+
+
 def image_payloads_in_blocks(blocks: list[JsonObject]) -> list[str]:
     """
-    Return the base64 payloads carried by a block list's image blocks.
+    Return the base64 payloads carried by a block list's image and document blocks.
 
     :param blocks: Canonical content blocks.
     :returns: Non-empty ``source.data`` strings, e.g. ``["iVBOR..."]``.
