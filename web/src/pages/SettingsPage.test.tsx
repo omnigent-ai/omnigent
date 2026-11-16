@@ -1842,6 +1842,20 @@ describe("SettingsPage", () => {
     ).toHaveAttribute("aria-label", "Use heavier code text");
   });
 
+  it("names the Settings data buttons and opens their dialogs as its overlays", async () => {
+    renderPage("/settings/appearance");
+    expect(document.querySelector('[data-settings-item="appearance-data"]')).not.toBeNull();
+    expect(
+      document.querySelector('[data-settings-control="appearance-data:export"]'),
+    ).toHaveAttribute("aria-label", "Export");
+    fireEvent.click(screen.getByTestId("reset-appearance-button"));
+    const dialog = await screen.findByRole("dialog", { name: "Reset appearance?" });
+    expect(dialog).toHaveAttribute("data-settings-overlay-owner", "appearance-data:reset");
+    expect(
+      document.querySelector('[data-settings-control="appearance-data:confirmReset"]'),
+    ).toHaveAttribute("aria-label", "Reset");
+  });
+
   it("renders the Sandbox Integrations rows from their Settings catalog entries", async () => {
     mocks.enabledConnections = ["github", "databricks"];
     renderPage("/settings/integrations");
