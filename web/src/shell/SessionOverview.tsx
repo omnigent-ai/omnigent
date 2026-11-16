@@ -1,6 +1,6 @@
 // WIP(session_overview): session total, per-model costs and direct sub-agents.
 
-import { type ReactNode, useSyncExternalStore } from "react";
+import { type ReactNode, useState, useSyncExternalStore } from "react";
 import { XIcon } from "lucide-react";
 import { Card, CardAction, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
@@ -40,8 +40,12 @@ const dockedOverviewPreference = createStoredChoicePreference(
 
 /** Whether the docked overview shows, and a setter that remembers the choice. */
 export function useDockedOverviewOpen(): readonly [boolean, (open: boolean) => void] {
-  const open = dockedOverviewPreference.use() === "open";
-  const setOpen = (next: boolean) => dockedOverviewPreference.write(next ? "open" : "closed");
+  // Storage only seeds and records the choice, so a failed write can't block the toggle.
+  const [open, setOpenState] = useState(() => dockedOverviewPreference.read() === "open");
+  const setOpen = (next: boolean) => {
+    setOpenState(next);
+    dockedOverviewPreference.write(next ? "open" : "closed");
+  };
   return [open, setOpen];
 }
 

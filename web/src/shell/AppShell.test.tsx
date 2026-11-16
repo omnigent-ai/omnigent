@@ -3175,6 +3175,33 @@ describe("Session overview", () => {
     expect(docked()).toBeInTheDocument();
   });
 
+  it("toggles the docked card when its choice can't be stored", async () => {
+    setWideViewport(true);
+    const key = "omnigent:session-overview-docked";
+    localStorage.setItem(key, "closed");
+    // Fail only this key's writes and removals; the shell stores other preferences too.
+    for (const method of ["setItem", "removeItem"] as const) {
+      const original = Storage.prototype[method];
+      const failing = vi.spyOn(Storage.prototype, method).mockImplementation(function (
+        this: Storage,
+        ...args: [string, string]
+      ) {
+        if (args[0] === key) throw new DOMException("Storage is full", "QuotaExceededError");
+        return original.apply(this, args);
+      });
+      onTestFinished(() => failing.mockRestore());
+    }
+    await renderOverviewShell(true, "collapsed");
+    const chip = () => screen.getByTestId("header-session-cost");
+
+    expect(docked()).toBeNull();
+    fireEvent.click(chip());
+    expect(docked()).toBeInTheDocument();
+    fireEvent.click(within(docked()!).getByRole("button", { name: "Hide session overview" }));
+    expect(docked()).toBeNull();
+    expect(localStorage.getItem(key)).toBe("closed");
+  });
+
   it.each([
     ["a narrow window", false, "collapsed"],
     ["an open workspace", true, "open"],
