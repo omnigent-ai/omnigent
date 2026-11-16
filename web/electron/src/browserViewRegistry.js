@@ -26,6 +26,8 @@ const {
   isProxyAddress,
   lookupHostAddresses,
 } = require("./browserUrlPolicy");
+const { createAgentNavigation } = require("./agentNavigation");
+const { agentInputInFlight } = require("./browserInput");
 
 // Each view is a separate renderer process; the cap bounds memory per window.
 const DEFAULT_CAP = 20;
@@ -95,6 +97,7 @@ function createBrowserViewRegistry({
   resolveHost = lookupHostAddresses,
   resolveProxy = async () => "DIRECT",
   cap = DEFAULT_CAP,
+  historyLoadTimeoutMs = 10_000,
   // Partition namespace for this registry's views — see agentPartition.
   // Injectable so tests can pin it; defaults to a per-instance unique value.
   partitionScope = `w${++registrySeq}`,
@@ -280,6 +283,8 @@ function createBrowserViewRegistry({
     const wc = entry.view && entry.view.webContents;
     if (!wc || typeof wc.on !== "function") return;
     wc.on("context-menu", (_event, params) => {
+      // An agent's right-click opens the page's own menu, never the shell's.
+      if (entry.suppressContextMenuUntil > Date.now()) return;
       const items = [];
       if (params.linkURL) {
         if (/^https?:\/\//i.test(params.linkURL)) {
@@ -322,6 +327,8 @@ function createBrowserViewRegistry({
           url: targetUrl,
           error: verdict.error,
         });
+        // Lets agent history navigation report the block.
+        if (event?.isMainFrame !== false) entry.agentNavBlockedError = verdict.error;
       }
     };
     wc.on("will-navigate", guard);
@@ -379,6 +386,8 @@ function createBrowserViewRegistry({
     if (!wc || typeof wc.on !== "function") return;
     wc.on("before-input-event", (event, input) => {
       if (!recentSessionSwitchSupported) return;
+      // An agent's key presses are for the page, never the shell.
+      if (agentInputInFlight(wc)) return;
       const type =
         input && input.type === "keyDown"
           ? "keydown"
@@ -428,6 +437,15 @@ function createBrowserViewRegistry({
       partition: agentPartition(partitionScope, conversationId),
     });
   }
+
+  // Agent viewport sizing and back / forward / reload.
+  const agentNavigation = createAgentNavigation({
+    entries,
+    isActive: (conversationId) => activeConversationId === conversationId,
+    checkAgentNavigationFor,
+    historyLoadTimeoutMs,
+    beginAgentNavigation,
+  });
 
   function entryForWebContents(webContentsId) {
     for (const entry of entries.values()) {
@@ -760,6 +778,7 @@ function createBrowserViewRegistry({
     needsAgentViewRevocation,
     revokeAgentView,
     checkAgentNavigation: checkAgentNavigationFor,
+    ...agentNavigation,
     shouldCancelAgentRequest,
     agentRequestHeaders,
     shouldCancelAgentResponse,
