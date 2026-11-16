@@ -12,6 +12,7 @@ that keeps grants, since runs apply them under either scheduler.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
@@ -507,10 +508,13 @@ def register_scheduled_task_permissions_routes(
         # Before the delete, so a restore can't give the grant to a re-registered account.
         account = await asyncio.to_thread(store.get_user, target_user_id)
         generation = account.account_generation if account is not None else None
+        deleting: asyncio.Task[bool] | None = None
         try:
-            if not await asyncio.to_thread(
-                store.revoke_for_scheduled_task, target_user_id, task.id
-            ):
+            deleting = asyncio.ensure_future(
+                asyncio.to_thread(store.revoke_for_scheduled_task, target_user_id, task.id)
+            )
+            # Shielded: a cancel waits for the delete below, so it can't land after a restore.
+            if not await asyncio.shield(deleting):
                 return Response(status_code=204)
             current = await owned_task(request, scheduled_task_id)
             # Both sessions: a run may have re-shared the first since its revoke. A first run
@@ -520,12 +524,19 @@ def register_scheduled_task_permissions_routes(
             if current.continues_session and current.session_id != _continued_session_id(task):
                 await revoke_from_task_session(current, target_user_id, permission_store=store)
         except (Exception, asyncio.CancelledError) as exc:
+            if deleting is not None:
+                # Its own failure is handled by restoring below.
+                with contextlib.suppress(Exception):
+                    await await_cleanup_task(deleting)
             # Whatever failed, even the delete or a disconnect, the grant goes back so a
-            # retry finds it. Restoring a grant the delete kept is a harmless upsert.
-            restoring = asyncio.ensure_future(
-                asyncio.to_thread(_restore_task_grant, store, target_user_id, task.id, generation)
-            )
-            await await_cleanup_task(restoring)
+            # retry finds it, unless the delete found none. Restoring a kept grant is an upsert.
+            if deleting is None or deleting.exception() is not None or deleting.result():
+                restoring = asyncio.ensure_future(
+                    asyncio.to_thread(
+                        _restore_task_grant, store, target_user_id, task.id, generation
+                    )
+                )
+                await await_cleanup_task(restoring)
             if isinstance(exc, (OmnigentError, asyncio.CancelledError)):
                 raise
             _logger.exception(

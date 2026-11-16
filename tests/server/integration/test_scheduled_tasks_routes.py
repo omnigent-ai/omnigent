@@ -5155,12 +5155,62 @@ async def test_a_revoke_cancelled_after_the_grant_delete_restores_the_grant(
         assert await asyncio.to_thread(deleted.wait, 15)
         # As when the client disconnects.
         pending.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await pending
     finally:
         release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await pending
     grants, _ = SqlAlchemyPermissionStore(db_uri).list_for_scheduled_task(task_id)
     assert [(grant.user_id, grant.level) for grant in grants] == [("bob@example.com", LEVEL_READ)]
+
+
+@_SHARING
+async def test_a_revoke_cancelled_before_the_grant_delete_commits_keeps_a_retry(
+    auth_client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import threading
+
+    from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ
+
+    session_id = _owned_session(db_uri)
+    task_id = await _create_task(auth_client, session_mode="continue", session_id=session_id)
+    assert (await _share(auth_client, task_id, "bob@example.com")).status_code == 200
+    delete_grant = SqlAlchemyPermissionStore.revoke_for_scheduled_task
+    deleting, release, finished = threading.Event(), threading.Event(), threading.Event()
+
+    def wait_then_delete(
+        self: SqlAlchemyPermissionStore, user_id: str, scheduled_task_id: str
+    ) -> bool:
+        deleting.set()
+        release.wait(15)
+        try:
+            return delete_grant(self, user_id, scheduled_task_id)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(SqlAlchemyPermissionStore, "revoke_for_scheduled_task", wait_then_delete)
+    url = _permissions_url(task_id, "bob@example.com")
+    pending = asyncio.ensure_future(auth_client.delete(url, headers=_headers()))
+    try:
+        assert await asyncio.to_thread(deleting.wait, 15)
+        # The client disconnects while the delete is still running.
+        pending.cancel()
+        # The request waits out the delete rather than restoring the grant under it.
+        await asyncio.wait([pending], timeout=1)
+        assert not pending.done()
+        # A run shares the session meanwhile, finding the automation grant still there.
+        SqlAlchemyPermissionStore(db_uri).grant("bob@example.com", session_id, LEVEL_READ)
+    finally:
+        release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await pending
+    assert await asyncio.to_thread(finished.wait, 15)
+
+    # The grant is back after the delete, so the owed session revoke can still be retried.
+    assert _task_grantees(db_uri, task_id) == ["bob@example.com"]
+    monkeypatch.setattr(SqlAlchemyPermissionStore, "revoke_for_scheduled_task", delete_grant)
+    assert (await auth_client.delete(url, headers=_headers())).status_code == 204
+    assert _task_grantees(db_uri, task_id) == []
+    assert _session_grants(db_uri, session_id) == {"alice@example.com": LEVEL_OWNER}
 
 
 @_SHARING
