@@ -807,9 +807,11 @@ async def test_active_creates_session_grant_and_run(
     assert not [
         k for k in conv_store.created[0]["labels"] if k.startswith("omnigent.mcp_service.")
     ]
-    assert conv_store.created[0]["title"] == (
-        "[automation job] nightly" if trigger and session_mode == "continue" else "nightly"
-    )
+    title = conv_store.created[0]["title"]
+    if session_mode == "continue":
+        assert title == ("[automation job] nightly" if trigger else "nightly")
+    else:
+        assert re.fullmatch(r"nightly \(\d{4}-\d{2}-\d{2} \d{2}:\d{2}\)", title)
     # NULL owner resolved to "local" and granted LEVEL_OWNER.
     assert perm.ensured == [RESERVED_USER_LOCAL]
     assert perm.grants and perm.grants[0][0] == RESERVED_USER_LOCAL
@@ -4536,6 +4538,25 @@ def test_session_approval_skipping_mode(
     assert fire_mod.session_approval_skipping_mode(conv) == expected
 
 
+def test_new_session_run_titles_carry_the_fire_time_in_the_task_timezone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 2026-11-13 17:05 UTC.
+    monkeypatch.setattr(fire_mod.time, "time", lambda: 1_794_589_500.0)
+
+    assert fire_mod._scheduled_session_title(_task(name="NHPC rollout check")) == (
+        "NHPC rollout check (2026-11-13 17:05)"
+    )
+    assert fire_mod._scheduled_session_title(
+        _task(name="NHPC rollout check", timezone="America/Los_Angeles")
+    ) == ("NHPC rollout check (2026-11-13 09:05)")
+    assert fire_mod._scheduled_session_title(_task(timezone="Not/AZone")) == (
+        "nightly (2026-11-13 17:05)"
+    )
+    # A continued session spans many runs, so one run's time would mislabel it.
+    assert fire_mod._scheduled_session_title(_task(session_mode="continue")) == "nightly"
+
+
 # ── Runs that start from a copy of a session ───────────────────────────────
 
 
@@ -4562,11 +4583,8 @@ async def test_a_run_starts_from_a_copy_of_the_source_session() -> None:
 
     assert conv_store.created == []
     (fork,) = conv_store.forked
-    assert (fork["source_id"], fork["agent_id"], fork["title"]) == (
-        "conv_source",
-        "ag_1",
-        "nightly",
-    )
+    assert (fork["source_id"], fork["agent_id"]) == ("conv_source", "ag_1")
+    assert fork["title"].startswith("nightly (")
     # The run rebuilds its native transcript from its own copy, never another session's file.
     assert fork["resume_source_native_session"] is False
     # It plans its own work: the source's journal stays behind.
