@@ -3,8 +3,7 @@ import { Route, Routes } from "react-router-dom";
 import { ChatPage as ChatPageImpl } from "@/pages/ChatPage";
 import { NotFoundPage as NotFoundPageImpl } from "@/pages/NotFoundPage";
 import { useOmnigentPageView } from "@/lib/analytics";
-import { PageLoading } from "@/components/PageLoading";
-import { Spinner } from "@/components/ui/spinner";
+import { ContentLoading, PageLoading } from "@/components/PageLoading";
 import { ChunkLoadErrorBoundary } from "@/components/ChunkLoadErrorBoundary";
 import { RenderErrorBoundary } from "@/components/RenderErrorBoundary";
 import { Outlet, useLocation, useNavigate } from "@/lib/routing";
@@ -83,13 +82,7 @@ const SettingsPage = lazy(() =>
 // gate is decided inside once the probe resolves.
 function FeatureGatedPage({ feature, children }: { feature: FeatureKey; children: ReactNode }) {
   const info = useServerInfo();
-  if (info === "loading") {
-    return (
-      <div className="flex min-h-0 flex-1 items-center justify-center">
-        <Spinner className="size-5 text-muted-foreground" aria-label="Loading" />
-      </div>
-    );
-  }
+  if (info === "loading") return <ContentLoading />;
   return isFeatureEnabled(info, feature) ? children : <NotFoundPage />;
 }
 
