@@ -20,6 +20,7 @@ from omnigent.errors import ErrorCode, OmnigentError, WrongReplicaError
 from omnigent.models.model_override import validate_model_override
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.auth import LEVEL_EDIT, RESERVED_USER_LOCAL, local_single_user_enabled
+from omnigent.server.proactive_agent import reject_proactive_agent_id
 from omnigent.server.routes._auth_helpers import require_access
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
 from omnigent.stores.host_store import host_is_live
@@ -91,6 +92,9 @@ async def resolve_project_session_create(
             continue
         if field not in fields_set and field in config and field in body.__class__.model_fields:
             updates[field] = config[field]
+    # The request's own agent_id was checked by its route; a project's saved
+    # agent is the caller's to edit, so it must not name the hidden agent either.
+    reject_proactive_agent_id(updates.get("agent_id"))
     if repository is not None and not {"workspace", "workspaces"} & fields_set:
         updates["workspaces"] = [repository]
     saved_provider = config.get("sandbox_provider")

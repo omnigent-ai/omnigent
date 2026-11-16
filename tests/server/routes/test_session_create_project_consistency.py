@@ -13,6 +13,7 @@ from fastapi import FastAPI
 from pydantic.version import version_short
 
 from omnigent.db.utils import builtin_agent_id
+from omnigent.errors import OmnigentError
 from omnigent.native._native_supersession import clear_replacement_create_body
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
@@ -548,6 +549,37 @@ async def test_shared_chokepoint_is_reusable_by_non_route_creators(
     )
     assert resolved.body.agent_id == CUSTOM_AGENT_ID
     assert resolved.body.workspace == "/scheduled"
+
+
+async def test_a_project_default_cannot_bind_the_proactive_agent(
+    project_create_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """The hidden agent runs only on its schedule, whichever way a create names it."""
+    from omnigent.server.proactive_agent import PROACTIVE_AGENT_ID
+
+    # Seeded at boot, so a create that names it would otherwise find it.
+    SqlAlchemyAgentStore(db_uri).create(
+        PROACTIVE_AGENT_ID, "proactive", f"{CUSTOM_AGENT_ID}/bundle"
+    )
+    project_id = await _project(
+        project_create_client, {"agent_id": PROACTIVE_AGENT_ID, "workspace": "/work/project"}
+    )
+    response = await project_create_client.post(
+        "/v1/sessions", json={"project_id": project_id}, headers=_headers()
+    )
+    assert response.status_code == 400, response.text
+    assert "built-in schedule" in response.text
+    listed = await project_create_client.get("/v1/sessions", headers=_headers())
+    assert listed.json()["data"] == []
+    # Uploads and imports resolve project defaults through the same chokepoint.
+    project = SqlAlchemyProjectStore(db_uri).get(project_id, user_id=ALICE)
+    assert project is not None
+    with pytest.raises(OmnigentError, match="built-in schedule"):
+        await resolve_project_session_create(
+            body=ProjectSessionCreateRequest(project_id=project_id),
+            user_id=ALICE,
+            project_store=SqlAlchemyProjectStore(db_uri),
+        )
 
 
 def _import_payload(external_session_id: str, **extra: object) -> dict[str, object]:
