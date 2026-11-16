@@ -314,6 +314,23 @@ def _restore_task_grant(
         _logger.exception("automation %s: could not restore %r's grant", task_id, user_id)
 
 
+def _canonical_grantee(store: PermissionStore, user_id: str) -> str:
+    """*user_id* as the store names grantees, or as given when the store doesn't know it.
+
+    As given, a principal who has left the directory can still be removed.
+
+    :raises OmnigentError: Any error from :meth:`PermissionStore.validate_grants`
+        except ``INVALID_INPUT``.
+    """
+    try:
+        [(grantee, _)] = store.validate_grants([(user_id, LEVEL_READ)])
+    except OmnigentError as exc:
+        if exc.code != ErrorCode.INVALID_INPUT:
+            raise
+        return user_id
+    return grantee
+
+
 def display_names_or_ids(store: PermissionStore, user_ids: Sequence[str]) -> dict[str, str]:
     """The store's display names, or the IDs themselves when the lookup fails."""
     try:
@@ -531,7 +548,8 @@ def register_scheduled_task_permissions_routes(
         Works without ``automations_v2``, since runs still apply existing grants.
 
         :param scheduled_task_id: The automation.
-        :param target_user_id: The grantee to remove, e.g. ``"alice@example.com"``.
+        :param target_user_id: The grantee to remove, e.g. ``"alice@example.com"``, in
+            any spelling :meth:`PermissionStore.validate_grants` resolves.
         :returns: 204 No Content.
         :raises OmnigentError: 404 when the caller does not own the automation, 403
             for an agent or a server that cannot keep automation grants, 500 when the
@@ -539,25 +557,27 @@ def register_scheduled_task_permissions_routes(
         """
         store = require_sharing(request, granting=False)
         task = await owned_task(request, scheduled_task_id)
-        add_audit_attrs(target_user_id=target_user_id)
+        # The grant route stores this spelling, so every call below uses it.
+        grantee = await asyncio.to_thread(_canonical_grantee, store, target_user_id)
+        add_audit_attrs(target_user_id=grantee)
         # Before their grant is read, so a restore stays pinned to the account that held it
         # and refuses one registered again since.
-        account = await asyncio.to_thread(store.get_user, target_user_id)
+        account = await asyncio.to_thread(store.get_user, grantee)
         generation = account.account_generation if account is not None else None
         # Access they never had from the automation, such as a hand-made session
         # share, stays.
         if (
-            await asyncio.to_thread(store.resolve_scheduled_task_access, [target_user_id], task.id)
+            await asyncio.to_thread(store.resolve_scheduled_task_access, [grantee], task.id)
             is None
         ):
             return Response(status_code=204)
         # Fresh, so a session a first run recorded since the load is the one revoked.
         task = await owned_task(request, scheduled_task_id)
-        await revoke_from_task_session(task, target_user_id, permission_store=store)
+        await revoke_from_task_session(task, grantee, permission_store=store)
         deleting: asyncio.Task[bool] | None = None
         try:
             deleting = asyncio.ensure_future(
-                asyncio.to_thread(store.revoke_for_scheduled_task, target_user_id, task.id)
+                asyncio.to_thread(store.revoke_for_scheduled_task, grantee, task.id)
             )
             # Shielded: a cancel waits for the delete below, so it can't land after a restore.
             if not await asyncio.shield(deleting):
@@ -566,9 +586,9 @@ def register_scheduled_task_permissions_routes(
             # Both sessions: a run may have re-shared the first since its revoke. A first run
             # records its session before sharing it, and shares only while the grant exists,
             # so a session recorded after this read never reaches them.
-            await revoke_from_task_session(task, target_user_id, permission_store=store)
+            await revoke_from_task_session(task, grantee, permission_store=store)
             if current.continues_session and current.session_id != _continued_session_id(task):
-                await revoke_from_task_session(current, target_user_id, permission_store=store)
+                await revoke_from_task_session(current, grantee, permission_store=store)
         except (Exception, asyncio.CancelledError) as exc:
             if deleting is not None:
                 # Its own failure is handled by restoring below.
@@ -578,16 +598,12 @@ def register_scheduled_task_permissions_routes(
             # retry finds it, unless the delete found none. Restoring a kept grant is an upsert.
             if deleting is None or deleting.exception() is not None or deleting.result():
                 restoring = asyncio.ensure_future(
-                    asyncio.to_thread(
-                        _restore_task_grant, store, target_user_id, task.id, generation
-                    )
+                    asyncio.to_thread(_restore_task_grant, store, grantee, task.id, generation)
                 )
                 await await_cleanup_task(restoring)
             if isinstance(exc, (OmnigentError, asyncio.CancelledError)):
                 raise
-            _logger.exception(
-                "automation %s: could not finish revoking %r", task.id, target_user_id
-            )
+            _logger.exception("automation %s: could not finish revoking %r", task.id, grantee)
             raise OmnigentError(
                 "Could not finish removing them from the automation, so it is still shared "
                 "with them. Try again.",

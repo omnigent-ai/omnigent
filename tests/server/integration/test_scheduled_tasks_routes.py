@@ -4845,6 +4845,63 @@ async def test_grant_stores_the_canonical_id_and_tolerates_a_name_lookup_failure
 
 
 @_SHARING
+@pytest.mark.parametrize(("refusal", "status"), [("invalid_input", 204), ("forbidden", 403)])
+async def test_revoke_uses_the_canonical_id_or_the_id_given_for_an_unknown_principal(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    refusal: str,
+    status: int,
+) -> None:
+    from omnigent.errors import ErrorCode, OmnigentError
+    from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ
+    from omnigent.server.routes import scheduled_task_permissions
+
+    left_directory: set[str] = set()
+
+    def canonical(
+        self: SqlAlchemyPermissionStore, grants: list[tuple[str, int]]
+    ) -> list[tuple[str, int]]:
+        if any(user_id.lower() in left_directory for user_id, _ in grants):
+            code = ErrorCode.INVALID_INPUT if refusal == "invalid_input" else ErrorCode.FORBIDDEN
+            raise OmnigentError("No such principal", code=code)
+        return [(user_id.lower(), level) for user_id, level in grants]
+
+    monkeypatch.setattr(SqlAlchemyPermissionStore, "validate_grants", canonical)
+    session_id = _owned_session(db_uri)
+    task_id = await _create_task(auth_client, session_mode="continue", session_id=session_id)
+    for user in ("Bob@Example.com", "Erin@Example.com"):
+        assert (await _share(auth_client, task_id, user)).status_code == 200
+    audited: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        scheduled_task_permissions, "add_audit_attrs", lambda **attrs: audited.append(attrs)
+    )
+
+    revoked = await auth_client.delete(
+        _permissions_url(task_id, "BOB@example.com"), headers=_headers()
+    )
+
+    assert revoked.status_code == 204, revoked.text
+    assert audited == [{"target_user_id": "bob@example.com"}]
+    assert _task_grantees(db_uri, task_id) == ["erin@example.com"]
+    erin = {"alice@example.com": LEVEL_OWNER, "erin@example.com": LEVEL_READ}
+    assert _session_grants(db_uri, session_id) == erin
+
+    # Erin left the directory. Only a lookup that finds no such principal falls back.
+    left_directory.add("erin@example.com")
+    revoked = await auth_client.delete(
+        _permissions_url(task_id, "erin@example.com"), headers=_headers()
+    )
+
+    assert revoked.status_code == status, revoked.text
+    removed = status == 204
+    assert _task_grantees(db_uri, task_id) == ([] if removed else ["erin@example.com"])
+    assert _session_grants(db_uri, session_id) == (
+        {"alice@example.com": LEVEL_OWNER} if removed else erin
+    )
+
+
+@_SHARING
 @pytest.mark.parametrize(
     ("mode", "target", "status"),
     [
