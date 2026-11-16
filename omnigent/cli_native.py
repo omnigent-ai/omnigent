@@ -89,6 +89,7 @@ def register_native_commands(cli: click.Group) -> None:
     _reject_smart_routing_prompt = _late_bound(lambda: _cli._reject_smart_routing_prompt)
     _reject_smart_routing_resume = _late_bound(lambda: _cli._reject_smart_routing_resume)
     _smart_routing_decision = _late_bound(lambda: _cli._smart_routing_decision)
+    _smart_routing_preflight = _late_bound(lambda: _cli._smart_routing_preflight)
     _launch_project_name = _late_bound(lambda: _cli._launch_project_name)
     _reject_project_on_resume = _late_bound(lambda: _cli._reject_project_on_resume)
     _resolve_launch_project_id = _late_bound(lambda: _cli._resolve_launch_project_id)
@@ -286,6 +287,12 @@ def register_native_commands(cli: click.Group) -> None:
         startup_profiler.mark("ensuring backend")
         server = _ensure_backend(server)
         startup_profiler.mark("backend ready", detail=f"server={server}")
+        # Preflight first, so an unavailable Smart Routing leaves no new project.
+        routing_host_id = (
+            _smart_routing_preflight(server=server, harness="claude-native")
+            if smart_routing
+            else None
+        )
         project_id = (
             _resolve_launch_project_id(server=server, project_name=project)
             if project is not None
@@ -325,7 +332,10 @@ def register_native_commands(cli: click.Group) -> None:
             # on and the decision card lands), so attach to it instead of
             # letting the wrapper bundle a fresh one.
             armed = _smart_routing_decision(
-                server=server, harness="claude-native", project_id=project_id
+                server=server,
+                harness="claude-native",
+                host_id=routing_host_id,
+                project_id=project_id,
             )
             resolved_session_id = armed.session_id or resolved_session_id
         run_claude_native(
@@ -461,6 +471,12 @@ def register_native_commands(cli: click.Group) -> None:
         # the same ownership model as attach/run/claude: the daemon-spawned runner
         # owns the app-server and TUI; the CLI attaches to the tmux terminal.
         server = _ensure_backend(server)
+        # Preflight first, so an unavailable Smart Routing leaves no new project.
+        routing_host_id = (
+            _smart_routing_preflight(server=server, harness="codex-native")
+            if smart_routing
+            else None
+        )
         project_id = (
             _resolve_launch_project_id(server=server, project_name=project)
             if project is not None
@@ -482,7 +498,10 @@ def register_native_commands(cli: click.Group) -> None:
             # yet, so ``model`` keeps whatever the user or config asked for
             # until the first typed message routes.
             armed = _smart_routing_decision(
-                server=server, harness="codex-native", project_id=project_id
+                server=server,
+                harness="codex-native",
+                host_id=routing_host_id,
+                project_id=project_id,
             )
             resolved_session_id = armed.session_id or resolved_session_id
         run_codex_native(

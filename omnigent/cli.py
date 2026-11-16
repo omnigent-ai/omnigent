@@ -8619,32 +8619,17 @@ def _resolve_launch_project_id(*, server: str, project_name: str) -> str:
     return project_id
 
 
-def _smart_routing_decision(
-    *, server: str, harness: str, project_id: str | None = None
-) -> ArmedSession:
+def _smart_routing_preflight(*, server: str, harness: str) -> str | None:
     """
-    Preflight Smart Routing, then create the session it will route in.
-
-    Preflight failures raise (a pick that cannot be applied is worse than no
-    pick); a create the server rejects comes back as a result with no session
-    whose notice is printed here, so the caller only has to launch a plain
-    wrapper session.
-
-    Nothing is routed at create: the session carries Smart Routing on, and
-    *harness*'s own first-message hook picks the model once the user types,
-    which is what the stderr line reports.
+    Check that Smart Routing can serve *harness* here, before any launch writes.
 
     :param server: Resolved Omnigent server base URL.
     :param harness: Canonical native harness to bind, e.g. ``"codex-native"``.
-    :param project_id: Project to file the armed session in, e.g. ``"proj_abc123"``.
-    :returns: The armed session to attach the wrapper to.
+    :returns: The host id the armed session should bind, or ``None`` when the
+        server doesn't know this host yet.
     :raises click.ClickException: When Smart Routing is unavailable.
     """
-    from omnigent.smart_routing_cli import (
-        arm_smart_routing_session,
-        check_smart_routing_available,
-        known_host_id,
-    )
+    from omnigent.smart_routing_cli import check_smart_routing_available, known_host_id
 
     # The session must be bound to the host it will run on: the server builds
     # the router's candidate model catalog from that host's model-options
@@ -8665,6 +8650,31 @@ def _smart_routing_decision(
         harnesses=(harness,),
         host_id=host_id,
     )
+    return host_id
+
+
+def _smart_routing_decision(
+    *, server: str, harness: str, host_id: str | None, project_id: str | None = None
+) -> ArmedSession:
+    """
+    Create the session Smart Routing will route in, after :func:`_smart_routing_preflight`.
+
+    A create the server rejects comes back as a result with no session whose
+    notice is printed here, so the caller only has to launch a plain wrapper
+    session.
+
+    Nothing is routed at create: the session carries Smart Routing on, and
+    *harness*'s own first-message hook picks the model once the user types,
+    which is what the stderr line reports.
+
+    :param server: Resolved Omnigent server base URL.
+    :param harness: Canonical native harness to bind, e.g. ``"codex-native"``.
+    :param host_id: Host id returned by the preflight, or ``None`` for a hostless create.
+    :param project_id: Project to file the armed session in, e.g. ``"proj_abc123"``.
+    :returns: The armed session to attach the wrapper to.
+    """
+    from omnigent.smart_routing_cli import arm_smart_routing_session
+
     armed = arm_smart_routing_session(
         base_url=server,
         harness=harness,

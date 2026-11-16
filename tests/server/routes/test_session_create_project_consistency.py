@@ -519,7 +519,10 @@ async def test_multipart_create_defaults_workspace_and_files_atomically(
 async def test_native_cli_create_files_the_session_without_folder_defaults(
     project_create_client: httpx.AsyncClient, create_native_session
 ) -> None:
-    project_id = await _project(project_create_client, {"workspace": "/work/project"})
+    project_id = await _project(
+        project_create_client,
+        {"workspace": "/work/project", "git": {"branch_name": "project-default"}},
+    )
     project_create_client.headers.update(_headers())
 
     session_id = await create_native_session(
@@ -532,8 +535,9 @@ async def test_native_cli_create_files_the_session_without_folder_defaults(
     session = await project_create_client.get(f"/v1/sessions/{session_id}")
     assert session.status_code == 200, session.text
     assert session.json()["project_id"] == project_id
-    # The CLI's launch directory, not the project's saved folder, is the workspace.
+    # The CLI's launch directory, not the project's saved folder or branch, is used.
     assert session.json()["workspace"] is None
+    assert session.json().get("git") is None
 
 
 async def test_multipart_malformed_project_config_is_structured_400(

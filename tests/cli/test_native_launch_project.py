@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
+import click
 import httpx
 import pytest
 import respx
 from click.testing import CliRunner
 
-from omnigent.cli import cli
+from omnigent.cli import _require_project_aware_session_create, cli
 
 _BASE = "http://localhost:6767"
 _HOST_ID = "host_abc123"
@@ -48,6 +50,23 @@ def launch_env(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
 def _mock_server_version(version: object = "0.22.0") -> respx.Route:
     return respx.get(f"{_BASE}/api/version").mock(
         return_value=httpx.Response(200, json={"version": version})
+    )
+
+
+def _mock_smart_routing(*, enabled: bool) -> None:
+    respx.get(f"{_BASE}/v1/info").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "smart_routing_enabled": enabled,
+                "smart_routing_sources": {"external": enabled, "oss": False},
+            },
+        )
+    )
+    respx.get(f"{_BASE}/v1/hosts").mock(
+        return_value=httpx.Response(
+            200, json={"hosts": [{"host_id": _HOST_ID, "status": "online"}]}
+        )
     )
 
 
@@ -205,20 +224,7 @@ def test_smart_routing_files_the_armed_session_in_the_project(
     launched_session: str | None,
     launch_env: dict[str, Any],
 ) -> None:
-    respx.get(f"{_BASE}/v1/info").mock(
-        return_value=httpx.Response(
-            200,
-            json={
-                "smart_routing_enabled": True,
-                "smart_routing_sources": {"external": True, "oss": False},
-            },
-        )
-    )
-    respx.get(f"{_BASE}/v1/hosts").mock(
-        return_value=httpx.Response(
-            200, json={"hosts": [{"host_id": _HOST_ID, "status": "online"}]}
-        )
-    )
+    _mock_smart_routing(enabled=True)
     _mock_projects({"id": _PROJECT_ID, "name": "factory workers"})
     armed = respx.post(f"{_BASE}/v1/sessions").mock(return_value=arm_response)
 
@@ -238,23 +244,25 @@ def test_smart_routing_files_the_armed_session_in_the_project(
 @pytest.mark.parametrize(("command", "launcher"), _LAUNCHERS)
 @pytest.mark.parametrize("routing_args", [[], ["--smart-routing"]])
 @pytest.mark.parametrize(
-    ("reported", "message"),
+    ("version_response", "message"),
     [
-        ("0.21.0", "This Omnigent server (0.21.0) can't file new sessions in a project"),
-        ("0.22.0.dev20261110", "server 0.22.0 or later"),
-        (None, "--project needs an Omnigent server that reports its version"),
-        ("unknown", "this server reported 'unknown'"),
+        (
+            httpx.Response(200, json={"version": "0.21.0"}),
+            "This Omnigent server (0.21.0) can't file new sessions in a project",
+        ),
+        (httpx.Response(500, text="unavailable"), "Could not use project 'factory workers'"),
     ],
 )
-def test_an_older_server_stops_the_launch_before_any_write(
+def test_an_older_or_unreachable_server_stops_the_launch_before_any_write(
     command: str,
     launcher: str,
     routing_args: list[str],
-    reported: object,
+    version_response: httpx.Response,
     message: str,
     launch_env: dict[str, Any],
 ) -> None:
-    _mock_server_version(reported)
+    _mock_smart_routing(enabled=True)
+    respx.get(f"{_BASE}/api/version").mock(return_value=version_response)
     projects = respx.route(url__startswith=f"{_BASE}/v1/projects")
     sessions = respx.route(url__startswith=f"{_BASE}/v1/sessions")
 
@@ -265,3 +273,49 @@ def test_an_older_server_stops_the_launch_before_any_write(
     assert not projects.called
     assert not sessions.called
     assert launch_env == {}
+
+
+@respx.mock
+@pytest.mark.parametrize(("command", "launcher"), _LAUNCHERS)
+def test_unavailable_smart_routing_stops_the_launch_before_the_project_is_created(
+    command: str, launcher: str, launch_env: dict[str, Any]
+) -> None:
+    _mock_smart_routing(enabled=False)
+    versions = _mock_server_version()
+    projects = respx.route(url__startswith=f"{_BASE}/v1/projects")
+
+    result = CliRunner().invoke(cli, [command, "--smart-routing", "--project", "factory workers"])
+
+    assert result.exit_code == 1, result.output
+    assert "Smart Routing is not enabled" in result.output
+    assert not versions.called
+    assert not projects.called
+    assert launch_env == {}
+
+
+@respx.mock
+@pytest.mark.parametrize("reported", ["0.22.0", "0.22.1", "0.23.0.dev0"])
+async def test_a_project_aware_server_version_is_accepted(reported: str) -> None:
+    _mock_server_version(reported)
+
+    async with httpx.AsyncClient(base_url=_BASE) as client:
+        await _require_project_aware_session_create(client)
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        ({"version": "0.21.0"}, "This Omnigent server (0.21.0) can't file new sessions"),
+        ({"version": "0.22.0.dev20261110"}, "needs server 0.22.0 or later"),
+        ({}, "this server reported None"),
+        ({"version": "unknown"}, "this server reported 'unknown'"),
+        (["0.22.0"], "this server reported None"),
+    ],
+)
+async def test_an_older_or_unversioned_server_is_refused(payload: object, message: str) -> None:
+    respx.get(f"{_BASE}/api/version").mock(return_value=httpx.Response(200, json=payload))
+
+    async with httpx.AsyncClient(base_url=_BASE) as client:
+        with pytest.raises(click.ClickException, match=re.escape(message)):
+            await _require_project_aware_session_create(client)

@@ -12,7 +12,12 @@ import respx
 from click import ClickException, UsageError
 from click.testing import CliRunner
 
-from omnigent.cli import _reject_smart_routing_prompt, _smart_routing_decision, cli
+from omnigent.cli import (
+    _reject_smart_routing_prompt,
+    _smart_routing_decision,
+    _smart_routing_preflight,
+    cli,
+)
 from omnigent.smart_routing_cli import (
     ROUTING_SESSION_LABELS,
     arm_smart_routing_session,
@@ -427,7 +432,8 @@ def test_the_decision_binds_the_launch_host_and_cwd(_routing_env: None) -> None:
     _mock_hosts({"claude-native": True})
     route = _mock_create(harness="claude-native")
 
-    armed = _smart_routing_decision(server=_BASE, harness="claude-native")
+    host_id = _smart_routing_preflight(server=_BASE, harness="claude-native")
+    armed = _smart_routing_decision(server=_BASE, harness="claude-native", host_id=host_id)
 
     assert armed.session_id == _SESSION_ID
     payload = json.loads(route.calls.last.request.content)
@@ -436,19 +442,31 @@ def test_the_decision_binds_the_launch_host_and_cwd(_routing_env: None) -> None:
 
 
 @respx.mock
+@pytest.mark.parametrize("project_id", [None, "proj_factory"])
 def test_the_decision_routes_hostlessly_when_the_server_does_not_know_the_host(
-    _routing_env: None,
+    project_id: str | None, _routing_env: None
 ) -> None:
     """An unregistered host degrades to a hostless create, not a failed one."""
     _mock_info()
     respx.get(f"{_BASE}/v1/hosts").mock(return_value=httpx.Response(200, json={"hosts": []}))
     route = _mock_create(harness="claude-native")
 
-    _smart_routing_decision(server=_BASE, harness="claude-native")
+    host_id = _smart_routing_preflight(server=_BASE, harness="claude-native")
+    _smart_routing_decision(
+        server=_BASE, harness="claude-native", host_id=host_id, project_id=project_id
+    )
 
     payload = json.loads(route.calls.last.request.content)
+    assert host_id is None
     assert "host_id" not in payload
-    assert "workspace" not in payload
+    if project_id is None:
+        assert "workspace" not in payload
+        assert "project_id" not in payload
+    else:
+        # Explicit nulls keep the project's saved folder defaults off a hostless create.
+        assert payload["project_id"] == project_id
+        assert payload["workspace"] is None
+        assert payload["git"] is None
 
 
 def test_known_host_id_requires_the_server_to_have_seen_the_host() -> None:
