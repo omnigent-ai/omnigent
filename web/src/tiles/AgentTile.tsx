@@ -18,7 +18,9 @@ import type { Conversation } from "@/hooks/useConversations";
 import { getSessionState, type SessionState } from "@/hooks/useSessionState";
 import { cn } from "@/lib/utils";
 import { conversationDisplayLabel } from "@/shell/sidebarNav";
+import { TileColorPicker } from "./TileColorPicker";
 import { TileResizeHandles } from "./TileResizeHandles";
+import { useTileColor } from "./tileColors";
 import type { TileResize } from "./TileGrid";
 import { isInteractiveTarget, needsYou } from "./tileSelection";
 
@@ -82,6 +84,7 @@ function AgentTileComponent({
   onPark,
 }: AgentTileProps) {
   const title = conversation.title || conversationDisplayLabel(conversation);
+  const color = useTileColor(conversation.id);
   const state = getSessionState(conversation);
   const waiting = needsYou(conversation);
   const project = projectName(conversation.workspace);
@@ -118,14 +121,23 @@ function AgentTileComponent({
         active && "border-brand-accent ring-2 ring-brand-accent/30",
         !active && waiting && "border-amber-500 ring-2 ring-amber-500/30",
       )}
+      // The tile's color borders it unless the active or waiting ring takes over.
+      style={active || waiting ? undefined : { borderColor: color.border }}
     >
-      <header className="flex h-9 shrink-0 items-center gap-2 border-b px-3">
+      <header
+        className="flex h-10 shrink-0 items-center gap-2 border-b pr-2 pl-2"
+        style={{ backgroundColor: color.tint }}
+      >
+        <TileColorPicker sessionId={conversation.id} title={title} color={color} />
         {state ? (
           <SessionStateBadge state={state} />
         ) : (
           <span aria-hidden className="size-2 shrink-0 rounded-full bg-muted-foreground" />
         )}
-        <strong title={title} className="min-w-0 truncate font-semibold">
+        <strong
+          title={title}
+          className="min-w-0 truncate text-sm font-semibold tracking-tight text-foreground"
+        >
           {title}
         </strong>
         <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground" title={subline}>
