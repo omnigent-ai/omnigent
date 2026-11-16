@@ -8,6 +8,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { FullscreenIcon } from "@/components/ai-elements/MermaidBlock";
 import { type ChildSessionInfo, useChildSessions } from "@/hooks/useChildSessions";
 import { useSavedWorkflows } from "@/hooks/useSavedWorkflows";
 import { type SessionJournalView, useSessionJournal } from "@/hooks/useSessionJournal";
@@ -817,6 +818,9 @@ describe("TasksPanel", () => {
             <SearchProbe />
           </>,
         );
+      // The fullscreen glyph a run row's graph button shows too.
+      const { container: fullscreenGlyph } = render(<FullscreenIcon />);
+      expect(screen.getByTestId("tasks-plan-graph").innerHTML).toBe(fullscreenGlyph.innerHTML);
       fireEvent.click(screen.getByTestId("tasks-plan-graph"));
       const overlay = await screen.findByTestId("workflow-graph-overlay");
       expect(overlay).toHaveAttribute("data-title", "The plan");
