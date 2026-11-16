@@ -1,6 +1,6 @@
 // Trigger-template fields shown in place of the scheduled-task prompt.
 
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 import { InfoIcon, PlusIcon, TriangleAlertIcon, XIcon } from "lucide-react";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
@@ -92,6 +92,8 @@ export function TriggerTemplateFields({
   onSelectOpenChange,
   toolsProvided = false,
   taskSessionMode = "new",
+  workflowField = null,
+  instructionsAreDetails = false,
 }: {
   source: TriggerSource;
   fields: TriggerFields;
@@ -102,6 +104,10 @@ export function TriggerTemplateFields({
   onSelectOpenChange: (open: boolean) => void;
   /** Where the task runs already gives the agent the service's tools, so skip that warning. */
   toolsProvided?: boolean;
+  /** The dialog's Workflow field, shown above the instructions. */
+  workflowField?: ReactNode;
+  /** A workflow was chosen, so the instructions are each run's details. */
+  instructionsAreDetails?: boolean;
 }) {
   const template = TRIGGER_TEMPLATES[source];
   const Icon = template.icon;
@@ -586,17 +592,24 @@ export function TriggerTemplateFields({
             className="flex min-h-[240px] flex-col gap-2"
             data-testid="task-trigger-instructions-panel"
           >
+            {workflowField}
             <div className="flex flex-col gap-1.5">
               <Textarea
                 id="task-trigger-instructions"
                 aria-label={
-                  taskSessionMode === "continue"
-                    ? "Instructions for the task session"
-                    : "Instructions for each session"
+                  instructionsAreDetails
+                    ? "Additional instructions"
+                    : taskSessionMode === "continue"
+                      ? "Instructions for the task session"
+                      : "Instructions for each session"
                 }
                 value={fields.instructions}
                 rows={3}
-                placeholder={template.instructionsPlaceholder}
+                placeholder={
+                  instructionsAreDetails
+                    ? "Optional. Instructions to customize the workflow."
+                    : template.instructionsPlaceholder
+                }
                 data-testid="task-trigger-instructions"
                 componentId="tasks.scheduled.trigger_instructions"
                 className="min-h-[240px] resize-none text-ui"
