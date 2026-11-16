@@ -149,11 +149,12 @@ tests" (ID …)", or "run my triage workflow" in chat):
 
 - Do the plan's step 1 first: decide whether this resumes, extends or starts
   a run from the request and journal.
-- A session created from the workflow's Run button already has its starting
-  plan in the journal. Continue that run using its saved snapshot and step IDs;
-  do not write another starting plan with `workflow_id`. Later edits to the
-  saved workflow do not replace this run's plan. Load the workflow only if you
-  need its description. An explicit request to run it again starts a new run.
+- A session started as a run of the workflow, from its Run button or by
+  another session, already has its starting plan in the journal. Continue
+  that run using its saved snapshot and step IDs; do not write another
+  starting plan with `workflow_id`. Later edits to the saved workflow do not
+  replace this run's plan. Load the workflow only if you need its
+  description. An explicit request to run it again starts a new run.
 - If there is no starting plan, load it with `sys_workflow_load`, by its ID
   when you have one, otherwise by name. If they describe it without its exact
   name, or the load returns
@@ -312,10 +313,13 @@ run it in its own session:
 
 - Write `started` on the step, then start a session for it with
   `sys_session_create`, using your own agent and `placement: same_host`.
+  For a saved workflow, also pass its ID as `workflow_id`: the session starts
+  with that workflow's plan, and the workflow's page lists the run.
   `sys_session_get_info` with no arguments gives your session ID, and
   `sys_agent_get` on that session gives your agent's ID. The first message
   must:
-  - tell it to load the `workflow` skill and run the workflow
+  - tell it to load the `workflow` skill and run the workflow, giving a saved
+    workflow's name and ID
   - give it everything it needs, since it doesn't see this conversation
   - include the relevant decisions, existing authorization and limits, and
     whether this is an unattended run; tell it to resolve routine choices
