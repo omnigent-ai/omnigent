@@ -47,7 +47,7 @@ describe("matchField", () => {
 
   it("ranks shorter fields and earlier substrings first within a class", () => {
     expect(match("open", "Open file")!.penalty).toBeLessThan(match("open", "Open folder")!.penalty);
-    expect(match("file", "a file")!.penalty).toBeLessThan(match("file", "the file")!.penalty);
+    expect(match("file", "a file xx")!.penalty).toBeLessThan(match("file", "xx a file")!.penalty);
   });
 
   it("passes the field weight through for callers to break ties", () => {
