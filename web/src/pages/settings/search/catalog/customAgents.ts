@@ -25,6 +25,37 @@ export const CUSTOM_AGENTS_LIST_ENTRY = settingsEntry({
 });
 
 /**
+ * The create page, reached from the list's Create. Its fields and buttons are the form's own,
+ * which the shell's dialog shares; the MCP server rows are not parts yet.
+ */
+export const CUSTOM_AGENT_CREATE_ENTRY = settingsEntry({
+  id: "custom-agent-create",
+  section: "custom-agents",
+  label: "Create custom agent",
+  description:
+    "Make an agent of your own: its name, harness, model, system instructions and MCP tools.",
+  keywords: ["new agent", "create agent", "custom agent", "system instructions", "mcp tools"],
+  // The required marker is part of each label, so each name keeps it.
+  parts: {
+    name: "Name *",
+    description: "Description",
+    harness: "Harness",
+    model: "Model *",
+    instructions: "System instructions",
+    addServer: "Add server",
+    cancel: "Cancel",
+    submit: "Save agent",
+  },
+  overlays: {
+    // The harnesses the server knows, named by their labels.
+    harness: { runtimeChoices: {} },
+  },
+  focus: "name",
+  // Its own page, reached from the list's Create.
+  revealedBy: "custom-agents-list",
+});
+
+/**
  * One agent's page, reached from the list, so search reveals it through the list. Back and
  * Retry aren't parts yet: Back's name would change, and Retry's is shared with other lists.
  */

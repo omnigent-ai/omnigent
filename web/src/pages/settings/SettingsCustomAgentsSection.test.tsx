@@ -409,6 +409,26 @@ async function openEditor() {
 }
 
 describe("editing custom agents", () => {
+  it("renders the create page from its Settings catalog entry, and keeps its names", async () => {
+    vi.mocked(authenticatedFetch).mockImplementation(async (input) => {
+      const url = new URL(String(input), "http://localhost");
+      if (url.pathname.endsWith("/v1/agent-harnesses") || url.searchParams.has("scope"))
+        return response(page([]));
+      return response({});
+    });
+    mount("/settings/custom-agents/new");
+    const name = await screen.findByRole("textbox", { name: "Name *" });
+    expect(document.querySelector('[data-settings-item="custom-agent-create"]')).not.toBeNull();
+    expect(name).toHaveAttribute("data-settings-control", "custom-agent-create:name");
+    expect(screen.getByRole("textbox", { name: "Model *" })).toHaveAttribute(
+      "data-settings-control",
+      "custom-agent-create:model",
+    );
+    expect(screen.getByRole("button", { name: "Save agent" })).toHaveAttribute(
+      "data-settings-control",
+      "custom-agent-create:submit",
+    );
+  });
   it("renders the agent page from its Settings catalog entry, with Cancel owning the discard dialog", async () => {
     configResponses();
     await openEditor();
