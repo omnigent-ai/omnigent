@@ -341,8 +341,9 @@ export function CreateScheduledTaskDialog({
   const [prompt, setPrompt] = useState("");
   // A saved workflow for each run to follow as saved, so the form hides the instructions.
   const [workflowChoice, setWorkflowChoice] = useState<SavedWorkflow | null>(null);
-  // An automation that already saved instructions with its workflow keeps them editable.
-  const [keepsWorkflowDetails, setKeepsWorkflowDetails] = useState(false);
+  // The workflow an automation already saved instructions with; they stay editable while it's
+  // chosen, and saving them empty ends that.
+  const [detailsWorkflowId, setDetailsWorkflowId] = useState<string | null>(null);
   const savedWorkflows = useSavedWorkflows({ enabled: open });
   // The rendered template text around the instructions of an older trigger. Never shown.
   const [systemPrompt, setSystemPrompt] = useState<string | null>(null);
@@ -650,7 +651,7 @@ export function CreateScheduledTaskDialog({
               (savedRun && { id: savedRun.id, name: savedRun.name, description: "" }))
           : null,
       );
-      setKeepsWorkflowDetails(!!savedRun?.details);
+      setDetailsWorkflowId(savedRun?.details ? savedRun.id : null);
       setPrompt(editingTriggerConfig ? "" : (savedRun?.details ?? parts.userPrompt));
       setSystemPrompt(parts.systemPrompt);
       setTimezone(editingTask?.timezone ?? localTimezone());
@@ -1080,6 +1081,7 @@ export function CreateScheduledTaskDialog({
       null;
   const workflowPrefix = skillInvocationPrefix(harnessSettings.harness);
   // With a workflow, text typed before choosing it stays hidden and out of each run.
+  const keepsWorkflowDetails = workflowChoice !== null && workflowChoice.id === detailsWorkflowId;
   const showsInstructions = workflowChoice === null || keepsWorkflowDetails;
   const withWorkflow = (text: string) =>
     workflowChoice

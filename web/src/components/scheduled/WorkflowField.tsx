@@ -13,8 +13,7 @@ import type { SavedWorkflow, WorkflowPagination } from "@/hooks/useSavedWorkflow
 import { cn } from "@/lib/utils";
 import { pickerTriggerClass } from "./pickerStyles";
 
-// Runs follow a chosen workflow as saved, so only an automation that already saved
-// instructions with its workflow shows them, until they're cleared.
+// Label and placeholder for instructions an automation already saved with its workflow.
 export const WORKFLOW_DETAILS_LABEL = "Additional instructions (optional)";
 export const WORKFLOW_DETAILS_PLACEHOLDER = "Leave empty to run the workflow as saved.";
 

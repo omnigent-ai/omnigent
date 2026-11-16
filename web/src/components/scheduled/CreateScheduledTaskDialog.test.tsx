@@ -7025,6 +7025,11 @@ describe("CreateScheduledTaskDialog workflow", () => {
     expect(screen.getByTestId("task-workflow-note")).toHaveTextContent(
       "Each run follows this workflow as saved.",
     );
+    // Clearing the workflow brings the draft back.
+    fireEvent.pointerDown(screen.getByTestId("task-workflow-trigger"), { button: 0 });
+    fireEvent.click(screen.getByTestId("workflow-picker-clear"));
+    expect(screen.getByTestId("task-prompt-input")).toHaveValue("Summarize the day.");
+    chooseWorkflow();
     const submit = screen.getByTestId("create-scheduled-task-submit");
     await waitFor(() => expect(submit).toBeEnabled());
     fireEvent.click(submit);
@@ -7078,30 +7083,128 @@ describe("CreateScheduledTaskDialog workflow", () => {
     expect(updateMutateAsync.mock.calls[0][0].input.prompt).toBe(run("The download tests"));
   });
 
+  it("stops showing saved instructions once they're saved empty", async () => {
+    const view = renderWithWorkflows(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({ prompt: run("The upload tests") })}
+      />,
+    );
+    fireEvent.change(screen.getByLabelText("Additional instructions (optional)"), {
+      target: { value: "" },
+    });
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    const saved = updateMutateAsync.mock.calls[0][0].input.prompt as string;
+    expect(saved).toBe(run(""));
+
+    const props = { onOpenChange: vi.fn(), editingTask: scheduledTask({ prompt: saved }) };
+    view.rerender(<CreateScheduledTaskDialog open={false} {...props} />);
+    view.rerender(<CreateScheduledTaskDialog open {...props} />);
+    expect(screen.queryByTestId("task-prompt-input")).toBeNull();
+    expect(screen.getByTestId("task-workflow-note")).toBeInTheDocument();
+  });
+
+  it("runs another chosen workflow as saved, without the first one's saved instructions", async () => {
+    const weeklyReport = {
+      id: "fedcba9876543210fedcba9876543210",
+      name: "Weekly report",
+      description: "Summarizes the week.",
+    };
+    savedWorkflowsList.current = [WORKFLOW, weeklyReport];
+    renderWithWorkflows(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({ prompt: run("The upload tests") })}
+      />,
+    );
+    fireEvent.pointerDown(screen.getByTestId("task-workflow-trigger"), { button: 0 });
+    fireEvent.click(screen.getByText(weeklyReport.name));
+    expect(screen.queryByTestId("task-prompt-input")).toBeNull();
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input.prompt).toBe(
+      `/workflow Run the saved workflow "Weekly report" (ID ${weeklyReport.id}).`,
+    );
+  });
+
+  function renderGithubTrigger(headersSupported: boolean) {
+    return render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        initialTrigger="github"
+        initialTemplateId="github"
+      />,
+      {
+        info: {
+          scheduled_task_session_modes: true,
+          scheduled_task_subhour: true,
+          scheduled_task_trigger_headers: headersSupported,
+          automation_trigger_poll_minutes: 30,
+          features: { automations_v2: true, session_orchestration: true, workflows: true },
+        },
+      },
+    );
+  }
+
+  /** Reopen a saved trigger to edit it, on its Instructions tab. */
+  function reopenTrigger(
+    view: ReturnType<typeof render>,
+    prompt: string,
+    headersSupported: boolean,
+  ) {
+    const props = {
+      onOpenChange: vi.fn(),
+      editingTask: scheduledTask({ prompt, sessionMode: "continue" }),
+    };
+    view.rerender(<CreateScheduledTaskDialog open={false} {...props} />);
+    view.rerender(<CreateScheduledTaskDialog open {...props} />);
+    // A trigger saved without a header reopens as its prompt, with no tabs.
+    if (headersSupported) {
+      fireEvent.mouseDown(screen.getByRole("tab", { name: "Instructions" }), { button: 0 });
+    }
+  }
+
+  const triggerInstructions = (prompt: string, headersSupported: boolean) =>
+    headersSupported
+      ? decodeTriggerPrompt(prompt)?.instructions
+      : splitTriggerPrompt(prompt).userPrompt;
+
+  it.each([false, true])(
+    "keeps a trigger's instructions saved with its workflow editable (header support %s)",
+    async (headersSupported) => {
+      const view = renderGithubTrigger(headersSupported);
+      fireEvent.change(screen.getByTestId("task-trigger-scope"), { target: { value: "acme/app" } });
+      fireEvent.mouseDown(screen.getByRole("tab", { name: "Instructions" }), { button: 0 });
+      // The shape older forms saved for a workflow with instructions.
+      fireEvent.change(screen.getByTestId("task-trigger-instructions"), {
+        target: { value: run("Only bugs") },
+      });
+      fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+      await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+
+      reopenTrigger(view, mutateAsync.mock.calls[0][0].prompt as string, headersSupported);
+      expect(screen.getByTestId("task-workflow-trigger")).toHaveTextContent(WORKFLOW.name);
+      const instructions = screen.getByLabelText("Additional instructions (optional)");
+      expect(instructions).toHaveValue("Only bugs");
+      fireEvent.change(instructions, { target: { value: "Only upload bugs" } });
+      fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+
+      await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+      const updated = updateMutateAsync.mock.calls[0][0].input.prompt as string;
+      expect(triggerInstructions(updated, headersSupported)).toBe(run("Only upload bugs"));
+    },
+  );
+
   it.each([false, true])(
     "creates and edits a workflow trigger with header support %s",
     async (headersSupported) => {
-      const view = render(
-        <CreateScheduledTaskDialog
-          open
-          onOpenChange={vi.fn()}
-          initialTrigger="github"
-          initialTemplateId="github"
-        />,
-        {
-          info: {
-            scheduled_task_session_modes: true,
-            scheduled_task_subhour: true,
-            scheduled_task_trigger_headers: headersSupported,
-            automation_trigger_poll_minutes: 30,
-            features: { automations_v2: true, session_orchestration: true, workflows: true },
-          },
-        },
-      );
-      const instructionsOf = (text: string) =>
-        headersSupported
-          ? decodeTriggerPrompt(text)?.instructions
-          : splitTriggerPrompt(text).userPrompt;
+      const view = renderGithubTrigger(headersSupported);
+      const instructionsOf = (text: string) => triggerInstructions(text, headersSupported);
       fireEvent.change(screen.getByTestId("task-trigger-scope"), { target: { value: "acme/app" } });
       fireEvent.mouseDown(screen.getByRole("tab", { name: "Instructions" }), { button: 0 });
       expect(screen.getByTestId("task-trigger-instructions-required")).toBeInTheDocument();
@@ -7117,15 +7220,7 @@ describe("CreateScheduledTaskDialog workflow", () => {
       expect(instructionsOf(prompt)).toBe(run(""));
       expect(hasTriggerHeader(prompt)).toBe(headersSupported);
 
-      const props = {
-        onOpenChange: vi.fn(),
-        editingTask: scheduledTask({ prompt, sessionMode: "continue" }),
-      };
-      view.rerender(<CreateScheduledTaskDialog open={false} {...props} />);
-      view.rerender(<CreateScheduledTaskDialog open {...props} />);
-      if (headersSupported) {
-        fireEvent.mouseDown(screen.getByRole("tab", { name: "Instructions" }), { button: 0 });
-      }
+      reopenTrigger(view, prompt, headersSupported);
       expect(screen.getByTestId("task-workflow-trigger")).toHaveTextContent(WORKFLOW.name);
       expect(screen.queryByLabelText("Additional instructions (optional)")).toBeNull();
       fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "Bug triage" } });
