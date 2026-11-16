@@ -203,6 +203,7 @@ async def test_create_without_harness_override_reports_spec_default(
         raise httpx.ConnectError("Artifact service unavailable")
 
     monkeypatch.setattr(AgentCache, "load", unavailable_bundle)
+    monkeypatch.setattr(AgentCache, "load_spec", unavailable_bundle)
     response = await client.get("/v1/sessions")
     assert response.status_code == 200
     listed_by_id = {item["id"]: item for item in response.json()["data"]}

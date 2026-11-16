@@ -405,6 +405,62 @@ describe("sort order", () => {
       vi.useRealTimers();
     }
   });
+
+  it.each([
+    {
+      // A yearly COUNT=1 rule has no next run the client can compute, so only the
+      // server's next_run_at puts a reminder due in two minutes first.
+      label: "a one-time reminder by the server's next run",
+      tasks: [
+        task({ id: "daily", name: "Daily", state: "active", rrule: "FREQ=DAILY;BYHOUR=6" }),
+        task({
+          id: "reminder",
+          name: "Reminder: check CI",
+          state: "active",
+          rrule: "FREQ=YEARLY;BYMONTH=1;BYMONTHDAY=1;BYHOUR=0;BYMINUTE=2;BYSECOND=0;COUNT=1",
+          timezone: "UTC",
+          nextRunAt: "2026-01-01T00:02:00+00:00",
+        }),
+      ],
+      expected: ["Reminder: check CI", "Daily"],
+    },
+    {
+      label: "recurring tasks by the server's next run, falling back on a bad one",
+      tasks: [
+        // The browser estimates 06:00, but the server says 23:00: the server wins.
+        task({
+          id: "server-late",
+          name: "Server says late",
+          state: "active",
+          rrule: "FREQ=DAILY;BYHOUR=6",
+          nextRunAt: "2026-01-01T23:00:00+00:00",
+        }),
+        // An unparseable server time falls back to the browser's 12:00 estimate.
+        task({
+          id: "fallback",
+          name: "Bad server time",
+          state: "active",
+          rrule: "FREQ=DAILY;BYHOUR=12",
+          timezone: "UTC",
+          nextRunAt: "not a time",
+        }),
+      ],
+      expected: ["Bad server time", "Server says late"],
+    },
+  ])("sorts $label", ({ tasks, expected }) => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-01-01T00:00:00Z"));
+    try {
+      setTasks(tasks);
+      renderPage();
+      const names = screen
+        .getAllByTestId("scheduled-task-row")
+        .map((r) => r.querySelector(".font-semibold")?.textContent);
+      expect(names).toEqual(expected);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe("filtering + search", () => {

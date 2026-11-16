@@ -887,10 +887,12 @@ class ToolGroupsConfig:
     limit and stops a small model from picking an irrelevant tool.
 
     :param browser: The ``browser_*`` embedded-browser tools (5).
-    :param scheduled_tasks: The ``sys_scheduled_task_*`` tools (4).
+    :param scheduled_tasks: The ``sys_scheduled_task_*`` tools (4) and ``sys_reminder_set``.
     :param comments: ``list_comments`` and ``update_comment``.
     :param policies: ``sys_add_policy`` and ``sys_policy_registry``.
     :param agent_discovery: The read-only ``sys_agent_*`` tools (3).
+    :param journal: The ``sys_journal_*`` tools (4): the session's plan, step
+        statuses and notes.
     :param projects: ``sys_project_list``, ``sys_project_update`` and
         ``sys_session_update``.
     """
@@ -900,6 +902,7 @@ class ToolGroupsConfig:
     comments: bool = True
     policies: bool = True
     agent_discovery: bool = True
+    journal: bool = True
     projects: bool = True
 
 

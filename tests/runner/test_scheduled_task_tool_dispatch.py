@@ -6,8 +6,8 @@ Covers the runner-side half:
   the correct ``/v1/scheduled-tasks`` REST verb + payload over ``server_client``,
   pass the JSON body through verbatim, and translate a server 4xx/5xx and a
   missing id into clean error JSON.
-- Registration: the four ``sys_scheduled_task_*`` names are always registered by
-  ``ToolManager`` (no spec opt-in) and are members of the local-dispatch and
+- Registration: the ``sys_scheduled_task_*`` names and ``sys_reminder_set`` are
+  always registered by ``ToolManager`` (no spec opt-in) and are members of the local-dispatch and
   native-relay tool sets.
 """
 
@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 
+import httpx
 import jsonschema
 import pytest
 
@@ -41,6 +42,7 @@ _ALL_NAMES = {
     "sys_scheduled_task_list",
     "sys_scheduled_task_update",
     "sys_scheduled_task_delete",
+    "sys_reminder_set",
 }
 _TASK_ID = "0123456789abcdef0123456789abcdef"
 _REVIEW_FIELDS = {"prompt": "Review every issue.", "permission_mode": None}
@@ -74,8 +76,10 @@ class _RecordingClient:
             body={"scheduled_task_projects": True, "scheduled_task_session_modes": True}
         )
 
-    async def get(self, url: str, *, timeout: object = None) -> _Resp:
-        self.calls.append(("GET", url, None))
+    async def get(
+        self, url: str, *, params: dict[str, str] | None = None, timeout: object = None
+    ) -> _Resp:
+        self.calls.append(("GET", url, params))
         return self._info if url == "/v1/info" else self._response
 
     async def post(
@@ -305,7 +309,8 @@ async def test_mcp_services_reach_a_server_that_supports_them() -> None:
 async def test_list_gets() -> None:
     client = _RecordingClient(_Resp(body={"scheduled_tasks": []}))
     out = await _execute_scheduled_task_tool("sys_scheduled_task_list", "", server_client=client)
-    assert client.calls[0] == ("GET", "/v1/scheduled-tasks", None)
+    # Reminders are left out of the list by default; an agent needs them to cancel one.
+    assert client.calls[0] == ("GET", "/v1/scheduled-tasks", {"kind": "all"})
     assert json.loads(out) == {"scheduled_tasks": []}
 
 
@@ -630,7 +635,7 @@ async def test_no_server_client_errors() -> None:
 
 
 def test_tools_registered_without_spec_optin() -> None:
-    """All four tools register on a minimal spec (always-on, like policy)."""
+    """All five tools register on a minimal spec (always-on, like policy)."""
     from omnigent.spec.types import AgentSpec
     from omnigent.tools.manager import ToolManager
 
@@ -697,3 +702,339 @@ async def test_update_forwards_session_fields() -> None:
     )
     _, _, body = client.calls[-1]
     assert body == {**_REVIEW_FIELDS, "session_mode": "continue", "session_id": None}
+
+
+# ── sys_reminder_set ─────────────────────────────────────────────────────────
+
+_REMINDER_NOW = "2026-11-10T22:15:30+00:00"
+
+
+class _ReminderClient(_RecordingClient):
+    """Answers ``/v1/info``, the calling session's snapshot, and the task create."""
+
+    def __init__(
+        self,
+        response: _Resp | None = None,
+        *,
+        one_time: bool | None = True,
+        session: _Resp | None = None,
+    ) -> None:
+        info: dict[str, object] = {"scheduled_task_session_modes": True}
+        if one_time is not None:  # None: an older server that omits the field
+            info["scheduled_task_one_time"] = one_time
+        super().__init__(
+            response or _Resp(body={"id": _TASK_ID, "next_run_at": "2026-11-10T23:01:00+00:00"}),
+            info=_Resp(body=info),
+        )
+        self._session = session or _Resp(body={"id": "conv_1", "agent_id": "ag_1"})
+        self.delete_response = _Resp(body={"deleted": True})
+        self.get_params: list[dict[str, str] | None] = []
+
+    async def get(
+        self, url: str, *, params: dict[str, str] | None = None, timeout: object = None
+    ) -> _Resp:
+        self.calls.append(("GET", url, None))
+        self.get_params.append(params)
+        if url == "/v1/info":
+            return self._info
+        return self._session
+
+    async def delete(self, url: str, *, timeout: object = None) -> _Resp:
+        self.calls.append(("DELETE", url, None))
+        return self.delete_response
+
+
+@pytest.fixture()
+def _frozen_now(monkeypatch: pytest.MonkeyPatch) -> None:
+    from datetime import datetime
+
+    from omnigent.runner import tool_dispatch
+
+    class _Frozen(datetime):
+        @classmethod
+        def now(cls, tz=None):  # type: ignore[override]
+            return datetime.fromisoformat(_REMINDER_NOW).astimezone(tz)
+
+    monkeypatch.setattr(tool_dispatch, "datetime", _Frozen)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_frozen_now")
+async def test_reminder_creates_a_one_time_task_that_continues_this_session() -> None:
+    client = _ReminderClient()
+    out = await execute_tool(
+        tool_name="sys_reminder_set",
+        arguments=json.dumps({"message": "Check CI on PR #12.", "delay_seconds": 2700}),
+        server_client=client,
+        conversation_id="conv_1",
+    )
+    assert [call[:2] for call in client.calls] == [
+        ("GET", "/v1/info"),
+        ("GET", "/v1/sessions/conv_1"),
+        ("POST", "/v1/scheduled-tasks"),
+    ]
+    # Only the agent id is needed from the session.
+    assert client.get_params[1] == {
+        "include_items": "false",
+        "include_usage": "false",
+        "include_liveness": "false",
+        "include_live_status": "false",
+    }
+    assert client.calls[-1][2] == {
+        "name": "Reminder: Check CI on PR #12.",
+        "prompt": "[Reminder set for 2026-11-10 23:01 UTC]\nCheck CI on PR #12.",
+        "rrule": "FREQ=YEARLY;BYMONTH=11;BYMONTHDAY=10;BYHOUR=23;BYMINUTE=1;BYSECOND=0;COUNT=1",
+        "timezone": "UTC",
+        "agent_id": "ag_1",
+        "permission_mode": None,
+        "session_mode": "continue",
+        "session_id": "conv_1",
+        "kind": "reminder",
+        "first_run_at": 1794351660,  # 2026-11-10T23:01:00Z
+    }
+    assert client.headers[-1] == {
+        ORCHESTRATION_SOURCE_HEADER: "conv_1",
+        "x-omnigent-automation-source": "agent",
+    }
+    assert json.loads(out) == {
+        "status": "scheduled",
+        "scheduled_task_id": _TASK_ID,
+        "fire_at": "2026-11-10T23:01:00+00:00",
+        "next_run_at": "2026-11-10T23:01:00+00:00",
+        "message": "Check CI on PR #12.",
+        "cancel_with": "sys_scheduled_task_delete",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_frozen_now")
+@pytest.mark.parametrize(
+    "info",
+    [
+        _Resp(body={"scheduled_task_session_modes": True}),
+        _Resp(body={"scheduled_task_session_modes": True, "scheduled_task_one_time": False}),
+        _Resp(status_code=503, body={"error": "unavailable"}),
+    ],
+    ids=["field_absent", "disabled", "info_unreadable"],
+)
+async def test_reminder_is_refused_on_a_server_without_one_time_schedules(info: _Resp) -> None:
+    client = _ReminderClient()
+    client._info = info
+    out = await _execute_scheduled_task_tool(
+        "sys_reminder_set",
+        json.dumps({"message": "ping", "delay_seconds": 1800}),
+        server_client=client,
+        conversation_id="conv_1",
+    )
+    assert "does not support one-time reminders" in json.loads(out)["error"]
+    assert [verb for verb, _url, _body in client.calls] == ["GET"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_frozen_now")
+@pytest.mark.parametrize(
+    "args,conversation_id,error",
+    [
+        ({"message": "ping", "delay_seconds": 1800}, None, "requires a session"),
+        ({"message": "  ", "delay_seconds": 1800}, "conv_1", "non-empty string"),
+        # One timing error is enough here; the resolver's own tests cover the rest.
+        ({"message": "ping"}, "conv_1", "exactly one"),
+    ],
+)
+async def test_reminder_argument_errors_make_no_server_calls(
+    args: dict[str, object], conversation_id: str | None, error: str
+) -> None:
+    client = _ReminderClient()
+    out = await _execute_scheduled_task_tool(
+        "sys_reminder_set",
+        json.dumps(args),
+        server_client=client,
+        conversation_id=conversation_id,
+    )
+    assert error in json.loads(out)["error"]
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_frozen_now")
+@pytest.mark.parametrize(
+    "session,error",
+    [
+        (_Resp(status_code=404, body={"error": "not found"}), "could not read this session"),
+        (_Resp(body={"id": "conv_1"}), "this session has no agent to remind"),
+        # A side chat's runner is its source's, which a reminder can't wake.
+        (
+            _Resp(body={"id": "conv_1", "agent_id": "ag_1", "side_chat_parent_id": "conv_0"}),
+            "can't be set from a side chat",
+        ),
+    ],
+    ids=["unreadable", "no_agent", "side_chat"],
+)
+async def test_reminder_needs_a_readable_session_with_an_agent(session: _Resp, error: str) -> None:
+    client = _ReminderClient(session=session)
+    out = json.loads(
+        await _execute_scheduled_task_tool(
+            "sys_reminder_set",
+            json.dumps({"message": "ping", "delay_seconds": 1800}),
+            server_client=client,
+            conversation_id="conv_1",
+        )
+    )
+    assert error in out["error"]
+    assert not [call for call in client.calls if call[0] == "POST"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_frozen_now")
+async def test_reminder_passes_the_servers_refusal_to_the_agent() -> None:
+    refusal = {
+        "error": {
+            "code": "invalid_input",
+            "message": "cannot continue this session: the session is a sub-agent's session",
+        }
+    }
+    client = _ReminderClient(_Resp(status_code=400, body=refusal))
+    out = json.loads(
+        await _execute_scheduled_task_tool(
+            "sys_reminder_set",
+            json.dumps({"message": "ping", "delay_seconds": 1800}),
+            server_client=client,
+            conversation_id="conv_1",
+        )
+    )
+    assert out["error"] == "server returned 400"
+    assert "sub-agent's session" in out["details"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_frozen_now")
+@pytest.mark.parametrize("next_run_at", ["2027-11-10T23:01:00+00:00", None, "not a time"])
+async def test_reminder_scheduled_for_another_time_is_deleted(next_run_at: str | None) -> None:
+    """A server that saved the reminder for another minute doesn't get to keep it."""
+    client = _ReminderClient(_Resp(body={"id": _TASK_ID, "next_run_at": next_run_at}))
+    out = json.loads(
+        await _execute_scheduled_task_tool(
+            "sys_reminder_set",
+            json.dumps({"message": "ping", "delay_seconds": 2700}),
+            server_client=client,
+            conversation_id="conv_1",
+        )
+    )
+    assert "it was deleted" in out["error"]
+    assert "status" not in out
+    assert client.calls[-1] == ("DELETE", f"/v1/scheduled-tasks/{_TASK_ID}", None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_frozen_now")
+@pytest.mark.parametrize("delete_fails_with", ["status", "transport"])
+async def test_reminder_reports_a_wrong_schedule_it_could_not_delete(
+    delete_fails_with: str,
+) -> None:
+    client = _ReminderClient(
+        _Resp(body={"id": _TASK_ID, "next_run_at": "2027-11-10T23:01:00+00:00"})
+    )
+    if delete_fails_with == "status":
+        client.delete_response = _Resp(status_code=503, body={"error": "unavailable"})
+    else:
+
+        async def unreachable(url: str, *, timeout: object = None) -> _Resp:
+            client.calls.append(("DELETE", url, None))
+            raise httpx.ConnectError("server unreachable")
+
+        client.delete = unreachable  # type: ignore[method-assign]
+    out = json.loads(
+        await _execute_scheduled_task_tool(
+            "sys_reminder_set",
+            json.dumps({"message": "ping", "delay_seconds": 2700}),
+            server_client=client,
+            conversation_id="conv_1",
+        )
+    )
+    assert "deleting it failed" in out["error"]
+    assert "was deleted" not in out["error"]
+    assert out["scheduled_task_id"] == _TASK_ID
+    assert client.calls[-1] == ("DELETE", f"/v1/scheduled-tasks/{_TASK_ID}", None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_frozen_now")
+@pytest.mark.parametrize("task_id", [None, "../scheduled-tasks", "T1"])
+async def test_a_wrong_schedule_without_a_usable_id_is_reported_not_deleted(
+    task_id: str | None,
+) -> None:
+    body: dict[str, object] = {"next_run_at": "2027-11-10T23:01:00+00:00"}
+    if task_id is not None:
+        body["id"] = task_id
+    client = _ReminderClient(_Resp(body=body))
+    out = json.loads(
+        await _execute_scheduled_task_tool(
+            "sys_reminder_set",
+            json.dumps({"message": "ping", "delay_seconds": 2700}),
+            server_client=client,
+            conversation_id="conv_1",
+        )
+    )
+    assert "returned no task id to delete" in out["error"]
+    assert not [call for call in client.calls if call[0] == "DELETE"]
+
+
+class _UnreadableResp(_Resp):
+    def json(self) -> object:
+        raise json.JSONDecodeError("Expecting value", "<truncated>", 0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_frozen_now")
+@pytest.mark.parametrize("fault", ["response_lost", "reply_unreadable", "502", "504"])
+async def test_an_uncertain_create_says_the_reminder_may_exist(fault: str) -> None:
+    """A create that may have been saved must not invite a duplicate on retry."""
+    if fault == "reply_unreadable":
+        client = _ReminderClient(_UnreadableResp(status_code=200))
+    elif fault.isdigit():
+        # A gateway can time out or fail after the server committed the task.
+        client = _ReminderClient(_Resp(status_code=int(fault), body={"detail": "upstream"}))
+    else:
+        client = _ReminderClient()
+
+        async def lost(url: str, **kwargs: object) -> _Resp:
+            client.calls.append(("POST", url, kwargs.get("json")))  # type: ignore[arg-type]
+            raise httpx.ReadTimeout("response lost")
+
+        client.post = lost  # type: ignore[method-assign]
+    out = json.loads(
+        await _execute_scheduled_task_tool(
+            "sys_reminder_set",
+            json.dumps({"message": "ping", "delay_seconds": 1800}),
+            server_client=client,
+            conversation_id="conv_1",
+        )
+    )
+    assert "may still have been created" in out["error"]
+    assert "sys_scheduled_task_list" in out["error"]
+    if fault.isdigit():
+        assert f"returned {fault}" in out["error"]
+        assert "upstream" in out["details"]
+    # No usable task id came back, so nothing is deleted.
+    assert not [call for call in client.calls if call[0] == "DELETE"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_frozen_now")
+async def test_a_failed_lookup_before_creating_makes_no_such_warning() -> None:
+    client = _ReminderClient()
+
+    async def unreachable(url: str, **kwargs: object) -> _Resp:
+        raise httpx.ConnectError("server unreachable")
+
+    client.get = unreachable  # type: ignore[method-assign]
+    out = json.loads(
+        await _execute_scheduled_task_tool(
+            "sys_reminder_set",
+            json.dumps({"message": "ping", "delay_seconds": 1800}),
+            server_client=client,
+            conversation_id="conv_1",
+        )
+    )
+    assert out["error"].startswith("sys_reminder_set failed:")
+    assert "may still have been created" not in out["error"]

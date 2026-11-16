@@ -284,7 +284,9 @@ def register_permissions_routes(
         await _require_access(
             user_id, session_id, LEVEL_READ, permission_store, conversation_store
         )
-        return {"owner": _get_session_owner_id(session_id, permission_store)}
+        return {
+            "owner": await asyncio.to_thread(_get_session_owner_id, session_id, permission_store)
+        }
 
     @router.get(
         "/sessions/{session_id}/permissions",
