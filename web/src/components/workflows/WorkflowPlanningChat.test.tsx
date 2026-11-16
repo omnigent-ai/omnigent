@@ -1,3 +1,4 @@
+import type { ComponentProps } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
@@ -83,17 +84,22 @@ const WORKFLOW: WorkflowDetail = {
   is_draft: true,
 };
 
-function Editor() {
+type PanelProps = Pick<
+  ComponentProps<typeof WorkflowPlanningChat>,
+  "expanded" | "onExpandedChange"
+>;
+
+function Editor(props: PanelProps) {
   const { data } = useWorkflow(WORKFLOW.id);
-  return data && <WorkflowPlanningChat workflow={data} onClose={vi.fn()} />;
+  return data && <WorkflowPlanningChat workflow={data} onClose={vi.fn()} {...props} />;
 }
 
-function openEditor() {
+function openEditor(props: PanelProps = {}) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   render(
     <QueryClientProvider client={client}>
       <MemoryRouter>
-        <Editor />
+        <Editor {...props} />
       </MemoryRouter>
     </QueryClientProvider>,
   );
@@ -131,7 +137,7 @@ it("attaches the real session before seeding its first message, and restores it 
   expect(chat).toHaveAttribute("data-full", "true");
   expect(chat).toHaveAttribute("data-read-only", "false");
   expect(useChatStore.getState().sideChatDrafts[SESSION]).toBe("Draft the release plan");
-  expect(screen.getByRole("link", { name: "Open planning session in full" })).toHaveAttribute(
+  expect(screen.getByRole("link", { name: "Open planning session" })).toHaveAttribute(
     "href",
     `/c/${SESSION}`,
   );
@@ -153,6 +159,25 @@ it("respects the session's edit permission when reopening", async () => {
   expect(await screen.findByTestId("chat")).toHaveAttribute("data-read-only", "true");
 });
 
+it("expands in place, apart from the link that opens the planning session", async () => {
+  vi.mocked(authenticatedFetch).mockImplementation(
+    async () => new Response(JSON.stringify({ ...WORKFLOW, planning_session_id: SESSION })),
+  );
+  const onExpandedChange = vi.fn();
+  openEditor({ onExpandedChange });
+  expect(await screen.findByRole("link", { name: "Open planning session" })).toHaveAttribute(
+    "href",
+    `/c/${SESSION}`,
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Expand planning chat" }));
+  expect(onExpandedChange).toHaveBeenCalledWith(true);
+
+  cleanup();
+  openEditor({ expanded: true, onExpandedChange });
+  fireEvent.click(await screen.findByRole("button", { name: "Collapse planning chat" }));
+  expect(onExpandedChange).toHaveBeenLastCalledWith(false);
+});
+
 it.each(["offline", "server-error", "refresh-error"] as const)(
   "keeps the planning session linked after a %s",
   async (state) => {
@@ -162,7 +187,7 @@ it.each(["offline", "server-error", "refresh-error"] as const)(
       return new Response(JSON.stringify({ ...WORKFLOW, planning_session_id: SESSION }));
     });
     const client = openEditor();
-    await screen.findByRole("link", { name: "Open planning session in full" });
+    await screen.findByRole("link", { name: "Open planning session" });
     expect(screen.queryByRole("button", { name: "Start planning" })).toBeNull();
     if (state === "refresh-error") {
       expect(screen.getByTestId("chat")).toHaveAttribute("data-session", SESSION);
@@ -192,12 +217,12 @@ it.each(["deleted", "archived"] as const)(
 
     openEditor();
     const start = await screen.findByRole("button", { name: "Start planning" });
-    expect(screen.queryByRole("link", { name: "Open planning session in full" })).toBeNull();
+    expect(screen.queryByRole("link", { name: "Open planning session" })).toBeNull();
     fireEvent.click(start);
 
     expect(await screen.findByTestId("chat")).toHaveAttribute("data-session", SESSION);
     expect(useChatStore.getState().sideChatDrafts[SESSION]).toBe("Draft the release plan");
-    expect(screen.getByRole("link", { name: "Open planning session in full" })).toHaveAttribute(
+    expect(screen.getByRole("link", { name: "Open planning session" })).toHaveAttribute(
       "href",
       `/c/${SESSION}`,
     );

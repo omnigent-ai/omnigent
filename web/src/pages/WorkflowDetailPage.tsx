@@ -86,6 +86,7 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
   const [sessionOpen, setSessionOpen] = useState(false);
   const [automationOpen, setAutomationOpen] = useState(false);
   const [plannerOpen, setPlannerOpen] = useState<boolean | null>(null);
+  const [plannerExpanded, setPlannerExpanded] = useState(false);
   const showPlanner = plannerOpen ?? workflow?.is_draft ?? false;
   const isMobile = useIsMobileViewport();
   const { session: planningSession, error: planningSessionError } = useSession(
@@ -153,10 +154,17 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
     !!proposedSteps?.length && stepSignature(proposedSteps) !== stepSignature(workflow.steps);
   const isDraft = workflow.is_draft ?? workflow.steps.length === 0;
   const canRun = !isDraft && !hasChanges;
+  // Expanded, the planner covers the page. `invisible` keeps the page's scroll
+  // position while taking its controls out of the tab order.
+  const plannerFillsPage = showPlanner && !isMobile && plannerExpanded;
 
   return (
     <div className="relative flex h-full min-h-0 flex-1 overflow-hidden">
-      <PageScroll className="min-w-0" contentClassName="px-6" data-testid="workflow-detail-page">
+      <PageScroll
+        className={cn("min-w-0", plannerFillsPage && "invisible")}
+        contentClassName="px-6"
+        data-testid="workflow-detail-page"
+      >
         <BackLink />
 
         <div className="mt-4 flex flex-wrap items-start justify-between gap-4">
@@ -368,9 +376,22 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
         ) : (
           <aside
             aria-label="Workflow planning chat"
-            className="w-[42%] min-w-96 max-w-xl shrink-0 border-l border-border bg-background pt-[calc(var(--omnigent-header-height)+var(--omnigent-inset-top))] pb-[var(--omnigent-inset-bottom)]"
+            className={cn(
+              "bg-background pt-[calc(var(--omnigent-header-height)+var(--omnigent-inset-top))] pb-[var(--omnigent-inset-bottom)]",
+              plannerFillsPage
+                ? "absolute inset-0"
+                : "w-[42%] min-w-96 max-w-xl shrink-0 border-l border-border",
+            )}
           >
-            <WorkflowPlanningChat workflow={workflow} onClose={() => setPlannerOpen(false)} />
+            <WorkflowPlanningChat
+              workflow={workflow}
+              expanded={plannerFillsPage}
+              onExpandedChange={setPlannerExpanded}
+              onClose={() => {
+                setPlannerOpen(false);
+                setPlannerExpanded(false);
+              }}
+            />
           </aside>
         ))}
     </div>
