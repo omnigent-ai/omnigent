@@ -1267,23 +1267,39 @@ def test_triggered_task_create_asks_with_its_whole_trigger() -> None:
 
 
 @pytest.mark.parametrize(
-    ("task_mode", "sessions_mode"),
+    ("task_mode", "worker", "sessions_mode"),
     [
-        (None, "permission_mode=agent default,"),
+        (None, None, "permission_mode=agent default,"),
         # A session create can't name a mode that skips approval, so the sessions
         # get the task's own.
         (
             "bypassPermissions",
+            None,
             "permission_mode=the task's mode: bypassPermissions (skips approval prompts",
+        ),
+        # Another agent gets the task's mode only if its harness has it; its own spec
+        # decides otherwise, and can skip approval.
+        (
+            "acceptEdits",
+            {"agent_id": "ag_codex", "permission_mode": None},
+            "permission_mode=the task's mode, acceptEdits, if agent ag_codex has it, else "
+            "agent ag_codex's own default, which its spec can set to skip approval,",
+        ),
+        (
+            None,
+            {"agent_id": "ag_codex"},
+            "permission_mode=agent ag_codex's own default, which its spec can set to skip "
+            "approval,",
         ),
     ],
 )
 def test_triggered_task_create_names_the_sessions_effective_permission_mode(
-    task_mode: object, sessions_mode: str
+    task_mode: object, worker: dict[str, object] | None, sessions_mode: str
 ) -> None:
-    result = _triggered_review(
-        "sys_triggered_task_create", {**_TRIGGER_CREATE, "permission_mode": task_mode}
-    )
+    args = {**_TRIGGER_CREATE, "permission_mode": task_mode}
+    if worker is not None:
+        args["worker"] = worker
+    result = _triggered_review("sys_triggered_task_create", args)
     assert result["result"] == "ASK"
     sessions = next(
         line for line in result["reason"].splitlines() if line.startswith("Sessions it starts:")
@@ -1415,9 +1431,10 @@ def test_triggered_task_update_names_what_it_changes() -> None:
     assert unchanged["result"] == "ASK"
     assert "Trigger: unchanged" in unchanged["reason"]
     assert "Watch:" not in unchanged["reason"]
+    # The saved sessions' agents aren't known, so the card says what each case gets.
     assert (
-        "Sessions it starts: unchanged; any without their own permission mode use the "
-        "task's mode: agent default (no task override)"
+        "Sessions it starts: unchanged; any without their own permission mode use their "
+        "agent's own default, which another agent's spec can set to skip approval"
     ) in unchanged["reason"]
     assert 'state="paused"' in unchanged["reason"]
 
@@ -1444,7 +1461,11 @@ def test_triggered_task_update_names_what_it_changes() -> None:
     assert "Link back: unchanged" in reason.splitlines()
     assert (
         "Sessions it starts: the worker settings below change; any without their own "
-        "permission mode use the task's mode: bypassPermissions (skips approval prompts"
+        "permission mode use the task's mode, bypassPermissions (skips approval prompts"
+    ) in reason
+    assert (
+        "if their agent has it, else their agent's own default, which another agent's spec "
+        "can set to skip approval"
     ) in reason
 
     # Part of a search can't be compiled without the saved rest, so it isn't asked.
@@ -1461,3 +1482,14 @@ def test_triggered_task_update_names_what_it_changes() -> None:
     assert (
         "Sessions it starts: sessions that run the task's own agent switch to the new agent_id"
     ) in switched["reason"]
+
+    # Passed together, the worker settings apply over the new agent's reset ones.
+    both = _triggered_review(
+        "sys_triggered_task_update",
+        {**review, "permission_mode": None, "agent_id": "ag_2", "worker": {"model": "m"}},
+    )
+    sessions = next(
+        line for line in both["reason"].splitlines() if line.startswith("Sessions it starts:")
+    )
+    assert "switch to the new agent_id" in sessions
+    assert "the worker settings below change" in sessions

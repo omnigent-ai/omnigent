@@ -2995,22 +2995,25 @@ def test_latest_runs_mysql_seek_one_run_per_task(store):
     assert {task_id: run.id for task_id, run in latest.items()} == {
         task.id: f"{n * 10_000 + 2_999:032x}" for n, task in enumerate(tasks)
     }
-    assert len(plans) == 1
-    assert "ix_scheduled_task_runs_scheduled_task_id" in plans[0], plans[0]
-    # Each task's lookup stops at its newest run instead of reading its 3,000.
-    examined = [
-        float(value) for value in re.findall(r"actual time=[^)]*? rows=([\d.]+)", plans[0])
-    ]
-    assert examined and max(examined) <= len(tasks), plans[0]
+    assert len(plans) == len(tasks)
+    for plan in plans:
+        assert "ix_scheduled_task_runs_scheduled_task_id" in plan, plan
+        # Each lookup stops at its task's newest run instead of reading its 3,000.
+        examined = [
+            float(value) for value in re.findall(r"actual time=[^)]*? rows=([\d.]+)", plan)
+        ]
+        assert examined and max(examined) <= 1, plan
 
 
 def test_list_page_pages_examined_tasks_and_scopes_owner_and_workspace(store):
     from omnigent.db.db_models import SqlScheduledTask
+    from omnigent.db.enum_codecs import encode_scheduled_task_state
 
     tasks = [_session_task(store, f"list-page-{i}") for i in range(4)]
     ordered = sorted(tasks, key=lambda task: (task.created_at, task.id))
     with store._session("test_list_page_scope") as session:
-        session.get(SqlScheduledTask, (0, ordered[1].id)).state = 3  # deleted, retained
+        retained = session.get(SqlScheduledTask, (current_workspace_id(), ordered[1].id))
+        retained.state = encode_scheduled_task_state("deleted")
     first, cursor = store.list_page(owner_user_id=tasks[0].user_id, limit=2)
     # The deleted task counts toward the page it was examined in, so the page is short.
     assert [task.id for task in first] == [ordered[0].id]
@@ -3108,13 +3111,15 @@ def test_latest_runs_read_one_run_per_task(store):
         task_id: run.status for task_id, run in latest.items()
     }
     assert store.list_latest_runs_for_tasks([]) == {}
-    assert len(queries) == 1
+    # One bounded read per task, however long its history.
+    assert len(queries) == 3 and all("LIMIT" in statement for statement, _ in queries)
     if store._engine.dialect.name != "sqlite":
         return
-    statement, parameters = queries[0]
     with store._engine.connect() as connection:
-        plan = str(connection.exec_driver_sql("EXPLAIN QUERY PLAN " + statement, parameters).all())
-    # Each task's run comes from a seek on the task/run index, not a sort of its history.
-    assert "CORRELATED SCALAR SUBQUERY" in plan
-    assert "ix_scheduled_task_runs_scheduled_task_id" in plan
-    assert "TEMP B-TREE" not in plan and "SCAN scheduled_task_runs" not in plan
+        for statement, parameters in queries:
+            plan = str(
+                connection.exec_driver_sql("EXPLAIN QUERY PLAN " + statement, parameters).all()
+            )
+            # A seek on the task/run index, not a sort of the task's history.
+            assert "ix_scheduled_task_runs_scheduled_task_id" in plan
+            assert "TEMP B-TREE" not in plan and "SCAN scheduled_task_runs" not in plan

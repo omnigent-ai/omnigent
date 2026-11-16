@@ -151,6 +151,7 @@ from omnigent.tools.builtins.triggered_tasks import (
     TRIGGERED_TASK_LIST,
     TRIGGERED_TASK_TOOL_NAMES,
     build_trigger_config,
+    connected_host_workspace_error,
     default_worker,
     polling_minutes,
     trigger_rrule,
@@ -5565,6 +5566,14 @@ async def _execute_triggered_task_tool(
     :returns: Tool output JSON string.
     """
     if tool_name == TRIGGERED_TASK_LIST:
+        # An older server ignores limit and returns, and reads, every task it has.
+        if not await _server_advertises(server_client, "triggered_task_tools"):
+            return json.dumps(
+                {
+                    "error": f"{tool_name}: this Omnigent server can't list tasks a page at a "
+                    "time; use sys_scheduled_task_list"
+                }
+            )
         limit = args.get("limit", LIST_PAGE_MAX)
         if (
             not isinstance(limit, int)
@@ -5596,7 +5605,6 @@ async def _execute_triggered_task_tool(
             config = decode_trigger_prompt(prompt) if isinstance(prompt, str) else None
             if config is not None:
                 views.append(triggered_task_view(task, config))
-        # A server without pages returns every task and no cursor.
         return json.dumps({"triggered_tasks": views, "next_cursor": body.get("next_cursor")})
 
     if tool_name == TRIGGERED_TASK_DELETE:
@@ -5651,6 +5659,9 @@ async def _execute_triggered_task_tool(
         saved = await _read_triggered_task(server_client, tool_name, args.get("triggered_task_id"))
         if isinstance(saved, str):
             return saved
+        workspace_error = connected_host_workspace_error(args, saved.task.get("execution_target"))
+        if workspace_error is not None:
+            return json.dumps({"error": f"{tool_name}: {workspace_error}"})
         worker = saved.config["worker"]
         if (
             "agent_id" in args
@@ -5913,16 +5924,30 @@ async def _execute_scheduled_task_tool(
         return json.dumps(
             {"error": f"server returned {resp.status_code}", "details": resp.text[:1000]}
         )
-    if tool_name == "sys_scheduled_task_list":
-        return json.dumps(_without_triggered_tasks(resp.json()))
+    if tool_name == "sys_scheduled_task_list" and server_client is not None:
+        return json.dumps(await _without_triggered_tasks(resp.json(), server_client))
     return json.dumps(resp.json())
 
 
-def _without_triggered_tasks(listing: object) -> object:
+async def _server_advertises(server_client: httpx.AsyncClient, flag: str) -> bool:
+    """Whether the server's ``/v1/info`` sets *flag*, e.g. ``"triggered_task_tools"``.
+
+    An unreachable or unreadable ``/v1/info`` counts as not setting it.
+    """
+    try:
+        response = await server_client.get("/v1/info", timeout=30.0)
+        info = _string_object_dict(response.json()) if response.status_code < 400 else None
+    except Exception:  # noqa: BLE001
+        return False
+    return info is not None and info.get(flag) is True
+
+
+async def _without_triggered_tasks(listing: object, server_client: httpx.AsyncClient) -> object:
     """A task list without the triggered tasks, which ``sys_triggered_task_list`` reports.
 
     Their prompts are long renders of a trigger that this family can't edit safely;
-    a note says how many were left out so a caller knows where to find them.
+    a note says how many were left out so a caller knows where to find them. A server
+    that can't page that list keeps them here, where it can still list them.
     """
     body = _string_object_dict(listing)
     tasks = body.get("scheduled_tasks") if body is not None else None
@@ -5937,7 +5962,9 @@ def _without_triggered_tasks(listing: object) -> object:
             and decode_trigger_prompt(task["prompt"]) is not None
         )
     ]
-    if len(kept) == len(tasks):
+    if len(kept) == len(tasks) or not await _server_advertises(
+        server_client, "triggered_task_tools"
+    ):
         return listing
     hidden = len(tasks) - len(kept)
     return {

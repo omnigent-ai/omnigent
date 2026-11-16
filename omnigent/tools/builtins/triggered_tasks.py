@@ -324,7 +324,7 @@ def _placement_properties(*, update: bool) -> dict[str, Any]:
                 "For connected_host: an existing absolute start path on the host; omit for "
                 "the host's home directory. For managed_sandbox: a repository URL, "
                 "optionally with #branch; omit for the provider default."
-                + (" Null restores the default." if update else "")
+                + (" For managed_sandbox, null restores the provider default." if update else "")
             ),
         },
         "host_id": {
@@ -648,6 +648,9 @@ def triggered_task_call_error(args: Mapping[str, object], *, action: str) -> str
         return "project_name must be a string; use project_id: null to clear"
     if args.get("execution_target") == "managed_sandbox" and args.get("host_id") is not None:
         return "a managed_sandbox task runs in a fresh sandbox each check; omit host_id"
+    if "workspace" in args and args["workspace"] is None:
+        if args.get("execution_target", "managed_sandbox") != "managed_sandbox":
+            return _CONNECTED_HOST_WORKSPACE_ERROR
     instructions = args["instructions"]
     if not isinstance(instructions, str) or not instructions.strip():
         return "instructions must be a non-empty string"
@@ -664,6 +667,26 @@ def triggered_task_call_error(args: Mapping[str, object], *, action: str) -> str
     if action == "update":
         return _partial_search_error(args)
     return None
+
+
+# The server restores a default workspace only for a managed sandbox.
+_CONNECTED_HOST_WORKSPACE_ERROR = (
+    "workspace null restores the default only for a managed_sandbox task; pass a path, "
+    "or omit workspace to keep it"
+)
+
+
+def connected_host_workspace_error(args: Mapping[str, object], saved_target: object) -> str | None:
+    """Why an update can't clear its workspace on the task's target, or ``None``.
+
+    :param args: Parsed update arguments.
+    :param saved_target: The saved task's ``execution_target``, e.g. ``"connected_host"``.
+    :returns: An error message, or ``None``.
+    """
+    if "workspace" not in args or args["workspace"] is not None:
+        return None
+    target = args.get("execution_target", saved_target or "connected_host")
+    return None if target == "managed_sandbox" else _CONNECTED_HOST_WORKSPACE_ERROR
 
 
 _NO_WORKER_OVERRIDES: TriggerWorkerConfig = {
@@ -842,10 +865,15 @@ def _parse_worker(raw: object, base: TriggerWorkerConfig) -> TriggerWorkerConfig
     def setting(key: str, saved: str) -> str:
         return (values[key] or "") if key in values else saved
 
+    # A blank agent means the task's own, like null.
+    agent_id = (values["agent_id"] or None) if "agent_id" in values else base["agentId"]
+    if agent_id != base["agentId"]:
+        # Like the form, another agent starts without the old one's model, effort and
+        # mode, which belong to its harness.
+        base = {**base, "model": "", "effort": "", "permissionMode": ""}
     worker: TriggerWorkerConfig = {
         "placement": base["placement"],
-        # A blank agent means the task's own, like null.
-        "agentId": (values["agent_id"] or None) if "agent_id" in values else base["agentId"],
+        "agentId": agent_id,
         "model": setting("model", base["model"]),
         "effort": setting("reasoning_effort", base["effort"]),
         "permissionMode": setting("permission_mode", base.get("permissionMode", "")),

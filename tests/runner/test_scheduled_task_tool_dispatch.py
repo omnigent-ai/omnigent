@@ -1413,12 +1413,20 @@ async def test_triggered_task_update_requires_the_review_fields() -> None:
 
 
 @pytest.mark.asyncio
-async def test_triggered_task_list_reads_an_older_servers_whole_list() -> None:
+async def test_triggered_task_list_refuses_a_server_that_cant_page_it() -> None:
+    # An older server ignores limit, so it would read and return every task.
     server = _TaskServer(paged=False)
     await _run(server, "sys_triggered_task_create", _JIRA_TRIGGER)
+    server.info = {**server.info, "triggered_task_tools": None}
+    calls = len(server.calls)
     out = await _run(server, "sys_triggered_task_list", {"limit": 1})
-    assert [task["triggered_task_id"] for task in out["triggered_tasks"]] == [_TASK_ID]
-    assert out["next_cursor"] is None
+    assert "can't list tasks a page at a time" in str(out["error"])
+    assert server.calls[calls:] == [("GET", "/v1/info", None)]
+
+    # Its scheduled-task list keeps the triggers, the one place it can list them.
+    scheduled = await _run(server, "sys_scheduled_task_list", {})
+    assert [task["id"] for task in scheduled["scheduled_tasks"]] == [_TASK_ID]
+    assert "note" not in scheduled
 
 
 @pytest.mark.asyncio
@@ -1449,6 +1457,25 @@ async def test_triggered_task_create_refuses_a_host_for_a_managed_sandbox_before
     )
     assert "omit host_id" in str(out["error"])
     assert server.calls == []
+
+
+@pytest.mark.asyncio
+async def test_triggered_task_update_refuses_to_clear_a_connected_hosts_workspace() -> None:
+    server = _TaskServer()
+    await _run(server, "sys_triggered_task_create", {**_JIRA_TRIGGER, "workspace": "/repo"})
+    out = await _run(
+        server,
+        "sys_triggered_task_update",
+        {
+            "triggered_task_id": _TASK_ID,
+            "instructions": "Investigate the ticket.",
+            "permission_mode": "acceptEdits",
+            "workspace": None,
+        },
+    )
+    # The server restores a default only for a managed sandbox, so nothing is patched.
+    assert "restores the default only for a managed_sandbox task" in str(out["error"])
+    assert server.mutations() == ["POST"]
 
 
 @pytest.mark.asyncio

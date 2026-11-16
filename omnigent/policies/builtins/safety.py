@@ -602,17 +602,27 @@ def _quoted(text: str) -> str:
     return "\n".join(f"> {escape_layout_controls(line)}" for line in text.splitlines())
 
 
-def _worker_permission(worker_mode: str, task_mode: object) -> str:
+def _worker_permission(worker_mode: str, task_mode: object, worker_agent: str | None) -> str:
     """How a review names the permission mode of the sessions a trigger starts.
 
     A session the task's run starts without its own mode gets the task's, even a mode
-    that skips approval, which a session create can't name itself.
+    that skips approval, which a session create can't name itself. Another agent gets
+    it only if its harness has that mode; otherwise the agent's own spec decides.
     """
     if worker_mode:
         return _inline(worker_mode)
+    if worker_agent is None:
+        return (
+            "agent default"
+            if task_mode is None
+            else (f"the task's mode: {_permission_setting(task_mode)}")
+        )
+    agent = _inline(worker_agent)
+    fallback = f"agent {agent}'s own default, which its spec can set to skip approval"
     if task_mode is None:
-        return "agent default"
-    return f"the task's mode: {_permission_setting(task_mode)}"
+        return fallback
+    setting = _permission_setting(task_mode)
+    return f"the task's mode, {setting}, if agent {agent} has it, else {fallback}"
 
 
 def _triggered_task_review(args: dict[str, object], *, action: str) -> PolicyResponse:
@@ -667,12 +677,15 @@ def _triggered_task_review(args: dict[str, object], *, action: str) -> PolicyRes
             link_back = "on, posting each session's link on its item"
             watch += f"Link back: {link_back if config['linkBack'] else 'off'}\n"
             worker = config["worker"]
+            mode = _worker_permission(
+                worker.get("permissionMode") or "", task_mode, worker["agentId"]
+            )
             sessions = (
                 f"agent={_inline(worker['agentId'] or 'same as the task')}, "
                 f"model={_inline(worker['model'] or 'agent default')}, "
                 f"reasoning_effort={_inline(worker['effort'] or 'default')}, "
                 "permission_mode="
-                f"{_worker_permission(worker.get('permissionMode') or '', task_mode)}, "
+                f"{mode}, "
                 f"placement={worker['placement']}, "
                 + (
                     "each match starts its own session"
@@ -681,19 +694,25 @@ def _triggered_task_review(args: dict[str, object], *, action: str) -> PolicyRes
                 )
             )
     if action == "update":
-        if "worker" in args:
-            sessions = "the worker settings below change"
-        elif "agent_id" in args:
-            sessions = (
+        changes = []
+        if "agent_id" in args:
+            # The runner resets these sessions' settings for the new agent, then applies
+            # any worker settings the call passes.
+            changes.append(
                 "sessions that run the task's own agent switch to the new agent_id with "
                 "these model, effort and mode settings; sessions with their own agent are "
                 "unchanged"
             )
-        else:
-            sessions = "unchanged"
-        sessions += (
-            "; any without their own permission mode use the task's mode: "
-            f"{_permission_setting(task_mode)}"
+        if "worker" in args:
+            changes.append("the worker settings below change")
+        sessions = "; ".join(changes) or "unchanged"
+        # The saved sessions' agents aren't known here, so say what each case gets.
+        fallback = "their agent's own default, which another agent's spec can set to skip approval"
+        sessions += "; any without their own permission mode use " + (
+            fallback
+            if task_mode is None
+            else f"the task's mode, {_permission_setting(task_mode)}, if their agent has it, "
+            f"else {fallback}"
         )
     subject = (
         f"triggered task {_clip(str(args.get('name')))!r}"

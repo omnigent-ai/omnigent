@@ -1200,38 +1200,31 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         scheduled_task_ids: builtins.list[str],
     ) -> dict[str, ScheduledTaskRun]:
         """Seek each task's newest run through the task/run index, one row per task."""
+        latest: dict[str, ScheduledTaskRun] = {}
         if not scheduled_task_ids:
-            return {}
-        workspace_id = current_workspace_id()
+            return latest
         with self._session("list_latest_runs_for_tasks") as session:
-            # Correlated per task, so the index's (scheduled_at, id) order ends the read
-            # at one run instead of ranking the task's whole history.
-            latest_run_id = (
-                select(SqlScheduledTaskRun.id)
-                .where(
-                    SqlScheduledTaskRun.workspace_id == workspace_id,
-                    SqlScheduledTaskRun.scheduled_task_id == SqlScheduledTask.id,
+            for task_id in scheduled_task_ids:
+                # One query per task, as the Inbox reads them: MySQL sorts a correlated
+                # subquery's whole run history, but seeks this one to its newest run.
+                row = (
+                    session.execute(
+                        select(SqlScheduledTaskRun)
+                        .where(
+                            SqlScheduledTaskRun.workspace_id == current_workspace_id(),
+                            SqlScheduledTaskRun.scheduled_task_id == task_id,
+                        )
+                        .order_by(
+                            desc(SqlScheduledTaskRun.scheduled_at), desc(SqlScheduledTaskRun.id)
+                        )
+                        .limit(1)
+                    )
+                    .scalars()
+                    .first()
                 )
-                .order_by(desc(SqlScheduledTaskRun.scheduled_at), desc(SqlScheduledTaskRun.id))
-                .limit(1)
-                .correlate(SqlScheduledTask)
-                .scalar_subquery()
-            )
-            latest = (
-                select(latest_run_id.label("run_id"))
-                .where(
-                    SqlScheduledTask.workspace_id == workspace_id,
-                    SqlScheduledTask.id.in_(scheduled_task_ids),
-                )
-                .subquery()
-            )
-            stmt = (
-                select(SqlScheduledTaskRun)
-                .join(latest, SqlScheduledTaskRun.id == latest.c.run_id)
-                .where(SqlScheduledTaskRun.workspace_id == workspace_id)
-            )
-            rows = session.execute(stmt).scalars().all()
-            return {row.scheduled_task_id: _run_to_entity(row) for row in rows}
+                if row is not None:
+                    latest[task_id] = _run_to_entity(row)
+        return latest
 
     # ── Database scheduler ───────────────────────────────────────
 

@@ -313,6 +313,39 @@ def test_instructions_limit_counts_like_the_web_form() -> None:
     assert isinstance(result, str) and "at most" in result
 
 
+@pytest.mark.parametrize(
+    ("worker", "expected"),
+    [
+        # Another agent starts without the task agent's harness-specific settings.
+        ({"agent_id": "ag_codex"}, {"agentId": "ag_codex", "model": "", "effort": ""}),
+        (
+            {"agent_id": "ag_codex", "model": "gpt-5"},
+            {"agentId": "ag_codex", "model": "gpt-5", "effort": ""},
+        ),
+        # The task's own agent keeps them.
+        ({"agent_id": None}, {"agentId": None, "model": "claude-x", "effort": "high"}),
+    ],
+)
+def test_another_worker_agent_starts_without_the_task_agents_settings(
+    worker: dict[str, Any], expected: dict[str, Any]
+) -> None:
+    defaults = default_worker(
+        execution_target=None,
+        model_override="claude-x",
+        reasoning_effort="high",
+        permission_mode="acceptEdits",
+        worker_permission_modes=True,
+    )
+    config = build_trigger_config(
+        {"provider": "jira", "scope": ["ES"], "instructions": "x", "worker": worker},
+        current=None,
+        worker_defaults=defaults,
+    )
+    assert not isinstance(config, str)
+    mode = "acceptEdits" if expected["agentId"] is None else ""
+    assert config["worker"] == {**expected, "placement": "same_host", "permissionMode": mode}
+
+
 def test_worker_settings_merge_over_the_defaults() -> None:
     config = _created(
         provider="jira",
@@ -613,6 +646,16 @@ _REVIEWED = {"instructions": "x", "permission_mode": None}
             {**_REVIEWED, "name": "n", "execution_target": "managed_sandbox", "host_id": "h1"},
             "create",
             "omit host_id",
+        ),
+        (
+            {
+                **_REVIEWED,
+                "triggered_task_id": "t1",
+                "execution_target": "connected_host",
+                "workspace": None,
+            },
+            "update",
+            "restores the default only for a managed_sandbox task",
         ),
         (
             {**_REVIEWED, "triggered_task_id": "t1", "conditions": []},
