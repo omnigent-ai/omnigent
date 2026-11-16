@@ -52,36 +52,26 @@ import {
   type HarnessFixMode,
 } from "@/lib/harnessFix";
 import { useSettingsRoute } from "../../shell/settingsNav";
+import {
+  HARNESS_CARD_ENTRIES,
+  HARNESS_DESCRIPTIONS,
+  HARNESSES_GRID_ENTRY,
+  type NativeHarnessId,
+} from "./search/catalog/harnesses";
+import { SettingsItem } from "./search/SettingsItem";
+import { settingsControlId, settingsControlProps } from "./search/settingsControl";
 
 interface HarnessEntry {
   /** Native harness slug (e.g. "claude-native") — the readiness/install key. */
-  harness: string;
+  harness: NativeHarnessId;
   name: string;
   description: string;
   agentName: string;
 }
 
-// One-line descriptions per harness, keyed by native slug. The server catalog
-// (/v1/harnesses) carries no descriptions, so these live here; the rest of each
-// entry (name, icon, order) comes from NATIVE_CODING_AGENTS.
-const HARNESS_DESCRIPTIONS: Record<string, string> = {
-  "claude-native": "Anthropic’s agent for coding and development workflows.",
-  "codex-native": "OpenAI’s coding agent for building features and fixing bugs.",
-  "opencode-native": "An open-source coding agent for terminal, IDE, and desktop.",
-  "cursor-native": "An AI editor with agents for navigating and editing code.",
-  "pi-native": "A minimal, extensible terminal coding agent.",
-  "devin-native": "Cognition’s autonomous coding agent.",
-  "antigravity-native": "Google’s agent platform for software development.",
-  "kiro-native": "An agentic IDE for spec-driven development.",
-  "qwen-native": "An open-source terminal coding agent powered by Qwen.",
-  "goose-native": "An open-source local agent for coding and automation.",
-  "kimi-native": "A terminal coding agent for editing code and running commands.",
-  "hermes-native": "An agent that learns reusable skills from experience.",
-};
-
 // The harness catalog, derived from the shared native-agent registry so this
-// list stays in step with the rest of the app; descriptions come from the map
-// above. Sorted by the registry's own picker order.
+// list stays in step with the rest of the app; descriptions come from the Settings
+// catalog. Sorted by the registry's own picker order.
 const HARNESS_ENTRIES: HarnessEntry[] = [...NATIVE_CODING_AGENTS]
   .sort((a, b) => a.sortRank - b.sortRank)
   .map((spec) => ({
@@ -207,35 +197,41 @@ export const SettingsHarnessesSection = () => {
         />
       ) : (
         <>
-          <div className="flex flex-wrap items-center justify-between gap-4 pb-6">
-            <h1 className="settings-page-title text-2xl font-medium">Harnesses</h1>
-            <HostSelect hosts={sortedHosts} selected={selectedHost} onSelect={setSelectedHostId} />
-          </div>
-          <div className="mb-6 flex items-center gap-2">
-            <div className="flex h-8 flex-1 items-center gap-2 rounded-lg border border-border px-2.5">
-              <SearchIcon className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
-              <input
-                type="search"
-                value={query}
-                onChange={(e) => setQuery(e.target.value)}
-                placeholder="Search agent harnesses..."
-                aria-label="Search agent harnesses"
-                data-testid="harness-search"
-                className="min-w-0 flex-1 bg-transparent text-ui outline-none placeholder:text-muted-foreground/50"
+          <SettingsItem entry={HARNESSES_GRID_ENTRY}>
+            <div className="flex flex-wrap items-center justify-between gap-4 pb-6">
+              <h1 className="settings-page-title text-2xl font-medium">Harnesses</h1>
+              <HostSelect
+                hosts={sortedHosts}
+                selected={selectedHost}
+                onSelect={setSelectedHostId}
               />
             </div>
-            <Tabs
-              value={installedOnly ? "installed" : "all"}
-              onValueChange={(v) => setInstalledOnly(v === "installed")}
-            >
-              <TabsList>
-                <TabsTrigger value="all">All</TabsTrigger>
-                <TabsTrigger value="installed" data-testid="harness-filter-installed">
-                  Configured
-                </TabsTrigger>
-              </TabsList>
-            </Tabs>
-          </div>
+            <div className="mb-6 flex items-center gap-2">
+              <div className="flex h-8 flex-1 items-center gap-2 rounded-lg border border-border px-2.5">
+                <SearchIcon className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
+                <input
+                  type="search"
+                  value={query}
+                  onChange={(e) => setQuery(e.target.value)}
+                  placeholder="Search agent harnesses..."
+                  {...settingsControlProps(HARNESSES_GRID_ENTRY, "search")}
+                  data-testid="harness-search"
+                  className="min-w-0 flex-1 bg-transparent text-ui outline-none placeholder:text-muted-foreground/50"
+                />
+              </div>
+              <Tabs
+                value={installedOnly ? "installed" : "all"}
+                onValueChange={(v) => setInstalledOnly(v === "installed")}
+              >
+                <TabsList {...settingsControlProps(HARNESSES_GRID_ENTRY, "filter")}>
+                  <TabsTrigger value="all">All</TabsTrigger>
+                  <TabsTrigger value="installed" data-testid="harness-filter-installed">
+                    Configured
+                  </TabsTrigger>
+                </TabsList>
+              </Tabs>
+            </div>
+          </SettingsItem>
           {!selectedHost && <NoHostNotice loading={hostsLoading} />}
           {filtered.length === 0 && (
             <p className="text-ui text-muted-foreground">
@@ -545,7 +541,7 @@ function SetupButton({ entry, onSetup }: { entry: HarnessEntry; onSetup: () => v
       variant="ghost"
       size="icon-sm"
       className="shrink-0"
-      aria-label={`Set up ${entry.name}`}
+      {...settingsControlProps(HARNESS_CARD_ENTRIES.entry(entry.harness), "setUp")}
       data-testid={`harness-action-${entry.harness}`}
       componentId="settings.harnesses.setup"
       onClick={(event) => {
@@ -580,6 +576,7 @@ function HarnessCard({
   const needsAttention = status.needsSetup || status.reason === "cli-unresponsive";
   const opensDetail = status.ready || (needsAttention && canFix);
   const navigate = useNavigate();
+  const card = HARNESS_CARD_ENTRIES.entry(entry.harness);
   const body = (
     <>
       <div className="flex items-start justify-between gap-2">
@@ -603,7 +600,7 @@ function HarnessCard({
           <Button
             size="icon-sm"
             variant="ghost"
-            aria-label={`${entry.name} settings`}
+            {...settingsControlProps(card, "settings")}
             data-testid={`harness-settings-${entry.harness}`}
             componentId="settings.harnesses.open_settings"
             onClick={(e) => {
@@ -625,23 +622,30 @@ function HarnessCard({
   );
   const className =
     "flex flex-col gap-2 rounded-xl border border-border bg-card p-4 transition-colors";
-  return opensDetail ? (
-    <Link
-      to={`/settings/harnesses/${entry.harness}${status.ready ? "" : "?tab=settings"}`}
-      // Only cards that open a details page get the hover, so it reads as clickable.
-      className={cn(
-        className,
-        "hover:border-foreground/20 hover:bg-muted/50 focus-visible:ring-3 focus-visible:ring-ring/50 focus-visible:outline-none",
+  // The grid cell wraps the card so search can reveal it; the card still fills the cell's height.
+  return (
+    <SettingsItem entry={card} className="grid">
+      {opensDetail ? (
+        <Link
+          // Named by its content, as before; the id only lets search find the link.
+          data-settings-control={settingsControlId(card, "open")}
+          to={`/settings/harnesses/${entry.harness}${status.ready ? "" : "?tab=settings"}`}
+          // Only cards that open a details page get the hover, so it reads as clickable.
+          className={cn(
+            className,
+            "hover:border-foreground/20 hover:bg-muted/50 focus-visible:ring-3 focus-visible:ring-ring/50 focus-visible:outline-none",
+          )}
+          data-testid={`harness-card-${entry.harness}`}
+          componentId="settings.harnesses.open"
+        >
+          {body}
+        </Link>
+      ) : (
+        <div className={className} data-testid={`harness-card-${entry.harness}`}>
+          {body}
+        </div>
       )}
-      data-testid={`harness-card-${entry.harness}`}
-      componentId="settings.harnesses.open"
-    >
-      {body}
-    </Link>
-  ) : (
-    <div className={className} data-testid={`harness-card-${entry.harness}`}>
-      {body}
-    </div>
+    </SettingsItem>
   );
 }
 

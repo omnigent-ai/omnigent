@@ -508,6 +508,52 @@ describe("Harnesses grid", () => {
   });
 });
 
+describe("Harnesses grid catalog rows", () => {
+  it("renders the page's search and filter as its row's controls, with their names", () => {
+    hosts = [ONLINE];
+    renderHarnesses();
+
+    expect(document.querySelector('[data-settings-item="harnesses"]')).toContainElement(
+      screen.getByRole("searchbox", { name: "Search agent harnesses" }),
+    );
+    expect(screen.getByRole("searchbox", { name: "Search agent harnesses" })).toHaveAttribute(
+      "data-settings-control",
+      "harnesses:search",
+    );
+    expect(screen.getByRole("tablist", { name: "Harness filter" })).toHaveAttribute(
+      "data-settings-control",
+      "harnesses:filter",
+    );
+  });
+
+  it("gives each card its own row, with its open link, settings and Set up controls", () => {
+    hosts = [
+      {
+        ...ONLINE,
+        configured_harnesses: { "claude-native": true, "codex-native": "binary-missing" },
+      },
+    ];
+    renderHarnesses();
+
+    const claudeRow = card("claude-native").closest('[data-settings-item="harness-claude-native"]');
+    expect(claudeRow).toContainElement(card("claude-native"));
+    expect(card("claude-native")).toHaveAttribute(
+      "data-settings-control",
+      "harness-claude-native:open",
+    );
+    // The link keeps the name its content gives it: no name of its own is added.
+    expect(card("claude-native")).not.toHaveAttribute("aria-label");
+    expect(screen.getByRole("button", { name: "Claude Code settings" })).toHaveAttribute(
+      "data-settings-control",
+      "harness-claude-native:settings",
+    );
+    expect(screen.getByRole("button", { name: "Set up Codex" })).toHaveAttribute(
+      "data-settings-control",
+      "harness-codex-native:setUp",
+    );
+  });
+});
+
 describe("Harness card navigation", () => {
   const selected = (name: string) =>
     screen.getByRole("tab", { name }).getAttribute("aria-selected");
