@@ -416,12 +416,18 @@ def create_workflows_router(
         return runs
 
     def _link_runs(
-        journal: SessionJournalStore, runs: list[WorkflowRun], user_id: str | None
+        journal: SessionJournalStore,
+        runs: list[WorkflowRun],
+        plans: Sequence[JournalEntry],
+        user_id: str | None,
     ) -> list[WorkflowRun]:
         """Add who started each run and the workflow runs below it.
 
         The sessions a run's session starts join its family, so one family read
-        finds them; a creator label records which session started each one.
+        finds them, and a creator label records which session started each one.
+        Each of those sessions adds the workflow run it began with.
+
+        :param plans: The plans that started *runs*, among others.
         """
         sessions = conversation_store.get_conversations([run.session_id for run in runs])
         families = conversation_store.get_session_families(
@@ -435,28 +441,27 @@ def create_workflows_router(
                 started.setdefault(starter, []).append(member)
         for members in started.values():
             members.sort(key=lambda member: (member.created_at, member.id))
-        # The session's next run ends this one, so an automation that reuses its
-        # session lists each run's sessions under that run only.
-        starts: dict[str, list[int]] = {}
-        for plan in journal.list_session_workflow_runs(list(sessions)):
-            starts.setdefault(plan.conversation_id, []).append(plan.created_at)
+        # A run ends when its session begins its next run, so an automation that
+        # reuses its session lists each run's sessions under that run only.
+        by_id = {plan.id: plan for plan in plans}
+        ends = journal.next_run_starts([by_id[run.id] for run in runs])
         below: dict[str, list[str]] = {}
-        for run in runs:
-            end = min(
-                (at for at in starts.get(run.session_id, ()) if at > run.started_at), default=None
-            )
+        for run, end in zip(runs, ends, strict=True):
             direct = [
                 member
                 for member in started.get(run.session_id, ())
                 if member.created_at >= run.started_at and (end is None or member.created_at < end)
             ]
             below[run.id] = _sessions_below(direct, started)
-        descendant_plans = journal.list_session_workflow_runs(
+        first_runs = journal.first_workflow_runs(
             list(dict.fromkeys(session_id for ids in below.values() for session_id in ids))
         )
-        runs_by_session: dict[str, list[WorkflowRun]] = {}
-        for descendant in _runs(journal, descendant_plans, user_id) if descendant_plans else ():
-            runs_by_session.setdefault(descendant.session_id, []).append(descendant)
+        descendants = {
+            descendant.session_id: descendant
+            for descendant in (
+                _runs(journal, list(first_runs.values()), user_id) if first_runs else ()
+            )
+        }
         starter_ids = {
             starter
             for member in known.values()
@@ -480,13 +485,20 @@ def create_workflows_router(
         for run in runs:
             run.started_by = started_by(run.session_id)
             run.descendant_runs = [
-                descendant
+                descendants[session_id]
                 for session_id in below[run.id]
-                for descendant in runs_by_session.get(session_id, ())
+                if session_id in descendants
             ]
             for descendant in run.descendant_runs:
                 descendant.started_by = started_by(descendant.session_id)
         return runs
+
+    def _readable_session(user_id: str | None, session_id: str) -> Conversation | None:
+        try:
+            session = conversation_store.get_conversation(uuid_to_bytes(session_id).hex())
+        except InvalidUuidError:
+            return None
+        return session if session is not None and _readable(user_id, session) else None
 
     @router.get("/workflows/{workflow_id}/runs", response_model=WorkflowRunList)
     async def list_workflow_runs(
@@ -504,9 +516,9 @@ def create_workflows_router(
 
         :param limit: Page size, e.g. ``20``.
         :param before: The previous page's ``next_cursor``.
-        :param session_id: Only that session's runs, e.g. for its Tasks tab. Read
-            access to the session stands in for owning the workflow, so people
-            the session is shared with see them too.
+        :param session_id: Only that session's current run, when it follows this
+            workflow, e.g. for its Tasks tab. Read access to the session stands
+            in for owning the workflow, so people it is shared with see it too.
         :raises OmnigentError: 401 if unauthenticated in multi-user mode, 404 if
             the caller has no such workflow or can't read the session, 400 for
             an invalid cursor.
@@ -515,38 +527,36 @@ def create_workflows_router(
         from omnigent.server.session_journal import open_store as open_journal_store
 
         user_id = require_user(request, auth_provider)
-        conversation_id = None
-        if session_id is None:
+        journal = open_journal_store(conversation_store)
+        next_cursor = None
+        if session_id is not None:
+            session = await asyncio.to_thread(_readable_session, user_id, session_id)
+            if session is None:
+                raise _not_found()
+            if journal is None:
+                return WorkflowRunList()
+            plan = await asyncio.to_thread(journal.current_workflow_run, session.id)
+            wanted = normalize_uuid(workflow_id)
+            plans = [plan] if plan is not None and plan.workflow_id == wanted else []
+        else:
             workflow = await asyncio.to_thread(_store().get, workflow_id, user_id=user_id)
             if workflow is None:
                 raise _not_found()
-            workflow_id = workflow.id
-        else:
+            if journal is None:
+                return WorkflowRunList()
             try:
-                conversation_id = uuid_to_bytes(session_id).hex()
-            except InvalidUuidError:
-                raise _not_found() from None
-            session = await asyncio.to_thread(conversation_store.get_conversation, conversation_id)
-            if session is None or not await asyncio.to_thread(_readable, user_id, session):
-                raise _not_found()
-        journal = open_journal_store(conversation_store)
-        if journal is None:
-            return WorkflowRunList()
-        try:
-            page = await asyncio.to_thread(
-                journal.list_workflow_runs,
-                workflow_id,
-                limit=limit,
-                before=before,
-                conversation_id=conversation_id,
-            )
-        except ValueError as exc:
-            raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+                page = await asyncio.to_thread(
+                    journal.list_workflow_runs, workflow.id, limit=limit, before=before
+                )
+            except ValueError as exc:
+                raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+            plans, next_cursor = page.plans, page.next_cursor
 
-        def runs() -> list[WorkflowRun]:
-            listed = _runs(journal, page.plans, user_id)
-            return _link_runs(journal, listed, user_id) if listed else listed
+        def runs(store: SessionJournalStore) -> list[WorkflowRun]:
+            listed = _runs(store, plans, user_id)
+            return _link_runs(store, listed, plans, user_id) if listed else listed
 
-        return WorkflowRunList(data=await asyncio.to_thread(runs), next_cursor=page.next_cursor)
+        data = await asyncio.to_thread(runs, journal)
+        return WorkflowRunList(data=data, next_cursor=next_cursor)
 
     return router

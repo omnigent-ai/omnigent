@@ -303,6 +303,26 @@ class SessionJournalStore:
         ).scalar_one_or_none()
 
     @staticmethod
+    def _oldest_kind_row(
+        session: Session, conversation_id: str, kind: int, *, after_position: int | None = None
+    ) -> SqlSessionJournalEntry | None:
+        statement = (
+            select(SqlSessionJournalEntry)
+            .where(
+                SqlSessionJournalEntry.workspace_id == current_workspace_id(),
+                SqlSessionJournalEntry.conversation_id == conversation_id,
+                SqlSessionJournalEntry.kind == kind,
+            )
+            .order_by(SqlSessionJournalEntry.position)
+            .limit(1)
+        )
+        if after_position is not None:
+            statement = statement.where(SqlSessionJournalEntry.position > after_position)
+        return session.execute(
+            _using(statement, "ix_session_journal_entries_kind")
+        ).scalar_one_or_none()
+
+    @staticmethod
     def _default_step(steps: list[dict[str, Any]] | None) -> str:
         """The step a status names when it names none: the only step of a one-step plan.
 
@@ -837,12 +857,7 @@ class SessionJournalStore:
             return boundary is None or plan.position > boundary.position
 
     def list_workflow_runs(
-        self,
-        workflow_id: str,
-        *,
-        limit: int = 20,
-        before: str | None = None,
-        conversation_id: str | None = None,
+        self, workflow_id: str, *, limit: int = 20, before: str | None = None
     ) -> WorkflowRunPage:
         """A saved workflow's runs in every session, newest first.
 
@@ -853,7 +868,6 @@ class SessionJournalStore:
         :param limit: Page size, 1 to
             :data:`~omnigent.entities.session_journal.JOURNAL_PAGE_MAX`.
         :param before: The previous page's ``next_cursor``.
-        :param conversation_id: Only this session's runs, e.g. for its Tasks tab.
         :raises ValueError: If an argument is invalid.
         """
         if not 1 <= limit <= JOURNAL_PAGE_MAX:
@@ -863,19 +877,13 @@ class SessionJournalStore:
         except InvalidUuidError as exc:
             raise ValueError("workflow_id must be a workflow ID") from exc
         entries = SqlSessionJournalEntry
-        conditions = [
-            entries.workspace_id == current_workspace_id(),
-            entries.workflow_id == workflow,
-            entries.kind == _PLAN_KIND,
-        ]
-        # One session holds few plans, so its kind index beats scanning every run.
-        index = "ix_session_journal_entries_workflow"
-        if conversation_id is not None:
-            conditions.append(entries.conversation_id == conversation_id)
-            index = "ix_session_journal_entries_kind"
         stmt = (
             select(entries)
-            .where(*conditions)
+            .where(
+                entries.workspace_id == current_workspace_id(),
+                entries.workflow_id == workflow,
+                entries.kind == _PLAN_KIND,
+            )
             .order_by(
                 entries.created_at.desc(), entries.conversation_id.desc(), entries.position.desc()
             )
@@ -901,7 +909,10 @@ class SessionJournalStore:
             for candidate_range in ranges:
                 rows.extend(
                     session.execute(
-                        _using(candidate_range.limit(limit + 1 - len(rows)), index)
+                        _using(
+                            candidate_range.limit(limit + 1 - len(rows)),
+                            "ix_session_journal_entries_workflow",
+                        )
                     ).scalars()
                 )
                 if len(rows) > limit:
@@ -911,34 +922,59 @@ class SessionJournalStore:
             plans=plans, next_cursor=_run_cursor(plans[-1]) if len(rows) > limit else None
         )
 
-    def list_session_workflow_runs(self, conversation_ids: Sequence[str]) -> list[JournalEntry]:
-        """Every saved-workflow run in these sessions, in journal order.
+    def next_run_starts(self, plans: Sequence[JournalEntry]) -> list[int | None]:
+        """When each plan's session began its next run, if it has.
 
-        A run is a plan that named a workflow, as in :meth:`list_workflow_runs`.
+        One single-row index read per plan, e.g. for a page of workflow runs.
+
+        :param plans: Plans that started runs.
+        :returns: Unix epoch seconds of the first run boundary after each plan,
+            in order, or ``None`` while the plan's run is its session's latest.
+        """
+        with self._session("read_next_run_starts") as session:
+            boundaries = [
+                self._oldest_kind_row(
+                    session, plan.conversation_id, _PLAN_STATUS_KIND, after_position=plan.position
+                )
+                for plan in plans
+            ]
+        return [None if boundary is None else boundary.created_at for boundary in boundaries]
+
+    def first_workflow_runs(self, conversation_ids: Sequence[str]) -> dict[str, JournalEntry]:
+        """The workflow run each session began with: its first plan, if that named a workflow.
+
+        One single-row index read per session.
 
         :param conversation_ids: The sessions, e.g. those a run's session started.
-        :returns: Their runs, grouped by session in the order given.
+        :returns: Each such session's first plan, by session ID.
         """
-        entries = SqlSessionJournalEntry
-        rows: list[SqlSessionJournalEntry] = []
-        with self._session("list_session_workflow_runs") as session:
-            for batch in batched(dict.fromkeys(conversation_ids), JOURNAL_DELETE_BATCH):
-                rows.extend(
-                    session.execute(
-                        _using(
-                            select(entries).where(
-                                entries.workspace_id == current_workspace_id(),
-                                entries.conversation_id.in_(batch),
-                                entries.kind == _PLAN_KIND,
-                                entries.workflow_id.is_not(None),
-                            ),
-                            "ix_session_journal_entries_kind",
-                        )
-                    ).scalars()
-                )
-        order = {conversation_id: index for index, conversation_id in enumerate(conversation_ids)}
-        rows.sort(key=lambda row: (order[row.conversation_id], row.position))
-        return self._entries(rows)
+        with self._session("read_first_workflow_runs") as session:
+            rows = [
+                row
+                for conversation_id in dict.fromkeys(conversation_ids)
+                if (row := self._oldest_kind_row(session, conversation_id, _PLAN_KIND)) is not None
+                and row.workflow_id is not None
+            ]
+        return {entry.conversation_id: entry for entry in self._entries(rows)}
+
+    def current_workflow_run(self, conversation_id: str) -> JournalEntry | None:
+        """The plan that began the session's current run, if that run follows a saved workflow.
+
+        Reads the newest run boundary, then the first plan after it.
+
+        :param conversation_id: The session, e.g. one whose Tasks tab is open.
+        """
+        with self._session("read_current_workflow_run") as session:
+            boundary = self._newest_kind_row(session, conversation_id, _PLAN_STATUS_KIND)
+            row = self._oldest_kind_row(
+                session,
+                conversation_id,
+                _PLAN_KIND,
+                after_position=None if boundary is None else boundary.position,
+            )
+        if row is None or row.workflow_id is None:
+            return None
+        return self._entries([row])[0]
 
     def run_start_plans(self, runs: Sequence[tuple[str, str]]) -> list[JournalEntry | None]:
         """Each automation run's first plan: the one it started with.

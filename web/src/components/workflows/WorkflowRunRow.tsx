@@ -52,7 +52,7 @@ export function WorkflowRunRow({
   now,
   workflowId,
   workflowName,
-  openWorkflow = false,
+  owned = true,
   parentSessionId,
 }: {
   run: WorkflowRun;
@@ -61,8 +61,11 @@ export function WorkflowRunRow({
   workflowId: string;
   /** The name of the run's workflow, or null when you can't see it. */
   workflowName: string | null;
-  /** Whether the row offers to open the run's workflow, which only its owner can. */
-  openWorkflow?: boolean;
+  /**
+   * Whether you own the run's workflow, and so the run: only then can a row
+   * below another run open that workflow or act on the run.
+   */
+  owned?: boolean;
   /** For a run listed below another, that run's session, whose runs need no "Started by". */
   parentSessionId?: string;
 }) {
@@ -72,12 +75,17 @@ export function WorkflowRunRow({
   );
   const state = describeWorkflowRun(run, sessionWorking);
   const progress = useMemo(() => runStepProgress(run, sessionWorking), [run, sessionWorking]);
+  const nested = parentSessionId !== undefined;
   // Stop while the run's session works; play once it stopped with tasks left.
-  const canAct = run.isCurrent && !run.archived;
+  const canAct = run.isCurrent && !run.archived && owned;
   const control = canAct
     ? planRunControl(progress, run.statuses, sessionWorking, run.planGraphRevision)
     : null;
-  const refreshKeys = [["workflow-runs", workflowId]];
+  // An action refreshes the list showing the row, and the run's own workflow's.
+  const refreshKeys = [
+    ["workflow-runs", workflowId],
+    ...(run.workflowId && run.workflowId !== workflowId ? [["workflow-runs", run.workflowId]] : []),
+  ];
   const taskMenus = useRunTaskMenus(canAct ? run.sessionId : null, refreshKeys, run.id);
   const [graphOpen, setGraphOpen] = useState(false);
   const sessionPath = `/c/${encodeURIComponent(run.sessionId)}`;
@@ -124,7 +132,7 @@ export function WorkflowRunRow({
               className="mt-3 pr-1"
             />
           )}
-          {parentSessionId === undefined && !!run.descendantRuns?.length && (
+          {!nested && !!run.descendantRuns?.length && (
             <DescendantRuns run={run} now={now} workflowId={workflowId} className="mt-3" />
           )}
         </div>
@@ -138,7 +146,7 @@ export function WorkflowRunRow({
             className="relative -my-1"
           />
         )}
-        {openWorkflow && run.workflowId && <RunWorkflowButton workflowId={run.workflowId} />}
+        {nested && owned && run.workflowId && <RunWorkflowButton workflowId={run.workflowId} />}
         <RunGraphButton
           runName={title}
           className="relative -my-1"
@@ -242,7 +250,7 @@ export function DescendantRuns({
                 now={now}
                 workflowId={workflowId}
                 workflowName={own?.name ?? null}
-                openWorkflow={own !== undefined}
+                owned={own !== undefined}
                 parentSessionId={run.sessionId}
               />
             );
@@ -275,7 +283,7 @@ export function SessionDescendantRuns({
       className="mt-2 border-t border-border px-2 pt-3"
       data-testid="tasks-descendant-runs"
     >
-      <DescendantRuns run={run} now={now} workflowId={workflowId} />
+      <DescendantRuns key={run.id} run={run} now={now} workflowId={workflowId} />
     </section>
   );
 }

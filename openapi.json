@@ -27112,7 +27112,7 @@
             }
           },
           {
-            "description": "Only that session's runs, e.g. for its Tasks tab. Read access to the session stands in for owning the workflow, so people the session is shared with see them too.",
+            "description": "Only that session's current run, when it follows this workflow, e.g. for its Tasks tab. Read access to the session stands in for owning the workflow, so people it is shared with see it too.",
             "in": "query",
             "name": "session_id",
             "required": false,

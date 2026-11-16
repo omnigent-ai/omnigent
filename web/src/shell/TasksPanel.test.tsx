@@ -363,11 +363,20 @@ describe("TasksPanel", () => {
       pagination: { hasMore: false, loadingMore: false, loadMore: vi.fn() },
     });
     const renderWorkflowRuns = vi.fn((id: string) => <p data-testid="workflow-runs-slot">{id}</p>);
-    const renderTasks = () =>
-      render(<TasksPanel conversationId="conv" active renderWorkflowRuns={renderWorkflowRuns} />, {
-        wrapper: ({ children }) => <MemoryRouter>{children}</MemoryRouter>,
-      });
+    const renderTasks = (active = true) =>
+      render(
+        <TasksPanel
+          conversationId="conv"
+          active={active}
+          renderWorkflowRuns={renderWorkflowRuns}
+        />,
+        { wrapper: ({ children }) => <MemoryRouter>{children}</MemoryRouter> },
+      );
     showJournal([{ ...journalPlan(0, ["explore"]), workflow_id: workflowId }]);
+    // A hidden panel leaves the runs out, so their list doesn't keep refreshing.
+    renderTasks(false);
+    expect(renderWorkflowRuns).not.toHaveBeenCalled();
+    cleanup();
     renderTasks();
     const slot = screen.getByTestId("workflow-runs-slot");
     expect(slot).toHaveTextContent(workflowId);

@@ -762,12 +762,12 @@ describe("WorkflowDetailPage", () => {
         sessionStatus: "running",
         descendantRuns: [
           {
-            ...run(ready, "Ready #1", {}),
+            ...run(ready, "Ready #1", { done: 1 }, [status("explore", "done")]),
             workflowId: calledId,
             startedBy: { sessionId: root, title: "Land stack" },
           },
           {
-            ...run("d".repeat(32), "Fix flaky test", {}),
+            ...run("d".repeat(32), "Fix flaky test", { done: 1 }, [status("explore", "done")]),
             workflowId: "e".repeat(32),
             startedBy: { sessionId: ready, title: "" },
           },
@@ -793,7 +793,8 @@ describe("WorkflowDetailPage", () => {
       "Ready #1",
       "Fix flaky test",
     ]);
-    // Only a run further down says who started it, and only your workflow opens.
+    // Only a run further down says who started it; only a run of your workflow
+    // opens that workflow or takes actions.
     expect(within(rows[0]!).queryByTestId("workflow-run-started-by")).toBeNull();
     const startedBy = within(rows[1]!).getByTestId("workflow-run-started-by");
     expect(startedBy).toHaveTextContent("Started by Untitled session");
@@ -803,6 +804,8 @@ describe("WorkflowDetailPage", () => {
       `/workflows/${calledId}`,
     );
     expect(within(rows[1]!).queryByTestId("run-workflow-button")).toBeNull();
+    expect(within(rows[0]!).getByRole("button", { name: "Continue the plan" })).toBeInTheDocument();
+    expect(within(rows[1]!).queryByRole("button", { name: "Continue the plan" })).toBeNull();
 
     fireEvent.click(earlier!);
     expect(earlier).toHaveAttribute("aria-expanded", "true");

@@ -1161,7 +1161,8 @@ export function TasksPanel({
   onShowInChat?: () => void;
   /**
    * The workflow runs below the session's run of its plan's workflow, shown
-   * after the tasks. Passed in because those rows are built from this panel's parts.
+   * after the tasks while the panel is active. Passed in because those rows
+   * are built from this panel's parts.
    */
   renderWorkflowRuns?: (workflowId: string) => ReactNode;
 }) {
@@ -1330,7 +1331,7 @@ export function TasksPanel({
               menuActionFor={menuActionFor}
               nativeMarkerIds={nativeMarkerIds}
             />
-            {workflowId && renderWorkflowRuns?.(workflowId)}
+            {active && workflowId && renderWorkflowRuns?.(workflowId)}
           </>
         )}
       </div>

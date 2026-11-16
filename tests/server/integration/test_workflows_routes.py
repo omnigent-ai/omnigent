@@ -18,7 +18,10 @@ from omnigent.entities.session_journal import JournalEntryTooLargeError
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.server.auth import LEVEL_READ
 from omnigent.server.feature_flags import resolve_feature_flags
-from omnigent.stores.conversation_store import CREATED_BY_SESSION_LABEL_KEY
+from omnigent.stores.conversation_store import (
+    CREATED_BY_SESSION_LABEL_KEY,
+    SCHEDULED_TASK_RUN_LABEL_KEY,
+)
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from omnigent.stores.session_journal_store import SessionJournalStore
@@ -564,68 +567,93 @@ async def test_runs_list_the_workflow_runs_their_sessions_started(
     unrun = start(root, "Plain worker", 125)
     second = start(root, "Ready #2", 130)
     await _run(client, second, ready, "ready-2")
+    # A session's later runs aren't what its starter began it for.
+    clock[0] = 140
+    await _run(client, first, ready, "ready-1-again")
+    # An automation's next occurrence starts a run without naming a workflow.
     clock[0] = 200
-    await _run(client, root, stack, "second-run")
-    later = start(root, "Ready #3", 210)
-    await _run(client, later, ready, "ready-3")
+    conversations.set_labels(root, {SCHEDULED_TASK_RUN_LABEL_KEY: "next-occurrence"})
+    noted = await client.post(
+        f"/v1/sessions/{root}/journal",
+        json=_write("note", {"body": "Next occurrence"}, "next-occurrence"),
+        headers=_runner(root),
+    )
+    assert noted.status_code == 200, noted.text
+    start(root, "Ready #3", 210)
 
     url = f"/v1/workflows/{stack['id']}/runs"
-    newer, older = (await client.get(url, headers=_headers())).json()["data"]
-    # Each run below another follows the session that started it, and a session's
-    # next run ends the runs that count as its earlier run's.
-    assert [run["title"] for run in older["descendant_runs"]] == [
+    (run,) = (await client.get(url, headers=_headers())).json()["data"]
+    # Each run below another follows the session that started it, and the
+    # session's next run, named or not, ends the sessions that count as its own.
+    assert [below["title"] for below in run["descendant_runs"]] == [
         "Ready #1",
         "Ready #1 fix",
         "Ready #2",
     ]
-    assert [run["session_id"] for run in newer["descendant_runs"]] == [later]
-    assert unrun not in {run["session_id"] for run in older["descendant_runs"]}
-    assert older["started_by"] is None and older["workflow_id"] == stack["id"]
-    assert [run["started_by"] for run in older["descendant_runs"]] == [
+    assert len(run["descendant_runs"]) == 3 and unrun not in {
+        below["session_id"] for below in run["descendant_runs"]
+    }
+    assert run["started_by"] is None and run["workflow_id"] == stack["id"]
+    assert [below["started_by"] for below in run["descendant_runs"]] == [
         {"session_id": root, "title": "Land stack"},
         {"session_id": first, "title": "Ready #1"},
         {"session_id": root, "title": "Land stack"},
     ]
     assert all(
-        run["workflow_id"] == ready["id"] and run["descendant_runs"] == []
-        for run in older["descendant_runs"]
+        below["workflow_id"] == ready["id"] and below["descendant_runs"] == []
+        for below in run["descendant_runs"]
     )
 
     # The called workflow's runs name who started them and list the runs below them.
     called = (await client.get(f"/v1/workflows/{ready['id']}/runs", headers=_headers())).json()
-    by_session = {run["session_id"]: run for run in called["data"]}
-    assert by_session[first]["started_by"] == {"session_id": root, "title": "Land stack"}
-    assert [run["session_id"] for run in by_session[first]["descendant_runs"]] == [deeper]
+    first_runs = [run for run in called["data"] if run["session_id"] == first]
+    again, original = first_runs
+    assert original["started_by"] == {"session_id": root, "title": "Land stack"}
+    assert [below["session_id"] for below in original["descendant_runs"]] == [deeper]
+    assert again["descendant_runs"] == []
 
-    # A session can't be read by someone it isn't shared with, so it names no starter.
-    SqlAlchemyPermissionStore(db_uri).grant(BOB, first, LEVEL_READ)
+    # Someone the session is shared with can't read its starter or the runs below it.
+    SqlAlchemyPermissionStore(db_uri).grant(BOB, second, LEVEL_READ)
     shared = await client.get(
-        f"/v1/workflows/{ready['id']}/runs", params={"session_id": first}, headers=_headers(BOB)
+        f"/v1/workflows/{ready['id']}/runs", params={"session_id": second}, headers=_headers(BOB)
     )
     assert shared.status_code == 200, shared.text
-    (run,) = shared.json()["data"]
-    assert run["session_id"] == first and run["started_by"] is None
-    assert run["descendant_runs"] == []
+    (viewed,) = shared.json()["data"]
+    assert viewed["session_id"] == second and viewed["started_by"] is None
 
 
-async def test_a_session_filter_lists_its_runs_for_anyone_who_can_read_it(
+async def test_a_session_filter_lists_its_current_run_for_anyone_who_can_read_it(
     client: httpx.AsyncClient, db_uri: str
 ) -> None:
     stack = await _save_workflow(client, "Land a stack")
+    other = await _save_workflow(client, "Ready a PR")
     shared = _session(db_uri, title="Shared")
     await _run(client, shared, stack, "shared-run")
+    await _run(client, shared, stack, "shared-run-again")
+    moved_on = _session(db_uri, title="Moved on")
+    await _run(client, moved_on, stack, "moved-on-run")
+    await _run(client, moved_on, other, "other-run")
     private = _session(db_uri, title="Private")
     await _run(client, private, stack, "private-run")
     SqlAlchemyPermissionStore(db_uri).grant(BOB, shared, LEVEL_READ)
     url = f"/v1/workflows/{stack['id']}/runs"
 
-    own = await client.get(url, params={"session_id": shared}, headers=_headers())
-    assert [run["session_id"] for run in own.json()["data"]] == [shared]
-    # Bob doesn't own the workflow, so only the session he can read lists its runs.
+    def run_ids(response: httpx.Response) -> list[str]:
+        assert response.status_code == 200, response.text
+        return [run["id"] for run in response.json()["data"]]
+
+    listed = (await client.get(url, headers=_headers())).json()["data"]
+    # Runs in one session list newest first; the newer one is the session's current run.
+    current = next(run["id"] for run in listed if run["session_id"] == shared)
+    own = run_ids(await client.get(url, params={"session_id": shared}, headers=_headers()))
+    assert own == [current]
+    moved = await client.get(url, params={"session_id": moved_on}, headers=_headers())
+    assert run_ids(moved) == []
+    # Bob doesn't own the workflow, so only the session he can read lists its run.
     assert (await client.get(url, headers=_headers(BOB))).status_code == 404
-    viewer = await client.get(url, params={"session_id": shared}, headers=_headers(BOB))
-    assert viewer.status_code == 200, viewer.text
-    assert [run["session_id"] for run in viewer.json()["data"]] == [shared]
+    assert (
+        run_ids(await client.get(url, params={"session_id": shared}, headers=_headers(BOB))) == own
+    )
     for session_id in (private, uuid4().hex, "not-a-session"):
         refused = await client.get(url, params={"session_id": session_id}, headers=_headers(BOB))
         assert refused.status_code == 404, session_id
