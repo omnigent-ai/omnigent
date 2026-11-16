@@ -435,6 +435,7 @@ class PersistentTaskScheduler:
         batch_size: int = DEFAULT_SCHEDULER_CONFIG.batch_size,
         max_startups: int = DEFAULT_SCHEDULER_CONFIG.max_startups,
         recovery_seconds: float = DEFAULT_SCHEDULER_CONFIG.recovery_seconds,
+        trigger_poll_seconds: int = TRIGGER_POLL_SECONDS,
     ) -> None:
         config = ScheduledTaskSchedulerConfig(
             poll_seconds=poll_seconds,
@@ -446,7 +447,7 @@ class PersistentTaskScheduler:
         )
         store.check_dispatch_support()
         store.configure_dispatch(True)
-        store.configure_trigger_polling(TRIGGER_POLL_SECONDS if busy_until is not None else None)
+        store.configure_trigger_polling(trigger_poll_seconds if busy_until is not None else None)
         self._store = store
         self._on_fire = on_fire
         self._on_expired = on_expired
@@ -454,6 +455,7 @@ class PersistentTaskScheduler:
         self._dispatch_enabled = dispatch_enabled
         self._poll_interval = poll_interval
         self._busy_until = busy_until
+        self._trigger_poll_seconds = trigger_poll_seconds
         self._now = now
         self._poll_seconds = config.poll_seconds
         self._renewal_seconds = config.renewal_seconds
@@ -665,12 +667,12 @@ class PersistentTaskScheduler:
     async def _next_occurrence(self, task: ScheduledTask, now: int) -> int | None:
         """The saved schedule's next occurrence, or sooner for a trigger the server can check.
 
-        A trigger polls every ``TRIGGER_POLL_SECONDS`` but never past its saved schedule's
+        A trigger polls every ``trigger_poll_seconds`` but never past its saved schedule's
         next occurrence, so a schedule that ends (``COUNT`` or ``UNTIL``) still ends it.
         """
         occurrence = await asyncio.to_thread(next_scheduled_time, task, now)
         if occurrence is not None and self._busy_until is not None and is_trigger_automation(task):
-            return min(occurrence, now + TRIGGER_POLL_SECONDS)
+            return min(occurrence, now + self._trigger_poll_seconds)
         return occurrence
 
     async def _skip_busy_occurrence(self, task: ScheduledTask, *, now: int, next_run: int) -> bool:

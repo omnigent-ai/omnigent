@@ -314,12 +314,14 @@ async def test_dispatch_hooks_pass_the_live_switch_and_interval_to_the_scheduler
         dispatch=ScheduledTaskDispatchHooks(
             dispatch_enabled=dispatch_enabled, poll_interval=poll_interval
         ),
+        server_config={"automation_trigger_poll_minutes": 30},
     )
     async with app.router.lifespan_context(app):
         scheduler = app.state.scheduled_task_scheduler
         assert isinstance(scheduler, PersistentTaskScheduler)
         assert scheduler._dispatch_enabled is dispatch_enabled
         assert scheduler._poll_interval is poll_interval
+        assert scheduler._trigger_poll_seconds == 30 * 60
 
 
 @pytest.mark.parametrize("features", ["-automations_v2", "automations_v2,-automations_v2"])

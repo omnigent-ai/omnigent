@@ -2376,6 +2376,8 @@ def create_app(
                     batch_size=dispatch_config.batch_size,
                     max_startups=dispatch_config.max_startups,
                     recovery_seconds=dispatch_config.recovery_seconds,
+                    # Poll at the advertised interval, which the form saves as the schedule.
+                    trigger_poll_seconds=trigger_poll_minutes * 60,
                 )
             app_inst.state.scheduled_task_scheduler = None
 

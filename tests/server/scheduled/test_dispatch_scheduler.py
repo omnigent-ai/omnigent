@@ -2622,8 +2622,43 @@ async def test_trigger_automations_poll_every_two_minutes_whatever_their_schedul
     assert store.get(task.id).next_run_at == task.next_run_at + TRIGGER_POLL_SECONDS
 
 
-async def test_an_uninitialized_trigger_automation_polls_within_two_minutes(
-    store, monkeypatch
+async def test_a_trigger_polls_at_the_configured_interval(store) -> None:
+    task = _task(store, rrule="FREQ=HOURLY", prompt=_TRIGGER_PROMPT, session_mode="continue")
+    clock = FakeClock(task.next_run_at)
+    scheduler = PersistentTaskScheduler(
+        store,
+        AsyncMock(),
+        AsyncMock(return_value=None),
+        now=clock.now,
+        busy_until=AsyncMock(return_value=None),
+        trigger_poll_seconds=600,
+    )
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    assert store.get(task.id).next_run_at == task.next_run_at + 600
+
+
+async def test_a_trigger_saved_with_a_shorter_schedule_keeps_it(store) -> None:
+    task = _task(
+        store, rrule="FREQ=MINUTELY;INTERVAL=10", prompt=_TRIGGER_PROMPT, session_mode="continue"
+    )
+    clock = FakeClock(task.next_run_at)
+    scheduler = PersistentTaskScheduler(
+        store,
+        AsyncMock(),
+        AsyncMock(return_value=None),
+        now=clock.now,
+        busy_until=AsyncMock(return_value=None),
+        trigger_poll_seconds=3600,
+    )
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    assert store.get(task.id).next_run_at == task.next_run_at + 600
+
+
+@pytest.mark.parametrize("interval", [TRIGGER_POLL_SECONDS, 600], ids=["default", "configured"])
+async def test_an_uninitialized_trigger_automation_polls_one_interval_out(
+    store, monkeypatch, interval
 ) -> None:
     from omnigent.stores.scheduled_task_store import sqlalchemy_store
 
@@ -2639,10 +2674,11 @@ async def test_an_uninitialized_trigger_automation_polls_within_two_minutes(
         AsyncMock(return_value=None),
         now=clock.now,
         busy_until=AsyncMock(return_value=None),
+        trigger_poll_seconds=interval,
     )
     await scheduler.poll_once()
     await _drain(scheduler)
-    assert store.get(task.id).next_run_at == task.created_at + TRIGGER_POLL_SECONDS
+    assert store.get(task.id).next_run_at == task.created_at + interval
 
 
 @pytest.mark.parametrize("busy_check", [True, False], ids=["busy-check", "no-busy-check"])
