@@ -34,8 +34,12 @@ function createSshHostStore(filePath) {
     record(serverTarget, hostId, destination) {
       const current = load();
       current[serverTarget] = { ...current[serverTarget], [hostId]: destination };
-      fs.mkdirSync(path.dirname(filePath()), { recursive: true });
-      fs.writeFileSync(filePath(), JSON.stringify(current, null, 2), { mode: 0o600 });
+      const file = filePath();
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      // Write a new file and rename it over the old one, so a crash can't truncate the record.
+      const temp = `${file}.${process.pid}.tmp`;
+      fs.writeFileSync(temp, JSON.stringify(current, null, 2), { mode: 0o600 });
+      fs.renameSync(temp, file);
     },
 
     /** The recorded destination for `hostId` on `serverTarget`, or null. */

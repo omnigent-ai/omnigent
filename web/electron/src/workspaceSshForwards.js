@@ -30,10 +30,12 @@ function createWorkspaceSshForwards(deps = {}) {
   /** @type {Map<string, {dir: string, session: any, ready: Promise<void>, forwards: Map<string, Promise<string>>, count: number, timer: any}>} */
   const connections = new Map();
 
-  /** Close `destination`'s connection; the next call opens a new one. */
-  function close(destination) {
-    const connection = connections.get(destination);
-    if (!connection) return;
+  /**
+   * End `connection` if it is still `destination`'s current one, so a failure from
+   * an older connection can't close the one that replaced it.
+   */
+  function closeConnection(destination, connection) {
+    if (connections.get(destination) !== connection) return;
     connections.delete(destination);
     clearTimeout(connection.timer);
     void connection.session
@@ -61,14 +63,12 @@ function createWorkspaceSshForwards(deps = {}) {
         count: 0,
         timer: null,
       };
-      opened.ready.catch(() => {
-        if (connections.get(destination) === opened) close(destination);
-      });
+      opened.ready.catch(() => closeConnection(destination, opened));
       connections.set(destination, opened);
       connection = opened;
     }
     clearTimeout(connection.timer);
-    connection.timer = setTimeout(() => close(destination), idleMs);
+    connection.timer = setTimeout(() => closeConnection(destination, connection), idleMs);
     connection.timer.unref?.();
     return connection;
   }
@@ -78,11 +78,18 @@ function createWorkspaceSshForwards(deps = {}) {
    *
    * @param {string} destination A destination validated by `validateDestination`.
    * @param {string} remotePath The host's socket path on that machine.
-   * @returns {Promise<string>}
+   * @returns {Promise<{socketPath: string, dropConnection: () => void}>} `dropConnection`
+   *   ends the connection this socket rides on; it does nothing once that is replaced.
    */
   async function localSocket(destination, remotePath) {
     const connection = connect(destination);
+    const assertCurrent = () => {
+      if (connections.get(destination) !== connection) {
+        throw new Error(`the connection to ${destination} closed`);
+      }
+    };
     await connection.ready;
+    assertCurrent();
     let forward = connection.forwards.get(remotePath);
     if (!forward) {
       connection.count += 1;
@@ -93,20 +100,25 @@ function createWorkspaceSshForwards(deps = {}) {
         }
         return localPath;
       });
-      const pending = forward;
-      connection.forwards.set(remotePath, pending);
-      pending.catch(() => {
-        if (connection.forwards.get(remotePath) === pending) connection.forwards.delete(remotePath);
-      });
+      connection.forwards.set(remotePath, forward);
+      // A refused forward usually means the shared connection is gone, so drop it.
+      forward.catch(() => closeConnection(destination, connection));
     }
-    return forward;
+    const socketPath = await forward;
+    assertCurrent();
+    return { socketPath, dropConnection: () => closeConnection(destination, connection) };
   }
 
   return {
     localSocket,
-    close,
+    /** Synchronous, for quit: kills every shared connection and removes its directory now. */
     closeAll: () => {
-      for (const destination of [...connections.keys()]) close(destination);
+      for (const [destination, connection] of [...connections]) {
+        connections.delete(destination);
+        clearTimeout(connection.timer);
+        connection.session.abort();
+        fs.rmSync(connection.dir, { recursive: true, force: true });
+      }
     },
   };
 }

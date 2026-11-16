@@ -13,11 +13,17 @@ const METHOD = "/omnigent.api.workspace.v1alpha1.WorkspaceService/ReadFile";
 const REMOTE = "/tmp/omnigent-workspace-ab12_x/workspace.sock";
 const unix = process.platform !== "win32";
 
+/** The host's answer: echo the socket path and the authorization header. */
+function answer(remotePath, req, res) {
+  res.writeHead(200, { "content-type": "application/connect+proto" });
+  res.end(`${remotePath} ${req.headers.authorization}`);
+}
+
 /**
  * A stand-in for ssh's shared connection. A forward serves HTTP on the local
  * socket, as the remote host would through a real `ssh -L`.
  */
-function fakeSsh({ openError = null, forwardCode = 0 } = {}) {
+function fakeSsh({ openError = null, openGate = null, forwardCode = 0, respond = answer } = {}) {
   const sessions = [];
   const servers = [];
   const createSession = (options) => {
@@ -25,16 +31,15 @@ function fakeSsh({ openError = null, forwardCode = 0 } = {}) {
       options,
       forwards: [],
       closed: false,
+      aborted: false,
       open: async () => {
+        await openGate;
         if (openError) throw new Error(openError);
       },
       forwardSocket: async (localPath, remotePath) => {
         session.forwards.push([localPath, remotePath]);
         if (forwardCode !== 0) return { code: forwardCode };
-        const server = http.createServer((req, res) => {
-          res.writeHead(200, { "content-type": "application/connect+proto" });
-          res.end(`${remotePath} ${req.headers.authorization}`);
-        });
+        const server = http.createServer((req, res) => respond(remotePath, req, res));
         servers.push(server);
         await new Promise((resolve) => {
           server.listen(localPath, resolve);
@@ -43,6 +48,9 @@ function fakeSsh({ openError = null, forwardCode = 0 } = {}) {
       },
       close: async () => {
         session.closed = true;
+      },
+      abort: () => {
+        session.aborted = true;
       },
     };
     sessions.push(session);
@@ -147,6 +155,85 @@ describe("workspace calls over SSH", { skip: !unix && "needs Unix sockets" }, ()
     routes.forwards = forwards;
 
     await assert.rejects(call(routes), /couldn't forward the workspace socket on my-box/);
+    assert.equal(ssh.sessions[0].closed, true, "a refused forward drops its connection");
+  });
+
+  it("keeps the shared connection when one request fails on its own", async () => {
+    const oversized = "/tmp/omnigent-workspace-big/workspace.sock";
+    ssh = fakeSsh({
+      respond: (remotePath, req, res) => {
+        if (remotePath === oversized) res.end(Buffer.alloc(16 * 1024 * 1024 + 1));
+        else answer(remotePath, req, res);
+      },
+    });
+    forwards = createWorkspaceSshForwards({ createSession: ssh.createSession });
+    routes.forwards = forwards;
+
+    await assert.rejects(call(routes, { socketPath: oversized }), /too large/);
+    const response = await call(routes);
+
+    assert.equal(Buffer.from(response.body).toString(), `${REMOTE} Bearer t`);
+    assert.equal(ssh.sessions.length, 1);
+    assert.equal(ssh.sessions[0].closed, false);
+  });
+
+  it("drops the connection when a forwarded socket refuses, so the next read opens a new one", async () => {
+    const gone = "/tmp/omnigent-workspace-gone/workspace.sock";
+    ssh = fakeSsh({
+      respond: (remotePath, req, res) => {
+        if (remotePath === gone) req.socket.destroy();
+        else answer(remotePath, req, res);
+      },
+    });
+    forwards = createWorkspaceSshForwards({ createSession: ssh.createSession });
+    routes.forwards = forwards;
+
+    await assert.rejects(call(routes, { socketPath: gone }), { code: "ECONNRESET" });
+    assert.equal(ssh.sessions[0].closed, true);
+    const response = await call(routes);
+
+    assert.equal(Buffer.from(response.body).toString(), `${REMOTE} Bearer t`);
+    assert.equal(ssh.sessions.length, 2);
+  });
+
+  it("a late failure leaves the connection that replaced its own", async () => {
+    const stale = await forwards.localSocket("my-box", REMOTE);
+    stale.dropConnection();
+    await forwards.localSocket("my-box", REMOTE);
+
+    stale.dropConnection();
+
+    assert.equal(ssh.sessions[0].closed, true);
+    assert.equal(ssh.sessions[1].closed, false, "the replacement stays open");
+  });
+
+  it("doesn't forward through a connection closed while it was opening", async () => {
+    let openDone;
+    ssh = fakeSsh({
+      openGate: new Promise((resolve) => {
+        openDone = resolve;
+      }),
+    });
+    forwards = createWorkspaceSshForwards({ createSession: ssh.createSession });
+    routes.forwards = forwards;
+
+    const pending = call(routes);
+    forwards.closeAll();
+    openDone();
+
+    await assert.rejects(pending, /the connection to my-box closed/);
+    assert.equal(ssh.sessions[0].forwards.length, 0);
+  });
+
+  it("closeAll kills the connections and removes their directories at once", async () => {
+    await call(routes);
+    const [session] = ssh.sessions;
+    const directory = path.dirname(session.forwards[0][0]);
+
+    forwards.closeAll();
+
+    assert.equal(session.aborted, true);
+    assert.equal(fs.existsSync(directory), false);
   });
 
   it("closes an idle connection", async () => {

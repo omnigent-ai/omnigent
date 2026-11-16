@@ -26,6 +26,9 @@ const TIMEOUT_MS = 30_000;
 // characters `ssh -L` can carry, in the directory shape the host makes.
 const REMOTE_SOCKET_PATH =
   /^(\/[A-Za-z0-9._-]+)*\/omnigent-workspace-[A-Za-z0-9_]+\/workspace\.sock$/;
+// Errors meaning the local socket's forward or its SSH connection is gone, as
+// opposed to one request failing on its own (a timeout, an oversized response).
+const CONNECTION_ERROR_CODES = new Set(["ECONNREFUSED", "ENOENT", "ECONNRESET"]);
 
 /**
  * Whether `socketPath` is a workspace socket an Omnigent host made for this user.
@@ -94,12 +97,13 @@ function workspaceSocketRequest(request, routes = {}) {
   }
   return forwards
     .localSocket(destination, socketPath)
-    .then((local) => send(local, methodPath, forwarded, body))
-    .catch((error) => {
-      // The connection may be gone (network, sleep); the next read opens a new one.
-      forwards.close(destination);
-      throw error;
-    });
+    .then(({ socketPath: local, dropConnection }) =>
+      send(local, methodPath, forwarded, body).catch((error) => {
+        // A dead forward or connection is replaced by the next read; a failed request is not.
+        if (CONNECTION_ERROR_CODES.has(error?.code)) dropConnection();
+        throw error;
+      }),
+    );
 }
 
 function send(socketPath, methodPath, forwarded, body) {
