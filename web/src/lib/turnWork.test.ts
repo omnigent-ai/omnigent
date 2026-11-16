@@ -84,6 +84,33 @@ describe("collectTurnWork", () => {
     });
   });
 
+  it("reads a shell's exit code inside an MCP content array", () => {
+    const blocks = (...texts: string[]) =>
+      JSON.stringify(texts.map((text) => ({ type: "text", text })));
+    const failed = JSON.stringify({ stdout: "", stderr: "failed", exit_code: 2 });
+    const passed = JSON.stringify({ stdout: "a\nb\n", stderr: "", exit_code: 0 });
+    const piFailure = JSON.stringify({ content: [{ type: "text", text: "x" }], isError: true });
+    const work = collectTurnWork([
+      tool("fail", "mcp__omnigent__sys_os_shell", { command: "false" }, blocks(failed)),
+      tool("ok", "mcp__omnigent__sys_os_shell", { command: "ls" }, blocks(passed)),
+      tool("codex", "shell", { command: "false" }, blocks("boom", "[exit code: 1]")),
+      tool("text", "Bash", { command: "ls" }, blocks("a\nb\nc")),
+      tool("wrapped", "Bash", { command: "ls" }, JSON.stringify({ result: "a\nb" })),
+      // Only Pi's own top-level envelope flags a failure, not one a command printed.
+      tool("echo", "mcp__omnigent__sys_os_shell", { command: "echo" }, blocks('{"isError":true}')),
+      tool("pi", "mcp__omnigent__sys_os_shell", { command: "cat" }, blocks(piFailure)),
+    ]);
+    expect(work.queries).toMatchObject([
+      { status: "failed", error: "Exit 2", resultSize: null },
+      { status: "completed", error: null, resultSize: "2 lines" },
+      { status: "failed", error: "Exit 1", resultSize: null },
+      { status: "completed", error: null, resultSize: "3 lines" },
+      { status: "completed", error: null, resultSize: "2 lines" },
+      { status: "completed", error: null, resultSize: "1 line" },
+      { status: "completed", error: null, resultSize: "1 line" },
+    ]);
+  });
+
   it("reports a tool's own error output and no result size", () => {
     const work = collectTurnWork([
       tool("bad", "query", { sql: "SELECT * FROM missing" }, "Error: table not found"),

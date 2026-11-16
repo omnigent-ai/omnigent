@@ -204,7 +204,7 @@ function completedWithoutFailure(item: ToolCallItem): boolean {
 }
 
 interface RecordedResult {
-  /** The tool's own output text, out of any Pi envelope. */
+  /** The tool's own output text, out of any Pi envelope, MCP content array or result wrapper. */
   text: string;
   parsed: ParsedToolOutput;
   /** The reported failure, or `null` when the result reports none. */
@@ -237,7 +237,8 @@ function readResult(output: string): RecordedResult {
   }
   const envelope = record === null ? null : contentEnvelopeText(record);
   if (envelope === null) {
-    return { text: output, parsed: outer, failure: editErrorMessage(output), flagged: null };
+    // Unwrapped text, so a shell parser sees the structured result inside an MCP array.
+    return { text: outer.text, parsed: outer, failure: editErrorMessage(output), flagged: null };
   }
   const inner = parseToolOutput(envelope);
   return {
