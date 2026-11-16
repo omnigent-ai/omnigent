@@ -1742,3 +1742,30 @@ describe("HarnessFixDialog as a Settings overlay", () => {
     expect(footerClose).toHaveAttribute("data-settings-dialog-action", "Close");
   });
 });
+
+describe("HarnessFixDialog's credential step as a Settings overlay", () => {
+  it("names the credential form's controls through the control that opened the dialog", async () => {
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={client}>
+        <SettingsOverlayOwner
+          entry={harnessFixOwner("codex-native", "fixAction")}
+          opener="fixAction"
+        >
+          <HarnessFixDialog {...baseProps} mode="reconfigure" />
+        </SettingsOverlayOwner>
+      </QueryClientProvider>,
+    );
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Use an API key or gateway URL instead" }),
+    );
+
+    expect(screen.getByLabelText("API key")).toHaveAttribute(
+      "data-settings-control",
+      "harness-codex-native-detail:apiKey",
+    );
+  });
+});
