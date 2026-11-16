@@ -262,10 +262,10 @@ async def test_connected_host_cannot_launch_after_reset_until_it_reconnects(setu
     from asgiref.testing import ApplicationCommunicator
 
     from omnigent.errors import OmnigentError
+    from tests.server.helpers import wait_for_tunnel_registration
     from tests.server.integration.test_host_tunnel_route import (
         _make_hello,
         _managed_scope,
-        _wait_registered,
         _websocket_scope,
     )
 
@@ -300,7 +300,7 @@ async def test_connected_host_cannot_launch_after_reset_until_it_reconnects(setu
         response = await connection.receive_output(timeout=5)
         assert response["type"] == "websocket.accept", response
         await connection.send_input({"type": "websocket.receive", "text": _make_hello()})
-        await asyncio.wait_for(_wait_registered(registry, host_id), timeout=5)
+        await wait_for_tunnel_registration(connection, registry, host_id)
 
     async def disconnect(connection: ApplicationCommunicator) -> None:
         await connection.send_input({"type": "websocket.disconnect", "code": 1000})
@@ -554,9 +554,9 @@ async def test_accounts_host_handshake_revalidates_each_connection(setup_app):
 
     from asgiref.testing import ApplicationCommunicator
 
+    from tests.server.helpers import wait_for_tunnel_registration
     from tests.server.integration.test_host_tunnel_route import (
         _make_hello,
-        _wait_registered,
         _websocket_scope,
     )
 
@@ -583,7 +583,7 @@ async def test_accounts_host_handshake_revalidates_each_connection(setup_app):
         assert response["type"] == "websocket.accept", response
         await connection.send_input({"type": "websocket.receive", "text": _make_hello()})
         registry = admin.app.state.host_registry
-        await asyncio.wait_for(_wait_registered(registry, host_id), timeout=5)
+        await wait_for_tunnel_registration(connection, registry, host_id)
         assert registry.get(host_id).account_generation == generation
         assert checked == [generation]
     finally:
