@@ -1120,11 +1120,6 @@ def live_server(
         compat_server_python() is None or meets_min_server_version(compat_version, "0.23.0")
     ):
         features = ",".join(filter(None, (features, "workflows")))
-    # Likewise the Tile view scenario.
-    if "tiles_view" not in features and (
-        compat_server_python() is None or meets_min_server_version(compat_version, "0.24.0")
-    ):
-        features = ",".join(filter(None, (features, "tiles_view")))
     env["OMNIGENT_FEATURES"] = features
     if "automations_v2" not in features and (
         compat_server_python() is None or meets_min_server_version(compat_version, "0.22.0")

@@ -108,6 +108,7 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
         "codex_plan_at_launch": True,
         "workspace_direct_access": False,
         "workspace_api_server_access": False,
+        "tiles_view": False,
     }
     assert data["sibling_sessions"] is True
     # Compatibility field for frontend builds predating the nested map.
