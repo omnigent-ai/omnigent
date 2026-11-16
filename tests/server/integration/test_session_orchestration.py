@@ -980,6 +980,47 @@ async def test_a_launch_skips_grantees_who_can_no_longer_see_its_source(
     assert _session_levels(db_uri, worker.id) == expected
 
 
+@pytest.mark.parametrize("placement,shared", [("managed", True), ("same_host", False)])
+async def test_restricted_sharing_shares_a_launch_without_a_workspace_only_as_a_new_sandbox(
+    auth_client, auth_app, peers, db_uri, monkeypatch, placement, shared
+):
+    """A new sandbox has no workspace yet; a same-host launch in a home directory is refused."""
+    from omnigent.host.frames import HostLaunchRunnerFrame, HostStatFrame, decode_host_frame
+    from omnigent.server.auth import SharingMode
+    from tests.server.integration.test_sessions_permissions import _register_online_host
+
+    source, _target, _captured = peers
+    task = _shared_automation(auth_app, db_uri, monkeypatch, source["agent_id"], ["bob"])
+    _as_run_session(db_uri, source["id"], task, ["bob"])
+    host_id = uuid4().hex
+    _register_online_host(auth_app, host_id, "alice")
+    SqlAlchemyConversationStore(db_uri).set_host_id(source["id"], host_id, workspace="/home/alice")
+
+    def answer_host(connection, payload):
+        frame = decode_host_frame(payload)
+        if isinstance(frame, HostStatFrame):
+            connection.pending_stats[frame.request_id].set_result(
+                {"status": "ok", "exists": True, "type": "directory", "canonical_path": frame.path}
+            )
+        elif isinstance(frame, HostLaunchRunnerFrame):
+            connection.pending_launches[frame.request_id].set_result({"status": "launched"})
+        else:
+            pytest.fail(f"Unexpected host frame: {frame}")
+
+    monkeypatch.setattr(auth_app.state.host_registry, "send_text", answer_host)
+    monkeypatch.setattr(auth_app.state, "sharing_mode", lambda: SharingMode.RESTRICTED_READ_ONLY)
+
+    result = await _launch_worker(auth_client, source["agent_id"], source["id"], placement)
+
+    assert result.get("conversation_id"), result
+    worker = SqlAlchemyConversationStore(db_uri).get_conversation(result["conversation_id"])
+    assert worker.workspace == (None if placement == "managed" else "/home/alice")
+    assert _session_levels(db_uri, worker.id) == {
+        "alice": LEVEL_OWNER,
+        **({"bob": LEVEL_READ} if shared else {}),
+    }
+
+
 @pytest.mark.parametrize("case", ["no_automation", "unshared", "grant_read_fails"])
 async def test_a_launch_the_automation_shares_with_no_one_stays_private(
     auth_client, auth_app, peers, db_uri, monkeypatch, case
