@@ -499,6 +499,21 @@ def _prompt_event(prompt: str) -> SessionEventInput:
     )
 
 
+# Kinds an agent sets to message its own session later. A firing belongs to the
+# session's current work, not to a new run, so nothing says no one is watching.
+SESSION_MESSAGE_KINDS = frozenset({"reminder"})
+
+
+def _task_prompt_event(task: ScheduledTask) -> SessionEventInput:
+    """The message a firing sends: a reminder's text as set, else the prompt and the note."""
+    if task.kind not in SESSION_MESSAGE_KINDS:
+        return _prompt_event(run_prompt_text(task))
+    return SessionEventInput(
+        type="message",
+        data={"role": "user", "content": [{"type": "input_text", "text": task.prompt}]},
+    )
+
+
 def build_on_fire(
     deps: FireDeps,
     *,
@@ -1172,6 +1187,11 @@ async def _continue_session(
         app_state=deps.app_state,
         host_registry=deps.host_registry,
     )
+    if task.kind in SESSION_MESSAGE_KINDS:
+        # Naming the run on the session would start a new journal run, resetting its
+        # plan's progress, and mark an attended session unattended.
+        await _send_session_message(conv, task, dispatch, recorder)
+        return
     progress = _PromptSendProgress()
     progress_token = _PROMPT_SEND_PROGRESS.set(progress)
     # Stamped before the prompt goes in, so the journal entries the session records
@@ -1212,6 +1232,28 @@ async def _continue_session(
         _PROMPT_SEND_PROGRESS.reset(progress_token)
     await recorder.finish("succeeded", conversation_id=session_id)
     _logger.info("scheduled fire: task %s continued session %s", task.id, session_id)
+
+
+async def _send_session_message(
+    conv: Conversation, task: ScheduledTask, dispatch: LaunchDispatch, recorder: _FireRecorder
+) -> None:
+    """Send a reminder's message into its session as part of its current work."""
+    try:
+        start_fire_stage("runner_start", session_id=conv.id)
+        await dispatch(conv, task)
+    except Exception:
+        _logger.exception(
+            "scheduled fire: could not send task %s's message into session %s", task.id, conv.id
+        )
+        await recorder.finish(
+            "failed",
+            conversation_id=conv.id,
+            error="runner launch/dispatch failed",
+            error_code="launch_failed",
+        )
+        return
+    await recorder.finish("succeeded", conversation_id=conv.id)
+    _logger.info("scheduled fire: task %s messaged session %s", task.id, conv.id)
 
 
 async def _settle_run_label(
@@ -2651,7 +2693,7 @@ async def _send_prompt(
         result = await _dispatch_session_event_to_runner(
             conv.id,
             conv,
-            _prompt_event(run_prompt_text(task)),
+            _task_prompt_event(task),
             deps.conversation_store,
             runner_client,
             agent_name=None,
@@ -2690,7 +2732,7 @@ def _make_managed_sandbox_dispatch(deps: FireDeps) -> LaunchDispatch:
         # No browser preference applies to a fire; keep the server default.
         await deps.startup_inputs.enqueue(
             conv.id,
-            _prompt_event(run_prompt_text(task)),
+            _task_prompt_event(task),
             user_id=task.user_id or RESERVED_USER_LOCAL,
             headers=Headers({BACKGROUND_SESSION_TITLES_HEADER: "on"}),
         )

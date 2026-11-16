@@ -3745,6 +3745,54 @@ async def test_a_legacy_fire_names_its_run_on_the_session_before_sending(continu
 
 
 @pytest.mark.asyncio
+async def test_a_reminder_continues_its_sessions_current_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reminder names no run on its session and doesn't say no one is watching.
+
+    Naming one would make the journal start a new run, resetting the session's plan
+    progress, and refuse a watched workflow's questions as unattended.
+    """
+    import omnigent.server.routes.sessions as sessions_routes
+    from omnigent.stores.conversation_store import SCHEDULED_TASK_RUN_LABEL_KEY
+
+    prompt = "[Reminder set for 2026-11-12 23:00 UTC]\nCheck whether CI passed."
+    reminder = _continuing_task(
+        kind="reminder",
+        prompt=prompt,
+        rrule="FREQ=YEARLY;BYMONTH=11;BYMONTHDAY=12;BYHOUR=23;BYMINUTE=0;BYSECOND=0;COUNT=1",
+    )
+    conv_store = _ExistingConversationStore(_continued_session())
+    store = FakeScheduledTaskStore(rows={"task_1": reminder})
+    sent: list[Any] = []
+
+    async def _runner_start(*args: Any) -> None:
+        return None
+
+    async def _runner_send(conv_id: str, conv: Any, event: Any, *args: Any, **kwargs: Any) -> Any:
+        sent.append(event)
+        return SimpleNamespace(accepted=True)
+
+    monkeypatch.setattr(sessions_routes, "_ensure_runner_session_initialized", _runner_start)
+    monkeypatch.setattr(sessions_routes, "_dispatch_session_event_to_runner", _runner_send)
+    deps = _deps(store, conversation_store=conv_store)
+
+    async def _launch(conv: Any, task: Any) -> None:
+        await fire_mod._send_prompt(deps, conv, object(), task)
+
+    await build_on_fire(deps, launch_dispatch=_launch)(0, "task_1")
+    await _drain()
+
+    assert SCHEDULED_TASK_RUN_LABEL_KEY not in conv_store.label_writes.get("conv_prev", {})
+    assert [event.data for event in sent] == [
+        {"role": "user", "content": [{"type": "input_text", "text": prompt}]}
+    ]
+    assert [(run["status"], run["conversation_id"]) for run in store.runs] == [
+        ("succeeded", "conv_prev")
+    ]
+
+
+@pytest.mark.asyncio
 async def test_a_continued_session_that_cannot_be_stamped_records_a_failed_run() -> None:
     """Without the label, the journal entries could land on another run, so nothing is sent."""
     conv_store = _ExistingConversationStore(_continued_session())

@@ -214,6 +214,13 @@ status is read from session activity, which needs no caller access check, so the
 poll does not act as the owner. A failed check sends the prompt. Other continued
 tasks, legacy timers and a scheduler with a custom `on_fire` hook (it has no busy
 check) follow the saved schedule and never skip, and neither does Run now.
+
+A continued run names itself on the session (`omnigent.scheduled_task_run`)
+before sending, so the journal starts a new run of the plan and the session counts
+as unattended. A reminder belongs to the session's current work instead: its
+message goes in as written, without the unattended-run note, and names no run, so
+a workflow keeps its progress and can still ask its user questions.
+
 If the replica stops before recording, recovery finds no session on the run and
 records `failed`; it never resends. A first run of such a task records its
 session on the task once the session exists and its owner is granted, so a run
