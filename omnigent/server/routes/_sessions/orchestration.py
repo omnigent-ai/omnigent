@@ -10653,10 +10653,9 @@ async def _relay_runner_stream_once(
                     if evt_type in _TERMINAL_RESPONSE_EVENT_TYPES:
                         # Persist the turn's usage (cost + token buckets) so
                         # policy callables can read
-                        # event["context"]["usage"]["total_cost_usd"]. Every
-                        # terminal counts: a turn that fails or is stopped also
-                        # made its model calls. The live publish below runs on
-                        # response.completed only.
+                        # event["context"]["usage"]["total_cost_usd"] and the
+                        # subtree roll-up below sees the new totals. A failed or
+                        # stopped turn also made model calls, so every terminal counts.
                         _accumulate_session_usage(
                             event.get("response", {}),
                             session_id,
@@ -10697,6 +10696,7 @@ async def _relay_runner_stream_once(
                                 ),
                             )
                         )
+                        _context_labels: dict[str, str] = {}
                         if evt_type == "response.completed":
                             # Persist the context-window indicator labels for an
                             # in-process turn (claude-sdk / openai-agents / pi):
@@ -10722,6 +10722,7 @@ async def _relay_runner_stream_once(
                                     session_id,
                                     _context_labels,
                                 )
+                        if evt_type == "response.completed" or _resp_usage:
                             # Push the server-computed cost AND token breakdown
                             # to the web client's session indicator, rolled up
                             # over the spawn subtree. The session's own event

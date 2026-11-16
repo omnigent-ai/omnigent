@@ -436,6 +436,7 @@ class ExecutorAdapter(HarnessApp):
                         # the finally's _safe_interrupt fallback still fires.
                         await executor.interrupt_session(self._session_key)
                         _turn_outcome = "cancelled"
+                        _keep_turn_usage(event, ctx)
                         clean_exit = (
                             await self._settle_interrupted_turn(event, turn_events, ctx)
                             if executor.resumes_after_interrupt()

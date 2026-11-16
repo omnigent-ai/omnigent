@@ -3271,8 +3271,19 @@ class _KeptSessionExecutor(Executor):
         self.closed.append(session_key)
 
 
+class _DroppedSessionExecutor(_KeptSessionExecutor):
+    """Executor that drops its native session on an interrupt."""
+
+    def resumes_after_interrupt(self) -> bool:
+        return False
+
+
 async def _interrupt_kept_session_turn(
-    stop_outcome: str, *, blocking_close: bool = False, blocking_interrupt: bool = False
+    stop_outcome: str,
+    *,
+    blocking_close: bool = False,
+    blocking_interrupt: bool = False,
+    executor_type: type[_KeptSessionExecutor] = _KeptSessionExecutor,
 ):
     """Start a turn on a :class:`_KeptSessionExecutor`, interrupt it, and return the pieces."""
     import asyncio
@@ -3281,7 +3292,7 @@ async def _interrupt_kept_session_turn(
     from omnigent.runtime.harnesses._scaffold import TurnContext
     from omnigent.server.schemas import CreateResponseRequest
 
-    executor = _KeptSessionExecutor(
+    executor = executor_type(
         stop_outcome, blocking_close=blocking_close, blocking_interrupt=blocking_interrupt
     )
     adapter = ExecutorAdapter(executor_factory=lambda: executor, session_key="sk")
@@ -3297,15 +3308,26 @@ async def _interrupt_kept_session_turn(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("stop_outcome", ["cancels_with_usage", "streams_then_cancels_with_usage"])
-async def test_interrupted_turn_keeps_the_usage_it_reports_as_it_ends(stop_outcome: str) -> None:
+@pytest.mark.parametrize(
+    ("stop_outcome", "executor_type"),
+    [
+        ("cancels_with_usage", _KeptSessionExecutor),
+        ("streams_then_cancels_with_usage", _KeptSessionExecutor),
+        ("cancels_with_usage", _DroppedSessionExecutor),
+    ],
+)
+async def test_interrupted_turn_keeps_the_usage_it_reports_as_it_ends(
+    stop_outcome: str, executor_type: type[_KeptSessionExecutor]
+) -> None:
     """The usage that an interrupted turn reports as it ends reaches its terminal event.
 
     A stop interrupts the turn; the native turn then ends with the usage of the
     model calls it made, at once or after more output. Those calls were spent, so
-    ``response.cancelled`` carries it.
+    ``response.cancelled`` carries it, whether or not the executor keeps its session.
     """
-    adapter, _, run_task, response = await _interrupt_kept_session_turn(stop_outcome)
+    adapter, _, run_task, response = await _interrupt_kept_session_turn(
+        stop_outcome, executor_type=executor_type
+    )
     ctx = adapter._in_flight["resp_1"]
 
     assert response.status_code == 204

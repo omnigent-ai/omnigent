@@ -353,35 +353,54 @@ async def test_relay_counts_the_usage_of_every_turn_end(db_uri: str, outcome: st
 
     A turn that fails or is stopped made its model calls too, so the relay adds
     the usage on ``response.failed`` and ``response.cancelled`` as it does on
-    ``response.completed``.
+    ``response.completed``, and publishes the new totals to the live badge.
     """
+    from omnigent.runtime import session_stream
     from omnigent.server.routes._sessions.orchestration import _relay_runner_stream_once
 
     store = SqlAlchemyConversationStore(db_uri)
     session = store.create_conversation()
     release = asyncio.Event()
     release.set()
+    usage = {
+        "input_tokens": 300,
+        "output_tokens": 40,
+        "total_tokens": 340,
+        "model": "claude-sonnet-5",
+        "cost_usd": 0.25,
+    }
     events = [
         {"type": "response.in_progress", "response": {"id": "turn", "model": "test"}},
         {
             "type": f"response.{outcome}",
-            "response": {
-                "id": "turn",
-                "status": outcome,
-                "usage": {"input_tokens": 300, "output_tokens": 40, "total_tokens": 340},
-            },
+            "response": {"id": "turn", "status": outcome, "usage": usage},
         },
         {"type": "session.status", "status": "failed" if outcome == "failed" else "idle"},
     ]
-    await _relay_runner_stream_once(
-        session.id,
-        _ScriptedRunnerClient(release, events),
-        store,  # type: ignore[arg-type]
-    )
+    collector = await start_session_stream_collector(session.id)
+    try:
+        await _relay_runner_stream_once(
+            session.id,
+            _ScriptedRunnerClient(release, events),
+            store,  # type: ignore[arg-type]
+        )
+        usage_event: dict[str, Any] | None = None
+        for _ in range(50):
+            event = await collector.next_event()
+            if event["type"] == "session.usage":
+                usage_event = event
+                break
+    finally:
+        await collector.stop()
+        session_stream.close(session.id)
+
     refreshed = store.get_conversation(session.id)
     assert refreshed is not None
     assert refreshed.session_usage.get("input_tokens") == 300
     assert refreshed.session_usage.get("output_tokens") == 40
+    assert usage_event is not None, "the turn end published no session.usage event"
+    assert usage_event["total_cost_usd"] == 0.25
+    assert usage_event["usage_by_model"]["claude-sonnet-5"]["input_tokens"] == 300
 
 
 @pytest.mark.parametrize(
