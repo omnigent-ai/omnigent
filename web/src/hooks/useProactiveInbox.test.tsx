@@ -564,3 +564,43 @@ it.each(["succeeds", "fails"])(
     }
   },
 );
+
+it("keeps a queued item's unread move on a list that never loaded it after another item's PATCH succeeds", async () => {
+  // The All tab's first page holds a newer read item; both unread ones are
+  // behind it. The Unread tab's page holds both.
+  const first: Suggestion = { ...item, id: "first", createdAt: 1 };
+  const second: Suggestion = { ...item, id: "second", createdAt: 0 };
+  const newer: Suggestion = { ...item, id: "newer", status: "read", createdAt: 2 };
+  vi.mocked(listSuggestions).mockImplementation(async (_cursor, statuses) =>
+    statuses?.length === 1
+      ? page([first, second], 2)
+      : { ...page([newer], 2), nextCursor: "1:first" },
+  );
+  const { result } = renderHook(
+    () => ({ all: useProactiveInbox(true), unread: useProactiveInbox(true, ["unread"]) }),
+    { wrapper },
+  );
+  await waitFor(() => expect(result.current.unread.items).toEqual([first, second]));
+  await waitFor(() => expect(result.current.all.unreadCount).toBe(2));
+  const patchFirst = deferred<SuggestionUpdateResult>();
+  const patchSecond = deferred<SuggestionUpdateResult>();
+  vi.mocked(updateSuggestion)
+    .mockReturnValueOnce(patchFirst.promise)
+    .mockReturnValueOnce(patchSecond.promise);
+
+  // Both are expanded before the first read mark is saved.
+  act(() => void result.current.unread.update("first", { status: "read" }));
+  act(() => void result.current.unread.update("second", { status: "read" }));
+  expect(result.current.all.unreadCount).toBe(0);
+  expect(result.current.unread.unreadCount).toBe(0);
+
+  vi.mocked(listSuggestions).mockImplementation(() => new Promise(() => {}));
+  // The first reply counts one unread item: the second mark is not saved yet.
+  await act(async () => patchFirst.resolve(saved({ ...first, status: "read" }, 1)));
+  expect(result.current.all.unreadCount).toBe(0);
+  expect(result.current.unread.unreadCount).toBe(0);
+
+  await act(async () => patchSecond.resolve(saved({ ...second, status: "read" }, 0)));
+  expect(result.current.all.unreadCount).toBe(0);
+  expect(result.current.unread.unreadCount).toBe(0);
+});

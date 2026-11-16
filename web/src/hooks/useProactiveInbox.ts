@@ -205,10 +205,23 @@ export function useProactiveInbox(
           await queryClient.cancelQueries({ queryKey: key });
           if (saved) {
             const reply = saved;
+            const before = dataVersions(queryClient, key);
             queryClient.setQueriesData<Pages>({ queryKey: key }, (data) =>
               data ? { ...data, pages: reconcileSuggestion(data.pages, reply) } : data,
             );
             scope.confirmed.set(id, reply.item.status);
+            // The reply's total covers only this item, since PATCHes run one at a
+            // time; other queued items are still missing from the lists it rewrote.
+            const after = dataVersions(queryClient, key);
+            for (const [other, versions] of scope.started) {
+              if (other === id) continue;
+              for (const [list, version] of versions) {
+                const rewritten = after.get(list);
+                if (version === before.get(list) && rewritten !== undefined) {
+                  versions.set(list, rewritten);
+                }
+              }
+            }
           }
           return saved !== null;
         })
