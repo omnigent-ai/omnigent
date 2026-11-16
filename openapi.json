@@ -15678,6 +15678,19 @@
             "title": "Is Current",
             "type": "boolean"
           },
+          "latest_plan_position": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Journal position of the latest plan within this invocation.",
+            "title": "Latest Plan Position"
+          },
           "progress": {
             "$ref": "#/components/schemas/WorkflowRunProgress",
             "description": "Where the run's steps stand."
@@ -15712,7 +15725,7 @@
             "type": "array"
           },
           "steps": {
-            "description": "The steps of the plan that started the run.",
+            "description": "The latest plan's steps within this invocation.",
             "items": {
               "$ref": "#/components/schemas/WorkflowStep"
             },
@@ -15771,7 +15784,7 @@
         "type": "object"
       },
       "WorkflowRunProgress": {
-        "description": "Where a run's steps stand: the steps of the plan that started it, counted\nby their current status in the session.",
+        "description": "Where a run's latest plan stands within its invocation, counted by each\nstep's newest status.",
         "properties": {
           "done": {
             "default": 0,
@@ -19605,7 +19618,7 @@
     },
     "/v1/scheduled-tasks/{scheduled_task_id}/run-steps": {
       "get": {
-        "description": "The plan steps of one page of a scheduled task's runs, for their timelines.\n\nPages like `GET /scheduled-tasks/{id}/runs`, most recent first. Each\nrun that wrote a plan lists the steps of its first plan and each step's\nnewest status entry: one run-index lookup per run, then one\nkind-and-step lookup per step. The response is `{\"runs\": [{\"run_id\", \"workflow_id\", \"plan_name\", \"is_current\", \"steps\", \"statuses\"}], \"next_cursor\"}`.",
+        "description": "The plan steps of one page of a scheduled task's runs, for their timelines.\n\nPages like `GET /scheduled-tasks/{id}/runs`, most recent first. Each\nrun that wrote a plan lists its latest plan within that invocation and\neach step's newest status entry. The first plan's ID still guards actions.\nThe response is `{\"runs\": [{\"run_id\", \"workflow_id\", \"plan_name\", \"is_current\", \"steps\", \"statuses\"}], \"next_cursor\"}`.",
         "operationId": "list_scheduled_task_run_steps_v1_scheduled_tasks__scheduled_task_id__run_steps_get",
         "parameters": [
           {
