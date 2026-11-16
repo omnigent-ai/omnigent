@@ -42,6 +42,7 @@ def test_unset_or_empty_uses_feature_defaults(environ: dict[str, str]) -> None:
         "canvas": False,
         "arca_shutdown_warnings": False,
         "import_review": False,
+        "custom_agents_settings_ui": True,
         "sidebar_grouping_ui": True,
         "workspace_content_search": False,
         "grid_sessions_display_ui": False,
@@ -148,6 +149,15 @@ def test_retired_feature_is_ignored_with_warning(
 
     assert flags == resolve_feature_flags({FEATURES_ENV_VAR: "usage_page"})
     assert f"{override} has been retired" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "override", ["", "custom_agents_settings_ui", "-custom_agents_settings_ui"]
+)
+def test_retired_frontend_feature_stays_reported_on(override: str) -> None:
+    flags = resolve_feature_flags({FEATURES_ENV_VAR: override})
+
+    assert flags.frontend_dict()["custom_agents_settings_ui"] is True
 
 
 def test_removed_harness_install_variable_fails_with_migration_hint() -> None:
