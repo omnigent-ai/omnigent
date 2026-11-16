@@ -43,8 +43,8 @@ share dialog warns its owner when an automation manages that session's sharing.
   does not open the automation's share dialog.
 - `legacy-automation`: when the server reports `shareable: false` for an
   automation, such as one created before its store could keep grants, Share stays
-  visible but disabled in the same places with the tooltip This is a legacy
-  automation. Recreate it to share it., and the server refuses a grant with that
+  visible but disabled in the same places, with the tooltip "This is a legacy
+  automation. Recreate it to share it." The server refuses a grant with the same
   message. Sharing off's reason wins when both apply; a server that sends no
   `shareable` leaves Share enabled.
 
