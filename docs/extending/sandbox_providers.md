@@ -1,10 +1,6 @@
 # Sandbox providers
 
-A sandbox provider provisions a remote sandbox on Modal, Daytona, Kubernetes,
-or another platform, starts an Omnigent agent host in it, and manages its
-lifecycle. Omnigent includes built-in providers, and you can add your own as a
-Python package registered through the `omnigent.sandbox_providers` entry-point
-group.
+Sandbox providers manage remote environments for Omnigent agent hosts. Use a built-in provider or add one through the `omnigent.sandbox_providers` entry-point group.
 
 ## Harness providers and model lists
 
