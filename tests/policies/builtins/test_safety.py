@@ -1340,6 +1340,7 @@ _OMITTED = object()
             "Missing review fields (permission_mode)",
         ),
         ("sys_triggered_task_update", {"permission_mode": "null"}, "permission_mode must be"),
+        ("sys_triggered_task_update", {"triggered_task_id": "../x"}, "triggered_task_id"),
         (
             "sys_triggered_task_update",
             {"worker": {"permission_mode": "bypassPermissions"}},

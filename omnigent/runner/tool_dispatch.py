@@ -5718,9 +5718,11 @@ async def _execute_triggered_task_tool(
     config = build_trigger_config(args, current=current, worker_defaults=worker_defaults)
     if isinstance(config, str):
         return json.dumps({"error": f"{tool_name}: {config}"})
+    # A paused task starts no sessions, so it can be paused after sandboxes go away.
     if (
         config["worker"]["placement"] == "managed"
         and info.get("managed_sandboxes_enabled") is not True
+        and not pausing
     ):
         return json.dumps(
             {

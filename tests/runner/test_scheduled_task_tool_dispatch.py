@@ -1555,6 +1555,27 @@ async def test_triggered_task_update_pauses_a_trigger_with_orchestration_off() -
     assert _saved_trigger(server)["scope"] == "ES"
 
 
+@pytest.mark.asyncio
+async def test_triggered_task_update_pauses_a_managed_worker_after_sandboxes_go_away() -> None:
+    server = _TaskServer(info={"managed_sandboxes_enabled": True})
+    await _run(
+        server, "sys_triggered_task_create", {**_JIRA_TRIGGER, "worker": {"placement": "managed"}}
+    )
+    server.info["managed_sandboxes_enabled"] = False
+    review = {
+        "triggered_task_id": _TASK_ID,
+        "instructions": "Investigate the ticket.",
+        "permission_mode": "acceptEdits",
+    }
+    # Running, its sessions would need a sandbox; paused, it starts none.
+    refused = await _run(server, "sys_triggered_task_update", review)
+    assert "needs managed sandboxes" in str(refused["error"])
+    paused = await _run(server, "sys_triggered_task_update", {**review, "state": "paused"})
+    assert paused["state"] == "paused"
+    assert server.mutations() == ["POST", "PATCH"]
+    assert _saved_trigger(server)["worker"]["placement"] == "managed"
+
+
 def _saved_trigger_task(task_id: str, **trigger: object) -> dict[str, object]:
     """A task as the trigger form saves it, for list paging and update tests."""
     config = build_trigger_config(

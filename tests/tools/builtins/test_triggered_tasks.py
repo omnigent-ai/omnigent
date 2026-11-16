@@ -687,6 +687,9 @@ _NAMED = {**_REVIEWED, "name": "n", "agent_id": "ag_1"}
         ({"instructions": "x"}, "update", "Missing review fields (permission_mode)"),
         ({"instructions": "x", "permission_mode": "null"}, "create", "permission_mode must"),
         (_REVIEWED, "update", "triggered_task_id"),
+        # The runner can't address these, so they are refused before anyone is asked.
+        ({**_REVIEWED, "triggered_task_id": "../x"}, "update", "triggered_task_id"),
+        ({**_REVIEWED, "triggered_task_id": ["t1"]}, "update", "triggered_task_id"),
         (_REVIEWED, "create", "name must be a non-empty string"),
         ({**_REVIEWED, "name": "n"}, "create", "agent_id must name the agent"),
         (

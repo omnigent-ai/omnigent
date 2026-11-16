@@ -86,6 +86,9 @@ _PERMISSION_MODE_NAMES = frozenset(
 _SCOPE_MATCHES = ("exact", "contains")
 _EXECUTION_TARGETS = ("connected_host", "managed_sandbox")
 
+# A task ID the runner can put in a request path, as for the scheduled-task tools.
+_TASK_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
+
 # The polling interval a minute-based rule names, e.g. "FREQ=MINUTELY;INTERVAL=10".
 _MINUTELY_RRULE = re.compile(r"FREQ=MINUTELY;INTERVAL=(\d+)")
 
@@ -659,8 +662,9 @@ def triggered_task_call_error(args: Mapping[str, object], *, action: str) -> str
     mode = args["permission_mode"]
     if mode is not None and (not isinstance(mode, str) or mode.strip().lower() in ("", "null")):
         return f"permission_mode must be a mode name, or {AGENT_DEFAULT_PERMISSION_MODE_HINT}."
-    if action == "update" and not args.get("triggered_task_id"):
-        return "Provide the triggered_task_id of the task to change."
+    task_id = args.get("triggered_task_id")
+    if action == "update" and not (isinstance(task_id, str) and _TASK_ID.fullmatch(task_id)):
+        return "Provide the triggered_task_id of the task to change, from sys_triggered_task_list."
     name = args.get("name")
     if (action == "create" or "name" in args) and (not isinstance(name, str) or not name.strip()):
         return "name must be a non-empty string"
