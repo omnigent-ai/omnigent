@@ -44,7 +44,7 @@ class ScheduledTask:
 
     A task's trigger is a required recurring ``rrule``.
 
-    :param id: UUID primary key (bare 32-char hex string, no dashes).
+    :param id: Primary key from the store's allocator; by default a bare 32-char hex UUID.
     :param workspace_id: Tenant partition key that owns this row.
     :param name: Human-readable task name, e.g. ``"nightly triage"``.
     :param prompt: The instruction dispatched to the agent on each firing.
