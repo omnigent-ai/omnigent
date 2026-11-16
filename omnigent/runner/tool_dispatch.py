@@ -5238,7 +5238,8 @@ _SCHEDULED_TASK_GATED_FIELDS = (
     (
         ("trigger_config",),
         "scheduled_task_slack_triggers",
-        "does not support trigger_config for Slack",
+        "does not support trigger_config for Slack; to pause or resume an existing "
+        "trigger, resend its saved prompt in place of trigger_config",
     ),
 )
 

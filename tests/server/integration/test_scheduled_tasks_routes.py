@@ -1685,7 +1685,7 @@ def _trigger_body(**overrides: object) -> dict[str, object]:
 
 
 async def test_slack_trigger_saves_the_prompt_and_schedule_it_compiles_to(
-    auth_client: httpx.AsyncClient, db_uri: str
+    auth_client: httpx.AsyncClient, auth_app: FastAPI, db_uri: str
 ) -> None:
     _make_user(db_uri)
     with capture_debug_rows("server") as rows:
@@ -1734,9 +1734,11 @@ async def test_slack_trigger_saves_the_prompt_and_schedule_it_compiles_to(
     unchanged = {"prompt": patched.json()["prompt"], "rrule": patched.json()["rrule"]}
     resent = await auth_client.patch(url, json=unchanged, headers=_headers())
     assert resent.status_code == 200, resent.text
-    # Clearing the session still starts a new polling session on the next run.
+    # Clearing the polling session a run adopted makes the next run start a new one.
+    auth_app.state.scheduled_task_store.update(task["id"], session_id=uuid.uuid4().hex)
     reset = await auth_client.patch(url, json={"session_id": None}, headers=_headers())
     assert reset.status_code == 200, reset.text
+    assert reset.json()["session_id"] is None
     for change in ({"prompt": "Do something else."}, {"rrule": "FREQ=HOURLY"}):
         refused = await auth_client.patch(url, json=change, headers=_headers())
         assert refused.status_code == 400, refused.text

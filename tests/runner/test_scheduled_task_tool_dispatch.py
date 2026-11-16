@@ -321,7 +321,10 @@ async def test_trigger_config_reaches_only_a_server_that_supports_it(supported: 
         )
     else:
         assert [url for _, url, _ in client.calls] == ["/v1/info"]
-        assert "does not support trigger_config" in json.loads(out)["error"]
+        error = json.loads(out)["error"]
+        assert "does not support trigger_config" in error
+        # An agent can still stop a trigger such a server already runs.
+        assert "resend its saved prompt" in error
 
 
 @pytest.mark.asyncio

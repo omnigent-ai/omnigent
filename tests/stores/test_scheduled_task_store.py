@@ -1105,15 +1105,18 @@ def test_trigger_config_round_trips_and_is_bounded_on_every_write(
 @pytest.mark.parametrize(
     "newer",
     [
-        {"trigger_config": {**_TRIGGER, "channels": ["bugs"]}, "prompt": "watch #bugs"},
-        {"model_override": "model-b", "prompt": "watch #eng with model-b"},
+        {"trigger_config": {**_TRIGGER, "channels": ["bugs"]}},
+        {"model_override": "model-b"},
+        {"reasoning_effort": "high"},
+        {"permission_mode": "acceptEdits"},
+        {"prompt": "watch #bugs"},
     ],
-    ids=["config", "settings"],
+    ids=["config", "model", "effort", "permission", "prompt"],
 )
 def test_a_stale_snapshot_cannot_overwrite_a_newer_trigger_prompt(
     store: SqlAlchemyScheduledTaskStore, newer: dict[str, Any]
 ) -> None:
-    """A prompt compiled from an older snapshot would no longer match the saved trigger."""
+    """Each input a trigger's prompt is compiled from conflicts on its own."""
     snapshot = _session_task(
         store, "st_stale_trigger", session_mode="continue", trigger_config=_TRIGGER
     )
@@ -1121,16 +1124,12 @@ def test_a_stale_snapshot_cannot_overwrite_a_newer_trigger_prompt(
     assert applied is not None
 
     with pytest.raises(OmnigentError, match="Reload and try again") as raised:
-        store.update(snapshot.id, expected_schedule=snapshot, name="renamed", prompt="watch #eng")
+        store.update(snapshot.id, expected_schedule=snapshot, name="renamed")
 
     assert raised.value.code == ErrorCode.CONFLICT
     saved = store.get(snapshot.id)
-    assert saved is not None
-    assert (saved.trigger_config, saved.prompt, saved.name) == (
-        applied.trigger_config,
-        applied.prompt,
-        applied.name,
-    )
+    assert saved is not None and saved.name == snapshot.name
+    assert {field: getattr(saved, field) for field in newer} == newer
 
 
 def test_update_guard_sees_the_locked_task_and_a_refusal_saves_nothing(
