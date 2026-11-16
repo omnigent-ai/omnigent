@@ -546,7 +546,7 @@ export const ComposerSendButton = forwardRef<
       {busy ? (
         <Loader2Icon className="size-4 animate-spin" />
       ) : interrupt ? (
-        <SquareIcon className="size-4 fill-current" />
+        <SquareIcon className="size-4 scale-[0.6] fill-current" />
       ) : (
         <ArrowUpIcon className="size-4" viewBox="4 4 16 16" />
       )}
