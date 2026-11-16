@@ -10,7 +10,9 @@ import { parseNativePermissionDelivery } from "./nativePermissionDelivery";
 // catch — please add an SSE-parser test when you touch this.
 
 import { assistantMessagePhase } from "./conversationItems";
+import type { JournalEntry } from "./sessionJournal";
 import { readSubagentActivity } from "./subagentActivity";
+import { readTaskActivity } from "./taskActivity";
 import type {
   BrowserActionRequestEvent,
   ClientTaskCancel,
@@ -39,6 +41,7 @@ import type {
   SessionBtwSidechatEvent,
   SessionChangedFilesInvalidatedEvent,
   SessionChildSessionUpdatedEvent,
+  SessionJournalAppendedEvent,
   SessionModelOptionsEvent,
   SessionCreatedEvent,
   SessionInputConsumedEvent,
@@ -570,6 +573,8 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
           ? data.background_task_count
           : undefined;
       const backgroundTasks = parseBackgroundTasks(data.background_tasks);
+      const backgroundAgents =
+        status === "waiting" ? parseBackgroundTasks(data.background_agents) : undefined;
       const rawError = data.error;
       // Parse via parseErrorInfo so a classified failure's optional
       // title/cause/remediation flow through, but keep the guard that both
@@ -592,6 +597,7 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
         responseId,
         backgroundTaskCount,
         ...(backgroundTasks !== undefined ? { backgroundTasks } : {}),
+        ...(backgroundAgents !== undefined ? { backgroundAgents } : {}),
         ...(blockedOn !== undefined ? { blockedOn } : {}),
         ...(error !== undefined ? { error } : {}),
       } satisfies SessionStatusEvent;
@@ -902,7 +908,7 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       type: "session_superseded",
       conversationId,
       targetConversationId,
-      reason: "clear",
+      reason: data.reason === "rewind" ? "rewind" : "clear",
     } satisfies SessionSupersededEvent;
   }
   if (eventType === "session.btw_sidechat") {
@@ -954,6 +960,19 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       childSessionId,
       child: child as Record<string, unknown>,
     } satisfies SessionChildSessionUpdatedEvent;
+  }
+  if (eventType === "session.journal.appended") {
+    const conversationId = data.conversation_id;
+    const entry = data.entry;
+    if (typeof conversationId !== "string" || !conversationId) return null;
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) return null;
+    const { id, position } = entry as Record<string, unknown>;
+    if (typeof id !== "string" || typeof position !== "number") return null;
+    return {
+      type: "session_journal_appended",
+      conversationId,
+      entry: entry as JournalEntry,
+    } satisfies SessionJournalAppendedEvent;
   }
   if (eventType === "session.changed_files.invalidated") {
     const sessionId = data.session_id;
@@ -1128,6 +1147,7 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       ...(p.native_delivery
         ? { nativeDelivery: parseNativePermissionDelivery(p.native_delivery) }
         : {}),
+      ...(p.is_blocking === false ? { isBlocking: false as const } : {}),
       elicitationId,
       targetSessionId:
         typeof targetSessionId === "string" && targetSessionId ? targetSessionId : null,
@@ -1147,6 +1167,9 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
         !Array.isArray(askUserQuestionRaw)
           ? (askUserQuestionRaw as Record<string, unknown>)
           : null,
+      ...(typeof p.journal_step === "string" && p.journal_step
+        ? { journalStep: p.journal_step }
+        : {}),
       exitPlanMode:
         exitPlanModeRaw && typeof exitPlanModeRaw === "object" && !Array.isArray(exitPlanModeRaw)
           ? (exitPlanModeRaw as Record<string, unknown>)
@@ -1363,7 +1386,8 @@ function parseOutputItem(data: Record<string, unknown>): StreamEvent | null {
     } satisfies TerminalCommandEvent;
   }
 
-  if (readSubagentActivity(rec)) {
+  // Task markers place and fold like sub-agent markers, so they share the notice kind.
+  if (readSubagentActivity(rec) || readTaskActivity(rec)) {
     return {
       type: "native_tool_call",
       toolType: "subagent_activity",

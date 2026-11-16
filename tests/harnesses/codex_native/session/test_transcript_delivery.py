@@ -12,9 +12,13 @@ from omnigent.harnesses.codex_native import forwarder as codex_native_forwarder
 from omnigent.harnesses.codex_native.bridge import (
     read_bridge_state,
 )
+from omnigent.inner.codex_native_executor import CodexNativeExecutor
+from omnigent.inner.executor import TurnComplete
 from tests.harnesses.codex_native.session._support import (
+    _agent_message_delta_event,
     _agent_message_event,
     _completed_event,
+    _expected_delta_data,
     _FakeCodexAppServerClient,
     _forwarder_context,
     _recording_forwarder_client,
@@ -251,6 +255,93 @@ def test_forwarder_posts_agent_item_after_stale_terminal_event(tmp_path: Path) -
         for payload in posted
         if payload["type"] == "external_conversation_item"
     ] == ["new response"]
+
+
+@pytest.mark.parametrize(
+    ("turn_id", "acknowledged_turn_id", "events_before_ack"),
+    [("turn_native", "turn_unstarted", 1), ("turn_web", "turn_web", 3)],
+    ids=["busy-thread-ack", "turn-finished-before-ack"],
+)
+def test_late_web_turn_start_ack_keeps_the_forwarder_turn_state(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    turn_id: str,
+    acknowledged_turn_id: str,
+    events_before_ack: int,
+) -> None:
+    """
+    A late ``turn/start`` response keeps the turn state the forwarder recorded.
+
+    Codex 0.142 acknowledges ``turn/start`` on a busy thread with a turn id that
+    never starts, and a short web turn can finish before its response is read.
+    """
+    _write_forwarder_bridge(tmp_path, active_turn_id=None)
+    posted: list[dict[str, Any]] = []
+    turn_events = [
+        _started_event(turn_id),
+        _agent_message_delta_event(turn_id, "item_agent", "reply"),
+        _completed_event(turn_id),
+    ]
+
+    async def run() -> None:
+        """Drive the web executor and the forwarder through one bridge directory."""
+        async with _recording_forwarder_client(posted) as client:
+            coalescer = codex_native_forwarder._OutputTextDeltaCoalescer(
+                client, "conv_123", flush_interval_seconds=60.0, flush_char_threshold=1000
+            )
+
+            async def forward(event: dict[str, Any]) -> None:
+                await codex_native_forwarder._handle_event(
+                    client,
+                    **_forwarder_context(client, tmp_path),
+                    event=event,
+                    delta_coalescer=coalescer,
+                )
+
+            class _LateAckClient(_FakeCodexAppServerClient):
+                def __init__(self, *_args: object, **_kwargs: object) -> None:
+                    super().__init__()
+
+                async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+                    assert method == "turn/start", method
+                    for event in turn_events[:events_before_ack]:
+                        await forward(event)
+                    return {
+                        "result": {"turn": {"id": acknowledged_turn_id, "status": "inProgress"}}
+                    }
+
+            monkeypatch.setattr(
+                "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+                _LateAckClient,
+            )
+            executor = CodexNativeExecutor(bridge_dir=tmp_path)
+            events = [
+                event
+                async for event in executor.run_turn(
+                    [{"role": "user", "content": [{"type": "input_text", "text": "web"}]}],
+                    [],
+                    "",
+                )
+            ]
+            assert [type(event) for event in events] == [TurnComplete]
+
+            for event in turn_events[events_before_ack:]:
+                await forward(event)
+            await coalescer.close()
+
+    asyncio.run(run())
+
+    assert [
+        payload["data"] for payload in posted if payload["type"] == "external_output_text_delta"
+    ] == [_expected_delta_data("reply", turn_id, "item_agent")]
+    assert [
+        payload["data"]["status"]
+        for payload in posted
+        if payload["type"] == "external_session_status"
+    ] == ["running", "idle"]
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert state.active_turn_id is None
 
 
 def test_forwarder_posts_user_message_on_assistant_item_started(tmp_path: Path) -> None:

@@ -328,6 +328,26 @@ def test_title_change_pushes_changed_frame(app: FastAPI, stores, fast_rescan: No
         assert items[s1]["title"] == "after"
 
 
+def test_share_change_pushes_owner_shared_flag(app: FastAPI, stores, fast_rescan: None) -> None:
+    """Granting and revoking another user reaches the owner's watched row on rescan,
+    with no other change to the session."""
+    permission_store = stores[2]
+    s1 = _seed_session(stores, owner=ALICE, title="mine")
+    with TestClient(app).websocket_connect(
+        "/v1/sessions/updates", headers={"X-Forwarded-Email": ALICE}
+    ) as ws:
+        ws.send_text(json.dumps({"type": "watch", "session_ids": [s1]}))
+        snapshot = _recv_until(ws, {"snapshot"})
+        assert snapshot["items"][0]["shared_with_others"] is False  # type: ignore[index]
+        permission_store.ensure_user(BOB)
+        permission_store.grant(BOB, s1, LEVEL_READ)
+        changed = _recv_until(ws, {"changed"})
+        assert changed["items"][0]["shared_with_others"] is True  # type: ignore[index]
+        permission_store.revoke(BOB, s1)
+        changed = _recv_until(ws, {"changed"})
+        assert changed["items"][0]["shared_with_others"] is False  # type: ignore[index]
+
+
 def test_cleared_field_pushes_explicit_null(app: FastAPI, stores, fast_rescan: None) -> None:
     """Clearing a previously-set nullable field (a runner unbind nulling
     ``runner_id``) pushes a ``changed`` frame that carries the key as an

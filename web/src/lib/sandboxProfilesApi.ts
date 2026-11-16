@@ -11,6 +11,8 @@ export interface SandboxProfile {
 export interface SandboxProfilesResponse {
   profiles: SandboxProfile[];
   managed_providers: string[];
+  /** Provider -> profile a create that names none takes; preselected when nothing is picked. */
+  default_profile_ids?: Record<string, string>;
   next_cursor: string | null;
 }
 

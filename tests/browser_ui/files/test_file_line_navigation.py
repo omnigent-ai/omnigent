@@ -133,6 +133,7 @@ def seeded_session(browser_contract: BrowserContract) -> BrowserSession:
         },
     )
     browser_contract.json(f"{api}/child_sessions", empty)
+    browser_contract.json(f"{api}/side_chats", empty)
     browser_contract.json(f"{api}/policies", empty)
     browser_contract.json("/v1/policy-registry", empty)
     browser_contract.json(f"{api}/owner", {"owner": None})
@@ -536,6 +537,18 @@ def test_content_search_opens_line_and_preserves_results(
     params = parse_qs(urlparse(submitted.value.url).query)
     assert params["include"] == ["src/**, *.{py,txt}"]
     assert params["exclude"] == ["**/tests/**, *.min.js"]
+    assert params["q"] == ["changed"]
+    assert params["regex"] == ["false"]
+    # Whole word is a keyboard-operable checkbox that sends a bounded regex on the same route.
+    whole_word = rail.get_by_role("checkbox", name="Whole word", exact=True)
+    expect(whole_word).not_to_be_checked()
+    whole_word.press("Space")
+    expect(whole_word).to_be_checked()
+    with page.expect_request(lambda request: "/content-search?" in request.url) as submitted:
+        search.press("Enter")
+    params = parse_qs(urlparse(submitted.value.url).query)
+    assert params["q"] == [r"\bchanged\b"]
+    assert params["regex"] == ["true"]
     result = rail.get_by_role("button", name=f"Open {_FILE_PATH} at line 351")
     result.click()
     page.wait_for_function(_CENTERED_LINE, arg={"text": _AFTER_LINES[350], "diff": False})
@@ -1042,19 +1055,21 @@ def test_markdown_diff_url_stays_stable_across_responsive_layouts(
 def test_large_markdown_citation_and_unsaved_resize(
     page: Page, seeded_session: BrowserSession
 ) -> None:
-    """Large Markdown uses source for citations and preserves drafts on mobile."""
+    """Large Markdown opens in Preview, uses source for citations, and keeps drafts on mobile."""
     path = "src/large.md"
-    content = "# Large file\n" + "A paragraph for source viewing.\n" * 35_000
+    content = "# Large file\n" + "A paragraph for source viewing.\n" * 20_000
     content += "Final large Markdown line."
     _mock_markdown_files(page, seeded_session, {path: content})
     _post_message(seeded_session, f"[End of document]({path}:{len(content.splitlines())})")
     viewer = _open_viewer(
         page, seeded_session, path, {"diffActive": False, "previewableViewMode": "preview"}
     )
+    expect(viewer.get_by_role("heading", name="Large file")).to_be_visible(timeout=30_000)
+    expect(viewer.locator(".monaco-editor")).to_have_count(0)
+    page.get_by_role("button", name="End of document", exact=True).click()
     editor = viewer.locator(".monaco-editor")
     expect(editor).to_be_visible(timeout=30_000)
-    expect(viewer.get_by_text("Large Markdown file opened as source", exact=False)).to_be_visible()
-    page.get_by_role("button", name="End of document", exact=True).click()
+    expect(viewer.get_by_text("Large Markdown file edited as source", exact=False)).to_be_visible()
     page.wait_for_function(
         _CENTERED_LINE, arg={"text": "Final large Markdown line.", "diff": False}
     )

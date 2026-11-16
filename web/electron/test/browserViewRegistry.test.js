@@ -445,7 +445,7 @@ function makeEventCapturingRegistry(extra = {}) {
       return ev;
     },
     fireContextMenu: (params) => handlers["context-menu"]({}, params),
-    windowOpen: (url) => windowOpenHandler({ url }),
+    windowOpen: (url, disposition) => windowOpenHandler({ url, disposition }),
   };
 }
 
@@ -1104,6 +1104,148 @@ describe("browserViewRegistry — network-layer agent guard (DNS + connected add
     );
   });
 
+  it("accepts a *.localhost response only from loopback on a direct route", async () => {
+    const context = { hostIsThisMachine: true };
+    const responsesOn = async (route, ips) => {
+      const proxyLookups = [];
+      const { registry, idOf } = makeNetworkGuardRegistry({
+        allowsLocalhost: (ctx) => ctx === context,
+        resolveProxy: async (url) => {
+          proxyLookups.push(url);
+          return route;
+        },
+      });
+      const url = "http://spog.dev.localhost:5173/";
+      registry.openOrNavigate("conv_1", url, undefined, { agent: true, agentContext: context });
+      const webContentsId = idOf("conv_1");
+      const cancels = await Promise.all(
+        ips.map((ip) => registry.shouldCancelAgentResponse({ webContentsId, url, ip })),
+      );
+      return { cancels, proxyLookups };
+    };
+    const direct = await responsesOn("DIRECT", ["127.0.0.1", "::1", "10.0.0.2", "93.184.215.14"]);
+    assert.deepEqual(direct.cancels, [false, false, true, true]);
+    // Only loopback responses reach the route check.
+    assert.deepEqual(direct.proxyLookups, [
+      "http://spog.dev.localhost:5173/",
+      "http://spog.dev.localhost:5173/",
+    ]);
+    // A local proxy answers from loopback but resolves the name on its own network.
+    const localProxy = await responsesOn("PROXY 127.0.0.1:3128", ["127.0.0.1"]);
+    assert.deepEqual(localProxy.cancels, [true]);
+    // A remote proxy's address gets no proxy exemption for *.localhost.
+    const remoteProxy = await responsesOn("PROXY proxy.corp:3128; DIRECT", ["10.0.0.2"]);
+    assert.deepEqual(remoteProxy.cancels, [true]);
+  });
+
+  it("sends *.localhost requests and IP-less upgrades only on a direct route for an eligible view", async () => {
+    const context = { hostIsThisMachine: true };
+    const verdictsOn = async (resolveProxy, viewId = "local") => {
+      const { registry, idOf, lookups } = makeNetworkGuardRegistry({
+        allowsLocalhost: (ctx) => ctx === context,
+        resolveProxy,
+      });
+      registry.openOrNavigate("local", "http://spog.dev.localhost:5173/", undefined, {
+        agent: true,
+        agentContext: context,
+      });
+      registry.openOrNavigate("remote", "https://example.com/", undefined, { agent: true });
+      const webContentsId = idOf(viewId);
+      const page = { webContentsId, url: "http://spog.dev.localhost:5173/", resourceType: "xhr" };
+      const socket = { webContentsId, url: "ws://spog.dev.localhost:5173/hmr" };
+      const worker = { ...page, webContentsId: undefined };
+      const verdicts = {
+        request: await registry.shouldCancelAgentRequest(page),
+        workerRequest: await registry.shouldCancelAgentRequest(
+          worker,
+          agentPartition("w-test", viewId),
+        ),
+        socketRequest: await registry.shouldCancelAgentRequest(socket),
+        upgrade: await registry.shouldCancelAgentResponse({
+          ...socket,
+          resourceType: "webSocket",
+          statusCode: 101,
+        }),
+        exactLocalhost: await registry.shouldCancelAgentRequest({
+          ...page,
+          url: "http://localhost:5173/",
+        }),
+      };
+      assert.deepEqual(lookups, [], "no DNS lookup for *.localhost");
+      return verdicts;
+    };
+    const directLookups = [];
+    const direct = async (url) => {
+      directLookups.push(url);
+      return "DIRECT";
+    };
+    assert.deepEqual(
+      await verdictsOn(direct),
+      {
+        request: false,
+        workerRequest: false,
+        socketRequest: false,
+        upgrade: false,
+        exactLocalhost: false,
+      },
+      "Chromium connects a direct *.localhost to loopback",
+    );
+    // WebSockets are looked up by their own scheme, which picks their proxy.
+    assert.deepEqual(directLookups, [
+      "http://spog.dev.localhost:5173/",
+      "http://spog.dev.localhost:5173/",
+      "ws://spog.dev.localhost:5173/hmr",
+      "ws://spog.dev.localhost:5173/hmr",
+    ]);
+    // An `https=`-only proxy rule carries WebSockets but not plain HTTP.
+    assert.deepEqual(
+      await verdictsOn(async (url) =>
+        new URL(url).protocol === "ws:" ? "PROXY 127.0.0.1:3128" : "DIRECT",
+      ),
+      {
+        request: false,
+        workerRequest: false,
+        socketRequest: true,
+        upgrade: true,
+        exactLocalhost: false,
+      },
+    );
+    assert.deepEqual(
+      await verdictsOn(direct, "remote"),
+      {
+        request: true,
+        workerRequest: true,
+        socketRequest: true,
+        upgrade: true,
+        exactLocalhost: true,
+      },
+      "an ineligible view never opens *.localhost",
+    );
+    const unsafeRoutes = {
+      empty: async () => "",
+      "proxy fallback": async () => "DIRECT; PROXY proxy.corp:3128",
+      unparsable: async () => "BOGUS",
+      "lookup failure": async () => {
+        throw new Error("no route");
+      },
+    };
+    const verdicts = await Promise.all(
+      Object.entries(unsafeRoutes).map(async ([label, route]) => [label, await verdictsOn(route)]),
+    );
+    // Exact localhost keeps its existing request-stage behaviour.
+    const refused = {
+      request: true,
+      workerRequest: true,
+      socketRequest: true,
+      upgrade: true,
+      exactLocalhost: false,
+    };
+    assert.deepEqual(
+      verdicts,
+      Object.keys(unsafeRoutes).map((label) => [label, refused]),
+    );
+  });
+
   it("forces policy-enforced network requests past the HTTP cache", () => {
     const { registry, idOf } = makeNetworkGuardRegistry();
     registry.openOrNavigate("conv_1", "https://example.com/", undefined, { agent: true });
@@ -1222,6 +1364,61 @@ describe("browserViewRegistry — child window.open is denied (S3)", () => {
     assert.deepEqual(windowOpen("file:///etc/passwd"), { action: "deny" });
     assert.deepEqual(windowOpen("javascript:alert(1)"), { action: "deny" });
     assert.deepEqual(loaded, []);
+  });
+
+  it("asks a supporting renderer for a new tab for a Cmd/Ctrl-clicked link only", () => {
+    const { registry, windowOpen, loaded, sent } = makeEventCapturingRegistry();
+    const viewId = "browser-tab:conv_1:tab_1";
+    registry.openOrNavigate(viewId, "https://example.com/", undefined, { agent: true });
+    const openTabRequests = () => sent.filter((s) => s.channel === "browser-open-tab");
+    loaded.length = 0;
+
+    assert.deepEqual(windowOpen("https://example.com/older-ui", "background-tab"), {
+      action: "deny",
+    });
+    assert.deepEqual(loaded, ["https://example.com/older-ui"], "an older UI keeps in-place loads");
+
+    registry.setOpenTabSupported(true);
+    loaded.length = 0;
+    assert.deepEqual(windowOpen("https://example.com/new-tab", "background-tab"), {
+      action: "deny",
+    });
+    assert.deepEqual(windowOpen("https://example.com/blank-target", "foreground-tab"), {
+      action: "deny",
+    });
+    assert.deepEqual(windowOpen("https://example.com/new-window", "new-window"), {
+      action: "deny",
+    });
+    assert.deepEqual(loaded, [
+      "https://example.com/blank-target",
+      "https://example.com/new-window",
+    ]);
+    assert.deepEqual(openTabRequests(), [
+      {
+        channel: "browser-open-tab",
+        payload: { conversationId: viewId, url: "https://example.com/new-tab" },
+      },
+    ]);
+
+    registry.setOpenTabSupported(false);
+    loaded.length = 0;
+    windowOpen("https://example.com/after-reload", "background-tab");
+    assert.deepEqual(loaded, ["https://example.com/after-reload"]);
+    assert.equal(openTabRequests().length, 1);
+  });
+
+  it("applies the popup policy before forwarding a Cmd/Ctrl-clicked link", () => {
+    const { registry, windowOpen, loaded, sent } = makeEventCapturingRegistry();
+    registry.openOrNavigate("conv_1", "https://example.com/", undefined, { agent: true });
+    registry.setOpenTabSupported(true);
+    loaded.length = 0;
+    windowOpen("http://169.254.169.254/latest/meta-data/", "background-tab");
+    windowOpen("file:///etc/passwd", "background-tab");
+    assert.deepEqual(loaded, []);
+    assert.deepEqual(
+      sent.map((s) => s.channel).filter((channel) => channel.startsWith("browser-")),
+      ["browser-view-created", "browser-nav-blocked"],
+    );
   });
 });
 

@@ -532,7 +532,7 @@ describe("HostBadge", () => {
   });
 
   it("offers reconnect for a dormant resumable managed host", () => {
-    // A resumable sandbox host reads offline while idle-stopped; reconnecting
+    // A resumable sandbox host reads offline while stopped; reconnecting
     // asks the server to wake it, as the next message would.
     useSessionMock.mockReturnValue({
       session: { hostId: "host_a1b2", hostResumable: true },

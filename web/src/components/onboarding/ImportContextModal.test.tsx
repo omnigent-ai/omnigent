@@ -113,7 +113,7 @@ describe("ImportContextModal – harness tabs", () => {
     renderModal();
     switchHarness("Codex");
 
-    expect(screen.getByText("Databricks (dbc-a5d4177a-49dc)")).toBeTruthy();
+    expect(screen.getByText("Databricks (dbc-12345678-abcd)")).toBeTruthy();
     expect(assetTabNames()).toEqual(["MCPs 2", "Skills 3"]);
     expect(rowNames("MCPs")).toEqual(["github", "web_search"]);
   });

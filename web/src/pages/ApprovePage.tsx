@@ -244,6 +244,7 @@ export function ApprovePage() {
           permissionDirectories={state.data.permission_directories}
           fileEdit={fileEdit}
           onSubmit={(_id, action, content, meta) => void submit(action, content, meta)}
+          keyboardActive
         />
       )}
       {state.kind === "pending" && !usesApprovalCard && (

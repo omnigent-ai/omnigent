@@ -625,6 +625,7 @@ class _DatabricksBearerAuth(httpx.Auth):
         # The config file as it was before this auth was resolved; stamped by
         # :func:`_resolve_databricks_auth`.
         self.resolved_config_file: _ConfigFileVersion = _UnknownConfigFile.UNKNOWN
+        self.resolved_workspace_host: str | None = None
 
     @property
     def profile_name(self) -> str | None:
@@ -705,6 +706,7 @@ def _resolve_databricks_auth(
     config_file = _databrickscfg_fingerprint()
     auth, resolved_host = _discover_databricks_auth(profile, host=host, workspace_id=workspace_id)
     auth.resolved_config_file = config_file
+    auth.resolved_workspace_host = host
     return auth, resolved_host
 
 
@@ -986,17 +988,16 @@ def _databrickscfg_fingerprint() -> tuple[int, int, int, int] | None:
 
 
 class _ReusedDatabricksTokenSource:
-    """Reuse SDK auth, re-resolving it after a mint fails or the config file changes."""
+    """Reuse SDK auth until a mint fails, the config changes, or the workspace changes."""
 
     def __init__(self, server_url: str | None = None, *, host: str | None = None) -> None:
         if server_url is not None and host is not None:
             raise ValueError("_ReusedDatabricksTokenSource takes server_url or host, not both")
         self._server_url = server_url
         self._host = host
-        # The reused auth and the config file version it was resolved from,
-        # replaced as one value so concurrent mints never pair one resolution's
-        # auth with another's version.
-        self._cached: tuple[_DatabricksBearerAuth, _ConfigFileVersion] | None = None
+        # Keep auth, its config version, and its workspace binding together so
+        # concurrent resolutions cannot pair auth with another resolution's state.
+        self._cached: tuple[_DatabricksBearerAuth, _ConfigFileVersion, str | None] | None = None
         self._failure_logged = False
 
     @property
@@ -1005,7 +1006,17 @@ class _ReusedDatabricksTokenSource:
         cached = self._cached
         return cached[0].profile_name if cached is not None else None
 
-    def _resolve(self) -> tuple[_DatabricksBearerAuth, _ConfigFileVersion] | None:
+    def _workspace_host(self) -> str | None:
+        """Return the explicit host or the server's current saved workspace."""
+        if self._host is not None:
+            return self._host
+        if self._server_url:
+            from omnigent.cli_auth import load_databricks_workspace_host
+
+            return load_databricks_workspace_host(self._server_url)
+        return None
+
+    def _resolve(self) -> tuple[_DatabricksBearerAuth, _ConfigFileVersion, str | None] | None:
         """Resolve fresh SDK auth, returning ``None`` on credential failure.
 
         Callers proceed unauthenticated on ``None``, so the failure is logged
@@ -1013,31 +1024,23 @@ class _ReusedDatabricksTokenSource:
         bearer. Only the first failure since the last successful resolution is
         logged, since a failing source is re-resolved on every mint.
 
-        :returns: The auth and the config file version taken before resolving
-            it, so a rewrite that lands mid-resolution still reads as a change
-            on the next mint.
+        :returns: The auth, config version, and workspace taken before resolution,
+            so concurrent config rewrites or logins remain visible on the next mint.
         """
+        workspace_host = self._workspace_host()
         config_file = _databrickscfg_fingerprint()
         try:
-            if self._host is not None:
-                auth = _resolve_databricks_auth(host=self._host)[0]
+            if workspace_host is not None:
+                auth = _resolve_databricks_auth(host=workspace_host)[0]
             else:
-                from omnigent.cli_auth import load_databricks_workspace_host
-
-                workspace_host = (
-                    load_databricks_workspace_host(self._server_url) if self._server_url else None
-                )
-                if workspace_host is not None:
-                    auth = _resolve_databricks_auth(host=workspace_host)[0]
-                else:
-                    auth = _resolve_databricks_auth()[0]
+                auth = _resolve_databricks_auth()[0]
         except (DatabricksAuthError, ImportError, ValueError) as exc:
             if not self._failure_logged:
                 self._failure_logged = True
                 logger.info("Databricks SDK auth unavailable: %s: %s", type(exc).__name__, exc)
             return None
         self._failure_logged = False
-        return auth, config_file
+        return auth, config_file, workspace_host
 
     def current_token(self) -> str | None:
         """Mint a token, resolving auth lazily and retrying once if it is stale.
@@ -1048,9 +1051,15 @@ class _ReusedDatabricksTokenSource:
         would otherwise keep serving the old one until the server rejects it.
         """
         cached = self._cached
-        if cached is not None and _databrickscfg_fingerprint() == cached[1]:
+        if (
+            cached is not None
+            and self._workspace_host() == cached[2]
+            and _databrickscfg_fingerprint() == cached[1]
+        ):
             try:
-                return cached[0].current_token()
+                token = cached[0].current_token()
+                if token:
+                    return token
             except DatabricksAuthError:
                 pass
         resolved = self._resolve()
@@ -1074,7 +1083,7 @@ class _ReusedDatabricksTokenSource:
         :param auth: Auth resolved outside this source, e.g. by a recovery
             after the server refused this source's token.
         """
-        self._cached = (auth, auth.resolved_config_file)
+        self._cached = (auth, auth.resolved_config_file, auth.resolved_workspace_host)
         self._failure_logged = False
 
 

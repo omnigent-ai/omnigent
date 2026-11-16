@@ -12,6 +12,8 @@ import type { useScheduledHarnessSettings } from "./useScheduledHarnessSettings"
  * Distinct from Claude's real `default` (Manual) mode so leaving the control
  * alone keeps the agent's configured mode rather than forcing Manual. */
 const PERMISSION_SELECT_DEFAULT = "__agent_default__";
+/** Sentinel for an empty mode that inherits another session's, shown beside Default. */
+const PERMISSION_SELECT_INHERITED = "__inherited__";
 
 export function ModelEffortFields({
   model,
@@ -23,6 +25,9 @@ export function ModelEffortFields({
   onEffortChange,
   onPermissionModeChange,
   onSelectOpenChange,
+  idPrefix = "task",
+  inheritedPermissionLabel,
+  defaultPermissionMode = "",
 }: {
   /** Selected model id/alias, or "" = agent default (nothing overridden). */
   model: string;
@@ -38,6 +43,12 @@ export function ModelEffortFields({
   /** Forwarded to each Select's onOpenChange so the parent Dialog can keep an
    * open dropdown from dismissing the whole modal. */
   onSelectOpenChange?: (open: boolean) => void;
+  /** Prefix for element ids and test ids, so two groups can share a form. */
+  idPrefix?: string;
+  /** Offers an empty mode under this label because it inherits another session's. */
+  inheritedPermissionLabel?: string;
+  /** The mode Default saves; "" leaves the mode empty. A listed mode hides Default once left. */
+  defaultPermissionMode?: string;
 }) {
   const modelOptions = settings.models.map((option) => ({
     id: option.id,
@@ -53,16 +64,32 @@ export function ModelEffortFields({
   const permissionOptions = settings.permissions.filter(
     (option) => settings.harness === "claude-native" || option.value !== "default",
   );
+  const inheritsPermission = Boolean(inheritedPermissionLabel) && permissionMode === "";
+  const permissionForSelectValue = (value: string) => {
+    if (value === PERMISSION_SELECT_INHERITED) return "";
+    return value === PERMISSION_SELECT_DEFAULT ? defaultPermissionMode : value;
+  };
+  let permissionSelectValue = permissionMode;
+  if (inheritsPermission) permissionSelectValue = PERMISSION_SELECT_INHERITED;
+  else if (
+    permissionMode === "" ||
+    (settings.harness !== "claude-native" && permissionMode === "default")
+  )
+    permissionSelectValue = PERMISSION_SELECT_DEFAULT;
+  // Once left, Default would duplicate a listed mode (Claude lists its default as Manual).
+  const showsDefaultPermission =
+    permissionSelectValue === PERMISSION_SELECT_DEFAULT ||
+    !permissionOptions.some((option) => option.value === defaultPermissionMode);
 
   return (
     <div className="flex flex-col gap-3 sm:gap-4">
       {settings.supportsModel && (
-        <div className="flex flex-col gap-3" data-testid="task-model-effort-row">
+        <div className="flex flex-col gap-3" data-testid={`${idPrefix}-model-effort-row`}>
           <div
             className="flex w-full min-w-0 items-center justify-between gap-4"
-            data-testid="task-model-control"
+            data-testid={`${idPrefix}-model-control`}
           >
-            <Label htmlFor="task-model">Model</Label>
+            <Label htmlFor={`${idPrefix}-model`}>Model</Label>
             <Select
               disabled={disabled}
               value={model === "" ? MODEL_SELECT_DEFAULT : model}
@@ -72,8 +99,8 @@ export function ModelEffortFields({
               onOpenChange={onSelectOpenChange}
             >
               <SelectTrigger
-                id="task-model"
-                data-testid="task-model-trigger"
+                id={`${idPrefix}-model`}
+                data-testid={`${idPrefix}-model-trigger`}
                 className={cn(
                   "w-auto max-w-[65%] border-0 shadow-none text-muted-foreground",
                   pickerTriggerClass,
@@ -99,9 +126,9 @@ export function ModelEffortFields({
           {effortOptions.length > 0 && (
             <div
               className="flex w-full min-w-0 items-center justify-between gap-4"
-              data-testid="task-effort-control"
+              data-testid={`${idPrefix}-effort-control`}
             >
-              <Label htmlFor="task-effort">Effort</Label>
+              <Label htmlFor={`${idPrefix}-effort`}>Effort</Label>
               <Select
                 disabled={disabled}
                 value={effort === "" ? EFFORT_SELECT_NONE : effort}
@@ -111,8 +138,8 @@ export function ModelEffortFields({
                 onOpenChange={onSelectOpenChange}
               >
                 <SelectTrigger
-                  id="task-effort"
-                  data-testid="task-effort-trigger"
+                  id={`${idPrefix}-effort`}
+                  data-testid={`${idPrefix}-effort-trigger`}
                   className={cn(
                     "w-auto max-w-[65%] border-0 shadow-none text-muted-foreground",
                     pickerTriggerClass,
@@ -144,25 +171,20 @@ export function ModelEffortFields({
       {permissionOptions.length > 0 && (
         <div
           className="flex w-full min-w-0 items-center justify-between gap-4"
-          data-testid="task-permission-control"
+          data-testid={`${idPrefix}-permission-control`}
         >
-          <Label htmlFor="task-permission">Permissions</Label>
+          <Label htmlFor={`${idPrefix}-permission`}>Permissions</Label>
           <Select
             disabled={disabled}
-            value={
-              permissionMode === "" ||
-              (settings.harness !== "claude-native" && permissionMode === "default")
-                ? PERMISSION_SELECT_DEFAULT
-                : permissionMode
-            }
+            value={permissionSelectValue}
             componentId="tasks.scheduled.permission_mode"
             valueHasNoPii
-            onValueChange={(v) => onPermissionModeChange(v === PERMISSION_SELECT_DEFAULT ? "" : v)}
+            onValueChange={(v) => onPermissionModeChange(permissionForSelectValue(v))}
             onOpenChange={onSelectOpenChange}
           >
             <SelectTrigger
-              id="task-permission"
-              data-testid="task-permission-trigger"
+              id={`${idPrefix}-permission`}
+              data-testid={`${idPrefix}-permission-trigger`}
               className={cn(
                 "w-auto max-w-[65%] border-0 shadow-none text-muted-foreground",
                 pickerTriggerClass,
@@ -175,7 +197,14 @@ export function ModelEffortFields({
               align="end"
               className="w-[min(20rem,calc(100vw-2rem))]"
             >
-              <SelectItem value={PERMISSION_SELECT_DEFAULT}>Default</SelectItem>
+              {inheritedPermissionLabel && (
+                <SelectItem value={PERMISSION_SELECT_INHERITED}>
+                  {inheritedPermissionLabel}
+                </SelectItem>
+              )}
+              {showsDefaultPermission && (
+                <SelectItem value={PERMISSION_SELECT_DEFAULT}>Default</SelectItem>
+              )}
               {permissionOptions.map((m) => (
                 <SelectItem key={m.value} value={m.value}>
                   {m.label}

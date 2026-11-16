@@ -9,7 +9,7 @@ import re
 import tarfile
 import threading
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, ClassVar
 
 import click
@@ -17,14 +17,18 @@ import httpx
 import yaml
 from fastapi import FastAPI
 
+from omnigent.host.frames import HostFrame, decode_host_frame
 from omnigent.onboarding.sandboxes import (
     RemoteCommandResult,
     RemoteProcess,
     SandboxLauncher,
 )
+from omnigent.onboarding.sandboxes.types import SandboxCapabilities
 from omnigent.runner.transports.ws_tunnel.frames import HelloFrame
 from omnigent.runtime import session_stream
+from omnigent.server.host_registry import HostConnection
 from omnigent.server.smart_routing import RoutingResult, RoutingSettings
+from tests.budgets import budget
 
 # Sentinel ready event so a stream collector's registration is a
 # deterministic sync point (first delivered item) rather than a
@@ -173,6 +177,8 @@ class FakeSandboxLauncher(SandboxLauncher):
         fail_on_command: str | None = None,
         home: str = "/root",
         can_resume: bool = False,
+        resume_preserves_host: bool = False,
+        started_sandbox_id: str | None = None,
         fail_on_resume: bool = False,
         provision_gate: threading.Event | None = None,
     ) -> None:
@@ -183,6 +189,11 @@ class FakeSandboxLauncher(SandboxLauncher):
         self._fail_on_command = fail_on_command
         self._home = home
         self.can_resume = can_resume
+        self._resume_preserves_host = resume_preserves_host
+        # When set, the host start surfaces this as the provider-assigned id (the
+        # Lambda MicroVMs shape: a real id only known at start, which the
+        # framework must persist over the reserved provision name).
+        self._started_sandbox_id = started_sandbox_id
         self.fail_on_resume = fail_on_resume
         self._provision_gate = provision_gate
         # Image reference / secret names / env names the production code
@@ -228,12 +239,25 @@ class FakeSandboxLauncher(SandboxLauncher):
         self.pod_ready_timeout_s: int | None = None
         self.runtime_class: str | None = None
         self.home_size_limit: str | None = None
+        # Lambda MicroVM ctor wiring (captured by
+        # install_fake_lambda_microvm_launcher).
+        self.region: str | None = None
+        self.image_identifier: str | None = None
+        self.image_version: str | None = None
+        self.execution_role_arn: str | None = None
+        self.egress_network_connectors: list[str] | None = None
         self.prepared = False
         self.provisioned_names: list[str] = []
         self.commands: list[str] = []
         self.host_starts: list[HostStartInvocation] = []
         self.terminated: list[str] = []
         self.resumed: list[str] = []
+        self.stopped: list[str] = []
+
+    @property
+    def capabilities(self) -> SandboxCapabilities:
+        """The base flags, plus the host-preserving resume this fake can claim."""
+        return replace(super().capabilities, resume_preserves_host=self._resume_preserves_host)
 
     def prepare(self) -> None:
         """Record the preflight call (no real SDK/credential check)."""
@@ -273,6 +297,10 @@ class FakeSandboxLauncher(SandboxLauncher):
                 raise click.ClickException("simulated in-sandbox host start failure")
             invocation = _parse_host_start(command)
             self.host_starts.append(invocation)
+            # Surface a provider-assigned id (known only at start) for the
+            # framework's write-back, mirroring Lambda MicroVMs' run-microvm.
+            if self._started_sandbox_id is not None:
+                self.started_sandbox_id = self._started_sandbox_id
             if self._on_host_start is not None:
                 self._on_host_start(invocation)
         return RemoteCommandResult(returncode=0, stdout="", stderr="")
@@ -296,6 +324,10 @@ class FakeSandboxLauncher(SandboxLauncher):
     def terminate(self, sandbox_id: str) -> None:
         """Record the termination."""
         self.terminated.append(sandbox_id)
+
+    def stop(self, sandbox_id: str) -> None:
+        """Record the stop."""
+        self.stopped.append(sandbox_id)
 
     def resume(self, sandbox_id: str) -> None:
         """Record the resume."""
@@ -659,6 +691,48 @@ def install_fake_kubernetes_launcher(
     monkeypatch.setattr(kubernetes_mod, "KubernetesSandboxLauncher", _ctor)
 
 
+def install_fake_lambda_microvm_launcher(
+    monkeypatch: Any,  # pytest.MonkeyPatch — Any avoids importing pytest in a helpers module
+    fake: FakeSandboxLauncher,
+) -> None:
+    """
+    Substitute the fake for ``LambdaMicroVMSandboxLauncher`` at its public seam.
+
+    The managed flow constructs ``LambdaMicroVMSandboxLauncher(region=…,
+    image_identifier=…, image_version=…, execution_role_arn=…, env=…,
+    egress_network_connectors=…)``; the shim records those constructor args on
+    the fake and hands it back, so production code runs unmodified against it.
+
+    :param monkeypatch: The test's ``pytest.MonkeyPatch``.
+    :param fake: The fake launcher to substitute.
+    """
+    import omnigent.onboarding.sandboxes.lambda_microvm as lambda_microvm_mod
+
+    def _ctor(
+        *,
+        region: str | None = None,
+        image_identifier: str | None = None,
+        image_version: str | None = None,
+        execution_role_arn: str | None = None,
+        env: list[str] | None = None,
+        egress_network_connectors: list[str] | None = None,
+    ) -> FakeSandboxLauncher:
+        """Stand-in constructor recording the construction wiring."""
+        fake.region = region
+        fake.image_identifier = image_identifier
+        fake.image_version = image_version
+        fake.execution_role_arn = execution_role_arn
+        fake.env = env
+        fake.egress_network_connectors = egress_network_connectors
+        # Report the lambda_microvm provider so managed-host teardown's provider
+        # match (launcher.provider vs host.sandbox_provider) exercises the real
+        # path instead of the FakeSandboxLauncher default ("modal").
+        fake.provider = "lambda_microvm"  # type: ignore[misc]  # shadow ClassVar per-instance
+        return fake
+
+    monkeypatch.setattr(lambda_microvm_mod, "LambdaMicroVMSandboxLauncher", _ctor)
+
+
 async def wait_for_completion(
     client: httpx.AsyncClient,
     response_id: str,
@@ -748,6 +822,7 @@ def build_agent_bundle(
     guardrails: dict[str, Any] | None = None,
     terminals: dict[str, Any] | None = None,
     include_llm: bool = True,
+    os_env: dict[str, Any] | None = None,
 ) -> bytes:
     """
     Build a minimal valid agent bundle (tar.gz) for testing.
@@ -784,6 +859,7 @@ def build_agent_bundle(
     :param terminals: Optional ``terminals:`` block written verbatim
         into the spec, e.g. ``{"shell": {"command": "bash"}}``.
         ``None`` omits it (the agent has no terminal access).
+    :param os_env: Optional explicit OS environment for the root agent.
     :param include_llm: Whether to include the default ``llm:`` block.
         Set ``False`` for model-less harness tests.
     :returns: A gzipped tar archive containing the generated
@@ -807,6 +883,8 @@ def build_agent_bundle(
         config["description"] = description
     if guardrails is not None:
         config["guardrails"] = guardrails
+    if os_env is not None:
+        config["os_env"] = os_env
     if terminals is not None:
         config["terminals"] = terminals
     if executor is not None:
@@ -852,6 +930,9 @@ def build_agent_bundle(
                 # ``sa["executor"]``.
                 "executor": sa.get("executor", {"config": {"harness": "claude-sdk"}}),
             }
+            for key in ("os_env", "terminals"):
+                if key in sa:
+                    sa_config[key] = sa[key]
             if "description" in sa:
                 sa_config["description"] = sa["description"]
             sa_bytes = yaml.dump(sa_config).encode()
@@ -980,6 +1061,7 @@ async def create_test_session(
     max_iterations: int | None = None,
     executor: dict[str, Any] | None = None,
     skills: list[dict[str, str]] | None = None,
+    bundle: bytes | None = None,
 ) -> dict[str, Any]:
     """
     Create a session via multipart ``POST /v1/sessions``.
@@ -1002,6 +1084,7 @@ async def create_test_session(
         "codex"}}``.
     :param skills: Optional bundled skills. Each dict must include
         ``"name"``, ``"description"``, and ``"content"``.
+    :param bundle: Optional caller-authored bundle instead of the default fixture.
     :returns: Parsed ``GET /v1/sessions/{id}`` snapshot.
     """
     metadata: dict[str, Any] = {}
@@ -1009,12 +1092,16 @@ async def create_test_session(
         metadata["title"] = title
     if labels is not None:
         metadata["labels"] = labels
-    bundle = build_agent_bundle(
-        name=name,
-        description=description,
-        max_iterations=max_iterations,
-        executor=executor,
-        skills=skills,
+    bundle = (
+        bundle
+        if bundle is not None
+        else build_agent_bundle(
+            name=name,
+            description=description,
+            max_iterations=max_iterations,
+            executor=executor,
+            skills=skills,
+        )
     )
     resp = await client.post(
         "/v1/sessions",
@@ -1190,3 +1277,38 @@ def policy_tool_call_request(
             "context": {},
         },
     }
+
+
+async def sent_to_host(
+    conn: HostConnection,
+    request: asyncio.Task[httpx.Response],
+    *,
+    timeout: float | None = None,
+) -> HostFrame:
+    """Wait for the frame a host route sends while ``request`` is in flight.
+
+    A host route looks up the host's owner in a worker thread before it sends,
+    and on a loaded test machine that can take seconds. So this waits for the
+    frame for as long as it takes, up to ``timeout`` (default ``budget(30)``,
+    scaled by ``OMNIGENT_TEST_TIMEOUT_SCALE``). If the request ends first, the
+    route answered without asking the host, and the assertion says what it
+    answered.
+    """
+    if timeout is None:
+        timeout = budget(30.0)
+    sent = asyncio.ensure_future(conn.outbound_queue.get())
+    try:
+        await asyncio.wait({sent, request}, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        if not sent.done():
+            sent.cancel()
+    if sent.done() and not sent.cancelled():
+        frame = sent.result()
+        assert frame is not None, "the host's connection closed instead of sending"
+        return decode_host_frame(frame.data)
+    if request.done():
+        response = request.result()
+        raise AssertionError(
+            f"the route answered {response.status_code} without asking the host: {response.text}"
+        )
+    raise AssertionError(f"the route didn't ask the host within {timeout:g}s")

@@ -24,6 +24,7 @@ import { ChevronRightIcon } from "lucide-react";
 import { LIVE_ITEM_PREFIX } from "@/lib/blocks";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { ConversationScrollLockContext } from "@/components/ai-elements/conversation";
+import { formatDuration } from "@/lib/relativeTime";
 import type { RenderItem } from "@/lib/renderItems";
 import type { SessionStatus } from "@/lib/types";
 import type { ActiveResponse } from "@/store/types";
@@ -33,7 +34,8 @@ import { ElicitationCard } from "./ApprovalCard";
 import { ReasoningView } from "./ReasoningView";
 import { SlashCommandCard } from "./SlashCommandCard";
 import { SmartRoutingCard } from "./SmartRoutingCard";
-import { SubagentActivityMessage } from "./SubagentActivityMessage";
+import { readTaskActivity } from "@/lib/taskActivity";
+import { ActivityNotice } from "./TaskActivityMessage";
 import { TerminalCommandCard } from "./TerminalCommandCard";
 import { ErrorBanner, PolicyDeniedBanner, RetryIndicator } from "./StatusBlocks";
 import { ToolCard, ToolGroupSummary } from "./ToolCard";
@@ -186,6 +188,9 @@ function hasFoldableShape(
     .findLast((item) => !isTrailingWrapup(item) && item.kind !== "subagent_activity");
   // A terminal failure or denial must stay visible beside the assistant text.
   if (isFailureItem(lastItem)) return false;
+  // A turn that moves tasks keeps its task markers in view: they're the turn's
+  // outline, and its tool calls stay in their own "Called N tools" groups.
+  if (items.some(isTaskMarker)) return false;
   return (
     !isProvisionalTrace(items) &&
     segments.some((segment) => segment.kind === "work") &&
@@ -480,6 +485,11 @@ function isTrailingWrapup(item: RenderItem): boolean {
  * Split work from assistant text while preserving order. Every completed
  * message stays visible unless `foldNarration` asks to fold narration.
  */
+/** A task's start or end, or a plan change, in the chat (sub-agent notices aren't). */
+function isTaskMarker(item: RenderItem): boolean {
+  return item.kind === "subagent_activity" && readTaskActivity(item.data) !== null;
+}
+
 function partitionTurn(
   items: RenderItem[],
   foldNarration = false,
@@ -641,7 +651,7 @@ function TurnWorkedFold({
   defaultOpen: boolean;
   children: ReactNode;
 }) {
-  const label = workedForS !== undefined ? `Worked for ${formatWorkedFor(workedForS)}` : "Worked";
+  const label = workedForS !== undefined ? `Worked for ${formatDuration(workedForS)}` : "Worked";
   const [open, setOpen] = useState(animateCollapse || defaultOpen);
   // Closing over the trace it replaces, the fold keeps that trace laid out as it was on
   // screen, so only its height changes; an opened fold indents it under the row.
@@ -772,18 +782,6 @@ function nearestScrollContainer(el: HTMLElement): HTMLElement | null {
   return null;
 }
 
-/** "8s", "1m 46s", "1h 2m" — matches the native CLIs' worked-for stamps. */
-function formatWorkedFor(seconds: number): string {
-  const s = Math.max(1, Math.round(seconds));
-  if (s < 60) return `${s}s`;
-  const m = Math.floor(s / 60);
-  const rem = s % 60;
-  if (m < 60) return rem > 0 ? `${m}m ${rem}s` : `${m}m`;
-  const h = Math.floor(m / 60);
-  const mm = m % 60;
-  return mm > 0 ? `${h}h ${mm}m` : `${h}h`;
-}
-
 /**
  * Split a contiguous tool run into the part that folds into the
  * collapsed summary group versus the part rendered individually.
@@ -892,7 +890,10 @@ function renderItem(
         >
           <FilePathAwareMessageResponse
             className="chat-markdown text-message"
-            mode={isTextStreaming ? "streaming" : "static"}
+            allowWorkspaceImages
+            allowShellCommands
+            mode={isTextStreaming || keepsStreamingMode(item) ? "streaming" : "static"}
+            isStreaming={isTextStreaming}
           >
             {item.text}
           </FilePathAwareMessageResponse>
@@ -1015,17 +1016,64 @@ function renderItem(
     case "elicitation":
       return <ElicitationCard key={key} item={item} />;
     case "subagent_activity":
-      return <SubagentActivityMessage key={key} data={item.data} />;
+      return <ActivityNotice key={key} data={item.data} />;
   }
 }
 
+// Any indent: a list item's continuation lines carry its content indent. A caret
+// followed by more label text is a footnote; a bare `[^]` is an ordinary label.
+const REFERENCE_DEFINITION = /^\s*\[(?!\^[^\]])(?:[^[\]\\]|\\.)+\]:/;
+// A label opened on this line and still open at its end (where a backslash may end
+// it), then the rest of one.
+const LABEL_OPEN = /^\s*\[(?!\^[^\]])((?:[^[\]\\]|\\.)*\\?)$/;
+const LABEL_REST = /^((?:[^[\]\\]|\\.)*\\?)(\]:)?/;
+const LINE_ENDING = /\r\n?|\n/;
+const MAX_LABEL_LENGTH = 999;
+// Blockquote and list markers at any indent, so nested containers are read too.
+const CONTAINER_PREFIX = /^(?:\s*(?:>|[-*+]|\d{1,9}[.)]))+/;
+
 /**
- * Stable key for each render item. Prefer the server-assigned item id;
- * fall back to call_id for tools (unique within a response) or to
- * position for pre-finalization fragments that don't carry an item id
- * yet (text/reasoning chunks emitted before their `output_item.done`).
+ * Conservatively detects a reference link definition, which resolves only when
+ * static mode renders the whole document. It reads past blockquote and list markers
+ * and doesn't exclude code, so it can match where markdown wouldn't but shouldn't
+ * miss a definition. One pass over the lines, so long or pathological text stays linear.
+ */
+export function mayDefineReferenceLink(text: string): boolean {
+  // Length of a label left open by earlier lines, or -1.
+  let openLabel = -1;
+  for (const line of text.split(LINE_ENDING)) {
+    const content = line.replace(CONTAINER_PREFIX, "");
+    if (openLabel >= 0) {
+      // A label continues over non-blank lines of label characters, up to 999 of them.
+      const [matched = "", chars = "", closed] = LABEL_REST.exec(content) ?? [];
+      openLabel += chars.length + 1;
+      if (closed && openLabel <= MAX_LABEL_LENGTH) return true;
+      const continues = matched === content && content.trim() !== "";
+      openLabel = continues && openLabel <= MAX_LABEL_LENGTH ? openLabel : -1;
+      if (openLabel >= 0) continue;
+    }
+    if (REFERENCE_DEFINITION.test(content)) return true;
+    openLabel = LABEL_OPEN.exec(content)?.[1]?.length ?? -1;
+  }
+  return false;
+}
+
+/**
+ * Streamed text stays in streaming mode once it settles: static mode renders a
+ * different tree, so switching would remount every block of the reply.
+ */
+function keepsStreamingMode(item: Extract<RenderItem, { kind: "text" }>): boolean {
+  return item.streamKey !== undefined && !mayDefineReferenceLink(item.text);
+}
+
+/**
+ * Stable key for each render item. Text that streamed into this page keeps
+ * its `streamKey` while its item id commits; otherwise prefer the
+ * server-assigned item id, then call_id for tools (unique within a
+ * response), then position for fragments that don't carry an item id yet.
  */
 function keyFor(item: RenderItem, index: number): string {
+  if (item.kind === "text" && item.streamKey) return item.streamKey;
   if (item.itemId) return `${item.kind}:${item.itemId}`;
   if (item.kind === "tool") return `tool:${item.execution.callId}`;
   if (item.kind === "elicitation") return `elicitation:${item.elicitationId}`;

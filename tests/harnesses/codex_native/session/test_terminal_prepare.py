@@ -15,12 +15,13 @@ import pytest
 
 from omnigent._runner_startup import RunnerStartupProgress
 from omnigent.harnesses.codex_native import main as codex_native
+from omnigent.runtime.prompt import WORKSPACE_IMAGE_INSTRUCTION
 from tests.harnesses.codex_native.session._support import (
     _write_source_rollout,
 )
 
 
-def test_wrapper_spec_raw_instructions_resolves_prompt(tmp_path: Path) -> None:
+def test_wrapper_spec_startup_instructions_resolves_prompt(tmp_path: Path) -> None:
     """The ``omnigent codex`` wrapper's own materialized spec is resolvable.
 
     Its ``prompt`` field is real ``AgentSpec.instructions`` content, not
@@ -28,16 +29,17 @@ def test_wrapper_spec_raw_instructions_resolves_prompt(tmp_path: Path) -> None:
     like any other codex-native author instructions.
     """
     spec_path = codex_native._materialize_codex_agent_spec(tmp_path, model=None)
-    result = codex_native._wrapper_spec_raw_instructions(spec_path)
+    result = codex_native._wrapper_spec_startup_instructions(spec_path)
     assert result is not None
     assert "Codex is running in the session terminal" in result
+    assert result.endswith(WORKSPACE_IMAGE_INSTRUCTION)
 
 
-def test_wrapper_spec_raw_instructions_degrades_on_malformed_spec(tmp_path: Path) -> None:
+def test_wrapper_spec_startup_instructions_degrades_on_malformed_spec(tmp_path: Path) -> None:
     """A malformed wrapper spec must not block the terminal launch."""
     bad_spec = tmp_path / "bad.yaml"
     bad_spec.write_text("not: [valid, agent, spec")
-    assert codex_native._wrapper_spec_raw_instructions(bad_spec) is None
+    assert codex_native._wrapper_spec_startup_instructions(bad_spec) == WORKSPACE_IMAGE_INSTRUCTION
 
 
 @pytest.mark.asyncio

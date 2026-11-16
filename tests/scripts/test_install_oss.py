@@ -346,10 +346,31 @@ def test_check_bubblewrap_missing_no_pkg_manager_warns_generically(
         ("--no-databricks --extra databricks", "omnigent[databricks]"),
     ],
 )
-def test_install_target_selects_extras(lib: Path, args: str, target: str) -> None:
+@pytest.mark.parametrize(
+    ("system", "arch", "translated", "python_request"),
+    [
+        ("Darwin", "arm64", "return 1", "cpython-3.12-macos-aarch64"),
+        ("Darwin", "x86_64", "echo 1", "cpython-3.12-macos-aarch64"),
+        ("Darwin", "x86_64", "echo 0", "3.12"),
+        ("Darwin", "x86_64", "return 1", "3.12"),
+        ("Linux", "x86_64", "echo 1", "3.12"),
+        ("Linux", "aarch64", "echo 1", "3.12"),
+    ],
+)
+def test_install_target_selects_extras_and_python(
+    lib: Path,
+    args: str,
+    target: str,
+    system: str,
+    arch: str,
+    translated: str,
+    python_request: str,
+) -> None:
     r = run(
         lib,
         f"""
+        uname() {{ case "$1" in -s) echo {system};; -m) echo {arch};; esac; }}
+        sysctl() {{ [ "$*" = '-in sysctl.proc_translated' ] || return 1; {translated}; }}
         uv() {{ printf 'arg=%s\\n' "$@"; }}
         parse_args {args}
         normalize_repo_url
@@ -363,7 +384,7 @@ def test_install_target_selects_extras(lib: Path, args: str, target: str) -> Non
         "--force",
         "-q",
         "--python",
-        "3.12",
+        python_request,
         target,
     ]
 

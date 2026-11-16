@@ -15,6 +15,7 @@ import pytest
 
 from omnigent.native import native_policy_hook
 from omnigent.native.native_policy_hook import (
+    TOOL_FAILED_PAYLOAD_KEY,
     _is_login_redirect_or_unauthorized,
     evaluation_response_to_hook_output,
     fail_ask_hook_output,
@@ -65,6 +66,8 @@ def test_post_tool_use_maps_to_phase_tool_result() -> None:
     event = result["event"]
     assert event["type"] == "PHASE_TOOL_RESULT"
     assert event["data"]["result"] == "root:x:0:0:..."
+    # Success is never asserted, so result policies still read the text.
+    assert "is_error" not in event["data"]
     # request_data carries the originating call so result policies can
     # correlate output back to the tool + args that produced it.
     assert event["request_data"] == {
@@ -73,7 +76,82 @@ def test_post_tool_use_maps_to_phase_tool_result() -> None:
     }
 
 
-@pytest.mark.parametrize("hook_event", ["PreToolUse", "PostToolUse"])
+def test_post_tool_use_failure_maps_to_phase_tool_result_error() -> None:
+    """
+    A failed tool call reaches TOOL_RESULT policies as an error result.
+
+    Claude Code fires PostToolUseFailure, not PostToolUse, when e.g. Bash
+    exits non-zero, and carries the failure text under ``error``. The text
+    is wrapped as ``{"error": ...}`` for policies that read it, and
+    ``is_error`` marks the failure so ``detect_thrashing`` counts it
+    whatever the text says.
+    """
+    result = hook_payload_to_evaluation_request(
+        "PostToolUseFailure",
+        {
+            "hook_event_name": "PostToolUseFailure",
+            "tool_name": "Bash",
+            "tool_input": {"command": "cat /nonexistent/t1"},
+            "tool_use_id": "toolu_1",
+            "error": "Exit code 1\ncat: /nonexistent/t1: No such file or directory",
+            "is_interrupt": False,
+        },
+    )
+    assert result is not None
+    event = result["event"]
+    assert event["type"] == "PHASE_TOOL_RESULT"
+    assert event["data"] == {
+        "result": {"error": "Exit code 1\ncat: /nonexistent/t1: No such file or directory"},
+        "is_error": True,
+    }
+    assert event["request_data"] == {
+        "name": "Bash",
+        "arguments": {"command": "cat /nonexistent/t1"},
+    }
+
+
+def test_post_tool_use_reported_failure_sets_is_error() -> None:
+    """An adapter's failure flag reaches result policies as ``is_error``.
+
+    Some harnesses report a failed call through ``PostToolUse`` with output
+    text that doesn't look like an error (Devin's ``"success": false``), so
+    the adapter's flag is the only reliable signal.
+    """
+    result = hook_payload_to_evaluation_request(
+        "PostToolUse",
+        {
+            "tool_name": "exec",
+            "tool_input": {"command": "cat /nonexistent/t1"},
+            "tool_output": "cat: /nonexistent/t1: No such file or directory",
+            TOOL_FAILED_PAYLOAD_KEY: True,
+        },
+    )
+    assert result is not None
+    assert result["event"]["data"] == {
+        "result": "cat: /nonexistent/t1: No such file or directory",
+        "is_error": True,
+    }
+
+
+def test_interrupted_tool_call_is_not_evaluated() -> None:
+    """A user interrupt is not a tool error, so result policies never count it."""
+    assert (
+        hook_payload_to_evaluation_request(
+            "PostToolUseFailure",
+            {
+                "hook_event_name": "PostToolUseFailure",
+                "tool_name": "Bash",
+                "tool_input": {"command": "sleep 30"},
+                "tool_use_id": "toolu_1",
+                "error": "Interrupted by user",
+                "is_interrupt": True,
+            },
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize("hook_event", ["PreToolUse", "PostToolUse", "PostToolUseFailure"])
 def test_omnigent_mcp_tools_are_skipped(hook_event: str) -> None:
     """
     Omnigent MCP tools return None and are never sent to /policies/evaluate.
@@ -215,21 +293,22 @@ def test_pre_tool_use_unknown_action_returns_none() -> None:
     assert output is None
 
 
-def test_post_tool_use_deny_maps_to_additional_context() -> None:
+@pytest.mark.parametrize("hook_event", ["PostToolUse", "PostToolUseFailure"])
+def test_post_tool_use_deny_maps_to_additional_context(hook_event: str) -> None:
     """
-    A PostToolUse DENY becomes an additionalContext warning, not a block.
+    A tool-result DENY becomes an additionalContext warning, not a block.
 
-    PostToolUse fires after the tool ran, so it cannot block — the
+    These hooks fire after the tool ran, so they cannot block — the
     verdict is surfaced to the model as context. A failure would either
     drop the warning or wrongly attempt to block an already-run tool.
     """
     output = evaluation_response_to_hook_output(
-        "PostToolUse",
+        hook_event,
         {"result": "POLICY_ACTION_DENY", "reason": "Sensitive data in output"},
     )
     assert output is not None
     hook_specific = output["hookSpecificOutput"]
-    assert hook_specific["hookEventName"] == "PostToolUse"
+    assert hook_specific["hookEventName"] == hook_event
     # The warning text must carry the reason so the model sees why.
     assert hook_specific["additionalContext"] == "[Policy violation] Sensitive data in output"
 
@@ -418,9 +497,10 @@ def test_fail_ask_user_prompt_submit_still_fails_closed() -> None:
     assert output["reason"]
 
 
-def test_fail_ask_post_tool_use_fails_open() -> None:
-    """``PostToolUse`` fails open under fail-ask, same as fail-closed."""
-    assert fail_ask_hook_output("PostToolUse") is None
+@pytest.mark.parametrize("hook_event", ["PostToolUse", "PostToolUseFailure"])
+def test_fail_ask_post_tool_use_fails_open(hook_event: str) -> None:
+    """Tool-result hooks fail open under fail-ask, same as fail-closed."""
+    assert fail_ask_hook_output(hook_event) is None
 
 
 def test_fail_ask_unknown_event_fails_open() -> None:

@@ -97,6 +97,17 @@ class _StubResourceRegistry:
         """
         self._terminal_activity_publisher = publisher
 
+    def wake_session_terminal_watchers(self, session_id: str) -> None:
+        """
+        Accept the turn-start wake the runner issues for every running status.
+
+        The stub owns no terminals, so there is no idle watcher to wake.
+
+        :param session_id: Session whose terminal watchers would be woken.
+        :returns: None.
+        """
+        del session_id
+
     def set_session_background_publisher(
         self,
         publisher: Callable[[str, bool], None],
@@ -112,6 +123,8 @@ class _StubResourceRegistry:
     def set_session_status_publisher(
         self,
         publisher: Callable[[str, str], None],
+        *,
+        accepts_inferred_status: Callable[[], bool] | None = None,
     ) -> None:
         """
         Accept the session-status publisher installed by the runner app.
@@ -120,8 +133,10 @@ class _StubResourceRegistry:
         callback (unused) to satisfy ``create_runner_app``'s wiring.
 
         :param publisher: Callable ``(session_id, status) -> None``.
+        :param accepts_inferred_status: Unused server capability check.
         :returns: None.
         """
+        del accepts_inferred_status
         self._session_status_publisher = publisher
 
     def set_session_failure_publisher(self, publisher: Callable[[str, str], None]) -> None:
@@ -147,6 +162,10 @@ class _StubResourceRegistry:
 
     def uses_copy_on_write(self, session_id: str) -> bool:
         """The stub has no sandbox environment."""
+        return False
+
+    def session_has_background_agents(self, session_id: str) -> bool:
+        """No terminal is running, so no background agent outlives a turn."""
         return False
 
     def compute_default_env_root(self, session_id: str, agent_spec: Any) -> str:
@@ -459,6 +478,10 @@ async def test_terminal_launch_with_bridge_inject_advertises_comment_tools(
         "sys_session_get_info",
         "sys_session_rename",
         "sys_session_message",
+        "sys_project_list",
+        "sys_session_update",
+        "sys_project_update",
+        "sys_session_link_pr",
         "ui_open_file",
         "sys_agent_list",
         "sys_agent_get",
@@ -485,6 +508,7 @@ async def test_terminal_launch_with_bridge_inject_advertises_comment_tools(
         "session_id",
         "message",
     ]
+    assert tools_by_name["sys_session_link_pr"]["parameters"]["required"] == ["url"]
     assert tools_by_name["ui_open_file"]["parameters"]["required"] == ["path"]
     assert tools_by_name["ui_open_file"]["parameters"]["additionalProperties"] is False
     # A url + token prove the localhost relay HTTP server actually started
@@ -555,7 +579,8 @@ async def test_native_observer_uses_first_original_and_skips_git_reads(
         }
     )
     read.side_effect = None
-    assert read.await_count == 2
+    # The recovered original adds a read of the patched text for the revert check.
+    assert read.await_count == 3
     assert resolve.call_count == 1
     for path in ("failed.txt", "continued.txt"):
         record = registry.get_changed_file(relay_env.session_id, path)
@@ -613,12 +638,42 @@ async def test_native_observer_uses_first_original_and_skips_git_reads(
         assert app.state.filesystem_registry.get_baseline(path) == original
         record = app.state.filesystem_registry.get_changed_file(relay_env.session_id, path)
         assert record is not None and record["status"] == "modified"
-    assert read.await_count == resolve.call_count == 2
+    assert resolve.call_count == 2
+    assert read.await_count == 4
     for call in read.await_args_list:
         assert call.kwargs == {"max_bytes": 1_048_576, "regular_only": True}
     subprocess.run(["git", "init", str(tmp_path / "repo")], check=True, capture_output=True)
     await patch_file("repo/file.txt", "@@ -1 +1 @@\n-old\n+new\n")
-    assert read.await_count == resolve.call_count == 2
+    assert resolve.call_count == 2
+    assert read.await_count == 4
+
+    for path in ("known.txt", "unknown.txt"):
+        (tmp_path / path).write_text("old\n")
+        await patch_file(path, "@@ -1 +1 @@\n-second\n+old\n")
+    assert registry.get_changed_file(relay_env.session_id, "known.txt") is None
+    record = registry.get_changed_file(relay_env.session_id, "unknown.txt")
+    assert record is not None and record["status"] == "modified"
+
+    edit = {"hook_event_name": "PostToolUse", "tool_name": "Edit", "tool_input": {}}
+    (tmp_path / "edited.txt").write_text("after\n")
+    await observe(
+        {**edit, "tool_response": {"filePath": "edited.txt", "originalFile": "before\n"}}
+    )
+    record = registry.get_changed_file(relay_env.session_id, "edited.txt")
+    assert record is not None and record["status"] == "modified"
+    (tmp_path / "edited.txt").write_text("before\n")
+    await observe({**edit, "tool_response": {"filePath": "edited.txt", "originalFile": "after\n"}})
+    assert registry.get_changed_file(relay_env.session_id, "edited.txt") is None
+
+    # A truncated or base64 read of these files would equal their original.
+    for path, original, content in (
+        ("grown.txt", "x" * 1_048_576, b"x" * 1_048_577),
+        ("binary.txt", "AAE=", b"\0\1"),
+    ):
+        (tmp_path / path).write_bytes(content)
+        await observe({**edit, "tool_response": {"filePath": path, "originalFile": original}})
+        record = registry.get_changed_file(relay_env.session_id, path)
+        assert record is not None and record["status"] == "modified"
 
 
 @pytest.mark.asyncio
@@ -689,8 +744,19 @@ class _ReapableStubResourceRegistry(_StubResourceRegistry):
 
 
 @pytest.mark.asyncio
-async def test_idle_pane_reap_closes_comment_relay(tmp_path: Path) -> None:
+async def test_idle_pane_reap_closes_comment_relay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Reaping an idle pane closes its relay; the next launch starts a fresh one."""
+    started_relays: list[bridge.ClaudeNativeToolRelay] = []
+    start_tool_relay = bridge.start_tool_relay
+
+    def start(**kwargs):
+        relay = start_tool_relay(**kwargs)
+        started_relays.append(relay)
+        return relay
+
+    monkeypatch.setattr(bridge, "start_tool_relay", start)
     app = create_runner_app(
         resource_registry=_ReapableStubResourceRegistry(tmp_path),
         server_client=NullServerClient(),  # type: ignore[arg-type]
@@ -709,15 +775,14 @@ async def test_idle_pane_reap_closes_comment_relay(tmp_path: Path) -> None:
         try:
             resp = await _launch_terminal(client, session_id, bridge_inject_dir=True)
             assert resp.status_code == 200, resp.text
-            relay_url = json.loads(relay_file.read_text())["url"]
+            relay_socket = started_relays[0]._httpd.socket
 
             await reaper._reap(pane)
             # A surviving relay keeps a listening socket per reaped session
             # until the session is deleted, exhausting the runner's descriptors.
             assert not relay_file.exists(), "tool_relay.json survived the idle reap"
-            with pytest.raises(httpx.ConnectError):
-                async with httpx.AsyncClient() as probe:
-                    await probe.get(relay_url, timeout=2.0)
+            # Another worker may already have reused the released pool port.
+            assert relay_socket.fileno() == -1
 
             resp = await _launch_terminal(client, session_id, bridge_inject_dir=True)
             assert resp.status_code == 200, resp.text
@@ -1213,6 +1278,7 @@ class _SwitchableServerClient:
         """
         self.agent_id = agent_id
         self.bridge_id = bridge_id
+        self.workflows_enabled = False
 
     class _Response:
         """Stub 200 response carrying a caller-supplied JSON body."""
@@ -1243,6 +1309,8 @@ class _SwitchableServerClient:
         :returns: Stub 200 response.
         """
         del kwargs
+        if url == "/v1/info":
+            return self._Response({"features": {"workflows": self.workflows_enabled}})
         if url.endswith("/labels"):
             labels = {BRIDGE_ID_LABEL_KEY: self.bridge_id} if self.bridge_id else {}
             return self._Response({"labels": labels})
@@ -1630,6 +1698,37 @@ async def test_native_revision_refreshes_relay_before_turn_without_reset(
                     assert current_relay["url"] == initial_relay["url"]
                     assert current_relay["token"] == initial_relay["token"]
                 assert manager.released == []
+            finally:
+                await client.delete(f"/v1/sessions/{session_id}")
+    finally:
+        shutil.rmtree(bridge_dir, ignore_errors=True)
+
+
+@pytest.mark.asyncio
+async def test_native_relay_updates_workflow_tools_after_server_reconnect(
+    tmp_path: Path,
+) -> None:
+    from omnigent.runner.journal_tools import JOURNAL_TOOL_NAMES
+
+    agent_id = "ag_workflows"
+    server_client = _SwitchableServerClient(agent_id)
+    app = _switch_app(tmp_path, server_client, {agent_id: _spec_without_terminals()})
+    session_id = f"conv_{uuid.uuid4().hex[:12]}"
+    bridge_dir = prepare_bridge_dir(session_id, workspace=tmp_path)
+    relay_file = bridge_dir / _TOOL_RELAY_FILE
+
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://runner"
+        ) as client:
+            try:
+                for enabled in (False, True, False):
+                    server_client.workflows_enabled = enabled
+                    await app.state.catch_up_scan()
+                    await _launch_bridged(client, session_id)
+                    names = _relay_tool_names(relay_file)
+                    assert names & JOURNAL_TOOL_NAMES == (JOURNAL_TOOL_NAMES if enabled else set())
+                    assert "list_comments" in names
             finally:
                 await client.delete(f"/v1/sessions/{session_id}")
     finally:

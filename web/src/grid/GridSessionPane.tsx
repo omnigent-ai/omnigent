@@ -1,6 +1,17 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ComponentProps } from "react";
+import {
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ComponentProps,
+} from "react";
 import { createPortal } from "react-dom";
+import { useQueryClient } from "@tanstack/react-query";
 import { useDraggable, useDroppable } from "@dnd-kit/core";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isFeatureEnabled } from "@/lib/capabilities";
 import { cn } from "@/lib/utils";
 import { Maximize2Icon, XIcon } from "lucide-react";
 import { SideChatPane } from "@/components/chat/SideChatPane";
@@ -51,6 +62,7 @@ import type { RightRailTab } from "@/shell/railTabs";
 import type { ChangedSort } from "@/shell/FlatFileList";
 import { WorkspacePanel } from "@/shell/WorkspacePanel";
 import { revealFolderInFilesPanel } from "@/shell/FilesPanel";
+import { selectPullRequestInPanel } from "@/shell/PullRequestPanel";
 import { citedFilePosition } from "@/shell/filePositionState";
 import { useGridSessions } from "./GridSessionsContext";
 
@@ -79,9 +91,11 @@ export function GridSessionPane({
   workspacePanel: GridWorkspacePanelProps;
   onOpenWorkspace: () => void;
 }) {
+  const queryClient = useQueryClient();
   const { session, isLoading: sessionLoading } = useSession(sessionId);
   const state = useConversationEntryState(sessionId);
   const canEdit = useCanEdit(sessionId);
+  const serverInfo = useServerInfo();
   const permissionLevel = session?.permissionLevel ?? (canEdit ? null : 1);
   const grids = useGridSessions()!;
   const title = session?.title || "Session";
@@ -234,11 +248,21 @@ export function GridSessionPane({
     };
   }, []);
   const navigateWorkspace = useCallback(
-    (path: string, options: OpenFileOptions | undefined, apply: () => void) => {
+    (path: string | null, options: OpenFileOptions | undefined, apply: () => void) => {
       if (navigationGuard.current) navigationGuard.current(path, options, apply);
       else apply();
     },
     [],
+  );
+  // Leaving the grid (the shell's Close) asks this cell's viewer about unsaved edits too.
+  const registerShellNavigationGuard = useContext(FileViewerContext)?.registerNavigationGuard;
+  useEffect(
+    () =>
+      registerShellNavigationGuard?.((path, options, navigate) => {
+        if (path === null) navigateWorkspace(null, options, navigate);
+        else navigate();
+      }),
+    [registerShellNavigationGuard, navigateWorkspace],
   );
   const openFile = useCallback(
     (path: string, options?: OpenFileOptions) => {
@@ -301,9 +325,13 @@ export function GridSessionPane({
     () => ({
       openFile,
       registerNavigationGuard,
-      openGithubTab: () => {
-        selectTab("github");
-        onOpenWorkspace();
+      guardFileNavigation: navigateWorkspace,
+      openGithubTab: (prUrl?: string) => {
+        navigateWorkspace("", undefined, () => {
+          if (prUrl) selectPullRequestInPanel(queryClient, sessionId, prUrl);
+          showTab("github");
+          onOpenWorkspace();
+        });
       },
       openFolder: showFiles
         ? (absolutePath: string) =>
@@ -322,7 +350,7 @@ export function GridSessionPane({
     [
       openFile,
       registerNavigationGuard,
-      selectTab,
+      queryClient,
       navigateWorkspace,
       showTab,
       onOpenWorkspace,
@@ -468,6 +496,7 @@ export function GridSessionPane({
             <div className={selected && workspacePanel.open ? "contents" : "hidden"}>
               <WorkspacePanel
                 contained
+                keyboardTarget={selected}
                 conversationId={sessionId}
                 sessionHarness={state.sessionHarness}
                 agentId={state.boundAgentId ?? session?.agentId ?? null}
@@ -494,6 +523,12 @@ export function GridSessionPane({
                 }}
                 showFilesPanel={showFiles}
                 showGithubTab={showFiles}
+                showTasksTab={
+                  (isFeatureEnabled(serverInfo, "workflows") &&
+                    serverInfo !== "loading" &&
+                    serverInfo.session_journal === true) ||
+                  (state.todos?.length ?? 0) > 0
+                }
                 showBrowserTab={supportsBrowser()}
                 onReveal={onOpenWorkspace}
                 changedCount={changedCount}

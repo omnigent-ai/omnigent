@@ -309,7 +309,7 @@ const CodeBlockBody = memo(
       >
         <code
           className={cn(
-            "font-mono text-ui",
+            "literal-code font-mono text-ui",
             showLineNumbers && "[counter-increment:line_0] [counter-reset:line]",
           )}
         >

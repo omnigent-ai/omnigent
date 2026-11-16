@@ -173,6 +173,7 @@ def log_task_created(
             "slack",
             "github",
             "linear",
+            "pagerduty",
             "follow-up-monitor",
             "pr-sweep",
             "news-digest",

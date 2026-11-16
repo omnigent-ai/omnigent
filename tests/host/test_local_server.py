@@ -44,7 +44,7 @@ def test_local_server_url_if_healthy_returns_url_when_alive_and_healthy(
     class _Resp:
         status_code = 200
 
-    def _fake_get(url: str, *, timeout: float, trust_env: bool) -> _Resp:
+    def _fake_get(url: str, *, timeout: float, trust_env: bool, **_kwargs: Any) -> _Resp:
         health_targets.append((url, trust_env))
         return _Resp()
 
@@ -72,7 +72,7 @@ def test_wait_for_local_server_bypasses_environment_proxies(
 
     health_targets: list[tuple[str, bool]] = []
 
-    def _fake_get(url: str, *, timeout: float, trust_env: bool) -> _Resp:
+    def _fake_get(url: str, *, timeout: float, trust_env: bool, **_kwargs: Any) -> _Resp:
         health_targets.append((url, trust_env))
         return _Resp()
 
@@ -1091,7 +1091,7 @@ def test_stop_untracked_local_server_kills_orphan_on_default_port(
     terminate it — returning the PID so the off-switch can report it.
     """
 
-    def _healthy(url: str, *, timeout: float, trust_env: bool) -> _FakeHealthResp:
+    def _healthy(url: str, *, timeout: float, trust_env: bool, **_kwargs: Any) -> _FakeHealthResp:
         assert trust_env is False
         return _FakeHealthResp(200, {"status": "ok"})
 
@@ -1177,7 +1177,7 @@ def test_stop_untracked_local_server_noop_when_nothing_listening(
     """
     import httpx
 
-    def _refused(url: str, *, timeout: float, trust_env: bool) -> Any:
+    def _refused(url: str, *, timeout: float, trust_env: bool, **_kwargs: Any) -> Any:
         assert trust_env is False
         raise httpx.ConnectError("connection refused")
 
@@ -1197,7 +1197,7 @@ def test_stop_untracked_local_server_noop_on_non_omnigent_listener(
 ) -> None:
     """A 200 that isn't ``{"status": "ok"}`` is some other app — never killed."""
 
-    def _foreign(url: str, *, timeout: float, trust_env: bool) -> _FakeHealthResp:
+    def _foreign(url: str, *, timeout: float, trust_env: bool, **_kwargs: Any) -> _FakeHealthResp:
         assert trust_env is False
         return _FakeHealthResp(200, {"hello": "world"})
 
@@ -1216,7 +1216,7 @@ def test_stop_untracked_local_server_noop_when_lsof_unavailable(
     than crashing — the off-switch then leaves a manual hint to the user.
     """
 
-    def _healthy(url: str, *, timeout: float, trust_env: bool) -> _FakeHealthResp:
+    def _healthy(url: str, *, timeout: float, trust_env: bool, **_kwargs: Any) -> _FakeHealthResp:
         assert trust_env is False
         return _FakeHealthResp(200, {"status": "ok"})
 
@@ -1518,7 +1518,7 @@ def test_wait_adopts_a_slow_boot_while_the_process_is_alive(
 
     calls = {"n": 0}
 
-    def _fake_get(url: str, *, timeout: float, trust_env: bool) -> _Resp:
+    def _fake_get(url: str, *, timeout: float, trust_env: bool, **_kwargs: Any) -> _Resp:
         del url, timeout, trust_env
         calls["n"] += 1
         if calls["n"] < 3:
@@ -1571,7 +1571,7 @@ def test_wait_stops_the_spawned_server_when_the_boot_ceiling_expires(
             del timeout
             return 0
 
-    def _fake_get(url: str, *, timeout: float, trust_env: bool) -> None:
+    def _fake_get(url: str, *, timeout: float, trust_env: bool, **_kwargs: Any) -> None:
         del url, timeout, trust_env
         raise httpx.ConnectError("never ready")
 

@@ -35,7 +35,7 @@ const {
 } = require("../src/omnigent_cli");
 
 describe("cliCommandParts", () => {
-  it("keeps public CLI paths bare and adds fixed isaac argv without a shell", () => {
+  it("keeps plain CLI paths bare and adds fixed isaac argv without a shell", () => {
     assert.deepEqual(cliCommandParts("/bin/omnigent"), {
       executable: "/bin/omnigent",
       prefixArgs: [],

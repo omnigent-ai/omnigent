@@ -188,8 +188,8 @@ function IntroDialog({
       id: "watch",
       title: "Watch for new work",
       description:
-        "Use Jira, Slack, GitHub, or Linear templates to check periodically and start sessions for matching items. Your agent needs access to the service.",
-      caption: "Jira · Slack · GitHub · Linear",
+        "Use Jira, Slack, GitHub, Linear, or PagerDuty templates to check periodically and start sessions for matching items. Your agent needs access to the service.",
+      caption: "Jira · Slack · GitHub · Linear · PagerDuty",
       result: "Start work on matching items",
       icon: SearchIcon,
     });

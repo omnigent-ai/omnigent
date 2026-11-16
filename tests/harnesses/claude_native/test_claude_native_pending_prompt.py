@@ -35,6 +35,28 @@ _PERMISSION = """\
 ╰──────────────────────────────────────────────────────────╯
 """
 _COMPOSER = "\n──────────────────────────────\n❯\n──────────────────────────────\n"
+_WRAPPED_QUESTION = _QUESTION.replace("Esc to cancel", "Esc to\ncancel")
+_WRAPPED_SELECT_QUESTION = _QUESTION.replace("Enter to select", "Enter to\nselect")
+_WRAPPED_MULTISELECT = _WRAPPED_QUESTION.replace(
+    "Enter to select", "Space to select · Enter to\nsubmit"
+)
+_SPLIT_CANCEL_QUESTION = _QUESTION.replace("cancel", "ca\nncel")
+_SPLIT_SELECT_QUESTION = _QUESTION.replace("select", "sel\nect")
+_SPLIT_ESCAPE_QUESTION = _QUESTION.replace("Esc", "Es\nc")
+_SPLIT_SUBMIT_QUESTION = _QUESTION.replace(
+    "Enter to select", "Space to select · Enter to sub\nmit"
+)
+_EXIT_PLAN_QUESTION = """\
+────────────────────────────────────────────────────────────────────────────────
+ Exit plan mode?
+  Claude wants to exit plan mode
+  ❯ 1. Yes, and switch to default (ask each time) for this session
+    2. No
+"""
+_WRAPPED_EXIT_PLAN_QUESTION = _EXIT_PLAN_QUESTION.replace(
+    "switch to default (ask each time) for this session",
+    "switch to default (ask each time)\n       for this session",
+)
 
 
 @pytest.fixture
@@ -72,7 +94,32 @@ def test_live_hook_protects_a_prompt_even_during_a_torn_capture(
     [
         _QUESTION,
         _QUESTION.replace("Enter to select", "Space to select · Enter to submit"),
+        _WRAPPED_QUESTION,
+        _WRAPPED_SELECT_QUESTION,
+        _WRAPPED_MULTISELECT,
+        _SPLIT_CANCEL_QUESTION,
+        _SPLIT_SELECT_QUESTION,
+        _SPLIT_ESCAPE_QUESTION,
+        _SPLIT_SUBMIT_QUESTION,
         _PERMISSION,
+        _EXIT_PLAN_QUESTION,
+        _EXIT_PLAN_QUESTION.replace("❯ 1.", "  1.").replace("  2. No", "❯ 2. No"),
+        _WRAPPED_EXIT_PLAN_QUESTION,
+    ],
+    ids=[
+        "question",
+        "multiselect",
+        "wrapped-cancel",
+        "wrapped-select",
+        "wrapped-submit",
+        "split-cancel-word",
+        "split-select-word",
+        "split-escape-word",
+        "split-submit-word",
+        "permission",
+        "clipped-plan-yes",
+        "clipped-plan-no",
+        "clipped-plan-wrapped",
     ],
 )
 @pytest.mark.parametrize("operation", ["message", "settings"])
@@ -94,7 +141,33 @@ def test_terminal_fallback_prompt_receives_no_injected_keystrokes(
     assert sent == []
 
 
-@pytest.mark.parametrize("pane", [_QUESTION, _PERMISSION])
+@pytest.mark.parametrize(
+    "pane",
+    [
+        _QUESTION,
+        _WRAPPED_QUESTION,
+        _WRAPPED_SELECT_QUESTION,
+        _WRAPPED_MULTISELECT,
+        _SPLIT_CANCEL_QUESTION,
+        _SPLIT_SELECT_QUESTION,
+        _SPLIT_ESCAPE_QUESTION,
+        _SPLIT_SUBMIT_QUESTION,
+        _PERMISSION,
+        _EXIT_PLAN_QUESTION,
+    ],
+    ids=[
+        "question",
+        "wrapped-cancel",
+        "wrapped-select",
+        "wrapped-submit",
+        "split-cancel-word",
+        "split-select-word",
+        "split-escape-word",
+        "split-submit-word",
+        "permission",
+        "clipped-plan",
+    ],
+)
 def test_decision_text_above_a_ready_composer_does_not_block_delivery(
     native_bridge: Path, monkeypatch: pytest.MonkeyPatch, pane: str
 ) -> None:
@@ -102,8 +175,45 @@ def test_decision_text_above_a_ready_composer_does_not_block_delivery(
     assert not bridge.has_pending_user_prompt(native_bridge)
 
 
+@pytest.mark.parametrize(
+    "pane",
+    [
+        _EXIT_PLAN_QUESTION.replace("❯", " "),
+        _EXIT_PLAN_QUESTION.split("  ❯")[0],
+        _EXIT_PLAN_QUESTION.replace("  Claude wants to exit plan mode\n", ""),
+        "\n".join("> " + line for line in _EXIT_PLAN_QUESTION.splitlines()),
+        _COMPOSER.replace("❯\n", "❯ " + _EXIT_PLAN_QUESTION.split("\n", 1)[1]),
+        _EXIT_PLAN_QUESTION.split("\n", 1)[1],
+        _EXIT_PLAN_QUESTION + "─" * 80 + "\nLauncher starting\n",
+    ],
+    ids=[
+        "no-selection",
+        "headlines-only",
+        "no-subtitle",
+        "quoted-text",
+        "draft",
+        "no-rule",
+        "old-decision-above-last-rule",
+    ],
+)
+def test_plan_decision_text_without_live_controls_does_not_block_delivery(
+    native_bridge: Path, monkeypatch: pytest.MonkeyPatch, pane: str
+) -> None:
+    monkeypatch.setattr(bridge, "_capture_pane", lambda *_: pane)
+    assert not bridge.has_pending_user_prompt(native_bridge)
+
+
+@pytest.mark.parametrize(
+    "pane",
+    [
+        "Settings panel\nEscape to close",
+        "──────────────────────────────\n"
+        "Showing detailed transcript · ctrl+o to toggle · ? for shortcuts\n",
+    ],
+    ids=["settings", "detailed-transcript"],
+)
 def test_hook_that_parks_between_overlay_captures_prevents_escape(
-    native_bridge: Path, monkeypatch: pytest.MonkeyPatch
+    native_bridge: Path, monkeypatch: pytest.MonkeyPatch, pane: str
 ) -> None:
     captures = 0
     sent = []
@@ -113,7 +223,7 @@ def test_hook_that_parks_between_overlay_captures_prevents_escape(
         captures += 1
         if captures == 2:
             _park_hook(native_bridge)
-        return "Settings panel\nEscape to close"
+        return pane
 
     monkeypatch.setattr(bridge, "_capture_pane", capture)
     monkeypatch.setattr(bridge, "_run_tmux", lambda *args: sent.append(args))
@@ -137,14 +247,45 @@ def test_question_appearing_after_readiness_prevents_paste(
     assert sent == []
 
 
+@pytest.mark.parametrize(
+    "pane",
+    [
+        _QUESTION,
+        _WRAPPED_QUESTION,
+        _WRAPPED_SELECT_QUESTION,
+        _WRAPPED_MULTISELECT,
+        _SPLIT_CANCEL_QUESTION,
+        _SPLIT_SELECT_QUESTION,
+        _SPLIT_ESCAPE_QUESTION,
+        _SPLIT_SUBMIT_QUESTION,
+        _EXIT_PLAN_QUESTION,
+    ],
+    ids=[
+        "question",
+        "wrapped-cancel",
+        "wrapped-select",
+        "wrapped-submit",
+        "split-cancel-word",
+        "split-select-word",
+        "split-escape-word",
+        "split-submit-word",
+        "clipped-plan",
+    ],
+)
 def test_question_appearing_during_readiness_does_not_become_a_terminal_timeout(
-    native_bridge: Path, monkeypatch: pytest.MonkeyPatch
+    native_bridge: Path, monkeypatch: pytest.MonkeyPatch, pane: str
 ) -> None:
-    monkeypatch.setattr(bridge, "_capture_pane", lambda *_: _QUESTION)
-    with pytest.raises(bridge.ClaudeUserPromptPending):
+    monkeypatch.setattr(bridge, "_capture_pane", lambda *_: pane)
+    monkeypatch.setattr(bridge, "_claude_pane_state", lambda *_: bridge._ClaudePaneState(True))
+    with pytest.raises(bridge.ClaudeUserPromptPending) as caught:
         bridge._wait_for_claude_prompt_ready(
-            "/tmp/example.sock", "main", timeout_s=0, bridge_dir=native_bridge
+            "/tmp/example.sock",
+            "main",
+            timeout_s=0,
+            bridge_dir=native_bridge,
+            extend_for_slow_boot=False,
         )
+    assert caught.value.nothing_typed
 
 
 def test_explicit_interrupt_can_cancel_a_pending_question(

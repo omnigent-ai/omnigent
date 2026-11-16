@@ -5,6 +5,11 @@ host owns (Claude Code, Codex and Cursor configs, including an organization's
 `managed-mcp.json`), Omnigent has no way to know that state: whatever manages those
 sign-ins does. This file is how that manager tells Omnigent.
 
+While a `managed-mcp.json` exists, Claude Code loads only the servers it lists, so the
+host reports only those for Claude. That file also needs Omnigent's relay entry for
+Claude sessions to keep Omnigent's tools; see
+[CLAUDE_MANAGED_MCP.md](CLAUDE_MANAGED_MCP.md).
+
 ## Where it lives
 
 `~/.omnigent/mcp-auth-status.json`, or the absolute path in
@@ -26,7 +31,7 @@ directory; the host passes runners that resolved path.
 
 | Field | Required | Meaning |
 | --- | --- | --- |
-| `harness` | yes | `claude`, `codex` or `cursor`: which harness loads the server. |
+| `harness` | yes | `claude`, `codex`, `cursor` or `pi`: which harness loads the server. |
 | `name` | yes | The server's name as the harness config spells it. |
 | `status` | yes | `connected` or `sign_in_required`. |
 | `sign_in_url` | no | Page that completes the sign-in. Only read with `sign_in_required`. |

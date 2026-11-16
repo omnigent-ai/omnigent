@@ -272,13 +272,17 @@ async def test_write_permission_matches_recorded_path_before_delivering(
     from omnigent.harnesses.kiro_native import bridge
     from tests.test_kiro_native_bridge import _WRITE_PERMISSION_PANE, _install_fake_tmux
 
-    monkeypatch.setattr(knp, "_DELIVERY_CONFIRM_TIMEOUT_S", 0.1)
-    for setting in (
-        "_PERMISSION_ENTER_SETTLE_S",
-        "_PERMISSION_KEY_INTERVAL_S",
-        "_POLL_INTERVAL_S",
-    ):
-        monkeypatch.setattr(bridge, setting, 0)
+    elapsed = 0.0
+
+    def advance(seconds: float) -> None:
+        nonlocal elapsed
+        elapsed += seconds
+
+    monkeypatch.setattr(
+        bridge,
+        "time",
+        SimpleNamespace(monotonic=lambda: elapsed, sleep=advance, time=bridge.time.time),
+    )
     rejected = _WRITE_PERMISSION_PANE.replace(
         "❯ Yes, single permission", "  Yes, single permission"
     ).replace("  No (Tab to edit)", "❯ No (Tab to edit)")
@@ -413,7 +417,11 @@ async def test_supervise_mirror_parks_then_releases_on_permission_response(
                 503 if receipt_unavailable else 200, request=httpx.Request("POST", url)
             )
 
-    monkeypatch.setattr(knp.httpx, "AsyncClient", _FakeAsyncClient)
+    # Patch the factory, not httpx.AsyncClient: SessionRoutingTransport builds its own
+    # inner AsyncClient, which would otherwise be recorded as the posting client.
+    monkeypatch.setattr(
+        "omnigent.cli_auth.open_server_client", lambda *_a, **_kw: _FakeAsyncClient()
+    )
 
     started = asyncio.Event()
     release = asyncio.Event()

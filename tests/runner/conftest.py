@@ -6,7 +6,7 @@ import asyncio
 import contextlib
 import json
 import os
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -331,6 +331,10 @@ class _FakeProcessManager:
         """Check if a session was registered via :meth:`get_client`."""
         return conversation_id in self._sessions
 
+    def registered_client(self, conversation_id: str) -> _ScriptedHarnessClient | None:
+        """Return the existing scripted client without creating a session."""
+        return self._client if conversation_id in self._sessions else None
+
     def has_active_turn(self, conversation_id: str) -> bool:
         """Check if a turn is marked active for this conversation."""
         return conversation_id in self._active_turns
@@ -359,7 +363,12 @@ class _FakeProcessManager:
         return True
 
     async def release(
-        self, conversation_id: str, *, only_if_idle_cutoff: float | None = None
+        self,
+        conversation_id: str,
+        *,
+        only_if_idle_cutoff: float | None = None,
+        expected_client: object = ...,
+        can_release: Callable[[], bool] | None = None,
     ) -> None:
         """Record a release and remove the session.
 
@@ -371,6 +380,13 @@ class _FakeProcessManager:
             conversation with an active turn is not torn down.
         """
         self.release_calls.append((conversation_id, only_if_idle_cutoff))
+        if can_release is not None and not can_release():
+            return
+        if (
+            expected_client is not ...
+            and self.registered_client(conversation_id) is not expected_client
+        ):
+            return
         if only_if_idle_cutoff is not None and conversation_id in self._active_turns:
             return
         self.released.append(conversation_id)

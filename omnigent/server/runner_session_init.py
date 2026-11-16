@@ -204,11 +204,11 @@ class RunnerSessionInitializer:
             and self._agent_store is not None
             and self._agent_cache is not None
         ):
-            from omnigent.server.mcp_compatibility import require_session_registry_mcp_support
+            from omnigent.server.runtime_compatibility import require_session_runtime_support
 
             async with store_slots or nullcontext():
                 await asyncio.to_thread(
-                    require_session_registry_mcp_support,
+                    require_session_runtime_support,
                     conversation,
                     connection.hello.capabilities,
                     component="runner",

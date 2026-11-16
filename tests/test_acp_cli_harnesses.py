@@ -110,8 +110,10 @@ def test_spawn_env_forwards_cwd_sandbox_and_quotes_command(
     assert "HARNESS_ACP_MODEL" not in env
 
 
+@pytest.mark.parametrize("row_passthrough", [(), ("TEST_ROW_AUTH",)])
 def test_jcode_connect_injects_gateway_env_and_passthrough(
     monkeypatch: pytest.MonkeyPatch,
+    row_passthrough: tuple[str, ...],
 ) -> None:
     """On a managed-connect host (and no explicit spec key), the jcode row's spawn env
     carries the broker bearer + JCODE_HOME + runtime dir and names ALL THREE in
@@ -128,12 +130,18 @@ def test_jcode_connect_injects_gateway_env_and_passthrough(
             "JCODE_RUNTIME_DIR": "/tmp/jc-home/run",
         },
     )
+    monkeypatch.setitem(
+        ACP_CLI_HARNESSES,
+        "jcode",
+        dataclasses.replace(ACP_CLI_HARNESSES["jcode"], env_passthrough=row_passthrough),
+    )
     env = _build_acp_cli_spawn_env(_spec("jcode"), harness="jcode", session_id="sess-1")
     assert env["JCODE_DBX_TOKEN"] == "fresh-bearer"
     assert env["JCODE_HOME"] == "/tmp/jc-home"
     assert env["JCODE_RUNTIME_DIR"] == "/tmp/jc-home/run"
     names = set(env["HARNESS_ACP_ENV_PASSTHROUGH"].split(","))
-    assert {"JCODE_DBX_TOKEN", "JCODE_HOME", "JCODE_RUNTIME_DIR"} <= names
+    assert {"JCODE_DBX_TOKEN", "JCODE_HOME", "JCODE_RUNTIME_DIR", *row_passthrough} <= names
+    assert ("TEST_ROW_AUTH" in names) == bool(row_passthrough)
 
 
 def test_jcode_no_connect_is_a_noop(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -220,6 +228,52 @@ def test_spawn_env_mirrors_row_omnigent_mcp(monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.setitem(ACP_CLI_HARNESSES, "fakecli", _FAKE_ROW)
     env = _build_acp_cli_spawn_env(_spec("fakecli"), harness="fakecli")
     assert env["HARNESS_ACP_OMNIGENT_MCP"] == "1"
+
+
+def test_spawn_env_names_a_row_auth_variable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A row's own auth variable must be named for the deny-by-default spawn env.
+
+    The wrap forwards only passthrough-named vars, so a vendor CLI that
+    authenticates from its own key starts unauthenticated when the row's
+    variable is left out, even though the setup hint told the user to set it.
+    """
+    keyed_row = dataclasses.replace(_FAKE_ROW, env_passthrough=("FAKE_API_KEY",))
+    monkeypatch.setitem(ACP_CLI_HARNESSES, "fakecli", keyed_row)
+    env = _build_acp_cli_spawn_env(_spec("fakecli"), harness="fakecli")
+    assert env["HARNESS_ACP_ENV_PASSTHROUGH"] == "FAKE_API_KEY"
+
+    # A row declaring none leaves the var unset rather than naming an empty
+    # list, so the wrap keeps its own default.
+    monkeypatch.setitem(ACP_CLI_HARNESSES, "fakecli", _FAKE_ROW)
+    env = _build_acp_cli_spawn_env(_spec("fakecli"), harness="fakecli")
+    assert "HARNESS_ACP_ENV_PASSTHROUGH" not in env
+
+
+def test_grok_row_passes_through_its_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The real Grok row must forward the key its auth hint advertises.
+
+    ``XAI_API_KEY`` is the documented API-key path for Grok Build, and an
+    API-key-only user has no OAuth login to fall back on.
+    """
+    row = ACP_CLI_HARNESSES["grok"]
+    assert "XAI_API_KEY" in row.install.auth_hint
+    env = _build_acp_cli_spawn_env(_spec("grok"), harness="grok")
+    assert "XAI_API_KEY" in env["HARNESS_ACP_ENV_PASSTHROUGH"].split(",")
+
+    from omnigent.inner.acp_executor import AcpExecutor
+    from omnigent.inner.acp_harness import _build_acp_executor
+
+    for name in ("OMNIGENT_RUNNER_ENV_PASSTHROUGH", "HARNESS_ACP_OS_ENV", "HARNESS_ACP_ENV_UNSET"):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("XAI_API_KEY", "example-xai-value")
+    monkeypatch.setenv("UNRELATED_API_KEY", "example-unrelated-value")
+    executor = _build_acp_executor()
+    assert isinstance(executor, AcpExecutor)
+    child_env = executor._build_spawn_env()
+    assert child_env.get("XAI_API_KEY") == "example-xai-value"
+    assert "UNRELATED_API_KEY" not in child_env
 
 
 # ---------------------------------------------------------------------------

@@ -1,11 +1,20 @@
 /**
- * Typed client for the `/v1/sessions/{id}/permissions` endpoints.
- * Mirrors `omnigent/server/routes/sessions.py` permission handlers.
+ * Typed client for the `/v1/sessions/{id}/permissions` and
+ * `/v1/scheduled-tasks/{id}/permissions` endpoints. Mirrors the handlers in
+ * `omnigent/server/routes/sessions/routes_permissions.py` and
+ * `omnigent/server/routes/scheduled_task_permissions.py`.
  */
 
 import type { Conversation } from "@/hooks/useConversations";
+import { isSingleUserMode, type ServerInfo } from "@/lib/capabilities";
 import type { Session } from "@/lib/types";
 import { authenticatedFetch } from "./identity";
+
+/** What a share dialog shares: a session, or an automation whose runs' sessions follow it. */
+export type ShareTarget = { kind: "session"; id: string } | { kind: "automation"; id: string };
+
+/** Numeric read level, the only level an automation can be shared at. */
+export const LEVEL_READ = 1;
 
 /**
  * Numeric permission level of the session owner. Mirrors
@@ -120,34 +129,87 @@ export function isSessionSharedWithOthers(
   return viewerOwnsSession && (ownerGrants ?? []).some((g) => g.user_id !== viewerId);
 }
 
-export interface Permission {
+/** One grant as a share dialog lists it, for a session or an automation. */
+export interface ShareGrant {
   user_id: string;
-  conversation_id: string;
   level: number;
+  /** The grantee's name; automations' grants carry it, sessions' do not. */
+  display_name?: string;
 }
 
-export async function listPermissions(sessionId: string): Promise<Permission[]> {
-  // The endpoint is cursor-paginated ({permissions, next_cursor}); follow the
-  // cursor and concatenate so callers always see the full grant list.
-  const all: Permission[] = [];
+export interface Permission extends ShareGrant {
+  conversation_id: string;
+}
+
+/** One grant on an automation; each carries the grantee's display name. */
+export interface AutomationPermission extends ShareGrant {
+  scheduled_task_id: string;
+  display_name: string;
+}
+
+/** The viewer's automation that sets a session's sharing on each run. */
+export interface ManagingAutomation {
+  id: string;
+  name: string;
+}
+
+/** Every grant on a session or an automation, as one list. */
+export interface GrantList<T extends ShareGrant = ShareGrant> {
+  permissions: T[];
+  /**
+   * The viewer's continue-session automation that replaces a session's shares
+   * on each run, or `null`; always `null` for an automation's own grants.
+   */
+  managedByAutomation: ManagingAutomation | null;
+}
+
+function permissionsPath(target: ShareTarget): string {
+  const collection = target.kind === "session" ? "sessions" : "scheduled-tasks";
+  return `/v1/${collection}/${encodeURIComponent(target.id)}/permissions`;
+}
+
+/** The server's error message for a failed response, or its status line. */
+async function responseError(res: Response): Promise<Error> {
+  const body = await res.json().catch(() => ({}));
+  return new Error(body?.error?.message ?? `${res.status} ${res.statusText}`);
+}
+
+/**
+ * Every grant from a cursor-paginated ({permissions, next_cursor}) list, with
+ * the managing automation the server names on its first page.
+ */
+async function listAllGrants<T extends ShareGrant>(target: ShareTarget): Promise<GrantList<T>> {
+  const all: T[] = [];
+  let managedByAutomation: ManagingAutomation | null = null;
   let after: string | null = null;
   // Each page provides the cursor for the next request.
   /* oxlint-disable no-await-in-loop */
   do {
-    const path = `/v1/sessions/${encodeURIComponent(sessionId)}/permissions${
-      after !== null ? `?after=${encodeURIComponent(after)}` : ""
-    }`;
-    const res = await authenticatedFetch(path);
-    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+    const query = after !== null ? `?after=${encodeURIComponent(after)}` : "";
+    const res = await authenticatedFetch(`${permissionsPath(target)}${query}`);
+    if (!res.ok) throw await responseError(res);
     const data = (await res.json()) as {
-      permissions: Permission[];
+      permissions: T[];
       next_cursor: string | null;
+      managed_by_automation?: ManagingAutomation | null;
     };
+    if (after === null) managedByAutomation = data.managed_by_automation ?? null;
     all.push(...data.permissions);
     after = data.next_cursor;
   } while (after !== null);
   /* oxlint-enable no-await-in-loop */
-  return all;
+  return { permissions: all, managedByAutomation };
+}
+
+export async function listPermissions(sessionId: string): Promise<GrantList<Permission>> {
+  return listAllGrants<Permission>({ kind: "session", id: sessionId });
+}
+
+/** Everyone an automation is shared with, which only its owner may list. */
+export async function listAutomationPermissions(
+  taskId: string,
+): Promise<GrantList<AutomationPermission>> {
+  return listAllGrants<AutomationPermission>({ kind: "automation", id: taskId });
 }
 
 export async function getSessionOwner(sessionId: string): Promise<string | null> {
@@ -157,24 +219,50 @@ export async function getSessionOwner(sessionId: string): Promise<string | null>
   return data.owner;
 }
 
+/**
+ * Grant a user or group access to a session or an automation. An automation
+ * takes read access only; the server refuses the owner, the public and reserved
+ * IDs (400) and what its sharing policy forbids (403), with a message saying why.
+ */
+export async function grantSharePermission<T extends ShareGrant = ShareGrant>(
+  target: ShareTarget,
+  userId: string,
+  level: number,
+  ensureMinimum = false,
+): Promise<T> {
+  const res = await authenticatedFetch(permissionsPath(target), {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      user_id: userId,
+      level,
+      ...(ensureMinimum ? { ensure_minimum: true } : {}),
+    }),
+  });
+  if (!res.ok) throw await responseError(res);
+  return (await res.json()) as T;
+}
+
 export async function grantPermission(
   sessionId: string,
   userId: string,
   level: number,
+  ensureMinimum = false,
 ): Promise<Permission> {
-  const res = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(sessionId)}/permissions`,
-    {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ user_id: userId, level }),
-    },
+  return grantSharePermission<Permission>(
+    { kind: "session", id: sessionId },
+    userId,
+    level,
+    ensureMinimum,
   );
-  if (!res.ok) {
-    const responseBody = await res.json().catch(() => ({}));
-    throw new Error(responseBody?.error?.message ?? `${res.status} ${res.statusText}`);
-  }
-  return (await res.json()) as Permission;
+}
+
+/** Remove a grant on a session or an automation; removing a missing one is harmless (204). */
+export async function revokeSharePermission(target: ShareTarget, userId: string): Promise<void> {
+  const res = await authenticatedFetch(`${permissionsPath(target)}/${encodeURIComponent(userId)}`, {
+    method: "DELETE",
+  });
+  if (!res.ok && res.status !== 204) throw await responseError(res);
 }
 
 /**
@@ -186,12 +274,23 @@ export async function grantPermission(
  * Either way it refuses to remove the owner's grant (403).
  */
 export async function revokePermission(sessionId: string, userId: string): Promise<void> {
-  const res = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(sessionId)}/permissions/${encodeURIComponent(userId)}`,
-    { method: "DELETE" },
+  return revokeSharePermission({ kind: "session", id: sessionId }, userId);
+}
+
+/**
+ * Whether the viewer may share an automation: the server can share automations,
+ * has other users (as session sharing requires), and the viewer owns it.
+ */
+export function canShareAutomation(
+  info: ServerInfo | "loading",
+  viewerId: string | null,
+  ownerUserId: string | null,
+): boolean {
+  return (
+    info !== "loading" &&
+    info.scheduled_task_sharing === true &&
+    !isSingleUserMode(info) &&
+    viewerId !== null &&
+    ownerUserId === viewerId
   );
-  if (!res.ok && res.status !== 204) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error(body?.error?.message ?? `${res.status} ${res.statusText}`);
-  }
 }

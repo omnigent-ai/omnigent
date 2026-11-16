@@ -167,7 +167,7 @@ plus the blackhole and flap idle rows at 120 s.
 - Each Codex tool call made while the server is down waits on the
   evaluate-policy hook's 30 s retry budget before proceeding. A chained tool
   turn therefore slows down during an outage, but it completes.
-- In "Approve for me" (the default Codex mode), escalated commands go to
+- In the "Approve for me" Codex mode, escalated commands go to
   Codex's automatic reviewer, which makes its own model call. When that call
   returned an unusable verdict, Codex rejected the command rather than asking
   the user. A model outage at that moment would likely do the same. This is

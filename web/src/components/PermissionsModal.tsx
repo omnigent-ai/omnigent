@@ -1,9 +1,10 @@
 /**
- * Permissions management modal for a session.
+ * Permissions management modal for a session or an automation.
  *
  * Displays current grants, allows granting/revoking access, and
  * toggling public visibility. Only accessible to users with
- * manage-level (3) permission on the session.
+ * manage-level (3) permission on the session. An automation is shared
+ * by its owner at read access only, with no public or link sharing.
  */
 
 import {
@@ -16,8 +17,9 @@ import {
   useState,
 } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { CheckIcon, LinkIcon, QrCodeIcon, Trash2Icon, UserPlusIcon } from "lucide-react";
+import { CheckIcon, InfoIcon, LinkIcon, QrCodeIcon, Trash2Icon, UserPlusIcon } from "lucide-react";
 import { QRCodeSVG } from "qrcode.react";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -37,21 +39,30 @@ import {
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import {
-  type Permission,
+  AutomationCallout,
+  AutomationLink,
+} from "@/components/scheduled/AutomationSourceDeleteNotice";
+import {
+  type ShareGrant,
+  type ShareTarget,
+  useGrantList,
   useGrantPermission,
-  usePermissions,
   useRevokePermission,
 } from "@/hooks/usePermissions";
 import { useSession } from "@/hooks/useSession";
 import { usePublicSharingMaxLevel } from "@/hooks/useSharing";
 import { useUserSearch } from "@/hooks/useUserSearch";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { SHARING_OFF_REASON } from "@/lib/capabilities";
 import { copyText } from "@/lib/clipboard";
 import { updateSession } from "@/lib/sessionsApi";
 import { getOmnigentUserSearch } from "@/lib/host";
-import { getShareableSessionLink } from "@/lib/shareLink";
+import { getSessionSharePath, getShareableSessionLink } from "@/lib/shareLink";
 import { workspaceSharingBlocked } from "@/lib/permissionsApi";
 import { useRebasePath } from "@/lib/routing";
+import { automationSharePath } from "@/lib/automationFromSession";
+import type { ScheduledTask } from "@/lib/scheduledTasksApi";
+import type { Session } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 const PUBLIC_USER = "__public__";
@@ -64,19 +75,32 @@ const LEVEL_LABELS: Record<number, string> = {
   4: "Owner",
 };
 
-interface PermissionsModalProps {
-  sessionId: string;
-  workspace?: string | null;
+/** The automation fields its share dialog shows. */
+export type SharedAutomation = Pick<ScheduledTask, "id" | "name" | "sessionMode">;
+
+type PermissionsModalProps = {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-}
+} & (
+  | { sessionId: string; workspace?: string | null; filePath?: string; automation?: undefined }
+  | {
+      automation: SharedAutomation;
+      sessionId?: undefined;
+      workspace?: undefined;
+      filePath?: undefined;
+    }
+);
 
-export function PermissionsModal({
-  sessionId,
-  workspace,
-  open,
-  onOpenChange,
-}: PermissionsModalProps) {
+export function PermissionsModal(props: PermissionsModalProps) {
+  const { workspace, filePath, open, onOpenChange } = props;
+  const target: ShareTarget =
+    props.automation !== undefined
+      ? { kind: "automation", id: props.automation.id }
+      : { kind: "session", id: props.sessionId };
+  // An automation has no public access, workspace files or link: its grantees
+  // read the sessions its runs create.
+  const automation = props.automation ?? null;
+  const sessionId = target.kind === "session" ? target.id : null;
   // Server sharing policy. While the boot probe is in flight we treat the
   // server as "on" (fail open) so the modal renders its full controls; the
   // server-side gate is the real enforcement point regardless.
@@ -84,36 +108,51 @@ export function PermissionsModal({
   const sharingMode = info === "loading" ? "on" : info.sharing_mode;
   const sharingOff = sharingMode === "off";
   const sharingReadOnly = sharingMode === "read_only" || sharingMode === "restricted_read_only";
+  const { session, error: sessionError } = useSession(open && !sharingOff ? sessionId : null);
+  const sharingWorkspace = workspace ?? (filePath ? session?.workspace : undefined);
   const workspaceBlocked =
-    sharingMode === "restricted_read_only" && workspaceSharingBlocked(workspace);
+    sharingMode === "restricted_read_only" && workspaceSharingBlocked(sharingWorkspace);
   // Disabling public sharing prevents new grants but still permits revocation.
   const publicSharingEnabled = info === "loading" ? true : info.public_sharing_enabled;
-  const { data: livePublicMaxLevel } = usePublicSharingMaxLevel(open && !sharingOff);
+  const { data: livePublicMaxLevel } = usePublicSharingMaxLevel(open && !sharingOff && !automation);
   const publicMaxLevel =
     (livePublicMaxLevel ?? (info === "loading" ? "read" : info.public_sharing_max_level)) === "edit"
       ? 2
       : 1;
   // In "off" mode never fetch the grant list — the modal short-circuits to a
-  // notice below, so the request would be wasted (and the server rejects any
-  // grant anyway).
-  const { data: permissions, isLoading } = usePermissions(open && !sharingOff ? sessionId : null);
-  const grant = useGrantPermission(sessionId);
-  const revoke = useRevokePermission(sessionId);
+  // notice below. Closing keeps the loaded list through the close animation.
+  const {
+    data: grantList,
+    isLoading,
+    isError: grantsFailed,
+    error: grantsError,
+    refetch: refreshPermissions,
+  } = useGrantList(target, open && !sharingOff);
+  const permissions = grantList?.permissions;
+  // The server names an automation only to its owner, while it replaces this
+  // session's shares on each run.
+  const managingAutomation = grantList?.managedByAutomation ?? null;
+  const grant = useGrantPermission(target);
+  const revoke = useRevokePermission(target);
 
   const [newUserId, setNewUserId] = useState("");
   const [newLevel, setNewLevel] = useState("1");
   const [error, setError] = useState<string | null>(null);
   const [showQr, setShowQr] = useState(false);
+  const [checkingPermissions, setCheckingPermissions] = useState(false);
   const blockedNoticeId = useId();
 
   // Whether the owner shared the workspace files with view-level collaborators.
   // Read from the (shared-cache) session snapshot; the toggle PATCHes it and
   // invalidates the snapshot so the rail's file surfaces appear/disappear.
-  const { session } = useSession(open && !sharingOff ? sessionId : null);
   const queryClient = useQueryClient();
   const shareWorkspace = useMutation({
-    mutationFn: (next: boolean) => updateSession(sessionId, { shareWorkspaceFiles: next }),
-    onSuccess: () => {
+    // Only a session has workspace files, so `target` is that session.
+    mutationFn: (next: boolean) => updateSession(target.id, { shareWorkspaceFiles: next }),
+    onSuccess: (updated) => {
+      queryClient.setQueryData<Session>(["session", sessionId], (previous) =>
+        previous ? { ...previous, shareWorkspaceFiles: updated.shareWorkspaceFiles } : previous,
+      );
       void queryClient.invalidateQueries({ queryKey: ["session", sessionId] });
     },
     onError: (err: Error) => setError(err.message),
@@ -122,26 +161,87 @@ export function PermissionsModal({
   // chat agent has none, so the toggle would be inert — hide it there.
   const hasWorkspace = !!session?.workspace;
   const workspaceShared = session?.shareWorkspaceFiles ?? false;
+  const fileShareUnavailable = !!filePath && (!session || workspaceBlocked);
+  const shareBusy =
+    checkingPermissions || grant.isPending || revoke.isPending || shareWorkspace.isPending;
+  const visibleError = error ?? (fileShareUnavailable ? sessionError?.message : null);
+
+  async function prepareFileShare() {
+    if (!filePath) return;
+    if (fileShareUnavailable) {
+      const message = "Workspace files are unavailable for sharing.";
+      setError(message);
+      throw new Error(message);
+    }
+    if (!workspaceShared) await shareWorkspace.mutateAsync(true);
+  }
+
+  async function openMobileLink() {
+    setError(null);
+    try {
+      await prepareFileShare();
+      setShowQr(true);
+    } catch {
+      // The workspace mutation displays its error in the dialog.
+    }
+  }
 
   const userGrants = (permissions ?? []).filter((p) => p.user_id !== PUBLIC_USER);
   const publicGrant = (permissions ?? []).find((p) => p.user_id === PUBLIC_USER);
   const publicLevel = publicGrant ? Math.min(publicGrant.level, publicMaxLevel) : 0;
 
-  function handleGrant(e: FormEvent) {
+  async function grantAccess(
+    userId: string,
+    level: number,
+    existingLevel = 0,
+    ensureMinimum = false,
+  ) {
+    let accessGranted = existingLevel >= level;
+    try {
+      if (!accessGranted) {
+        await grant.mutateAsync({ userId, level, ensureMinimum });
+        accessGranted = true;
+      }
+      await prepareFileShare();
+      return true;
+    } catch (err) {
+      const message = (err as Error).message;
+      setError(
+        filePath && accessGranted
+          ? `Session access is granted, but file sharing failed: ${message}`
+          : message,
+      );
+      return false;
+    }
+  }
+
+  async function handleGrant(e: FormEvent) {
     e.preventDefault();
     const trimmed = newUserId.trim();
-    if (!trimmed || workspaceBlocked) return;
+    if (
+      !trimmed ||
+      shareBusy ||
+      workspaceBlocked ||
+      fileShareUnavailable ||
+      (!!filePath && permissions === undefined)
+    )
+      return;
     setError(null);
-    grant.mutate(
-      { userId: trimmed, level: parseInt(newLevel, 10) },
-      {
-        onSuccess: () => {
-          setNewUserId("");
-          setNewLevel("1");
-        },
-        onError: (err) => setError(err.message),
-      },
-    );
+    setCheckingPermissions(!!filePath);
+    try {
+      const currentPermissions = filePath
+        ? (await refreshPermissions({ throwOnError: true })).data?.permissions
+        : undefined;
+      const existingGrant = currentPermissions?.find((p) => p.user_id === trimmed);
+      if (await grantAccess(trimmed, parseInt(newLevel, 10), existingGrant?.level, !!filePath)) {
+        setNewUserId("");
+        setNewLevel("1");
+      }
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setCheckingPermissions(false);
+    }
   }
 
   function handleRevoke(userId: string) {
@@ -151,23 +251,32 @@ export function PermissionsModal({
     });
   }
 
-  function handleChangeLevel(userId: string, level: number) {
-    if (workspaceBlocked) return;
+  async function handleChangeLevel(userId: string, level: number) {
+    if (workspaceBlocked || fileShareUnavailable) return;
     setError(null);
-    grant.mutate({ userId, level }, { onError: (err) => setError(err.message) });
+    await grantAccess(userId, level);
   }
 
-  function handlePublicLevel(value: string) {
+  async function handlePublicLevel(value: string) {
     const level = Number(value);
     if (level > 0 && (workspaceBlocked || !publicSharingEnabled)) return;
     setError(null);
     if (level > 0) {
-      grant.mutate({ userId: PUBLIC_USER, level }, { onError: (err) => setError(err.message) });
+      await grantAccess(PUBLIC_USER, level);
     } else {
       revoke.mutate(PUBLIC_USER, {
         onError: (err) => setError(err.message),
       });
     }
+  }
+
+  let description = "Invite others to view or collaborate on this session.";
+  if (automation) {
+    description = "Each run's session is shared with the people below, with Read access.";
+  } else if (filePath) {
+    description = "This link opens the selected file in full screen.";
+  } else if (sharingReadOnly) {
+    description = "This server allows read-only sharing — invite others to view this session.";
   }
 
   // "off" short-circuit: sharing is disabled server-wide, so skip the whole
@@ -178,9 +287,7 @@ export function PermissionsModal({
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">Sharing unavailable</DialogTitle>
-            <DialogDescription>
-              Sharing has been disabled for this Omnigent server.
-            </DialogDescription>
+            <DialogDescription>{SHARING_OFF_REASON}</DialogDescription>
           </DialogHeader>
           <DialogFooter>
             <Button variant="outline" onClick={() => onOpenChange(false)}>
@@ -196,15 +303,24 @@ export function PermissionsModal({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
-          <DialogTitle className="flex items-center gap-2">Share this session</DialogTitle>
+          <DialogTitle className="flex items-center gap-2">
+            {automation
+              ? "Share this automation"
+              : filePath
+                ? "Share this file"
+                : "Share this session"}
+          </DialogTitle>
           <DialogDescription asChild>
             <div className="space-y-3">
-              <p>
-                {sharingReadOnly
-                  ? "This server allows read-only sharing — invite others to view this session."
-                  : "Invite others to view or collaborate on this session."}
-              </p>
-              {sharingReadOnly && (
+              <p>{description}</p>
+              {automation?.sessionMode === "continue" && (
+                <p>
+                  Sharing it replaces the shares on the session it continues with this list,
+                  including people added there by hand, even at Edit or Manage. The owner and
+                  General access are kept.
+                </p>
+              )}
+              {sharingReadOnly && !filePath && (
                 <p>
                   Please be careful when sharing. Read access will allow for reading of all session
                   outputs.
@@ -213,8 +329,32 @@ export function PermissionsModal({
             </div>
           </DialogDescription>
         </DialogHeader>
+        {managingAutomation && (
+          <AutomationCallout
+            title="Sharing is managed by an automation"
+            testId="share-managed-by-automation"
+          >
+            Shares added or removed here are replaced with the automation&apos;s list on each run of{" "}
+            <AutomationLink
+              task={managingAutomation}
+              to={automationSharePath(info, managingAutomation)}
+              onNavigate={() => onOpenChange(false)}
+            />{" "}
+            and whenever its sharing changes. General access isn&apos;t affected.
+          </AutomationCallout>
+        )}
+        {filePath && (
+          <Alert role="note" className="bg-muted/50">
+            <InfoIcon />
+            <AlertTitle>Shares the entire session and all workspace files</AlertTitle>
+            <AlertDescription>
+              Includes all messages. Sharing enables files for every session reader. New invites
+              default to read-only; existing permissions stay.
+            </AlertDescription>
+          </Alert>
+        )}
 
-        {(publicSharingEnabled || publicGrant) && (
+        {!automation && (publicSharingEnabled || publicGrant) && (
           <div className="flex min-w-0 items-center justify-between gap-3 rounded-lg border px-3 py-2">
             <div className="min-w-0">
               <p className="text-ui font-medium">General access</p>
@@ -227,9 +367,8 @@ export function PermissionsModal({
               onValueChange={handlePublicLevel}
               disabled={
                 isLoading ||
-                grant.isPending ||
-                revoke.isPending ||
-                (workspaceBlocked && !publicGrant)
+                shareBusy ||
+                ((workspaceBlocked || fileShareUnavailable) && !publicGrant)
               }
               componentId="diagnostics.permissions.public_level"
               valueHasNoPii
@@ -239,13 +378,21 @@ export function PermissionsModal({
               </SelectTrigger>
               <SelectContent position="popper" align="start">
                 <SelectItem value="0">No access</SelectItem>
-                <SelectItem value="1" disabled={workspaceBlocked || !publicSharingEnabled}>
+                <SelectItem
+                  value="1"
+                  disabled={workspaceBlocked || fileShareUnavailable || !publicSharingEnabled}
+                >
                   Read
                 </SelectItem>
                 {publicMaxLevel === 2 && (
                   <SelectItem
                     value="2"
-                    disabled={sharingReadOnly || workspaceBlocked || !publicSharingEnabled}
+                    disabled={
+                      sharingReadOnly ||
+                      workspaceBlocked ||
+                      fileShareUnavailable ||
+                      !publicSharingEnabled
+                    }
                   >
                     Edit
                   </SelectItem>
@@ -260,25 +407,29 @@ export function PermissionsModal({
             file surfaces open up; edit collaborators already have them. Shown
             only for sessions that actually have a workspace on disk. */}
         {hasWorkspace && (
-          <div
-            className="flex items-center justify-between rounded-lg border px-3 py-2"
-            data-testid="share-workspace-files"
-          >
-            <div>
-              <p className="text-ui font-medium">Workspace files</p>
-              <p className="text-sm text-muted-foreground">
-                Let people with view access browse this session's files
-              </p>
+          <div className="rounded-lg border px-3 py-2" data-testid="share-workspace-files">
+            {filePath && <p className="mb-2 break-all font-mono text-sm">{filePath}</p>}
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="text-ui font-medium">
+                  {filePath ? "All workspace files" : "Workspace files"}
+                </p>
+                <p className="text-sm text-muted-foreground">
+                  {filePath
+                    ? "Let everyone with Read access browse all workspace files"
+                    : "Let people with view access browse this session's files"}
+                </p>
+              </div>
+              <Switch
+                checked={workspaceShared}
+                onCheckedChange={(checked) => {
+                  setError(null);
+                  shareWorkspace.mutate(checked);
+                }}
+                disabled={shareBusy}
+                componentId="diagnostics.permissions.share_workspace_toggle"
+              />
             </div>
-            <Switch
-              checked={workspaceShared}
-              onCheckedChange={(checked) => {
-                setError(null);
-                shareWorkspace.mutate(checked);
-              }}
-              disabled={shareWorkspace.isPending}
-              componentId="diagnostics.permissions.share_workspace_toggle"
-            />
           </div>
         )}
 
@@ -288,6 +439,10 @@ export function PermissionsModal({
         <div className="min-w-0" data-testid="share-grants">
           {isLoading ? (
             <p className="text-ui text-muted-foreground py-2">Loading…</p>
+          ) : grantsFailed && !permissions ? (
+            <p role="alert" className="text-ui text-destructive py-2">
+              Couldn&apos;t load who has access: {grantsError.message}
+            </p>
           ) : userGrants.length === 0 ? (
             <p className="text-ui text-muted-foreground py-2">No grants yet.</p>
           ) : (
@@ -309,8 +464,9 @@ export function PermissionsModal({
                     permission={p}
                     onRevoke={handleRevoke}
                     onChangeLevel={handleChangeLevel}
-                    busy={grant.isPending || revoke.isPending}
-                    readOnly={sharingReadOnly}
+                    busy={shareBusy}
+                    levelDisabled={fileShareUnavailable}
+                    readOnly={sharingReadOnly || !!automation}
                   />
                 ))}
               </div>
@@ -335,32 +491,46 @@ export function PermissionsModal({
             </label>
             <AddUserField value={newUserId} onChange={setNewUserId} disabled={workspaceBlocked} />
           </div>
-          <div>
-            <label htmlFor="perm-level" className="text-sm font-medium text-muted-foreground">
-              Level
-            </label>
-            <Select
-              value={newLevel}
-              onValueChange={setNewLevel}
-              disabled={workspaceBlocked}
-              componentId="diagnostics.permissions.grant_level"
-              valueHasNoPii
-            >
-              <SelectTrigger className="mt-1 w-24" aria-label="New user permission">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent position="popper" align="start">
-                <SelectItem value="1">Read</SelectItem>
-                {/* Read-only sharing caps new grants at view; hide Edit. */}
-                {!sharingReadOnly && <SelectItem value="2">Edit</SelectItem>}
-              </SelectContent>
-            </Select>
-          </div>
+          {automation ? (
+            <div>
+              <span className="text-sm font-medium text-muted-foreground">Level</span>
+              <p className="mt-1 flex h-8 w-24 items-center px-3 text-ui text-muted-foreground">
+                Read
+              </p>
+            </div>
+          ) : (
+            <div>
+              <label htmlFor="perm-level" className="text-sm font-medium text-muted-foreground">
+                Level
+              </label>
+              <Select
+                value={newLevel}
+                onValueChange={setNewLevel}
+                disabled={workspaceBlocked}
+                componentId="diagnostics.permissions.grant_level"
+                valueHasNoPii
+              >
+                <SelectTrigger className="mt-1 w-24" aria-label="New user permission">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent position="popper" align="start">
+                  <SelectItem value="1">Read</SelectItem>
+                  {/* Read-only sharing caps new grants at view; hide Edit. */}
+                  {!sharingReadOnly && <SelectItem value="2">Edit</SelectItem>}
+                </SelectContent>
+              </Select>
+            </div>
+          )}
           <Button
             type="submit"
             size="sm"
-            loading={grant.isPending}
-            disabled={workspaceBlocked || !newUserId.trim()}
+            loading={checkingPermissions || grant.isPending || shareWorkspace.isPending}
+            disabled={
+              workspaceBlocked ||
+              !newUserId.trim() ||
+              fileShareUnavailable ||
+              (!!filePath && permissions === undefined)
+            }
             aria-describedby={workspaceBlocked ? blockedNoticeId : undefined}
             componentId="diagnostics.permissions.grant"
           >
@@ -369,22 +539,31 @@ export function PermissionsModal({
           </Button>
         </form>
 
-        {error && <p className="text-sm text-destructive">{error}</p>}
+        {visibleError && <p className="text-sm text-destructive">{visibleError}</p>}
 
         {/* Keep the default stacking below sm: one row of Copy link + QR +
             Done overflows a phone-width dialog and widens the whole grid. */}
         <DialogFooter className="sm:justify-between">
-          <div className="flex items-center gap-2">
-            <CopyLinkButton sessionId={sessionId} />
-            <Button
-              variant="ghost"
-              onClick={() => setShowQr(true)}
-              className="gap-1.5 text-primary"
-            >
-              <QrCodeIcon className="size-3.5" />
-              Open in mobile app
-            </Button>
-          </div>
+          {sessionId !== null && (
+            <div className="flex items-center gap-2">
+              <CopyLinkButton
+                sessionId={sessionId}
+                filePath={filePath}
+                beforeCopy={filePath ? prepareFileShare : undefined}
+                onError={setError}
+                disabled={!!filePath && (fileShareUnavailable || shareBusy)}
+              />
+              <Button
+                variant="ghost"
+                onClick={openMobileLink}
+                disabled={!!filePath && (fileShareUnavailable || shareBusy)}
+                className="gap-1.5 text-primary"
+              >
+                <QrCodeIcon className="size-3.5" />
+                Open in mobile app
+              </Button>
+            </div>
+          )}
           <Button variant="outline" onClick={() => onOpenChange(false)}>
             Done
           </Button>
@@ -392,7 +571,14 @@ export function PermissionsModal({
       </DialogContent>
 
       {/* Separate modal for the QR code so the share dialog stays compact. */}
-      <QrCodeDialog sessionId={sessionId} open={showQr} onOpenChange={setShowQr} />
+      {sessionId !== null && (
+        <QrCodeDialog
+          sessionId={sessionId}
+          filePath={filePath}
+          open={showQr}
+          onOpenChange={setShowQr}
+        />
+      )}
     </Dialog>
   );
 }
@@ -581,22 +767,41 @@ function AddUserCombobox({ value, onChange, disabled }: AddUserFieldProps) {
  * URL `getShareableSessionLink` resolves — so standalone and embedded (host-transformed)
  * origins agree on the same server the desktop shell's deep-link handler keys
  * off of (see `electron/src/deepLink.js`). The path is always basename-less
- * `/c/<id>`; the workspace mount is server-determined and intentionally absent.
+ * `/c/<id>` with optional `file` and `fullscreen` query parameters; the workspace
+ * mount is server-determined and intentionally absent.
  */
-function getDeepLink(sessionId: string, rebasePath: (path: string) => string): string {
-  const url = getShareableSessionLink(sessionId, rebasePath);
+function getDeepLink(
+  sessionId: string,
+  rebasePath: (path: string) => string,
+  filePath?: string,
+): string {
+  const url = getShareableSessionLink(sessionId, rebasePath, filePath);
+  const path = getSessionSharePath(sessionId, filePath);
   try {
     const { host } = new URL(url);
-    return `omnigent://${host}/c/${sessionId}`;
+    return `omnigent://${host}${path}`;
   } catch {
     // Unparseable transform output: fall back to the current origin's host.
-    return `omnigent://${window.location.host}/c/${sessionId}`;
+    return `omnigent://${window.location.host}${path}`;
   }
 }
 
-function CopyLinkButton({ sessionId }: { sessionId: string }) {
+function CopyLinkButton({
+  sessionId,
+  filePath,
+  beforeCopy,
+  onError,
+  disabled,
+}: {
+  sessionId: string;
+  filePath?: string;
+  beforeCopy?: () => Promise<void>;
+  onError: (message: string | null) => void;
+  disabled?: boolean;
+}) {
   const [copied, setCopied] = useState(false);
   const rebasePath = useRebasePath();
+  const label = filePath ? "Copy file link" : "Copy link";
 
   useEffect(() => {
     if (!copied) return;
@@ -604,25 +809,49 @@ function CopyLinkButton({ sessionId }: { sessionId: string }) {
     return () => clearTimeout(id);
   }, [copied]);
 
-  const handleCopy = useCallback(() => {
-    const url = getShareableSessionLink(sessionId, rebasePath);
-    copyText(url).then(
-      () => setCopied(true),
-      (err) => {
-        console.warn("Failed to copy link to clipboard", err);
-      },
-    );
-  }, [sessionId, rebasePath]);
+  const handleCopy = useCallback(async () => {
+    const url = getShareableSessionLink(sessionId, rebasePath, filePath);
+    setCopied(false);
+    onError(null);
+    const [clipboard, prepared] = await Promise.allSettled([copyText(url), beforeCopy?.()]);
+    if (clipboard.status === "rejected") {
+      console.warn("Failed to copy link to clipboard", clipboard.reason);
+    }
+    if (prepared.status === "rejected") {
+      console.warn("Failed to prepare file share", prepared.reason);
+      const message = (prepared.reason as Error).message;
+      if (clipboard.status === "fulfilled") {
+        onError(
+          `Link copied, but file sharing failed: ${message}. Please try again before sharing this link.`,
+        );
+      } else {
+        onError(`Could not copy the link, and file sharing failed: ${message}. Please try again.`);
+      }
+      return;
+    }
+    if (clipboard.status === "rejected") {
+      if (filePath) {
+        onError(
+          "Could not copy the link. Workspace files are shared with everyone who has Read access. Please try copying again.",
+        );
+      } else {
+        onError("Could not copy the link. Please try again or use the mobile QR code.");
+      }
+      return;
+    }
+    setCopied(true);
+  }, [sessionId, rebasePath, filePath, beforeCopy, onError]);
 
   return (
     <Button
       variant="ghost"
       onClick={handleCopy}
+      disabled={disabled}
       className="gap-1.5 text-primary"
       componentId="diagnostics.permissions.copy_link"
     >
       {copied ? <CheckIcon className="size-3.5" /> : <LinkIcon className="size-3.5" />}
-      {copied ? "Copied!" : "Copy link"}
+      {copied ? "Copied!" : label}
     </Button>
   );
 }
@@ -637,15 +866,17 @@ function CopyLinkButton({ sessionId }: { sessionId: string }) {
  */
 function QrCodeDialog({
   sessionId,
+  filePath,
   open,
   onOpenChange,
 }: {
   sessionId: string;
+  filePath?: string;
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }) {
   const rebasePath = useRebasePath();
-  const deepLink = getDeepLink(sessionId, rebasePath);
+  const deepLink = getDeepLink(sessionId, rebasePath, filePath);
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -656,7 +887,9 @@ function QrCodeDialog({
             Open in mobile app
           </DialogTitle>
           <DialogDescription>
-            Scan with your phone's camera to open this session in the Omnigent app.
+            {filePath
+              ? "Scan with your phone's camera to open this file in the Omnigent app."
+              : "Scan with your phone's camera to open this session in the Omnigent app."}
           </DialogDescription>
         </DialogHeader>
         <div className="flex justify-center">
@@ -669,7 +902,7 @@ function QrCodeDialog({
               // mode; the padding also serves as the QR quiet zone.
               bgColor="#ffffff"
               fgColor="#000000"
-              aria-label="QR code to open this session in the Omnigent app"
+              aria-label={`QR code to open this ${filePath ? "file" : "session"} in the Omnigent app`}
             />
           </div>
         </div>
@@ -688,12 +921,14 @@ function GrantRow({
   onRevoke,
   onChangeLevel,
   busy,
+  levelDisabled,
   readOnly,
 }: {
-  permission: Permission;
+  permission: ShareGrant;
   onRevoke: (userId: string) => void;
   onChangeLevel: (userId: string, level: number) => void;
   busy: boolean;
+  levelDisabled: boolean;
   readOnly: boolean;
 }) {
   const isOwner = permission.level === 4;
@@ -704,6 +939,8 @@ function GrantRow({
   // Read-only sharing mode: existing grants can't be re-leveled, so the level
   // shows as a fixed label (like owner/manage) — but the row stays revocable.
   const fixedLevel = isOwner || isManage || readOnly;
+  // An automation's grants carry a display name; the ID follows when it differs.
+  const name = permission.display_name ?? permission.user_id;
 
   return (
     <div className="flex items-center gap-2 rounded-md px-2 py-0.5 hover:bg-muted/50">
@@ -711,7 +948,10 @@ function GrantRow({
           every grantee shares one company domain — and the title tooltip
           carries the full id. */}
       <span className="flex-1 truncate text-ui" title={permission.user_id}>
-        {permission.user_id}
+        {name}
+        {name !== permission.user_id && (
+          <span className="ml-2 text-sm text-muted-foreground">{permission.user_id}</span>
+        )}
       </span>
       {fixedLevel ? (
         <span className="flex h-8 w-28 items-center px-3 text-ui text-muted-foreground">
@@ -721,7 +961,7 @@ function GrantRow({
         <Select
           value={String(permission.level)}
           onValueChange={(v) => onChangeLevel(permission.user_id, parseInt(v, 10))}
-          disabled={busy}
+          disabled={busy || levelDisabled}
         >
           <SelectTrigger
             className="h-8 w-28"

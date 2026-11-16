@@ -29,8 +29,10 @@ from omnigent.harnesses.claude_native.bridge import (
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN, token_bound_runner_id
 from omnigent.terminals.program_status import ProgramStatusReader
 from tests._helpers.session import bundle_files, post_session_bundle
+from tests.e2e._claude_host_support import (
+    _send_user_message,
+)
 from tests.e2e.test_host_claude_native_e2e import _poll_for_assistant_marker
-from tests.e2e.test_host_claude_native_fork_e2e import _send_user_message
 from tests.server.integration.mock_llm_server import (
     anthropic_sse_text_response,
     anthropic_sse_tool_call_response,

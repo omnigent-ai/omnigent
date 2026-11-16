@@ -6,18 +6,28 @@
 // (no async search index), so a plain invalidate can't resurrect a just-deleted
 // row — no patch-in-place gymnastics are needed here.
 
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  useMutation,
+  useQueries,
+  useQuery,
+  useQueryClient,
+  type QueryClient,
+} from "@tanstack/react-query";
+import { invalidateSessionGrants } from "@/hooks/usePermissions";
+import { LIST_ROW_QUERY_ROOTS } from "@/lib/sessionListCache";
 import {
   createScheduledTask,
   deleteScheduledTask,
   getScheduledTask,
   listScheduledTaskRuns,
+  listScheduledTaskRunSteps,
   listScheduledTasks,
   runScheduledTaskNow,
   updateScheduledTask,
   type CreateScheduledTaskInput,
   type ScheduledTask,
   type ScheduledTaskRun,
+  type ScheduledTaskRunSteps,
   type UpdateScheduledTaskInput,
 } from "@/lib/scheduledTasksApi";
 
@@ -166,6 +176,55 @@ export function useScheduledTaskRuns(id: string, enabled = true, awaitingRun = f
   });
 }
 
+/** How many runs one request for their plans covers. */
+const RUN_STEPS_PAGE = 20;
+
+/**
+ * The plans an automation's runs started with, by run ID, for their timelines.
+ * Asks for the given runs 20 at a time, paging as the run list does; only the
+ * newest 20 poll, and only while one of them is in flight. Session updates also
+ * refresh a page when a short continuation finishes between history polls.
+ *
+ * @param runs - The task's runs, most recent first, from `useScheduledTaskRuns`.
+ * @param enabled - Whether the server supports workflow history.
+ */
+export function useScheduledTaskRunSteps(
+  id: string,
+  runs: readonly ScheduledTaskRun[] | undefined,
+  enabled: boolean,
+): ReadonlyMap<string, ScheduledTaskRunSteps> {
+  const pages: ScheduledTaskRun[][] = [];
+  for (let start = 0; start < (runs?.length ?? 0); start += RUN_STEPS_PAGE) {
+    pages.push((runs ?? []).slice(start, start + RUN_STEPS_PAGE));
+  }
+  const newestUnsettled = hasUnsettledRun(pages[0]);
+  return useQueries({
+    queries: pages.map((page, index) => {
+      // Each page starts after the previous page's last run, as the run list pages.
+      const after = index === 0 ? undefined : pages[index - 1]!.at(-1)!.id;
+      return {
+        queryKey: [
+          "scheduled-task-run-steps",
+          id,
+          after ?? null,
+          page.map((run) => [
+            run.id,
+            run.status,
+            run.conversationStatus,
+            run.conversationUpdatedAt,
+          ]),
+        ],
+        queryFn: () => listScheduledTaskRunSteps(id, { limit: RUN_STEPS_PAGE, after }),
+        enabled,
+        staleTime: 30_000,
+        refetchInterval: index === 0 && newestUnsettled ? RUNS_REFETCH_INTERVAL_MS : false,
+      };
+    }),
+    combine: (results) =>
+      new Map(results.flatMap((result) => result.data ?? []).map((steps) => [steps.runId, steps])),
+  });
+}
+
 /** Create a scheduled task, then refresh the list. */
 export function useCreateScheduledTask() {
   const queryClient = useQueryClient();
@@ -190,8 +249,41 @@ export function useUpdateScheduledTask() {
       // A schedule/state change can shift the run history too (e.g. a
       // just-reactivated task), so refresh that task's runs if they're loaded.
       void queryClient.invalidateQueries({ queryKey: scheduledTaskRunsKey(updated.id) });
+      // Switching to new sessions stops it managing its session's sharing.
+      invalidateSessionGrants(queryClient);
     },
   });
+}
+
+/**
+ * Refresh the cached session lists, and the sessions' own entries when known,
+ * after an automation adds the session its runs start from or clears its label.
+ */
+export function refreshAutomationSourceSession(
+  queryClient: QueryClient,
+  sessionIds?: string | readonly string[] | null,
+): void {
+  for (const root of LIST_ROW_QUERY_ROOTS) {
+    void queryClient.invalidateQueries({ queryKey: [root] });
+  }
+  void queryClient.invalidateQueries({ queryKey: ["projects"] });
+  const ids = typeof sessionIds === "string" ? [sessionIds] : (sessionIds ?? []);
+  for (const id of ids) void queryClient.invalidateQueries({ queryKey: ["session", id] });
+}
+
+/**
+ * Drop deleted tasks from every cache, so a page can't render one from a cache
+ * that is still fresh, then refresh the list.
+ */
+export function forgetScheduledTasks(queryClient: QueryClient, ids: string[]): void {
+  queryClient.setQueryData<ScheduledTask[]>(SCHEDULED_TASKS_KEY, (tasks) =>
+    tasks?.filter((t) => !ids.includes(t.id)),
+  );
+  for (const id of ids) {
+    queryClient.removeQueries({ queryKey: scheduledTaskKey(id), exact: true });
+    queryClient.removeQueries({ queryKey: scheduledTaskRunsKey(id), exact: true });
+  }
+  void queryClient.invalidateQueries({ queryKey: SCHEDULED_TASKS_KEY });
 }
 
 /** Delete a task, then refresh the list. */
@@ -200,14 +292,17 @@ export function useDeleteScheduledTask() {
   return useMutation({
     mutationFn: (id: string) => deleteScheduledTask(id),
     onSuccess: (_data, id) => {
-      // Drop the deleted task everywhere it's cached, so Back to its detail
-      // page can't render it from a cache that is still fresh.
-      queryClient.setQueryData<ScheduledTask[]>(SCHEDULED_TASKS_KEY, (tasks) =>
-        tasks?.filter((t) => t.id !== id),
-      );
-      queryClient.removeQueries({ queryKey: scheduledTaskKey(id), exact: true });
-      queryClient.removeQueries({ queryKey: scheduledTaskRunsKey(id), exact: true });
-      void queryClient.invalidateQueries({ queryKey: SCHEDULED_TASKS_KEY });
+      const deleted =
+        queryClient.getQueryData<ScheduledTask>(scheduledTaskKey(id)) ??
+        queryClient.getQueryData<ScheduledTask[]>(SCHEDULED_TASKS_KEY)?.find((t) => t.id === id);
+      forgetScheduledTasks(queryClient, [id]);
+      // A deleted automation no longer manages its session's sharing.
+      invalidateSessionGrants(queryClient);
+      // The server cleared the automation's label from the session it ran from,
+      // so menus and delete warnings must stop naming the automation.
+      if (deleted?.sourceSessionId) {
+        refreshAutomationSourceSession(queryClient, deleted.sourceSessionId);
+      }
     },
   });
 }

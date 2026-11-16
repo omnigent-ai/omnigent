@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { getSessionState } from "./useSessionState";
+import { getSessionState, isSessionWorking } from "./useSessionState";
 import type { Conversation } from "@/hooks/useConversations";
 
 type SessionFields = Pick<
@@ -76,7 +76,6 @@ describe("getSessionState — priority composition", () => {
     expect(getSessionState(conv({ ...shells, status: "idle" }), "disconnected")).toEqual({
       kind: "disconnected",
     });
-    expect(getSessionState(conv({ ...shells, status: "failed" }))).toEqual({ kind: "error" });
     expect(getSessionState(conv({ ...shells, status: "idle" }), "error")).toEqual({
       kind: "error",
     });
@@ -93,7 +92,7 @@ describe("getSessionState — priority composition", () => {
     ).toEqual({ kind: "awaiting", count: 1 });
   });
 
-  it("returns error from the existing failed session status", () => {
+  it("flags status-only failures without a latest-activity label", () => {
     expect(getSessionState(conv({ status: "failed" }))).toEqual({ kind: "error" });
   });
 
@@ -104,13 +103,13 @@ describe("getSessionState — priority composition", () => {
     expect(getSessionState(conv({ status: "failed" }), "recovered_disconnect")).toBeNull();
   });
 
-  it("follows status updates without retaining an old error", () => {
-    const conversation = conv({ status: "failed" });
-    expect(getSessionState(conversation)).toEqual({ kind: "error" });
+  it("follows status updates while the labelled error is kept", () => {
+    const conversation = conv({ status: "idle" });
+    expect(getSessionState(conversation, "error")).toEqual({ kind: "error" });
     conversation.status = "running";
-    expect(getSessionState(conversation)).toEqual({ kind: "running" });
+    expect(getSessionState(conversation, "error")).toEqual({ kind: "running" });
     conversation.status = "idle";
-    expect(getSessionState(conversation)).toBeNull();
+    expect(getSessionState(conversation, null)).toBeNull();
   });
 
   it("treats failed + pending elicitation as awaiting (the actionable signal)", () => {
@@ -136,5 +135,19 @@ describe("getSessionState — priority composition", () => {
   it("returns null when conversation status is undefined", () => {
     // Older sessions whose server payload predates the `status` field.
     expect(getSessionState(conv({}))).toBeNull();
+  });
+});
+
+describe("isSessionWorking", () => {
+  it.each([
+    [{ status: "running" }, true],
+    [{ status: "idle", pending_elicitations_count: 1 }, true],
+    [{ status: "idle", background_work_running: true }, true],
+    [{ status: "failed", background_work_running: true }, true],
+    [{ status: "idle", pending_elicitations_count: 0, background_work_running: false }, false],
+    [{ status: "failed" }, false],
+    [{}, false],
+  ] satisfies [SessionFields, boolean][])("%o -> %s", (fields, expected) => {
+    expect(isSessionWorking(conv(fields))).toBe(expected);
   });
 });

@@ -149,7 +149,7 @@ def test_login_probe_execs_discovered_absolute_binary(
             args=argv, returncode=0, stdout='{"loggedIn": true}', stderr=""
         )
 
-    monkeypatch.setattr(hi.subprocess, "run", _run)
+    monkeypatch.setattr(hi, "run_isolated", _run)
     with _deleted_cwd(tmp_path):
         assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY) is True
     assert executed == [discovered]
@@ -172,7 +172,7 @@ def test_login_probe_refuses_relative_discovery_under_deleted_cwd(
             args=argv, returncode=0, stdout='{"loggedIn": true}', stderr=""
         )
 
-    monkeypatch.setattr(hi.subprocess, "run", _run)
+    monkeypatch.setattr(hi, "run_isolated", _run)
     with _deleted_cwd(tmp_path):
         assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY) is False
     assert executed == []
@@ -192,7 +192,7 @@ def test_version_probe_refuses_relative_discovery_under_deleted_cwd(
             args=argv, returncode=0, stdout="2.1.268 (Claude Code)", stderr=""
         )
 
-    monkeypatch.setattr(hi.subprocess, "run", _run)
+    monkeypatch.setattr(hi, "run_isolated", _run)
     with _deleted_cwd(tmp_path):
         version, _range = hi.harness_cli_version(ANTHROPIC_FAMILY)
     assert version is None

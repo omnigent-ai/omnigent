@@ -105,7 +105,9 @@ async def codex_client(
         auth_provider=UnifiedAuthProvider(source="header", local_single_user=False),
         permission_store=permissions,
     )
-    app.state.feature_flags = FeatureFlags(frozenset({Feature.SESSION_ORCHESTRATION}))
+    app.state.feature_flags = FeatureFlags(
+        frozenset({Feature.SESSION_ORCHESTRATION, Feature.PEER_SESSION_MESSAGING})
+    )
     pending_inputs.reset_for_tests()
     try:
         async with httpx.AsyncClient(

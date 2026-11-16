@@ -213,7 +213,8 @@ const RUN_FAILURES: Readonly<Record<string, RunFailure>> = {
   owner_deleted: { stage: "Owner", reason: "The owner's account was removed." },
   owner_identity_unavailable: {
     stage: "Owner",
-    reason: "Couldn't act as the owner. The next run tries again.",
+    // Recurrence-neutral: a one-time automation, such as a reminder, has no next run.
+    reason: "Couldn't act as the owner. A recurring automation tries again at its next run.",
   },
   reauthorization_required: {
     stage: "Owner",
@@ -337,7 +338,7 @@ const MONTH_NAMES = [
  * formatter doesn't special-case, so a valid-but-unusual rule still renders
  * something readable rather than blank.
  */
-export function describeSchedule(rrule: string): string {
+export function describeSchedule(rrule: string, timezone?: string): string {
   const rule = tryParse(rrule);
   if (!rule) return rrule;
   const o = rule.origOptions;
@@ -347,6 +348,35 @@ export function describeSchedule(rrule: string): string {
   const timeSuffix = ` at ${formatClockTime(hour, minute)}`;
   const days = normalizeWeekdays(o.byweekday);
   const interval = typeof o.interval === "number" && o.interval > 1 ? o.interval : 1;
+
+  // A one-time rule, such as a reminder, runs at its first match and then completes.
+  if (o.count === 1) {
+    const months = normalizeNums(o.bymonth);
+    const monthDays = normalizeNums(o.bymonthday);
+    const hours = normalizeNums(o.byhour);
+    const minutes = normalizeNums(o.byminute);
+    const monthName = months.length === 1 ? MONTH_NAMES[months[0]! - 1] : undefined;
+    // A literal date only for the reminder shape: one month, one positive day and
+    // one time. Anything else (negative days, several times) names no single moment.
+    if (
+      o.freq === RRule.YEARLY &&
+      monthName !== undefined &&
+      monthDays.length === 1 &&
+      monthDays[0]! > 0 &&
+      hours.length <= 1 &&
+      minutes.length <= 1
+    ) {
+      // A reminder is stored in UTC, so name the zone its time is in.
+      const zone = !timezone ? "" : timezone === "UTC" ? " UTC" : ` (${timezone})`;
+      return `Once on ${monthName} ${monthDays[0]}${timeSuffix}${zone}`;
+    }
+    const recurring = rrule
+      .replace(/^RRULE:/i, "")
+      .split(";")
+      .filter((part) => !/^\s*COUNT\s*=/i.test(part))
+      .join(";");
+    return `Once: ${describeSchedule(recurring)}`;
+  }
 
   if (o.freq === RRule.MINUTELY) {
     // The library's toText() drops minute-rule filters; preserve them verbatim.

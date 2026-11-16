@@ -609,7 +609,7 @@ async function signIn(ctx) {
   const holds = await Promise.all(busy.map((port) => session.holdRemote(port)));
   const held = busy.filter((_, index) => holds[index].code === 0);
   // Take the port the CLI should pick before it starts: tools that forward new
-  // remote listeners to this computer (Arca Companion, VS Code) would grab it first.
+  // remote listeners to this computer (VS Code, for example) would grab it first.
   let forwarded =
     expected !== null && (await session.forwardLocal(expected)).code === 0 ? expected : null;
   if (ctx.isCanceled()) return canceledResult();

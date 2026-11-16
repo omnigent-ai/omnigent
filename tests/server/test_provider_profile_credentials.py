@@ -21,6 +21,7 @@ from omnigent.onboarding.sandboxes.profiles import (
 )
 from omnigent.server.connections_registry import blocking_owner_resolver
 from omnigent.server.managed_hosts import (
+    ManagedHostLaunch,
     ManagedSandboxConfig,
     ManagedSandboxDeployment,
     build_owner_launcher,
@@ -210,7 +211,7 @@ async def test_profile_selection_precedes_launch_with_bound_owner_credentials(
         prepared_profiles.append(launcher.selected)
         FakeSandboxLauncher.prepare(launcher)
 
-    started = AsyncMock(return_value="/workspace")
+    started = AsyncMock(return_value=ManagedHostLaunch(host_id="host", workspace="/workspace"))
     monkeypatch.setattr("omnigent.server.managed_hosts._register_and_start_host", started)
     monkeypatch.setattr(_CredentialProvider, "prepare", prepare)
     with workspace_scope(41):

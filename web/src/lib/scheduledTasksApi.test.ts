@@ -149,7 +149,8 @@ describe("listScheduledTaskRuns", () => {
       firedAt: 1_700_000_005,
       finishedAt: 1_700_000_050,
       errorCode: null,
-      // An older server sends no session read state.
+      // An older server sends no failure detail or session read state.
+      errorDetail: null,
       conversationUpdatedAt: null,
       conversationStatus: null,
       viewerLastSeen: null,
@@ -159,19 +160,20 @@ describe("listScheduledTaskRuns", () => {
     });
   });
 
-  it("maps a run's session read state when the server sends it", async () => {
+  it("maps a run's failure detail and session read state when the server sends them", async () => {
     fetchMock.mockResolvedValueOnce(
       mockResponse({
         runs: [
           {
             id: "run_1",
             scheduled_task_id: "st_1",
-            status: "succeeded",
+            status: "failed",
             scheduled_at: 1_700_000_000,
             conversation_id: "conv_1",
             fired_at: 1_700_000_005,
             finished_at: 1_700_000_050,
-            error_code: null,
+            error_code: "sandbox_registration_timeout",
+            error_detail: "the sandbox did not register within 720 seconds",
             conversation_updated_at: 1_700_000_060,
             conversation_status: "idle",
             viewer_last_seen: 1_700_000_055,
@@ -184,6 +186,7 @@ describe("listScheduledTaskRuns", () => {
     );
     const [run] = await listScheduledTaskRuns("st_1");
     expect(run).toMatchObject({
+      errorDetail: "the sandbox did not register within 720 seconds",
       conversationUpdatedAt: 1_700_000_060,
       conversationStatus: "idle",
       viewerLastSeen: 1_700_000_055,

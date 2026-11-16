@@ -18,7 +18,9 @@ import {
 import { FileDiff } from "@pierre/diffs/react";
 import type { DiffLineAnnotation, FileDiffMetadata, SelectedLineRange } from "@pierre/diffs";
 import { Button } from "@/components/ui/button";
+import { tabsListVariants } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import type { Comment } from "@/hooks/useComments";
 import {
   usePullRequestReviewThreadComposer,
   type PullRequestChangedFile,
@@ -30,6 +32,7 @@ import {
 } from "@/lib/pullRequestReviewThreads";
 import { cn } from "@/lib/utils";
 import { PullRequestCommentForm } from "./PullRequestCommentComposer";
+import { LocalReviewComment } from "./LocalReviewComment";
 import { PullRequestReviewThread, type ReviewThreadContext } from "./PullRequestReviewThread";
 import { highlightsSupported } from "./previewSearch";
 
@@ -114,7 +117,9 @@ function splitPath(path: string): { dir: string; name: string } {
 interface ReviewAnnotation {
   threads: ReviewThread[];
   newThread?: boolean;
+  localComments?: Comment[];
 }
+const NO_LOCAL_COMMENTS: Comment[] = [];
 export type DiffOptions = React.ComponentProps<typeof FileDiff<ReviewAnnotation>>["options"];
 
 /**
@@ -188,6 +193,8 @@ function clearFindMatch() {
   if (highlightsSupported()) CSS.highlights.delete(FIND_HIGHLIGHT);
 }
 
+const NO_THREADS: ReviewThread[] = [];
+
 /**
  * One file's section in the stacked diff: a sticky grey header (chevron + status
  * + path + diffstat) and the file's rendered diff. Clicking the header toggles
@@ -204,11 +211,15 @@ export function PullRequestFileSection({
   threads,
   threadContext,
   matchingRevision,
+  localComments = NO_LOCAL_COMMENTS,
+  canCommentLocally = false,
   headerActions,
   forceExpanded = false,
   forceMount = false,
   bypassLargeDiffGate = false,
   highlight = null,
+  reviewable = true,
+  reviewActions,
 }: {
   file: PullRequestChangedFile;
   /** Parsed per-file diff from the whole-PR patch; absent for binary/unparsed. */
@@ -221,6 +232,8 @@ export function PullRequestFileSection({
   threads: ReviewThread[];
   threadContext: ReviewThreadContext;
   matchingRevision: boolean;
+  localComments?: Comment[];
+  canCommentLocally?: boolean;
   /** Controls beside the header's toggle button. */
   headerActions?: React.ReactNode;
   /** Show the diff even while `collapsed` (a temporary reveal). */
@@ -231,6 +244,13 @@ export function PullRequestFileSection({
   bypassLargeDiffGate?: boolean;
   /** The active find match; painted and centred, apart from the reader's selection. */
   highlight?: FindHighlight | null;
+  /**
+   * Whether this file offers review features: conversations, drafts, line selection and the
+   * viewed controls. Off, the section shows the diff alone. Saved drafts are left as they are.
+   */
+  reviewable?: boolean;
+  /** Review controls beside the header, such as the viewed toggle. Shown only while reviewable. */
+  reviewActions?: React.ReactNode;
 }) {
   const ref = useRef<HTMLDivElement>(null);
   // The force flags latch, so a section stays mounted and ungated after the reader moves on.
@@ -251,6 +271,8 @@ export function PullRequestFileSection({
     threadContext.headSha ?? "",
     threadContext.baseSha ?? "",
   );
+  const canStart = reviewable && (threadContext.canCreate || canCommentLocally);
+  const local = composer.draft.destination === "local";
   const revision = `${threadContext.baseSha}:${threadContext.headSha}`;
   const [selection, setSelection] = useState<{
     revision: string;
@@ -261,27 +283,31 @@ export function PullRequestFileSection({
   const selectedLines = selection?.revision === revision ? selection.range : null;
   const readerLines =
     selectionPreview?.revision === revision ? selectionPreview.range : selectedLines;
+  // A line selection starts a review conversation, so it exists only where reviews do.
   const previewSelection = useCallback(
-    (range: SelectedLineRange | null) => setSelectionPreview({ revision, range }),
-    [revision],
+    (range: SelectedLineRange | null) => {
+      if (reviewable) setSelectionPreview({ revision, range });
+    },
+    [revision, reviewable],
   );
   const commitSelection = useCallback(
     (range: SelectedLineRange | null) => {
+      if (!reviewable) return;
       setSelection({ revision, range });
       setSelectionPreview(undefined);
     },
-    [revision],
+    [revision, reviewable],
   );
   const [selectionError, setSelectionError] = useState<string>();
   const startConversation = (range: SelectedLineRange) => {
-    if (!threadContext.canCreate || !fileDiff || composer.draft.pending) return;
+    if (!canStart || !fileDiff || composer.draft.pending) return;
     const lines = reviewSelection(range, fileDiff);
     if (!lines) {
       setSelectionError("Select lines within one diff hunk, on the same side.");
       return;
     }
     setSelectionError(undefined);
-    composer.selectLines(lines);
+    composer.selectLines(lines, threadContext.canCreate ? undefined : "local");
   };
 
   useEffect(() => {
@@ -316,18 +342,49 @@ export function PullRequestFileSection({
     !pureRename &&
     seen &&
     (fileDiff.unifiedLineCount <= LARGE_DIFF_THRESHOLD || showLargeDiff);
-  const anchor = composer.draft.anchor;
-  const showGutterUtility = !!threadContext.canCreate && (!anchor || composer.stale);
+  // With review off, a saved draft and the conversations stay in their stores, unshown here.
+  const anchor = reviewable ? composer.draft.anchor : null;
+  const shownThreads = reviewable ? threads : NO_THREADS;
+  const shownLocalComments = reviewable ? localComments : NO_LOCAL_COMMENTS;
+  const showGutterUtility = !!canStart && (!anchor || composer.stale);
   const showDraftInline = !!anchor && !composer.stale && renderingDiff;
-  const { annotations, unplaced } = useMemo(() => {
+  const { annotations, unplaced, unplacedLocal } = useMemo(() => {
     const { annotations: threadAnnotations, unplaced: unplacedThreads } = reviewThreadAnnotations(
-      threads,
+      shownThreads,
       renderingDiff ? fileDiff : undefined,
       matchingRevision,
     );
     const inlineAnnotations: DiffLineAnnotation<ReviewAnnotation>[] = threadAnnotations.map(
       (annotation) => ({ ...annotation, metadata: { threads: annotation.metadata } }),
     );
+    const unplacedLocalComments: Comment[] = [];
+    for (const comment of shownLocalComments) {
+      const saved = comment.anchor_metadata!;
+      const side = saved.side === "LEFT" ? "deletions" : "additions";
+      if (
+        !renderingDiff ||
+        !fileDiff ||
+        !reviewSelection(
+          { side, start: saved.start_line ?? saved.line, end: saved.line },
+          fileDiff,
+        ) ||
+        saved.head_sha !== threadContext.headSha ||
+        saved.base_sha !== threadContext.baseSha
+      ) {
+        unplacedLocalComments.push(comment);
+        continue;
+      }
+      const existing = inlineAnnotations.find(
+        (item) => item.side === side && item.lineNumber === saved.line,
+      );
+      if (existing) (existing.metadata.localComments ??= []).push(comment);
+      else
+        inlineAnnotations.push({
+          side,
+          lineNumber: saved.line,
+          metadata: { threads: [], localComments: [comment] },
+        });
+    }
     if (showDraftInline) {
       const side = anchor.side === "LEFT" ? "deletions" : "additions";
       const existing = inlineAnnotations.find(
@@ -341,8 +398,22 @@ export function PullRequestFileSection({
           metadata: { threads: [], newThread: true },
         });
     }
-    return { annotations: inlineAnnotations, unplaced: unplacedThreads };
-  }, [threads, renderingDiff, fileDiff, matchingRevision, anchor, showDraftInline]);
+    return {
+      annotations: inlineAnnotations,
+      unplaced: unplacedThreads,
+      unplacedLocal: unplacedLocalComments,
+    };
+  }, [
+    shownThreads,
+    renderingDiff,
+    fileDiff,
+    matchingRevision,
+    anchor,
+    showDraftInline,
+    shownLocalComments,
+    threadContext.headSha,
+    threadContext.baseSha,
+  ]);
 
   // Centre the active find match once its row renders. A large diff can take longer than the
   // frame budget, so the next onPostRender centres it instead.
@@ -406,7 +477,7 @@ export function PullRequestFileSection({
           The pull request changed. Your draft is saved; select its lines again before posting.
         </p>
       )}
-      {!threadContext.canCreate && (
+      {!canStart && (
         <p role="status" className="px-3 pb-2">
           Your draft is saved. Commenting is currently unavailable.
         </p>
@@ -416,7 +487,50 @@ export function PullRequestFileSection({
         account={threadContext.account}
         inline
         newThread
-        disabled={composer.stale || !threadContext.canCreate}
+        local={local}
+        disabled={composer.stale || (local ? !canCommentLocally : !threadContext.canCreate)}
+        destinationControl={
+          <div
+            className={cn(tabsListVariants(), "h-8 shrink-0")}
+            role="group"
+            aria-label="Comment destination"
+          >
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <button
+                  type="button"
+                  className={cn(
+                    "inline-flex h-[calc(100%-1px)] cursor-pointer items-center justify-center rounded-md border border-transparent px-1.5 py-0.5 text-ui font-medium transition-colors disabled:pointer-events-none disabled:opacity-50",
+                    !local ? "bg-background text-foreground shadow-sm" : "text-muted-foreground",
+                  )}
+                  aria-pressed={!local}
+                  disabled={!threadContext.canCreate || composer.draft.pending}
+                  onClick={() => composer.setDestination("github")}
+                >
+                  GitHub
+                </button>
+              </TooltipTrigger>
+              <TooltipContent>Post a review comment on the GitHub pull request.</TooltipContent>
+            </Tooltip>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <button
+                  type="button"
+                  className={cn(
+                    "inline-flex h-[calc(100%-1px)] cursor-pointer items-center justify-center rounded-md border border-transparent px-1.5 py-0.5 text-ui font-medium transition-colors disabled:pointer-events-none disabled:opacity-50",
+                    local ? "bg-background text-foreground shadow-sm" : "text-muted-foreground",
+                  )}
+                  aria-pressed={local}
+                  disabled={!canCommentLocally || composer.draft.pending}
+                  onClick={() => composer.setDestination("local")}
+                >
+                  Agent
+                </button>
+              </TooltipTrigger>
+              <TooltipContent>Leave a comment for your agent in this session.</TooltipContent>
+            </Tooltip>
+          </div>
+        }
       />
     </section>
   );
@@ -451,23 +565,26 @@ export function PullRequestFileSection({
             )}
           </span>
           <DiffStat file={file} />
-          {threads.length > 0 && (
+          {shownThreads.length > 0 && (
             <span
               className="flex shrink-0 items-center gap-1 text-xs text-muted-foreground"
-              title={`${threads.length} conversation${threads.length === 1 ? "" : "s"}`}
+              title={`${shownThreads.length} conversation${shownThreads.length === 1 ? "" : "s"}`}
             >
               <MessageSquareIcon className="size-3" />
-              {threads.length}
+              {shownThreads.length}
             </span>
           )}
         </button>
-        {headerActions && (
-          <div className="flex shrink-0 items-center gap-1 pr-2">{headerActions}</div>
+        {(headerActions || (reviewable && reviewActions)) && (
+          <div className="flex shrink-0 items-center gap-1 pr-2">
+            {headerActions}
+            {reviewable && reviewActions}
+          </div>
         )}
       </div>
       {!collapsed && (
         <>
-          {selectionError && (
+          {reviewable && selectionError && (
             <p role="alert" className="px-3 py-2 text-ui">
               {selectionError}
             </p>
@@ -488,6 +605,19 @@ export function PullRequestFileSection({
           ))}
         </div>
       )}
+      {!collapsed &&
+        unplacedLocal.map((comment) => (
+          <div className="px-3" key={comment.id}>
+            <LocalReviewComment
+              comment={comment}
+              canEdit={canCommentLocally}
+              outdated={
+                comment.anchor_metadata?.head_sha !== threadContext.headSha ||
+                comment.anchor_metadata?.base_sha !== threadContext.baseSha
+              }
+            />
+          </div>
+        ))}
       {collapsed ? null : pureRename ? (
         <div className="p-4 text-ui text-muted-foreground">File renamed without changes.</div>
       ) : !seen ? (
@@ -518,14 +648,14 @@ export function PullRequestFileSection({
               fileDiff={fileDiff}
               options={{
                 ...options,
-                enableLineSelection: !!threadContext.canCreate,
+                enableLineSelection: !!canStart,
                 enableGutterUtility: showGutterUtility,
                 onLineSelectionStart: previewSelection,
                 onLineSelectionChange: previewSelection,
                 onLineSelectionEnd: commitSelection,
                 onPostRender: repaintHighlight,
               }}
-              selectedLines={readerLines}
+              selectedLines={reviewable ? readerLines : null}
               disableWorkerPool
               renderGutterUtility={
                 showGutterUtility
@@ -565,6 +695,13 @@ export function PullRequestFileSection({
               renderAnnotation={(annotation) => (
                 <div className="min-w-0 px-3">
                   {annotation.metadata.newThread && newConversation}
+                  {annotation.metadata.localComments?.map((comment) => (
+                    <LocalReviewComment
+                      key={comment.id}
+                      comment={comment}
+                      canEdit={canCommentLocally}
+                    />
+                  ))}
                   {annotation.metadata.threads.map((thread) => (
                     <PullRequestReviewThread
                       key={thread.id}

@@ -16,7 +16,11 @@ from typing import TypedDict, cast
 from cachetools import TTLCache
 from mcp.client.stdio import get_default_environment
 
-from omnigent.host.mcp_inventory import ConfiguredMcpServer, configured_mcp_servers
+from omnigent.host.mcp_inventory import (
+    ConfiguredMcpServer,
+    configured_mcp_servers,
+    find_configured_server,
+)
 from omnigent.inner._proc import remember_process_group, spawn_kwargs
 from omnigent.inner._subprocess_lifecycle import terminate_subprocess
 from omnigent.runner.identity import strip_runner_auth_secrets
@@ -167,19 +171,7 @@ class HostMcpTools:
         self, harness: str, name: str, plugin: str | None = None, source_id: str | None = None
     ) -> McpProbeResult:
         servers = await asyncio.to_thread(configured_mcp_servers)
-        matches = [
-            s
-            for s in servers
-            if s.summary["harness"] == harness
-            and (
-                s.summary.get("source_id") == source_id
-                if source_id is not None
-                else (s.summary["name"], s.summary.get("plugin")) == (name, plugin)
-            )
-        ]
-        if len(matches) != 1:
-            raise LookupError("MCP server unavailable or ambiguous")
-        server = matches[0]
+        server = find_configured_server(harness, name, plugin, source_id, servers=servers)
         try:
             config, cwd, transport = _effective_config(server)
         except PermissionError:

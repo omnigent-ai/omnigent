@@ -45,21 +45,21 @@ export function attachmentMarkdown(attachment: PullRequestAttachment, fileName: 
   return `![${alt}](${attachment.url})`;
 }
 
-// ── Uploaded image copies ───────────────────────────────────────────────────
+// ── Uploaded media copies ───────────────────────────────────────────────────
 // GitHub serves a fresh upload only about 15s after a saved body links it, so the
-// images uploaded from this tab show from local copies, keyed by their unique
-// asset URL, until the page reloads. Videos render as links and are not kept.
+// images and videos uploaded from this tab show from local copies, keyed by their
+// unique asset URL, until the page reloads.
 
-const MAX_UPLOADED_IMAGE_COPIES = 50;
-const uploadedImageCopies = new Map<string, string>();
+const MAX_UPLOADED_MEDIA_COPIES = 50;
+const uploadedMediaCopies = new Map<string, string>();
 
-export function rememberUploadedImage(url: string, file: File): void {
-  if (!file.type.startsWith("image/")) return;
-  uploadedImageCopies.set(url, URL.createObjectURL(file));
-  for (const [oldest, copy] of uploadedImageCopies) {
-    if (uploadedImageCopies.size <= MAX_UPLOADED_IMAGE_COPIES) break;
+export function rememberUploadedMedia(url: string, file: File): void {
+  if (!isAttachableMedia(file)) return;
+  uploadedMediaCopies.set(url, URL.createObjectURL(file));
+  for (const [oldest, copy] of uploadedMediaCopies) {
+    if (uploadedMediaCopies.size <= MAX_UPLOADED_MEDIA_COPIES) break;
     URL.revokeObjectURL(copy);
-    uploadedImageCopies.delete(oldest);
+    uploadedMediaCopies.delete(oldest);
   }
 }
 
@@ -71,7 +71,7 @@ function PullRequestImage({
   className,
   ...props
 }: React.ComponentProps<"img"> & { node?: unknown }) {
-  const shown = (typeof src === "string" && uploadedImageCopies.get(src)) || src;
+  const shown = (typeof src === "string" && uploadedMediaCopies.get(src)) || src;
   // Keyed by source, so the same element given a new URL tries it.
   const [failedSrc, setFailedSrc] = useState<string | undefined>(undefined);
   if (shown && failedSrc === shown) {
@@ -89,8 +89,47 @@ function PullRequestImage({
   );
 }
 
+/**
+ * A bare attachment URL GitHub plays as a video, from its local copy when this tab
+ * uploaded it. One that won't play, e.g. an image or a not-yet-served upload, stays
+ * the link it was before.
+ */
+function PullRequestVideo({
+  node: _node,
+  src,
+  className,
+  ...props
+}: React.ComponentProps<"video"> & { node?: unknown }) {
+  const shown = (src && uploadedMediaCopies.get(src)) || src;
+  const [failedSrc, setFailedSrc] = useState<string | undefined>(undefined);
+  if (src && failedSrc === shown) {
+    return (
+      <a
+        href={src}
+        target="_blank"
+        rel="noreferrer"
+        data-streamdown="link"
+        className="wrap-anywhere font-medium text-primary underline"
+      >
+        {src}
+      </a>
+    );
+  }
+  return (
+    <video
+      {...props}
+      src={shown}
+      onError={() => setFailedSrc(shown)}
+      className={cn("my-4 block max-h-160 max-w-full rounded-lg", className)}
+    />
+  );
+}
+
 /** Markdown components for PR descriptions and comments. */
-export const PULL_REQUEST_MARKDOWN_COMPONENTS: Components = { img: PullRequestImage };
+export const PULL_REQUEST_MARKDOWN_COMPONENTS: Components = {
+  img: PullRequestImage,
+  video: PullRequestVideo,
+};
 
 // ── Description drafts ──────────────────────────────────────────────────────
 // Kept outside React so a draft, and uploads still landing in it, survive the
@@ -145,12 +184,12 @@ export function insertOnOwnLine(body: string, text: string, start: number, end: 
   };
 }
 
-/** Forget every draft and uploaded image copy; for tests. */
+/** Forget every draft and uploaded media copy; for tests. */
 export function resetPullRequestDescriptionDrafts(): void {
   descriptionDrafts.clear();
   lastUploadId = 0;
-  uploadedImageCopies.forEach((copy) => URL.revokeObjectURL(copy));
-  uploadedImageCopies.clear();
+  uploadedMediaCopies.forEach((copy) => URL.revokeObjectURL(copy));
+  uploadedMediaCopies.clear();
   draftListeners.forEach((listener) => listener());
 }
 
@@ -396,7 +435,7 @@ function PullRequestDescriptionEditor({
         });
         uploadPullRequestAttachment(conversationId, prUrl, file).then(
           (attachment) => {
-            rememberUploadedImage(attachment.url, file);
+            rememberUploadedMedia(attachment.url, file);
             updateDescriptionDraft(
               draftKey,
               (current) => ({
