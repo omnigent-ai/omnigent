@@ -346,6 +346,6 @@ def test_prompt_tells_polly_when_the_run_stops(prompt_workspace: Path) -> None:
     prompt = " ".join(prompt_file.read_text().split())
     assert f"this run is stopped at {time.strftime('%H:%M', time.gmtime(stop))} UTC" in prompt
     # The timer leaves seven minutes to write the review.
-    seconds = int(re.search(r"`sys_timer_set` with `seconds` (\d+)", prompt)[1])
+    seconds = int(re.search(r"`sys_timer_set` once, with `seconds` (\d+)", prompt)[1])
     assert 18 * 60 - 10 <= seconds <= 18 * 60
     assert "cancel each sub-agent still running with `sys_cancel_task`" in prompt

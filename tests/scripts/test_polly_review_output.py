@@ -261,7 +261,8 @@ def test_review_diagnostics_retain_raw_stdout(
         assert result.returncode == 124, result.stdout + result.stderr
         assert "no review was published" in result.stdout
         assert (tmp_path / "cleanup-marker").exists()
-        assert not (tmp_path / "github_output").exists()
+        # The timeout is recorded for the reviewer-report steps; no review is ready.
+        assert (tmp_path / "github_output").read_text() == "timed_out=true\n"
         assert not (tmp_path / "polly_review.txt").exists()
         assert run_step("Prepare Polly diagnostics").returncode == 0
         diagnostics = tmp_path / "polly-diagnostics"

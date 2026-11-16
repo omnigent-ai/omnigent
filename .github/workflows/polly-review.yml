@@ -585,8 +585,8 @@ jobs:
               time_budget_rule = f"""
           **Time budget** — this run is stopped at {stop_clock} UTC, and a review
           that isn't finished by then is never posted. Before you dispatch anything,
-          call `sys_timer_set` with `seconds` {timer_seconds} and `note` "time budget:
-          publish now". When it fires, dispatch nothing more and stop waiting: cancel
+          call `sys_timer_set` once, with `seconds` {timer_seconds} and `note` "time
+          budget: publish now". When it fires, dispatch nothing more and stop waiting: cancel
           each sub-agent still running with `sys_cancel_task`, then write your review
           from the reports you have, and say under Non-blocking notes which areas
           weren't reviewed.
