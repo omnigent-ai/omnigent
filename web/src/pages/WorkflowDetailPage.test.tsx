@@ -517,6 +517,72 @@ describe("WorkflowDetailPage", () => {
     }
   });
 
+  it("edits the description in place, keeping the draft when a save fails", async () => {
+    const actual = await vi.importActual<typeof WorkflowHooks>("@/hooks/useWorkflow");
+    vi.mocked(useWorkflow).mockImplementation(actual.useWorkflow);
+    mockRuns([]);
+    let stored: WorkflowDetail = { ...WORKFLOW };
+    const patches: unknown[] = [];
+    let rejectSave = true;
+    vi.mocked(authenticatedFetch).mockImplementation(async (_path, options) => {
+      if (options?.method === "PATCH") {
+        patches.push(JSON.parse(String(options.body)));
+        if (rejectSave)
+          return new Response(
+            JSON.stringify({ error: { message: "Try again", type: "server_error" } }),
+            { status: 500 },
+          );
+        stored = {
+          ...stored,
+          description: (patches.at(-1) as { description: string }).description,
+        };
+      }
+      return new Response(JSON.stringify(stored));
+    });
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    try {
+      renderPage();
+      await screen.findByTestId("workflow-detail-description");
+      const editorName = { name: "Workflow description" };
+
+      // An unchanged description closes on Escape without saving.
+      fireEvent.click(screen.getByRole("button", { name: "Edit description" }));
+      const unchanged = screen.getByRole("textbox", editorName);
+      expect(unchanged).toHaveValue(WORKFLOW.description);
+      expect(unchanged).toHaveFocus();
+      expect((unchanged as HTMLTextAreaElement).selectionStart).toBe(WORKFLOW.description.length);
+      fireEvent.keyDown(unchanged, { key: "Escape" });
+      expect(screen.queryByRole("textbox", editorName)).toBeNull();
+
+      fireEvent.click(screen.getByRole("button", { name: "Edit description" }));
+      fireEvent.change(screen.getByRole("textbox", editorName), {
+        target: { value: "  Finds flaky tests and fixes the clear ones.  " },
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Save" }));
+      expect(await screen.findByRole("alert")).toHaveTextContent("Couldn’t save the description");
+      // Escape asks before discarding the edit.
+      fireEvent.keyDown(screen.getByRole("textbox", editorName), { key: "Escape" });
+      expect(confirm).toHaveBeenCalledOnce();
+      expect(screen.getByRole("textbox", editorName)).toHaveValue(
+        "  Finds flaky tests and fixes the clear ones.  ",
+      );
+
+      rejectSave = false;
+      fireEvent.click(screen.getByRole("button", { name: "Save" }));
+      await waitFor(() => expect(screen.queryByRole("textbox", editorName)).toBeNull());
+      expect(patches).toEqual([
+        { description: "Finds flaky tests and fixes the clear ones." },
+        { description: "Finds flaky tests and fixes the clear ones." },
+      ]);
+      expect(screen.getByTestId("workflow-detail-description").textContent).toBe(
+        "Finds flaky tests and fixes the clear ones.",
+      );
+      expect(screen.queryByRole("alert")).toBeNull();
+    } finally {
+      confirm.mockRestore();
+    }
+  });
+
   it("shows each run's tasks as the Tasks tab's timeline, and opens a task in its session", () => {
     mockWorkflow({});
     const session = "a".repeat(32);
