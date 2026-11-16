@@ -14,7 +14,7 @@ import { isSessionSharedWithOthers } from "@/lib/permissionsApi";
 import {
   buildPendingBubbles,
   buildSlashCommandMap,
-  reloadCommandItemIds,
+  appendsReloadCommand,
   composerOffersClear,
   composerOffersRewind,
   buildSlashCommandWithArgsSet,
@@ -1504,7 +1504,7 @@ describe("composer /clear and /rewind gating", () => {
   });
 });
 
-describe("reloadCommandItemIds", () => {
+describe("appendsReloadCommand", () => {
   const command = (name: string, kind: string, itemId: string | null) =>
     ({
       type: "slash_command",
@@ -1514,16 +1514,43 @@ describe("reloadCommandItemIds", () => {
       arguments: "",
       output: null,
     }) as AnyBlock;
+  const tail = command("effort", "command", "item_tail");
 
-  it("lists only reload command runs that came from server items", () => {
-    const blocks = [
-      command("reload-skills", "command", "item_a"),
+  it("detects a reload card appended after the last server item", () => {
+    expect(
+      appendsReloadCommand([tail], [tail, command("reload-skills", "command", "item_new")]),
+    ).toBe(true);
+    expect(
+      appendsReloadCommand([tail], [tail, command("reload-plugins", "command", "item_new")]),
+    ).toBe(true);
+  });
+
+  it("ignores prepended history and in-place updates of existing cards", () => {
+    const loaded = command("reload-skills", "command", "item_loaded");
+    expect(
+      appendsReloadCommand([tail], [command("reload-skills", "command", "item_old"), tail]),
+    ).toBe(false);
+    expect(appendsReloadCommand([loaded], [{ ...loaded, output: "Reloaded" } as AnyBlock])).toBe(
+      false,
+    );
+  });
+
+  it("counts every reload card when the previous tail is gone", () => {
+    expect(appendsReloadCommand([tail], [command("reload-skills", "command", "item_other")])).toBe(
+      true,
+    );
+    expect(appendsReloadCommand([], [command("reload-plugins", "command", "item_first")])).toBe(
+      true,
+    );
+  });
+
+  it("ignores other commands, skill invocations and unsaved cards", () => {
+    const appended = [
       command("effort", "command", "item_b"),
       command("reload-skills", "skill", "item_c"),
       command("reload-plugins", "command", null),
-      command("reload-plugins", "command", "item_d"),
     ];
-    expect(reloadCommandItemIds(blocks)).toBe("item_a\nitem_d");
+    expect(appendsReloadCommand([tail], [tail, ...appended])).toBe(false);
   });
 });
 

@@ -2308,21 +2308,27 @@ interface ComposerProps {
 }
 
 /**
- * Item ids of the Claude Code ``/reload-skills`` and ``/reload-plugins`` runs in
- * a transcript, newline-joined so a store selector can compare it by value.
+ * Whether *current* appends a Claude Code ``/reload-skills`` or ``/reload-plugins``
+ * card after the last server item of *previous*. Prepended history pages don't
+ * count; a replaced window whose old tail is gone counts every reload card.
  */
-export function reloadCommandItemIds(blocks: readonly AnyBlock[]): string {
-  const itemIds: string[] = [];
-  for (const block of blocks) {
+export function appendsReloadCommand(
+  previous: readonly AnyBlock[],
+  current: readonly AnyBlock[],
+): boolean {
+  const previousTail = previous.findLast((block) => block.ctx.itemId)?.ctx.itemId;
+  for (let index = current.length - 1; index >= 0; index--) {
+    const block = current[index];
+    if (previousTail && block.ctx.itemId === previousTail) return false;
     if (
       block.type === "slash_command" &&
       block.kind === "command" &&
       (block.name === "reload-skills" || block.name === "reload-plugins") &&
       block.ctx.itemId
     )
-      itemIds.push(block.ctx.itemId);
+      return true;
   }
-  return itemIds.join("\n");
+  return false;
 }
 
 /**
@@ -3221,29 +3227,31 @@ function ComposerImpl(
   // Claude Code built-ins that reload skills and plugins in place; they reach
   // the TUI as text, like /compact.
   const showReload = sessionHarness === "claude-native";
-  // Rescan the menu's skills once Claude has run a reload sent from here, so a
-  // queued reload also sees skills created before it ran. Reload cards that
-  // arrive with loaded history only move the baseline.
-  const reloadItemIds = useChatStore((s) => (showReload ? reloadCommandItemIds(s.blocks) : ""));
-  const pendingReloadsRef = useRef(0);
-  const seenReloadsRef = useRef<{ conversationId: string | null; itemIds: Set<string> } | null>(
-    null,
-  );
+  // Rescan the menu's skills when a reload card arrives, i.e. once Claude has run
+  // the command, so a queued reload also sees skills created before it ran.
+  // Hydration and conversation switches load existing cards, not new runs.
+  const reloadSkillsRef = useRef(reloadSkills);
   useEffect(() => {
-    const current = reloadItemIds ? reloadItemIds.split("\n") : [];
-    const seen = seenReloadsRef.current;
-    if (seen?.conversationId !== conversationId) {
-      // A first send may assign the id; only leaving a real conversation drops its reloads.
-      if (seen?.conversationId) pendingReloadsRef.current = 0;
-      seenReloadsRef.current = { conversationId, itemIds: new Set(current) };
-      return;
-    }
-    const ran = current.filter((itemId) => !seen.itemIds.has(itemId)).length;
-    for (const itemId of current) seen.itemIds.add(itemId);
-    if (ran === 0 || pendingReloadsRef.current === 0) return;
-    pendingReloadsRef.current = Math.max(0, pendingReloadsRef.current - ran);
-    void reloadSkills().catch(() => undefined);
-  }, [conversationId, reloadItemIds, reloadSkills]);
+    reloadSkillsRef.current = reloadSkills;
+  }, [reloadSkills]);
+  useEffect(() => {
+    if (!showReload) return;
+    // A switch can set the id first and the new conversation's blocks in a later update.
+    let awaitingSwitchedBlocks = false;
+    return useChatStore.subscribe((state, previous) => {
+      if (state.conversationId !== previous.conversationId) {
+        awaitingSwitchedBlocks = state.blocks === previous.blocks;
+        return;
+      }
+      if (state.blocks === previous.blocks) return;
+      const loadedExisting = awaitingSwitchedBlocks || previous.loadingConversation;
+      awaitingSwitchedBlocks = false;
+      if (loadedExisting || !appendsReloadCommand(previous.blocks, state.blocks)) return;
+      void reloadSkillsRef.current().catch(() => {
+        toast.error("Couldn't refresh the skills in the / menu");
+      });
+    });
+  }, [showReload]);
   const skillPrefix = skillInvocationPrefix(sessionHarness);
   // /side is a Codex Code CLI built-in (ephemeral fork side chat), so offer it
   // only on codex-native sessions. Selected/typed, it sends as plaintext to the
@@ -3778,7 +3786,6 @@ function ComposerImpl(
         setValue("");
         setCommandError(null);
         const command = arg ? `${cmd} ${arg}` : cmd;
-        pendingReloadsRef.current += 1;
         appendEntry(command);
         onSend(command);
         return true;

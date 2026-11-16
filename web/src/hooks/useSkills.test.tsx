@@ -2,7 +2,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { useState, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, expectTypeOf, it, vi } from "vitest";
-import { useSkills, type SkillsTarget } from "./useSkills";
+import { skillsQueryKey, useSkills, type SkillsTarget } from "./useSkills";
 
 const fetchMock = vi.fn();
 const target = { hostId: "host", harness: "claude-native", path: "/repo" };
@@ -289,18 +289,58 @@ describe("useSkills", () => {
     expect(fetchMock.mock.calls[1][0]).toBe("/v1/skills?session_id=session-a&refresh=true");
   });
 
-  it("keeps the loaded catalog when a rescan fails", async () => {
-    fetchMock.mockResolvedValueOnce(response());
-    const { result } = renderHook(() => useSkills({ target: { sessionId: "session-a" } }), {
-      wrapper,
+  const renderWithClient = (sessionTarget: SkillsTarget) => {
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false, refetchOnWindowFocus: false } },
     });
+    const view = renderHook(() => useSkills({ target: sessionTarget }), {
+      wrapper: ({ children }: { children: ReactNode }) => (
+        <QueryClientProvider client={client}>{children}</QueryClientProvider>
+      ),
+    });
+    return { client, ...view };
+  };
+
+  it("keeps the loaded catalog, and its age, when a rescan fails", async () => {
+    fetchMock.mockResolvedValueOnce(response());
+    const sessionTarget = { sessionId: "session-a" };
+    const { client, result } = renderWithClient(sessionTarget);
     await waitFor(() => expect(result.current.skills).toEqual(skills));
+    const loadedAt = client.getQueryState(skillsQueryKey(sessionTarget))?.dataUpdatedAt;
     fetchMock.mockResolvedValueOnce(response([], 502));
     await act(async () => {
       await expect(result.current.reload()).rejects.toThrow();
     });
     expect(result.current.skills).toEqual(skills);
     expect(result.current.skillsStatus).toBe("ready");
+    expect(client.getQueryState(skillsQueryKey(sessionTarget))?.dataUpdatedAt).toBe(loadedAt);
+  });
+
+  it("rescans again when an invalidation replaces the rescan with a cached read", async () => {
+    const added = [...skills, { name: "added", description: "Added on disk" }];
+    fetchMock.mockResolvedValueOnce(response());
+    const { client, result } = renderWithClient({ sessionId: "session-a" });
+    await waitFor(() => expect(result.current.skills).toEqual(skills));
+    fetchMock
+      .mockImplementationOnce(() => new Promise<Response>(() => {}))
+      .mockResolvedValueOnce(response())
+      .mockResolvedValueOnce(response(added));
+    let reloading!: Promise<void>;
+    act(() => {
+      reloading = result.current.reload();
+    });
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    await act(async () => {
+      await client.invalidateQueries({ queryKey: ["skills", "session-a"] });
+      await reloading;
+    });
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      "/v1/skills?session_id=session-a",
+      "/v1/skills?session_id=session-a&refresh=true",
+      "/v1/skills?session_id=session-a",
+      "/v1/skills?session_id=session-a&refresh=true",
+    ]);
+    await waitFor(() => expect(result.current.skills).toEqual(added));
   });
 
   it("lets a scheduled refetch share an in-flight reload instead of racing it", async () => {

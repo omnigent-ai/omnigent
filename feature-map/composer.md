@@ -206,13 +206,15 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   name the affected files).
 - `reload-commands`: in Claude Code native sessions, `/reload-skills` and
   `/reload-plugins [--force]` run in the session's Claude Code process, which
-  keeps running. When Claude Code has run one sent from the chat composer,
-  including a reload that waited in the queue, the host's skill catalog is
-  rescanned so the `/` menu lists the new skills. The chat shows a **Command** card whose Output is Claude Code's
-  result line. Other harnesses do not offer them; a typed command is sent as
+  keeps running. The chat shows a **Command** card whose Output is Claude Code's
+  result line. When a new reload card arrives, including one for a reload that
+  waited in the queue, the host's skill catalog is rescanned so the `/` menu
+  lists the new skills; cards loaded with history or a conversation switch do
+  not rescan. Other harnesses do not offer them; a typed command is sent as
   text. States: unexpected arguments (error under the composer), a Claude Code
   build without the command (re-sent as plain text), no result written within
-  a few seconds (card without Output).
+  a few seconds (card without Output), a failed rescan (toast; the menu keeps
+  its previous skills).
 - `session-mcp-status`: selecting `/mcp` in a started session replaces the slash
   suggestions with the MCP servers enabled for that session and links to harness
   Settings with the session’s host preselected. Host-native entries are limited
@@ -824,7 +826,7 @@ Other connection providers alone do not enable the managed MCP picker.
   after adding a skill or installing a plugin mid-session, then runs the new
   skill and checks that the Claude process and earlier context survived.
   Typed commands, argument errors, the harness gate and the rescan after each
-  reload sent from the composer are in `web/src/pages/ChatPage.composer.test.tsx`; the Command
+  new reload card are in `web/src/pages/ChatPage.composer.test.tsx`; the Command
   card's Output, including a result written after the echo was read, in
   `tests/harnesses/claude_native/test_claude_native_bridge.py`. Manually, add a
   skill under the workspace's `.claude/skills` during a native session, run

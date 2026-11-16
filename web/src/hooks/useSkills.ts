@@ -94,20 +94,31 @@ export function useSkills({ target, enabled = true, starting = false }: SkillsOp
   const reload = useCallback(async () => {
     if (target === null || !available) return;
     const queryKey = skillsQueryKey(target);
-    // Cancel any stale fetch; later readers then share this rescan's request.
-    await queryClient.cancelQueries({ queryKey });
-    const previous = queryClient.getQueryData<SkillsCatalog>(queryKey);
-    try {
-      await queryClient.fetchQuery({
-        queryKey,
-        queryFn: ({ signal }) => fetchSkills(target, signal, { refresh: true }),
-        staleTime: 0,
-      });
-    } catch (error) {
-      // A failed rescan leaves the loaded catalog usable instead of an error state.
-      if (previous !== undefined) queryClient.setQueryData(queryKey, previous);
-      throw error;
-    }
+    const rescan = async (): Promise<boolean> => {
+      // Cancel any stale fetch; later readers then share this rescan's request.
+      await queryClient.cancelQueries({ queryKey });
+      const previous = queryClient.getQueryState<SkillsCatalog>(queryKey);
+      let rescanned = false;
+      try {
+        await queryClient.fetchQuery({
+          queryKey,
+          queryFn: async ({ signal }) => {
+            const catalog = await fetchSkills(target, signal, { refresh: true });
+            rescanned = true;
+            return catalog;
+          },
+          staleTime: 0,
+        });
+      } catch (error) {
+        // A failed rescan leaves the loaded catalog usable, and as stale as it was.
+        if (previous?.data !== undefined)
+          queryClient.setQueryData(queryKey, previous.data, { updatedAt: previous.dataUpdatedAt });
+        throw error;
+      }
+      return rescanned;
+    };
+    // An invalidation (e.g. a session rebind) can swap the rescan for a cached read.
+    if (!(await rescan())) await rescan();
   }, [available, queryClient, target]);
   return {
     skills: available ? (query.data?.skills ?? []) : [],
