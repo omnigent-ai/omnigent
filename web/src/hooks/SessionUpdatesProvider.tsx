@@ -32,6 +32,7 @@ import {
   isSessionArchiving,
   isSessionDeleting,
   markRecentlyCreated,
+  withLabelWrite,
   withMoveTombstone,
 } from "@/hooks/useConversations";
 import {
@@ -102,7 +103,9 @@ function applyItemsToCache(
     itemsById.set(
       item.id,
       nullsToUndefined(
-        withMoveTombstone(isSessionArchiving(item.id) ? { ...item, archived: true } : item),
+        withMoveTombstone(
+          withLabelWrite(isSessionArchiving(item.id) ? { ...item, archived: true } : item, true),
+        ),
       ),
     );
   }
