@@ -147,10 +147,11 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   text field. Built-ins handled locally leave the quotes in the draft, except
   `/side`, which carries them into the new side chat. A skill or other command
   sent to the harness leads the message, followed by the quotes and the text
-  around them. If a quoted skill fails to send, its draft returns to the
-  composer with the quotes. Unknown slash text, or a command in a draft that
-  also carries attachments, mentions or review comments, keeps its place after
-  the quotes.
+  around them. A skill that can't be sent yet, such as while the host
+  reconnects, stays in the composer. If the server refuses a quoted skill, its
+  draft returns with the quotes. Unknown slash text, or a command in a draft
+  that also carries attachments, mentions or review comments, keeps its place
+  after the quotes.
   Claude Code and Codex native sessions offer `/clear` only when `/v1/info`
   lists `clear` in `session_event_types`; claude-sdk sessions only when it
   reports `session_claude_sdk_clear`. Otherwise a typed `/clear` goes to the

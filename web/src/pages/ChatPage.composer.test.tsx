@@ -7035,8 +7035,11 @@ describe("Composer reply quotes", () => {
     expect(screen.getByTestId("composer-reply-quote")).toHaveTextContent("Use the filler pattern");
     expect(screen.getByLabelText("Reply text before quote 1")).toHaveValue("Context first");
     expect(textarea()).toHaveValue("/deslop tighten it");
+    onSendSlashCommand.mockReturnValueOnce(false);
     fireEvent.keyDown(textarea(), { key: "Enter" });
     expect(onSendSlashCommand).toHaveBeenLastCalledWith(...onSendSlashCommand.mock.calls[0]!);
+    expect(screen.getByTestId("composer-reply-quote")).toHaveTextContent("Use the filler pattern");
+    expect(textarea()).toHaveValue("/deslop tighten it");
   });
 
   it.each([false, true])(

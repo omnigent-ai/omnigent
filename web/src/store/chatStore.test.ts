@@ -5661,7 +5661,14 @@ describe("chatStore — sendSlashCommand", () => {
     expect(useChatStore.getState().conversationId).toBe("conv_slash_other");
   });
 
-  it("rolls back a failed slash command and returns its quoted draft to the sender", async () => {
+  it.each([
+    [
+      "returns its quoted draft when the server refuses it",
+      { error: { code: "runner_unavailable" } },
+      true,
+    ],
+    ["withholds its quoted draft when delivery is unknown", { error: "boom" }, false],
+  ])("rolls back a failed slash command and %s", async (_case, errorBody, restored) => {
     // Same for a thrown POST: the old code skipped the rollback entirely once
     // the sender was backgrounded, stranding the echo and leaving `status`
     // pinned at "streaming" for that conversation.
@@ -5672,7 +5679,7 @@ describe("chatStore — sendSlashCommand", () => {
       const url = String(input);
       if (url.endsWith("/v1/sessions/conv_slash_fail/events")) {
         return new Promise<Response>((resolve) => {
-          rejectPost = () => resolve(mockResponse({ error: "boom" }, { ok: false, status: 500 }));
+          rejectPost = () => resolve(mockResponse(errorBody, { ok: false, status: 500 }));
         });
       }
       return defaultFetchHandler(input, init);
@@ -5696,12 +5703,16 @@ describe("chatStore — sendSlashCommand", () => {
     const sender = conversationRegistry.peek("conv_slash_fail")!.getState();
     expect(sender.pendingUserMessages).toEqual([]);
     expect(sender.status).toBe("idle");
-    expect(sender.failedSendDraft).toEqual({
-      conversationId: "conv_slash_fail",
-      text: serializeReplyDraft(replyDraft),
-      files: [],
-      replyDraft,
-    });
+    expect(sender.failedSendDraft).toEqual(
+      restored
+        ? {
+            conversationId: "conv_slash_fail",
+            text: serializeReplyDraft(replyDraft),
+            files: [],
+            replyDraft,
+          }
+        : null,
+    );
     expect(useChatStore.getState().failedSendDraft).toBeNull();
   });
 

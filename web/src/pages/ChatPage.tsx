@@ -1211,16 +1211,16 @@ export function ChatPage() {
 
   const onSendSlashCommand = useCallback(
     (name: string, args: string, replyDraft?: StoredReplyDraft) => {
-      if (!agentId) return;
+      if (!agentId) return false;
       // Slash commands aren't replayed (an edge), but still route an unbound
       // coding clone to the directory picker so it isn't a dead end.
       if (urlConvId && runnerOnline === false && routesToResumePicker) {
         setResumeDirDialogOpen(true);
-        return;
+        return false;
       }
       if (urlConvId && isUnreachable) {
         void reconnect();
-        return;
+        return false;
       }
       void useChatStore.getState().sendSlashCommand(name, args, agentId, {
         replyDraft,
@@ -1228,6 +1228,7 @@ export function ChatPage() {
           navigate(`/c/${newId}`, { replace: true });
         },
       });
+      return true;
     },
     [agentId, urlConvId, runnerOnline, routesToResumePicker, isUnreachable, reconnect, navigate],
   );
@@ -1545,7 +1546,7 @@ interface MainAgentSurfaceProps {
    * is sent as plaintext for the vendor TUI to handle. See
    * `ComposerProps.onSendSlashCommand`.
    */
-  onSendSlashCommand?: (name: string, args: string, replyDraft?: StoredReplyDraft) => void;
+  onSendSlashCommand?: (name: string, args: string, replyDraft?: StoredReplyDraft) => boolean;
   onStop: () => void;
   onShowReconnectHelp: () => void;
   /** Sending reconnects the offline Arca host, so the composer stays enabled. */
@@ -1893,7 +1894,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
       onSendSlashCommand && !isNativeWrapper
         ? (name: string, args: string, replyDraft?: StoredReplyDraft) => {
             setSendScrollNonce((n) => n + 1);
-            onSendSlashCommand(name, args, replyDraft);
+            return onSendSlashCommand(name, args, replyDraft);
           }
         : undefined,
     [onSendSlashCommand, isNativeWrapper],
@@ -2192,7 +2193,7 @@ interface ComposerProps {
    * native-terminal sessions, which always send `/skill` as plaintext so
    * the vendor TUI loads the skill itself.
    */
-  onSendSlashCommand?: (name: string, args: string, replyDraft?: StoredReplyDraft) => void;
+  onSendSlashCommand?: (name: string, args: string, replyDraft?: StoredReplyDraft) => boolean;
   onStop: () => void;
   agents: Agent[] | undefined;
   selectedAgentId: string | null;
@@ -4265,12 +4266,13 @@ function ComposerImpl(
       const cmd = parts[0].toLowerCase();
       const arg = parts[1] ?? "";
       const sendSkill = (match: { command: string; args: string }) => {
-        appendEntry(quotedCommand ? fullText : trimmed, storedReplyDraft);
         const name = match.command.slice(1);
-        // The quoted draft comes back to the composer if the skill can't be sent.
-        if (quotedCommand)
-          onSendSlashCommand?.(name, withQuotedContext(match.args), storedReplyDraft);
-        else onSendSlashCommand?.(name, match.args);
+        // A command that isn't dispatched stays in the composer.
+        const dispatched = quotedCommand
+          ? onSendSlashCommand?.(name, withQuotedContext(match.args), storedReplyDraft)
+          : onSendSlashCommand?.(name, match.args);
+        if (dispatched === false) return;
+        appendEntry(quotedCommand ? fullText : trimmed, storedReplyDraft);
         dirtyRef.current = true;
         replaceText("");
         setCommandError(null);

@@ -3390,8 +3390,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       failSet((s) => ({
         pendingUserMessages: s.pendingUserMessages.filter((p) => p.tempId !== tempId),
       }));
-      // Like a failed quoted message, a quoted command's draft goes back to its composer.
-      if (opts?.replyDraft && failTarget !== null) {
+      // A quoted draft comes back only when the server refused it; an unanswered POST may have run.
+      const refused = err instanceof ApiError && err.code !== null;
+      if (opts?.replyDraft && refused && failTarget !== null) {
         const replyDraft = opts.replyDraft;
         const text = serializeReplyDraft(replyDraft);
         failSet({ failedSendDraft: { conversationId: failTarget, text, files: [], replyDraft } });
