@@ -684,6 +684,69 @@ describe("TasksPanel", () => {
     }
   });
 
+  it("hides run controls after the final step finishes, even with unfinished earlier steps", () => {
+    showJournal([
+      journalPlan(0, ["explore"], ["work", ["explore"]], ["report", ["work"]]),
+      status(1, "explore", "done"),
+      status(2, "report", "done"),
+    ]);
+    const withdrawContinue = registerContinuePlan("conv", vi.fn());
+    const withdrawStop = registerStopWork("conv", vi.fn());
+    try {
+      setSession({ sessionStatus: "running" });
+      renderPanel();
+      expect(screen.queryByTestId("plan-stop")).toBeNull();
+      expect(screen.queryByTestId("plan-continue")).toBeNull();
+
+      setSession({ sessionStatus: "idle" });
+      expect(screen.queryByTestId("plan-stop")).toBeNull();
+      expect(screen.queryByTestId("plan-continue")).toBeNull();
+      expect(screen.queryByTestId("tasks-paused")).toBeNull();
+
+      showJournal([
+        journalPlan(0, ["explore"], ["work", ["explore"]], ["report", ["work"]]),
+        status(1, "explore", "done"),
+        status(2, "report", "done"),
+        status(3, "work", "started"),
+      ]);
+      setSession({ sessionStatus: "running" });
+      expect(screen.getByTestId("plan-stop")).toBeInTheDocument();
+      setSession({ sessionStatus: "idle" });
+      expect(screen.getByTestId("plan-continue")).toBeInTheDocument();
+
+      showJournal([
+        journalPlan(0, ["explore"], ["work", ["explore"]], ["report", ["work"]]),
+        status(1, "explore", "done"),
+        status(2, "report", "done"),
+        journalPlan(3, ["explore"], ["review", ["explore"]], ["report", ["review"]]),
+      ]);
+      setSession({ sessionStatus: "running" });
+      expect(screen.getByTestId("plan-stop")).toBeInTheDocument();
+      setSession({ sessionStatus: "idle" });
+      expect(screen.getByTestId("plan-continue")).toBeInTheDocument();
+
+      const dependencyEntries = [
+        journalPlan(0, ["review"], ["report"]),
+        status(1, "review", "started"),
+        status(2, "report", "done"),
+        journalPlan(3, ["review"], ["report", ["review"]]),
+      ];
+      showJournal(dependencyEntries);
+      setSession({ sessionStatus: "running" });
+      expect(screen.getByTestId("plan-stop")).toBeInTheDocument();
+      setSession({ sessionStatus: "idle" });
+      expect(screen.getByTestId("plan-continue")).toBeInTheDocument();
+      showJournal([...dependencyEntries, status(4, "review", "done"), status(5, "report", "done")]);
+      setSession({ sessionStatus: "running" });
+      expect(screen.queryByTestId("plan-stop")).toBeNull();
+      setSession({ sessionStatus: "idle" });
+      expect(screen.queryByTestId("plan-continue")).toBeNull();
+    } finally {
+      act(withdrawContinue);
+      act(withdrawStop);
+    }
+  });
+
   it("heads the list with the plan's name", () => {
     const named = journalPlan(0, ["baseline"]);
     named.content.name = "Cut GET /orders p95 by 20%";
@@ -778,6 +841,25 @@ describe("TasksPanel", () => {
       todos: [{ content: "Deploy", status: "in_progress", activeForm: "Deploying" }],
     });
     expect(screen.getByTestId("tasks-row")).toHaveAttribute("data-state", "running");
+
+    let withdrawStop = () => {};
+    act(() => {
+      withdrawStop = registerStopWork("conv", vi.fn());
+    });
+    try {
+      showJournal([status(1, "deploy", "done")]);
+      setSession({
+        todos: [{ content: "Deploy", status: "completed", activeForm: "Deploying" }],
+      });
+      // A status without its plan cannot declare the workflow complete.
+      expect(screen.getByTestId("plan-stop")).toBeInTheDocument();
+    } finally {
+      act(withdrawStop);
+    }
+    showJournal([]);
+    setSession({
+      todos: [{ content: "Deploy", status: "in_progress", activeForm: "Deploying" }],
+    });
 
     vi.mocked(useOptionalLoadedConversations).mockReturnValue({
       ...conversationPage([conversation("conv")]).data!,
