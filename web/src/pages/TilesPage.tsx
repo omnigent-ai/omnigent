@@ -2,7 +2,7 @@
 // agent (the only one with a composer). Gallery shows live tiles, Focus puts the
 // active agent in a large pane beside a live strip, Cards shows status only.
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useSearchParams } from "@/lib/routing";
 import {
   LayersIcon,
@@ -35,6 +35,13 @@ import {
   writeTilesView,
 } from "@/tiles/tilesPreferences";
 import { useReleaseIdleTileStreams } from "@/tiles/useTileStreams";
+import {
+  ActiveTileWorkspace,
+  type TileFileContext,
+  type TileSwitchGuard,
+} from "@/tiles/ActiveTileWorkspace";
+import { FileViewerContext } from "@/shell/FileViewerContext";
+import { useResizableWorkspacePanel } from "@/shell/useResizableWorkspacePanel";
 import { TileStackDrawer } from "@/tiles/TileStackDrawer";
 import {
   isQuiet,
@@ -118,6 +125,8 @@ export function TilesPage() {
   const tilesById = useMemo(() => new Map(tiles.map((tile) => [tile.id, tile])), [tiles]);
   const orderedIds = useMemo(() => tiles.map((tile) => tile.id), [tiles]);
   const activeId = resolveActiveId(tiles, chosenId);
+  const activeIdRef = useRef(activeId);
+  activeIdRef.current = activeId;
   const liveIds = useMemo(
     () =>
       view === "cards"
@@ -158,9 +167,22 @@ export function TilesPage() {
     [setSearchParams],
   );
   // Cards are an overview: picking one opens it in Focus as the active agent.
+  // The Workspace panel follows the active tile; switching asks it about unsaved edits.
+  const workspaceUi = useResizableWorkspacePanel("tiles", "Resize tiles workspace");
+  const switchGuard = useRef<TileSwitchGuard | null>(null);
+  const setSwitchGuard = useCallback((guard: TileSwitchGuard | null) => {
+    switchGuard.current = guard;
+  }, []);
+  const [tileFileContext, setTileFileContext] = useState<TileFileContext | null>(null);
   const activate = useCallback(
-    (sessionId: string) =>
-      updateParams(view === "cards" ? { active: sessionId, view: "focus" } : { active: sessionId }),
+    (sessionId: string) => {
+      const apply = () =>
+        updateParams(
+          view === "cards" ? { active: sessionId, view: "focus" } : { active: sessionId },
+        );
+      if (switchGuard.current && sessionId !== activeIdRef.current) switchGuard.current(apply);
+      else apply();
+    },
     [updateParams, view],
   );
   const openSingle = useCallback((sessionId: string) => navigate(`/c/${sessionId}`), [navigate]);
@@ -171,11 +193,12 @@ export function TilesPage() {
   const working = counts.working;
   const waiting = counts["needs-you"];
   const activeTile = activeId ? (tilesById.get(activeId) ?? null) : null;
+  const showWorkspace = view !== "cards" && activeTile !== null;
 
   const renderTile = (id: string, variant: AgentTileVariant, resize?: TileResize) => {
     const conversation = tilesById.get(id);
     if (!conversation) return null;
-    return (
+    const tile = (
       <AgentTile
         conversation={conversation}
         active={id === activeId}
@@ -190,6 +213,11 @@ export function TilesPage() {
         onPark={park}
       />
     );
+    return id === activeId && tileFileContext ? (
+      <FileViewerContext.Provider value={tileFileContext}>{tile}</FileViewerContext.Provider>
+    ) : (
+      tile
+    );
   };
 
   return (
@@ -203,6 +231,20 @@ export function TilesPage() {
           {view !== "cards" && liveIds.size < tiles.length && ` · ${liveIds.size} streaming`}
         </p>
         <div className="ml-auto flex items-center gap-2">
+          {showWorkspace && (
+            <Button
+              variant="ghost"
+              size="xs"
+              className={cn("gap-1.5", workspaceUi.open && "bg-accent text-accent-foreground")}
+              aria-pressed={workspaceUi.open}
+              data-testid="tiles-workspace-toggle"
+              title="Files, changes and terminals for the active agent"
+              onClick={workspaceUi.toggleWorkspace}
+            >
+              <PanelRightIcon className="size-3.5" />
+              Files
+            </Button>
+          )}
           <Button
             variant="ghost"
             size="xs"
@@ -267,68 +309,80 @@ export function TilesPage() {
         />
       )}
 
-      {isLoading ? (
-        <div className="flex flex-1 items-center justify-center text-muted-foreground">
-          <Loader2Icon className="size-5 animate-spin" aria-label="Loading agents" />
-        </div>
-      ) : tiles.length === 0 && filtering ? (
-        <div className="flex flex-1 flex-col items-center justify-center gap-3 text-sm text-muted-foreground">
-          No agents match these filters.
-          <Button
-            variant="outline"
-            size="xs"
-            onClick={() => {
-              writeTileStatusFilter("all");
-              setQuery("");
-              setSearchParams(
-                (current) => {
-                  const params = new URLSearchParams(current);
-                  params.delete("project");
-                  return params;
-                },
-                { replace: true },
-              );
-            }}
-          >
-            Clear filters
-          </Button>
-        </div>
-      ) : tiles.length === 0 && stacked.length > 0 ? (
-        <div className="flex flex-1 flex-col items-center justify-center gap-3 text-sm text-muted-foreground">
-          All your agents are in the Stack.
-          <Button variant="outline" size="xs" onClick={() => setStackOpen(true)}>
-            Show the Stack
-          </Button>
-        </div>
-      ) : tiles.length === 0 ? (
-        <div className="flex flex-1 items-center justify-center text-sm text-muted-foreground">
-          No active agents. Sessions that are running, waiting on you, or used in the last two days
-          appear here.
-        </div>
-      ) : view === "focus" && activeTile ? (
-        <div className="flex min-h-0 flex-1 gap-3 p-3">
-          <div className="flex min-h-0 min-w-0 flex-1">{renderTile(activeTile.id, "tile")}</div>
-          {tiles.length > 1 && (
-            <div className="flex min-h-0 w-[380px] shrink-0 flex-col gap-3 overflow-y-auto">
-              {orderedIds
-                .filter((id) => id !== activeTile.id)
-                .map((id) => (
-                  <div key={id} className="flex h-[260px] shrink-0">
-                    {renderTile(id, "strip")}
-                  </div>
-                ))}
-            </div>
-          )}
-        </div>
-      ) : (
-        <TileGrid
-          ids={orderedIds}
-          chosenColumns={chosenColumns}
-          layout={view === "cards" ? "cards" : "gallery"}
-          onMeasure={setGridWidth}
-          renderTile={(id, resize) => renderTile(id, view === "cards" ? "card" : "tile", resize)}
-        />
-      )}
+      <div ref={workspaceUi.container} className="flex min-h-0 min-w-0 flex-1">
+        {isLoading ? (
+          <div className="flex flex-1 items-center justify-center text-muted-foreground">
+            <Loader2Icon className="size-5 animate-spin" aria-label="Loading agents" />
+          </div>
+        ) : tiles.length === 0 && filtering ? (
+          <div className="flex flex-1 flex-col items-center justify-center gap-3 text-sm text-muted-foreground">
+            No agents match these filters.
+            <Button
+              variant="outline"
+              size="xs"
+              onClick={() => {
+                writeTileStatusFilter("all");
+                setQuery("");
+                setSearchParams(
+                  (current) => {
+                    const params = new URLSearchParams(current);
+                    params.delete("project");
+                    return params;
+                  },
+                  { replace: true },
+                );
+              }}
+            >
+              Clear filters
+            </Button>
+          </div>
+        ) : tiles.length === 0 && stacked.length > 0 ? (
+          <div className="flex flex-1 flex-col items-center justify-center gap-3 text-sm text-muted-foreground">
+            All your agents are in the Stack.
+            <Button variant="outline" size="xs" onClick={() => setStackOpen(true)}>
+              Show the Stack
+            </Button>
+          </div>
+        ) : tiles.length === 0 ? (
+          <div className="flex flex-1 items-center justify-center text-sm text-muted-foreground">
+            No active agents. Sessions that are running, waiting on you, or used in the last two
+            days appear here.
+          </div>
+        ) : view === "focus" && activeTile ? (
+          <div className="flex min-h-0 flex-1 gap-3 p-3">
+            <div className="flex min-h-0 min-w-0 flex-1">{renderTile(activeTile.id, "tile")}</div>
+            {tiles.length > 1 && (
+              <div className="flex min-h-0 w-[380px] shrink-0 flex-col gap-3 overflow-y-auto">
+                {orderedIds
+                  .filter((id) => id !== activeTile.id)
+                  .map((id) => (
+                    <div key={id} className="flex h-[260px] shrink-0">
+                      {renderTile(id, "strip")}
+                    </div>
+                  ))}
+              </div>
+            )}
+          </div>
+        ) : (
+          <TileGrid
+            ids={orderedIds}
+            chosenColumns={chosenColumns}
+            layout={view === "cards" ? "cards" : "gallery"}
+            onMeasure={setGridWidth}
+            renderTile={(id, resize) => renderTile(id, view === "cards" ? "card" : "tile", resize)}
+          />
+        )}
+        {showWorkspace && activeTile && (
+          <ActiveTileWorkspace
+            key={activeTile.id}
+            sessionId={activeTile.id}
+            workspacePanel={workspaceUi.workspacePanel}
+            onOpenWorkspace={workspaceUi.openWorkspace}
+            onFileContext={setTileFileContext}
+            onSwitchGuard={setSwitchGuard}
+          />
+        )}
+      </div>
       {stackOpen && (
         <div id="tiles-stack">
           <TileStackDrawer
