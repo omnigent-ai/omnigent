@@ -1503,8 +1503,8 @@ async def test_triggered_task_update_refuses_part_of_a_search_before_any_request
     [
         ({}, 200, False),
         ({"triggered_task_tools": None}, 200, True),
-        # Without orchestration the triggered update is refused, so pausing stays here.
-        ({"features": {"session_orchestration": False}}, 200, True),
+        # Without orchestration the triggered update still pauses it, so this refuses.
+        ({"features": {"session_orchestration": False}}, 200, False),
         # An unreadable /v1/info doesn't show an older server, so nothing is overwritten.
         ({}, 503, False),
     ],
@@ -1532,6 +1532,27 @@ async def test_scheduled_task_update_keeps_a_triggered_tasks_prompt(
     if not patched:
         assert "sys_triggered_task_update" in str(out["error"])
         assert server.tasks[_TASK_ID]["prompt"] == saved
+
+
+@pytest.mark.asyncio
+async def test_triggered_task_update_pauses_a_trigger_with_orchestration_off() -> None:
+    server = _TaskServer()
+    await _run(server, "sys_triggered_task_create", _JIRA_TRIGGER)
+    server.info["features"] = {"session_orchestration": False}
+    review = {
+        "triggered_task_id": _TASK_ID,
+        "instructions": "Investigate the ticket.",
+        "permission_mode": "acceptEdits",
+    }
+    # A change that leaves it running needs orchestration to start its sessions.
+    refused = await _run(server, "sys_triggered_task_update", review)
+    assert "session orchestration turned off" in str(refused["error"])
+    assert server.mutations() == ["POST"]
+    # Pausing starts none, so it stays possible; the trigger keeps its header.
+    paused = await _run(server, "sys_triggered_task_update", {**review, "state": "paused"})
+    assert paused["state"] == "paused"
+    assert server.mutations() == ["POST", "PATCH"]
+    assert _saved_trigger(server)["scope"] == "ES"
 
 
 def _saved_trigger_task(task_id: str, **trigger: object) -> dict[str, object]:

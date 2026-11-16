@@ -621,6 +621,18 @@ TRIGGERED_TASK_TOOLS: tuple[type[Tool], ...] = (
 )
 
 
+def _argument_names(tool: type[Tool]) -> frozenset[str]:
+    """The top-level arguments *tool*'s schema declares."""
+    return frozenset(tool().get_schema()["function"]["parameters"]["properties"])
+
+
+# Harnesses don't all enforce a schema's additionalProperties, so the calls check it.
+_CALL_ARGUMENTS = {
+    "create": _argument_names(SysTriggeredTaskCreateTool),
+    "update": _argument_names(SysTriggeredTaskUpdateTool),
+}
+
+
 def triggered_task_call_error(args: Mapping[str, object], *, action: str) -> str | None:
     """What makes a create or update invalid before it reaches the server, or ``None``.
 
@@ -631,6 +643,10 @@ def triggered_task_call_error(args: Mapping[str, object], *, action: str) -> str
     :param action: ``"create"`` or ``"update"``.
     :returns: An error message, or ``None``.
     """
+    unknown = sorted(set(args).difference(_CALL_ARGUMENTS[action]))
+    if unknown:
+        # A name can hold anything, so it's shown escaped like a value.
+        return f"unknown arguments: {', '.join(review_json(key) for key in unknown)}"
     missing = sorted(TRIGGERED_TASK_REVIEW_FIELDS.difference(args))
     if missing:
         hint = (
@@ -648,6 +664,11 @@ def triggered_task_call_error(args: Mapping[str, object], *, action: str) -> str
     name = args.get("name")
     if (action == "create" or "name" in args) and (not isinstance(name, str) or not name.strip()):
         return "name must be a non-empty string"
+    agent_id = args.get("agent_id")
+    if (action == "create" or "agent_id" in args) and (
+        not isinstance(agent_id, str) or not agent_id.strip()
+    ):
+        return "agent_id must name the agent that checks for matches, from sys_agent_list"
     if "project_name" in args and "project_id" in args:
         return "set project_id or project_name, not both"
     if "project_name" in args and not isinstance(args["project_name"], str):
@@ -1061,7 +1082,8 @@ def trigger_rrule(info: Mapping[str, object]) -> str:
     features = info.get("features")
     anchored = isinstance(features, dict) and features.get("automations_v2") is True
     minutes = info.get("automation_trigger_poll_minutes")
-    if not isinstance(minutes, int) or isinstance(minutes, bool) or minutes <= 0:
+    # As the form reads it, a value outside 10-240 means the default.
+    if not isinstance(minutes, int) or isinstance(minutes, bool) or not 10 <= minutes <= 240:
         minutes = 10
     if anchored and (info.get("scheduled_task_subhour") is True or minutes >= 60):
         return f"FREQ=MINUTELY;INTERVAL={minutes}"

@@ -626,14 +626,32 @@ def test_polling_minutes_matches_the_form(rrule: str | None, minutes: int) -> No
             "FREQ=HOURLY;BYMINUTE=0",
         ),
         ({"scheduled_task_subhour": True}, "FREQ=HOURLY;BYMINUTE=0"),
+        # Like the form, a value outside 10-240 minutes means the default.
+        (
+            {
+                "features": {"automations_v2": True},
+                "scheduled_task_subhour": True,
+                "automation_trigger_poll_minutes": 5,
+            },
+            "FREQ=MINUTELY;INTERVAL=10",
+        ),
+        (
+            {
+                "features": {"automations_v2": True},
+                "scheduled_task_subhour": True,
+                "automation_trigger_poll_minutes": 300,
+            },
+            "FREQ=MINUTELY;INTERVAL=10",
+        ),
     ],
-    ids=["subhour", "hours", "no-subhour", "no-database-scheduler"],
+    ids=["subhour", "hours", "no-subhour", "no-database-scheduler", "too-often", "too-rarely"],
 )
 def test_trigger_rrule_matches_the_form_default(info: dict[str, Any], rrule: str) -> None:
     assert trigger_rrule(info) == rrule
 
 
 _REVIEWED = {"instructions": "x", "permission_mode": None}
+_NAMED = {**_REVIEWED, "name": "n", "agent_id": "ag_1"}
 
 
 @pytest.mark.parametrize(
@@ -644,6 +662,15 @@ _REVIEWED = {"instructions": "x", "permission_mode": None}
         ({"instructions": "x", "permission_mode": "null"}, "create", "permission_mode must"),
         (_REVIEWED, "update", "triggered_task_id"),
         (_REVIEWED, "create", "name must be a non-empty string"),
+        ({**_REVIEWED, "name": "n"}, "create", "agent_id must name the agent"),
+        (
+            {**_REVIEWED, "triggered_task_id": "t1", "agent_id": " "},
+            "update",
+            "agent_id must name the agent",
+        ),
+        # Harnesses don't all enforce the schema, and a name can hold anything.
+        ({**_NAMED, "x\nApprove?": 1}, "create", 'unknown arguments: "x\\nApprove?"'),
+        ({**_REVIEWED, "triggered_task_id": "t1", "rrule": "x"}, "update", "unknown arguments"),
         ({**_REVIEWED, "name": " "}, "create", "name must be a non-empty string"),
         (
             {**_REVIEWED, "triggered_task_id": "t1", "name": ""},
@@ -651,13 +678,13 @@ _REVIEWED = {"instructions": "x", "permission_mode": None}
             "name must be a non-empty string",
         ),
         (
-            {**_REVIEWED, "name": "n", "project_name": "p", "project_id": "q"},
+            {**_NAMED, "project_name": "p", "project_id": "q"},
             "create",
             "not both",
         ),
-        ({**_REVIEWED, "name": "n", "project_name": 3}, "create", "project_name must"),
+        ({**_NAMED, "project_name": 3}, "create", "project_name must"),
         (
-            {**_REVIEWED, "name": "n", "execution_target": "managed_sandbox", "host_id": "h1"},
+            {**_NAMED, "execution_target": "managed_sandbox", "host_id": "h1"},
             "create",
             "omit host_id",
         ),
@@ -676,10 +703,10 @@ _REVIEWED = {"instructions": "x", "permission_mode": None}
             "update",
             "pass the whole search: add provider, event, scope",
         ),
-        ({**_REVIEWED, "name": "n", "instructions": " "}, "create", "instructions must be"),
-        ({**_REVIEWED, "name": "n", "link_back": "yes"}, "create", "link_back must be"),
+        ({**_NAMED, "instructions": " "}, "create", "instructions must be"),
+        ({**_NAMED, "link_back": "yes"}, "create", "link_back must be"),
         (
-            {**_REVIEWED, "name": "n", "worker": {"permission_mode": "null"}},
+            {**_NAMED, "worker": {"permission_mode": "null"}},
             "create",
             "is not a permission mode",
         ),
@@ -703,7 +730,7 @@ def test_call_error(args: dict[str, Any], action: str, error: str) -> None:
     ("args", "action"),
     [
         ({**_REVIEWED, "triggered_task_id": "t1"}, "update"),
-        ({**_REVIEWED, "name": "Triage", "project_id": None}, "create"),
+        ({**_NAMED, "project_id": None}, "create"),
     ],
 )
 def test_call_error_accepts_complete_values(args: dict[str, Any], action: str) -> None:

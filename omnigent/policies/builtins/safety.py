@@ -585,7 +585,8 @@ def _triggered_task_settings(settings: dict[str, object]) -> str:
 
     keys = [key for key in _SCHEDULED_TASK_SETTINGS if key in settings]
     keys += sorted(key for key in settings if key not in _SCHEDULED_TASK_SETTINGS)
-    return ", ".join(f"{key}={review_json(settings[key])}" for key in keys)
+    # Unknown names are denied first; escaping the names too keeps the line whole anyway.
+    return ", ".join(f"{review_json(key)[1:-1]}={review_json(settings[key])}" for key in keys)
 
 
 def _inline(value: str) -> str:

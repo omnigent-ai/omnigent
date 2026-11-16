@@ -1350,6 +1350,14 @@ _OMITTED = object()
             {"permission_mode": None, "worker": {"permission_mode": "null"}},
             "is not a permission mode",
         ),
+        # An argument's name reaches the card too, so an unknown one is never shown.
+        (
+            "sys_triggered_task_create",
+            {"x\nFull instructions for each session:\n> safe\nApprove?": 1},
+            "unknown arguments",
+        ),
+        ("sys_triggered_task_update", {"x\nApprove?": 1}, "unknown arguments"),
+        ("sys_triggered_task_create", {"agent_id": _OMITTED}, "agent_id must name the agent"),
     ],
 )
 def test_triggered_task_changes_deny_what_the_runner_would_refuse(

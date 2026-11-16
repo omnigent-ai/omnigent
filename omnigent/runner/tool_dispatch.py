@@ -5195,13 +5195,18 @@ _SCHEDULED_TASK_GATED_FIELDS = (
 
 
 async def _scheduled_task_session_fields_refusal(
-    server_client: httpx.AsyncClient, tool_name: str, payload: _JsonObject
+    server_client: httpx.AsyncClient,
+    tool_name: str,
+    payload: _JsonObject,
+    *,
+    info: _JsonObject | None = None,
 ) -> str | None:
     """An error for optional fields this server would reject, or ``None`` to send them.
 
     An older server forbids unknown fields, so the payload would fail with a 422
     that does not say why. Asked only when the call carries one of the fields; an
-    unreadable ``/v1/info`` counts as unsupported, as for task projects.
+    unreadable ``/v1/info`` counts as unsupported, as for task projects. A caller
+    that already read ``/v1/info`` passes it as *info*.
     """
     gated = [
         (capability, reason)
@@ -5210,8 +5215,11 @@ async def _scheduled_task_session_fields_refusal(
     ]
     if not gated:
         return None
-    info = await server_client.get("/v1/info", timeout=30.0)
-    advertised = info.json() if info.status_code < 400 else {}
+    if info is not None:
+        advertised: _JsonObject = info
+    else:
+        response = await server_client.get("/v1/info", timeout=30.0)
+        advertised = response.json() if response.status_code < 400 else {}
     for capability, reason in gated:
         if advertised.get(capability) is not True:
             return json.dumps({"error": f"{tool_name}: this Omnigent server {reason}"})
@@ -5457,7 +5465,7 @@ def _triggered_task_session_link(server_client: httpx.AsyncClient) -> str:
 
 
 async def _triggered_task_server_info(
-    server_client: httpx.AsyncClient, tool_name: str
+    server_client: httpx.AsyncClient, tool_name: str, *, needs_orchestration: bool = True
 ) -> _JsonObject | str:
     """The server's ``/v1/info`` when it can run triggered tasks, else a refusal.
 
@@ -5469,12 +5477,19 @@ async def _triggered_task_server_info(
         return json.dumps(
             {"error": f"{tool_name}: couldn't read this Omnigent server's /v1/info; try again"}
         )
-    error = _triggered_task_capability_error(info, tool_name)
+    error = _triggered_task_capability_error(
+        info, tool_name, needs_orchestration=needs_orchestration
+    )
     return info if error is None else error
 
 
-def _triggered_task_capability_error(info: _JsonObject, tool_name: str) -> str | None:
-    """Why the server whose ``/v1/info`` is *info* can't run triggered tasks, or ``None``."""
+def _triggered_task_capability_error(
+    info: _JsonObject, tool_name: str, *, needs_orchestration: bool = True
+) -> str | None:
+    """Why the server whose ``/v1/info`` is *info* can't run triggered tasks, or ``None``.
+
+    A call that leaves the task paused starts no sessions, so it can skip orchestration.
+    """
     if info.get("triggered_task_tools") is not True:
         return json.dumps(
             {"error": f"{tool_name}: this Omnigent server does not support triggered tasks"}
@@ -5484,7 +5499,7 @@ def _triggered_task_capability_error(info: _JsonObject, tool_name: str) -> str |
             {"error": f"{tool_name}: automations are not enabled on this Omnigent server"}
         )
     features = _string_object_dict(info.get("features")) or {}
-    if features.get("session_orchestration") is not True:
+    if needs_orchestration and features.get("session_orchestration") is not True:
         # Each match starts a session with sys_session_create.
         return json.dumps(
             {
@@ -5642,7 +5657,11 @@ async def _execute_triggered_task_tool(
         return json.dumps({"error": f"{tool_name}: {error}"})
     project_name = args.get("project_name")
     name = args.get("name")
-    info = await _triggered_task_server_info(server_client, tool_name)
+    # Pausing must stay possible while orchestration is off, so polling can be stopped.
+    pausing = action == "update" and args.get("state") == "paused"
+    info = await _triggered_task_server_info(
+        server_client, tool_name, needs_orchestration=not pausing
+    )
     if isinstance(info, str):
         return info
     if ("project_name" in args or "project_id" in args) and info.get(
@@ -5732,7 +5751,9 @@ async def _execute_triggered_task_tool(
         if config["source"] != current["source"]:
             # The watch session's checkpoint tracks the old provider's items.
             payload["session_id"] = None
-    refusal = await _scheduled_task_session_fields_refusal(server_client, tool_name, payload)
+    refusal = await _scheduled_task_session_fields_refusal(
+        server_client, tool_name, payload, info=info
+    )
     if refusal is not None:
         return refusal
     if isinstance(project_name, str):
@@ -5991,9 +6012,9 @@ async def _triggered_task_update_refusal(
 ) -> str | None:
     """A refusal to rewrite a triggered task's prompt as plain text, or ``None``.
 
-    Refused only where ``sys_triggered_task_update`` can change it instead. Where it
-    can't (an older server, or session orchestration turned off), the plain update
-    stays available so the task can still be paused or edited.
+    Refused wherever ``sys_triggered_task_update`` exists, which can pause a task even
+    with session orchestration off. On an older server, which lacks it, the plain
+    update stays available so the task can still be paused or edited.
     """
     body = _string_object_dict(task) or {}
     prompt = body.get("prompt")
@@ -6009,7 +6030,8 @@ async def _triggered_task_update_refusal(
                 "sys_triggered_task_update can change it; try again"
             }
         )
-    if _triggered_task_capability_error(info, tool_name) is not None:
+    if info.get("triggered_task_tools") is not True:
+        # A server that predates the triggered tools has no other way to change one.
         return None
     return json.dumps(
         {
