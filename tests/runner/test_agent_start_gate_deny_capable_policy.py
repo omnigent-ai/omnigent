@@ -357,12 +357,22 @@ async def test_direct_stream_legacy_model_obeys_inference_allowlist(
 
 @pytest.mark.parametrize(
     "cache_state",
-    ["same-harness", "original-harness", "replaced-entry", "background", "native-selection"],
+    [
+        "same-harness",
+        "original-harness",
+        "replaced-entry",
+        "background",
+        "native-selection",
+        "lazy-metadata",
+        "lazy-replaced-entry",
+    ],
 )
 async def test_cached_harness_selection_preserves_single_policy_transform(
     monkeypatch: pytest.MonkeyPatch, cache_state: str
 ) -> None:
     monkeypatch.setattr(runner_app_module, "_session_inboxes_ref", {})
+    monkeypatch.setattr(runner_app_module, "_session_agent_ids_ref", {})
+    lazy_metadata = cache_state in {"lazy-metadata", "lazy-replaced-entry"}
     declared = _spec()
     resolver = AsyncMock(return_value=declared)
 
@@ -406,40 +416,60 @@ async def test_cached_harness_selection_preserves_single_policy_transform(
         ]
     )
     manager = _FakeProcessManager(worker)
+    server_client = NullServerClient()
+    if lazy_metadata:
+        monkeypatch.setattr(
+            server_client,
+            "get",
+            AsyncMock(return_value=httpx.Response(200, json={"agent_id": "agent"})),
+        )
+        monkeypatch.setattr(
+            "omnigent.models.model_catalog.catalog_for_spec", Mock(return_value={})
+        )
     app = create_runner_app(
         process_manager=manager,
         spec_resolver=resolver,
-        server_client=NullServerClient(),
+        server_client=server_client,
     )
     harness = {
         "original-harness": "claude-sdk",
         "native-selection": "opencode-native",
+        "lazy-metadata": "claude-sdk",
+        "lazy-replaced-entry": "claude-sdk",
     }.get(cache_state, "pi")
     async with _runner_client(app) as client:
-        initialized = await client.post(
-            "/v1/sessions",
-            json={
-                "session_id": _SESSION_ID,
-                "agent_id": "agent",
-                "session_init": {
-                    "protocol_version": 2,
-                    "server_version": "0.6.0.dev0",
+        if lazy_metadata:
+            # Model discovery caches the policy without binding an agent_id for the next turn.
+            metadata = await client.get(f"/v1/sessions/{_SESSION_ID}/models")
+            assert metadata.status_code == 200, metadata.text
+            assert not manager.get_client_calls
+            assert _SESSION_ID not in runner_app_module._session_agent_ids_ref
+            gate.assert_awaited_once_with(declared, harness)
+        else:
+            initialized = await client.post(
+                "/v1/sessions",
+                json={
                     "session_id": _SESSION_ID,
                     "agent_id": "agent",
-                    "snapshot": {
-                        "created_at": 1,
-                        "updated_at": 1,
-                        "labels": {},
-                        "harness_override": "pi",
+                    "session_init": {
+                        "protocol_version": 2,
+                        "server_version": "0.6.0.dev0",
+                        "session_id": _SESSION_ID,
+                        "agent_id": "agent",
+                        "snapshot": {
+                            "created_at": 1,
+                            "updated_at": 1,
+                            "labels": {},
+                            "harness_override": "pi",
+                        },
                     },
                 },
-            },
-        )
-        assert initialized.status_code == 201, initialized.text
-        gate.assert_awaited_once_with(declared, "pi")
+            )
+            assert initialized.status_code == 201, initialized.text
+            gate.assert_awaited_once_with(declared, "pi")
         cache = register_routes.call_args.kwargs["_session_spec_cache"]
         original_cached = cache[_SESSION_ID]
-        if cache_state == "replaced-entry":
+        if cache_state in {"replaced-entry", "lazy-replaced-entry"}:
             cache[_SESSION_ID] = replace(cache[_SESSION_ID], name="external-cache-entry")
         query = "" if cache_state == "background" else "?stream=true"
         response = await client.post(
@@ -447,9 +477,13 @@ async def test_cached_harness_selection_preserves_single_policy_transform(
             json={
                 "type": "message",
                 "role": "user",
-                "agent_id": "agent",
+                **({} if lazy_metadata else {"agent_id": "agent"}),
                 "harness": harness,
                 "has_mcp_servers": cache_state == "original-harness",
+                "spawn_env": {
+                    "POLICY_NAME": "untrusted",
+                    "HARNESS_CLAUDE_SDK_OS_ENV": '{"sandbox":{"type":"none"}}',
+                },
             },
         )
         if cache_state == "background":
@@ -457,12 +491,36 @@ async def test_cached_harness_selection_preserves_single_policy_transform(
             if task is not None:
                 await asyncio.wait_for(task, timeout=5)
     assert response.status_code == (202 if cache_state == "background" else 200), response.text
+    if cache_state == "lazy-replaced-entry":
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in response.text.splitlines()
+            if line.startswith("data: ")
+        ]
+        [failure] = [event for event in events if event.get("type") == "response.failed"]
+        assert failure["response"]["error"] == {
+            "code": "RuntimeError",
+            "message": "Failed to resolve the agent spec for this turn.",
+            "type": "RuntimeError",
+            "undelivered": True,
+        }
+        assert not manager.get_client_calls
+        assert not worker.posted_bodies
+        build_environment.assert_not_called()
+        dispatch_tool.assert_not_awaited()
+        gate.assert_awaited_once_with(declared, harness)
+        resolver.assert_awaited_once_with("agent", _SESSION_ID)
+        return
+    assert "response.failed" not in response.text
     assert manager.get_client_calls[-1] == (
         _SESSION_ID,
         harness,
         {"POLICY_NAME": f"{declared.name}-{harness}"},
     )
     selected = build_environment.call_args.args[0]
+    if cache_state == "lazy-metadata":
+        assert selected is original_cached
+        assert cache[_SESSION_ID] is original_cached
     assert f"Policy for {harness}." in worker.posted_bodies[-1]["instructions"]
     dispatch_tool.assert_awaited_once()
     assert dispatch_tool.call_args.kwargs["agent_spec"] is selected
@@ -476,8 +534,8 @@ async def test_cached_harness_selection_preserves_single_policy_transform(
         assert context.agent_spec is selected
         assert context.ensure_comment_relay.keywords["effective_spec_entry"] is selected
         assert launch_terminal.call_args.kwargs["resolve_agent_spec"] is None
-    if cache_state in {"same-harness", "background"}:
-        gate.assert_awaited_once_with(declared, "pi")
+    if cache_state in {"same-harness", "background", "lazy-metadata"}:
+        gate.assert_awaited_once_with(declared, harness)
         resolver.assert_awaited_once()
     else:
         assert gate.await_args_list[1].args == (declared, harness)

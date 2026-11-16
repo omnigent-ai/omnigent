@@ -9,6 +9,7 @@ import shlex
 import socket
 import subprocess
 import sys
+import tomllib
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
@@ -647,22 +648,29 @@ def test_installed_codex_native_commands_remain_inside_outer_sandbox(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("allow_network", [False, True], ids=["skip-denied", "discover-allowed"])
 async def test_codex_provider_discovery_runs_inside_requested_sandbox(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, active_sandbox_type: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, active_sandbox_type: str, allow_network: bool
 ) -> None:
-    from omnigent.harnesses.codex_native.app_server import prepare_codex_provider_config
+    from omnigent.harnesses.codex_native import app_server
 
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     executable = tmp_path / "install" / "bin" / "codex"
     executable.parent.mkdir(parents=True)
     home = executable.parent / "runtime-home"
+    home.mkdir()
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(
+        "omnigent.databricks_ai_gateway.DATABRICKS_TRUSTED_HOST_SUFFIXES", (".example.test",)
+    )
     canary = tmp_path / "private.txt"
     canary.write_text("private canary")
     report = home / "discovery.json"
     script = f"""
 import json, os, pathlib, sys
+from urllib.parse import urlparse
+from websockets.sync.server import serve
 assert 'app-server' in sys.argv[1:]
 try:
     pathlib.Path({str(canary)!r}).read_text()
@@ -675,6 +683,22 @@ pathlib.Path({str(report)!r}).write_text(json.dumps({{
     'filtered': 'HOST_ONLY' not in os.environ,
     'denied': denied,
 }}))
+def respond(connection):
+    for raw in connection:
+        request = json.loads(raw)
+        if 'id' not in request:
+            continue
+        if request['method'] == 'initialize':
+            result = {{'userAgent': 'fake-codex'}}
+        else:
+            assert request['method'] == 'config/read'
+            result = {{'config': {{'model_providers': {{'inherited': {{
+                'base_url': 'https://gateway.example.test/ai-gateway/codex/v1',
+            }}}}}}}}
+        connection.send(json.dumps({{'id': request['id'], 'result': result}}))
+address = urlparse(sys.argv[sys.argv.index('--listen') + 1])
+with serve(respond, address.hostname, address.port) as server:
+    server.serve_forever()
 """
     executable.write_text(
         f'#!/bin/sh\nexec {shlex.quote(sys.executable)} -c {shlex.quote(script)} "$@"\n'
@@ -686,24 +710,46 @@ pathlib.Path({str(report)!r}).write_text(json.dumps({{
             type=active_sandbox_type,
             read_paths=[str(workspace)],
             write_paths=[],
-            allow_network=False,
+            allow_network=allow_network,
         ),
     )
-    with _prepared_launch("codex", executable, workspace, spec) as launch_path:
-        overrides = await prepare_codex_provider_config(
-            home,
-            [],
-            codex_path=launch_path,
+    env = {"PATH": os.environ["PATH"], "HOME": str(home), "HOST_ONLY": "parent-value"}
+    started = AsyncMock(wraps=app_server._start_codex_model_discovery_process)
+    monkeypatch.setattr(app_server, "_start_codex_model_discovery_process", started)
+    with contextlib.closing(
+        prepare_codex_worker(
+            codex_path=str(executable),
             cwd=workspace,
-            env={"PATH": os.environ["PATH"], "HOME": str(home), "HOST_ONLY": "parent-value"},
+            codex_home=home,
+            os_env=spec,
+            spawn_env_names=["PATH", "HOME", "CODEX_HOME"],
+            worker_env={},
+        )
+    ) as worker:
+        overrides = await app_server.prepare_codex_provider_config(
+            home,
+            ['model_providers.configured={name="Configured",base_url="https://other.test"}'],
+            codex_path=worker.launch_path,
+            cwd=workspace,
+            env=env,
             source_home=home,
+            allow_discovery=worker.allow_network,
         )
     assert overrides == []
-    assert json.loads(report.read_text()) == {
-        "cwd": str(workspace.resolve()),
-        "filtered": True,
-        "denied": True,
-    }
+    providers = tomllib.loads((home / "config.toml").read_text())["model_providers"]
+    assert providers["configured"]["base_url"] == "https://other.test"
+    if allow_network:
+        started.assert_awaited_once()
+        assert providers["inherited"]["http_headers"]["Databricks-Custom-Coding-Agent"] == "codex"
+        assert json.loads(report.read_text()) == {
+            "cwd": str(workspace.resolve()),
+            "filtered": True,
+            "denied": True,
+        }
+    else:
+        started.assert_not_awaited()
+        assert not report.exists()
+        assert "inherited" not in providers
 
 
 def test_pi_version_probe_runs_inside_requested_sandbox(

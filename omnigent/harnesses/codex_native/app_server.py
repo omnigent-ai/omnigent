@@ -2102,11 +2102,14 @@ async def prepare_codex_provider_config(
     source_home: Path | None = None,
     client_surface: str | None = None,
     app_server_command: tuple[str, ...] = (),
+    allow_discovery: bool = True,
 ) -> list[str]:
     """Materialize provider config, attributing gateway providers Codex inherits.
 
     Credentials are materialized first so they stay out of process arguments. Codex
     resolves inherited providers itself only when Omnigent didn't pick the provider.
+
+    :param allow_discovery: Whether the prepared worker permits the loopback probe.
     """
     overrides = materialize_codex_provider_config(
         codex_home,
@@ -2116,6 +2119,9 @@ async def prepare_codex_provider_config(
         client_surface=client_surface,
     )
     if not _codex_may_inherit_provider(overrides, app_server_command):
+        return overrides
+    if not allow_discovery:
+        _logger.info("Codex provider attribution skipped: discovery requires loopback access")
         return overrides
     executable, *launch_args = app_server_command or (codex_path,)
     try:

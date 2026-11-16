@@ -126,9 +126,11 @@ def test_brokered_gateway_rejects_missing_sandbox(
     assert worker_env == {BROKERED_CODEX_ENV: "1"}
 
 
+@pytest.mark.parametrize("allow_network", [True, False])
 def test_successful_active_sandbox_returns_owned_launcher(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    allow_network: bool,
 ) -> None:
     codex = tmp_path / "bin" / "codex"
     codex.parent.mkdir()
@@ -146,10 +148,9 @@ def test_successful_active_sandbox_returns_owned_launcher(
         captured["policy"] = policy
         return str(launcher)
 
-    monkeypatch.setattr(
-        "omnigent.inner.codex_worker.resolve_sandbox",
-        Mock(return_value=_active_policy(tmp_path)),
-    )
+    policy = _active_policy(tmp_path)
+    policy.allow_network = allow_network
+    monkeypatch.setattr("omnigent.inner.codex_worker.resolve_sandbox", Mock(return_value=policy))
     monkeypatch.setattr("omnigent.inner.codex_worker.get_backend", Mock(return_value=backend))
     monkeypatch.setattr("omnigent.inner.codex_worker.create_exec_launcher", _create_launcher)
 
@@ -163,12 +164,13 @@ def test_successful_active_sandbox_returns_owned_launcher(
 
     assert worker.launch_path == str(launcher)
     assert worker.sandboxed
+    assert worker.allow_network is allow_network
     assert codex_home.resolve() in captured["policy"].write_roots
     read_roots = captured["policy"].read_roots
     assert read_roots is not None
     assert codex.resolve().parent in read_roots
     assert captured["policy"].spawn_env_allowlist == ["CODEX_HOME", "PATH"]
-    assert captured["policy"].allow_network
+    assert captured["policy"].allow_network is allow_network
 
     worker.close()
     worker.close()
@@ -299,6 +301,7 @@ def test_brokered_catalog_probe_is_network_denied(
 
     policy = captured["policy"]
     assert not policy.allow_network
+    assert probe.allow_network is False
     assert policy.egress_relay_port is None
     assert policy.egress_socket_path is None
     assert policy.spawn_env_allowlist == ["CODEX_HOME", "HOME", "PATH"]
@@ -356,6 +359,7 @@ def test_non_signer_egress_rules_route_only_through_owned_proxy(
         os_env=OSEnvSpec(
             sandbox=OSEnvSandboxSpec(
                 type="darwin_seatbelt",
+                allow_network=True,
                 egress_rules=["POST api.example.com/v1/responses"],
                 egress_allow_private_destinations=True,
             )
@@ -366,6 +370,7 @@ def test_non_signer_egress_rules_route_only_through_owned_proxy(
 
     policy = captured["policy"]
     assert not policy.allow_network
+    assert worker.allow_network is False
     assert policy.egress_relay_port == handle.relay_port
     assert policy.egress_socket_path == str(handle.socket_path)
     assert egress_tmpdir in policy.write_roots
@@ -804,6 +809,7 @@ def test_explicit_none_sandbox_keeps_direct_worker_path(tmp_path: Path) -> None:
 
     assert worker.launch_path == str(codex)
     assert not worker.sandboxed
+    assert worker.allow_network is True
     worker.close()
     assert codex.exists()
 

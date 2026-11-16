@@ -7317,9 +7317,13 @@ def signed_disabled_mcp_session(disabled_mcp_session, monkeypatch):
     return harness
 
 
-@pytest.mark.parametrize("discovery_outcome", ["success", "failure", "cancelled"])
+@pytest.mark.parametrize(
+    ("discovery_outcome", "allow_network"),
+    [("success", True), ("success", False), ("failure", True), ("cancelled", True)],
+    ids=["network-allowed", "network-denied", "failure", "cancelled"],
+)
 async def test_provider_discovery_uses_prepared_worker_and_staged_environment(
-    disabled_mcp_session, tmp_path, monkeypatch, discovery_outcome
+    disabled_mcp_session, tmp_path, monkeypatch, discovery_outcome, allow_network
 ):
     from omnigent.inner.codex_worker import CodexWorkerLaunch
 
@@ -7328,7 +7332,9 @@ async def test_provider_discovery_uses_prepared_worker_and_staged_environment(
     session._os_env_spec = OSEnvSpec(sandbox=OSEnvSandboxSpec(type="darwin_seatbelt"))
     session._env = {"HOST_ONLY": "parent-value"}
     launcher = tmp_path / "sandbox-launcher"
-    launch = CodexWorkerLaunch(str(launcher), sandboxed=True, _owned_launcher=launcher)
+    launch = CodexWorkerLaunch(
+        str(launcher), sandboxed=True, allow_network=allow_network, _owned_launcher=launcher
+    )
     discovery_started = asyncio.Event()
     discovery_pending = asyncio.Event()
     private_homes = []
@@ -7350,6 +7356,7 @@ async def test_provider_discovery_uses_prepared_worker_and_staged_environment(
         assert launcher.exists()
         assert (codex_home / "config.toml").is_file()
         assert kwargs["codex_path"] == str(launcher)
+        assert kwargs["allow_discovery"] is allow_network
         assert kwargs["cwd"] == tmp_path.resolve()
         assert kwargs["env"] is worker_prepare.call_args.kwargs["worker_env"]
         assert kwargs["env"] == {

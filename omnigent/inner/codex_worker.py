@@ -59,6 +59,7 @@ class CodexWorkerLaunch:
 
     launch_path: str
     sandboxed: bool
+    allow_network: bool = True
     _owned_launcher: Path | None = None
     _egress_handle: EgressProxyHandle | None = None
     _egress_tmpdir: Path | None = None
@@ -115,6 +116,7 @@ def prepare_codex_catalog_probe(
         return CodexWorkerLaunch(
             launch_path=str(launcher),
             sandboxed=True,
+            allow_network=False,
             _owned_launcher=launcher,
         )
 
@@ -320,6 +322,7 @@ def prepare_codex_worker(
         return CodexWorkerLaunch(
             launch_path=str(launcher),
             sandboxed=True,
+            allow_network=policy.allow_network,
             _owned_launcher=launcher,
             _egress_handle=egress_handle,
             _egress_tmpdir=egress_tmpdir,

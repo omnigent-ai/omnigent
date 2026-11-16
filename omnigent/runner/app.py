@@ -9964,12 +9964,10 @@ async def _resolve_harness_launch(
         cannot be resolved. Callers catch this to surface a clean error
         rather than spawning an invalid harness subprocess.
     """
-    if agent_id and spec_resolver:
-        spec_entry = (
-            effective_spec_entry
-            if effective_spec_entry is not None
-            else await spec_resolver(agent_id, session_id)
-        )
+    spec_entry = effective_spec_entry
+    if spec_entry is None and agent_id and spec_resolver:
+        spec_entry = await spec_resolver(agent_id, session_id)
+    if spec_entry is not None:
         needs_start_gate = effective_spec_entry is None
         spec = _unwrap_resolved_spec(spec_entry)
         workdir = _resolved_spec_workdir(spec_entry)

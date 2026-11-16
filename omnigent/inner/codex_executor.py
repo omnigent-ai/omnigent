@@ -3358,6 +3358,7 @@ class _CodexAppServerSession:
                     env=proc_env,
                     retry_policy=self._retry_policy,
                     client_surface=harness_client_surface(),
+                    allow_discovery=worker_launch.allow_network,
                 )
             from omnigent.mcp_disabled_servers import (
                 RELAUNCH_WITHOUT_OVERRIDES_EVENT,
