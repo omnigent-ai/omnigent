@@ -328,10 +328,8 @@ def linked_issues(pull_request: str) -> dict | None:
     return {"issues": issues, "omitted": omitted}
 
 
-# The Codex executor's tool-result record, from the start of its log line, e.g.
-# "INFO  11-16 07:56:43.234 inner.codex_executor  run_turn  | Codex dynamic tool result: ...".
-# Anchoring it keeps text quoted inside another record, such as a logged final answer,
-# from passing for one.
+# The Codex executor's tool-result record, anchored to the start of its log line so text
+# quoted inside another record, such as a logged final answer, can't pass for one.
 _TOOL_RESULT_RECORD = re.compile(
     r"[A-Z]+ +\d\d-\d\d \d\d:\d\d:\d\d\.\d+ inner\.codex_executor +\S+ +\| "
     r"Codex dynamic tool result: turn_id=\S+ call_id=\S+ "
