@@ -825,6 +825,25 @@ describe("TasksPanel", () => {
     });
     expect(screen.getByTestId("tasks-row")).toHaveAttribute("data-state", "running");
 
+    let withdrawStop = () => {};
+    act(() => {
+      withdrawStop = registerStopWork("conv", vi.fn());
+    });
+    try {
+      showJournal([status(1, "deploy", "done")]);
+      setSession({
+        todos: [{ content: "Deploy", status: "completed", activeForm: "Deploying" }],
+      });
+      // A status without its plan cannot declare the workflow complete.
+      expect(screen.getByTestId("plan-stop")).toBeInTheDocument();
+    } finally {
+      act(withdrawStop);
+    }
+    showJournal([]);
+    setSession({
+      todos: [{ content: "Deploy", status: "in_progress", activeForm: "Deploying" }],
+    });
+
     vi.mocked(useOptionalLoadedConversations).mockReturnValue({
       ...conversationPage([conversation("conv")]).data!,
       pageParams: [undefined],

@@ -385,7 +385,7 @@ class SessionJournalStore:
         :param kind: One of :data:`~omnigent.entities.session_journal.JOURNAL_KINDS`.
         :param content: The kind's fields, checked with
             :func:`~omnigent.entities.session_journal.normalize_content`. A plan's
-            version increments here; its graph position changes only for a new
+            version increments here; its graph revision changes only for a new
             invocation or changed step dependencies.
         :param idempotency_key: Names the write, e.g. ``"tool:toolu_01…"``. A
             retry with the same key returns the entry the first attempt wrote.
@@ -422,8 +422,8 @@ class SessionJournalStore:
             if kind != "plan":
                 raise InvalidJournalEntryError("only a plan names a workflow")
             workflow_id = _workflow_id(workflow_id)
-        # A plan's version is known only under the lock, so its size is checked there.
-        stored = None if kind == "plan" else self._stored_contents([fields])[0]
+        # Plan and status revision metadata is known only under the lock.
+        stored = None if kind in ("plan", "status") else self._stored_contents([fields])[0]
         code = encode_journal_entry_kind(kind)
 
         def write(session: Session) -> tuple[SqlSessionJournalEntry, bool, dict[str, Any] | None]:
@@ -463,17 +463,24 @@ class SessionJournalStore:
                 if previous is not None and (kind != "note" or starts_run)
                 else None
             )
+            graph_revision = (
+                uuid.uuid4().hex
+                if starts_run
+                else previous_content.get("graph_revision")
+                if previous_content
+                else None
+            )
             if kind == "plan":
                 version = 1 if previous_content is None else previous_content["version"] + 1
-                graph_position: int | None = position + int(starts_run)
+                graph_revision = uuid.uuid4().hex
                 if previous_content is not None and not starts_run:
                     previous_graph = {
                         item["id"]: set(item["depends_on"]) for item in previous_content["steps"]
                     }
                     graph = {item["id"]: set(item["depends_on"]) for item in fields["steps"]}
                     if graph == previous_graph:
-                        graph_position = previous_content.get("graph_position")
-                entry_content = {"version": version, **fields, "graph_position": graph_position}
+                        graph_revision = previous_content.get("graph_revision")
+                entry_content = {"version": version, **fields, "graph_revision": graph_revision}
                 encoded = self._stored_contents(
                     [entry_content, *([{"status": "started"}] if starts_run else [])]
                 )
@@ -486,7 +493,7 @@ class SessionJournalStore:
                         {
                             **previous_content,
                             "version": previous_content["version"] + 1,
-                            "graph_position": position + 1,
+                            "graph_revision": graph_revision,
                         },
                         {"status": "started"},
                     ]
@@ -508,6 +515,11 @@ class SessionJournalStore:
                 )
                 if waiting:
                     raise StepNotReadyError(entry_step, waiting)
+                entry_content = {
+                    **fields,
+                    **({"graph_revision": graph_revision} if graph_revision is not None else {}),
+                }
+                entry_text = self._stored_contents([entry_content])[0]
             if (
                 position + 1 + int(starts_run) + int(copied_plan_text is not None)
                 > JOURNAL_MAX_ENTRIES

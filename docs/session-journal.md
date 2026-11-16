@@ -65,10 +65,10 @@ A status belongs to a step ID within a run, not to a plan version. Replanning
 or saving the plan keeps that progress. Starting another invocation resets it;
 the task list reads the run boundary even when it predates the loaded page.
 
-Omnigent records `graph_position` in plan content when step IDs or dependencies
-change, or a new invocation starts. Saving or renaming an unchanged graph keeps
-that position, so it does not reopen finished work. Older plans can omit this
-metadata or carry `null` when the graph's revision is unknown.
+Omnigent records a stable `graph_revision` ID in plan content when step IDs or
+dependencies change, or a new invocation starts. Statuses record that revision,
+and saving unchanged steps keeps it, so saves and forks preserve completion.
+Older plans can omit this metadata or carry `null` when the revision is unknown.
 
 Limits: a plan has at most 100 steps and 32 KiB of JSON, and its name at most 80
 characters; status text is required except for `started`; a note is at most 4

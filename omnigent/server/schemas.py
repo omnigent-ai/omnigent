@@ -3525,7 +3525,7 @@ class WorkflowRun(BaseModel):
     One run of a saved workflow: a session that started it.
 
     :param id: The run's ID: that of the plan entry that started it.
-    :param plan_graph_position: Journal position where this run's graph last changed;
+    :param plan_graph_revision: Stable ID for this run's current graph;
         ``None`` for older plans without revision metadata.
     :param session_id: The session that ran it.
     :param title: The session's title; empty when it has none yet.
@@ -3542,7 +3542,7 @@ class WorkflowRun(BaseModel):
     """
 
     id: str
-    plan_graph_position: int | None = None
+    plan_graph_revision: str | None = None
     session_id: str
     title: str
     started_at: int

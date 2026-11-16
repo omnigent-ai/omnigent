@@ -105,7 +105,11 @@ def test_appends_take_consecutive_positions_and_plans_count_versions(
     assert [first.entry.position, status.entry.position, second.entry.position] == [1, 2, 3]
     assert first.entry.content["version"] == 1 and second.entry.content["version"] == 2
     assert first.entry.step is None and first.entry.content["source"] == "agent"
-    assert status.entry.content == {"status": "done", "text": "p95 430 ms"}
+    assert status.entry.content == {
+        "status": "done",
+        "text": "p95 430 ms",
+        "graph_revision": first.entry.content["graph_revision"],
+    }
     assert status.entry.scheduled_task_run_id == RUN
     assert all(result.created for result in (first, status, second))
     assert len(status.entry.id) == 32 and status.entry.created_at > 0
@@ -114,8 +118,7 @@ def test_appends_take_consecutive_positions_and_plans_count_versions(
     current = journal.current_plan(SESSION)
     assert current is not None and current.id == second.entry.id
     assert current.content["version"] == 2
-    assert first.entry.content["graph_position"] == first.entry.position
-    assert second.entry.content["graph_position"] == second.entry.position
+    assert first.entry.content["graph_revision"] != second.entry.content["graph_revision"]
     for index, starts_run in enumerate([False, False, True]):
         saved = journal.append(
             SESSION,
@@ -126,9 +129,9 @@ def test_appends_take_consecutive_positions_and_plans_count_versions(
             scheduled_task_run_id=RUN,
             start_run=starts_run,
         ).entry
-        assert saved.content["graph_position"] == (
-            saved.position if starts_run else second.entry.position
-        )
+        assert (
+            saved.content["graph_revision"] != second.entry.content["graph_revision"]
+        ) == starts_run
 
 
 def test_a_retried_append_returns_the_first_attempts_entry(journal: SessionJournalStore) -> None:
@@ -520,6 +523,10 @@ def test_a_fork_carries_the_journal_and_continues_it(
         fork.id, "status", {"status": "started"}, idempotency_key="k3", step="video"
     )
     assert started.entry.position == 4
+    assert (
+        started.entry.content["graph_revision"]
+        == journal.current_plan(fork.id).content["graph_revision"]
+    )
     assert len(journal.list_entries(SESSION).entries) == 4
 
 
@@ -979,10 +986,9 @@ def test_a_deployment_encrypts_content_a_batch_at_a_time(
         SESSION, "status", {"status": "done", "text": "ok"}, idempotency_key="k2", step="a"
     )
     sealed.calls.clear()
-    # The entry is encrypted before the lock; the plan and the dependency's newest
-    # status are each decrypted once.
+    # Revision metadata comes from the plan before encrypting the new status.
     sealed.append(SESSION, "status", {"status": "started"}, idempotency_key="k3", step="b")
-    assert sealed.calls == [("encrypt", 1), ("decrypt", 1), ("decrypt", 1)]
+    assert sealed.calls == [("decrypt", 1), ("decrypt", 1), ("encrypt", 1)]
 
     sealed.calls.clear()
     entries = sealed.list_entries(SESSION).entries

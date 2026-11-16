@@ -127,13 +127,10 @@ export function currentPlan(entries: readonly JournalEntry[]): JournalEntry | nu
 }
 
 /** The current graph's revision, preserved across saves that only change plan metadata. */
-export function planGraphPosition(entries: readonly JournalEntry[]): number | undefined {
+export function planGraphRevision(entries: readonly JournalEntry[]): string | number | undefined {
   const plan = currentPlan(entries);
   if (!plan) return undefined;
-  if ("graph_position" in plan.content)
-    return typeof plan.content.graph_position === "number"
-      ? plan.content.graph_position
-      : undefined;
+  if (typeof plan.content.graph_revision === "string") return plan.content.graph_revision;
   const graphKey = (entry: JournalEntry) => {
     const graph = planSteps(entry).map((step) => [step.id, [...step.depends_on].sort()] as const);
     graph.sort(([left], [right]) => left.localeCompare(right));
@@ -316,7 +313,10 @@ export function planTally(progress: readonly StepProgress[]): Record<StepState, 
 }
 
 /** Completed final steps supersede older statuses; newer plans or statuses can add unfinished work. */
-export function isPlanComplete(progress: readonly StepProgress[], planPosition?: number): boolean {
+export function isPlanComplete(
+  progress: readonly StepProgress[],
+  planRevision?: string | number,
+): boolean {
   const dependencies = new Set(progress.flatMap((item) => item.step.depends_on));
   const finalSteps = progress.filter((item) => !dependencies.has(item.step.id));
   const byId = new Map(progress.map((item) => [item.step.id, item]));
@@ -331,12 +331,15 @@ export function isPlanComplete(progress: readonly StepProgress[], planPosition?:
         seen.add(id);
         const upstream = byId.get(id);
         if (!upstream) continue;
-        const upstreamPosition = upstream.status?.position ?? planPosition;
         if (
           upstream.state !== "done" &&
-          upstreamPosition !== undefined &&
           finalStep.status &&
-          upstreamPosition > finalStep.status.position
+          (upstream.status
+            ? upstream.status.position > finalStep.status.position
+            : typeof planRevision === "number"
+              ? planRevision > finalStep.status.position
+              : planRevision !== undefined &&
+                planRevision !== finalStep.status.content.graph_revision)
         )
           return false;
         pending.push(...upstream.step.depends_on);
@@ -433,11 +436,11 @@ export function pausedLabel(
   progress: readonly StepProgress[],
   entries: readonly JournalEntry[],
   sessionWorking: boolean,
-  planPosition = planGraphPosition(entries),
+  planRevision = planGraphRevision(entries),
 ): PausedLabel | null {
   if (
     sessionWorking ||
-    isPlanComplete(progress, planPosition) ||
+    (planRevision !== undefined && isPlanComplete(progress, planRevision)) ||
     progress.some((item) => item.state === "needs_input")
   )
     return null;
@@ -457,12 +460,12 @@ export function pausedLabel(
  * the list ended ("All done", or "Finished, 1 failed").
  *
  * @param paused - What an idle list says, from {@link pausedLabel}.
- * @param planPosition - Graph revision position, to recognize new prerequisites after completion.
+ * @param planRevision - Graph revision ID or legacy position, to recognize new prerequisites.
  */
 export function taskPreviewText(
   progress: readonly StepProgress[],
   paused: PausedLabel | null = null,
-  planPosition?: number,
+  planRevision?: string | number,
 ): string | null {
   if (progress.length === 0) return null;
   const failedCount = progress.filter((item) => item.state === "failed").length;
@@ -470,7 +473,7 @@ export function taskPreviewText(
   const livePrompt = progress.some(
     (item) => item.state === "needs_input" && item.status && statusOf(item.status) === "started",
   );
-  if (!livePrompt && isPlanComplete(progress, planPosition)) return finished;
+  if (!livePrompt && isPlanComplete(progress, planRevision)) return finished;
   const order: StepState[] = ["needs_input", "running", "stopped", "ready", "waiting"];
   for (const state of order) {
     const item = progress.find((candidate) => candidate.state === state);

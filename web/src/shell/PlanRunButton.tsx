@@ -5,7 +5,7 @@ import {
   isPlanComplete,
   type JournalEntry,
   pausedLabel,
-  planGraphPosition,
+  planGraphRevision,
   type StepProgress,
 } from "@/lib/sessionJournal";
 import { cn } from "@/lib/utils";
@@ -22,12 +22,12 @@ export function planRunControl(
   progress: readonly StepProgress[],
   entries: readonly JournalEntry[],
   sessionWorking: boolean,
-  planPosition = planGraphPosition(entries),
+  planRevision = planGraphRevision(entries),
 ): PlanRunControl | null {
-  if (sessionWorking && planPosition === undefined) return "stop";
-  if (isPlanComplete(progress, planPosition)) return null;
+  if (sessionWorking && planRevision === undefined) return "stop";
+  if (planRevision !== undefined && isPlanComplete(progress, planRevision)) return null;
   if (sessionWorking) return "stop";
-  return pausedLabel(progress, entries, false, planPosition) ? "play" : null;
+  return pausedLabel(progress, entries, false, planRevision) ? "play" : null;
 }
 
 /**

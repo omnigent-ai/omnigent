@@ -3,7 +3,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 import type { SessionTasksView } from "@/hooks/useSessionTasks";
 import {
   finishedTaskCount,
-  planGraphPosition,
+  planGraphRevision,
   planName,
   taskPreviewText,
   WAITING_FOR_YOU,
@@ -38,7 +38,7 @@ export function ChatTasksPreview({
   if (!hasTaskPreview(tasks)) return null;
   const { progress } = tasks;
   const finished = finishedTaskCount(progress);
-  const text = taskPreviewText(progress, tasks.paused, planGraphPosition(tasks.journal.entries));
+  const text = taskPreviewText(progress, tasks.paused, planGraphRevision(tasks.journal.entries));
   const waiting = text?.startsWith(`${WAITING_FOR_YOU}:`) ?? false;
   const name = planName(tasks.plan);
   const button = (

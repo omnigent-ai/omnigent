@@ -15678,18 +15678,17 @@
             "title": "Is Current",
             "type": "boolean"
           },
-          "plan_graph_position": {
+          "plan_graph_revision": {
             "anyOf": [
               {
-                "format": "int64",
-                "type": "integer"
+                "type": "string"
               },
               {
                 "type": "null"
               }
             ],
-            "description": "Journal position where this run's graph last changed; `None` for older plans without revision metadata.",
-            "title": "Plan Graph Position"
+            "description": "Stable ID for this run's current graph; `None` for older plans without revision metadata.",
+            "title": "Plan Graph Revision"
           },
           "progress": {
             "$ref": "#/components/schemas/WorkflowRunProgress",

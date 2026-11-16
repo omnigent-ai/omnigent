@@ -9,7 +9,7 @@ import {
   mergeJournalEntries,
   nativeTaskProgress,
   pausedLabel,
-  planGraphPosition,
+  planGraphRevision,
   planName,
   planSteps,
   planTally,
@@ -300,6 +300,11 @@ describe("isPlanComplete", () => {
     expect(isPlanComplete(insertedProgress, inserted.position)).toBe(false);
     expect(pausedLabel(insertedProgress, insertedEntries, false)).toBe("Stopped");
     expect(taskPreviewText(insertedProgress, null, inserted.position)).toBe("Next: review");
+    const legacyEntries = [
+      ...insertedEntries,
+      { ...inserted, position: 5, content: { ...inserted.content, graph_revision: null } },
+    ];
+    expect(pausedLabel(insertedProgress, legacyEntries, false)).toBe("Stopped");
 
     const unchanged = plan(2, ["explore"], ["work", ["explore"]], ["report", ["work"]]);
     const saved = { ...unchanged, position: 4, workflow_id: "a".repeat(32) };
@@ -312,13 +317,31 @@ describe("isPlanComplete", () => {
     ];
     const savedProgress = stepProgress(planSteps(saved), savedEntries, false);
     expect(pausedLabel(savedProgress, savedEntries, false)).toBeNull();
-    expect(planGraphPosition(savedEntries)).toBe(unchanged.position);
-    expect(taskPreviewText(savedProgress, null, planGraphPosition(savedEntries))).toBe("All done");
+    expect(planGraphRevision(savedEntries)).toBe(unchanged.position);
+    expect(taskPreviewText(savedProgress, null, planGraphRevision(savedEntries))).toBe("All done");
     const partialEntries = [
-      ...savedEntries.filter((entry) => entry.kind !== "plan"),
-      { ...saved, content: { ...saved.content, graph_position: unchanged.position } },
+      ...savedEntries
+        .filter((entry) => entry.kind !== "plan")
+        .map((entry) => ({
+          ...entry,
+          content: { ...entry.content, graph_revision: "graph-0" },
+        })),
+      { ...saved, content: { ...saved.content, graph_revision: "graph-0" } },
     ];
-    expect(pausedLabel(savedProgress, partialEntries, false)).toBeNull();
+    expect(
+      pausedLabel(stepProgress(planSteps(saved), partialEntries, false), partialEntries, false),
+    ).toBeNull();
+    const forkedEntries = [
+      { ...saved, position: 0, content: { ...saved.content, graph_revision: "graph-0" } },
+      status(1, "work", "done"),
+      status(2, "report", "done", { content: { status: "done", graph_revision: "graph-0" } }),
+    ];
+    expect(
+      isPlanComplete(
+        stepProgress(planSteps(saved), forkedEntries, false),
+        planGraphRevision(forkedEntries),
+      ),
+    ).toBe(true);
   });
 
   it.each(["a", "b"])("compares %s with its own branch's completion", (upstream) => {

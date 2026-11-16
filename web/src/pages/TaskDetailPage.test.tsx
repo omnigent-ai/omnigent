@@ -1434,7 +1434,7 @@ describe("runs of a saved workflow", () => {
   const STEPS: ScheduledTaskRunSteps = {
     runId: "run_1",
     planId: "plan_1",
-    planGraphPosition: 0,
+    planGraphRevision: "graph-0",
     isCurrent: true,
     workflowId: "9".repeat(32),
     planName: "Triage",
@@ -1451,7 +1451,7 @@ describe("runs of a saved workflow", () => {
         step: "explore",
         author: { type: "agent" },
         kind: "status",
-        content: { status: "done", text: "Found it" },
+        content: { status: "done", text: "Found it", graph_revision: "graph-0" },
       },
     ],
   };
@@ -1585,7 +1585,7 @@ describe("runs of a saved workflow", () => {
           "run_1",
           {
             ...STEPS,
-            planGraphPosition: undefined,
+            planGraphRevision: undefined,
             statuses: [STEPS.statuses[0]!, { ...STEPS.statuses[0]!, id: "s2", step: "fix" }],
           },
         ],
