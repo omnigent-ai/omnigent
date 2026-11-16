@@ -569,3 +569,13 @@ def test_describe_trigger_arguments_shows_every_value_in_full() -> None:
     # JSON-encoded, so quotes and line breaks stay inside the value.
     assert lines[3].endswith('END"}') and '\\"crash\\"' in lines[3]
     assert len(lines) == 4
+
+
+def test_update_to_another_provider_keeps_where_matches_go() -> None:
+    """Like the form, a source switch keeps one task session; it isn't a provider field."""
+    current = _created(provider="jira", scope=["ES"], session_per_match=False)
+    switched = _update(current, provider="linear", scope=["ENG"])
+    assert not isinstance(switched, str)
+    assert switched["taskSessionMode"] == "continue"
+    per_match = _update(current, provider="linear", scope=["ENG"], session_per_match=True)
+    assert not isinstance(per_match, str) and "taskSessionMode" not in per_match

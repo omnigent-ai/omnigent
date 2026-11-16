@@ -593,7 +593,14 @@ def _triggered_task_review(args: dict[str, object], *, action: str) -> PolicyRes
     error = triggered_task_review_error(args, action=action, require_complete=False)
     if error:
         return {"result": "DENY", "reason": f"Cannot {action} a triggered task. {error}"}
-    sessions = "unchanged" if action == "update" and "worker" not in args else ""
+    sessions = ""
+    if action == "update" and "worker" not in args:
+        sessions = (
+            "sessions that run the task's own agent switch to the new agent_id with these "
+            "model, effort and mode settings; sessions with their own agent are unchanged"
+            if "agent_id" in args
+            else "unchanged"
+        )
     # The compiled search the poller runs, e.g. its JQL; an update can't know it here.
     watch = ""
     if action == "create":

@@ -56,6 +56,9 @@ TRIGGERED_TASK_TOOL_NAMES: frozenset[str] = frozenset(
 # Resent on every create and update so the approval shows the effective values.
 TRIGGERED_TASK_REVIEW_FIELDS = frozenset({"instructions", "permission_mode"})
 
+# The most automations one list call reads, the server's page limit.
+LIST_PAGE_MAX = 100
+
 # Arguments that describe the trigger, as opposed to where and how the task runs.
 TRIGGER_ARGUMENTS = (
     "provider",
@@ -454,7 +457,9 @@ class SysTriggeredTaskListTool(Tool):
             "List your triggered tasks: each one's trigger, instructions, settings and "
             "state, when it last checked for matches (last_checked_at, "
             "last_check_status), and watch_session_id, the session that checks and "
-            "whose replies say which sessions it started."
+            "whose replies say which sessions it started. Results come a page of your "
+            "automations at a time, oldest first: while next_cursor is set, call again "
+            "with it as cursor. A page can hold fewer triggered tasks than limit, even none."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -462,7 +467,26 @@ class SysTriggeredTaskListTool(Tool):
         return _function_schema(
             self.name(),
             self.description(),
-            {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
+            {
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": LIST_PAGE_MAX,
+                        "description": (
+                            f"Automations to read for this page, 1-{LIST_PAGE_MAX}; "
+                            f"default {LIST_PAGE_MAX}."
+                        ),
+                    },
+                    "cursor": {
+                        "type": "string",
+                        "description": "The next_cursor of the previous page.",
+                    },
+                },
+                "required": [],
+                "additionalProperties": False,
+            },
         )
 
 
@@ -817,6 +841,9 @@ def build_trigger_config(
         if event != fields["event"]:
             fields = dict(with_trigger_event(source, cast(Any, fields), event))
         worker = {**(current["worker"] if current is not None else worker_defaults)}
+        # Like the form, a new source keeps where matches go along with the workers.
+        if current is not None and current.get("taskSessionMode") == "continue":
+            fields["taskSessionMode"] = "continue"
 
     scope_match = args.get("scope_match")
     if scope_match is not None and scope_match not in _SCOPE_MATCHES:

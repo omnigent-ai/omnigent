@@ -127,25 +127,9 @@ def test_fixture_covers_every_source_and_event() -> None:
             assert (source, event.id) in covered
 
 
-def test_fingerprint_is_the_web_form_hash() -> None:
-    case = _RENDERS[0]
-    header_line, body = case["prompt"].split("\n", 1)
-    header = json.loads(header_line.removeprefix("<!-- omnigent-trigger v1 ").removesuffix(" -->"))
-    canonical = {key: value for key, value in header.items() if key != "fingerprint"}
-    expected = trigger_prompts._cyrb53(f"{trigger_prompts._js_json(canonical)}\n{body}")
-    assert header["fingerprint"] == expected
-    assert trigger_prompts._trigger_fingerprint(case["config"], body) == expected
-
-
-def test_decode_rejects_edits_outside_the_form() -> None:
+def test_decode_rejects_a_header_version_too_large_for_an_int() -> None:
+    # The fixture's decode cases cover edited bodies, other versions and no header.
     prompt = _RENDERS[0]["prompt"]
-    assert decode_trigger_prompt(prompt) is not None
-    assert decode_trigger_prompt(prompt + " ") is None
-    assert (
-        decode_trigger_prompt(prompt.replace("omnigent-trigger v1 ", "omnigent-trigger v3 "))
-        is None
-    )
-    assert decode_trigger_prompt("x" * 5000) is None
     huge_version = prompt.replace("omnigent-trigger v1 ", f"omnigent-trigger v{'9' * 5000} ")
     assert decode_trigger_prompt(huge_version) is None
 

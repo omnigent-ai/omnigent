@@ -1110,17 +1110,43 @@ def create_scheduled_tasks_router(
             next_run_at=_next_run_at(task, request),
         )
 
+    def _task_cursor(after: str | None, detail: str) -> tuple[int, str] | None:
+        """Parse a ``<created_at>:<task id>`` page cursor, or raise a 422 with *detail*."""
+        if after is None:
+            return None
+        try:
+            timestamp, task_id = after.split(":")
+            cursor = (int(timestamp), uuid.UUID(task_id).hex)
+            if not 0 <= cursor[0] <= 2**63 - 1:
+                raise ValueError("invalid timestamp")
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=detail) from exc
+        return cursor
+
     @router.get("/scheduled-tasks")
     async def list_scheduled_tasks(
         request: Request,
         kind: Literal["automation", "all"] = Query(default="automation"),
-    ) -> dict[str, list[dict[str, Any]]]:
+        limit: int | None = Query(
+            default=None,
+            ge=1,
+            le=100,
+            description="Tasks to examine per page; omit to list every task.",
+        ),
+        after: str | None = Query(
+            default=None, max_length=64, description="A previous page's next_cursor."
+        ),
+    ) -> dict[str, Any]:
         """List the caller's scheduled tasks.
 
         Lists automations unless *kind* is ``all``, so the reminders agents set for
         their own sessions stay off the Automations page. There is no reminders-only
         view: this list reads every task the owner has, and a selective filter needs
         an indexed, paginated query first.
+
+        With *limit*, the list is one page read through the owner index, oldest
+        first, and the response adds ``next_cursor`` (``null`` on the last page). A
+        page counts the tasks it examined, so filtered-out tasks can leave it short.
 
         Lazy-on-read stale backstop: before returning, force-fail any of this
         owner's runs still ``running`` past the 6h max age (``incomplete``), so
@@ -1133,9 +1159,19 @@ def create_scheduled_tasks_router(
         """
         owner = _owner(request)
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
+        if limit is None:
+            if after is not None:
+                raise HTTPException(status_code=422, detail="after needs limit")
+            listed, next_cursor = store.list(owner_user_id=owner_id), None
+        else:
+            listed, next_cursor = store.list_page(
+                owner_user_id=owner_id,
+                limit=limit,
+                after=_task_cursor(after, "Invalid scheduled task cursor"),
+            )
         tasks = [
             t
-            for t in store.list(owner_user_id=owner_id)
+            for t in listed
             if _owns_task(t, owner_id) and (kind == "all" or t.kind == "automation")
         ]
         task_ids = [t.id for t in tasks]
@@ -1144,7 +1180,7 @@ def create_scheduled_tasks_router(
         # dead run as ``failed`` rather than a stuck ``running``.
         force_fail_stale_runs(store, running)
         latest_status = store.list_latest_run_status_for_tasks(task_ids)
-        return {
+        body: dict[str, Any] = {
             "scheduled_tasks": [
                 _to_response(
                     t,
@@ -1154,6 +1190,9 @@ def create_scheduled_tasks_router(
                 for t in tasks
             ]
         }
+        if limit is not None:
+            body["next_cursor"] = f"{next_cursor[0]}:{next_cursor[1]}" if next_cursor else None
+        return body
 
     @router.get("/scheduled-tasks/inbox", response_model=AutomationFailurePage)
     async def list_automation_inbox(
@@ -1164,22 +1203,11 @@ def create_scheduled_tasks_router(
         """Latest sessionless failures; session-linked failures use the session Inbox."""
         owner = _owner(request)
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
-        cursor = None
-        if after is not None:
-            try:
-                timestamp, task_id = after.split(":")
-                cursor = (int(timestamp), uuid.UUID(task_id).hex)
-                if not 0 <= cursor[0] <= 2**63 - 1:
-                    raise ValueError("invalid timestamp")
-            except ValueError as exc:
-                raise HTTPException(
-                    status_code=422, detail="Invalid automation Inbox cursor"
-                ) from exc
         failures, next_cursor = store.list_inbox_failures(
             owner_user_id=owner_id,
             generation=account_generation(owner_id or RESERVED_USER_LOCAL),
             check_generation=current_account_user() is not None,
-            after=cursor,
+            after=_task_cursor(after, "Invalid automation Inbox cursor"),
             limit=limit,
         )
         return AutomationFailurePage(

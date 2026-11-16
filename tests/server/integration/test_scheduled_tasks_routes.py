@@ -833,6 +833,39 @@ async def test_the_reminder_tools_request_continues_its_session(
     assert (task.permission_mode, task.state, task.next_run_at) == (None, "active", fire_at)
 
 
+async def test_the_list_pages_through_the_owner_index_with_limit(
+    auth_client: httpx.AsyncClient,
+) -> None:
+    created = []
+    for index in range(3):
+        resp = await auth_client.post(
+            "/v1/scheduled-tasks", json=_create_body(name=f"paged {index}"), headers=_headers()
+        )
+        assert resp.status_code == 200, resp.text
+        created.append(resp.json()["id"])
+
+    first = await auth_client.get("/v1/scheduled-tasks", params={"limit": 2}, headers=_headers())
+    assert first.status_code == 200, first.text
+    page = first.json()
+    assert len(page["scheduled_tasks"]) == 2 and page["next_cursor"] is not None
+    second = await auth_client.get(
+        "/v1/scheduled-tasks",
+        params={"limit": 2, "after": page["next_cursor"]},
+        headers=_headers(),
+    )
+    assert second.status_code == 200, second.text
+    rest = second.json()
+    assert rest["next_cursor"] is None
+    paged = [t["id"] for t in [*page["scheduled_tasks"], *rest["scheduled_tasks"]]]
+    assert sorted(paged) == sorted(created) and len(set(paged)) == 3
+    # Without limit the list keeps its unpaged shape for existing clients.
+    unpaged = await auth_client.get("/v1/scheduled-tasks", headers=_headers())
+    assert "next_cursor" not in unpaged.json()
+    for params in ({"after": page["next_cursor"]}, {"limit": 2, "after": "not-a-cursor"}):
+        bad = await auth_client.get("/v1/scheduled-tasks", params=params, headers=_headers())
+        assert bad.status_code == 422, bad.text
+
+
 @pytest.mark.parametrize("auth_app", ["one_time"], indirect=True)
 async def test_the_list_leaves_reminders_out_until_an_edit_makes_one_an_automation(
     auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str

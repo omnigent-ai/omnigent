@@ -1,7 +1,4 @@
-// Golden outputs of this renderer for its Python port, omnigent/tools/builtins/trigger_prompts.py,
-// which agents use to create trigger automations. tests/tools/builtins/test_trigger_prompts.py
-// checks the port against the same file. After changing how a trigger renders, saves or
-// validates, regenerate the fixture and update the port until both suites pass:
+// Golden fixture for the Python port (omnigent/tools/builtins/trigger_prompts.py); after a change, run
 //   pnpm --filter web exec vitest run src/components/scheduled/triggerTemplates.parity.test.ts -u
 import { describe, expect, it } from "vitest";
 import {

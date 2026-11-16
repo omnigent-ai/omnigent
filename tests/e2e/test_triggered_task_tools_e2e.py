@@ -21,10 +21,11 @@ from dev.repro_env.runtime import write_model_config
 from omnigent.native.permission_modes import PERMISSION_LAUNCH_ARGS
 from omnigent.onboarding.ambient import CLAUDE_CODE_MANAGED_SETTINGS_PATHS
 from omnigent.tools.builtins.trigger_prompts import decode_trigger_prompt
+from tests._helpers.mock_llm import advertised_tool_names
 from tests._helpers.native_session import create_native_session
 from tests._helpers.polling import poll_until
 from tests._helpers.server_runner import server_runner
-from tests._helpers.session import bundle_files, post_session_bundle
+from tests._helpers.session import bundle_files, post_session_bundle, send_user_text
 from tests.e2e._native_resume_helpers import poll_for_pending_elicitation, resolve_elicitation
 from tests.e2e.conftest import configure_mock_llm, get_mock_requests, set_fallback_mock_llm
 
@@ -194,17 +195,7 @@ def test_agent_creates_runs_changes_and_deletes_a_jira_trigger(
                     poll_until(lambda: text in json.dumps(items(session)), timeout_s=90)
 
                 def send(session, text):
-                    response = client.post(
-                        f"/v1/sessions/{session}/events",
-                        json={
-                            "type": "message",
-                            "data": {
-                                "role": "user",
-                                "content": [{"type": "input_text", "text": text}],
-                            },
-                        },
-                    )
-                    assert response.status_code == 202, response.text
+                    send_user_text(client, session_id=session, text=text)
 
                 def wait_for_relay_tools(session, name):
                     # Native CLIs can take input before their MCP connection finishes discovery.
@@ -217,9 +208,7 @@ def test_agent_creates_runs_changes_and_deletes_a_jira_trigger(
                         if snapshot["status"] != "idle" or snapshot.get("pending_inputs"):
                             return False
                         requests = [r for r in get_mock_requests(mock) if _PROBE in json.dumps(r)]
-                        if any(
-                            t.get("name") == name for r in requests for t in r.get("tools", [])
-                        ):
+                        if name in advertised_tool_names(requests):
                             return True
                         if len(requests) > seen:
                             seen = len(requests)
@@ -246,8 +235,6 @@ def test_agent_creates_runs_changes_and_deletes_a_jira_trigger(
                 # The owner's CLI mustn't stop for its own tool prompts, which a person
                 # would answer in its terminal; Omnigent's approval of the call still applies.
                 if harness == "codex-native":
-                    # Codex's own default asks before each Omnigent tool call;
-                    # the mocked automatic reviewer approves them instead.
                     metadata["terminal_launch_args"] = PERMISSION_LAUNCH_ARGS["codex-native"][
                         "approve-for-me"
                     ]

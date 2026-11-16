@@ -1743,6 +1743,10 @@ _TOOL_GROUP_MEMBERS: dict[str, frozenset[str]] = {
             "sys_scheduled_task_update",
             "sys_scheduled_task_delete",
             "sys_reminder_set",
+            "sys_triggered_task_create",
+            "sys_triggered_task_list",
+            "sys_triggered_task_update",
+            "sys_triggered_task_delete",
         }
     ),
     "comments": frozenset({"list_comments", "update_comment"}),
@@ -1783,13 +1787,13 @@ def test_tool_groups_false_drops_only_that_group(group: str) -> None:
 
 def test_tool_groups_all_false_keeps_the_load_bearing_tools() -> None:
     """
-    With every group off, the 20 gated tools are gone but the session
+    With every group off, the 25 gated tools are gone but the session
     reads, ``sys_session_rename`` and ``sys_cancel_task`` stay: multi-agent
     participation and async handles depend on them, so they have no key.
     """
     names = _tool_names(_grouped_spec(**dict.fromkeys(_TOOL_GROUP_MEMBERS, False)))
     gated = frozenset().union(*_TOOL_GROUP_MEMBERS.values())
-    assert len(gated) == 21
+    assert len(gated) == 25
     assert not (gated & names)
     assert {
         "sys_session_list",

@@ -193,6 +193,37 @@ class ScheduledTaskStore(ABC):
         """
         ...
 
+    def list_page(
+        self,
+        *,
+        owner_user_id: str | None,
+        limit: int,
+        after: tuple[int, str] | None = None,
+    ) -> tuple[builtins.list[ScheduledTask], tuple[int, str] | None]:
+        """
+        One page of an owner's non-deleted tasks, ordered by ``created_at ASC, id ASC``.
+
+        The cursor is the ``(created_at, id)`` of the last task examined, so a page
+        that skipped deleted tasks can hold fewer than *limit*. Stores without an
+        indexed page read slice their full :meth:`list`.
+
+        :param owner_user_id: The owner, or ``None`` for tasks without one.
+        :param limit: Most tasks to examine, 1-100.
+        :param after: A previous page's cursor, or ``None`` for the first page.
+        :returns: The page and the next cursor, or ``None`` when no tasks remain.
+        """
+        if not 1 <= limit <= 100:
+            raise ValueError("limit must be between 1 and 100")
+        tasks = [
+            task
+            for task in self.list(owner_user_id=owner_user_id)
+            if task.user_id == owner_user_id
+            and (after is None or (task.created_at, task.id) > after)
+        ]
+        page = tasks[:limit]
+        cursor = (page[-1].created_at, page[-1].id) if len(tasks) > limit else None
+        return page, cursor
+
     def list_inbox_failures(
         self,
         *,

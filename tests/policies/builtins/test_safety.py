@@ -1299,6 +1299,20 @@ def test_triggered_task_update_names_what_it_changes() -> None:
     assert 'scope: ["OPS"]' in changed["reason"]
     assert 'worker: {"permission_mode": "acceptEdits"}' in changed["reason"]
 
+    # An agent switch changes the sessions that run the task's own agent.
+    switched = _triggered_review(
+        "sys_triggered_task_update",
+        {
+            "triggered_task_id": "0123456789abcdef0123456789abcdef",
+            "instructions": "Investigate the ticket.",
+            "permission_mode": None,
+            "agent_id": "ag_2",
+        },
+    )
+    assert (
+        "Sessions it starts: sessions that run the task's own agent switch to the new agent_id"
+    ) in switched["reason"]
+
 
 def test_triggered_task_update_denies_an_unreviewable_mode() -> None:
     result = _triggered_review(

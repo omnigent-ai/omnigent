@@ -356,6 +356,39 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             rows = session.execute(stmt).scalars().all()
             return [_to_entity(r) for r in rows]
 
+    def list_page(
+        self,
+        *,
+        owner_user_id: str | None,
+        limit: int,
+        after: tuple[int, str] | None = None,
+    ) -> tuple[builtins.list[ScheduledTask], tuple[int, str] | None]:
+        """Seek through the owner index, then skip deleted tasks so the scan stays bounded."""
+        if not 1 <= limit <= 100:
+            raise ValueError("limit must be between 1 and 100")
+        with self._session("list_task_page") as session:
+            stmt = select(SqlScheduledTask).where(
+                SqlScheduledTask.workspace_id == current_workspace_id(),
+                SqlScheduledTask.user_id == owner_user_id,
+            )
+            if after is not None:
+                stmt = stmt.where(
+                    self._cursor_after((SqlScheduledTask.created_at, SqlScheduledTask.id), after)
+                )
+            rows = (
+                session.execute(
+                    stmt.order_by(
+                        asc(SqlScheduledTask.created_at), asc(SqlScheduledTask.id)
+                    ).limit(limit + 1)
+                )
+                .scalars()
+                .all()
+            )
+            page = rows[:limit]
+            cursor = (page[-1].created_at, page[-1].id) if len(rows) > limit else None
+            deleted = encode_scheduled_task_state("deleted")
+            return [_to_entity(row) for row in page if row.state != deleted], cursor
+
     def list_active(self) -> builtins.list[ScheduledTask]:
         """List active scheduled tasks ordered by ``created_at ASC, id ASC``."""
         with self._session("list_active_tasks") as session:

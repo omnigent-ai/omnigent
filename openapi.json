@@ -19263,7 +19263,7 @@
     },
     "/v1/scheduled-tasks": {
       "get": {
-        "description": "List the caller's scheduled tasks.\n\nLists automations unless *kind* is `all`, so the reminders agents set for\ntheir own sessions stay off the Automations page. There is no reminders-only\nview: this list reads every task the owner has, and a selective filter needs\nan indexed, paginated query first.\n\nLazy-on-read stale backstop: before returning, force-fail any of this\nowner's runs still `running` past the 6h max age (`incomplete`), so\na future Tasks-list \"last-run status\" badge never shows a stale orphan\nas `running`. Pure age check \u2014 one indexed, owner-scoped query for the\nowner's running runs, then a conditional `update_run`; NO per-run\nconversation I/O. Young in-flight runs are untouched, and completion of\na normal run is handled event-driven (the `_publish_status` hook), not\nhere.",
+        "description": "List the caller's scheduled tasks.\n\nLists automations unless *kind* is `all`, so the reminders agents set for\ntheir own sessions stay off the Automations page. There is no reminders-only\nview: this list reads every task the owner has, and a selective filter needs\nan indexed, paginated query first.\n\nWith *limit*, the list is one page read through the owner index, oldest\nfirst, and the response adds `next_cursor` (`null` on the last page). A\npage counts the tasks it examined, so filtered-out tasks can leave it short.\n\nLazy-on-read stale backstop: before returning, force-fail any of this\nowner's runs still `running` past the 6h max age (`incomplete`), so\na future Tasks-list \"last-run status\" badge never shows a stale orphan\nas `running`. Pure age check \u2014 one indexed, owner-scoped query for the\nowner's running runs, then a conditional `update_run`; NO per-run\nconversation I/O. Young in-flight runs are untouched, and completion of\na normal run is handled event-driven (the `_publish_status` hook), not\nhere.",
         "operationId": "list_scheduled_tasks_v1_scheduled_tasks_get",
         "parameters": [
           {
@@ -19279,6 +19279,45 @@
               "title": "Kind",
               "type": "string"
             }
+          },
+          {
+            "description": "Tasks to examine per page; omit to list every task.",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 100,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Tasks to examine per page; omit to list every task.",
+              "title": "Limit"
+            }
+          },
+          {
+            "description": "A previous page's next_cursor.",
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 64,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "A previous page's next_cursor.",
+              "title": "After"
+            }
           }
         ],
         "responses": {
@@ -19286,13 +19325,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": {
-                    "items": {
-                      "additionalProperties": true,
-                      "type": "object"
-                    },
-                    "type": "array"
-                  },
+                  "additionalProperties": true,
                   "title": "Response List Scheduled Tasks V1 Scheduled Tasks Get",
                   "type": "object"
                 }

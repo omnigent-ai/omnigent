@@ -2865,3 +2865,71 @@ def test_inbox_mysql_deep_page_seeks_to_cursor(store):
         float(value) for value in re.findall(r"actual time=[^)]*? rows=([\d.]+)", plans[0])
     ]
     assert examined and max(examined) <= 51, plans[0]
+
+
+def test_list_page_pages_examined_tasks_and_scopes_owner_and_workspace(store):
+    from omnigent.db.db_models import SqlScheduledTask
+
+    tasks = [_session_task(store, f"list-page-{i}") for i in range(4)]
+    ordered = sorted(tasks, key=lambda task: (task.created_at, task.id))
+    with store._session("test_list_page_scope") as session:
+        session.get(SqlScheduledTask, (0, ordered[1].id)).state = 3  # deleted, retained
+    first, cursor = store.list_page(owner_user_id=tasks[0].user_id, limit=2)
+    # The deleted task counts toward the page it was examined in, so the page is short.
+    assert [task.id for task in first] == [ordered[0].id]
+    assert cursor == (ordered[1].created_at, ordered[1].id)
+    rest, final = store.list_page(owner_user_id=tasks[0].user_id, limit=2, after=cursor)
+    assert [task.id for task in rest] == [ordered[2].id, ordered[3].id]
+    assert final is None
+    assert store.list_page(owner_user_id="someone-else", limit=10) == ([], None)
+    assert store.list_page(owner_user_id=None, limit=10) == ([], None)
+    with workspace_scope(99):
+        assert store.list_page(owner_user_id=tasks[0].user_id, limit=10) == ([], None)
+    with pytest.raises(ValueError):
+        store.list_page(owner_user_id=tasks[0].user_id, limit=101)
+
+
+def test_list_page_query_plan_seeks_the_owner_index(store):
+    from sqlalchemy import event
+
+    task = _session_task(store, "list-page-plan")
+    queries = []
+
+    def capture(conn, cursor, statement, parameters, context, executemany):
+        if statement.lstrip().startswith("SELECT"):
+            queries.append((statement, parameters))
+
+    event.listen(store._engine, "before_cursor_execute", capture)
+    try:
+        store.list_page(owner_user_id=task.user_id, limit=1)
+        store.list_page(owner_user_id=task.user_id, after=(task.created_at - 1, task.id), limit=1)
+    finally:
+        event.remove(store._engine, "before_cursor_execute", capture)
+    assert len(queries) == 2
+    assert all("LIMIT" in statement for statement, _ in queries)
+    if store._engine.dialect.name != "sqlite":
+        return
+    with store._engine.connect() as connection:
+        for statement, parameters in queries:
+            plan = str(
+                connection.exec_driver_sql("EXPLAIN QUERY PLAN " + statement, parameters).all()
+            )
+            assert "ix_scheduled_tasks_user_scope" in plan
+            assert "SEARCH" in plan and "TEMP B-TREE" not in plan
+
+
+def test_list_page_falls_back_to_slicing_a_custom_stores_list():
+    from types import SimpleNamespace
+
+    from omnigent.stores.scheduled_task_store import ScheduledTaskStore
+
+    # Equal created_at values page by id, so the cursor's tie-breaker matters.
+    tasks = [SimpleNamespace(id=f"{i:032x}", created_at=i // 2, user_id="u") for i in range(5)]
+    custom = SimpleNamespace(
+        list=lambda owner_user_id: [*tasks, SimpleNamespace(**{**vars(tasks[0]), "user_id": "v"})]
+    )
+    first, cursor = ScheduledTaskStore.list_page(custom, owner_user_id="u", limit=3)
+    assert [task.id for task in first] == [task.id for task in tasks[:3]]
+    rest, final = ScheduledTaskStore.list_page(custom, owner_user_id="u", limit=3, after=cursor)
+    assert [task.id for task in rest] == [task.id for task in tasks[3:]]
+    assert final is None

@@ -145,6 +145,7 @@ from omnigent.tools.builtins.trigger_prompts import (
     encode_trigger_prompt,
 )
 from omnigent.tools.builtins.triggered_tasks import (
+    LIST_PAGE_MAX,
     TRIGGERED_TASK_CREATE,
     TRIGGERED_TASK_DELETE,
     TRIGGERED_TASK_LIST,
@@ -5240,15 +5241,31 @@ async def _project_id_for_name(
     return project_id
 
 
-def _reminder_may_exist(tool_name: str, problem: str, *, details: str | None = None) -> str:
-    """An error for a create that may have been saved, so a retry doesn't duplicate it."""
+def _create_may_exist(
+    tool_name: str, problem: str, *, check: str, details: str | None = None
+) -> str:
+    """An error for a create that may have been saved, so a retry doesn't duplicate it.
+
+    :param check: How to look for it before retrying, e.g. ``"check
+        sys_triggered_task_list before creating it again"``.
+    """
     error: dict[str, str] = {
-        "error": f"{tool_name}: {problem}. It may still have been created: check "
-        "sys_scheduled_task_list for a 'Reminder: ...' automation before setting it again."
+        "error": f"{tool_name}: {problem}. It may still have been created: {check}."
     }
     if details is not None:
         error["details"] = details
     return json.dumps(error)
+
+
+def _reminder_may_exist(tool_name: str, problem: str, *, details: str | None = None) -> str:
+    """An error for a reminder create that may have been saved."""
+    return _create_may_exist(
+        tool_name,
+        problem,
+        check="check sys_scheduled_task_list for a 'Reminder: ...' automation before "
+        "setting it again",
+        details=details,
+    )
 
 
 _REMINDER_SESSION_PARAMS = {
@@ -5545,7 +5562,22 @@ async def _execute_triggered_task_tool(
     :returns: Tool output JSON string.
     """
     if tool_name == TRIGGERED_TASK_LIST:
-        response = await server_client.get("/v1/scheduled-tasks", timeout=30.0)
+        limit = args.get("limit", LIST_PAGE_MAX)
+        if (
+            not isinstance(limit, int)
+            or isinstance(limit, bool)
+            or not 1 <= limit <= LIST_PAGE_MAX
+        ):
+            return json.dumps(
+                {"error": f"{tool_name}: limit must be a whole number from 1 to {LIST_PAGE_MAX}"}
+            )
+        params: dict[str, str | int] = {"limit": limit}
+        cursor = args.get("cursor")
+        if cursor is not None:
+            if not isinstance(cursor, str) or not cursor:
+                return json.dumps({"error": f"{tool_name}: cursor must be a next_cursor value"})
+            params["after"] = cursor
+        response = await server_client.get("/v1/scheduled-tasks", params=params, timeout=30.0)
         if response.status_code >= 400:
             return json.dumps(
                 {
@@ -5553,14 +5585,16 @@ async def _execute_triggered_task_tool(
                     "details": response.text[:1000],
                 }
             )
-        tasks = (_string_object_dict(response.json()) or {}).get("scheduled_tasks")
+        body = _string_object_dict(response.json()) or {}
+        tasks = body.get("scheduled_tasks")
         views = []
         for task in tasks if isinstance(tasks, list) else []:
             prompt = task.get("prompt") if isinstance(task, dict) else None
             config = decode_trigger_prompt(prompt) if isinstance(prompt, str) else None
             if config is not None:
                 views.append(triggered_task_view(task, config))
-        return json.dumps({"triggered_tasks": views})
+        # A server without pages returns every task and no cursor.
+        return json.dumps({"triggered_tasks": views, "next_cursor": body.get("next_cursor")})
 
     if tool_name == TRIGGERED_TASK_DELETE:
         saved = await _read_triggered_task(server_client, tool_name, args.get("triggered_task_id"))
@@ -5622,8 +5656,28 @@ async def _execute_triggered_task_tool(
         saved = await _read_triggered_task(server_client, tool_name, args.get("triggered_task_id"))
         if isinstance(saved, str):
             return saved
+        worker = saved.config["worker"]
+        if (
+            "agent_id" in args
+            and args["agent_id"] != saved.task.get("agent_id")
+            and worker["agentId"] is None
+        ):
+            # Sessions that run the task's agent can't keep the old harness's settings,
+            # as the task's own model, effort and mode don't carry across a switch.
+            placement = worker["placement"]
+            worker = default_worker(
+                execution_target=None,
+                model_override=args.get("model_override"),
+                reasoning_effort=args.get("reasoning_effort"),
+                permission_mode=args.get("permission_mode"),
+                worker_permission_modes=info.get("session_create_permission_modes") is True,
+            )
+            worker["placement"] = placement
+            saved = _SavedTrigger(
+                url=saved.url, task=saved.task, config={**saved.config, "worker": worker}
+            )
         existing = saved
-        worker_defaults = saved.config["worker"]
+        worker_defaults = worker
     task_url = existing.url if existing is not None else None
     task: _JsonObject = existing.task if existing is not None else {}
     current = existing.config if existing is not None else None
@@ -5671,17 +5725,33 @@ async def _execute_triggered_task_tool(
     mutation_headers = (
         {ORCHESTRATION_SOURCE_HEADER: conversation_id} if conversation_id is not None else {}
     )
+    # A create the server may have saved before its reply was lost: a blind retry would
+    # leave two tasks watching the same items, each starting sessions for every match.
+    check = "check sys_triggered_task_list before creating it again"
     if task_url is None:
-        response = await server_client.post(
-            "/v1/scheduled-tasks",
-            json=payload,
-            timeout=30.0,
-            headers={
-                **mutation_headers,
-                "x-omnigent-automation-source": "agent",
-                "x-omnigent-automation-template": config["source"],
-            },
-        )
+        try:
+            response = await server_client.post(
+                "/v1/scheduled-tasks",
+                json=payload,
+                timeout=30.0,
+                headers={
+                    **mutation_headers,
+                    "x-omnigent-automation-source": "agent",
+                    "x-omnigent-automation-template": config["source"],
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            return _create_may_exist(
+                tool_name, f"the request to create it failed ({exc})", check=check
+            )
+        if response.status_code >= 500:
+            # A gateway can answer 502 or 504 after the server saved the task.
+            return _create_may_exist(
+                tool_name,
+                f"the server returned {response.status_code}",
+                check=check,
+                details=response.text[:1000],
+            )
     else:
         response = await server_client.patch(
             task_url, json=payload, headers=mutation_headers, timeout=30.0
@@ -5690,7 +5760,14 @@ async def _execute_triggered_task_tool(
         return json.dumps(
             {"error": f"server returned {response.status_code}", "details": response.text[:1000]}
         )
-    saved = _string_object_dict(response.json()) or {}
+    try:
+        saved = _string_object_dict(response.json()) or {}
+    except ValueError:
+        if task_url is None:
+            return _create_may_exist(
+                tool_name, "the server's reply to the create was unreadable", check=check
+            )
+        raise
     saved_prompt = saved.get("prompt")
     saved_config = decode_trigger_prompt(saved_prompt) if isinstance(saved_prompt, str) else None
     return json.dumps(
@@ -5878,15 +5955,15 @@ async def _triggered_task_update_refusal(
 ) -> str | None:
     """A refusal to rewrite a triggered task's prompt as plain text, or ``None``.
 
-    Refused only where ``sys_triggered_task_update`` can change it instead; an older
-    server keeps the plain update so the task can still be paused or edited.
+    Refused only where ``sys_triggered_task_update`` can change it instead. Where it
+    can't (an older server, or session orchestration turned off), the plain update
+    stays available so the task can still be paused or edited.
     """
     body = _string_object_dict(task) or {}
     prompt = body.get("prompt")
     if not isinstance(prompt, str) or decode_trigger_prompt(prompt) is None:
         return None
-    info = await server_client.get("/v1/info", timeout=30.0)
-    if info.status_code >= 400 or info.json().get("triggered_task_tools") is not True:
+    if isinstance(await _triggered_task_server_info(server_client, tool_name), str):
         return None
     return json.dumps(
         {

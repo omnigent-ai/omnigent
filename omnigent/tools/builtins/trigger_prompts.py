@@ -293,9 +293,7 @@ _SERVICE_NAMES: dict[TriggerSource, str] = {
 
 
 # ── JavaScript string semantics ────────────────────────────────────────────
-#
-# The form runs in a browser, so trimming, regex classes, lengths and JSON follow
-# JavaScript's rules. These helpers reproduce them where Python's differ.
+# The form runs in a browser, so these follow JavaScript's trim, regex, length and JSON rules.
 
 # JavaScript's WhiteSpace and LineTerminator characters: what ``trim()`` strips and
 # ``\s`` matches. Python's ``str.strip()`` also strips U+001C-U+001F and U+0085 and

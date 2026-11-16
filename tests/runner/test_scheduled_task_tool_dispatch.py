@@ -40,7 +40,11 @@ from omnigent.tools.builtins.scheduled_tasks import (
     SysScheduledTaskCreateTool,
     SysScheduledTaskUpdateTool,
 )
-from omnigent.tools.builtins.trigger_prompts import TriggerConfig, decode_trigger_prompt
+from omnigent.tools.builtins.trigger_prompts import (
+    TriggerConfig,
+    decode_trigger_prompt,
+    encode_trigger_prompt,
+)
 from omnigent.tools.builtins.triggered_tasks import build_trigger_config, default_worker
 
 _ALL_NAMES = {
@@ -1107,7 +1111,18 @@ class _TaskServer:
         if url == "/v1/info":
             return _Resp(status_code=self.info_status, body=self.info)
         if url == "/v1/scheduled-tasks":
-            return _Resp(body={"scheduled_tasks": list(self.tasks.values())})
+            tasks = list(self.tasks.values())
+            if not params or "limit" not in params:
+                return _Resp(body={"scheduled_tasks": tasks})
+            # Pages by position; the cursor is the index of the next task.
+            start = int(params.get("after", 0))
+            end = start + int(params["limit"])
+            return _Resp(
+                body={
+                    "scheduled_tasks": tasks[start:end],
+                    "next_cursor": str(end) if end < len(tasks) else None,
+                }
+            )
         task = self._task(url)
         return _Resp(body=task) if task else _Resp(status_code=404, body={"detail": "not found"})
 
@@ -1382,7 +1397,14 @@ async def test_triggered_task_update_requires_the_review_fields() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("info", "patched"), [({}, False), ({"triggered_task_tools": None}, True)]
+    ("info", "patched"),
+    [
+        ({}, False),
+        ({"triggered_task_tools": None}, True),
+        # Without orchestration the triggered update is refused, so pausing stays here.
+        ({"features": {"session_orchestration": False}}, True),
+    ],
+    ids=["triggered-tools", "older-server", "orchestration-off"],
 )
 async def test_scheduled_task_update_keeps_a_triggered_tasks_prompt(
     info: dict[str, object], patched: bool
@@ -1403,3 +1425,121 @@ async def test_scheduled_task_update_keeps_a_triggered_tasks_prompt(
     assert ("PATCH" in server.mutations()) is patched
     if not patched:
         assert "change it with sys_triggered_task_update" in str(out["error"])
+
+
+def _saved_trigger_task(task_id: str, **trigger: object) -> dict[str, object]:
+    """A task as the trigger form saves it, for list paging and update tests."""
+    config = build_trigger_config(
+        {**_JIRA_TRIGGER, **trigger},
+        current=None,
+        worker_defaults=default_worker(
+            execution_target=None,
+            model_override=None,
+            reasoning_effort=None,
+            permission_mode=None,
+            worker_permission_modes=True,
+        ),
+    )
+    assert not isinstance(config, str), config
+    return {
+        "id": task_id,
+        "name": "Triage ES",
+        "agent_id": "ag_1",
+        "rrule": "FREQ=MINUTELY;INTERVAL=10",
+        "prompt": encode_trigger_prompt(
+            config, session_link="http://127.0.0.1:6767/c/CONVERSATION_ID"
+        ),
+    }
+
+
+@pytest.mark.asyncio
+async def test_triggered_task_list_pages_and_passes_the_cursor_back() -> None:
+    ids = [f"{index:032x}" for index in range(3)]
+    server = _TaskServer(
+        tasks=[_saved_trigger_task(ids[0]), _plain_task(ids[1]), _saved_trigger_task(ids[2])]
+    )
+    first = await _run(server, "sys_triggered_task_list", {"limit": 2})
+    assert server.calls[-1] == ("GET", "/v1/scheduled-tasks", {"limit": 2})
+    # The plain task is read but not reported, so the page holds one trigger.
+    assert [task["triggered_task_id"] for task in first["triggered_tasks"]] == [ids[0]]
+    assert first["next_cursor"] == "2"
+    rest = await _run(server, "sys_triggered_task_list", {"limit": 2, "cursor": "2"})
+    assert server.calls[-1] == ("GET", "/v1/scheduled-tasks", {"limit": 2, "after": "2"})
+    assert [task["triggered_task_id"] for task in rest["triggered_tasks"]] == [ids[2]]
+    assert rest["next_cursor"] is None
+    bad = await _run(server, "sys_triggered_task_list", {"limit": 0})
+    assert "limit must be a whole number from 1 to 100" in str(bad["error"])
+
+
+@pytest.mark.asyncio
+async def test_triggered_task_agent_switch_resets_the_sessions_inherited_settings() -> None:
+    server = _TaskServer()
+    await _run(
+        server,
+        "sys_triggered_task_create",
+        {**_JIRA_TRIGGER, "model_override": "model-a", "reasoning_effort": "high"},
+    )
+    assert _saved_trigger(server)["worker"]["permissionMode"] == "acceptEdits"
+    await _run(
+        server,
+        "sys_triggered_task_update",
+        {
+            "triggered_task_id": _TASK_ID,
+            "instructions": "Investigate the ticket.",
+            "permission_mode": None,
+            "agent_id": "ag_2",
+        },
+    )
+    # Sessions that run the task's agent take the new agent's settings, as the task does.
+    assert _saved_trigger(server)["worker"] == {
+        "placement": "same_host",
+        "agentId": None,
+        "model": "",
+        "effort": "",
+        "permissionMode": "",
+    }
+
+
+@pytest.mark.asyncio
+async def test_triggered_task_agent_switch_keeps_sessions_with_their_own_agent() -> None:
+    server = _TaskServer()
+    worker = {"agent_id": "ag_worker", "model": "model-b", "permission_mode": "acceptEdits"}
+    await _run(server, "sys_triggered_task_create", {**_JIRA_TRIGGER, "worker": worker})
+    before = _saved_trigger(server)["worker"]
+    await _run(
+        server,
+        "sys_triggered_task_update",
+        {
+            "triggered_task_id": _TASK_ID,
+            "instructions": "Investigate the ticket.",
+            "permission_mode": None,
+            "agent_id": "ag_2",
+        },
+    )
+    assert _saved_trigger(server)["worker"] == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", ["timeout", "502", "unreadable"])
+async def test_triggered_task_create_says_it_may_exist_when_the_reply_is_lost(fault: str) -> None:
+    """A blind retry would leave two tasks starting sessions for the same items."""
+    server = _TaskServer()
+    record = server.post
+
+    async def lost(url: str, **kwargs: object) -> _Resp:
+        response = await record(url, **kwargs)  # type: ignore[arg-type]
+        if fault == "timeout":
+            raise httpx.ReadTimeout("response lost")
+        if fault == "502":
+            return _Resp(status_code=502, body={"error": "upstream"})
+
+        class _Unreadable(_Resp):
+            def json(self) -> object:
+                raise ValueError("not JSON")
+
+        return _Unreadable(body=response.json())
+
+    server.post = lost  # type: ignore[method-assign]
+    out = await _run(server, "sys_triggered_task_create", _JIRA_TRIGGER)
+    assert "may still have been created" in str(out["error"])
+    assert "check sys_triggered_task_list before creating it again" in str(out["error"])
