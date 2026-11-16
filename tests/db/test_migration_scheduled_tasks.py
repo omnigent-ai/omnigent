@@ -22,6 +22,8 @@ from uuid import uuid4
 import pytest
 import sqlalchemy as sa
 from alembic import command
+from alembic.migration import MigrationContext
+from alembic.operations import Operations
 from sqlalchemy.dialects import mysql
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import DBAPIError, IntegrityError
@@ -144,9 +146,15 @@ def test_trigger_config_is_a_bounded_varbinary_on_mysql() -> None:
     migration = import_module(
         "omnigent.db.migrations.versions.5c1e8f2a9d47_add_scheduled_task_trigger_config"
     )
+    output = StringIO()
+    context = MigrationContext.configure(
+        dialect_name="mysql", opts={"as_sql": True, "output_buffer": output}
+    )
+    with Operations.context(context):
+        migration.upgrade()
     model = SqlScheduledTask.__table__.c.trigger_config.type
 
-    assert migration._TRIGGER_CONFIG.compile(dialect=mysql.dialect()) == "VARBINARY(16383)"
+    assert "ADD COLUMN trigger_config VARBINARY(16383)" in output.getvalue()
     assert model.compile(dialect=mysql.dialect()) == "VARBINARY(16383)"
     # Hex digits carry four bits each, so this can't compress below the bound.
     with pytest.raises(ValueError, match="exceeds 16383 bytes"):
