@@ -112,6 +112,7 @@ _COMPACTION_WAIT_TIMEOUT_SECONDS = 60.0
 _DELIVERY_RPC_TIMEOUT_SECONDS = 30.0
 _GOAL_RPC_TIMEOUT_SECONDS = 30.0
 _DELIVERY_RECEIPT_TIMEOUT_SECONDS = 2.0
+_ERROR_DIAGNOSTIC_TIMEOUT_SECONDS = 1.0
 _MAX_CODEX_TEXT_INPUT_CHARS = 1 << 20
 _CODEX_COMPACTING_FAILURE = CodexStartupFailure(
     message="Codex is still compacting, so this message was not delivered.",
@@ -1423,9 +1424,15 @@ class CodexNativeExecutor(Executor):
                         # Name the servers a still-unsettled MCP startup is
                         # blocked on — the most common cause of an injection
                         # failure this early in the session's life.
-                        waiting = mcp_startup_waiting_detail(read_mcp_startup(self._bridge_dir))
-                        if waiting and not undelivered:
-                            error_msg = f"{error_msg} ({waiting})"
+                        if not undelivered:
+                            with contextlib.suppress(OSError, TimeoutError):
+                                async with asyncio.timeout(_ERROR_DIAGNOSTIC_TIMEOUT_SECONDS):
+                                    mcp_startup = await asyncio.to_thread(
+                                        read_mcp_startup, self._bridge_dir
+                                    )
+                                waiting = mcp_startup_waiting_detail(mcp_startup)
+                                if waiting:
+                                    error_msg = f"{error_msg} ({waiting})"
                     finally:
                         await client.close()
             break

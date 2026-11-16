@@ -8,6 +8,7 @@ import contextlib
 import errno
 import json
 import logging
+import threading
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
@@ -41,6 +42,7 @@ from omnigent.inner.executor import (
 )
 from omnigent.inner.native_attachments import attachment_cache_dir
 from omnigent.native.input_diagnostics import input_delivery_scope
+from tests.budgets import budget
 
 # A 1x1 transparent PNG, base64-encoded — a real decodable image small
 # enough to embed, used to prove image blocks are materialized to disk
@@ -4737,10 +4739,15 @@ def test_turn_start_is_not_gated_on_pending_mcp_startup(
     assert [method for method, _ in _FakeCodexNativeClient.requests] == ["turn/start"]
 
 
-def test_turn_error_names_pending_mcp_servers(
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "diagnostic", ["ready", "slow", "timeout", "cancel", "stat-error", "undelivered"]
+)
+async def test_turn_error_names_pending_mcp_servers(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
+    diagnostic: str,
 ) -> None:
     """
     A turn failure during MCP startup names the still-pending servers.
@@ -4750,6 +4757,8 @@ def test_turn_error_names_pending_mcp_servers(
     error and has no idea codex is still booting MCP servers.
     """
     from omnigent.harnesses.codex_native.bridge import update_mcp_server_startup
+
+    closed = asyncio.Event()
 
     class _FailingTurnClient(_FakeCodexNativeClient):
         """Fake client whose ``turn/start`` fails like a mid-boot app-server."""
@@ -4763,8 +4772,17 @@ def test_turn_error_names_pending_mcp_servers(
             :returns: Codex-shaped response payload.
             """
             if method == "turn/start":
+                if diagnostic == "undelivered":
+                    raise codex_native_executor._CodexNativeInputUndelivered(
+                        codex_native_executor._CODEX_COMPACTING_FAILURE,
+                        preserve_session=True,
+                    )
                 raise RuntimeError("app-server hiccup")
             return await super().request(method, params)
+
+        async def close(self) -> None:
+            await super().close()
+            closed.set()
 
     _FailingTurnClient.requests = []
     _FailingTurnClient.created = []
@@ -4776,11 +4794,65 @@ def test_turn_error_names_pending_mcp_servers(
     _seed_bridge(tmp_path)
     update_mcp_server_startup(tmp_path, "storage-console", "starting")
     executor = CodexNativeExecutor(bridge_dir=tmp_path)
+    entered = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    original_stat = Path.stat
 
-    events = _collect_turn_events(executor, "hi")
+    def stat(path: Path, *args: Any, **kwargs: Any) -> Any:
+        if path == tmp_path / "mcp_startup.json":
+            if diagnostic == "undelivered":
+                raise AssertionError("optional diagnostics delayed an explicit refusal")
+            if diagnostic == "stat-error":
+                raise PermissionError("MCP diagnostic state unavailable")
+            if diagnostic in {"slow", "timeout", "cancel"}:
+                entered.set()
+                release.wait(timeout=budget(5))
+                finished.set()
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", stat)
+    monkeypatch.setattr(
+        codex_native_executor, "_ERROR_DIAGNOSTIC_TIMEOUT_SECONDS", budget(0.5), raising=False
+    )
+
+    async def collect() -> list[Any]:
+        return [
+            event async for event in executor.run_turn([{"role": "user", "content": "hi"}], [], "")
+        ]
+
+    task = asyncio.create_task(collect())
+    try:
+        if diagnostic in {"slow", "timeout", "cancel"}:
+            assert await asyncio.to_thread(entered.wait, budget(10))
+            assert not finished.is_set(), "MCP diagnostic read blocked the runner loop"
+            if diagnostic == "slow":
+                release.set()
+            elif diagnostic == "cancel":
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(task, timeout=budget(3))
+                assert closed.is_set()
+                return
+        events = await asyncio.wait_for(task, timeout=budget(3))
+        assert closed.is_set()
+        if diagnostic == "timeout":
+            assert not finished.is_set(), "failure reporting waited for optional storage"
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+        if entered.is_set():
+            assert await asyncio.to_thread(finished.wait, budget(10))
 
     assert [type(event) for event in events] == [ExecutorError]
-    assert "MCP startup still waiting on storage-console" in events[0].message
+    if diagnostic in {"ready", "slow"}:
+        assert "MCP startup still waiting on storage-console" in events[0].message
+    elif diagnostic == "undelivered":
+        assert events[0].code == "codex_compacting"
+        assert events[0].undelivered and events[0].preserve_session
+    else:
+        assert events[0].message == "Codex native executor error: app-server hiccup"
+        assert not events[0].undelivered
 
     from omnigent.debug_logging import record_to_row
 
@@ -4796,7 +4868,9 @@ def test_turn_error_names_pending_mcp_servers(
     assert row["session_id"] == state.session_id
     assert row["event_name"] == "codex_turn_injection_failed"
     assert row["attributes"]["thread_id"] == state.thread_id
-    assert row["attributes"]["exception_type"] == "RuntimeError"
+    assert row["attributes"]["exception_type"] == (
+        "_CodexNativeInputUndelivered" if diagnostic == "undelivered" else "RuntimeError"
+    )
     assert str(tmp_path) not in json.dumps(row["attributes"])
 
 
