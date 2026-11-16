@@ -917,7 +917,8 @@ class SysSessionCreateTool(Tool):
       a fresh session-scoped agent.
 
     An optional ``message`` starts the session's first user turn;
-    an optional ``title`` labels the session.
+    an optional ``title`` labels the session. With ``agent_id``, an optional
+    ``workflow_id`` starts the session as a run of a saved workflow.
 
     Returns a handle ``{conversation_id, agent_id, title, status}``, plus
     ``project_id`` and ``project_name`` for an independent session. The session runs
@@ -1141,6 +1142,17 @@ class SysSessionCreateTool(Tool):
                                 "'approve-for-me' (agent_id only). Modes that skip "
                                 "approval, such as 'bypassPermissions' or 'full-access', "
                                 "are refused. Omit to use the agent's default."
+                            ),
+                        },
+                        "workflow_id": {
+                            "type": "string",
+                            "description": (
+                                "Optional ID of one of your saved workflows, from "
+                                "sys_workflow_list or sys_workflow_load (agent_id only). "
+                                "The session starts as a run of it, with the workflow's "
+                                "steps as its plan, and the workflow's page lists the run. "
+                                "Still give it a message asking it to run the workflow "
+                                "with the workflow skill."
                             ),
                         },
                     },

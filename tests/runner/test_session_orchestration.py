@@ -33,6 +33,7 @@ def test_create_schema_exposes_project_name_and_permission_mode():
     assert schema["parameters"]["properties"]["project_name"]["type"] == "string"
     assert schema["parameters"]["properties"]["permission_mode"]["type"] == "string"
     assert schema["parameters"]["properties"]["project_id"]["type"] == "string"
+    assert schema["parameters"]["properties"]["workflow_id"]["type"] == "string"
 
 
 @pytest.mark.asyncio
@@ -83,11 +84,14 @@ async def test_create_sends_permission_mode_only_to_a_server_that_applies_it(adv
         ({"agent_id": "worker", "permission_mode": ""}, "nonempty string"),
         ({"agent_id": "worker", "permission_mode": 1}, "nonempty string"),
         ({"config_path": "agent.yaml", "permission_mode": "auto"}, "requires agent_id"),
+        ({"agent_id": "worker", "workflow_id": " "}, "nonempty string"),
+        ({"agent_id": "worker", "workflow_id": 1}, "nonempty string"),
+        ({"config_path": "agent.yaml", "workflow_id": uuid4().hex}, "requires agent_id"),
     ],
 )
-async def test_create_refuses_unusable_permission_mode(arguments, error):
+async def test_create_refuses_unusable_permission_mode_or_workflow_id(arguments, error):
     def unexpected(request):
-        pytest.fail("A refused permission_mode must not reach the server")
+        pytest.fail("A refused option must not reach the server")
 
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(unexpected), base_url="http://server"
@@ -101,6 +105,55 @@ async def test_create_refuses_unusable_permission_mode(arguments, error):
             )
         )
     assert error in result["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("placement", ["child", "same_host"])
+# None is an older server, which omits the capability.
+@pytest.mark.parametrize(
+    ("advertised", "workflows", "error"),
+    [
+        (True, True, None),
+        (None, True, "can't start a session as a workflow run"),
+        (True, False, "Workflows are disabled"),
+    ],
+)
+async def test_create_sends_workflow_id_only_to_a_server_that_starts_the_run(
+    placement, advertised, workflows, error
+):
+    requests = []
+    workflow_id = uuid4().hex
+
+    def respond(request):
+        requests.append(request)
+        if request.url.path == "/v1/info":
+            info = {"features": {"workflows": workflows}}
+            if advertised is not None:
+                info["session_create_workflow_id"] = advertised
+            return httpx.Response(200, json=info)
+        return httpx.Response(201, json={"id": "conv_worker", "agent_id": "worker"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://server"
+    ) as client:
+        result = json.loads(
+            await execute_tool(
+                tool_name="sys_session_create",
+                arguments=json.dumps(
+                    {"agent_id": "worker", "placement": placement, "workflow_id": workflow_id}
+                ),
+                server_client=client,
+                conversation_id="manager",
+            )
+        )
+
+    posts = [request for request in requests if request.method == "POST"]
+    if error is None:
+        assert result["conversation_id"] == "conv_worker", result
+        assert json.loads(posts[0].content)["workflow_id"] == workflow_id
+    else:
+        assert error in result["error"]
+        assert posts == []
 
 
 @pytest.mark.parametrize("spec", [AgentSpec(spec_version=1), None])
