@@ -164,6 +164,15 @@ def test_tool_result_content_blocks_rehydrates_only_block_arrays() -> None:
     # Document blocks the API would reject keep the raw string.
     assert fn(json.dumps([pdf_block("[application/pdf content omitted]")])) is None
     assert fn(json.dumps([pdf_block(pdf, "text/plain")])) is None
+    assert fn(json.dumps([pdf_block("")])) is None
+    pdf_source = pdf_block(pdf)["source"]
+    for source in (
+        "not an object",
+        {"type": "url", "url": "https://example.com/report.pdf"},
+        {**pdf_source, "data": 1234},
+        {key: value for key, value in pdf_source.items() if key != "type"},
+    ):
+        assert fn(json.dumps([{"type": "document", "source": source}])) is None, source
 
 
 def test_strip_unparseable_image_output_negatives_are_byte_for_byte() -> None:

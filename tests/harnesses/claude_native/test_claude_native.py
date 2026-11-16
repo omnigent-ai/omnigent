@@ -8547,6 +8547,30 @@ def test_clone_claude_transcript_repairs_stale_image_duplication(
         "parentUuid": "u5",
         "toolUseResult": stripped_pdf_meta,
     }
+    b64_native_image = "iVBORw0KGgo" + "L" * 4000 + "="
+    native_image_block = {
+        "type": "image",
+        "source": {"type": "base64", "media_type": "image/png", "data": b64_native_image},
+    }
+    stripped_image_meta = {
+        "type": "image",
+        "file": {"base64": "", "type": "image/png", "originalSize": 3009},
+    }
+    native_image = {
+        **native_pdf,
+        "uuid": "u7",
+        "parentUuid": "u6",
+        "message": {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_7", "content": [native_image_block]}
+            ],
+        },
+        "toolUseResult": {
+            **stripped_image_meta,
+            "file": {**stripped_image_meta["file"], "base64": b64_native_image},
+        },
+    }
     source_path.write_text(
         "".join(
             json.dumps(record) + "\n"
@@ -8557,6 +8581,7 @@ def test_clone_claude_transcript_repairs_stale_image_duplication(
                 stale_pdf,
                 native_pdf,
                 stripped_native_pdf,
+                native_image,
             )
         ),
         encoding="utf-8",
@@ -8565,6 +8590,7 @@ def test_clone_claude_transcript_repairs_stale_image_duplication(
     assert source_text.count(b64_structured) == 2, "pre-fix wedged state"
     assert source_text.count(b64_mcp) == 2, "pre-fix wedged state"
     assert source_text.count(b64_native_pdf) == 3
+    assert source_text.count(b64_native_image) == 2
     monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects_dir)
 
     result = claude_native._clone_claude_transcript(
@@ -8600,14 +8626,15 @@ def test_clone_claude_transcript_repairs_stale_image_duplication(
     # A PDF replayed as a raw string becomes a document block, kept once.
     assert records[3]["message"]["content"][0]["content"] == pdf_blocks
     assert text.count(b64_pdf) == 1
+    # Claude Code's Read metadata keeps its native shape, as current releases store it.
     assert records[4]["message"]["content"][0]["content"] == native_pdf_blocks
-    assert json.loads(records[4]["toolUseResult"]) == claude_native._redact_binary_blocks(
-        native_pdf_blocks
-    )
-    # Metadata Claude Code already stripped keeps its native shape.
+    assert records[4]["toolUseResult"] == stripped_pdf_meta
     assert records[5]["message"]["content"][0]["content"] == native_pdf_blocks
     assert records[5]["toolUseResult"] == stripped_pdf_meta
     assert text.count(b64_native_pdf) == 2
+    assert records[6]["message"]["content"][0]["content"] == [native_image_block]
+    assert records[6]["toolUseResult"] == stripped_image_meta
+    assert text.count(b64_native_image) == 1
     # The fork must not mutate the source session's transcript.
     assert source_path.read_text(encoding="utf-8") == source_text
 
