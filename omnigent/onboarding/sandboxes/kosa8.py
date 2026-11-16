@@ -39,6 +39,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import posixpath
 import queue
 import re
 import secrets
@@ -106,6 +107,8 @@ _EXEC_READY_TIMEOUT_S = 60.0
 _EXEC_READY_POLL_S = 1.0
 # The files API takes at most 8 MiB per request; larger files go in parts.
 _UPLOAD_CHUNK_BYTES = 8 * 1024 * 1024 - 64 * 1024
+# The files API reaches only this directory; uploads elsewhere are staged here.
+_FILES_ROOT = "/workspace"
 _RUNNING_STATES = frozenset({"running"})
 _ASLEEP_STATES = frozenset({"sleeping", "paused"})
 _BOOTING_STATES = frozenset({"creating"})
@@ -882,31 +885,44 @@ class Kosa8SandboxLauncher(SandboxLauncher):
         """
         Copy a local file into the sandbox.
 
-        The files API takes at most 8 MiB per request, so a larger file goes
-        up in parts that a command then joins.
+        The files API reaches only ``/workspace``, so a file bound elsewhere
+        (such as ``/tmp``) is uploaded under ``/workspace`` and then moved by a
+        command. The API takes at most 8 MiB per request, so a larger file
+        goes up in parts that a command then joins.
 
         :raises click.ClickException: If the transfer fails.
         """
         data = local_path.read_bytes()
         client = self._kosa8()
+        normalized = posixpath.normpath(remote_path)
+        direct = normalized.startswith(f"{_FILES_ROOT}/")
+        staged = remote_path
+        if not direct:
+            staged = f"{_FILES_ROOT}/.omnigent-upload-{secrets.token_hex(8)}"
         try:
             if len(data) <= _UPLOAD_CHUNK_BYTES:
-                client.write_file(sandbox_id, remote_path, data)
-                return
-            parts = []
-            for index, start in enumerate(range(0, len(data), _UPLOAD_CHUNK_BYTES)):
-                part = f"{remote_path}.part{index:04d}"
-                client.write_file(sandbox_id, part, data[start : start + _UPLOAD_CHUNK_BYTES])
-                parts.append(part)
+                client.write_file(sandbox_id, staged, data)
+                parts = [staged]
+            else:
+                parts = []
+                for index, start in enumerate(range(0, len(data), _UPLOAD_CHUNK_BYTES)):
+                    part = f"{staged}.part{index:04d}"
+                    client.write_file(sandbox_id, part, data[start : start + _UPLOAD_CHUNK_BYTES])
+                    parts.append(part)
         except _Kosa8APIError as exc:
             raise click.ClickException(
                 f"File upload to kosa8 sandbox '{sandbox_id}' failed: {exc}"
             ) from exc
+        if parts == [remote_path]:
+            return
+        target = shlex.quote(remote_path)
+        parent = shlex.quote(posixpath.dirname(normalized) or "/")
+        prefix = "" if direct else f"mkdir -p -- {parent} && "
+        if len(parts) == 1:
+            self.run(sandbox_id, f"{prefix}mv -f -- {shlex.quote(parts[0])} {target}")
+            return
         quoted = " ".join(shlex.quote(part) for part in parts)
-        self.run(
-            sandbox_id,
-            f"cat {quoted} > {shlex.quote(remote_path)} && rm -f {quoted}",
-        )
+        self.run(sandbox_id, f"{prefix}cat {quoted} > {target} && rm -f {quoted}")
 
     def stream_exec(self, sandbox_id: str, command: str, *, pty: bool = False) -> RemoteProcess:
         """

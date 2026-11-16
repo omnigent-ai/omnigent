@@ -368,29 +368,51 @@ def test_put_small_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None
     local = tmp_path / "w.tgz"
     local.write_bytes(b"payload")
 
+    _launcher(monkeypatch, fake).put(SBX, local, "/workspace/oa-wheels.tgz")
+
+    assert fake.files == {"/workspace/oa-wheels.tgz": b"payload"}
+    assert fake.commands == []
+
+
+def test_put_outside_the_workspace_is_staged_and_moved(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The files API reaches /workspace only, so /tmp files go there first."""
+    fake = _FakeKosa8()
+    monkeypatch.setattr(kosa8_module.secrets, "token_hex", lambda n: "abc")
+    local = tmp_path / "w.tgz"
+    local.write_bytes(b"payload")
+
     _launcher(monkeypatch, fake).put(SBX, local, "/tmp/oa-wheels.tgz")
 
-    assert fake.files == {"/tmp/oa-wheels.tgz": b"payload"}
-    assert fake.commands == []
+    assert fake.files == {"/workspace/.omnigent-upload-abc": b"payload"}
+    (move,) = fake.commands
+    assert move[:2] == ["bash", "-lc"]
+    assert move[2].startswith(
+        "mkdir -p -- /tmp && mv -f -- /workspace/.omnigent-upload-abc /tmp/oa-wheels.tgz"
+    )
 
 
 def test_put_large_file_in_parts(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     fake = _FakeKosa8()
     monkeypatch.setattr(kosa8_module, "_UPLOAD_CHUNK_BYTES", 4)
+    monkeypatch.setattr(kosa8_module.secrets, "token_hex", lambda n: "abc")
     local = tmp_path / "w.tgz"
     local.write_bytes(b"0123456789")
 
     _launcher(monkeypatch, fake).put(SBX, local, "/tmp/w.tgz")
 
+    staged = "/workspace/.omnigent-upload-abc"
     assert fake.files == {
-        "/tmp/w.tgz.part0000": b"0123",
-        "/tmp/w.tgz.part0001": b"4567",
-        "/tmp/w.tgz.part0002": b"89",
+        f"{staged}.part0000": b"0123",
+        f"{staged}.part0001": b"4567",
+        f"{staged}.part0002": b"89",
     }
     (join,) = fake.commands
     assert join[:2] == ["bash", "-lc"]
     assert join[2].startswith(
-        "cat /tmp/w.tgz.part0000 /tmp/w.tgz.part0001 /tmp/w.tgz.part0002 > /tmp/w.tgz"
+        f"mkdir -p -- /tmp && cat {staged}.part0000 {staged}.part0001 {staged}.part0002"
+        " > /tmp/w.tgz"
     )
 
 
