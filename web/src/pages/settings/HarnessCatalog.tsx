@@ -10,11 +10,16 @@ import { cn } from "@/lib/utils";
 import { mcpServerDisplayName } from "@/lib/mcpServerName";
 import { Button } from "@/components/ui/button";
 import {
+  type HarnessPluginEntry,
+  type HarnessSkillEntry,
   INVENTORY_COUNT_SEPARATOR,
   INVENTORY_KIND_LABELS,
-  type InventoryHarnessDetailEntry,
+  type InventoryPageEntries,
+  SKILL_PAGE_FAMILIES,
 } from "./search/catalog/harnesses";
 import { settingsControlProps } from "./search/settingsControl";
+import { SettingsItem } from "./search/SettingsItem";
+import { SettingsContent, SettingsDataRegion } from "./search/settingsOwnership";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import type { Host } from "@/hooks/useHosts";
 import {
@@ -34,7 +39,9 @@ import { Spinner } from "../../components/ui/spinner";
 type CatalogKind = "mcps" | "skills" | "plugins";
 
 // The server probes MCP tools and reads skill contents for these families only.
-const DETAILED_HARNESSES: ReadonlySet<InventoryHarness> = new Set(["claude", "codex", "cursor"]);
+const DETAILED_HARNESSES: ReadonlySet<InventoryHarness> = new Set<InventoryHarness>(
+  SKILL_PAGE_FAMILIES,
+);
 
 const KINDS: { id: CatalogKind; label: string; noun: string }[] = [
   { id: "mcps", label: INVENTORY_KIND_LABELS.mcps, noun: "MCP servers" },
@@ -87,14 +94,14 @@ export function HarnessCatalog({
   settings,
   host,
   family,
-  detail,
+  entries,
   defaultTab = "mcps",
 }: {
   header: ReactNode;
   settings: ReactNode;
   host: Host;
   family: InventoryHarness;
-  detail: InventoryHarnessDetailEntry;
+  entries: InventoryPageEntries;
   defaultTab?: CatalogKind | "settings";
 }) {
   // `?tab=settings` (the grid card's gear) opens on Settings; otherwise MCP servers.
@@ -158,10 +165,11 @@ export function HarnessCatalog({
       ? unavailable.includes("skills") && unavailable.includes("mcps")
       : unavailable.includes(kind);
 
-  if (selectedSkill !== null)
+  if (selectedSkill !== null && entries.skill)
     return (
       <SkillPage
         host={host}
+        entry={entries.skill}
         harness={INVENTORY_HARNESS_IDS[family]}
         name={selectedSkill.name}
         sourceId={selectedSkill.sourceId}
@@ -177,6 +185,7 @@ export function HarnessCatalog({
     return (
       <PluginPage
         host={host}
+        entry={entries.plugin}
         plugin={open}
         mcps={pluginMcps(open)}
         onBack={back}
@@ -218,7 +227,7 @@ export function HarnessCatalog({
         <TabsList
           variant="line"
           className="w-full justify-start border-b border-border px-0"
-          {...settingsControlProps(detail, "tab")}
+          {...settingsControlProps(entries.detail, "tab")}
         >
           {KINDS.map((k) => (
             <TabsTrigger
@@ -242,41 +251,45 @@ export function HarnessCatalog({
           {ownList(
             "skills",
             own.skills.length,
-            <ul className="flex flex-col gap-2">
-              {own.skills.map((skill) => (
-                <CatalogRow
-                  key={skill.id}
-                  icon={<SparkleIcon className="size-4 text-muted-foreground" />}
-                  name={skill.name}
-                  detail={skill.description}
-                  onOpen={
-                    contentSupported ? () => setSelectedSkill({ name: skill.name }) : undefined
-                  }
-                />
-              ))}
-            </ul>,
+            <SettingsDataRegion entry={entries.detail} region="skills">
+              <ul className="flex flex-col gap-2">
+                {own.skills.map((skill) => (
+                  <CatalogRow
+                    key={skill.id}
+                    icon={<SparkleIcon className="size-4 text-muted-foreground" />}
+                    name={skill.name}
+                    detail={skill.description}
+                    onOpen={
+                      contentSupported ? () => setSelectedSkill({ name: skill.name }) : undefined
+                    }
+                  />
+                ))}
+              </ul>
+            </SettingsDataRegion>,
           )}
         </TabsContent>
         <TabsContent value="plugins">
           {ownList(
             "plugins",
             own.plugins.length,
-            <ul className="flex flex-col gap-2">
-              {own.plugins.map((plugin) => {
-                const mcps = pluginMcps(plugin);
-                return (
-                  <CatalogRow
-                    key={plugin.id}
-                    icon={<PlugIcon className="size-4 text-muted-foreground" />}
-                    name={plugin.name}
-                    detail={[pluginDetail(plugin, mcps.length), plugin.description]
-                      .filter(Boolean)
-                      .join(" · ")}
-                    onOpen={() => setOpen(plugin)}
-                  />
-                );
-              })}
-            </ul>,
+            <SettingsDataRegion entry={entries.detail} region="plugins">
+              <ul className="flex flex-col gap-2">
+                {own.plugins.map((plugin) => {
+                  const mcps = pluginMcps(plugin);
+                  return (
+                    <CatalogRow
+                      key={plugin.id}
+                      icon={<PlugIcon className="size-4 text-muted-foreground" />}
+                      name={plugin.name}
+                      detail={[pluginDetail(plugin, mcps.length), plugin.description]
+                        .filter(Boolean)
+                        .join(" · ")}
+                      onOpen={() => setOpen(plugin)}
+                    />
+                  );
+                })}
+              </ul>
+            </SettingsDataRegion>,
           )}
         </TabsContent>
       </Tabs>
@@ -325,6 +338,7 @@ function CatalogRow({
   );
   return (
     <li
+      data-settings-region-row={onOpen ? true : undefined}
       className={cn(
         "flex items-center rounded-xl border border-border transition-colors",
         onOpen && "hover:bg-muted/50",
@@ -376,12 +390,14 @@ function pluginDetail(plugin: InventoryPlugin, mcpCount: number) {
 
 function PluginPage({
   host,
+  entry,
   plugin,
   mcps,
   onBack,
   onSkillOpen,
 }: {
   host: Host;
+  entry: HarnessPluginEntry;
   plugin: InventoryPlugin;
   mcps: InventoryMcpServer[];
   onBack: () => void;
@@ -390,7 +406,7 @@ function PluginPage({
   const needsUpdate = plugin.marketplace !== undefined && !plugin.skill_entries;
   const skills = plugin.skill_entries ?? plugin.skills.map((name) => ({ name, id: undefined }));
   return (
-    <>
+    <SettingsItem entry={entry}>
       <BackButton label="Plugins" onClick={onBack} />
       <div className="flex min-w-0 items-center gap-3">
         <span className="flex size-10 shrink-0 items-center justify-center rounded-lg border border-border">
@@ -405,7 +421,11 @@ function PluginPage({
         <p className="mt-4 text-sm text-muted-foreground">{plugin.description}</p>
       )}
       <Tabs defaultValue="skills" className="mt-6 gap-4">
-        <TabsList variant="line" className="w-full justify-start border-b border-border pb-1">
+        <TabsList
+          variant="line"
+          className="w-full justify-start border-b border-border pb-1"
+          {...settingsControlProps(entry, "tab")}
+        >
           <TabsTrigger value="skills" className="flex-none">
             Skills · {plugin.skills.length}
           </TabsTrigger>
@@ -415,21 +435,23 @@ function PluginPage({
         </TabsList>
         <TabsContent value="skills">
           {needsUpdate && <Notice>Update {host.name} to read installed plugin skills.</Notice>}
-          <ul className="flex flex-col gap-2">
-            {plugin.skills.length === 0 && <Notice>No skills found.</Notice>}
-            {skills.map(({ name, id }) => (
-              <CatalogRow
-                key={id ?? name}
-                icon={<SparkleIcon className="size-4 text-muted-foreground" />}
-                name={name}
-                onOpen={
-                  onSkillOpen && !needsUpdate
-                    ? () => onSkillOpen(`${plugin.name}:${name}`, id)
-                    : undefined
-                }
-              />
-            ))}
-          </ul>
+          <SettingsDataRegion entry={entry} region="skills">
+            <ul className="flex flex-col gap-2">
+              {plugin.skills.length === 0 && <Notice>No skills found.</Notice>}
+              {skills.map(({ name, id }) => (
+                <CatalogRow
+                  key={id ?? name}
+                  icon={<SparkleIcon className="size-4 text-muted-foreground" />}
+                  name={name}
+                  onOpen={
+                    onSkillOpen && !needsUpdate
+                      ? () => onSkillOpen(`${plugin.name}:${name}`, id)
+                      : undefined
+                  }
+                />
+              ))}
+            </ul>
+          </SettingsDataRegion>
         </TabsContent>
         <TabsContent value="mcps">
           <McpList
@@ -445,12 +467,13 @@ function PluginPage({
           />
         </TabsContent>
       </Tabs>
-    </>
+    </SettingsItem>
   );
 }
 
 function SkillPage({
   host,
+  entry,
   harness,
   name,
   sourceId,
@@ -459,6 +482,7 @@ function SkillPage({
   onUnavailable,
 }: {
   host: Host;
+  entry: HarnessSkillEntry;
   harness: string;
   name: string;
   sourceId?: string;
@@ -472,7 +496,7 @@ function SkillPage({
     if (missingRoute) onUnavailable();
   }, [missingRoute, onUnavailable]);
   return (
-    <>
+    <SettingsItem entry={entry}>
       <BackButton label={backLabel} onClick={onBack} />
       <h1 className="settings-page-title truncate text-2xl font-medium">{name}</h1>
       {query.isPending ? (
@@ -490,18 +514,20 @@ function SkillPage({
           )}
           <h2 className="mt-6 text-ui font-medium">Contents</h2>
           {query.data.truncated && <Notice>Contents truncated (256 KiB limit).</Notice>}
-          <div className="prose prose-sm mt-2 max-w-none overflow-x-auto rounded-xl border border-border p-5 dark:prose-invert">
-            <ReactMarkdown
-              remarkPlugins={[remarkGfm]}
-              skipHtml
-              components={SKILL_MARKDOWN_COMPONENTS}
-            >
-              {query.data.content}
-            </ReactMarkdown>
-          </div>
+          <SettingsContent entry={entry} area="skill">
+            <div className="prose prose-sm mt-2 max-w-none overflow-x-auto rounded-xl border border-border p-5 dark:prose-invert">
+              <ReactMarkdown
+                remarkPlugins={[remarkGfm]}
+                skipHtml
+                components={SKILL_MARKDOWN_COMPONENTS}
+              >
+                {query.data.content}
+              </ReactMarkdown>
+            </div>
+          </SettingsContent>
         </>
       ) : null}
-    </>
+    </SettingsItem>
   );
 }
 
