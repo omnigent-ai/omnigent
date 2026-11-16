@@ -64,6 +64,8 @@ DATABASE_PREFIXES = (
     "tests/stores/",
     "tests/db/",
     "deploy/cockroachdb/",
+    # Native drivers install through this action. SQLite does not.
+    ".github/actions/setup-uv/",
 )
 DATABASE_FILES = {
     "omnigent/server/accounts_store.py",
@@ -72,6 +74,7 @@ DATABASE_FILES = {
     "omnigent/util/uuid.py",
     "omnigent/entities/comment.py",
     "tests/conftest.py",
+    ".python-version",
     "uv.lock",
     "pyproject.toml",
     ".github/workflows/ci.yml",
