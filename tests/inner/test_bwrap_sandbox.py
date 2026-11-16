@@ -48,6 +48,7 @@ from omnigent.inner.bwrap_sandbox import (
     BwrapSandboxBackend,
     _bwrap_extra_seccomp_rules,
     _detect_host_sandbox_backend,
+    _gpu_device_binds,
     _should_bind_host_proc,
 )
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
@@ -1160,6 +1161,26 @@ def test_wrap_launcher_argv_binds_proc_on_lakebox(
     )
     assert _has_pair_single_dest(argv, "--dev", "/dev")
     assert "--tmpfs" in argv
+
+
+def test_gpu_device_binds_exposes_nvidia_nodes_and_driver_sysfs(tmp_path: Path) -> None:
+    """Each ``nvidia*`` node is dev-bound back and the driver sysfs is read-only."""
+    for name in ("nvidia0", "nvidiactl", "nvidia-uvm", "null"):
+        (tmp_path / name).touch()
+    (tmp_path / "nvidia-caps").mkdir()
+    argv = _gpu_device_binds(tmp_path)
+    for name in ("nvidia0", "nvidiactl", "nvidia-uvm", "nvidia-caps"):
+        node = str(tmp_path / name)
+        assert _has_pair(argv, "--dev-bind-try", node, node)
+    assert str(tmp_path / "null") not in argv
+    assert _has_pair(argv, "--ro-bind-try", "/sys/module/nvidia", "/sys/module/nvidia")
+    assert _has_pair(argv, "--ro-bind-try", "/sys/module/nvidia_uvm", "/sys/module/nvidia_uvm")
+
+
+def test_gpu_device_binds_empty_without_nvidia_nodes(tmp_path: Path) -> None:
+    """A host with no NVIDIA nodes gets no device or sysfs mounts."""
+    (tmp_path / "null").touch()
+    assert _gpu_device_binds(tmp_path) == []
 
 
 # ---------------------------------------------------------------------------
