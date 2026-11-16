@@ -185,14 +185,30 @@ describe("copying a selection from an agent reply", () => {
     );
   });
 
-  it("stops linking at a link whose text the plain copy lacks", async () => {
+  it("places links by position when the browser renders line breaks", async () => {
+    const section = await renderReply(
+      "[one<br>two](https://example.com/one) then [onetwo](https://example.com/two)",
+    );
+    select(section, "one", "onetwo");
+    // The browser copies <br> as a newline, which Range text leaves out.
+    vi.spyOn(Selection.prototype, "toString").mockReturnValue("one\ntwo then onetwo");
+
+    expect(copy(section).flavors["text/plain"]).toBe(
+      "[one\ntwo](<https://example.com/one>) then [onetwo](<https://example.com/two>)",
+    );
+  });
+
+  it("keeps the plain text as copied when it differs from the reply's text", async () => {
     const section = await renderReply(
       "Use [alpha](https://example.com/a) then [beta](https://example.com/b).",
     );
     select(section, "Use", "beta");
-    vi.spyOn(Selection.prototype, "toString").mockReturnValue("Use ALPHA then beta");
+    vi.spyOn(Selection.prototype, "toString").mockReturnValue("Use alpha, then beta");
 
-    expect(copy(section).flavors["text/plain"]).toBe("Use ALPHA then beta");
+    const { flavors } = copy(section);
+
+    expect(flavors["text/plain"]).toBe("Use alpha, then beta");
+    expect(flavors["text/html"]).toContain('<a href="https://example.com/b">beta</a>');
   });
 
   it("ignores a link the selection only touches at its edge", async () => {

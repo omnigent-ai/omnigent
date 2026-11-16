@@ -122,19 +122,6 @@ function appendCleaned(source: Node, target: Node): void {
   }
 }
 
-/** The part of `link` that `range` covers. */
-function selectedPart(range: Range, link: Element): Range {
-  const part = document.createRange();
-  part.selectNodeContents(link);
-  if (range.compareBoundaryPoints(Range.START_TO_START, part) > 0) {
-    part.setStart(range.startContainer, range.startOffset);
-  }
-  if (range.compareBoundaryPoints(Range.END_TO_END, part) < 0) {
-    part.setEnd(range.endContainer, range.endOffset);
-  }
-  return part;
-}
-
 /** Whether `content` has top-level children that only make sense inside `tag`. */
 function needsContainer(content: Node, tag: string): boolean {
   return Array.from(content.childNodes).some((child) => {
@@ -181,63 +168,65 @@ function wrapperFor(ancestor: Element, range: Range): Element {
   return wrapper;
 }
 
-// Elements whose text the browser's plain-text copy separates with a line break.
-const BLOCK_TAGS = new Set(["div", "p", "pre", "blockquote", "ul", "ol", "li", "table", "tr"]);
-for (const tag of ["td", "th", "h1", "h2", "h3", "h4", "h5", "h6"]) BLOCK_TAGS.add(tag);
-
 const UNCOPIED_TEXT_TAGS = new Set(["script", "style", "template"]);
 
-/** Whether the browser leaves `node`'s text out of a plain-text copy. */
-function isUncopiedText(node: Node, root: Element): boolean {
-  for (let element = node.parentElement; element; element = element.parentElement) {
-    if (UNCOPIED_TEXT_TAGS.has(element.localName)) return true;
+/** Whether the browser leaves text inside `element` out of a plain-text copy. */
+function hidesText(element: Element | null, root: Element, cache: Map<Element, boolean>): boolean {
+  if (!element) return false;
+  let hidden = cache.get(element);
+  if (hidden === undefined) {
     const style = window.getComputedStyle(element);
-    if (style.display === "none" || style.userSelect === "none") return true;
-    if (element === root) return false;
+    hidden =
+      UNCOPIED_TEXT_TAGS.has(element.localName) ||
+      style.display === "none" ||
+      style.userSelect === "none" ||
+      (element !== root && hidesText(element.parentElement, root, cache));
+    cache.set(element, hidden);
   }
-  return false;
+  return hidden;
 }
 
-function blockOf(node: Node, root: Element): Element {
-  let element = node.parentElement;
-  while (element && element !== root && !BLOCK_TAGS.has(element.localName)) {
-    element = element.parentElement;
-  }
-  return element ?? root;
+interface SelectedText {
+  text: string;
+  /** Where each copied text node's selected part sits in `text`. */
+  spans: Map<Text, { start: number; end: number }>;
 }
 
 /**
- * The text of `range` as the browser's plain-text copy shows it, near enough
- * to count words: unselectable text is skipped and blocks end with a line break.
+ * The selected text that the browser's plain-text copy includes, minus the
+ * line breaks it adds between blocks; alignment ignores whitespace.
  */
-function visibleText(range: Range, root: Element): string {
+function selectedText(range: Range, root: Element): SelectedText {
   const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  const hiddenCache = new Map<Element, boolean>();
+  const spans = new Map<Text, { start: number; end: number }>();
   let text = "";
-  let previousBlock: Element | null = null;
-  for (let node = walker.nextNode(); node; node = walker.nextNode()) {
-    if (!range.intersectsNode(node) || isUncopiedText(node, root)) continue;
-    const data = (node as Text).data;
+  for (let node = walker.nextNode() as Text | null; node; node = walker.nextNode() as Text | null) {
+    if (!range.intersectsNode(node) || hidesText(node.parentElement, root, hiddenCache)) continue;
     const from = node === range.startContainer ? range.startOffset : 0;
-    const to = node === range.endContainer ? range.endOffset : data.length;
-    const block = blockOf(node, root);
-    if (previousBlock && block !== previousBlock) text += "\n";
-    previousBlock = block;
-    text += data.slice(from, to);
+    const to = node === range.endContainer ? range.endOffset : node.data.length;
+    spans.set(node, { start: text.length, end: text.length + to - from });
+    text += node.data.slice(from, to);
   }
-  return text;
+  return { text, spans };
 }
 
-function escapeRegExp(text: string): string {
-  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
+const isSpace = (character: string) => /\s/.test(character);
 
-/** A pattern for `label` that tolerates the browser's whitespace rendering. */
-function labelPattern(label: string): string {
-  return escapeRegExp(label.trim()).replace(/\s+/g, "\\s+");
-}
-
-function countMatches(text: string, pattern: string): number {
-  return text.match(new RegExp(pattern, "g"))?.length ?? 0;
+/**
+ * Maps each non-space character of `rendered` to its index in `plain`, or
+ * returns null when the two differ in anything but whitespace and case.
+ */
+function alignText(rendered: string, plain: string): number[] | null {
+  const positions: number[] = new Array<number>(rendered.length).fill(-1);
+  let cursor = 0;
+  for (let index = 0; index < rendered.length; index++) {
+    if (isSpace(rendered[index]!)) continue;
+    while (cursor < plain.length && isSpace(plain[cursor]!)) cursor++;
+    if (plain[cursor]?.toLowerCase() !== rendered[index]!.toLowerCase()) return null;
+    positions[index] = cursor++;
+  }
+  return plain.slice(cursor).trim() ? null : positions;
 }
 
 /** Whether `label` is the URL itself, allowing for the renderer's href normalization. */
@@ -259,30 +248,30 @@ function markdownLink(label: string, href: string): string {
 }
 
 interface SelectedLink {
-  label: string;
   href: string;
-  /** Times the label's text occurs between the previous link and this one. */
-  earlierMatches: number;
+  /** The link's selected text, as a span of the rendered selection text. */
+  start: number;
+  end: number;
 }
 
 /**
- * Rewrites each selected link's visible text in `plainText` as a markdown link.
- * Links are matched in document order, skipping plain occurrences of the same
- * words. Stops at a link it cannot find, since later counts assume it was found.
+ * Rewrites each selected link's text in `plainText` as a markdown link, using
+ * the link's position in `rendered`. Leaves `plainText` as copied when the two
+ * texts cannot be aligned, rather than guess which words a link covers.
  */
-function linkifyPlainText(plainText: string, links: SelectedLink[]): string {
+function linkifyPlainText(plainText: string, rendered: string, links: SelectedLink[]): string {
+  const positions = alignText(rendered, plainText);
+  if (!positions) return plainText;
   let output = "";
   let cursor = 0;
-  for (const { label, href, earlierMatches } of links) {
-    const matcher = new RegExp(labelPattern(label), "g");
-    matcher.lastIndex = cursor;
-    let match = matcher.exec(plainText);
-    for (let skipped = 0; match && skipped < earlierMatches; skipped++) {
-      match = matcher.exec(plainText);
-    }
-    if (!match) break;
-    output += plainText.slice(cursor, match.index) + markdownLink(match[0], href);
-    cursor = match.index + match[0].length;
+  for (const { href, start, end } of links) {
+    const mapped = positions.slice(start, end).filter((position) => position >= 0);
+    if (!mapped.length || mapped[0]! < cursor) continue;
+    const labelStart = mapped[0]!;
+    const labelEnd = mapped[mapped.length - 1]! + 1;
+    output += plainText.slice(cursor, labelStart);
+    output += markdownLink(plainText.slice(labelStart, labelEnd), href);
+    cursor = labelEnd;
   }
   return output + plainText.slice(cursor);
 }
@@ -298,20 +287,23 @@ export function selectionToLinkedPayload(
   root: Element,
   plainText: string,
 ): RichTextPayload | null {
+  const rendered = selectedText(range, root);
   const links: SelectedLink[] = [];
-  const gap = document.createRange();
-  gap.setStart(range.startContainer, range.startOffset);
   for (const link of Array.from(root.querySelectorAll("a[href]"))) {
     const href = pasteableHref(link);
     if (!href || !range.intersectsNode(link)) continue;
-    const part = selectedPart(range, link);
-    const label = part.toString();
+    let start = Infinity;
+    let end = -Infinity;
+    const walker = document.createTreeWalker(link, NodeFilter.SHOW_TEXT);
+    for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+      const span = rendered.spans.get(node as Text);
+      if (!span) continue;
+      start = Math.min(start, span.start);
+      end = Math.max(end, span.end);
+    }
     // A selection edge can touch a link without selecting any of its text.
-    if (!label.trim()) continue;
-    gap.setEnd(part.startContainer, part.startOffset);
-    const earlierMatches = countMatches(visibleText(gap, root), labelPattern(label));
-    links.push({ label, href, earlierMatches });
-    gap.setStart(part.endContainer, part.endOffset);
+    if (end < start || !rendered.text.slice(start, end).trim()) continue;
+    links.push({ href, start, end });
   }
   if (!links.length) return null;
 
@@ -337,7 +329,10 @@ export function selectionToLinkedPayload(
 
   const container = document.createElement("div");
   appendCleaned(content, container);
-  return { html: container.innerHTML.trim(), text: linkifyPlainText(plainText, links) };
+  return {
+    html: container.innerHTML.trim(),
+    text: linkifyPlainText(plainText, rendered.text, links),
+  };
 }
 
 /**
