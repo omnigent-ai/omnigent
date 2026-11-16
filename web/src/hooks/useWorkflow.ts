@@ -51,14 +51,39 @@ export function useWorkflow(workflowId: string) {
   });
 }
 
-async function writeWorkflow(path: string, method: string, body: object): Promise<WorkflowDetail> {
-  const res = await authenticatedFetch(path, {
+function sendWorkflow(path: string, method: string, body: object): Promise<Response> {
+  return authenticatedFetch(path, {
     method,
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
+}
+
+async function savedWorkflow(res: Response): Promise<WorkflowDetail> {
   if (!res.ok) throw await apiErrorFromResponse(res);
   return res.json() as Promise<WorkflowDetail>;
+}
+
+async function writeWorkflow(path: string, method: string, body: object): Promise<WorkflowDetail> {
+  return savedWorkflow(await sendWorkflow(path, method, body));
+}
+
+/** Whether a server from before `expected_description` refused it as an unknown field. */
+async function refusesExpectedDescription(res: Response): Promise<boolean> {
+  if (res.status !== 422) return false;
+  const body = (await res
+    .clone()
+    .json()
+    .catch(() => null)) as { detail?: unknown } | null;
+  return (
+    Array.isArray(body?.detail) &&
+    body.detail.some(
+      (issue: { type?: unknown; loc?: unknown }) =>
+        issue?.type === "extra_forbidden" &&
+        Array.isArray(issue.loc) &&
+        issue.loc.at(-1) === "expected_description",
+    )
+  );
 }
 
 function useWorkflowSaved() {
@@ -113,16 +138,23 @@ export function useCloneWorkflow() {
 
 /**
  * Apply the reviewed proposal, its steps and any new description, to the existing workflow.
- * The server keeps a description that is no longer `expected_description`.
+ * The server keeps a description that is no longer `expected_description`; a server too old
+ * to check that gets the steps alone, so its description stays.
  */
 export function useSaveWorkflowPlan(workflowId: string) {
   const onSuccess = useWorkflowSaved();
   return useMutation({
-    mutationFn: (proposal: {
+    mutationFn: async (proposal: {
       steps: WorkflowStep[];
       description?: string;
       expected_description?: string;
-    }) => writeWorkflow(workflowPath(workflowId), "PATCH", proposal),
+    }) => {
+      const path = workflowPath(workflowId);
+      const res = await sendWorkflow(path, "PATCH", proposal);
+      if (proposal.expected_description !== undefined && (await refusesExpectedDescription(res)))
+        return writeWorkflow(path, "PATCH", { steps: proposal.steps });
+      return savedWorkflow(res);
+    },
     onSuccess,
   });
 }

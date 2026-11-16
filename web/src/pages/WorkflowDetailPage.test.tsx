@@ -551,6 +551,68 @@ describe("WorkflowDetailPage", () => {
     expect(description()).toBe("Edited by hand");
   });
 
+  it("saves only the steps when an older server refuses the description check", async () => {
+    const actual = await vi.importActual<typeof WorkflowHooks>("@/hooks/useWorkflow");
+    vi.mocked(useWorkflow).mockImplementation(actual.useWorkflow);
+    mockRuns([]);
+    let stored: WorkflowDetail = {
+      ...WORKFLOW,
+      steps: [],
+      is_draft: true,
+      planning_session_id: "a".repeat(32),
+      updated_at: 100,
+    };
+    const patches: unknown[] = [];
+    vi.mocked(authenticatedFetch).mockImplementation(async (_path, options) => {
+      if (options?.method === "PATCH") {
+        const body = JSON.parse(String(options.body));
+        patches.push(body);
+        // How a server from before expected_description refuses the unknown field.
+        if ("expected_description" in body) {
+          const detail = [{ type: "extra_forbidden", loc: ["body", "expected_description"] }];
+          return new Response(JSON.stringify({ detail }), { status: 422 });
+        }
+        stored = { ...stored, steps: body.steps, is_draft: false, updated_at: 200 };
+      }
+      return new Response(JSON.stringify(stored));
+    });
+    const proposal: JournalEntry = {
+      id: "proposal",
+      position: 1,
+      created_at: 150,
+      scheduled_task_run_id: null,
+      step: null,
+      author: { type: "agent" },
+      kind: "plan",
+      content: { steps: WORKFLOW.steps, description: "Fixes one flaky test." },
+    };
+    vi.mocked(useSessionJournal).mockReturnValue({
+      entries: [proposal],
+      isLoading: false,
+      error: null,
+      hasOlder: false,
+      loadingOlder: false,
+      loadOlder: vi.fn(),
+      retry: vi.fn(),
+    });
+    renderPage();
+
+    await screen.findByTestId("workflow-detail-title");
+    fireEvent.click(screen.getByRole("button", { name: "Save plan" }));
+    await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent("Saved plan"));
+    expect(patches).toEqual([
+      {
+        steps: WORKFLOW.steps,
+        description: "Fixes one flaky test.",
+        expected_description: WORKFLOW.description,
+      },
+      { steps: WORKFLOW.steps },
+    ]);
+    expect(screen.getByTestId("workflow-detail-description").textContent).toBe(
+      WORKFLOW.description,
+    );
+  });
+
   it("shows the workflow, its steps, and the sessions that ran it", () => {
     mockWorkflow({});
     mockRuns([

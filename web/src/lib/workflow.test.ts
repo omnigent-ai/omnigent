@@ -167,6 +167,8 @@ describe("editWorkflowPlanPrompt", () => {
     expect(prompt).toContain("Read the saved plan and use it as the starting point");
     expect(prompt).toContain("wait for my answer before proposing or publishing changes");
     expect(prompt).toContain("Preserve steps I haven't asked to change");
+    expect(prompt).toContain("Set description on every plan you publish");
+    expect(prompt).toContain("Save plan stores it as the workflow description");
     expect(prompt).not.toContain("Draft a useful first proposal now");
   });
 
@@ -176,12 +178,6 @@ describe("editWorkflowPlanPrompt", () => {
     expect(prompt).toContain(`Workflow description: ${workflow.description}`);
     expect(prompt).toContain("Draft a useful first proposal now");
     expect(prompt).toContain("I will use Save plan on the workflow page to apply the proposal");
-  });
-
-  it("asks for a description on every proposal, which Save plan stores", () => {
-    const prompt = editWorkflowPlanPrompt(workflow);
-    expect(prompt).toContain("Set description on every plan you publish");
-    expect(prompt).toContain("Save plan stores it as the workflow description");
   });
 });
 
