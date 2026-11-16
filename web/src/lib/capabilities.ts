@@ -71,7 +71,9 @@ export type FeatureKey =
   | "session_orchestration"
   | "workflows"
   | "session_overview"
-  | "project_repository_creation";
+  | "project_repository_creation"
+  | "workspace_direct_access"
+  | "workspace_api_server_access";
 
 /** Deployment-wide release-feature values advertised by the server. */
 export type FeatureValues = Record<string, boolean>;
@@ -351,6 +353,11 @@ export interface ServerInfo {
   scheduled_task_projects?: boolean;
   /** Latest sessionless automation failures can be listed for Inbox. */
   scheduled_task_inbox?: boolean;
+  /**
+   * Owners can share automations (``/v1/scheduled-tasks/{id}/permissions``);
+   * absent on older servers (off).
+   */
+  scheduled_task_sharing?: boolean;
   /** Scheduled permissions support native harnesses beyond Claude Code. */
   scheduled_task_harness_settings?: boolean;
   /** Automations accept modes that skip approval; older servers may reject them. */
@@ -707,6 +714,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           filesystem_attachments: parseFilesystemAttachments(data.filesystem_attachments),
           scheduled_task_projects: data.scheduled_task_projects === true,
           scheduled_task_inbox: data.scheduled_task_inbox === true,
+          scheduled_task_sharing: data.scheduled_task_sharing === true,
           scheduled_task_harness_settings: data.scheduled_task_harness_settings === true,
           scheduled_task_approval_skipping_modes:
             data.scheduled_task_approval_skipping_modes === true,
@@ -748,6 +756,14 @@ export function getCachedServerInfo(): ServerInfo | null {
  */
 export function isSingleUserMode(info: ServerInfo | "loading"): boolean {
   return info !== "loading" && info.single_user;
+}
+
+/** Why Share controls are disabled while the server turns sharing off. */
+export const SHARING_OFF_REASON = "Sharing has been disabled for this Omnigent server.";
+
+/** Whether the server turns sharing off; `false` while the probe loads (fail open). */
+export function isSharingOff(info: ServerInfo | "loading"): boolean {
+  return info !== "loading" && info.sharing_mode === "off";
 }
 
 /**
