@@ -15,7 +15,7 @@ import { type SavedWorkflow, useDeleteWorkflow } from "@/hooks/useSavedWorkflows
 import { SCHEDULED_TASKS_KEY } from "@/hooks/useScheduledTasks";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { listScheduledTasks } from "@/lib/scheduledTasksApi";
-import { parseSavedWorkflowMessage } from "@/lib/workflow";
+import { automationsUsingWorkflow } from "@/lib/workflow";
 
 export function DeleteWorkflowDialog({
   workflow,
@@ -37,9 +37,7 @@ export function DeleteWorkflowDialog({
     refetchOnMount: "always",
     retry: false,
   });
-  const linkedAutomations = (automations.data ?? []).filter(
-    (task) => parseSavedWorkflowMessage(task.prompt)?.id === workflow.id,
-  );
+  const linkedAutomations = automationsUsingWorkflow(automations.data ?? [], workflow.id);
   const checking =
     info === "loading" || (automationsEnabled && (automations.isPending || automations.isFetching));
   const checkFailed = automationsEnabled && automations.isError;

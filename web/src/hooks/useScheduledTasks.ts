@@ -57,10 +57,11 @@ export function useScheduledTasks() {
     staleTime: 30_000,
     // POLLING CONTRACT — read before reusing this hook.
     // The 60s interval only runs while a component that mounts this hook is
-    // mounted; TanStack Query tears the interval down on unmount. Today the sole
-    // consumer is TasksPage, which is route-scoped and lazy-loaded at /tasks — so
-    // polling happens ONLY while the user is on the Scheduled Tasks page and
-    // stops the moment they navigate away.
+    // mounted; TanStack Query tears the interval down on unmount. Today the
+    // consumers are TasksPage (/tasks) and a saved workflow's page
+    // (/workflows/:id), both route-scoped and lazy-loaded — so polling happens
+    // ONLY while the user is on one of those pages and stops the moment they
+    // navigate away.
     // GUARD RAIL: do NOT mount this hook in a persistent / always-rendered spot
     // (sidebar, global layout, an app-shell badge). That would silently turn a
     // page-scoped poll into app-wide 60s background traffic. If you need a
