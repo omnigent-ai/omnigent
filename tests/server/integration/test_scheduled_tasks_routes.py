@@ -103,6 +103,7 @@ def _build_app(
     automations_feature: bool = True,
     session_mcp_selection: object | None = None,
     workflows: bool = False,
+    session_orchestration: bool = True,
 ) -> FastAPI:
     from omnigent.server.auth import UnifiedAuthProvider
     from omnigent.stores.host_store import HostStore
@@ -130,6 +131,7 @@ def _build_app(
                     + ("" if automations_feature else ",-automations")
                     + (",one_time_automations" if one_time else "")
                     + (",workflows" if workflows else "")
+                    + ("" if session_orchestration else ",-session_orchestration")
                 )
             }
         ),
@@ -1722,6 +1724,12 @@ async def test_slack_trigger_saves_the_prompt_and_schedule_it_compiles_to(
     assert patched.json()["trigger_config"]["channels"] == ["bugs"]
     assert "Watch: new Slack messages in #bugs\n" in patched.json()["prompt"]
     assert 'reasoning_effort "high"' in patched.json()["prompt"]
+    # A settings-only update compiles it again too.
+    patched = await auth_client.patch(
+        url, json={"permission_mode": "acceptEdits"}, headers=_headers()
+    )
+    assert patched.status_code == 200, patched.text
+    assert 'permission_mode "acceptEdits"' in patched.json()["prompt"]
     # Resending what the server compiled is no change; changing it is refused.
     unchanged = {"prompt": patched.json()["prompt"], "rrule": patched.json()["rrule"]}
     resent = await auth_client.patch(url, json=unchanged, headers=_headers())
@@ -1737,23 +1745,21 @@ async def test_slack_trigger_saves_the_prompt_and_schedule_it_compiles_to(
     assert removed.status_code == 422, removed.text
 
 
-@pytest.mark.parametrize(
-    "body",
-    [
-        _trigger_body(rrule=_VALID_RRULE),
-        _trigger_body(prompt="triage the queue"),
-        _trigger_body(session_mode="continue"),
-        {**_trigger_body(), "trigger_config": {**_SLACK_TRIGGER, "channels": ["a b"]}},
-        {key: value for key, value in _create_body().items() if key != "prompt"},
-    ],
-    ids=["rrule", "prompt", "session-mode", "bad-channel", "no-prompt-or-trigger"],
-)
-async def test_create_takes_either_a_trigger_or_a_prompt_and_rrule(
-    auth_client: httpx.AsyncClient, db_uri: str, body: dict[str, object]
+async def test_slack_trigger_needs_session_orchestration(
+    runtime_init: None, db_uri: str, tmp_path: Path, mock_llm: ControllableMockClient
 ) -> None:
+    """The trigger's session starts a session for each match."""
+    app = _build_app(db_uri, tmp_path, session_orchestration=False)
     _make_user(db_uri)
-    response = await auth_client.post("/v1/scheduled-tasks", json=body, headers=_headers())
-    assert response.status_code == 422, response.text
+    _register_host(app, "4b653f6031f35d168cc0b37caa1306d1", "alice@example.com")
+    async with _serve(app, mock_llm, tmp_path) as client:
+        response = await client.post(
+            "/v1/scheduled-tasks", json=_trigger_body(), headers=_headers()
+        )
+        info = (await client.get("/v1/info", headers=_headers())).json()
+    assert response.status_code == 400, response.text
+    assert "needs session orchestration" in response.text
+    assert info["scheduled_task_slack_triggers"] is False
 
 
 async def test_a_scheduled_task_cannot_become_a_trigger(

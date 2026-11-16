@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import builtins
-import json
 import logging
 import uuid
 from collections.abc import Callable
@@ -18,6 +17,7 @@ from sqlalchemy.sql.elements import ColumnElement
 from omnigent.db.account_authority import require_active_account
 from omnigent.db.db_models import (
     DEFAULT_WORKSPACE_ID,
+    MAX_STORED_VALUE_BYTES,
     SqlHost,
     SqlPreference,
     SqlScheduledTask,
@@ -38,6 +38,7 @@ from omnigent.db.enum_codecs import (
     encode_scheduled_task_session_mode,
     encode_scheduled_task_state,
 )
+from omnigent.db.envelope import seal
 from omnigent.db.keyset import keyset_after
 from omnigent.db.utils import (
     get_or_create_engine,
@@ -158,8 +159,17 @@ def _to_entity(row: SqlScheduledTask) -> ScheduledTask:
         next_run_at=row.next_run_at,
         project_id=row.project_id,
         delegation_ref=row.delegation_ref,
-        trigger_config=json.loads(row.trigger_config) if row.trigger_config else None,
+        trigger_config=row.trigger_config,
     )
+
+
+def _require_storable_trigger_config(trigger_config: dict[str, Any]) -> None:
+    """Refuse a config too large for its column with a client error, not a failed write."""
+    if len(seal(trigger_config)) > MAX_STORED_VALUE_BYTES:
+        raise OmnigentError(
+            "trigger_config is too large to store; use fewer or shorter values",
+            code=ErrorCode.INVALID_INPUT,
+        )
 
 
 # What a session is created with and keeps, so an edit to any of them makes a
@@ -289,6 +299,8 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             )
         ):
             raise ValueError("a reminder needs a one-time rule that continues a given session")
+        if trigger_config is not None:
+            _require_storable_trigger_config(trigger_config)
         created_at = now_epoch()
 
         def write(session: Session) -> ScheduledTask:
@@ -299,7 +311,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 name=name,
                 prompt=prompt,
                 rrule=rrule,
-                trigger_config=json.dumps(trigger_config) if trigger_config is not None else None,
+                trigger_config=trigger_config,
                 user_id=user_id,
                 agent_id=agent_id,
                 timezone=timezone,
@@ -460,6 +472,8 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         """
         updated_at = now_epoch()
         checks_owner = state is not None and state != "deleted"
+        if trigger_config is not None:
+            _require_storable_trigger_config(trigger_config)
 
         def write(session: Session) -> ScheduledTask | None:
             # Writers lock accounts before resource rows, so the owner read without a
@@ -486,21 +500,32 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 guard(_to_entity(row))
             if expected_schedule is not None:
                 current = _to_entity(row)
+                # The agent and MCP services are validated together, so an edit to
+                # either since the snapshot invalidates the other.
+                compared = (
+                    "rrule",
+                    "session_mode",
+                    "execution_target",
+                    "agent_id",
+                    "mcp_services",
+                )
+                if current.trigger_config is not None:
+                    # A trigger's prompt was compiled from these, so a caller that
+                    # compiled one from an older snapshot would overwrite a newer one.
+                    compared += (
+                        "trigger_config",
+                        "prompt",
+                        "model_override",
+                        "reasoning_effort",
+                        "permission_mode",
+                    )
                 if any(
                     getattr(current, field) != getattr(expected_schedule, field)
-                    # The agent and MCP services are validated together, so an
-                    # edit to either since the snapshot invalidates the other.
-                    for field in (
-                        "rrule",
-                        "session_mode",
-                        "execution_target",
-                        "agent_id",
-                        "mcp_services",
-                    )
+                    for field in compared
                 ):
                     raise OmnigentError(
-                        "The automation's schedule, execution, agent or MCP settings changed. "
-                        "Reload and try again.",
+                        "The automation's schedule, execution, agent, MCP or trigger settings "
+                        "changed. Reload and try again.",
                         code=ErrorCode.CONFLICT,
                     )
             if checks_owner and (
@@ -520,11 +545,9 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             if rrule is not None and row.rrule != rrule:
                 row.rrule = rrule
                 changed = True
-            if trigger_config is not None:
-                encoded_trigger = json.dumps(trigger_config)
-                if row.trigger_config != encoded_trigger:
-                    row.trigger_config = encoded_trigger
-                    changed = True
+            if trigger_config is not None and row.trigger_config != trigger_config:
+                row.trigger_config = trigger_config
+                changed = True
             if agent_id is not None and row.agent_id != agent_id:
                 row.agent_id = agent_id
                 changed = True
