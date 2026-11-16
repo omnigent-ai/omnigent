@@ -172,8 +172,8 @@ def agent_shared_target_guard(
 
     It checks the task as locked for the update. Granting locks that row too, so a
     grant either commits before the check and is seen, or waits until the new target
-    is saved. On Databricks, grants live in WHS and take no such lock, so there it
-    only narrows the race.
+    is saved. For a permission store outside this database, the guard narrows the race
+    but cannot serialize grants.
 
     :returns: The guard, or ``None`` when a person sent the update.
     """
