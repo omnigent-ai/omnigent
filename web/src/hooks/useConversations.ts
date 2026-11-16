@@ -1994,16 +1994,24 @@ function refuseOverlappingPinWrite(queryClient: QueryClient) {
   }
 }
 
+/** The fields of a cached session copy an overlay can check before writing. */
+export interface CachedLabelCopy {
+  labels?: Record<string, string>;
+  board_revision?: string | null;
+}
+
 /**
  * Set one label on every cached copy of a session row — list pages, project
  * folders, the pinned list, the open-session row and its snapshot — keeping
- * each copy's other labels. `value` undefined removes the label.
+ * each copy's other labels. `value` undefined removes the label. `isCurrent`,
+ * when given, skips copies it rejects (e.g. ones newer data already replaced).
  */
 export function overlayLabelIntoCaches(
   queryClient: QueryClient,
   id: string,
   key: string,
   value: string | undefined,
+  isCurrent: (copy: CachedLabelCopy) => boolean = () => true,
 ): void {
   const withLabel = (labels: Record<string, string> | undefined) => {
     const rest = Object.fromEntries(Object.entries(labels ?? {}).filter(([k]) => k !== key));
@@ -2014,7 +2022,7 @@ export function overlayLabelIntoCaches(
       queryKey: [root],
     })) {
       const row = data?.pages.flatMap((p) => p.data).find((c) => c.id === id);
-      if (!row) continue;
+      if (!row || !isCurrent(row)) continue;
       const { data: next } = mergeItemsIntoPages(
         data,
         new Map([[id, { id, labels: withLabel(row.labels) } satisfies SessionListWireItem]]),
@@ -2030,16 +2038,16 @@ export function overlayLabelIntoCaches(
       ? {
           ...old,
           conversations: old.conversations.map((c) =>
-            c.id === id ? { ...c, labels: withLabel(c.labels) } : c,
+            c.id === id && isCurrent(c) ? { ...c, labels: withLabel(c.labels) } : c,
           ),
         }
       : old,
   );
   queryClient.setQueryData<Conversation | null>(["conversation-backfill", id], (old) =>
-    old ? { ...old, labels: withLabel(old.labels) } : old,
+    old && isCurrent(old) ? { ...old, labels: withLabel(old.labels) } : old,
   );
   queryClient.setQueryData<Session>(["session", id], (old) =>
-    old ? { ...old, labels: withLabel(old.labels) } : old,
+    old && isCurrent(old) ? { ...old, labels: withLabel(old.labels) } : old,
   );
 }
 

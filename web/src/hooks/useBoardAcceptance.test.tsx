@@ -5,7 +5,7 @@ import type { ReactNode } from "react";
 import { showToast } from "@/components/ui/toast";
 import type * as identity from "@/lib/identity";
 import { authenticatedFetch } from "@/lib/identity";
-import { BOARD_ACCEPTED_LABEL_KEY } from "@/lib/sessionBoard";
+import { BOARD_ACCEPTED_LABEL_KEY, boardColumn } from "@/lib/sessionBoard";
 import type { ConversationsInfiniteData } from "@/lib/sessionListCache";
 import { setSessionBoardAccepted, useSetBoardAccepted } from "./useBoardAcceptance";
 import { PINNED_CONVERSATIONS_KEY, type Conversation } from "./useConversations";
@@ -19,7 +19,7 @@ vi.mock("@/lib/identity", async (importActual) => ({
 const LIST_KEY = ["conversations", "", false, null, "mine"];
 const FOLDER_KEY = ["project-sessions", "Sprint", "updated_at", false];
 
-function row(labels: Record<string, string> = {}): Conversation {
+function row(labels: Record<string, string> = {}, boardRevision = "rev_reviewed"): Conversation {
   return {
     id: "conv_a",
     object: "conversation",
@@ -29,6 +29,7 @@ function row(labels: Record<string, string> = {}): Conversation {
     labels: { keep: "1", ...labels },
     permission_level: null,
     status: "idle",
+    board_revision: boardRevision,
   };
 }
 
@@ -39,19 +40,40 @@ function pages(conversation: Conversation): ConversationsInfiniteData {
   };
 }
 
-function seededClient(conversation: Conversation) {
-  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+// Write the row into every cached list, as a refetch or the session stream does.
+function deliver(client: QueryClient, conversation: Conversation) {
   client.setQueryData(LIST_KEY, pages(conversation));
   client.setQueryData(FOLDER_KEY, pages(conversation));
   client.setQueryData(PINNED_CONVERSATIONS_KEY, {
     conversations: [conversation],
     filterHonored: true,
   });
+}
+
+function seededClient(conversation: Conversation) {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  deliver(client, conversation);
   return client;
 }
 
+function cachedRow(client: QueryClient, key: readonly unknown[]) {
+  return client.getQueryData<ConversationsInfiniteData>(key)?.pages[0].data[0];
+}
+
+// Each call's response waits until the test resolves it, in call order.
+function deferredResponses() {
+  const pending: ((response: Response) => void)[] = [];
+  vi.mocked(authenticatedFetch).mockImplementation(
+    () =>
+      new Promise<Response>((resolve) => {
+        pending.push(resolve);
+      }),
+  );
+  return pending;
+}
+
 function cachedLabels(client: QueryClient, key: readonly unknown[]) {
-  return client.getQueryData<ConversationsInfiniteData>(key)?.pages[0].data[0].labels;
+  return cachedRow(client, key)?.labels;
 }
 
 function pinnedLabels(client: QueryClient) {
@@ -161,6 +183,85 @@ describe("useSetBoardAccepted", () => {
     expect(pinnedLabels(client)?.[BOARD_ACCEPTED_LABEL_KEY]).toBe("1700000101");
   });
 
+  it("keeps newer same-second activity reopened when the older Accept response lands", async () => {
+    const respond = deferredResponses();
+    const client = seededClient(row());
+    const { result } = renderMutation(client);
+
+    act(() => result.current.mutate({ row: row(), reviewedRevision: "rev_reviewed" }));
+    await waitFor(() => expect(boardColumn(cachedRow(client, LIST_KEY)!)).toBe("done"));
+    // Activity in the same second streams in first: a new revision, acceptance removed.
+    const newer = row({}, "rev_newer");
+    deliver(client, newer);
+    respond[0](
+      new Response(JSON.stringify(row({ [BOARD_ACCEPTED_LABEL_KEY]: "1700000101" })), {
+        status: 200,
+      }),
+    );
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    for (const key of [LIST_KEY, FOLDER_KEY]) expect(cachedRow(client, key)).toEqual(newer);
+    expect(pinnedLabels(client)).toEqual(newer.labels);
+    expect(boardColumn(cachedRow(client, LIST_KEY)!)).toBe("needs_review");
+  });
+
+  it("refetches when a list fetched before the write committed lands before the response", async () => {
+    const respond = deferredResponses();
+    const client = seededClient(row());
+    const { result } = renderMutation(client);
+
+    act(() => result.current.mutate({ row: row(), reviewedRevision: "rev_reviewed" }));
+    await waitFor(() => expect(boardColumn(cachedRow(client, LIST_KEY)!)).toBe("done"));
+    // Same revision, no acceptance yet: a list read taken before the PATCH committed.
+    deliver(client, row());
+    const stored = { keep: "1", [BOARD_ACCEPTED_LABEL_KEY]: "1700000101" };
+    respond[0](new Response(JSON.stringify(row(stored)), { status: 200 }));
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    expect(client.getQueryState(LIST_KEY)?.isInvalidated).toBe(true);
+    expect(client.getQueryState(PINNED_CONVERSATIONS_KEY)?.isInvalidated).toBe(true);
+  });
+
+  it("leaves newer activity alone when a Reopen fails after it streamed in", async () => {
+    const respond = deferredResponses();
+    const before = row({ [BOARD_ACCEPTED_LABEL_KEY]: "1700000101" });
+    const client = seededClient(before);
+    const { result } = renderMutation(client);
+
+    act(() => result.current.mutate({ row: before, reviewedRevision: null }));
+    await waitFor(() =>
+      expect(cachedLabels(client, LIST_KEY)?.[BOARD_ACCEPTED_LABEL_KEY]).toBe(""),
+    );
+    const newer = row({}, "rev_newer");
+    deliver(client, newer);
+    respond[0](new Response(JSON.stringify({ error: { message: "nope" } }), { status: 503 }));
+    await waitFor(() => expect(result.current.isError).toBe(true));
+
+    for (const key of [LIST_KEY, FOLDER_KEY]) expect(cachedRow(client, key)).toEqual(newer);
+    expect(pinnedLabels(client)).toEqual(newer.labels);
+    expect(showToast).toHaveBeenCalledWith("Couldn't reopen the session.");
+  });
+
+  it("lets only the latest write to a session settle its label", async () => {
+    const respond = deferredResponses();
+    const client = seededClient(row());
+    const { result } = renderMutation(client);
+
+    act(() => result.current.mutate({ row: row(), reviewedRevision: "rev_reviewed" }));
+    await waitFor(() => expect(respond).toHaveLength(1));
+    act(() => result.current.mutate({ row: row(), reviewedRevision: "rev_reviewed" }));
+    await waitFor(() => expect(respond).toHaveLength(2));
+    // The first Accept fails while the second is still in flight.
+    respond[0](new Response(JSON.stringify({ error: { message: "nope" } }), { status: 503 }));
+    await waitFor(() => expect(showToast).toHaveBeenCalledWith("Couldn't accept the session."));
+    expect(cachedLabels(client, LIST_KEY)?.[BOARD_ACCEPTED_LABEL_KEY]).toBe("1700000101");
+
+    const stored = { keep: "1", [BOARD_ACCEPTED_LABEL_KEY]: "1700000105" };
+    respond[1](new Response(JSON.stringify(row(stored)), { status: 200 }));
+    await waitFor(() => expect(cachedLabels(client, LIST_KEY)).toEqual(stored));
+    expect(pinnedLabels(client)).toEqual(stored);
+  });
+
   it("restores the previous acceptance and says so when the PATCH fails", async () => {
     vi.mocked(authenticatedFetch).mockResolvedValue(
       new Response(JSON.stringify({ error: { message: "nope" } }), { status: 403 }),
@@ -175,6 +276,8 @@ describe("useSetBoardAccepted", () => {
     expect(cachedLabels(client, LIST_KEY)).toEqual(before.labels);
     expect(cachedLabels(client, FOLDER_KEY)).toEqual(before.labels);
     expect(showToast).toHaveBeenCalledWith("Couldn't reopen the session.");
+    // The write may have committed before it failed, so the lists refetch.
+    expect(client.getQueryState(PINNED_CONVERSATIONS_KEY)?.isInvalidated).toBe(true);
   });
 
   it("explains a refused Accept when the session changed since review", async () => {
