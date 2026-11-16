@@ -9,9 +9,8 @@ name: CI
 # have their own group). When Python tests run, `ci-tooling` (tests/scripts) is
 # kept only if the PR touches CI, release or dev tooling or a manifest (see
 # dependency_scope.py); push, scheduled and manual runs always include it.
-# Postgres, MySQL and CockroachDB lanes rerun tests/stores and tests/db only
-# when dependency_scope.py marks the diff as database-relevant. Push,
-# scheduled and manual runs always run those lanes.
+# Dialect lanes run on a PR only when dependency_scope.py marks the diff
+# as database-relevant. Push, scheduled and manual runs always run them.
 # Draft PRs are skipped (ready_for_review re-fires the workflow).
 # A `coverage-report` job combines per-shard coverage for code-coverage.yml.
 

@@ -68,6 +68,9 @@ DATABASE_PREFIXES = (
 DATABASE_FILES = {
     "omnigent/server/accounts_store.py",
     "omnigent/server/device_grant_store.py",
+    # UUID bytes are bound into binary columns; the anchor cap sizes MySQL VARBINARY.
+    "omnigent/util/uuid.py",
+    "omnigent/entities/comment.py",
     "tests/conftest.py",
     "uv.lock",
     "pyproject.toml",
@@ -203,8 +206,8 @@ def select_scope(files: list[dict], *, read=None, reason: str = "") -> dict[str,
         "python_matrix": python_matrix(
             backend, tooling=bool(reason) or not files or touches_tooling(paths)
         ),
-        # Same unscoped runs always rerun the dialect lanes. A PR runs them only
-        # when a changed path can affect tests/stores or tests/db on another backend.
+        # Unscoped runs always run the dialect lanes. A PR runs them only when a
+        # changed path can affect tests/stores or tests/db on another backend.
         "database": str(bool(reason) or not files or touches_database(paths)).lower(),
         "integration": str(backend).lower(),
         "e2e": str(backend or "javascript" in scopes).lower(),
