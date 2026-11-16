@@ -12,6 +12,7 @@ import { isDatabricksWorkspace, isHostRoutingEnabled, resolveMediaUrl } from "@/
 import { authenticatedFetch } from "@/lib/identity";
 import { getSessionHost, isHostKeyless } from "@/lib/sessionHost";
 import { readVideoResponse } from "@/lib/videoFetch";
+import { readFileViaWorkspaceApi } from "@/lib/workspaceApi";
 import { isAndroidShell, isIOSShell } from "@/lib/nativeBridge";
 import { isTempConvId } from "@/lib/tempConversationId";
 import {
@@ -110,6 +111,11 @@ export async function fetchFileContent(
   signal?: AbortSignal,
   options: { scope?: "workspace" } = {},
 ): Promise<FileContentResponse> {
+  // The workspace API reads only inside the workspace, so it serves either scope.
+  if (!browseLocationBase(path)) {
+    const viaApi = await readFileViaWorkspaceApi(conversationId, path, signal);
+    if (viaApi) return viaApi;
+  }
   const res = await authenticatedFetch(workspaceFileUrl(conversationId, path, options), { signal });
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   // Older servers ignore scope; automatic previews must fail closed there.
