@@ -155,6 +155,7 @@ function run(
 ): WorkflowRun {
   return {
     id: `plan-${sessionId}`,
+    planGraphPosition: 0,
     sessionId,
     title,
     startedAt: Date.parse("2026-11-12T15:04:00Z") / 1000,
@@ -477,6 +478,7 @@ describe("WorkflowDetailPage", () => {
       ]),
       sessionStatus: "running",
       backgroundWorkRunning: true,
+      planGraphPosition: 0,
     };
     mockRuns([completedRun]);
     const { rerender } = renderPage();
@@ -490,7 +492,19 @@ describe("WorkflowDetailPage", () => {
     mockRuns([
       {
         ...completedRun,
-        latestPlanPosition: 2,
+        planGraphPosition: undefined,
+        progress: { total: 2, started: 0, done: 2, needsInput: 0, failed: 0 },
+        statuses: [status("explore", "done"), status("fix", "done")],
+      },
+    ]);
+    rerender(<WorkflowDetailPage />);
+    expect(row).toHaveAttribute("data-run-state", "running");
+    expect(within(row).getByRole("button", { name: "Stop" })).toBeInTheDocument();
+
+    mockRuns([
+      {
+        ...completedRun,
+        planGraphPosition: 2,
         steps: [
           WORKFLOW.steps[0]!,
           { id: "review", name: "Review", goal: null, depends_on: ["explore"] },

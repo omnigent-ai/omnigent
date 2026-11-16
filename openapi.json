@@ -15678,7 +15678,7 @@
             "title": "Is Current",
             "type": "boolean"
           },
-          "latest_plan_position": {
+          "plan_graph_position": {
             "anyOf": [
               {
                 "format": "int64",
@@ -15688,8 +15688,8 @@
                 "type": "null"
               }
             ],
-            "description": "Journal position of the latest plan within this invocation.",
-            "title": "Latest Plan Position"
+            "description": "Journal position where this run's graph last changed; `None` for older plans without revision metadata.",
+            "title": "Plan Graph Position"
           },
           "progress": {
             "$ref": "#/components/schemas/WorkflowRunProgress",

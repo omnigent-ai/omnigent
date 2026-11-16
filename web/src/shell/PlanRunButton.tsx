@@ -2,10 +2,10 @@ import { PlayIcon, SquareIcon } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import {
-  currentPlan,
   isPlanComplete,
   type JournalEntry,
   pausedLabel,
+  planGraphPosition,
   type StepProgress,
 } from "@/lib/sessionJournal";
 import { cn } from "@/lib/utils";
@@ -22,8 +22,9 @@ export function planRunControl(
   progress: readonly StepProgress[],
   entries: readonly JournalEntry[],
   sessionWorking: boolean,
-  planPosition = currentPlan(entries)?.position,
+  planPosition = planGraphPosition(entries),
 ): PlanRunControl | null {
+  if (sessionWorking && planPosition === undefined) return "stop";
   if (isPlanComplete(progress, planPosition)) return null;
   if (sessionWorking) return "stop";
   return pausedLabel(progress, entries, false, planPosition) ? "play" : null;

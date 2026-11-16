@@ -1434,6 +1434,7 @@ describe("runs of a saved workflow", () => {
   const STEPS: ScheduledTaskRunSteps = {
     runId: "run_1",
     planId: "plan_1",
+    planGraphPosition: 0,
     isCurrent: true,
     workflowId: "9".repeat(32),
     planName: "Triage",
@@ -1577,6 +1578,21 @@ describe("runs of a saved workflow", () => {
     rerender(renderWorkflowPage());
     expect(within(row).queryByTestId("plan-continue")).toBeNull();
     expect(within(row).queryByTestId("plan-stop")).toBeNull();
+
+    vi.mocked(hooks.useScheduledTaskRunSteps).mockReturnValue(
+      new Map([
+        [
+          "run_1",
+          {
+            ...STEPS,
+            planGraphPosition: undefined,
+            statuses: [STEPS.statuses[0]!, { ...STEPS.statuses[0]!, id: "s2", step: "fix" }],
+          },
+        ],
+      ]),
+    );
+    rerender(renderWorkflowPage());
+    expect(within(row).getByRole("button", { name: "Stop" })).toBeInTheDocument();
   });
 
   it.each([false, true])(

@@ -3525,7 +3525,8 @@ class WorkflowRun(BaseModel):
     One run of a saved workflow: a session that started it.
 
     :param id: The run's ID: that of the plan entry that started it.
-    :param latest_plan_position: Journal position of the latest plan within this invocation.
+    :param plan_graph_position: Journal position where this run's graph last changed;
+        ``None`` for older plans without revision metadata.
     :param session_id: The session that ran it.
     :param title: The session's title; empty when it has none yet.
     :param started_at: Unix epoch seconds when the run's plan was written.
@@ -3541,7 +3542,7 @@ class WorkflowRun(BaseModel):
     """
 
     id: str
-    latest_plan_position: int | None = None
+    plan_graph_position: int | None = None
     session_id: str
     title: str
     started_at: int

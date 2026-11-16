@@ -114,6 +114,21 @@ def test_appends_take_consecutive_positions_and_plans_count_versions(
     current = journal.current_plan(SESSION)
     assert current is not None and current.id == second.entry.id
     assert current.content["version"] == 2
+    assert first.entry.content["graph_position"] == first.entry.position
+    assert second.entry.content["graph_position"] == second.entry.position
+    for index, starts_run in enumerate([False, False, True]):
+        saved = journal.append(
+            SESSION,
+            "plan",
+            {**_plan("goal", "opt", "baseline"), "name": "Saved workflow"},
+            idempotency_key=f"save:{index}",
+            workflow_id="a" * 32,
+            scheduled_task_run_id=RUN,
+            start_run=starts_run,
+        ).entry
+        assert saved.content["graph_position"] == (
+            saved.position if starts_run else second.entry.position
+        )
 
 
 def test_a_retried_append_returns_the_first_attempts_entry(journal: SessionJournalStore) -> None:

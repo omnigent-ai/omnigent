@@ -1337,7 +1337,7 @@ async def test_a_workflows_runs_list_the_sessions_that_ran_it(
     page = (await client.get(url, headers=_headers(ALICE))).json()
     original = next(run for run in page["data"] if run["id"] == first_plan.id)
     assert original["is_current"]
-    assert original["latest_plan_position"] == journal.current_plan(first).position
+    assert original["plan_graph_position"] == journal.current_plan(first).position
     assert [step["id"] for step in original["steps"]] == ["explore", "fix", "publish"]
     assert original["progress"] == {
         "total": 3,
@@ -1466,7 +1466,7 @@ async def test_an_automations_runs_list_the_steps_of_their_latest_plans(
     assert shown["plan_id"] == plan_id
     latest_plan = session_journal_store.SessionJournalStore(db_uri).current_plan(planned)
     assert latest_plan is not None
-    assert shown["latest_plan_position"] == latest_plan.position
+    assert shown["plan_graph_position"] == latest_plan.position
     assert [step["id"] for step in shown["steps"]] == ["explore", "fix", "publish"]
     assert [(s["step"], s["content"]["status"]) for s in shown["statuses"]] == [
         ("explore", "done"),

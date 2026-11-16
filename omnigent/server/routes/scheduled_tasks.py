@@ -1336,7 +1336,7 @@ def create_scheduled_tasks_router(
                 {
                     "run_id": run.id,
                     "plan_id": plan.id,
-                    "latest_plan_position": latest_plan.position,
+                    "plan_graph_position": latest_plan.content.get("graph_position"),
                     "workflow_id": plan.workflow_id,
                     "plan_name": plan.content.get("name"),
                     "is_current": (

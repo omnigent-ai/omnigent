@@ -10,6 +10,7 @@ function run(
 ): WorkflowRun {
   return {
     id: "c".repeat(32),
+    planGraphPosition: 0,
     sessionId: "a".repeat(32),
     title: "Fix the upload test",
     startedAt: 1_762_900_000,

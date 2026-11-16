@@ -126,6 +126,31 @@ export function currentPlan(entries: readonly JournalEntry[]): JournalEntry | nu
   return entries.findLast((entry) => entry.kind === "plan") ?? null;
 }
 
+/** The current graph's revision, preserved across saves that only change plan metadata. */
+export function planGraphPosition(entries: readonly JournalEntry[]): number | undefined {
+  const plan = currentPlan(entries);
+  if (!plan) return undefined;
+  if ("graph_position" in plan.content)
+    return typeof plan.content.graph_position === "number"
+      ? plan.content.graph_position
+      : undefined;
+  const graphKey = (entry: JournalEntry) => {
+    const graph = planSteps(entry).map((step) => [step.id, [...step.depends_on].sort()] as const);
+    graph.sort(([left], [right]) => left.localeCompare(right));
+    return JSON.stringify(graph);
+  };
+  const key = graphKey(plan);
+  let position = plan.position;
+  for (let index = entries.indexOf(plan) - 1; index >= 0; index -= 1) {
+    const entry = entries[index];
+    if (entry.kind === "plan_status") break;
+    if (entry.kind !== "plan") continue;
+    if (graphKey(entry) !== key) break;
+    position = entry.position;
+  }
+  return position;
+}
+
 /**
  * The saved workflow the current plan came from. Only the plan that starts a
  * run names it, so a replan that keeps one of that plan's steps came from it
@@ -408,7 +433,7 @@ export function pausedLabel(
   progress: readonly StepProgress[],
   entries: readonly JournalEntry[],
   sessionWorking: boolean,
-  planPosition = currentPlan(entries)?.position,
+  planPosition = planGraphPosition(entries),
 ): PausedLabel | null {
   if (
     sessionWorking ||
@@ -432,7 +457,7 @@ export function pausedLabel(
  * the list ended ("All done", or "Finished, 1 failed").
  *
  * @param paused - What an idle list says, from {@link pausedLabel}.
- * @param planPosition - Latest plan position, to recognize unstarted prerequisites after completion.
+ * @param planPosition - Graph revision position, to recognize new prerequisites after completion.
  */
 export function taskPreviewText(
   progress: readonly StepProgress[],

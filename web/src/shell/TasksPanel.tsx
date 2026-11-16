@@ -44,6 +44,7 @@ import {
   finishedTaskCount,
   isPlanComplete,
   isRestart,
+  planGraphPosition,
   planName,
   planTally,
   planWorkflowId,
@@ -1307,7 +1308,9 @@ export function TasksPanel({
               }
               onContinuePlan={continuePlan && (() => continuePlan(planName(plan)))}
               menuActionFor={menuActionFor}
-              onStop={isPlanComplete(progress, plan?.position) ? undefined : stopActiveWork}
+              onStop={
+                isPlanComplete(progress, planGraphPosition(entries)) ? undefined : stopActiveWork
+              }
             />
             <TaskList
               progress={progress}

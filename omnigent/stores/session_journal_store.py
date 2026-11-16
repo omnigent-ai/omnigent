@@ -385,7 +385,8 @@ class SessionJournalStore:
         :param kind: One of :data:`~omnigent.entities.session_journal.JOURNAL_KINDS`.
         :param content: The kind's fields, checked with
             :func:`~omnigent.entities.session_journal.normalize_content`. A plan's
-            version is set here: the previous plan's version plus one.
+            version increments here; its graph position changes only for a new
+            invocation or changed step dependencies.
         :param idempotency_key: Names the write, e.g. ``"tool:toolu_01…"``. A
             retry with the same key returns the entry the first attempt wrote.
         :param step: The plan step the entry is about. A status without one
@@ -464,7 +465,15 @@ class SessionJournalStore:
             )
             if kind == "plan":
                 version = 1 if previous_content is None else previous_content["version"] + 1
-                entry_content = {"version": version, **fields}
+                graph_position: int | None = position + int(starts_run)
+                if previous_content is not None and not starts_run:
+                    previous_graph = {
+                        item["id"]: set(item["depends_on"]) for item in previous_content["steps"]
+                    }
+                    graph = {item["id"]: set(item["depends_on"]) for item in fields["steps"]}
+                    if graph == previous_graph:
+                        graph_position = previous_content.get("graph_position")
+                entry_content = {"version": version, **fields, "graph_position": graph_position}
                 encoded = self._stored_contents(
                     [entry_content, *([{"status": "started"}] if starts_run else [])]
                 )
@@ -474,7 +483,11 @@ class SessionJournalStore:
                 assert previous_content is not None
                 copied_plan_text, run_started_text = self._stored_contents(
                     [
-                        {**previous_content, "version": previous_content["version"] + 1},
+                        {
+                            **previous_content,
+                            "version": previous_content["version"] + 1,
+                            "graph_position": position + 1,
+                        },
                         {"status": "started"},
                     ]
                 )

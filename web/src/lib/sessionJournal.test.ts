@@ -9,6 +9,7 @@ import {
   mergeJournalEntries,
   nativeTaskProgress,
   pausedLabel,
+  planGraphPosition,
   planName,
   planSteps,
   planTally,
@@ -299,6 +300,25 @@ describe("isPlanComplete", () => {
     expect(isPlanComplete(insertedProgress, inserted.position)).toBe(false);
     expect(pausedLabel(insertedProgress, insertedEntries, false)).toBe("Stopped");
     expect(taskPreviewText(insertedProgress, null, inserted.position)).toBe("Next: review");
+
+    const unchanged = plan(2, ["explore"], ["work", ["explore"]], ["report", ["work"]]);
+    const saved = { ...unchanged, position: 4, workflow_id: "a".repeat(32) };
+    const savedEntries = [
+      plan(0, ["work"], ["report", ["work"]]),
+      status(1, "work", "done"),
+      unchanged,
+      status(3, "report", "done"),
+      saved,
+    ];
+    const savedProgress = stepProgress(planSteps(saved), savedEntries, false);
+    expect(pausedLabel(savedProgress, savedEntries, false)).toBeNull();
+    expect(planGraphPosition(savedEntries)).toBe(unchanged.position);
+    expect(taskPreviewText(savedProgress, null, planGraphPosition(savedEntries))).toBe("All done");
+    const partialEntries = [
+      ...savedEntries.filter((entry) => entry.kind !== "plan"),
+      { ...saved, content: { ...saved.content, graph_position: unchanged.position } },
+    ];
+    expect(pausedLabel(savedProgress, partialEntries, false)).toBeNull();
   });
 
   it.each(["a", "b"])("compares %s with its own branch's completion", (upstream) => {

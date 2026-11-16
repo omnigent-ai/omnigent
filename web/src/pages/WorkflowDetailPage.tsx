@@ -475,7 +475,7 @@ function WorkflowRunRow({
   // Stop while the run's session works; play once it stopped with tasks left.
   const canAct = run.isCurrent && !run.archived;
   const control = canAct
-    ? planRunControl(progress, run.statuses, sessionWorking, run.latestPlanPosition)
+    ? planRunControl(progress, run.statuses, sessionWorking, run.planGraphPosition)
     : null;
   const refreshKeys = [["workflow-runs", workflowId]];
   const taskMenus = useRunTaskMenus(canAct ? run.sessionId : null, refreshKeys, run.id);
