@@ -248,8 +248,8 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
     FeatureDefinition(
         feature=Feature.WORKSPACE_DIRECT_ACCESS,
         description=(
-            "Owners read a session's workspace straight from its host's local socket; "
-            "the server and the host must both enable it"
+            "Owners read a session's workspace straight from its host's socket, "
+            "with a short-lived token this server issues"
         ),
         owner="server",
         review_by_release="0.27.0",

@@ -60,6 +60,7 @@ function serve(readFile: () => Uint8Array<ArrayBuffer>): void {
   vi.mocked(authenticatedFetch).mockImplementation(async (input) => {
     if (String(input).endsWith("/direct-access")) {
       return Response.json({
+        host_id: "host-1",
         socket_path: "/tmp/omnigent-workspace-x/workspace.sock",
         token: "tok",
         expires_at: Date.now() / 1000 + 300,
@@ -160,6 +161,7 @@ describe("readFileViaWorkspaceApi", () => {
     );
     expect(socket).toHaveBeenCalledTimes(2);
     expect(socket.mock.calls[0]![0]).toMatchObject({
+      hostId: "host-1",
       socketPath: "/tmp/omnigent-workspace-x/workspace.sock",
       path: `/${READ_FILE}`,
       headers: { authorization: "Bearer tok" },

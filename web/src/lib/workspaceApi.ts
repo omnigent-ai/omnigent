@@ -19,6 +19,7 @@ type Route = "direct" | "server";
 
 /** The server's grant to read one session's workspace from its host's socket. */
 interface DirectGrant {
+  hostId: string;
   socketPath: string;
   token: string;
   /** When the host stops accepting the token, in this machine's clock (the host's). */
@@ -76,8 +77,18 @@ async function requestGrant(sessionId: string): Promise<DirectGrant> {
     signal: AbortSignal.timeout(GRANT_TIMEOUT_MS),
   });
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  const body = (await res.json()) as { socket_path: string; token: string; expires_at: number };
-  return { socketPath: body.socket_path, token: body.token, expiresAtMs: body.expires_at * 1000 };
+  const body = (await res.json()) as {
+    host_id: string;
+    socket_path: string;
+    token: string;
+    expires_at: number;
+  };
+  return {
+    hostId: body.host_id,
+    socketPath: body.socket_path,
+    token: body.token,
+    expiresAtMs: body.expires_at * 1000,
+  };
 }
 
 /** The session's current grant; concurrent reads share one request for it. */
@@ -119,6 +130,7 @@ function directClient(
         // The shell can't cancel its call, so a cancelled read just stops waiting.
         const response = await abortable(
           send({
+            hostId: grant.hostId,
             socketPath: grant.socketPath,
             path: new URL(String(input)).pathname,
             headers,
