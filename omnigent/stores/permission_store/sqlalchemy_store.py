@@ -217,7 +217,7 @@ def _require_storable_scheduled_task_grant(user_id: str, level: int) -> None:
     """Refuse a grant the share table cannot hold or the store must never hold."""
     require_grantee_id_fits(user_id)
     # A fast path; the grant rechecks under the key's collation, which folds accents too.
-    if user_id.strip().casefold() in _RESERVED_GRANTEES:
+    if session_sharing.is_reserved_grantee(user_id):
         raise _reserved_grantee_error(user_id)
     if level not in session_sharing.SCHEDULED_TASK_GRANT_LEVELS:
         raise OmnigentError(

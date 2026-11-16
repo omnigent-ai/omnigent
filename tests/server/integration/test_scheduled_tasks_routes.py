@@ -4541,6 +4541,10 @@ async def test_only_the_owner_reaches_an_automations_permissions(
         ("  ", 1, 400),
         ("alice@example.com", 1, 400),
         ("__public__", 1, 400),
+        # Reserved IDs in another case or with outer space.
+        ("__PUBLIC__", 1, 400),
+        (" __public__ ", 1, 400),
+        ("Local", 1, 400),
         ("bob@example.com", 2, 400),
         ("bob@example.com", 3, 400),
         ("bob@example.com", 4, 422),

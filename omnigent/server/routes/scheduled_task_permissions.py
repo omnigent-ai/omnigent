@@ -29,7 +29,7 @@ from omnigent.debug_logging import add_audit_attrs
 from omnigent.entities import ScheduledTask
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER, RUNNER_TUNNEL_TOKEN_HEADER
-from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
+from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_LOCAL
 from omnigent.server.feature_flags import Feature
 from omnigent.server.managed_hosts import is_repo_workspace
 from omnigent.server.scheduled.run_sharing import (
@@ -40,6 +40,7 @@ from omnigent.server.scheduled.run_sharing import (
 from omnigent.server.schemas import GrantPermissionRequest
 from omnigent.server.session_sharing import (
     SCHEDULED_TASK_GRANT_LEVELS,
+    is_reserved_grantee,
     require_sharing_mode_allows_grant,
 )
 from omnigent.stores import ConversationStore
@@ -406,9 +407,11 @@ def register_scheduled_task_permissions_routes(
                 "An automation's owner cannot be granted access to it",
                 code=ErrorCode.INVALID_INPUT,
             )
-        if grantee == RESERVED_USER_PUBLIC:
+        # Variants too, before ensure_user could add a user row for one.
+        if is_reserved_grantee(grantee):
             raise OmnigentError(
-                "Automations cannot be shared publicly; name a user or group",
+                "Automations cannot be shared publicly or with the local user; name a user "
+                "or group",
                 code=ErrorCode.INVALID_INPUT,
             )
         target = await asyncio.to_thread(store.get_user, grantee)
