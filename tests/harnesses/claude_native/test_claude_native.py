@@ -8537,20 +8537,34 @@ def test_clone_claude_transcript_repairs_stale_image_duplication(
                 {"type": "tool_result", "tool_use_id": "toolu_5", "content": native_pdf_blocks}
             ],
         },
-        # Claude Code's own Read metadata repeats the payload.
+        # Older Claude Code kept the payload in its own Read metadata.
         "toolUseResult": {"type": "pdf", "file": {"base64": b64_native_pdf, "originalSize": 3009}},
+    }
+    stripped_pdf_meta = {"type": "pdf", "file": {"base64": "", "originalSize": 3009}}
+    stripped_native_pdf = {
+        **native_pdf,
+        "uuid": "u6",
+        "parentUuid": "u5",
+        "toolUseResult": stripped_pdf_meta,
     }
     source_path.write_text(
         "".join(
             json.dumps(record) + "\n"
-            for record in (stale_structured, stale_mixed, plain_result, stale_pdf, native_pdf)
+            for record in (
+                stale_structured,
+                stale_mixed,
+                plain_result,
+                stale_pdf,
+                native_pdf,
+                stripped_native_pdf,
+            )
         ),
         encoding="utf-8",
     )
     source_text = source_path.read_text(encoding="utf-8")
     assert source_text.count(b64_structured) == 2, "pre-fix wedged state"
     assert source_text.count(b64_mcp) == 2, "pre-fix wedged state"
-    assert source_text.count(b64_native_pdf) == 2
+    assert source_text.count(b64_native_pdf) == 3
     monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects_dir)
 
     result = claude_native._clone_claude_transcript(
@@ -8587,8 +8601,13 @@ def test_clone_claude_transcript_repairs_stale_image_duplication(
     assert records[3]["message"]["content"][0]["content"] == pdf_blocks
     assert text.count(b64_pdf) == 1
     assert records[4]["message"]["content"][0]["content"] == native_pdf_blocks
-    assert text.count(b64_native_pdf) == 1
-    assert "application/pdf" in records[4]["toolUseResult"]
+    assert json.loads(records[4]["toolUseResult"]) == claude_native._redact_binary_blocks(
+        native_pdf_blocks
+    )
+    # Metadata Claude Code already stripped keeps its native shape.
+    assert records[5]["message"]["content"][0]["content"] == native_pdf_blocks
+    assert records[5]["toolUseResult"] == stripped_pdf_meta
+    assert text.count(b64_native_pdf) == 2
     # The fork must not mutate the source session's transcript.
     assert source_path.read_text(encoding="utf-8") == source_text
 
