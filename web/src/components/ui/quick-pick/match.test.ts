@@ -391,6 +391,16 @@ describe("wordCoalescedRanges", () => {
     expect(words("stng", "Settings")).toEqual(["Settings"]);
   });
 
+  it("still marks a word whole when a range crosses into it from the word before", () => {
+    const text = "Show-Files";
+    const ranges = [
+      { start: 3, end: 6 },
+      { start: 7, end: 8 },
+      { start: 9, end: 10 },
+    ];
+    expect(wordCoalescedRanges(text, ranges)).toEqual([{ start: 3, end: 10 }]);
+  });
+
   it("keeps a single run inside a word as typed", () => {
     expect(words("gose", "Go to Settings")).toEqual(["Go", "Se"]);
     expect(words("nt", "New tab")).toEqual(["N", "t"]);

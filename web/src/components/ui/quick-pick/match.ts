@@ -147,6 +147,8 @@ export function wordCoalescedRanges(text: string, ranges: readonly MatchRange[])
     const start = word.index;
     const end = start + word[0].length;
     while (index < merged.length && merged[index].end <= start) result.push(merged[index++]);
+    // A range that crosses into this word stays as is; the ones inside the word still count.
+    if (index < merged.length && merged[index].start < start) result.push(merged[index++]);
     let inside = index;
     while (inside < merged.length && merged[inside].start >= start && merged[inside].end <= end) {
       inside++;
