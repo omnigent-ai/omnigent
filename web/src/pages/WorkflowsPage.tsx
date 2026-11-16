@@ -27,11 +27,12 @@ import { useAutomationsEnabled } from "@/hooks/useConversations";
 import { automationPagePath } from "@/lib/automationFromSession";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { useNavigate } from "@/lib/routing";
-import { useCreateWorkflowDraft } from "@/hooks/useWorkflow";
+import { useCloneWorkflow, useCreateWorkflowDraft } from "@/hooks/useWorkflow";
 
 export function WorkflowsPage() {
   const { workflows, isLoading, isError, refresh, pagination } = useSavedWorkflows();
   const createDraft = useCreateWorkflowDraft();
+  const cloneWorkflow = useCloneWorkflow();
   const navigate = useNavigate();
   const info = useServerInfo();
   const automationsEnabled = useAutomationsEnabled();
@@ -128,6 +129,13 @@ export function WorkflowsPage() {
                     }
                   : undefined
               }
+              onClone={() =>
+                cloneWorkflow.mutate(workflow.id, {
+                  onSuccess: (copy) => navigate(`/workflows/${copy.id}`),
+                  onError: (error) => showToast(`Couldn’t clone workflow. ${error.message}`),
+                })
+              }
+              cloning={cloneWorkflow.isPending}
               onDelete={() => setDeleteTarget(workflow)}
             />
           ))}

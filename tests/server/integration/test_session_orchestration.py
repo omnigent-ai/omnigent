@@ -2,6 +2,7 @@
 
 import json
 from contextvars import ContextVar
+from unittest.mock import Mock
 from uuid import uuid4
 
 import pytest
@@ -9,7 +10,7 @@ import pytest
 from omnigent.native.permission_modes import PERMISSION_LAUNCH_ARGS
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER, RUNNER_TUNNEL_TOKEN_HEADER
 from omnigent.runner.tool_dispatch import execute_tool
-from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ
+from omnigent.server.auth import LEVEL_EDIT, LEVEL_OWNER, LEVEL_READ
 from omnigent.server.feature_flags import (
     FEATURES_ENV_VAR,
     Feature,
@@ -20,6 +21,8 @@ from omnigent.server.sharing_settings import write_peer_session_messaging_overri
 from omnigent.stores.conversation_store import (
     CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
     CREATED_BY_SESSION_LABEL_KEY,
+    SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY,
+    SCHEDULED_TASK_LAUNCH_LABEL_KEY,
     SCHEDULED_TASK_ORIGIN_LABEL_KEY,
     SIDE_CHAT_SOURCE_LABEL_KEY,
 )
@@ -822,6 +825,301 @@ async def test_worker_started_before_a_legacy_run_is_recorded_uses_the_automatio
     assert len(workers) == 1 and workers[0].get("conversation_id"), workers
     worker = conversations.get_conversation(workers[0]["conversation_id"])
     assert worker.terminal_launch_args == PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"]
+
+
+def _shared_automation(auth_app, db_uri, monkeypatch, agent_id, grantees, **fields):
+    """Alice's automation, shared at Read with *grantees*, with managed launches stubbed."""
+    from omnigent.server.routes.sessions import routes_core
+    from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
+
+    schedules = SqlAlchemyScheduledTaskStore(db_uri)
+    task = schedules.create(
+        scheduled_task_id=uuid4().hex,
+        name="Shared watcher",
+        prompt="Start a worker for each new item",
+        rrule="FREQ=HOURLY",
+        user_id="alice",
+        agent_id=agent_id,
+        timezone="UTC",
+        execution_target="managed_sandbox",
+        **fields,
+    )
+    monkeypatch.setattr(auth_app.state, "scheduled_task_store", schedules)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    for grantee in grantees:
+        permissions.ensure_user(grantee)
+        permissions.grant_for_scheduled_task(grantee, task.id, LEVEL_READ)
+
+    async def launch(**kwargs):
+        pass
+
+    monkeypatch.setattr(routes_core, "_run_managed_launch", launch)
+    return task
+
+
+def _as_run_session(db_uri, session_id, task, grantees):
+    """Label *session_id* as *task*'s run session and share it with *grantees*, as runs do."""
+    SqlAlchemyConversationStore(db_uri).set_labels(
+        session_id,
+        {SCHEDULED_TASK_ORIGIN_LABEL_KEY: task.id, SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY: "run"},
+    )
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    for grantee in grantees:
+        permissions.grant(grantee, session_id, LEVEL_READ)
+
+
+async def _launch_worker(auth_client, agent_id, launcher_id, placement="managed", **arguments):
+    return json.loads(
+        await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"agent_id": agent_id, "placement": placement, **arguments}),
+            server_client=auth_client,
+            conversation_id=launcher_id,
+        )
+    )
+
+
+def _session_levels(db_uri, session_id):
+    grants, _ = SqlAlchemyPermissionStore(db_uri).list_for_session(session_id)
+    return {grant.user_id: grant.level for grant in grants}
+
+
+@pytest.mark.parametrize("siblings_enabled", [True, False], ids=["sibling", "independent"])
+async def test_launches_from_a_run_tree_are_shared_with_the_automation_grantees(
+    auth_client, auth_app, peers, db_uri, monkeypatch, siblings_enabled
+):
+    source, _target, _captured = peers
+    if not siblings_enabled:
+        auth_app.state.feature_flags = FeatureFlags(
+            auth_app.state.feature_flags.enabled_features - {Feature.SIBLING_SESSIONS}
+        )
+    task = _shared_automation(auth_app, db_uri, monkeypatch, source["agent_id"], ["bob", "carol"])
+    _as_run_session(db_uri, source["id"], task, ["bob", "carol"])
+    conversations = SqlAlchemyConversationStore(db_uri)
+
+    launcher = source["id"]
+    # From the run's session, then a session it launched, then a child of the next one.
+    for depth in range(3):
+        result = await _launch_worker(auth_client, source["agent_id"], launcher)
+        assert result.get("conversation_id"), result
+        worker = conversations.get_conversation(result["conversation_id"])
+        assert worker.labels[SCHEDULED_TASK_LAUNCH_LABEL_KEY] == task.id
+        assert _session_levels(db_uri, worker.id) == {
+            "alice": LEVEL_OWNER,
+            "bob": LEVEL_READ,
+            "carol": LEVEL_READ,
+        }
+        assert worker.parent_conversation_id is None
+        if siblings_enabled:
+            assert worker.family_id == source["id"]
+        else:
+            assert worker.labels[CREATED_BY_SESSION_LABEL_KEY] == launcher
+        auth_client.headers.update(_bind_runner(db_uri, worker.id))
+        launcher = worker.id
+        if depth == 1:
+            response = await auth_client.post(
+                "/v1/sessions",
+                json={"agent_id": source["agent_id"], "parent_session_id": worker.id},
+            )
+            assert response.status_code == 201, response.text
+            launcher = response.json()["id"]
+
+    for value in (task.id, ""):
+        labels = {SCHEDULED_TASK_LAUNCH_LABEL_KEY: value}
+        response = await auth_client.post(
+            "/v1/sessions", json={"agent_id": source["agent_id"], "labels": labels}
+        )
+        assert response.status_code == 400, response.text
+        response = await auth_client.patch(f"/v1/sessions/{worker.id}", json={"labels": labels})
+        assert response.status_code == 400, response.text
+    assert conversations.get_conversation(worker.id).labels[SCHEDULED_TASK_LAUNCH_LABEL_KEY] == (
+        task.id
+    )
+
+
+@pytest.mark.parametrize("case", ["continued_by_another_automation", "revoked_by_hand"])
+async def test_a_launch_skips_grantees_who_can_no_longer_see_its_source(
+    auth_client, auth_app, peers, db_uri, monkeypatch, case
+):
+    from omnigent.server.scheduled.run_sharing import sync_task_session
+
+    source, _target, _captured = peers
+    first = _shared_automation(auth_app, db_uri, monkeypatch, source["agent_id"], ["bob", "dana"])
+    _as_run_session(db_uri, source["id"], first, ["bob", "dana"])
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    if case == "continued_by_another_automation":
+        second = _shared_automation(
+            auth_app,
+            db_uri,
+            monkeypatch,
+            source["agent_id"],
+            ["carol"],
+            session_mode="continue",
+            session_id=source["id"],
+        )
+        # The second automation's sync leaves the session shared with only its grantees.
+        await sync_task_session(
+            second,
+            conversation_store=SqlAlchemyConversationStore(db_uri),
+            permission_store=permissions,
+            app_state=auth_app.state,
+            host_registry=None,
+        )
+        assert _session_levels(db_uri, source["id"]) == {"alice": LEVEL_OWNER, "carol": LEVEL_READ}
+        # The labels still name the first automation, whose grantees can't see the session.
+        expected = {"alice": LEVEL_OWNER}
+    else:
+        permissions.revoke("bob", source["id"])
+        expected = {"alice": LEVEL_OWNER, "dana": LEVEL_READ}
+
+    result = await _launch_worker(auth_client, source["agent_id"], source["id"])
+
+    assert result.get("conversation_id"), result
+    worker = SqlAlchemyConversationStore(db_uri).get_conversation(result["conversation_id"])
+    assert worker.labels[SCHEDULED_TASK_LAUNCH_LABEL_KEY] == first.id
+    assert _session_levels(db_uri, worker.id) == expected
+
+
+@pytest.mark.parametrize("placement,shared", [("managed", True), ("same_host", False)])
+async def test_restricted_sharing_shares_a_launch_without_a_workspace_only_as_a_new_sandbox(
+    auth_client, auth_app, peers, db_uri, monkeypatch, placement, shared
+):
+    """A new sandbox has no workspace yet; a same-host launch in a home directory is refused."""
+    from omnigent.host.frames import HostLaunchRunnerFrame, HostStatFrame, decode_host_frame
+    from omnigent.server.auth import SharingMode
+    from tests.server.integration.test_sessions_permissions import _register_online_host
+
+    source, _target, _captured = peers
+    task = _shared_automation(auth_app, db_uri, monkeypatch, source["agent_id"], ["bob"])
+    _as_run_session(db_uri, source["id"], task, ["bob"])
+    host_id = uuid4().hex
+    _register_online_host(auth_app, host_id, "alice")
+    SqlAlchemyConversationStore(db_uri).set_host_id(source["id"], host_id, workspace="/home/alice")
+
+    def answer_host(connection, payload):
+        frame = decode_host_frame(payload)
+        if isinstance(frame, HostStatFrame):
+            connection.pending_stats[frame.request_id].set_result(
+                {"status": "ok", "exists": True, "type": "directory", "canonical_path": frame.path}
+            )
+        elif isinstance(frame, HostLaunchRunnerFrame):
+            connection.pending_launches[frame.request_id].set_result({"status": "launched"})
+        else:
+            pytest.fail(f"Unexpected host frame: {frame}")
+
+    monkeypatch.setattr(auth_app.state.host_registry, "send_text", answer_host)
+    monkeypatch.setattr(auth_app.state, "sharing_mode", lambda: SharingMode.RESTRICTED_READ_ONLY)
+
+    result = await _launch_worker(auth_client, source["agent_id"], source["id"], placement)
+
+    assert result.get("conversation_id"), result
+    worker = SqlAlchemyConversationStore(db_uri).get_conversation(result["conversation_id"])
+    assert worker.workspace == (None if placement == "managed" else "/home/alice")
+    assert _session_levels(db_uri, worker.id) == {
+        "alice": LEVEL_OWNER,
+        **({"bob": LEVEL_READ} if shared else {}),
+    }
+
+
+@pytest.mark.parametrize("sharing_fails", [False, True], ids=["shared", "sharing_failed"])
+async def test_a_launch_is_shared_before_its_first_task_can_dispatch(
+    auth_client, auth_app, peers, db_uri, monkeypatch, sharing_fails
+):
+    """A sandbox host's startup recovery delivers a saved first task at once, and the
+    worker's own launches need its grants, so its task is saved only once sharing settles."""
+    from unittest.mock import AsyncMock
+
+    from omnigent.host.frames import HostHelloFrame
+    from omnigent.server.scheduled import run_sharing
+    from tests._helpers.polling import poll_until_async
+
+    source, _target, _captured = peers
+    task = _shared_automation(auth_app, db_uri, monkeypatch, source["agent_id"], ["bob"])
+    _as_run_session(db_uri, source["id"], task, ["bob"])
+    host_id = uuid4().hex
+    connection = auth_app.state.host_registry.register(
+        host_id,
+        AsyncMock(),
+        HostHelloFrame(version="test", frame_protocol_version=1, name="sandbox", runners=[]),
+        owner="alice",
+        registered_with_managed_token=True,
+    )
+    startup = auth_app.state.startup_inputs
+    dispatched = []
+
+    async def dispatch(context, session_id, event):
+        dispatched.append(session_id)
+        return {}
+
+    monkeypatch.setattr(startup, "dispatch", dispatch)
+    if sharing_fails:
+        monkeypatch.setattr(
+            SqlAlchemyPermissionStore,
+            "list_for_scheduled_task",
+            Mock(side_effect=RuntimeError("automation grants unavailable")),
+        )
+    share = run_sharing.share_launched_session
+    during_sharing = []
+
+    async def recover_while_sharing(task, session, **kwargs):
+        # The worker is on the connected sandbox host before its share settles.
+        SqlAlchemyConversationStore(db_uri).set_host_id(session.id, host_id, "/work")
+        during_sharing.append(await startup._recover_session(auth_app, session.id, connection))
+        await share(task, session, **kwargs)
+        during_sharing.append(list(dispatched))
+
+    monkeypatch.setattr(run_sharing, "share_launched_session", recover_while_sharing)
+
+    result = await _launch_worker(
+        auth_client, source["agent_id"], source["id"], "managed", message="Start"
+    )
+
+    worker_id = result.get("conversation_id")
+    assert worker_id, result
+    # Recovery found nothing to deliver, and nothing was dispatched, until sharing settled.
+    assert during_sharing == [False, []]
+    assert _session_levels(db_uri, worker_id) == {
+        "alice": LEVEL_OWNER,
+        **({} if sharing_fails else {"bob": LEVEL_READ}),
+    }
+    # The task was saved after sharing, failed or not, and recovery now delivers it.
+    assert await startup._recover_session(auth_app, worker_id, connection) is True
+    await poll_until_async(lambda: worker_id in dispatched, timeout_s=5)
+
+
+@pytest.mark.parametrize("case", ["no_automation", "unshared", "grant_read_fails"])
+async def test_a_launch_the_automation_shares_with_no_one_stays_private(
+    auth_client, auth_app, peers, db_uri, monkeypatch, case
+):
+    source, _target, _captured = peers
+    task = _shared_automation(
+        auth_app,
+        db_uri,
+        monkeypatch,
+        source["agent_id"],
+        [] if case == "unshared" else ["bob"],
+    )
+    if case == "no_automation":
+        # Bob can read the session, but it isn't a run's.
+        SqlAlchemyPermissionStore(db_uri).grant("bob", source["id"], LEVEL_READ)
+    else:
+        _as_run_session(db_uri, source["id"], task, [] if case == "unshared" else ["bob"])
+    if case == "grant_read_fails":
+        monkeypatch.setattr(
+            SqlAlchemyPermissionStore,
+            "list_for_scheduled_task",
+            Mock(side_effect=RuntimeError("automation grants unavailable")),
+        )
+
+    result = await _launch_worker(auth_client, source["agent_id"], source["id"])
+
+    assert result.get("conversation_id"), result
+    worker = SqlAlchemyConversationStore(db_uri).get_conversation(result["conversation_id"])
+    assert _session_levels(db_uri, worker.id) == {"alice": LEVEL_OWNER}
+    # The launch still joins the automation it came from.
+    assert worker.labels.get(SCHEDULED_TASK_LAUNCH_LABEL_KEY) == (
+        None if case == "no_automation" else task.id
+    )
 
 
 @pytest.mark.parametrize("placement", ["same_host", "managed"])

@@ -5,7 +5,7 @@ import { authenticatedFetch } from "@/lib/identity";
 import type { JournalEntry, JournalPlanStep } from "@/lib/sessionJournal";
 import type { WorkflowRun } from "@/lib/workflowRuns";
 import type { WorkflowStep } from "@/lib/workflowGraphLayout";
-import { apiErrorFromResponse } from "@/lib/sessionsApi";
+import { ApiError, apiErrorFromResponse } from "@/lib/sessionsApi";
 
 /** A saved workflow with its steps, as `GET /v1/workflows/{id}` returns it. */
 export interface WorkflowDetail extends SavedWorkflow {
@@ -77,6 +77,38 @@ export function useCreateWorkflowDraft() {
   });
 }
 
+/** Copy the saved plan into a new workflow, without its planning chat or runs. */
+export function useCloneWorkflow() {
+  const onSuccess = useWorkflowSaved();
+  return useMutation({
+    mutationFn: async (workflowId: string) => {
+      const res = await authenticatedFetch(workflowPath(workflowId));
+      if (!res.ok) throw await apiErrorFromResponse(res);
+      const workflow = (await res.json()) as WorkflowDetail;
+      for (let copy = 1; ; copy += 1) {
+        const suffix = copy === 1 ? " (copy)" : ` (copy ${copy})`;
+        const name =
+          [...workflow.name]
+            .slice(0, 80 - suffix.length)
+            .join("")
+            .trimEnd() + suffix;
+        try {
+          // A name conflict must resolve before trying the next name.
+          // oxlint-disable-next-line no-await-in-loop
+          return await writeWorkflow("/v1/workflows", "POST", {
+            name,
+            description: workflow.description,
+            steps: workflow.steps,
+          });
+        } catch (error) {
+          if (!(error instanceof ApiError) || error.status !== 409) throw error;
+        }
+      }
+    },
+    onSuccess,
+  });
+}
+
 /** Apply the reviewed proposal to the existing workflow. */
 export function useSaveWorkflowPlan(workflowId: string) {
   const onSuccess = useWorkflowSaved();
@@ -104,6 +136,7 @@ interface RunsPage {
 
 interface RawRun {
   id: string;
+  plan_graph_revision?: string | number | null;
   session_id: string;
   title: string;
   started_at: number;
@@ -142,6 +175,7 @@ export function useWorkflowRuns(workflowId: string) {
       return {
         runs: (body.data ?? []).map((run) => ({
           id: run.id,
+          planGraphRevision: run.plan_graph_revision ?? undefined,
           sessionId: run.session_id,
           title: run.title,
           startedAt: run.started_at,

@@ -22,7 +22,6 @@ import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import { isFeatureEnabled } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { hasCommandModifier } from "@/lib/hotkeys";
 import {
   isElectronShell,
   isNativeShell,
@@ -30,6 +29,7 @@ import {
   supportsDesktopCommands,
 } from "@/lib/nativeBridge";
 import { shortcutGroupsFor } from "@/lib/shortcutCatalog";
+import { matchesShortcut } from "@/lib/shortcuts/registry";
 
 // Custom event the dialog listens for, so non-adjacent surfaces (e.g. the
 // account menu) can open it without threading state through the tree.
@@ -126,7 +126,7 @@ export function KeyboardShortcutsDialog() {
       // ⌘/Ctrl + / toggles the panel. Plain `/` is the composer's slash-menu
       // trigger, so require the platform command modifier and no Shift/Alt to
       // avoid clashing (only ⌘/ on macOS, only Ctrl+/ on Win/Linux).
-      if (hasCommandModifier(e) && !e.altKey && !e.shiftKey && e.key === "/") {
+      if (matchesShortcut(e, "shortcuts.show")) {
         e.preventDefault();
         setOpen((prev) => !prev);
       }
