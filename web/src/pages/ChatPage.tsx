@@ -3790,6 +3790,8 @@ function ComposerImpl(
           lines.push("No usage data yet — send a message first.");
         }
         lines.push(`Items in context: ${blocks.length}`);
+        dirtyRef.current = true;
+        editText(null, "");
         setCommandError(lines.join("\n"));
         return true;
       }
@@ -3819,6 +3821,8 @@ function ComposerImpl(
       }
       case "/help": {
         const lines = Object.entries(slashCommands).map(([name, desc]) => `${name} — ${desc}`);
+        dirtyRef.current = true;
+        editText(null, "");
         setCommandError(lines.join("\n"));
         return true;
       }
@@ -4236,7 +4240,7 @@ function ComposerImpl(
     const tailText = draft.text.trim();
     const noAttachedContext =
       files.length === 0 && !hasMentions && localReviewComments.length === 0;
-    // A known command typed after reply quotes runs with the quotes as context.
+    // A known command typed after reply quotes sends them as context; local built-ins keep them.
     const quotedCommand =
       draft.quotes.length > 0 &&
       noAttachedContext &&

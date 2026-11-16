@@ -6973,21 +6973,28 @@ describe("Composer reply quotes", () => {
     expect(textarea()).toHaveValue("");
   });
 
-  it("clears only a quoted built-in's text when it is sent from an earlier field", () => {
-    const ref = createRef<ComponentRef<typeof Composer>>();
-    const props = composerProps();
-    render(<Composer {...props} ref={ref} />);
-    fireEvent.change(textarea(), { target: { value: "My context" } });
-    act(() => ref.current?.appendReplyQuote("Use the filler pattern"));
-    fireEvent.change(textarea(), { target: { value: "/new" } });
-    const earlier = screen.getByLabelText("Reply text before quote 1");
-    act(() => earlier.focus());
-    fireEvent.keyDown(earlier, { key: "Enter" });
+  it.each(["/new", "/help", "/context"])(
+    "clears only a quoted %s's text when it is sent from an earlier field",
+    (command) => {
+      const ref = createRef<ComponentRef<typeof Composer>>();
+      const props = composerProps();
+      render(<Composer {...props} ref={ref} />);
+      fireEvent.change(textarea(), { target: { value: "My context" } });
+      act(() => ref.current?.appendReplyQuote("Use the filler pattern"));
+      fireEvent.change(textarea(), { target: { value: command } });
+      const earlier = screen.getByLabelText("Reply text before quote 1");
+      act(() => earlier.focus());
+      fireEvent.keyDown(earlier, { key: "Enter" });
 
-    expect(props.onNewSession).toHaveBeenCalledOnce();
-    expect(earlier).toHaveValue("My context");
-    expect(textarea()).toHaveValue("");
-  });
+      expect(props.onSend).not.toHaveBeenCalled();
+      expect(props.onNewSession).toHaveBeenCalledTimes(command === "/new" ? 1 : 0);
+      expect(earlier).toHaveValue("My context");
+      expect(screen.getByTestId("composer-reply-quote")).toHaveTextContent(
+        "Use the filler pattern",
+      );
+      expect(textarea()).toHaveValue("");
+    },
+  );
 
   it("invokes a skill chosen after a reply quote with the quote as context", () => {
     setComposerState({
@@ -7055,6 +7062,53 @@ describe("Composer reply quotes", () => {
       }
     },
   );
+
+  it("keeps text typed while an unquoted /side is still opening", async () => {
+    setComposerState({ sessionHarness: "openai-agents", sideChatToOpen: null, sideChatDrafts: {} });
+    composerSessionSnapshot.sideChatAllowed = true;
+    let finishCreate = () => {};
+    vi.spyOn(sessionsApi, "createSideChat").mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          finishCreate = () => resolve({ childSessionId: "conv_side" });
+        }),
+    );
+    try {
+      renderWithTooltips(<Composer {...composerProps({ permissionLevel: 4 })} />);
+      fireEvent.change(textarea(), { target: { value: "/side why this one?" } });
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+      fireEvent.change(textarea(), { target: { value: "A new thought" } });
+      await act(async () => finishCreate());
+
+      expect(useChatStore.getState().sideChatDrafts).toEqual({ conv_side: "why this one?" });
+      expect(textarea()).toHaveValue("A new thought");
+    } finally {
+      composerSessionSnapshot.sideChatAllowed = null;
+    }
+  });
+
+  it("keeps a quoted /side draft when the side chat can't be created", async () => {
+    setComposerState({ sessionHarness: "openai-agents", sideChatToOpen: null, sideChatDrafts: {} });
+    composerSessionSnapshot.sideChatAllowed = true;
+    vi.spyOn(sessionsApi, "createSideChat").mockRejectedValue(new Error("fork failed"));
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    try {
+      renderWithTooltips(<Composer {...composerProps({ permissionLevel: 4 })} ref={ref} />);
+      act(() => ref.current?.appendReplyQuote("Use the filler pattern"));
+      fireEvent.change(textarea(), { target: { value: "/side why this one?" } });
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+      await act(async () => {});
+
+      expect(sessionsApi.createSideChat).toHaveBeenCalledOnce();
+      expect(useChatStore.getState().sideChatDrafts).toEqual({});
+      expect(screen.getByTestId("composer-reply-quote")).toHaveTextContent(
+        "Use the filler pattern",
+      );
+      expect(textarea()).toHaveValue("/side why this one?");
+    } finally {
+      composerSessionSnapshot.sideChatAllowed = null;
+    }
+  });
 
   it.each([
     ["a skill", "/deslop tighten it", "/deslop tighten it"],
