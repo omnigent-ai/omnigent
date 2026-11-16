@@ -2822,6 +2822,7 @@ def register_core_routes(
                 conversation_store=conversation_store,
                 liveness_lookup=liveness_lookup,
                 host_store=getattr(request.app.state, "host_store", None),
+                host_session_recoverer=getattr(request.app.state, "host_session_recoverer", None),
                 # Only an owner's read may settle a row.
                 may_settle=lambda conv, perms=perms_by_conv: (
                     permission_store is None
@@ -4660,6 +4661,7 @@ def register_core_routes(
                 delete_worktree=body.delete_worktree,
                 host_store=getattr(request.app.state, "host_store", None),
                 sandbox_config=getattr(request.app.state, "sandbox_config", None),
+                host_session_recoverer=getattr(request.app.state, "host_session_recoverer", None),
                 after_turn=normalize_uuid(request.headers.get(ORCHESTRATION_SOURCE_HEADER))
                 == lifecycle_id,
             )

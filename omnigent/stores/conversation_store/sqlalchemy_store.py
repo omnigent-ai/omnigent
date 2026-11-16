@@ -101,7 +101,7 @@ from omnigent.native.session_todos import validate_session_todos
 from omnigent.session_import.models import IMPORT_SOURCE_LABEL_KEY
 from omnigent.session_recovery import (
     RECOVERY_LABEL_PREFIX,
-    RECOVERY_PROMPT,
+    RECOVERY_NOTICE,
     SessionRecovery,
     reject_recovery_labels,
 )
@@ -3190,18 +3190,30 @@ class SqlAlchemyConversationStore(ConversationStore):
         # FOR UPDATE lock while it round-trips. strip_nul_bytes runs here so a
         # Postgres text column never sees a NUL (tool output can embed one, e.g.
         # reading a binary file), which would abort the whole INSERT.
-        for item in items:
+        recovery_candidates: dict[int, NewConversationItem] = {}
+        for index, item in enumerate(items):
             if (
                 isinstance(item.data, MessageData)
                 and item.data.role == "user"
+                and not item.data.is_meta
                 and not item.data.user_authored
-                and item.data.content == [{"type": "input_text", "text": RECOVERY_PROMPT}]
+                and len(item.data.content) == 1
+                and item.data.content[0].get("type") == "input_text"
+                and isinstance(text := item.data.content[0].get("text"), str)
+                and text.startswith(f"{RECOVERY_NOTICE}\n")
+                and text[len(RECOVERY_NOTICE) :].strip()
             ):
-                item.data = item.data.model_copy(update={"is_meta": True})
+                recovery_candidates[index] = item.model_copy(
+                    update={"data": item.data.model_copy(update={"is_meta": True})}
+                )
+        # Native echoes omit the submitted input ID. Prepare both forms so the
+        # locked recovery claim can decide without an encryption RPC under lock.
         raw_jsons = [
-            strip_nul_bytes(json.dumps(item.data.model_dump(exclude_none=True))) for item in items
+            strip_nul_bytes(json.dumps(item.data.model_dump(exclude_none=True)))
+            for item in [*items, *recovery_candidates.values()]
         ]
         encoded_data = self._encode_item_data_batch(raw_jsons)
+        recovery_encoded = dict(zip(recovery_candidates, encoded_data[len(items) :], strict=True))
         workspace_id = current_workspace_id()
         # Precompute per-item row values (sans position) BEFORE the write
         # transaction so a CockroachDB 40001 replay reuses the same generated
@@ -3209,7 +3221,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         # stable id doubles as the row id so an idempotent re-post targets the
         # same primary key (see the dedup probe inside ``write``).
         prepared_rows: list[tuple[NewConversationItem, dict[str, object], str | None]] = []
-        for item, data in zip(items, encoded_data, strict=True):
+        for item, data in zip(items, encoded_data[: len(items)], strict=True):
             search = self._item_search_text(item)
             if item.response_id == PENDING_INPUT_RESPONSE_ID and search is not None:
                 search = ""
@@ -3294,15 +3306,38 @@ class SqlAlchemyConversationStore(ConversationStore):
                         if item.stable_id is not None
                     ]
 
-            # Accepted new input cancels a pending continuation in the same transaction.
-            if any(
+            has_new_input = any(
                 item.stable_id not in existing_by_id
                 and isinstance(item.data, MessageData)
                 and item.data.role == "user"
                 and not item.data.is_meta
                 for item in items
-            ):
-                _write_session_recovery(session, conversation_id, None)
+            )
+            recovery = _read_session_recovery(session, conversation_id) if has_new_input else None
+            append_rows = []
+            seen_stable_ids: set[str] = set(existing_by_id)
+            for index, (item, prepared, search) in enumerate(prepared_rows):
+                if item.stable_id is None or item.stable_id not in seen_stable_ids:
+                    if (
+                        recovery is not None
+                        and recovery.phase in {"dispatching", "submitted"}
+                        and recovery.attempt_id
+                        and index in recovery_candidates
+                    ):
+                        item = recovery_candidates[index]
+                        prepared = {**prepared, "data": recovery_encoded[index]}
+                    elif (
+                        isinstance(item.data, MessageData)
+                        and item.data.role == "user"
+                        and not item.data.is_meta
+                        and recovery is not None
+                    ):
+                        # Real input supersedes recovery and any later echo in this batch.
+                        _write_session_recovery(session, conversation_id, None)
+                        recovery = None
+                    if item.stable_id is not None:
+                        seen_stable_ids.add(item.stable_id)
+                append_rows.append((item, prepared, search))
 
             replacements: dict[str, tuple[int, int]] = {}
             for item, prepared, _ in prepared_rows:
@@ -3391,7 +3426,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             row_values: list[dict[str, object]] = []
             fresh_items: list[tuple[int, NewConversationItem]] = []
             batch_stable: dict[str, ConversationItem] = {}
-            for item, prepared, search in prepared_rows:
+            for item, prepared, search in append_rows:
                 if item.stable_id is not None:
                     if item.stable_id in existing_by_id:
                         persisted.append(deduped_by_id[item.stable_id])

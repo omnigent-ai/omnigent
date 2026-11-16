@@ -947,6 +947,89 @@ def test_recovery_labels_are_private_and_cannot_be_overwritten_or_forked(
     assert max(map(len, _col(conv_db, "conversation_labels", "value"))) <= 256
 
 
+@pytest.mark.parametrize(
+    ("phase", "attempt_id", "user_authored", "expected_meta"),
+    [
+        (None, None, False, False),
+        ("pending", "attempt", False, False),
+        ("launching", "attempt", False, False),
+        ("dispatching", None, False, False),
+        ("dispatching", "attempt", False, True),
+        ("submitted", "attempt", False, True),
+        ("stopped", "attempt", False, False),
+        ("failed", "attempt", False, False),
+        ("dispatching", "attempt", True, False),
+    ],
+)
+@pytest.mark.parametrize("custom_prompt", [False, True])
+def test_recovery_notice_requires_a_dispatched_attempt(
+    store: SqlAlchemyConversationStore,
+    phase: Any,
+    attempt_id: str | None,
+    user_authored: bool,
+    expected_meta: bool,
+    custom_prompt: bool,
+) -> None:
+    from omnigent.entities import MessageData, NewConversationItem
+    from omnigent.session_recovery import RECOVERY_NOTICE, RECOVERY_PROMPT, SessionRecovery
+
+    conv = store.create_conversation()
+    state = (
+        SessionRecovery("a" * 32, "runner", 100, phase=phase, attempts=1, attempt_id=attempt_id)
+        if phase is not None
+        else None
+    )
+    if state is not None:
+        assert store.replace_session_recovery(conv.id, None, state)
+    notice = (
+        f"{RECOVERY_NOTICE}\nContinue from the checkpoint." if custom_prompt else RECOVERY_PROMPT
+    )
+    item = NewConversationItem(
+        response_id="native",
+        type="message",
+        data=MessageData(
+            role="user",
+            user_authored=user_authored,
+            content=[{"type": "input_text", "text": notice}],
+        ),
+    )
+    [persisted] = store.append(conv.id, [item])
+    assert persisted.data.is_meta is expected_meta
+    assert item.data.is_meta is False
+    assert store.list_items(conv.id).data == [persisted]
+    assert store.get_session_recovery(conv.id) == (state if expected_meta else None)
+
+
+@pytest.mark.parametrize("input_first", [False, True])
+def test_input_in_the_same_batch_supersedes_later_native_recovery_echoes(
+    store: SqlAlchemyConversationStore, input_first: bool
+) -> None:
+    from omnigent.entities import MessageData, NewConversationItem
+    from omnigent.session_recovery import RECOVERY_PROMPT, SessionRecovery
+
+    conv = store.create_conversation()
+    state = SessionRecovery(
+        "a" * 32, "runner", 100, phase="dispatching", attempts=1, attempt_id="attempt"
+    )
+    assert store.replace_session_recovery(conv.id, None, state)
+    texts = ["New task", RECOVERY_PROMPT] if input_first else [RECOVERY_PROMPT, "New task"]
+    persisted = store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                response_id="native",
+                type="message",
+                data=MessageData(role="user", content=[{"type": "input_text", "text": text}]),
+            )
+            for text in texts
+        ],
+    )
+    assert [item.data.is_meta for item in persisted] == (
+        [False, False] if input_first else [True, False]
+    )
+    assert store.get_session_recovery(conv.id) is None
+
+
 def test_failed_input_does_not_cancel_recovery(
     store: SqlAlchemyConversationStore, conv_db: Path
 ) -> None:

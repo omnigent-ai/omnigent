@@ -301,21 +301,34 @@ async def test_recovery_has_own_readiness_and_stable_identity_across_failed_post
     client.release.set()
     initializer = RunnerSessionInitializer(registry, server_version="test")  # type: ignore[arg-type]
     conv = _conversation()
+    prompt = "[System: session resumed]\nCheck the task checkpoint before continuing."
     await initializer.initialize(conv, client, timeout=10)  # type: ignore[arg-type]
     client.status_code = 500
-    await initializer.initialize(conv, client, timeout=10, resume_interrupted_turn=True)  # type: ignore[arg-type]
+    await initializer.initialize(  # type: ignore[arg-type]
+        conv, client, timeout=10, resume_interrupted_turn=True, recovery_prompt=prompt
+    )
     first_id = client.calls[-1]["session_init"]["recovery_id"]
     client.status_code = 201
-    await initializer.initialize(conv, client, timeout=10, resume_interrupted_turn=True)  # type: ignore[arg-type]
+    await initializer.initialize(  # type: ignore[arg-type]
+        conv, client, timeout=10, resume_interrupted_turn=True, recovery_prompt=prompt
+    )
     assert len(client.calls) == 3
     assert first_id and client.calls[-1]["session_init"]["recovery_id"] == first_id
-    await initializer.initialize(conv, client, timeout=10, resume_interrupted_turn=True)  # type: ignore[arg-type]
+    assert all(call["session_init"]["recovery_prompt"] == prompt for call in client.calls[1:])
+    envelope = parse_runner_session_init_envelope(client.calls[-1])
+    assert envelope is not None and envelope.recovery_prompt == prompt
+    await initializer.initialize(  # type: ignore[arg-type]
+        conv, client, timeout=10, resume_interrupted_turn=True, recovery_prompt=prompt
+    )
     assert len(client.calls) == 3
     # A later binding back to this live runner starts a distinct recovery.
     initializer.invalidate_session(conv.id)
     assert not initializer.is_initialized(conv, client)  # type: ignore[arg-type]
-    await initializer.initialize(conv, client, timeout=10, resume_interrupted_turn=True)  # type: ignore[arg-type]
+    await initializer.initialize(  # type: ignore[arg-type]
+        conv, client, timeout=10, resume_interrupted_turn=True, recovery_prompt=prompt
+    )
     assert client.calls[-1]["session_init"]["recovery_id"] != first_id
+    assert client.calls[-1]["session_init"]["recovery_prompt"] == prompt
     assert initializer.is_initialized(conv, client)  # type: ignore[arg-type]
 
 

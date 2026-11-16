@@ -1571,9 +1571,9 @@ def register_events_routes(
         if body.type == _RETRY_SESSION_TYPE or (
             body.type == "message" and body.data.get("role", "user") == "user"
         ):
-            from omnigent.server.host_session_recovery import stop_recovery
-
-            await asyncio.to_thread(stop_recovery, conversation_store, conv, only_pending=True)
+            recoverer = getattr(request.app.state, "host_session_recoverer", None)
+            if recoverer is not None:
+                await asyncio.to_thread(recoverer.stop_recovery, conv, only_pending=True)
 
         # Set when this message sends a file outside the default extensions, which
         # the bound runtime must be able to deliver as a file.
@@ -2024,9 +2024,9 @@ def register_events_routes(
                 user_id, session_id, LEVEL_OWNER, permission_store, conversation_store
             )
         if body.type in (_INTERRUPT_TYPE, _STOP_SESSION_TYPE):
-            from omnigent.server.host_session_recovery import stop_recovery
-
-            await asyncio.to_thread(stop_recovery, conversation_store, conv)
+            recoverer = getattr(request.app.state, "host_session_recoverer", None)
+            if recoverer is not None:
+                await asyncio.to_thread(recoverer.stop_recovery, conv)
             startup = getattr(request.app.state, "startup_inputs", None)
             if startup is not None:
                 await startup.cancel(session_id)
@@ -2199,6 +2199,9 @@ def register_events_routes(
                     stop_conv.runner_id,
                     stop_host_registry,
                     conversation_store,
+                    host_session_recoverer=getattr(
+                        request.app.state, "host_session_recoverer", None
+                    ),
                 )
                 if not host_stopped:
                     host_conn = (
@@ -2277,6 +2280,9 @@ def register_events_routes(
                         session_id,
                         conversation_store,
                         int(time.time()) - RUNNER_LIVENESS_TTL_S,
+                        host_session_recoverer=getattr(
+                            request.app.state, "host_session_recoverer", None
+                        ),
                     )
             # Stop is non-sticky: no persistent marker is written. The
             # runner tunnel dropping above flips ``runner_online`` to false

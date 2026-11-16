@@ -297,7 +297,7 @@ credential context; the default context is a no-op.
 
 ## Automatic continuation after a host restart
 
-Managed deployments can opt in through the existing host configuration:
+Administrators can opt a provider in through the server's existing host configuration:
 
 ```yaml
 sandbox:
@@ -305,7 +305,17 @@ sandbox:
   host_config:
     host:
       recover_interrupted_sessions: true
+      # Optional administrator instructions; the resume marker is added automatically.
+      recovery_prompt: >-
+        Continue the current task from its checkpoint. Check interrupted
+        operations before repeating them.
 ```
+
+Both the server's provider configuration and the host's hello must opt in.
+A host cannot enable this by advertising the capability alone. Omit the flag or
+set it to `false` to keep the existing manual continuation behavior, including
+for existing managed controllers. The optional prompt must be nonblank and at
+most 8,000 characters; omitting it uses the built-in continuation instructions.
 
 This is off by default and independent of `resume_stopped`. The provider must
 restore the workspace, credentials, and harness state **before starting the
@@ -322,11 +332,19 @@ automatic continuation. Missing workspace directories are refused, not recreated
 The feature does not provision compute or call provider wake methods: the provider
 or infrastructure supervisor must bring the host back first.
 
-Recovery intent is private conversation state, with at most three launch attempts
+Recovery intent uses private `omnigent.recovery.*` conversation labels: the host
+and runner bindings, interruption time, phase, attempt count and identity, and
+next retry time. These labels are hidden from normal label reads and forks and
+cannot be written through ordinary label APIs. No new table or ledger is needed.
+
+Recovery permits at most three launch attempts
 and a 24-hour window per interrupted task. Launch retries back off; the budget
 survives server restarts. An uncertain continuation delivery stops automatically
 instead of replaying potentially completed work. A new user message starts a fresh
-budget. This is not an exactly-once guarantee for tool side effects.
+budget. During recovery the session continues automatically without a visible
+synthetic user message. When the retry budget is exhausted or continuation
+delivery is uncertain, it shows “Automatic resume failed. Please send a new
+message to continue.” This is not an exactly-once guarantee for tool side effects.
 
 Custom conversation stores opt in with `supports_session_recovery = True` after
 implementing `get_session_recovery` and atomic `replace_session_recovery`, ordered

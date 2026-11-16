@@ -32,6 +32,7 @@ from omnigent.runner.session_history import CANCELLATION_MARKER_TEXT
 from omnigent.runner.session_init_protocol import (
     build_runner_session_init_payload,
 )
+from omnigent.session_recovery import RECOVERY_NOTICE, RECOVERY_PROMPT
 from omnigent.spec.types import AgentSpec
 from omnigent.tools.builtins.browser import BROWSER_TOOL_NAMES
 from tests.runner.conftest import (
@@ -429,14 +430,24 @@ async def test_suppressed_reinitialization_preserves_active_turn(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "custom_prompt", [None, RECOVERY_PROMPT, "Check the task checkpoint before continuing."]
+)
 async def test_explicit_recovery_deduplicates_history_heuristic(
     caplog: pytest.LogCaptureFixture,
+    custom_prompt: str | None,
 ) -> None:
     """Retrying a continuation must not also replay a trailing user item."""
     app, _pm, harness = _build_sdk_app(_HistoryServerClient())
     caplog.set_level(logging.INFO, logger="omnigent.runner.app")
     payload = _session_init_payload(suppress_recovery_turn=False)
     payload["session_init"].update(resume_interrupted_turn=True, recovery_id="same-interruption")
+    if custom_prompt is not None:
+        payload["session_init"]["recovery_prompt"] = (
+            custom_prompt
+            if custom_prompt == RECOVERY_PROMPT
+            else f"{RECOVERY_NOTICE}\n{custom_prompt}"
+        )
     async with _runner_client(app) as client:
         for _ in range(2):
             response = await client.post("/v1/sessions", json=payload)
@@ -447,14 +458,24 @@ async def test_explicit_recovery_deduplicates_history_heuristic(
     assert len(harness.posted_bodies) == 1
     content = str(harness.posted_bodies[0]["content"])
     assert "hello from history" in content
-    assert "Continue the existing task" in content
+    assert (RECOVERY_NOTICE in content) is (custom_prompt is not None)
+    instruction = (
+        custom_prompt
+        if custom_prompt is not None and custom_prompt != RECOVERY_PROMPT
+        else "Continue the existing task"
+    )
+    assert instruction in content
+    if custom_prompt is not None and custom_prompt != RECOVERY_PROMPT:
+        assert "Continue the existing task" not in content
     from omnigent.runtime.harnesses._executor_adapter import _translate_input_to_messages
 
     messages = _translate_input_to_messages(harness.posted_bodies[0]["content"])
-    recovery = next(
-        message for message in messages if "Continue the existing task" in str(message["content"])
-    )
+    recovery = next(message for message in messages if instruction in str(message["content"]))
     assert "input_item_id" not in recovery
+    raw_recovery = next(
+        item for item in harness.posted_bodies[0]["content"] if instruction in str(item)
+    )
+    assert raw_recovery.get("is_meta", False) is (custom_prompt is not None)
     # The first init started the continuation; the retry saw the consumed
     # recovery id and started nothing.
     rows = _init_rows(caplog)
@@ -580,12 +601,12 @@ async def test_forward_in_flight_during_initialization_skips_history_recovery(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "statuses, startup_repaint",
+    "statuses, startup_repaint, custom_prompt",
     [
-        (("running", "idle"), None),
-        (("waiting", "idle"), None),
-        (("running", "idle"), "settled"),
-        (("running", "idle"), "busy"),
+        (("running", "idle"), None, None),
+        (("waiting", "idle"), None, None),
+        (("running", "idle"), "settled", "Check the task checkpoint before continuing."),
+        (("running", "idle"), "busy", None),
     ],
 )
 async def test_native_activity_during_initialization_distinguishes_turns_from_repaints(
@@ -593,6 +614,7 @@ async def test_native_activity_during_initialization_distinguishes_turns_from_re
     tmp_path: Path,
     statuses: tuple[str, str],
     startup_repaint: str | None,
+    custom_prompt: str | None,
 ) -> None:
     """Explicit turns suppress recovery after returning to idle; startup repaints do not."""
     from unittest.mock import AsyncMock
@@ -622,6 +644,8 @@ async def test_native_activity_during_initialization_distinguishes_turns_from_re
     app, _pm, harness = _build_sdk_app(PausedSeedServer(), resources)
     payload = _session_init_payload(suppress_recovery_turn=False)
     payload["session_init"].update(resume_interrupted_turn=True, recovery_id="native-interrupted")
+    if custom_prompt is not None:
+        payload["session_init"]["recovery_prompt"] = f"{RECOVERY_NOTICE}\n{custom_prompt}"
     payload["session_init"]["snapshot"]["harness_override"] = "cursor-native"
     async with _runner_client(app) as client:
         recovery = asyncio.create_task(client.post("/v1/sessions", json=payload))
@@ -652,5 +676,10 @@ async def test_native_activity_during_initialization_distinguishes_turns_from_re
         if turn is not None:
             await asyncio.wait_for(turn, timeout=5)
         assert len(harness.posted_bodies) == int(startup_repaint is not None)
+        if custom_prompt is not None:
+            content = str(harness.posted_bodies[0]["content"])
+            assert RECOVERY_NOTICE in content
+            assert custom_prompt in content
+            assert "Continue the existing task" not in content
         assert (await client.post("/v1/sessions", json=payload)).status_code == 201
         assert len(harness.posted_bodies) == int(startup_repaint is not None)

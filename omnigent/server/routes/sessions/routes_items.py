@@ -167,6 +167,7 @@ def register_items_routes(
             conversation_store=conversation_store,
             liveness_lookup=liveness_lookup,
             host_store=getattr(request.app.state, "host_store", None),
+            host_session_recoverer=getattr(request.app.state, "host_session_recoverer", None),
             may_settle=lambda _conv: True,
         )
 

@@ -21,6 +21,8 @@ proving the grace-window guard.
 from __future__ import annotations
 
 import time
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import httpx
 import pytest
@@ -31,11 +33,16 @@ from sqlalchemy.orm import Session
 
 from omnigent.db.db_models import SqlHost, current_workspace_id
 from omnigent.db.utils import generate_agent_id, get_or_create_engine, now_epoch
+from omnigent.server.host_session_recovery import HostSessionRecoverer
+from omnigent.server.managed_hosts import ManagedSandboxConfig, ManagedSandboxDeployment
+from omnigent.server.routes._sessions import helpers, orchestration
 from omnigent.server.routes._sessions.helpers import (
     _session_status_cache,
     reconcile_orphaned_running_status,
 )
 from omnigent.server.routes._sessions.orchestration import HOST_OFFLINE_HOLD_S
+from omnigent.server.schemas import ErrorDetail
+from omnigent.session_recovery import RECOVERY_LABEL_PREFIX
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.conversation_store import RUNNER_LIVENESS_TTL_S
 from omnigent.stores.conversation_store.sqlalchemy_store import (
@@ -121,6 +128,76 @@ def test_reconcile_is_conditional_and_marks_scheduled_run_incomplete(
     fresh = store.get_conversation(fresh_sid)
     assert fresh is not None
     assert fresh.live_status == "running"
+
+
+@pytest.mark.parametrize("enabled", [False, True], ids=["opt-out", "opt-in"])
+@pytest.mark.parametrize("path", ["orphan", "offline"])
+async def test_interrupted_runner_bookkeeping_requires_recovery_opt_in(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, enabled: bool, path: str
+) -> None:
+    sid = _seed_running_session(db_uri, runner_fresh=False)
+    store = SqlAlchemyConversationStore(db_uri)
+    host_id = "a" * 32
+    store.set_host_id(sid, host_id, workspace="/workspace")
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    config = ManagedSandboxDeployment.single(
+        ManagedSandboxConfig(
+            server_url="https://server.example.test",
+            launcher_factory=Mock(),
+            token_ttl_s=3600,
+            provider="test",
+            host_config={"host": {"recover_interrupted_sessions": enabled}},
+        )
+    )
+    service = HostSessionRecoverer(
+        store,
+        Mock(get=Mock(return_value=None)),
+        Mock(
+            get_host=Mock(return_value=SimpleNamespace(deleted_at=None, sandbox_provider="test"))
+        ),
+        Mock(),
+        Mock(),
+        sandbox_config=config,
+    )
+    publish_status = Mock()
+    monkeypatch.setattr(helpers, "_publish_status", publish_status)
+    monkeypatch.setattr(orchestration, "_publish_status", publish_status)
+    error = ErrorDetail(code="runner_disconnected", message="Runner disconnected unexpectedly.")
+    if path == "orphan":
+        assert reconcile_orphaned_running_status(
+            sid, store, int(time.time()) - 90, host_session_recoverer=service
+        )
+    else:
+        await orchestration._mark_runner_sessions_offline_impl(
+            [conv], error, store, host_session_recoverer=service
+        )
+    recovery = store.get_session_recovery(sid)
+    if enabled:
+        assert recovery is not None
+        assert (recovery.host_id, recovery.runner_id, recovery.phase) == (
+            host_id,
+            conv.runner_id,
+            "pending",
+        )
+        publish_status.assert_not_called()
+    else:
+        assert recovery is None
+        current = store.get_conversation(sid)
+        assert current is not None
+        assert not any(key.startswith(RECOVERY_LABEL_PREFIX) for key in current.labels)
+        if path == "orphan":
+            publish_status.assert_called_once_with(
+                sid, "idle", persist_live_status=False, scheduled_run_outcome="failed"
+            )
+        else:
+            publish_status.assert_called_once_with(
+                sid,
+                "failed",
+                error,
+                failure_origin="runner_offline_sweep",
+                disconnect_evidence=None,
+            )
 
 
 # ── Facet 1: GET /v1/sessions settles orphaned "running" rows ────────────

@@ -187,6 +187,7 @@ class RunnerSessionInitializer:
         suppress_recovery_turn: bool = False,
         resume_interrupted_turn: bool = False,
         recovery_id: str | None = None,
+        recovery_prompt: str | None = None,
         generation: int | None = None,
         store_slots: asyncio.Semaphore | None = None,
         trigger: str = "unspecified",
@@ -266,6 +267,7 @@ class RunnerSessionInitializer:
                 suppress_recovery_turn=suppress_recovery_turn,
                 resume_interrupted_turn=resume_interrupted_turn,
                 recovery_id=recovery_id,
+                recovery_prompt=recovery_prompt,
             )
 
             async def post_session_init() -> httpx.Response:

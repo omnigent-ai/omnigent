@@ -41,6 +41,7 @@ import threading
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -81,6 +82,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+from omnigent.stores.host_store import HostStore
 from tests.budgets import budget
 from tests.runner.helpers import NullServerClient
 from tests.runtime.harnesses._test_scaffold_harnesses import _EchoHarness
@@ -346,7 +348,9 @@ class _TunnelStack:
 
 
 @pytest_asyncio.fixture()
-async def tunnel_three_layer_stack(tmp_path: Path) -> AsyncIterator[_TunnelStack]:
+async def tunnel_three_layer_stack(
+    tmp_path: Path, request: pytest.FixtureRequest
+) -> AsyncIterator[_TunnelStack]:
     """Wire Omnigent server + WS-tunneled runner + EchoHarness in-process.
 
     Lifecycle: build stores, init runtime, override the test harness
@@ -415,6 +419,7 @@ async def tunnel_three_layer_stack(tmp_path: Path) -> AsyncIterator[_TunnelStack
         conversation_store=conv_store,
         artifact_store=artifact_store,
         agent_cache=agent_cache,
+        host_store=HostStore(db_uri) if getattr(request, "param", False) else None,
     )
     set_runner_router(ap_app.state.runner_router)
 
@@ -2986,13 +2991,20 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
 
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("_isolated_session_status_cache")
+@pytest.mark.parametrize("tunnel_three_layer_stack", [True], indirect=True)
 @pytest.mark.parametrize("recovery_pending", [False, True])
-async def test_root_reconnect_defers_to_durable_host_recovery_on_another_replica(
+@pytest.mark.parametrize("provider_enabled", [False, True])
+@pytest.mark.parametrize("host_capability", [None, False, True])
+async def test_root_reconnect_requires_provider_opt_in_before_suppressing_legacy_recovery(
     tunnel_three_layer_stack: _TunnelStack,
     monkeypatch: pytest.MonkeyPatch,
     recovery_pending: bool,
+    provider_enabled: bool,
+    host_capability: bool | None,
 ) -> None:
+    from omnigent.host.frames import HostHelloFrame
     from omnigent.runtime import get_conversation_store
+    from omnigent.server.managed_hosts import ManagedSandboxConfig, ManagedSandboxDeployment
     from omnigent.session_recovery import SessionRecovery
 
     stack = tunnel_three_layer_stack
@@ -3002,7 +3014,33 @@ async def test_root_reconnect_defers_to_durable_host_recovery_on_another_replica
     store = get_conversation_store()
     host_id = "a" * 32
     store.set_host_id(session_id, host_id, workspace="/restored")
-    assert stack.ap_app.state.host_registry.get(host_id) is None
+    service = stack.ap_app.state.host_session_recoverer
+    service.sandbox_config = ManagedSandboxDeployment.single(
+        ManagedSandboxConfig(
+            server_url="https://server.example.test",
+            launcher_factory=lambda: None,
+            token_ttl_s=3600,
+            provider="test",
+            host_config={"host": {"recover_interrupted_sessions": provider_enabled}},
+        )
+    )
+    monkeypatch.setattr(
+        service.host_store,
+        "get_host",
+        lambda _: SimpleNamespace(sandbox_provider="test", deleted_at=None),
+    )
+    if host_capability is not None:
+        stack.ap_app.state.host_registry.register(
+            host_id,
+            AsyncMock(),
+            HostHelloFrame(
+                version="test",
+                frame_protocol_version=1,
+                name="recovery-host",
+                recover_interrupted_sessions=host_capability,
+            ),
+            owner=None,
+        )
     if recovery_pending:
         assert store.replace_session_recovery(
             session_id, None, SessionRecovery(host_id, _RUNNER_ID, 100, phase="launching")
@@ -3013,4 +3051,6 @@ async def test_root_reconnect_defers_to_durable_host_recovery_on_another_replica
     async with _reconnect_fires_connect_hook(
         stack.ap_app, stack.fake_pm, wait_for_recover=session_id
     ):
-        assert spy.call_args.kwargs["suppress_recovery_turn"] is recovery_pending
+        expected = provider_enabled and host_capability is not False and recovery_pending
+        assert spy.call_args.kwargs["suppress_recovery_turn"] is expected
+        assert (store.get_session_recovery(session_id) is not None) is recovery_pending
