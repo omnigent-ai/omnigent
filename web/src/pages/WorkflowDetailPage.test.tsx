@@ -358,12 +358,16 @@ describe("WorkflowDetailPage", () => {
     };
     const page = screen.getByTestId("workflow-detail-page");
     const planner = screen.getByRole("complementary", { name: "Workflow planning chat" });
+    const panel = screen.getByTestId("workflow-planner-panel");
 
     fireEvent.click(screen.getByRole("button", { name: "Expand planning chat" }));
-    expect(planner).toHaveClass("absolute", "inset-0");
+    expect(panel).toHaveClass("absolute", "inset-0");
     expect(page).toHaveClass("invisible");
-    fireEvent.click(screen.getByRole("button", { name: "Collapse planning chat" }));
+    // The aside still reserves its width, so the hidden page doesn't reflow.
+    expect(planner).toHaveClass("w-[42%]");
     expect(planner).not.toHaveClass("absolute");
+    fireEvent.click(screen.getByRole("button", { name: "Collapse planning chat" }));
+    expect(panel).not.toHaveClass("absolute");
     expect(page).not.toHaveClass("invisible");
 
     // Every close path, including the phone sheet after the window narrows,

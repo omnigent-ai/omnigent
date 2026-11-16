@@ -141,6 +141,8 @@ it("attaches the real session before seeding its first message, and restores it 
     "href",
     `/c/${SESSION}`,
   );
+  // Without a handler, as on phones, the header offers no expand toggle.
+  expect(screen.queryByRole("button", { name: "Expand planning chat" })).toBeNull();
 
   cleanup();
   useChatStore.getState().clearSideChatDraft(SESSION);

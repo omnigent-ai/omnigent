@@ -154,8 +154,8 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
     !!proposedSteps?.length && stepSignature(proposedSteps) !== stepSignature(workflow.steps);
   const isDraft = workflow.is_draft ?? workflow.steps.length === 0;
   const canRun = !isDraft && !hasChanges;
-  // Expanded, the planner covers the page. `invisible` keeps the page's scroll
-  // position while taking its controls out of the tab order.
+  // Expanded, the planner covers the page, which keeps its width underneath so
+  // it doesn't reflow; `invisible` keeps its scroll position and tab order out.
   const plannerFillsPage = showPlanner && !isMobile && plannerExpanded;
   // Every close path resets expansion, including the phone sheet after the window
   // narrows, so the planner reopens beside the page.
@@ -385,21 +385,22 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
             </DialogContent>
           </Dialog>
         ) : (
-          <aside
-            aria-label="Workflow planning chat"
-            className={cn(
-              "bg-background pt-[calc(var(--omnigent-header-height)+var(--omnigent-inset-top))] pb-[var(--omnigent-inset-bottom)]",
-              plannerFillsPage
-                ? "absolute inset-0"
-                : "w-[42%] min-w-96 max-w-xl shrink-0 border-l border-border",
-            )}
-          >
-            <WorkflowPlanningChat
-              workflow={workflow}
-              expanded={plannerFillsPage}
-              onExpandedChange={setPlannerExpanded}
-              onClose={closePlanner}
-            />
+          // The aside keeps its width in the row while its panel covers the page.
+          <aside aria-label="Workflow planning chat" className="w-[42%] min-w-96 max-w-xl shrink-0">
+            <div
+              data-testid="workflow-planner-panel"
+              className={cn(
+                "bg-background pt-[calc(var(--omnigent-header-height)+var(--omnigent-inset-top))] pb-[var(--omnigent-inset-bottom)]",
+                plannerFillsPage ? "absolute inset-0" : "h-full border-l border-border",
+              )}
+            >
+              <WorkflowPlanningChat
+                workflow={workflow}
+                expanded={plannerFillsPage}
+                onExpandedChange={setPlannerExpanded}
+                onClose={closePlanner}
+              />
+            </div>
           </aside>
         ))}
     </div>
