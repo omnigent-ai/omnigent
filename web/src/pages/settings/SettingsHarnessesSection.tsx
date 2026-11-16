@@ -32,7 +32,6 @@ import {
 } from "@/hooks/useHosts";
 import { ApiError } from "@/lib/sessionsApi";
 import { useCuratedOutHarnesses } from "@/hooks/useCuratedOutHarnesses";
-import { INVENTORY_HARNESS_IDS, INVENTORY_HARNESSES } from "@/hooks/useHarnessInventory";
 import {
   HARNESS_CREDENTIAL_COPY,
   harnessInstallableOnHost,
@@ -54,12 +53,21 @@ import {
 import { useSettingsRoute } from "../../shell/settingsNav";
 import {
   HARNESS_CARD_ENTRIES,
+  HARNESS_CREDENTIAL_ENTRIES,
   HARNESS_DESCRIPTIONS,
+  HARNESS_DETAIL_ENTRIES,
+  type HarnessCredentialActionName,
+  type HarnessFixActionName,
+  harnessInventoryPage,
   HARNESSES_GRID_ENTRY,
   type NativeHarnessId,
 } from "./search/catalog/harnesses";
 import { SettingsItem } from "./search/SettingsItem";
-import { settingsControlId, settingsControlProps } from "./search/settingsControl";
+import {
+  type SettingsControlProps,
+  settingsControlId,
+  settingsControlProps,
+} from "./search/settingsControl";
 
 interface HarnessEntry {
   /** Native harness slug (e.g. "claude-native") — the readiness/install key. */
@@ -695,8 +703,21 @@ function HarnessDetail({
           description: `${accountDetails(account)} — new sessions on ${host?.name ?? "this host"} can’t use ${entry.name} until you sign in again.`,
         }
       : presentedCredential;
+  const detail = HARNESS_DETAIL_ENTRIES.entry(entry.harness);
+  const credentialEntry = HARNESS_CREDENTIAL_ENTRIES.entry(entry.harness);
+  const credentialAction = (name?: HarnessCredentialActionName) => ({
+    label:
+      name === undefined
+        ? credentialEntry.parts.credentialAction
+        : credentialEntry.nameAlternatives.credentialAction[name],
+    control: settingsControlProps(
+      credentialEntry,
+      "credentialAction",
+      name === undefined ? undefined : { alternative: name },
+    ),
+  });
   const header = (
-    <>
+    <SettingsItem entry={detail}>
       <BackButton label="Harnesses" to="/settings/harnesses" />
       <div className="flex items-start justify-between gap-4">
         <div className="flex min-w-0 items-center gap-3">
@@ -716,44 +737,46 @@ function HarnessDetail({
         </div>
       </div>
       {host && canSetup && <MachineField host={host} />}
-    </>
+    </SettingsItem>
   );
   const credentialCard = (
-    <CredentialCard
-      label={
-        account?.expired && credentialProblem
-          ? "Sign-in expired"
-          : credentialProblem
-            ? "Not signed in"
-            : credential.label
-      }
-      description={
-        account?.expired && credentialProblem
-          ? credential.description
-          : credentialProblem && host
-            ? missingHarnessCredentialCopy(entry.harness, entry.name, host.name)
-            : credential.description
-      }
-      ready={status.ready}
-      warning={credentialProblem}
-      showStatus={canSetup}
-      statusLabel={
-        status.reason === "cli-unresponsive"
-          ? "Not checked"
-          : status.reason === "binary-missing" || status.reason === "unconfigured"
-            ? reconfigurationReason(status.reason)
-            : "Needs reconfiguration"
-      }
-      action={
-        status.ready && canFix && canSwitchHarnessAccount(host, entry.harness)
-          ? { label: "Switch account", onClick: () => onFix("switch") }
-          : status.reason === "needs-auth" && account?.expired && canFix
-            ? { label: "Sign in again", onClick: () => onFix(mode) }
-            : credentialProblem && canFix
-              ? { label: "Reconfigure", onClick: () => onFix(mode) }
-              : undefined
-      }
-    />
+    <SettingsItem entry={credentialEntry}>
+      <CredentialCard
+        label={
+          account?.expired && credentialProblem
+            ? "Sign-in expired"
+            : credentialProblem
+              ? "Not signed in"
+              : credential.label
+        }
+        description={
+          account?.expired && credentialProblem
+            ? credential.description
+            : credentialProblem && host
+              ? missingHarnessCredentialCopy(entry.harness, entry.name, host.name)
+              : credential.description
+        }
+        ready={status.ready}
+        warning={credentialProblem}
+        showStatus={canSetup}
+        statusLabel={
+          status.reason === "cli-unresponsive"
+            ? "Not checked"
+            : status.reason === "binary-missing" || status.reason === "unconfigured"
+              ? reconfigurationReason(status.reason)
+              : "Needs reconfiguration"
+        }
+        action={
+          status.ready && canFix && canSwitchHarnessAccount(host, entry.harness)
+            ? { ...credentialAction("switch"), onClick: () => onFix("switch") }
+            : status.reason === "needs-auth" && account?.expired && canFix
+              ? { ...credentialAction("signInAgain"), onClick: () => onFix(mode) }
+              : credentialProblem && canFix
+                ? { ...credentialAction(), onClick: () => onFix(mode) }
+                : undefined
+        }
+      />
+    </SettingsItem>
   );
   const settings = host ? (
     <div className="flex flex-col gap-6">
@@ -780,14 +803,15 @@ function HarnessDetail({
     </div>
   ) : null;
   // The host inventory only covers these families' MCP servers, skills, and plugins.
-  const family = INVENTORY_HARNESSES.find((f) => INVENTORY_HARNESS_IDS[f] === entry.harness);
-  if (host && family && (status.ready || canFix)) {
+  const inventoryPage = harnessInventoryPage(entry.harness);
+  if (host && inventoryPage && (status.ready || canFix)) {
     return (
       <HarnessCatalog
         header={header}
         settings={settings}
         host={host}
-        family={family}
+        family={inventoryPage.family}
+        detail={inventoryPage.detail}
         defaultTab={status.ready ? "mcps" : "settings"}
       />
     );
@@ -878,16 +902,10 @@ function HarnessWarning({
           : mode === "update"
             ? `${entry.name} is out of date on ${host.name}. Update it so new sessions can use ${entry.name}.`
             : `${entry.name} isn’t set up on ${host.name}, so new sessions can’t use ${entry.name}.`;
-  const action =
-    mode === "tmux"
-      ? "Set up tmux"
-      : !installable
-        ? "Set up"
-        : mode === "update"
-          ? "Update"
-          : mode === "install"
-            ? "Install"
-            : "Reconfigure";
+  const detail = HARNESS_DETAIL_ENTRIES.entry(entry.harness);
+  const fixKey = fixActionKey(mode, installable);
+  const actionLabel =
+    fixKey === undefined ? detail.parts.fixAction : detail.nameAlternatives.fixAction[fixKey];
   return (
     <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-amber-500/30 bg-amber-500/10 p-4 text-ui">
       <div className="flex min-w-0 flex-1 items-start gap-3">
@@ -895,12 +913,32 @@ function HarnessWarning({
         <p>{copy}</p>
       </div>
       {!host.sandbox_provider && reason !== "cli-unresponsive" && (
-        <Button size="sm" onClick={() => onFix(mode)}>
-          {action}
+        <Button
+          size="sm"
+          {...settingsControlProps(
+            detail,
+            "fixAction",
+            fixKey === undefined ? undefined : { alternative: fixKey },
+          )}
+          onClick={() => onFix(mode)}
+        >
+          {actionLabel}
         </Button>
       )}
     </div>
   );
+}
+
+/** The fix a setup warning's button names, by key; undefined is the plain "Set up". */
+function fixActionKey(
+  mode: HarnessFixMode,
+  installable: boolean,
+): HarnessFixActionName | undefined {
+  if (mode === "tmux") return "tmux";
+  if (!installable) return undefined;
+  if (mode === "update") return "update";
+  if (mode === "install") return "install";
+  return "reconfigure";
 }
 
 function ReadyNotice({
@@ -1048,7 +1086,7 @@ function CredentialCard({
   warning: boolean;
   showStatus: boolean;
   statusLabel: string;
-  action?: { label: string; onClick: () => void };
+  action?: { label: string; onClick: () => void; control: SettingsControlProps };
 }) {
   const body = (
     <>
@@ -1098,7 +1136,7 @@ function CredentialCard({
       {action ? (
         <button
           type="button"
-          aria-label={action.label}
+          {...action.control}
           className={cn(
             "flex w-full cursor-pointer items-center gap-3 rounded-xl border p-3 text-left transition-colors focus-visible:ring-3 focus-visible:ring-ring/50 focus-visible:outline-none",
             warning

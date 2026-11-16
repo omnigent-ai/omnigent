@@ -9,6 +9,8 @@ import { Link, useSearchParams } from "@/lib/routing";
 import { cn } from "@/lib/utils";
 import { mcpServerDisplayName } from "@/lib/mcpServerName";
 import { Button } from "@/components/ui/button";
+import type { InventoryHarnessDetailEntry } from "./search/catalog/harnesses";
+import { settingsControlProps } from "./search/settingsControl";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import type { Host } from "@/hooks/useHosts";
 import {
@@ -81,12 +83,14 @@ export function HarnessCatalog({
   settings,
   host,
   family,
+  detail,
   defaultTab = "mcps",
 }: {
   header: ReactNode;
   settings: ReactNode;
   host: Host;
   family: InventoryHarness;
+  detail: InventoryHarnessDetailEntry;
   defaultTab?: CatalogKind | "settings";
 }) {
   // `?tab=settings` (the grid card's gear) opens on Settings; otherwise MCP servers.
@@ -207,7 +211,11 @@ export function HarnessCatalog({
         componentId="settings.harnesses.tab"
         className="mt-8 gap-4"
       >
-        <TabsList variant="line" className="w-full justify-start border-b border-border px-0">
+        <TabsList
+          variant="line"
+          className="w-full justify-start border-b border-border px-0"
+          {...settingsControlProps(detail, "tab")}
+        >
           {KINDS.map((k) => (
             <TabsTrigger
               key={k.id}

@@ -554,6 +554,44 @@ describe("Harnesses grid catalog rows", () => {
   });
 });
 
+describe("Harness page catalog rows", () => {
+  it("names an inventory page's tab list, and keeps its row around the header", () => {
+    hosts = [ONLINE];
+    renderHarnesses("claude-native");
+
+    expect(
+      document.querySelector('[data-settings-item="harness-claude-native-detail"]'),
+    ).toContainElement(screen.getByRole("heading", { name: "Claude Code" }));
+    expect(screen.getByRole("tablist", { name: "Claude Code view" })).toHaveAttribute(
+      "data-settings-control",
+      "harness-claude-native-detail:tab",
+    );
+  });
+
+  it("names the setup warning's fix and the credential card's action by their key", () => {
+    hosts = [{ ...ONLINE, configured_harnesses: { "codex-native": "binary-missing" } }];
+    renderHarnesses("codex-native");
+
+    expect(screen.getByRole("button", { name: "Install" })).toHaveAttribute(
+      "data-settings-control",
+      "harness-codex-native-detail:fixAction",
+    );
+    expect(
+      document.querySelector('[data-settings-item="harness-codex-native-credential"]'),
+    ).toBeTruthy();
+  });
+
+  it("names the credential card's action, Reconfigure, by its own control", () => {
+    hosts = [ONLINE];
+    renderHarnesses("codex-native");
+
+    expect(screen.getByRole("button", { name: "Reconfigure" })).toHaveAttribute(
+      "data-settings-control",
+      "harness-codex-native-credential:credentialAction",
+    );
+  });
+});
+
 describe("Harness card navigation", () => {
   const selected = (name: string) =>
     screen.getByRole("tab", { name }).getAttribute("aria-selected");
