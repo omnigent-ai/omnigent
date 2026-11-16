@@ -619,6 +619,100 @@ async def test_deleting_the_session_stops_an_answer_on_its_way(
     assert delivered == []
 
 
+@pytest.mark.parametrize("then", ["server_back", "session_deleted"])
+async def test_a_late_answer_outlasts_a_failed_delivery(
+    monkeypatch: pytest.MonkeyPatch, then: str
+) -> None:
+    from omnigent.runner import subagent_work
+
+    async def no_backoff(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(journal_tools, "_ANSWER_WAIT_IN_TURN_S", 0.2)
+    # Long enough that only the server's reconnect can bring the next try.
+    monkeypatch.setattr(journal_tools, "_ANSWER_REDELIVERY_DELAYS_S", (30.0,))
+    monkeypatch.setattr(subagent_work, "_wake_retry_sleep", no_backoff)
+    elicitation_id = workflow_elicitation_id(SESSION, "tool:toolu_redeliver")
+    refused: list[httpx.Request] = []
+    messages: list[dict[str, object]] = []
+    server_up = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == f"/v1/sessions/{SESSION}/events":
+            if not server_up:
+                refused.append(request)
+                return httpx.Response(503, json={"error": "runner_unavailable"})
+            messages.append(json.loads(request.content))
+            return httpx.Response(200, json={"queued": True})
+        return httpx.Response(200, json={"entry": _STATUS, "elicitation_id": elicitation_id})
+
+    async with _client(handler) as server:
+        try:
+            result = await _run(
+                server,
+                "sys_workflow_request_input",
+                {"step": "deploy", "questions": [_QUESTION]},
+                call_id="toolu_redeliver",
+                publish_event=lambda *_: None,
+            )
+            assert result["still_open"] is True
+            assert pending_approvals.resolve(
+                elicitation_id, True, {"Deploy to prod now?": "Deploy"}
+            )
+            await poll_until_async(
+                lambda: len(refused) == subagent_work._WAKE_POST_MAX_ATTEMPTS, timeout_s=5
+            )
+            # Every attempt failed, and the answer waits for the next try.
+            assert journal_tools.answer_arrives_as_message(elicitation_id)
+            if then == "session_deleted":
+                await journal_tools.cancel_session_questions(SESSION)
+            server_up = True
+            pending_approvals.notify_server_reconnect()
+            if then == "server_back":
+                await poll_until_async(lambda: messages, timeout_s=5)
+            else:
+                await asyncio.sleep(0.1)
+        finally:
+            await journal_tools.cancel_session_questions(SESSION)
+    expected = {
+        "type": "message",
+        "data": {"role": "user", "content": [{"type": "input_text", "text": _ANSWERED_NOTICE}]},
+    }
+    assert messages == ([expected] if then == "server_back" else [])
+    assert not journal_tools.answer_arrives_as_message(elicitation_id)
+
+
+async def test_a_stopped_turn_leaves_its_question_open_for_a_late_answer() -> None:
+    elicitation_id = workflow_elicitation_id(SESSION, "tool:toolu_stopped")
+    messages: list[dict[str, object]] = []
+    published: list[dict[str, object]] = []
+    async with _client(_late_question_server(elicitation_id, messages)) as server:
+        try:
+            call = asyncio.create_task(
+                _run(
+                    server,
+                    "sys_workflow_request_input",
+                    {"step": "deploy", "questions": [_QUESTION]},
+                    call_id="toolu_stopped",
+                    publish_event=lambda _session, event: published.append(event),
+                )
+            )
+            # The question is up once its task's status is published.
+            await poll_until_async(lambda: published, timeout_s=5)
+            call.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await call
+            assert journal_tools.answer_arrives_as_message(elicitation_id)
+            assert not pending_approvals.has_pending(SESSION)
+            assert pending_approvals.resolve(
+                elicitation_id, True, {"Deploy to prod now?": "Deploy"}
+            )
+            await poll_until_async(lambda: messages, timeout_s=5)
+        finally:
+            await journal_tools.cancel_session_questions(SESSION)
+    assert [message["data"]["content"][0]["text"] for message in messages] == [_ANSWERED_NOTICE]
+
+
 @pytest.mark.parametrize("ending", ["expiry", "session_deleted"])
 async def test_a_question_closed_without_an_answer_wakes_nobody(
     monkeypatch: pytest.MonkeyPatch, ending: str

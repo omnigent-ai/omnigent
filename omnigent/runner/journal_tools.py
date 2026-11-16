@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import contextlib
 import difflib
 import hashlib
 import itertools
@@ -292,6 +293,9 @@ _STILL_OPEN_DETAIL = (
     "No answer yet. The question stays in the user's Inbox. Finish work that doesn't depend "
     "on it, then end your turn; their answer will arrive as a new message."
 )
+# Once a late answer's message fails every attempt, the next tries wait for the
+# server's reconnect or these delays, whichever comes first.
+_ANSWER_REDELIVERY_DELAYS_S = (30.0, 60.0, 120.0, 300.0, 600.0, 1800.0, 3600.0)
 
 
 @dataclass(frozen=True)
@@ -475,6 +479,14 @@ def _deliver_answer_as_message(
             if verdict.timed_out:
                 return
             notice = _answer_notice(step, questions, verdict)
+            for delay_s in _ANSWER_REDELIVERY_DELAYS_S:
+                generation = pending_approvals.current_server_generation()
+                if await _deliver_subagent_wake_post(server_client, conversation_id, notice):
+                    return
+                with contextlib.suppress(TimeoutError):
+                    await pending_approvals.wait_for_server_reconnect(
+                        generation, timeout_seconds=delay_s
+                    )
             if not await _deliver_subagent_wake_post(server_client, conversation_id, notice):
                 _logger.warning(
                     "could not deliver the answer to workflow question %s",
