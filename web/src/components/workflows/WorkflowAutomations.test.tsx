@@ -109,25 +109,36 @@ describe("WorkflowAutomations", () => {
     expect(within(trigger!).getByText(/^Last run failed/)).toHaveClass("text-status-red");
   });
 
-  it("says when no automation runs it, keeps the list through a failed refresh, and says when none loaded", async () => {
-    vi.mocked(authenticatedFetch).mockImplementation(async () => automationResponse([UNRELATED]));
+  it("keeps loaded rows through a failed refresh, and says when none loaded or none run it", async () => {
     const client = renderAutomations();
-    expect(await screen.findByTestId("workflow-automations-empty")).toHaveTextContent(
-      "No automations yet.",
-    );
+    expect(await screen.findAllByTestId("workflow-automation")).toHaveLength(2);
 
     vi.mocked(authenticatedFetch).mockImplementation(
       async () => new Response(null, { status: 500 }),
     );
-    await act(() => client.invalidateQueries({ queryKey: SCHEDULED_TASKS_KEY }));
+    await act(async () => {
+      await client.invalidateQueries({ queryKey: SCHEDULED_TASKS_KEY });
+      // Query observers hear of the failed refresh on a zero-delay timer.
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, 0);
+      });
+    });
     expect(client.getQueryState(SCHEDULED_TASKS_KEY)?.status).toBe("error");
-    expect(screen.getByTestId("workflow-automations-empty")).toBeInTheDocument();
+    expect(screen.getAllByTestId("workflow-automation")).toHaveLength(2);
+    expect(screen.getByRole("link", { name: "Daily triage" })).toBeVisible();
     expect(screen.queryByTestId("workflow-automations-error")).toBeNull();
 
     cleanup();
     renderAutomations();
     expect(await screen.findByTestId("workflow-automations-error")).toHaveTextContent(
       "Couldn’t load automations.",
+    );
+
+    cleanup();
+    vi.mocked(authenticatedFetch).mockImplementation(async () => automationResponse([UNRELATED]));
+    renderAutomations();
+    expect(await screen.findByTestId("workflow-automations-empty")).toHaveTextContent(
+      "No automations yet.",
     );
   });
 });
