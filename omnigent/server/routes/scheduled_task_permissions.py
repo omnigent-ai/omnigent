@@ -560,7 +560,7 @@ def register_scheduled_task_permissions_routes(
         """
         store = require_sharing(request, granting=False)
         task = await owned_task(request, scheduled_task_id)
-        # The grant route stores this spelling, so every call below uses it.
+        # Audit the requested ID first, in case resolving it fails.
         add_audit_attrs(target_user_id=target_user_id)
         # The stored spelling, so every call below finds the grant the list showed.
         grantee = await asyncio.to_thread(_grantee_to_remove, store, task.id, target_user_id)

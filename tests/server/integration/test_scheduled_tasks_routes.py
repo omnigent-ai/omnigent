@@ -4895,8 +4895,14 @@ async def test_revoke_removes_the_grant_under_the_spelling_the_store_holds(
     erin = {"alice@example.com": LEVEL_OWNER, "erin@example.com": LEVEL_READ}
     assert _session_grants(db_uri, session_id) == erin
 
-    # A grantee the directory now refuses, or can't look up, is still removed.
+    # A spelling the directory refuses, or can't look up, is used as given.
     refused.add("erin@example.com")
+    revoked = await auth_client.delete(
+        _permissions_url(task_id, "ERIN@example.com"), headers=_headers()
+    )
+    assert revoked.status_code == 204, revoked.text
+    assert _task_grantees(db_uri, task_id) == ["erin@example.com"]
+    # So a grantee it now refuses is still removed by their listed ID.
     revoked = await auth_client.delete(
         _permissions_url(task_id, "erin@example.com"), headers=_headers()
     )
