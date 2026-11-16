@@ -889,32 +889,44 @@ def _fail_next_request(
 
 
 @pytest.mark.parametrize("stderr_text", ["", "helper startup failed\n", "helper failed: café\n"])
-def test_helper_exit_detail_does_not_wait_for_stderr_eof(tmp_path: Path, stderr_text: str) -> None:
+@pytest.mark.parametrize("encoding", ["utf-8", "latin-1"])
+def test_helper_exit_detail_does_not_wait_for_stderr_eof(
+    tmp_path: Path, stderr_text: str, encoding: str
+) -> None:
     os_env = _helper_env(tmp_path, "none")
     read_fd, write_fd = os.pipe()
     try:
         with (
-            os.fdopen(read_fd, "r", encoding="utf-8") as stderr_reader,
+            os.fdopen(read_fd, "r", encoding=encoding) as stderr_reader,
             os.fdopen(write_fd, "wb", buffering=0) as stderr_writer,
         ):
             process = subprocess.Popen(
-                [sys.executable, "-c", "pass"],
+                [
+                    sys.executable,
+                    "-c",
+                    "import os, sys; os.close(1); "
+                    "os.write(2, sys.argv[1].encode(sys.argv[2])); os._exit(7)",
+                    stderr_text,
+                    encoding,
+                ],
+                stdout=subprocess.PIPE,
                 stderr=stderr_writer,
                 text=True,
-                encoding="utf-8",
+                encoding=encoding,
             )
             process.stderr = stderr_reader
             os_env._helper._proc = process
-            assert process.wait(timeout=10) == 0
+            assert process.stdout is not None
+            assert process.stdout.read() == ""
             # A surviving descendant can keep this pipe open after the helper exits.
-            stderr_writer.write(stderr_text.encode("utf-8"))
             with ThreadPoolExecutor(max_workers=1) as executor:
                 result = executor.submit(os_env._helper._helper_exit_detail_locked)
                 try:
                     detail = result.result(timeout=5)
                 finally:
                     stderr_writer.close()
-            expected = "OS environment helper exited with code 0"
+            assert process.wait(timeout=10) == 7
+            expected = "OS environment helper exited with code 7"
             if stderr_text:
                 expected += f": {stderr_text.strip()}"
             assert detail == expected

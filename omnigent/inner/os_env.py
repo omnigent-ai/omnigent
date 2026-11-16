@@ -792,6 +792,8 @@ class _HelperProcessClient:
         if self._proc.stderr is not None:
             try:
                 # Descendants can keep stderr open after the launcher exits.
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    self._proc.wait(timeout=1)
                 stderr_fd = self._proc.stderr.fileno()
                 os.set_blocking(stderr_fd, False)
                 stderr = (
