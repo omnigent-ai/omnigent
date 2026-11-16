@@ -5,7 +5,9 @@
  *
  * Data comes from `useScheduledTasks`. Pause/resume and delete go through the
  * update/delete mutations, which invalidate the list. Share opens the shared
- * permissions dialog for an automation the viewer owns.
+ * permissions dialog for an automation the viewer owns. On a multi-user server
+ * that shares automations, a "Shared with me" tab lists other users'
+ * automations shared with the viewer, read-only, a page at a time.
  * The human-readable schedule and next-run text are computed client-side from
  * each task's stored RRULE (`scheduleText`) — there is no backend next-run
  * endpoint.
@@ -40,11 +42,12 @@ import {
   useDeleteScheduledTask,
   useRunScheduledTaskNow,
   useScheduledTasks,
+  useSharedScheduledTasks,
   useUpdateScheduledTask,
 } from "@/hooks/useScheduledTasks";
 import { useNow } from "@/hooks/useNow";
 import { useViewerId } from "@/hooks/useViewerId";
-import { canShareAutomation } from "@/lib/permissionsApi";
+import { automationSharingAvailable, canShareAutomation } from "@/lib/permissionsApi";
 import { ScheduledTaskApiError, type ScheduledTask } from "@/lib/scheduledTasksApi";
 import { nextRunAtMs } from "@/lib/scheduleText";
 import { cn } from "@/lib/utils";
@@ -56,6 +59,46 @@ const FILTER_TABS: { value: FilterTab; label: string }[] = [
   { value: "active", label: "Active" },
   { value: "paused", label: "Paused" },
 ];
+
+/**
+ * The tasks matching the search and Active/Paused filter: ACTIVE first by soonest
+ * next run, PAUSED last by name. The server's next run is authoritative (it counts
+ * COUNT from the task's creation, which the client can't); the local estimate is
+ * only a fallback. Active rows with no computable next run sort after the rest.
+ */
+function filterAndSortTasks(
+  tasks: ScheduledTask[],
+  search: string,
+  filter: FilterTab,
+): ScheduledTask[] {
+  const q = search.trim().toLowerCase();
+  const matches = tasks.filter((t) => {
+    if (filter === "active" && t.state !== "active") return false;
+    if (filter === "paused" && t.state !== "paused") return false;
+    if (q && !t.name.toLowerCase().includes(q)) return false;
+    return true;
+  });
+  const nextRunByTaskId = new Map(
+    matches
+      .filter((t) => t.state === "active")
+      .map((t) => {
+        const server = t.nextRunAt != null ? Date.parse(t.nextRunAt) : Number.NaN;
+        return [t.id, Number.isNaN(server) ? nextRunAtMs(t.rrule, t.timezone) : server];
+      }),
+  );
+  return matches.slice().sort((a, b) => {
+    const aPaused = a.state === "paused";
+    const bPaused = b.state === "paused";
+    if (aPaused !== bPaused) return aPaused ? 1 : -1;
+    if (aPaused && bPaused) return a.name.localeCompare(b.name);
+    const aNext = nextRunByTaskId.get(a.id) ?? null;
+    const bNext = nextRunByTaskId.get(b.id) ?? null;
+    if (aNext == null && bNext == null) return a.name.localeCompare(b.name);
+    if (aNext == null) return 1;
+    if (bNext == null) return -1;
+    return aNext - bNext;
+  });
+}
 
 export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }) {
   const newTaskButtonRef = useRef<HTMLButtonElement>(null);
@@ -85,8 +128,20 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
   const selectedTemplate = AUTOMATION_TEMPLATES.find((template) => template.id === templateId);
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
-  const view = templatesOnly || searchParams.get("view") === "templates" ? "templates" : "yours";
-  useOmnigentPageView(view === "templates" ? "tasks.templates" : "tasks");
+  const info = useServerInfo();
+  const sharingAvailable = automationSharingAvailable(info);
+  const requestedViewParam = searchParams.get("view");
+  // A linked Shared tab waits for the server's capabilities rather than bouncing.
+  const view =
+    templatesOnly || requestedViewParam === "templates"
+      ? "templates"
+      : requestedViewParam === "shared" && (info === "loading" || sharingAvailable)
+        ? "shared"
+        : "yours";
+  useOmnigentPageView(
+    view === "templates" ? "tasks.templates" : view === "shared" ? "tasks.shared" : "tasks",
+  );
+  const sharedQuery = useSharedScheduledTasks(sharingAvailable && view === "shared");
   const requestedView = useRef<string>(view);
   useEffect(() => {
     requestedView.current = view;
@@ -96,7 +151,6 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
   }, [templatesOnly, navigate]);
   // A trigger's manager keeps one session and starts its workers from it, so
   // the templates need "continue in the same session" and session orchestration.
-  const info = useServerInfo();
   const triggersSupported =
     info !== "loading" &&
     info.scheduled_task_session_modes === true &&
@@ -147,42 +201,26 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
     }
   }
 
-  const filtered = useMemo(() => {
-    const all = tasks ?? [];
-    const q = search.trim().toLowerCase();
-    const matches = all.filter((t) => {
-      if (filter === "active" && t.state !== "active") return false;
-      if (filter === "paused" && t.state !== "paused") return false;
-      if (q && !t.name.toLowerCase().includes(q)) return false;
-      return true;
-    });
-    // The server's next run is authoritative (it counts COUNT from the task's
-    // creation, which the client can't); the local estimate is only a fallback.
-    const nextRunByTaskId = new Map(
-      matches
-        .filter((t) => t.state === "active")
-        .map((t) => {
-          const server = t.nextRunAt != null ? Date.parse(t.nextRunAt) : Number.NaN;
-          return [t.id, Number.isNaN(server) ? nextRunAtMs(t.rrule, t.timezone) : server];
-        }),
-    );
-    // Sort: ACTIVE first (soonest next-run at the top), PAUSED last. The
-    // least-actionable (paused) rows sink to the bottom rather than leading the
-    // list. Active rows with no computable next-run sort after those that have
-    // one; paused rows keep a stable name order among themselves.
-    return matches.slice().sort((a, b) => {
-      const aPaused = a.state === "paused";
-      const bPaused = b.state === "paused";
-      if (aPaused !== bPaused) return aPaused ? 1 : -1;
-      if (aPaused && bPaused) return a.name.localeCompare(b.name);
-      const aNext = nextRunByTaskId.get(a.id) ?? null;
-      const bNext = nextRunByTaskId.get(b.id) ?? null;
-      if (aNext == null && bNext == null) return a.name.localeCompare(b.name);
-      if (aNext == null) return 1;
-      if (bNext == null) return -1;
-      return aNext - bNext;
-    });
-  }, [tasks, search, filter]);
+  const filtered = useMemo(
+    () => filterAndSortTasks(tasks ?? [], search, filter),
+    [tasks, search, filter],
+  );
+  const sharedTasks = useMemo(
+    () => sharedQuery.data?.pages.flatMap((page) => page.tasks) ?? [],
+    [sharedQuery.data],
+  );
+  const sharedFiltered = useMemo(
+    () => filterAndSortTasks(sharedTasks, search, filter),
+    [sharedTasks, search, filter],
+  );
+  const { hasNextPage: sharedHasMore, isFetchingNextPage: sharedFetchingMore } = sharedQuery;
+  const fetchMoreShared = sharedQuery.fetchNextPage;
+  // A page can come back empty while more remain; keep going until one has rows.
+  useEffect(() => {
+    if (view === "shared" && sharedTasks.length === 0 && sharedHasMore && !sharedFetchingMore) {
+      void fetchMoreShared();
+    }
+  }, [view, sharedTasks.length, sharedHasMore, sharedFetchingMore, fetchMoreShared]);
 
   // A per-task busy flag so a row's menu disables while its own mutation runs.
   // Covers pause/resume (update), delete, and run-now so the ⋯ menu can't be
@@ -236,6 +274,19 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
   }
 
   const hasAnyTasks = (tasks ?? []).length > 0;
+  const hasAnyShared = sharedTasks.length > 0;
+  const listControls = (hasAny: boolean) => (
+    <TaskListControls
+      search={search}
+      onSearchChange={setSearch}
+      filter={filter}
+      onFilterChange={(value) => {
+        trackClick(`tasks.filter_${value}`, "button");
+        setFilter(value);
+      }}
+      showFilters={hasAny}
+    />
+  );
 
   const createDialog = (
     <CreateScheduledTaskDialog
@@ -302,7 +353,7 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
           trackValueChange("tasks.view", "tabs", value, { valueHasNoPii: true });
           setSearchParams((current) => {
             const next = new URLSearchParams(current);
-            if (value === "templates") next.set("view", "templates");
+            if (value === "templates" || value === "shared") next.set("view", value);
             else next.delete("view");
             return next;
           });
@@ -334,48 +385,17 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
           <TabsTrigger value="yours" className="h-8 flex-none px-3">
             Your automations
           </TabsTrigger>
+          {(sharingAvailable || view === "shared") && (
+            <TabsTrigger value="shared" className="h-8 flex-none px-3">
+              Shared with me
+            </TabsTrigger>
+          )}
           <TabsTrigger value="templates" className="h-8 flex-none px-3">
             Templates
           </TabsTrigger>
         </TabsList>
         <TabsContent value="yours" className="mt-4">
-          <div className="mb-4 flex flex-col gap-5">
-            <div className="relative">
-              <SearchIcon className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground" />
-              <Input
-                value={search}
-                onChange={(e) => setSearch(e.target.value)}
-                placeholder="Search automations…"
-                componentId="tasks.search"
-                data-testid="tasks-search"
-                className="pl-9"
-              />
-            </div>
-            {hasAnyTasks && (
-              <div aria-label="Filter automations" className="flex items-center gap-1">
-                {FILTER_TABS.map((tab) => (
-                  <button
-                    key={tab.value}
-                    type="button"
-                    aria-pressed={filter === tab.value}
-                    data-testid={`tasks-filter-${tab.value}`}
-                    onClick={() => {
-                      trackClick(`tasks.filter_${tab.value}`, "button");
-                      setFilter(tab.value);
-                    }}
-                    className={cn(
-                      "rounded-md px-3 py-1 text-ui font-medium transition-colors",
-                      filter === tab.value
-                        ? "bg-muted text-foreground"
-                        : "text-muted-foreground hover:bg-muted/50 hover:text-foreground",
-                    )}
-                  >
-                    {tab.label}
-                  </button>
-                ))}
-              </div>
-            )}
-          </div>
+          {listControls(hasAnyTasks)}
 
           {isError ? (
             <div
@@ -425,6 +445,68 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
             <TemplateGallery onPick={openFromTemplate} preview />
           )}
         </TabsContent>
+        <TabsContent value="shared" className="mt-4">
+          {listControls(hasAnyShared)}
+          {sharedQuery.isError ? (
+            <div
+              role="alert"
+              data-testid="shared-tasks-load-error"
+              className="flex items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-ui"
+            >
+              <TriangleAlertIcon className="size-4 shrink-0 text-destructive" />
+              <span className="flex-1">Couldn’t load automations shared with you.</span>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => void sharedQuery.refetch()}
+                componentId="tasks.shared.retry"
+              >
+                Retry
+              </Button>
+            </div>
+          ) : sharedQuery.isLoading || (!hasAnyShared && sharedHasMore) ? (
+            <div className="flex items-center gap-2 py-12 text-ui text-muted-foreground">
+              <Loader2Icon className="size-4 animate-spin" />
+              Loading automations…
+            </div>
+          ) : sharedFiltered.length === 0 ? (
+            <div className="py-8" data-testid="shared-tasks-empty-state">
+              <div className="py-10 text-center text-ui text-muted-foreground">
+                {hasAnyShared ? "No automations found" : "No automations are shared with you yet"}
+              </div>
+            </div>
+          ) : (
+            <div className="flex flex-col gap-2" data-testid="shared-tasks-list">
+              {sharedFiltered.map((task) => (
+                <ScheduledTaskRow
+                  key={task.id}
+                  task={task}
+                  now={now}
+                  busy={false}
+                  onEdit={handleEdit}
+                  onPauseToggle={handlePauseToggle}
+                  onRunNow={handleRunNow}
+                  onDelete={handleDelete}
+                />
+              ))}
+            </div>
+          )}
+          {!sharedQuery.isError && hasAnyShared && sharedHasMore && (
+            <div className="mt-3 flex justify-center">
+              <Button
+                variant="outline"
+                size="sm"
+                data-testid="shared-tasks-show-more"
+                componentId="tasks.shared.show_more"
+                disabled={sharedFetchingMore}
+                onClick={() => void fetchMoreShared()}
+              >
+                {sharedFetchingMore && <Loader2Icon className="size-4 animate-spin" />}
+                Show more
+              </Button>
+            </div>
+          )}
+        </TabsContent>
         <TabsContent value="templates" className="mt-4">
           {triggersSupported ? (
             <TemplateGallery onPick={openFromTemplate} />
@@ -444,6 +526,58 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
         />
       )}
     </PageScroll>
+  );
+}
+
+/** The search box and, once there are tasks, the All / Active / Paused filter. */
+function TaskListControls({
+  search,
+  onSearchChange,
+  filter,
+  onFilterChange,
+  showFilters,
+}: {
+  search: string;
+  onSearchChange: (value: string) => void;
+  filter: FilterTab;
+  onFilterChange: (value: FilterTab) => void;
+  showFilters: boolean;
+}) {
+  return (
+    <div className="mb-4 flex flex-col gap-5">
+      <div className="relative">
+        <SearchIcon className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground" />
+        <Input
+          value={search}
+          onChange={(e) => onSearchChange(e.target.value)}
+          placeholder="Search automations…"
+          componentId="tasks.search"
+          data-testid="tasks-search"
+          className="pl-9"
+        />
+      </div>
+      {showFilters && (
+        <div aria-label="Filter automations" className="flex items-center gap-1">
+          {FILTER_TABS.map((tab) => (
+            <button
+              key={tab.value}
+              type="button"
+              aria-pressed={filter === tab.value}
+              data-testid={`tasks-filter-${tab.value}`}
+              onClick={() => onFilterChange(tab.value)}
+              className={cn(
+                "rounded-md px-3 py-1 text-ui font-medium transition-colors",
+                filter === tab.value
+                  ? "bg-muted text-foreground"
+                  : "text-muted-foreground hover:bg-muted/50 hover:text-foreground",
+              )}
+            >
+              {tab.label}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
   );
 }
 

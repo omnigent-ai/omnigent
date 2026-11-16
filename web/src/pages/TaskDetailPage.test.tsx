@@ -1012,6 +1012,112 @@ describe("sharing", () => {
   });
 });
 
+describe("an automation shared with the viewer", () => {
+  const sharingInfo: ServerInfo = {
+    ...SERVER_INFO_OFFLINE_FALLBACK,
+    scheduled_task_sharing: true,
+    features: { workflows: true },
+  };
+  const sharedTask = (overrides: Partial<ScheduledTask> = {}) =>
+    task({
+      ownerUserId: "alice@example.com",
+      viewerRole: "viewer",
+      ownerDisplayName: "Alice",
+      hostId: "h_owner",
+      projectId: "proj_owner",
+      ...overrides,
+    });
+
+  function renderShared(data: ScheduledTask, entry = "/tasks/st_1") {
+    vi.mocked(useViewerId).mockReturnValue("bob@example.com");
+    setTask(data);
+    render(<CapabilitiesProvider info={sharingInfo}>{pageTree([entry])}</CapabilitiesProvider>);
+  }
+
+  it("names its owner and shows every change disabled with why", () => {
+    renderShared(sharedTask(), "/tasks/st_1?share=1");
+    expect(screen.getByTestId("task-detail-owner")).toHaveTextContent("Shared by Alice");
+    const controls: [string, string][] = [
+      ["Share automation", "Only the automation's owner can share it."],
+      ["Edit automation", "Only the automation's owner can edit it."],
+      ["Delete automation", "Only the automation's owner can delete it."],
+      ["Run now", "Only the automation's owner can run it."],
+      ["Pause automation", "Only the automation's owner can pause it."],
+    ];
+    for (const [label, reason] of controls) {
+      const wrapper = screen.getByRole("group", { name: label });
+      expect(wrapper).toHaveAttribute("aria-disabled", "true");
+      const control = within(wrapper).getByRole(label === "Pause automation" ? "switch" : "button");
+      expect(control).toBeDisabled();
+      fireEvent.click(control);
+      fireEvent.focus(wrapper);
+      expect(screen.getByRole("tooltip")).toHaveTextContent(reason);
+      fireEvent.blur(wrapper);
+    }
+    expect(updateMutate).not.toHaveBeenCalled();
+    expect(deleteMutate).not.toHaveBeenCalled();
+    expect(runNowMutate).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("edit-dialog-open")).toBeNull();
+    // A share link the owner would follow opens nothing for a viewer.
+    expect(screen.queryByTestId("share-dialog-open")).toBeNull();
+  });
+
+  it("says Resume on a paused automation", () => {
+    renderShared(sharedTask({ state: "paused" }));
+    expect(screen.getByRole("group", { name: "Resume automation" })).toHaveAttribute(
+      "aria-disabled",
+      "true",
+    );
+  });
+
+  it("keeps the owner's host, project and source session private", () => {
+    renderShared(sharedTask({ sourceSessionId: "conv_copy" }));
+    expect(screen.getByTestId("task-detail-starts-from")).toHaveTextContent(
+      "Each run starts with a copy of a session the owner chose.",
+    );
+    expect(screen.queryByRole("link", { name: "Weekly rubric copy" })).toBeNull();
+    openConfiguration();
+    expect(screen.getByTestId("task-detail-host")).toHaveTextContent("The owner's host");
+    expect(screen.queryByTestId("task-detail-project")).toBeNull();
+  });
+
+  it("shows run history and each run's tasks, without the owner's plan controls", () => {
+    const steps: ScheduledTaskRunSteps = {
+      runId: "run_1",
+      planId: "plan_1",
+      planGraphRevision: "graph-0",
+      isCurrent: true,
+      workflowId: "9".repeat(32),
+      planName: "Triage",
+      steps: [
+        { id: "explore", name: "Explore", goal: null, depends_on: [] },
+        { id: "fix", name: "Fix", goal: null, depends_on: ["explore"] },
+      ],
+      statuses: [],
+    };
+    setRuns([run({ id: "run_1", status: "succeeded", conversationId: "c_9" })]);
+    vi.mocked(hooks.useScheduledTaskRunSteps).mockReturnValue(new Map([["run_1", steps]]));
+    renderShared(sharedTask());
+    const row = screen.getByTestId("task-detail-run");
+    expect(within(row).getByTestId("run-open")).toHaveAttribute("href", "/c/c_9");
+    expect(within(row).getAllByTestId("tasks-progress-segment")).toHaveLength(2);
+    expect(within(row).getByTestId("run-graph-button")).toBeInTheDocument();
+    expect(within(row).queryByTestId("run-workflow-button")).toBeNull();
+    expect(within(row).queryByTestId("plan-continue")).toBeNull();
+    expect(within(row).queryByTestId("plan-stop")).toBeNull();
+
+    // The owner's same row keeps them.
+    cleanup();
+    vi.mocked(useViewerId).mockReturnValue("alice@example.com");
+    setTask(sharedTask({ viewerRole: "owner", ownerDisplayName: null }));
+    render(<CapabilitiesProvider info={sharingInfo}>{pageTree()}</CapabilitiesProvider>);
+    const ownersRow = screen.getByTestId("task-detail-run");
+    expect(within(ownersRow).getByTestId("plan-continue")).toBeInTheDocument();
+    expect(within(ownersRow).getByTestId("run-workflow-button")).toBeInTheDocument();
+    expect(screen.queryByTestId("task-detail-owner")).toBeNull();
+  });
+});
+
 describe("run history", () => {
   it.each([
     [1.234, "$1.23"],

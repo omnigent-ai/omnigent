@@ -12,6 +12,7 @@ import { FALLBACK_SERVER_INFO } from "./capabilities";
 import * as identity from "./identity";
 import {
   LEVEL_OWNER,
+  automationSharingAvailable,
   canShareAutomation,
   derivePermissionLevel,
   grantPermission,
@@ -410,6 +411,15 @@ describe("canShareAutomation", () => {
     ["a server still loading", "loading" as const, owner, false],
   ])("answers for %s", (_label, info, viewerId, expected) => {
     expect(canShareAutomation(info, viewerId, owner)).toBe(expected);
+  });
+
+  it.each([
+    ["a multi-user server that shares automations", sharing, true],
+    ["a single-user server", { ...sharing, single_user: true }, false],
+    ["a server without automation sharing", FALLBACK_SERVER_INFO, false],
+    ["a server still loading", "loading" as const, false],
+  ])("lists shared automations on %s", (_label, info, expected) => {
+    expect(automationSharingAvailable(info)).toBe(expected);
   });
 });
 

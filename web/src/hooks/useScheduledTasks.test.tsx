@@ -20,11 +20,13 @@ import {
   useScheduledTaskRuns,
   useScheduledTaskRunSteps,
   useScheduledTasks,
+  useSharedScheduledTasks,
   useUpdateScheduledTask,
 } from "./useScheduledTasks";
 
 vi.mock("@/lib/scheduledTasksApi", () => ({
   listScheduledTasks: vi.fn(),
+  listSharedScheduledTasks: vi.fn(),
   getScheduledTask: vi.fn(),
   listScheduledTaskRuns: vi.fn(),
   listScheduledTaskRunSteps: vi.fn(),
@@ -106,6 +108,41 @@ describe("useScheduledTasks", () => {
     const { result } = renderHook(() => useScheduledTasks(), { wrapper });
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
     expect(result.current.data).toEqual([TASK]);
+  });
+});
+
+describe("useSharedScheduledTasks", () => {
+  const SHARED = { ...TASK, id: "st_shared", viewerRole: "viewer" as const };
+
+  it("pages by cursor and paints the shared task's detail from its cache", async () => {
+    vi.mocked(api.listSharedScheduledTasks)
+      .mockResolvedValueOnce({ tasks: [], nextCursor: "st_0" })
+      .mockResolvedValueOnce({ tasks: [SHARED], nextCursor: null });
+    let resolveDetail: (task: api.ScheduledTask) => void = () => {};
+    vi.mocked(api.getScheduledTask).mockReturnValue(
+      new Promise((resolve) => {
+        resolveDetail = resolve;
+      }),
+    );
+    const { wrapper } = makeWrapper();
+    const { result } = renderHook(() => useSharedScheduledTasks(true), { wrapper });
+    await waitFor(() => expect(result.current.hasNextPage).toBe(true));
+    expect(api.listSharedScheduledTasks).toHaveBeenLastCalledWith(null);
+    await act(() => result.current.fetchNextPage());
+    await waitFor(() => expect(result.current.hasNextPage).toBe(false));
+    expect(api.listSharedScheduledTasks).toHaveBeenLastCalledWith("st_0");
+    expect(result.current.data?.pages.flatMap((page) => page.tasks)).toEqual([SHARED]);
+
+    const detail = renderHook(() => useScheduledTask("st_shared"), { wrapper });
+    expect(detail.result.current.data).toEqual(SHARED);
+    resolveDetail(SHARED);
+  });
+
+  it("does not fetch while disabled", () => {
+    vi.mocked(api.listSharedScheduledTasks).mockClear();
+    const { wrapper } = makeWrapper();
+    renderHook(() => useSharedScheduledTasks(false), { wrapper });
+    expect(api.listSharedScheduledTasks).not.toHaveBeenCalled();
   });
 });
 
