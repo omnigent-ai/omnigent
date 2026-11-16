@@ -56,7 +56,6 @@ from .os_env import (
 )
 from .sandbox import (
     SandboxPolicy,
-    _default_sandbox_for_platform,
     cleanup_private_tmpdir,
     create_exec_launcher,
     create_private_tmpdir,
@@ -1084,8 +1083,6 @@ def build_terminal_os_env_spec(
             cwd=os.getcwd(),
             sandbox=OSEnvSandboxSpec(type="none"),
         )
-    elif effective_os_env_spec.sandbox is None:
-        effective_os_env_spec.sandbox = _default_sandbox_for_platform()
 
     if cwd_override is not None:
         if not spec.allow_cwd_override:

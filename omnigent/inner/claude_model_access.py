@@ -6,7 +6,6 @@ import asyncio
 import base64
 import json
 import os
-import plistlib
 import re
 import secrets
 import shlex
@@ -18,7 +17,6 @@ from collections.abc import Callable, Collection, Mapping, MutableMapping, Seque
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from urllib.parse import urlsplit
-from xml.parsers.expat import ExpatError
 
 from omnigent.databricks_ai_gateway import (
     CLAUDE_CODE_AGENT,
@@ -178,6 +176,11 @@ class _UniqueManagedDict(dict[str, object]):
 def _validate_claude_managed_preferences(
     paths: Sequence[Path], forbidden_env_names: Collection[str]
 ) -> None:
+    if not paths:
+        return
+    import plistlib
+    from xml.parsers.expat import ExpatError
+
     validate_object = _managed_config_object_validator(forbidden_env_names)
 
     def validate_value(value: object) -> None:

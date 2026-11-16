@@ -263,8 +263,7 @@ async def test_rest_terminal_omitted_sandbox_uses_platform_default_and_model_acc
     effective = terminal_mod.build_terminal_os_env_spec(
         spec.terminals["shell"], parent_os_env_spec=spec.os_env
     )
-    assert effective.sandbox is not None
-    assert effective.sandbox.type == terminal_mod._default_sandbox_for_platform().type
+    assert effective.sandbox is None
     assert env_spec.sandbox is None
     async with _runner(spec, bundle, override="claude-sdk") as (client, terminals, _):
         response = await client.post(

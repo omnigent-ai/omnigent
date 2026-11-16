@@ -2784,6 +2784,8 @@ def test_create_terminal_instance_propagates_keep_alive_after_exit(
     result = create_terminal_instance(name="bash", session_key="s1", spec=spec)
     try:
         assert result.instance.keep_alive_after_exit is keep_alive
+        assert result.instance.sandbox_policy is None
+        assert spec.os_env.sandbox is None
     finally:
         shutil.rmtree(result.instance.private_dir, ignore_errors=True)
 

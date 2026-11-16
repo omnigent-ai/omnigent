@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, Mock
 import httpx
 import pytest
 
+import omnigent.inner.terminal as terminal_mod
 from omnigent.inner.claude_model_access import (
     HELPER_ENV,
     ClaudeAuthRequired,
@@ -28,8 +29,8 @@ from omnigent.inner.egress.certs import HostCertCache
 from omnigent.inner.egress.proxy import EgressProxy
 from omnigent.inner.egress.rules import parse_rules
 from omnigent.inner.model_signing import SigningRejected, _validate_headers
-from omnigent.inner.sandbox import SandboxPolicy
-from omnigent.inner.terminal import TerminalCreateResult, TerminalInstance
+from omnigent.inner.sandbox import SandboxPolicy, _default_sandbox_for_platform
+from omnigent.inner.terminal import TerminalInstance
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.terminals.registry import TerminalRegistry
 
@@ -770,43 +771,108 @@ async def test_upstream_401_refreshes_credential_on_the_next_request(
         await upstream.wait_closed()
 
 
-@pytest.mark.parametrize("sandboxed", [True, False])
+@pytest.mark.parametrize(
+    ("sandbox_type", "sdk_owned", "fork"),
+    [
+        ("linux_bwrap", True, False),
+        ("none", True, False),
+        (None, True, False),
+        (None, False, False),
+        (None, True, True),
+    ],
+    ids=["explicit-sdk", "sdk-optout", "implicit-sdk", "other-harness", "protected-sdk-fork"],
+)
+@pytest.mark.parametrize("inherited", [False, True])
+@pytest.mark.parametrize("use_factory", [False, True])
 async def test_terminal_inherits_automatic_model_access_only_when_sandboxed(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sandboxed: bool
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    sandbox_type: str | None,
+    sdk_owned: bool,
+    fork: bool,
+    inherited: bool,
+    use_factory: bool,
 ) -> None:
-    access = ClaudeModelAccess("https://model.test", "x-api-key", lambda: "secret")
-    instance = TerminalInstance("bash", "s1", tmp_path / "tmux.sock", tmp_path)
-    if sandboxed:
-        instance.sandbox_policy = SandboxPolicy(
-            "linux_bwrap", True, [tmp_path], [tmp_path], [], False
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    source = (workspace if fork else tmp_path) / "provider.json"
+    source.write_text("{}")
+    access = ClaudeModelAccess("https://model.test", "x-api-key", lambda: "secret", (source,))
+
+    def resolve(spec: OSEnvSpec, cwd: Path) -> SandboxPolicy:
+        assert spec.sandbox is not None
+        expected_type = sandbox_type or _default_sandbox_for_platform().type
+        assert spec.sandbox.type == expected_type
+        return SandboxPolicy(spec.sandbox.type, True, [cwd], [cwd], [], False)
+
+    # Keep construction and credential protection real, without starting platform processes.
+    monkeypatch.setattr(terminal_mod, "_require_supported_tmux", lambda: None)
+    monkeypatch.setattr(terminal_mod, "create_os_environment", lambda *args, **kwargs: None)
+    monkeypatch.setattr(terminal_mod, "resolve_sandbox", resolve)
+    launch_process = AsyncMock()
+    monkeypatch.setattr(TerminalInstance, "launch", launch_process)
+    monkeypatch.setattr(TerminalInstance, "is_alive", AsyncMock(return_value=True))
+    if fork:
+        monkeypatch.setattr(
+            terminal_mod,
+            "_copy_tree",
+            Mock(side_effect=AssertionError("credential sources must be rejected before copying")),
         )
-    monkeypatch.setattr(instance, "launch", AsyncMock())
-    monkeypatch.setattr(instance, "is_alive", AsyncMock(return_value=True))
-    monkeypatch.setattr(instance, "close", AsyncMock())
-    monkeypatch.setattr(
-        "omnigent.terminals.registry.create_terminal_instance",
-        lambda *args, **kwargs: TerminalCreateResult(instance, tmp_path),
-    )
     registry = TerminalRegistry()
-    resolver = AsyncMock(return_value=access)
-    registry.model_access_resolver = resolver
-    terminal_spec = TerminalEnvSpec(
-        os_env=OSEnvSpec(
-            cwd=str(tmp_path),
-            sandbox=OSEnvSandboxSpec(type="linux_bwrap" if sandboxed else "none"),
-        )
+    resolver = AsyncMock(return_value=access if sdk_owned else None)
+    factory = Mock(return_value=access if sdk_owned else None)
+    if not use_factory:
+        registry.model_access_resolver = resolver
+    environment_spec = OSEnvSpec(
+        cwd=str(workspace),
+        sandbox=OSEnvSandboxSpec(type=sandbox_type) if sandbox_type is not None else None,
+        fork=fork,
     )
-    await registry.launch("conversation", "bash", "s1", terminal_spec)
-    if sandboxed:
-        assert instance.model_access is access
-        resolver.assert_awaited_once_with("conversation")
-    else:
-        assert instance.model_access is None
-        resolver.assert_not_called()
+    terminal_spec = TerminalEnvSpec(os_env="inherit" if inherited else environment_spec)
+    try:
+        launch = registry.launch(
+            "conversation",
+            "bash",
+            "s1",
+            terminal_spec,
+            parent_os_env=environment_spec if inherited else None,
+            model_access_factory=factory if use_factory else None,
+        )
+        if fork:
+            with pytest.raises(RuntimeError, match="terminal model access rejected"):
+                await launch
+            launch_process.assert_not_awaited()
+            return
+        instance = await launch
+        sandboxed = sdk_owned and sandbox_type != "none"
+        assert (instance.sandbox_policy is not None) == sandboxed
+        if sandboxed:
+            assert instance.model_access is access
+            assert instance.sandbox_policy is not None
+            assert instance.sandbox_policy.active
+            assert instance.sandbox_policy.credential_source_paths is not None
+            assert source in instance.sandbox_policy.credential_source_paths
+        else:
+            assert instance.model_access is None
+        if sandbox_type == "none":
+            resolver.assert_not_called()
+            factory.assert_not_called()
+        elif use_factory:
+            factory.assert_called_once_with()
+            resolver.assert_not_called()
+        else:
+            resolver.assert_awaited_once_with("conversation")
+            factory.assert_not_called()
+        if sandbox_type is None:
+            assert environment_spec.sandbox is None
+    finally:
+        await registry.shutdown()
 
 
+@pytest.mark.parametrize("other_harness", ["claude-native", "codex-native", "codex"])
 def test_terminal_uses_selected_provider_and_does_not_grant_other_harnesses(
     monkeypatch: pytest.MonkeyPatch,
+    other_harness: str,
 ) -> None:
     from omnigent.runtime import workflow
 
@@ -827,7 +893,7 @@ def test_terminal_uses_selected_provider_and_does_not_grant_other_harnesses(
     assert access.base_url == "https://model.test/gateway"
     assert access.credential() == "provider-secret"
     build.reset_mock()
-    spec.executor.config["harness"] = "codex"
+    spec.executor.config["harness"] = other_harness
     assert workflow.claude_terminal_model_access(spec) is None
     build.assert_not_called()
 

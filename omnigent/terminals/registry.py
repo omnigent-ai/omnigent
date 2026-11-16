@@ -40,7 +40,7 @@ import asyncio
 import logging
 import threading
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
 from urllib.parse import quote
@@ -49,6 +49,7 @@ from omnigent.debug_logging import debug_event
 from omnigent.inner.claude_model_access import ClaudeModelAccess
 from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
 from omnigent.inner.os_env import OSEnvironment
+from omnigent.inner.sandbox import _default_sandbox_for_platform
 from omnigent.inner.terminal import (
     TerminalInstance,
     build_terminal_os_env_spec,
@@ -324,11 +325,15 @@ class TerminalRegistry:
             sandbox_override=sandbox_override,
         )
         model_access = None
-        if environment_spec.sandbox is not None and environment_spec.sandbox.type != "none":
+        if environment_spec.sandbox is None or environment_spec.sandbox.type != "none":
             if self.model_access_resolver is not None:
                 model_access = await self.model_access_resolver(conversation_id)
             elif model_access_factory is not None:
                 model_access = await asyncio.to_thread(model_access_factory)
+        if model_access is not None and environment_spec.sandbox is None:
+            # Only SDK-owned terminals inherit implicit process containment.
+            environment_spec.sandbox = _default_sandbox_for_platform()
+            spec = replace(spec, os_env=environment_spec)
         parent_environment = None
         if environment_spec.sandbox is not None and any(
             p.copy_on_write for p in environment_spec.sandbox.write_path_specs
