@@ -135,6 +135,7 @@ const omnigentCli = require("./omnigent_cli");
 const { workspaceSocketRequest } = require("./workspaceSocket");
 const { createWorkspaceSshForwards } = require("./workspaceSshForwards");
 const { createSshHostStore } = require("./sshHosts");
+const { createSshTargetChecks } = require("./sshTargets");
 
 const serverManager = require("./server_manager");
 const { diagnostics } = require("./diagnostics");
@@ -360,6 +361,7 @@ const arcaIdentities = createArcaIdentityStore();
 // Hosts this desktop connected over SSH, and the connections that reach their workspace sockets.
 const sshHosts = createSshHostStore(() => path.join(app.getPath("userData"), "ssh-hosts.json"));
 const workspaceSshForwards = createWorkspaceSshForwards();
+const sshTargetChecks = createSshTargetChecks({ record: sshHosts.record });
 
 function startArcaHostConnect(serverUrl, deps) {
   const finish = arcaIdentities.begin(serverUrl);
@@ -5393,6 +5395,9 @@ function registerIpc() {
     const serverUrl = senderServerUrl(event);
     return workspaceSocketRequest(request, {
       sshDestination: (hostId) => (serverUrl ? sshHosts.destination(serverUrl, hostId) : null),
+      verifySshTarget: serverUrl
+        ? (hostId, alias, proves) => sshTargetChecks.verify(serverUrl, hostId, alias, proves)
+        : undefined,
       forwards: workspaceSshForwards,
     });
   });

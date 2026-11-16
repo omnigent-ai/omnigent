@@ -27,6 +27,7 @@ vi.mock("@/lib/identity", () => ({ authenticatedFetch: (u: string) => authentica
 vi.mock("@/lib/nativeBridge", () => ({
   isIOSShell: () => isIOSShell(),
   isAndroidShell: () => isAndroidShell(),
+  workspaceSocketBridge: () => null,
 }));
 vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
   browseLocationBase: () => "",
@@ -36,7 +37,7 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
 vi.mock("@/store/chatStore", () => ({ useChatStore: () => undefined }));
 
 import { clearHostKeyless, markHostKeyless, setSessionHost } from "@/lib/sessionHost";
-import { downloadWorkspaceFile, workspaceFileMediaUrl } from "./useFileContent";
+import { downloadWorkspaceFile, fetchFileContent, workspaceFileMediaUrl } from "./useFileContent";
 
 const RAW_URL =
   "/v1/sessions/sess_abc/resources/environments/default/filesystem/src/main.py?download=true";
@@ -79,6 +80,18 @@ describe("downloadWorkspaceFile base-path handling", () => {
     await downloadWorkspaceFile("sess_abc", "src/main.py");
 
     expect(authenticatedFetch).toHaveBeenCalledWith(RAW_URL);
+  });
+});
+
+describe("fetchFileContent", () => {
+  it("keeps the SSH alias for the desktop out of the REST request", async () => {
+    authenticatedFetch.mockResolvedValue(new Response("{}", { status: 200 }));
+
+    await fetchFileContent("sess_abc", "src/main.py", undefined, { sshTarget: "my-box" });
+
+    expect(authenticatedFetch).toHaveBeenCalledWith(
+      "/v1/sessions/sess_abc/resources/environments/default/filesystem/src/main.py",
+    );
   });
 });
 
