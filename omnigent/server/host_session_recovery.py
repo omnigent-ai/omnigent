@@ -113,9 +113,6 @@ class HostSessionRecoverer:
         """Resolve administrator policy without waking or changing the host."""
         if not self.store.supports_session_recovery or self.sandbox_config is None or not host_id:
             return None
-        connection = self.hosts.get(host_id)
-        if connection is not None and not connection.hello.recover_interrupted_sessions:
-            return None
         host = self.host_store.get_host(host_id)
         if host is None or host.deleted_at is not None or host.sandbox_provider is None:
             return None
@@ -127,6 +124,9 @@ class HostSessionRecoverer:
             not isinstance(settings, dict)
             or settings.get("recover_interrupted_sessions") is not True
         ):
+            return None
+        connection = self.hosts.get(host_id)
+        if connection is not None and not connection.hello.recover_interrupted_sessions:
             return None
         custom = settings.get("recovery_prompt")
         return (
@@ -379,5 +379,5 @@ class HostSessionRecoverer:
             message="Automatic resume failed. Please send a new message to continue.",
         )
         _logger.warning("Automatic resume failed for session=%s: %s", conv.id, reason)
-        _publish_status(conv.id, "failed", error)
+        _publish_status(conv.id, "failed", error, failure_origin="host_session_recovery")
         await _persist_session_status_error_labels(conv.id, error, self.store)

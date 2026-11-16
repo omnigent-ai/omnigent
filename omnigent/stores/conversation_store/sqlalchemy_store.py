@@ -726,12 +726,11 @@ def _fetch_labels(
         statement = select(SqlConversationLabel.key, SqlConversationLabel.value).where(
             SqlConversationLabel.workspace_id == current_workspace_id(),
             SqlConversationLabel.conversation_id == conversation_id,
-            ~SqlConversationLabel.key.startswith(RECOVERY_LABEL_PREFIX),
         )
         if keys is not None:
             statement = statement.where(SqlConversationLabel.key.in_(keys))
         rows = session.execute(statement).tuples().all()
-    return dict(rows)
+    return {key: value for key, value in rows if not key.startswith(RECOVERY_LABEL_PREFIX)}
 
 
 def _fetch_labels_bulk(
@@ -763,12 +762,12 @@ def _fetch_labels_bulk(
         ).where(
             SqlConversationLabel.workspace_id == current_workspace_id(),
             SqlConversationLabel.conversation_id.in_(conversation_ids),
-            ~SqlConversationLabel.key.startswith(RECOVERY_LABEL_PREFIX),
         )
     ).all()
     out: dict[str, dict[str, str]] = {}
     for conv_id, key, value in rows:
-        out.setdefault(conv_id, {})[key] = value
+        if not key.startswith(RECOVERY_LABEL_PREFIX):
+            out.setdefault(conv_id, {})[key] = value
     return out
 
 
