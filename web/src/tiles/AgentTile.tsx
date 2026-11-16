@@ -2,7 +2,13 @@
 // only the active tile has a composer. Cards show status without streaming.
 
 import { memo, type KeyboardEvent, type MouseEvent } from "react";
-import { ExternalLinkIcon, FolderIcon, GitBranchIcon, RadioTowerIcon } from "lucide-react";
+import {
+  ExternalLinkIcon,
+  FolderIcon,
+  GitBranchIcon,
+  RadioTowerIcon,
+  StarIcon,
+} from "lucide-react";
 import { SideChatPane } from "@/components/chat/SideChatPane";
 import { RenderErrorBoundary } from "@/components/RenderErrorBoundary";
 import { SessionStateBadge } from "@/components/SessionStateBadge";
@@ -26,6 +32,10 @@ interface AgentTileProps {
   onOpenSingle: (sessionId: string) => void;
   /** Gallery tiles can be resized in whole grid slots. */
   resize?: TileResize;
+  /** Pinned (starred) state; the star shows only when `onToggleStar` is set. */
+  starred?: boolean;
+  starDisabled?: boolean;
+  onToggleStar?: (conversation: Conversation) => void;
 }
 
 function projectName(workspace: string | null | undefined): string | null {
@@ -63,6 +73,9 @@ function AgentTileComponent({
   onActivate,
   onOpenSingle,
   resize,
+  starred = false,
+  starDisabled = false,
+  onToggleStar,
 }: AgentTileProps) {
   const title = conversation.title || conversationDisplayLabel(conversation);
   const state = getSessionState(conversation);
@@ -114,6 +127,19 @@ function AgentTileComponent({
         <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground" title={subline}>
           {subline}
         </span>
+        {onToggleStar && (
+          <Button
+            variant="ghost"
+            size="icon-xs"
+            aria-label={starred ? `Unstar ${title}` : `Star ${title}`}
+            aria-pressed={starred}
+            title={starred ? "Unstar (unpin)" : "Star (pin to the top)"}
+            disabled={starDisabled}
+            onClick={() => onToggleStar(conversation)}
+          >
+            <StarIcon className={cn("size-3.5", starred && "fill-amber-400 text-amber-500")} />
+          </Button>
+        )}
         <Button
           variant="ghost"
           size="icon-xs"
