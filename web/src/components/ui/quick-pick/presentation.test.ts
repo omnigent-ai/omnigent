@@ -234,6 +234,26 @@ describe("navigateQuickPick", () => {
     expect(navigateQuickPick(rows, 1, { type: "previous" }, { loop: true })).toBe(5);
   });
 
+  it("moves from a row that can't be picked to its neighbours, not the top", () => {
+    const loading = buildQuickPickRows({
+      segments: [
+        {
+          sourceId: "s",
+          ranking: "provider",
+          items: [item("r0"), item("r1"), item("more", { disabledReason: "Loading" }), item("r3")],
+        },
+      ],
+      query: "",
+    });
+    // [r0, r1, more (disabled), r3]
+    expect(navigateQuickPick(loading, 2, { type: "next" })).toBe(3);
+    expect(navigateQuickPick(loading, 2, { type: "previous" })).toBe(1);
+    expect(navigateQuickPick(loading, 2, { type: "pageDown", pageSize: 1 })).toBe(3);
+    expect(navigateQuickPick(loading, 2, { type: "pageUp", pageSize: 1 })).toBe(1);
+    // With nothing active yet, ArrowDown still starts at the top.
+    expect(navigateQuickPick(loading, -1, { type: "next" })).toBe(0);
+  });
+
   it("jumps to the first row of the next or previous group", () => {
     expect(navigateQuickPick(rows, 1, { type: "nextGroup" })).toBe(4);
     expect(navigateQuickPick(rows, 2, { type: "nextGroup" })).toBe(4);

@@ -231,9 +231,12 @@ export function navigateQuickPick(
   if (selectable.length === 0) return -1;
   const position = selectable.indexOf(activeIndex);
   const last = selectable.length - 1;
+  // From a row that can't be picked, such as Show more while it loads, moves start
+  // where that row sits rather than at the top.
+  const firstAfter = selectable.findIndex((index) => index > activeIndex);
+  const below = firstAfter === -1 ? selectable.length : firstAfter;
   const step = (direction: 1 | -1): number => {
-    if (position === -1) return direction === 1 ? selectable[0] : activeIndex;
-    const target = position + direction;
+    const target = position !== -1 ? position + direction : direction === 1 ? below : below - 1;
     if (target >= 0 && target <= last) return selectable[target];
     return loop ? selectable[direction === 1 ? 0 : last] : activeIndex;
   };
@@ -253,9 +256,11 @@ export function navigateQuickPick(
       return groupStart !== -1 ? groupStart : step(direction);
     }
     case "pageDown":
-      return selectable[Math.min(last, Math.max(position, 0) + navigation.pageSize)];
+      return selectable[
+        Math.min(last, Math.max(position !== -1 ? position : below - 1, 0) + navigation.pageSize)
+      ];
     case "pageUp":
-      return selectable[Math.max(0, position - navigation.pageSize)];
+      return selectable[Math.max(0, (position !== -1 ? position : below) - navigation.pageSize)];
   }
 }
 
