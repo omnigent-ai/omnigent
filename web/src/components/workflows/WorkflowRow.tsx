@@ -1,5 +1,5 @@
 import type { ComponentType, ReactNode } from "react";
-import { ClockIcon, MoreHorizontalIcon, PlayIcon, Trash2Icon } from "lucide-react";
+import { ClockIcon, CopyIcon, MoreHorizontalIcon, PlayIcon, Trash2Icon } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -23,17 +23,26 @@ export interface WorkflowRowProps {
   workflow: SavedWorkflow;
   onRun: (workflow: SavedWorkflow) => void;
   onCreateAutomation?: (workflow: SavedWorkflow) => void;
+  onClone: (workflow: SavedWorkflow) => void;
+  cloning?: boolean;
   onDelete: (workflow: SavedWorkflow) => void;
 }
 
 /**
  * One saved workflow: its name and description, opening its page, with Run,
- * Create automation and Delete in a ⋯ menu and on right-click, like an
+ * Create automation, Clone and Delete in a ⋯ menu and on right-click, like an
  * automation's row.
  */
-export function WorkflowRow({ workflow, onRun, onCreateAutomation, onDelete }: WorkflowRowProps) {
+export function WorkflowRow({
+  workflow,
+  onRun,
+  onCreateAutomation,
+  onClone,
+  cloning,
+  onDelete,
+}: WorkflowRowProps) {
   const navigate = useNavigate();
-  const actions = { workflow, onRun, onCreateAutomation, onDelete };
+  const actions = { workflow, onRun, onCreateAutomation, onClone, cloning, onDelete };
 
   return (
     <ContextMenu>
@@ -106,13 +115,11 @@ function WorkflowMenuItems({
   workflow,
   onRun,
   onCreateAutomation,
+  onClone,
+  cloning,
   onDelete,
-}: {
+}: WorkflowRowProps & {
   Item: ComponentType<MenuItemProps>;
-  workflow: SavedWorkflow;
-  onRun: (workflow: SavedWorkflow) => void;
-  onCreateAutomation?: (workflow: SavedWorkflow) => void;
-  onDelete: (workflow: SavedWorkflow) => void;
 }) {
   const { trackClick } = useOmnigentAnalytics();
   return (
@@ -141,6 +148,17 @@ function WorkflowMenuItems({
           Create automation
         </Item>
       )}
+      <Item
+        disabled={cloning}
+        onSelect={() => {
+          trackClick("workflows.row.clone", "button");
+          onClone(workflow);
+        }}
+        data-testid="workflow-clone"
+      >
+        <CopyIcon className="size-4" />
+        Clone
+      </Item>
       <Item
         variant="destructive"
         onSelect={() => {

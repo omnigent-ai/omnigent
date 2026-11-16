@@ -44,17 +44,23 @@ from omnigent.server.auth import (
     effective_admin,
 )
 from omnigent.server.sharing_settings import effective_public_level
-from omnigent.stores.permission_store import MAX_GRANTS_PAGE_SIZE, PermissionStore
+from omnigent.stores.permission_store import (
+    MAX_GRANTEE_ID_CHARS,
+    MAX_GRANTS_PAGE_SIZE,
+    PermissionStore,
+    require_grantee_id_fits,
+)
 
 # Sentinel rows excluded from list_users() — never real, actionable
 # actors. Mirrors accounts_store._HIDDEN_LIST_USERS so the admin user
 # list is identical across auth modes.
 _HIDDEN_LIST_USERS = frozenset({RESERVED_USER_PUBLIC, RESERVED_USER_LOCAL})
 
-# Width of scheduled_task_shares.user_id, which SQLite does not enforce.
-_GRANTEE_ID_TYPE = SqlScheduledTaskShare.__table__.c.user_id.type
-assert isinstance(_GRANTEE_ID_TYPE, String) and _GRANTEE_ID_TYPE.length is not None
-_GRANTEE_ID_MAX_CHARS: int = _GRANTEE_ID_TYPE.length
+# SQLite does not enforce these widths, so grants check MAX_GRANTEE_ID_CHARS themselves.
+assert all(
+    isinstance(column.type, String) and column.type.length == MAX_GRANTEE_ID_CHARS
+    for column in (SqlScheduledTaskShare.__table__.c.user_id, SqlUser.__table__.c.id)
+)
 # Never automation grantees: automations are never public, and ``local`` is the
 # single-user identity rather than someone to share with.
 _RESERVED_GRANTEES = frozenset({RESERVED_USER_PUBLIC, RESERVED_USER_LOCAL})
@@ -152,13 +158,34 @@ def _upsert_grant(
     level: int,
     *,
     ensure_minimum: bool = False,
+    keep_existing: bool = False,
 ) -> Insert:
     """Build a grant upsert, replacing the level unless stronger access is preserved.
 
     :param key: The row's primary key columns other than ``workspace_id``.
     :param ensure_minimum: Atomically retain the higher existing or requested level.
+    :param keep_existing: Leave an existing row exactly as it is.
     """
     key_columns = ["workspace_id", *key]
+    if keep_existing:
+        if dialect == "sqlite":
+            return (
+                sqlite_insert(model)
+                .values(**key, level=level)
+                .on_conflict_do_nothing(index_elements=key_columns)
+            )
+        if dialect == "mysql":
+            # ``level = level`` keeps the stored value.
+            return (
+                mysql_insert(model)
+                .values(**key, level=level)
+                .on_duplicate_key_update(level=model.level)
+            )
+        return (
+            pg_insert(model)
+            .values(**key, level=level)
+            .on_conflict_do_nothing(index_elements=key_columns)
+        )
     next_level = case((model.level < level, level), else_=model.level) if ensure_minimum else level
     if dialect == "sqlite":
         return (
@@ -188,13 +215,9 @@ def _reserved_grantee_error(user_id: str) -> OmnigentError:
 
 def _require_storable_scheduled_task_grant(user_id: str, level: int) -> None:
     """Refuse a grant the share table cannot hold or the store must never hold."""
-    if len(user_id) > _GRANTEE_ID_MAX_CHARS:
-        raise OmnigentError(
-            f"A grantee ID may be at most {_GRANTEE_ID_MAX_CHARS} characters.",
-            code=ErrorCode.INVALID_INPUT,
-        )
+    require_grantee_id_fits(user_id)
     # A fast path; the grant rechecks under the key's collation, which folds accents too.
-    if user_id.strip().casefold() in _RESERVED_GRANTEES:
+    if session_sharing.is_reserved_grantee(user_id):
         raise _reserved_grantee_error(user_id)
     if level not in session_sharing.SCHEDULED_TASK_GRANT_LEVELS:
         raise OmnigentError(
@@ -515,6 +538,51 @@ class SqlAlchemyPermissionStore(PermissionStore):
             level=granted_level,
         )
 
+    def grant_if_absent(self, user_id: str, conversation_id: str, level: int) -> bool:
+        """Insert a grant unless the grantee holds one. See base class for contract.
+
+        The insert leaves an existing row unchanged, so a stored grant never changes.
+        A locking read finds an existing grant first; on MySQL its gap lock and on
+        SQLite the write lock hold off a concurrent insert. On PostgreSQL and
+        CockroachDB a grant can still commit between the read and the insert, so the
+        insert's ``RETURNING`` row decides whether it wrote one.
+        """
+
+        def write(session: Session) -> bool:
+            require_active_account(session, user_id)
+            held = session.execute(
+                select(SqlSessionPermission.level)
+                .where(
+                    SqlSessionPermission.workspace_id == current_workspace_id(),
+                    SqlSessionPermission.user_id == user_id,
+                    SqlSessionPermission.conversation_id == conversation_id,
+                )
+                .with_for_update()
+            ).first()
+            if held is not None:
+                return False
+            dialect = self._engine.dialect.name
+            insert = _upsert_grant(
+                dialect,
+                SqlSessionPermission,
+                {"user_id": user_id, "conversation_id": conversation_id},
+                level,
+                keep_existing=True,
+            )
+            if dialect in ("postgresql", "cockroachdb"):
+                # ON CONFLICT DO NOTHING returns no row when a concurrent grant won.
+                inserted = session.execute(insert.returning(SqlSessionPermission.user_id))
+                return inserted.first() is not None
+            session.execute(insert)
+            return True
+
+        written = run_write_transaction(
+            self._session_immediate, "grant_permission_if_absent", write
+        )
+        if written:
+            self._invalidate_resolve_cache_for_session(conversation_id)
+        return written
+
     def revoke(self, user_id: str, conversation_id: str) -> bool:
         """Remove a permission grant. See base class for contract."""
 
@@ -538,6 +606,30 @@ class SqlAlchemyPermissionStore(PermissionStore):
         )
         # Evict after commit: a revoke must not be served stale from this
         # instance's cache.
+        self._invalidate_resolve_cache_for_session(conversation_id)
+        return deleted
+
+    def revoke_if_level(self, user_id: str, conversation_id: str, level: int) -> bool:
+        """Remove a grant still at *level* in one conditional delete. See base class."""
+
+        def write(session: Session) -> bool:
+            result = cast(
+                CursorResult[tuple[object]],
+                session.execute(
+                    delete(SqlSessionPermission).where(
+                        SqlSessionPermission.workspace_id == current_workspace_id(),
+                        SqlSessionPermission.user_id == user_id,
+                        SqlSessionPermission.conversation_id == conversation_id,
+                        SqlSessionPermission.level == level,
+                    )
+                ),
+            )
+            return result.rowcount > 0
+
+        deleted = run_write_transaction(
+            self._session_immediate, "revoke_permission_at_level", write
+        )
+        # Evict after commit, as revoke does.
         self._invalidate_resolve_cache_for_session(conversation_id)
         return deleted
 

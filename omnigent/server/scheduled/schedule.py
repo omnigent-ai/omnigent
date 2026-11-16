@@ -55,10 +55,22 @@ def manual_trigger_key() -> str:
     return f"manual:{uuid.uuid4().hex}"
 
 
+# Namespace for task IDs that are not UUIDs, such as ones a deployment allocates.
+_NON_UUID_TASK_ID_NAMESPACE = uuid.UUID("8220eb40-f537-40d8-882a-419033fcd6ad")
+
+
+def _task_id_namespace(task_id: str) -> uuid.UUID:
+    """The UUIDv5 namespace a task's sandbox host IDs derive from: the ID itself if a UUID."""
+    try:
+        return uuid.UUID(task_id)
+    except ValueError:
+        return uuid.uuid5(_NON_UUID_TASK_ID_NAMESPACE, task_id)
+
+
 def sandbox_host_id(task_id: str, workspace_id: int, trigger_key: str) -> str:
     """The fresh sandbox identity for one occurrence, from fields no task edit changes."""
     # UUIDv5 lets every replica derive the same sandbox host ID for this task occurrence.
-    return uuid.uuid5(uuid.UUID(task_id), f"{workspace_id}:{trigger_key}").hex
+    return uuid.uuid5(_task_id_namespace(task_id), f"{workspace_id}:{trigger_key}").hex
 
 
 def continued_sandbox_host_id(task_id: str, workspace_id: int) -> str:
@@ -67,7 +79,7 @@ def continued_sandbox_host_id(task_id: str, workspace_id: int) -> str:
     Derived only from fields no task edit changes, so every run routes to the
     replica holding that sandbox's connection, and a session reset keeps it.
     """
-    return uuid.uuid5(uuid.UUID(task_id), f"{workspace_id}:continue").hex
+    return uuid.uuid5(_task_id_namespace(task_id), f"{workspace_id}:continue").hex
 
 
 def occurrence_host_id(task: ScheduledTask, trigger_key: str) -> str | None:
