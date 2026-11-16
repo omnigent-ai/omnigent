@@ -970,13 +970,14 @@ def test_host_oauth_file_is_reread_without_exposing_refresh_token(tmp_path: Path
 
 
 def test_databricks_auth_pins_the_trusted_executable_before_worker_start(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    auth_runtime: tuple[Path, Path, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from omnigent.inner import claude_model_access as module
     from omnigent.inner.model_auth import _TrustedExecutable
 
+    interpreter, _, _ = auth_runtime
     path = tmp_path / "profile-auth"
-    path.write_text(f"#!{sys.executable}\nprint('unused')\n")
+    path.write_text(f"#!{interpreter}\nprint('unused')\n")
     info = path.stat()
     executable = _TrustedExecutable(path, (info.st_dev, info.st_ino))
     monkeypatch.setattr(module, "_resolve_auth_executable", lambda: executable)
@@ -989,7 +990,7 @@ def test_databricks_auth_pins_the_trusted_executable_before_worker_start(
     assert access.credential() == "parent-bearer"
     assert access.auth_executable is not None
     assert access.auth_executable.path == executable.path
-    assert access.auth_executable.interpreter == Path(sys.executable)
+    assert access.auth_executable.interpreter == interpreter
     mint.assert_awaited_once_with(
         host="https://model.test",
         profile="selected-profile",
@@ -1007,8 +1008,12 @@ def auth_runtime(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path,
     from omnigent.inner.model_auth import _TrustedExecutable
 
     runtime = tmp_path / "auth-venv"
-    venv.EnvBuilder(with_pip=False, symlinks=True).create(runtime)
+    # Linux CI's shared Python can be world-writable; keep its binary private.
+    venv.EnvBuilder(with_pip=False, symlinks=sys.platform != "linux").create(runtime)
     interpreter = runtime / "bin/python"
+    if sys.platform == "linux":
+        interpreter.unlink()
+        interpreter.symlink_to(f"python{sys.version_info.major}.{sys.version_info.minor}")
     packages = (
         runtime
         / "lib"
