@@ -4,6 +4,7 @@ import {
   useContext,
   useEffect,
   useMemo,
+  useRef,
   useState,
   type ReactNode,
 } from "react";
@@ -20,6 +21,7 @@ import { useNavigate, useParams } from "@/lib/routing";
 import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
 import { isTempConvId } from "@/lib/tempConversationId";
 import {
+  gridLayoutForSessions,
   gridSessionIds,
   parseSessionGrids,
   removeGridSession,
@@ -28,6 +30,7 @@ import {
   type SessionGrid,
   type SplitEdge,
 } from "./gridLayout";
+import { recordUnsavedWrite, withUnsaved, type UnsavedGrids } from "./unsavedGrids";
 
 interface GridSessionsContextValue {
   enabled: boolean;
@@ -44,6 +47,13 @@ interface GridSessionsContextValue {
   deleteGrid: (id: string) => void;
   renameGrid: (id: string, name: string) => void;
   swapPanes: (firstId: string, secondId: string, edge?: SplitEdge) => void;
+  /**
+   * Save a new grid of two to four sessions and open it; false when none was
+   * made. `run` tags it with the best-of-N run it shows.
+   */
+  openGrid: (sessionIds: readonly string[], name?: string, run?: string) => boolean;
+  /** Delete the saved grids tagged with a best-of-N run. */
+  deleteRunGrids: (run: string) => void;
 }
 
 const GridSessionsContext = createContext<GridSessionsContextValue | null>(null);
@@ -79,18 +89,26 @@ function EnabledGridSessionsProvider({ children }: { children: ReactNode }) {
       return [];
     }
   }, [storageKey]);
+  // Per storage key, changes failed writes couldn't store; they stay usable in this tab.
+  const unsaved = useRef(new Map<string, UnsavedGrids>());
+  // Stored grids, plus this tab's unsaved changes on top.
+  const latest = useCallback(
+    (): SessionGrid[] =>
+      storageKey === null ? EMPTY_GRIDS : withUnsaved(read(), unsaved.current.get(storageKey)),
+    [read, storageKey],
+  );
   const [saved, setSaved] = useState(() => ({ key: storageKey, grids: read() }));
-  if (saved.key !== storageKey) setSaved({ key: storageKey, grids: read() });
+  if (saved.key !== storageKey) setSaved({ key: storageKey, grids: latest() });
   useEffect(() => {
     if (storageKey === null) return;
     const onStorage = (event: StorageEvent) => {
       if (event.key !== null && event.key !== storageKey) return;
       if (event.storageArea !== localStorage) return;
-      setSaved({ key: storageKey, grids: read() });
+      setSaved({ key: storageKey, grids: latest() });
     };
     window.addEventListener("storage", onStorage);
     return () => window.removeEventListener("storage", onStorage);
-  }, [storageKey, read]);
+  }, [storageKey, latest]);
   const grids = saved.key === storageKey ? saved.grids : EMPTY_GRIDS;
   const activeGrid = grids.find((grid) => grid.id === gridId);
   const [selection, setSelection] = useState<{ gridId: string; sessionId: string } | null>(null);
@@ -102,18 +120,30 @@ function EnabledGridSessionsProvider({ children }: { children: ReactNode }) {
       ? selection.sessionId
       : activeSessionIds[0];
   const value = useMemo<GridSessionsContextValue>(() => {
-    const save = (next: SessionGrid[]) => {
+    // Grids saved right now, by any tab: writes that finish after an await
+    // (a launch, an archive) must not restore an older render's list.
+    const current = () => (storageKey === null ? grids : latest());
+    /** Show and store `next`, built from `base`. */
+    const save = (next: SessionGrid[], base: SessionGrid[]) => {
       if (storageKey === null) return;
       setSaved({ key: storageKey, grids: next });
       try {
         localStorage.setItem(storageKey, JSON.stringify(next));
+        unsaved.current.delete(storageKey);
       } catch {
+        const pending = recordUnsavedWrite(unsaved.current.get(storageKey), read(), base, next);
+        if (pending) unsaved.current.set(storageKey, pending);
+        else unsaved.current.delete(storageKey);
         toast.warning("Grid changes could not be saved on this device.");
       }
     };
     const deleteGrid = (id: string) => {
       if (storageKey === null) return;
-      save(grids.filter((grid) => grid.id !== id));
+      const base = current();
+      save(
+        base.filter((grid) => grid.id !== id),
+        base,
+      );
       if (id === gridId) navigate("/");
     };
     return {
@@ -133,11 +163,14 @@ function EnabledGridSessionsProvider({ children }: { children: ReactNode }) {
         if (!layout) return;
         const next = splitGrid(layout, targetId, sessionId, edge);
         if (!next) return;
-        const grid = { ...activeGrid, id: activeGrid?.id ?? randomUUID(), layout: next };
+        // A session added to a run's grid makes it the user's own grid.
+        const { run: _run, ...kept } = activeGrid ?? {};
+        const grid = { ...kept, id: activeGrid?.id ?? randomUUID(), layout: next };
         save(
           activeGrid
             ? grids.map((entry) => (entry.id === grid.id ? grid : entry))
             : [...grids, grid],
+          grids,
         );
         if (!activeGrid) navigate(`/grid/${grid.id}`);
       },
@@ -145,10 +178,16 @@ function EnabledGridSessionsProvider({ children }: { children: ReactNode }) {
         if (!activeGrid) return;
         const layout = removeGridSession(activeGrid.layout, sessionId);
         if (layout === null || typeof layout === "string") {
-          save(grids.filter((grid) => grid.id !== activeGrid.id));
+          save(
+            grids.filter((grid) => grid.id !== activeGrid.id),
+            grids,
+          );
           navigate(layout ? `/c/${layout}` : "/");
         } else {
-          save(grids.map((grid) => (grid.id === activeGrid.id ? { ...grid, layout } : grid)));
+          save(
+            grids.map((grid) => (grid.id === activeGrid.id ? { ...grid, layout } : grid)),
+            grids,
+          );
         }
       },
       deleteGrid,
@@ -156,12 +195,40 @@ function EnabledGridSessionsProvider({ children }: { children: ReactNode }) {
         if (!activeGrid) return;
         const layout = swapGridSessions(activeGrid.layout, firstId, secondId, edge);
         if (layout !== activeGrid.layout)
-          save(grids.map((grid) => (grid.id === activeGrid.id ? { ...grid, layout } : grid)));
+          save(
+            grids.map((grid) => (grid.id === activeGrid.id ? { ...grid, layout } : grid)),
+            grids,
+          );
+      },
+      openGrid: (sessionIds, name, run) => {
+        const layout = gridLayoutForSessions(sessionIds);
+        if (storageKey === null || layout === null) return false;
+        const trimmed = name?.trim().slice(0, USER_SESSION_TITLE_MAX_CHARS);
+        const grid: SessionGrid = {
+          id: randomUUID(),
+          ...(trimmed ? { name: trimmed } : {}),
+          ...(run ? { run } : {}),
+          layout,
+        };
+        const base = current();
+        save([...base, grid], base);
+        navigate(`/grid/${grid.id}`);
+        return true;
+      },
+      deleteRunGrids: (run) => {
+        const all = current();
+        const kept = all.filter((grid) => grid.run !== run);
+        if (storageKey === null || kept.length === all.length) return;
+        save(kept, all);
+        if (gridId && !kept.some((grid) => grid.id === gridId)) navigate("/");
       },
       renameGrid: (id, name) => {
         const trimmed = name.trim().slice(0, USER_SESSION_TITLE_MAX_CHARS);
         if (trimmed)
-          save(grids.map((grid) => (grid.id === id ? { ...grid, name: trimmed } : grid)));
+          save(
+            grids.map((grid) => (grid.id === id ? { ...grid, name: trimmed } : grid)),
+            grids,
+          );
       },
     };
   }, [
@@ -172,6 +239,8 @@ function EnabledGridSessionsProvider({ children }: { children: ReactNode }) {
     gridId,
     navigate,
     storageKey,
+    read,
+    latest,
     identityReady,
     desktop,
   ]);

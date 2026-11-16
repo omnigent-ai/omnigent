@@ -236,6 +236,53 @@ describe("HeaderConversationMenu", () => {
     expect(screen.getByTestId("header-rename-conversation")).toBeInTheDocument();
   });
 
+  it.each([true, false])("offers best-of-N actions on an attempt (flag: %s)", (enabled) => {
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <CapabilitiesProvider
+          info={{
+            ...FALLBACK_SERVER_INFO,
+            sibling_sessions: true,
+            features: { best_of_n: enabled },
+          }}
+        >
+          <MemoryRouter>
+            <HeaderConversationMenu
+              conversation={{
+                ...CONVERSATION,
+                host_id: "host_1",
+                workspace: "/repo",
+                labels: {
+                  "omnigent.best_of_n.group": "g",
+                  "omnigent.best_of_n.attempts": "conv-1,conv-2",
+                },
+              }}
+              currentProject={null}
+              canShare
+              canFork
+              onShare={() => {}}
+              onFork={mocks.fork}
+            />
+          </MemoryRouter>
+        </CapabilitiesProvider>
+      </QueryClientProvider>,
+    );
+    openMenu();
+    const labels = screen.getAllByRole("menuitem").map((item) => item.textContent?.trim());
+    if (!enabled) {
+      expect(labels).not.toContain("Best of N…");
+      expect(labels).not.toContain("Keep this attempt");
+      return;
+    }
+    expect(labels.slice(labels.indexOf("Fork"), labels.indexOf("Fork") + 3)).toEqual([
+      "Fork",
+      "Best of N…",
+      "Keep this attempt",
+    ]);
+    fireEvent.click(screen.getByTestId("header-keep-attempt"));
+    expect(screen.getByTestId("keep-attempt-dialog")).toHaveTextContent("Keep this attempt?");
+  });
+
   it("opens from the keyboard and focuses the first action", () => {
     renderMenu();
     const trigger = screen.getByRole("button", { name: "Conversation actions" });

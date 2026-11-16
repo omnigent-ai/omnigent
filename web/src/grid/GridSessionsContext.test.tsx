@@ -56,8 +56,29 @@ function Probe() {
       </button>
       <output data-testid="selected">{grids?.selectedSessionId}</output>
       <output data-testid="count">{grids?.grids.length ?? 0}</output>
+      <output data-testid="names">
+        {grids?.grids.map((grid) => grid.name ?? grid.id).join(",")}
+      </output>
+      <button type="button" onClick={() => grids?.deleteGrid("saved")}>
+        Delete saved
+      </button>
       <button type="button" onClick={() => grids?.split("first", "second", "right")}>
         Split
+      </button>
+      <button
+        type="button"
+        onClick={(event) => {
+          const opened = grids?.openGrid(["first", "second", "third"], "  Best of 3  ") ?? false;
+          event.currentTarget.dataset.opened = String(opened);
+        }}
+      >
+        Open run
+      </button>
+      <button type="button" onClick={() => grids?.openGrid(["first", "second"], "Pair", "g")}>
+        Open run pair
+      </button>
+      <button type="button" onClick={() => grids?.deleteRunGrids("g")}>
+        Delete run
       </button>
       <button type="button" onClick={() => grids?.closePane("second")}>
         Close
@@ -76,6 +97,7 @@ function tree(path: string, enabled = true, children: ReactNode = <Probe />) {
         <Routes>
           <Route path="/c/:conversationId" element={element} />
           <Route path="/grid/:gridId" element={element} />
+          <Route path="/" element={element} />
         </Routes>
       </MemoryRouter>
     </CapabilitiesProvider>
@@ -147,6 +169,46 @@ it.each([true, false])("persists and scopes grids (secure context: %s)", (secure
   expect(screen.getByTestId("count")).toHaveTextContent("0");
 });
 
+it("opens a new grid of given sessions, and declines without saved grids", () => {
+  const key = "omnigent:session-grids:one:alice";
+  const view = render(tree("/c/first"));
+  fireEvent.click(screen.getByText("Open run"));
+  expect(screen.getByText("Open run")).toHaveAttribute("data-opened", "true");
+  expect(screen.getByTestId("path").textContent).toMatch(/^\/grid\//);
+  expect(screen.getByTestId("order")).toHaveTextContent("first,second,third");
+  expect(screen.getByTestId("name")).toHaveTextContent(/^Best of 3$/);
+  expect(JSON.parse(localStorage.getItem(key)!)).toHaveLength(1);
+  view.unmount();
+  localStorage.clear();
+  device.mobile = true;
+  render(tree("/c/first"));
+  fireEvent.click(screen.getByText("Open run"));
+  expect(screen.getByText("Open run")).toHaveAttribute("data-opened", "false");
+  expect(screen.getByTestId("path")).toHaveTextContent("/c/first");
+  expect(localStorage.getItem(key)).toBeNull();
+});
+
+it("deletes only grids tagged with the run, and untags a grid the user extends", () => {
+  const key = "omnigent:session-grids:one:alice";
+  const mine = { id: "mine", layout: splitGrid("first", "first", "second", "right") };
+  localStorage.setItem(key, JSON.stringify([mine]));
+  render(tree("/c/first"));
+  fireEvent.click(screen.getByText("Open run pair"));
+  expect(JSON.parse(localStorage.getItem(key)!)[1]).toMatchObject({ name: "Pair", run: "g" });
+  // Deleting the open run grid returns to the landing page.
+  fireEvent.click(screen.getByText("Delete run"));
+  expect(JSON.parse(localStorage.getItem(key)!)).toEqual([mine]);
+  expect(screen.getByTestId("path")).toHaveTextContent(/^\/$/);
+
+  fireEvent.click(screen.getByText("Open run pair"));
+  fireEvent.click(screen.getByText("Add third"));
+  const extended = JSON.parse(localStorage.getItem(key)!)[1];
+  expect(gridSessionIds(extended.layout)).toEqual(["first", "third", "second"]);
+  expect(extended.run).toBeUndefined();
+  fireEvent.click(screen.getByText("Delete run"));
+  expect(JSON.parse(localStorage.getItem(key)!)).toHaveLength(2);
+});
+
 it("gates creation and keeps an unsaved grid usable when storage is full", () => {
   const read = vi.spyOn(Storage.prototype, "getItem");
   const view = render(tree("/c/first", false));
@@ -162,18 +224,47 @@ it("gates creation and keeps an unsaved grid usable when storage is full", () =>
   expect(screen.getByTestId("path")).toHaveTextContent("/c/first");
   expect(localStorage.length).toBe(0);
   view.rerender(tree("/c/first"));
-  vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
-    throw new Error("quota");
+  const key = "omnigent:session-grids:one:alice";
+  const layout = splitGrid("x", "x", "y", "right");
+  localStorage.setItem(key, JSON.stringify([{ id: "saved", name: "Saved", layout }]));
+  fireEvent(window, new StorageEvent("storage", { key, storageArea: localStorage }));
+  expect(screen.getByTestId("names")).toHaveTextContent("Saved");
+  const storeItem = Storage.prototype.setItem;
+  let full = true;
+  vi.spyOn(Storage.prototype, "setItem").mockImplementation(function (
+    this: Storage,
+    name: string,
+    value: string,
+  ) {
+    if (full) throw new Error("quota");
+    storeItem.call(this, name, value);
   });
   const warning = vi.spyOn(toast, "warning").mockReturnValue("warning");
   fireEvent.click(screen.getByText("Split"));
   expect(screen.getByTestId("path").textContent).toMatch(/^\/grid\//);
-  expect(screen.getByTestId("count")).toHaveTextContent("1");
+  expect(screen.getByTestId("count")).toHaveTextContent("2");
   expect(warning).toHaveBeenCalledOnce();
   fireEvent.click(screen.getByText("Rename"));
   fireEvent.click(screen.getByText("Add third"));
   expect(screen.getByTestId("name")).toHaveTextContent("My work");
   expect(screen.getByTestId("order")).toHaveTextContent("first,third,second");
+
+  // Later writes start from storage, yet keep the grid it couldn't hold.
+  fireEvent.click(screen.getByText("Delete saved"));
+  expect(screen.getByTestId("names")).toHaveTextContent(/^My work$/);
+  expect(screen.getByTestId("order")).toHaveTextContent("first,third,second");
+  // Another tab's write is merged in, not traded for this tab's unsaved grid.
+  full = false;
+  localStorage.setItem(key, JSON.stringify([{ id: "other", name: "Other", layout }]));
+  full = true;
+  fireEvent(window, new StorageEvent("storage", { key, storageArea: localStorage }));
+  expect(screen.getByTestId("names")).toHaveTextContent(/^Other,My work$/);
+  fireEvent.click(screen.getByText("Open run pair"));
+  expect(screen.getByTestId("names")).toHaveTextContent(/^Other,My work,Pair$/);
+  expect(screen.getByTestId("name")).toHaveTextContent("Pair");
+  fireEvent.click(screen.getByText("Delete run"));
+  expect(screen.getByTestId("names")).toHaveTextContent(/^Other,My work$/);
+  expect(screen.getByTestId("path")).toHaveTextContent(/^\/$/);
 });
 
 it("syncs other tabs' grids before editing and observes removals", () => {
