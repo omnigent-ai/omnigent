@@ -12012,19 +12012,34 @@ def _queued_statuses(app: FastAPI, conv: str) -> list[str]:
     return statuses
 
 
+@pytest.mark.parametrize(
+    ("child_running", "expected"), [(False, "idle"), (True, "waiting")], ids=["idle", "waiting"]
+)
 @pytest.mark.asyncio
-async def test_interrupt_without_a_turn_reasserts_idle() -> None:
-    """Stop on an idle session publishes ``idle`` so a stale server ``running`` clears."""
-    conv = "conv_interrupt_idle"
+async def test_interrupt_without_a_turn_reasserts_the_resting_status(
+    child_running: bool, expected: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Stop with no turn re-publishes the resting status, so a stale ``running`` clears."""
+    # A server that can serialize ``waiting`` (older ones receive ``running``).
+    monkeypatch.setattr("omnigent.runner.app._server_version", "0.6.0")
+    conv = "conv_interrupt_resting"
+    child = "conv_interrupt_resting_child"
     pm = _RecoveryFakeProcessManager(_RecoveryScriptedHarnessClient([]))
     app = create_runner_app(
         process_manager=pm,  # type: ignore[arg-type]
         server_client=NullServerClient(),  # type: ignore[arg-type]
     )
-    async with _recovery_runner_client(app) as http:
-        response = await http.post(f"/v1/sessions/{conv}/events", json={"type": "interrupt"})
+    if child_running:
+        subagent_work.register_subagent_work(
+            parent_session_id=conv, child_session_id=child, agent="worker", title="task"
+        )
+    try:
+        async with _recovery_runner_client(app) as http:
+            response = await http.post(f"/v1/sessions/{conv}/events", json={"type": "interrupt"})
+    finally:
+        subagent_work.unregister_subagent_work(child)
     assert response.status_code == 204, response.text
-    assert _queued_statuses(app, conv) == ["idle"]
+    assert _queued_statuses(app, conv) == [expected]
 
 
 @pytest.mark.asyncio

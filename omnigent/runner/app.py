@@ -4619,6 +4619,17 @@ def create_runner_app(
         _interrupted_sessions.discard(conv_id)
         return True
 
+    def _resting_status(conv_id: str) -> str:
+        """Return the status a session with no turn rests at: ``waiting`` while sub-agents run."""
+        children = _subagent_work_by_parent.get(conv_id, set())
+        has_running_children = any(
+            (entry := _subagent_work_by_child.get(child_id)) is not None
+            and entry.status in ("launching", "running", "waiting")
+            for child_id in children
+        )
+        waiting = has_running_children or conv_id in _subagent_wake_pending
+        return "waiting" if waiting else "idle"
+
     def _on_proxy_stream_end(
         conv_id: str,
         *,
@@ -4704,14 +4715,7 @@ def create_runner_app(
                 # An intermediate idle lets headless clients stop the runner early.
                 _rewake_parent_if_inbox_stranded(conv_id)
                 inbox_recovery_checked = True
-                children = _subagent_work_by_parent.get(conv_id, set())
-                has_running_children = any(
-                    (entry := _subagent_work_by_child.get(child_id)) is not None
-                    and entry.status in ("launching", "running", "waiting")
-                    for child_id in children
-                )
-                waiting = has_running_children or conv_id in _subagent_wake_pending
-                _publish_turn_status(conv_id, "waiting" if waiting else "idle")
+                _publish_turn_status(conv_id, _resting_status(conv_id))
         if was_interrupted or cancelled:
             if conv_id in _desynced_sessions and not has_buffered:
                 # This turn was torn down by desync recovery (which sets the
@@ -8087,8 +8091,8 @@ def create_runner_app(
                 return _interrupt_resp
             _had_turn = conversation_id in _active_turns
             await _cancel_inprocess_turn(conversation_id)
-            # No turn to stop: re-assert idle so Stop clears a persisted ``running``
-            # whose idle edge never reached the server.
+            # No turn to stop: re-assert the resting status so Stop clears a persisted
+            # ``running`` whose turn-end edge never reached the server.
             if (
                 not _had_turn
                 and conversation_id not in _active_turns
@@ -8097,7 +8101,7 @@ def create_runner_app(
                     and process_manager.has_active_turn(conversation_id)
                 )
             ):
-                _publish_turn_status(conversation_id, "idle")
+                _publish_turn_status(conversation_id, _resting_status(conversation_id))
             return Response(status_code=204)
 
         if body_type == "external_session_status":
