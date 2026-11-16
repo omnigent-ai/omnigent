@@ -81,6 +81,7 @@ const FAILURE_CODE_DESCRIPTIONS: Record<string, string> = {
   terminal_launch_failed: "The agent's terminal couldn't be started on the host.",
   runner_error: "Something went wrong setting up the turn on the host.",
   runner_disconnected: "The connection to the host dropped unexpectedly.",
+  session_recovery_failed: "Automatic resume failed. Please send a new message to continue.",
   runner_unavailable: "The session's runner isn't connected to the server.",
   connection_error:
     "The connection to the agent dropped mid-turn; retrying usually continues the turn.",

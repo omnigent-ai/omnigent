@@ -5018,13 +5018,29 @@ def create_app(
         return _HostOfflineHold(outcome, mid_turn_sessions, owners)
 
     async def _relay_turn_held_for_host(runner_id: str, session_id: str) -> bool:
-        """Whether this replica's disconnect task holds a lost relay's turn for its host."""
+        """Whether host recovery owns the lost relay's outcome."""
         task = _disconnect_grace_tasks.get(runner_id)
-        if task is None or task.done():
+        if (task is None or task.done()) and host_session_recoverer is None:
             return False
         try:
             conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if (
+                conv is not None
+                and host_session_recoverer is not None
+                and await asyncio.to_thread(host_session_recoverer.enabled, conv.host_id)
+            ):
+                recovery = await asyncio.to_thread(
+                    conversation_store.get_session_recovery, session_id
+                )
+                if (
+                    recovery is not None
+                    and recovery.host_id == conv.host_id
+                    and recovery.runner_id == conv.runner_id
+                ):
+                    return True
         except Exception:  # noqa: BLE001 — unreadable: the relay fails the turn as before
+            return False
+        if task is None or task.done():
             return False
         return conv is not None and await _host_offline(await _routing_host_id([conv])) is True
 
