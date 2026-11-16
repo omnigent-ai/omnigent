@@ -888,6 +888,40 @@ def _fail_next_request(
     return helper
 
 
+@pytest.mark.parametrize("stderr_text", ["", "helper startup failed\n", "helper failed: café\n"])
+def test_helper_exit_detail_does_not_wait_for_stderr_eof(tmp_path: Path, stderr_text: str) -> None:
+    os_env = _helper_env(tmp_path, "none")
+    read_fd, write_fd = os.pipe()
+    try:
+        with (
+            os.fdopen(read_fd, "r", encoding="utf-8") as stderr_reader,
+            os.fdopen(write_fd, "wb", buffering=0) as stderr_writer,
+        ):
+            process = subprocess.Popen(
+                [sys.executable, "-c", "pass"],
+                stderr=stderr_writer,
+                text=True,
+                encoding="utf-8",
+            )
+            process.stderr = stderr_reader
+            os_env._helper._proc = process
+            assert process.wait(timeout=10) == 0
+            # A surviving descendant can keep this pipe open after the helper exits.
+            stderr_writer.write(stderr_text.encode("utf-8"))
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                result = executor.submit(os_env._helper._helper_exit_detail_locked)
+                try:
+                    detail = result.result(timeout=5)
+                finally:
+                    stderr_writer.close()
+            expected = "OS environment helper exited with code 0"
+            if stderr_text:
+                expected += f": {stderr_text.strip()}"
+            assert detail == expected
+    finally:
+        os_env.close()
+
+
 @pytest.mark.parametrize("backend", _HELPER_BACKENDS)
 def test_shell_command_is_not_rerun_when_its_helper_dies_before_replying(
     tmp_path: Path, backend: str
