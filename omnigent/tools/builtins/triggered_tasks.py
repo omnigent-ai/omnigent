@@ -999,8 +999,8 @@ def build_trigger_config(
     A create builds its search from the provider's empty form, as the web form does. An
     update keeps the saved search unless the call passes a whole new one (see
     :func:`triggered_task_call_error`), which is built the same way, so the approval can
-    compile it from the call alone. Link-back, where matches go and the worker settings
-    change only when the call passes them.
+    compile it from the call alone. Where matches go and the worker settings change only
+    when the call passes them; a link-back the owner didn't choose follows the event.
 
     :param args: Parsed tool arguments, e.g. ``{"provider": "jira", "scope": ["ES"], ...}``.
     :param current: The task's saved trigger on update, ``None`` on create.
@@ -1020,11 +1020,15 @@ def build_trigger_config(
             return search
         fields = search
         if current is not None:
-            for key in ("linkBack", "linkBackTouched", "taskSessionMode"):
-                if key in current:
-                    fields[key] = current[key]
-                else:
-                    fields.pop(key, None)
+            # As in the form, a link-back the owner chose stays; otherwise the new
+            # event's default applies, e.g. off for review requests.
+            if current.get("linkBackTouched"):
+                fields["linkBack"] = current["linkBack"]
+                fields["linkBackTouched"] = True
+            if "taskSessionMode" in current:
+                fields["taskSessionMode"] = current["taskSessionMode"]
+            else:
+                fields.pop("taskSessionMode", None)
     else:
         fields = dict(current)
     source = cast(Any, fields["source"])

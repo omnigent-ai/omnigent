@@ -442,6 +442,32 @@ def test_update_with_a_new_search_builds_it_from_the_call() -> None:
     assert switched == {**expected, "worker": current["worker"]}
 
 
+@pytest.mark.parametrize(
+    ("link_back", "expected"),
+    [
+        # Never chosen, it follows the new event, whose default is off for review requests.
+        (None, False),
+        (True, True),
+    ],
+    ids=["unchosen", "chosen"],
+)
+def test_a_new_search_keeps_only_a_chosen_link_back(
+    link_back: bool | None, expected: bool
+) -> None:
+    current = _created(
+        provider="jira", scope=["ES"], **({} if link_back is None else {"link_back": link_back})
+    )
+    switched = _update(
+        current,
+        provider="github",
+        event="review",
+        scope=["octo-org/octo-repo"],
+        target="me",
+        conditions=[],
+    )
+    assert not isinstance(switched, str) and switched["linkBack"] is expected
+
+
 def test_update_needs_the_whole_search_to_change_it() -> None:
     current = _created(provider="slack", scope=["eng-support"])
     error = _update(current, event="dm", scope=["alice"])

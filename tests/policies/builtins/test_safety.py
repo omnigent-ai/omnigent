@@ -1472,7 +1472,9 @@ def test_triggered_task_update_names_what_it_changes() -> None:
         '> Watch: new Jira tickets matching this JQL:\n> project = "OPS" AND labels = "bug"'
     ) in reason
     assert 'worker: {"permission_mode": "acceptEdits"}' in reason
-    assert "Link back: unchanged" in reason.splitlines()
+    assert "Link back: as saved if it was chosen, else on (this event's default)" in (
+        reason.splitlines()
+    )
     assert (
         "Sessions it starts: the worker settings below change; any without their own "
         "permission mode use the task's mode, bypassPermissions (skips approval prompts"

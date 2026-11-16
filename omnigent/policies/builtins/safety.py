@@ -672,8 +672,12 @@ def _triggered_task_review(args: dict[str, object], *, action: str) -> PolicyRes
         )
         if action == "update":
             if "link_back" not in args:
-                # A new search keeps the saved link-back, whatever the new event's default.
-                watch += "Link back: unchanged\n"
+                # Only the runner sees whether the saved link-back was chosen.
+                default = "on" if config["linkBack"] else "off"
+                watch += (
+                    f"Link back: as saved if it was chosen, else {default} "
+                    "(this event's default)\n"
+                )
         else:
             link_back = "on, posting each session's link on its item"
             watch += f"Link back: {link_back if config['linkBack'] else 'off'}\n"
