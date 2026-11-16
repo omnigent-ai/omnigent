@@ -82,6 +82,11 @@ KIMI_KEY = "kimi"
 # installer, not an npm package managed by ``omni setup``.
 KIRO_KEY = "kiro"
 
+# Cline authenticates through its own ``cline auth`` provider picker (device
+# OAuth or API key → ``~/.cline/data/settings/providers.json``), not via the
+# ambient provider config; it ships as the ``cline`` npm package.
+CLINE_KEY = "cline"
+
 # Minimum CLI versions for native harnesses where the runtime has a known
 # feature floor. These are intentionally conservative: the runtime may
 # gracefully degrade on older CLIs, but setup enforces the floor so a user
@@ -117,6 +122,10 @@ KIRO_KEY = "kiro"
 #   this spec installs), whose releases are a 0.x series — NOT the separate
 #   ``kimi-cli`` project, which numbers from 1.x. Its first release after
 #   2026-06-01 is 0.7.0.
+# - cline: the ``cline hub`` command/event protocol (session.create /
+#   session.attach / session.send_input / run.* events) is verified on
+#   3.0.74; earlier builds may lack the hub schedule commands the native
+#   harness depends on.
 # - hermes: parent_session_id schema introduced in v0.17.0. Hermes reports a
 #   semver version with the build date alongside it
 #   (``Hermes Agent v0.19.1 (2026.7.30)``), so the floor is that semver.
@@ -126,6 +135,7 @@ _QWEN_MIN_VERSION = "0.18.1"
 _GOOSE_MIN_VERSION = "1.38.0"
 _HERMES_MIN_VERSION = "0.17.0"
 _KIRO_MIN_VERSION = "2.10.0"
+_CLINE_MIN_VERSION = "3.0.74"
 _CLAUDE_MIN_VERSION = "2.1.161"
 _CURSOR_MIN_VERSION = "2026.06.02"
 _KIMI_MIN_VERSION = "0.7.0"
@@ -303,6 +313,19 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         package=None,
         install_hint="curl -fsSL https://cli.kiro.dev/install | bash",
         min_version=_KIRO_MIN_VERSION,
+    ),
+    # Cline ships as the ``cline`` npm package. ``cline auth`` opens an
+    # interactive provider picker (device OAuth / API key). ``status_args``
+    # and ``logout_args`` stay None: ``cline auth status`` is not a real
+    # subcommand (it parses "status" as a provider id), and there is no
+    # sign-out verb — readiness is file-checked via
+    # ``cline_auth.cline_auth_configured`` instead.
+    CLINE_KEY: HarnessInstallSpec(
+        "Cline",
+        "cline",
+        package="cline",
+        login_args=("auth",),
+        min_version=_CLINE_MIN_VERSION,
     ),
     # The native Antigravity (agy) TUI bridge wraps the ``agy`` CLI. agy's auth
     # service is reached by launching ``agy`` itself (no login subcommand); after

@@ -34,6 +34,9 @@ class ClineBridgeState:
         runner resource).
     :param server_url: Omnigent server base URL for elicitation calls.
     :param headers: Auth headers the runner carries, for those calls.
+    :param workspace: Hub workspace cwd — needed to re-run ``cline hub
+        start`` when a hub restart invalidates the persisted token.
+    :param cline_command: Resolved ``cline`` binary path, same purpose.
     """
 
     ws_url: str
@@ -42,6 +45,8 @@ class ClineBridgeState:
     pid: int = 0
     server_url: str = ""
     headers: dict[str, str] = dataclass_field(default_factory=dict)
+    workspace: str = ""
+    cline_command: str = ""
 
 
 def bridge_state_path(bridge_dir: Path) -> Path:
@@ -62,6 +67,8 @@ def write_bridge_state(bridge_dir: Path, state: ClineBridgeState) -> None:
                 "pid": state.pid,
                 "server_url": state.server_url,
                 "headers": state.headers,
+                "workspace": state.workspace,
+                "cline_command": state.cline_command,
             }
         )
     )
@@ -84,6 +91,8 @@ def read_bridge_state(bridge_dir: Path) -> ClineBridgeState | None:
         pid=int(raw.get("pid") or 0),
         server_url=str(raw.get("server_url") or ""),
         headers={str(k): str(v) for k, v in headers.items()} if isinstance(headers, dict) else {},
+        workspace=str(raw.get("workspace") or ""),
+        cline_command=str(raw.get("cline_command") or ""),
     )
 
 

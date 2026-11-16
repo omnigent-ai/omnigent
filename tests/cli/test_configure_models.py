@@ -13,8 +13,8 @@ harness on a single compact row — the name on the left, then an aligned
 ``✓``/``✗`` status column — in 0.3 priority order: ``1=Claude``,
 ``2=Codex``, ``3=Cursor``, ``4=OpenCode``, ``5=Hermes``, ``6=Pi``,
 ``7=Antigravity``, ``8=Qwen Code``, ``9=Goose``, ``10=Copilot``, ``11=Kiro``,
-``12=Kimi Code``, ``13=Import from OpenClaw``, ``14=Custom ACP agent``,
-``15=Quit``. There is no "More" folding — every harness is visible at once —
+``12=Kimi Code``, ``13=Cline``, ``14=Import from OpenClaw``,
+``15=Custom ACP agent``, ``16=Quit``. There is no "More" folding — every harness is visible at once —
 and the actionable hint (install command / next step)
 renders only for the highlighted row, as the selector's description line.
 Selecting a harness drills into level 2 — its configured credentials, then ``+ Add a
@@ -1798,6 +1798,7 @@ def test_overview_lists_all_harnesses_in_priority_order(isolated_config, monkeyp
         "Copilot",
         "Kiro",
         "Kimi Code",
+        "Cline",
         "Import from OpenClaw",
         "Custom ACP agent",
         "Quit",
@@ -2264,7 +2265,7 @@ def test_overview_status_color_distinguishes_missing_from_unconfigured(
     assert "[red]✗ Not installed[/]" in codex
 
 
-@pytest.mark.parametrize("name", ["Kiro", "Kimi Code"])
+@pytest.mark.parametrize("name", ["Kiro", "Kimi Code", "Cline"])
 def test_installed_native_cli_auth_unknown_rows_are_not_configured(
     isolated_config, monkeypatch, name: str
 ) -> None:
@@ -2287,6 +2288,7 @@ def test_installed_native_cli_auth_unknown_rows_are_not_configured(
     # Kimi's row now consults a combined auth probe; force "not configured" so
     # the assertion is deterministic regardless of the dev machine.
     monkeypatch.setattr("omnigent.onboarding.kimi_auth.kimi_auth_configured", lambda: False)
+    monkeypatch.setattr("omnigent.onboarding.cline_auth.cline_auth_configured", lambda: False)
     options, selectable, descriptions, _compact, _max_visible = _capture_setup_overview(
         monkeypatch
     )
@@ -2312,6 +2314,27 @@ def test_overview_kimi_row_reflects_detected_login(isolated_config, monkeypatch)
         monkeypatch
     )
     row_index = _overview_row_names(options, selectable).index("Kimi Code")
+    assert "[green]✓ Signed in[/]" in options[row_index]
+    assert "[yellow]✗ Not configured[/]" not in options[row_index]
+    # A ready row carries no next-step hint.
+    assert descriptions[row_index] == ""
+
+
+def test_overview_cline_row_reflects_detected_login(isolated_config, monkeypatch) -> None:
+    """An installed cline with a provider credential renders green "Signed in".
+
+    The row consults the file-based probe ``cline_auth_configured`` (the same
+    ``~/.cline`` providers.json the hub harness reads) and renders ready when
+    a provider credential is present, mirroring the kimi row's split.
+    """
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_install.harness_cli_installed", lambda family: True
+    )
+    monkeypatch.setattr("omnigent.onboarding.cline_auth.cline_auth_configured", lambda: True)
+    options, selectable, descriptions, _compact, _max_visible = _capture_setup_overview(
+        monkeypatch
+    )
+    row_index = _overview_row_names(options, selectable).index("Cline")
     assert "[green]✓ Signed in[/]" in options[row_index]
     assert "[yellow]✗ Not configured[/]" not in options[row_index]
     # A ready row carries no next-step hint.
@@ -2345,6 +2368,7 @@ def test_overview_descriptions_map_to_their_rows(isolated_config, monkeypatch) -
     # Kimi's row consults a combined auth probe; force "not configured" so the
     # hint is asserted deterministically.
     monkeypatch.setattr("omnigent.onboarding.kimi_auth.kimi_auth_configured", lambda: False)
+    monkeypatch.setattr("omnigent.onboarding.cline_auth.cline_auth_configured", lambda: False)
     monkeypatch.setattr(
         "omnigent.onboarding.opencode_auth.opencode_auth_summary",
         lambda: OpenCodeAuthSummary(installed=True, stored_providers=(), env_providers=()),
@@ -2385,6 +2409,7 @@ def test_overview_descriptions_map_to_their_rows(isolated_config, monkeypatch) -
         == "Sign in with `kimi login`, or (pay-per-use) set a Kimi API key in"
         " `~/.kimi-code/config.toml`."
     )
+    assert desc_by_name["Cline"] == "Sign in with `cline auth`."
     assert desc_by_name["Quit"] == ""
 
 

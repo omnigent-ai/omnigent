@@ -9,11 +9,16 @@ owns, so this never stops a hub it finds already running.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import logging
 import shutil
 from dataclasses import dataclass
+from pathlib import Path
 
 _DEFAULT_TIMEOUT_S = 30.0
+
+logger = logging.getLogger(__name__)
 
 
 class ClineHubStartError(RuntimeError):
@@ -84,10 +89,53 @@ async def ensure_cline_hub(
     return parse_hub_start_json(out.decode(errors="replace"))
 
 
+def token_fingerprint(auth_token: str) -> str:
+    """Log-safe token identifier (never log the token itself)."""
+    return hashlib.sha256(auth_token.encode()).hexdigest()[:8] if auth_token else "none"
+
+
+def resolve_cline_provider_settings(
+    cline_home: Path | None = None,
+) -> tuple[str | None, str | None]:
+    """Read ``lastUsedProvider`` (and its model) from Cline's providers.json.
+
+    ``session.create`` without ``providerId``/``modelId`` records placeholder
+    ``"hub"`` values and the run fails with ``Unknown or disabled provider
+    "hub"`` — headless-driven sessions need real coordinates up front, since
+    the TUI is what normally rewrites them on attach.
+
+    :param cline_home: Override for ``~/.cline`` (tests); ``None`` uses home.
+    :returns: ``(provider_id, model_id)`` — ``(None, None)`` when unreadable.
+    """
+    path = (cline_home or Path.home() / ".cline") / "data/settings/providers.json"
+    try:
+        record = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None, None
+    if not isinstance(record, dict):
+        return None, None
+    provider = record.get("lastUsedProvider")
+    if not isinstance(provider, str) or not provider:
+        providers = record.get("providers")
+        provider = next(iter(providers), None) if isinstance(providers, dict) else None
+        if not provider:
+            return None, None
+    model: str | None = None
+    entry = (record.get("providers") or {}).get(provider)
+    if isinstance(entry, dict):
+        settings = entry.get("settings")
+        if isinstance(settings, dict) and isinstance(settings.get("model"), str):
+            model = settings["model"]
+    logger.debug("cline provider settings: provider=%s model=%s", provider, model)
+    return provider, model
+
+
 __all__ = [
     "ClineHubEndpoint",
     "ClineHubStartError",
     "ensure_cline_hub",
     "parse_hub_start_json",
     "resolve_cline_executable",
+    "resolve_cline_provider_settings",
+    "token_fingerprint",
 ]

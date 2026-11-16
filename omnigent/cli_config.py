@@ -2930,6 +2930,69 @@ def _manage_kimi_harness() -> None:
             status = None
 
 
+def _manage_cline_harness() -> None:
+    """Run the level-2 loop for Cline: install the CLI and drive ``cline auth``.
+
+    Cline owns its auth — ``cline auth`` opens an interactive provider picker
+    (device-flow OAuth for hosted providers, API-key entry for BYO) that
+    writes ``~/.cline/data/settings/providers.json``. Omnigent stores no
+    Cline credential. There is no ``cline auth status`` probe (the CLI parses
+    "status" as a provider id) and no sign-out verb, so the auth state is
+    file-checked via
+    :func:`~omnigent.onboarding.cline_auth.cline_auth_configured` and login
+    is offered every time (the interactive picker lets the user cancel).
+
+    Like the other CLI-backed harnesses, a missing CLI gates the drill-in.
+
+    :returns: None. Side effects: may run ``cline auth`` in the foreground.
+    """
+    from omnigent.onboarding.cline_auth import cline_auth_configured
+    from omnigent.onboarding.harness_install import (
+        CLINE_KEY,
+        harness_cli_installed,
+        harness_install_spec,
+        harness_login,
+    )
+    from omnigent.onboarding.interactive import console, select
+
+    if not harness_cli_installed(CLINE_KEY):
+        spec = harness_install_spec(CLINE_KEY)
+        hint = (spec.install_hint if spec else None) or "npm install -g cline"
+        console.print(
+            "  Cline's CLI isn't installed. Install it with:\n"
+            f"    [bold]{hint}[/bold]\n"
+            "  then re-open this menu to sign in."
+        )
+        return
+
+    configured_status = "✓ Cline is configured (provider credential detected)"
+    status: str | None = configured_status if cline_auth_configured() else None
+    while True:
+        rows: list[_HarnessMenuRow] = [
+            _HarnessMenuRow("Sign in / pick a provider (cline auth)", action="login"),
+            _HarnessMenuRow("← Back", action="back"),
+        ]
+        idx = select(
+            "Cline — authentication is managed by the cline CLI",
+            [r.label for r in rows],
+            clear_on_exit=True,
+            status=status,
+        )
+        if idx < 0:  # Esc / q
+            return
+        action = rows[idx].action
+        if action == "back":
+            return
+        if action == "login":
+            console.print("  [dim]Opening cline's provider picker (cline auth)…[/dim]")
+            harness_login(CLINE_KEY)
+            status = (
+                configured_status
+                if cline_auth_configured()
+                else "cline auth finished — no provider credential detected yet"
+            )
+
+
 def _prompt_install_copilot() -> str | None:
     """Offer to install the missing ``copilot`` extra; return a status line.
 
@@ -3734,6 +3797,7 @@ def _run_configure_harnesses_interactive() -> None:
     from omnigent.onboarding.extra_install import extra_install_display
     from omnigent.onboarding.goose_auth import goose_config_summary
     from omnigent.onboarding.harness_install import (
+        CLINE_KEY,
         COPILOT_KEY,
         CURSOR_KEY,
         DEVIN_KEY,
@@ -3811,6 +3875,10 @@ def _run_configure_harnesses_interactive() -> None:
     # / ``kimi provider add`` → ~/.kimi-code/config.toml), so it dispatches to its
     # own drill-in rather than ``_manage_harness_providers``.
     _KIMI = "\x00kimi"
+    # Sentinel marking the Cline row — like Kimi it owns its own auth
+    # (``cline auth`` provider picker → ~/.cline), so it dispatches to its
+    # own drill-in rather than ``_manage_harness_providers``.
+    _CLINE = "\x00cline"
     # Sentinels for the generic-ACP rows. Each configured agent gets its own row
     # (``_ACP_AGENT_PREFIX + slug`` → per-agent remove drill-in); import/add rows
     # jump straight into those flows. Not a provider family — each ACP agent owns
@@ -4265,6 +4333,37 @@ def _run_configure_harnesses_interactive() -> None:
                 )
             )
 
+        # Cline — native hub harness, own auth via ``cline auth`` (device OAuth
+        # or API key → ~/.cline). No status probe exists, so a file check
+        # (``cline_auth_configured``) distinguishes signed-in from
+        # installed-but-unconfigured. npm-installed, so the spec's package
+        # name drives the install hint.
+        if harness_cli_installed(CLINE_KEY):
+            from omnigent.onboarding.cline_auth import cline_auth_configured
+
+            if cline_auth_configured():
+                rows.append((_CLINE, "Cline", "Signed in", "ready", ""))
+            else:
+                rows.append(
+                    (
+                        _CLINE,
+                        "Cline",
+                        "Not configured",
+                        "warn",
+                        "Sign in with `cline auth`.",
+                    )
+                )
+        else:
+            rows.append(
+                (
+                    _CLINE,
+                    "Cline",
+                    _cli_absence_label(CLINE_KEY),
+                    "missing",
+                    _install_hint(harness_install_display(CLINE_KEY)),
+                )
+            )
+
         # Custom ACP agents — the generic `acp` harness driving any user-configured
         # ACP-agent command. Each configured agent gets its own overview row
         # (select → per-agent remove drill-in) so it sits alongside the built-in
@@ -4391,5 +4490,7 @@ def _run_configure_harnesses_interactive() -> None:
             _manage_kiro_harness()
         elif selected_target == _KIMI:
             _manage_kimi_harness()
+        elif selected_target == _CLINE:
+            _manage_cline_harness()
         else:  # Quit row (or, defensively, a non-family row)
             return

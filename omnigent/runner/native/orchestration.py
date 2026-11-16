@@ -10663,7 +10663,11 @@ async def _auto_create_cline_terminal(
     from omnigent.harnesses.cline_native.client import ClineHubClient, ClineHubError
     from omnigent.harnesses.cline_native.forwarder import run_cline_forwarder
     from omnigent.harnesses.cline_native.main import resolve_cline_executable
-    from omnigent.harnesses.cline_native.serve import ensure_cline_hub
+    from omnigent.harnesses.cline_native.serve import (
+        ensure_cline_hub,
+        resolve_cline_provider_settings,
+        token_fingerprint,
+    )
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
 
     # Tear down any forwarder left from a prior terminal for this session so
@@ -10692,6 +10696,16 @@ async def _auto_create_cline_terminal(
         )
 
     endpoint = await ensure_cline_hub(cwd=workspace, executable=cline_command)
+    _logger.info(
+        "cline-native: hub ensured at %s (token fp %s) for session %s",
+        endpoint.ws_url,
+        token_fingerprint(endpoint.auth_token),
+        session_id,
+    )
+    # Headless-driven sessions need real provider/model up front — the hub
+    # records placeholder "hub" values otherwise and runs fail with
+    # 'Unknown or disabled provider "hub"'.
+    provider, model = resolve_cline_provider_settings()
     client = await ClineHubClient.connect(
         endpoint.ws_url,
         endpoint.auth_token,
@@ -10717,16 +10731,31 @@ async def _auto_create_cline_terminal(
         external_id = launch_config.external_session_id
         cline_session_id: str | None = None
         if external_id:
+            # ``session.attach`` is the live reattach path (``session.resume``
+            # is rejected by the hub's schedule interface on cline 3.0.74).
+            # A restart marks sessions ``aborted`` — attach answers anyway,
+            # so the recorded status decides whether to reuse or recreate.
             try:
-                cline_session_id = await client.session_resume(
-                    external_id,
-                    workspace_root=workspace,
-                    cwd=workspace,
-                )
-            except (ClineHubError, OSError, RuntimeError):
+                attached = await client.session_attach(external_id)
+                status = str(attached.get("status") or "")
+                if status in {"aborted", "terminated", "deleted", "closed"}:
+                    _logger.warning(
+                        "cline session %s is %s after hub restart; creating fresh",
+                        external_id,
+                        status,
+                    )
+                else:
+                    cline_session_id = str(attached.get("sessionId") or external_id)
+                    _logger.info(
+                        "cline-native: reattached to hub session %s (status=%s)",
+                        cline_session_id,
+                        status,
+                    )
+            except (ClineHubError, OSError, RuntimeError) as exc:
                 _logger.warning(
-                    "cline session.resume failed for %s; starting a fresh session",
+                    "cline session.attach failed for %s (%s); starting a fresh session",
                     external_id,
+                    exc,
                 )
         if cline_session_id is None:
             # Approvals route through Omnigent's elicitation hook (the
@@ -10735,6 +10764,8 @@ async def _auto_create_cline_terminal(
             cline_session_id = await client.session_create(
                 workspace_root=workspace,
                 cwd=workspace,
+                provider=provider,
+                model=model,
                 auto_approve_tools=False,
             )
             if server_client is not None and cline_session_id:
@@ -10747,6 +10778,21 @@ async def _auto_create_cline_terminal(
         await client.close()
         raise
 
+    # Record what the hub actually stored — provider/model drift ("hub"
+    # placeholders) and dead statuses are the failure modes that matter here.
+    with contextlib.suppress(ClineHubError, OSError, RuntimeError):
+        record = await client.session_get(cline_session_id)
+        _logger.info(
+            "cline-native: hub session %s for %s: %s",
+            cline_session_id,
+            session_id,
+            {
+                "status": record.get("status"),
+                "provider": (record.get("metadata") or {}).get("provider"),
+                "model": (record.get("metadata") or {}).get("model"),
+            },
+        )
+
     write_bridge_state(
         bridge_dir,
         ClineBridgeState(
@@ -10756,6 +10802,8 @@ async def _auto_create_cline_terminal(
             pid=0,
             server_url=(runner_server_url or ""),
             headers=(dict(server_client.headers) if server_client is not None else {}),
+            workspace=workspace,
+            cline_command=cline_command,
         ),
     )
     # The launch connection is only needed for setup; the forwarder and the
@@ -10773,6 +10821,9 @@ async def _auto_create_cline_terminal(
                 base_url=str(server_client.base_url).rstrip("/"),
                 headers={},
                 session_id=session_id,
+                cwd=workspace,
+                executable=cline_command,
+                bridge_dir=bridge_dir,
             ),
             name=f"cline-forwarder-{session_id}",
         )

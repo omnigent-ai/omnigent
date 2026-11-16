@@ -35,6 +35,13 @@ class ClineHubError(RuntimeError):
     """A hub command error or a transport failure."""
 
 
+def _token_fingerprint(auth_token: str) -> str:
+    """Log-safe token identifier (never log the token itself)."""
+    from omnigent.harnesses.cline_native.serve import token_fingerprint
+
+    return token_fingerprint(auth_token)
+
+
 @dataclass
 class ClineHubClient:
     """One registered connection to a ``cline hub`` daemon.
@@ -72,11 +79,26 @@ class ClineHubClient:
         # deduped away and its events routed to the first. Default to unique.
         client_id = client_id or f"omnigent-{_pid()}-{secrets.token_hex(3)}"
         import websockets
+        from websockets.exceptions import InvalidStatus
 
-        ws = await websockets.connect(
-            ws_url,
-            subprotocols=[websockets.Subprotocol(f"cline-hub-auth.{auth_token}")],
-        )
+        try:
+            ws = await websockets.connect(
+                ws_url,
+                subprotocols=[websockets.Subprotocol(f"cline-hub-auth.{auth_token}")],
+            )
+        except InvalidStatus as exc:
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            hint = (
+                "stale auth token (hub restarted?)"
+                if status == 401
+                else "hub unreachable or not a hub endpoint"
+            )
+            raise ClineHubError(
+                f"cline hub connect failed for {ws_url} "
+                f"(HTTP {status}, token {_token_fingerprint(auth_token)}): {hint}"
+            ) from exc
+        except OSError as exc:
+            raise ClineHubError(f"cline hub connect failed for {ws_url}: {exc}") from exc
         client = cls(ws=ws, client_id=client_id)
         client._recv_task = asyncio.create_task(client._recv_loop(), name="cline-hub-recv")
         try:
@@ -125,9 +147,14 @@ class ClineHubClient:
         payload: dict[str, Any] | None = None,
         *,
         session_id: str | None = None,
-        timeout_s: float = 60.0,
+        timeout_s: float | None = 60.0,
     ) -> dict[str, Any]:
-        """Send a hub command and await its reply payload."""
+        """Send a hub command and await its reply payload.
+
+        ``timeout_s=None`` waits until the reply arrives or the connection
+        closes — used for ``session.send_input``, whose reply only lands when
+        the run settles.
+        """
         request_id = f"omni-{next(self._next_id)}"
         fut: asyncio.Future = asyncio.get_event_loop().create_future()
         self._pending[request_id] = fut
@@ -142,7 +169,7 @@ class ClineHubClient:
             envelope["sessionId"] = session_id
         try:
             await self.ws.send(json.dumps({"kind": "command", "envelope": envelope}))
-            reply = await asyncio.wait_for(fut, timeout_s)
+            reply = await fut if timeout_s is None else await asyncio.wait_for(fut, timeout_s)
         finally:
             self._pending.pop(request_id, None)
         if not reply.get("ok"):
@@ -231,6 +258,32 @@ class ClineHubClient:
         resumed = session.get("sessionId") if isinstance(session, dict) else None
         return str(resumed or session_id)
 
+    async def session_get(self, session_id: str) -> dict[str, Any]:
+        """Return the hub's session record; ``session_not_found`` when gone."""
+        payload = await self.command("session.get", {}, session_id=session_id)
+        session = payload.get("session")
+        return session if isinstance(session, dict) else {}
+
+    async def session_attach(self, session_id: str) -> dict[str, Any]:
+        """Attach this client as a session participant; returns the record.
+
+        This is the live reattach path — ``session.resume`` is rejected by
+        the hub's schedule interface on cline 3.0.74. A terminated session
+        still replies to ``attach`` but refuses ``send_input``, so callers
+        must check the returned ``status``.
+        """
+        payload = await self.command(
+            "session.attach", {"sessionId": session_id}, session_id=session_id
+        )
+        session = payload.get("session")
+        return session if isinstance(session, dict) else {}
+
+    async def session_list(self) -> list[dict[str, Any]]:
+        """Return all sessions the hub knows about."""
+        payload = await self.command("session.list", {})
+        sessions = payload.get("sessions")
+        return sessions if isinstance(sessions, list) else []
+
     async def send_input(
         self,
         session_id: str,
@@ -278,6 +331,11 @@ class ClineHubClient:
             },
         )
 
+    async def wait_closed(self) -> tuple[int | None, str]:
+        """Resolve when the socket closes; returns ``(code, reason)``."""
+        await self.ws.wait_closed()
+        return self.ws.close_code, (self.ws.close_reason or "")
+
     async def close(self) -> None:
         """Tear down the receive task and socket."""
         if self._recv_task is not None:
@@ -312,8 +370,14 @@ class ClineHubClient:
         except asyncio.CancelledError:
             raise
         except Exception:
-            logger.exception("cline hub recv loop ended")
+            logger.exception("cline hub recv loop ended for %s", self.client_id)
         finally:
+            logger.info(
+                "cline hub connection closed for %s (code=%s reason=%r)",
+                self.client_id,
+                getattr(self.ws, "close_code", None),
+                getattr(self.ws, "close_reason", None),
+            )
             for fut in self._pending.values():
                 if not fut.done():
                     fut.set_exception(ClineHubError("hub connection closed"))

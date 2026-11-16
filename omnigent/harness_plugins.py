@@ -470,6 +470,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         streaming=True,
         fork_history=_FH.NONE,
         instruction_delivery=_ID.NOT_DELIVERED,
+        workspace_file_mentions=True,
     ),
     "antigravity-native": _C(
         _IM.NATIVE_TUI,

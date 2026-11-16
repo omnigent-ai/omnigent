@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import logging
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -212,6 +214,14 @@ def make_event_sink(
     return _on_event, task
 
 
+# Hub restart marks sessions ``aborted``; they refuse further input and only
+# a fresh ``session.create`` revives the conversation — terminal for the
+# forwarder, which exits so the next terminal ensure can rebuild.
+_DEAD_SESSION_STATUSES = {"aborted", "terminated", "deleted", "closed"}
+
+_MAX_BACKOFF_S = 60.0
+
+
 async def run_cline_forwarder(
     *,
     ws_url: str,
@@ -221,19 +231,73 @@ async def run_cline_forwarder(
     headers: dict[str, str],
     session_id: str,
     agent_name: str = _DEFAULT_AGENT_NAME,
+    cwd: str = "",
+    executable: str = "",
+    bridge_dir: Path | None = None,
 ) -> None:
     """Own the forwarder connection for one session's lifetime.
 
     Connects to the hub, subscribes to the session's event stream, and holds
     the socket open so :func:`make_event_sink` drains events into Omnigent
-    posts. Runs until cancelled; a dead connection logs and exits rather than
-    looping (the runner's task registry treats exit as terminal).
-    """
-    from omnigent.harnesses.cline_native.client import ClineHubClient
+    posts. On socket loss the loop re-runs ``cline hub start`` (a hub restart
+    rotates the auth token), refreshes bridge state, re-subscribes, and keeps
+    mirroring; it exits only on cancellation or when the hub session itself
+    is gone (``session_not_found`` / dead status), which the next terminal
+    ensure rebuilds.
 
-    client = await ClineHubClient.connect(ws_url, auth_token)
-    try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as http:
+    :param cwd: Workspace root for re-ensuring the hub after a restart.
+    :param executable: ``cline`` binary path for the same re-ensure.
+    :param bridge_dir: Per-session bridge dir — refreshed coordinates are
+        written back so the executor/approval paths pick up the new token.
+    """
+    from omnigent.harnesses.cline_native.client import ClineHubClient, ClineHubError
+
+    backoff = 1.0
+    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as http:
+        while True:
+            try:
+                client = await ClineHubClient.connect(
+                    ws_url, auth_token, workspace_root=cwd, cwd=cwd
+                )
+            except (ClineHubError, OSError) as exc:
+                logger.warning(
+                    "cline forwarder %s: hub connect failed (%s); re-ensuring hub",
+                    session_id,
+                    exc,
+                )
+                refreshed = await _refresh_hub_endpoint(
+                    cwd=cwd,
+                    executable=executable,
+                    bridge_dir=bridge_dir,
+                    session_id=session_id,
+                )
+                if refreshed is not None:
+                    ws_url, auth_token = refreshed.ws_url, refreshed.auth_token
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, _MAX_BACKOFF_S)
+                continue
+            try:
+                record = await client.session_get(hub_session_id)
+            except ClineHubError as exc:
+                if "session_not_found" in str(exc):
+                    logger.error(
+                        "cline forwarder %s: hub session %s no longer exists; exiting",
+                        session_id,
+                        hub_session_id,
+                    )
+                    await client.close()
+                    return
+                record = {}
+            status = str(record.get("status") or "")
+            if status in _DEAD_SESSION_STATUSES:
+                logger.error(
+                    "cline forwarder %s: hub session %s is %s; exiting",
+                    session_id,
+                    hub_session_id,
+                    status,
+                )
+                await client.close()
+                return
             _on_event, drain = make_event_sink(
                 http,
                 base_url=base_url,
@@ -242,16 +306,79 @@ async def run_cline_forwarder(
                 agent_name=agent_name,
             )
             client.set_event_handler(_on_event)
-            await client.subscribe(hub_session_id)
             try:
-                while True:
-                    await asyncio.sleep(3600)
+                await client.subscribe(hub_session_id)
+                logger.info(
+                    "cline forwarder %s: subscribed to hub session %s at %s",
+                    session_id,
+                    hub_session_id,
+                    ws_url,
+                )
+                code, reason = await client.wait_closed()
+                logger.warning(
+                    "cline forwarder %s: hub socket closed (code=%s reason=%r); reconnecting",
+                    session_id,
+                    code,
+                    reason,
+                )
             finally:
                 drain.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await drain
-    finally:
-        await client.close()
+                await client.close()
+            # A dropped socket usually means the hub restarted and rotated its
+            # token — fetch fresh coordinates before the next connect attempt.
+            refreshed = await _refresh_hub_endpoint(
+                cwd=cwd,
+                executable=executable,
+                bridge_dir=bridge_dir,
+                session_id=session_id,
+            )
+            if refreshed is not None:
+                ws_url, auth_token = refreshed.ws_url, refreshed.auth_token
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, _MAX_BACKOFF_S)
+
+
+async def _refresh_hub_endpoint(
+    *,
+    cwd: str,
+    executable: str,
+    bridge_dir: Path | None,
+    session_id: str,
+) -> Any | None:
+    """Re-run ``cline hub start`` and publish the fresh token in bridge state."""
+    from omnigent.harnesses.cline_native.bridge import (
+        read_bridge_state,
+        write_bridge_state,
+    )
+    from omnigent.harnesses.cline_native.serve import ClineHubStartError, ensure_cline_hub
+
+    try:
+        endpoint = await ensure_cline_hub(cwd=cwd, executable=executable or None)
+    except (ClineHubStartError, OSError) as exc:
+        logger.warning(
+            "cline forwarder %s: cline hub start failed during refresh: %s",
+            session_id,
+            exc,
+        )
+        return None
+    if bridge_dir is not None:
+        state = read_bridge_state(bridge_dir)
+        if state is not None and (
+            state.ws_url != endpoint.ws_url or state.auth_token != endpoint.auth_token
+        ):
+            write_bridge_state(
+                bridge_dir,
+                dataclasses.replace(
+                    state, ws_url=endpoint.ws_url, auth_token=endpoint.auth_token
+                ),
+            )
+            logger.info(
+                "cline forwarder %s: refreshed bridge state for hub restart",
+                session_id,
+            )
+    return endpoint
 
 
 __all__ = [
