@@ -1495,10 +1495,7 @@ def test_target_write_cannot_cross_registration(setup_app, monkeypatch, operatio
     assert stores["permission_store"].get("alice", session_id) is None
 
 
-@pytest.mark.parametrize("setup_app", [True], indirect=True)
-@pytest.mark.parametrize("method", ["ensure_user", "grant_for_scheduled_task"])
-def test_automation_share_cannot_cross_registration(setup_app, monkeypatch, method):
-    admin, _, stores, _ = setup_app
+def _create_schedule(admin: TestClient) -> str:
     created = admin.post(
         "/v1/scheduled-tasks",
         json={
@@ -1510,7 +1507,28 @@ def test_automation_share_cannot_cross_registration(setup_app, monkeypatch, meth
         },
     )
     assert created.status_code == 200, created.text
-    task_id = created.json()["id"]
+    return created.json()["id"]
+
+
+def _replace_alice_during(admin, reached, resume, method, url, **kwargs):
+    """Send the request as *admin*, and replace alice once it sets *reached*."""
+    requester = TestClient(admin.app)
+    requester.cookies.update(admin.cookies)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(requester.request, method, url, **kwargs)
+        try:
+            assert reached.wait(15)
+            _replace_alice(admin)
+        finally:
+            resume.set()
+        return pending.result(timeout=15)
+
+
+@pytest.mark.parametrize("setup_app", [True], indirect=True)
+@pytest.mark.parametrize("method", ["ensure_user", "grant_for_scheduled_task"])
+def test_automation_share_cannot_cross_registration(setup_app, monkeypatch, method):
+    admin, _, stores, _ = setup_app
+    task_id = _create_schedule(admin)
     permissions = stores["permission_store"]
     original = getattr(permissions, method)
     reached, resume = Event(), Event()
@@ -1522,22 +1540,46 @@ def test_automation_share_cannot_cross_registration(setup_app, monkeypatch, meth
         return original(user_id, *args, **kwargs)
 
     monkeypatch.setattr(permissions, method, paused)
-    requester = TestClient(admin.app)
-    requester.cookies.update(admin.cookies)
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        pending = pool.submit(
-            requester.put,
-            f"/v1/scheduled-tasks/{task_id}/permissions",
-            json={"user_id": "alice", "level": 1},
-        )
-        try:
-            assert reached.wait(15)
-            _replace_alice(admin)
-        finally:
-            resume.set()
-        response = pending.result(timeout=15)
+    response = _replace_alice_during(
+        admin,
+        reached,
+        resume,
+        "PUT",
+        f"/v1/scheduled-tasks/{task_id}/permissions",
+        json={"user_id": "alice", "level": 1},
+    )
     # The grant was meant for the deleted account, not the new one.
     assert response.status_code == 409, response.text
+    assert permissions.list_for_scheduled_task(task_id) == ([], None)
+
+
+@pytest.mark.parametrize("setup_app", [True], indirect=True)
+def test_a_failed_automation_revoke_restores_no_grant_to_a_replaced_account(
+    setup_app, monkeypatch
+):
+    admin, _, stores, _ = setup_app
+    task_id = _create_schedule(admin)
+    shared = admin.put(
+        f"/v1/scheduled-tasks/{task_id}/permissions", json={"user_id": "alice", "level": 1}
+    )
+    assert shared.status_code == 200, shared.text
+    permissions = stores["permission_store"]
+    delete_grant = permissions.revoke_for_scheduled_task
+    reached, resume = Event(), Event()
+
+    def delete_then_fail(user_id, scheduled_task_id):
+        delete_grant(user_id, scheduled_task_id)
+        reached.set()
+        assert resume.wait(15)
+        # Committed, but the route sees an error and puts the grant back.
+        raise RuntimeError("connection lost after commit")
+
+    monkeypatch.setattr(permissions, "revoke_for_scheduled_task", delete_then_fail)
+    response = _replace_alice_during(
+        admin, reached, resume, "DELETE", f"/v1/scheduled-tasks/{task_id}/permissions/alice"
+    )
+    assert response.status_code == 500, response.text
+    # The grant being restored was the deleted account's, not the new one's.
     assert permissions.list_for_scheduled_task(task_id) == ([], None)
 
 

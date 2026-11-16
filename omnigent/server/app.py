@@ -392,8 +392,9 @@ class ServerInfoResponse(BaseModel):
     scheduled_task_projects: bool = False
     # Bounded latest-failure feed for the Inbox.
     scheduled_task_inbox: bool = False
-    # ``/v1/scheduled-tasks/{id}/permissions`` shares automations; off without
-    # ``automations_v2`` or a permission store that keeps automation grants.
+    # Grants can be added through ``/v1/scheduled-tasks/{id}/permissions``: needs
+    # ``automations_v2`` and a store that keeps them. Listing and removing need only the
+    # store, through the API; the automation pages need the flag.
     scheduled_task_sharing: bool = False
     # Session PATCH and project create check the agent tool's calling session;
     # absent on older servers, where moves must not run.
