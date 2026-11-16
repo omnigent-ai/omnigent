@@ -12478,6 +12478,15 @@ async def _create_session_from_existing_agent(
         resolve_project_session_create,
         server_sandbox_providers,
     )
+    from omnigent.server.session_journal import initialize_workflow_plan, load_workflow_for_run
+    from omnigent.server.workflows import require_workflows
+
+    workflow = None
+    if body.workflow_id is not None:
+        require_workflows(request)
+        workflow = await load_workflow_for_run(
+            conversation_store, body.workflow_id, user_id=user_id
+        )
 
     project_resolution = await resolve_project_session_create(
         body=body,
@@ -13225,6 +13234,14 @@ async def _create_session_from_existing_agent(
                 harness_override=harness_override,
                 **snapshot_kwargs,
             )
+            if workflow is not None:
+                try:
+                    await initialize_workflow_plan(
+                        conversation_store, conv, workflow, user_id=user_id
+                    )
+                except Exception:
+                    await conversation_store.delete_conversation(conv.id)
+                    raise
             if body.sibling_source_id is not None:
                 from omnigent.server.session_families import complete_sibling_creation
 

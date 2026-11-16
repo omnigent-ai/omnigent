@@ -513,6 +513,7 @@ export function WorkflowSessionForm({
           : undefined;
       const session = await createSession(agent.id, [], {
         projectId,
+        workflowId: request.kind === "run" ? request.workflow.id : undefined,
         // The drafting session is named for the workflow it creates.
         title:
           request.kind === "create"
