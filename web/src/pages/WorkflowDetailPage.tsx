@@ -19,6 +19,7 @@ import {
 import { PageScroll } from "@/components/PageScroll";
 import { CreateScheduledTaskDialog } from "@/components/scheduled/CreateScheduledTaskDialog";
 import { DeleteWorkflowDialog } from "@/components/workflows/DeleteWorkflowDialog";
+import { WorkflowAutomations } from "@/components/workflows/WorkflowAutomations";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import { showToast } from "@/components/ui/toast";
@@ -274,6 +275,10 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
             </div>
           )}
         </section>
+
+        {automationsEnabled && !isDraft && (
+          <WorkflowAutomations workflowId={workflowId} now={now} />
+        )}
 
         {!isDraft && (
           <>
