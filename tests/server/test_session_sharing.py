@@ -93,6 +93,26 @@ def test_restricted_allows_read_in_ordinary_or_unknown_workspace(workspace: str 
         _check_mode(state, LEVEL_EDIT, workspace)
 
 
+@pytest.mark.parametrize("workspace", [None, ""])
+def test_restricted_can_refuse_an_unknown_workspace(workspace: str | None) -> None:
+    with pytest.raises(OmnigentError, match="no known working directory") as refused:
+        require_sharing_mode_allows_grant(
+            _state(SharingMode.RESTRICTED_READ_ONLY),
+            level=LEVEL_READ,
+            load_workspace=lambda: workspace,
+            allow_unknown_workspace=False,
+        )
+    assert refused.value.code == ErrorCode.FORBIDDEN
+    # Only the restricted mode looks at the workspace.
+    for mode in (SharingMode.ON, SharingMode.READ_ONLY):
+        require_sharing_mode_allows_grant(
+            _state(mode),
+            level=LEVEL_READ,
+            load_workspace=lambda: workspace,
+            allow_unknown_workspace=False,
+        )
+
+
 @pytest.mark.parametrize(
     "mode,expected_loads",
     [
