@@ -4816,14 +4816,59 @@ async def test_sharing_is_advertised_and_served_together(
     revoked = await auth_client.delete(
         _permissions_url(task_id, "bob@example.com"), headers=_headers()
     )
-    if sharing:
-        assert [shared.status_code, listed.status_code, revoked.status_code] == [200, 200, 204]
-        return
+    # Listing and removing need only the store, whose grants runs apply on either scheduler.
+    assert [shared.status_code, listed.status_code, revoked.status_code] == [
+        200 if sharing else 403,
+        200 if store_supports else 403,
+        204 if store_supports else 403,
+    ]
     for response in (shared, listed, revoked):
-        assert response.status_code == 403, response.text
-        assert response.json()["error"]["message"] == (
-            "Sharing automations is not supported by this server."
+        if response.status_code == 403:
+            assert response.json()["error"]["message"] == (
+                "Sharing automations is not supported by this server."
+            )
+
+
+async def test_owners_still_remove_grants_after_automations_v2_is_turned_off(
+    auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ
+    from omnigent.server.scheduled.run_sharing import sync_continued_session
+
+    # This server runs without automations_v2; the grant was made while it was on.
+    session_id = _owned_session(db_uri)
+    task_id = await _create_task(auth_client, session_mode="continue", session_id=session_id)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    permissions.ensure_user("bob@example.com")
+    permissions.grant_for_scheduled_task("bob@example.com", task_id, LEVEL_READ)
+    task = SqlAlchemyScheduledTaskStore(db_uri).get(task_id)
+    session = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert task is not None and session is not None
+
+    async def run_sync() -> None:
+        # What each run does with its continued session, on either scheduler.
+        await sync_continued_session(
+            task,
+            session,
+            forced=False,
+            permission_store=permissions,
+            app_state=auth_app.state,
+            host_registry=None,
         )
+
+    owner = {"alice@example.com": LEVEL_OWNER}
+    await run_sync()
+    assert _session_grants(db_uri, session_id) == {**owner, "bob@example.com": LEVEL_READ}
+    listed = await auth_client.get(_permissions_url(task_id), headers=_headers())
+    assert [p["user_id"] for p in listed.json()["permissions"]] == ["bob@example.com"]
+    revoked = await auth_client.delete(
+        _permissions_url(task_id, "bob@example.com"), headers=_headers()
+    )
+    assert revoked.status_code == 204, revoked.text
+    assert _task_grantees(db_uri, task_id) == []
+    assert _session_grants(db_uri, session_id) == owner
+    await run_sync()
+    assert _session_grants(db_uri, session_id) == owner
 
 
 @_SHARING

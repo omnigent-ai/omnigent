@@ -5,7 +5,8 @@ revoke, and agents may not call these routes. Grants are Read only and never pub
 A grant syncs a continue-session automation's session right away, best-effort; the
 next run's sync is the backstop. A revoke removes the person from that session
 before it deletes their automation grant, so a failed revoke is retried by repeating
-the DELETE.
+the DELETE. Granting needs ``automations_v2``; listing and revoking only need a store
+that keeps grants, since runs apply them under either scheduler.
 """
 
 from __future__ import annotations
@@ -106,12 +107,15 @@ def owns_scheduled_task(task: ScheduledTask, owner_id: str | None) -> bool:
     )
 
 
+def stores_scheduled_task_grants(permission_store: PermissionStore | None) -> bool:
+    """Whether the server keeps automation grants, which runs apply under either scheduler."""
+    return permission_store is not None and permission_store.supports_scheduled_task_grants
+
+
 def scheduled_task_sharing_supported(state: Any, permission_store: PermissionStore | None) -> bool:
     """Whether automations can be shared: ``automations_v2`` and a store that keeps grants."""
-    return (
-        permission_store is not None
-        and permission_store.supports_scheduled_task_grants
-        and state.feature_flags.enabled(Feature.AUTOMATIONS_V2)
+    return stores_scheduled_task_grants(permission_store) and state.feature_flags.enabled(
+        Feature.AUTOMATIONS_V2
     )
 
 
@@ -297,14 +301,23 @@ def register_scheduled_task_permissions_routes(
         not-found error the other automation routes give.
     """
 
-    def require_sharing(request: Request) -> PermissionStore:
-        """Refuse an agent, then a server that cannot share automations."""
+    def require_sharing(request: Request, *, granting: bool) -> PermissionStore:
+        """Refuse an agent, then a server that cannot keep automation grants.
+
+        Only granting needs ``automations_v2``: runs apply stored grants without it, so
+        their owner can still list and remove them.
+        """
         if request_from_agent(request):
             raise OmnigentError(
                 "Agents cannot view or change who an automation is shared with",
                 code=ErrorCode.FORBIDDEN,
             )
-        if not scheduled_task_sharing_supported(request.app.state, permission_store):
+        supported = (
+            scheduled_task_sharing_supported(request.app.state, permission_store)
+            if granting
+            else stores_scheduled_task_grants(permission_store)
+        )
+        if not supported:
             raise scheduled_task_sharing_unsupported()
         assert permission_store is not None
         return permission_store
@@ -350,9 +363,9 @@ def register_scheduled_task_permissions_routes(
         :param after: Cursor — user_id to start after (exclusive).
         :returns: ``{"permissions": [...], "next_cursor": str|null}``.
         :raises OmnigentError: 404 when the caller does not own the automation, 403
-            for an agent or a server that cannot share automations.
+            for an agent or a server that cannot keep automation grants.
         """
-        store = require_sharing(request)
+        store = require_sharing(request, granting=False)
         task = await owned_task(request, scheduled_task_id)
         grants, next_cursor = await asyncio.to_thread(
             store.list_for_scheduled_task, task.id, limit=limit, after_user_id=after
@@ -394,7 +407,7 @@ def register_scheduled_task_permissions_routes(
             policy, 400 for an empty or over-long ID, the owner, ``__public__`` or a
             level other than read.
         """
-        store = require_sharing(request)
+        store = require_sharing(request, granting=True)
         task = await owned_task(request, scheduled_task_id)
         if not body.user_id.strip():
             raise OmnigentError(
@@ -469,15 +482,16 @@ def register_scheduled_task_permissions_routes(
         meanwhile is revoked once the grant is gone, and the grant is put back if that
         fails. Sessions of earlier runs of a new-session automation keep their grants.
         Idempotent: 204 without touching anything when they hold no automation grant.
+        Works without ``automations_v2``, since runs still apply existing grants.
 
         :param scheduled_task_id: The automation.
         :param target_user_id: The grantee to remove, e.g. ``"alice@example.com"``.
         :returns: 204 No Content.
         :raises OmnigentError: 404 when the caller does not own the automation, 403
-            for an agent or a server that cannot share automations, 500 when a
+            for an agent or a server that cannot keep automation grants, 500 when a
             session revoke fails.
         """
-        store = require_sharing(request)
+        store = require_sharing(request, granting=False)
         task = await owned_task(request, scheduled_task_id)
         add_audit_attrs(target_user_id=target_user_id)
         # Access they never had from the automation, such as a hand-made session
