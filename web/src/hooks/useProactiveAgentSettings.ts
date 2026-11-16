@@ -14,6 +14,8 @@ export interface ProactiveAgentSettings {
   enabled: boolean;
   /** Whether the caller may change the workspace setting. */
   can_manage_workspace: boolean;
+  /** The agent's id, which its Inbox items carry; absent from older servers. */
+  agent_id?: string;
 }
 
 /** Which setting a change targets: the caller's own, or the workspace's. */

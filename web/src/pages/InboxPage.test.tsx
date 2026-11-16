@@ -90,7 +90,7 @@ vi.mock("@/hooks/useProactiveInbox", () => ({ useProactiveInbox: vi.fn() }));
 // or failed, which the page must not read as "no suggestions".
 const advisor = vi.hoisted(() => ({
   available: true,
-  settings: { enabled: true } as { enabled: boolean } | undefined,
+  settings: { enabled: true } as { enabled: boolean; agent_id?: string } | undefined,
   failed: false,
   refetch: (() => {}) as () => void,
 }));
@@ -1749,6 +1749,7 @@ describe("agent suggestions", () => {
       ],
       media: [],
       sourceSessionId: "sess_src",
+      agentId: "agent_advisor",
       status: "unread",
       resolution: "none",
       createdAt: 1_700_000_000,
@@ -1823,6 +1824,45 @@ describe("agent suggestions", () => {
     expect(screen.getByText("No suggestions from Omni Advisor")).toBeInTheDocument();
   });
 
+  it("names the session behind another agent's item and keeps it off the Omni Advisor tab", () => {
+    advisor.settings = { enabled: true, agent_id: "agent_advisor" };
+    const other = suggestion({
+      id: "sug_2",
+      title: "Check the deploy",
+      agentId: "agent_other",
+      sourceSessionId: "sess_other",
+      createdAt: 1_700_000_100,
+    });
+    stub({ items: [other, suggestion()], unreadCount: 2 });
+    renderPage();
+
+    expect(
+      screen.getByRole("button", { name: "Omni Advisor · Suggested follow-up: Ramp up the flag" }),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Suggested follow-up: Check the deploy" }));
+    const origin = screen.getByTestId("inbox-suggestion-origin");
+    expect(within(origin).getByRole("link", { name: "its session" })).toHaveAttribute(
+      "href",
+      "/c/sess_other",
+    );
+
+    selectTab("Omni Advisor");
+    expect(screen.queryByRole("button", { name: /Check the deploy/ })).toBeNull();
+    expect(
+      screen.getByRole("button", { name: "Omni Advisor · Suggested follow-up: Ramp up the flag" }),
+    ).toBeInTheDocument();
+  });
+
+  it("shows other agents' items where the deployment does not offer Omni Advisor", () => {
+    advisor.available = false;
+    stub({ items: [suggestion({ agentId: "agent_other" })], unreadCount: 1 });
+    renderPage();
+
+    expect(screen.queryByRole("tab", { name: "Omni Advisor" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Suggested follow-up: Ramp up the flag" }));
+    expect(screen.getByTestId("inbox-suggestion-origin")).toHaveTextContent("Posted from");
+  });
+
   it("has no Omni Advisor tab while it is off for the viewer", () => {
     window.localStorage.setItem("omnigent:inbox-filter", "advisor");
     advisor.settings = { enabled: false };
@@ -1888,10 +1928,11 @@ describe("agent suggestions", () => {
 
   it("does not show the Omni Advisor tab while the settings are unknown, unless it was selected", () => {
     advisor.settings = undefined;
-    stub({ items: [], enabled: false });
+    stub({ items: [], enabled: true });
     renderPage();
     expect(screen.queryByRole("tab", { name: "Omni Advisor" })).toBeNull();
-    expect(screen.getByText("Loading inbox…")).toBeInTheDocument();
+    // Other agents' items do not wait on Omni Advisor's settings.
+    expect(screen.queryByText("Loading inbox…")).toBeNull();
   });
 
   it("keeps loading while the Omni Advisor settings are unknown", () => {
