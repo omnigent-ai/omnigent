@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Iterator
+from importlib import import_module
 from io import StringIO
 from pathlib import Path
 from uuid import uuid4
@@ -20,6 +21,7 @@ from uuid import uuid4
 import pytest
 import sqlalchemy as sa
 from alembic import command
+from sqlalchemy.dialects import mysql, sqlite
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import DBAPIError, IntegrityError
 
@@ -99,6 +101,7 @@ def test_scheduled_tasks_columns(db_engine: Engine) -> None:
     assert columns["source_session_id"]["nullable"] is True
     assert columns["mcp_services"]["nullable"] is True
     assert columns["kind"]["nullable"] is False
+    assert columns["trigger_config"]["nullable"] is True
     cols = set(columns)
     assert cols == {
         "workspace_id",
@@ -131,7 +134,21 @@ def test_scheduled_tasks_columns(db_engine: Engine) -> None:
         "session_id",
         "source_session_id",
         "kind",
+        "trigger_config",
     }
+
+
+def test_trigger_config_is_a_bounded_varbinary_on_mysql() -> None:
+    """New columns hold at most 16,383 bytes, in a bounded binary type where the engine has one."""
+    migration = import_module(
+        "omnigent.db.migrations.versions.5c1e8f2a9d47_add_scheduled_task_trigger_config"
+    )
+    model = SqlScheduledTask.__table__.c.trigger_config.type
+
+    assert migration._TRIGGER_CONFIG.compile(dialect=mysql.dialect()) == "VARBINARY(16383)"
+    assert model.compile(dialect=mysql.dialect()) == "VARBINARY(16383)"
+    with pytest.raises(ValueError, match="exceeds 16383 bytes"):
+        model.process_bind_param(b"x" * 16_384, sqlite.dialect())
 
 
 @pytest.mark.parametrize("db_engine", _SCHEMA_PATHS, indirect=True)
