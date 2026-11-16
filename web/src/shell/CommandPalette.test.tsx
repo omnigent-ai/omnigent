@@ -104,6 +104,14 @@ beforeEach(() => {
 });
 afterEach(cleanup);
 
+/** Every non-empty live region's text, so both palettes' status messages read the same. */
+const announced = () =>
+  screen
+    .getAllByRole("status")
+    .map((region) => region.textContent)
+    .filter(Boolean)
+    .join(" ");
+
 describe("CommandPalette — sessions", () => {
   it.each([false, true])(
     "requests active sessions and keeps owned and shared results (sessionsOnly=%s)",
@@ -271,7 +279,7 @@ describe("CommandPalette — sessions", () => {
     });
     renderPalette({ sessionsOnly: true });
     expect(fetchNextPage).not.toHaveBeenCalled();
-    expect(screen.getByRole("status").textContent).toContain("Couldn't load");
+    expect(announced()).toContain("Couldn't load");
     expect(screen.queryByText("No results found")).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Retry" }));
     expect(fetchNextPage).toHaveBeenCalledOnce();
@@ -283,7 +291,7 @@ describe("CommandPalette — sessions", () => {
       const refetch = vi.fn();
       useConversations.mockReturnValue({ isError: true, isFetching: false, refetch });
       renderPalette({ sessionsOnly });
-      expect(screen.getByRole("status").textContent).toContain("Couldn't load sessions.");
+      expect(announced()).toContain("Couldn't load sessions.");
       expect(screen.queryByText("No results found")).toBeNull();
       fireEvent.click(screen.getByRole("button", { name: "Retry" }));
       expect(refetch).toHaveBeenCalledOnce();
@@ -293,7 +301,7 @@ describe("CommandPalette — sessions", () => {
   it("shows only one loading message during the initial session fetch", () => {
     setSessions([], true);
     renderPalette({ sessionsOnly: true });
-    expect(screen.getByRole("status").textContent).toBe("Loading sessions…");
+    expect(announced()).toBe("Loading sessions…");
     expect(screen.queryByText("Searching…")).toBeNull();
     expect(screen.queryByText("No results found")).toBeNull();
   });
@@ -345,7 +353,7 @@ describe("CommandPalette — sessions", () => {
     setSessions(Array.from({ length: 100 }, (_, i) => conv(`c${i}`, `Session ${i}`)));
     renderPalette({ sessionsOnly: true });
     expect(screen.getAllByRole("option")).toHaveLength(50);
-    expect(screen.getByRole("status").textContent).toContain("Showing 50 of 100 matches.");
+    expect(announced()).toContain("Showing 50 of 100 matches.");
     fireEvent.change(screen.getByTestId("command-palette-input"), { target: { value: "Session" } });
     expect(screen.getAllByRole("option")).toHaveLength(50);
     expect(document.querySelector("mark")?.textContent).toBe("Session");
@@ -1073,7 +1081,7 @@ describe("CommandPalette — title and content groups", () => {
     renderPalette();
     search("deploy");
 
-    expect(screen.getByRole("status").textContent).toContain("Couldn't load more sessions.");
+    expect(announced()).toContain("Couldn't load more sessions.");
     // A slow content request doesn't block retrying the failed title page.
     fireEvent.click(screen.getByRole("button", { name: "Retry" }));
     expect(fetchTitlePage).toHaveBeenCalledOnce();
@@ -1090,7 +1098,7 @@ describe("CommandPalette — title and content groups", () => {
     renderPalette();
     search("deploy");
 
-    expect(screen.getByRole("status").textContent).toContain("Couldn't load sessions.");
+    expect(announced()).toContain("Couldn't load sessions.");
     fireEvent.click(screen.getByRole("button", { name: "Retry" }));
     expect(refetchContent).toHaveBeenCalledOnce();
     expect(refetchTitle).not.toHaveBeenCalled();
