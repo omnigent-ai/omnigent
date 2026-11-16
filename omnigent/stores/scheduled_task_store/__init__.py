@@ -620,7 +620,7 @@ class ScheduledTaskStore(ABC):
         scheduled_task_ids: builtins.list[str],
     ) -> dict[str, str]:
         """
-        Return each task's MOST RECENT run status in one windowed query.
+        Return each task's MOST RECENT run status in one query, reading one run per task.
 
         Powers the Tasks-list completion badge: the route resolves the owner's
         tasks, then this returns ``{task_id: status}`` for the single latest run

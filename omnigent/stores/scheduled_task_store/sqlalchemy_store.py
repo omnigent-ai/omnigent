@@ -9,7 +9,7 @@ from collections.abc import Callable
 from functools import partial
 from typing import Any, cast
 
-from sqlalchemy import and_, asc, desc, func, or_, select, tuple_, update
+from sqlalchemy import and_, asc, desc, or_, select, tuple_, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session
 from sqlalchemy.sql.elements import ColumnElement
@@ -1175,37 +1175,38 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
     ) -> dict[str, str]:
         """Return ``{task_id: latest_run_status}`` for the given tasks.
 
-        One windowed query: ``row_number()`` partitioned by ``scheduled_task_id``
-        and ordered ``scheduled_at DESC, id DESC`` (the same order as
-        :meth:`list_runs`) picks each task's single most-recent run, decoded to
-        its status name. Tasks with no runs are absent from the map. Both SQLite
-        (>= 3.25) and PostgreSQL support window functions, matching the
-        conversation store's ``row_number()`` usage.
+        One query selects each requested task in the current workspace with a
+        correlated ``LIMIT 1`` lookup of its newest run, ordered ``scheduled_at
+        DESC, id DESC`` like :meth:`list_runs`. That lookup seeks
+        ``ix_scheduled_task_runs_scheduled_task_id``, so each task reads one run
+        however long its history. Tasks with no runs are absent from the map.
         """
         if not scheduled_task_ids:
             return {}
-        with self._session("list_latest_run_status_for_tasks") as session:
-            ranked = (
-                select(
-                    SqlScheduledTaskRun.scheduled_task_id.label("task_id"),
-                    SqlScheduledTaskRun.status.label("status"),
-                    func.row_number()
-                    .over(
-                        partition_by=SqlScheduledTaskRun.scheduled_task_id,
-                        order_by=(
-                            desc(SqlScheduledTaskRun.scheduled_at),
-                            desc(SqlScheduledTaskRun.id),
-                        ),
-                    )
-                    .label("row_num"),
-                )
-                .where(SqlScheduledTaskRun.workspace_id == current_workspace_id())
-                .where(SqlScheduledTaskRun.scheduled_task_id.in_(scheduled_task_ids))
-                .subquery()
+        workspace_id = current_workspace_id()
+        latest_status = (
+            select(SqlScheduledTaskRun.status)
+            .where(
+                SqlScheduledTaskRun.workspace_id == workspace_id,
+                SqlScheduledTaskRun.scheduled_task_id == SqlScheduledTask.id,
             )
-            stmt = select(ranked.c.task_id, ranked.c.status).where(ranked.c.row_num == 1)
-            rows = session.execute(stmt).all()
-            return {task_id: decode_scheduled_task_run_status(status) for task_id, status in rows}
+            .order_by(desc(SqlScheduledTaskRun.scheduled_at), desc(SqlScheduledTaskRun.id))
+            .limit(1)
+            .correlate(SqlScheduledTask)
+            .scalar_subquery()
+        )
+        with self._session("list_latest_run_status_for_tasks") as session:
+            rows = session.execute(
+                select(SqlScheduledTask.id, latest_status).where(
+                    SqlScheduledTask.workspace_id == workspace_id,
+                    SqlScheduledTask.id.in_(scheduled_task_ids),
+                )
+            ).all()
+            return {
+                task_id: decode_scheduled_task_run_status(status)
+                for task_id, status in rows
+                if status is not None
+            }
 
     # ── Database scheduler ───────────────────────────────────────
 
