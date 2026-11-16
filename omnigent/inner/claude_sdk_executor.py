@@ -2046,6 +2046,8 @@ def prepare_claude_cli_path(
         raise OSError("Sandboxed Claude requires a resolved CLI executable")
     if _sandbox_disabled_by_env():
         raise OSError(f"{_NO_SANDBOX_ENV} conflicts with the required Claude sandbox")
+    if model_access is not None and worker_env is None:
+        raise ValueError("Brokered Claude model access requires an owned worker environment")
 
     cwd = _resolve_sandbox_cwd(spec.cwd)
     sandbox = resolve_sandbox(spec, cwd)
@@ -2200,9 +2202,12 @@ def prepare_claude_cli_path(
             plugin_dir=plugin_dir,
         )
     except BaseException:
-        if egress_handle is not None:
-            egress_handle.stop()
-        cleanup_private_tmpdir(runtime_tmpdir)
+        try:
+            if egress_handle is not None:
+                with suppress(Exception):
+                    egress_handle.stop()
+        finally:
+            cleanup_private_tmpdir(runtime_tmpdir)
         raise
 
 

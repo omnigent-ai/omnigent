@@ -392,6 +392,63 @@ def test_bundle_sources_include_config_aliases_without_exporting_skills(tmp_path
         access.protect_sources(policy, workspace)
 
 
+@pytest.mark.parametrize(
+    "grant_kind,grant_target",
+    [
+        ("read_root", "directory"),
+        ("read_root", "child"),
+        ("write_root", "directory"),
+        ("write_root", "child"),
+        ("write_file", "secret"),
+        ("cwd", "child"),
+    ],
+)
+def test_bundle_directory_symlink_targets_cannot_be_granted(
+    tmp_path: Path, grant_kind: str, grant_target: str
+) -> None:
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    external = tmp_path / "external-config"
+    child = external / "nested"
+    child.mkdir(parents=True)
+    secret = child / "credentials.json"
+    secret.write_text('{"api_key":"parent-only-key"}')
+    alias = bundle / "private-config"
+    alias.symlink_to(external, target_is_directory=True)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    access = ClaudeModelAccess(
+        "https://model.example.test", "authorization", lambda: "parent-only-key"
+    ).with_bundle_sources(bundle)
+    target = {"directory": external, "child": child, "secret": secret}[grant_target]
+    policy = SandboxPolicy("linux_bwrap", True, [], [workspace], [], False)
+    cwd = workspace
+    if grant_kind == "read_root":
+        policy.read_roots.append(target)
+    elif grant_kind == "write_root":
+        policy.write_roots.append(target)
+    elif grant_kind == "write_file":
+        policy.write_files.append(target)
+    else:
+        cwd = target
+
+    with pytest.raises(ValueError, match="outside sandbox"):
+        access.protect_sources(policy, cwd)
+
+    assert alias in access.source_paths
+
+
+def test_create_proxy_requires_upstream_ca_bundle_before_loading_certificates(
+    tmp_path: Path,
+) -> None:
+    access = ClaudeModelAccess(
+        "https://model.example.test", "authorization", lambda: "parent-only-key"
+    )
+
+    with pytest.raises(ValueError, match="upstream"):
+        access.create_proxy([], tmp_path / "ca.pem", tmp_path / "ca-key.pem")
+
+
 def _write_oauth(path: Path, token: str = "initial") -> None:
     path.write_text(
         json.dumps(

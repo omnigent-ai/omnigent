@@ -282,7 +282,8 @@ class ClaudeModelAccess:
         sources.extend(
             path
             for path in root.rglob("*")
-            if path.is_file() and path.relative_to(root).parts[0] != "skills"
+            if (path.is_file() or path.is_symlink())
+            and path.relative_to(root).parts[0] != "skills"
         )
         return replace(self, source_paths=(*self.source_paths, *sources))
 
@@ -449,7 +450,8 @@ class ClaudeModelAccess:
         credential_rewrites: list[CredentialRewriteRule] | None = None,
         request_body_transform: RequestBodyTransform | None = None,
     ) -> EgressProxy:
-        assert upstream_ca_bundle is not None
+        if upstream_ca_bundle is None:
+            raise ValueError("Claude model relay requires an upstream CA bundle")
         return _ClaudeRelay(
             access=self,
             rules=rules,

@@ -185,14 +185,21 @@ def test_sdk_bundled_cli_uses_the_same_required_sandbox(
         executor._prepared_cli.close()
 
 
+@pytest.mark.parametrize(
+    "stop_error", [None, OSError("stop failed")], ids=["stopped", "stop-error"]
+)
 def test_egress_failure_releases_proxy_and_preserves_caller_environment(
-    worker_policy: SandboxPolicy, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    worker_policy: SandboxPolicy,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stop_error: OSError | None,
 ) -> None:
     proxy = Mock(
         relay_port=34567,
         socket_path=tmp_path / "relay.sock",
         ca_bundle_path=tmp_path / "ca.pem",
     )
+    proxy.stop.side_effect = stop_error
     monkeypatch.setattr(claude, "start_egress_proxy", Mock(return_value=proxy))
     scratch = tmp_path / "scratch"
     scratch.mkdir()
@@ -212,6 +219,19 @@ def test_egress_failure_releases_proxy_and_preserves_caller_environment(
     assert env == {"NO_PROXY": "*"}
     proxy.stop.assert_called_once()
     assert not scratch.exists()
+
+
+def test_brokered_model_access_requires_worker_environment(
+    worker_policy: SandboxPolicy, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    create_runtime = Mock(side_effect=AssertionError("must reject before runtime creation"))
+    monkeypatch.setattr(claude, "create_private_tmpdir", create_runtime)
+    access = ClaudeModelAccess("https://model.test", "x-api-key", lambda: "synthetic")
+
+    with pytest.raises(ValueError, match="owned worker environment"):
+        claude.prepare_claude_cli_path("/bin/claude", OSEnvSpec(), model_access=access)
+
+    create_runtime.assert_not_called()
 
 
 @pytest.fixture

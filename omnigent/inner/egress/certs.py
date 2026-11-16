@@ -117,6 +117,7 @@ class HostCertCache:
     def _build_context(cert_pem: bytes, key_pem: bytes) -> ssl.SSLContext:
         """Build an SSLContext from in-memory PEM cert/key bytes."""
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
         with tempfile.NamedTemporaryFile(suffix=".pem", delete=False) as cf:
             cf.write(cert_pem)
             cert_file = cf.name

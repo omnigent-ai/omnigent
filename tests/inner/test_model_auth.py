@@ -6,6 +6,7 @@ import asyncio
 import os
 import stat
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -13,6 +14,7 @@ from omnigent.inner._proc import process_alive
 from omnigent.inner.model_auth import (
     PROVIDER_AUTH_REQUIRED,
     ProviderAuthRequired,
+    _pin_auth_python_runtime,
     _profile_token_argv,
     _resolve_auth_executable,
     _TrustedExecutable,
@@ -21,6 +23,126 @@ from omnigent.inner.model_auth import (
 
 _HOST = "https://workspace.cloud.databricks.com"
 _PROFILE = "agent-profile"
+
+
+@pytest.fixture
+def trusted_python_helper(tmp_path: Path) -> tuple[_TrustedExecutable, Path, Path, Path]:
+    # Disposable native-file stand-in: rejection tests must never modify host Python.
+    binary_dir = tmp_path / "native-runtime"
+    binary_dir.mkdir()
+    binary = binary_dir / "python-real"
+    binary.write_bytes(b"\x7fELF-disposable-runtime")
+    binary.chmod(0o700)
+    hop_dir = tmp_path / "interpreter-links"
+    hop_dir.mkdir()
+    hop = hop_dir / "python"
+    hop.symlink_to(binary)
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    runtime_bin = tmp_path / "runtime-bin"
+    runtime_bin.mkdir()
+    (runtime / "bin").symlink_to(runtime_bin, target_is_directory=True)
+    interpreter = runtime / "bin/python"
+    interpreter.symlink_to(hop)
+    helper = tmp_path / "profile-auth"
+    helper.write_text(f"#!{interpreter}\nprint('unused')\n")
+    helper.chmod(0o700)
+    info = helper.stat()
+    return _TrustedExecutable(helper, (info.st_dev, info.st_ino)), interpreter, hop, binary
+
+
+def test_pinned_interpreter_keeps_original_invocation_path(
+    trusted_python_helper: tuple[_TrustedExecutable, Path, Path, Path],
+) -> None:
+    executable, interpreter, _, binary = trusted_python_helper
+    pinned = _pin_auth_python_runtime(executable)
+
+    assert pinned.interpreter == interpreter
+    assert pinned.interpreter != binary
+    info = binary.stat()
+    assert pinned.interpreter_identity == (info.st_dev, info.st_ino)
+
+
+@pytest.mark.parametrize("stage", ["pin", "mint"])
+@pytest.mark.parametrize(
+    "component", ["directory-target", "hop-parent", "resolved-parent", "leaf"]
+)
+async def test_interpreter_rejects_writable_provenance_before_launch(
+    trusted_python_helper: tuple[_TrustedExecutable, Path, Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+    component: str,
+) -> None:
+    executable, interpreter, hop, binary = trusted_python_helper
+    if stage == "mint":
+        executable = _pin_auth_python_runtime(executable)
+    unsafe = {
+        "directory-target": interpreter.parent.resolve(),
+        "hop-parent": hop.parent,
+        "resolved-parent": binary.parent,
+        "leaf": binary,
+    }[component]
+    unsafe.chmod(0o777)
+    spawn = AsyncMock()
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+
+    if stage == "pin":
+        with pytest.raises(PermissionError, match="unsafe"):
+            _pin_auth_python_runtime(executable)
+    else:
+        with pytest.raises(ProviderAuthRequired):
+            await mint_profile_token(host=_HOST, profile=_PROFILE, _executable=executable)
+    spawn.assert_not_awaited()
+
+
+@pytest.mark.parametrize("component", ["symlink", "leaf"])
+def test_interpreter_rejects_foreign_owned_leaf_and_symlink(
+    trusted_python_helper: tuple[_TrustedExecutable, Path, Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    component: str,
+) -> None:
+    executable, _, hop, binary = trusted_python_helper
+    foreign = hop if component == "symlink" else binary
+    original_lstat = Path.lstat
+
+    def foreign_lstat(path: Path) -> os.stat_result:
+        info = original_lstat(path)
+        if path == foreign:
+            fields = list(info)
+            fields[4] = os.getuid() + 1
+            return os.stat_result(fields)
+        return info
+
+    monkeypatch.setattr(Path, "lstat", foreign_lstat)
+    with pytest.raises(PermissionError, match="unsafe ownership"):
+        _pin_auth_python_runtime(executable)
+
+
+@pytest.mark.parametrize("change", ["replace-binary", "retarget-link", "missing-identity"])
+async def test_interpreter_identity_rechecked_before_mint(
+    trusted_python_helper: tuple[_TrustedExecutable, Path, Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    change: str,
+) -> None:
+    executable, interpreter, hop, binary = trusted_python_helper
+    if change == "missing-identity":
+        executable = _TrustedExecutable(executable.path, executable.identity, interpreter)
+    else:
+        executable = _pin_auth_python_runtime(executable)
+        replacement = binary.with_name("replacement")
+        replacement.write_bytes(binary.read_bytes())
+        replacement.chmod(0o700)
+        if change == "replace-binary":
+            replacement.replace(binary)
+        else:
+            hop.unlink()
+            hop.symlink_to(replacement)
+    spawn = AsyncMock()
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+
+    with pytest.raises(ProviderAuthRequired):
+        await mint_profile_token(host=_HOST, profile=_PROFILE, _executable=executable)
+    spawn.assert_not_awaited()
 
 
 def _write_ucode(path: Path, body: str) -> Path:

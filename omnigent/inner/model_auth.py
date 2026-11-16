@@ -56,6 +56,7 @@ class _TrustedExecutable:
     path: Path
     identity: tuple[int, int]
     interpreter: Path | None = None
+    interpreter_identity: tuple[int, int] | None = None
 
 
 def _validated_authority(host: str, profile: str) -> tuple[str, str]:
@@ -99,7 +100,7 @@ def _validate_provenance_chain(path: Path) -> None:
         sticky_temp_root = (
             stat.S_ISDIR(info.st_mode) and info.st_uid == 0 and bool(info.st_mode & stat.S_ISVTX)
         )
-        if writable and not sticky_temp_root:
+        if writable and not sticky_temp_root and not stat.S_ISLNK(info.st_mode):
             raise PermissionError("trusted ucode executable has unsafe writable path component")
         if current.parent == current:
             return
@@ -119,22 +120,24 @@ def _resolve_auth_executable() -> _TrustedExecutable:
     if candidate is None:
         raise FileNotFoundError("trusted ucode executable is unavailable")
     candidate_path = Path(candidate).absolute()
-    _validate_provenance_chain(candidate_path.parent)
-    # Validate every symlink hop rather than trusting Path.resolve() alone.
-    hop = candidate_path
-    seen: set[Path] = set()
-    while hop.is_symlink():
-        if hop in seen:
-            raise PermissionError("trusted ucode executable has unsafe symlink loop")
-        seen.add(hop)
-        _validate_provenance_chain(hop.parent)
-        target = Path(os.readlink(hop))
-        hop = (hop.parent / target).absolute() if not target.is_absolute() else target
-    resolved = candidate_path.resolve(strict=True)
-    _validate_provenance_chain(resolved.parent)
+    executable = _validate_auth_executable_path(candidate_path)
     workspace = Path.cwd().resolve(strict=True)
-    if _is_beneath(candidate_path, workspace) or _is_beneath(resolved, workspace):
-        raise PermissionError("trusted ucode executable must not be workspace-controlled")
+    if _is_beneath(candidate_path, workspace) or _is_beneath(executable.path, workspace):
+        raise PermissionError("trusted authentication executable must not be workspace-controlled")
+    return executable
+
+
+def _validate_auth_executable_path(path: Path) -> _TrustedExecutable:
+    """Validate every lexical and resolved component, including the executable leaf."""
+    from .sandbox import _launcher_path_variants
+
+    try:
+        variants = _launcher_path_variants(path)
+    except RuntimeError as exc:
+        raise PermissionError("trusted authentication executable has a symlink loop") from exc
+    for variant in variants:
+        _validate_provenance_chain(variant)
+    resolved = path.resolve(strict=True)
     info = resolved.stat()
     mode = info.st_mode
     if (
@@ -142,7 +145,7 @@ def _resolve_auth_executable() -> _TrustedExecutable:
         or not os.access(resolved, os.X_OK)
         or mode & (stat.S_IWGRP | stat.S_IWOTH)
     ):
-        raise PermissionError("trusted ucode executable is unsafe")
+        raise PermissionError("trusted authentication executable is unsafe")
     return _TrustedExecutable(path=resolved, identity=(info.st_dev, info.st_ino))
 
 
@@ -158,11 +161,12 @@ def _pin_auth_python_runtime(executable: _TrustedExecutable) -> _TrustedExecutab
     ):
         raise ValueError("profile authentication requires an absolute Python interpreter shebang")
     interpreter = Path(words[0])
-    _validate_provenance_chain(interpreter.parent)
+    target = _validate_auth_executable_path(interpreter)
     with interpreter.open("rb") as source:
         if source.read(2) == b"#!":
             raise ValueError("profile authentication requires a native Python interpreter")
-    return replace(executable, interpreter=interpreter)
+    # Keep the invocation path: resolving a venv symlink would bypass its site-packages.
+    return replace(executable, interpreter=interpreter, interpreter_identity=target.identity)
 
 
 def _validate_auth_runtime(executable: _TrustedExecutable, policy: SandboxPolicy) -> None:
@@ -274,6 +278,9 @@ async def mint_profile_token(
             raise PermissionError("trusted ucode executable changed before launch")
         helper_argv = _profile_token_argv(executable.path, host=host, profile=profile)
         if executable.interpreter is not None:
+            target = _validate_auth_executable_path(executable.interpreter)
+            if target.identity != executable.interpreter_identity:
+                raise PermissionError("trusted authentication interpreter changed before launch")
             helper_argv = [str(executable.interpreter), "-I", *helper_argv]
         pass_fds: tuple[int, ...] = ()
         if os.name == "posix":
