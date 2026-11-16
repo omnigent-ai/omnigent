@@ -20633,7 +20633,7 @@
     },
     "/v1/scheduled-tasks/shared": {
       "get": {
-        "description": "List one page of the automations other users shared with the caller.\n\nA grant to the caller or to any of their groups counts, and each automation is\nlisted once, ordered by ID. Deleted automations, reminders and the caller's own\nautomations are left out, so a page can be short, or empty while\n`next_cursor` is set. Each item has the list's shape with `viewer_role`\n`\"viewer\"` and the owner's `owner_display_name`. Empty on a server that\ncannot share automations and for the local user.\n\n**Returns:** `{\"scheduled_tasks\": [...], \"next_cursor\": str|null}`.\n\n**Raises**\n\n- `OmnigentError` \u2014 403 for an agent's request; 422 for a malformed cursor.",
+        "description": "List one page of the automations other users shared with the caller.\n\nA grant to the caller or to any of their groups counts, and each automation is\nlisted once, ordered by ID. Deleted automations, reminders and the caller's own\nautomations are left out, so a page can be short, or empty while\n`next_cursor` is set. Each item has the list's shape with `viewer_role`\n`\"viewer\"` and the owner's `owner_display_name`. Empty on a server that\ncannot share automations and for the local user. Unlike the owner's list, this\ndoesn't fail stale running runs, so it reads one run per automation.\n\n**Returns:** `{\"scheduled_tasks\": [...], \"next_cursor\": str|null}`.\n\n**Raises**\n\n- `OmnigentError` \u2014 403 for an agent's request; 422 for a malformed cursor.",
         "operationId": "list_shared_scheduled_tasks_v1_scheduled_tasks_shared_get",
         "parameters": [
           {

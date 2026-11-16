@@ -5902,6 +5902,13 @@ async def test_the_shared_list_pages_automations_shared_with_the_caller(
     )
     _in_groups(monkeypatch, {"bob@example.com": ["team"]})
 
+    def _scans_run_history(*_args: object, **_kwargs: object) -> list[object]:
+        raise AssertionError("the shared list reads one run per automation")
+
+    # Finding running runs reads each automation's whole history.
+    monkeypatch.setattr(
+        SqlAlchemyScheduledTaskStore, "list_running_runs_for_tasks", _scans_run_history
+    )
     listed: list[dict[str, Any]] = []
     cursor = None
     pages = 0

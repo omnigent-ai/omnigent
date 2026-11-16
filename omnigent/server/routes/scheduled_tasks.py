@@ -1262,7 +1262,8 @@ def create_scheduled_tasks_router(
         automations are left out, so a page can be short, or empty while
         ``next_cursor`` is set. Each item has the list's shape with ``viewer_role``
         ``"viewer"`` and the owner's ``owner_display_name``. Empty on a server that
-        cannot share automations and for the local user.
+        cannot share automations and for the local user. Unlike the owner's list, this
+        doesn't fail stale running runs, so it reads one run per automation.
 
         :param limit: Max automations to return (1–100, default 50).
         :param after: Cursor, a previous page's ``next_cursor``.
@@ -1304,8 +1305,7 @@ def create_scheduled_tasks_router(
             and not is_proactive_task(task)
         ]
         ids = [task.id for task in tasks]
-        running = await asyncio.to_thread(store.list_running_runs_for_tasks, ids)
-        await asyncio.to_thread(force_fail_stale_runs, store, running)
+        # Reads one run per automation; a stale running run fails when its history is read.
         latest_status = await asyncio.to_thread(store.list_latest_run_status_for_tasks, ids)
         names = await _owner_display_names(tasks)
         return {
