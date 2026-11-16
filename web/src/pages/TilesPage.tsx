@@ -4,7 +4,13 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useNavigate, useSearchParams } from "@/lib/routing";
-import { LayoutGridIcon, Loader2Icon, PanelRightIcon, RectangleHorizontalIcon } from "lucide-react";
+import {
+  LayersIcon,
+  LayoutGridIcon,
+  Loader2Icon,
+  PanelRightIcon,
+  RectangleHorizontalIcon,
+} from "lucide-react";
 import { Button } from "@/components/ui/button";
 import type { Conversation } from "@/hooks/useConversations";
 import { useSidebarData } from "@/hooks/useSidebarData";
@@ -29,6 +35,16 @@ import {
   writeTilesView,
 } from "@/tiles/tilesPreferences";
 import { useReleaseIdleTileStreams } from "@/tiles/useTileStreams";
+import { TileStackDrawer } from "@/tiles/TileStackDrawer";
+import {
+  isQuiet,
+  parkTile,
+  partitionStack,
+  pruneStack,
+  unstackTile,
+  useTileStack,
+  writeTileStack,
+} from "@/tiles/tileStack";
 import { canFavorite, useTileFavorite } from "@/tiles/useTileFavorite";
 import { TileFilterBar } from "@/tiles/TileFilterBar";
 import { favoritesFirst, filterTiles, projectsOf, statusCounts } from "@/tiles/tileFilters";
@@ -58,13 +74,43 @@ export function TilesPage() {
   const statusFilter = useTileStatusFilter();
   const projectFilter = searchParams.get("project");
   const [query, setQuery] = useState("");
-  const tiles = useMemo(
+  const visible = useMemo(
     () =>
       favoritesFirst(
         filterTiles(activeTiles, { status: statusFilter, project: projectFilter, query }),
       ),
     [activeTiles, statusFilter, projectFilter, query],
   );
+  const stackState = useTileStack();
+  const { onGrid: tiles, stacked } = useMemo(
+    () => partitionStack(visible, stackState, Date.now()),
+    [visible, stackState],
+  );
+  const quietIds = useMemo(
+    () => new Set(stacked.filter((row) => isQuiet(row, Date.now())).map((row) => row.id)),
+    [stacked],
+  );
+  const [stackOpen, setStackOpen] = useState(false);
+  const park = useCallback(
+    (sessionId: string) => writeTileStack(parkTile(stackState, sessionId)),
+    [stackState],
+  );
+  const unstack = useCallback(
+    (conversation: Conversation) =>
+      writeTileStack(unstackTile(stackState, conversation.id, quietIds.has(conversation.id))),
+    [stackState, quietIds],
+  );
+  // Forget stacked ids whose sessions are gone, once the list has loaded.
+  useEffect(() => {
+    if (rows.length === 0) return;
+    const pruned = pruneStack(stackState, new Set(rows.map((row) => row.id)));
+    if (
+      pruned.parked.length !== stackState.parked.length ||
+      pruned.kept.length !== stackState.kept.length
+    ) {
+      writeTileStack(pruned);
+    }
+  }, [rows, stackState]);
   const counts = useMemo(() => statusCounts(activeTiles), [activeTiles]);
   const projects = useMemo(() => projectsOf(activeTiles), [activeTiles]);
   const filtering = statusFilter !== "all" || projectFilter !== null || query !== "";
@@ -141,6 +187,7 @@ export function TilesPage() {
         starred={isSessionPinned(conversation)}
         starDisabled={favorite.saving}
         onToggleStar={canFavorite(conversation) ? favorite.toggle : undefined}
+        onPark={park}
       />
     );
   };
@@ -150,12 +197,24 @@ export function TilesPage() {
       <div className="flex shrink-0 flex-wrap items-center gap-3 border-b px-4 py-2.5">
         <h1 className="text-base font-semibold">Agents</h1>
         <p className="text-xs text-muted-foreground" data-testid="tiles-summary">
-          {activeTiles.length} active · {working} working · {waiting} need you · {dormant.length}{" "}
-          dormant
+          {activeTiles.length} active · {working} working · {waiting} need you · {stacked.length}{" "}
+          stacked · {dormant.length} dormant
           {filtering && ` · ${tiles.length} shown`}
           {view !== "cards" && liveIds.size < tiles.length && ` · ${liveIds.size} streaming`}
         </p>
         <div className="ml-auto flex items-center gap-2">
+          <Button
+            variant="ghost"
+            size="xs"
+            className={cn("gap-1.5", stackOpen && "bg-accent text-accent-foreground")}
+            aria-expanded={stackOpen}
+            aria-controls="tiles-stack"
+            data-testid="tiles-stack-toggle"
+            onClick={() => setStackOpen((open) => !open)}
+          >
+            <LayersIcon className="size-3.5" />
+            Stack · {stacked.length}
+          </Button>
           {view !== "focus" && (
             <ColumnsPicker
               columns={chosenColumns}
@@ -234,6 +293,13 @@ export function TilesPage() {
             Clear filters
           </Button>
         </div>
+      ) : tiles.length === 0 && stacked.length > 0 ? (
+        <div className="flex flex-1 flex-col items-center justify-center gap-3 text-sm text-muted-foreground">
+          All your agents are in the Stack.
+          <Button variant="outline" size="xs" onClick={() => setStackOpen(true)}>
+            Show the Stack
+          </Button>
+        </div>
       ) : tiles.length === 0 ? (
         <div className="flex flex-1 items-center justify-center text-sm text-muted-foreground">
           No active agents. Sessions that are running, waiting on you, or used in the last two days
@@ -262,6 +328,16 @@ export function TilesPage() {
           onMeasure={setGridWidth}
           renderTile={(id, resize) => renderTile(id, view === "cards" ? "card" : "tile", resize)}
         />
+      )}
+      {stackOpen && (
+        <div id="tiles-stack">
+          <TileStackDrawer
+            stacked={stacked}
+            quietIds={quietIds}
+            onUnstack={unstack}
+            onOpenSingle={openSingle}
+          />
+        </div>
       )}
     </div>
   );
