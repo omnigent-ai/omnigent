@@ -725,7 +725,7 @@ function RunRow({
   // Stop while the run's session works; play once it stopped with tasks left.
   const control =
     showTasks && steps?.isCurrent && steps.planId
-      ? planRunControl(progress, steps.statuses, sessionWorking)
+      ? planRunControl(progress, steps.statuses, sessionWorking, steps.latestPlanPosition)
       : null;
   // What the run's buttons and task menus refresh once its session takes them.
   const refreshKeys = [

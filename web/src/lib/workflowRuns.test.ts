@@ -1,4 +1,6 @@
 import { describe, expect, it } from "vitest";
+import { journalEntry, journalPlan } from "@/test/journalFixtures";
+import { planSteps } from "./sessionJournal";
 
 import { describeWorkflowRun, type WorkflowRun } from "./workflowRuns";
 
@@ -30,6 +32,15 @@ describe("describeWorkflowRun", () => {
 
   it("says a run whose steps are all done is done", () => {
     expect(describeWorkflowRun(run({ done: 5 }))).toEqual({ kind: "done", label: "Done" });
+    const completed = {
+      ...run({ total: 2, done: 1, failed: 1 }),
+      steps: planSteps(journalPlan(0, ["work"], ["report", ["work"]])),
+      statuses: [
+        journalEntry(1, { kind: "status", step: "work", content: { status: "failed" } }),
+        journalEntry(2, { kind: "status", step: "report", content: { status: "done" } }),
+      ],
+    };
+    expect(describeWorkflowRun(completed)).toEqual({ kind: "done", label: "Finished, 1 failed" });
   });
 
   it("shows a running run's progress, even past a failed step it may retry", () => {

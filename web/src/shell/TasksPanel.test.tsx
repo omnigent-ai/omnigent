@@ -713,6 +713,17 @@ describe("TasksPanel", () => {
       expect(screen.getByTestId("plan-stop")).toBeInTheDocument();
       setSession({ sessionStatus: "idle" });
       expect(screen.getByTestId("plan-continue")).toBeInTheDocument();
+
+      showJournal([
+        journalPlan(0, ["explore"], ["work", ["explore"]], ["report", ["work"]]),
+        status(1, "explore", "done"),
+        status(2, "report", "done"),
+        journalPlan(3, ["explore"], ["review", ["explore"]], ["report", ["review"]]),
+      ]);
+      setSession({ sessionStatus: "running" });
+      expect(screen.getByTestId("plan-stop")).toBeInTheDocument();
+      setSession({ sessionStatus: "idle" });
+      expect(screen.getByTestId("plan-continue")).toBeInTheDocument();
     } finally {
       act(withdrawContinue);
       act(withdrawStop);

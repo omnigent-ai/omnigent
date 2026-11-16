@@ -1307,7 +1307,7 @@ export function TasksPanel({
               }
               onContinuePlan={continuePlan && (() => continuePlan(planName(plan)))}
               menuActionFor={menuActionFor}
-              onStop={isPlanComplete(progress) ? undefined : stopActiveWork}
+              onStop={isPlanComplete(progress, plan?.position) ? undefined : stopActiveWork}
             />
             <TaskList
               progress={progress}

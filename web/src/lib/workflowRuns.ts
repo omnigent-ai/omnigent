@@ -10,6 +10,8 @@ import {
 export interface WorkflowRun {
   /** The ID of the plan entry that started the run. */
   id: string;
+  /** Journal position of the latest plan within this invocation. */
+  latestPlanPosition?: number;
   sessionId: string;
   /** The session's title; empty when it has none yet. */
   title: string;
@@ -67,8 +69,11 @@ export function describeWorkflowRun(
 ): WorkflowRunState {
   const { total, done, needsInput, failed } = run.progress;
   const count = `${done} of ${total} done`;
-  if (isPlanComplete(runStepProgress(run, sessionWorking)) || (total > 0 && done === total))
-    return { kind: "done", label: "Done" };
+  if (
+    isPlanComplete(runStepProgress(run, sessionWorking), run.latestPlanPosition) ||
+    (total > 0 && done === total)
+  )
+    return { kind: "done", label: failed > 0 ? `Finished, ${failed} failed` : "Done" };
   if (needsInput > 0) return { kind: "waiting", label: "Waiting for you" };
   if (run.isCurrent && sessionWorking) return { kind: "running", label: count };
   if (failed > 0) return { kind: "failed", label: `Failed · ${count}` };

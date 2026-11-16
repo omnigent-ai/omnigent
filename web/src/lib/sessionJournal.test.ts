@@ -281,6 +281,24 @@ describe("isPlanComplete", () => {
       { id: "publish", name: "Publish", goal: null, depends_on: ["report"] },
     ];
     expect(isPlanComplete(stepProgress(replanned, entries, false))).toBe(false);
+
+    const inserted = plan(
+      4,
+      ["explore"],
+      ["work", ["explore"]],
+      ["review", ["work"]],
+      ["report", ["review"]],
+    );
+    const insertedEntries = [
+      status(1, "explore", "done"),
+      status(2, "work", "done"),
+      status(3, "report", "done"),
+      inserted,
+    ];
+    const insertedProgress = stepProgress(planSteps(inserted), insertedEntries, false);
+    expect(isPlanComplete(insertedProgress, inserted.position)).toBe(false);
+    expect(pausedLabel(insertedProgress, insertedEntries, false)).toBe("Stopped");
+    expect(taskPreviewText(insertedProgress, null, inserted.position)).toBe("Next: review");
   });
 
   it.each(["a", "b"])("compares %s with its own branch's completion", (upstream) => {
@@ -415,6 +433,13 @@ describe("taskPreviewText", () => {
       true,
     );
     expect(taskPreviewText(asking)).toBe("Waiting for you: approve");
+    const followUp = stepProgress(
+      planSteps(plan(0, ["deploy"], ["report", ["deploy"]])),
+      [status(1, "deploy", "started"), status(2, "report", "done")],
+      true,
+      true,
+    );
+    expect(taskPreviewText(followUp)).toBe("Waiting for you: deploy");
     // A task left started while the session is idle says so.
     const stopped = stepProgress(
       planSteps(plan(0, ["deploy"])),

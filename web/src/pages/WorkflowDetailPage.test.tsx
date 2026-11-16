@@ -487,6 +487,23 @@ describe("WorkflowDetailPage", () => {
     expect(within(row).queryByTestId("plan-stop")).toBeNull();
     expect(screen.getByTestId("workflow-detail-run")).toBeEnabled();
 
+    mockRuns([
+      {
+        ...completedRun,
+        latestPlanPosition: 2,
+        steps: [
+          WORKFLOW.steps[0]!,
+          { id: "review", name: "Review", goal: null, depends_on: ["explore"] },
+          { ...WORKFLOW.steps[1]!, depends_on: ["review"] },
+        ],
+        progress: { total: 3, started: 0, done: 2, needsInput: 0, failed: 0 },
+        statuses: [status("explore", "done"), status("fix", "done")],
+      },
+    ]);
+    rerender(<WorkflowDetailPage />);
+    expect(row).toHaveAttribute("data-run-state", "running");
+    expect(within(row).getByRole("button", { name: "Stop" })).toBeInTheDocument();
+
     // A replan keeps the run's ID and can add work after its original last step.
     mockRuns([
       {

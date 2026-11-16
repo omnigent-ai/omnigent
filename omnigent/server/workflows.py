@@ -365,6 +365,7 @@ def create_workflows_router(
             runs.append(
                 WorkflowRun(
                     id=plan.id,
+                    latest_plan_position=latest_plan.position,
                     session_id=plan.conversation_id,
                     title=session.title or "",
                     started_at=plan.created_at,

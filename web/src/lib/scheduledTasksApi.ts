@@ -390,6 +390,8 @@ export async function listScheduledTaskRuns(id: string): Promise<ScheduledTaskRu
 export interface ScheduledTaskRunSteps {
   runId: string;
   planId: string | null;
+  /** Journal position of the latest plan within this invocation. */
+  latestPlanPosition?: number;
   isCurrent: boolean;
   /** The saved workflow the plan runs, when it named one. */
   workflowId: string | null;
@@ -417,6 +419,7 @@ export async function listScheduledTaskRunSteps(
     runs?: {
       run_id: string;
       plan_id?: string;
+      latest_plan_position?: number | null;
       is_current?: boolean;
       workflow_id: string | null;
       plan_name?: string | null;
@@ -427,6 +430,7 @@ export async function listScheduledTaskRunSteps(
   return (body.runs ?? []).map((run) => ({
     runId: run.run_id,
     planId: run.plan_id ?? null,
+    latestPlanPosition: run.latest_plan_position ?? undefined,
     isCurrent: run.is_current === true,
     workflowId: run.workflow_id,
     planName: run.plan_name ?? null,

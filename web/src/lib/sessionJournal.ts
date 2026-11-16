@@ -290,8 +290,8 @@ export function planTally(progress: readonly StepProgress[]): Record<StepState, 
   return tally;
 }
 
-/** Completed final steps supersede older statuses, but newer unfinished work reopens them. */
-export function isPlanComplete(progress: readonly StepProgress[]): boolean {
+/** Completed final steps supersede older statuses; newer plans or statuses can add unfinished work. */
+export function isPlanComplete(progress: readonly StepProgress[], planPosition?: number): boolean {
   const dependencies = new Set(progress.flatMap((item) => item.step.depends_on));
   const finalSteps = progress.filter((item) => !dependencies.has(item.step.id));
   const byId = new Map(progress.map((item) => [item.step.id, item]));
@@ -306,11 +306,12 @@ export function isPlanComplete(progress: readonly StepProgress[]): boolean {
         seen.add(id);
         const upstream = byId.get(id);
         if (!upstream) continue;
+        const upstreamPosition = upstream.status?.position ?? planPosition;
         if (
           upstream.state !== "done" &&
-          upstream.status &&
+          upstreamPosition !== undefined &&
           finalStep.status &&
-          upstream.status.position > finalStep.status.position
+          upstreamPosition > finalStep.status.position
         )
           return false;
         pending.push(...upstream.step.depends_on);
@@ -407,10 +408,11 @@ export function pausedLabel(
   progress: readonly StepProgress[],
   entries: readonly JournalEntry[],
   sessionWorking: boolean,
+  planPosition = currentPlan(entries)?.position,
 ): PausedLabel | null {
   if (
     sessionWorking ||
-    isPlanComplete(progress) ||
+    isPlanComplete(progress, planPosition) ||
     progress.some((item) => item.state === "needs_input")
   )
     return null;
@@ -430,15 +432,20 @@ export function pausedLabel(
  * the list ended ("All done", or "Finished, 1 failed").
  *
  * @param paused - What an idle list says, from {@link pausedLabel}.
+ * @param planPosition - Latest plan position, to recognize unstarted prerequisites after completion.
  */
 export function taskPreviewText(
   progress: readonly StepProgress[],
   paused: PausedLabel | null = null,
+  planPosition?: number,
 ): string | null {
   if (progress.length === 0) return null;
   const failedCount = progress.filter((item) => item.state === "failed").length;
   const finished = failedCount === 0 ? "All done" : `Finished, ${failedCount} failed`;
-  if (isPlanComplete(progress)) return finished;
+  const livePrompt = progress.some(
+    (item) => item.state === "needs_input" && item.status && statusOf(item.status) === "started",
+  );
+  if (!livePrompt && isPlanComplete(progress, planPosition)) return finished;
   const order: StepState[] = ["needs_input", "running", "stopped", "ready", "waiting"];
   for (const state of order) {
     const item = progress.find((candidate) => candidate.state === state);
