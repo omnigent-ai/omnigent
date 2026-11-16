@@ -1,9 +1,32 @@
-// Every searchable Settings row, by section. Sections add their rows here as they move onto
-// the catalog; until then the list is empty, so no row is revealed by a link.
+// Every searchable Settings row, by section. A new section is a type error here until it
+// lists its rows, even if it has none yet.
 
+import type { SettingsSectionId } from "@/shell/settingsNav";
+
+import { IMPORT_SETTINGS } from "./import";
 import type { SettingsEntry } from "./types";
 
-export const SETTINGS_ENTRIES: readonly SettingsEntry[] = [];
+export const SECTION_CATALOGS: Readonly<Record<SettingsSectionId, readonly SettingsEntry[]>> = {
+  appearance: [],
+  harnesses: [],
+  "custom-agents": [],
+  general: [],
+  git: [],
+  integrations: [],
+  mcp: [],
+  shortcuts: [],
+  import: IMPORT_SETTINGS,
+  account: [],
+  admin: [],
+  members: [],
+  policies: [],
+  sharing: [],
+  archived: [],
+  cli: [],
+  updates: [],
+};
+
+export const SETTINGS_ENTRIES: readonly SettingsEntry[] = Object.values(SECTION_CATALOGS).flat();
 
 const ENTRIES_BY_ID = new Map(SETTINGS_ENTRIES.map((entry) => [entry.id, entry]));
 
