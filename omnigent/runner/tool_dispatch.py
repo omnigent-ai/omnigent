@@ -154,7 +154,7 @@ from omnigent.tools.builtins.triggered_tasks import (
     default_worker,
     polling_minutes,
     trigger_rrule,
-    triggered_task_review_error,
+    triggered_task_call_error,
     triggered_task_view,
 )
 from omnigent.tools.builtins.ui import OpenFileRequest, UiOpenFileTool
@@ -484,9 +484,8 @@ _AGENT_TOOLS = frozenset({"sys_agent_get", "sys_agent_download", "sys_agent_list
 _POLICY_TOOLS = frozenset({"sys_add_policy", "sys_policy_registry"})
 
 # Priority 5l.1: Scheduled-task management — the runner proxies the Omnigent
-# server's /v1/scheduled-tasks REST endpoints (same posture as _POLICY_TOOLS).
-# sys_reminder_set creates a one-time task that continues the calling session,
-# and the sys_triggered_task_* tools compile a trigger into a task that polls.
+# server's /v1/scheduled-tasks REST endpoints (same posture as _POLICY_TOOLS), also
+# for sys_reminder_set and the sys_triggered_task_* tools (triggers become polling tasks).
 _SCHEDULED_TASK_TOOLS = (
     frozenset(
         {
@@ -5617,19 +5616,11 @@ async def _execute_triggered_task_tool(
         )
 
     action = "create" if tool_name == TRIGGERED_TASK_CREATE else "update"
-    error = triggered_task_review_error(args, action=action)
+    error = triggered_task_call_error(args, action=action)
     if error:
         return json.dumps({"error": f"{tool_name}: {error}"})
-    if "project_name" in args and "project_id" in args:
-        return json.dumps({"error": f"{tool_name}: set project_id or project_name, not both"})
     project_name = args.get("project_name")
-    if "project_name" in args and not isinstance(project_name, str):
-        return json.dumps(
-            {"error": f"{tool_name}: project_name must be a string; use project_id: null to clear"}
-        )
     name = args.get("name")
-    if "name" in args and (not isinstance(name, str) or not name.strip()):
-        return json.dumps({"error": f"{tool_name}: name must be a non-empty string"})
     info = await _triggered_task_server_info(server_client, tool_name)
     if isinstance(info, str):
         return info

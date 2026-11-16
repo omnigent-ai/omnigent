@@ -2944,18 +2944,66 @@ def test_list_page_query_plan_seeks_the_owner_index(store):
             assert "SEARCH" in plan and "TEMP B-TREE" not in plan
 
 
-def test_list_page_falls_back_to_slicing_a_custom_stores_list():
+def test_a_store_without_indexed_reads_refuses_to_page():
     from types import SimpleNamespace
 
     from omnigent.stores.scheduled_task_store import ScheduledTaskStore
 
-    # Equal created_at values page by id, so the cursor's tie-breaker matters.
-    tasks = [SimpleNamespace(id=f"{i:032x}", created_at=i // 2, user_id="u") for i in range(5)]
-    custom = SimpleNamespace(
-        list=lambda owner_user_id: [*tasks, SimpleNamespace(**{**vars(tasks[0]), "user_id": "v"})]
-    )
-    first, cursor = ScheduledTaskStore.list_page(custom, owner_user_id="u", limit=3)
-    assert [task.id for task in first] == [task.id for task in tasks[:3]]
-    rest, final = ScheduledTaskStore.list_page(custom, owner_user_id="u", limit=3, after=cursor)
-    assert [task.id for task in rest] == [task.id for task in tasks[3:]]
-    assert final is None
+    # Paging by slicing list() would read every task for each page.
+    custom = SimpleNamespace(list=lambda owner_user_id: pytest.fail("read every task"))
+    with pytest.raises(NotImplementedError):
+        ScheduledTaskStore.list_page(custom, owner_user_id="u", limit=3)
+    with pytest.raises(NotImplementedError):
+        ScheduledTaskStore.list_latest_runs_for_tasks(custom, [_uid("t")])
+
+
+def test_latest_runs_read_one_run_per_task(store):
+    from sqlalchemy import event
+
+    busy = _session_task(store, "latest-busy")
+    tied = _session_task(store, "latest-tied")
+    idle = _session_task(store, "latest-idle")
+    for n in range(30):
+        store.create_run(
+            run_id=_uid(f"latest-busy-{n}"),
+            scheduled_task_id=busy.id,
+            status="succeeded" if n < 29 else "running",
+            scheduled_at=100 + n,
+        )
+    # Equal scheduled_at values break the tie on id, as list_runs orders them.
+    for seed in ("a", "b"):
+        store.create_run(
+            run_id=_uid(f"latest-tied-{seed}"),
+            scheduled_task_id=tied.id,
+            status="failed",
+            scheduled_at=500,
+        )
+    queries = []
+
+    def capture(conn, cursor, statement, parameters, context, executemany):
+        if statement.lstrip().startswith("SELECT"):
+            queries.append((statement, parameters))
+
+    event.listen(store._engine, "before_cursor_execute", capture)
+    try:
+        latest = store.list_latest_runs_for_tasks([busy.id, tied.id, idle.id])
+    finally:
+        event.remove(store._engine, "before_cursor_execute", capture)
+    assert set(latest) == {busy.id, tied.id}
+    assert latest[busy.id].id == _uid("latest-busy-29")
+    assert latest[busy.id].status == "running"
+    assert latest[tied.id].id == store.list_runs(tied.id, limit=1)[0][0].id
+    assert store.list_latest_run_status_for_tasks([busy.id, tied.id]) == {
+        task_id: run.status for task_id, run in latest.items()
+    }
+    assert store.list_latest_runs_for_tasks([]) == {}
+    assert len(queries) == 1
+    if store._engine.dialect.name != "sqlite":
+        return
+    statement, parameters = queries[0]
+    with store._engine.connect() as connection:
+        plan = str(connection.exec_driver_sql("EXPLAIN QUERY PLAN " + statement, parameters).all())
+    # Each task's run comes from a seek on the task/run index, not a sort of its history.
+    assert "CORRELATED SCALAR SUBQUERY" in plan
+    assert "ix_scheduled_task_runs_scheduled_task_id" in plan
+    assert "TEMP B-TREE" not in plan and "SCAN scheduled_task_runs" not in plan

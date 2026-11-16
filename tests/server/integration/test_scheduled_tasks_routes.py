@@ -883,6 +883,63 @@ async def test_the_list_pages_through_the_owner_index_with_limit(
         assert bad.status_code == 422, bad.text
 
 
+async def test_a_page_reads_only_each_tasks_latest_run(
+    auth_client: httpx.AsyncClient,
+    auth_app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import time
+    import uuid
+
+    from omnigent.server.scheduled.run_reconciler import STALE_RUN_MAX_AGE_SECONDS
+    from omnigent.stores.scheduled_task_store import ScheduledTaskStore
+
+    _make_user(db_uri)
+    created = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(), headers=_headers()
+    )
+    task_id = created.json()["id"]
+    for n in range(40):
+        _seed_run(
+            db_uri,
+            task_id,
+            uuid.uuid4().hex,
+            scheduled_at=1000 + n,
+            conversation_id=uuid.uuid4().hex,
+        )
+    stale = int(time.time()) - STALE_RUN_MAX_AGE_SECONDS - 60
+    _seed_run(
+        db_uri,
+        task_id,
+        uuid.uuid4().hex,
+        status="running",
+        scheduled_at=stale,
+        fired_at=stale + 1,
+        finished_at=None,
+        conversation_id=uuid.uuid4().hex,
+    )
+    store = auth_app.state.scheduled_task_store
+
+    # The unpaged list's helpers read every run a task has; a page must not use them.
+    def whole_history(task_ids: list[str]) -> object:
+        pytest.fail("a page read a task's whole run history")
+
+    monkeypatch.setattr(store, "list_running_runs_for_tasks", whole_history)
+    monkeypatch.setattr(store, "list_latest_run_status_for_tasks", whole_history)
+    resp = await auth_client.get("/v1/scheduled-tasks", params={"limit": 1}, headers=_headers())
+    assert resp.status_code == 200, resp.text
+    [row] = resp.json()["scheduled_tasks"]
+    # The stale run heads the history, so the page fails it before reporting it.
+    assert row["last_run_status"] == "failed"
+
+    monkeypatch.setattr(
+        store, "list_page", lambda **kwargs: ScheduledTaskStore.list_page(store, **kwargs)
+    )
+    unpaged = await auth_client.get("/v1/scheduled-tasks", params={"limit": 1}, headers=_headers())
+    assert unpaged.status_code == 501, unpaged.text
+
+
 @pytest.mark.parametrize("auth_app", ["one_time"], indirect=True)
 async def test_the_list_leaves_reminders_out_until_an_edit_makes_one_an_automation(
     auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str

@@ -7,6 +7,8 @@ trigger the web form saves, and how a saved trigger is reported back.
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import Any
 
 import jsonschema
@@ -17,6 +19,8 @@ from omnigent.tools.builtins.trigger_prompts import (
     TRIGGER_TEMPLATES,
     TriggerConfig,
     TriggerWorkerConfig,
+    decode_trigger_prompt,
+    describe_trigger_watch,
     trigger_fields_complete,
 )
 from omnigent.tools.builtins.triggered_tasks import (
@@ -28,7 +32,7 @@ from omnigent.tools.builtins.triggered_tasks import (
     describe_trigger_arguments,
     polling_minutes,
     trigger_rrule,
-    triggered_task_review_error,
+    triggered_task_call_error,
     triggered_task_view,
 )
 
@@ -373,28 +377,37 @@ def test_update_keeps_what_the_call_leaves_out() -> None:
     assert updated == {**current, "instructions": "Fix it."}
 
 
-def test_update_to_another_event_keeps_what_the_form_keeps() -> None:
+def test_update_with_a_new_search_builds_it_from_the_call() -> None:
     current = _created(
         provider="github",
         event="pr",
         scope=["octo-org/octo-repo"],
-        conditions=[
-            {"field": "label", "operator": "is", "value": "bug"},
-            {"field": "reviewer", "operator": "is", "value": "me"},
-        ],
+        conditions=[{"field": "reviewer", "operator": "is", "value": "me"}],
+        link_back=False,
+        session_per_match=False,
+        worker={"agent_id": "ag_worker"},
     )
-    switched = _update(current, event="issue")
-    assert not isinstance(switched, str)
-    assert switched["scope"] == "octo-org/octo-repo"
-    # Issues have no reviewer, so that condition goes.
-    assert switched["conditions"] == [{"field": "label", "operator": "is", "value": "bug"}]
+    search = {
+        "provider": "github",
+        "event": "issue",
+        "scope": ["octo-org/octo-repo"],
+        "conditions": [{"field": "label", "operator": "is", "value": "bug"}],
+    }
+    switched = _update(current, **search)
+    # The search is the call's, as a create builds it; delivery and workers stay.
+    expected = _created(**search, link_back=False, session_per_match=False)
+    assert switched == {**expected, "worker": current["worker"]}
 
 
-def test_update_to_an_event_watching_other_things_needs_scope() -> None:
+def test_update_needs_the_whole_search_to_change_it() -> None:
     current = _created(provider="slack", scope=["eng-support"])
-    assert _update(current, event="dm") == "scope is required"
-    dm = _update(current, event="dm", scope=["alice"])
-    assert not isinstance(dm, str) and dm["scope"] == "alice"
+    error = _update(current, event="dm", scope=["alice"])
+    assert error == (
+        "to change what it watches, pass the whole search: add provider, conditions "
+        "(sys_triggered_task_list shows the current values)"
+    )
+    dm = _update(current, provider="slack", event="dm", scope=["alice"], conditions=[])
+    assert not isinstance(dm, str) and (dm["event"], dm["scope"]) == ("dm", "alice")
 
 
 def test_update_to_another_provider_starts_from_its_empty_form() -> None:
@@ -404,8 +417,7 @@ def test_update_to_another_provider_starts_from_its_empty_form() -> None:
         conditions=[{"field": "label", "operator": "is", "value": "bug"}],
         worker={"agent_id": "ag_worker"},
     )
-    assert _update(current, provider="linear") == "pass scope when changing the provider"
-    switched = _update(current, provider="linear", scope=["ENG"])
+    switched = _update(current, provider="linear", event="created", scope=["ENG"], conditions=[])
     assert not isinstance(switched, str)
     assert (switched["source"], switched["event"], switched["conditions"]) == (
         "linear",
@@ -414,6 +426,31 @@ def test_update_to_another_provider_starts_from_its_empty_form() -> None:
     )
     # The sessions it starts keep their settings, as when the form switches source.
     assert switched["worker"]["agentId"] == "ag_worker"
+
+
+def test_an_unrelated_update_keeps_a_trigger_that_watches_anyone() -> None:
+    fixture = json.loads(
+        (Path(__file__).resolve().parents[1] / "fixtures" / "trigger_prompts.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    [case] = [c for c in fixture["renders"] if c["name"] == "jira-assigned-without-target"]
+    current = decode_trigger_prompt(case["prompt"])
+    assert current is not None and "target" not in current
+    watch = describe_trigger_watch(current)
+    assert "assigned to anyone" in watch
+    updated = _update(current, instructions="Fix it.")
+    assert not isinstance(updated, str)
+    assert describe_trigger_watch(updated) == watch
+    # The list restates the saved search, so resending it watches the same tickets.
+    view = triggered_task_view({"id": "t1"}, current)
+    assert view["target"] == ""
+    resent = _update(
+        current,
+        **{key: view[key] for key in ("provider", "event", "scope", "target", "conditions")},
+    )
+    assert not isinstance(resent, str)
+    assert describe_trigger_watch(resent) == watch
 
 
 @pytest.mark.parametrize(
@@ -530,27 +567,61 @@ def test_trigger_rrule_matches_the_form_default(info: dict[str, Any], rrule: str
     assert trigger_rrule(info) == rrule
 
 
+_REVIEWED = {"instructions": "x", "permission_mode": None}
+
+
 @pytest.mark.parametrize(
     ("args", "action", "error"),
     [
         ({"permission_mode": None}, "create", "Missing review fields (instructions)"),
         ({"instructions": "x"}, "update", "Missing review fields (permission_mode)"),
         ({"instructions": "x", "permission_mode": "null"}, "create", "permission_mode must"),
-        ({"instructions": "x", "permission_mode": None}, "update", "triggered_task_id"),
+        (_REVIEWED, "update", "triggered_task_id"),
+        (_REVIEWED, "create", "name must be a non-empty string"),
+        ({**_REVIEWED, "name": " "}, "create", "name must be a non-empty string"),
+        (
+            {**_REVIEWED, "triggered_task_id": "t1", "name": ""},
+            "update",
+            "name must be a non-empty string",
+        ),
+        (
+            {**_REVIEWED, "name": "n", "project_name": "p", "project_id": "q"},
+            "create",
+            "not both",
+        ),
+        ({**_REVIEWED, "name": "n", "project_name": 3}, "create", "project_name must"),
+        (
+            {**_REVIEWED, "triggered_task_id": "t1", "conditions": []},
+            "update",
+            "pass the whole search: add provider, event, scope",
+        ),
+        ({**_REVIEWED, "name": "n", "instructions": " "}, "create", "instructions must be"),
+        ({**_REVIEWED, "name": "n", "link_back": "yes"}, "create", "link_back must be"),
+        (
+            {**_REVIEWED, "triggered_task_id": "t1", "session_per_match": 1},
+            "update",
+            "session_per_match must be",
+        ),
+        (
+            {**_REVIEWED, "triggered_task_id": "t1", "worker": {"permission_mode": "bypass"}},
+            "update",
+            "skips approval",
+        ),
     ],
 )
-def test_review_error(args: dict[str, Any], action: str, error: str) -> None:
-    assert error in (triggered_task_review_error(args, action=action) or "")
+def test_call_error(args: dict[str, Any], action: str, error: str) -> None:
+    assert error in (triggered_task_call_error(args, action=action) or "")
 
 
-def test_review_error_accepts_complete_values() -> None:
-    assert (
-        triggered_task_review_error(
-            {"instructions": "x", "permission_mode": None, "triggered_task_id": "t1"},
-            action="update",
-        )
-        is None
-    )
+@pytest.mark.parametrize(
+    ("args", "action"),
+    [
+        ({**_REVIEWED, "triggered_task_id": "t1"}, "update"),
+        ({**_REVIEWED, "name": "Triage", "project_id": None}, "create"),
+    ],
+)
+def test_call_error_accepts_complete_values(args: dict[str, Any], action: str) -> None:
+    assert triggered_task_call_error(args, action=action) is None
 
 
 def test_describe_trigger_arguments_shows_every_value_in_full() -> None:
@@ -574,8 +645,9 @@ def test_describe_trigger_arguments_shows_every_value_in_full() -> None:
 def test_update_to_another_provider_keeps_where_matches_go() -> None:
     """Like the form, a source switch keeps one task session; it isn't a provider field."""
     current = _created(provider="jira", scope=["ES"], session_per_match=False)
-    switched = _update(current, provider="linear", scope=["ENG"])
+    search = {"provider": "linear", "event": "created", "scope": ["ENG"], "conditions": []}
+    switched = _update(current, **search)
     assert not isinstance(switched, str)
     assert switched["taskSessionMode"] == "continue"
-    per_match = _update(current, provider="linear", scope=["ENG"], session_per_match=True)
+    per_match = _update(current, **search, session_per_match=True)
     assert not isinstance(per_match, str) and "taskSessionMode" not in per_match

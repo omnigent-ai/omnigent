@@ -350,16 +350,23 @@ def test_agent_creates_runs_changes_and_deletes_a_jira_trigger(
                 # The list reports the trigger, not the prompt or schedule it renders to.
                 assert _TRIGGER_OPENING not in listed and "rrule" not in listed
 
+                # A changed search is passed whole, as the list shows it.
                 change = {
                     "triggered_task_id": task_id,
                     "instructions": trigger["instructions"],
                     "permission_mode": permission_mode,
+                    "provider": "jira",
+                    "event": "created",
+                    "scope": ["ES"],
                     "conditions": [{"field": "priority", "operator": "is", "value": "High"}],
                     "state": "paused",
                 }
                 script(_PAUSE, "sys_triggered_task_update", change, "update", "TRIGGER_PAUSED")
                 send(owner, _PAUSE)
-                approve(owner, approval_card(owner, f"triggered task {task_id}"))
+                card = approval_card(owner, f"triggered task {task_id}")
+                # The owner sees the search the change compiles to before approving it.
+                assert 'priority = \\"High\\"' in json.dumps(card)
+                approve(owner, card)
                 wait_text(owner, "TRIGGER_PAUSED")
                 task = client.get(f"/v1/scheduled-tasks/{task_id}").json()
                 assert task["state"] == "paused"

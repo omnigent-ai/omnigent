@@ -1144,6 +1144,7 @@ def create_scheduled_tasks_router(
         With *limit*, the list is one page read through the owner index, oldest
         first, and the response adds ``next_cursor`` (``null`` on the last page). A
         page counts the tasks it examined, so filtered-out tasks can leave it short.
+        It reads only each task's latest run, so the backstop below covers just that.
 
         Lazy-on-read stale backstop: before returning, force-fail any of this
         owner's runs still ``running`` past the 6h max age (``incomplete``), so
@@ -1161,22 +1162,35 @@ def create_scheduled_tasks_router(
                 raise HTTPException(status_code=422, detail="after needs limit")
             listed, next_cursor = store.list(owner_user_id=owner_id), None
         else:
-            listed, next_cursor = store.list_page(
-                owner_user_id=owner_id,
-                limit=limit,
-                after=_task_cursor(after, "Invalid scheduled task cursor"),
-            )
+            cursor = _task_cursor(after, "Invalid scheduled task cursor")
+            try:
+                listed, next_cursor = store.list_page(
+                    owner_user_id=owner_id, limit=limit, after=cursor
+                )
+            except NotImplementedError:
+                raise HTTPException(
+                    status_code=501, detail="This server's task store can't page tasks"
+                ) from None
         tasks = [
             t
             for t in listed
             if owns_scheduled_task(t, owner_id) and (kind == "all" or t.kind == "automation")
         ]
         task_ids = [t.id for t in tasks]
-        running = store.list_running_runs_for_tasks(task_ids)
-        # Force-fail stale orphans FIRST so the completion badge below reports a
-        # dead run as ``failed`` rather than a stuck ``running``.
-        force_fail_stale_runs(store, running)
-        latest_status = store.list_latest_run_status_for_tasks(task_ids)
+        if limit is None:
+            running = store.list_running_runs_for_tasks(task_ids)
+            # Force-fail stale orphans FIRST so the completion badge below reports a
+            # dead run as ``failed`` rather than a stuck ``running``.
+            force_fail_stale_runs(store, running)
+            latest_status = store.list_latest_run_status_for_tasks(task_ids)
+        else:
+            # A page reads only each task's latest run, so its work stays bounded by
+            # the page; that run is the one its badge reports.
+            latest = store.list_latest_runs_for_tasks(task_ids)
+            latest_status = {
+                run.scheduled_task_id: run.status
+                for run in force_fail_stale_runs(store, list(latest.values()))
+            }
         body: dict[str, Any] = {
             "scheduled_tasks": [
                 _to_response(

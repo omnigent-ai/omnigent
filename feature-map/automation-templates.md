@@ -154,8 +154,9 @@ to customize.
   and orchestration. Unsupported servers still allow creation from scratch.
 - `agent-tools`: an agent creates the same triggers with `sys_triggered_task_create`,
   giving the provider, event, scope, conditions, and instructions instead of a prompt and
-  schedule. Create and update wait on an approval card that shows the whole trigger and
-  the instructions; nothing is saved until the owner approves. The automation then
+  schedule. Create and update wait on an approval card that shows the whole trigger,
+  the compiled search, and the instructions; nothing is saved until the owner approves.
+  An update that changes the search passes all of it. The automation then
   lists, opens in the trigger form, and polls like one made in the form.
   `sys_triggered_task_list` reports triggers rather than their prompts,
   `sys_scheduled_task_list` leaves them out, and the tools are refused on servers
@@ -228,9 +229,10 @@ Minute-schedule checks use the server’s advertised sub-hour capability and `au
   through REST, and confirm no rendered prompt is shown. The
   preview entry runs at mobile width; the Templates entry runs at desktop width.
 - `tests/e2e/test_triggered_task_tools_e2e.py::test_agent_creates_runs_changes_and_deletes_a_jira_trigger`
-  (own environment, scripted model) drives an SDK agent and Codex through the agent
-  tools: approval before the save, the saved header, Run now sending the poller the
-  rendered prompt without the header, the list, a paused update, and delete.
+  (own environment, scripted model) drives an SDK agent, Claude Code, and Codex through
+  the agent tools: approval before the save, the saved header, Run now sending the poller
+  the rendered prompt without the header, the list, a paused update with a new search
+  shown on its approval card, and delete.
 - `tests/e2e_ui/scheduled/test_scheduled_tasks_page.py::test_ten_minute_host_schedule_round_trip`
   covers new-session host creation, nine-minute rejection, reopening, and switching
   to continuation while preserving ten minutes. In either edit entry point, also

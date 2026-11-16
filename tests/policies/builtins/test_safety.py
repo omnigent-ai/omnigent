@@ -1215,9 +1215,7 @@ def test_block_skills_alias_matching_does_not_over_block() -> None:
 def _triggered_review(tool: str, arguments: dict[str, object]):
     from omnigent.policies.builtins.safety import ask_on_scheduled_task_change
 
-    return ask_on_scheduled_task_change(
-        {"type": "tool_call", "target": tool, "data": {"arguments": arguments}}
-    )
+    return ask_on_scheduled_task_change(tc(tool, arguments))
 
 
 _TRIGGER_CREATE: dict[str, object] = {
@@ -1229,18 +1227,22 @@ _TRIGGER_CREATE: dict[str, object] = {
     "permission_mode": "acceptEdits",
     "model_override": "model-a",
 }
+_TASK_ID = "0123456789abcdef0123456789abcdef"
 
 
 def test_triggered_task_create_asks_with_its_whole_trigger() -> None:
     """Raw JQL runs with the owner's credentials, so the review never shortens it."""
     jql = 'summary ~ "crash" AND ' + "labels != wontfix AND " * 20 + "END-SENTINEL"
     instructions = "Investigate the ticket.\n" * 40 + "INSTRUCTIONS-END"
+    workspace = "/home/me/" + "deep/" * 30 + "WORKSPACE-END"
     result = _triggered_review(
         "sys_triggered_task_create",
         {
             **_TRIGGER_CREATE,
             "instructions": instructions,
             "conditions": [{"field": "jql", "operator": "matches", "value": jql}],
+            "workspace": workspace,
+            "mcp_services": [f"service-{n}" for n in range(30)],
         },
     )
     assert result["result"] == "ASK"
@@ -1254,60 +1256,130 @@ def test_triggered_task_create_asks_with_its_whole_trigger() -> None:
         "Sessions it starts: agent=same as the task, model=model-a, reasoning_effort=default, "
         "permission_mode=acceptEdits, placement=same_host, each match starts its own session"
     ) in reason
-    assert "agent_id=ag_1" in reason and "model_override=model-a" in reason
+    # Every setting is shown whole, JSON-encoded, however long.
+    assert 'agent_id="ag_1"' in reason and 'model_override="model-a"' in reason
+    assert f'workspace="{workspace}"' in reason
+    assert '"service-29"]' in reason
     # The compiled search the poller will run, as well as the arguments behind it.
     assert 'Watch: new Jira tickets matching this JQL:\nproject = "ES" AND (summary ~' in reason
 
 
-def test_triggered_task_create_denies_a_trigger_the_runner_would_refuse() -> None:
+@pytest.mark.parametrize(
+    ("task_mode", "sessions_mode"),
+    [
+        ("acceptEdits", "permission_mode=acceptEdits,"),
+        (None, "permission_mode=agent default,"),
+        # A session create can't name a mode that skips approval, so the sessions
+        # get the task's own.
+        (
+            "bypassPermissions",
+            "permission_mode=the task's mode: bypassPermissions (skips approval prompts",
+        ),
+    ],
+)
+def test_triggered_task_create_names_the_sessions_effective_permission_mode(
+    task_mode: object, sessions_mode: str
+) -> None:
     result = _triggered_review(
-        "sys_triggered_task_create",
+        "sys_triggered_task_create", {**_TRIGGER_CREATE, "permission_mode": task_mode}
+    )
+    assert result["result"] == "ASK"
+    sessions = next(
+        line for line in result["reason"].splitlines() if line.startswith("Sessions it starts:")
+    )
+    assert sessions_mode in sessions
+
+
+@pytest.mark.parametrize(
+    ("change", "error"),
+    [
+        (
+            {"conditions": [{"field": "label", "operator": "contains", "value": "x"}]},
+            "jira label takes the operators is, is_not",
+        ),
+        ({"name": " "}, "name must be a non-empty string"),
+        ({"project_name": "Ops", "project_id": "p1"}, "set project_id or project_name, not both"),
+        ({"permission_mode": "null"}, "permission_mode must be"),
+    ],
+)
+def test_triggered_task_create_denies_what_the_runner_would_refuse(
+    change: dict[str, object], error: str
+) -> None:
+    result = _triggered_review("sys_triggered_task_create", {**_TRIGGER_CREATE, **change})
+    assert result["result"] == "DENY"
+    assert error in result["reason"]
+
+
+def test_triggered_task_update_denies_delivery_settings_the_runner_would_refuse() -> None:
+    result = _triggered_review(
+        "sys_triggered_task_update",
         {
-            **_TRIGGER_CREATE,
-            "conditions": [{"field": "label", "operator": "contains", "value": "x"}],
+            "triggered_task_id": _TASK_ID,
+            "instructions": "Investigate the ticket.",
+            "permission_mode": None,
+            "worker": {"permission_mode": "bypassPermissions"},
         },
     )
     assert result["result"] == "DENY"
-    assert "jira label takes the operators is, is_not" in result["reason"]
+    assert "skips approval" in result["reason"]
+
+
+def test_triggered_task_create_denies_a_call_without_its_review_fields() -> None:
+    args = {key: value for key, value in _TRIGGER_CREATE.items() if key != "permission_mode"}
+    result = _triggered_review("sys_triggered_task_create", args)
+    assert result["result"] == "DENY"
+    assert "Missing review fields (permission_mode)" in result["reason"]
 
 
 def test_triggered_task_update_names_what_it_changes() -> None:
+    review = {"triggered_task_id": _TASK_ID, "instructions": "Investigate the ticket."}
     unchanged = _triggered_review(
-        "sys_triggered_task_update",
-        {
-            "triggered_task_id": "0123456789abcdef0123456789abcdef",
-            "instructions": "Investigate the ticket.",
-            "permission_mode": None,
-            "state": "paused",
-        },
+        "sys_triggered_task_update", {**review, "permission_mode": None, "state": "paused"}
     )
     assert unchanged["result"] == "ASK"
     assert "Trigger: unchanged" in unchanged["reason"]
-    assert "Sessions it starts: unchanged" in unchanged["reason"]
-    assert "state=paused" in unchanged["reason"]
+    assert "Watch:" not in unchanged["reason"]
+    assert (
+        "Sessions it starts: unchanged; any without their own permission mode use the "
+        "task's mode: agent default (no task override)"
+    ) in unchanged["reason"]
+    assert 'state="paused"' in unchanged["reason"]
 
+    # A new search compiles from the call alone, so the approver sees what it watches.
     changed = _triggered_review(
         "sys_triggered_task_update",
         {
-            "triggered_task_id": "0123456789abcdef0123456789abcdef",
-            "instructions": "Investigate the ticket.",
-            "permission_mode": None,
+            **review,
+            "permission_mode": "bypassPermissions",
+            "provider": "jira",
+            "event": "created",
             "scope": ["OPS"],
+            "conditions": [{"field": "label", "operator": "is", "value": "bug"}],
             "worker": {"permission_mode": "acceptEdits"},
         },
     )
-    assert 'scope: ["OPS"]' in changed["reason"]
-    assert 'worker: {"permission_mode": "acceptEdits"}' in changed["reason"]
+    assert changed["result"] == "ASK"
+    reason = changed["reason"]
+    assert 'scope: ["OPS"]' in reason
+    assert 'Watch: new Jira tickets matching this JQL:\nproject = "OPS" AND labels = "bug"' in (
+        reason
+    )
+    assert 'worker: {"permission_mode": "acceptEdits"}' in reason
+    assert (
+        "Sessions it starts: the worker settings below change; any without their own "
+        "permission mode use the task's mode: bypassPermissions (skips approval prompts"
+    ) in reason
+
+    # Part of a search can't be compiled without the saved rest, so it isn't asked.
+    partial = _triggered_review(
+        "sys_triggered_task_update", {**review, "permission_mode": None, "scope": ["OPS"]}
+    )
+    assert partial["result"] == "DENY"
+    assert "pass the whole search: add provider, event, conditions" in partial["reason"]
 
     # An agent switch changes the sessions that run the task's own agent.
     switched = _triggered_review(
-        "sys_triggered_task_update",
-        {
-            "triggered_task_id": "0123456789abcdef0123456789abcdef",
-            "instructions": "Investigate the ticket.",
-            "permission_mode": None,
-            "agent_id": "ag_2",
-        },
+        "sys_triggered_task_update", {**review, "permission_mode": None, "agent_id": "ag_2"}
     )
     assert (
         "Sessions it starts: sessions that run the task's own agent switch to the new agent_id"

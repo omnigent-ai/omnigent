@@ -71,6 +71,10 @@ TRIGGER_ARGUMENTS = (
     "session_per_match",
     "worker",
 )
+# What a trigger watches. An update passes the whole search or none of it, so its
+# approval can show the search it compiles to.
+SEARCH_ARGUMENTS = ("provider", "event", "scope", "scope_match", "target", "conditions")
+_RESTATED_SEARCH_ARGUMENTS = ("provider", "event", "scope", "conditions")
 _WORKER_ARGUMENTS = ("agent_id", "model", "reasoning_effort", "permission_mode", "placement")
 _WORKER_PLACEMENTS = ("same_host", "managed")
 _SCOPE_MATCHES = ("exact", "contains")
@@ -114,8 +118,8 @@ _SCOPE_MATCH_DESC = (
 )
 
 _TARGET_DESC = (
-    "Who the event names. jira 'assigned': the new assignee — 'me' (default), 'anyone', "
-    "'unassigned', or a name or email. github 'review': the requested reviewer — 'me' "
+    "Who the event names. jira 'assigned': the new assignee — 'me' (default), 'anyone' "
+    "(or ''), 'unassigned', or a name or email. github 'review': the requested reviewer — 'me' "
     "(default), a username, or 'org/team'. Other events take no target."
 )
 
@@ -261,27 +265,32 @@ def _trigger_properties(*, update: bool) -> dict[str, Any]:
         "provider": {"type": "string", "enum": list(TRIGGER_SOURCES)},
         "event": {
             "type": "string",
-            "description": described(_EVENT_DESC, "Another event, as in create."),
+            "description": described(_EVENT_DESC, "As in create; part of the search."),
         },
         "scope": {
             "type": "array",
             "items": {"type": "string"},
-            "description": described(_SCOPE_DESC, "Replaces the scope, as in create."),
+            "description": described(_SCOPE_DESC, "As in create; part of the search."),
         },
         "scope_match": {
             "type": "string",
             "enum": list(_SCOPE_MATCHES),
-            "description": described(_SCOPE_MATCH_DESC, "As in create."),
+            "description": described(
+                _SCOPE_MATCH_DESC, "As in create; part of the search, defaulting to 'exact'."
+            ),
         },
         "target": {
             "type": "string",
-            "description": described(_TARGET_DESC, "As in create."),
+            "description": described(
+                _TARGET_DESC, "As in create; part of the search, defaulting to 'me'."
+            ),
         },
         "conditions": {
             "type": "array",
             "items": _condition_schema(),
             "description": described(
-                _CONDITIONS_DESC, "Replaces every condition; fields and operators as in create."
+                _CONDITIONS_DESC,
+                "Every condition, as in create ([] for none); part of the search.",
             ),
         },
         "instructions": {
@@ -373,12 +382,14 @@ class SysTriggeredTaskCreateTool(Tool):
             "ticket created in a Jira project or a review requested from you on GitHub. "
             "Give the provider, what to watch (event, scope, conditions) and the "
             "instructions each session gets; the item's details are added for it. New "
-            "matches usually start a session within about 10 minutes; items from before "
-            "the task existed are skipped. The agent needs the provider's tools where the "
-            "task runs (an MCP server for Jira, Slack, Linear or PagerDuty, which "
-            "mcp_services can start, or the GitHub CLI or a GitHub MCP server); without "
-            "them it reports what is missing. What it posts uses your accounts and ends "
-            "with 'Sent with Omnigent'. The task also appears on the Automations page. "
+            "matches usually start a session within about 10 minutes. The first check "
+            "also picks up items from about the hour before; for assignments and review "
+            "requests, only changes after that check count. The agent needs the "
+            "provider's tools where the task runs (an MCP server for Jira, Slack, Linear "
+            "or PagerDuty, which mcp_services can start, or the GitHub CLI or a GitHub MCP "
+            "server); without them it reports what is missing. What it posts uses your "
+            "accounts and ends with 'Sent with Omnigent'. The task also appears on the "
+            "Automations page. "
             "Manage it with sys_triggered_task_list, sys_triggered_task_update and "
             "sys_triggered_task_delete."
         )
@@ -502,13 +513,13 @@ class SysTriggeredTaskUpdateTool(Tool):
     def description(cls) -> str:
         """:returns: Human-readable description of the tool."""
         return (
-            "Change a triggered task (from sys_triggered_task_list). Only the fields you "
-            "pass change, except instructions and permission_mode: resend those even "
-            "when unchanged. A different event keeps the scope when it watches the same "
-            "kind of thing and drops conditions it can't use; a different provider needs "
-            "scope again and starts the task over for that provider. Pass state "
-            "'paused' to stop it without deleting it, or 'active' to resume. Sessions it "
-            "already started are not changed."
+            "Change a triggered task (from sys_triggered_task_list). Resend instructions "
+            "and permission_mode even when unchanged; anything else changes only if you "
+            "pass it. To change what it watches, pass the whole search as the list shows "
+            "it, with your changes: provider, event, scope and conditions, and target or "
+            "scope_match where they apply. A different provider starts the task's checks "
+            "over. Pass state 'paused' to stop it without deleting it, or 'active' to "
+            "resume. Sessions it already started are not changed."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -600,19 +611,18 @@ TRIGGERED_TASK_TOOLS: tuple[type[Tool], ...] = (
 )
 
 
-def triggered_task_review_error(
-    args: Mapping[str, object], *, action: str, require_complete: bool = True
-) -> str | None:
-    """The problem with a create or update's review values, or ``None``.
+def triggered_task_call_error(args: Mapping[str, object], *, action: str) -> str | None:
+    """What makes a create or update invalid before it reaches the server, or ``None``.
+
+    The approval policy and the runner both check it, so nobody is asked to approve a
+    call the runner would refuse.
 
     :param args: Parsed tool arguments.
     :param action: ``"create"`` or ``"update"``.
-    :param require_complete: Whether both review fields must be present; the approval
-        policy relaxes this only to describe what a call left out.
-    :returns: An error message, or ``None`` when the values can be reviewed.
+    :returns: An error message, or ``None``.
     """
     missing = sorted(TRIGGERED_TASK_REVIEW_FIELDS.difference(args))
-    if require_complete and missing:
+    if missing:
         hint = (
             "List the task and retry with its instructions and permission_mode."
             if action == "update"
@@ -620,15 +630,56 @@ def triggered_task_review_error(
             f"{AGENT_DEFAULT_PERMISSION_MODE_HINT}."
         )
         return f"Missing review fields ({', '.join(missing)}). {hint}"
-    if "permission_mode" in args:
-        mode = args["permission_mode"]
-        if mode is not None and (
-            not isinstance(mode, str) or mode.strip().lower() in ("", "null")
-        ):
-            return f"permission_mode must be a mode name, or {AGENT_DEFAULT_PERMISSION_MODE_HINT}."
+    mode = args["permission_mode"]
+    if mode is not None and (not isinstance(mode, str) or mode.strip().lower() in ("", "null")):
+        return f"permission_mode must be a mode name, or {AGENT_DEFAULT_PERMISSION_MODE_HINT}."
     if action == "update" and not args.get("triggered_task_id"):
         return "Provide the triggered_task_id of the task to change."
+    name = args.get("name")
+    if (action == "create" or "name" in args) and (not isinstance(name, str) or not name.strip()):
+        return "name must be a non-empty string"
+    if "project_name" in args and "project_id" in args:
+        return "set project_id or project_name, not both"
+    if "project_name" in args and not isinstance(args["project_name"], str):
+        return "project_name must be a string; use project_id: null to clear"
+    instructions = args["instructions"]
+    if not isinstance(instructions, str) or not instructions.strip():
+        return "instructions must be a non-empty string"
+    if instructions_length(instructions.strip()) > MAX_INSTRUCTIONS_CHARS:
+        return f"instructions can be at most {MAX_INSTRUCTIONS_CHARS} characters"
+    for key in ("link_back", "session_per_match"):
+        if key in args and not isinstance(args[key], bool):
+            return f"{key} must be true or false"
+    if "worker" in args:
+        # The saved worker it merges into can't change whether these values are valid.
+        worker = _parse_worker(args["worker"], _NO_WORKER_OVERRIDES)
+        if isinstance(worker, str):
+            return worker
+    if action == "update":
+        return _partial_search_error(args)
     return None
+
+
+_NO_WORKER_OVERRIDES: TriggerWorkerConfig = {
+    "placement": "same_host",
+    "agentId": None,
+    "model": "",
+    "effort": "",
+    "permissionMode": "",
+}
+
+
+def _partial_search_error(args: Mapping[str, object]) -> str | None:
+    """Why an update's search is only part of one, or ``None``."""
+    if not any(key in args for key in SEARCH_ARGUMENTS):
+        return None
+    absent = [key for key in _RESTATED_SEARCH_ARGUMENTS if key not in args]
+    if not absent:
+        return None
+    return (
+        f"to change what it watches, pass the whole search: add {', '.join(absent)} "
+        "(sys_triggered_task_list shows the current values)"
+    )
 
 
 def default_worker(
@@ -799,76 +850,42 @@ def _parse_worker(raw: object, base: TriggerWorkerConfig) -> TriggerWorkerConfig
     return worker
 
 
-def build_trigger_config(
-    args: Mapping[str, object],
-    *,
-    current: TriggerConfig | None,
-    worker_defaults: TriggerWorkerConfig,
-) -> TriggerConfig | str:
-    """The trigger a create or update call describes, or the reason it is invalid.
+def _build_search(args: Mapping[str, object]) -> dict[str, Any] | str:
+    """The fields a call's search sets, from the provider's empty form, or the problem.
 
-    A create starts from the provider's empty form. An update starts from ``current``;
-    another event keeps what the web form keeps when the owner switches events, and
-    another provider starts over from that provider's empty form. The call's trigger
-    arguments then replace what they name.
-
-    :param args: Parsed tool arguments, e.g. ``{"provider": "jira", "scope": ["ES"], ...}``.
-    :param current: The task's saved trigger on update, ``None`` on create.
-    :param worker_defaults: Worker settings for a create; an update keeps ``current``'s.
-    :returns: The complete trigger, or an error message.
+    :param args: Parsed tool arguments with the search, e.g. ``{"provider": "jira", ...}``.
+    :returns: The trigger fields, with ``source`` and ``event``, or an error message.
     """
-    raw_source = args.get("provider", current["source"] if current is not None else None)
+    raw_source = args.get("provider")
     if raw_source not in TRIGGER_SOURCES:
         return f"provider must be one of: {', '.join(TRIGGER_SOURCES)}"
     source = cast(Any, raw_source)
-    template = TRIGGER_TEMPLATES[source]
-    events = [event.id for event in template.events]
-    same_source = current is not None and current["source"] == source
-    raw_event = args.get("event", current["event"] if same_source and current else events[0])
+    events = [event.id for event in TRIGGER_TEMPLATES[source].events]
+    raw_event = args.get("event", events[0])
     if raw_event not in events:
         return f"{source} event must be one of: {', '.join(events)}"
     event = cast(str, raw_event)
+    fields: dict[str, Any] = dict(empty_trigger_fields(source))
+    if event != fields["event"]:
+        # Like the form, an event with a target starts at "me".
+        fields = dict(with_trigger_event(source, cast(Any, fields), event))
 
-    if same_source and current is not None:
-        fields: dict[str, Any] = dict(current)
-        worker: TriggerWorkerConfig = {**current["worker"]}
-        if event != current["event"]:
-            fields = dict(with_trigger_event(source, cast(Any, fields), event))
-    else:
-        if current is not None and "scope" not in args:
-            return "pass scope when changing the provider"
-        fields = dict(empty_trigger_fields(source))
-        if event != fields["event"]:
-            fields = dict(with_trigger_event(source, cast(Any, fields), event))
-        worker = {**(current["worker"] if current is not None else worker_defaults)}
-        # Like the form, a new source keeps where matches go along with the workers.
-        if current is not None and current.get("taskSessionMode") == "continue":
-            fields["taskSessionMode"] = "continue"
-
-    scope_match = args.get("scope_match")
-    if scope_match is not None and scope_match not in _SCOPE_MATCHES:
+    scope_match = args.get("scope_match", "exact")
+    if scope_match not in _SCOPE_MATCHES:
         return "scope_match must be 'exact' or 'contains'"
     if scope_match == "contains" and "contains" not in trigger_scope_operators(source):
         return f"scope_match 'contains' is for pagerduty, not {source}"
-    if "scope" in args:
-        entries = _parse_scope(source, event, args["scope"])
-        if isinstance(entries, str):
-            return entries
-        fields["scope"] = ", ".join(entries)
-    else:
-        entries = _scope_entries(fields["scope"])
-        if not entries:
-            return "scope is required"
-    if scope_match is None:
-        scope_match = "contains" if fields.get("scopeOperator") == "contains" else "exact"
+    if "scope" not in args:
+        return "scope is required"
+    entries = _parse_scope(source, event, args["scope"])
+    if isinstance(entries, str):
+        return entries
     if scope_match == "contains" and len(entries) != 1:
         return "scope_match 'contains' takes exactly one scope entry"
     if trigger_scope(source, event).is_group and len(entries) < 2:
         return "a group DM scope names at least two people besides you"
-    # A saved scope keeps its operator unless the call changes the scope, so an
-    # unrelated update renders the same prompt.
-    if "scope" in args or "scope_match" in args or "scopeOperator" not in fields:
-        fields["scopeOperator"] = _scope_operator(source, event, entries, cast(str, scope_match))
+    fields["scope"] = ", ".join(entries)
+    fields["scopeOperator"] = _scope_operator(source, event, entries, cast(str, scope_match))
 
     event_spec = trigger_event(source, event)
     if "target" in args:
@@ -892,6 +909,50 @@ def build_trigger_config(
         if isinstance(conditions, str):
             return conditions
         fields["conditions"] = conditions
+    return {**fields, "source": source, "event": event}
+
+
+def build_trigger_config(
+    args: Mapping[str, object],
+    *,
+    current: TriggerConfig | None,
+    worker_defaults: TriggerWorkerConfig,
+) -> TriggerConfig | str:
+    """The trigger a create or update call describes, or the reason it is invalid.
+
+    A create builds its search from the provider's empty form, as the web form does. An
+    update keeps the saved search unless the call passes a whole new one (see
+    :func:`triggered_task_call_error`), which is built the same way, so the approval can
+    compile it from the call alone. Link-back, where matches go and the worker settings
+    change only when the call passes them.
+
+    :param args: Parsed tool arguments, e.g. ``{"provider": "jira", "scope": ["ES"], ...}``.
+    :param current: The task's saved trigger on update, ``None`` on create.
+    :param worker_defaults: Worker settings for a create; an update keeps ``current``'s.
+    :returns: The complete trigger, or an error message.
+    """
+    worker: TriggerWorkerConfig = {
+        **(current["worker"] if current is not None else worker_defaults)
+    }
+    fields: dict[str, Any]
+    if current is None or any(key in args for key in SEARCH_ARGUMENTS):
+        partial = _partial_search_error(args) if current is not None else None
+        if partial is not None:
+            return partial
+        search = _build_search(args)
+        if isinstance(search, str):
+            return search
+        fields = search
+        if current is not None:
+            for key in ("linkBack", "linkBackTouched", "taskSessionMode"):
+                if key in current:
+                    fields[key] = current[key]
+                else:
+                    fields.pop(key, None)
+    else:
+        fields = dict(current)
+    source = cast(Any, fields["source"])
+    event = cast(str, fields["event"])
 
     instructions = args.get("instructions", fields.get("instructions", ""))
     if not isinstance(instructions, str) or not instructions.strip():
@@ -969,8 +1030,9 @@ def triggered_task_view(task: Mapping[str, Any], config: TriggerConfig) -> dict[
         "scope": _scope_entries(config["scope"]),
         "scope_match": "contains" if config.get("scopeOperator") == "contains" else "exact",
     }
-    if "target" in config:
-        view["target"] = config["target"]
+    if trigger_event(config["source"], config["event"]).target is not None:
+        # The form can save no target, which watches anyone; '' restates that.
+        view["target"] = config.get("target") or ""
     view.update(
         {
             "conditions": [

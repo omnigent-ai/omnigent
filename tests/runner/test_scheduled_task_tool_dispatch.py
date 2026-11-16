@@ -1093,9 +1093,13 @@ class _TaskServer:
         info: dict[str, object] | None = None,
         info_status: int = 200,
         tasks: list[dict[str, object]] | None = None,
+        paged: bool = True,
+        task_status: int = 200,
     ) -> None:
         self.info = {**_TRIGGER_INFO, **(info or {})}
         self.info_status = info_status
+        self.paged = paged
+        self.task_status = task_status
         self.tasks: dict[str, dict[str, object]] = {str(t["id"]): t for t in tasks or []}
         self.calls: list[tuple[str, str, dict[str, object] | None]] = []
         self.headers: list[dict[str, str] | None] = []
@@ -1112,7 +1116,8 @@ class _TaskServer:
             return _Resp(status_code=self.info_status, body=self.info)
         if url == "/v1/scheduled-tasks":
             tasks = list(self.tasks.values())
-            if not params or "limit" not in params:
+            # An older server ignores limit and sends every task, without a cursor.
+            if not params or "limit" not in params or not self.paged:
                 return _Resp(body={"scheduled_tasks": tasks})
             # Pages by position; the cursor is the index of the next task.
             start = int(params.get("after", 0))
@@ -1124,6 +1129,8 @@ class _TaskServer:
                 }
             )
         task = self._task(url)
+        if task and self.task_status >= 400:
+            return _Resp(status_code=self.task_status, body={"detail": "unavailable"})
         return _Resp(body=task) if task else _Resp(status_code=404, body={"detail": "not found"})
 
     async def post(
@@ -1321,6 +1328,9 @@ async def test_triggered_task_update_rerenders_from_the_saved_trigger() -> None:
             "triggered_task_id": _TASK_ID,
             "instructions": "Fix the ticket.",
             "permission_mode": "acceptEdits",
+            "provider": "jira",
+            "event": "created",
+            "scope": ["ES"],
             "conditions": [{"field": "priority", "operator": "is", "value": "High"}],
             "state": "paused",
         },
@@ -1354,7 +1364,9 @@ async def test_triggered_task_update_to_another_provider_starts_its_session_over
             "instructions": "Investigate the issue.",
             "permission_mode": "acceptEdits",
             "provider": "linear",
+            "event": "created",
             "scope": ["ENG"],
+            "conditions": [],
             "name": "Triage ENG",
         },
     )
@@ -1393,6 +1405,50 @@ async def test_triggered_task_update_requires_the_review_fields() -> None:
     out = await _run(server, "sys_triggered_task_update", {"triggered_task_id": _TASK_ID})
     assert "Missing review fields (instructions, permission_mode)" in str(out["error"])
     assert server.mutations() == ["POST"]
+
+
+@pytest.mark.asyncio
+async def test_triggered_task_list_reads_an_older_servers_whole_list() -> None:
+    server = _TaskServer(paged=False)
+    await _run(server, "sys_triggered_task_create", _JIRA_TRIGGER)
+    out = await _run(server, "sys_triggered_task_list", {"limit": 1})
+    assert [task["triggered_task_id"] for task in out["triggered_tasks"]] == [_TASK_ID]
+    assert out["next_cursor"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool", ["sys_triggered_task_update", "sys_triggered_task_delete"])
+async def test_triggered_task_changes_stop_when_the_task_cant_be_read(tool: str) -> None:
+    server = _TaskServer()
+    await _run(server, "sys_triggered_task_create", _JIRA_TRIGGER)
+    server.task_status = 503
+    args: dict[str, object] = {"triggered_task_id": _TASK_ID}
+    if tool == "sys_triggered_task_update":
+        args.update(
+            instructions="Investigate the ticket.", permission_mode="acceptEdits", state="paused"
+        )
+    out = await _run(server, tool, args)
+    assert out["error"] == "server returned 503"
+    assert server.mutations() == ["POST"]
+
+
+@pytest.mark.asyncio
+async def test_triggered_task_update_refuses_part_of_a_search_before_any_request() -> None:
+    server = _TaskServer()
+    await _run(server, "sys_triggered_task_create", _JIRA_TRIGGER)
+    calls = len(server.calls)
+    out = await _run(
+        server,
+        "sys_triggered_task_update",
+        {
+            "triggered_task_id": _TASK_ID,
+            "instructions": "Investigate the ticket.",
+            "permission_mode": "acceptEdits",
+            "scope": ["OPS"],
+        },
+    )
+    assert "pass the whole search: add provider, event, conditions" in str(out["error"])
+    assert len(server.calls) == calls
 
 
 @pytest.mark.asyncio

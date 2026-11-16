@@ -575,35 +575,55 @@ def _reminder_review(args: dict[str, object]) -> PolicyResponse:
     }
 
 
+def _triggered_task_settings(settings: dict[str, object]) -> str:
+    """``key=value`` pairs for every task setting, each value JSON-encoded and in full.
+
+    Unlike :func:`_scheduled_task_settings`, nothing is shortened: a workspace path or an
+    MCP service list decides where unattended sessions run and what they can reach.
+    """
+    keys = [key for key in _SCHEDULED_TASK_SETTINGS if key in settings]
+    keys += sorted(key for key in settings if key not in _SCHEDULED_TASK_SETTINGS)
+    return ", ".join(f"{key}={_json.dumps(settings[key], ensure_ascii=False)}" for key in keys)
+
+
+def _worker_permission(worker_mode: str, task_mode: object) -> str:
+    """How a review names the permission mode of the sessions a trigger starts.
+
+    A session the task's run starts without its own mode gets the task's, even a mode
+    that skips approval, which a session create can't name itself.
+    """
+    if worker_mode:
+        return worker_mode
+    if task_mode is None:
+        return "agent default"
+    return f"the task's mode: {_permission_setting(task_mode)}"
+
+
 def _triggered_task_review(args: dict[str, object], *, action: str) -> PolicyResponse:
     """ASK to create or change a triggered task, showing its trigger and instructions in full.
 
-    A create is checked as the runner will build it, so an invalid trigger is refused
-    before anyone is asked to approve it, and the sessions' inherited settings are shown.
+    The trigger is built as the runner will build it, so a call the runner would refuse
+    is denied before anyone is asked. A create, or an update that passes a new search,
+    shows the search the poller will run and the sessions' settings.
     """
     from omnigent.tools.builtins.trigger_prompts import describe_trigger_watch
     from omnigent.tools.builtins.triggered_tasks import (
+        SEARCH_ARGUMENTS,
         TRIGGER_ARGUMENTS,
         build_trigger_config,
         default_worker,
         describe_trigger_arguments,
-        triggered_task_review_error,
+        triggered_task_call_error,
     )
 
-    error = triggered_task_review_error(args, action=action, require_complete=False)
+    error = triggered_task_call_error(args, action=action)
     if error:
         return {"result": "DENY", "reason": f"Cannot {action} a triggered task. {error}"}
-    sessions = ""
-    if action == "update" and "worker" not in args:
-        sessions = (
-            "sessions that run the task's own agent switch to the new agent_id with these "
-            "model, effort and mode settings; sessions with their own agent are unchanged"
-            if "agent_id" in args
-            else "unchanged"
-        )
-    # The compiled search the poller runs, e.g. its JQL; an update can't know it here.
+    task_mode = args.get("permission_mode")
     watch = ""
-    if action == "create":
+    sessions = ""
+    if action == "create" or any(key in args for key in SEARCH_ARGUMENTS):
+        # An update's new search is built from the call alone, so it compiles here too.
         config = build_trigger_config(
             args,
             current=None,
@@ -611,32 +631,47 @@ def _triggered_task_review(args: dict[str, object], *, action: str) -> PolicyRes
                 execution_target=args.get("execution_target"),
                 model_override=args.get("model_override"),
                 reasoning_effort=args.get("reasoning_effort"),
-                permission_mode=args.get("permission_mode"),
+                permission_mode=task_mode,
                 worker_permission_modes=True,
             ),
         )
         if isinstance(config, str):
-            return {"result": "DENY", "reason": f"Cannot create a triggered task. {config}"}
+            return {"result": "DENY", "reason": f"Cannot {action} a triggered task. {config}"}
         watch = f"{describe_trigger_watch(config)}\n"
-        worker = config["worker"]
-        sessions = (
-            f"agent={worker['agentId'] or 'same as the task'}, "
-            f"model={worker['model'] or 'agent default'}, "
-            f"reasoning_effort={worker['effort'] or 'default'}, "
-            f"permission_mode={worker.get('permissionMode') or 'agent default'}, "
-            f"placement={worker['placement']}, "
-            + (
-                "each match starts its own session"
-                if config.get("taskSessionMode") != "continue"
-                else "every match goes to one task session"
+        if action == "create":
+            worker = config["worker"]
+            sessions = (
+                f"agent={worker['agentId'] or 'same as the task'}, "
+                f"model={worker['model'] or 'agent default'}, "
+                f"reasoning_effort={worker['effort'] or 'default'}, "
+                "permission_mode="
+                f"{_worker_permission(worker.get('permissionMode') or '', task_mode)}, "
+                f"placement={worker['placement']}, "
+                + (
+                    "each match starts its own session"
+                    if config.get("taskSessionMode") != "continue"
+                    else "every match goes to one task session"
+                )
             )
+    if action == "update":
+        if "worker" in args:
+            sessions = "the worker settings below change"
+        elif "agent_id" in args:
+            sessions = (
+                "sessions that run the task's own agent switch to the new agent_id with "
+                "these model, effort and mode settings; sessions with their own agent are "
+                "unchanged"
+            )
+        else:
+            sessions = "unchanged"
+        sessions += (
+            "; any without their own permission mode use the task's mode: "
+            f"{_permission_setting(task_mode)}"
         )
-    elif "worker" in args:
-        sessions = "worker settings below"
     subject = (
-        f"triggered task {_clip(str(args.get('name') or '(unnamed)'))!r}"
+        f"triggered task {_clip(str(args.get('name')))!r}"
         if action == "create"
-        else f"triggered task {_clip(str(args.get('triggered_task_id') or '(no id)'))}"
+        else f"triggered task {_clip(str(args.get('triggered_task_id')))}"
     )
     trigger = describe_trigger_arguments(args)
     task_settings = {
@@ -644,20 +679,19 @@ def _triggered_task_review(args: dict[str, object], *, action: str) -> PolicyRes
         for key, value in args.items()
         if key not in TRIGGER_ARGUMENTS and key != "instructions"
     }
-    settings = _scheduled_task_settings(task_settings, skip="instructions")
-    instructions = args.get("instructions", "(unchanged; not supplied)")
+    settings = _triggered_task_settings(task_settings)
     return {
         "result": "ASK",
         "reason": (
             f"Agent wants to {action} {subject}. It starts a session, unattended, for "
             "each new matching item and posts with your accounts.\n"
-            f"Task permission setting: {_permission_setting(args.get('permission_mode'))}\n"
+            f"Task permission setting: {_permission_setting(task_mode)}\n"
             f"Sessions it starts: {sessions}\n"
             f"Settings: {settings or '(none)'}\n"
             f"{watch}"
             + ("Trigger:\n" + "\n".join(trigger) if trigger else "Trigger: unchanged")
             + "\nFull instructions for each session:\n"
-            f"{instructions}\n"
+            f"{args['instructions']}\n"
             "Approve?"
         ),
     }
