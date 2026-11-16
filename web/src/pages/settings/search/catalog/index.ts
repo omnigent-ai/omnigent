@@ -3,8 +3,10 @@
 
 import type { SettingsSectionId } from "@/shell/settingsNav";
 
+import { CLI_SETTINGS } from "./cli";
 import { IMPORT_SETTINGS } from "./import";
 import type { SettingsEntry } from "./types";
+import { UPDATES_SETTINGS } from "./updates";
 
 export const SECTION_CATALOGS: Readonly<Record<SettingsSectionId, readonly SettingsEntry[]>> = {
   appearance: [],
@@ -22,8 +24,8 @@ export const SECTION_CATALOGS: Readonly<Record<SettingsSectionId, readonly Setti
   policies: [],
   sharing: [],
   archived: [],
-  cli: [],
-  updates: [],
+  cli: CLI_SETTINGS,
+  updates: UPDATES_SETTINGS,
 };
 
 export const SETTINGS_ENTRIES: readonly SettingsEntry[] = Object.values(SECTION_CATALOGS).flat();
