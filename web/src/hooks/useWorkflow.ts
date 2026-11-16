@@ -5,7 +5,7 @@ import { authenticatedFetch } from "@/lib/identity";
 import type { JournalEntry, JournalPlanStep } from "@/lib/sessionJournal";
 import type { WorkflowRun } from "@/lib/workflowRuns";
 import type { WorkflowStep } from "@/lib/workflowGraphLayout";
-import { apiErrorFromResponse } from "@/lib/sessionsApi";
+import { ApiError, apiErrorFromResponse } from "@/lib/sessionsApi";
 
 /** A saved workflow with its steps, as `GET /v1/workflows/{id}` returns it. */
 export interface WorkflowDetail extends SavedWorkflow {
@@ -73,6 +73,38 @@ export function useCreateWorkflowDraft() {
   return useMutation({
     mutationFn: (draft: { name: string; description: string }) =>
       writeWorkflow("/v1/workflows", "POST", { ...draft, steps: [] }),
+    onSuccess,
+  });
+}
+
+/** Copy the saved plan into a new workflow, without its planning chat or runs. */
+export function useCloneWorkflow() {
+  const onSuccess = useWorkflowSaved();
+  return useMutation({
+    mutationFn: async (workflowId: string) => {
+      const res = await authenticatedFetch(workflowPath(workflowId));
+      if (!res.ok) throw await apiErrorFromResponse(res);
+      const workflow = (await res.json()) as WorkflowDetail;
+      for (let copy = 1; ; copy += 1) {
+        const suffix = copy === 1 ? " (copy)" : ` (copy ${copy})`;
+        const name =
+          [...workflow.name]
+            .slice(0, 80 - suffix.length)
+            .join("")
+            .trimEnd() + suffix;
+        try {
+          // A name conflict must resolve before trying the next name.
+          // oxlint-disable-next-line no-await-in-loop
+          return await writeWorkflow("/v1/workflows", "POST", {
+            name,
+            description: workflow.description,
+            steps: workflow.steps,
+          });
+        } catch (error) {
+          if (!(error instanceof ApiError) || error.status !== 409) throw error;
+        }
+      }
+    },
     onSuccess,
   });
 }
