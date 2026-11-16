@@ -5990,6 +5990,30 @@ describe("chatStore — send while streaming (queueing)", () => {
     expect(errorBlocks[0]).toMatchObject({ code: "executor_error", message: "boom" });
   });
 
+  it.each(["session_recovery_failed", "executor_error"])(
+    "supersedes the disconnect only for automatic resume exhaustion, received %s",
+    (code) => {
+      useChatStore.setState({
+        conversationId: "conv_abc",
+        sessionStatus: "running",
+        blocks: [],
+      });
+      for (const errorCode of ["runner_disconnected", code]) {
+        handleSessionEvent({
+          type: "session_status",
+          conversationId: "conv_abc",
+          status: "failed",
+          responseId: "resp_interrupted",
+          error: { code: errorCode, message: errorCode },
+        });
+      }
+      const errors = useChatStore.getState().blocks.filter((block) => block.type === "error");
+      expect(errors.map((block) => block.code)).toEqual(
+        code === "session_recovery_failed" ? [code] : ["runner_disconnected", code],
+      );
+    },
+  );
+
   it("stops reporting a status-only relaunch failure as the latest error after a resume", () => {
     // A failed resume, then a successful one that adds no items.
     useChatStore.setState({

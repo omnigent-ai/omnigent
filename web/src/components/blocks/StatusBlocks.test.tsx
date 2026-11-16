@@ -693,6 +693,16 @@ describe("ErrorBanner", () => {
     await waitFor(() => expect(onRetry).toHaveBeenCalledWith(relatedDisconnect));
   });
 
+  it("shows the final automatic resume guidance without a manual resume action", () => {
+    const message = "Automatic resume failed. Please send a new message to continue.";
+    render(
+      <ErrorBanner message={message} source="" code="session_recovery_failed" onRetry={vi.fn()} />,
+    );
+    expect(screen.getByTestId("error-headline")).toHaveTextContent(message);
+    expect(screen.queryByRole("button", { name: "Resume session" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+  });
+
   it("retries classified rate-limit errors and preserves the provider's details", async () => {
     let resolveRetry: (() => void) | undefined;
     const onRetry = vi.fn(

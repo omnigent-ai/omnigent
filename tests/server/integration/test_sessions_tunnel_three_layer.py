@@ -3054,3 +3054,8 @@ async def test_root_reconnect_requires_provider_opt_in_before_suppressing_legacy
         expected = provider_enabled and host_capability is not False and recovery_pending
         assert spy.call_args.kwargs["suppress_recovery_turn"] is expected
         assert (store.get_session_recovery(session_id) is not None) is recovery_pending
+        from omnigent.server.routes._sessions import orchestration
+
+        probe = orchestration._relay_turn_held_for_host
+        assert probe is not None
+        assert await probe(_RUNNER_ID, session_id) is expected
