@@ -165,6 +165,54 @@ describe("PoliciesPage list", () => {
   });
 });
 
+describe("PoliciesPage Settings rows", () => {
+  it("renders the add and list rows, and each policy's actions, from their Settings catalog entries", async () => {
+    setPolicies([policy({ id: "p1", name: "block_canada", enabled: true })]);
+    renderPage();
+    await screen.findByText("block_canada");
+
+    expect(document.querySelector('[data-settings-item="policies-add"]')).not.toBeNull();
+    expect(document.querySelector('[data-settings-item="policies-list"]')).not.toBeNull();
+    expect(
+      document.querySelector('[data-settings-region="policies-list:policies"]'),
+    ).not.toBeNull();
+    const card = screen.getByText("block_canada").closest("[data-settings-region-row]");
+    expect(card?.querySelector('[data-settings-row-action="toggle"]')).not.toBeNull();
+    expect(card?.querySelector('[data-settings-row-action="remove"]')).not.toBeNull();
+  });
+
+  it("names the Add dialog's filter, policy name and submit from their entries", async () => {
+    vi.mocked(policies.usePolicyRegistry).mockReturnValue({
+      data: [
+        {
+          handler: "omnigent.policies.block_canada",
+          kind: "callable",
+          name: "Block Canada",
+          description: "Deny anything mentioning Canada.",
+          params_schema: null,
+        },
+      ],
+    } as never);
+    renderPage();
+    await screen.findByText(/No global policies configured/);
+    fireEvent.click(screen.getByRole("button", { name: /Add policy/ }));
+    const dialog = await screen.findByRole("dialog");
+    expect(dialog.getAttribute("data-settings-overlay-owner")).toBe("policies-add:add");
+    expect(within(dialog).getByRole("textbox", { name: "Filter policies" })).toBeInTheDocument();
+    expect(
+      dialog.querySelector('[data-settings-row-action="choose"][data-settings-region-row]'),
+    ).not.toBeNull();
+
+    fireEvent.click(within(dialog).getByText("Block Canada"));
+    expect(within(dialog).getByRole("textbox", { name: "Policy name" })).toHaveValue(
+      "block_canada",
+    );
+    expect(
+      within(dialog).getByRole("button", { name: "Add" }).getAttribute("data-settings-control"),
+    ).toBe("policies-add:submit");
+  });
+});
+
 describe("PoliciesPage actions", () => {
   it("toggling a policy's switch fires the update mutation with the new state", async () => {
     setPolicies([policy({ id: "p1", name: "block_canada", enabled: true })]);
