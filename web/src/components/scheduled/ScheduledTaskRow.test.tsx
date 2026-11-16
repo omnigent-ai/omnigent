@@ -1,5 +1,5 @@
 // Tests for ScheduledTaskRow: the server-sourced next-run text and the ⋯ menu
-// actions (Run now / Pause-Resume / Edit / Delete) dispatching their callbacks.
+// actions (Run now / Pause-Resume / Edit / Share / Delete) dispatching their callbacks.
 //
 // The row is fully props-driven, so these render it directly with a built task
 // object — no hook mocking needed. The ⋯ menu is a Radix dropdown; opening it
@@ -9,6 +9,7 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ScheduledTaskRow } from "./ScheduledTaskRow";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import type * as RoutingModule from "@/lib/routing";
@@ -80,7 +81,9 @@ function renderRow(
       }}
     >
       <MemoryRouter>
-        <ScheduledTaskRow {...props} />
+        <TooltipProvider>
+          <ScheduledTaskRow {...props} />
+        </TooltipProvider>
       </MemoryRouter>
     </CapabilitiesProvider>,
   );
@@ -128,6 +131,31 @@ describe("⋯ menu actions", () => {
     expect(runNow).toBeInTheDocument();
     fireEvent.click(runNow);
     expect(onRunNow).toHaveBeenCalledWith(t);
+  });
+
+  it("offers Share only when the page passes onShare, and dispatches it", () => {
+    const onShare = vi.fn();
+    const t = task();
+    renderRow(t, { onShare });
+    fireEvent.pointerDown(screen.getByTestId("task-row-menu"), { button: 0 });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Share" }));
+    expect(onShare).toHaveBeenCalledWith(t);
+
+    cleanup();
+    renderRow(t);
+    fireEvent.pointerDown(screen.getByTestId("task-row-menu"), { button: 0 });
+    expect(screen.getByTestId("task-edit")).toBeInTheDocument();
+    expect(screen.queryByTestId("task-share")).toBeNull();
+  });
+
+  it("shows Share disabled, without dispatching, when given a reason", () => {
+    const onShare = vi.fn();
+    renderRow(task(), { onShare, shareDisabledReason: "Sharing is off." });
+    fireEvent.pointerDown(screen.getByTestId("task-row-menu"), { button: 0 });
+    const share = screen.getByRole("menuitem", { name: "Share" });
+    expect(share).toHaveAttribute("aria-disabled", "true");
+    fireEvent.click(share);
+    expect(onShare).not.toHaveBeenCalled();
   });
 
   it("disables the menu trigger while the row is busy", () => {

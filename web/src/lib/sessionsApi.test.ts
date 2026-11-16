@@ -348,6 +348,7 @@ describe("createSession", () => {
     await createSession("agent_xyz", [], {
       projectId: "proj_tests",
       hostId: "host_1",
+      workflowId: "0123456789abcdef0123456789abcdef",
       workspace: "/home/you/project",
       labels: { "omnigent.ui": "terminal" },
       terminalLaunchArgs: ["--permission-mode", "plan"],
@@ -362,6 +363,7 @@ describe("createSession", () => {
       project_id: "proj_tests",
       git: null,
       host_id: "host_1",
+      workflow_id: "0123456789abcdef0123456789abcdef",
       workspace: "/home/you/project",
       labels: { "omnigent.ui": "terminal" },
       terminal_launch_args: ["--permission-mode", "plan"],
@@ -394,6 +396,7 @@ describe("createSession", () => {
         hostId: "0123456789abcdef0123456789abcdef",
       },
       initialInput: firstMessage,
+      workflowId: "0123456789abcdef0123456789abcdef",
     });
     await createSession("agent_xyz", [], { sandbox: { provider: null, workspaces: [] } });
 
@@ -413,6 +416,7 @@ describe("createSession", () => {
       workspaces: ["https://github.com/example/app#main"],
       host_id: "0123456789abcdef0123456789abcdef",
       initial_input: firstMessage,
+      workflow_id: "0123456789abcdef0123456789abcdef",
     });
     // No provider leaves the choice to the server; no repositories is an empty workspace.
     expect(bodies[1]).toEqual({

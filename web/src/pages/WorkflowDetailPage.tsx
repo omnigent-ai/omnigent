@@ -474,7 +474,9 @@ function WorkflowRunRow({
   const progress = useMemo(() => runStepProgress(run, sessionWorking), [run, sessionWorking]);
   // Stop while the run's session works; play once it stopped with tasks left.
   const canAct = run.isCurrent && !run.archived;
-  const control = canAct ? planRunControl(progress, run.statuses, sessionWorking) : null;
+  const control = canAct
+    ? planRunControl(progress, run.statuses, sessionWorking, run.planGraphRevision)
+    : null;
   const refreshKeys = [["workflow-runs", workflowId]];
   const taskMenus = useRunTaskMenus(canAct ? run.sessionId : null, refreshKeys, run.id);
   const [graphOpen, setGraphOpen] = useState(false);

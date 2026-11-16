@@ -14,6 +14,7 @@ import sqlalchemy as sa
 from omnigent.db import current_query_name
 from omnigent.db.compression import EncryptedTextPayload, decode, encode_encrypted
 from omnigent.db.db_models import MAX_STORED_VALUE_BYTES, SqlSessionJournalEntry
+from omnigent.db.utils import get_or_create_engine, shared_read_scope
 from omnigent.entities import MessageData, NewConversationItem
 from omnigent.entities.session_journal import (
     InvalidJournalEntryError,
@@ -105,7 +106,11 @@ def test_appends_take_consecutive_positions_and_plans_count_versions(
     assert [first.entry.position, status.entry.position, second.entry.position] == [1, 2, 3]
     assert first.entry.content["version"] == 1 and second.entry.content["version"] == 2
     assert first.entry.step is None and first.entry.content["source"] == "agent"
-    assert status.entry.content == {"status": "done", "text": "p95 430 ms"}
+    assert status.entry.content == {
+        "status": "done",
+        "text": "p95 430 ms",
+        "graph_revision": first.entry.content["graph_revision"],
+    }
     assert status.entry.scheduled_task_run_id == RUN
     assert all(result.created for result in (first, status, second))
     assert len(status.entry.id) == 32 and status.entry.created_at > 0
@@ -114,6 +119,20 @@ def test_appends_take_consecutive_positions_and_plans_count_versions(
     current = journal.current_plan(SESSION)
     assert current is not None and current.id == second.entry.id
     assert current.content["version"] == 2
+    assert first.entry.content["graph_revision"] != second.entry.content["graph_revision"]
+    for index, starts_run in enumerate([False, False, True]):
+        saved = journal.append(
+            SESSION,
+            "plan",
+            {**_plan("goal", "opt", "baseline"), "name": "Saved workflow"},
+            idempotency_key=f"save:{index}",
+            workflow_id="a" * 32,
+            scheduled_task_run_id=RUN,
+            start_run=starts_run,
+        ).entry
+        assert (
+            saved.content["graph_revision"] != second.entry.content["graph_revision"]
+        ) == starts_run
 
 
 def test_a_retried_append_returns_the_first_attempts_entry(journal: SessionJournalStore) -> None:
@@ -505,6 +524,10 @@ def test_a_fork_carries_the_journal_and_continues_it(
         fork.id, "status", {"status": "started"}, idempotency_key="k3", step="video"
     )
     assert started.entry.position == 4
+    assert (
+        started.entry.content["graph_revision"]
+        == journal.current_plan(fork.id).content["graph_revision"]
+    )
     assert len(journal.list_entries(SESSION).entries) == 4
 
 
@@ -753,6 +776,76 @@ def test_a_workflows_runs_page_newest_first_across_sessions(
         assert deep_cost <= baseline_cost + 100, (baseline_cost, deep_cost)
 
 
+@pytest.mark.parametrize("encrypted", [False, True])
+def test_legacy_graph_revisions_ignore_saves_and_isolate_replans_and_invocations(
+    journal: SessionJournalStore, monkeypatch: pytest.MonkeyPatch, encrypted: bool
+) -> None:
+    if encrypted:
+        journal = _SealedJournal(journal.storage_location)
+    monkeypatch.setattr(session_journal_store, "JOURNAL_COPY_BATCH", 2)
+    first = journal.append(SESSION, "plan", _plan("a", "b"), idempotency_key="first").entry
+    for index in range(3):
+        saved = journal.append(
+            SESSION,
+            "plan",
+            {**_plan("b", "a"), "name": f"Renamed {index}"},
+            idempotency_key=f"save:{index}",
+            workflow_id=WORKFLOW,
+            start_run=False,
+        ).entry
+    changed_content = {
+        "name": "Changed dependencies",
+        "steps": [
+            {"id": "a", "name": "A"},
+            {"id": "b", "name": "B", "depends_on": ["a"]},
+        ],
+    }
+    changed = journal.append(SESSION, "plan", changed_content, idempotency_key="changed").entry
+    renamed = journal.append(
+        SESSION, "plan", {**changed_content, "name": "Renamed"}, idempotency_key="renamed"
+    ).entry
+    next_run = journal.append(
+        SESSION, "plan", changed_content, idempotency_key="next-run", workflow_id=WORKFLOW
+    ).entry
+    latest = journal.append(SESSION, "plan", changed_content, idempotency_key="latest").entry
+    assert journal.plan_graph_revisions([saved, renamed, latest]) == [
+        entry.content["graph_revision"] for entry in (first, changed, next_run)
+    ]
+
+    # Old journals lack revision IDs, including across later saves and invocations.
+    plans = journal.list_entries(SESSION, kind="plan").entries
+    with sa.create_engine(journal.storage_location).begin() as connection:
+        for plan in plans:
+            content = {
+                key: value for key, value in plan.content.items() if key != "graph_revision"
+            }
+            connection.execute(
+                sa.update(SqlSessionJournalEntry)
+                .where(SqlSessionJournalEntry.id == plan.id)
+                .values(content=journal._stored_contents([content])[0])
+            )
+    legacy = {entry.id: entry for entry in journal.list_entries(SESSION, kind="plan").entries}
+    transactions: list[object] = []
+
+    def capture(connection, _cursor, statement, _parameters, _context, _executemany):
+        if "session_journal_entries" in statement:
+            transaction = connection.get_transaction()
+            assert transaction is not None
+            transactions.append(transaction)
+
+    engine = get_or_create_engine(journal.storage_location)
+    sa.event.listen(engine, "before_cursor_execute", capture)
+    try:
+        with shared_read_scope():
+            assert journal.plan_graph_revisions(
+                [legacy[entry.id] for entry in (saved, renamed, latest, first)]
+            ) == [first.position, changed.position, next_run.position, first.position]
+    finally:
+        sa.event.remove(engine, "before_cursor_execute", capture)
+    assert len(transactions) > 4
+    assert len({id(transaction) for transaction in transactions}) == len(transactions)
+
+
 @pytest.mark.parametrize("next_workflow", [None, WORKFLOW, OTHER_WORKFLOW])
 def test_plan_step_statuses_reads_each_steps_newest_status(
     journal: SessionJournalStore, next_workflow: str | None
@@ -765,6 +858,7 @@ def test_plan_step_statuses_reads_each_steps_newest_status(
             SESSION, "status", {"status": status, "text": "x"}, idempotency_key=key, step=step
         )
     other = journal.append(OTHER, "plan", _plan("a"), idempotency_key="k4").entry
+    assert journal.run_latest_plans([plan, other]) == [plan, other]
 
     statuses = journal.plan_step_statuses([plan, other])
     assert [{step: e.content["status"] for step, e in s.items()} for s in statuses] == [
@@ -780,6 +874,11 @@ def test_plan_step_statuses_reads_each_steps_newest_status(
         idempotency_key="k5",
         workflow_id=next_workflow,
     ).entry
+    assert journal.run_latest_plans([plan, other, later]) == [
+        later if next_workflow is None else plan,
+        other,
+        later,
+    ]
     assert journal.plan_step_statuses([later]) == (
         [statuses[0]] if next_workflow is None else [{}]
     )
@@ -831,7 +930,9 @@ def test_an_automation_runs_start_plan_is_its_first(
         step="a",
         scheduled_task_run_id=RUN,
     )
-    journal.append(SESSION, "plan", content, idempotency_key="k2", scheduled_task_run_id=RUN)
+    replan = journal.append(
+        SESSION, "plan", content, idempotency_key="k2", scheduled_task_run_id=RUN
+    ).entry
     journal.append(
         SESSION,
         "status",
@@ -844,6 +945,7 @@ def test_an_automation_runs_start_plan_is_its_first(
 
     plans = journal.run_start_plans([(RUN, SESSION), (other_run, SESSION), (RUN, OTHER)])
     assert [plan.id if plan else None for plan in plans] == [first.id, None, None]
+    assert journal.run_latest_plans([first]) == [replan]
     assert journal.is_current_run(SESSION, first.id, RUN)
     assert not journal.is_current_run(OTHER, first.id, RUN)
     assert not journal.is_current_run(SESSION, MISSING, RUN)
@@ -884,6 +986,7 @@ def test_an_automation_runs_start_plan_is_its_first(
     second = journal.run_start_plans([(other_run, SESSION)])[0]
     assert second is not None
     assert second.content["steps"] == first.content["steps"]
+    assert journal.run_latest_plans([first, second]) == [replan, second]
     assert not journal.is_current_run(SESSION, first.id, RUN)
     assert journal.is_current_run(SESSION, second.id, other_run)
     with pytest.raises(StepNotReadyError, match="b waits on a"):
@@ -954,10 +1057,9 @@ def test_a_deployment_encrypts_content_a_batch_at_a_time(
         SESSION, "status", {"status": "done", "text": "ok"}, idempotency_key="k2", step="a"
     )
     sealed.calls.clear()
-    # The entry is encrypted before the lock; the plan and the dependency's newest
-    # status are each decrypted once.
+    # Revision metadata comes from the plan before encrypting the new status.
     sealed.append(SESSION, "status", {"status": "started"}, idempotency_key="k3", step="b")
-    assert sealed.calls == [("encrypt", 1), ("decrypt", 1), ("decrypt", 1)]
+    assert sealed.calls == [("decrypt", 1), ("decrypt", 1), ("encrypt", 1)]
 
     sealed.calls.clear()
     entries = sealed.list_entries(SESSION).entries

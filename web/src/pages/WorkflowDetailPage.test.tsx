@@ -143,7 +143,7 @@ function status(step: string, value: string): JournalEntry {
     step,
     author: { type: "agent" },
     kind: "status",
-    content: { status: value, text: "x" },
+    content: { status: value, text: "x", graph_revision: "graph-0" },
   };
 }
 
@@ -155,6 +155,7 @@ function run(
 ): WorkflowRun {
   return {
     id: `plan-${sessionId}`,
+    planGraphRevision: "graph-0",
     sessionId,
     title,
     startedAt: Date.parse("2026-11-12T15:04:00Z") / 1000,
@@ -466,6 +467,91 @@ describe("WorkflowDetailPage", () => {
     expect(within(background!).getByRole("button", { name: "Stop" })).toBeInTheDocument();
     expect(within(finished!).queryByTestId("plan-continue")).toBeNull();
     expect(within(finished!).queryByTestId("plan-stop")).toBeNull();
+  });
+
+  it("finishes a run when its final step is done despite earlier statuses and session activity", () => {
+    mockWorkflow({});
+    const completedRun: WorkflowRun = {
+      ...run("a".repeat(32), "Finished run", { done: 1, needsInput: 1 }, [
+        status("explore", "needs_input"),
+        { ...status("fix", "done"), position: 2 },
+      ]),
+      sessionStatus: "running",
+      backgroundWorkRunning: true,
+      planGraphRevision: "graph-0",
+    };
+    mockRuns([completedRun]);
+    const { rerender } = renderPage();
+    const row = screen.getByTestId("workflow-run");
+    expect(row).toHaveAttribute("data-run-state", "done");
+    expect(within(row).getByTestId("workflow-run-state")).toHaveTextContent("Done");
+    expect(within(row).queryByTestId("plan-continue")).toBeNull();
+    expect(within(row).queryByTestId("plan-stop")).toBeNull();
+    expect(screen.getByTestId("workflow-detail-run")).toBeEnabled();
+
+    mockRuns([
+      {
+        ...completedRun,
+        planGraphRevision: undefined,
+        progress: { total: 2, started: 0, done: 2, needsInput: 0, failed: 0 },
+        statuses: [status("explore", "done"), status("fix", "done")],
+      },
+    ]);
+    rerender(<WorkflowDetailPage />);
+    expect(row).toHaveAttribute("data-run-state", "running");
+    expect(within(row).getByRole("button", { name: "Stop" })).toBeInTheDocument();
+
+    mockRuns([
+      {
+        ...completedRun,
+        planGraphRevision: undefined,
+        sessionStatus: "idle",
+        backgroundWorkRunning: false,
+        steps: [
+          WORKFLOW.steps[0]!,
+          { id: "review", name: "Review", goal: null, depends_on: ["explore"] },
+          { ...WORKFLOW.steps[1]!, depends_on: ["review"] },
+        ],
+        progress: { total: 3, started: 0, done: 2, needsInput: 0, failed: 0 },
+        statuses: [status("explore", "done"), status("fix", "done")],
+      },
+    ]);
+    rerender(<WorkflowDetailPage />);
+    expect(row).toHaveAttribute("data-run-state", "stopped");
+    expect(within(row).getByRole("button", { name: "Continue the plan" })).toBeInTheDocument();
+
+    mockRuns([
+      {
+        ...completedRun,
+        planGraphRevision: "graph-2",
+        steps: [
+          WORKFLOW.steps[0]!,
+          { id: "review", name: "Review", goal: null, depends_on: ["explore"] },
+          { ...WORKFLOW.steps[1]!, depends_on: ["review"] },
+        ],
+        progress: { total: 3, started: 0, done: 2, needsInput: 0, failed: 0 },
+        statuses: [status("explore", "done"), status("fix", "done")],
+      },
+    ]);
+    rerender(<WorkflowDetailPage />);
+    expect(row).toHaveAttribute("data-run-state", "running");
+    expect(within(row).getByRole("button", { name: "Stop" })).toBeInTheDocument();
+
+    // A replan keeps the run's ID and can add work after its original last step.
+    mockRuns([
+      {
+        ...completedRun,
+        steps: [
+          ...completedRun.steps,
+          { id: "publish", name: "Publish", goal: null, depends_on: ["fix"] },
+        ],
+        progress: { total: 3, started: 1, done: 2, needsInput: 0, failed: 0 },
+        statuses: [status("explore", "done"), status("fix", "done"), status("publish", "started")],
+      },
+    ]);
+    rerender(<WorkflowDetailPage />);
+    expect(row).toHaveAttribute("data-run-state", "running");
+    expect(within(row).getByRole("button", { name: "Stop" })).toBeInTheDocument();
   });
 
   it.each([

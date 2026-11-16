@@ -11271,6 +11271,7 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
         FAMILY_PIN_LABEL_PREFIX,
         SCHEDULED_TASK_ACTIVITY_LABEL_KEY,
         SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY,
+        SCHEDULED_TASK_LAUNCH_LABEL_KEY,
         SCHEDULED_TASK_ORIGIN_LABEL_KEY,
         SCHEDULED_TASK_PENDING_RUN_LABEL_PREFIX,
         SCHEDULED_TASK_RUN_LABEL_KEY,
@@ -11293,6 +11294,8 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
         # Deleting a session also deletes the automation this label names.
         SCHEDULED_TASK_SOURCE_LABEL_KEY,
         SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY,
+        # Launches from a session carrying it are shared with that automation's grantees.
+        SCHEDULED_TASK_LAUNCH_LABEL_KEY,
         CREATED_BY_SESSION_LABEL_KEY,
     ):
         if key in labels:
