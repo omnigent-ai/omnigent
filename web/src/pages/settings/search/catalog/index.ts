@@ -3,9 +3,11 @@
 
 import type { SettingsSectionId } from "@/shell/settingsNav";
 
+import { ACCOUNT_SETTINGS } from "./account";
 import { ARCHIVED_SETTINGS } from "./archived";
 import { CLI_SETTINGS } from "./cli";
 import { IMPORT_SETTINGS } from "./import";
+import { MCP_SETTINGS } from "./mcp";
 import type { SettingsEntry } from "./types";
 import { UPDATES_SETTINGS } from "./updates";
 
@@ -16,10 +18,10 @@ export const SECTION_CATALOGS: Readonly<Record<SettingsSectionId, readonly Setti
   general: [],
   git: [],
   integrations: [],
-  mcp: [],
+  mcp: MCP_SETTINGS,
   shortcuts: [],
   import: IMPORT_SETTINGS,
-  account: [],
+  account: ACCOUNT_SETTINGS,
   admin: [],
   members: [],
   policies: [],

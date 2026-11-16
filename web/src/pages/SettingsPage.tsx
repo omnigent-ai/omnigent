@@ -105,6 +105,11 @@ import {
   settingsRowOverlayProps,
   settingsRuntimeChoiceProps,
 } from "@/pages/settings/search/settingsOwnership";
+import { MCP_SERVICES_ENTRY } from "@/pages/settings/search/catalog/mcp";
+import {
+  ACCOUNT_PASSWORD_ENTRY,
+  ACCOUNT_SIGN_OUT_ENTRY,
+} from "@/pages/settings/search/catalog/account";
 import { SessionTitleInstructionsControl } from "@/components/SessionTitleInstructionsControl";
 import { McpRegistryConnections } from "@/components/McpRegistry";
 import { ThemeColorPicker } from "@/components/theme/ThemeColorPicker";
@@ -425,17 +430,19 @@ export function SettingsPage() {
       {section === "git" && <GitSection />}
       {section === "integrations" && <IntegrationsSection />}
       {section === "mcp" && (
-        <Section title="MCP">
-          {info !== "loading" && info.enabled_connections?.includes("mcp") ? (
-            <McpRegistryConnections />
-          ) : (
-            <p className="text-sm text-muted-foreground">
-              {info === "loading"
-                ? "Loading MCP services…"
-                : "MCP services are not configured on this server."}
-            </p>
-          )}
-        </Section>
+        <SettingsItem entry={MCP_SERVICES_ENTRY}>
+          <Section title="MCP">
+            {info !== "loading" && info.enabled_connections?.includes("mcp") ? (
+              <McpRegistryConnections />
+            ) : (
+              <p className="text-sm text-muted-foreground">
+                {info === "loading"
+                  ? "Loading MCP services…"
+                  : "MCP services are not configured on this server."}
+              </p>
+            )}
+          </Section>
+        </SettingsItem>
       )}
       {section === "shortcuts" && <ShortcutsSection />}
       {section === "import" && <ImportSection />}
@@ -2944,26 +2951,32 @@ function AccountSection() {
           {/* Change password is accounts-only — an OIDC identity's password
               lives with the IdP, so there's nothing to change here. */}
           {accountsEnabled && (
+            <SettingsItem entry={ACCOUNT_PASSWORD_ENTRY}>
+              <Button
+                {...settingsControlProps(ACCOUNT_PASSWORD_ENTRY, "change")}
+                variant="ghost"
+                className="w-full justify-start gap-2"
+                onClick={() => {
+                  resetPwForm();
+                  setPwOpen(true);
+                }}
+                componentId="settings.account.change_password"
+              >
+                <KeyRoundIcon className="size-4" /> Change password
+              </Button>
+            </SettingsItem>
+          )}
+          <SettingsItem entry={ACCOUNT_SIGN_OUT_ENTRY}>
             <Button
+              {...settingsControlProps(ACCOUNT_SIGN_OUT_ENTRY, "signOut")}
               variant="ghost"
               className="w-full justify-start gap-2"
-              onClick={() => {
-                resetPwForm();
-                setPwOpen(true);
-              }}
-              componentId="settings.account.change_password"
+              onClick={() => void onSignOut()}
+              componentId="settings.account.sign_out"
             >
-              <KeyRoundIcon className="size-4" /> Change password
+              <LogOutIcon className="size-4" /> Sign out
             </Button>
-          )}
-          <Button
-            variant="ghost"
-            className="w-full justify-start gap-2"
-            onClick={() => void onSignOut()}
-            componentId="settings.account.sign_out"
-          >
-            <LogOutIcon className="size-4" /> Sign out
-          </Button>
+          </SettingsItem>
         </div>
       </div>
 
@@ -2974,7 +2987,7 @@ function AccountSection() {
           if (!open) resetPwForm();
         }}
       >
-        <DialogContent>
+        <DialogContent {...settingsOverlayProps(ACCOUNT_PASSWORD_ENTRY, "change")}>
           <DialogHeader>
             <DialogTitle>Change password</DialogTitle>
             <DialogDescription>
@@ -2993,6 +3006,7 @@ function AccountSection() {
               }}
             >
               <Input
+                {...settingsControlProps(ACCOUNT_PASSWORD_ENTRY, "currentPassword")}
                 type="password"
                 autoComplete="current-password"
                 placeholder="Current password"
@@ -3002,6 +3016,7 @@ function AccountSection() {
                 required
               />
               <Input
+                {...settingsControlProps(ACCOUNT_PASSWORD_ENTRY, "newPassword")}
                 type="password"
                 autoComplete="new-password"
                 placeholder="New password"
@@ -3011,6 +3026,7 @@ function AccountSection() {
                 required
               />
               <Input
+                {...settingsControlProps(ACCOUNT_PASSWORD_ENTRY, "confirmPassword")}
                 type="password"
                 autoComplete="new-password"
                 placeholder="Confirm new password"
@@ -3029,6 +3045,11 @@ function AccountSection() {
               )}
               <DialogFooter>
                 <Button
+                  {...settingsControlProps(
+                    ACCOUNT_PASSWORD_ENTRY,
+                    "submit",
+                    pwBusy ? { alternative: "busy" } : undefined,
+                  )}
                   type="submit"
                   disabled={
                     pwBusy || oldPw.length === 0 || newPw.length === 0 || confirmPw.length === 0
@@ -3043,7 +3064,12 @@ function AccountSection() {
 
           {pwDone && (
             <DialogFooter>
-              <Button onClick={() => setPwOpen(false)}>Done</Button>
+              <Button
+                {...settingsControlProps(ACCOUNT_PASSWORD_ENTRY, "done")}
+                onClick={() => setPwOpen(false)}
+              >
+                Done
+              </Button>
             </DialogFooter>
           )}
         </DialogContent>

@@ -1760,6 +1760,22 @@ describe("SettingsPage", () => {
     expect(row.querySelector('[data-settings-row-action="unarchive"]')).not.toBeNull();
   });
 
+  it("renders the Account rows and the password dialog from their Settings catalog entries", async () => {
+    renderPage("/settings/account");
+    await screen.findByRole("button", { name: "Sign out" });
+    expect(document.querySelector('[data-settings-item="account-sign-out"]')).not.toBeNull();
+    expect(
+      document.querySelector('[data-settings-control="account-password:change"]'),
+    ).not.toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Change password" }));
+    expect(
+      document.querySelector('[data-settings-control="account-password:currentPassword"]'),
+    ).not.toBeNull();
+    expect(
+      document.querySelector('[data-settings-control="account-password:submit"]'),
+    ).not.toBeNull();
+  });
+
   it("lists archived sessions and unarchives on click", () => {
     mocks.conversations = [
       conv("conv_active"),
