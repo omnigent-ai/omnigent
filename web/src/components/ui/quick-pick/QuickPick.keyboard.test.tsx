@@ -258,6 +258,15 @@ describe("QuickPick other navigation keys", () => {
     expect(active()).toBe("s1");
   });
 
+  it("leave Shift+Home and Shift+End to the text field, so they select the query", () => {
+    const { press, active } = renderPicker();
+    expect(press("End", { shiftKey: true })).toBe(true);
+    expect(active()).toBe("s1");
+    press("End");
+    expect(press("Home", { shiftKey: true })).toBe(true);
+    expect(active()).toBe("a2");
+  });
+
   it("page by the rows that fit, ten without a layout, without wrapping", () => {
     const many = Array.from({ length: 15 }, (_, index) => item(`row-${index}`));
     const { press, active } = renderPicker([{ sourceId: "s", ranking: "client", items: many }]);

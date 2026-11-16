@@ -158,6 +158,7 @@ export function QuickPick<Value>({
     // Keys that drive an IME composition, including its Enter, belong to the composition.
     if (isImeCompositionKeyEvent(event)) return;
     // Meta jumps to the ends and Alt between groups, as in the command menu this replaces.
+    // Shift+Home/End stay with the text field, so they still select the query.
     const arrow = (forward: boolean): QuickPickNavigation =>
       event.metaKey
         ? { type: forward ? "last" : "first" }
@@ -169,9 +170,9 @@ export function QuickPick<Value>({
         ? arrow(true)
         : event.key === "ArrowUp"
           ? arrow(false)
-          : event.key === "Home"
+          : event.key === "Home" && !event.shiftKey
             ? { type: "first" }
-            : event.key === "End"
+            : event.key === "End" && !event.shiftKey
               ? { type: "last" }
               : event.key === "PageDown"
                 ? { type: "pageDown", pageSize: pageSize() }
