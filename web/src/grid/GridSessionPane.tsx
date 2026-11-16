@@ -43,11 +43,6 @@ import {
   nativeCodingAgentForHarness,
   nativeCodingAgentForSubagentWrapper,
 } from "@/lib/nativeCodingAgents";
-import {
-  compactModelTriggerLabel,
-  formatStatusEffortLabel,
-  formatStatusModelLabel,
-} from "@/lib/composerModelLabel";
 import { permissionChip, permissionChipKind } from "@/lib/permissionModeCycle";
 import { isOwnerLevel } from "@/lib/permissionsApi";
 import type { Session } from "@/lib/types";
@@ -495,7 +490,7 @@ export function GridSessionPane({
                         />
                       </>
                     ),
-                    trailing: session && <GridModelStatus session={session} />,
+                    trailing: session && <GridHarnessStatus session={session} />,
                   }}
                 />
               </RenderErrorBoundary>
@@ -673,38 +668,25 @@ function GridPermissionPicker({
   );
 }
 
-/** The cell session's harness, model and effort, read-only; switch models full screen. */
-function GridModelStatus({ session }: { session: Session }) {
-  // Live state first: the snapshot misses picks made full screen or in the terminal.
-  const state = useConversationEntryState(session.id);
-  const harness = state.sessionHarness ?? session.harness ?? null;
-  const agent = nativeCodingAgentForHarness(harness);
-  const options = state.codexModelOptions.length
-    ? state.codexModelOptions
-    : (session.codexModelOptions ?? []);
-  const model =
-    state.llmModel ?? state.sessionModelOverride ?? session.llmModel ?? session.modelOverride;
-  const harnessLabel = agent?.displayName ?? session.agentName ?? "Session";
-  const modelLabel = formatStatusModelLabel(model ?? null, options);
-  const effortLabel = formatStatusEffortLabel(
-    state.sessionReasoningEffort ?? session.reasoningEffort ?? null,
-  );
-  const summary = [harnessLabel, modelLabel, effortLabel].filter(Boolean).join(" · ");
+/** The cell session's harness, read-only; the model is shown and switched full screen. */
+function GridHarnessStatus({ session }: { session: Session }) {
+  const agent = nativeCodingAgentForHarness(session.harness);
+  const label = agent?.displayName ?? session.agentName ?? "Session";
   return (
     <span
-      title={summary}
-      aria-label={summary}
-      data-testid="grid-model-status"
+      title={label}
+      aria-label={label}
+      data-testid="grid-harness-status"
       className="flex h-8 min-w-0 items-center gap-1 px-2 text-muted-foreground md:h-7"
     >
       <ComposerAgentIcon
         agent={{
           name: agent?.agentName ?? session.agentName ?? "",
-          harness: agent?.harness ?? harness,
+          harness: agent?.harness ?? session.harness ?? null,
         }}
       />
       <span className={cn("min-w-0 truncate text-ui", COMPOSER_COLLAPSED_LABEL_CLASS)}>
-        {compactModelTriggerLabel(modelLabel ?? harnessLabel)}
+        {label}
       </span>
     </span>
   );

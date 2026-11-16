@@ -580,7 +580,7 @@ side-chat message loads it into that side chat's composer, not the main one.
 
 **Grid cell** (desktop session grids, see [Sessions](sessions.md)): each cell's
 one-row composer shows the session's host status, permission mode (switchable by
-the owner) and harness, model and effort. Switch hosts and models from the
+the owner) and harness. Switch hosts and see or switch the model from the
 full-screen view.
 
 ## Driving it with the repro environment

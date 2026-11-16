@@ -103,7 +103,7 @@ vi.mock("@/hooks/useSession", () => ({
     session: {
       id,
       title: id,
-      llmModel: "snapshot-model",
+      harness: "claude-native",
       agentId: `agent-${id}`,
       labels: fixture.labels,
       permissionLevel: fixture.permissionLevel,
@@ -120,9 +120,6 @@ vi.mock("@/hooks/useConversationEntryState", () => ({
   useConversationEntryState: () => ({
     terminalPending: fixture.terminalPending,
     claudePermissionMode: "default",
-    codexModelOptions: [],
-    llmModel: "live-model",
-    sessionReasoningEffort: "high",
   }),
 }));
 vi.mock("@/hooks/RunnerHealthProvider", () => ({
@@ -273,11 +270,9 @@ it("shows each cell's session controls and targets that session's permission mod
   // An inactive cell keeps the toggle's slot, so activating it never shifts the titlebar.
   expect(second.queryByRole("button", { name: /grid workspace$/ })).toBeNull();
   expect(second.getByLabelText(/grid workspace$/)).toHaveStyle({ visibility: "hidden" });
-  // Host and model are read-only here (switch them full screen); live state beats the snapshot.
+  // Host and harness are read-only here; switch hosts and models full screen.
   expect(second.getByText("Host for second (status only)")).toBeInTheDocument();
-  expect(second.getByTestId("grid-model-status")).toHaveAccessibleName(
-    "Session · live-model · High",
-  );
+  expect(second.getByTestId("grid-harness-status")).toHaveAccessibleName("Claude Code");
   fireEvent.pointerDown(second.getByRole("button", { name: "Permission mode: Manual" }), {
     button: 0,
   });
