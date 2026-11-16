@@ -25,16 +25,29 @@ def _process_lock(path: str) -> FileLock:
 
 
 @contextmanager
-def crdb_schema_ddl_lock(dialect: str) -> Iterator[None]:
+def crdb_schema_ddl_lock(dialect: str, *, wait_s: float | None = None) -> Iterator[bool]:
     """Hold the lock while issuing CockroachDB DDL; other dialects run unlocked.
 
     CockroachDB's descriptor and system tables are cluster-wide, so concurrent
     DDL from another worker's database can abort a schema change with
     ``RETRY_SERIALIZABLE``. Re-entrant in one process: a migration test holds it
     while its setup creates the worker database, which takes it again.
+
+    :param wait_s: Longest wait for the lock, e.g. ``120.0``; ``None`` waits forever.
+    :returns: Whether the lock is held; ``False`` only when *wait_s* ran out.
     """
     if dialect != "cockroachdb":
-        yield
+        yield True
         return
-    with _process_lock(str(_CRDB_SCHEMA_LOCK)):
-        yield
+    from filelock import Timeout
+
+    lock = _process_lock(str(_CRDB_SCHEMA_LOCK))
+    try:
+        lock.acquire(timeout=-1 if wait_s is None else wait_s)
+    except Timeout:
+        yield False
+        return
+    try:
+        yield True
+    finally:
+        lock.release()

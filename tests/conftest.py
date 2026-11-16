@@ -665,6 +665,10 @@ def cleanup_snapshot_failures(pytestconfig: pytest.Config) -> Generator[None, No
     yield
 
 
+# Well inside the per-test timeout, which covers a session fixture's setup and teardown.
+_WORKER_DB_LOCK_WAIT_S = 120.0
+
+
 @pytest.fixture(scope="session")
 def _worker_db_uri() -> Generator[str, None, None]:
     """
@@ -693,7 +697,8 @@ def _worker_db_uri() -> Generator[str, None, None]:
 
     root_engine = _sa.create_engine(base_uri, isolation_level="AUTOCOMMIT")
     dialect = root_engine.dialect.name
-    with crdb_schema_ddl_lock(dialect):
+    # Bounded, as the wait counts against the test's timeout; past it, go unlocked.
+    with crdb_schema_ddl_lock(dialect, wait_s=_WORKER_DB_LOCK_WAIT_S):
         with root_engine.connect() as conn:
             if dialect == "mysql":
                 conn.execute(
@@ -717,15 +722,19 @@ def _worker_db_uri() -> Generator[str, None, None]:
         _engine_cache.pop(uri, None)
     engine.dispose()
 
-    root_engine2 = _sa.create_engine(base_uri, isolation_level="AUTOCOMMIT")
-    with crdb_schema_ddl_lock(dialect), root_engine2.connect() as conn:
-        if dialect == "mysql":
-            conn.execute(_sa.text(f"DROP DATABASE IF EXISTS `{db_name}`"))
-        elif dialect == "cockroachdb":
-            conn.execute(_sa.text(f'DROP DATABASE IF EXISTS "{db_name}" CASCADE'))
-        else:
-            conn.execute(_sa.text(f'DROP DATABASE IF EXISTS "{db_name}" WITH (FORCE)'))
-    root_engine2.dispose()
+    with crdb_schema_ddl_lock(dialect, wait_s=_WORKER_DB_LOCK_WAIT_S) as locked:
+        if not locked:
+            # The next run's setup drops the leftover database.
+            return
+        root_engine2 = _sa.create_engine(base_uri, isolation_level="AUTOCOMMIT")
+        with root_engine2.connect() as conn:
+            if dialect == "mysql":
+                conn.execute(_sa.text(f"DROP DATABASE IF EXISTS `{db_name}`"))
+            elif dialect == "cockroachdb":
+                conn.execute(_sa.text(f'DROP DATABASE IF EXISTS "{db_name}" CASCADE'))
+            else:
+                conn.execute(_sa.text(f'DROP DATABASE IF EXISTS "{db_name}" WITH (FORCE)'))
+        root_engine2.dispose()
 
 
 @pytest.fixture(scope="session")

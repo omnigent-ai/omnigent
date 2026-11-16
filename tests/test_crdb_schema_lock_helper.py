@@ -26,3 +26,19 @@ def test_nested_holders_in_one_process_re_enter_the_lock(
     worker.start()
     worker.join(timeout=10)
     assert entered.is_set(), "a nested holder blocked on its own lock"
+
+
+def test_a_bounded_wait_reports_that_another_process_holds_the_lock(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from filelock import FileLock
+
+    lock_path = tmp_path / "schema.lock"
+    monkeypatch.setattr(crdb_schema_lock, "_CRDB_SCHEMA_LOCK", lock_path)
+    # A separate instance stands in for another worker process.
+    with FileLock(str(lock_path)), crdb_schema_ddl_lock("cockroachdb", wait_s=0.05) as locked:
+        assert locked is False
+    with crdb_schema_ddl_lock("cockroachdb", wait_s=0.05) as locked:
+        assert locked is True
+    with crdb_schema_ddl_lock("postgresql", wait_s=0) as locked:
+        assert locked is True
