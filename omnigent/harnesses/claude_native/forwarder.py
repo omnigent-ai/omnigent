@@ -4806,7 +4806,8 @@ async def _forward_available_status_events(
                     _http_status_for_log(exc),
                     extra={"session_id": session_id},
                 )
-                if status != "failed":
+                # Only the hand-off to the parent failed; this session's own turn did not.
+                if status != "failed" and not _is_subagent_delivery_not_confirmed(exc):
                     await _post_forwarder_failed_status(
                         client,
                         session_id=session_id,
@@ -7324,11 +7325,13 @@ def _is_subagent_delivery_not_confirmed(exc: httpx.HTTPError) -> bool:
 
     The runner returns this application-level 503 when a terminal sub-agent
     payload could not be delivered to the parent inbox (no work entry / inbox).
-    It is a bounded-retry class, distinct from a generic transient 5xx.
+    It is a bounded-retry class, distinct from a generic transient 5xx. The
+    server relays it as a ``runner_unavailable`` 503 quoting the runner body.
 
     :param exc: HTTP exception raised while posting an Omnigent event.
     :returns: ``True`` only for a 503 whose JSON body carries
-        ``error == "subagent_delivery_not_confirmed"``.
+        ``error == "subagent_delivery_not_confirmed"``, or whose
+        ``runner_unavailable`` error message quotes that runner body.
     """
     if not isinstance(exc, httpx.HTTPStatusError):
         return False
@@ -7338,7 +7341,14 @@ def _is_subagent_delivery_not_confirmed(exc: httpx.HTTPError) -> bool:
         body = exc.response.json()
     except Exception:  # noqa: BLE001 — best-effort body parse
         return False
-    return isinstance(body, dict) and body.get("error") == "subagent_delivery_not_confirmed"
+    error = body.get("error") if isinstance(body, dict) else None
+    if error == "subagent_delivery_not_confirmed":
+        return True
+    return (
+        isinstance(error, dict)
+        and error.get("code") == ErrorCode.RUNNER_UNAVAILABLE
+        and "subagent_delivery_not_confirmed" in str(error.get("message", ""))
+    )
 
 
 def _http_status_for_log(exc: httpx.HTTPError) -> int | None:

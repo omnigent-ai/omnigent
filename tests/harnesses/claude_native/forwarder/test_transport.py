@@ -652,6 +652,49 @@ async def test_rejected_hook_status_keeps_delivery_failure_identity(tmp_path: Pa
 
 
 @pytest.mark.asyncio
+async def test_undeliverable_subagent_result_drops_hook_status_without_failing(
+    tmp_path: Path,
+) -> None:
+    bridge_dir = tmp_path / "bridge"
+    record_hook_event(bridge_dir, {"hook_event_name": "Stop", "session_id": "native-session"})
+    requests: list[dict[str, Any]] = []
+    relayed_message = (
+        "Runner rejected external_session_status 'idle' with status 503: "
+        '{"error":"subagent_delivery_not_confirmed","reason":"missing_parent_inbox"}'
+    )
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return httpx.Response(
+            503, json={"error": {"code": "runner_unavailable", "message": relayed_message}}
+        )
+
+    state = forwarder.HookForwardState(event_cursor=0, byte_offset=0)
+    retry_tracker = forwarder._PostRetryTracker(
+        max_not_confirmed_attempts=3, base_delay_s=0.0, max_delay_s=0.0
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handle), base_url="http://test"
+    ) as client:
+        for _ in range(5):
+            state = await forwarder._forward_available_status_events(
+                client=client,
+                session_id="conv_synthetic",
+                bridge_dir=bridge_dir,
+                state=state,
+                retry_tracker=retry_tracker,
+                dedupe=forwarder._ForwardDedupeState(),
+                task_subjects={},
+                task_statuses={},
+                task_order=[],
+                response_id="resp_synthetic",
+            )
+
+    assert [request["data"]["status"] for request in requests] == ["idle"] * 3
+    assert state.event_cursor == 1
+
+
+@pytest.mark.asyncio
 async def test_forwarder_retries_user_item_on_ambiguous_post_failure(tmp_path: Path) -> None:
     """
     An ambiguous POST failure holds the cursor and re-posts the item.
