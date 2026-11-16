@@ -382,9 +382,15 @@ function PreviewWithSearch({
   commentHint?: { conversationId: string; onSwitchToEdit: () => void };
 }) {
   const previewRef = useRef<HTMLDivElement>(null);
+  // A spreadsheet reads its file before its table (the scroller) mounts.
+  const [spreadsheetScroller, setSpreadsheetScroller] = useState(false);
   // The preview div (not the FileViewer content area) is the real scroller
   // here, so scroll persistence attaches to it directly.
-  const handleScroll = useScrollRestore(previewRef, scrollKey, scrollReady);
+  const handleScroll = useScrollRestore(
+    previewRef,
+    scrollKey,
+    scrollReady && (kind !== "spreadsheet" || spreadsheetScroller),
+  );
   // A table re-renders its rows on sort and filter without new content, so it
   // says when find must look again.
   const [tableRowsVersion, setTableRowsVersion] = useState(0);
@@ -416,6 +422,7 @@ function PreviewWithSearch({
         rootRef={previewRef}
         onScroll={handleScroll}
         onRowsChange={handleTableRowsChange}
+        onScrollerChange={setSpreadsheetScroller}
       />
     ) : kind === "table" ? (
       <DataTablePreview

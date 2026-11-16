@@ -36,6 +36,7 @@ export function SpreadsheetPreview({
   rootRef,
   onScroll,
   onRowsChange,
+  onScrollerChange,
 }: {
   /** The file's bytes, base64-encoded as the server sends a binary file. */
   content: string;
@@ -47,12 +48,21 @@ export function SpreadsheetPreview({
   rootRef?: RefObject<HTMLDivElement | null>;
   onScroll?: (event: UIEvent<HTMLElement>) => void;
   onRowsChange?: () => void;
+  /** Whether a table (the scroller *rootRef* points at) is showing, so a saved scroll can restore. */
+  onScrollerChange?: (mounted: boolean) => void;
 }) {
   const [state, setState] = useState<LoadState>({ status: "loading" });
   const [active, setActive] = useState(0);
   // Switching sheets, or the file loading, failing or emptying on a refresh,
   // changes what find searches.
   useEffect(() => onRowsChange?.(), [active, state, onRowsChange]);
+  // Only a sheet with a table mounts the scroller; loading, errors and empty
+  // sheets don't, so a saved scroll position waits for it.
+  const hasScroller =
+    state.status === "ready" &&
+    state.sheets.length > 0 &&
+    state.sheets[Math.min(active, state.sheets.length - 1)]?.table != null;
+  useEffect(() => onScrollerChange?.(hasScroller), [hasScroller, onScrollerChange]);
 
   useEffect(() => {
     // Both formats keep their index at the end of the file, which a partial read lacks.
