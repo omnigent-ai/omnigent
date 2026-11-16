@@ -414,6 +414,15 @@ async def _validate_rrule_or_400(
         raise OmnigentError(f"invalid rrule: {exc}", code=ErrorCode.INVALID_INPUT) from exc
 
 
+def _require_trigger_orchestration(request: Request) -> None:
+    """Refuse a trigger on a server whose sessions can't start a session per match."""
+    if not request.app.state.feature_flags.enabled(Feature.SESSION_ORCHESTRATION):
+        raise OmnigentError(
+            "trigger_config needs session orchestration, which this server disables",
+            code=ErrorCode.INVALID_INPUT,
+        )
+
+
 def _validate_timezone_or_400(timezone: str) -> None:
     """Raise a 400 ``OmnigentError`` if *timezone* is not a valid IANA timezone."""
     try:
@@ -972,14 +981,8 @@ def create_scheduled_tasks_router(
         trigger = body.trigger_config
         rrule = body.rrule if trigger is None else slack_trigger_rrule(trigger_poll_minutes)
         session_mode = body.session_mode if trigger is None else "continue"
-        if trigger is not None and not request.app.state.feature_flags.enabled(
-            Feature.SESSION_ORCHESTRATION
-        ):
-            # The trigger's session starts a session for each match.
-            raise OmnigentError(
-                "trigger_config needs session orchestration, which this server disables",
-                code=ErrorCode.INVALID_INPUT,
-            )
+        if trigger is not None:
+            _require_trigger_orchestration(request)
         await _validate_rrule_or_400(
             rrule,
             session_mode,
@@ -1498,6 +1501,9 @@ def create_scheduled_tasks_router(
                 "Only a trigger automation has a trigger_config to change",
                 code=ErrorCode.INVALID_INPUT,
             )
+        if "trigger_config" in fields:
+            # Other updates, such as a pause, still work, so a trigger can always be stopped.
+            _require_trigger_orchestration(request)
         if existing.trigger_config is not None:
             changed = sorted(
                 name

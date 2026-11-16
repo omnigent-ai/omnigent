@@ -101,6 +101,30 @@ def test_without_conditions_every_top_level_message_counts() -> None:
 
 
 @pytest.mark.parametrize(
+    ("condition", "clause"),
+    [
+        (
+            {"field": "text", "operator": "contains", "value": "error"},
+            'whose text contains "error"',
+        ),
+        (
+            {"field": "text", "operator": "not_contains", "value": "ignore"},
+            'whose text doesn\'t contain "ignore"',
+        ),
+        ({"field": "topic", "operator": "about", "value": "a bug"}, "that are about a bug"),
+        ({"field": "author", "operator": "is", "value": "@alerts-bot"}, "posted by @alerts-bot"),
+        ({"field": "author", "operator": "is_not", "value": "alice"}, "not posted by alice"),
+    ],
+    ids=["text-contains", "text-not-contains", "topic-about", "author-is", "author-is-not"],
+)
+def test_each_condition_reads_as_a_clause(condition: dict, clause: str) -> None:
+    prompt = _compile(_config(conditions=[condition]))
+
+    assert f"Watch: new Slack messages in #eng-support, C0123ABCD {clause}\n" in prompt
+    assert f" Only messages {clause} count." in prompt
+
+
+@pytest.mark.parametrize(
     "overrides",
     [
         {"channels": []},

@@ -1752,13 +1752,29 @@ async def test_slack_trigger_needs_session_orchestration(
     app = _build_app(db_uri, tmp_path, session_orchestration=False)
     _make_user(db_uri)
     _register_host(app, "4b653f6031f35d168cc0b37caa1306d1", "alice@example.com")
+    # A trigger saved while orchestration was on.
+    saved = app.state.scheduled_task_store.create(
+        scheduled_task_id=uuid.uuid4().hex,
+        user_id="alice@example.com",
+        session_mode="continue",
+        trigger_config={**_SLACK_TRIGGER, "conditions": []},
+        **_create_body(),
+    )
+    url = f"/v1/scheduled-tasks/{saved.id}"
     async with _serve(app, mock_llm, tmp_path) as client:
-        response = await client.post(
+        created = await client.post(
             "/v1/scheduled-tasks", json=_trigger_body(), headers=_headers()
         )
+        changed = await client.patch(
+            url, json={"trigger_config": _SLACK_TRIGGER}, headers=_headers()
+        )
+        paused = await client.patch(url, json={"state": "paused"}, headers=_headers())
         info = (await client.get("/v1/info", headers=_headers())).json()
-    assert response.status_code == 400, response.text
-    assert "needs session orchestration" in response.text
+    for refused in (created, changed):
+        assert refused.status_code == 400, refused.text
+        assert "needs session orchestration" in refused.text
+    # It can still be stopped.
+    assert paused.status_code == 200, paused.text
     assert info["scheduled_task_slack_triggers"] is False
 
 

@@ -8,12 +8,15 @@ channels, as a storage envelope (``omnigent.db.envelope``) of at most 16,383
 bytes (``VARBINARY`` on MySQL).
 Tasks are read by primary key, so no index is added.
 
-The column is nullable and nothing reads it yet, so this migration runs online
-and every server keeps working on either side of it. Deploy it before the
-application release that writes it. That release still saves each trigger's
-compiled prompt in ``prompt``, so a server that predates the release keeps
-running those tasks from their saved prompts. To roll back, downgrade the
-application first. The downgrade then drops the column and the configs in it;
+The column is nullable, so this migration runs online and servers from before
+it keep working after it. The model maps the column, so every read of a task
+selects it: the migration must run before any server with that mapping starts.
+Servers apply pending migrations when they first open the database; a
+deployment that runs migrations separately must apply this one first. The
+release that writes the column still saves each trigger's compiled prompt in
+``prompt``, so a server without that release keeps running those tasks from
+their saved prompts. To roll back, first return every server to a release
+without the mapping. The downgrade then drops the column and the configs in it;
 the tasks keep running their saved prompts.
 """
 
