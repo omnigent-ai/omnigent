@@ -425,24 +425,23 @@ export function ServerSelectStep({
             in the cloud.
           </p>
 
-          <div className="flex  items-center gap-2">
-            {/* URL input with an inline Join on the right — no separate submit below. */}
-            <div className="flex flex-1 items-center gap-2 rounded-lg border border-border px-3">
-              <Input
-                value={typedUrl}
-                onChange={(e) => {
-                  setTypedUrl(e.target.value);
-                  setSelected(null);
-                  clearInputState();
-                }}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") addServer();
-                }}
-                placeholder="Enter Omnigent server URL"
-                className="border-0 px-0 shadow-none focus-visible:ring-0"
-                aria-label="Server URL"
-              />
-            </div>
+          <div className="flex items-center gap-2">
+            {/* URL input with an inline Join on the right — no separate submit below.
+                The input owns its border so outline, fill and focus ring stay aligned. */}
+            <Input
+              value={typedUrl}
+              onChange={(e) => {
+                setTypedUrl(e.target.value);
+                setSelected(null);
+                clearInputState();
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") addServer();
+              }}
+              placeholder="Enter Omnigent server URL"
+              className="flex-1 px-3"
+              aria-label="Server URL"
+            />
             <Button type="button" disabled={typedUrl.trim().length === 0} onClick={addServer}>
               Join
               <ArrowRight className="size-4" aria-hidden />
