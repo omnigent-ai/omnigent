@@ -773,10 +773,14 @@ def is_text_content_type(content_type: str) -> bool:
 def encode_body(body: bytes, content_type: str) -> tuple[str, str]:
     """Return ``(encoded_body, encoding)`` for a body+content-type pair.
 
-    Picks utf-8 inline for text-shaped content, base64 otherwise.
+    Picks utf-8 inline for valid text-shaped content, base64 otherwise.
     """
     if is_text_content_type(content_type):
-        return body.decode("utf-8", errors="replace"), "utf-8"
+        try:
+            return body.decode("utf-8"), "utf-8"
+        except UnicodeDecodeError:
+            # Byte ranges and streaming chunks can split a UTF-8 character.
+            pass
     return base64.b64encode(body).decode("ascii"), "base64"
 
 

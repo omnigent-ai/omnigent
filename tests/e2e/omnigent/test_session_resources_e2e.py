@@ -439,6 +439,21 @@ def test_session_resources_e2e(
             assert complete.status_code == 200
             assert complete.content == b"hello e2e"
 
+            unicode_path = f"{fs}/_e2e_unicode.txt"
+            written = client.put(unicode_path, json={"content": "é", "encoding": "utf-8"})
+            assert written.status_code == 200
+            unicode_download = f"{unicode_path}?download=true"
+            complete = client.get(unicode_download)
+            assert complete.status_code == 200
+            assert complete.content == b"\xc3\xa9"
+
+            partial = client.get(unicode_download, headers={"Range": "bytes=0-0"})
+            assert partial.status_code == 206
+            assert partial.content == b"\xc3"
+            assert partial.headers["content-length"] == "1"
+            assert partial.headers["content-range"] == "bytes 0-0/2"
+            assert client.delete(unicode_path).status_code == 200
+
             # Edit
             resp = client.patch(
                 f"{fs}/_e2e_test.txt",
