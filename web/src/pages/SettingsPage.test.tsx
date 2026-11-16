@@ -1747,6 +1747,19 @@ describe("SettingsPage", () => {
     expect(localStorage.getItem("omnigent:default-base-branch")).toBeNull();
   });
 
+  it("renders the Archived sessions rows from their Settings catalog entries", () => {
+    mocks.conversations = [conv("conv_archived", { archived: true, title: "Old chat" })];
+    renderPage("/settings/archived");
+
+    expect(document.querySelector('[data-settings-item="archived-sessions"]')).not.toBeNull();
+    expect(
+      document.querySelector('[data-settings-control="archived-sessions:select"]'),
+    ).not.toBeNull();
+    const row = screen.getByTestId("archived-row");
+    expect(row.querySelector('[data-settings-row-action="delete"]')).not.toBeNull();
+    expect(row.querySelector('[data-settings-row-action="unarchive"]')).not.toBeNull();
+  });
+
   it("lists archived sessions and unarchives on click", () => {
     mocks.conversations = [
       conv("conv_active"),

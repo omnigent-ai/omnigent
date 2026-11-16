@@ -95,7 +95,16 @@ import {
   settingsDescriptionId,
   settingsLabelId,
 } from "@/pages/settings/search/settingsControl";
-import { settingsOverlayProps } from "@/pages/settings/search/settingsOwnership";
+import {
+  ARCHIVED_RETENTION_OPTIONS,
+  ARCHIVED_SESSIONS_ENTRY,
+} from "@/pages/settings/search/catalog/archived";
+import {
+  SettingsDataRegion,
+  settingsOverlayProps,
+  settingsRowOverlayProps,
+  settingsRuntimeChoiceProps,
+} from "@/pages/settings/search/settingsOwnership";
 import { SessionTitleInstructionsControl } from "@/components/SessionTitleInstructionsControl";
 import { McpRegistryConnections } from "@/components/McpRegistry";
 import { ThemeColorPicker } from "@/components/theme/ThemeColorPicker";
@@ -3080,14 +3089,6 @@ function dateGroupLabel(timestampSec: number, now: Date = new Date()): string {
   return date.toLocaleDateString(undefined, { month: "long", year: "numeric" });
 }
 
-const RETENTION_OPTIONS: { label: string; value: string; days: number | null }[] = [
-  { label: "Never", value: "never", days: null },
-  { label: "After 7 days", value: "7", days: 7 },
-  { label: "After 30 days", value: "30", days: 30 },
-  { label: "After 60 days", value: "60", days: 60 },
-  { label: "After 90 days", value: "90", days: 90 },
-];
-
 function retentionDaysToSelectValue(days: number | null): string {
   if (days === null) return "never";
   return String(days);
@@ -3236,224 +3237,250 @@ function ArchivedSection() {
   }, [archived]);
 
   return (
-    <Section
-      title="Archived sessions"
-      description="Restore archived sessions to the sidebar or delete them permanently."
-    >
-      <div className="mb-4 flex flex-wrap items-center gap-x-6 gap-y-2">
-        <div className="flex items-center gap-2">
-          <label htmlFor="archived-retention" className="text-ui text-muted-foreground">
-            Mark as expired after
-          </label>
-          <Select
-            value={retentionDaysToSelectValue(retentionDays)}
-            onValueChange={(value) => {
-              const days = selectValueToRetentionDays(value);
-              setRetentionDays(days);
-              writeRetentionDays(days);
-            }}
-          >
-            <SelectTrigger
-              id="archived-retention"
-              aria-label="Mark archived sessions as expired after"
-              data-testid="archived-retention"
-              className="w-40"
-            >
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent position="popper" align="start">
-              {RETENTION_OPTIONS.map((opt) => (
-                <SelectItem key={opt.value} value={opt.value}>
-                  {opt.label}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        </div>
-        {items.length > 0 && (
+    <SettingsItem entry={ARCHIVED_SESSIONS_ENTRY}>
+      <Section
+        title={ARCHIVED_SESSIONS_ENTRY.label}
+        description={ARCHIVED_SESSIONS_ENTRY.description}
+      >
+        <div className="mb-4 flex flex-wrap items-center gap-x-6 gap-y-2">
           <div className="flex items-center gap-2">
-            <label htmlFor="archived-project-filter" className="text-ui text-muted-foreground">
-              Project
+            <label htmlFor="archived-retention" className="text-ui text-muted-foreground">
+              Mark as expired after
             </label>
             <Select
-              value={projectToSelectValue(project)}
-              onValueChange={(value) => setProject(selectValueToProject(value))}
+              value={retentionDaysToSelectValue(retentionDays)}
+              onValueChange={(value) => {
+                const days = selectValueToRetentionDays(value);
+                setRetentionDays(days);
+                writeRetentionDays(days);
+              }}
             >
               <SelectTrigger
-                id="archived-project-filter"
-                aria-label="Filter archived sessions by project"
-                data-testid="archived-project-filter"
-                className="w-56"
+                {...settingsControlProps(ARCHIVED_SESSIONS_ENTRY, "retention")}
+                id="archived-retention"
+                data-testid="archived-retention"
+                className="w-40"
               >
                 <SelectValue />
               </SelectTrigger>
-              <SelectContent position="popper" align="start">
-                <SelectItem value={ALL_PROJECTS_VALUE}>All projects</SelectItem>
-                {items.map((name) => (
-                  <SelectItem
-                    key={name}
-                    value={projectToSelectValue(name)}
-                    data-testid={`archived-project-option-${name}`}
-                  >
-                    {name}
+              <SelectContent
+                {...settingsOverlayProps(ARCHIVED_SESSIONS_ENTRY, "retention")}
+                position="popper"
+                align="start"
+              >
+                {ARCHIVED_RETENTION_OPTIONS.map((opt) => (
+                  <SelectItem key={opt.value} value={opt.value}>
+                    {opt.label}
                   </SelectItem>
                 ))}
               </SelectContent>
             </Select>
           </div>
-        )}
-        {!selectionMode && archived.length > 0 && (
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            data-testid="archived-toggle-selection"
-            onClick={() => setSelectionMode(true)}
-          >
-            Select
-          </Button>
-        )}
-      </div>
-
-      {selectionMode && (
-        <ArchivedBulkActionBar
-          selectedIds={selectedIds}
-          allArchived={archived}
-          onSelectAll={selectAll}
-          onDeselectAll={deselectAll}
-          onExit={exitSelectionMode}
-        />
-      )}
-
-      {ownedExpiredSessions.length > 0 && (
-        <div className="mb-4 flex items-center gap-3 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2">
-          <ClockIcon className="size-4 shrink-0 text-destructive" />
-          <span className="text-ui flex-1">
-            {ownedExpiredSessions.length === 1
-              ? "1 expired session"
-              : `${ownedExpiredSessions.length} expired sessions`}{" "}
-            {listQuery.hasNextPage ? "on loaded pages " : ""}past the {retentionDays}-day retention
-            period.
-          </span>
-          <Button
-            type="button"
-            variant="destructive"
-            size="sm"
-            data-testid="delete-expired"
-            disabled={bulkDelete.isPending}
-            onClick={() => setDeleteExpiredOpen(true)}
-          >
-            Delete expired
-          </Button>
-          <Dialog open={deleteExpiredOpen} onOpenChange={setDeleteExpiredOpen}>
-            <DialogContent>
-              <DialogHeader>
-                <DialogTitle>Delete expired sessions?</DialogTitle>
-                <DialogDescription>
-                  {ownedExpiredSessions.length === 1
-                    ? "1 owned archived session"
-                    : `${ownedExpiredSessions.length} owned archived sessions`}{" "}
-                  older than {retentionDays} days {listQuery.hasNextPage ? "on loaded pages " : ""}
-                  will be permanently deleted. This cannot be undone.
-                  {listQuery.hasNextPage && (
-                    <span className="mt-2 block text-sm">
-                      Note: More archived sessions may exist on unfetched pages. Click "Load more"
-                      to see all expired sessions before deleting.
-                    </span>
-                  )}
-                </DialogDescription>
-              </DialogHeader>
-              <DialogFooter>
-                <Button
-                  variant="ghost"
-                  onClick={() => setDeleteExpiredOpen(false)}
-                  disabled={bulkDelete.isPending}
+          {items.length > 0 && (
+            <div className="flex items-center gap-2">
+              <label htmlFor="archived-project-filter" className="text-ui text-muted-foreground">
+                Project
+              </label>
+              <Select
+                value={projectToSelectValue(project)}
+                onValueChange={(value) => setProject(selectValueToProject(value))}
+              >
+                <SelectTrigger
+                  {...settingsControlProps(ARCHIVED_SESSIONS_ENTRY, "projectFilter")}
+                  id="archived-project-filter"
+                  data-testid="archived-project-filter"
+                  className="w-56"
                 >
-                  Cancel
-                </Button>
-                <Button
-                  variant="destructive"
-                  disabled={bulkDelete.isPending}
-                  onClick={() => {
-                    bulkDelete.mutate({ ids: ownedExpiredSessions.map((c) => c.id) });
-                    setDeleteExpiredOpen(false);
-                  }}
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent
+                  {...settingsOverlayProps(ARCHIVED_SESSIONS_ENTRY, "projectFilter")}
+                  position="popper"
+                  align="start"
                 >
-                  Delete{" "}
-                  {ownedExpiredSessions.length === 1
-                    ? "1 session"
-                    : `${ownedExpiredSessions.length} sessions`}
-                </Button>
-              </DialogFooter>
-            </DialogContent>
-          </Dialog>
-        </div>
-      )}
-
-      {listQuery.isLoading ? (
-        <p className="text-ui text-muted-foreground">Loading…</p>
-      ) : archived.length === 0 && !listQuery.hasNextPage ? (
-        // Definitive empty only when there are no archived rows AND no further
-        // pages to fetch.
-        <p className="text-ui text-muted-foreground">
-          {project ? "No archived sessions in this project." : "No archived sessions."}
-        </p>
-      ) : (
-        <>
-          {archived.length > 0 && (
-            <div className="flex flex-col gap-4">
-              {groupedArchived.map((group) => (
-                <div key={group.label}>
-                  <h3 className="mb-1 px-3 text-sm font-medium text-muted-foreground">
-                    {group.label}
-                  </h3>
-                  <ul className="flex flex-col gap-0.5">
-                    {group.conversations.map((conv) => (
-                      <ArchivedRow
-                        key={conv.id}
-                        conversation={conv}
-                        cutoff={cutoff}
-                        selectionMode={selectionMode}
-                        isSelected={selectedIds.has(conv.id)}
-                        onToggleSelected={toggleSelected}
-                      />
-                    ))}
-                  </ul>
-                </div>
-              ))}
+                  <SelectItem value={ALL_PROJECTS_VALUE}>All projects</SelectItem>
+                  {items.map((name) => (
+                    <SelectItem
+                      {...settingsRuntimeChoiceProps(ARCHIVED_SESSIONS_ENTRY, "projectFilter")}
+                      key={name}
+                      value={projectToSelectValue(name)}
+                      data-testid={`archived-project-option-${name}`}
+                    >
+                      {name}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
             </div>
           )}
-          {archived.length === 0 && (
-            // The list fetches a mixed page (active + archived rows) and filters
-            // to archived client-side; archived sessions are older and can sort
-            // onto later pages, so a page with none isn't the end. Offer to page
-            // forward instead of dead-ending on the definitive empty state.
-            <p className="text-ui text-muted-foreground">
-              {project
-                ? "No archived sessions in this project on this page."
-                : "No archived sessions on this page."}
-            </p>
+          {!selectionMode && archived.length > 0 && (
+            <Button
+              {...settingsControlProps(ARCHIVED_SESSIONS_ENTRY, "select")}
+              type="button"
+              variant="outline"
+              size="sm"
+              data-testid="archived-toggle-selection"
+              onClick={() => setSelectionMode(true)}
+            >
+              Select
+            </Button>
           )}
-          {/* Keep the pager visible whenever more pages exist, independent of the
+        </div>
+
+        {selectionMode && (
+          <ArchivedBulkActionBar
+            selectedIds={selectedIds}
+            allArchived={archived}
+            onSelectAll={selectAll}
+            onDeselectAll={deselectAll}
+            onExit={exitSelectionMode}
+          />
+        )}
+
+        {ownedExpiredSessions.length > 0 && (
+          <div className="mb-4 flex items-center gap-3 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2">
+            <ClockIcon className="size-4 shrink-0 text-destructive" />
+            <span className="text-ui flex-1">
+              {ownedExpiredSessions.length === 1
+                ? "1 expired session"
+                : `${ownedExpiredSessions.length} expired sessions`}{" "}
+              {listQuery.hasNextPage ? "on loaded pages " : ""}past the {retentionDays}-day
+              retention period.
+            </span>
+            <Button
+              {...settingsControlProps(ARCHIVED_SESSIONS_ENTRY, "deleteExpired")}
+              type="button"
+              variant="destructive"
+              size="sm"
+              data-testid="delete-expired"
+              disabled={bulkDelete.isPending}
+              onClick={() => setDeleteExpiredOpen(true)}
+            >
+              Delete expired
+            </Button>
+            <Dialog open={deleteExpiredOpen} onOpenChange={setDeleteExpiredOpen}>
+              <DialogContent {...settingsOverlayProps(ARCHIVED_SESSIONS_ENTRY, "deleteExpired")}>
+                <DialogHeader>
+                  <DialogTitle>Delete expired sessions?</DialogTitle>
+                  <DialogDescription>
+                    {ownedExpiredSessions.length === 1
+                      ? "1 owned archived session"
+                      : `${ownedExpiredSessions.length} owned archived sessions`}{" "}
+                    older than {retentionDays} days{" "}
+                    {listQuery.hasNextPage ? "on loaded pages " : ""}
+                    will be permanently deleted. This cannot be undone.
+                    {listQuery.hasNextPage && (
+                      <span className="mt-2 block text-sm">
+                        Note: More archived sessions may exist on unfetched pages. Click "Load more"
+                        to see all expired sessions before deleting.
+                      </span>
+                    )}
+                  </DialogDescription>
+                </DialogHeader>
+                <DialogFooter>
+                  <Button
+                    data-settings-dialog-action="Cancel"
+                    variant="ghost"
+                    onClick={() => setDeleteExpiredOpen(false)}
+                    disabled={bulkDelete.isPending}
+                  >
+                    Cancel
+                  </Button>
+                  <Button
+                    {...settingsControlProps(ARCHIVED_SESSIONS_ENTRY, "expiredConfirm", {
+                      runtime: String(ownedExpiredSessions.length),
+                      variant: ownedExpiredSessions.length === 1 ? "one" : undefined,
+                    })}
+                    variant="destructive"
+                    disabled={bulkDelete.isPending}
+                    onClick={() => {
+                      bulkDelete.mutate({ ids: ownedExpiredSessions.map((c) => c.id) });
+                      setDeleteExpiredOpen(false);
+                    }}
+                  >
+                    Delete{" "}
+                    {ownedExpiredSessions.length === 1
+                      ? "1 session"
+                      : `${ownedExpiredSessions.length} sessions`}
+                  </Button>
+                </DialogFooter>
+              </DialogContent>
+            </Dialog>
+          </div>
+        )}
+
+        {listQuery.isLoading ? (
+          <p className="text-ui text-muted-foreground">Loading…</p>
+        ) : archived.length === 0 && !listQuery.hasNextPage ? (
+          // Definitive empty only when there are no archived rows AND no further
+          // pages to fetch.
+          <p className="text-ui text-muted-foreground">
+            {project ? "No archived sessions in this project." : "No archived sessions."}
+          </p>
+        ) : (
+          <>
+            {archived.length > 0 && (
+              <div className="flex flex-col gap-4">
+                {groupedArchived.map((group) => (
+                  <div key={group.label}>
+                    <h3 className="mb-1 px-3 text-sm font-medium text-muted-foreground">
+                      {group.label}
+                    </h3>
+                    <SettingsDataRegion entry={ARCHIVED_SESSIONS_ENTRY} region="sessions">
+                      <ul className="flex flex-col gap-0.5">
+                        {group.conversations.map((conv) => (
+                          <ArchivedRow
+                            key={conv.id}
+                            conversation={conv}
+                            cutoff={cutoff}
+                            selectionMode={selectionMode}
+                            isSelected={selectedIds.has(conv.id)}
+                            onToggleSelected={toggleSelected}
+                          />
+                        ))}
+                      </ul>
+                    </SettingsDataRegion>
+                  </div>
+                ))}
+              </div>
+            )}
+            {archived.length === 0 && (
+              // The list fetches a mixed page (active + archived rows) and filters
+              // to archived client-side; archived sessions are older and can sort
+              // onto later pages, so a page with none isn't the end. Offer to page
+              // forward instead of dead-ending on the definitive empty state.
+              <p className="text-ui text-muted-foreground">
+                {project
+                  ? "No archived sessions in this project on this page."
+                  : "No archived sessions on this page."}
+              </p>
+            )}
+            {/* Keep the pager visible whenever more pages exist, independent of the
               current page's archived count — otherwise a first page of only
               active rows would hide the archived rows on later pages. */}
-          {listQuery.hasNextPage && (
-            <div className="mt-3">
-              <Button
-                type="button"
-                variant="ghost"
-                size="sm"
-                data-testid="archived-load-more"
-                disabled={listQuery.isFetchingNextPage}
-                onClick={() => void listQuery.fetchNextPage()}
-              >
-                {listQuery.isFetchingNextPage ? "Loading…" : "Load more"}
-              </Button>
-            </div>
-          )}
-        </>
-      )}
-    </Section>
+            {listQuery.hasNextPage && (
+              <div className="mt-3">
+                <Button
+                  {...settingsControlProps(
+                    ARCHIVED_SESSIONS_ENTRY,
+                    "loadMore",
+                    listQuery.isFetchingNextPage ? { alternative: "loading" } : undefined,
+                  )}
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  data-testid="archived-load-more"
+                  disabled={listQuery.isFetchingNextPage}
+                  onClick={() => void listQuery.fetchNextPage()}
+                >
+                  {listQuery.isFetchingNextPage ? "Loading…" : "Load more"}
+                </Button>
+              </div>
+            )}
+          </>
+        )}
+      </Section>
+    </SettingsItem>
   );
 }
 
@@ -3491,6 +3518,8 @@ function ArchivedBulkActionBar({
   const allSelected = count > 0 && count === allArchived.length;
   const isBusy = bulkArchive.isPending || bulkDelete.isPending;
   const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
+  // How many owned sessions an action applies to; with none, its name is the plain verb.
+  const ownedCount = ownedSelected.length > 0 ? String(ownedSelected.length) : "";
 
   function handleUnarchive() {
     if (ownedSelected.length === 0) return;
@@ -3515,6 +3544,11 @@ function ArchivedBulkActionBar({
             {count === 0 ? "None selected" : `${count} selected`}
           </span>
           <Button
+            {...settingsControlProps(
+              ARCHIVED_SESSIONS_ENTRY,
+              "selectAll",
+              allSelected ? { alternative: "deselect" } : undefined,
+            )}
             type="button"
             variant="ghost"
             size="sm"
@@ -3524,11 +3558,11 @@ function ArchivedBulkActionBar({
             {allSelected ? "Deselect all" : "Select all"}
           </Button>
           <Button
+            {...settingsControlProps(ARCHIVED_SESSIONS_ENTRY, "exitSelection")}
             type="button"
             variant="secondary"
             size="icon-sm"
             className="-translate-y-1/2 absolute top-1/2 right-1 shrink-0 rounded-full"
-            aria-label="Exit selection mode"
             data-testid="archived-exit-selection"
             onClick={onExit}
           >
@@ -3538,6 +3572,9 @@ function ArchivedBulkActionBar({
 
         <div className="flex items-center gap-1.5">
           <Button
+            {...settingsControlProps(ARCHIVED_SESSIONS_ENTRY, "bulkUnarchive", {
+              runtime: ownedCount,
+            })}
             type="button"
             variant="outline"
             size="sm"
@@ -3554,6 +3591,9 @@ function ArchivedBulkActionBar({
             Unarchive {ownedSelected.length > 0 ? ownedSelected.length : ""}
           </Button>
           <Button
+            {...settingsControlProps(ARCHIVED_SESSIONS_ENTRY, "bulkDelete", {
+              runtime: ownedCount,
+            })}
             type="button"
             variant="outline"
             size="sm"
@@ -3579,7 +3619,7 @@ function ArchivedBulkActionBar({
       </div>
 
       <Dialog open={confirmDeleteOpen} onOpenChange={setConfirmDeleteOpen}>
-        <DialogContent>
+        <DialogContent {...settingsOverlayProps(ARCHIVED_SESSIONS_ENTRY, "bulkDelete")}>
           <DialogHeader>
             <DialogTitle>Delete {ownedSelected.length} session(s)?</DialogTitle>
             <DialogDescription>
@@ -3589,6 +3629,7 @@ function ArchivedBulkActionBar({
           </DialogHeader>
           <DialogFooter>
             <Button
+              data-settings-dialog-action="Cancel"
               type="button"
               variant="ghost"
               onClick={() => setConfirmDeleteOpen(false)}
@@ -3597,6 +3638,9 @@ function ArchivedBulkActionBar({
               Cancel
             </Button>
             <Button
+              {...settingsControlProps(ARCHIVED_SESSIONS_ENTRY, "bulkConfirm", {
+                runtime: String(ownedSelected.length),
+              })}
               type="button"
               variant="destructive"
               onClick={handleDelete}
@@ -3676,6 +3720,7 @@ function ArchivedRow({
       {!selectionMode && (
         <div className="flex shrink-0 items-center gap-1 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100">
           <Button
+            data-settings-row-action="delete"
             type="button"
             variant="ghost"
             size="icon-sm"
@@ -3687,6 +3732,7 @@ function ArchivedRow({
             <Trash2Icon className="size-4 text-destructive" />
           </Button>
           <Button
+            data-settings-row-action="unarchive"
             type="button"
             variant="ghost"
             size="sm"
@@ -3710,7 +3756,7 @@ function ArchivedRow({
       )}
 
       <Dialog open={deleteOpen} onOpenChange={setDeleteOpen}>
-        <DialogContent>
+        <DialogContent {...settingsRowOverlayProps(ARCHIVED_SESSIONS_ENTRY, "sessions", "delete")}>
           <DialogHeader>
             <DialogTitle>Delete session?</DialogTitle>
             <DialogDescription>
@@ -3719,10 +3765,16 @@ function ArchivedRow({
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
-            <Button variant="ghost" onClick={() => setDeleteOpen(false)} disabled={del.isPending}>
+            <Button
+              data-settings-row-action="cancel"
+              variant="ghost"
+              onClick={() => setDeleteOpen(false)}
+              disabled={del.isPending}
+            >
               Cancel
             </Button>
             <Button
+              data-settings-row-action="delete"
               variant="destructive"
               disabled={del.isPending}
               onClick={() => {
