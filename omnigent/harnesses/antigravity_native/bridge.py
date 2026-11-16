@@ -403,6 +403,8 @@ _AGY_ENABLED_TOOLS = [
     "sys_terminal_list",
     "sys_terminal_read",
     "sys_terminal_send",
+    "sys_trigger_dispatch",
+    "sys_trigger_state",
     "update_comment",
 ]
 

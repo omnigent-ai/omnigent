@@ -9,6 +9,7 @@ import {
   stripAutomationContext,
   AUTOMATION_CONTEXT_NOTE,
   EARLIER_AUTOMATION_CONTEXT_NOTES,
+  stripTriggerDispatchConfig,
 } from "./systemMessage";
 
 describe("isClaudeAgentMessageContent", () => {
@@ -333,5 +334,21 @@ describe("stripAutomationContext", () => {
     for (const note of EARLIER_AUTOMATION_CONTEXT_NOTES) {
       expect(stripAutomationContext(`Review the changes.\n\n${note}`)).toBe("Review the changes.");
     }
+  });
+});
+
+describe("stripTriggerDispatchConfig", () => {
+  const block = '<omnigent-trigger-dispatch v1>\n{"source":"slack"}\n</omnigent-trigger-dispatch>';
+
+  it("hides the trailing dispatch config block", () => {
+    expect(stripTriggerDispatchConfig(`Each run:\n1. Do it.\n\n${block}\n`)).toBe(
+      "Each run:\n1. Do it.",
+    );
+  });
+
+  it("keeps a block that isn't last, and text without one", () => {
+    const quoted = `See ${block} here`;
+    expect(stripTriggerDispatchConfig(quoted)).toBe(quoted);
+    expect(stripTriggerDispatchConfig("plain text")).toBe("plain text");
   });
 });

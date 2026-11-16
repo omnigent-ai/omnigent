@@ -1066,6 +1066,7 @@ export function CreateScheduledTaskDialog({
     pollingIntervalMinutes:
       schedule.preset === "custom" && schedule.customFreq === "minutely" ? schedule.interval : 60,
     taskSessionTitle: name,
+    triggerDispatch: isFeatureEnabled(info, "trigger_dispatch_tools"),
   };
   // An edit keeps the saved workers; a new trigger's workers run where the manager
   // runs (beside it on a connected host, or each in its own sandbox).

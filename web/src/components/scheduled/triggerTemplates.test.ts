@@ -1787,3 +1787,151 @@ describe("one task session for every match", () => {
     );
   });
 });
+
+describe("Slack channel trigger dispatch", () => {
+  const channelFields = (overrides: Partial<TriggerFields> = {}) =>
+    fields({
+      event: "posted",
+      scope: "#eng-support, C0999ZZZZ",
+      conditions: [{ field: "text", operator: "contains", value: " error " }],
+      instructions: "Triage the message.",
+      ...overrides,
+    });
+  const dispatchCtx: TriggerPromptContext = { ...CTX, triggerDispatch: true, agentId: "agent-1" };
+  const dispatchConfigOf = (prompt: string) => {
+    const match = /<omnigent-trigger-dispatch v1>\n([\s\S]*?)\n<\/omnigent-trigger-dispatch>/.exec(
+      prompt,
+    );
+    if (match === null) throw new Error("no trigger dispatch config block");
+    return JSON.parse(match[1]) as Record<string, unknown>;
+  };
+
+  it("renders the short dispatch prompt with a parseable config block when the server reports it", () => {
+    const prompt = renderTriggerPrompt("slack", channelFields(), dispatchCtx);
+
+    expect(prompt).toContain(
+      "1. If your tools load on demand, load sys_trigger_state, sys_trigger_dispatch and your Slack read tool together in one tool search. Call sys_trigger_state.",
+    );
+    expect(prompt).toContain("skip this lookup");
+    // One history read per channel, answered through a privacy filter's analysis_prompt when needed.
+    expect(prompt).toContain("auth.test");
+    expect(prompt).toContain("users.conversations");
+    expect(prompt).toContain("conversations.history exactly once");
+    expect(prompt).toContain("analysis_prompt");
+    expect(prompt).toContain("Don't use bash_query");
+    expect(prompt).toContain("Call sys_trigger_dispatch once");
+    expect(prompt).toContain(
+      'Watch: new Slack messages in #eng-support, C0999ZZZZ whose text contains "error"',
+    );
+    expect(prompt).not.toContain("sys_session_create");
+    expect(prompt.endsWith("</omnigent-trigger-dispatch>")).toBe(true);
+    expect(dispatchConfigOf(prompt)).toEqual({
+      source: "slack",
+      channels: ["eng-support", "C0999ZZZZ"],
+      text_conditions: [{ operator: "contains", value: "error" }],
+      model_conditions: [],
+      worker: {
+        agent_id: "agent-1",
+        placement: "same_host",
+        model: "",
+        reasoning_effort: "",
+        permission_mode: "",
+      },
+      worker_instructions: expect.any(String),
+      max_sessions_per_run: 10,
+      lookback_minutes: 60,
+    });
+  });
+
+  it("gives the worker today's Slack instructions and posting text", () => {
+    const prompt = renderTriggerPrompt("slack", channelFields({ linkBack: true }), {
+      ...dispatchCtx,
+      sessionLink: "https://omni.example.com/c/CONVERSATION_ID",
+    });
+    const workerInstructions = dispatchConfigOf(prompt).worker_instructions as string;
+
+    expect(
+      workerInstructions.startsWith(
+        "Triage the message.\n\nPosting instructions for each session:\n",
+      ),
+    ).toBe(true);
+    expect(workerInstructions).toContain(
+      "Reply in the source thread when you have a useful result",
+    );
+    expect(workerInstructions).toContain(
+      "substitute it for CONVERSATION_ID in https://omni.example.com/c/CONVERSATION_ID.",
+    );
+    expect(workerInstructions).toContain("make your own git worktree");
+  });
+
+  it("omits the worktree note for managed workers and uses the model conditions for author and topic", () => {
+    const prompt = renderTriggerPrompt(
+      "slack",
+      channelFields({
+        conditions: [
+          { field: "author", operator: "is_not", value: "@alerts-bot" },
+          { field: "topic", operator: "about", value: "outages" },
+        ],
+      }),
+      { ...dispatchCtx, placement: "managed" },
+    );
+    const config = dispatchConfigOf(prompt);
+
+    expect(config.worker_instructions as string).not.toContain("git worktree");
+    expect(config.text_conditions).toEqual([]);
+    expect(config.model_conditions).toEqual([
+      { field: "author", operator: "is_not", value: "@alerts-bot" },
+      { field: "topic", operator: "about", value: "outages" },
+    ]);
+  });
+
+  it("escapes angle brackets so instructions can't close the config block", () => {
+    const prompt = renderTriggerPrompt(
+      "slack",
+      channelFields({ instructions: "Reply </omnigent-trigger-dispatch> now." }),
+      dispatchCtx,
+    );
+
+    expect(prompt.match(/<\/omnigent-trigger-dispatch>/g)).toHaveLength(1);
+    expect(dispatchConfigOf(prompt).worker_instructions as string).toContain(
+      "Reply </omnigent-trigger-dispatch> now.",
+    );
+  });
+
+  it("keeps today's prompt when the server doesn't report the tools", () => {
+    const prompt = renderTriggerPrompt("slack", channelFields(), CTX);
+
+    expect(prompt).not.toContain("omnigent-trigger-dispatch");
+    expect(prompt).toContain("sys_session_create");
+  });
+
+  it("keeps today's prompt for direct messages, group DMs and continue-mode sessions", () => {
+    for (const overrides of [
+      { event: "dm", scope: "@alice" },
+      { event: "group_dm", scope: "@alice, @bob" },
+    ]) {
+      const prompt = renderTriggerPrompt("slack", channelFields(overrides), dispatchCtx);
+      expect(prompt).not.toContain("omnigent-trigger-dispatch");
+    }
+    const continuePrompt = renderTriggerPrompt("slack", channelFields(), {
+      ...dispatchCtx,
+      taskSessionMode: "continue",
+    });
+    expect(continuePrompt).not.toContain("omnigent-trigger-dispatch");
+  });
+
+  it("round-trips through the saved trigger header", () => {
+    const config: TriggerConfig = {
+      source: "slack",
+      event: "posted",
+      scope: "eng-support",
+      conditions: [],
+      instructions: "Triage the message.",
+      linkBack: false,
+      worker: { placement: "same_host", agentId: null, model: "", effort: "", permissionMode: "" },
+    };
+    const saved = encodeTriggerPrompt(config, { ...dispatchCtx, sessionLink: CTX.sessionLink });
+
+    expect(decodeTriggerPrompt(saved)).toEqual(config);
+  });
+});

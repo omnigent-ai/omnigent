@@ -74,6 +74,7 @@ from omnigent.runner.journal_tools import (
     server_workflows_enabled,
 )
 from omnigent.runner.session_requests import remember_session_host
+from omnigent.runner.trigger_dispatch import execute_trigger_dispatch, execute_trigger_state
 from omnigent.runtime.mcp_tool_result import encode_mcp_image_result, native_image_payload
 from omnigent.tools import ToolManager
 from omnigent.tools.base import Tool, ToolContext
@@ -138,6 +139,7 @@ from omnigent.tools.builtins.timer import (
     # schema advertises.
     validate_timer_set_args,
 )
+from omnigent.tools.builtins.trigger_dispatch import SysTriggerDispatchTool, SysTriggerStateTool
 from omnigent.tools.builtins.ui import OpenFileRequest, UiOpenFileTool
 from omnigent.tools.builtins.update_comment import UpdateCommentTool
 from omnigent.tools.builtins.upload_file import UploadFileTool, safe_resolve
@@ -331,6 +333,10 @@ _TURN_ACTOR_LABEL = "omnigent.turn_actor"
 # via the JSON POST /v1/sessions create — same server-permission posture
 # as _execute_subagent_tool.
 _SESSION_CREATE_TOOLS = frozenset({"sys_session_create"})
+
+# Slack trigger dispatch: runner-local tools that read the manager's config block and start
+# workers through the same ``_execute_session_create`` path. Gated by the trigger feature flag.
+_TRIGGER_DISPATCH_TOOLS = frozenset({SysTriggerStateTool.name(), SysTriggerDispatchTool.name()})
 
 # Priority 5f.0: Session query tools — peek/list/close/get_info/share. The
 # runner has no in-process ConversationStore, so these read/mutate session
@@ -531,6 +537,7 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     | _LIST_MODELS_TOOLS
     | _ADVISE_MODELS_TOOLS
     | _SESSION_CREATE_TOOLS
+    | _TRIGGER_DISPATCH_TOOLS
     | _TASK_LIFECYCLE_TOOLS
     | _AGENT_TOOLS
     | _POLICY_TOOLS
@@ -961,6 +968,7 @@ _ALL_LOCAL_TOOLS = (
     | _LIST_MODELS_TOOLS
     | _ADVISE_MODELS_TOOLS
     | _SESSION_CREATE_TOOLS
+    | _TRIGGER_DISPATCH_TOOLS
     | _SESSION_QUERY_TOOLS
     | _SESSION_SELF_WRITE_TOOLS
     | _PROJECT_TOOLS
@@ -3671,6 +3679,49 @@ async def _finalize_created_session(
             }
         )
     return json.dumps(handle)
+
+
+async def _execute_trigger_tool(
+    tool_name: str,
+    args: _JsonObject,
+    *,
+    server_client: httpx.AsyncClient | None,
+    conversation_id: str | None,
+    publish_event: Callable[[str, _JsonObject], None] | None,
+    agent_spec: AgentSpec | None = None,
+    runner_workspace: Path | None = None,
+) -> str:
+    """
+    Run ``sys_trigger_state`` or ``sys_trigger_dispatch`` for a Slack trigger manager.
+
+    Workers start through :func:`_execute_session_create`, the same path as
+    ``sys_session_create``, so placement, agent and permission checks are shared.
+
+    :param tool_name: ``"sys_trigger_state"`` or ``"sys_trigger_dispatch"``.
+    :param args: Parsed tool arguments; ignored by ``sys_trigger_state``.
+    :returns: The tool's JSON result.
+    """
+    if tool_name == SysTriggerStateTool.name():
+        return await execute_trigger_state(
+            server_client=server_client, conversation_id=conversation_id
+        )
+
+    async def create_worker(worker_args: _JsonObject) -> str:
+        return await _execute_session_create(
+            worker_args,
+            server_client=server_client,
+            conversation_id=conversation_id,
+            publish_event=publish_event,
+            agent_spec=agent_spec,
+            runner_workspace=runner_workspace,
+        )
+
+    return await execute_trigger_dispatch(
+        args,
+        server_client=server_client,
+        conversation_id=conversation_id,
+        create_worker=create_worker,
+    )
 
 
 async def _execute_session_create(
@@ -7776,6 +7827,16 @@ async def execute_tool(
             output = await execute(args, server_client, conversation_id)
         elif tool_name in _SESSION_CREATE_TOOLS:
             output = await _execute_session_create(
+                args,
+                server_client=server_client,
+                conversation_id=conversation_id,
+                publish_event=publish_event,
+                agent_spec=agent_spec,
+                runner_workspace=runner_workspace,
+            )
+        elif tool_name in _TRIGGER_DISPATCH_TOOLS:
+            output = await _execute_trigger_tool(
+                tool_name,
                 args,
                 server_client=server_client,
                 conversation_id=conversation_id,

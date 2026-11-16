@@ -61,6 +61,7 @@ import {
   isSystemUserContent,
   parseSystemMessage,
   stripAutomationContext,
+  stripTriggerDispatchConfig,
 } from "@/lib/systemMessage";
 import { Button } from "@/components/ui/button";
 import { BrandLogo } from "@/components/BrandLogo";
@@ -129,13 +130,18 @@ export const SessionSharedContext = createContext(false);
 
 /** A user message's raw text, minus runtime context and any sender prefix. */
 function userMessageBody(content: MessageContentBlock[]): string {
-  const text = stripAutomationContext(joinTextBlocks(content));
+  const text = displayedUserText(content);
   return codexAsyncQuestionReplyText(splitSessionMessageOrigin(text)?.body ?? text);
 }
 
 /** The sending session of a user message another session sent, or null. */
 export function userMessageOrigin(content: MessageContentBlock[]): SessionMessageOrigin | null {
-  return splitSessionMessageOrigin(stripAutomationContext(joinTextBlocks(content)));
+  return splitSessionMessageOrigin(displayedUserText(content));
+}
+
+/** A user message's text without the runtime notes and tool config people don't need to read. */
+function displayedUserText(content: MessageContentBlock[]): string {
+  return stripTriggerDispatchConfig(stripAutomationContext(joinTextBlocks(content)));
 }
 
 /** A user message's text for reading and copying: mention markers become ``@name``. */
