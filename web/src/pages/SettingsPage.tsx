@@ -82,6 +82,20 @@ import { useTheme } from "next-themes";
 import { PageScroll } from "@/components/PageScroll";
 import { SettingsGroup } from "@/components/SettingsGroup";
 import { SettingsLabel } from "@/components/SettingsLabel";
+import { LOCAL_CLI_ENTRY } from "@/pages/settings/search/catalog/cli";
+import {
+  CHECK_FOR_UPDATES_ENTRY,
+  INSTALL_UPDATES_ON_QUIT_ENTRY,
+  UPDATE_MODE_ENTRY,
+  UPDATE_MODE_LABELS,
+} from "@/pages/settings/search/catalog/updates";
+import { SettingsItem } from "@/pages/settings/search/SettingsItem";
+import {
+  settingsControlProps,
+  settingsDescriptionId,
+  settingsLabelId,
+} from "@/pages/settings/search/settingsControl";
+import { settingsOverlayProps } from "@/pages/settings/search/settingsOwnership";
 import { SessionTitleInstructionsControl } from "@/components/SessionTitleInstructionsControl";
 import { McpRegistryConnections } from "@/components/McpRegistry";
 import { ThemeColorPicker } from "@/components/theme/ThemeColorPicker";
@@ -2590,7 +2604,7 @@ function LocalCliSection() {
         {status === null ? (
           <p className="text-ui text-muted-foreground">CLI status is unavailable.</p>
         ) : (
-          <div className="flex flex-col gap-4">
+          <SettingsItem entry={LOCAL_CLI_ENTRY} className="flex flex-col gap-4">
             <div className="flex items-center gap-2 text-ui">
               <span
                 aria-hidden
@@ -2642,6 +2656,7 @@ function LocalCliSection() {
                 {status.source === "configured" && (
                   <div>
                     <Button
+                      {...settingsControlProps(LOCAL_CLI_ENTRY, "reset")}
                       variant="ghost"
                       size="sm"
                       disabled={busy}
@@ -2653,19 +2668,12 @@ function LocalCliSection() {
                 )}
               </>
             )}
-          </div>
+          </SettingsItem>
         )}
       </SettingsGroup>
     </Section>
   );
 }
-
-const UPDATE_MODE_LABELS: Record<UpdateMode, string> = {
-  default: "Automatic (check periodically, ask before installing)",
-  start: "Check when Omnigent starts",
-  manual: "Manual only",
-  none: "Off",
-};
 
 function UpdatesSection() {
   const bridge = updateBridge();
@@ -2754,46 +2762,68 @@ function UpdatesSection() {
       ) : (
         <div className="flex max-w-2xl flex-col gap-6">
           <SettingsGroup title="Preferences" testId="settings-group-update-preferences">
-            <label className="flex flex-col gap-2">
-              <span className="text-ui font-normal md:font-medium">Update mode</span>
-              <Select
-                value={config.mode}
-                onValueChange={(value) => void persistConfig({ mode: value as UpdateMode })}
-                disabled={saving}
-                componentId="settings.updates.mode"
-                valueHasNoPii
-              >
-                <SelectTrigger className="w-full max-w-md" data-testid="update-mode-select">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {(Object.keys(UPDATE_MODE_LABELS) as UpdateMode[]).map((mode) => (
-                    <SelectItem key={mode} value={mode}>
-                      {UPDATE_MODE_LABELS[mode]}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </label>
+            <SettingsItem entry={UPDATE_MODE_ENTRY}>
+              <label className="flex flex-col gap-2">
+                <span
+                  id={settingsLabelId(UPDATE_MODE_ENTRY)}
+                  className="text-ui font-normal md:font-medium"
+                >
+                  Update mode
+                </span>
+                <Select
+                  value={config.mode}
+                  onValueChange={(value) => void persistConfig({ mode: value as UpdateMode })}
+                  disabled={saving}
+                  componentId="settings.updates.mode"
+                  valueHasNoPii
+                >
+                  <SelectTrigger
+                    {...settingsControlProps(UPDATE_MODE_ENTRY)}
+                    className="w-full max-w-md"
+                    data-testid="update-mode-select"
+                  >
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent {...settingsOverlayProps(UPDATE_MODE_ENTRY)}>
+                    {(Object.keys(UPDATE_MODE_LABELS) as UpdateMode[]).map((mode) => (
+                      <SelectItem key={mode} value={mode}>
+                        {UPDATE_MODE_LABELS[mode]}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </label>
+            </SettingsItem>
 
-            <div className="mt-4 flex items-center justify-between gap-4 border-t border-border pt-4">
-              <SettingsLabel
-                label="Install downloaded updates on next quit"
-                description="Applies only after you choose to download an update."
-              />
-              <Switch
-                checked={config.autoInstall}
-                onCheckedChange={(checked) => void persistConfig({ autoInstall: checked })}
-                disabled={saving}
-                aria-label="Install downloaded updates on next quit"
-                componentId="settings.updates.auto_install"
-              />
+            <div className="mt-4 border-t border-border pt-4">
+              <SettingsItem
+                entry={INSTALL_UPDATES_ON_QUIT_ENTRY}
+                className="flex items-center justify-between gap-4"
+              >
+                <SettingsLabel
+                  label={INSTALL_UPDATES_ON_QUIT_ENTRY.label}
+                  labelId={settingsLabelId(INSTALL_UPDATES_ON_QUIT_ENTRY)}
+                  descriptionId={settingsDescriptionId(INSTALL_UPDATES_ON_QUIT_ENTRY)}
+                  description={INSTALL_UPDATES_ON_QUIT_ENTRY.description}
+                />
+                <Switch
+                  {...settingsControlProps(INSTALL_UPDATES_ON_QUIT_ENTRY)}
+                  checked={config.autoInstall}
+                  onCheckedChange={(checked) => void persistConfig({ autoInstall: checked })}
+                  disabled={saving}
+                  componentId="settings.updates.auto_install"
+                />
+              </SettingsItem>
             </div>
           </SettingsGroup>
 
           <SettingsGroup title="Actions" testId="settings-group-update-actions">
-            <div className="flex flex-wrap items-center gap-3">
+            <SettingsItem
+              entry={CHECK_FOR_UPDATES_ENTRY}
+              className="flex flex-wrap items-center gap-3"
+            >
               <Button
+                {...settingsControlProps(CHECK_FOR_UPDATES_ENTRY, "check")}
                 onClick={() => void onCheck()}
                 loading={checking}
                 componentId="settings.updates.check_now"
@@ -2801,7 +2831,7 @@ function UpdatesSection() {
                 Check for updates now
               </Button>
               {saving && <span className="text-sm text-muted-foreground">Saving…</span>}
-            </div>
+            </SettingsItem>
           </SettingsGroup>
 
           {lastCheckError && (

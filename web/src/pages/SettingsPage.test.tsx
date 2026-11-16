@@ -1616,6 +1616,17 @@ describe("SettingsPage", () => {
     });
   });
 
+  it("renders each Updates row from its Settings catalog entry", async () => {
+    installUpdateBridge();
+
+    renderPage("/settings/updates");
+    expect(await screen.findByRole("heading", { name: "Updates" })).toBeInTheDocument();
+
+    for (const id of ["update-mode", "install-updates-on-quit", "check-for-updates"]) {
+      expect(document.querySelector(`[data-settings-item="${id}"]`)).not.toBeNull();
+    }
+  });
+
   it("surfaces manual update-check failures in Settings", async () => {
     const { bridge, emitStatus } = installUpdateBridge();
     vi.mocked(bridge.check).mockRejectedValueOnce(new Error("Cannot find latest.yml: 404"));
