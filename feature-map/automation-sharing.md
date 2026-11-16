@@ -45,8 +45,9 @@ runs' sessions in their own Omnigent Automation folder.
   does not open the automation's share dialog.
 - `shared-list`: a Shared with me tab beside Your automations lists the
   automations shared with the viewer, directly or through a group, only on a
-  multi-user server advertising `scheduled_task_sharing`. Cards look like the
-  viewer's own, with the same search and Active/Paused filter, and the subline
+  multi-user server advertising `scheduled_task_shared_with_me`; older servers
+  advertise `scheduled_task_sharing` without it. Cards look like the viewer's
+  own, with the same search and Active/Paused filter, and the subline
   starts Shared by and the owner's name. It loads 50 at a time with Show more,
   moving on by itself past a page that came back empty. Empty: No automations
   are shared with you yet.
@@ -94,9 +95,10 @@ runs' sessions in their own Omnigent Automation folder.
 
 Preconditions: a multi-user server (not single-user) with `automations_v2` on,
 which is the default, and a database permission store, so `/v1/info` reports
-`scheduled_task_sharing: true`. Sign in as two users with distinct IDs such as
-`alice@example.com` and `bob@example.com`. Browser drives need a server origin
-other than loopback, as the
+`scheduled_task_sharing: true` and `scheduled_task_shared_with_me: true`. Sign
+in as two users with distinct IDs such as `alice@example.com` and
+`bob@example.com`. Browser drives need a server origin other than loopback, as
+the
 [multi-user collaboration helper](../tests/e2e_ui/collaboration/_multi_user_server.py)
 uses, because the session Share button is disabled on a local server.
 

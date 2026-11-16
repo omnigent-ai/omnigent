@@ -7994,6 +7994,11 @@
             "title": "Scheduled Task Session Modes",
             "type": "boolean"
           },
+          "scheduled_task_shared_with_me": {
+            "default": false,
+            "title": "Scheduled Task Shared With Me",
+            "type": "boolean"
+          },
           "scheduled_task_sharing": {
             "default": false,
             "title": "Scheduled Task Sharing",

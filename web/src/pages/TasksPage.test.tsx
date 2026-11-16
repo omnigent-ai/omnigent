@@ -820,7 +820,11 @@ describe("sharing from the row menu", () => {
 });
 
 describe("automations shared with the viewer", () => {
-  const SHARING_INFO = { ...TRIGGER_INFO, scheduled_task_sharing: true };
+  const SHARING_INFO = {
+    ...TRIGGER_INFO,
+    scheduled_task_sharing: true,
+    scheduled_task_shared_with_me: true,
+  };
   const shared = (overrides: Partial<ScheduledTask> = {}) =>
     task({
       id: "st_shared",
@@ -913,6 +917,10 @@ describe("automations shared with the viewer", () => {
   it.each([
     ["a server that cannot share automations", TRIGGER_INFO],
     ["a single-user server", { ...SHARING_INFO, single_user: true }],
+    [
+      "an older server that shares automations but cannot list them",
+      { ...TRIGGER_INFO, scheduled_task_sharing: true },
+    ],
   ])("has no Shared with me tab on %s", (_label, info) => {
     setSharedPages([{ tasks: [shared()], nextCursor: null }]);
     openSharedTab(info);

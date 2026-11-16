@@ -366,6 +366,11 @@ export interface ServerInfo {
    */
   scheduled_task_sharing?: boolean;
   /**
+   * Automations shared with the viewer can be listed (``/v1/scheduled-tasks/shared``);
+   * absent on older servers (off), including some that advertise sharing.
+   */
+  scheduled_task_shared_with_me?: boolean;
+  /**
    * The deployment offers the proactive agent (Omni Advisor) to this caller;
    * whether it is on for them is at ``GET /v1/proactive-agent/settings``.
    */
@@ -743,6 +748,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           scheduled_task_projects: data.scheduled_task_projects === true,
           scheduled_task_inbox: data.scheduled_task_inbox === true,
           scheduled_task_sharing: data.scheduled_task_sharing === true,
+          scheduled_task_shared_with_me: data.scheduled_task_shared_with_me === true,
           proactive_agent_available: data.proactive_agent_available === true,
           scheduled_task_harness_settings: data.scheduled_task_harness_settings === true,
           scheduled_task_approval_skipping_modes:

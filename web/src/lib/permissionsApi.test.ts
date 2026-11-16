@@ -12,7 +12,6 @@ import { FALLBACK_SERVER_INFO } from "./capabilities";
 import * as identity from "./identity";
 import {
   LEVEL_OWNER,
-  automationSharingAvailable,
   canShareAutomation,
   derivePermissionLevel,
   grantPermission,
@@ -22,6 +21,7 @@ import {
   listPermissions,
   revokePermission,
   revokeSharePermission,
+  sharedAutomationsListed,
   workspaceSharingBlocked,
 } from "./permissionsApi";
 
@@ -412,14 +412,26 @@ describe("canShareAutomation", () => {
   ])("answers for %s", (_label, info, viewerId, expected) => {
     expect(canShareAutomation(info, viewerId, owner)).toBe(expected);
   });
+});
 
+describe("sharedAutomationsListed", () => {
+  const listed = {
+    ...FALLBACK_SERVER_INFO,
+    scheduled_task_sharing: true,
+    scheduled_task_shared_with_me: true,
+  };
   it.each([
-    ["a multi-user server that shares automations", sharing, true],
-    ["a single-user server", { ...sharing, single_user: true }, false],
+    ["a multi-user server that lists them", listed, true],
+    ["a single-user server", { ...listed, single_user: true }, false],
+    [
+      "an older server that shares automations but cannot list them",
+      { ...FALLBACK_SERVER_INFO, scheduled_task_sharing: true },
+      false,
+    ],
     ["a server without automation sharing", FALLBACK_SERVER_INFO, false],
     ["a server still loading", "loading" as const, false],
-  ])("lists shared automations on %s", (_label, info, expected) => {
-    expect(automationSharingAvailable(info)).toBe(expected);
+  ])("answers for %s", (_label, info, expected) => {
+    expect(sharedAutomationsListed(info)).toBe(expected);
   });
 });
 

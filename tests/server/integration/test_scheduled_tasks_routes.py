@@ -5112,6 +5112,8 @@ async def test_sharing_is_advertised_and_served_together(
         )
     info = (await auth_client.get("/v1/info", headers=_headers())).json()
     assert info["scheduled_task_sharing"] is sharing
+    # Clients gate the shared list on its own flag, as older servers lack it.
+    assert info["scheduled_task_shared_with_me"] is sharing
     task_id = await _create_task(auth_client)
     shared = await _share(auth_client, task_id, "bob@example.com")
     listed = await auth_client.get(_permissions_url(task_id), headers=_headers())

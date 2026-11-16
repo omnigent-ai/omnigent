@@ -6,8 +6,8 @@
  * Data comes from `useScheduledTasks`. Pause/resume and delete go through the
  * update/delete mutations, which invalidate the list. Share opens the shared
  * permissions dialog for an automation the viewer owns. On a multi-user server
- * that shares automations, a "Shared with me" tab lists other users'
- * automations shared with the viewer, read-only, a page at a time.
+ * that lists them, a "Shared with me" tab lists other users' automations
+ * shared with the viewer, read-only, a page at a time.
  * The human-readable schedule and next-run text are computed client-side from
  * each task's stored RRULE (`scheduleText`) — there is no backend next-run
  * endpoint.
@@ -47,7 +47,7 @@ import {
 } from "@/hooks/useScheduledTasks";
 import { useNow } from "@/hooks/useNow";
 import { useViewerId } from "@/hooks/useViewerId";
-import { automationSharingAvailable, canShareAutomation } from "@/lib/permissionsApi";
+import { canShareAutomation, sharedAutomationsListed } from "@/lib/permissionsApi";
 import { ScheduledTaskApiError, type ScheduledTask } from "@/lib/scheduledTasksApi";
 import { nextRunAtMs } from "@/lib/scheduleText";
 import { cn } from "@/lib/utils";
@@ -129,19 +129,19 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const info = useServerInfo();
-  const sharingAvailable = automationSharingAvailable(info);
+  const sharedListAvailable = sharedAutomationsListed(info);
   const requestedViewParam = searchParams.get("view");
   // A linked Shared tab waits for the server's capabilities rather than bouncing.
   const view =
     templatesOnly || requestedViewParam === "templates"
       ? "templates"
-      : requestedViewParam === "shared" && (info === "loading" || sharingAvailable)
+      : requestedViewParam === "shared" && (info === "loading" || sharedListAvailable)
         ? "shared"
         : "yours";
   useOmnigentPageView(
     view === "templates" ? "tasks.templates" : view === "shared" ? "tasks.shared" : "tasks",
   );
-  const sharedQuery = useSharedScheduledTasks(sharingAvailable && view === "shared");
+  const sharedQuery = useSharedScheduledTasks(sharedListAvailable && view === "shared");
   const requestedView = useRef<string>(view);
   useEffect(() => {
     requestedView.current = view;
@@ -396,7 +396,7 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
           <TabsTrigger value="yours" className="h-8 flex-none px-3">
             Your automations
           </TabsTrigger>
-          {(sharingAvailable || view === "shared") && (
+          {(sharedListAvailable || view === "shared") && (
             <TabsTrigger value="shared" className="h-8 flex-none px-3">
               Shared with me
             </TabsTrigger>

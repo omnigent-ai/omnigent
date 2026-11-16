@@ -278,18 +278,30 @@ export async function revokePermission(sessionId: string, userId: string): Promi
 }
 
 /**
- * Whether automations can be shared on this server: it advertises automation
- * sharing and has other users, as session sharing requires.
+ * Whether the viewer may share an automation: the server can share automations,
+ * has other users (as session sharing requires), and the viewer owns it.
  */
-export function automationSharingAvailable(info: ServerInfo | "loading"): boolean {
-  return info !== "loading" && info.scheduled_task_sharing === true && !isSingleUserMode(info);
-}
-
-/** Whether the viewer may share an automation: sharing is available and they own it. */
 export function canShareAutomation(
   info: ServerInfo | "loading",
   viewerId: string | null,
   ownerUserId: string | null,
 ): boolean {
-  return automationSharingAvailable(info) && viewerId !== null && ownerUserId === viewerId;
+  return (
+    info !== "loading" &&
+    info.scheduled_task_sharing === true &&
+    !isSingleUserMode(info) &&
+    viewerId !== null &&
+    ownerUserId === viewerId
+  );
+}
+
+/**
+ * Whether the server lists the automations shared with the viewer: it serves
+ * `/v1/scheduled-tasks/shared` and has other users. Older servers that share
+ * automations lack that route.
+ */
+export function sharedAutomationsListed(info: ServerInfo | "loading"): boolean {
+  return (
+    info !== "loading" && info.scheduled_task_shared_with_me === true && !isSingleUserMode(info)
+  );
 }
