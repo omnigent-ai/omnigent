@@ -593,6 +593,24 @@ describe("side chat opened from a + button", () => {
     expect(screen.getByTestId("other-field")).toHaveFocus();
   });
 
+  it("continues a restored draft from its end when the input takes focus", () => {
+    conversationRegistry.acquire(childId).setState({ boundAgentId: null, sessionStatus: "idle" });
+    const draft = "Add a step that opens the upgrade PRs";
+    useChatStore.setState({
+      sideChatComposers: { [childId]: { text: draft, files: [], autoFocus: true } },
+    });
+    renderPane(<SideChatPane childId={childId} />);
+    const input = screen.getByTestId<HTMLTextAreaElement>("side-chat-input");
+    // Browsers can leave a restored value's caret before its first word.
+    input.setSelectionRange(0, 0);
+
+    act(() => conversationRegistry.acquire(childId).setState({ boundAgentId: "agent_side" }));
+
+    expect(input).toHaveFocus();
+    expect(input.selectionStart).toBe(draft.length);
+    expect(input.selectionEnd).toBe(draft.length);
+  });
+
   it("leaves a text input that already had focus before the pane mounted alone", () => {
     conversationRegistry.acquire(childId).setState({ boundAgentId: null, sessionStatus: "idle" });
     useChatStore.setState({
