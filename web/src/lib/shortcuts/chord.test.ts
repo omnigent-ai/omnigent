@@ -80,6 +80,20 @@ describe("chordMatches", () => {
     expect(chordMatches(rename, altGraph, false)).toBe(false);
   });
 
+  it("compares the key exactly only for a chord that opts in", () => {
+    const kelvin = press({ key: "\u212A", metaKey: true });
+    expect(chordMatches({ mod: true, key: "k" }, kelvin, true)).toBe(true);
+    expect(chordMatches({ mod: true, key: "k", exactKey: true }, kelvin, true)).toBe(false);
+    expect(chordMatches({ key: "Tab", exactKey: true }, press({ key: "tab" }), true)).toBe(false);
+    expect(chordMatches({ key: "Tab", exactKey: true }, press({ key: "Tab" }), true)).toBe(true);
+  });
+
+  it("matches under AltGr only for a chord that opts in", () => {
+    const slash = press({ key: "/", ctrlKey: true, altGraph: true });
+    expect(chordMatches({ mod: true, key: "/" }, slash, false)).toBe(false);
+    expect(chordMatches({ mod: true, key: "/", matchesAltGraph: true }, slash, false)).toBe(true);
+  });
+
   it("reads AltGr from a DOM keydown", () => {
     const event = new KeyboardEvent("keydown", {
       key: "r",

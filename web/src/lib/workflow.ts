@@ -13,7 +13,7 @@ export const WORKFLOW_SKILL = "workflow";
 
 /**
  * Added to the workflow message when the user reviews the plan before work starts. The
- * workflow skill says how: the review comes right after the exploration every plan starts with.
+ * workflow skill places that review before executing the proposed work.
  */
 export const REVIEW_PLAN_FIRST = "Let me review the plan before you start the work.";
 
@@ -181,7 +181,7 @@ export function runSavedWorkflowPrompt(
   workflow: { id: string; name: string },
   details = "",
 ): string {
-  const request = `Use the ${WORKFLOW_SKILL} skill to run the saved workflow "${workflow.name}" (ID ${workflow.id}).`;
+  const request = `Use the ${WORKFLOW_SKILL} skill to run the saved workflow "${workflow.name}" (ID ${workflow.id}).\n\nIf the session journal already contains this workflow's plan, continue that run without writing a second starting plan.`;
   return details.trim() ? `${request}\n\n${details.trim()}` : request;
 }
 

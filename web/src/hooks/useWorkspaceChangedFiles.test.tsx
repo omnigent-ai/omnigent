@@ -268,10 +268,10 @@ afterEach(() => {
 });
 
 describe("useWorkspaceChangedFiles gating", () => {
-  it("preserves optional repository identity and workspace-relative paths", async () => {
+  it("preserves optional repository identity, untracked lines and relative paths", async () => {
     onlineMock.mockReturnValue(true);
     const entries = [
-      { path: "api/app.py", name: "app.py", repository_root: "api" },
+      { path: "api/app.py", name: "app.py", repository_root: "api", untracked_lines: 4 },
       { path: "notes.md", name: "notes.md" },
     ].map((entry) => ({ ...entry, status: "modified", bytes: 12, modified_at: null }));
     fetchMock
@@ -281,6 +281,8 @@ describe("useWorkspaceChangedFiles gating", () => {
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
     expect(result.current.data?.data).toMatchObject(entries);
     expect(result.current.data?.data[1].repository_root).toBeUndefined();
+    // Runners that predate untracked line counts omit the field.
+    expect(result.current.data?.data[1].untracked_lines).toBeNull();
   });
 
   it("does not fetch when the runner is offline and the host is also down", async () => {
