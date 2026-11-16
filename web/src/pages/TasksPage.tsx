@@ -213,14 +213,25 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
     () => filterAndSortTasks(sharedTasks, search, filter),
     [sharedTasks, search, filter],
   );
-  const { hasNextPage: sharedHasMore, isFetchingNextPage: sharedFetchingMore } = sharedQuery;
+  const {
+    hasNextPage: sharedHasMore,
+    isFetchingNextPage: sharedFetchingMore,
+    isError: sharedFailed,
+  } = sharedQuery;
   const fetchMoreShared = sharedQuery.fetchNextPage;
-  // A page can come back empty while more remain; keep going until one has rows.
+  // A page can come back empty while more remain; keep going until one has rows,
+  // but not past a failure, which waits for Retry.
   useEffect(() => {
-    if (view === "shared" && sharedTasks.length === 0 && sharedHasMore && !sharedFetchingMore) {
+    if (
+      view === "shared" &&
+      sharedTasks.length === 0 &&
+      sharedHasMore &&
+      !sharedFetchingMore &&
+      !sharedFailed
+    ) {
       void fetchMoreShared();
     }
-  }, [view, sharedTasks.length, sharedHasMore, sharedFetchingMore, fetchMoreShared]);
+  }, [view, sharedTasks.length, sharedHasMore, sharedFetchingMore, sharedFailed, fetchMoreShared]);
 
   // A per-task busy flag so a row's menu disables while its own mutation runs.
   // Covers pause/resume (update), delete, and run-now so the ⋯ menu can't be

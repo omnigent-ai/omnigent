@@ -510,6 +510,8 @@ class PermissionStore(ABC):
 
         The default is the user alone. Stores that model group membership override
         this to add the user's groups, so a grant to a group reaches its members.
+        Keep the list small: :meth:`list_scheduled_tasks_shared_with` reads one
+        window per principal, so a store with many groups must cap what it returns.
 
         :param user_id: The caller, e.g. ``"alice@example.com"``.
         :returns: The caller's ID followed by any groups they belong to.
@@ -528,6 +530,8 @@ class PermissionStore(ABC):
         Ordered by task ID, each task once however many principals hold a grant on it.
         A page can be shorter than *limit*, even empty, while ``next_cursor`` is set:
         grants on deleted tasks are skipped, not replaced. Owner rules are the caller's.
+        Work grows with the number of principals, one bounded window each; SQLite also
+        refuses a compound select of more than 500 terms, so callers cap *principals*.
 
         :param principals: The caller's ID and groups, from :meth:`caller_principals`.
         :param limit: Max task IDs to return, 1 to

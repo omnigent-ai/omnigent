@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import json
 import uuid
 from collections.abc import AsyncIterator, Callable, Iterator
@@ -5660,6 +5661,45 @@ async def test_recipients_read_an_automation_its_runs_and_their_steps(
     ] * 3
     assert (await client.delete(_read_urls(task_id)[0], headers=_headers())).status_code == 200
     assert (await client.get(_read_urls(task_id)[0], headers=_CAROL)).status_code == 404
+
+
+async def test_a_reminder_is_neither_shared_nor_shown_to_recipients(
+    workflows_client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = workflows_client
+    task_id = await _create_task(client)
+    assert (await _share(client, task_id, "bob@example.com")).status_code == 200
+    get = SqlAlchemyScheduledTaskStore.get
+
+    def as_reminder(self: SqlAlchemyScheduledTaskStore, *args: Any, **kwargs: Any) -> Any:
+        task = get(self, *args, **kwargs)
+        if task is None or task.id != task_id:
+            return task
+        return dataclasses.replace(task, kind="reminder")
+
+    monkeypatch.setattr(SqlAlchemyScheduledTaskStore, "get", as_reminder)
+
+    refused = await _share(client, task_id, "carol@example.com")
+
+    assert refused.status_code == 400, refused.text
+    assert _task_grantees(db_uri, task_id) == ["bob@example.com"]
+    # A grant made before it became a reminder gives no access.
+    for url in _read_urls(task_id):
+        assert (await client.get(url, headers=_BOB)).status_code == 404, url
+
+
+async def test_a_deleted_automation_stays_hidden_from_a_grant_that_outlived_it(
+    workflows_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    client = workflows_client
+    task_id = await _create_task(client)
+    assert (await _share(client, task_id, "bob@example.com")).status_code == 200
+    # Tombstoned with its grants still in place, as when deleting them failed.
+    SqlAlchemyScheduledTaskStore(db_uri).update(task_id, state="deleted")
+
+    assert _task_grantees(db_uri, task_id) == ["bob@example.com"]
+    for url in _read_urls(task_id):
+        assert (await client.get(url, headers=_BOB)).status_code == 404, url
 
 
 @_SHARING

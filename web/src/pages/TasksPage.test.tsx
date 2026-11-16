@@ -893,6 +893,15 @@ describe("automations shared with the viewer", () => {
     expect(fetchNextSharedPage).toHaveBeenCalledTimes(1);
   });
 
+  it("stops loading past an empty page once a page fails, until Retry", () => {
+    // An empty page with more to come, whose next page failed.
+    setSharedPages([{ tasks: [], nextCursor: "st_0" }], { isError: true });
+    openSharedTab();
+
+    expect(fetchNextSharedPage).not.toHaveBeenCalled();
+    expect(screen.getByTestId("shared-tasks-load-error")).toBeInTheDocument();
+  });
+
   it("says when nothing is shared with the viewer", () => {
     setSharedPages([{ tasks: [], nextCursor: null }]);
     openSharedTab();

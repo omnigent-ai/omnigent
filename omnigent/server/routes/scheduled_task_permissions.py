@@ -132,6 +132,7 @@ def scheduled_task_viewer_role(
     if (
         caller_id is None
         or task.state == "deleted"
+        or task.kind != "automation"
         or request_from_agent(request)
         or not scheduled_task_sharing_supported(request.app.state, permission_store)
     ):
@@ -438,11 +439,17 @@ def register_scheduled_task_permissions_routes(
         :returns: The resulting grant.
         :raises OmnigentError: 404 when the caller does not own the automation, 403
             for an agent, a server that cannot share automations or the sharing
-            policy, 400 for an empty or over-long ID, the owner, ``__public__`` or a
-            level other than read.
+            policy, 400 for a reminder, an empty or over-long ID, the owner,
+            ``__public__`` or a level other than read.
         """
         store = require_sharing(request, granting=True)
         task = await owned_task(request, scheduled_task_id)
+        # A reminder belongs to its session, so it is shared by sharing that session.
+        if task.kind != "automation":
+            raise OmnigentError(
+                "Only automations can be shared; share the reminder's session instead",
+                code=ErrorCode.INVALID_INPUT,
+            )
         if not body.user_id.strip():
             raise OmnigentError(
                 "Name a user or group to share the automation with",
