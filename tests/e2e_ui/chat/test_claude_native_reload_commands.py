@@ -32,6 +32,7 @@ from tests.e2e_ui.chat.test_claude_skills_menu_terminal_parity import (
     _PLUGIN,
     _host_command,
     _install_claude_plugin,
+    _terminal_pane,
 )
 from tests.e2e_ui.conftest import configure_mock_llm, set_fallback_mock_llm
 from tests.e2e_ui.messages.test_message_render_parity import _select_view_mode
@@ -80,8 +81,7 @@ def _wait_tui_ready(base_url: str, session_id: str) -> str:
     deadline = time.monotonic() + _FIRST_TURN_TIMEOUT_MS / 1000
     pane = ""
     while time.monotonic() < deadline:
-        meta = _pane_metadata(base_url, session_id)
-        pane = "" if meta is None else _tmux(meta, "capture-pane", "-p")
+        pane = _terminal_pane(base_url, session_id)
         if "❯" in pane or "? for shortcuts" in pane:
             return _pane_pid(base_url, session_id)
         time.sleep(1)
