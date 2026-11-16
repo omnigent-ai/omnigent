@@ -19,13 +19,13 @@ import {
   ListChecksIcon,
   Loader2Icon,
   MessageCircleQuestionMarkIcon,
+  NetworkIcon,
   PlayIcon,
   RotateCcwIcon,
   SquareIcon,
   WorkflowIcon,
   XIcon,
 } from "lucide-react";
-import { FullscreenIcon } from "@/components/ai-elements/MermaidBlock";
 import { SessionActionMenuItem } from "@/components/SessionActionMenuItem";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -1053,7 +1053,7 @@ function TasksHeader({
                   data-testid="tasks-plan-graph"
                   onClick={onOpenGraph}
                 >
-                  <FullscreenIcon className="size-3.5" />
+                  <NetworkIcon className="size-3.5" />
                 </Button>
               )}
               {onSaveWorkflow && (

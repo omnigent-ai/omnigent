@@ -1,9 +1,8 @@
 import { useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { WorkflowIcon } from "lucide-react";
+import { NetworkIcon, WorkflowIcon } from "lucide-react";
 import { toast } from "sonner";
 
-import { FullscreenIcon } from "@/components/ai-elements/MermaidBlock";
 import { Button } from "@/components/ui/button";
 import { useSavedWorkflows } from "@/hooks/useSavedWorkflows";
 import { workflowQuestionStep } from "@/lib/blocks";
@@ -171,7 +170,7 @@ export function RunPlanButton({
   );
 }
 
-/** Opens a run on its workflow's graph, with the diagrams' "View fullscreen" icon. */
+/** Opens a run on its workflow's graph, with the graph icon the Agents tab's Graph view uses. */
 export function RunGraphButton({
   runName,
   onClick,
@@ -193,7 +192,7 @@ export function RunGraphButton({
       data-testid="run-graph-button"
       onClick={onClick}
     >
-      <FullscreenIcon />
+      <NetworkIcon className="size-4" />
     </Button>
   );
 }
