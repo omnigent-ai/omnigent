@@ -332,10 +332,17 @@ class SubAgentToolCall(ExecutorEvent):
 
 @dataclass
 class TurnCancelled(ExecutorEvent):
-    """The current assistant turn was cancelled before completion."""
+    """The current assistant turn was cancelled before completion.
+
+    :param usage: Token usage of the model calls the turn made before it was
+        cancelled, or ``None`` when nothing was observed. Same shape as
+        :attr:`TurnComplete.usage`. The calls were spent, so the session's
+        cost counts them.
+    """
 
     reason: str = "user_cancelled"
     phase: str = "model"
+    usage: ExecutorUsage | None = None
 
 
 @dataclass
@@ -353,11 +360,10 @@ class ExecutorError(ExecutorEvent):
         :class:`RetryableLLMError` and :class:`PermanentLLMError`.
     :param usage: Token usage the executor observed before the turn
         failed, or ``None`` when nothing was observed. Same shape as
-        :attr:`TurnComplete.usage`. ``context_tokens`` (window fill) is
-        the meaningful field here: a turn that dies after the model
-        call started has already reported its prompt size, and
-        discarding it freezes the context-occupancy meter at the
-        previous turn's value exactly when the session is in trouble.
+        :attr:`TurnComplete.usage`. The session's cost counts it, and
+        ``context_tokens`` (window fill) keeps the context-occupancy meter
+        from freezing at the previous turn's value when a turn dies after
+        the model call started.
     :param preserve_session: The executor released its per-call resources and is
         safe to reuse without teardown. Native submission bridges may preserve
         independently running work after a lost reply. Defaults to ``False``.
