@@ -1568,13 +1568,6 @@ def register_events_routes(
                     f"Invalid data payload for event type {body.type!r}: {exc}",
                     code=ErrorCode.INVALID_INPUT,
                 ) from exc
-        if body.type == _RETRY_SESSION_TYPE or (
-            body.type == "message" and body.data.get("role", "user") == "user"
-        ):
-            recoverer = getattr(request.app.state, "host_session_recoverer", None)
-            if recoverer is not None:
-                await asyncio.to_thread(recoverer.stop_recovery, conv, only_pending=True)
-
         # Set when this message sends a file outside the default extensions, which
         # the bound runtime must be able to deliver as a file.
         outgoing_needs_delivery_capability = False
@@ -1676,6 +1669,9 @@ def register_events_routes(
                 user_id=user_id,
                 permission_store=permission_store,
             )
+            recoverer = getattr(request.app.state, "host_session_recoverer", None)
+            if recoverer is not None:
+                await asyncio.to_thread(recoverer.stop_recovery, conv, only_pending=True)
             if startup is not None and await startup.retry(session_id):
                 if conv.host_id is not None:
                     startup.host_changed(request.app, conv.host_id)

@@ -4803,6 +4803,7 @@ def create_app(
                     recovery is not None
                     and recovery.host_id == conv.host_id
                     and recovery.runner_id == conv.runner_id
+                    and recovery.phase in {"pending", "launching", "dispatching", "submitted"}
                 ):
                     return True
         except Exception:  # noqa: BLE001 — unreadable: the relay fails the turn as before

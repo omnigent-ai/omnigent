@@ -4891,6 +4891,7 @@ async def _mark_runner_sessions_offline_once(
             recovery is not None
             and recovery.host_id == conv.host_id
             and recovery.runner_id == conv.runner_id
+            and recovery.phase in {"pending", "launching", "dispatching", "submitted"}
         ):
             continue
         _publish_status(

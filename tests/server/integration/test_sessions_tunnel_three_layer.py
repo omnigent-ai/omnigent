@@ -39,7 +39,7 @@ import json
 import tarfile
 import threading
 from collections.abc import AsyncIterator, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -3056,3 +3056,10 @@ async def test_root_reconnect_requires_provider_opt_in_before_suppressing_legacy
         probe = orchestration._relay_turn_held_for_host
         assert probe is not None
         assert await probe(_RUNNER_ID, session_id) is provider_enabled
+        for phase in ("stopped", "failed"):
+            recovery = store.get_session_recovery(session_id)
+            assert recovery is not None
+            assert store.replace_session_recovery(
+                session_id, recovery, replace(recovery, phase=phase)
+            )
+            assert not await probe(_RUNNER_ID, session_id)
