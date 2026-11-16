@@ -43,3 +43,4 @@ class SessionRecovery:
     attempts: int = 0
     attempt_id: str | None = None
     retry_at: int = 0
+    launch_runner_id: str | None = None

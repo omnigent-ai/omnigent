@@ -588,6 +588,11 @@ class ConversationStore(ABC):
         del conversation_id
         return None
 
+    def get_session_interruption_time(self, conversation_id: str) -> int | None:
+        """Original disconnect-error timestamp, or None when unavailable."""
+        del conversation_id
+        return None
+
     def replace_session_recovery(
         self,
         conversation_id: str,

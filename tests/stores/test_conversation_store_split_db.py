@@ -883,11 +883,20 @@ def test_get_conversation_takes_one_checkout_per_engine(
 def test_recovery_state_shares_input_transaction_and_workspace_scope(
     store: SqlAlchemyConversationStore, conv_db: Path
 ) -> None:
+    from dataclasses import fields
+
+    from sqlalchemy import event
+
     from omnigent.db.db_models import workspace_scope
     from omnigent.entities import MessageData, NewConversationItem
     from omnigent.session_recovery import SessionRecovery
 
-    conv = store.create_conversation(host_id="a" * 32, runner_id="old", workspace="/restored")
+    conv = store.create_conversation(
+        host_id="a" * 32,
+        runner_id="old",
+        workspace="/restored",
+        labels={f"custom.{index}": "value" for index in range(100)},
+    )
     intent = SessionRecovery("a" * 32, "old", 100)
     tables = _tables(conv_db)
     assert store.replace_session_recovery(conv.id, None, intent)
@@ -897,23 +906,93 @@ def test_recovery_state_shares_input_transaction_and_workspace_scope(
     with workspace_scope(42):
         assert store.get_session_recovery(conv.id) is None
         assert not store.replace_session_recovery(conv.id, None, intent)
-    store.append(
-        conv.id,
-        [
-            NewConversationItem(
-                response_id="user",
-                type="message",
-                data=MessageData(
-                    role="user", content=[{"type": "input_text", "text": "new work"}]
-                ),
+    statements: list[tuple[str, Any]] = []
+
+    def capture(_conn, _cursor, statement, parameters, _context, _many):
+        if "FROM conversation_labels" in statement:
+            statements.append((statement, parameters))
+
+    event.listen(store._conv_engine, "before_cursor_execute", capture)
+    try:
+        store.append(
+            conv.id,
+            [
+                NewConversationItem(
+                    response_id="user",
+                    type="message",
+                    data=MessageData(
+                        role="user", content=[{"type": "input_text", "text": "new work"}]
+                    ),
+                )
+            ],
+        )
+    finally:
+        event.remove(store._conv_engine, "before_cursor_execute", capture)
+    assert len(statements) == 2  # Recovery read and cancellation delete.
+    with store._conv_engine.connect() as connection:
+        for statement, parameters in statements:
+            plan = " ".join(
+                str(row[-1])
+                for row in connection.exec_driver_sql(
+                    "EXPLAIN QUERY PLAN " + statement, parameters
+                )
             )
-        ],
-    )
+            assert "(workspace_id=? AND conversation_id=? AND key=?)" in plan, plan
+            assert len(parameters) == 2 + len(fields(SessionRecovery))
     assert store.get_session_recovery(conv.id) is None
     assert not store.replace_session_recovery(conv.id, intent, None)
     assert store.replace_session_recovery(conv.id, None, intent)
     asyncio.run(store.delete_conversation(conv.id))
     assert _count(conv_db, "conversation_labels") == 0
+
+
+@pytest.mark.parametrize(
+    "code", [None, "runner_disconnected", "runner_interrupted", "session_recovery_failed", ""]
+)
+def test_session_interruption_time_uses_error_label_timestamp_and_workspace_scope(
+    store: SqlAlchemyConversationStore, code: str | None
+) -> None:
+    from sqlalchemy import event
+
+    from omnigent.db.db_models import workspace_scope
+
+    conv = store.create_conversation()
+    if code is not None:
+        store.set_labels(conv.id, {"omnigent.last_task_error_code": code}, updated_at=100)
+    store.set_labels(conv.id, {"unrelated": "newer"}, updated_at=200)
+    statements: list[tuple[str, Any]] = []
+
+    def capture(_conn, _cursor, statement, parameters, _context, _many):
+        if statement.lstrip().startswith("SELECT"):
+            statements.append((statement, parameters))
+
+    event.listen(store._conv_engine, "before_cursor_execute", capture)
+    try:
+        assert store.get_session_interruption_time(conv.id) == (
+            100 if code in {"runner_disconnected", "runner_interrupted"} else None
+        )
+    finally:
+        event.remove(store._conv_engine, "before_cursor_execute", capture)
+    assert len(statements) == 1
+    statement, parameters = statements[0]
+    assert len(parameters) == 3
+    with store._conv_engine.connect() as connection:
+        plan = " ".join(
+            str(row[-1])
+            for row in connection.exec_driver_sql("EXPLAIN QUERY PLAN " + statement, parameters)
+        )
+    assert "(workspace_id=? AND conversation_id=? AND key=?)" in plan, plan
+    with workspace_scope(42):
+        assert store.get_session_interruption_time(conv.id) is None
+        other = store.create_conversation(conversation_id=conv.id)
+        store.set_labels(
+            other.id, {"omnigent.last_task_error_code": "runner_interrupted"}, updated_at=300
+        )
+        assert store.get_session_interruption_time(conv.id) == 300
+    assert store.get_session_interruption_time(conv.id) == (
+        100 if code in {"runner_disconnected", "runner_interrupted"} else None
+    )
+    assert store.get_session_interruption_time("0" * 32) is None
 
 
 def test_recovery_labels_are_private_and_cannot_be_overwritten_or_forked(
@@ -925,8 +1004,17 @@ def test_recovery_labels_are_private_and_cannot_be_overwritten_or_forked(
     from omnigent.session_recovery import RECOVERY_LABEL_PREFIX, SessionRecovery
 
     conv = store.create_conversation(labels={"team": "platform"})
-    intent = SessionRecovery("a" * 64, "b" * 64, 100, attempt_id="c" * 64, attempts=3)
+    intent = SessionRecovery(
+        "a" * 64, "b" * 64, 100, attempt_id="c" * 64, attempts=3, launch_runner_id="replacement"
+    )
     assert store.replace_session_recovery(conv.id, None, intent)
+    with sqlite3.connect(conv_db) as connection:
+        connection.execute(
+            "INSERT INTO conversation_labels "
+            "(workspace_id, conversation_id, key, value, updated_at) "
+            "VALUES (0, ?, ?, 'private', 100)",
+            (bytes.fromhex(conv.id), RECOVERY_LABEL_PREFIX + "future"),
+        )
     assert store.get_session_recovery(conv.id) == intent
     assert store.get_conversation(conv.id).labels == {"team": "platform"}
     assert store.list_conversations().data[0].labels == {"team": "platform"}
@@ -945,6 +1033,10 @@ def test_recovery_labels_are_private_and_cannot_be_overwritten_or_forked(
     assert store.get_session_recovery(conv.id) == intent
     assert store.get_conversation(conv.id).labels == {"team": "platform"}
     assert max(map(len, _col(conv_db, "conversation_labels", "value"))) <= 256
+    assert store.replace_session_recovery(conv.id, intent, None)
+    assert store.get_session_recovery(conv.id) is None
+    assert RECOVERY_LABEL_PREFIX + "future" in _col(conv_db, "conversation_labels", "key")
+    assert store.get_conversation(conv.id).labels == {"team": "platform"}
 
 
 @pytest.mark.parametrize(

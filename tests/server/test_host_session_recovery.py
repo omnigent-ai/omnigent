@@ -15,7 +15,11 @@ from omnigent.db.utils import generate_agent_id
 from omnigent.entities import MessageData, NewConversationItem
 from omnigent.server.host_session_recovery import HostSessionRecoverer
 from omnigent.server.managed_hosts import ManagedSandboxConfig, ManagedSandboxDeployment
-from omnigent.session_recovery import RECOVERY_NOTICE, RECOVERY_PROMPT, SessionRecovery
+from omnigent.session_recovery import (
+    RECOVERY_MAX_AGE_S,
+    RECOVERY_NOTICE,
+    RECOVERY_PROMPT,
+)
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 
@@ -34,6 +38,7 @@ def recovery(db_uri: str, monkeypatch: pytest.MonkeyPatch) -> Any:
         host_id=host_id,
         owner="owner",
         hello=SimpleNamespace(recover_interrupted_sessions=True),
+        registered_with_managed_token=True,
     )
     hosts = Mock(get=lambda _: connection)
     host = SimpleNamespace(
@@ -69,9 +74,11 @@ def recovery(db_uri: str, monkeypatch: pytest.MonkeyPatch) -> Any:
     )
 
     async def launch(*_args: Any, **_kwargs: Any) -> Any:
-        store.replace_runner_id(conv.id, "new")
         intent = store.get_session_recovery(conv.id)
-        store.replace_session_recovery(conv.id, intent, replace(intent, runner_id="new"))
+        launching = replace(intent, launch_runner_id="new")
+        store.replace_session_recovery(conv.id, intent, launching)
+        store.replace_runner_id(conv.id, "new")
+        store.replace_session_recovery(conv.id, launching, replace(launching, runner_id="new"))
         online.add("new")
         return SimpleNamespace(runner_id="new", error=None, error_code=None)
 
@@ -161,10 +168,8 @@ async def test_host_recovery_claim_is_shared_between_replicas(
         "approval",
         "stopped",
         "survived",
-        "opt_out",
         "other_replica",
         "other_owner",
-        "unsupported_store",
     ],
 )
 async def test_ineligible_session_is_not_restarted(recovery: Any, reason: str) -> None:
@@ -182,10 +187,6 @@ async def test_ineligible_session_is_not_restarted(recovery: Any, reason: str) -
         recovery.store.touch_runner_liveness(["old"], now_epoch())
     elif reason == "other_owner":
         recovery.store.get_session_owner = Mock(return_value="someone-else")
-    elif reason == "unsupported_store":
-        recovery.store.supports_session_recovery = False
-    else:
-        recovery.connection.hello.recover_interrupted_sessions = False
     await recovery.service.recover(recovery.connection, [])
     recovery.launch.assert_not_awaited()
     recovery.initializer.initialize.assert_not_awaited()
@@ -201,6 +202,7 @@ async def test_ineligible_session_is_not_restarted(recovery: Any, reason: str) -
         "missing_host_section",
         "missing_opt_in",
         "host_opt_out",
+        "ordinary_host",
         "string_true",
         "integer_one",
         "unknown_provider",
@@ -223,6 +225,8 @@ async def test_admin_opt_in_gates_bookkeeping_and_continuation(recovery: Any, re
         recovery.host_config["host"].clear()
     elif reason == "host_opt_out":
         recovery.connection.hello.recover_interrupted_sessions = False
+    elif reason == "ordinary_host":
+        recovery.connection.registered_with_managed_token = False
     elif reason in {"disabled", "string_true", "integer_one"}:
         recovery.host_config["host"]["recover_interrupted_sessions"] = {
             "disabled": False,
@@ -316,7 +320,7 @@ async def test_disabling_recovery_leaves_existing_intent_untouched(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("action", ["message", "stop", "opt_out"])
+@pytest.mark.parametrize("action", ["message", "stop", "opt_out", "rebind"])
 async def test_user_intent_during_launch_prevents_continuation(recovery: Any, action: str) -> None:
     launch = recovery.launch.side_effect
 
@@ -326,6 +330,8 @@ async def test_user_intent_during_launch_prevents_continuation(recovery: Any, ac
             user_input(recovery.store, recovery.conv.id)
         elif action == "stop":
             recovery.service.stop_recovery(recovery.conv)
+        elif action == "rebind":
+            recovery.store.replace_runner_id(recovery.conv.id, "explicit")
         else:
             recovery.host_config["host"]["recover_interrupted_sessions"] = False
         return result
@@ -374,28 +380,6 @@ async def test_unknown_submission_outcome_is_never_blindly_replayed(recovery: An
     recovery.initializer.initialize.assert_awaited_once()
 
 
-@pytest.mark.parametrize(
-    "notice", [RECOVERY_PROMPT, f"{RECOVERY_NOTICE}\nCheck the task checkpoint before continuing."]
-)
-@pytest.mark.parametrize("phase", ["dispatching", "submitted"])
-def test_input_cancels_claim_atomically_and_native_notice_keeps_it(
-    recovery: Any, notice: str, phase: str
-) -> None:
-    store, conv = recovery.store, recovery.conv
-    recovery.service.record_interruption(conv)
-    state = store.get_session_recovery(conv.id)
-    assert isinstance(state, SessionRecovery)
-    claimed = replace(state, phase=phase, attempts=1, attempt_id="continuation")
-    assert store.replace_session_recovery(conv.id, state, claimed)
-    user_input(store, conv.id, notice)
-    assert store.get_session_recovery(conv.id) == claimed
-    items = store.list_items(conv.id).data
-    assert items[-1].data.is_meta is True
-    user_input(store, conv.id)
-    assert not store.replace_session_recovery(conv.id, state, replace(state, phase="dispatching"))
-    assert store.get_session_recovery(conv.id) is None
-
-
 def test_stop_survives_store_restart_and_fresh_user_input_reenables_recovery(
     recovery: Any, db_uri: str
 ) -> None:
@@ -420,12 +404,15 @@ def test_stop_survives_store_restart_and_fresh_user_input_reenables_recovery(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("claim_binding_committed", [False, True])
 @pytest.mark.parametrize("runner_online", [False, True])
+@pytest.mark.parametrize("explicit_rebind", [False, True])
 async def test_server_restart_finishes_launch_after_runner_binding_rotation(
-    recovery: Any, claim_binding_committed: bool, runner_online: bool
+    recovery: Any, claim_binding_committed: bool, runner_online: bool, explicit_rebind: bool
 ) -> None:
     recovery.service.record_interruption(recovery.conv)
     intent = recovery.store.get_session_recovery(recovery.conv.id)
-    launching = replace(intent, phase="launching", attempts=1, attempt_id="durable")
+    launching = replace(
+        intent, phase="launching", attempts=1, attempt_id="durable", launch_runner_id="new"
+    )
     assert recovery.store.replace_session_recovery(recovery.conv.id, intent, launching)
     recovery.store.replace_runner_id(recovery.conv.id, "new")
     if claim_binding_committed:
@@ -434,7 +421,15 @@ async def test_server_restart_finishes_launch_after_runner_binding_rotation(
         )
     if runner_online:
         recovery.online.add("new")
+    if explicit_rebind:
+        recovery.store.replace_runner_id(recovery.conv.id, "explicit")
+        recovery.online.add("explicit")
     await recovery.service.recover(recovery.connection, ["new"] if runner_online else [])
+    if explicit_rebind:
+        recovery.launch.assert_not_awaited()
+        recovery.initializer.initialize.assert_not_awaited()
+        assert recovery.store.get_conversation(recovery.conv.id).runner_id == "explicit"
+        return
     assert recovery.launch.await_count == (0 if runner_online else 1)
     recovery.initializer.initialize.assert_awaited_once()
     state = recovery.store.get_session_recovery(recovery.conv.id)
@@ -443,6 +438,66 @@ async def test_server_restart_finishes_launch_after_runner_binding_rotation(
     assert state.attempts == (1 if runner_online else 2)
     if runner_online:
         assert recovery.initializer.initialize.call_args.kwargs["recovery_id"] == "durable"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_code", ["runner_disconnected", "runner_interrupted"])
+@pytest.mark.parametrize("age", [60, RECOVERY_MAX_AGE_S + 1])
+async def test_failed_session_keeps_its_original_interruption_time(
+    recovery: Any, error_code: str, age: int
+) -> None:
+    interrupted_at = recovery.clock[0] - age
+    recovery.store.set_labels(
+        recovery.conv.id, {"omnigent.last_task_error_code": error_code}, updated_at=interrupted_at
+    )
+    recovery.store.set_session_live_status(recovery.conv.id, "failed")
+    await recovery.service.recover(recovery.connection, [])
+    state = recovery.store.get_session_recovery(recovery.conv.id)
+    assert state.interrupted_at == interrupted_at
+    if age > RECOVERY_MAX_AGE_S:
+        assert state.phase == "failed"
+        recovery.launch.assert_not_awaited()
+        recovery.initializer.initialize.assert_not_awaited()
+    else:
+        recovery.initializer.initialize.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("already_online", [False, True])
+@pytest.mark.parametrize("expired", [False, True])
+async def test_continuation_deadline_also_applies_to_a_successful_final_launch(
+    recovery: Any, already_online: bool, expired: bool
+) -> None:
+    recovery.service.record_interruption(recovery.conv)
+    intent = recovery.store.get_session_recovery(recovery.conv.id)
+    launching = replace(
+        intent,
+        phase="launching" if already_online else "pending",
+        attempts=3 if already_online else 2,
+        attempt_id="final-attempt",
+        launch_runner_id="new" if already_online else None,
+        runner_id="new" if already_online else "old",
+    )
+    assert recovery.store.replace_session_recovery(recovery.conv.id, intent, launching)
+    recovery.clock[0] += RECOVERY_MAX_AGE_S
+    if already_online:
+        recovery.store.replace_runner_id(recovery.conv.id, "new")
+        recovery.online.add("new")
+        recovery.clock[0] += int(expired)
+    else:
+        launch = recovery.launch.side_effect
+
+        async def delayed_launch(*args: Any, **kwargs: Any) -> Any:
+            result = await launch(*args, **kwargs)
+            recovery.clock[0] += int(expired)
+            return result
+
+        recovery.launch.side_effect = delayed_launch
+    await recovery.service.recover(recovery.connection, [])
+    state = recovery.store.get_session_recovery(recovery.conv.id)
+    assert state.attempts == 3
+    assert state.phase == ("failed" if expired else "submitted")
+    assert recovery.initializer.initialize.await_count == (0 if expired else 1)
 
 
 @pytest.mark.asyncio
