@@ -51,6 +51,7 @@ async def wait_for_tunnel_registration(
         await poll_until_async(
             lambda: communicator.future.done() or registry.get(peer_id) is not None,
             timeout_s=budget(15.0),
+            interval_s=0.01,
         )
     except AssertionError as exc:
         stack = io.StringIO()
