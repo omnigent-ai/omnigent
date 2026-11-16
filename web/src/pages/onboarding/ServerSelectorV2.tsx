@@ -353,7 +353,10 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
     setup.installed === false && setup.installSupported === false && !skipInstall;
   const terminalUrl = terminalTarget.url;
   // Laptop setup offered from the server list is optional, so a failure can still open it.
-  const optionalLaptop = terminalRunner === "local" && runnerTarget?.from === "server";
+  const optionalLaptop =
+    terminalTarget.kind === "connect" &&
+    terminalTarget.back === "runner" &&
+    runnerTarget?.from === "server";
   const connectAnyway =
     terminalUrl !== undefined &&
     (terminalTarget.kind === "local" || remoteRunnerFailed || manualInstall || optionalLaptop)
@@ -513,8 +516,8 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
             />
           ) : (
             <SetupTerminalStep
-              // Switching to server-only connect starts a fresh terminal run.
-              key={terminalRunner ?? terminalTarget.kind}
+              // Switching to server-only connect, or skipping the install, starts a fresh run.
+              key={`${terminalRunner ?? terminalTarget.kind}:${skipInstall}`}
               onInstallCli={needsInstall && !skipInstall ? setup.onInstallCli : undefined}
               onInstallLog={setup.onInstallLog}
               onRun={runTerminal}

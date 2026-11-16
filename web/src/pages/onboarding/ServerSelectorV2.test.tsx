@@ -943,6 +943,20 @@ describe("ServerSelectorV2", () => {
     expect(onConnectRunner).not.toHaveBeenCalled();
   });
 
+  it("a failed CLI install can continue on shells without connectRunner", async () => {
+    const onConnect = vi.fn().mockResolvedValue({});
+    joinTypedServer({
+      installed: false,
+      onInstallCli: vi.fn().mockResolvedValue({ ok: false, error: "Installer failed" }),
+      onConnect,
+    });
+    fireEvent.click(await screen.findByRole("radio", { name: /install cli first/i }));
+    fireEvent.click(screen.getByRole("button", { name: "Install Omnigent" }));
+    await screen.findByText("Installer failed");
+    fireEvent.click(screen.getByRole("button", { name: "Continue anyway" }));
+    await waitFor(() => expect(onConnect).toHaveBeenCalledOnce());
+  });
+
   it("without in-app install, Install CLI first shows the manual instructions", async () => {
     const onConnect = vi.fn().mockResolvedValue({});
     joinTypedServer({
