@@ -2999,6 +2999,13 @@ function AppShellImpl() {
   const setSessionOverviewOpen = sessionOverviewDocked
     ? setSessionOverviewDockedOpen
     : setSessionOverviewOverlayOpen;
+  // One card for both placements; only one of them mounts it at a time.
+  const sessionOverviewCard = (
+    <SessionOverview
+      onClose={() => setSessionOverviewOpen(false)}
+      changesSessionId={showFilesPanel ? serverConversationId : undefined}
+    />
+  );
   useEffect(() => {
     if (!workspacePanelVisible || !focusWorkspaceTabsOnOpenRef.current) return;
     focusWorkspaceTabsOnOpenRef.current = false;
@@ -3141,10 +3148,7 @@ function AppShellImpl() {
                           open={sessionOverviewOpen}
                           onOpenChange={setSessionOverviewOpen}
                         >
-                          <SessionOverview
-                            onClose={() => setSessionOverviewOpen(false)}
-                            changesSessionId={showFilesPanel ? serverConversationId : undefined}
-                          />
+                          {sessionOverviewCard}
                         </SessionCostButton>
                       )
                     }
@@ -3248,10 +3252,7 @@ function AppShellImpl() {
                     aria-label="Session overview"
                     className="flex w-64 shrink-0 flex-col overflow-y-auto px-2 pb-3 pt-12"
                   >
-                    <SessionOverview
-                      onClose={() => setSessionOverviewOpen(false)}
-                      changesSessionId={showFilesPanel ? serverConversationId : undefined}
-                    />
+                    {sessionOverviewCard}
                   </aside>
                 )}
 

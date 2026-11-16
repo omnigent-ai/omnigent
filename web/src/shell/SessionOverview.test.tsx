@@ -103,10 +103,16 @@ describe("SessionOverview", () => {
     if (docked) {
       expect(popover).toBeNull();
       expect(chip()).not.toHaveAttribute("aria-haspopup");
+      expect(chip()).not.toHaveAttribute("aria-controls");
     } else {
       expect(popover).toHaveTextContent("overview card");
       expect(chip()).toHaveAttribute("aria-haspopup", "dialog");
+      expect(chip()).toHaveAttribute("aria-controls", popover!.id);
     }
+
+    fireEvent.click(chip());
+    expect(onOpenChange).toHaveBeenLastCalledWith(false);
+    expect(onOpenChange).toHaveBeenCalledTimes(2);
   });
 
   it("closes the popover on Escape and returns focus to the chip", async () => {
@@ -128,6 +134,22 @@ describe("SessionOverview", () => {
     expect(chip).toHaveAttribute("aria-expanded", "false");
     // Radix restores focus after the content unmounts.
     await waitFor(() => expect(chip).toHaveFocus());
+
+    // A pointer press outside the open popover closes it too.
+    rerender(button(true));
+    const reopened = screen.getByRole("dialog", { name: "Session overview" });
+    // Radix listens for outside presses a tick after mounting, then dismisses on the click.
+    await act(
+      () =>
+        new Promise<void>((resolve) => {
+          setTimeout(resolve, 0);
+        }),
+    );
+    fireEvent.pointerDown(document.body);
+    fireEvent.click(document.body);
+    expect(onOpenChange).toHaveBeenCalledTimes(2);
+    expect(onOpenChange).toHaveBeenLastCalledWith(false);
+    expect(reopened).toBeInTheDocument();
   });
 
   it("keeps the chip focused when the placement changes", () => {

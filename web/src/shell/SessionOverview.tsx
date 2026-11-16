@@ -81,6 +81,8 @@ export function SessionCostButton({
               <button
                 type="button"
                 aria-haspopup={docked ? undefined : "dialog"}
+                // Docked, no popover content exists for the trigger to point at.
+                {...(docked && { "aria-controls": undefined })}
                 data-testid="header-session-cost"
                 // Shown cards get the view toggle's selected look, so open never reads as hover.
                 className={cn(
