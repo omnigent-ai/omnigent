@@ -453,7 +453,16 @@ def register_scheduled_task_permissions_routes(
         with target_account_scope(grantee, target.account_generation if target else None):
             await asyncio.to_thread(store.ensure_user, grantee)
             perm = await asyncio.to_thread(store.grant_for_scheduled_task, grantee, task.id, level)
-        await sync_session(request, task)
+        # Reloaded: the grant locks the task, so a retarget since the load is seen and the
+        # session its runs now continue is the one shared. Best-effort, like the sync.
+        try:
+            current = await owned_task(request, scheduled_task_id)
+        except Exception:
+            _logger.warning(
+                "automation %s: could not reload it to share its session", task.id, exc_info=True
+            )
+        else:
+            await sync_session(request, current)
         add_audit_attrs(target_user_id=grantee, level=level)
         # The grant is committed, so a failed name lookup must not fail the request.
         names = await asyncio.to_thread(_display_names, store, [perm.user_id])

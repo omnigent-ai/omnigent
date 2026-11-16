@@ -4749,6 +4749,55 @@ async def test_a_grant_made_during_an_agents_retarget_still_refuses_it(
 
 
 @_SHARING
+async def test_a_grant_shares_the_session_an_agent_moved_the_automation_to(
+    auth_app: FastAPI,
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import threading
+
+    from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ
+
+    first, second = _owned_session(db_uri), _owned_session(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    permissions.ensure_user("erin@example.com")
+    permissions.grant("erin@example.com", first, LEVEL_READ)
+    task_id = await _create_task(auth_client, session_mode="continue", session_id=first)
+    grant = SqlAlchemyPermissionStore.grant_for_scheduled_task
+    reached, resume = threading.Event(), threading.Event()
+
+    def wait_then_grant(
+        self: SqlAlchemyPermissionStore, user_id: str, scheduled_task_id: str, level: int
+    ) -> Any:
+        reached.set()
+        assert resume.wait(15)
+        return grant(self, user_id, scheduled_task_id, level)
+
+    monkeypatch.setattr(SqlAlchemyPermissionStore, "grant_for_scheduled_task", wait_then_grant)
+    sharing = asyncio.ensure_future(_share(auth_client, task_id, "bob@example.com"))
+    try:
+        assert await asyncio.to_thread(reached.wait, 15)
+        # Not shared yet, so both of the agent's retarget checks pass.
+        transport = httpx.ASGITransport(app=auth_app, client=("192.0.2.10", 12345))
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as agent:
+            moved = await agent.patch(
+                f"/v1/scheduled-tasks/{task_id}",
+                json={"session_id": second},
+                headers=_agent_headers(db_uri),
+            )
+        assert moved.status_code == 200, moved.text
+    finally:
+        resume.set()
+    shared = await sharing
+    assert shared.status_code == 200, shared.text
+    owner = {"alice@example.com": LEVEL_OWNER}
+    # The session the grant's load saw keeps its own sharing.
+    assert _session_grants(db_uri, first) == {**owner, "erin@example.com": LEVEL_READ}
+    assert _session_grants(db_uri, second) == {**owner, "bob@example.com": LEVEL_READ}
+
+
+@_SHARING
 async def test_agents_can_still_edit_a_shared_automation_in_place(
     auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str
 ) -> None:
