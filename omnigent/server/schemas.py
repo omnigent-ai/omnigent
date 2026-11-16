@@ -3506,8 +3506,8 @@ class WorkflowList(BaseModel):
 
 class WorkflowRunProgress(BaseModel):
     """
-    Where a run's steps stand: the steps of the plan that started it, counted
-    by their current status in the session.
+    Where a run's latest plan stands within its invocation, counted by each
+    step's newest status.
 
     :param total: Steps in that plan, e.g. ``5``.
     :param started: Steps in progress.
@@ -3528,6 +3528,8 @@ class WorkflowRun(BaseModel):
     One run of a saved workflow: a session that started it.
 
     :param id: The run's ID: that of the plan entry that started it.
+    :param plan_graph_revision: Stable graph ID, or the earliest position of the
+        unchanged legacy graph. ``None`` when authoritative context is unavailable.
     :param session_id: The session that ran it.
     :param title: The session's title; empty when it has none yet.
     :param started_at: Unix epoch seconds when the run's plan was written.
@@ -3537,12 +3539,13 @@ class WorkflowRun(BaseModel):
     :param background_work_running: Whether background work outlives the session's turn.
     :param archived: Whether the session is archived.
     :param progress: Where the run's steps stand.
-    :param steps: The steps of the plan that started the run.
+    :param steps: The latest plan's steps within this invocation.
     :param statuses: Each of those steps' newest status entry; a step with
         none yet is left out.
     """
 
     id: str
+    plan_graph_revision: str | int | None = None
     session_id: str
     title: str
     started_at: int

@@ -1304,9 +1304,9 @@ def create_scheduled_tasks_router(
         """The plan steps of one page of a scheduled task's runs, for their timelines.
 
         Pages like ``GET /scheduled-tasks/{id}/runs``, most recent first. Each
-        run that wrote a plan lists the steps of its first plan and each step's
-        newest status entry: one run-index lookup per run, then one
-        kind-and-step lookup per step. The response is ``{"runs": [{"run_id",
+        run that wrote a plan lists its latest plan within that invocation and
+        each step's newest status entry. The first plan's ID still guards actions.
+        The response is ``{"runs": [{"run_id", "plan_id", "plan_graph_revision",
         "workflow_id", "plan_name", "is_current", "steps", "statuses"}], "next_cursor"}``.
         """
         from omnigent.server.session_journal import entry_to_response, open_store
@@ -1322,7 +1322,11 @@ def create_scheduled_tasks_router(
             journal.run_start_plans, [(run.id, run.conversation_id or "") for run in served]
         )
         found = [(run, plan) for run, plan in zip(served, plans, strict=True) if plan is not None]
-        statuses = await asyncio.to_thread(journal.plan_step_statuses, [plan for _, plan in found])
+        latest_plans = await asyncio.to_thread(
+            journal.run_latest_plans, [plan for _, plan in found]
+        )
+        revisions = await asyncio.to_thread(journal.plan_graph_revisions, latest_plans)
+        statuses = await asyncio.to_thread(journal.plan_step_statuses, latest_plans)
         current_plans = await asyncio.to_thread(
             journal.current_run_plan_ids, [plan for _, plan in found]
         )
@@ -1334,6 +1338,7 @@ def create_scheduled_tasks_router(
                 {
                     "run_id": run.id,
                     "plan_id": plan.id,
+                    "plan_graph_revision": revision,
                     "workflow_id": plan.workflow_id,
                     "plan_name": plan.content.get("name"),
                     "is_current": (
@@ -1342,13 +1347,15 @@ def create_scheduled_tasks_router(
                         and session.labels.get(SCHEDULED_TASK_RUN_LABEL_KEY) == run.id
                         and not session.archived
                     ),
-                    "steps": plan.content.get("steps", []),
+                    "steps": latest_plan.content.get("steps", []),
                     "statuses": [
                         entry_to_response(entry).model_dump(mode="json")
                         for entry in step_statuses.values()
                     ],
                 }
-                for (run, plan), step_statuses in zip(found, statuses, strict=True)
+                for (run, plan), latest_plan, revision, step_statuses in zip(
+                    found, latest_plans, revisions, statuses, strict=True
+                )
             ],
             "next_cursor": next_cursor,
         }

@@ -90,7 +90,9 @@ async def test_session_creation_snapshots_workflow_before_initial_items(
     plan = entries[1]
     assert plan["author"] == {"type": "omnigent"}
     assert plan["workflow_id"] == workflow["id"]
-    assert plan["content"] == {
+    content = dict(plan["content"])
+    assert isinstance(content.pop("graph_revision"), str)
+    assert content == {
         "name": workflow["name"],
         "steps": workflow["steps"],
         "version": 1,
