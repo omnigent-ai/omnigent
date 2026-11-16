@@ -344,6 +344,9 @@ class HostHelloFrame:
     :param workspace_token_key: Key the server signs direct-access tokens with
         (see :mod:`omnigent.host.workspace_tokens`). Sent with
         ``workspace_socket``; never logged.
+    :param cli_command: Command that invokes the Omnigent CLI on this host, e.g.
+        ``"omni"`` or a wrapper such as ``"acme omni"``, so UI hints name a
+        command the user can run there. ``None`` from older hosts.
     """
 
     version: str
@@ -360,6 +363,7 @@ class HostHelloFrame:
     connection_id: str | None = None
     workspace_socket: str | None = None
     workspace_token_key: str | None = field(default=None, repr=False)
+    cli_command: str | None = None
 
 
 @dataclass
@@ -1810,6 +1814,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "connection_id": frame.connection_id,
                 "workspace_socket": frame.workspace_socket,
                 "workspace_token_key": frame.workspace_token_key,
+                "cli_command": frame.cli_command,
             }
         )
     if isinstance(frame, HostConnectionErrorFrame):
@@ -3002,6 +3007,7 @@ def _decode_host_hello(msg: _JsonObject) -> HostHelloFrame:
         connection_id=_optional_nullable_str(msg, "connection_id"),
         workspace_socket=_optional_nullable_str(msg, "workspace_socket"),
         workspace_token_key=_optional_nullable_str(msg, "workspace_token_key"),
+        cli_command=_optional_nullable_str(msg, "cli_command"),
     )
 
 

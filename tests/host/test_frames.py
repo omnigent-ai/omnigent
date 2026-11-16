@@ -865,6 +865,7 @@ def test_hello_frame_round_trip() -> None:
         connection_id="host-connection-1",
         workspace_socket="/tmp/omnigent-workspace-x/workspace.sock",
         workspace_token_key="key-abc",
+        cli_command="acme omni",
     )
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostHelloFrame)
@@ -876,6 +877,7 @@ def test_hello_frame_round_trip() -> None:
     assert decoded.connection_id == "host-connection-1"
     assert decoded.workspace_socket == "/tmp/omnigent-workspace-x/workspace.sock"
     assert decoded.workspace_token_key == "key-abc"
+    assert decoded.cli_command == "acme omni"
     # The signing key must never reach a log line through the frame's repr.
     assert "key-abc" not in repr(decoded)
 
@@ -900,6 +902,7 @@ def test_hello_frame_without_interactive_shells_is_backward_compatible() -> None
     assert decoded.connection_id is None
     assert decoded.workspace_socket is None
     assert decoded.workspace_token_key is None
+    assert decoded.cli_command is None
 
 
 def test_hello_frame_capabilities_round_trip() -> None:

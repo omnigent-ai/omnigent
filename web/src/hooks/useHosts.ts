@@ -44,6 +44,16 @@ export interface Host {
    * or server — and must not gate anything away; only an explicit `false` does.
    */
   gateway_inference?: Record<string, boolean> | null;
+  /**
+   * Command that invokes the Omnigent CLI on this host, e.g. `"omni"` or a
+   * wrapper such as `"acme omni"`. Absent from older hosts and servers.
+   */
+  cli_command?: string | null;
+}
+
+/** The `<cli> setup` command to run on `host`, falling back to `omni setup`. */
+export function hostSetupCommand(host: Pick<Host, "cli_command">): string {
+  return `${host.cli_command?.trim() || "omni"} setup`;
 }
 
 export interface HarnessAccountProvider {

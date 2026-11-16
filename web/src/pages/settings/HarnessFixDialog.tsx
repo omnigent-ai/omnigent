@@ -24,6 +24,7 @@ import {
   fetchHarnessLogin,
   isSecureVerificationUrl,
   cancelHarnessLogin,
+  hostSetupCommand,
   logoutHarnessOnHost,
   refreshHarnessesOnHost,
   startHarnessLogin,
@@ -105,6 +106,7 @@ export function HarnessFixDialog(props: HarnessFixDialogProps) {
   const { open, onOpenChange, mode: requestedMode, host, harness, harnessLabel, onFixed } = props;
   const hostId = host.host_id;
   const hostName = host.name;
+  const setupCommand = hostSetupCommand(host);
   const queryClient = useQueryClient();
   const { mutateAsync: installHarness } = useInstallHarness(hostId);
   const info = useServerInfo();
@@ -642,7 +644,7 @@ export function HarnessFixDialog(props: HarnessFixDialogProps) {
               onUseCredentialForm={() => setPhase("credentials")}
             />
           ) : phase === "error" ? (
-            <ErrorState error={error} hostName={hostName} />
+            <ErrorState error={error} hostName={hostName} setupCommand={setupCommand} />
           ) : deviceLogin?.kind === "code" ? (
             <DeviceCodeState
               login={deviceLogin.login}
@@ -664,6 +666,7 @@ export function HarnessFixDialog(props: HarnessFixDialogProps) {
             <IsaacCommand
               harnessLabel={harnessLabel}
               hostName={hostName}
+              setupCommand={setupCommand}
               stillNotReady={stillNotReady}
             />
           ) : phase === "credentials" ? (
@@ -678,6 +681,7 @@ export function HarnessFixDialog(props: HarnessFixDialogProps) {
             <SetupCommand
               harnessLabel={harnessLabel}
               hostName={hostName}
+              setupCommand={setupCommand}
               stillNotReady={stillNotReady}
             />
           ) : phase === "tmux" ? (
@@ -1126,16 +1130,18 @@ function PersonalCommand({
 function IsaacCommand({
   harnessLabel,
   hostName,
+  setupCommand,
   stillNotReady,
 }: {
   harnessLabel: string;
   hostName: string;
+  setupCommand: string;
   stillNotReady: boolean;
 }) {
   return (
     <>
       <DialogDescription>Run this in a terminal on {hostName}, then come back.</DialogDescription>
-      <CommandRow command="omni setup" label="Copy omni setup" />
+      <CommandRow command={setupCommand} label={`Copy ${setupCommand}`} />
       <p className="text-sm text-muted-foreground">
         Choose {harnessLabel}, then the Databricks Unity Gateway credential.
       </p>
@@ -1151,19 +1157,21 @@ function IsaacCommand({
 function SetupCommand({
   harnessLabel,
   hostName,
+  setupCommand,
   stillNotReady,
 }: {
   harnessLabel: string;
   hostName: string;
+  setupCommand: string;
   stillNotReady: boolean;
 }) {
   return (
     <>
       <DialogDescription>
-        Run <code className="font-mono text-foreground">omni setup</code> on {hostName} to finish
-        setting up {harnessLabel}.
+        Run <code className="font-mono text-foreground">{setupCommand}</code> on {hostName} to
+        finish setting up {harnessLabel}.
       </DialogDescription>
-      <CommandRow command="omni setup" label="Copy omni setup" />
+      <CommandRow command={setupCommand} label={`Copy ${setupCommand}`} />
       {stillNotReady && (
         <p role="status" className="text-sm text-destructive">
           {harnessLabel} still isn’t ready on {hostName}.
@@ -1257,7 +1265,15 @@ function Steps({ rows }: { rows: [string, "active" | "pending"][] }) {
   );
 }
 
-function ErrorState({ error, hostName }: { error: string; hostName: string }) {
+function ErrorState({
+  error,
+  hostName,
+  setupCommand,
+}: {
+  error: string;
+  hostName: string;
+  setupCommand: string;
+}) {
   return (
     <>
       <DialogDescription>
@@ -1266,7 +1282,7 @@ function ErrorState({ error, hostName }: { error: string; hostName: string }) {
       <div className="rounded-xl border border-destructive/30 bg-destructive/5 px-3.5 py-2.5 text-ui text-destructive">
         {error}
       </div>
-      <CommandRow command="omni setup" label="Copy omni setup" />
+      <CommandRow command={setupCommand} label={`Copy ${setupCommand}`} />
     </>
   );
 }

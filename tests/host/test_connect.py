@@ -3207,6 +3207,33 @@ async def test_hello_advertises_the_workspace_socket_only_while_it_runs(
         assert hello.workspace_token_key is None
 
 
+@pytest.mark.parametrize(("wrapper", "expected"), [("acme omni", "acme omni"), (None, "omni")])
+async def test_hello_reports_cli_command_for_setup_hints(
+    monkeypatch: pytest.MonkeyPatch, wrapper: str | None, expected: str
+) -> None:
+    """The hello names the CLI the user runs on this host, so UI hints match it."""
+    if wrapper is None:
+        monkeypatch.delenv("OMNIGENT_WRAPPER_COMMAND", raising=False)
+    else:
+        monkeypatch.setenv("OMNIGENT_WRAPPER_COMMAND", wrapper)
+    host = _make_host_process()
+
+    async def _discover() -> None:
+        host._capabilities_initialized = True
+
+    monkeypatch.setattr(host, "_initialize_capabilities", _discover)
+    tunnel = _BlockingTunnel()
+    serve_task = asyncio.create_task(host._serve_frames(tunnel))  # type: ignore[arg-type]
+    try:
+        await asyncio.wait_for(tunnel.first_send.wait(), timeout=1.0)
+    finally:
+        await _cancel(serve_task)
+
+    hello = decode_host_frame(tunnel.sent[0])
+    assert isinstance(hello, HostHelloFrame)
+    assert hello.cli_command == expected
+
+
 @pytest.mark.parametrize(
     ("features", "enabled"),
     [("workspace_direct_access", True), ("", False), ("not_a_feature", False)],
