@@ -103,7 +103,9 @@ async def _apply_task_grants(
         for grant in existing:
             if grant.level == LEVEL_OWNER or grant.user_id in kept:
                 continue
-            if await _held_under_the_stores_comparison(permission_store, task, grant.user_id):
+            if await _held_under_the_stores_comparison(
+                permission_store, task, grant.user_id, if_unknown=True
+            ):
                 continue
             try:
                 await asyncio.to_thread(permission_store.revoke, grant.user_id, session.id)
@@ -147,13 +149,15 @@ async def _apply_task_grants(
 
 
 async def _held_under_the_stores_comparison(
-    permission_store: PermissionStore, task: ScheduledTask, user_id: str
+    permission_store: PermissionStore, task: ScheduledTask, user_id: str, *, if_unknown: bool
 ) -> bool:
     """Whether the automation's share table matches *user_id* to one of its grantees.
 
     Grantees otherwise match exactly. On MySQL the table's collation also matches a case
-    or accent variant, whose session grant would be revoked and re-added at Read. A
-    failed check counts as a match, so it never causes a revocation.
+    or accent variant, whose session grant would be revoked and re-added at Read.
+
+    :param if_unknown: The answer when the check fails. Revocation passes ``True``, so
+        a failed check never revokes a share.
     """
     try:
         held = await asyncio.to_thread(
@@ -161,11 +165,12 @@ async def _held_under_the_stores_comparison(
         )
     except Exception:
         _logger.exception(
-            "automation %s: could not check %r against its grants; keeping their share",
+            "automation %s: could not check %r against its grants; treating them as %s",
             task.id,
             user_id,
+            "a grantee" if if_unknown else "not a grantee",
         )
-        return True
+        return if_unknown
     return held is not None
 
 
@@ -175,9 +180,10 @@ async def _share_with_grantee(
     """Grant *grantee* Read on *session* if they still hold the automation's grant.
 
     Pins the grantee's account as the session share route does, so an account deleted
-    and registered again since the list was read is refused, not granted.
+    and registered again since the list was read is refused, not granted. The grant is
+    checked again after the write, and the share is taken back if it was revoked.
 
-    :returns: Whether a grant was written.
+    :returns: Whether a grant was written and kept.
     """
     account = await asyncio.to_thread(permission_store.get_user, grantee)
     with target_account_scope(grantee, account.account_generation if account else None):
@@ -190,9 +196,25 @@ async def _share_with_grantee(
         await asyncio.to_thread(permission_store.ensure_user, grantee)
         # Automations grant Read only (SCHEDULED_TASK_GRANT_LEVELS). A share made since
         # the session's grants were read is kept, never lowered.
-        return await asyncio.to_thread(
+        written = await asyncio.to_thread(
             permission_store.grant_if_absent, grantee, session.id, LEVEL_READ
         )
+        if not written or await _held_under_the_stores_comparison(
+            permission_store, task, grantee, if_unknown=False
+        ):
+            return written
+        # Revoked since the check, perhaps after the revoke's own sync ran, or the
+        # recheck failed: take the share back rather than leave it unmanaged.
+        try:
+            await asyncio.to_thread(permission_store.revoke, grantee, session.id)
+        except Exception:
+            _logger.exception(
+                "automation %s: could not take back %r's share of session %s",
+                task.id,
+                grantee,
+                session.id,
+            )
+        return False
 
 
 async def _share_best_effort(

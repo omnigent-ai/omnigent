@@ -232,6 +232,44 @@ async def test_a_sync_keeps_a_grant_the_database_matches_to_a_grantee(
     }
 
 
+@pytest.mark.parametrize("fault", ["revoked", "recheck_failed"])
+async def test_a_share_is_taken_back_unless_the_grant_outlasts_its_write(
+    permissions, task, announced, monkeypatch, fault
+) -> None:
+    """A revoke that lands between the run's check and its write, after which the
+    revoke's own sync finds nothing to remove, must not leave Alice on the session."""
+    session = _session(permissions, **{RESERVED_USER_LOCAL: LEVEL_OWNER})
+    grant_if_absent = permissions.grant_if_absent
+    resolve = permissions.resolve_scheduled_task_access
+    fail_next_check = False
+
+    def write(user_id: str, conversation_id: str, level: int) -> bool:
+        nonlocal fail_next_check
+        if user_id == "alice@example.com":
+            if fault == "revoked":
+                permissions.revoke_for_scheduled_task(user_id, task.id)
+            else:
+                fail_next_check = True
+        return grant_if_absent(user_id, conversation_id, level)
+
+    def check(principals: list[str], scheduled_task_id: str) -> Any:
+        nonlocal fail_next_check
+        if fail_next_check:
+            fail_next_check = False
+            raise RuntimeError("check failed")
+        return resolve(principals, scheduled_task_id)
+
+    monkeypatch.setattr(permissions, "grant_if_absent", write)
+    monkeypatch.setattr(permissions, "resolve_scheduled_task_access", check)
+    await _sync(permissions, task, session)
+
+    assert _levels(permissions, session.id) == {
+        RESERVED_USER_LOCAL: LEVEL_OWNER,
+        "bob@example.com": LEVEL_READ,
+    }
+    assert announced == [("bob@example.com", session.id)]
+
+
 async def test_a_failed_grantee_check_keeps_the_share(permissions, task, monkeypatch) -> None:
     grants = {RESERVED_USER_LOCAL: LEVEL_OWNER, "carol@example.com": LEVEL_READ}
     session = _session(permissions, **grants)
