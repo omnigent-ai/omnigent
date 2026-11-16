@@ -1184,6 +1184,23 @@ describe("side-chat interrupt", () => {
     expect(input).toHaveValue("Keep this draft");
   });
 
+  it("closes /help output from Escape before interrupting", () => {
+    conversationRegistry.acquire(childId).setState({ sessionHarness: "claude-sdk" });
+    renderPane(<SideChatPane childId={childId} />);
+    const input = screen.getByTestId("side-chat-input");
+    fireEvent.change(input, { target: { value: "/help" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    const notice = screen.getByTestId("side-chat-command-notice");
+    expect(notice).toHaveTextContent(/Show available slash commands/);
+    expect(notice).toHaveAttribute("data-escape-owner");
+
+    fireEvent.keyDown(input, { key: "Escape" });
+    expect(screen.queryByTestId("side-chat-command-notice")).toBeNull();
+    expect(sessionsApi.interrupt).not.toHaveBeenCalled();
+    fireEvent.keyDown(input, { key: "Escape" });
+    expect(sessionsApi.interrupt).toHaveBeenCalledTimes(1);
+  });
+
   it("steers a follow-up into the running side chat when Always steer is on", () => {
     writeAlwaysSteer(true);
     renderPane(<SideChatPane childId={childId} />);
