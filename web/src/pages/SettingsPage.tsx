@@ -93,6 +93,7 @@ import {
 } from "@/pages/settings/search/catalog/updates";
 import { SettingsEntryLabel, SettingsItem } from "@/pages/settings/search/SettingsItem";
 import {
+  type SettingsControlProps,
   settingsControlProps,
   settingsDescriptionId,
   settingsLabelId,
@@ -109,9 +110,14 @@ import {
   settingsRuntimeChoiceProps,
 } from "@/pages/settings/search/settingsOwnership";
 import {
+  CODE_FONT_FAMILY_ENTRY,
+  CODE_FONT_SIZE_ENTRY,
+  CODE_FONT_WEIGHT_ENTRY,
   COLOR_THEME_ENTRY,
   TERMINAL_THEME_ENTRY,
   THEME_MODE_ENTRY,
+  UI_FONT_FAMILY_ENTRY,
+  UI_FONT_SIZE_ENTRY,
 } from "@/pages/settings/search/catalog/appearance";
 import { MCP_SERVICES_ENTRY } from "@/pages/settings/search/catalog/mcp";
 import {
@@ -2289,12 +2295,8 @@ function UiFontSizeControl() {
   const atMax = px >= UI_FONT_SIZE_MAX;
 
   return (
-    <div className="flex items-center justify-between gap-6">
-      <SettingsLabel
-        className="flex-1"
-        label="Interface font size"
-        description="Sets interface and conversation text. Icons and spacing stay fixed."
-      />
+    <SettingsItem entry={UI_FONT_SIZE_ENTRY} className="flex items-center justify-between gap-6">
+      <SettingsEntryLabel entry={UI_FONT_SIZE_ENTRY} className="flex-1" />
       {/* One cohesive pill: [ −  | value px |  + ]. Segments share the pill
           border via inner dividers rather than floating as separate boxes. */}
       <div
@@ -2306,7 +2308,7 @@ function UiFontSizeControl() {
         )}
       >
         <StepperButton
-          label="Decrease interface font size"
+          control={settingsControlProps(UI_FONT_SIZE_ENTRY, "decrease")}
           testId="ui-font-size-dec"
           disabled={atMin}
           onClick={() => commit(px - UI_FONT_SIZE_STEP)}
@@ -2321,7 +2323,7 @@ function UiFontSizeControl() {
             min={UI_FONT_SIZE_MIN}
             max={UI_FONT_SIZE_MAX}
             step={UI_FONT_SIZE_STEP}
-            aria-label="Interface font size in pixels"
+            {...settingsControlProps(UI_FONT_SIZE_ENTRY, "field")}
             data-testid="ui-font-size-input"
             className="w-8 bg-transparent text-center text-ui font-medium tabular-nums outline-none [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
             value={draft}
@@ -2333,7 +2335,7 @@ function UiFontSizeControl() {
           />
         </div>
         <StepperButton
-          label="Increase interface font size"
+          control={settingsControlProps(UI_FONT_SIZE_ENTRY, "increase")}
           testId="ui-font-size-inc"
           disabled={atMax}
           onClick={() => commit(px + UI_FONT_SIZE_STEP)}
@@ -2342,7 +2344,7 @@ function UiFontSizeControl() {
           <PlusIcon className="ui-icon" />
         </StepperButton>
       </div>
-    </div>
+    </SettingsItem>
   );
 }
 
@@ -2366,20 +2368,18 @@ function UiFontFamilyControl() {
   const isDefault = family.trim() === UI_FONT_FAMILY_DEFAULT;
 
   return (
-    <div
+    <SettingsItem
+      entry={UI_FONT_FAMILY_ENTRY}
       role="group"
       aria-label="Font family"
       className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-x-2 gap-y-3 md:grid-cols-[minmax(0,1fr)_auto_auto]"
     >
-      <SettingsLabel
-        label="Font family"
-        className="md:mr-4"
-        description="Use an installed font. Leave blank for the system default."
-      />
+      <SettingsEntryLabel entry={UI_FONT_FAMILY_ENTRY} className="md:mr-4" />
       <Button
         type="button"
         variant="ghost"
         size="sm"
+        {...settingsControlProps(UI_FONT_FAMILY_ENTRY, "reset")}
         data-testid="ui-font-family-reset"
         disabled={isDefault}
         className={cn("h-9", isDefault && "invisible")}
@@ -2390,7 +2390,7 @@ function UiFontFamilyControl() {
       </Button>
       <Input
         type="text"
-        aria-label="UI font family"
+        {...settingsControlProps(UI_FONT_FAMILY_ENTRY, "field")}
         data-testid="ui-font-family-input"
         placeholder="System default"
         spellCheck={false}
@@ -2400,7 +2400,7 @@ function UiFontFamilyControl() {
         value={family}
         onChange={(e) => update(e.target.value)}
       />
-    </div>
+    </SettingsItem>
   );
 }
 
@@ -2450,12 +2450,8 @@ function UiCodeFontSizeControl() {
   const atMax = px >= CODE_FONT_SIZE_MAX;
 
   return (
-    <div className="flex items-center justify-between gap-6">
-      <SettingsLabel
-        label="Code font size"
-        className="flex-1"
-        description="Size of code in the editor and terminal."
-      />
+    <SettingsItem entry={CODE_FONT_SIZE_ENTRY} className="flex items-center justify-between gap-6">
+      <SettingsEntryLabel entry={CODE_FONT_SIZE_ENTRY} className="flex-1" />
       {/* One cohesive pill: [ −  | value px |  + ] — same shell as the UI
           font-size control. */}
       <div
@@ -2467,7 +2463,7 @@ function UiCodeFontSizeControl() {
         )}
       >
         <StepperButton
-          label="Decrease code font size"
+          control={settingsControlProps(CODE_FONT_SIZE_ENTRY, "decrease")}
           testId="code-font-size-dec"
           disabled={atMin}
           onClick={() => commit(px - CODE_FONT_SIZE_STEP)}
@@ -2482,7 +2478,7 @@ function UiCodeFontSizeControl() {
             min={CODE_FONT_SIZE_MIN}
             max={CODE_FONT_SIZE_MAX}
             step={CODE_FONT_SIZE_STEP}
-            aria-label="Code font size in pixels"
+            {...settingsControlProps(CODE_FONT_SIZE_ENTRY, "field")}
             data-testid="code-font-size-input"
             className="w-8 bg-transparent text-center text-ui font-medium tabular-nums outline-none [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
             value={draft}
@@ -2494,7 +2490,7 @@ function UiCodeFontSizeControl() {
           />
         </div>
         <StepperButton
-          label="Increase code font size"
+          control={settingsControlProps(CODE_FONT_SIZE_ENTRY, "increase")}
           testId="code-font-size-inc"
           disabled={atMax}
           onClick={() => commit(px + CODE_FONT_SIZE_STEP)}
@@ -2503,7 +2499,7 @@ function UiCodeFontSizeControl() {
           <PlusIcon className="ui-icon" />
         </StepperButton>
       </div>
-    </div>
+    </SettingsItem>
   );
 }
 
@@ -2524,20 +2520,18 @@ function UiCodeFontFamilyControl() {
   const isDefault = family.trim() === CODE_FONT_FAMILY_DEFAULT;
 
   return (
-    <div
+    <SettingsItem
+      entry={CODE_FONT_FAMILY_ENTRY}
       role="group"
       aria-label="Code font family"
       className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-x-2 gap-y-3 md:grid-cols-[minmax(0,1fr)_auto_auto]"
     >
-      <SettingsLabel
-        label="Code font family"
-        className="md:mr-4"
-        description="Font for the editor and terminal. Leave blank for the default."
-      />
+      <SettingsEntryLabel entry={CODE_FONT_FAMILY_ENTRY} className="md:mr-4" />
       <Button
         type="button"
         variant="ghost"
         size="sm"
+        {...settingsControlProps(CODE_FONT_FAMILY_ENTRY, "reset")}
         data-testid="code-font-family-reset"
         disabled={isDefault}
         className={cn("h-9", isDefault && "invisible")}
@@ -2548,7 +2542,7 @@ function UiCodeFontFamilyControl() {
       </Button>
       <Input
         type="text"
-        aria-label="Code font family"
+        {...settingsControlProps(CODE_FONT_FAMILY_ENTRY, "field")}
         data-testid="code-font-family-input"
         placeholder="Editor default"
         spellCheck={false}
@@ -2558,7 +2552,7 @@ function UiCodeFontFamilyControl() {
         value={family}
         onChange={(e) => update(e.target.value)}
       />
-    </div>
+    </SettingsItem>
   );
 }
 
@@ -2572,34 +2566,34 @@ function UiCodeFontWeightControl() {
   };
 
   return (
-    <div className="flex items-center justify-between gap-6" data-testid="code-font-weight-control">
-      <SettingsLabel
-        label="Heavier code font"
-        className="flex-1"
-        description="Use heavier text in the editor and terminal."
-      />
+    <SettingsItem
+      entry={CODE_FONT_WEIGHT_ENTRY}
+      className="flex items-center justify-between gap-6"
+      data-testid="code-font-weight-control"
+    >
+      <SettingsEntryLabel entry={CODE_FONT_WEIGHT_ENTRY} className="flex-1" />
       <Switch
-        aria-label="Use heavier code text"
+        {...settingsControlProps(CODE_FONT_WEIGHT_ENTRY, "toggle")}
         checked={heavier}
         onCheckedChange={toggle}
         data-testid="heavier-code-text-toggle"
         className="shrink-0"
         componentId="settings.appearance.heavier_code_text"
       />
-    </div>
+    </SettingsItem>
   );
 }
 
 /** Flanking +/- segment of the font-size pill: square, ghost-hover, no border. */
 function StepperButton({
-  label,
+  control,
   testId,
   disabled,
   onClick,
   componentId,
   children,
 }: {
-  label: string;
+  control: SettingsControlProps;
   testId: string;
   disabled: boolean;
   onClick: () => void;
@@ -2610,7 +2604,7 @@ function StepperButton({
   return (
     <button
       type="button"
-      aria-label={label}
+      {...control}
       data-testid={testId}
       disabled={disabled}
       onClick={() => {
