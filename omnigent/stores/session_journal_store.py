@@ -221,6 +221,11 @@ class SessionJournalStore:
 
     # ── Appends ───────────────────────────────────────
 
+    def validate_initial_plan(self, content: Mapping[str, Any]) -> None:
+        """Check a first plan and its run marker, including storage codec overhead."""
+        fields = normalize_content("plan", content)
+        self._stored_contents([{"version": 1, **fields}, {"status": "started"}])
+
     def _lock_head(self, session: Session, conversation_id: str) -> int:
         """Lock the session's heads row, creating it on the first append.
 

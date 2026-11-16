@@ -26,6 +26,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, Query, Request
@@ -116,6 +118,31 @@ def open_store(conversation_store: object) -> SessionJournalStore | None:
         return store
 
 
+def _require_store(conversation_store: ConversationStore) -> SessionJournalStore:
+    store = open_store(conversation_store)
+    if store is None:
+        raise OmnigentError(
+            "Session journals are not available on this server", code=ErrorCode.NOT_FOUND
+        )
+    return store
+
+
+@contextmanager
+def _journal_errors() -> Iterator[None]:
+    try:
+        yield
+    except JournalSessionNotFoundError as exc:
+        raise session_not_found() from exc
+    except JournalEntryTooLargeError as exc:
+        raise OmnigentError(f"entry_too_large: {exc}", code=ErrorCode.INVALID_INPUT) from exc
+    except StepNotReadyError as exc:
+        raise OmnigentError(f"step_not_ready: {exc}", code=ErrorCode.CONFLICT) from exc
+    except JournalFullError as exc:
+        raise OmnigentError(f"journal_full: {exc}", code=ErrorCode.CONFLICT) from exc
+    except InvalidJournalEntryError as exc:
+        raise OmnigentError(f"invalid_entry: {exc}", code=ErrorCode.INVALID_INPUT) from exc
+
+
 async def require_current_workflow_run(
     conversations: ConversationStore, conversation_id: str, plan_id: str | None
 ) -> None:
@@ -191,7 +218,21 @@ def entry_to_response(entry: JournalEntry) -> SessionJournalEntry:
 async def load_workflow_for_run(
     conversation_store: ConversationStore, workflow_id: str, *, user_id: str | None
 ) -> Workflow:
-    """Load the caller's saved plan before creating a run."""
+    """Load and validate the caller's saved plan before creating its session."""
+    workflow = await _load_workflow(conversation_store, workflow_id, user_id=user_id)
+    store = _require_store(conversation_store)
+    with _journal_errors():
+        await asyncio.to_thread(
+            store.validate_initial_plan,
+            {"name": workflow.name, "steps": workflow.steps, "source": "workflow"},
+        )
+    return workflow
+
+
+async def _load_workflow(
+    conversation_store: ConversationStore, workflow_id: str, *, user_id: str | None
+) -> Workflow:
+    """Look up the caller's owned workflow with saved steps."""
     workflows = open_workflow_store(conversation_store)
     try:
         uuid_to_bytes(workflow_id)
@@ -225,20 +266,17 @@ async def initialize_workflow_plan(
     user_id: str | None,
 ) -> None:
     """Snapshot a saved plan before the session can receive its first input."""
-    store = open_store(conversation_store)
-    if store is None:
-        raise OmnigentError(
-            "Session journals are not available on this server", code=ErrorCode.NOT_FOUND
+    store = _require_store(conversation_store)
+    with _journal_errors():
+        appended = await asyncio.to_thread(
+            store.append,
+            session.id,
+            "plan",
+            {"name": workflow.name, "steps": workflow.steps, "source": "workflow"},
+            idempotency_key="workflow:initial-plan",
+            workflow_id=workflow.id,
+            scheduled_task_run_id=_run_id(session),
         )
-    appended = await asyncio.to_thread(
-        store.append,
-        session.id,
-        "plan",
-        {"name": workflow.name, "steps": workflow.steps, "source": "workflow"},
-        idempotency_key="workflow:initial-plan",
-        workflow_id=workflow.id,
-        scheduled_task_run_id=_run_id(session),
-    )
     await _observe_entry(conversation_store, store, session, appended, user_id=user_id)
 
 
@@ -305,12 +343,7 @@ def create_session_journal_router(
     router = APIRouter(dependencies=[Depends(require_workflows)])
 
     def _store() -> SessionJournalStore:
-        store = open_store(conversation_store)
-        if store is None:
-            raise OmnigentError(
-                "Session journals are not available on this server", code=ErrorCode.NOT_FOUND
-            )
-        return store
+        return _require_store(conversation_store)
 
     async def _session(request: Request, session_id: str, level: int) -> Conversation:
         user_id = get_user_id(request, auth_provider)
@@ -399,7 +432,7 @@ def create_session_journal_router(
         store = _store()
         if kind == "status" and content.get("status") == "needs_input":
             await asyncio.to_thread(_require_attended_session, conversation_store, session)
-        try:
+        with _journal_errors():
             appended = await asyncio.to_thread(
                 lambda: store.append(
                     session.id,
@@ -412,16 +445,6 @@ def create_session_journal_router(
                     start_run=start_run,
                 )
             )
-        except JournalSessionNotFoundError as exc:
-            raise session_not_found() from exc
-        except JournalEntryTooLargeError as exc:
-            raise OmnigentError(f"entry_too_large: {exc}", code=ErrorCode.INVALID_INPUT) from exc
-        except StepNotReadyError as exc:
-            raise OmnigentError(f"step_not_ready: {exc}", code=ErrorCode.CONFLICT) from exc
-        except JournalFullError as exc:
-            raise OmnigentError(f"journal_full: {exc}", code=ErrorCode.CONFLICT) from exc
-        except InvalidJournalEntryError as exc:
-            raise OmnigentError(f"invalid_entry: {exc}", code=ErrorCode.INVALID_INPUT) from exc
         await _observe_entry(conversation_store, store, session, appended, user_id=user_id)
         return appended.entry
 
@@ -457,7 +480,7 @@ def create_session_journal_router(
             raise OmnigentError(
                 "invalid_entry: only a plan names a workflow", code=ErrorCode.INVALID_INPUT
             )
-        await load_workflow_for_run(
+        await _load_workflow(
             conversation_store, workflow_id, user_id=get_user_id(request, auth_provider)
         )
 

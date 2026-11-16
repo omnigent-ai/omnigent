@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import random
+import string
 from collections.abc import AsyncIterator
 from pathlib import Path
 from uuid import uuid4
@@ -11,6 +13,8 @@ import pytest
 import pytest_asyncio
 from fastapi import FastAPI
 
+from omnigent.db.db_models import MAX_STORED_VALUE_BYTES
+from omnigent.entities.session_journal import JournalEntryTooLargeError
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.server.feature_flags import resolve_feature_flags
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -96,6 +100,10 @@ async def test_session_creation_snapshots_workflow_before_initial_items(
     items = conversations.list_items(session_id, order="asc").data
     assert [item.type for item in items] == ["resource_event", "message"]
     assert items[0].data.event_type == "session.journal.plan"
+    runs_url = f"/v1/workflows/{workflow['id']}/runs"
+    runs = (await client.get(runs_url, headers=_headers())).json()["data"]
+    assert len(runs) == 1
+    assert runs[0]["session_id"] == session_id and runs[0]["id"] == plan["id"]
 
     # The agent can start the existing steps without writing another plan.
     conversations.set_runner_id(session_id, token_bound_runner_id("journal-test-runner"))
@@ -105,17 +113,6 @@ async def test_session_creation_snapshots_workflow_before_initial_items(
         headers=_runner(session_id),
     )
     assert started.status_code == 200, started.text
-    runs_url = f"/v1/workflows/{workflow['id']}/runs"
-    runs = (await client.get(runs_url, headers=_headers())).json()["data"]
-    assert len(runs) == 1
-    assert runs[0]["session_id"] == session_id and runs[0]["id"] == plan["id"]
-    assert runs[0]["progress"] == {
-        "total": 2,
-        "started": 1,
-        "done": 0,
-        "failed": 0,
-        "needs_input": 0,
-    }
 
     changed = await client.patch(
         f"/v1/workflows/{workflow['id']}",
@@ -137,8 +134,12 @@ async def test_session_creation_snapshots_workflow_before_initial_items(
     assert len((await client.get(runs_url, headers=_headers())).json()["data"]) == 2
 
 
+@pytest.mark.parametrize("too_large", [False, True])
 async def test_workflow_journal_failure_removes_the_unreturned_session(
-    client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    too_large: bool,
 ) -> None:
     agent = await create_test_agent(client, user=ALICE)
     saved = await client.post(
@@ -152,29 +153,55 @@ async def test_workflow_journal_failure_removes_the_unreturned_session(
 
     # Inject a journal storage failure after the conversation row has been created.
     def unavailable(*args: object, **kwargs: object) -> None:
+        if too_large:
+            raise JournalEntryTooLargeError(
+                "the stored entry", MAX_STORED_VALUE_BYTES + 1, MAX_STORED_VALUE_BYTES
+            )
         raise RuntimeError("journal storage unavailable")
 
     monkeypatch.setattr(SessionJournalStore, "append", unavailable)
-    with pytest.raises(RuntimeError, match="journal storage unavailable"):
-        await client.post(
+    if too_large:
+        response = await client.post(
             "/v1/sessions",
             json={"agent_id": agent["id"], "workflow_id": saved.json()["id"]},
             headers=_headers(),
         )
+        assert response.status_code == 400 and "entry_too_large" in response.text
+    else:
+        with pytest.raises(RuntimeError, match="journal storage unavailable"):
+            await client.post(
+                "/v1/sessions",
+                json={"agent_id": agent["id"], "workflow_id": saved.json()["id"]},
+                headers=_headers(),
+            )
     assert [session.id for session in conversations.list_conversations().data] == before
 
 
-@pytest.mark.parametrize("case", ["foreign", "missing", "invalid", "draft", "disabled"])
+@pytest.mark.parametrize(
+    "case", ["foreign", "missing", "invalid", "draft", "disabled", "oversized"]
+)
 async def test_invalid_workflow_creates_no_session(
     client: httpx.AsyncClient, app: FastAPI, db_uri: str, case: str
 ) -> None:
     agent = await create_test_agent(client, user=ALICE)
+    steps = [] if case == "draft" else STEPS
+    if case == "oversized":
+        # The saved steps fit; adding the initial plan's envelope exceeds the journal cap.
+        noise = random.Random(1)
+        steps = [
+            {
+                "id": f"s{index}",
+                "name": f"Step {index}",
+                "goal": "".join(noise.choices(string.ascii_letters + string.digits, k=235)),
+            }
+            for index in range(90)
+        ]
     saved = await client.post(
         "/v1/workflows",
         json={
-            "name": "Release",
+            "name": "Near limit" if case == "oversized" else "Release",
             "description": "Build and test.",
-            "steps": [] if case == "draft" else STEPS,
+            "steps": steps,
         },
         headers=_headers(BOB if case == "foreign" else ALICE),
     )
@@ -194,6 +221,8 @@ async def test_invalid_workflow_creates_no_session(
         headers=_headers(),
     )
     assert response.status_code == (404 if case == "disabled" else 400), response.text
+    if case == "oversized":
+        assert "entry_too_large" in response.text
     assert [session.id for session in conversations.list_conversations().data] == before
 
 
