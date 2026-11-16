@@ -1058,8 +1058,8 @@ def test_recovery_labels_are_private_and_cannot_be_overwritten_or_forked(
         ("dispatching", None, False, False),
         ("dispatching", "attempt", False, True),
         ("submitted", "attempt", False, True),
-        ("stopped", "attempt", False, False),
-        ("failed", "attempt", False, False),
+        ("stopped", "attempt", False, True),
+        ("failed", "attempt", False, True),
         ("dispatching", "attempt", True, False),
     ],
 )
@@ -1130,6 +1130,35 @@ def test_input_in_the_same_batch_supersedes_later_native_recovery_echoes(
         [False, False] if input_first else [True, False]
     )
     assert store.get_session_recovery(conv.id) is None
+
+
+@pytest.mark.parametrize("value", ["legacy text", '"pending"'])
+def test_legacy_recovery_labels_do_not_block_new_input(
+    store: SqlAlchemyConversationStore, conv_db: Path, value: str
+) -> None:
+    from omnigent.entities import MessageData, NewConversationItem
+
+    conv = store.create_conversation()
+    with sqlite3.connect(conv_db) as connection:
+        connection.execute(
+            "INSERT INTO conversation_labels "
+            "(workspace_id, conversation_id, key, value, updated_at) VALUES (0, ?, ?, ?, 100)",
+            (bytes.fromhex(conv.id), "omnigent.recovery.phase", value),
+        )
+    assert store.get_session_recovery(conv.id) is None
+    [item] = store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                response_id="user",
+                type="message",
+                data=MessageData(
+                    role="user", content=[{"type": "input_text", "text": "new work"}]
+                ),
+            )
+        ],
+    )
+    assert store.list_items(conv.id).data == [item]
 
 
 def test_failed_input_does_not_cancel_recovery(
