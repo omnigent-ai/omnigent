@@ -8,6 +8,7 @@ import contextlib
 import errno
 import json
 import logging
+import threading
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
@@ -1942,6 +1943,95 @@ def test_shell_wait_timeout_and_cancellation_do_not_consume_followup(
     assert _FakeCodexNativeClient.requests[-1][0] == "turn/start"
     settled = read_bridge_state(tmp_path)
     assert settled is not None and settled.active_shell_turn_id is None
+
+
+@pytest.mark.parametrize("operation", ["read", "reconcile"])
+@pytest.mark.parametrize("cancel_wait", [False, True], ids=["timeout", "cancel"])
+@pytest.mark.parametrize("require_idle", [True, False], ids=["followup", "accepted-shell"])
+async def test_shell_wait_slow_metadata_remains_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    operation: str,
+    cancel_wait: bool,
+    require_idle: bool,
+) -> None:
+    """A stalled state file cannot freeze cancellation or extend the shell wait."""
+    _seed_bridge(tmp_path)
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    state = replace(state, pending_shell_command_id="pending-shell")
+    write_bridge_state(tmp_path, state)
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    original_read = Path.read_text
+    original_write = codex_native_executor.reconcile_shell_command_state
+
+    def hold() -> None:
+        started.set()
+        assert release.wait(5), "test did not release shell metadata"
+
+    def read(path: Path, *args: Any, **kwargs: Any) -> str:
+        if operation == "read" and path == tmp_path / "state.json":
+            hold()
+        try:
+            return original_read(path, *args, **kwargs)
+        finally:
+            if operation == "read" and path == tmp_path / "state.json":
+                finished.set()
+
+    def reconcile(*args: Any, **kwargs: Any) -> None:
+        hold()
+        try:
+            original_write(*args, **kwargs)
+        finally:
+            finished.set()
+
+    class FenceClient(_FakeCodexNativeClient):
+        requests = []
+
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            type(self).requests.append((method, params))
+            assert method == "turn/steer" and params["input"] == []
+            raise CodexAppServerResponseError(
+                {"code": -32600, "message": "no active turn to steer"}
+            )
+
+    monkeypatch.setattr(Path, "read_text", read)
+    if operation == "reconcile":
+        monkeypatch.setattr(codex_native_executor, "reconcile_shell_command_state", reconcile)
+    guard = threading.Timer(3, release.set)
+    guard.start()
+    task = asyncio.create_task(
+        codex_native_executor._wait_for_shell_completion(
+            FenceClient(), tmp_path, state, wait_seconds=0.2, require_idle=require_idle
+        )
+    )
+    try:
+        assert await asyncio.to_thread(started.wait, 2)
+        assert not release.is_set(), "shell metadata blocked the runner event loop"
+        if cancel_wait:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 1)
+        elif require_idle:
+            with pytest.raises(codex_native_executor._CodexNativeInputUndelivered) as failure:
+                await asyncio.wait_for(task, 1)
+            assert failure.value.failure.code == "codex_shell_busy"
+        else:
+            assert await asyncio.wait_for(task, 1) == state
+        assert not finished.is_set()
+        requests = list(FenceClient.requests)
+        release.set()
+        assert await asyncio.to_thread(finished.wait, 2)
+        await asyncio.sleep(0)
+        assert FenceClient.requests == requests
+        assert all(params["input"] == [] for _, params in requests)
+    finally:
+        release.set()
+        guard.cancel()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 @pytest.mark.parametrize(

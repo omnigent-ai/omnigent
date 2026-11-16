@@ -732,22 +732,25 @@ async def _reconcile_shell_command(
         # Shell and steer requests share Codex's per-thread FIFO. Unlike the
         # shell ack or thread/read, steer waits for the core operation to run.
         async with asyncio.timeout(timeout_seconds):
-            await client.request(
-                "turn/steer",
-                {"threadId": state.thread_id, "expectedTurnId": expected_turn_id, "input": []},
-            )
-    except CodexAppServerResponseError as error:
-        if error.code != -32600:
-            return
-        if error.message == "no active turn to steer":
-            reconcile_shell_command_state(bridge_dir, state, None)
-            return
-        prefix = f"expected active turn id `{expected_turn_id}` but found `"
-        message = error.message or ""
-        if message.startswith(prefix) and message.endswith("`"):
-            active_turn_id = message[len(prefix) : -1]
-            if active_turn_id and "`" not in active_turn_id:
-                reconcile_shell_command_state(bridge_dir, state, active_turn_id)
+            try:
+                await client.request(
+                    "turn/steer",
+                    {"threadId": state.thread_id, "expectedTurnId": expected_turn_id, "input": []},
+                )
+            except CodexAppServerResponseError as error:
+                if error.code != -32600:
+                    return
+                if error.message == "no active turn to steer":
+                    await asyncio.to_thread(reconcile_shell_command_state, bridge_dir, state, None)
+                    return
+                prefix = f"expected active turn id `{expected_turn_id}` but found `"
+                message = error.message or ""
+                if message.startswith(prefix) and message.endswith("`"):
+                    active_turn_id = message[len(prefix) : -1]
+                    if active_turn_id and "`" not in active_turn_id:
+                        await asyncio.to_thread(
+                            reconcile_shell_command_state, bridge_dir, state, active_turn_id
+                        )
     except (TimeoutError, OSError, RuntimeError, WebSocketException):
         _logger.debug("Codex shell reconciliation remains unresolved", exc_info=True)
 
@@ -764,8 +767,15 @@ async def _wait_for_shell_completion(
     deadline = asyncio.get_running_loop().time() + (
         _SHELL_COMPLETION_WAIT_SECONDS if wait_seconds is None else wait_seconds
     )
+    reconciled = False
     while True:
-        current = read_bridge_state(bridge_dir)
+        try:
+            async with asyncio.timeout_at(deadline):
+                current = await asyncio.to_thread(read_bridge_state, bridge_dir)
+        except TimeoutError:
+            if not require_idle:
+                return state
+            raise _CodexNativeInputUndelivered(_CODEX_SHELL_WAIT_FAILURE) from None
         if current is None or not _codex_binding_matches(current, state):
             if not require_idle:
                 return state
@@ -779,6 +789,9 @@ async def _wait_for_shell_completion(
             )
         if current.pending_shell_command_id is None and current.active_shell_turn_id is None:
             return current
+        if reconciled:
+            remaining = deadline - asyncio.get_running_loop().time()
+            await asyncio.sleep(min(_SHELL_TURN_POLL_SECONDS, max(0, remaining)))
         remaining = deadline - asyncio.get_running_loop().time()
         if remaining <= 0:
             if not require_idle:
@@ -787,8 +800,7 @@ async def _wait_for_shell_completion(
         await _reconcile_shell_command(
             client, bridge_dir, current, min(_SHELL_RECONCILIATION_RPC_SECONDS, remaining)
         )
-        remaining = deadline - asyncio.get_running_loop().time()
-        await asyncio.sleep(min(_SHELL_TURN_POLL_SECONDS, max(0, remaining)))
+        reconciled = True
 
 
 async def _set_codex_goal(client: CodexAppServerClient, *, thread_id: str, objective: str) -> None:
