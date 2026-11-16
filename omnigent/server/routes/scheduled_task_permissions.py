@@ -495,6 +495,10 @@ def register_scheduled_task_permissions_routes(
         store = require_sharing(request, granting=False)
         task = await owned_task(request, scheduled_task_id)
         add_audit_attrs(target_user_id=target_user_id)
+        # Before their grant is read, so a restore stays pinned to the account that held it
+        # and refuses one registered again since.
+        account = await asyncio.to_thread(store.get_user, target_user_id)
+        generation = account.account_generation if account is not None else None
         # Access they never had from the automation, such as a hand-made session
         # share, stays.
         if (
@@ -505,9 +509,6 @@ def register_scheduled_task_permissions_routes(
         # Fresh, so a session a first run recorded since the load is the one revoked.
         task = await owned_task(request, scheduled_task_id)
         await revoke_from_task_session(task, target_user_id, permission_store=store)
-        # Before the delete, so a restore can't give the grant to a re-registered account.
-        account = await asyncio.to_thread(store.get_user, target_user_id)
-        generation = account.account_generation if account is not None else None
         deleting: asyncio.Task[bool] | None = None
         try:
             deleting = asyncio.ensure_future(

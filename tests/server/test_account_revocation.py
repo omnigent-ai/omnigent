@@ -1554,8 +1554,9 @@ def test_automation_share_cannot_cross_registration(setup_app, monkeypatch, meth
 
 
 @pytest.mark.parametrize("setup_app", [True], indirect=True)
+@pytest.mark.parametrize("replaced_after", ["resolve_scheduled_task_access", "grant_delete"])
 def test_a_failed_automation_revoke_restores_no_grant_to_a_replaced_account(
-    setup_app, monkeypatch
+    setup_app, monkeypatch, replaced_after
 ):
     admin, _, stores, _ = setup_app
     task_id = _create_schedule(admin)
@@ -1564,16 +1565,30 @@ def test_a_failed_automation_revoke_restores_no_grant_to_a_replaced_account(
     )
     assert shared.status_code == 200, shared.text
     permissions = stores["permission_store"]
-    delete_grant = permissions.revoke_for_scheduled_task
     reached, resume = Event(), Event()
+
+    def pause_once():
+        if not reached.is_set():
+            reached.set()
+            assert resume.wait(15)
+
+    lookup = permissions.resolve_scheduled_task_access
+    delete_grant = permissions.revoke_for_scheduled_task
+
+    def lookup_then_pause(*args, **kwargs):
+        held = lookup(*args, **kwargs)
+        if replaced_after == "resolve_scheduled_task_access":
+            pause_once()
+        return held
 
     def delete_then_fail(user_id, scheduled_task_id):
         delete_grant(user_id, scheduled_task_id)
-        reached.set()
-        assert resume.wait(15)
+        if replaced_after == "grant_delete":
+            pause_once()
         # Committed, but the route sees an error and puts the grant back.
         raise RuntimeError("connection lost after commit")
 
+    monkeypatch.setattr(permissions, "resolve_scheduled_task_access", lookup_then_pause)
     monkeypatch.setattr(permissions, "revoke_for_scheduled_task", delete_then_fail)
     response = _replace_alice_during(
         admin, reached, resume, "DELETE", f"/v1/scheduled-tasks/{task_id}/permissions/alice"
