@@ -703,7 +703,9 @@ async def test_sandbox_repository_create_edit_and_target_switch(
         auth_app.state.sandbox_config = None
 
 
-@pytest.mark.parametrize("edit", ["rename", "agent", "clear", "invalid", "repository"])
+@pytest.mark.parametrize(
+    "edit", ["rename", "agent", "clear", "invalid", "repository", "shared_agent_rename"]
+)
 async def test_edit_legacy_sandbox_workspace(
     auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str, edit: str
 ) -> None:
@@ -726,10 +728,24 @@ async def test_edit_legacy_sandbox_workspace(
             "clear": {"workspace": None},
             "invalid": {"workspace": "/another/directory"},
             "repository": {"workspace": "https://github.com/example/runtime"},
+            # The cleared pin isn't a move, so an agent may rename a shared automation.
+            "shared_agent_rename": {"name": "Renamed"},
         }
-        updated = await auth_client.patch(
-            f"/v1/scheduled-tasks/{task_id}", json=changes[edit], headers=_headers()
-        )
+        if edit == "shared_agent_rename":
+            permissions = SqlAlchemyPermissionStore(db_uri)
+            permissions.ensure_user("bob@example.com")
+            permissions.grant_for_scheduled_task("bob@example.com", task_id, 1)
+            transport = httpx.ASGITransport(app=auth_app, client=("192.0.2.10", 12345))
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as agent:
+                updated = await agent.patch(
+                    f"/v1/scheduled-tasks/{task_id}",
+                    json=changes[edit],
+                    headers=_agent_headers(db_uri),
+                )
+        else:
+            updated = await auth_client.patch(
+                f"/v1/scheduled-tasks/{task_id}", json=changes[edit], headers=_headers()
+            )
         if edit == "invalid":
             assert updated.status_code == 400, updated.text
             assert store.get(task_id).workspace == "/home/me"

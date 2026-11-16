@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import replace
 from typing import Any
 
 from fastapi import APIRouter, Query, Request
@@ -30,6 +31,7 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER, RUNNER_TUNNEL_TOKEN_HEADER
 from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
 from omnigent.server.feature_flags import Feature
+from omnigent.server.managed_hosts import is_repo_workspace
 from omnigent.server.scheduled.run_sharing import (
     is_managed_run_session,
     revoke_from_task_session,
@@ -120,6 +122,20 @@ def has_scheduled_task_grants(permission_store: PermissionStore | None, task_id:
     return bool(grants)
 
 
+def without_legacy_sandbox_workspace(task: ScheduledTask) -> ScheduledTask:
+    """*task* as its runs see it, with a managed sandbox's legacy directory pin removed.
+
+    Those pins already run with the provider default, so they read as no workspace.
+    """
+    if (
+        task.execution_target == "managed_sandbox"
+        and task.workspace is not None
+        and not is_repo_workspace(task.workspace)
+    ):
+        return replace(task, workspace=None)
+    return task
+
+
 def _retargets(fields: Mapping[str, object], task: ScheduledTask) -> bool:
     """Whether saving *fields* changes where *task*'s runs happen."""
 
@@ -179,7 +195,10 @@ def agent_shared_target_guard(
     """
     if not request_from_agent(request):
         return None
-    return lambda locked: _refuse_shared_retarget(fields, locked, permission_store)
+    # Compared as the route compares it, so a legacy pin the update clears isn't a move.
+    return lambda locked: _refuse_shared_retarget(
+        fields, without_legacy_sandbox_workspace(locked), permission_store
+    )
 
 
 async def automation_managing_session(

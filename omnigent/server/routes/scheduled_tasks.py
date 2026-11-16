@@ -45,7 +45,7 @@ from omnigent.server.auth import (
 )
 from omnigent.server.bundles import agent_for_user
 from omnigent.server.feature_flags import DeploymentGate, deployment_gate_enabled
-from omnigent.server.managed_hosts import is_repo_workspace, parse_repo_workspace
+from omnigent.server.managed_hosts import parse_repo_workspace
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._host_launch import resolve_host_owner
 from omnigent.server.routes._session_create_validation import (
@@ -65,6 +65,7 @@ from omnigent.server.routes.scheduled_task_permissions import (
     owns_scheduled_task,
     register_scheduled_task_permissions_routes,
     require_agent_keeps_shared_target,
+    without_legacy_sandbox_workspace,
 )
 from omnigent.server.scheduled.harness_settings import (
     validate_scheduled_permission_mode,
@@ -1422,15 +1423,9 @@ def create_scheduled_tasks_router(
             permission_store=permission_store,
         )
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
-        existing = _require_owned(scheduled_task_id, owner_id)
-        legacy_workspace = (
-            existing.execution_target == "managed_sandbox"
-            and existing.workspace is not None
-            and not is_repo_workspace(existing.workspace)
-        )
-        if legacy_workspace:
-            # Legacy directory pins already run with the provider default.
-            existing = replace(existing, workspace=None)
+        stored = _require_owned(scheduled_task_id, owner_id)
+        existing = without_legacy_sandbox_workspace(stored)
+        legacy_workspace = existing.workspace != stored.workspace
         if body.timezone is not None:
             _validate_timezone_or_400(body.timezone)
         fields = body.model_dump(exclude_unset=True)
