@@ -142,14 +142,27 @@ describe("QuickPick rows", () => {
     expect(screen.getByRole("button", { name: "Close search" })).toBeTruthy();
   });
 
-  it("shows the caller's status in place of the count or the empty message", () => {
-    const { input, rerender, onAccept } = renderPicker({ status: "Couldn't load sessions." });
-    expect(screen.getAllByRole("status")).toHaveLength(1);
-    expect(screen.getByRole("status").textContent).toBe("Couldn't load sessions.");
+  it("shows the caller's status above the rows and still announces the count", () => {
+    const { input } = renderPicker({
+      status: (
+        <p>
+          <span role="status">Couldn't load sessions.</span>
+          <button type="button">Retry</button>
+        </p>
+      ),
+    });
+    const announced = () => screen.getAllByRole("status").map((region) => region.textContent);
+    expect(announced()).toEqual(["Couldn't load sessions.", "2 results"]);
+    expect(screen.getByRole("button", { name: "Retry" }).closest('[role="status"]')).toBeNull();
     fireEvent.change(input, { target: { value: "zzzz" } });
-    expect(screen.getByRole("status").textContent).toBe("Couldn't load sessions.");
-    rerender(<Harness onAccept={onAccept} />);
-    expect(screen.getByRole("status").textContent).toBe("No results found");
+    expect(announced()).toEqual(["Couldn't load sessions.", "No results found"]);
+  });
+
+  it("shows nothing for an empty list when the caller passes no empty message", () => {
+    const { input } = renderPicker({ emptyMessage: null });
+    fireEvent.change(input, { target: { value: "zzzz" } });
+    expect(screen.getByRole("status").textContent).toBe("");
+    expect(screen.getByRole("status").className).toContain("sr-only");
   });
 });
 

@@ -34,11 +34,11 @@ export interface QuickPickProps<Value> {
   onAccept: (item: QuickPickItem<Value>) => void;
   /** How rows' matched text stands out, unless a row sets its own. */
   matchHighlight?: MatchHighlight;
-  /** Shown when no row is listed, such as "No results found". */
+  /** Shown and announced when no row is listed, such as "No results found"; null shows nothing. */
   emptyMessage: ReactNode;
   /**
-   * Shown and announced above the rows in place of the result count and the empty
-   * message, such as a load error with Retry.
+   * Shown above the rows, such as a load error with Retry. It isn't announced; mark the
+   * caller's text `role="status"` and keep buttons outside it.
    */
   status?: ReactNode;
   /** Content below the rows inside the scrolling area, such as a button that loads more. */
@@ -310,16 +310,15 @@ export function QuickPick<Value>({
         data-slot="quick-pick-scroll"
         className={cn("overflow-y-auto p-1", fillHeight ? "min-h-0 flex-1" : "max-h-72")}
       >
-        {/* One live region: the caller's status, the visible empty message, or the count. */}
+        {status && <div data-slot="quick-pick-status">{status}</div>}
+        {/* Announces the empty message, shown, or the result count, visually hidden. */}
         <div
           role="status"
           aria-live="polite"
-          data-slot={resultCount === 0 && !status ? "quick-pick-empty" : undefined}
-          className={
-            status ? undefined : resultCount === 0 ? "py-6 text-center text-ui" : "sr-only"
-          }
+          data-slot={resultCount === 0 ? "quick-pick-empty" : undefined}
+          className={resultCount === 0 && emptyMessage ? "py-6 text-center text-ui" : "sr-only"}
         >
-          {status ?? (resultCount === 0 ? emptyMessage : resultCountText(resultCount))}
+          {resultCount === 0 ? emptyMessage : resultCountText(resultCount)}
         </div>
         <div id={listId} role="listbox" aria-label={label}>
           {sections.map((section, sectionIndex) => {

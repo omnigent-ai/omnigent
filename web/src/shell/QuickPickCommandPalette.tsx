@@ -157,11 +157,13 @@ export function QuickPickCommandPalette({
   const loadStatus =
     search.loadError || loadingSessions ? (
       <p className="px-3 py-2 text-xs text-muted-foreground">
-        {search.loadError
-          ? search.loadMoreError
-            ? "Couldn't load more sessions."
-            : "Couldn't load sessions."
-          : "Loading sessions…"}
+        <span role="status">
+          {search.loadError
+            ? search.loadMoreError
+              ? "Couldn't load more sessions."
+              : "Couldn't load sessions."
+            : "Loading sessions…"}
+        </span>
         {search.loadError && (
           <button
             type="button"
@@ -176,7 +178,7 @@ export function QuickPickCommandPalette({
     ) : null;
   // The cap stays visible with a load message, so hidden matches are never a surprise.
   const capStatus = sessionsOnly && search.sessions.length > search.visibleSessions.length && (
-    <p className="px-3 py-2 text-xs text-muted-foreground">
+    <p role="status" className="px-3 py-2 text-xs text-muted-foreground">
       Showing {search.visibleSessions.length} of {search.sessions.length} matches. Type more to
       narrow your search.
     </p>
@@ -238,7 +240,10 @@ export function QuickPickCommandPalette({
           activeId={parkedId}
           onActiveIdChange={() => setParkedId(null)}
           inputTestId="command-palette-input"
-          emptyMessage={search.searchFetching ? "Searching…" : "No results found"}
+          // As in today's palette, a load error or loading message stands in for the empty one.
+          emptyMessage={
+            loadStatus ? null : search.searchFetching ? "Searching…" : "No results found"
+          }
           status={status}
           listEnd={olderSessions}
           inputEnd={
