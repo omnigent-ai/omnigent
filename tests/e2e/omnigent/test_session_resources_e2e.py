@@ -421,6 +421,24 @@ def test_session_resources_e2e(
             assert resp.status_code == 200
             assert resp.json()["content"] == "hello e2e"
 
+            # Media loads seek through the server and the runner tunnel.
+            download_url = f"{fs}/_e2e_test.txt?download=true"
+            partial = client.get(download_url, headers={"Range": "bytes=6-8"})
+            assert partial.status_code == 206, partial.text
+            assert partial.content == b"e2e"
+            assert partial.headers["content-range"] == "bytes 6-8/9"
+            assert partial.headers["content-length"] == "3"
+            assert partial.headers["accept-ranges"] == "bytes"
+            assert "content-encoding" not in partial.headers
+
+            unsatisfiable = client.get(download_url, headers={"Range": "bytes=9-"})
+            assert unsatisfiable.status_code == 416, unsatisfiable.text
+            assert unsatisfiable.headers["content-range"] == "bytes */9"
+
+            complete = client.get(download_url)
+            assert complete.status_code == 200
+            assert complete.content == b"hello e2e"
+
             # Edit
             resp = client.patch(
                 f"{fs}/_e2e_test.txt",
