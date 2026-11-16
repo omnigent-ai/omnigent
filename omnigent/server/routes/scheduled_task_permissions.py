@@ -314,19 +314,21 @@ def _restore_task_grant(
         _logger.exception("automation %s: could not restore %r's grant", task_id, user_id)
 
 
-def _canonical_grantee(store: PermissionStore, user_id: str) -> str:
-    """*user_id* as the store names grantees, or as given when the store doesn't know it.
+def _grantee_to_remove(store: PermissionStore, task_id: str, user_id: str) -> str:
+    """The spelling under which the automation holds *user_id*'s grant.
 
-    As given, a principal who has left the directory can still be removed.
-
-    :raises OmnigentError: Any error from :meth:`PermissionStore.validate_grants`
-        except ``INVALID_INPUT``.
+    As given when that holds a grant, as a listed ID does, so a store that renames or
+    refuses the principal since can't block the removal. Otherwise the store's
+    canonical form, or as given when the lookup fails.
     """
+    if store.resolve_scheduled_task_access([user_id], task_id) is not None:
+        return user_id
     try:
         [(grantee, _)] = store.validate_grants([(user_id, LEVEL_READ)])
-    except OmnigentError as exc:
-        if exc.code != ErrorCode.INVALID_INPUT:
-            raise
+    except Exception:
+        _logger.warning(
+            "could not resolve %r to remove it; using it as given", user_id, exc_info=True
+        )
         return user_id
     return grantee
 
@@ -494,8 +496,9 @@ def register_scheduled_task_permissions_routes(
                 "An automation's owner cannot be granted access to it",
                 code=ErrorCode.INVALID_INPUT,
             )
-        # Variants too, before ensure_user could add a user row for one.
-        if is_reserved_grantee(grantee):
+        # Variants too, before ensure_user could add a user row for one, and the store's
+        # public groups, which a sync never revokes.
+        if is_reserved_grantee(grantee) or grantee in store.public_grantees():
             raise OmnigentError(
                 "Automations cannot be shared publicly or with the local user; name a user "
                 "or group",
@@ -558,7 +561,9 @@ def register_scheduled_task_permissions_routes(
         store = require_sharing(request, granting=False)
         task = await owned_task(request, scheduled_task_id)
         # The grant route stores this spelling, so every call below uses it.
-        grantee = await asyncio.to_thread(_canonical_grantee, store, target_user_id)
+        add_audit_attrs(target_user_id=target_user_id)
+        # The stored spelling, so every call below finds the grant the list showed.
+        grantee = await asyncio.to_thread(_grantee_to_remove, store, task.id, target_user_id)
         add_audit_attrs(target_user_id=grantee)
         # Before their grant is read, so a restore stays pinned to the account that held it
         # and refuses one registered again since.

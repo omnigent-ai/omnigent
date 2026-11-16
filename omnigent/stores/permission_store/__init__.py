@@ -216,7 +216,7 @@ class PermissionStore(ABC):
         self,
         conversation_id: str,
         *,
-        limit: int,
+        limit: int = 100,
         after_user_id: str | None = None,
     ) -> tuple[list[SessionPermission], str | None]:
         """Return the grants set on a session itself, paged as :meth:`list_for_session`.

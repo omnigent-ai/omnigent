@@ -4845,24 +4845,22 @@ async def test_grant_stores_the_canonical_id_and_tolerates_a_name_lookup_failure
 
 
 @_SHARING
-@pytest.mark.parametrize(("refusal", "status"), [("invalid_input", 204), ("forbidden", 403)])
-async def test_revoke_uses_the_canonical_id_or_the_id_given_for_an_unknown_principal(
-    auth_client: httpx.AsyncClient,
-    db_uri: str,
-    monkeypatch: pytest.MonkeyPatch,
-    refusal: str,
-    status: int,
+@pytest.mark.parametrize("refusal", ["invalid_input", "forbidden", "unavailable"])
+async def test_revoke_removes_the_grant_under_the_spelling_the_store_holds(
+    auth_client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch, refusal: str
 ) -> None:
     from omnigent.errors import ErrorCode, OmnigentError
     from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ
     from omnigent.server.routes import scheduled_task_permissions
 
-    left_directory: set[str] = set()
+    refused: set[str] = set()
 
     def canonical(
         self: SqlAlchemyPermissionStore, grants: list[tuple[str, int]]
     ) -> list[tuple[str, int]]:
-        if any(user_id.lower() in left_directory for user_id, _ in grants):
+        if any(user_id.lower() in refused for user_id, _ in grants):
+            if refusal == "unavailable":
+                raise RuntimeError("directory unavailable")
             code = ErrorCode.INVALID_INPUT if refusal == "invalid_input" else ErrorCode.FORBIDDEN
             raise OmnigentError("No such principal", code=code)
         return [(user_id.lower(), level) for user_id, level in grants]
@@ -4872,33 +4870,59 @@ async def test_revoke_uses_the_canonical_id_or_the_id_given_for_an_unknown_princ
     task_id = await _create_task(auth_client, session_mode="continue", session_id=session_id)
     for user in ("Bob@Example.com", "Erin@Example.com"):
         assert (await _share(auth_client, task_id, user)).status_code == 200
+    # A grant held under a spelling the store no longer produces, as after a rename.
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    permissions.ensure_user("Carol@Example.com")
+    permissions.grant_for_scheduled_task("Carol@Example.com", task_id, LEVEL_READ)
+    permissions.grant("Carol@Example.com", session_id, LEVEL_READ)
     audited: list[dict[str, object]] = []
     monkeypatch.setattr(
         scheduled_task_permissions, "add_audit_attrs", lambda **attrs: audited.append(attrs)
     )
 
+    # A spelling that holds no grant is canonicalized.
     revoked = await auth_client.delete(
         _permissions_url(task_id, "BOB@example.com"), headers=_headers()
     )
-
     assert revoked.status_code == 204, revoked.text
-    assert audited == [{"target_user_id": "bob@example.com"}]
+    assert audited[-1] == {"target_user_id": "bob@example.com"}
+    # The listed spelling is used as given.
+    revoked = await auth_client.delete(
+        _permissions_url(task_id, "Carol@Example.com"), headers=_headers()
+    )
+    assert revoked.status_code == 204, revoked.text
     assert _task_grantees(db_uri, task_id) == ["erin@example.com"]
     erin = {"alice@example.com": LEVEL_OWNER, "erin@example.com": LEVEL_READ}
     assert _session_grants(db_uri, session_id) == erin
 
-    # Erin left the directory. Only a lookup that finds no such principal falls back.
-    left_directory.add("erin@example.com")
+    # A grantee the directory now refuses, or can't look up, is still removed.
+    refused.add("erin@example.com")
     revoked = await auth_client.delete(
         _permissions_url(task_id, "erin@example.com"), headers=_headers()
     )
 
-    assert revoked.status_code == status, revoked.text
-    removed = status == 204
-    assert _task_grantees(db_uri, task_id) == ([] if removed else ["erin@example.com"])
-    assert _session_grants(db_uri, session_id) == (
-        {"alice@example.com": LEVEL_OWNER} if removed else erin
+    assert revoked.status_code == 204, revoked.text
+    assert _task_grantees(db_uri, task_id) == []
+    assert _session_grants(db_uri, session_id) == {"alice@example.com": LEVEL_OWNER}
+
+
+@_SHARING
+async def test_grant_refuses_the_stores_public_grantees(
+    auth_client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A store whose General access is a built-in group, which a sync never revokes.
+    monkeypatch.setattr(
+        SqlAlchemyPermissionStore, "public_grantees", lambda self: frozenset({"users"})
     )
+    task_id = await _create_task(auth_client)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    users = {user.id for user in permissions.list_users()}
+
+    refused = await _share(auth_client, task_id, "users")
+
+    assert refused.status_code == 400, refused.text
+    assert _task_grantees(db_uri, task_id) == []
+    assert {user.id for user in permissions.list_users()} == users
 
 
 @_SHARING
