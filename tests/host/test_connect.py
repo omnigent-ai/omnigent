@@ -3217,6 +3217,27 @@ async def test_workspace_socket_without_its_extra_leaves_the_host_running(
     assert await _make_host_process()._start_workspace_socket() is None
 
 
+async def test_installed_workspace_extra_starts_the_socket_without_a_host_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An installed `omnigent[workspace-api]` opens the socket; no host flag gates it."""
+    socket = object()
+    started_for: list[str] = []
+
+    async def _start(_reader: object, *, host_id: str) -> object:
+        started_for.append(host_id)
+        return socket
+
+    monkeypatch.setitem(
+        sys.modules,
+        "omnigent.host.workspace_service",
+        SimpleNamespace(start_workspace_socket=_start),
+    )
+
+    assert await _make_host_process()._start_workspace_socket() is socket
+    assert started_for == ["host_test_connect"]
+
+
 async def test_slow_capability_discovery_blocks_registration_and_frame_dispatch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

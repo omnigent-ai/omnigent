@@ -6259,6 +6259,8 @@ if (!gotLock) {
   app.on("quit", clearQuitForceExitTimer);
   app.on("before-quit", (event) => {
     quitConfirmation.quitStarted();
+    // Forced exits below skip will-quit, so SSH connections are torn down here first.
+    workspaceSshForwards.closeAll();
     if (quitCleanupDone) return;
     // A second quit (e.g. Cmd-Q again during the SIGKILL grace window) must not
     // re-enter shutdown() concurrently — just keep deferring until the first

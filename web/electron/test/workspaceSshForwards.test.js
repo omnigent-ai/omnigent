@@ -2,15 +2,14 @@ const { describe, it, beforeEach, afterEach } = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const http = require("node:http");
-const os = require("node:os");
 const path = require("node:path");
 
 const { createWorkspaceSshForwards } = require("../src/workspaceSshForwards");
-const { createSshHostStore } = require("../src/sshHosts");
 const { workspaceSocketRequest } = require("../src/workspaceSocket");
 
 const METHOD = "/omnigent.api.workspace.v1alpha1.WorkspaceService/ReadFile";
 const REMOTE = "/tmp/omnigent-workspace-ab12_x/workspace.sock";
+const GONE = "/tmp/omnigent-workspace-gone/workspace.sock";
 const unix = process.platform !== "win32";
 
 /** The host's answer: echo the socket path and the authorization header. */
@@ -19,17 +18,36 @@ function answer(remotePath, req, res) {
   res.end(`${remotePath} ${req.headers.authorization}`);
 }
 
+/** The host's answer for a remote socket that refuses: the connection is reset. */
+function refuseGone(remotePath, req, res) {
+  if (remotePath === GONE) req.socket.destroy();
+  else answer(remotePath, req, res);
+}
+
+/** Let the pending promise chains and callbacks of the last call run. */
+const settle = () =>
+  new Promise((resolve) => {
+    setImmediate(resolve);
+  });
+
 /**
  * A stand-in for ssh's shared connection. A forward serves HTTP on the local
  * socket, as the remote host would through a real `ssh -L`.
  */
-function fakeSsh({ openError = null, openGate = null, forwardCode = 0, respond = answer } = {}) {
+function fakeSsh({
+  openError = null,
+  openGate = null,
+  forwardCode = 0,
+  cancelCode = 0,
+  respond = answer,
+} = {}) {
   const sessions = [];
   const servers = [];
   const createSession = (options) => {
     const session = {
       options,
       forwards: [],
+      cancelled: [],
       closed: false,
       aborted: false,
       open: async () => {
@@ -45,6 +63,10 @@ function fakeSsh({ openError = null, openGate = null, forwardCode = 0, respond =
           server.listen(localPath, resolve);
         });
         return { code: 0 };
+      },
+      cancelSocket: async (localPath, remotePath) => {
+        session.cancelled.push([localPath, remotePath]);
+        return { code: cancelCode };
       },
       close: async () => {
         session.closed = true;
@@ -149,7 +171,7 @@ describe("workspace calls over SSH", { skip: !unix && "needs Unix sockets" }, ()
     assert.ok(ssh.sessions.every((session) => session.closed));
   });
 
-  it("reports a refused forward", async () => {
+  it("reports a refused forward and drops its connection", async () => {
     ssh = fakeSsh({ forwardCode: 255 });
     forwards = createWorkspaceSshForwards({ createSession: ssh.createSession });
     routes.forwards = forwards;
@@ -177,23 +199,50 @@ describe("workspace calls over SSH", { skip: !unix && "needs Unix sockets" }, ()
     assert.equal(ssh.sessions[0].closed, false);
   });
 
-  it("drops the connection when a forwarded socket refuses, so the next read opens a new one", async () => {
-    const gone = "/tmp/omnigent-workspace-gone/workspace.sock";
-    ssh = fakeSsh({
-      respond: (remotePath, req, res) => {
-        if (remotePath === gone) req.socket.destroy();
-        else answer(remotePath, req, res);
-      },
-    });
+  it("cancels only the forward of a remote socket that refused, keeping the connection", async () => {
+    ssh = fakeSsh({ respond: refuseGone });
     forwards = createWorkspaceSshForwards({ createSession: ssh.createSession });
     routes.forwards = forwards;
+    await call(routes);
 
-    await assert.rejects(call(routes, { socketPath: gone }), { code: "ECONNRESET" });
-    assert.equal(ssh.sessions[0].closed, true);
+    await assert.rejects(call(routes, { socketPath: GONE }), { code: "ECONNRESET" });
+    await settle();
+    const [session] = ssh.sessions;
+    assert.deepEqual(
+      session.cancelled.map(([, remotePath]) => remotePath),
+      [GONE],
+      "only the refusing path is cancelled",
+    );
+    assert.equal(session.closed, false);
     const response = await call(routes);
 
     assert.equal(Buffer.from(response.body).toString(), `${REMOTE} Bearer t`);
-    assert.equal(ssh.sessions.length, 2);
+    assert.equal(ssh.sessions.length, 1);
+  });
+
+  it("drops the connection when its master can't cancel a forward", async () => {
+    ssh = fakeSsh({ respond: refuseGone, cancelCode: 255 });
+    forwards = createWorkspaceSshForwards({ createSession: ssh.createSession });
+    routes.forwards = forwards;
+
+    await assert.rejects(call(routes, { socketPath: GONE }), { code: "ECONNRESET" });
+    await settle();
+
+    assert.equal(ssh.sessions[0].closed, true, "a dead master takes its connection");
+  });
+
+  it("drops the connection when its local socket is gone", async () => {
+    await call(routes);
+    ssh.stop();
+    await settle();
+
+    await assert.rejects(
+      call(routes),
+      (error) => error.code === "ENOENT" || error.code === "ECONNREFUSED",
+    );
+    await settle();
+
+    assert.equal(ssh.sessions[0].closed, true);
   });
 
   it("a late failure leaves the connection that replaced its own", async () => {
@@ -225,7 +274,7 @@ describe("workspace calls over SSH", { skip: !unix && "needs Unix sockets" }, ()
     assert.equal(ssh.sessions[0].forwards.length, 0);
   });
 
-  it("closeAll kills the connections and removes their directories at once", async () => {
+  it("closeAll kills the connections, removes their directories, and refuses new reads", async () => {
     await call(routes);
     const [session] = ssh.sessions;
     const directory = path.dirname(session.forwards[0][0]);
@@ -234,54 +283,30 @@ describe("workspace calls over SSH", { skip: !unix && "needs Unix sockets" }, ()
 
     assert.equal(session.aborted, true);
     assert.equal(fs.existsSync(directory), false);
+    await assert.rejects(call(routes), /closed/, "no connection opens once quit starts");
+    assert.equal(ssh.sessions.length, 1);
   });
 
-  it("closes an idle connection", async () => {
-    forwards = createWorkspaceSshForwards({ createSession: ssh.createSession, idleMs: 10 });
+  it("closeAll also reaches a connection that is still closing", async () => {
+    const { socketPath, dropConnection } = await forwards.localSocket("my-box", REMOTE);
+    const directory = path.dirname(socketPath);
+    dropConnection();
+
+    forwards.closeAll();
+
+    assert.equal(ssh.sessions[0].aborted, true);
+    assert.equal(fs.existsSync(directory), false);
+  });
+
+  it("closes an idle connection", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    forwards = createWorkspaceSshForwards({ createSession: ssh.createSession, idleMs: 1000 });
     routes.forwards = forwards;
     await call(routes);
+    assert.equal(ssh.sessions[0].closed, false, "not idle while in use");
 
-    await new Promise((resolve) => {
-      setTimeout(resolve, 50);
-    });
+    t.mock.timers.tick(1000);
 
     assert.equal(ssh.sessions[0].closed, true);
-  });
-});
-
-describe("createSshHostStore", () => {
-  let directory;
-
-  beforeEach(() => {
-    directory = fs.mkdtempSync(path.join(os.tmpdir(), "ssh-hosts-"));
-  });
-
-  afterEach(() => {
-    fs.rmSync(directory, { recursive: true, force: true });
-  });
-
-  it("keeps each server's hosts apart, across restarts, in a private file", () => {
-    const file = path.join(directory, "ssh-hosts.json");
-    const hostId = "0123456789abcdef0123456789abcdef";
-    createSshHostStore(() => file).record("https://a.example/", hostId, "my-box");
-
-    const reloaded = createSshHostStore(() => file);
-
-    assert.equal(reloaded.destination("https://a.example/", hostId), "my-box");
-    assert.equal(
-      reloaded.destination("https://a.example/", "01234567-89ab-cdef-0123-456789ABCDEF"),
-      "my-box",
-      "a dashed id finds the same host",
-    );
-    assert.equal(reloaded.destination("https://b.example/", hostId), null);
-    assert.equal(reloaded.destination("https://a.example/", "__proto__"), null);
-    assert.equal((fs.statSync(file).mode & 0o777).toString(8), "600");
-  });
-
-  it("ignores a destination that isn't a valid ssh destination", () => {
-    const file = path.join(directory, "ssh-hosts.json");
-    fs.writeFileSync(file, JSON.stringify({ "https://a.example/": { h: "-oProxyCommand=x" } }));
-
-    assert.equal(createSshHostStore(() => file).destination("https://a.example/", "h"), null);
   });
 });

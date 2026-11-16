@@ -27,8 +27,11 @@ function createWorkspaceSshForwards(deps = {}) {
   const makeTempDir =
     deps.makeTempDir ?? (() => fs.mkdtempSync(path.join(os.tmpdir(), "omni-ws-ssh-")));
   const idleMs = deps.idleMs ?? IDLE_MS;
-  /** @type {Map<string, {dir: string, session: any, ready: Promise<void>, forwards: Map<string, Promise<string>>, count: number, timer: any}>} */
+  /** @type {Map<string, {dir: string, session: any, ready: Promise<void>, forwards: Map<string, {localPath: string, pending: Promise<string>}>, count: number, timer: any}>} */
   const connections = new Map();
+  // Connections whose graceful close is still running; quit must still reach them.
+  const retiring = new Set();
+  let shutDown = false;
 
   /**
    * End `connection` if it is still `destination`'s current one, so a failure from
@@ -38,10 +41,27 @@ function createWorkspaceSshForwards(deps = {}) {
     if (connections.get(destination) !== connection) return;
     connections.delete(destination);
     clearTimeout(connection.timer);
+    retiring.add(connection);
     void connection.session
       .close()
       .catch(() => {})
-      .finally(() => fs.rmSync(connection.dir, { recursive: true, force: true }));
+      .finally(() => {
+        retiring.delete(connection);
+        fs.rmSync(connection.dir, { recursive: true, force: true });
+      });
+  }
+
+  /**
+   * Cancel one remote socket's forward so the next read forwards it afresh. If ssh
+   * can't cancel it, the master is gone, so the whole connection goes.
+   */
+  function dropForward(destination, connection, remotePath, forward) {
+    if (connections.get(destination) !== connection) return;
+    if (connection.forwards.get(remotePath) !== forward) return;
+    connection.forwards.delete(remotePath);
+    void connection.session.cancelSocket(forward.localPath, remotePath).then((result) => {
+      if (result.code !== 0) closeConnection(destination, connection);
+    });
   }
 
   function connect(destination) {
@@ -78,10 +98,12 @@ function createWorkspaceSshForwards(deps = {}) {
    *
    * @param {string} destination A destination validated by `validateDestination`.
    * @param {string} remotePath The host's socket path on that machine.
-   * @returns {Promise<{socketPath: string, dropConnection: () => void}>} `dropConnection`
-   *   ends the connection this socket rides on; it does nothing once that is replaced.
+   * @returns {Promise<{socketPath: string, dropConnection: () => void, dropForward: () => void}>}
+   *   `dropConnection` ends the connection this socket rides on, and `dropForward` only
+   *   this socket's forward; both do nothing once they are already replaced.
    */
   async function localSocket(destination, remotePath) {
+    if (shutDown) throw new Error("the workspace SSH connections are closed");
     const connection = connect(destination);
     const assertCurrent = () => {
       if (connections.get(destination) !== connection) {
@@ -94,31 +116,41 @@ function createWorkspaceSshForwards(deps = {}) {
     if (!forward) {
       connection.count += 1;
       const localPath = path.join(connection.dir, `w${connection.count}.sock`);
-      forward = connection.session.forwardSocket(localPath, remotePath).then((result) => {
+      const pending = connection.session.forwardSocket(localPath, remotePath).then((result) => {
         if (result.code !== 0) {
           throw new Error(`couldn't forward the workspace socket on ${destination}`);
         }
         return localPath;
       });
+      forward = { localPath, pending };
       connection.forwards.set(remotePath, forward);
       // A refused forward usually means the shared connection is gone, so drop it.
-      forward.catch(() => closeConnection(destination, connection));
+      pending.catch(() => closeConnection(destination, connection));
     }
-    const socketPath = await forward;
+    const socketPath = await forward.pending;
     assertCurrent();
-    return { socketPath, dropConnection: () => closeConnection(destination, connection) };
+    return {
+      socketPath,
+      dropConnection: () => closeConnection(destination, connection),
+      dropForward: () => dropForward(destination, connection, remotePath, forward),
+    };
   }
 
   return {
     localSocket,
-    /** Synchronous, for quit: kills every shared connection and removes its directory now. */
+    /**
+     * Synchronous, for quit: refuses new connections and kills the open ones now,
+     * since forced exits can skip the async shutdown.
+     */
     closeAll: () => {
-      for (const [destination, connection] of [...connections]) {
-        connections.delete(destination);
+      shutDown = true;
+      for (const connection of [...connections.values(), ...retiring]) {
         clearTimeout(connection.timer);
         connection.session.abort();
         fs.rmSync(connection.dir, { recursive: true, force: true });
       }
+      connections.clear();
+      retiring.clear();
     },
   };
 }
