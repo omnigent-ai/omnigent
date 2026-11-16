@@ -244,6 +244,19 @@ release don't appear. Hover a step in the graph to see all of it. In a run's
 graph, the card says where the task stands, as the strip's does, and a step's
 **⋯** menu has its task's action.
 
+A run that started other workflow runs, as in "A workflow can run another
+workflow" above, shows **Ran N workflows** under its tasks. The list holds every
+workflow run below it, flat: those of the sessions its session started while
+the run was current, then theirs, each right after the run that started it. It
+starts open while any of them is working or waiting. A run there that another
+of them started, and a run on the called workflow's own page, says **Started
+by** and links to the session that started it. A session's Tasks tab shows the
+same list under its tasks when its plan came from a saved workflow, for anyone
+who can read the session. The links follow the `omnigent.created_by_session_id`
+label of the sessions `sys_session_create` starts on a host or sandbox, and their
+session family, so they need the default `sibling_sessions` feature; child
+sessions aren't listed.
+
 ## Automations
 
 An automation's prompt asks the agent to read its journal first, write a plan if

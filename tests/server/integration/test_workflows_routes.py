@@ -16,8 +16,11 @@ from fastapi import FastAPI
 from omnigent.db.db_models import MAX_STORED_VALUE_BYTES
 from omnigent.entities.session_journal import JournalEntryTooLargeError
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
+from omnigent.server.auth import LEVEL_READ
 from omnigent.server.feature_flags import resolve_feature_flags
+from omnigent.stores.conversation_store import CREATED_BY_SESSION_LABEL_KEY
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from omnigent.stores.session_journal_store import SessionJournalStore
 from omnigent.tools.builtins.journal import JOURNAL_TOOLS
 from tests.debug_log_helpers import capture_debug_rows
@@ -509,3 +512,120 @@ async def test_draft_planning_is_persistent_private_and_separate_from_runs(
     assert (await client.get("/v1/workflows", headers=_headers(ALICE))).json()["data"][0][
         "is_draft"
     ] is True
+
+
+async def _save_workflow(client: httpx.AsyncClient, name: str) -> dict[str, str]:
+    saved = await client.post(
+        "/v1/workflows",
+        json={"name": name, "description": f"{name}.", "steps": STEPS},
+        headers=_headers(),
+    )
+    assert saved.status_code == 200, saved.text
+    return saved.json()
+
+
+async def _run(
+    client: httpx.AsyncClient, session_id: str, workflow: dict[str, str], key: str
+) -> None:
+    """Start a run of *workflow* in *session_id*, as its agent does."""
+    response = await client.post(
+        f"/v1/sessions/{session_id}/journal",
+        json=_write(
+            "plan", {"name": workflow["name"], "steps": STEPS}, key, workflow_id=workflow["id"]
+        ),
+        headers=_runner(session_id),
+    )
+    assert response.status_code == 200, response.text
+
+
+async def test_runs_list_the_workflow_runs_their_sessions_started(
+    client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = [100]
+    for module in ("session_journal_store", "conversation_store.sqlalchemy_store"):
+        monkeypatch.setattr(f"omnigent.stores.{module}.now_epoch", lambda: clock[0])
+    stack = await _save_workflow(client, "Land a stack")
+    ready = await _save_workflow(client, "Ready a PR")
+    conversations = SqlAlchemyConversationStore(db_uri)
+
+    def start(starter: str, title: str, at: int) -> str:
+        # As sys_session_create's same-host placement records an independent session.
+        clock[0] = at
+        session_id = _session(db_uri, title=title, labels={CREATED_BY_SESSION_LABEL_KEY: starter})
+        conversations.add_new_sibling(starter, session_id, user_id=ALICE)
+        return session_id
+
+    root = _session(db_uri, title="Land stack")
+    await _run(client, root, stack, "first-run")
+    first = start(root, "Ready #1", 110)
+    await _run(client, first, ready, "ready-1")
+    deeper = start(first, "Ready #1 fix", 120)
+    await _run(client, deeper, ready, "ready-1-fix")
+    unrun = start(root, "Plain worker", 125)
+    second = start(root, "Ready #2", 130)
+    await _run(client, second, ready, "ready-2")
+    clock[0] = 200
+    await _run(client, root, stack, "second-run")
+    later = start(root, "Ready #3", 210)
+    await _run(client, later, ready, "ready-3")
+
+    url = f"/v1/workflows/{stack['id']}/runs"
+    newer, older = (await client.get(url, headers=_headers())).json()["data"]
+    # Each run below another follows the session that started it, and a session's
+    # next run ends the runs that count as its earlier run's.
+    assert [run["title"] for run in older["descendant_runs"]] == [
+        "Ready #1",
+        "Ready #1 fix",
+        "Ready #2",
+    ]
+    assert [run["session_id"] for run in newer["descendant_runs"]] == [later]
+    assert unrun not in {run["session_id"] for run in older["descendant_runs"]}
+    assert older["started_by"] is None and older["workflow_id"] == stack["id"]
+    assert [run["started_by"] for run in older["descendant_runs"]] == [
+        {"session_id": root, "title": "Land stack"},
+        {"session_id": first, "title": "Ready #1"},
+        {"session_id": root, "title": "Land stack"},
+    ]
+    assert all(
+        run["workflow_id"] == ready["id"] and run["descendant_runs"] == []
+        for run in older["descendant_runs"]
+    )
+
+    # The called workflow's runs name who started them and list the runs below them.
+    called = (await client.get(f"/v1/workflows/{ready['id']}/runs", headers=_headers())).json()
+    by_session = {run["session_id"]: run for run in called["data"]}
+    assert by_session[first]["started_by"] == {"session_id": root, "title": "Land stack"}
+    assert [run["session_id"] for run in by_session[first]["descendant_runs"]] == [deeper]
+
+    # A session can't be read by someone it isn't shared with, so it names no starter.
+    SqlAlchemyPermissionStore(db_uri).grant(BOB, first, LEVEL_READ)
+    shared = await client.get(
+        f"/v1/workflows/{ready['id']}/runs", params={"session_id": first}, headers=_headers(BOB)
+    )
+    assert shared.status_code == 200, shared.text
+    (run,) = shared.json()["data"]
+    assert run["session_id"] == first and run["started_by"] is None
+    assert run["descendant_runs"] == []
+
+
+async def test_a_session_filter_lists_its_runs_for_anyone_who_can_read_it(
+    client: httpx.AsyncClient, db_uri: str
+) -> None:
+    stack = await _save_workflow(client, "Land a stack")
+    shared = _session(db_uri, title="Shared")
+    await _run(client, shared, stack, "shared-run")
+    private = _session(db_uri, title="Private")
+    await _run(client, private, stack, "private-run")
+    SqlAlchemyPermissionStore(db_uri).grant(BOB, shared, LEVEL_READ)
+    url = f"/v1/workflows/{stack['id']}/runs"
+
+    own = await client.get(url, params={"session_id": shared}, headers=_headers())
+    assert [run["session_id"] for run in own.json()["data"]] == [shared]
+    # Bob doesn't own the workflow, so only the session he can read lists its runs.
+    assert (await client.get(url, headers=_headers(BOB))).status_code == 404
+    viewer = await client.get(url, params={"session_id": shared}, headers=_headers(BOB))
+    assert viewer.status_code == 200, viewer.text
+    assert [run["session_id"] for run in viewer.json()["data"]] == [shared]
+    for session_id in (private, uuid4().hex, "not-a-session"):
+        refused = await client.get(url, params={"session_id": session_id}, headers=_headers(BOB))
+        assert refused.status_code == 404, session_id

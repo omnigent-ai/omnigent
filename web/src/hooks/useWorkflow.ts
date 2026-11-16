@@ -153,46 +153,60 @@ interface RawRun {
   };
   steps?: JournalPlanStep[];
   statuses?: JournalEntry[];
+  workflow_id?: string;
+  started_by?: { session_id: string; title: string } | null;
+  descendant_runs?: RawRun[];
+}
+
+function toWorkflowRun(run: RawRun): WorkflowRun {
+  return {
+    id: run.id,
+    workflowId: run.workflow_id,
+    planGraphRevision: run.plan_graph_revision ?? undefined,
+    sessionId: run.session_id,
+    title: run.title,
+    startedAt: run.started_at,
+    isCurrent: run.is_current === true,
+    sessionStatus: run.session_status,
+    backgroundWorkRunning: run.background_work_running ?? false,
+    archived: run.archived,
+    progress: {
+      total: run.progress.total,
+      started: run.progress.started,
+      done: run.progress.done,
+      needsInput: run.progress.needs_input,
+      failed: run.progress.failed,
+    },
+    steps: run.steps ?? [],
+    statuses: run.statuses ?? [],
+    startedBy: run.started_by
+      ? { sessionId: run.started_by.session_id, title: run.started_by.title }
+      : undefined,
+    descendantRuns: (run.descendant_runs ?? []).map(toWorkflowRun),
+  };
 }
 
 /**
  * The sessions that ran a saved workflow, newest first, a page at a time.
  *
  * @param workflowId - The workflow.
+ * @param sessionId - Only that session's runs, e.g. for its Tasks tab.
  * @returns An infinite query: `fetchNextPage` loads older runs while `hasNextPage`.
  */
-export function useWorkflowRuns(workflowId: string) {
+export function useWorkflowRuns(workflowId: string, sessionId?: string) {
   return useInfiniteQuery({
-    queryKey: ["workflow-runs", workflowId],
+    queryKey: sessionId ? ["workflow-runs", workflowId, sessionId] : ["workflow-runs", workflowId],
     queryFn: async ({ pageParam, signal }): Promise<RunsPage> => {
       const params = new URLSearchParams({ limit: String(RUNS_PAGE) });
       if (pageParam) params.set("before", pageParam);
+      if (sessionId) params.set("session_id", sessionId);
       const res = await authenticatedFetch(`${workflowPath(workflowId)}/runs?${params}`, {
         signal,
       });
       if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
       const body = (await res.json()) as { data?: RawRun[]; next_cursor?: string | null };
       return {
-        runs: (body.data ?? []).map((run) => ({
-          id: run.id,
-          planGraphRevision: run.plan_graph_revision ?? undefined,
-          sessionId: run.session_id,
-          title: run.title,
-          startedAt: run.started_at,
-          isCurrent: run.is_current === true,
-          sessionStatus: run.session_status,
-          backgroundWorkRunning: run.background_work_running ?? false,
-          archived: run.archived,
-          progress: {
-            total: run.progress.total,
-            started: run.progress.started,
-            done: run.progress.done,
-            needsInput: run.progress.needs_input,
-            failed: run.progress.failed,
-          },
-          steps: run.steps ?? [],
-          statuses: run.statuses ?? [],
-        })),
+        runs: (body.data ?? []).map(toWorkflowRun),
         nextCursor: body.next_cursor ?? null,
       };
     },

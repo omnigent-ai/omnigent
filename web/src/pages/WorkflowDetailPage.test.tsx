@@ -4,9 +4,10 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { showToast } from "@/components/ui/toast";
+import { SessionDescendantRuns } from "@/components/workflows/WorkflowRunRow";
 import type { WorkflowSessionRequest } from "@/components/workflows/WorkflowSessionDialog";
 import type { SavedWorkflow } from "@/hooks/useSavedWorkflows";
-import { useDeleteWorkflow } from "@/hooks/useSavedWorkflows";
+import { useDeleteWorkflow, useSavedWorkflows } from "@/hooks/useSavedWorkflows";
 import {
   useWorkflow,
   useWorkflowRuns,
@@ -193,6 +194,16 @@ function mockRuns(runs: WorkflowRun[], state: Record<string, unknown> = {}) {
     ...state,
   } as unknown as ReturnType<typeof useWorkflowRuns>);
   return fetchNextPage;
+}
+
+function mockSavedWorkflows(workflows: SavedWorkflow[]) {
+  vi.mocked(useSavedWorkflows).mockReturnValue({
+    workflows,
+    isLoading: false,
+    isError: false,
+    refresh: vi.fn(),
+    pagination: { hasMore: false, loadingMore: false, loadMore: vi.fn() },
+  });
 }
 
 const deleteWorkflow = vi.fn();
@@ -737,6 +748,114 @@ describe("WorkflowDetailPage", () => {
     expect(overlay).toHaveTextContent("explore:done fix:needs_input");
     fireEvent.click(within(overlay).getByRole("button", { name: "Close graph" }));
     expect(screen.queryByTestId("workflow-graph-overlay")).toBeNull();
+  });
+
+  it("lists the workflow runs below a run, saying who started the ones further down", () => {
+    mockWorkflow({});
+    const calledId = "c".repeat(32);
+    mockSavedWorkflows([{ id: calledId, name: "Ready a PR", description: "Readies one PR." }]);
+    const root = "a".repeat(32);
+    const ready = "b".repeat(32);
+    mockRuns([
+      {
+        ...run(root, "Land stack", { done: 1 }),
+        sessionStatus: "running",
+        descendantRuns: [
+          {
+            ...run(ready, "Ready #1", {}),
+            workflowId: calledId,
+            startedBy: { sessionId: root, title: "Land stack" },
+          },
+          {
+            ...run("d".repeat(32), "Fix flaky test", {}),
+            workflowId: "e".repeat(32),
+            startedBy: { sessionId: ready, title: "" },
+          },
+        ],
+      },
+      {
+        ...run("f".repeat(32), "Earlier stack", { done: 2 }),
+        descendantRuns: [run("0".repeat(32), "Ready #0", { done: 2 })],
+      },
+    ]);
+    renderPage();
+
+    const [current, earlier] = screen.getAllByTestId("workflow-run-descendants-toggle");
+    // A run still going shows the runs below it; a finished one starts folded.
+    expect(current).toHaveTextContent("Ran 2 workflows");
+    expect(current).toHaveAttribute("aria-expanded", "true");
+    expect(earlier).toHaveTextContent("Ran 1 workflow");
+    expect(earlier).toHaveAttribute("aria-expanded", "false");
+    const rows = within(screen.getByTestId("workflow-run-descendants")).getAllByTestId(
+      "workflow-run",
+    );
+    expect(rows.map((row) => row.querySelector("a")?.textContent)).toEqual([
+      "Ready #1",
+      "Fix flaky test",
+    ]);
+    // Only a run further down says who started it, and only your workflow opens.
+    expect(within(rows[0]!).queryByTestId("workflow-run-started-by")).toBeNull();
+    const startedBy = within(rows[1]!).getByTestId("workflow-run-started-by");
+    expect(startedBy).toHaveTextContent("Started by Untitled session");
+    expect(startedBy).toHaveAttribute("href", `/c/${ready}`);
+    expect(within(rows[0]!).getByTestId("run-workflow-button")).toHaveAttribute(
+      "href",
+      `/workflows/${calledId}`,
+    );
+    expect(within(rows[1]!).queryByTestId("run-workflow-button")).toBeNull();
+
+    fireEvent.click(earlier!);
+    expect(earlier).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getAllByTestId("workflow-run-descendants")).toHaveLength(2);
+  });
+
+  it("links a run another session started back to that session", () => {
+    mockWorkflow({});
+    const starter = "a".repeat(32);
+    mockRuns([
+      { ...run("b".repeat(32), "Ready #1", {}), startedBy: { sessionId: starter, title: "Stack" } },
+      run("c".repeat(32), "Ran directly", {}),
+    ]);
+    renderPage();
+
+    const [started, direct] = screen.getAllByTestId("workflow-run");
+    const link = within(started!).getByTestId("workflow-run-started-by");
+    expect(link).toHaveTextContent("Started by Stack");
+    expect(link).toHaveAttribute("href", `/c/${starter}`);
+    expect(within(direct!).queryByTestId("workflow-run-started-by")).toBeNull();
+    expect(screen.queryByTestId("workflow-run-descendants-toggle")).toBeNull();
+  });
+
+  it("lists the workflow runs below a session's current run in its Tasks tab", () => {
+    mockSavedWorkflows([]);
+    const session = "a".repeat(32);
+    mockRuns([
+      {
+        ...run(session, "Land stack", {}),
+        id: "plan-earlier",
+        isCurrent: false,
+        descendantRuns: [run("b".repeat(32), "Ready #0", {})],
+      },
+      { ...run(session, "Land stack", {}), descendantRuns: [run("c".repeat(32), "Ready #1", {})] },
+    ]);
+    const tasksTab = () =>
+      render(<SessionDescendantRuns sessionId={session} workflowId={WORKFLOW.id} />, {
+        wrapper: ({ children }) => (
+          <QueryClientProvider client={new QueryClient()}>
+            <MemoryRouter>{children}</MemoryRouter>
+          </QueryClientProvider>
+        ),
+      });
+    tasksTab();
+    expect(useWorkflowRuns).toHaveBeenCalledWith(WORKFLOW.id, session);
+    fireEvent.click(screen.getByTestId("workflow-run-descendants-toggle"));
+    const rows = within(screen.getByTestId("tasks-descendant-runs")).getAllByTestId("workflow-run");
+    expect(rows.map((row) => row.querySelector("a")?.textContent)).toEqual(["Ready #1"]);
+    cleanup();
+
+    mockRuns([run(session, "Land stack", {})]);
+    tasksTab();
+    expect(screen.queryByTestId("tasks-descendant-runs")).toBeNull();
   });
 
   it("says when nothing ran it yet, and loads older runs on request", () => {

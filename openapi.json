@@ -15764,6 +15764,14 @@
             "title": "Background Work Running",
             "type": "boolean"
           },
+          "descendant_runs": {
+            "description": "The workflow runs below this one: those of the sessions its session started while it was current, then theirs, each right after the run that started it. Empty on the runs listed here.",
+            "items": {
+              "$ref": "#/components/schemas/WorkflowRun"
+            },
+            "title": "Descendant Runs",
+            "type": "array"
+          },
           "id": {
             "description": "The run's ID: that of the plan entry that started it.",
             "title": "Id",
@@ -15816,6 +15824,17 @@
             "title": "Started At",
             "type": "integer"
           },
+          "started_by": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkflowRunStarter"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The session that started it, when another session did and the caller can read that session."
+          },
           "statuses": {
             "description": "Each of those steps' newest status entry; a step with none yet is left out.",
             "items": {
@@ -15836,10 +15855,16 @@
             "description": "The session's title; empty when it has none yet.",
             "title": "Title",
             "type": "string"
+          },
+          "workflow_id": {
+            "description": "The saved workflow the run follows.",
+            "title": "Workflow Id",
+            "type": "string"
           }
         },
         "required": [
           "id",
+          "workflow_id",
           "session_id",
           "title",
           "started_at",
@@ -15925,6 +15950,27 @@
           "total"
         ],
         "title": "WorkflowRunProgress",
+        "type": "object"
+      },
+      "WorkflowRunStarter": {
+        "description": "The session that started a workflow run.",
+        "properties": {
+          "session_id": {
+            "description": "That session's ID.",
+            "title": "Session Id",
+            "type": "string"
+          },
+          "title": {
+            "description": "Its title; empty when it has none yet.",
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "title"
+        ],
+        "title": "WorkflowRunStarter",
         "type": "object"
       },
       "WorkflowStep": {
@@ -27023,7 +27069,7 @@
     },
     "/v1/workflows/{workflow_id}/runs": {
       "get": {
-        "description": "List one of the caller's workflows' runs, newest first.\n\nA run is the plan that named the workflow, so a session that ran it\ntwice is listed twice. Sessions the caller can't read are left out.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated in multi-user mode, 404 if the caller has no such workflow, 400 for an invalid cursor.",
+        "description": "List one of the caller's workflows' runs, newest first.\n\nA run is the plan that named the workflow, so a session that ran it\ntwice is listed twice. Sessions the caller can't read are left out.\nEach run names the session that started it and the workflow runs below it.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated in multi-user mode, 404 if the caller has no such workflow or can't read the session, 400 for an invalid cursor.",
         "operationId": "list_workflow_runs_v1_workflows__workflow_id__runs_get",
         "parameters": [
           {
@@ -27063,6 +27109,23 @@
                 }
               ],
               "title": "Before"
+            }
+          },
+          {
+            "description": "Only that session's runs, e.g. for its Tasks tab. Read access to the session stands in for owning the workflow, so people the session is shared with see them too.",
+            "in": "query",
+            "name": "session_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Session Id"
             }
           }
         ],

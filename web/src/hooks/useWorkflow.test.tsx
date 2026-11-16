@@ -180,3 +180,46 @@ describe("useWorkflowRuns live refresh", () => {
     expect(authenticatedFetch).not.toHaveBeenCalled();
   });
 });
+
+describe("useWorkflowRuns runs below a run", () => {
+  it("maps who started each run and the runs below it, for one session when asked", async () => {
+    vi.mocked(authenticatedFetch).mockImplementation(async () =>
+      Response.json({
+        data: [
+          {
+            ...RUNNING_RUN,
+            workflow_id: "workflow",
+            started_by: null,
+            descendant_runs: [
+              {
+                ...COMPLETED_RUN,
+                workflow_id: "called",
+                started_by: { session_id: "session_new", title: "New run" },
+              },
+            ],
+          },
+        ],
+        next_cursor: null,
+      }),
+    );
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    );
+    const { result } = renderHook(() => useWorkflowRuns("workflow", "session_new"), { wrapper });
+    await act(() => vi.advanceTimersByTimeAsync(1));
+
+    const url = new URL(String(vi.mocked(authenticatedFetch).mock.calls[0]?.[0]), "http://x");
+    expect(url.searchParams.get("session_id")).toBe("session_new");
+    const [run] = result.current.data?.pages[0].runs ?? [];
+    expect(run).toMatchObject({ workflowId: "workflow", startedBy: undefined });
+    expect(run?.descendantRuns).toEqual([
+      expect.objectContaining({
+        id: "run_old",
+        workflowId: "called",
+        startedBy: { sessionId: "session_new", title: "New run" },
+        descendantRuns: [],
+      }),
+    ]);
+  });
+});

@@ -1152,12 +1152,18 @@ export function TasksPanel({
   active,
   onStartWorkflow,
   onShowInChat,
+  renderWorkflowRuns,
 }: {
   conversationId: string;
   active: boolean;
   onStartWorkflow?: () => void;
   /** Called before a task's click scrolls the chat to it, e.g. to close a phone's drawer. */
   onShowInChat?: () => void;
+  /**
+   * The workflow runs below the session's run of its plan's workflow, shown
+   * after the tasks. Passed in because those rows are built from this panel's parts.
+   */
+  renderWorkflowRuns?: (workflowId: string) => ReactNode;
 }) {
   const tasks = useSessionTasks(conversationId, active);
   const { journal, plan, progress } = tasks;
@@ -1168,6 +1174,7 @@ export function TasksPanel({
   const stopActiveWork = tasks.sessionWorking ? stopWork : undefined;
   const continuePlan = useSessionTasksActions((state) => state.continuePlan[conversationId]);
   const entries = tasks.journalSupported ? journal.entries : NO_ENTRIES;
+  const workflowId = planWorkflowId(entries);
   const names = new Map(progress.map((item) => [item.step.id, item.step.name]));
   const empty = progress.length === 0;
   const showPlan = !tasks.loading && !journal.error && progress.length > 0;
@@ -1298,7 +1305,7 @@ export function TasksPanel({
           <>
             <TasksHeader
               plan={plan}
-              workflowId={planWorkflowId(entries)}
+              workflowId={workflowId}
               progress={progress}
               paused={tasks.paused}
               stuck={stuck}
@@ -1323,6 +1330,7 @@ export function TasksPanel({
               menuActionFor={menuActionFor}
               nativeMarkerIds={nativeMarkerIds}
             />
+            {workflowId && renderWorkflowRuns?.(workflowId)}
           </>
         )}
       </div>
