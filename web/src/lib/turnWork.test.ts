@@ -389,6 +389,29 @@ describe("collectTurnWork", () => {
     ]);
   });
 
+  it("reports a Pi shell failure its envelope flags, but not error-like output alone", () => {
+    const flagged = JSON.stringify({
+      content: [{ type: "text", text: "Command exited with code 1" }],
+      isError: true,
+    });
+    const noisy = JSON.stringify({
+      content: [{ type: "text", text: "Error: retrying\ndone" }],
+      isError: false,
+    });
+    const work = collectTurnWork([
+      tool("fail", "bash", { command: "false" }, flagged),
+      tool("noisy", "bash", { command: "./build.sh" }, noisy),
+      tool("plain", "Bash", { command: "cat err.txt" }, "Error: from the file"),
+      tool("echo", "Bash", { command: "echo '{\"isError\":true}'" }, '{"isError":true}'),
+    ]);
+    expect(work.queries).toMatchObject([
+      { status: "failed", error: "Command exited with code 1", resultSize: null },
+      { status: "completed", error: null, resultSize: "2 lines" },
+      { status: "completed", error: null, resultSize: "1 line" },
+      { status: "completed", error: null, resultSize: "1 line" },
+    ]);
+  });
+
   it("reads OpenCode's web tools and provider page opens", () => {
     const items: RenderItem[] = [
       tool("ocsearch", "websearch", { query: "interest rates" }, "results"),

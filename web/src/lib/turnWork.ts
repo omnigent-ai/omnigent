@@ -19,6 +19,7 @@ import {
   isRecord,
   ownValue,
   parseToolOutput,
+  contentBlockText,
   contentEnvelopeText,
   editErrorMessage,
   toolErrorMessage,
@@ -173,8 +174,10 @@ function toolQuery(item: ToolCallItem, key: string, call: QueryCall): TurnQuery 
   if (item.output === null) return { ...base, ...callStatus(item.state, null), resultSize: null };
 
   if (call.outputFormat !== undefined) {
-    const parsed = parseShellToolOutput(readResult(item.output).text, call.outputFormat);
-    let failure: string | null = null;
+    const recorded = readResult(item.output);
+    const parsed = parseShellToolOutput(recorded.text, call.outputFormat);
+    // A shell's own output may say anything; only its exit status or a harness flag is a failure.
+    let failure = recorded.flagged;
     if (parsed.timedOut) failure = "Timed out";
     else if (parsed.exitCode !== null && parsed.exitCode !== 0) failure = `Exit ${parsed.exitCode}`;
     const status = callStatus(item.state, failure);
@@ -206,6 +209,8 @@ interface RecordedResult {
   parsed: ParsedToolOutput;
   /** The reported failure, or `null` when the result reports none. */
   failure: string | null;
+  /** A failure the harness flagged on its envelope (`"isError": true`), whatever the output says. */
+  flagged: string | null;
 }
 
 /**
@@ -217,14 +222,29 @@ interface RecordedResult {
 function readResult(output: string): RecordedResult {
   const outer = parseToolOutput(output);
   // `parseToolOutput` already unwrapped an MCP content-block array; don't peel twice.
-  const envelope =
-    outer.kind === "json" && outer.text === output ? contentEnvelopeText(outer.value) : null;
-  if (envelope === null) return { text: output, parsed: outer, failure: editErrorMessage(output) };
+  const record =
+    outer.kind === "json" && outer.text === output && isRecord(outer.value) ? outer.value : null;
+  // Pi's failure envelope: content blocks plus `isError`, not merely a record saying so.
+  const flaggedText = record?.isError === true ? contentBlockText(record.content) : null;
+  if (flaggedText !== null) {
+    const failure = editErrorMessage(output);
+    return {
+      text: flaggedText,
+      parsed: outer,
+      failure,
+      flagged: failure,
+    };
+  }
+  const envelope = record === null ? null : contentEnvelopeText(record);
+  if (envelope === null) {
+    return { text: output, parsed: outer, failure: editErrorMessage(output), flagged: null };
+  }
   const inner = parseToolOutput(envelope);
   return {
     text: envelope,
     parsed: inner,
     failure: inner.kind === "json" ? toolErrorMessage(inner) : null,
+    flagged: null,
   };
 }
 
