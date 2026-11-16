@@ -33,20 +33,12 @@ from omnigent.db.account_authority import account_generation, current_account_us
 from omnigent.entities import Agent, Conversation, ScheduledTask, ScheduledTaskRun
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.inner._subprocess_lifecycle import await_cleanup_task
-from omnigent.runner.identity import (
-    ORCHESTRATION_SOURCE_HEADER,
-    RUNNER_TUNNEL_TOKEN_HEADER,
-)
 from omnigent.runtime import pending_elicitations
-from omnigent.server.auth import (
-    LEVEL_OWNER,
-    RESERVED_USER_LOCAL,
-    AuthProvider,
-    bind_host_is_loopback,
-)
+from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.bundles import agent_for_user
 from omnigent.server.feature_flags import DeploymentGate, Feature, deployment_gate_enabled
 from omnigent.server.managed_hosts import parse_repo_workspace
+from omnigent.server.routes._agent_origin import require_agent_origin
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._host_launch import resolve_host_owner
 from omnigent.server.routes._session_create_validation import (
@@ -60,7 +52,6 @@ from omnigent.server.routes._sessions.helpers import (
     _session_status_from_cache,
 )
 from omnigent.server.routes._sessions.orchestration import _list_status_with_starting
-from omnigent.server.routes.runner_tunnel import _expected_runner_id_from_headers
 from omnigent.server.routes.scheduled_task_permissions import (
     agent_shared_target_guard,
     owns_scheduled_task,
@@ -87,7 +78,6 @@ from omnigent.server.scheduled.slack_trigger import (
 )
 from omnigent.server.scheduled.telemetry import log_task_created
 from omnigent.server.session_mcp_selection import MAX_SESSION_MCP_SERVICES, session_mcp_selection
-from omnigent.server.session_orchestration import require_owned_session
 from omnigent.server.workflows import require_workflows
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
 from omnigent.stores.artifact_store import ArtifactStore
@@ -431,6 +421,9 @@ def _validate_timezone_or_400(timezone: str) -> None:
         ) from exc
 
 
+_AGENT_AUTOMATION_ACTION = "Agent automation changes"
+
+
 def _inbox_cursor_task_id(task_id: str) -> str:
     """An Inbox cursor's task ID: bare hex if a UUID, else as the store allocated it.
 
@@ -442,70 +435,6 @@ def _inbox_cursor_task_id(task_id: str) -> str:
         return uuid.UUID(task_id).hex
     except ValueError:
         return task_id
-
-
-def require_scheduled_task_agent_origin(
-    request: Request,
-    *,
-    owner: str,
-    auth_provider: AuthProvider | None,
-    conversation_store: ConversationStore,
-    permission_store: PermissionStore | None,
-) -> None:
-    """Bind a runner-marked mutation to the owner's source session and runner."""
-    if auth_provider is None or owner == RESERVED_USER_LOCAL:
-        return
-    if ORCHESTRATION_SOURCE_HEADER not in request.headers:
-        # UI/API saves and older runners do not opt into source verification.
-        return
-    source_id = (request.headers.get(ORCHESTRATION_SOURCE_HEADER) or "").strip()
-    if not source_id or permission_store is None:
-        raise OmnigentError(
-            "Agent automation changes require a source session",
-            code=ErrorCode.FORBIDDEN,
-        )
-    try:
-        source = require_owned_session(
-            source_id,
-            owner,
-            conversation_store,
-            permission_store,
-        )
-    except OmnigentError as exc:
-        raise OmnigentError(
-            "Agent automation changes require an owned source session",
-            code=ErrorCode.FORBIDDEN,
-        ) from exc
-    is_loopback = request.client is not None and bind_host_is_loopback(request.client.host)
-    allowed_tokens = request.app.state.runner_tunnel_tokens
-    try:
-        try:
-            expected_runner_id = _expected_runner_id_from_headers(
-                request.headers, allowed_tunnel_tokens=allowed_tokens
-            )
-        except ValueError:
-            if not is_loopback:
-                raise
-            expected_runner_id = _expected_runner_id_from_headers(request.headers)
-        if expected_runner_id is None and allowed_tokens is None and not is_loopback:
-            raise ValueError("runner tunnel token is required")
-    except ValueError as exc:
-        raise OmnigentError(
-            "Agent automation changes require an authorized runner token",
-            code=ErrorCode.FORBIDDEN,
-        ) from exc
-    if (
-        not source.runner_id
-        or (expected_runner_id is not None and expected_runner_id != source.runner_id)
-        or (
-            RUNNER_TUNNEL_TOKEN_HEADER not in request.headers
-            and source.runner_id.startswith("runner_token_")
-        )
-    ):
-        raise OmnigentError(
-            "Agent automation changes require the source session's bound runner",
-            code=ErrorCode.FORBIDDEN,
-        )
 
 
 def create_scheduled_tasks_router(
@@ -1022,8 +951,9 @@ def create_scheduled_tasks_router(
     ) -> dict[str, Any]:
         """Create a scheduled task and arm it on the live scheduler."""
         owner = _owner(request)
-        require_scheduled_task_agent_origin(
+        require_agent_origin(
             request,
+            action=_AGENT_AUTOMATION_ACTION,
             owner=owner,
             auth_provider=auth_provider,
             conversation_store=conversation_store,
@@ -1533,8 +1463,9 @@ def create_scheduled_tasks_router(
     ) -> dict[str, Any]:
         """Update mutable fields of a task and re-sync the scheduler."""
         owner = _owner(request)
-        require_scheduled_task_agent_origin(
+        require_agent_origin(
             request,
+            action=_AGENT_AUTOMATION_ACTION,
             owner=owner,
             auth_provider=auth_provider,
             conversation_store=conversation_store,
