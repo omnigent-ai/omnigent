@@ -1,12 +1,13 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, createEvent, fireEvent, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { BlockRenderer } from "@/components/blocks/BlockRenderer";
 import { FileViewerContext } from "@/shell/FileViewerContext";
 
 afterEach(() => {
+  vi.restoreAllMocks();
   cleanup();
   window.getSelection()?.removeAllRanges();
 });
@@ -115,6 +116,65 @@ describe("copying a selection from an agent reply", () => {
     expect(flavors["text/plain"]).toContain("item [mail](<mailto:team@example.com>)");
   });
 
+  it("links the anchor, not earlier plain text with the same words", async () => {
+    const section = await renderReply(
+      "Read docs, then [docs](https://example.com/setup). Use mydoc or [doc](https://example.com/doc) and [docs page](https://example.com/page).",
+    );
+
+    select(section, "Read", "page");
+    expect(copy(section).flavors["text/plain"]).toBe(
+      "Read docs, then [docs](<https://example.com/setup>). Use mydoc or [doc](<https://example.com/doc>) and [docs page](<https://example.com/page>)",
+    );
+
+    // Ends inside the last link, whose selected part repeats earlier words.
+    const range = document.createRange();
+    const start = textNodeContaining(section, "mydoc");
+    range.setStart(start, start.data.indexOf("mydoc"));
+    range.setEnd(textNodeContaining(section, "docs page"), "docs".length);
+    window.getSelection()!.removeAllRanges();
+    window.getSelection()!.addRange(range);
+    expect(copy(section).flavors["text/plain"]).toBe(
+      "mydoc or [doc](<https://example.com/doc>) and [docs](<https://example.com/page>)",
+    );
+  });
+
+  it("keeps list and table containers around selected items", async () => {
+    const section = await renderReply(
+      "1. one\n2. two [guide](https://example.com/guide)\n3. three\n\n" +
+        "| name | link |\n| --- | --- |\n| alpha | [x](https://example.com/x) |\n\n" +
+        "> quoted [q](https://example.com/q)\n>\n> second",
+    );
+
+    select(section, "two", "three");
+    expect(copy(section).flavors["text/html"]!.replace(/>\s+</g, "><")).toBe(
+      '<ol start="2"><li>two <a href="https://example.com/guide">guide</a></li><li>three</li></ol>',
+    );
+
+    select(section, "alpha", "x");
+    expect(copy(section).flavors["text/html"]!.replace(/>\s+</g, "><")).toBe(
+      '<table><tbody><tr><td>alpha</td><td><a href="https://example.com/x">x</a></td></tr></tbody></table>',
+    );
+
+    select(section, "quoted", "second");
+    expect(copy(section).flavors["text/html"]!.replace(/>\s+</g, "><")).toBe(
+      '<blockquote><p>quoted <a href="https://example.com/q">q</a></p><p>second</p></blockquote>',
+    );
+  });
+
+  it("ignores a link the selection only touches at its edge", async () => {
+    const section = await renderReply("First paragraph.\n\n[Next](https://example.com) paragraph.");
+    const range = document.createRange();
+    range.setStart(textNodeContaining(section, "First"), 0);
+    range.setEnd(textNodeContaining(section, "Next"), 0);
+    window.getSelection()!.removeAllRanges();
+    window.getSelection()!.addRange(range);
+
+    const { flavors, prevented } = copy(section);
+
+    expect(prevented).toBe(false);
+    expect(flavors).toEqual({});
+  });
+
   it("leaves a bare URL as typed and escapes markdown in link text", async () => {
     const section = await renderReply(
       "Open https://example.com/a, https://example.com or [a [b] c](https://example.com/b?q=<x>) now.",
@@ -156,6 +216,31 @@ describe("copying a selection from an agent reply", () => {
   it("keeps the browser's copy for a selection without a pasteable link", async () => {
     const section = await renderReply("Plain **prose** and [a file](src/App.tsx) here.");
     select(section, "Plain", "here.");
+
+    const { flavors, prevented } = copy(section);
+
+    expect(prevented).toBe(false);
+    expect(flavors).toEqual({});
+  });
+
+  it("keeps the browser's copy for a multi-range selection", async () => {
+    const section = await renderReply("Read [docs](https://example.com) first.");
+    select(section, "Read", "first.");
+    const selection = window.getSelection()!;
+    vi.spyOn(selection, "rangeCount", "get").mockReturnValue(2);
+
+    const { flavors, prevented } = copy(section);
+
+    expect(prevented).toBe(false);
+    expect(flavors).toEqual({});
+  });
+
+  it("keeps the browser's copy when the conversion fails", async () => {
+    const section = await renderReply("Read [docs](https://example.com) first.");
+    select(section, "Read", "first.");
+    vi.spyOn(Range.prototype, "cloneContents").mockImplementation(() => {
+      throw new Error("conversion failed");
+    });
 
     const { flavors, prevented } = copy(section);
 

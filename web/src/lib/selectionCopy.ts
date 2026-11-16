@@ -63,6 +63,22 @@ const DROPPED_TAGS = new Set([
 // selection of just a link's text is still a link.
 const WRAPPING_TAGS = new Set(["a", "strong", "b", "em", "i", "u", "s", "del", "code"]);
 
+// Containers that copied children are invalid or meaningless without, e.g. list
+// items selected across a list need their list.
+const CONTAINERS_OF: Record<string, string[]> = {
+  li: ["ul", "ol"],
+  tr: ["table", "thead", "tbody", "tfoot"],
+  td: ["tr"],
+  th: ["tr"],
+  thead: ["table"],
+  tbody: ["table"],
+  tfoot: ["table"],
+  p: ["blockquote"],
+  ul: ["blockquote"],
+  ol: ["blockquote"],
+  pre: ["blockquote"],
+};
+
 /** The pasteable href of `element` when it is a link that works outside the app. */
 function pasteableHref(element: Element): string | null {
   if (element.localName !== "a") return null;
@@ -119,8 +135,38 @@ function selectedPart(range: Range, link: Element): Range {
   return part;
 }
 
+/** Whether `content` has top-level children that only make sense inside `tag`. */
+function needsContainer(content: Node, tag: string): boolean {
+  return Array.from(content.childNodes).some((child) => {
+    if (!(child instanceof Element)) return false;
+    return CONTAINERS_OF[keptTag(child) ?? ""]?.includes(tag) ?? false;
+  });
+}
+
+/** A shallow copy of `ancestor` to wrap copied content, numbering an `ol` from the first selected item. */
+function wrapperFor(ancestor: Element, range: Range): Element {
+  const wrapper = ancestor.cloneNode(false) as Element;
+  if (ancestor.localName !== "ol") return wrapper;
+  const items = Array.from(ancestor.children).filter((child) => child.localName === "li");
+  const firstSelected = items.findIndex((item) => range.intersectsNode(item));
+  const start = Number.parseInt(ancestor.getAttribute("start") ?? "1", 10);
+  if (firstSelected > 0 && Number.isFinite(start)) {
+    wrapper.setAttribute("start", String(start + firstSelected));
+  }
+  return wrapper;
+}
+
 function escapeRegExp(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** A pattern for `label` that tolerates the browser's whitespace rendering. */
+function labelPattern(label: string): string {
+  return escapeRegExp(label.trim()).replace(/\s+/g, "\\s+");
+}
+
+function countMatches(text: string, pattern: string): number {
+  return text.match(new RegExp(pattern, "g"))?.length ?? 0;
 }
 
 /** Whether `label` is the URL itself, allowing for the renderer's href normalization. */
@@ -141,22 +187,30 @@ function markdownLink(label: string, href: string): string {
   return `[${escapedLabel}](<${escapedHref}>)`;
 }
 
+interface SelectedLink {
+  label: string;
+  href: string;
+  /** Times the label's text occurs between the previous link and this one. */
+  earlierMatches: number;
+}
+
 /**
  * Rewrites each selected link's visible text in `plainText` as a markdown link.
- * Links are matched in document order, tolerating whitespace differences
- * between the browser's text rendering and the DOM's text.
+ * Links are matched in document order, skipping plain occurrences of the same words.
  */
-function linkifyPlainText(plainText: string, links: { label: string; href: string }[]): string {
+function linkifyPlainText(plainText: string, links: SelectedLink[]): string {
   let output = "";
   let cursor = 0;
-  for (const { label, href } of links) {
-    const pattern = escapeRegExp(label.trim()).replace(/\s+/g, "\\s+");
-    if (!pattern) continue;
-    const match = new RegExp(pattern).exec(plainText.slice(cursor));
+  for (const { label, href, earlierMatches } of links) {
+    const matcher = new RegExp(labelPattern(label), "g");
+    matcher.lastIndex = cursor;
+    let match = matcher.exec(plainText);
+    for (let skipped = 0; match && skipped < earlierMatches; skipped++) {
+      match = matcher.exec(plainText);
+    }
     if (!match) continue;
-    const start = cursor + match.index;
-    output += plainText.slice(cursor, start) + markdownLink(match[0], href);
-    cursor = start + match[0].length;
+    output += plainText.slice(cursor, match.index) + markdownLink(match[0], href);
+    cursor = match.index + match[0].length;
   }
   return output + plainText.slice(cursor);
 }
@@ -172,15 +226,24 @@ export function selectionToLinkedPayload(
   root: Element,
   plainText: string,
 ): RichTextPayload | null {
-  const links = Array.from(root.querySelectorAll("a[href]")).flatMap((link) => {
+  const links: SelectedLink[] = [];
+  const gap = document.createRange();
+  gap.setStart(range.startContainer, range.startOffset);
+  for (const link of Array.from(root.querySelectorAll("a[href]"))) {
     const href = pasteableHref(link);
-    if (!href || !range.intersectsNode(link)) return [];
-    return [{ label: selectedPart(range, link).toString(), href }];
-  });
+    if (!href || !range.intersectsNode(link)) continue;
+    const part = selectedPart(range, link);
+    const label = part.toString();
+    // A selection edge can touch a link without selecting any of its text.
+    if (!label.trim()) continue;
+    gap.setEnd(part.startContainer, part.startOffset);
+    links.push({ label, href, earlierMatches: countMatches(gap.toString(), labelPattern(label)) });
+    gap.setStart(part.endContainer, part.endOffset);
+  }
   if (!links.length) return null;
 
   // cloneContents keeps elements the range only partly covers, but not the
-  // common ancestor itself or the elements above it.
+  // common ancestor itself or the elements above it, so re-add the ones that matter.
   let content: Node = range.cloneContents();
   const common = range.commonAncestorContainer;
   for (
@@ -189,8 +252,8 @@ export function selectionToLinkedPayload(
     ancestor = ancestor.parentElement
   ) {
     const tag = pasteableHref(ancestor) ? "a" : keptTag(ancestor);
-    if (!tag || !WRAPPING_TAGS.has(tag)) continue;
-    const wrapper = ancestor.cloneNode(false) as Element;
+    if (!tag || !(WRAPPING_TAGS.has(tag) || needsContainer(content, tag))) continue;
+    const wrapper = wrapperFor(ancestor, range);
     wrapper.appendChild(content);
     const holder = document.createDocumentFragment();
     holder.appendChild(wrapper);
