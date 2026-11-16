@@ -11,7 +11,13 @@ from collections.abc import Callable
 from typing import Any
 
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.server.auth import LEVEL_READ, SharingMode, workspace_sharing_blocked
+from omnigent.server.auth import (
+    LEVEL_READ,
+    RESERVED_USER_LOCAL,
+    RESERVED_USER_PUBLIC,
+    SharingMode,
+    workspace_sharing_blocked,
+)
 from omnigent.server.sharing_settings import PublicSharingMaxLevel
 
 # Levels a read-only sharing mode allows. Downstream deployments may patch this to add levels.
@@ -20,6 +26,14 @@ READ_ONLY_MODE_LEVELS: frozenset[int] = frozenset({LEVEL_READ})
 # Levels an automation may grant; Edit would turn off its runs' orchestration. The
 # permission store enforces it; widening it needs no migration.
 SCHEDULED_TASK_GRANT_LEVELS: frozenset[int] = frozenset({LEVEL_READ})
+
+
+def is_reserved_grantee(user_id: str) -> bool:
+    """Whether *user_id* names the local user or the public, ignoring case and outer space.
+
+    A database collation can match more variants, such as accented ones on MySQL.
+    """
+    return user_id.strip().casefold() in (RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC)
 
 
 def _sharing_mode(state: Any) -> SharingMode:

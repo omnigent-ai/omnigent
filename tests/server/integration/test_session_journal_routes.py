@@ -11,8 +11,10 @@ from pathlib import Path
 import httpx
 import pytest
 import pytest_asyncio
+import sqlalchemy as sa
 from fastapi import FastAPI
 
+from omnigent.db.db_models import SqlSessionJournalEntry
 from omnigent.runner.identity import (
     ORCHESTRATION_SOURCE_HEADER,
     RUNNER_TUNNEL_TOKEN_HEADER,
@@ -380,7 +382,11 @@ async def test_the_runner_appends_and_people_page_the_journal(
     assert written[0]["content"]["version"] == 1
     assert written[0]["content"]["name"] == "Cut GET /orders p95 by 20%"
     assert written[0]["author"] == {"type": "agent"} and written[0]["step"] is None
-    assert written[2]["content"] == {"status": "done", "text": "p95 430 ms"}
+    assert written[2]["content"] == {
+        "status": "done",
+        "text": "p95 430 ms",
+        "graph_revision": written[0]["content"]["graph_revision"],
+    }
 
     retried = await client.post(
         url, json=_write("note", {"body": "again"}, "tool:4"), headers=_runner(session_id)
@@ -837,7 +843,13 @@ async def test_a_workflow_question_marks_its_task_and_returns_the_answer(
     # The task waits for the user, its status the question.
     entry = published[-1]["entry"]
     assert entry["step"] == "deploy"
-    assert entry["content"] == {"status": "needs_input", "text": "Approve the deploy to prod?"}
+    plan = session_journal_store.SessionJournalStore(db_uri).current_plan(session_id)
+    assert plan is not None
+    assert entry["content"] == {
+        "status": "needs_input",
+        "text": "Approve the deploy to prod?",
+        "graph_revision": plan.content["graph_revision"],
+    }
 
     while not pending_approvals.resolve(
         event["elicitation_id"], True, {"Approve the deploy to prod?": "Approve"}
@@ -1276,6 +1288,44 @@ async def test_a_workflows_runs_list_the_sessions_that_ran_it(
         ("explore", "done")
     ]
 
+    # Old journals have no revision metadata, but still have plan chronology.
+    legacy_content = {
+        key: value for key, value in first_plan.content.items() if key != "graph_revision"
+    }
+    with sa.create_engine(db_uri).begin() as connection:
+        connection.execute(
+            sa.update(SqlSessionJournalEntry)
+            .where(SqlSessionJournalEntry.id == first_plan.id)
+            .values(content=SessionJournalStore(db_uri)._stored_contents([legacy_content])[0])
+        )
+    legacy_runs = (await client.get(url, headers=_headers(ALICE))).json()["data"]
+    legacy_run = next(run for run in legacy_runs if run["id"] == first_plan.id)
+    assert legacy_run["plan_graph_revision"] == first_plan.position
+    SessionJournalStore(db_uri).append(
+        first,
+        "plan",
+        {**plan, "name": "Renamed triage"},
+        idempotency_key="legacy-save",
+        start_run=False,
+    )
+    legacy_runs = (await client.get(url, headers=_headers(ALICE))).json()["data"]
+    legacy_run = next(run for run in legacy_runs if run["id"] == first_plan.id)
+    assert legacy_run["plan_graph_revision"] == first_plan.position
+
+    journal_url = f"/v1/sessions/{first}/journal"
+    latest = await client.get(
+        journal_url, params={"kind": "plan", "order": "desc", "limit": 1}, headers=_headers(ALICE)
+    )
+    assert latest.json()["data"][0]["content"]["graph_revision"] == first_plan.position
+    unchanged = await client.post(
+        journal_url,
+        json=_write("plan", plan, "legacy-post-save"),
+        headers=_runner(first),
+    )
+    assert unchanged.status_code == 200, unchanged.text
+    assert unchanged.json()["content"]["graph_revision"] == first_plan.position
+    assert SessionJournalStore(db_uri).current_plan(first).content["graph_revision"] is None
+
     conversations = SqlAlchemyConversationStore(db_uri)
     child = _session(db_uri, parent_conversation_id=first)
     for _ in range(60):
@@ -1325,14 +1375,40 @@ async def test_a_workflows_runs_list_the_sessions_that_ran_it(
     assert bad.status_code == 400
 
     journal = SessionJournalStore(db_uri)
-    # Editing the current plan retains its run; another workflow supersedes it.
-    journal.append(first, "plan", plan, idempotency_key="replan")
+    # A replan can add work after the original final step is done.
+    journal.append(
+        first, "status", {"status": "done", "text": "Fixed"}, idempotency_key="fixed", step="fix"
+    )
+    expanded_steps = [*steps, {"id": "publish", "name": "Publish", "depends_on": ["fix"]}]
+    journal.append(first, "plan", {**plan, "steps": expanded_steps}, idempotency_key="replan")
+    journal.append(
+        first, "status", {"status": "started"}, idempotency_key="publishing", step="publish"
+    )
     page = (await client.get(url, headers=_headers(ALICE))).json()
-    assert next(run for run in page["data"] if run["id"] == first_plan.id)["is_current"]
+    original = next(run for run in page["data"] if run["id"] == first_plan.id)
+    assert original["is_current"]
+    assert original["plan_graph_revision"] == journal.current_plan(first).content["graph_revision"]
+    assert [step["id"] for step in original["steps"]] == ["explore", "fix", "publish"]
+    assert original["progress"] == {
+        "total": 3,
+        "started": 1,
+        "done": 2,
+        "needs_input": 0,
+        "failed": 0,
+    }
+    assert [(s["step"], s["content"]["status"]) for s in original["statuses"]] == [
+        ("explore", "done"),
+        ("fix", "done"),
+        ("publish", "started"),
+    ]
     journal.append(first, "plan", plan, idempotency_key="another-run", workflow_id=workflow_id)
     page = (await client.get(url, headers=_headers(ALICE))).json()
     first_runs = [run for run in page["data"] if run["session_id"] == first]
     assert [run["is_current"] for run in first_runs] == [True, False]
+    assert [step["id"] for step in first_runs[0]["steps"]] == ["explore", "fix"]
+    assert first_runs[0]["statuses"] == []
+    assert first_runs[1]["steps"] == original["steps"]
+    assert first_runs[1]["statuses"] == original["statuses"]
     journal.append(
         first, "plan", plan, idempotency_key="another-workflow", workflow_id=uuid.uuid4().hex
     )
@@ -1346,7 +1422,7 @@ async def test_a_workflows_runs_list_the_sessions_that_ran_it(
 
 
 @pytest.mark.parametrize("supersede_at", ["before_dispatch", "runner_lookup", "sdk_routing"])
-async def test_an_automations_runs_list_the_steps_of_their_first_plans(
+async def test_an_automations_runs_list_the_steps_of_their_latest_plans(
     client: httpx.AsyncClient,
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
@@ -1426,10 +1502,27 @@ async def test_an_automations_runs_list_the_steps_of_their_first_plans(
         == run_ids[0]
     )
 
-    replan = _write("plan", {"name": "Triage", "steps": steps}, "tool:replan")
-    assert (await client.post(url, json=replan, headers=_runner(planned))).status_code == 200
+    expanded_steps = [*steps, {"id": "publish", "name": "Publish", "depends_on": ["fix"]}]
+    for body in (
+        _write("status", {"status": "done", "text": "Fixed"}, "tool:fixed", step="fix"),
+        _write("plan", {"name": "Triage", "steps": expanded_steps}, "tool:replan"),
+        _write("status", {"status": "started"}, "tool:publishing", step="publish"),
+    ):
+        response = await client.post(url, json=body, headers=_runner(planned))
+        assert response.status_code == 200, response.text
     runs_url = f"/v1/scheduled-tasks/{task.id}/run-steps"
-    assert (await client.get(runs_url, headers=_headers(ALICE))).json()["runs"][0]["is_current"]
+    shown = (await client.get(runs_url, headers=_headers(ALICE))).json()["runs"][0]
+    assert shown["is_current"]
+    assert shown["plan_id"] == plan_id
+    latest_plan = session_journal_store.SessionJournalStore(db_uri).current_plan(planned)
+    assert latest_plan is not None
+    assert shown["plan_graph_revision"] == latest_plan.content["graph_revision"]
+    assert [step["id"] for step in shown["steps"]] == ["explore", "fix", "publish"]
+    assert [(s["step"], s["content"]["status"]) for s in shown["statuses"]] == [
+        ("explore", "done"),
+        ("fix", "done"),
+        ("publish", "started"),
+    ]
     current = await client.post(events_url, json=action, headers=_headers(ALICE))
     assert current.status_code == 202, current.text
 
@@ -1498,6 +1591,6 @@ async def test_an_automations_runs_list_the_steps_of_their_first_plans(
     assert [(s["step"], s["content"]["status"]) for s in runs[0]["statuses"]] == [
         ("explore", "started")
     ]
-    assert [(s["step"], s["content"]["status"]) for s in runs[1]["statuses"]] == [
-        ("explore", "done")
-    ]
+    assert runs[1]["plan_id"] == plan_id
+    assert runs[1]["steps"] == shown["steps"]
+    assert runs[1]["statuses"] == shown["statuses"]

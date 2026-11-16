@@ -65,6 +65,14 @@ A status belongs to a step ID within a run, not to a plan version. Replanning
 or saving the plan keeps that progress. Starting another invocation resets it;
 the task list reads the run boundary even when it predates the loaded page.
 
+Omnigent records a stable `graph_revision` ID in plan content when step IDs or
+dependencies change, or a new invocation starts. Statuses record that revision,
+and saving unchanged steps keeps it, so saves and forks preserve completion.
+Older plans can omit this metadata or carry `null` when the revision is unknown.
+Journal responses resolve the newest plan's legacy graph on read and return its
+earliest unchanged position as a numeric `graph_revision`, without changing stored content.
+This keeps completion accurate when a client's loaded history skips replans.
+
 Limits: a plan has at most 100 steps and 32 KiB of JSON, and its name at most 80
 characters; status text is required except for `started`; a note is at most 4
 KiB. Every stored entry is at most 16,383 bytes after compression, and a
@@ -159,7 +167,9 @@ evidence requirement before the coordinator accepts it.
 
 A workflow can run another workflow as one of its steps, such as getting each
 PR in a stack ready to merge. The agent starts the other workflow in its own
-session on the same host, with the workflow skill running. That session
+session on the same host, with the workflow skill running. For a saved
+workflow, it passes `workflow_id` to `sys_session_create`, so that session
+starts with the workflow's plan and appears in the workflow's runs. That session
 reports back with `sys_session_message` when its plan finishes, and the agent
 also checks on it periodically with a background timer of its own. Workers get
 the relevant inputs, decisions, authorization and limits, and report blockers
