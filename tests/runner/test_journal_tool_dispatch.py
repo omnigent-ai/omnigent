@@ -8,13 +8,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+from typing import Any, cast
 
 import httpx
 import jsonschema
 import pytest
 
 from omnigent.entities.workflow_questions import workflow_elicitation_id
-from omnigent.runner import pending_approvals
+from omnigent.runner import journal_tools, pending_approvals
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER, RUNNER_TUNNEL_TOKEN_HEADER
 from omnigent.runner.journal_tools import (
     JOURNAL_TOOL_NAMES,
@@ -33,6 +34,7 @@ from omnigent.spec.parser import parse_tool_groups
 from omnigent.spec.types import AgentSpec
 from omnigent.tools import ToolManager
 from omnigent.tools.builtins.journal import JOURNAL_TOOLS
+from tests._helpers.polling import poll_until_async
 
 SESSION = "4e92b5a0c0ee6db3f874f9c4a3f855a5"
 _ENTRY = {
@@ -441,6 +443,148 @@ async def test_a_dismissed_question_tells_the_agent_not_to_ask_again() -> None:
         await answer
     assert result["answered"] is False
     assert "don't ask again this turn" in result["detail"]
+
+
+def test_a_question_returns_to_its_agent_before_the_native_tool_relay_gives_up() -> None:
+    """The relay can't pause its budget for a wait past the server hop, so the call ends first."""
+    from omnigent.harnesses.claude_native import bridge
+
+    assert journal_tools._ANSWER_WAIT_IN_TURN_S < bridge._TOOL_CALL_TIMEOUT_S
+
+
+def _late_question_server(elicitation_id: str, messages: list[dict[str, object]]):
+    """Takes the question and records the messages the runner sends its session."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == f"/v1/sessions/{SESSION}/events":
+            messages.append(json.loads(request.content))
+            return httpx.Response(200, json={"queued": True})
+        return httpx.Response(200, json={"entry": _STATUS, "elicitation_id": elicitation_id})
+
+    return handler
+
+
+@pytest.mark.parametrize(
+    ("action", "content", "notice"),
+    [
+        (
+            "accept",
+            {"Deploy to prod now?": "Deploy"},
+            '[System: the user answered your question on task "deploy"]\n'
+            "Q: Deploy to prod now?\n"
+            "A: Deploy\n"
+            "Write the task's next status: started to resume it, done for an approval given, "
+            "failed for one refused. Then go on with the plan.",
+        ),
+        (
+            "decline",
+            None,
+            '[System: the user dismissed your question on task "deploy"]\n'
+            "The task stays waiting for them; don't ask again unless they bring it up.",
+        ),
+    ],
+    ids=["answered", "dismissed"],
+)
+async def test_an_answer_after_the_call_returned_reaches_the_session_as_a_message(
+    monkeypatch: pytest.MonkeyPatch, action: str, content: dict | None, notice: str
+) -> None:
+    from omnigent.runner import create_runner_app
+    from tests.runner.conftest import _FakeProcessManager, _ScriptedHarnessClient
+    from tests.runner.helpers import NullServerClient
+
+    monkeypatch.setattr(journal_tools, "_ANSWER_WAIT_IN_TURN_S", 0.2)
+    elicitation_id = workflow_elicitation_id(SESSION, "tool:toolu_late")
+    messages: list[dict[str, object]] = []
+    published: list[dict[str, object]] = []
+    harness = _ScriptedHarnessClient([])
+    runner = create_runner_app(
+        process_manager=cast(Any, _FakeProcessManager(harness)),
+        server_client=cast(Any, NullServerClient()),
+    )
+    async with (
+        _client(_late_question_server(elicitation_id, messages)) as server,
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=runner), base_url="http://runner"
+        ) as runner_client,
+    ):
+        try:
+            result = await _run(
+                server,
+                "sys_workflow_request_input",
+                {"step": "deploy", "questions": [_QUESTION]},
+                call_id="toolu_late",
+                publish_event=lambda _session, event: published.append(event),
+            )
+            assert result["answered"] is False
+            assert result["still_open"] is True
+            # Nothing clears the question, so it stays answerable in the Inbox and chat.
+            assert [event["type"] for event in published] == ["session.journal.appended"]
+            # The server forwards the answer to the runner as it does any other.
+            response = await runner_client.post(
+                f"/v1/sessions/{SESSION}/events",
+                json={
+                    "type": "approval",
+                    "data": {
+                        "elicitation_id": elicitation_id,
+                        "action": action,
+                        **({"content": content} if content else {}),
+                    },
+                },
+            )
+            assert response.status_code in (200, 204)
+            await poll_until_async(lambda: messages, timeout_s=5)
+        finally:
+            await journal_tools.cancel_session_questions(SESSION)
+    assert messages == [
+        {
+            "type": "message",
+            "data": {"role": "user", "content": [{"type": "input_text", "text": notice}]},
+        }
+    ]
+    # A late dismissal doesn't interrupt what the agent is doing by then.
+    assert [event["type"] for event in harness.patched_events] == ["approval"]
+    assert published[-1] == {
+        "type": "response.elicitation_resolved",
+        "elicitation_id": elicitation_id,
+    }
+    assert not journal_tools.answer_arrives_as_message(elicitation_id)
+    assert not pending_approvals.has_pending(SESSION)
+
+
+@pytest.mark.parametrize("ending", ["expiry", "session_deleted"])
+async def test_a_question_closed_without_an_answer_wakes_nobody(
+    monkeypatch: pytest.MonkeyPatch, ending: str
+) -> None:
+    monkeypatch.setattr(journal_tools, "_ANSWER_WAIT_IN_TURN_S", 0.2)
+    if ending == "expiry":
+        monkeypatch.setattr(pending_approvals, "_DEFAULT_WAIT_SECONDS", 0.6)
+    elicitation_id = workflow_elicitation_id(SESSION, "tool:toolu_unanswered")
+    messages: list[dict[str, object]] = []
+    published: list[dict[str, object]] = []
+    async with _client(_late_question_server(elicitation_id, messages)) as server:
+        try:
+            result = await _run(
+                server,
+                "sys_workflow_request_input",
+                {"step": "deploy", "questions": [_QUESTION]},
+                call_id="toolu_unanswered",
+                publish_event=lambda _session, event: published.append(event),
+            )
+            assert result["still_open"] is True
+            if ending == "session_deleted":
+                await journal_tools.cancel_session_questions(SESSION)
+            await poll_until_async(
+                lambda: not journal_tools.answer_arrives_as_message(elicitation_id), timeout_s=5
+            )
+        finally:
+            await journal_tools.cancel_session_questions(SESSION)
+    assert messages == []
+    assert published[-1] == {
+        "type": "response.elicitation_resolved",
+        "elicitation_id": elicitation_id,
+        "reason": "unanswered",
+    }
+    assert not pending_approvals.has_pending(SESSION)
 
 
 # ── Saved workflows ───────────────────────────────────

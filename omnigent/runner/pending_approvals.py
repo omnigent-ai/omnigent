@@ -67,10 +67,13 @@ class Verdict:
     :param content: The resolver's ``content`` map, or ``None`` when the
         verdict carried none (a bare approve/reject card, a decline, or a
         timeout).
+    :param timed_out: ``True`` when nobody answered before the wait expired,
+        as opposed to a decline.
     """
 
     approved: bool
     content: ElicitContent | None = None
+    timed_out: bool = False
 
 
 # Module-global registry: elicitation_id → asyncio.Future[Verdict].
@@ -312,7 +315,7 @@ async def wait_for_user_verdict(
             verdict = await asyncio.wait_for(fut, timeout=effective_timeout)
         answered = True
     except TimeoutError:
-        verdict = Verdict(approved=False)
+        verdict = Verdict(approved=False, timed_out=True)
     except ServerReconnected:
         reconnecting = True
         raise

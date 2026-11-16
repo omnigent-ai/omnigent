@@ -222,8 +222,10 @@ When the user asks to review the plan before the work starts:
   Then ask with `sys_workflow_request_input`: the step, and everything you need
   in one call, each question with your options and your recommendation. It
   marks the step `needs_input`, puts the questions in the user's Inbox, and
-  waits for the answer. Use it, not your own question tool (such as
-  AskUserQuestion or request_user_input).
+  waits a few minutes for the answer. If it returns `still_open`, end your
+  turn once nothing else is ready; the answer arrives later as a message. Use
+  it, not your own question tool (such as AskUserQuestion or
+  request_user_input).
 - When the user answers a step that waits for them, in the Inbox, in the chat
   or with **Continue** in the Tasks tab, write `started` on it before you work
   on it again, or `done` if its work is already done, for example by another
