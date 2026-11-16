@@ -2065,6 +2065,55 @@ async def test_shell_wait_observes_completion_during_its_final_poll(
     assert settled.active_turn_id is None and settled.active_shell_turn_id is None
 
 
+async def test_shell_marker_outlasts_idle_fence_before_its_turn_starts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Codex can report no active turn before it starts an acknowledged shell turn."""
+    _FakeCodexNativeClient.requests = []
+
+    class _LateShellClient(_FakeCodexNativeClient):
+        shell_queued = False
+
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            try:
+                return await super().request(method, params)
+            finally:
+                if method == "thread/shellCommand":
+                    type(self).shell_queued = True
+                elif type(self).shell_queued and params.get("input") == []:
+                    type(self).shell_queued = False
+                    type(self).native_active_turn_id = "turn_shell"
+                    update_active_turn_id(tmp_path, "turn_shell")
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient", _LateShellClient
+    )
+    monkeypatch.setattr(codex_native_executor, "_SHELL_TURN_WAIT_SECONDS", 0.1)
+    monkeypatch.setattr(codex_native_executor, "_SHELL_TURN_POLL_SECONDS", 0.01)
+    _seed_bridge(tmp_path)
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    async def collect(text: str) -> list[Any]:
+        return [
+            event async for event in executor.run_turn([{"role": "user", "content": text}], [], "")
+        ]
+
+    with native_shell_authorization("sleep 1"):
+        assert [type(event) for event in await collect("!sleep 1")] == [TurnComplete]
+    state = read_bridge_state(tmp_path)
+    assert state is not None and state.pending_shell_command_id is not None
+
+    followup = asyncio.create_task(collect("and then?"))
+    await asyncio.sleep(0.05)
+    assert not followup.done()
+    _LateShellClient.native_active_turn_id = None
+    clear_active_turn_id_if_matches(tmp_path, "turn_shell")
+    assert [type(event) for event in await asyncio.wait_for(followup, 2)] == [TurnComplete]
+    assert [
+        method for method, params in _FakeCodexNativeClient.requests if params.get("input") != []
+    ] == ["thread/shellCommand", "turn/start"]
+
+
 @pytest.mark.parametrize(
     ("text", "command"),
     [

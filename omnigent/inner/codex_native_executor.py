@@ -699,7 +699,8 @@ async def _run_codex_shell_command(
         raise _CodexNativeInputUndelivered(_CODEX_SHELL_AUTHORIZATION_REQUIRED)
     state = await _wait_for_shell_completion(client, bridge_dir, state)
     request_id = uuid.uuid4().hex
-    if not mark_shell_command_pending(bridge_dir, state, request_id):
+    pending = mark_shell_command_pending(bridge_dir, state, request_id)
+    if pending is None:
         raise _CodexNativeInputUndelivered(_CODEX_SHELL_WAIT_FAILURE)
     try:
         await _native_delivery_request(
@@ -715,7 +716,12 @@ async def _run_codex_shell_command(
     # Notifications cannot correlate a shell item with this submission. Keep
     # the marker until a core queue fence proves prompts are safe again.
     await _wait_for_shell_completion(
-        client, bridge_dir, state, wait_seconds=_SHELL_TURN_WAIT_SECONDS, require_idle=False
+        client,
+        bridge_dir,
+        state,
+        wait_seconds=_SHELL_TURN_WAIT_SECONDS,
+        require_idle=False,
+        submitted=pending,
     )
     _logger.info("Codex native submitted user shell command")
 
@@ -730,6 +736,8 @@ async def _reconcile_shell_command(
     bridge_dir: Path,
     state: CodexNativeBridgeState,
     deadline: float,
+    *,
+    idle_settles: bool = True,
 ) -> None:
     """Probe core turn state after earlier shell operations, without adding input."""
     expected_turn_id = f"omnigent-shell-fence-{uuid.uuid4().hex}"
@@ -755,7 +763,10 @@ async def _reconcile_shell_command(
                 if error.code != -32600:
                     return
                 if error.message == "no active turn to steer":
-                    await asyncio.to_thread(reconcile_shell_command_state, bridge_dir, state, None)
+                    if idle_settles:
+                        await asyncio.to_thread(
+                            reconcile_shell_command_state, bridge_dir, state, None
+                        )
                     return
                 prefix = f"expected active turn id `{expected_turn_id}` but found `"
                 message = error.message or ""
@@ -776,6 +787,7 @@ async def _wait_for_shell_completion(
     *,
     wait_seconds: float | None = None,
     require_idle: bool = True,
+    submitted: CodexNativeBridgeState | None = None,
 ) -> CodexNativeBridgeState:
     """Retain prompts until a standalone shell turn can no longer swallow steering."""
     deadline = asyncio.get_running_loop().time() + (
@@ -807,7 +819,14 @@ async def _wait_for_shell_completion(
             if not require_idle:
                 return current
             raise _CodexNativeInputUndelivered(_CODEX_SHELL_WAIT_FAILURE)
-        await _reconcile_shell_command(client, bridge_dir, current, deadline)
+        # Codex can acknowledge a shell before its turn starts, so an idle fence
+        # proves completion only after the bridge has recorded a turn change.
+        idle_settles = (
+            submitted is None or current.active_turn_revision != submitted.active_turn_revision
+        )
+        await _reconcile_shell_command(
+            client, bridge_dir, current, deadline, idle_settles=idle_settles
+        )
         remaining = deadline - asyncio.get_running_loop().time()
         await asyncio.sleep(min(_SHELL_TURN_POLL_SECONDS, max(0, remaining)))
 

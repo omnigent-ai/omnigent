@@ -1827,7 +1827,7 @@ def _replace_active_turn_id_unlocked(
 
 def mark_shell_command_pending(
     bridge_dir: Path, state: CodexNativeBridgeState, request_id: str
-) -> bool:
+) -> CodexNativeBridgeState | None:
     """Record a shell submission before its empty RPC acknowledgement can arrive."""
     with _bridge_state_lock(bridge_dir):
         current = read_bridge_state(bridge_dir)
@@ -1838,16 +1838,14 @@ def mark_shell_command_pending(
             or current.socket_path != state.socket_path
             or current.pending_shell_command_id is not None
         ):
-            return False
-        _write_bridge_state_unlocked(
-            bridge_dir,
-            replace(
-                current,
-                pending_shell_command_id=request_id,
-                pending_shell_parent_turn_id=current.active_turn_id,
-            ),
+            return None
+        pending = replace(
+            current,
+            pending_shell_command_id=request_id,
+            pending_shell_parent_turn_id=current.active_turn_id,
         )
-        return True
+        _write_bridge_state_unlocked(bridge_dir, pending)
+        return pending
 
 
 def clear_pending_shell_command(bridge_dir: Path, request_id: str) -> None:
