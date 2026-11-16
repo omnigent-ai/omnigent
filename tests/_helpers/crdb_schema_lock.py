@@ -17,11 +17,11 @@ _CRDB_SCHEMA_LOCK = Path(tempfile.gettempdir()) / "omnigent-crdb-schema-ddl.lock
 
 
 @functools.cache
-def _process_lock() -> FileLock:
+def _process_lock(path: str) -> FileLock:
     # One instance per process, so nested holders re-enter instead of deadlocking.
     from filelock import FileLock
 
-    return FileLock(str(_CRDB_SCHEMA_LOCK))
+    return FileLock(path)
 
 
 @contextmanager
@@ -36,5 +36,5 @@ def crdb_schema_ddl_lock(dialect: str) -> Iterator[None]:
     if dialect != "cockroachdb":
         yield
         return
-    with _process_lock():
+    with _process_lock(str(_CRDB_SCHEMA_LOCK)):
         yield

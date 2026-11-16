@@ -7,6 +7,7 @@ from unittest.mock import Mock
 import pytest
 from filelock import FileLock, Timeout
 
+from tests._helpers import crdb_schema_lock
 from tests.db import conftest as schema_fixtures
 
 pytest_plugins = ["pytester"]
@@ -42,7 +43,7 @@ def test_schema_lock_is_released_after_protocol(
 ) -> None:
     monkeypatch.setenv("OMNIGENT_TEST_DB_URI", "cockroachdb://localhost/database")
     lock_path = tmp_path / "schema.lock"
-    monkeypatch.setattr(schema_fixtures, "_CRDB_SCHEMA_LOCK", lock_path)
+    monkeypatch.setattr(crdb_schema_lock, "_CRDB_SCHEMA_LOCK", lock_path)
     item = Mock(path=Path("test_migration_example.py"), fixturenames=["db_uri"], callspec=None)
     protocol = schema_fixtures.pytest_runtest_protocol(item)
     next(protocol)
@@ -71,13 +72,13 @@ from pathlib import Path
 import pytest
 from filelock import FileLock, Timeout
 
-from tests.db import conftest as schema_fixtures
+from tests._helpers import crdb_schema_lock
 
 pytest_plugins = ["tests.db.conftest"]
-schema_fixtures._CRDB_SCHEMA_LOCK = Path(__file__).with_suffix(".lock")
+crdb_schema_lock._CRDB_SCHEMA_LOCK = Path(__file__).with_suffix(".lock")
 
 def assert_schema_locked():
-    with pytest.raises(Timeout), FileLock(schema_fixtures._CRDB_SCHEMA_LOCK, timeout=0):
+    with pytest.raises(Timeout), FileLock(crdb_schema_lock._CRDB_SCHEMA_LOCK, timeout=0):
         pass
 
 @pytest.hookimpl(tryfirst=True)
@@ -94,7 +95,7 @@ def db_uri():
     return "sqlite://"
 
 def pytest_sessionfinish():
-    with FileLock(schema_fixtures._CRDB_SCHEMA_LOCK, timeout=0):
+    with FileLock(crdb_schema_lock._CRDB_SCHEMA_LOCK, timeout=0):
         pass
 """)
     pytester.makepyfile(
