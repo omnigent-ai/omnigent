@@ -426,6 +426,18 @@ class PermissionStore(ABC):
         """
         return False
 
+    def scheduled_task_shareable(self, scheduled_task_id: str) -> bool:  # noqa: ARG002
+        """Whether this automation can be shared, given a server that shares automations.
+
+        A store returns ``False`` for an automation whose grants it cannot keep, such as
+        one created before the store supported grants. Automation lists call this once
+        per row, so it must be a pure check with no I/O.
+
+        :param scheduled_task_id: The automation.
+        :returns: ``True``, the default, unless the store cannot keep its grants.
+        """
+        return True
+
     def grant_for_scheduled_task(
         self,
         user_id: str,  # noqa: ARG002

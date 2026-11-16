@@ -5039,6 +5039,51 @@ async def test_sharing_is_advertised_and_served_together(
             )
 
 
+@_SHARING
+async def test_an_automation_its_store_cannot_share_is_reported_and_refused(
+    auth_app: FastAPI,
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    legacy_id, current_id = await _create_task(auth_client), await _create_task(auth_client)
+
+    async def listed_shareable() -> dict[str, bool]:
+        listed = await auth_client.get("/v1/scheduled-tasks", headers=_headers())
+        assert listed.status_code == 200, listed.text
+        return {task["id"]: task["shareable"] for task in listed.json()["scheduled_tasks"]}
+
+    assert await listed_shareable() == {legacy_id: True, current_id: True}
+    monkeypatch.setattr(
+        SqlAlchemyPermissionStore,
+        "scheduled_task_shareable",
+        lambda self, task_id: task_id != legacy_id,
+    )
+    assert await listed_shareable() == {legacy_id: False, current_id: True}
+    for task_id, shareable in ((legacy_id, False), (current_id, True)):
+        url = f"/v1/scheduled-tasks/{task_id}"
+        detail = await auth_client.get(url, headers=_headers())
+        renamed = await auth_client.patch(url, json={"name": "renamed"}, headers=_headers())
+        assert [detail.json()["shareable"], renamed.json()["shareable"]] == [shareable] * 2
+
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    users = {user.id for user in permissions.list_users()}
+    refused = await _share(auth_client, legacy_id, "bob@example.com")
+    assert refused.status_code == 403, refused.text
+    assert refused.json()["error"]["code"] == "forbidden"
+    assert refused.json()["error"]["message"] == (
+        "This is a legacy automation. Recreate it to share it."
+    )
+    # Refused before any write.
+    assert _task_grantees(db_uri, legacy_id) == []
+    assert {user.id for user in permissions.list_users()} == users
+    assert (await _share(auth_client, current_id, "bob@example.com")).status_code == 200
+    # Sharing off is the reason given, as in the web app.
+    auth_app.state.sharing_mode = lambda: SharingMode.OFF
+    off = await _share(auth_client, legacy_id, "bob@example.com")
+    assert off.json()["error"]["message"] == "Sharing has been disabled for this Omnigent server."
+
+
 async def test_owners_still_remove_grants_after_automations_v2_is_turned_off(
     auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str
 ) -> None:
