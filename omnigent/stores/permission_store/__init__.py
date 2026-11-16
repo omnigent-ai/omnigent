@@ -167,6 +167,18 @@ class PermissionStore(ABC):
         """
         ...
 
+    def get_direct(self, user_id: str, conversation_id: str) -> SessionPermission | None:
+        """Look up the grant *user_id* holds on the session itself.
+
+        Excludes access through groups, folders or admin rights. The default returns
+        :meth:`get`; stores whose :meth:`get` reports effective access override this.
+
+        :param user_id: The grantee, e.g. ``"alice@example.com"``.
+        :param conversation_id: The session, e.g. ``"conv_abc123"``.
+        :returns: The :class:`SessionPermission` if found, otherwise ``None``.
+        """
+        return self.get(user_id, conversation_id)
+
     @abstractmethod
     def reassign_user_grants(self, from_user_id: str, to_user_id: str) -> int:
         """Move one user's grants to another user.
@@ -199,6 +211,26 @@ class PermissionStore(ABC):
             if no more results.
         """
         ...
+
+    def list_direct_for_session(
+        self,
+        conversation_id: str,
+        *,
+        limit: int,
+        after_user_id: str | None = None,
+    ) -> tuple[list[SessionPermission], str | None]:
+        """Return the grants set on a session itself, paged as :meth:`list_for_session`.
+
+        Excludes access through groups, folders or admin rights. The default returns
+        :meth:`list_for_session`; stores whose list reports effective access override this.
+
+        :param conversation_id: The session to query.
+        :param limit: Max grants to return.
+        :param after_user_id: Exclusive cursor — return grants with
+            user_id > this value.
+        :returns: Tuple of (grants, next_cursor), as :meth:`list_for_session` returns.
+        """
+        return self.list_for_session(conversation_id, limit=limit, after_user_id=after_user_id)
 
     @abstractmethod
     def list_for_sessions(
@@ -415,6 +447,17 @@ class PermissionStore(ABC):
         :returns: A name for every ID in *user_ids*.
         """
         return {user_id: user_id for user_id in user_ids}
+
+    def public_grantees(self) -> frozenset[str]:
+        """The grantee IDs that stand for public or workspace-wide access to a session.
+
+        A sync to an automation's grantees keeps grants to these. The default is
+        ``{"__public__"}``; stores that grant General access to a group override this.
+        """
+        # Imported here so loading the store ABCs doesn't load the server's auth module.
+        from omnigent.server.auth import RESERVED_USER_PUBLIC
+
+        return frozenset({RESERVED_USER_PUBLIC})
 
     # ── Scheduled task grants ─────────────────────────────────────────────
     # The defaults suit a store that cannot persist these grants: it holds none,
