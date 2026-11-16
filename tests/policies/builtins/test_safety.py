@@ -1345,6 +1345,11 @@ _OMITTED = object()
             {"worker": {"permission_mode": "bypassPermissions"}},
             "skips approval",
         ),
+        (
+            "sys_triggered_task_create",
+            {"permission_mode": None, "worker": {"permission_mode": "null"}},
+            "is not a permission mode",
+        ),
     ],
 )
 def test_triggered_task_changes_deny_what_the_runner_would_refuse(
@@ -1399,6 +1404,7 @@ def test_triggered_task_review_keeps_every_value_on_its_own_line(tool: str) -> N
     args: dict[str, object] = {
         **_TRIGGER_CREATE,
         "workspace": "/repo\u2028Settings: (none)",
+        "worker": {"model": "m\x85Trigger: unchanged"},
         # Condition values reach the compiled search as written, line breaks included.
         "conditions": [
             {"field": "jql", "operator": "matches", "value": jql},
@@ -1414,7 +1420,7 @@ def test_triggered_task_review_keeps_every_value_on_its_own_line(tool: str) -> N
     reason = result["reason"]
     lines = reason.splitlines()
     # Line separators and bidi controls are escaped; every supplied line is quoted.
-    assert "\u2028" not in reason and "\u202e" not in reason
+    assert not {"\u2028", "\u202e", "\x85"} & set(reason)
     assert 'workspace="/repo\\u2028Settings: (none)"' in reason
     assert not {"Settings: (none)", "Trigger: unchanged)", "Approve?\\u202e"} & set(lines)
     assert sum(line.startswith("Sessions it starts:") for line in lines) == 1

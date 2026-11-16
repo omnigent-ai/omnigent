@@ -23,6 +23,7 @@ from typing import Any, cast
 from omnigent.native.permission_modes import (
     AGENT_DEFAULT_PERMISSION_MODE_HINT,
     APPROVAL_SKIPPING_PERMISSION_MODES,
+    PERMISSION_LAUNCH_ARGS,
 )
 from omnigent.tools.base import Tool
 from omnigent.tools.builtins.trigger_prompts import (
@@ -77,15 +78,20 @@ SEARCH_ARGUMENTS = ("provider", "event", "scope", "scope_match", "target", "cond
 _RESTATED_SEARCH_ARGUMENTS = ("provider", "event", "scope", "conditions")
 _WORKER_ARGUMENTS = ("agent_id", "model", "reasoning_effort", "permission_mode", "placement")
 _WORKER_PLACEMENTS = ("same_host", "managed")
+# Every harness's mode names; the server checks a mode against the worker's own harness
+# when it starts the session, which the runner can't know here.
+_PERMISSION_MODE_NAMES = frozenset(
+    mode for modes in PERMISSION_LAUNCH_ARGS.values() for mode in modes
+)
 _SCOPE_MATCHES = ("exact", "contains")
 _EXECUTION_TARGETS = ("connected_host", "managed_sandbox")
 
 # The polling interval a minute-based rule names, e.g. "FREQ=MINUTELY;INTERVAL=10".
 _MINUTELY_RRULE = re.compile(r"FREQ=MINUTELY;INTERVAL=(\d+)")
 
-# Line and paragraph separators and bidirectional controls, which JSON leaves raw but which
-# could lay out a value as other lines of an approval review.
-_LAYOUT_CONTROLS = re.compile("[\u061c\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]")
+# Line breaks JSON leaves raw (next line, line and paragraph separators) and bidirectional
+# controls, which could lay out a value as other lines of an approval review.
+_LAYOUT_CONTROLS = re.compile("[\u0085\u061c\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]")
 
 _PERMISSION_MODE_DESC = (
     "Permission mode for this task and, by default, the sessions it starts, in the "
@@ -878,6 +884,11 @@ def _parse_worker(raw: object, base: TriggerWorkerConfig) -> TriggerWorkerConfig
         "effort": setting("reasoning_effort", base["effort"]),
         "permissionMode": setting("permission_mode", base.get("permissionMode", "")),
     }
+    if worker["permissionMode"] and worker["permissionMode"] not in _PERMISSION_MODE_NAMES:
+        return (
+            f"worker.permission_mode {worker['permissionMode']!r} is not a permission mode; "
+            f"use one of the agent's modes, or {AGENT_DEFAULT_PERMISSION_MODE_HINT}"
+        )
     if worker["permissionMode"] in APPROVAL_SKIPPING_PERMISSION_MODES:
         return (
             f"worker.permission_mode {worker['permissionMode']!r} skips approval, which "

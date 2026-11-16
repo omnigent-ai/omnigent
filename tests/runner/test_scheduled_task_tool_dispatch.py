@@ -1253,7 +1253,7 @@ async def test_triggered_task_create_saves_what_the_trigger_form_saves(
     ("info", "info_status", "error"),
     [
         ({"triggered_task_tools": None}, 200, "does not support triggered tasks"),
-        ({}, 503, "does not support triggered tasks"),
+        ({}, 503, "couldn't read this Omnigent server's /v1/info"),
         ({"automations_enabled": False}, 200, "automations are not enabled"),
         ({"features": {"session_orchestration": False}}, 200, "session orchestration"),
     ],
@@ -1499,22 +1499,26 @@ async def test_triggered_task_update_refuses_part_of_a_search_before_any_request
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("info", "patched"),
+    ("info", "info_status", "patched"),
     [
-        ({}, False),
-        ({"triggered_task_tools": None}, True),
+        ({}, 200, False),
+        ({"triggered_task_tools": None}, 200, True),
         # Without orchestration the triggered update is refused, so pausing stays here.
-        ({"features": {"session_orchestration": False}}, True),
+        ({"features": {"session_orchestration": False}}, 200, True),
+        # An unreadable /v1/info doesn't show an older server, so nothing is overwritten.
+        ({}, 503, False),
     ],
-    ids=["triggered-tools", "older-server", "orchestration-off"],
+    ids=["triggered-tools", "older-server", "orchestration-off", "info-unreadable"],
 )
 async def test_scheduled_task_update_keeps_a_triggered_tasks_prompt(
-    info: dict[str, object], patched: bool
+    info: dict[str, object], info_status: int, patched: bool
 ) -> None:
     """Where the triggered tools exist, the plain update can't overwrite a trigger."""
     server = _TaskServer()
     await _run(server, "sys_triggered_task_create", _JIRA_TRIGGER)
     server.info.update(info)
+    server.info_status = info_status
+    saved = server.tasks[_TASK_ID]["prompt"]
     out = await _run(
         server,
         "sys_scheduled_task_update",
@@ -1526,7 +1530,8 @@ async def test_scheduled_task_update_keeps_a_triggered_tasks_prompt(
     )
     assert ("PATCH" in server.mutations()) is patched
     if not patched:
-        assert "change it with sys_triggered_task_update" in str(out["error"])
+        assert "sys_triggered_task_update" in str(out["error"])
+        assert server.tasks[_TASK_ID]["prompt"] == saved
 
 
 def _saved_trigger_task(task_id: str, **trigger: object) -> dict[str, object]:

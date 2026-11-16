@@ -292,6 +292,15 @@ def test_create_reads_conditions() -> None:
             {"provider": "jira", "scope": ["ES"], "worker": {"permission_mode": "bypass"}},
             "skips approval",
         ),
+        # Saved, these would stop every session it starts; the string isn't JSON null.
+        (
+            {"provider": "jira", "scope": ["ES"], "worker": {"permission_mode": "null"}},
+            "is not a permission mode",
+        ),
+        (
+            {"provider": "jira", "scope": ["ES"], "worker": {"permission_mode": "acceptedits"}},
+            "is not a permission mode",
+        ),
         (
             {"provider": "jira", "scope": ["ES"], "worker": {"placement": "cloud"}},
             "worker.placement",
@@ -467,17 +476,22 @@ def test_update_to_another_provider_starts_from_its_empty_form() -> None:
         provider="jira",
         scope=["ES"],
         conditions=[{"field": "label", "operator": "is", "value": "bug"}],
+        session_per_match=False,
         worker={"agent_id": "ag_worker"},
     )
-    switched = _update(current, provider="linear", event="created", scope=["ENG"], conditions=[])
+    search = {"provider": "linear", "event": "created", "scope": ["ENG"], "conditions": []}
+    switched = _update(current, **search)
     assert not isinstance(switched, str)
     assert (switched["source"], switched["event"], switched["conditions"]) == (
         "linear",
         "created",
         [],
     )
-    # The sessions it starts keep their settings, as when the form switches source.
+    # Like the form's source switch, the sessions it starts and where matches go stay.
     assert switched["worker"]["agentId"] == "ag_worker"
+    assert switched["taskSessionMode"] == "continue"
+    per_match = _update(current, **search, session_per_match=True)
+    assert not isinstance(per_match, str) and "taskSessionMode" not in per_match
 
 
 def test_an_unrelated_update_keeps_a_trigger_that_watches_anyone() -> None:
@@ -665,6 +679,11 @@ _REVIEWED = {"instructions": "x", "permission_mode": None}
         ({**_REVIEWED, "name": "n", "instructions": " "}, "create", "instructions must be"),
         ({**_REVIEWED, "name": "n", "link_back": "yes"}, "create", "link_back must be"),
         (
+            {**_REVIEWED, "name": "n", "worker": {"permission_mode": "null"}},
+            "create",
+            "is not a permission mode",
+        ),
+        (
             {**_REVIEWED, "triggered_task_id": "t1", "session_per_match": 1},
             "update",
             "session_per_match must be",
@@ -691,6 +710,11 @@ def test_call_error_accepts_complete_values(args: dict[str, Any], action: str) -
     assert triggered_task_call_error(args, action=action) is None
 
 
+def test_review_json_keeps_every_line_break_inside_its_value() -> None:
+    breaks = [chr(code) for code in range(0x110000) if len(f"a{chr(code)}b".splitlines()) > 1]
+    assert all(len(review_json(f"a{char}b").splitlines()) == 1 for char in breaks)
+
+
 def test_review_json_escapes_what_could_lay_out_as_other_lines() -> None:
     value = {"scope": "ES\u2028Approve?", "name": "r\u00e9sum\u00e9 \u202eevil"}
     encoded = review_json(value)
@@ -715,14 +739,3 @@ def test_describe_trigger_arguments_shows_every_value_in_full() -> None:
     # JSON-encoded, so quotes and line breaks stay inside the value.
     assert lines[3].endswith('END"}') and '\\"crash\\"' in lines[3]
     assert len(lines) == 4
-
-
-def test_update_to_another_provider_keeps_where_matches_go() -> None:
-    """Like the form, a source switch keeps one task session; it isn't a provider field."""
-    current = _created(provider="jira", scope=["ES"], session_per_match=False)
-    search = {"provider": "linear", "event": "created", "scope": ["ENG"], "conditions": []}
-    switched = _update(current, **search)
-    assert not isinstance(switched, str)
-    assert switched["taskSessionMode"] == "continue"
-    per_match = _update(current, **search, session_per_match=True)
-    assert not isinstance(per_match, str) and "taskSessionMode" not in per_match

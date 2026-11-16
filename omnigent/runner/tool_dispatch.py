@@ -5464,9 +5464,18 @@ async def _triggered_task_server_info(
     A server that doesn't advertise ``triggered_task_tools`` predates them: its
     approval policy wouldn't review these calls, so nothing is sent to it.
     """
-    info_response = await server_client.get("/v1/info", timeout=30.0)
-    info = _string_object_dict(info_response.json()) if info_response.status_code < 400 else None
-    if info is None or info.get("triggered_task_tools") is not True:
+    info = await _server_info(server_client)
+    if info is None:
+        return json.dumps(
+            {"error": f"{tool_name}: couldn't read this Omnigent server's /v1/info; try again"}
+        )
+    error = _triggered_task_capability_error(info, tool_name)
+    return info if error is None else error
+
+
+def _triggered_task_capability_error(info: _JsonObject, tool_name: str) -> str | None:
+    """Why the server whose ``/v1/info`` is *info* can't run triggered tasks, or ``None``."""
+    if info.get("triggered_task_tools") is not True:
         return json.dumps(
             {"error": f"{tool_name}: this Omnigent server does not support triggered tasks"}
         )
@@ -5483,7 +5492,7 @@ async def _triggered_task_server_info(
                 "and this server has session orchestration turned off"
             }
         )
-    return info
+    return None
 
 
 @dataclass(frozen=True)
@@ -5929,16 +5938,18 @@ async def _execute_scheduled_task_tool(
     return json.dumps(resp.json())
 
 
-async def _server_advertises(server_client: httpx.AsyncClient, flag: str) -> bool:
-    """Whether the server's ``/v1/info`` sets *flag*, e.g. ``"triggered_task_tools"``.
-
-    An unreachable or unreadable ``/v1/info`` counts as not setting it.
-    """
+async def _server_info(server_client: httpx.AsyncClient) -> _JsonObject | None:
+    """The server's ``/v1/info``, or ``None`` when it can't be reached or read."""
     try:
         response = await server_client.get("/v1/info", timeout=30.0)
-        info = _string_object_dict(response.json()) if response.status_code < 400 else None
+        return _string_object_dict(response.json()) if response.status_code < 400 else None
     except Exception:  # noqa: BLE001
-        return False
+        return None
+
+
+async def _server_advertises(server_client: httpx.AsyncClient, flag: str) -> bool:
+    """Whether the server's ``/v1/info`` sets *flag*; one that can't be read doesn't."""
+    info = await _server_info(server_client)
     return info is not None and info.get(flag) is True
 
 
@@ -5988,7 +5999,17 @@ async def _triggered_task_update_refusal(
     prompt = body.get("prompt")
     if not isinstance(prompt, str) or decode_trigger_prompt(prompt) is None:
         return None
-    if isinstance(await _triggered_task_server_info(server_client, tool_name), str):
+    info = await _server_info(server_client)
+    if info is None:
+        # Only a server known to predate the triggered tools may rewrite a trigger here.
+        return json.dumps(
+            {
+                "error": f"{tool_name}: {body.get('id')} is a triggered task, and this "
+                "server's /v1/info couldn't be read to tell whether "
+                "sys_triggered_task_update can change it; try again"
+            }
+        )
+    if _triggered_task_capability_error(info, tool_name) is not None:
         return None
     return json.dumps(
         {
