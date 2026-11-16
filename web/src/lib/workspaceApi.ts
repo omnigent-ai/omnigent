@@ -6,6 +6,7 @@ import { createConnectTransport } from "@connectrpc/connect-web";
 import { base64Encode } from "@bufbuild/protobuf/wire";
 import {
   ContentEncoding,
+  EntryType,
   WorkspaceService,
   type FileMetadata,
 } from "@/gen/omnigent/api/workspace/v1alpha1/workspace_pb";
@@ -168,20 +169,20 @@ function serverClient(sessionId: string): WorkspaceClient {
   );
 }
 
-async function readFileOn(
+async function callOn<T>(
   route: Route,
   sessionId: string,
-  path: string,
+  call: (client: WorkspaceClient) => Promise<T>,
   signal?: AbortSignal,
   sshTarget?: string | null,
-): Promise<FileContentResponse> {
-  if (route === "server") return readFile(serverClient(sessionId), path, signal);
+): Promise<T> {
+  if (route === "server") return call(serverClient(sessionId));
   const send = workspaceSocketBridge();
   if (!send) throw new Error("The desktop shell can't reach local sockets");
   const pending = directGrant(sessionId);
   try {
     const grant = await abortable(pending, signal);
-    return await readFile(directClient(grant, send, sshTarget), path, signal);
+    return await call(directClient(grant, send, sshTarget));
   } catch (error) {
     // Drop only the grant this read used; a parallel read may have renewed it.
     if (!signal?.aborted && grants.get(sessionId)?.pending === pending) grants.delete(sessionId);
@@ -228,32 +229,70 @@ async function readFile(
   };
 }
 
+/** One directory entry, in the REST listing's shape. */
+export interface ListedEntry {
+  id: string;
+  name: string;
+  path: string;
+  type: "file" | "directory";
+  bytes: number | null;
+  modified_at: number | null;
+}
+
+const LIST_PAGE_SIZE = 1000;
+
+async function listDirectory(
+  client: WorkspaceClient,
+  path: string,
+  maxEntries: number,
+  signal?: AbortSignal,
+): Promise<{ data: ListedEntry[]; hasMore: boolean }> {
+  const data: ListedEntry[] = [];
+  let pageToken = "";
+  // Each page needs the token the previous one returned.
+  /* oxlint-disable no-await-in-loop */
+  do {
+    const page = await client.listDirectory(
+      { path, pageSize: Math.min(LIST_PAGE_SIZE, maxEntries - data.length), pageToken },
+      { signal },
+    );
+    for (const entry of page.entries) {
+      data.push({
+        // The REST listing's entry id is its path.
+        id: entry.path,
+        name: entry.name,
+        path: entry.path,
+        type: entry.type === EntryType.DIRECTORY ? "directory" : "file",
+        bytes: entry.size === undefined ? null : Number(entry.size),
+        modified_at: entry.modifyTime ? Number(entry.modifyTime.seconds) : null,
+      });
+    }
+    pageToken = page.nextPageToken;
+  } while (pageToken && data.length < maxEntries);
+  /* oxlint-enable no-await-in-loop */
+  return { data, hasMore: pageToken !== "" };
+}
+
 /**
- * Read a workspace file through the workspace API, on the first route that works.
+ * Call the workspace API on the first route that works, or return null so the
+ * caller uses REST.
  *
  * Tries the host's local socket first (desktop shell only, with a short-lived
  * token the server grants the session's owner), then the server. A route that
- * fails is skipped for the session for a while; REST is the fallback.
- *
- * :param sessionId: The session whose workspace to read.
- * :param path: Workspace-relative path, e.g. ``"src/main.py"``.
- * :param sshTarget: An SSH alias the desktop may try for a host on another
- *     machine it has no destination for, e.g. from the host's provider.
- * :returns: The REST route's payload, or null when the caller should read
- *     through REST: no route is enabled or working, or the API answered with
- *     an error, which REST reports in the shape callers expect.
+ * fails is skipped for the session for a while. An error answer also returns
+ * null, since REST reports it in the shape callers expect.
  */
-export async function readFileViaWorkspaceApi(
+async function viaWorkspaceApi<T>(
   sessionId: string,
-  path: string,
+  call: (client: WorkspaceClient) => Promise<T>,
   signal?: AbortSignal,
   sshTarget?: string | null,
-): Promise<FileContentResponse | null> {
+): Promise<T | null> {
   // Each route's attempt must finish before the next is tried.
   /* oxlint-disable no-await-in-loop */
   for (const route of routesFor(sessionId, sshTarget)) {
     try {
-      return await readFileOn(route, sessionId, path, signal, sshTarget);
+      return await callOn(route, sessionId, call, signal, sshTarget);
     } catch (error) {
       signal?.throwIfAborted();
       const code = error instanceof ConnectError ? error.code : null;
@@ -266,4 +305,48 @@ export async function readFileViaWorkspaceApi(
   }
   /* oxlint-enable no-await-in-loop */
   return null;
+}
+
+/**
+ * List a workspace directory through the workspace API, in the REST listing's
+ * shape and order (ascending by path), reading pages up to `maxEntries`.
+ *
+ * :param sessionId: The session whose workspace to list.
+ * :param path: Workspace-relative directory, ``""`` for the root.
+ * :param maxEntries: Stop after this many entries, e.g. ``1000``.
+ * :returns: The entries and whether more remain, or null when the caller
+ *     should list through REST (see :func:`readFileViaWorkspaceApi`).
+ */
+export function listDirectoryViaWorkspaceApi(
+  sessionId: string,
+  path: string,
+  maxEntries: number,
+  signal?: AbortSignal,
+): Promise<{ data: ListedEntry[]; hasMore: boolean } | null> {
+  return viaWorkspaceApi(
+    sessionId,
+    (client) => listDirectory(client, path, maxEntries, signal),
+    signal,
+  );
+}
+
+/**
+ * Read a workspace file through the workspace API, on the first route that
+ * works (see :func:`viaWorkspaceApi`).
+ *
+ * :param sessionId: The session whose workspace to read.
+ * :param path: Workspace-relative path, e.g. ``"src/main.py"``.
+ * :param sshTarget: An SSH alias the desktop may try for a host on another
+ *     machine it has no destination for, e.g. from the host's provider.
+ * :returns: The REST route's payload, or null when the caller should read
+ *     through REST: no route is enabled or working, or the API answered with
+ *     an error.
+ */
+export async function readFileViaWorkspaceApi(
+  sessionId: string,
+  path: string,
+  signal?: AbortSignal,
+  sshTarget?: string | null,
+): Promise<FileContentResponse | null> {
+  return viaWorkspaceApi(sessionId, (client) => readFile(client, path, signal), signal, sshTarget);
 }

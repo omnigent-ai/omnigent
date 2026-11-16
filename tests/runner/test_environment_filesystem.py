@@ -3680,3 +3680,31 @@ def test_download_over_the_wire_fails_instead_of_truncating(
     message = str(excinfo.value)
     assert str(_DOWNLOAD_CHUNK) in message
     assert str(_SHRINK_SIZE) in message
+
+
+@pytest.mark.parametrize("directory", ["", "tree"])
+async def test_runner_listing_matches_the_host_reader(
+    client: httpx.AsyncClient, workspace: Path, directory: str
+) -> None:
+    """The workspace API lists through the host's reader, so it must answer like the runner."""
+    from omnigent.workspace_fs import WorkspaceReader
+
+    tree = workspace / "tree"
+    (tree / "sub").mkdir(parents=True)
+    (tree / "empty").mkdir()
+    (tree / ".hidden").write_text("x")
+    (tree / "file.txt").write_text("12345")
+    (tree / "dir-link").symlink_to(tree / "sub")
+    (tree / "broken-link").symlink_to(tree / "missing")
+    if sys.platform.startswith("linux"):
+        # Skipped by both: a non-UTF-8 name can't travel in JSON.
+        with open(os.path.join(os.fsencode(tree), b"bad-\xff"), "wb") as handle:
+            handle.write(b"x")
+    url = _FS_URL + (f"/{directory}" if directory else "")
+
+    runner = await client.get(url, params={"limit": 1000, "order": "asc"})
+    host = WorkspaceReader(workspace).list_directory(directory, limit=1000, after=None)
+
+    assert runner.status_code == 200, runner.text
+    assert runner.json()["data"] == host.data
+    assert runner.json()["has_more"] is host.has_more

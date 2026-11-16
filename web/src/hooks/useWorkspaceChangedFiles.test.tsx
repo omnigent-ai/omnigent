@@ -4,6 +4,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useEffect } from "react";
 import type { ReactNode } from "react";
 
+vi.mock(import("@/lib/workspaceApi"), async (original) => ({
+  ...(await original()),
+  listDirectoryViaWorkspaceApi: vi.fn(async () => null),
+}));
 vi.mock("@/hooks/RunnerHealthProvider", () => ({
   useSessionRunnerOnline: vi.fn(),
   useSessionHostOnline: vi.fn(),
@@ -43,6 +47,7 @@ import {
 import { goToFileSearchState, goToFileStatusMessage } from "@/shell/goToFileSearchStatus";
 
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { listDirectoryViaWorkspaceApi } from "@/lib/workspaceApi";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { conversationRegistry } from "@/store/conversationRegistry";
 
@@ -731,6 +736,32 @@ describe("useWorkspaceDirectory gating", () => {
     expect(fetchMock.mock.calls[0][0]).toBe(
       "/v1/sessions/conv_live/resources/environments/default/filesystem/src/inner?limit=1000&order=asc",
     );
+  });
+
+  it("lists through the workspace API when it answers, with no REST request", async () => {
+    onlineMock.mockReturnValue(true);
+    vi.mocked(listDirectoryViaWorkspaceApi).mockResolvedValueOnce({
+      data: [
+        {
+          id: "src/inner/a.ts",
+          name: "a.ts",
+          path: "src/inner/a.ts",
+          type: "file",
+          bytes: 3,
+          modified_at: 1,
+        },
+      ],
+      hasMore: false,
+    });
+
+    const { result } = renderHook(() => useWorkspaceDirectory("conv_api", "src/inner"), {
+      wrapper: Wrap,
+    });
+
+    await waitFor(() => expect(result.current.data).toBeDefined());
+    expect(result.current.data?.map((file) => file.path)).toEqual(["src/inner/a.ts"]);
+    expect(listDirectoryViaWorkspaceApi).toHaveBeenCalledWith("conv_api", "src/inner", 1000);
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("does not fetch when path is null (pre-existing gate)", async () => {

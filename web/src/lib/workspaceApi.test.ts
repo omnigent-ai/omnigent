@@ -1,13 +1,16 @@
-import { create, toBinary, type MessageInitShape } from "@bufbuild/protobuf";
+import { create, fromBinary, toBinary, type MessageInitShape } from "@bufbuild/protobuf";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   ContentEncoding,
+  EntryType,
+  ListDirectoryRequestSchema,
+  ListDirectoryResponseSchema,
   ReadFileResponseSchema,
 } from "@/gen/omnigent/api/workspace/v1alpha1/workspace_pb";
 import { getCachedServerInfo, type ServerInfo } from "@/lib/capabilities";
 import { authenticatedFetch } from "@/lib/identity";
 import { workspaceSocketBridge, type WorkspaceSocketResponse } from "@/lib/nativeBridge";
-import { readFileViaWorkspaceApi } from "./workspaceApi";
+import { listDirectoryViaWorkspaceApi, readFileViaWorkspaceApi } from "./workspaceApi";
 
 vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
 vi.mock("@/lib/nativeBridge", () => ({ workspaceSocketBridge: vi.fn() }));
@@ -260,5 +263,62 @@ describe("readFileViaWorkspaceApi", () => {
     await readFileViaWorkspaceApi("s-backoff", "notes.md");
 
     expect(socket).toHaveBeenCalledTimes(2);
+  });
+
+  it("lists a directory through the server in the REST listing's shape, page by page", async () => {
+    enable("workspace_api_server_access");
+    const tokens: string[] = [];
+    vi.mocked(authenticatedFetch).mockImplementation(async (_input, init) => {
+      const request = fromBinary(ListDirectoryRequestSchema, init!.body as Uint8Array);
+      tokens.push(request.pageToken);
+      const page = request.pageToken
+        ? { entries: [{ name: "b.ts", path: "src/b.ts", type: EntryType.FILE, size: 3n }] }
+        : {
+            entries: [
+              {
+                name: "a",
+                path: "src/a",
+                type: EntryType.DIRECTORY,
+                modifyTime: { seconds: 1700000000n },
+              },
+            ],
+            nextPageToken: "src/a",
+          };
+      return new Response(
+        toBinary(ListDirectoryResponseSchema, create(ListDirectoryResponseSchema, page)),
+        { headers: { "content-type": "application/proto" } },
+      );
+    });
+
+    const listed = await listDirectoryViaWorkspaceApi("s-list", "src", 1000);
+
+    expect(listed).toEqual({
+      data: [
+        {
+          id: "src/a",
+          name: "a",
+          path: "src/a",
+          type: "directory",
+          bytes: null,
+          modified_at: 1700000000,
+        },
+        {
+          id: "src/b.ts",
+          name: "b.ts",
+          path: "src/b.ts",
+          type: "file",
+          bytes: 3,
+          modified_at: null,
+        },
+      ],
+      hasMore: false,
+    });
+    expect(tokens).toEqual(["", "src/a"]);
+    expect(String(vi.mocked(authenticatedFetch).mock.calls[0]![0])).toBe(
+      "/v1/sessions/s-list/workspace/omnigent.api.workspace.v1alpha1.WorkspaceService/ListDirectory",
+    );
+
+    // Stops at the caller's limit and reports that more remain.
+    expect((await listDirectoryViaWorkspaceApi("s-list", "src", 1))?.hasMore).toBe(true);
   });
 });
