@@ -12,6 +12,7 @@ import { INTEGRATION_SETTINGS } from "./integrations";
 import { MCP_SETTINGS } from "./mcp";
 import { MEMBERS_SETTINGS } from "./members";
 import { POLICIES_SETTINGS } from "./policies";
+import { SHARING_SETTINGS } from "./sharing";
 import type { SettingsEntry } from "./types";
 import { UPDATES_SETTINGS } from "./updates";
 
@@ -29,7 +30,7 @@ export const SECTION_CATALOGS: Readonly<Record<SettingsSectionId, readonly Setti
   admin: [],
   members: MEMBERS_SETTINGS,
   policies: POLICIES_SETTINGS,
-  sharing: [],
+  sharing: SHARING_SETTINGS,
   archived: ARCHIVED_SETTINGS,
   cli: CLI_SETTINGS,
   updates: UPDATES_SETTINGS,
