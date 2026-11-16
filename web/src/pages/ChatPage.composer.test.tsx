@@ -6927,20 +6927,36 @@ describe("Composer reply quotes", () => {
     expect(screen.getByTestId("slash-menu-item-help")).toBeInTheDocument();
   });
 
-  it("sends unknown slash-command-looking replies as part of the quoted message", () => {
+  it("keeps the slash menu closed in reply text before a quote", () => {
     const ref = createRef<ComponentRef<typeof Composer>>();
-    const props = composerProps();
-    render(<Composer {...props} ref={ref} />);
-    act(() => ref.current?.appendReplyQuote("Explain /frobnicate"));
-    fireEvent.change(textarea(), { target: { value: "/frobnicate" } });
-    expect(activeRow()).toBeNull();
-    fireEvent.keyDown(textarea(), { key: "Enter" });
-    expect(props.onSend).toHaveBeenCalledWith("> Explain /frobnicate\n\n/frobnicate", undefined, {
-      version: 1,
-      quotes: [{ before: "", text: "Explain /frobnicate" }],
-      text: "/frobnicate",
-    });
+    render(<Composer {...composerProps()} ref={ref} />);
+    act(() => textarea().focus());
+    act(() => ref.current?.appendReplyQuote("First quote"));
+    act(() => ref.current?.appendReplyQuote("Second quote"));
+    const earlier = screen.getByLabelText("Reply text before quote 2");
+    act(() => earlier.focus());
+    fireEvent.change(earlier, { target: { value: "/" } });
+    expect(earlier).toHaveValue("/");
+    expect(screen.queryByTestId("slash-menu-item-help")).toBeNull();
   });
+
+  it.each(["/frobnicate", "constructor is wrong"])(
+    "sends a reply that is not a known command after its quote: %s",
+    (typed) => {
+      const ref = createRef<ComponentRef<typeof Composer>>();
+      const props = composerProps();
+      render(<Composer {...props} ref={ref} />);
+      act(() => ref.current?.appendReplyQuote("Explain it"));
+      fireEvent.change(textarea(), { target: { value: typed } });
+      expect(activeRow()).toBeNull();
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+      expect(props.onSend).toHaveBeenCalledWith(`> Explain it\n\n${typed}`, undefined, {
+        version: 1,
+        quotes: [{ before: "", text: "Explain it" }],
+        text: typed,
+      });
+    },
+  );
 
   it("runs a built-in chosen after a reply quote and keeps the quote", () => {
     const ref = createRef<ComponentRef<typeof Composer>>();

@@ -4229,12 +4229,12 @@ function ComposerImpl(
     // Slash command path: text that reads as "/name ..." (not a file path) or
     // invokes a known catalog skill by its full name, with no attachments.
     // Built-ins run locally; anything unhandled falls through to plaintext.
-    // A known command typed after reply quotes runs with the quotes as context.
     const tailText = draft.text.trim();
+    // A known command typed after reply quotes runs with the quotes as context.
     const quotedCommand =
       draft.quotes.length > 0 &&
       (matchSlashCommandInvocation(tailText, slashCommandNames) !== null ||
-        tailText.split(/\s+/)[0].toLowerCase() in offeredBuiltinCommands);
+        Object.hasOwn(offeredBuiltinCommands, tailText.split(/\s+/)[0].toLowerCase()));
     const commandText = quotedCommand ? tailText : trimmed;
     const withQuotedContext = (text: string) =>
       quotedCommand
