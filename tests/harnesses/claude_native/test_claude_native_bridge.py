@@ -49,7 +49,6 @@ from omnigent.harnesses.claude_native.bridge import (
     _is_box_rule,
     _JsonlRecord,
     _occupying_surface,
-    _passthrough_slash_command_name,
     augment_claude_args,
     claude_global_config_path,
     count_hook_events,
@@ -5700,11 +5699,6 @@ def test_escape_unsupported_slash_command(content: str, expected: str) -> None:
     assert _escape_unsupported_slash_command(content) == expected
 
 
-@pytest.mark.parametrize("content", ["/reload-skills", "/reload-plugins --force"])
-def test_reload_commands_fall_back_to_text_on_cli_builds_without_them(content: str) -> None:
-    assert _passthrough_slash_command_name(content) == content.split()[0].removeprefix("/")
-
-
 @pytest.mark.parametrize("content", ["/help", "/exit now", "/not-a-real-skill hello"])
 def test_escaped_slash_command_survives_invisible_character_removal(content: str) -> None:
     """
@@ -5873,9 +5867,20 @@ def _run_unknown_command_injection(
     return loaded_payloads
 
 
+@pytest.mark.parametrize(
+    ("content", "reject_name"),
+    [
+        ("/not-a-real-skill hello world", "not-a-real-skill"),
+        # Claude Code builds without the reload commands reject them the same way.
+        ("/reload-skills", "reload-skills"),
+        ("/reload-plugins --force", "reload-plugins"),
+    ],
+)
 def test_unknown_command_rejection_redelivers_escaped(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    content: str,
+    reject_name: str,
 ) -> None:
     """
     A message rejected as "Unknown command" is re-delivered escaped.
@@ -5889,15 +5894,15 @@ def test_unknown_command_rejection_redelivers_escaped(
     payloads = _run_unknown_command_injection(
         tmp_path,
         monkeypatch,
-        content="/not-a-real-skill hello world",
-        reject_name="not-a-real-skill",
+        content=content,
+        reject_name=reject_name,
     )
     assert len(payloads) == 2, (
         f"Expected the rejected message to be pasted twice (raw, then escaped); "
         f"got {len(payloads)} paste(s)."
     )
-    assert payloads[0].startswith(b"/not-a-real-skill")
-    assert payloads[1].startswith(b" /not-a-real-skill hello world")
+    assert payloads[0].startswith(f"/{reject_name}".encode())
+    assert payloads[1].startswith(f" {content}".encode())
 
 
 def test_unknown_name_accepted_as_skill_is_not_redelivered(

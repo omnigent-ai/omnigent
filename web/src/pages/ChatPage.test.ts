@@ -2,7 +2,7 @@ import { act, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Bubble, RenderItem } from "@/lib/renderItems";
 import type { RoutingScope } from "@/lib/routingDecision";
-import type { ToolExecution } from "@/lib/blocks";
+import type { AnyBlock, ToolExecution } from "@/lib/blocks";
 import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
 import type { Session } from "@/lib/types";
 import {
@@ -14,6 +14,7 @@ import { isSessionSharedWithOthers } from "@/lib/permissionsApi";
 import {
   buildPendingBubbles,
   buildSlashCommandMap,
+  reloadCommandItemIds,
   composerOffersClear,
   composerOffersRewind,
   buildSlashCommandWithArgsSet,
@@ -1500,6 +1501,29 @@ describe("composer /clear and /rewind gating", () => {
     expect(composerOffersRewind(harness, info({ session_rewind: true }))).toBe(offered);
     expect(composerOffersRewind(harness, info({}))).toBe(false);
     expect(composerOffersRewind(harness, "loading")).toBe(false);
+  });
+});
+
+describe("reloadCommandItemIds", () => {
+  const command = (name: string, kind: string, itemId: string | null) =>
+    ({
+      type: "slash_command",
+      ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId: "", itemId },
+      kind,
+      name,
+      arguments: "",
+      output: null,
+    }) as AnyBlock;
+
+  it("lists only reload command runs that came from server items", () => {
+    const blocks = [
+      command("reload-skills", "command", "item_a"),
+      command("effort", "command", "item_b"),
+      command("reload-skills", "skill", "item_c"),
+      command("reload-plugins", "command", null),
+      command("reload-plugins", "command", "item_d"),
+    ];
+    expect(reloadCommandItemIds(blocks)).toBe("item_a\nitem_d");
   });
 });
 

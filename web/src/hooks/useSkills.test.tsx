@@ -105,10 +105,12 @@ describe("useSkills", () => {
   });
 
   it.each([{ target: null }, { target, enabled: false }])(
-    "does not discover with an unavailable or disabled target: %j",
+    "does not discover or reload with an unavailable or disabled target: %j",
     async (options) => {
       const { result } = renderHook(() => useSkills(options), { wrapper });
-      await act(async () => {});
+      await act(async () => {
+        await result.current.reload();
+      });
       expect(result.current.skillsStatus).toBe("unavailable");
       expect(fetchMock).not.toHaveBeenCalled();
     },
@@ -331,14 +333,6 @@ describe("useSkills", () => {
     });
     await waitFor(() => expect(result.current.skills).toEqual(added));
     expect(fetchMock).toHaveBeenCalledTimes(2);
-  });
-
-  it("does not reload an unavailable catalog", async () => {
-    const { result } = renderHook(() => useSkills({ target: null }), { wrapper });
-    await act(async () => {
-      await result.current.reload();
-    });
-    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("rejects malformed catalogs", async () => {

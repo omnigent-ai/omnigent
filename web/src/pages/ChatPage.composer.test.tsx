@@ -1504,6 +1504,20 @@ describe("Composer slash-command menu", () => {
       expect(reload).toHaveBeenCalledTimes(2);
     });
 
+    it("rescans when a reconnect replaces the transcript window with the new reload", () => {
+      const { conversationId, blocks } = useChatStore.getState();
+      onTestFinished(() => useChatStore.setState({ conversationId, blocks }));
+      useChatStore.setState({
+        conversationId: "conv_reload",
+        blocks: [commandBlock("reload-skills", "item_earlier")],
+      });
+      renderForHarness("claude-native");
+      fireEvent.change(textarea(), { target: { value: "/reload-skills" } });
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+      act(() => useChatStore.setState({ blocks: [commandBlock("reload-skills", "item_new")] }));
+      expect(skillsFixture.getState().reload).toHaveBeenCalledOnce();
+    });
+
     it("does not rescan for reload cards loaded with another conversation", () => {
       const { conversationId, blocks } = useChatStore.getState();
       onTestFinished(() => useChatStore.setState({ conversationId, blocks }));

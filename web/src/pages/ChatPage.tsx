@@ -2307,14 +2307,22 @@ interface ComposerProps {
   onViewportShrinkPinScroll?: () => void;
 }
 
-/** Count the Claude Code ``/reload-skills`` and ``/reload-plugins`` runs in a transcript. */
-export function countReloadCommands(blocks: readonly AnyBlock[]): number {
-  return blocks.filter(
-    (block) =>
+/**
+ * Item ids of the Claude Code ``/reload-skills`` and ``/reload-plugins`` runs in
+ * a transcript, newline-joined so a store selector can compare it by value.
+ */
+export function reloadCommandItemIds(blocks: readonly AnyBlock[]): string {
+  const itemIds: string[] = [];
+  for (const block of blocks) {
+    if (
       block.type === "slash_command" &&
       block.kind === "command" &&
-      (block.name === "reload-skills" || block.name === "reload-plugins"),
-  ).length;
+      (block.name === "reload-skills" || block.name === "reload-plugins") &&
+      block.ctx.itemId
+    )
+      itemIds.push(block.ctx.itemId);
+  }
+  return itemIds.join("\n");
 }
 
 /**
@@ -3216,22 +3224,26 @@ function ComposerImpl(
   // Rescan the menu's skills once Claude has run a reload sent from here, so a
   // queued reload also sees skills created before it ran. Reload cards that
   // arrive with loaded history only move the baseline.
-  const reloadCommandCount = useChatStore((s) => (showReload ? countReloadCommands(s.blocks) : 0));
+  const reloadItemIds = useChatStore((s) => (showReload ? reloadCommandItemIds(s.blocks) : ""));
   const pendingReloadsRef = useRef(0);
-  const seenReloadsRef = useRef<{ conversationId: string | null; count: number } | null>(null);
+  const seenReloadsRef = useRef<{ conversationId: string | null; itemIds: Set<string> } | null>(
+    null,
+  );
   useEffect(() => {
+    const current = reloadItemIds ? reloadItemIds.split("\n") : [];
     const seen = seenReloadsRef.current;
-    seenReloadsRef.current = { conversationId, count: reloadCommandCount };
     if (seen?.conversationId !== conversationId) {
       // A first send may assign the id; only leaving a real conversation drops its reloads.
       if (seen?.conversationId) pendingReloadsRef.current = 0;
+      seenReloadsRef.current = { conversationId, itemIds: new Set(current) };
       return;
     }
-    const ran = reloadCommandCount - seen.count;
-    if (ran <= 0 || pendingReloadsRef.current === 0) return;
+    const ran = current.filter((itemId) => !seen.itemIds.has(itemId)).length;
+    for (const itemId of current) seen.itemIds.add(itemId);
+    if (ran === 0 || pendingReloadsRef.current === 0) return;
     pendingReloadsRef.current = Math.max(0, pendingReloadsRef.current - ran);
     void reloadSkills().catch(() => undefined);
-  }, [conversationId, reloadCommandCount, reloadSkills]);
+  }, [conversationId, reloadItemIds, reloadSkills]);
   const skillPrefix = skillInvocationPrefix(sessionHarness);
   // /side is a Codex Code CLI built-in (ephemeral fork side chat), so offer it
   // only on codex-native sessions. Selected/typed, it sends as plaintext to the
