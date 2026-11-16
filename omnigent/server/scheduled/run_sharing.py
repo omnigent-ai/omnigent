@@ -10,8 +10,9 @@ list at Read, with the owner's authority:
   session to the list, revoking any grant not on it except the owner's and
   ``__public__``.
 * An independent or sibling session launched from a run's session tree, directly
-  or through other launches, is granted to every grantee as it is created. Child
-  sessions need nothing: their access resolves through their root.
+  or through other launches, is granted as it is created to each grantee who still
+  holds a grant on that tree's root. Child sessions need nothing: their access
+  resolves through their root.
 
 Both grant lists are read a page at a time, never whole. A grant is revoked only
 once the automation's share table confirms its holder isn't a grantee, so a read
@@ -101,6 +102,7 @@ async def _apply_task_grants(
     app_state: Any | None,
     host_registry: Any | None,
     revocation: _Revocation,
+    visible_from: str | None,
 ) -> None:
     # Revocations first, so a sharing policy that refuses additions still revokes.
     if await _revocation_applies(task, session, permission_store, revocation):
@@ -112,6 +114,7 @@ async def _apply_task_grants(
         permission_store=permission_store,
         app_state=app_state,
         host_registry=host_registry,
+        visible_from=visible_from,
     )
 
 
@@ -197,11 +200,16 @@ async def _add_missing_grantees(
     permission_store: PermissionStore,
     app_state: Any | None,
     host_registry: Any | None,
+    visible_from: str | None,
 ) -> None:
     """Share *session* at Read with each of the automation's grantees who has no share.
 
     Reads the automation's grants a page at a time. The sharing policy is checked
     once, before the first write; a refusal or a failed read stops the pass.
+
+    :param visible_from: A session ID, or ``None``. When set, only grantees with a
+        direct grant on that session get *session*; one whose grant can't be read
+        is skipped.
     """
     policy_checked = False
     cursor: str | None = None
@@ -235,6 +243,10 @@ async def _add_missing_grantees(
                 continue
             if held is not None:
                 continue
+            if visible_from is not None and not await asyncio.to_thread(
+                _holds_grant, permission_store, task, grantee, visible_from
+            ):
+                continue
             if not policy_checked:
                 try:
                     await asyncio.to_thread(
@@ -257,6 +269,22 @@ async def _add_missing_grantees(
                 _announce_session_added(grantee, session.id)
         if cursor is None:
             return
+
+
+def _holds_grant(
+    permission_store: PermissionStore, task: ScheduledTask, user_id: str, session_id: str
+) -> bool:
+    """Whether *user_id* holds a direct grant on *session_id*; ``False`` when unreadable."""
+    try:
+        return permission_store.get(user_id, session_id) is not None
+    except Exception:
+        _logger.exception(
+            "automation %s: could not read %r's share of session %s; not sharing with them",
+            task.id,
+            user_id,
+            session_id,
+        )
+        return False
 
 
 def _held_under_the_stores_comparison(
@@ -358,6 +386,7 @@ async def _share_best_effort(
     app_state: Any | None,
     host_registry: Any | None,
     revocation: _Revocation,
+    visible_from: str | None = None,
 ) -> None:
     try:
         if permission_store is None or not permission_store.supports_scheduled_task_grants:
@@ -370,6 +399,7 @@ async def _share_best_effort(
             app_state=app_state,
             host_registry=host_registry,
             revocation=revocation,
+            visible_from=visible_from,
         )
     except Exception:
         _logger.exception("automation %s: could not share session %s", task.id, session.id)
@@ -459,18 +489,23 @@ async def share_launched_session(
     task: ScheduledTask,
     session: Conversation,
     *,
+    launched_from_root: str,
     managed: bool,
     permission_store: PermissionStore | None,
     app_state: Any | None,
     host_registry: Any | None,
 ) -> None:
-    """Share a session launched from *task*'s run tree with each of its grantees, at Read.
+    """Share a session launched from *task*'s run tree at Read with its grantees who can see it.
 
-    As :func:`share_new_run_session`, except that the session's own placement, not
-    the automation's, decides whether it is a sandbox. Never raises.
+    Only grantees still holding a direct grant on the launching tree's root get it:
+    another automation that continues that session, or a hand revoke, may have
+    removed someone. Otherwise as :func:`share_new_run_session`, except that the
+    session's own placement, not the automation's, decides whether it is a sandbox.
+    Never raises.
 
     :param task: The automation from :func:`launching_automation`.
     :param session: The launched session, owned by *task*'s owner.
+    :param launched_from_root: The root of the session tree that launched *session*.
     :param managed: Whether *session* asked for a new server-provisioned sandbox.
     :param permission_store: The server's permission store; ``None`` does nothing.
     :param app_state: ``app.state``, which carries the sharing policy.
@@ -484,6 +519,7 @@ async def share_launched_session(
         app_state=app_state,
         host_registry=host_registry,
         revocation=_Revocation.NONE,
+        visible_from=launched_from_root,
     )
 
 

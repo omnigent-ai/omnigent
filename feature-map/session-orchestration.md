@@ -81,8 +81,9 @@ MCP independent creation.
   kept session starts one worker per match (`docs/AUTOMATIONS.md`). A worker
   started from a run's session tree, or from a worker started that way, is
   labeled `omnigent.scheduled_task_launch` with the automation and shared at
-  read access with the automation's current grantees before it starts; a fork
-  of a run's session shares nothing. Covered by
+  read access, before it starts, with the automation's current grantees who can
+  still see the session it was launched from; a fork of a run's session shares
+  nothing. Covered by
   `tests/server/integration/test_session_orchestration.py::test_launches_from_a_run_tree_are_shared_with_the_automation_grantees`
   and `tests/server/scheduled/test_run_sharing.py`.
 - `projects`: `sys_project_list` pages the owner's projects oldest first and

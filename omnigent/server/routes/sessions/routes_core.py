@@ -1773,13 +1773,14 @@ def register_core_routes(
                 )
             resp.permission_level = grant.level
         await _accept_initial_input(request, resp.id, body.initial_input, user_id)
-        if launching_task is not None and conv is not None:
+        if launching_task is not None and conv is not None and source is not None:
             from omnigent.server.scheduled.run_sharing import share_launched_session
 
             # Before any runner launches, so recipients can follow it from its first turn.
             await share_launched_session(
                 launching_task,
                 conv,
+                launched_from_root=source.root_conversation_id,
                 managed=resolved_body.host_type == "managed",
                 permission_store=permission_store,
                 app_state=request.app.state,

@@ -141,11 +141,13 @@ async def test_a_launch_without_a_workspace_is_shared_only_as_a_new_sandbox(
     permissions, task, announced, managed, execution_target, shared
 ) -> None:
     """The launched session's own placement decides, not the automation's target."""
+    run_session = _session(permissions, **dict.fromkeys(GRANTEES, LEVEL_READ))
     session = replace(_session(permissions), host_id=None, workspace=None)
 
     await share_launched_session(
         replace(task, execution_target=execution_target),
         session,
+        launched_from_root=run_session.id,
         managed=managed,
         permission_store=permissions,
         app_state=SimpleNamespace(sharing_mode=lambda: SharingMode.RESTRICTED_READ_ONLY),
@@ -156,6 +158,39 @@ async def test_a_launch_without_a_workspace_is_shared_only_as_a_new_sandbox(
         dict.fromkeys(GRANTEES, LEVEL_READ) if shared else {}
     )
     assert len(announced) == (len(GRANTEES) if shared else 0)
+
+
+@pytest.mark.parametrize("fault", ["not_on_root", "root_grant_unreadable"])
+async def test_a_launch_is_shared_only_with_grantees_who_can_see_its_root(
+    permissions, task, announced, monkeypatch, fault
+) -> None:
+    alice, bob = GRANTEES
+    run_session = _session(
+        permissions, **{bob: LEVEL_READ, **({} if fault == "not_on_root" else {alice: LEVEL_READ})}
+    )
+    if fault == "root_grant_unreadable":
+        get = permissions.get
+
+        def fail_alices_root_grant(user_id: str, session_id: str) -> Any:
+            if (user_id, session_id) == (alice, run_session.id):
+                raise RuntimeError("grant read failed")
+            return get(user_id, session_id)
+
+        monkeypatch.setattr(permissions, "get", fail_alices_root_grant)
+    launched = _session(permissions)
+
+    await share_launched_session(
+        task,
+        launched,
+        launched_from_root=run_session.id,
+        managed=False,
+        permission_store=permissions,
+        app_state=None,
+        host_registry=None,
+    )
+
+    assert _levels(permissions, launched.id) == {bob: LEVEL_READ}
+    assert announced == [(bob, launched.id)]
 
 
 def _recording(read: Any, reads: list[str]) -> Any:
