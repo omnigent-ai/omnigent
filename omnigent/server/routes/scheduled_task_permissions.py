@@ -508,13 +508,23 @@ def register_scheduled_task_permissions_routes(
             return Response(status_code=204)
         # A first run records its session before it shares it, and shares only while the
         # grant exists, so any session recorded after this read never reaches them.
-        current = await owned_task(request, scheduled_task_id)
-        if current.continues_session and current.session_id != _continued_session_id(task):
-            try:
+        try:
+            current = await owned_task(request, scheduled_task_id)
+            if current.continues_session and current.session_id != _continued_session_id(task):
                 await revoke_from_task_session(current, target_user_id, permission_store=store)
-            except OmnigentError:
-                await asyncio.to_thread(_restore_task_grant, store, target_user_id, current.id)
+        except Exception as exc:
+            # Whatever failed, including the read, the grant goes back so a retry finds it.
+            await asyncio.to_thread(_restore_task_grant, store, target_user_id, task.id)
+            if isinstance(exc, OmnigentError):
                 raise
+            _logger.exception(
+                "automation %s: could not finish revoking %r", task.id, target_user_id
+            )
+            raise OmnigentError(
+                "Could not finish removing them from the automation, so it is still shared "
+                "with them. Try again.",
+                code=ErrorCode.INTERNAL_ERROR,
+            ) from exc
         # A full sync only after a change, so an automation nobody shares never
         # overwrites its session's other shares.
         await sync_session(request, current)

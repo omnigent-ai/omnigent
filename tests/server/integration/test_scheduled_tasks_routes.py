@@ -5042,6 +5042,51 @@ async def test_a_revoke_that_cannot_reach_the_session_keeps_the_grant_for_a_retr
 
 
 @_SHARING
+async def test_a_failed_read_after_the_grant_delete_restores_the_grant(
+    auth_client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.server.auth import LEVEL_OWNER
+
+    task_id = await _create_task(auth_client, session_mode="continue")
+    assert (await _share(auth_client, task_id, "bob@example.com")).status_code == 200
+    sessions = _record_first_session_before_grant_delete(monkeypatch, db_uri, "bob@example.com")
+    delete_grant = SqlAlchemyPermissionStore.revoke_for_scheduled_task
+    get = SqlAlchemyScheduledTaskStore.get
+    state = {"failures_left": 1, "fail_next_read": False}
+
+    def delete_then_fail_the_next_read(
+        self: SqlAlchemyPermissionStore, user_id: str, scheduled_task_id: str
+    ) -> bool:
+        deleted = delete_grant(self, user_id, scheduled_task_id)
+        if state["failures_left"]:
+            state["failures_left"] -= 1
+            state["fail_next_read"] = True
+        return deleted
+
+    def get_or_fail(self: SqlAlchemyScheduledTaskStore, *args: Any, **kwargs: Any) -> Any:
+        if state["fail_next_read"]:
+            state["fail_next_read"] = False
+            raise RuntimeError("transient database error")
+        return get(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        SqlAlchemyPermissionStore, "revoke_for_scheduled_task", delete_then_fail_the_next_read
+    )
+    monkeypatch.setattr(SqlAlchemyScheduledTaskStore, "get", get_or_fail)
+    url = _permissions_url(task_id, "bob@example.com")
+
+    failed = await auth_client.delete(url, headers=_headers())
+
+    assert failed.status_code == 500, failed.text
+    # The grant is back, so the session recorded meanwhile is still owed a revoke.
+    assert _task_grantees(db_uri, task_id) == ["bob@example.com"]
+    assert "bob@example.com" in _session_grants(db_uri, sessions[0])
+    assert (await auth_client.delete(url, headers=_headers())).status_code == 204
+    assert _task_grantees(db_uri, task_id) == []
+    assert _session_grants(db_uri, sessions[0]) == {"alice@example.com": LEVEL_OWNER}
+
+
+@_SHARING
 async def test_session_permissions_name_the_automation_that_manages_them(
     auth_client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
