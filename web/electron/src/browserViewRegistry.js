@@ -27,7 +27,8 @@ const {
   lookupHostAddresses,
 } = require("./browserUrlPolicy");
 
-const DEFAULT_CAP = 10;
+// Each view is a separate renderer process; the cap bounds memory per window.
+const DEFAULT_CAP = 20;
 
 // Map WebSocket handshakes onto the HTTP URL rules.
 function httpUrlForWebSocket(url) {

@@ -652,7 +652,7 @@ including the address bar, chat links, and agent actions, enforces this policy.
 **Pieces:**
 
 - `src/browserViewRegistry.js` — a per-**conversation** `Map` of
-  `WebContentsView`s (cap 10). `setActive` attaches one view to the host window
+  `WebContentsView`s (cap 20). `setActive` attaches one view to the host window
   and **detaches (does not destroy)** the previous one, so a background
   conversation's page keeps running when the user switches away; views are
   destroyed only on explicit close or window teardown. Each child view keeps
