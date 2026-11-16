@@ -5501,6 +5501,117 @@ describe("sidebar_grouping_ui release flag", () => {
     expect(within(shared).getByText("conv_shared_alpha")).toBeInTheDocument();
     expect(screen.queryByText("conv_owned")).toBeNull(); // in the collapsed Alpha folder
   });
+
+  // Server-owned labels on the session an automation's run created.
+  const RUN_LABELS = {
+    "omnigent.scheduled_task_origin": "st_1",
+    "omnigent.scheduled_task_initial_run": "run_1",
+  };
+  const ALICE = "alice@example.com";
+  const SHARED_RUNS = [
+    // Alice filed her automation's runs into her own project.
+    conv("conv_shared_run", "Claude Code", {
+      owner: ALICE,
+      labels: { ...RUN_LABELS, omni_project: "Alpha" },
+    }),
+    conv("conv_shared_launch", "Claude Code", {
+      owner: ALICE,
+      labels: { "omnigent.scheduled_task_launch": "st_1" },
+    }),
+    // A fork keeps the origin but drops the initial run, so it's an ordinary share.
+    conv("conv_shared_fork", "Claude Code", {
+      owner: ALICE,
+      labels: { "omnigent.scheduled_task_origin": "st_1" },
+    }),
+    conv("conv_shared_other", "Claude Code", { owner: ALICE }),
+  ];
+  const automationFolder = () =>
+    screen.getByRole("button", { name: /^Omnigent Automation/ }).closest("section")!;
+
+  it("files other users' automation runs in the viewer's Omnigent Automation folder", () => {
+    projectsMock.push("Alpha", "Omnigent Automation");
+    mockConversations([
+      conv("conv_own_run", "Claude Code", {
+        labels: { ...RUN_LABELS, omni_project: "Omnigent Automation" },
+      }),
+      ...SHARED_RUNS,
+    ]);
+    renderGroupingSidebar();
+    selectSessionFilter("all");
+    fireEvent.click(screen.getByRole("button", { name: /^Omnigent Automation/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Alpha" }));
+
+    const folder = automationFolder();
+    const alpha = screen.getByRole("button", { name: "Alpha" }).closest("section")!;
+    const shared = screen.getByRole("button", { name: "Shared with me" }).closest("section")!;
+    for (const id of ["conv_own_run", "conv_shared_run", "conv_shared_launch"]) {
+      expect(within(folder).getByText(id)).toBeInTheDocument();
+      expect(within(shared).queryByText(id)).toBeNull();
+    }
+    expect(within(alpha).queryByText("conv_shared_run")).toBeNull();
+    for (const id of ["conv_shared_fork", "conv_shared_other"]) {
+      expect(within(shared).getByText(id)).toBeInTheDocument();
+      expect(within(folder).queryByText(id)).toBeNull();
+    }
+    // A shared run names its owner; the viewer's own run doesn't.
+    const sharedRow = within(folder).getByText("conv_shared_run").closest("li")!;
+    expect(within(sharedRow).getByTestId("session-row-meta")).toHaveTextContent(ALICE);
+    const ownRow = within(folder).getByText("conv_own_run").closest("li")!;
+    expect(within(ownRow).queryByTestId("session-row-meta")).toBeNull();
+    // Filing stays the owner's: a shared run offers no Move to project.
+    fireEvent.pointerDown(within(sharedRow).getByTestId("conversation-actions"), { button: 0 });
+    expect(
+      screen.queryByTestId("mark-unread-conversation") ??
+        screen.getByTestId("mark-read-conversation"),
+    ).toBeInTheDocument();
+    expect(screen.queryByTestId("move-to-project")).toBeNull();
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
+
+    // My sessions lists only the viewer's own; the Shared filter lists them all.
+    selectSessionFilter("mine");
+    expect(within(automationFolder()).getByText("conv_own_run")).toBeInTheDocument();
+    expect(screen.queryByText("conv_shared_run")).toBeNull();
+    showSharedTab();
+    for (const run of SHARED_RUNS) expect(screen.getByText(run.id)).toBeInTheDocument();
+  });
+
+  it("shows the folder where the viewer's project will go until they have it", () => {
+    projectsMock.push("Alpha", "Zeta");
+    mockConversations(SHARED_RUNS);
+    const view = renderGroupingSidebar();
+    selectSessionFilter("all");
+    const folderNames = () =>
+      screen
+        .getAllByRole("button", { name: /^(Alpha|Zeta|Omnigent Automation)/ })
+        .map((button) => button.textContent);
+    expect(folderNames()).toEqual(["Alpha", "Omnigent Automation", "Zeta"]);
+    // Nothing to rename, delete or start a session in: it isn't a project yet.
+    expect(
+      screen.queryByRole("button", { name: "Project actions for Omnigent Automation" }),
+    ).toBeNull();
+    expect(screen.queryByRole("button", { name: "New session in Omnigent Automation" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /^Omnigent Automation/ }));
+    expect(within(automationFolder()).getByText("conv_shared_run")).toBeInTheDocument();
+
+    // The viewer's own first automation creates the project, which takes its place.
+    projectsMock.splice(1, 0, "Omnigent Automation");
+    view.refresh();
+    expect(folderNames()).toEqual(["Alpha", "Omnigent Automation", "Zeta"]);
+    expect(within(automationFolder()).getByText("conv_shared_run")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Project actions for Omnigent Automation" }),
+    ).toBeInTheDocument();
+
+    // Without a shared run, or on My sessions, there is no placeholder.
+    projectsMock.splice(1, 1);
+    view.refresh();
+    selectSessionFilter("mine");
+    expect(screen.queryByRole("button", { name: /^Omnigent Automation/ })).toBeNull();
+    selectSessionFilter("all");
+    mockConversations([SHARED_RUNS[2]!, SHARED_RUNS[3]!]);
+    view.refresh();
+    expect(screen.queryByRole("button", { name: /^Omnigent Automation/ })).toBeNull();
+  });
 });
 
 it.each(["default", "updated", "shared"])(
