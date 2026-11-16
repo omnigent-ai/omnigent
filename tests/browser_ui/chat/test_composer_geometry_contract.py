@@ -670,20 +670,6 @@ def test_worktree_radios_center_on_their_labels(
 ) -> None:
     chat = chat_session_contract
     chat.contract.json(
-        "/v1/hosts",
-        {
-            "hosts": [
-                {
-                    "host_id": chat.host_id,
-                    "name": "Browser host",
-                    "owner": "local",
-                    "status": "online",
-                    "configured_harnesses": {chat.harness: True},
-                }
-            ]
-        },
-    )
-    chat.contract.json(
         f"/v1/hosts/{chat.host_id}/worktrees",
         {
             "data": [
