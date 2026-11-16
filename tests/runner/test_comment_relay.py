@@ -744,8 +744,19 @@ class _ReapableStubResourceRegistry(_StubResourceRegistry):
 
 
 @pytest.mark.asyncio
-async def test_idle_pane_reap_closes_comment_relay(tmp_path: Path) -> None:
+async def test_idle_pane_reap_closes_comment_relay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Reaping an idle pane closes its relay; the next launch starts a fresh one."""
+    relays: list[bridge.ClaudeNativeToolRelay] = []
+    original_start = bridge.start_tool_relay
+
+    def start_relay(**kwargs):
+        relay = original_start(**kwargs)
+        relays.append(relay)
+        return relay
+
+    monkeypatch.setattr(bridge, "start_tool_relay", start_relay)
     app = create_runner_app(
         resource_registry=_ReapableStubResourceRegistry(tmp_path),
         server_client=NullServerClient(),  # type: ignore[arg-type]
@@ -764,15 +775,14 @@ async def test_idle_pane_reap_closes_comment_relay(tmp_path: Path) -> None:
         try:
             resp = await _launch_terminal(client, session_id, bridge_inject_dir=True)
             assert resp.status_code == 200, resp.text
-            relay_url = json.loads(relay_file.read_text())["url"]
+            assert relays[0]._httpd.socket.fileno() >= 0
 
             await reaper._reap(pane)
             # A surviving relay keeps a listening socket per reaped session
             # until the session is deleted, exhausting the runner's descriptors.
             assert not relay_file.exists(), "tool_relay.json survived the idle reap"
-            with pytest.raises(httpx.ConnectError):
-                async with httpx.AsyncClient() as probe:
-                    await probe.get(relay_url, timeout=2.0)
+            # Another worker can immediately reuse a released pool port.
+            assert relays[0]._httpd.socket.fileno() == -1
 
             resp = await _launch_terminal(client, session_id, bridge_inject_dir=True)
             assert resp.status_code == 200, resp.text
