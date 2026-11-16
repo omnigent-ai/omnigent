@@ -97,8 +97,6 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
   const [plannerExpanded, setPlannerExpanded] = useState(false);
   // Non-zero while the open planning chat flashes; each press restarts it.
   const [plannerFlash, setPlannerFlash] = useState(0);
-  // The proposal this page saved last and the write that saved it.
-  const [lastSave, setLastSave] = useState<{ position: number; updatedAt?: number } | null>(null);
   const showPlanner = plannerOpen ?? workflow?.is_draft ?? false;
   const isMobile = useIsMobileViewport();
   const { session: planningSession, error: planningSessionError } = useSession(
@@ -164,13 +162,16 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
   const runList = runs.data?.pages.flatMap((page) => page.runs) ?? [];
   const proposal = canReadProposal ? currentPlan(journal.entries) : null;
   const proposedSteps = proposal ? planSteps(proposal) : null;
-  // Only a proposal newer than the workflow's last write replaces its description, so an edit
-  // made since stands. Journal order tells proposals from the one this page just saved;
-  // otherwise timestamps are whole seconds, so a tie keeps the stored description.
+  // A proposal replaces the description only if it's newer than where the description came
+  // from, so an edit made since stands: the proposal it was saved from, by journal order, or
+  // else the workflow's last write, in whole seconds, where a tie keeps the description.
+  const savedFrom = journal.entries.findLast(
+    (entry) => entry.kind === "plan" && planDescription(entry) === workflow.description,
+  );
   const proposalIsNewer =
     proposal !== null &&
-    (lastSave !== null && lastSave.updatedAt === workflow.updated_at
-      ? proposal.position > lastSave.position
+    (savedFrom
+      ? proposal.position > savedFrom.position
       : proposal.created_at > (workflow.updated_at ?? 0));
   const proposedDescription = proposalIsNewer ? planDescription(proposal) : null;
   const newDescription =
@@ -293,7 +294,7 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
                 disabled={savePlan.isPending}
                 loading={savePlan.isPending}
                 onClick={() => {
-                  if (!proposal || !proposedSteps) return;
+                  if (!proposedSteps) return;
                   setPlannerOpen(showPlanner);
                   // The server keeps a description another client changed after this page loaded it.
                   const description =
@@ -302,12 +303,7 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
                       : { description: newDescription, expected_description: workflow.description };
                   savePlan.mutate(
                     { steps: proposedSteps, ...description },
-                    {
-                      onSuccess: (saved) => {
-                        setLastSave({ position: proposal.position, updatedAt: saved.updated_at });
-                        showToast("Plan saved");
-                      },
-                    },
+                    { onSuccess: () => showToast("Plan saved") },
                   );
                 }}
               >

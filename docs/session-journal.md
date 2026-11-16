@@ -207,9 +207,10 @@ still controls that order. Creating a workflow does not run its steps.
 In the workflow page's planning chat, the agent publishes proposals only;
 **Save plan** applies them to the workflow that already exists. Each proposal
 carries a description written for its steps, which the page shows until you
-save and Save plan stores with them. Only a proposal written after the
-workflow's last change replaces its description, and a description another
-client saved after the page loaded stays.
+save and Save plan stores with them. A proposal replaces the description only
+if it is newer than where that description came from: the proposal it was
+saved from, or else the workflow's last change. A description another client
+saved after the page loaded stays.
 
 Authoring reads the referenced SOPs, runbooks and relevant linked procedures
 before proposing execution steps. The plan carries forward their actions,

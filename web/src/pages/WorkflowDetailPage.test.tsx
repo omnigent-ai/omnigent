@@ -623,15 +623,29 @@ describe("WorkflowDetailPage", () => {
     await act(async () => releaseFirstSave());
 
     await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent("Unsaved changes"));
-    expect(screen.getByTestId("workflow-detail-description").textContent).toBe(
-      "Fixes flaky tests.",
-    );
+    const description = () => screen.getByTestId("workflow-detail-description").textContent;
+    expect(description()).toBe("Fixes flaky tests.");
+
+    // Reopened, the page still tells the newer proposal from the one it saved.
+    cleanup();
+    renderPage();
+    await screen.findByTestId("workflow-detail-title");
+    expect(screen.getByRole("status")).toHaveTextContent("Unsaved changes");
+    expect(description()).toBe("Fixes flaky tests.");
     fireEvent.click(screen.getByRole("button", { name: "Save plan" }));
     await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent("Saved plan"));
     expect(patches.map((patch) => patch.description)).toEqual([
       "Fixes one flaky test.",
       "Fixes flaky tests.",
     ]);
+
+    // Another client's description from the same second as that save stands after a refetch.
+    stored = { ...stored, description: "Edited elsewhere." };
+    cleanup();
+    renderPage();
+    await screen.findByTestId("workflow-detail-title");
+    expect(description()).toBe("Edited elsewhere.");
+    expect(screen.getByRole("status")).toHaveTextContent("Saved plan");
   });
 
   it("shows the workflow, its steps, and the sessions that ran it", () => {
