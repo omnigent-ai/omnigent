@@ -42,6 +42,7 @@ from omnigent.tools.builtins.trigger_prompts import (
     trigger_event,
     trigger_fields_complete,
     trigger_scope,
+    trigger_scope_entries,
     trigger_scope_operators,
     with_trigger_event,
 )
@@ -565,7 +566,11 @@ class SysTriggeredTaskUpdateTool(Tool):
                     },
                     "permission_mode": {
                         "type": ["string", "null"],
-                        "description": "As in create; resend the current value when unchanged.",
+                        "description": (
+                            "As in create; resend the current value when unchanged. Sessions "
+                            "it starts keep the mode saved in worker, which a create copies "
+                            "from this one; change that with worker.permission_mode."
+                        ),
                     },
                     "mcp_services": {
                         "type": "array",
@@ -962,9 +967,11 @@ def _build_search(args: Mapping[str, object]) -> dict[str, Any] | str:
         return entries
     if scope_match == "contains" and len(entries) != 1:
         return "scope_match 'contains' takes exactly one scope entry"
-    if trigger_scope(source, event).is_group and len(entries) < 2:
-        return "a group DM scope names at least two people besides you"
     fields["scope"] = ", ".join(entries)
+    # Counted as the renderer reads them, where "alice" and "@Alice" are one person.
+    people = trigger_scope_entries(cast(Any, {"source": source, "event": event, **fields}))
+    if trigger_scope(source, event).is_group and len(people) < 2:
+        return "a group DM scope names at least two different people besides you"
     fields["scopeOperator"] = _scope_operator(source, event, entries, cast(str, scope_match))
 
     event_spec = trigger_event(source, event)

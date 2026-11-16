@@ -215,7 +215,15 @@ def test_create_reads_conditions() -> None:
             {"provider": "pagerduty", "scope": ["A", "B"], "scope_match": "contains"},
             "exactly one scope entry",
         ),
-        ({"provider": "slack", "event": "group_dm", "scope": ["alice"]}, "at least two people"),
+        (
+            {"provider": "slack", "event": "group_dm", "scope": ["alice"]},
+            "at least two different people",
+        ),
+        # One person written two ways, as the renderer reads them.
+        (
+            {"provider": "slack", "event": "group_dm", "scope": ["alice", "@Alice"]},
+            "at least two different people",
+        ),
         ({"provider": "jira", "scope": ["ES"], "target": "me"}, "takes no target"),
         (
             {"provider": "github", "event": "review", "scope": ["o/r"], "target": ""},
