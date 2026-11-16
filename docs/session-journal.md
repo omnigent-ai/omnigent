@@ -167,7 +167,9 @@ evidence requirement before the coordinator accepts it.
 
 A workflow can run another workflow as one of its steps, such as getting each
 PR in a stack ready to merge. The agent starts the other workflow in its own
-session on the same host, with the workflow skill running. That session
+session on the same host, with the workflow skill running. For a saved
+workflow, it passes `workflow_id` to `sys_session_create`, so that session
+starts with the workflow's plan and appears in the workflow's runs. That session
 reports back with `sys_session_message` when its plan finishes, and the agent
 also checks on it periodically with a background timer of its own. Workers get
 the relevant inputs, decisions, authorization and limits, and report blockers

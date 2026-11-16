@@ -3709,7 +3709,8 @@ async def _execute_session_create(
 
     :param args: Parsed arguments; exactly one of ``agent_id`` /
         ``config_path`` required, ``title`` / ``message`` / ``model`` /
-        ``reasoning_effort`` optional in both modes.
+        ``reasoning_effort`` optional in both modes, ``workflow_id`` with
+        ``agent_id`` only.
     :param server_client: HTTP client pointed at the Omnigent server; ``None``
         returns an error string.
     :param conversation_id: The caller's session id — the forced parent;
@@ -3792,6 +3793,13 @@ async def _execute_session_create(
         if has_config_path:
             # A new agent's own config sets its permission mode.
             return json.dumps({"error": "permission_mode requires agent_id"})
+    workflow_id = args.get("workflow_id")
+    if workflow_id is not None:
+        if not isinstance(workflow_id, str) or not workflow_id.strip():
+            return json.dumps({"error": "workflow_id must be a nonempty string"})
+        if has_config_path:
+            # The bundled create doesn't copy a workflow's plan into the journal.
+            return json.dumps({"error": "workflow_id requires agent_id"})
     if has_config_path:
         return await _session_create_from_config_path(
             str(config_path),
@@ -3810,6 +3818,8 @@ async def _execute_session_create(
         reasoning_effort=args.get("reasoning_effort"),
         permission_mode=permission_mode,
     )
+    if workflow_id is not None:
+        body["workflow_id"] = workflow_id
     headers: dict[str, str] = {}
     if placement != "child":
         from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
@@ -3849,6 +3859,7 @@ async def _execute_session_create(
             or args.get("project_id") is not None
             or args.get("project_name") is not None
             or permission_mode is not None
+            or workflow_id is not None
         ):
             info = await server_client.get("/v1/info", timeout=30.0)
             info.raise_for_status()
@@ -3877,6 +3888,23 @@ async def _execute_session_create(
                     "no session was created. Omit permission_mode to use the agent's default."
                 }
             )
+        if workflow_id is not None:
+            features = info_data.get("features")
+            # With workflows off the server refuses the create as not found,
+            # which would read as a missing agent.
+            if not isinstance(features, dict) or features.get("workflows") is not True:
+                return json.dumps(
+                    {"error": "Workflows are disabled on this server; no session was created."}
+                )
+            # An older server ignores the field, so the session would start without the plan.
+            if info_data.get("session_create_workflow_id") is not True:
+                return json.dumps(
+                    {
+                        "error": "This Omnigent server can't start a session as a workflow "
+                        "run; no session was created. Omit workflow_id and ask the session "
+                        "to load the workflow itself."
+                    }
+                )
         if placement == "managed":
             if (
                 info_data.get("sibling_sessions") is True

@@ -333,6 +333,8 @@ class ServerInfoResponse(BaseModel):
     scheduled_task_harness_settings: bool = True
     # Session creates accept ``permission_mode``; older servers ignore it.
     session_create_permission_modes: bool = True
+    # Session creates accept ``workflow_id``; older servers ignore it.
+    session_create_workflow_id: bool = True
     scripted_sessions: bool = False
     # Scheduled tasks accept explicit modes that skip approval; servers that omit
     # this may reject them, so clients hide those modes.

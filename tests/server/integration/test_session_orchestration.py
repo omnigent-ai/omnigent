@@ -1552,6 +1552,56 @@ async def test_created_session_refuses_an_unusable_permission_mode(
     assert {conversation.id for conversation in store.list_conversations().data} == before
 
 
+@pytest.mark.parametrize("orchestration_environment", ["workflows"], indirect=True)
+@pytest.mark.parametrize("placement", ["child", "managed"])
+async def test_created_session_starts_as_a_run_of_a_saved_workflow(
+    auth_client, peers, monkeypatch, placement
+):
+    from omnigent.server.routes.sessions import routes_core
+
+    source, _, _ = peers
+    worker_agent_id = await _upload_codex_worker(auth_client)
+
+    async def launch(**kwargs):
+        pass
+
+    monkeypatch.setattr(routes_core, "_run_managed_launch", launch)
+    saved = await auth_client.post(
+        "/v1/workflows",
+        json={
+            "name": "Review changes",
+            "description": "Review the local changes.",
+            "steps": [{"id": "review", "name": "Review the diff", "goal": "Find regressions."}],
+        },
+    )
+    assert saved.status_code == 200, saved.text
+    workflow = saved.json()
+    result = json.loads(
+        await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps(
+                {
+                    "agent_id": worker_agent_id,
+                    "placement": placement,
+                    "workflow_id": workflow["id"],
+                }
+            ),
+            server_client=auth_client,
+            conversation_id=source["id"],
+        )
+    )
+    session_id = result.get("conversation_id")
+    assert session_id and "error" not in result, result
+    plans = await auth_client.get(f"/v1/sessions/{session_id}/journal", params={"kind": "plan"})
+    assert plans.status_code == 200, plans.text
+    (plan,) = plans.json()["data"]
+    assert plan["workflow_id"] == workflow["id"]
+    assert plan["content"]["steps"] == workflow["steps"]
+    runs = await auth_client.get(f"/v1/workflows/{workflow['id']}/runs")
+    assert runs.status_code == 200, runs.text
+    assert [run["session_id"] for run in runs.json()["data"]] == [session_id]
+
+
 @pytest.mark.parametrize("shape", ["parent", "multipart", "initial_items", "skill"])
 async def test_independent_creation_rejects_child_or_bundle_shape(auth_client, peers, shape):
     from tests._helpers.session import post_session_bundle
