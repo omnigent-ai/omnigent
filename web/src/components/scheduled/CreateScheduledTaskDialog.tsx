@@ -840,7 +840,8 @@ export function CreateScheduledTaskDialog({
     const updated = updateTriggerWorkerSettings(effectivePrompt, settings);
     if (updated === null) return;
     const parts = splitTriggerPrompt(updated);
-    setPrompt(withoutWorkflow(parts.userPrompt));
+    // A chosen workflow leaves the hidden draft out of the prompt, so keep the draft as typed.
+    if (showsInstructions) setPrompt(withoutWorkflow(parts.userPrompt));
     setSystemPrompt(parts.systemPrompt);
   }
 

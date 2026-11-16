@@ -3870,6 +3870,29 @@ describe("automation trigger type", () => {
       expect(input).not.toHaveProperty("sessionId");
     });
 
+    it("keeps the instructions a chosen workflow hides when the worker changes", async () => {
+      savedWorkflowsList.current = [
+        { id: "0123456789abcdef0123456789abcdef", name: "Triage", description: "Triages." },
+      ];
+      try {
+        render(
+          dialog(
+            { editingTask: slackTask },
+            { features: { automations_v2: true, session_orchestration: true, workflows: true } },
+          ),
+        );
+        fireEvent.pointerDown(screen.getByTestId("task-workflow-trigger"), { button: 0 });
+        fireEvent.click(screen.getByTestId("composer-saved-workflow"));
+        expect(screen.queryByTestId("task-prompt-input")).toBeNull();
+        await choose("Polly", "task-worker-agent-trigger");
+        fireEvent.pointerDown(screen.getByTestId("task-workflow-trigger"), { button: 0 });
+        fireEvent.click(screen.getByTestId("workflow-picker-clear"));
+        expect(screen.getByTestId("task-prompt-input")).toHaveValue("Answer the question.");
+      } finally {
+        savedWorkflowsList.current = [];
+      }
+    });
+
     it("keeps a worker permission mode chosen while switched when switching back", async () => {
       render(dialog({ editingTask: slackTask }, { session_create_permission_modes: true }));
       await choose("Jira");
@@ -7212,6 +7235,17 @@ describe("CreateScheduledTaskDialog workflow", () => {
       // Each session follows the workflow as saved, so there are no instructions to require.
       expect(screen.queryByTestId("task-trigger-instructions-required")).toBeNull();
       expect(screen.queryByTestId("task-trigger-instructions")).toBeNull();
+      // A draft typed without the workflow comes back when it's cleared, and stays out of its runs.
+      fireEvent.pointerDown(screen.getByTestId("task-workflow-trigger"), { button: 0 });
+      fireEvent.click(screen.getByTestId("workflow-picker-clear"));
+      fireEvent.change(screen.getByTestId("task-trigger-instructions"), {
+        target: { value: "Only bugs" },
+      });
+      chooseWorkflow();
+      fireEvent.pointerDown(screen.getByTestId("task-workflow-trigger"), { button: 0 });
+      fireEvent.click(screen.getByTestId("workflow-picker-clear"));
+      expect(screen.getByTestId("task-trigger-instructions")).toHaveValue("Only bugs");
+      chooseWorkflow();
       fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
 
       await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
