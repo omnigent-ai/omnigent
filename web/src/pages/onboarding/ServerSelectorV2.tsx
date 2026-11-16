@@ -165,6 +165,9 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
   // With MDM presets everyone starts on the landing: its dropdown holds recents
   // and a URL field, and it shows connect errors itself.
   const mdm = setup.managedServers.length > 0;
+  // Without presets, a set-up local install gets the same dropdown landing,
+  // below "Continue locally"; "Connect to new server…" still opens the list.
+  const localInstall = mdm ? undefined : setup.recentServers.find(isLocalInstall);
   // A failed connect reloads with an error (?error=&url=) whose banner lives on
   // the server step, so open there; "Connect to new server…" too (initialStep).
   const failedOrForced = setup.error !== undefined || setup.initialStep === "server";
@@ -172,9 +175,12 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
   // users — or one who cleared every server — land on the welcome.
   const returning = setup.connectedBefore === true || setup.recentServers.length > 0;
   const hasServers = setup.recentServers.length > 0 || mdm;
-  const [step, setStep] = useState<Step>(
-    !mdm && (failedOrForced || (returning && hasServers)) ? "server" : "landing",
-  );
+  const startOnServerList = mdm
+    ? false
+    : localInstall !== undefined
+      ? setup.initialStep === "server"
+      : failedOrForced || (returning && hasServers);
+  const [step, setStep] = useState<Step>(startOnServerList ? "server" : "landing");
   const [landingError, setLandingError] = useState(setup.error);
   // Wizard color scheme radio. Seeded from the shell's current source (which
   // survives navigation), defaulting to "system" when the shell doesn't report.
@@ -299,6 +305,14 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
     if (!returning && (await pickRunnerFor(url))) return;
     setLandingError(undefined);
     const result = await connect(url, "landing");
+    if (result.error) setLandingError(result.error);
+  };
+  // A running local install opens directly; a stopped one starts in the terminal step.
+  const continueLocally = async (url: string) => {
+    setLandingError(undefined);
+    const check = await setup.onCheckServer(url).catch(() => ({ status: "unreachable" as const }));
+    const result =
+      check.status === "unreachable" ? await connect(url, "landing") : await connectToServer(url);
     if (result.error) setLandingError(result.error);
   };
   // Connect from the terminal: success navigates away, a rejection or cancel
@@ -441,6 +455,10 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
             connection={connection}
             onCancelConnect={cancelConnect}
             onGetStarted={() => setStep("local")}
+            onContinueLocally={
+              localInstall === undefined ? undefined : () => void continueLocally(localInstall)
+            }
+            onCreateServer={setup.onCloudSetup}
             onJoinServer={() => setStep("server")}
             onJoinManaged={joinFromLanding}
             onJoinUrl={joinFromLanding}
