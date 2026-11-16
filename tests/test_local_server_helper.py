@@ -222,6 +222,29 @@ def test_routable_host_waits_for_its_own_tunnel_and_names_the_failure() -> None:
     assert other not in probes
 
 
+def test_wait_online_keeps_waiting_until_the_hosts_tunnel_answers(tmp_path: Path) -> None:
+    """An online hosts-table row alone doesn't end ``Host.wait_online``."""
+    import httpx
+
+    from tests._helpers.host import Host
+
+    host_id = "a" * 32
+    probes: list[str] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/hosts":
+            return httpx.Response(200, json={"hosts": [{"host_id": host_id, "status": "online"}]})
+        probes.append(request.url.path)
+        # The tunnel registers on the second probe.
+        return httpx.Response(200 if len(probes) > 1 else 400, json={"entries": []})
+
+    proc = Mock(poll=Mock(return_value=None))
+    host = Host(proc=proc, host_id=host_id, home=tmp_path, log_path=tmp_path / "host.log")
+    with httpx.Client(base_url="http://test", transport=httpx.MockTransport(respond)) as client:
+        assert host.wait_online(client, timeout=5, poll_interval=0)["host_id"] == host_id
+    assert probes == [f"/v1/hosts/{host_id}/filesystem"] * 2
+
+
 def test_routable_host_skips_a_host_whose_tunnel_probe_raises() -> None:
     """A probe that times out on one host doesn't hide a later host whose tunnel answers."""
     import httpx
