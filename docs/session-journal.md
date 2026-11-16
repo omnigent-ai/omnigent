@@ -54,7 +54,10 @@ The newest status for a step is its current one:
   uncertainty and pending CI, jobs or workers do not need this status.
   The agent asks with `sys_workflow_request_input`, which writes the status for
   it, so the question reaches the user's Inbox. It shows as Waiting for you,
-  in pink.
+  in pink. The tool waits about four minutes for the answer. After that the
+  question stays open in the Inbox and chat, the agent ends its turn, and an
+  answer (or a dismissal) reaches the session as a `[System: …]` message that
+  starts the agent's next turn. An unanswered question expires after a day.
 - `failed`: the step's own work failed.
 
 The workflow skill keeps the agent working while any step is ready or started:
@@ -110,7 +113,7 @@ spec can drop it with `tool_groups.journal: false` (see
 | `sys_journal_write_plan(name, steps, workflow_id?)`                | Sets the session's plan: its name and the whole graph; returns `{id, position, version}`. `workflow_id` names the saved workflow the plan starts a run of.                                                                                                                      |
 | `sys_journal_write_status(status, step?, text?)`                    | Records a step's status. `step` may be left out when the plan has one step. Every status needs every step it depends on to be done first; otherwise the write fails with `step_not_ready`, naming them.                                                                         |
 | `sys_journal_write_note(body, step?)`                               | Adds a note.                                                                                                                                                                                                                                                                    |
-| `sys_workflow_request_input(step, questions)`                      | Asks the user about a task in the current plan and waits for the answer. It marks the task `needs_input` with the first question, raises the questions as an elicitation in the Inbox with the options as buttons, and returns `{answered, answers}`.                           |
+| `sys_workflow_request_input(step, questions)`                      | Asks the user about a task in the current plan and waits a few minutes for the answer. It marks the task `needs_input` with the first question, raises the questions as an elicitation in the Inbox with the options as buttons, and returns `{answered, answers}`, or `{answered: false, still_open: true}` when no answer came in time; a later answer reaches the session as a message. |
 | `sys_workflow_save(name, description, steps)` | Saves a reusable workflow for the session's owner through `POST /v1/workflows`, and returns `{id, name}`, or `name_taken`. The session's current plan is then written again naming the workflow, with no new chat line. The `save-workflow` skill says how to make the steps generic. A save from a session shared with edit access is refused. |
 | `sys_workflow_load(workflow)` | Loads one of the owner's saved workflows by ID or name, with its steps. A name with no exact match returns `workflow_not_found` with the closest names. |
 | `sys_workflow_list(cursor?, limit?)` | Lists the owner's saved workflows by name, 20 at a time unless `limit` says otherwise (at most 50): each one's ID, name and the start of its description, without steps. `next_cursor` pages to the rest. |
