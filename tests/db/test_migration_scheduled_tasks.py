@@ -12,6 +12,7 @@ legacy writers, history preservation, and guarded rollback.
 from __future__ import annotations
 
 import os
+import random
 from collections.abc import Iterator
 from importlib import import_module
 from io import StringIO
@@ -21,7 +22,7 @@ from uuid import uuid4
 import pytest
 import sqlalchemy as sa
 from alembic import command
-from sqlalchemy.dialects import mysql, sqlite
+from sqlalchemy.dialects import mysql
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import DBAPIError, IntegrityError
 
@@ -147,8 +148,9 @@ def test_trigger_config_is_a_bounded_varbinary_on_mysql() -> None:
 
     assert migration._TRIGGER_CONFIG.compile(dialect=mysql.dialect()) == "VARBINARY(16383)"
     assert model.compile(dialect=mysql.dialect()) == "VARBINARY(16383)"
+    # Hex digits carry four bits each, so this can't compress below the bound.
     with pytest.raises(ValueError, match="exceeds 16383 bytes"):
-        model.process_bind_param(b"x" * 16_384, sqlite.dialect())
+        model.process_bind_param({"value": random.Random(0).randbytes(17_000).hex()}, None)
 
 
 @pytest.mark.parametrize("db_engine", _SCHEMA_PATHS, indirect=True)

@@ -4,7 +4,8 @@ Revision ID: 5c1e8f2a9d47
 Revises: f7c2d8a4b901
 
 ``trigger_config`` holds what a trigger automation watches, such as Slack
-channels, as framed JSON of at most 16,383 bytes (``VARBINARY`` on MySQL).
+channels, as a storage envelope (``omnigent.db.envelope``) of at most 16,383
+bytes (``VARBINARY`` on MySQL).
 Tasks are read by primary key, so no index is added.
 
 The column is nullable and nothing reads it yet, so this migration runs online
