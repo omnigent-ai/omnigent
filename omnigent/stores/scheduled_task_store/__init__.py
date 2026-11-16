@@ -161,6 +161,7 @@ class ScheduledTaskStore(ABC):
         delegation_ref: str | None = None,
         first_run_at: int | None = None,
         kind: str = "automation",
+        trigger_config: dict[str, Any] | None = None,
     ) -> ScheduledTask:
         """
         Insert a new scheduled task.
@@ -203,6 +204,8 @@ class ScheduledTaskStore(ABC):
             the same write. ``None`` skips the check.
         :param kind: ``"automation"`` (default), or ``"reminder"`` for a one-time
             (``COUNT=1``) task that continues ``session_id``.
+        :param trigger_config: What a trigger automation watches, which its
+            ``prompt`` and ``rrule`` were compiled from; ``None`` for other tasks.
         :returns: The newly created :class:`ScheduledTask`.
         :raises ScheduledTaskFirstRunMismatchError: If ``first_run_at`` is set and
             the first run differs; nothing is saved.
@@ -296,6 +299,7 @@ class ScheduledTaskStore(ABC):
         state: str | None = None,
         last_run_at: int | None = None,
         last_run_conversation_id: str | None = _UNSET,
+        trigger_config: dict[str, Any] | None = None,
         expected_schedule: ScheduledTask | None = None,
         guard: Callable[[ScheduledTask], None] | None = None,
     ) -> ScheduledTask | None:
@@ -313,7 +317,8 @@ class ScheduledTaskStore(ABC):
 
         Passing ``rrule`` updates the recurring trigger; ``None``
         leaves it unchanged. ``mcp_services`` replaces the task's MCP services
-        (an empty tuple clears them); ``None`` leaves them unchanged.
+        (an empty tuple clears them); ``None`` leaves them unchanged. So does
+        ``trigger_config``, which replaces a trigger automation's whole config.
 
         Passing ``agent_id`` rebinds the task to a different agent, which
         switches the harness its future firings run. The fire path reads

@@ -36,7 +36,7 @@ from omnigent.inner._subprocess_lifecycle import await_cleanup_task
 from omnigent.runtime import pending_elicitations
 from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.bundles import agent_for_user
-from omnigent.server.feature_flags import DeploymentGate, deployment_gate_enabled
+from omnigent.server.feature_flags import DeploymentGate, Feature, deployment_gate_enabled
 from omnigent.server.managed_hosts import parse_repo_workspace
 from omnigent.server.routes._agent_origin import require_agent_origin
 from omnigent.server.routes._auth_helpers import require_user
@@ -71,6 +71,11 @@ from omnigent.server.scheduled.rrule import (
 )
 from omnigent.server.scheduled.run_reconciler import force_fail_stale_runs
 from omnigent.server.scheduled.run_sharing import delete_task_grants
+from omnigent.server.scheduled.slack_trigger import (
+    SlackTriggerConfig,
+    compile_slack_trigger_prompt,
+    slack_trigger_rrule,
+)
 from omnigent.server.scheduled.telemetry import log_task_created
 from omnigent.server.session_mcp_selection import MAX_SESSION_MCP_SERVICES, session_mcp_selection
 from omnigent.server.workflows import require_workflows
@@ -99,6 +104,10 @@ _MANAGED_SANDBOX_WITH_HOST_MSG = (
     "a managed_sandbox task runs in a fresh sandbox each fire; do not set host_id"
 )
 _SESSION_ID_WITHOUT_CONTINUE_MSG = "session_id requires session_mode 'continue'"
+# Fields the server sets for a trigger automation, so its requests leave them out.
+_TRIGGER_COMPILED_FIELDS = frozenset(
+    {"prompt", "rrule", "session_mode", "session_id", "source_session_id", "first_run_at"}
+)
 _SOURCE_SESSION_CONTINUE_MSG = (
     "an automation with source_session_id starts each run in a new session; "
     "session_mode must be 'new'"
@@ -126,8 +135,12 @@ class CreateScheduledTaskRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     name: str
-    prompt: str
-    rrule: str
+    # Required unless trigger_config is given; the server compiles both from it.
+    prompt: str = ""
+    rrule: str = ""
+    # What a trigger automation watches. The server compiles the prompt, a polling
+    # rrule and session_mode "continue" from it.
+    trigger_config: SlackTriggerConfig | None = None
     agent_id: str
     timezone: str = "UTC"
     model_override: str | None = None
@@ -163,6 +176,16 @@ class CreateScheduledTaskRequest(BaseModel):
 
     @model_validator(mode="after")
     def _validate_create(self) -> CreateScheduledTaskRequest:
+        if self.trigger_config is None:
+            missing = [name for name in ("prompt", "rrule") if name not in self.model_fields_set]
+            if missing:
+                raise ValueError(f"{' and '.join(missing)} required without trigger_config")
+        else:
+            compiled = sorted(_TRIGGER_COMPILED_FIELDS.intersection(self.model_fields_set))
+            if compiled:
+                raise ValueError(
+                    f"omit {', '.join(compiled)} with trigger_config; the server sets them"
+                )
         if self.execution_target not in _VALID_EXECUTION_TARGETS:
             raise ValueError("execution_target must be 'connected_host' or 'managed_sandbox'")
         if self.execution_target == "managed_sandbox" and self.host_id is not None:
@@ -211,6 +234,8 @@ class UpdateScheduledTaskRequest(BaseModel):
     execution_target: str | None = Field(default=None, min_length=1)
     state: str | None = None
     project_id: str | None = None  # null unfiles future runs
+    # Replaces a trigger automation's config, recompiling its prompt.
+    trigger_config: SlackTriggerConfig | None = None
 
     @model_validator(mode="after")
     def _validate_patch(self) -> UpdateScheduledTaskRequest:
@@ -227,6 +252,8 @@ class UpdateScheduledTaskRequest(BaseModel):
             raise ValueError(_MANAGED_SANDBOX_WITH_HOST_MSG)
         if "agent_id" in self.model_fields_set and self.agent_id is None:
             raise ValueError("agent_id cannot be null")
+        if "trigger_config" in self.model_fields_set and self.trigger_config is None:
+            raise ValueError("trigger_config cannot be null; delete the task instead")
         return self
 
 
@@ -273,6 +300,7 @@ def _to_response(
         "name": task.name,
         "prompt": task.prompt,
         "rrule": task.rrule,
+        "trigger_config": task.trigger_config,
         # JSON key preserved for API/UI stability; the DB column + entity
         # attribute are now ``user_id``.
         "owner_user_id": task.user_id,
@@ -386,6 +414,15 @@ async def _validate_rrule_or_400(
         raise OmnigentError(f"invalid rrule: {exc}", code=ErrorCode.INVALID_INPUT) from exc
 
 
+def _require_trigger_orchestration(request: Request) -> None:
+    """Refuse a trigger on a server whose sessions can't start a session per match."""
+    if not request.app.state.feature_flags.enabled(Feature.SESSION_ORCHESTRATION):
+        raise OmnigentError(
+            "trigger_config needs session orchestration, which this server disables",
+            code=ErrorCode.INVALID_INPUT,
+        )
+
+
 def _validate_timezone_or_400(timezone: str) -> None:
     """Raise a 400 ``OmnigentError`` if *timezone* is not a valid IANA timezone."""
     try:
@@ -426,6 +463,7 @@ def create_scheduled_tasks_router(
     project_store: ProjectStore | None = None,
     automations: DeploymentGate = True,
     liveness_lookup: Callable[[list[str]], dict[str, SessionLiveness]] | None = None,
+    trigger_poll_minutes: int = 10,
 ) -> APIRouter:
     """Build the scheduled-tasks router.
 
@@ -940,9 +978,14 @@ def create_scheduled_tasks_router(
             conversation_store=conversation_store,
             permission_store=permission_store,
         )
+        trigger = body.trigger_config
+        rrule = body.rrule if trigger is None else slack_trigger_rrule(trigger_poll_minutes)
+        session_mode = body.session_mode if trigger is None else "continue"
+        if trigger is not None:
+            _require_trigger_orchestration(request)
         await _validate_rrule_or_400(
-            body.rrule,
-            body.session_mode,
+            rrule,
+            session_mode,
             body.execution_target,
             allow_single_fire=one_time_schedules_supported(request),
         )
@@ -965,6 +1008,16 @@ def create_scheduled_tasks_router(
             permission_mode=permission_mode,
             execution_target=body.execution_target,
         )
+        prompt = body.prompt
+        if trigger is not None:
+            prompt = compile_slack_trigger_prompt(
+                trigger,
+                execution_target=body.execution_target,
+                model_override=model_override,
+                reasoning_effort=reasoning_effort,
+                permission_mode=permission_mode,
+                poll_minutes=trigger_poll_minutes,
+            )
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
         project_owner = _project_owner(owner)
         # Known before the task exists, since a sandbox session must run on the
@@ -1033,8 +1086,9 @@ def create_scheduled_tasks_router(
                 task = store.create(
                     scheduled_task_id=task_id,
                     name=body.name,
-                    prompt=body.prompt,
-                    rrule=body.rrule,
+                    prompt=prompt,
+                    rrule=rrule,
+                    trigger_config=trigger.model_dump() if trigger is not None else None,
                     user_id=owner_id,
                     agent_id=bound.id,
                     timezone=body.timezone,
@@ -1043,7 +1097,7 @@ def create_scheduled_tasks_router(
                     permission_mode=permission_mode,
                     mcp_services=mcp_services,
                     max_cost_usd=body.max_cost_usd,
-                    session_mode=body.session_mode,
+                    session_mode=session_mode,
                     session_id=body.session_id,
                     source_session_id=source_copy.id if source_copy is not None else None,
                     workspace=workspace,
@@ -1089,7 +1143,11 @@ def create_scheduled_tasks_router(
             task,
             owner=owner,
             source=request.headers.get("x-omnigent-automation-source"),
-            template=request.headers.get("x-omnigent-automation-template"),
+            template=(
+                trigger.provider
+                if trigger is not None
+                else request.headers.get("x-omnigent-automation-template")
+            ),
         )
         scheduler = _scheduler(request)
         if scheduler is not None and not getattr(
@@ -1438,6 +1496,29 @@ def create_scheduled_tasks_router(
             fields.pop("session_mode", None)
         if fields.get("mcp_services") is None:
             fields.pop("mcp_services", None)
+        if existing.trigger_config is None and "trigger_config" in fields:
+            raise OmnigentError(
+                "Only a trigger automation has a trigger_config to change",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if "trigger_config" in fields:
+            # Other updates, such as a pause, still work, so a trigger can always be stopped.
+            _require_trigger_orchestration(request)
+        if existing.trigger_config is not None:
+            changed = sorted(
+                name
+                for name in _TRIGGER_COMPILED_FIELDS.intersection(fields)
+                if fields[name] != getattr(existing, name)
+                # Clearing it still starts a new polling session on the next run.
+                and not (name == "session_id" and fields[name] is None)
+            )
+            if changed:
+                raise OmnigentError(
+                    f"The server sets {', '.join(changed)} for a trigger automation; "
+                    "change trigger_config instead",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            fields["rrule"] = slack_trigger_rrule(trigger_poll_minutes)
         target_session_mode = fields.get("session_mode", existing.session_mode)
         target_execution = fields.get("execution_target") or existing.execution_target
         if body.rrule is not None or {"session_mode", "execution_target"}.intersection(fields):
@@ -1606,6 +1687,16 @@ def create_scheduled_tasks_router(
                 fields["host_id"] = picked.host_id
         elif "permission_mode" in fields and continuing.continues_session:
             await _require_mode_fits_session(request, continuing)
+        if existing.trigger_config is not None:
+            # Every setting the prompt names may have changed, so compile it again.
+            fields["prompt"] = compile_slack_trigger_prompt(
+                body.trigger_config or SlackTriggerConfig.model_validate(existing.trigger_config),
+                execution_target=target_execution,
+                model_override=fields.get("model_override", existing.model_override),
+                reasoning_effort=fields.get("reasoning_effort", existing.reasoning_effort),
+                permission_mode=fields.get("permission_mode", existing.permission_mode),
+                poll_minutes=trigger_poll_minutes,
+            )
         project_owner = _project_owner(owner)
         try:
             # On the derived fields, so a session the update clears counts as a change.

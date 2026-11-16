@@ -57,3 +57,41 @@ def test_a_reminder_that_does_not_fit_is_rejected(fields: dict[str, str]) -> Non
 def test_an_unknown_kind_is_rejected() -> None:
     with pytest.raises(ValidationError, match="kind"):
         CreateScheduledTaskRequest(**_BODY, kind="trigger")
+
+
+_TRIGGER = {
+    "provider": "slack",
+    "event": "posted",
+    "channels": ["eng-support"],
+    "instructions": "Answer the question.",
+}
+_TRIGGER_BODY = {key: value for key, value in _BODY.items() if key not in ("prompt", "rrule")}
+
+
+def test_a_trigger_takes_the_place_of_the_prompt_and_rule() -> None:
+    request = CreateScheduledTaskRequest(**_TRIGGER_BODY, trigger_config=_TRIGGER)
+    assert request.trigger_config is not None
+    assert request.trigger_config.channels == ["eng-support"]
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"rrule": "FREQ=DAILY"},
+        {"prompt": "ping"},
+        {"session_mode": "continue"},
+        {"session_id": "conv_1"},
+        {"source_session_id": "conv_1"},
+        {"first_run_at": 1_900_000_000},
+    ],
+    ids=["rrule", "prompt", "session_mode", "session_id", "source_session_id", "first_run_at"],
+)
+def test_a_trigger_leaves_out_what_the_server_sets(fields: dict[str, object]) -> None:
+    with pytest.raises(ValidationError, match="the server sets them"):
+        CreateScheduledTaskRequest(**_TRIGGER_BODY, **fields, trigger_config=_TRIGGER)
+
+
+def test_a_task_without_a_trigger_needs_its_prompt() -> None:
+    body = {key: value for key, value in _BODY.items() if key != "prompt"}
+    with pytest.raises(ValidationError, match="prompt required without trigger_config"):
+        CreateScheduledTaskRequest(**body)

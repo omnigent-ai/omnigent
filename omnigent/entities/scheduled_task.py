@@ -19,6 +19,7 @@ comments, and schema on "scheduled task"; only presentation strings say
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
@@ -101,6 +102,10 @@ class ScheduledTask:
     :param kind: ``"automation"``, or ``"reminder"`` for a one-time message an
         agent set for its own session. Clients list reminders apart from
         automations; scheduling and firing ignore it.
+    :param trigger_config: What a trigger automation watches, e.g.
+        ``{"provider": "slack", "event": "posted", "channels": ["eng"], ...}``.
+        The server compiled ``prompt``, ``rrule`` and ``session_mode`` from it.
+        ``None`` for a task that runs its own prompt.
     """
 
     id: str
@@ -133,6 +138,7 @@ class ScheduledTask:
     next_run_at: int | None = None
     project_id: str | None = None
     delegation_ref: str | None = None
+    trigger_config: dict[str, Any] | None = None
 
     @property
     def continues_session(self) -> bool:

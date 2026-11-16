@@ -340,6 +340,8 @@ class ServerInfoResponse(BaseModel):
     # before dispatch; older servers would send it to the model.
     scheduled_task_trigger_headers: bool = True
     automation_trigger_poll_minutes: int = 10
+    # Scheduled tasks accept a Slack ``trigger_config``; older servers reject it.
+    scheduled_task_slack_triggers: bool = False
     # Longest session message this server delivers; older servers omit it and
     # deliver at most 8,000 characters.
     session_message_max_chars: int = SESSION_MESSAGE_MAX_CHARS
@@ -4022,6 +4024,8 @@ def create_app(
                 "automations_enabled": automations_enabled,
                 "proactive_agent_available": app.state.proactive_agent_available(),
                 "automation_trigger_poll_minutes": trigger_poll_minutes,
+                "scheduled_task_slack_triggers": automations_enabled
+                and app.state.feature_flags.enabled(Feature.SESSION_ORCHESTRATION),
                 "branding": branding_snapshot.config(),
                 "picker": picker_curation.config(),
             }
@@ -4373,6 +4377,7 @@ def create_app(
                 project_store=project_store,
                 automations=app.state.automations_available,
                 liveness_lookup=_bulk_session_liveness,
+                trigger_poll_minutes=trigger_poll_minutes,
             ),
             prefix="/v1",
             tags=["scheduled_tasks"],

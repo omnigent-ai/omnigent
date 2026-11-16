@@ -7,6 +7,7 @@ SQLite database.
 
 from __future__ import annotations
 
+import random
 import uuid
 from typing import Any
 
@@ -1069,6 +1070,66 @@ def test_update_from_a_stale_snapshot_conflicts_on_agent_or_mcp_changes(
     saved = store.get(snapshot.id)
     assert saved is not None
     assert (saved.agent_id, saved.mcp_services) == (applied.agent_id, applied.mcp_services)
+
+
+_TRIGGER = {
+    "provider": "slack",
+    "event": "posted",
+    "channels": ["eng"],
+    "conditions": [],
+    "instructions": "Answer the question.",
+}
+
+
+def test_trigger_config_round_trips_and_is_bounded_on_every_write(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    task = _session_task(
+        store, "st_trigger_bound", session_mode="continue", trigger_config=_TRIGGER
+    )
+    saved = store.get(task.id)
+    assert saved is not None and saved.trigger_config == _TRIGGER
+
+    # Hex digits carry four bits each, so this can't compress under the column's bound.
+    too_large = {**_TRIGGER, "instructions": random.Random(0).randbytes(17_000).hex()}
+    with pytest.raises(OmnigentError, match="too large to store") as raised:
+        _session_task(store, "st_trigger_huge", session_mode="continue", trigger_config=too_large)
+    assert raised.value.code == ErrorCode.INVALID_INPUT
+    assert store.get(_uid("st_trigger_huge")) is None
+    with pytest.raises(OmnigentError, match="too large to store"):
+        store.update(task.id, trigger_config=too_large)
+    saved = store.get(task.id)
+    assert saved is not None and saved.trigger_config == _TRIGGER
+
+
+@pytest.mark.parametrize(
+    "newer",
+    [
+        {"trigger_config": {**_TRIGGER, "channels": ["bugs"]}},
+        {"model_override": "model-b"},
+        {"reasoning_effort": "high"},
+        {"permission_mode": "acceptEdits"},
+        {"prompt": "watch #bugs"},
+    ],
+    ids=["config", "model", "effort", "permission", "prompt"],
+)
+def test_a_stale_snapshot_cannot_overwrite_a_newer_trigger_prompt(
+    store: SqlAlchemyScheduledTaskStore, newer: dict[str, Any]
+) -> None:
+    """Each input a trigger's prompt is compiled from conflicts on its own."""
+    snapshot = _session_task(
+        store, "st_stale_trigger", session_mode="continue", trigger_config=_TRIGGER
+    )
+    applied = store.update(snapshot.id, expected_schedule=snapshot, **newer)
+    assert applied is not None
+
+    with pytest.raises(OmnigentError, match="Reload and try again") as raised:
+        store.update(snapshot.id, expected_schedule=snapshot, name="renamed")
+
+    assert raised.value.code == ErrorCode.CONFLICT
+    saved = store.get(snapshot.id)
+    assert saved is not None and saved.name == snapshot.name
+    assert {field: getattr(saved, field) for field in newer} == newer
 
 
 def test_update_guard_sees_the_locked_task_and_a_refusal_saves_nothing(

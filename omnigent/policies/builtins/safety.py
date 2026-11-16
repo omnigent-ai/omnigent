@@ -424,6 +424,8 @@ _PREVIEW_VALUE_CHARS = 60
 _PREVIEW_EXTRA_CHARS = 200
 
 _SCHEDULED_TASK_REVIEW_FIELDS = frozenset({"prompt", "permission_mode"})
+# A trigger's config is what its prompt is compiled from, so it is reviewed instead.
+_TRIGGER_REVIEW_FIELDS = frozenset({"trigger_config", "permission_mode"})
 _PERMISSION_MODE_VALUES = f"a mode name, or {AGENT_DEFAULT_PERMISSION_MODE_HINT}"
 
 
@@ -465,15 +467,20 @@ def scheduled_task_review_error(
     args: dict[str, object], *, action: str, require_complete: bool = True
 ) -> str | None:
     """Validate review values, allowing omitted fields only for legacy callers."""
-    missing = sorted(_SCHEDULED_TASK_REVIEW_FIELDS.difference(args))
+    reviewed = "trigger_config" if "trigger_config" in args else "prompt"
+    missing = sorted(_review_fields(args).difference(args))
     if require_complete and missing:
         hint = (
-            "List the task and retry with its full prompt and permission_mode."
+            f"List the task and retry with its full {reviewed} and permission_mode."
             if action == "update"
-            else f"Retry with prompt and permission_mode: {_PERMISSION_MODE_VALUES}."
+            else f"Retry with {reviewed} and permission_mode: {_PERMISSION_MODE_VALUES}."
         )
         return f"Missing review fields ({', '.join(missing)}). {hint}"
-    if "prompt" in args or action == "create":
+    if "trigger_config" in args:
+        instructions = _trigger_instructions(args["trigger_config"])
+        if not isinstance(instructions, str) or not instructions.strip():
+            return "The trigger's instructions must be a non-empty string."
+    elif "prompt" in args or action == "create":
         prompt = args.get("prompt")
         if not isinstance(prompt, str) or not prompt.strip():
             return "The automation prompt must be a non-empty string."
@@ -486,6 +493,16 @@ def scheduled_task_review_error(
     if action == "update" and not args.get("scheduled_task_id"):
         return "Provide the scheduled_task_id of the automation to update."
     return None
+
+
+def _review_fields(args: dict[str, object]) -> frozenset[str]:
+    """The arguments a user must see to approve this call."""
+    return _TRIGGER_REVIEW_FIELDS if "trigger_config" in args else _SCHEDULED_TASK_REVIEW_FIELDS
+
+
+def _trigger_instructions(trigger: object) -> object:
+    """What each session a trigger starts is told to do, if the config names it."""
+    return trigger.get("instructions") if isinstance(trigger, dict) else None
 
 
 def _scheduled_task_review(args: dict[str, object], *, action: str, subject: str) -> str:
@@ -502,7 +519,7 @@ def _scheduled_task_review(args: dict[str, object], *, action: str, subject: str
     ):
         permission_mode += " (skips approval prompts, so unattended runs act without asking)"
     legacy_notice = ""
-    if action == "update" and _SCHEDULED_TASK_REVIEW_FIELDS.difference(args):
+    if action == "update" and _review_fields(args).difference(args):
         legacy_notice = (
             "Legacy partial update: some review values were not supplied. "
             "Inspect the existing automation before approving.\n"
@@ -517,14 +534,29 @@ def _scheduled_task_review(args: dict[str, object], *, action: str, subject: str
             )
     if args.get("session_mode") == "continue":
         permission_mode += "; a continued session keeps its own permission mode"
-    settings = _scheduled_task_settings(args, skip="prompt")
+    instructions = f"Full automation instructions:\n{prompt}\n"
+    if "trigger_config" in args:
+        trigger = args["trigger_config"]
+        watch = (
+            {key: value for key, value in trigger.items() if key != "instructions"}
+            if isinstance(trigger, dict)
+            else trigger
+        )
+        # One escaped JSON line, so no value can pass for another line of the prompt.
+        instructions = (
+            f"Trigger: {_json.dumps(watch, ensure_ascii=True, sort_keys=True)}\n"
+            "Instructions for the session it starts for each matching message:\n"
+            f"{_trigger_instructions(trigger)}\n"
+        )
+    settings = _scheduled_task_settings(
+        {key: value for key, value in args.items() if key != "trigger_config"}, skip="prompt"
+    )
     return (
         f"Agent wants to {action} {subject}.\n"
         f"{legacy_notice}"
         f"Task permission setting: {permission_mode}\n"
         f"Settings: {settings or '(none)'}\n"
-        "Full automation instructions:\n"
-        f"{prompt}\n"
+        f"{instructions}"
         "Approve?"
     )
 
