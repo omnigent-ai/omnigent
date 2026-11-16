@@ -345,6 +345,8 @@ def test_prompt_tells_polly_when_the_run_stops(prompt_workspace: Path) -> None:
     assert result.returncode == 0, result.stdout + result.stderr
     prompt = " ".join(prompt_file.read_text().split())
     assert f"this run is stopped at {time.strftime('%H:%M', time.gmtime(stop))} UTC" in prompt
+    # A timer set later than planned still has the cutoff to go by.
+    assert f"so it fires at {time.strftime('%H:%M', time.gmtime(stop - 7 * 60))} UTC" in prompt
     # The timer leaves seven minutes to write the review.
     seconds = int(re.search(r"`sys_timer_set` once, with `seconds` (\d+)", prompt)[1])
     assert 18 * 60 - 10 <= seconds <= 18 * 60

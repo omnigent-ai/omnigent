@@ -581,15 +581,17 @@ jobs:
           if os.environ.get("POLLY_REVIEW_DEADLINE"):
               stop = int(os.environ["POLLY_REVIEW_DEADLINE"])
               stop_clock = time.strftime("%H:%M", time.gmtime(stop))
+              publish_clock = time.strftime("%H:%M", time.gmtime(stop - 7 * 60))
               timer_seconds = max(stop - 7 * 60 - int(time.time()), 0)
               time_budget_rule = f"""
           **Time budget** — this run is stopped at {stop_clock} UTC, and a review
           that isn't finished by then is never posted. Before you dispatch anything,
           call `sys_timer_set` once, with `seconds` {timer_seconds} and `note` "time
-          budget: publish now". When it fires, dispatch nothing more and stop waiting: cancel
-          each sub-agent still running with `sys_cancel_task`, then write your review
-          from the reports you have, and say under Non-blocking notes which areas
-          weren't reviewed.
+          budget: publish now", so it fires at {publish_clock} UTC. When it fires, or
+          once it is past {publish_clock} UTC, dispatch nothing more and stop waiting:
+          cancel each sub-agent still running with `sys_cancel_task`, then write your
+          review from the reports you have, and say under Non-blocking notes which
+          areas weren't reviewed.
           """
 
           prompt = f"""Review this pull request and provide structured feedback.
