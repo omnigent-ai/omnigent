@@ -1,10 +1,7 @@
 name: web Tests
 
-# Runs Vitest and the format check for the web frontend on every non-draft PR
-# that touches web/** and on push to main. Pull requests shard `vitest run`
-# and skip coverage. Pushes to main run `vitest run --coverage` once and
-# publish the UI coverage artifact. Draft PRs are skipped; `ready_for_review`
-# refires when the draft is converted.
+# Web frontend tests: PRs run sharded Vitest without coverage; pushes to main
+# run coverage once and publish the UI coverage artifact.
 
 on:
   pull_request:
