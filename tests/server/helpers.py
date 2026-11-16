@@ -822,6 +822,7 @@ def build_agent_bundle(
     guardrails: dict[str, Any] | None = None,
     terminals: dict[str, Any] | None = None,
     include_llm: bool = True,
+    tool_groups: dict[str, bool] | None = None,
     os_env: dict[str, Any] | None = None,
 ) -> bytes:
     """
@@ -862,6 +863,8 @@ def build_agent_bundle(
     :param os_env: Optional explicit OS environment for the root agent.
     :param include_llm: Whether to include the default ``llm:`` block.
         Set ``False`` for model-less harness tests.
+    :param tool_groups: Optional ``tool_groups:`` block written verbatim,
+        e.g. ``{"user_inbox": True}``. ``None`` omits it.
     :returns: A gzipped tar archive containing the generated
         ``config.yaml`` plus optional sub-agent and skill files.
     """
@@ -887,6 +890,8 @@ def build_agent_bundle(
         config["os_env"] = os_env
     if terminals is not None:
         config["terminals"] = terminals
+    if tool_groups is not None:
+        config["tool_groups"] = tool_groups
     if executor is not None:
         config["executor"] = dict(executor)
         config["executor"].setdefault("config", {}).setdefault("harness", "claude-sdk")

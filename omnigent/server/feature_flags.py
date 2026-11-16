@@ -53,6 +53,7 @@ class Feature(StrEnum):
     PROJECT_REPOSITORY_CREATION = "project_repository_creation"
     WORKSPACE_DIRECT_ACCESS = "workspace_direct_access"
     WORKSPACE_API_SERVER_ACCESS = "workspace_api_server_access"
+    PROACTIVE_AGENT = "proactive_agent"
 
 
 @dataclass(frozen=True)
@@ -270,6 +271,15 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         owner="server",
         review_by_release="0.27.0",
         frontend_visible=True,
+    ),
+    FeatureDefinition(
+        feature=Feature.PROACTIVE_AGENT,
+        description="Agent-posted Inbox suggestions and the proactive agent that writes them",
+        owner="server",
+        review_by_release="0.25.0",
+        # Clients probe proactive_agent_available in GET /v1/info; the settings
+        # decide whether it is enabled.
+        frontend_visible=False,
     ),
 )
 

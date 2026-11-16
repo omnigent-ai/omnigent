@@ -49,6 +49,8 @@ from omnigent.tools.builtins import (
     SysSessionUpdateTool,
     SysTimerCancelTool,
     SysTimerSetTool,
+    SysUserInboxListTool,
+    SysUserInboxPostTool,
     UpdateCommentTool,
     any_skill_has_resources,
     get_builtin_tool,
@@ -197,6 +199,7 @@ class ToolManager:
         self._register_policy_tools()
         self._register_scheduled_task_tools()
         self._register_journal_tools()
+        self._register_user_inbox_tools()
         self._register_browser_tools()
 
     def _register_policy_tools(self) -> None:
@@ -251,6 +254,13 @@ class ToolManager:
 
         for tool_class in JOURNAL_TOOLS:
             self._tools[tool_class.name()] = tool_class()
+
+    def _register_user_inbox_tools(self) -> None:
+        """Register the owner-Inbox tools for agents that opt in."""
+        if not self._spec.tool_groups.user_inbox:
+            return
+        for tool in (SysUserInboxPostTool(), SysUserInboxListTool()):
+            self._tools[tool.name()] = tool
 
     def _register_async_inbox_tools(self) -> None:
         """

@@ -398,3 +398,13 @@ def encode_journal_entry_kind(name: str) -> int:
 def decode_journal_entry_kind(code: int) -> str:
     """Decode a ``session_journal_entries.kind`` int code to its name."""
     return _decode(JOURNAL_ENTRY_KIND, code, field="session_journal_entries.kind")
+
+
+def encode_inbox_item_status(name: str) -> int:
+    """Encode an ``inbox_items.status`` name to its int code."""
+    return _encode(INBOX_ITEM_STATUS, name, field="inbox_items.status")
+
+
+def decode_inbox_item_status(code: int) -> str:
+    """Decode an ``inbox_items.status`` int code to its name."""
+    return _decode(INBOX_ITEM_STATUS, code, field="inbox_items.status")
