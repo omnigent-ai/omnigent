@@ -81,8 +81,9 @@ function isSeparator(value: string): boolean {
   return value === "/" || value === "\\";
 }
 
-function isWordBoundary(value: string): boolean {
-  return isSeparator(value) || value === "_" || value === "-" || value === "." || value === " ";
+/** True when `index` starts a word: the first character, or one after a non-word character. */
+function startsWord(target: FoldedText, index: number): boolean {
+  return index === 0 || !target.characters[index - 1].isWord;
 }
 
 function sourceRange(target: FoldedText, first: number, last: number): MatchRange {
@@ -127,7 +128,7 @@ function bestSubstring(
   const values = target.values;
   let first = -1;
   for (let start = contiguousStart(query, values); start !== -1;) {
-    if (start === 0 || !target.characters[start - 1].isWord) return { start, atWordStart: true };
+    if (startsWord(target, start)) return { start, atWordStart: true };
     if (first === -1) first = start;
     start = contiguousStart(query, values, start + 1);
   }
@@ -143,19 +144,20 @@ interface SubsequenceMatch {
 // word boundaries cost more, so compact and initial-letter matches win.
 function scanToEnd(
   query: readonly string[],
-  target: readonly string[],
+  target: FoldedText,
   startIndex: number,
   endIndex: number,
 ): SubsequenceMatch | null {
+  const values = target.values;
   let score = 1;
   const offsets = [startIndex];
   let lastIndex = startIndex;
   let lastSequential = false;
-  if (startIndex > 0 && !isWordBoundary(target[startIndex - 1])) score += 2;
+  if (!startsWord(target, startIndex)) score += 2;
   for (let queryIndex = 1; queryIndex < query.length; queryIndex++) {
     let index = -1;
     for (let candidate = lastIndex + 1; candidate < endIndex; candidate++) {
-      if (target[candidate] === query[queryIndex]) {
+      if (values[candidate] === query[queryIndex]) {
         index = candidate;
         break;
       }
@@ -167,7 +169,7 @@ function scanToEnd(
         score += 1;
       }
     } else {
-      if (!isWordBoundary(target[index - 1])) score += 2;
+      if (!startsWord(target, index)) score += 2;
       lastSequential = false;
       score += index - lastIndex;
     }
@@ -181,13 +183,13 @@ function scanToEnd(
 // scattered match does not hide a compact later one.
 function scanFromEachStart(
   query: readonly string[],
-  target: readonly string[],
+  target: FoldedText,
   from: number,
   to: number,
 ): SubsequenceMatch | null {
   const starts: number[] = [];
   for (let index = from; index < to; index++) {
-    if (target[index] === query[0]) starts.push(index);
+    if (target.values[index] === query[0]) starts.push(index);
   }
   if (starts.length === 0) return null;
   const limit = Math.min(starts.length, MAX_FUZZY_STARTS);
@@ -202,21 +204,19 @@ function scanFromEachStart(
 }
 
 // Path-like targets prefer matches inside the last path component.
-function subsequenceMatch(
-  query: readonly string[],
-  target: readonly string[],
-): SubsequenceMatch | null {
+function subsequenceMatch(query: readonly string[], target: FoldedText): SubsequenceMatch | null {
+  const values = target.values;
   let filenameStart = 0;
-  for (let index = target.length - 1; index >= 0; index--) {
-    if (isSeparator(target[index])) {
+  for (let index = values.length - 1; index >= 0; index--) {
+    if (isSeparator(values[index])) {
       filenameStart = index + 1;
       break;
     }
   }
-  if (filenameStart < target.length) {
-    const match = scanFromEachStart(query, target, filenameStart, target.length);
+  if (filenameStart < values.length) {
+    const match = scanFromEachStart(query, target, filenameStart, values.length);
     if (match) {
-      const filenameLength = target.length - filenameStart;
+      const filenameLength = values.length - filenameStart;
       const score =
         query.length === filenameLength
           ? match.score / 4
@@ -225,7 +225,7 @@ function subsequenceMatch(
     }
   }
   if (filenameStart === 0) return null;
-  const match = scanFromEachStart(query, target, 0, target.length);
+  const match = scanFromEachStart(query, target, 0, values.length);
   return match ? { score: match.score * 10, offsets: match.offsets } : null;
 }
 
@@ -260,7 +260,7 @@ export function matchField(
     };
   }
   if (matching === "contiguous") return null;
-  const match = subsequenceMatch(query, values);
+  const match = subsequenceMatch(query, target);
   if (!match) return null;
   return {
     matchClass: MatchClass.subsequence,
