@@ -6,6 +6,8 @@ covered in ``test_claimed_fire.py`` and ``test_fire.py``.
 
 from __future__ import annotations
 
+import asyncio
+import threading
 import uuid
 from dataclasses import replace
 from types import SimpleNamespace
@@ -232,12 +234,14 @@ async def test_a_sync_keeps_a_grant_the_database_matches_to_a_grantee(
     }
 
 
+@pytest.mark.parametrize("upgraded", [False, True], ids=["unchanged", "upgraded"])
 @pytest.mark.parametrize("fault", ["revoked", "recheck_failed"])
 async def test_a_share_is_taken_back_unless_the_grant_outlasts_its_write(
-    permissions, task, announced, monkeypatch, fault
+    permissions, task, announced, monkeypatch, fault, upgraded
 ) -> None:
     """A revoke that lands between the run's check and its write, after which the
-    revoke's own sync finds nothing to remove, must not leave Alice on the session."""
+    revoke's own sync finds nothing to remove, must not leave Alice on the session.
+    Taking the share back never removes an upgrade made by hand since the write."""
     session = _session(permissions, **{RESERVED_USER_LOCAL: LEVEL_OWNER})
     grant_if_absent = permissions.grant_if_absent
     resolve = permissions.resolve_scheduled_task_access
@@ -250,7 +254,11 @@ async def test_a_share_is_taken_back_unless_the_grant_outlasts_its_write(
                 permissions.revoke_for_scheduled_task(user_id, task.id)
             else:
                 fail_next_check = True
-        return grant_if_absent(user_id, conversation_id, level)
+        written = grant_if_absent(user_id, conversation_id, level)
+        if upgraded and user_id == "alice@example.com":
+            # The owner upgrades Alice by hand before the run rechecks her grant.
+            permissions.grant(user_id, conversation_id, LEVEL_EDIT)
+        return written
 
     def check(principals: list[str], scheduled_task_id: str) -> Any:
         nonlocal fail_next_check
@@ -263,11 +271,52 @@ async def test_a_share_is_taken_back_unless_the_grant_outlasts_its_write(
     monkeypatch.setattr(permissions, "resolve_scheduled_task_access", check)
     await _sync(permissions, task, session)
 
+    upgrade = {"alice@example.com": LEVEL_EDIT} if upgraded else {}
     assert _levels(permissions, session.id) == {
         RESERVED_USER_LOCAL: LEVEL_OWNER,
         "bob@example.com": LEVEL_READ,
+        **upgrade,
     }
     assert announced == [("bob@example.com", session.id)]
+
+
+async def test_a_cancelled_share_still_takes_back_a_grant_revoked_during_its_write(
+    permissions, task, announced, monkeypatch
+) -> None:
+    session = _session(permissions)
+    grant_if_absent = permissions.grant_if_absent
+    revoke_if_level = permissions.revoke_if_level
+    writing, release = threading.Event(), threading.Event()
+    taken_back: list[bool] = []
+
+    def held_write(user_id: str, conversation_id: str, level: int) -> bool:
+        writing.set()
+        assert release.wait(10)
+        return grant_if_absent(user_id, conversation_id, level)
+
+    def take_back(user_id: str, conversation_id: str, level: int) -> bool:
+        taken_back.append(revoke_if_level(user_id, conversation_id, level))
+        return taken_back[-1]
+
+    monkeypatch.setattr(permissions, "grant_if_absent", held_write)
+    monkeypatch.setattr(permissions, "revoke_if_level", take_back)
+    sharing = asyncio.create_task(
+        share_new_run_session(
+            task, session, permission_store=permissions, app_state=None, host_registry=None
+        )
+    )
+    assert await asyncio.to_thread(writing.wait, 10)
+    # Alice's grant is revoked while her share is being written, and the run is cancelled.
+    permissions.revoke_for_scheduled_task("alice@example.com", task.id)
+    sharing.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await sharing
+
+    # The cancel propagated only once the written share had been taken back.
+    assert taken_back == [True]
+    assert _levels(permissions, session.id) == {}
+    assert announced == []
 
 
 async def test_a_failed_grantee_check_keeps_the_share(permissions, task, monkeypatch) -> None:

@@ -19,6 +19,7 @@ a failure is logged so it never changes a run's outcome.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from enum import Enum
 from typing import Any
@@ -103,8 +104,12 @@ async def _apply_task_grants(
         for grant in existing:
             if grant.level == LEVEL_OWNER or grant.user_id in kept:
                 continue
-            if await _held_under_the_stores_comparison(
-                permission_store, task, grant.user_id, if_unknown=True
+            if await asyncio.to_thread(
+                _held_under_the_stores_comparison,
+                permission_store,
+                task,
+                grant.user_id,
+                if_unknown=True,
             ):
                 continue
             try:
@@ -134,21 +139,11 @@ async def _apply_task_grants(
         )
         return
     for grant in missing:
-        try:
-            written = await _share_with_grantee(permission_store, task, session, grant.user_id)
-        except Exception:
-            _logger.exception(
-                "automation %s: could not share session %s with %r",
-                task.id,
-                session.id,
-                grant.user_id,
-            )
-            continue
-        if written:
+        if await _share_with_grantee(permission_store, task, session, grant.user_id):
             _announce_session_added(grant.user_id, session.id)
 
 
-async def _held_under_the_stores_comparison(
+def _held_under_the_stores_comparison(
     permission_store: PermissionStore, task: ScheduledTask, user_id: str, *, if_unknown: bool
 ) -> bool:
     """Whether the automation's share table matches *user_id* to one of its grantees.
@@ -160,9 +155,7 @@ async def _held_under_the_stores_comparison(
         a failed check never revokes a share.
     """
     try:
-        held = await asyncio.to_thread(
-            permission_store.resolve_scheduled_task_access, [user_id], task.id
-        )
+        held = permission_store.resolve_scheduled_task_access([user_id], task.id)
     except Exception:
         _logger.exception(
             "automation %s: could not check %r against its grants; treating them as %s",
@@ -177,44 +170,69 @@ async def _held_under_the_stores_comparison(
 async def _share_with_grantee(
     permission_store: PermissionStore, task: ScheduledTask, session: Conversation, grantee: str
 ) -> bool:
+    """Run :func:`_share_and_confirm` in a thread, which a cancelled run waits for.
+
+    The thread can commit the share after a cancel, so cancellation propagates only
+    once the share has been rechecked and, if need be, taken back.
+
+    :returns: Whether a grant was written and kept.
+    :raises asyncio.CancelledError: When cancelled, once the thread has finished.
+    """
+    sharing = asyncio.ensure_future(
+        asyncio.to_thread(_share_and_confirm, permission_store, task, session, grantee)
+    )
+    try:
+        return await asyncio.shield(sharing)
+    except asyncio.CancelledError:
+        while not sharing.done():
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.wait([sharing])
+        raise
+
+
+def _share_and_confirm(
+    permission_store: PermissionStore, task: ScheduledTask, session: Conversation, grantee: str
+) -> bool:
     """Grant *grantee* Read on *session* if they still hold the automation's grant.
 
     Pins the grantee's account as the session share route does, so an account deleted
     and registered again since the list was read is refused, not granted. The grant is
-    checked again after the write, and the share is taken back if it was revoked.
+    checked again after the write, and the share is taken back if it was revoked. Never
+    raises: a failure is logged.
 
     :returns: Whether a grant was written and kept.
     """
-    account = await asyncio.to_thread(permission_store.get_user, grantee)
-    with target_account_scope(grantee, account.account_generation if account else None):
-        # Checked after the pin: a replaced account no longer holds the grant.
-        held = await asyncio.to_thread(
-            permission_store.resolve_scheduled_task_access, [grantee], task.id
+    try:
+        account = permission_store.get_user(grantee)
+        with target_account_scope(grantee, account.account_generation if account else None):
+            # Checked after the pin: a replaced account no longer holds the grant.
+            if permission_store.resolve_scheduled_task_access([grantee], task.id) is None:
+                return False
+            permission_store.ensure_user(grantee)
+            # Automations grant Read only (SCHEDULED_TASK_GRANT_LEVELS). A share made
+            # since the session's grants were read is kept, never lowered.
+            written = permission_store.grant_if_absent(grantee, session.id, LEVEL_READ)
+    except Exception:
+        _logger.exception(
+            "automation %s: could not share session %s with %r", task.id, session.id, grantee
         )
-        if held is None:
-            return False
-        await asyncio.to_thread(permission_store.ensure_user, grantee)
-        # Automations grant Read only (SCHEDULED_TASK_GRANT_LEVELS). A share made since
-        # the session's grants were read is kept, never lowered.
-        written = await asyncio.to_thread(
-            permission_store.grant_if_absent, grantee, session.id, LEVEL_READ
-        )
-        if not written or await _held_under_the_stores_comparison(
-            permission_store, task, grantee, if_unknown=False
-        ):
-            return written
-        # Revoked since the check, perhaps after the revoke's own sync ran, or the
-        # recheck failed: take the share back rather than leave it unmanaged.
-        try:
-            await asyncio.to_thread(permission_store.revoke, grantee, session.id)
-        except Exception:
-            _logger.exception(
-                "automation %s: could not take back %r's share of session %s",
-                task.id,
-                grantee,
-                session.id,
-            )
         return False
+    if not written or _held_under_the_stores_comparison(
+        permission_store, task, grantee, if_unknown=False
+    ):
+        return written
+    # Revoked since the check, perhaps after the revoke's own sync ran, or the recheck
+    # failed: take the share back, unless it was changed since, e.g. upgraded by hand.
+    try:
+        permission_store.revoke_if_level(grantee, session.id, LEVEL_READ)
+    except Exception:
+        _logger.exception(
+            "automation %s: could not take back %r's share of session %s",
+            task.id,
+            grantee,
+            session.id,
+        )
+    return False
 
 
 async def _share_best_effort(
