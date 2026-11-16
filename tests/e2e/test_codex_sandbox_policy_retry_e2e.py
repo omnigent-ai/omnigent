@@ -39,9 +39,11 @@ def observe_spawn(event, arguments):
         return
     executable, argv, cwd, env = arguments
     if "omnigent.inner.codex_harness" in argv:
-        assert env["HARNESS_CODEX_GATEWAY_AUTH_COMMAND"] == "printf %s mock-key"
         with Path(os.environ["SANDBOX_RETRY_SPAWNS"]).open("a") as output:
-            output.write(json.dumps(json.loads(env["HARNESS_CODEX_OS_ENV"])) + "\\n")
+            output.write(json.dumps({
+                "os_env": json.loads(env["HARNESS_CODEX_OS_ENV"]),
+                "gateway_auth_command": env.get("HARNESS_CODEX_GATEWAY_AUTH_COMMAND"),
+            }) + "\\n")
 
 sys.addaudithook(observe_spawn)
 from omnigent.runner._entry import main
@@ -153,22 +155,29 @@ def test_codex_rejects_fork_then_retries_with_sandbox_in_same_session(
             f"if (echo forbidden > {shlex.quote(str(forbidden))}) 2>/dev/null; "
             "then echo WORKSPACE_WRITE_ALLOWED; else echo WORKSPACE_WRITE_DENIED; fi"
         )
-        configure_mock_llm(
-            mock_url,
-            [
-                {
-                    "tool_calls": [
-                        {
-                            "call_id": "sandbox_probe",
-                            "name": "exec_command",
-                            "arguments": json.dumps({"cmd": command, "max_output_tokens": 1000}),
-                        }
-                    ]
-                },
-                {"text": _MARKER, "stream": True},
-            ],
-            key=_MODEL,
-        )
+        # Codex versions expose either the legacy shell or unified exec tool.
+        for tool_name, arguments in (
+            ("shell_command", {"command": command}),
+            ("exec_command", {"cmd": command, "max_output_tokens": 1000}),
+        ):
+            configure_mock_llm(
+                mock_url,
+                [
+                    {
+                        "tool_calls": [
+                            {
+                                "call_id": "sandbox_probe",
+                                "name": tool_name,
+                                "arguments": json.dumps(arguments),
+                            }
+                        ]
+                    },
+                    {"text": _MARKER, "stream": True},
+                ],
+                key=f"sandbox-probe-{tool_name}",
+                match="Complete the corrected policy retry.",
+                required_tools=[tool_name],
+            )
         stack.start_runner(
             bootstrap=_RUNNER_BOOTSTRAP,
             env={**runtime_env, "SANDBOX_RETRY_SPAWNS": str(spawn_ledger)},
@@ -246,8 +255,9 @@ def test_codex_rejects_fork_then_retries_with_sandbox_in_same_session(
         launches = [json.loads(line) for line in spawn_ledger.read_text().splitlines()]
         assert launches, "recovery must launch the real Codex harness"
         for launch in launches:
-            assert launch["fork"] is False
-            sandbox = launch["sandbox"]
+            assert launch["gateway_auth_command"] == "printf %s mock-key"
+            assert launch["os_env"]["fork"] is False
+            sandbox = launch["os_env"]["sandbox"]
             assert sandbox["type"] == backend
             assert sandbox["allow_network"] is True
             assert sandbox["read_paths"] == ["."]
