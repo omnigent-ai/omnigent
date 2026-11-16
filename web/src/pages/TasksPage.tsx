@@ -4,7 +4,8 @@
  * and tabs for existing automations and reusable templates.
  *
  * Data comes from `useScheduledTasks`. Pause/resume and delete go through the
- * update/delete mutations, which invalidate the list.
+ * update/delete mutations, which invalidate the list. Share opens the shared
+ * permissions dialog for an automation the viewer owns.
  * The human-readable schedule and next-run text are computed client-side from
  * each task's stored RRULE (`scheduleText`) — there is no backend next-run
  * endpoint.
@@ -20,6 +21,7 @@ import {
   TriangleAlertIcon,
 } from "lucide-react";
 import { PageScroll } from "@/components/PageScroll";
+import { PermissionsModal } from "@/components/PermissionsModal";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -41,6 +43,8 @@ import {
   useUpdateScheduledTask,
 } from "@/hooks/useScheduledTasks";
 import { useNow } from "@/hooks/useNow";
+import { useViewerId } from "@/hooks/useViewerId";
+import { canShareAutomation } from "@/lib/permissionsApi";
 import { ScheduledTaskApiError, type ScheduledTask } from "@/lib/scheduledTasksApi";
 import { nextRunAtMs } from "@/lib/scheduleText";
 import { cn } from "@/lib/utils";
@@ -73,6 +77,10 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
   const [filter, setFilter] = useState<FilterTab>("all");
   const [manualOpen, setManualOpen] = useState(false);
   const [editingTask, setEditingTask] = useState<ScheduledTask | null>(null);
+  // Kept after closing so the dialog can animate out.
+  const [sharingTask, setSharingTask] = useState<ScheduledTask | null>(null);
+  const [shareOpen, setShareOpen] = useState(false);
+  const viewerId = useViewerId();
   const [templateId, setTemplateId] = useState<string | null>(null);
   const selectedTemplate = AUTOMATION_TEMPLATES.find((template) => template.id === templateId);
   const navigate = useNavigate();
@@ -220,6 +228,11 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
     setTemplateId(null);
     setEditingTask(task);
     setManualOpen(true);
+  }
+
+  function handleShare(task: ScheduledTask) {
+    setSharingTask(task);
+    setShareOpen(true);
   }
 
   const hasAnyTasks = (tasks ?? []).length > 0;
@@ -400,6 +413,9 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
                   onPauseToggle={handlePauseToggle}
                   onRunNow={handleRunNow}
                   onDelete={handleDelete}
+                  onShare={
+                    canShareAutomation(info, viewerId, task.ownerUserId) ? handleShare : undefined
+                  }
                 />
               ))}
             </div>
@@ -418,6 +434,14 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
       </Tabs>
 
       {createDialog}
+      {sharingTask && (
+        <PermissionsModal
+          key={sharingTask.id}
+          automation={sharingTask}
+          open={shareOpen}
+          onOpenChange={setShareOpen}
+        />
+      )}
     </PageScroll>
   );
 }

@@ -77,6 +77,12 @@ vi.mock("@/components/scheduled/CreateScheduledTaskDialog", () => ({
     ) : null,
 }));
 
+// Stub the share dialog to a marker naming the automation it shares.
+vi.mock("@/components/PermissionsModal", () => ({
+  PermissionsModal: ({ automation, open }: { automation?: { id: string }; open: boolean }) =>
+    open ? <div data-testid="share-dialog-open" data-automation-id={automation?.id ?? ""} /> : null,
+}));
+
 function task(overrides: Partial<ScheduledTask> = {}): ScheduledTask {
   return {
     id: "st_1",
@@ -747,6 +753,37 @@ describe("row actions", () => {
     fireEvent.pointerDown(screen.getByTestId("task-row-menu"), { button: 0 });
     fireEvent.click(screen.getByTestId("task-delete"));
     expect(deleteMutate).toHaveBeenCalledWith("st_1");
+  });
+});
+
+describe("sharing from the row menu", () => {
+  const SHARING_INFO = { ...TRIGGER_INFO, scheduled_task_sharing: true };
+
+  function openRowMenu(viewerId: string, info: typeof SERVER_INFO_OFFLINE_FALLBACK) {
+    vi.mocked(useViewerId).mockReturnValue(viewerId);
+    setTasks([task({ id: "st_share", ownerUserId: "alice@example.com" })]);
+    renderPage("/tasks", "", info);
+    // A known viewer gets the first-visit guide; dismiss it.
+    fireEvent.click(screen.getByRole("button", { name: "Maybe later" }));
+    fireEvent.pointerDown(screen.getByTestId("task-row-menu"), { button: 0 });
+  }
+
+  it("opens the share dialog for an automation the viewer owns", () => {
+    openRowMenu("alice@example.com", SHARING_INFO);
+    fireEvent.click(screen.getByTestId("task-share"));
+    expect(screen.getByTestId("share-dialog-open")).toHaveAttribute(
+      "data-automation-id",
+      "st_share",
+    );
+  });
+
+  it.each([
+    ["another user", "bob@example.com", SHARING_INFO],
+    ["a server that cannot share automations", "alice@example.com", TRIGGER_INFO],
+  ])("offers no Share to %s", (_label, viewerId, info) => {
+    openRowMenu(viewerId, info);
+    expect(screen.getByTestId("task-edit")).toBeInTheDocument();
+    expect(screen.queryByTestId("task-share")).toBeNull();
   });
 });
 

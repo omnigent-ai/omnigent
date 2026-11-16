@@ -12,8 +12,8 @@
 // client-recomputed instant can't match the server anchor for INTERVAL>1 rules)
 // is not violated. Paused rows are NOT dimmed — the title stays fully legible
 // and the pill is the sole paused signal. A hover-revealed ellipsis (⋯) action
-// menu (Run now / Pause / Resume / Edit / Delete) sits on the right; right-clicking
-// the card opens the same actions as a context menu.
+// menu (Run now / Share / Pause / Resume / Edit / Delete) sits on the right;
+// right-clicking the card opens the same actions as a context menu.
 
 import { useId, useMemo, useState, type ComponentType, type ReactNode } from "react";
 import {
@@ -22,6 +22,7 @@ import {
   PauseIcon,
   PencilIcon,
   PlayIcon,
+  ShareIcon,
   Trash2Icon,
   TriangleAlertIcon,
 } from "lucide-react";
@@ -54,6 +55,7 @@ export function ScheduledTaskRow({
   onPauseToggle,
   onRunNow,
   onDelete,
+  onShare,
   busy,
 }: {
   task: ScheduledTask;
@@ -66,6 +68,8 @@ export function ScheduledTaskRow({
   onPauseToggle: (task: ScheduledTask) => void;
   onRunNow: (task: ScheduledTask) => void;
   onDelete: (task: ScheduledTask) => void;
+  /** Offers Share when set: the viewer owns the task and the server can share automations. */
+  onShare?: (task: ScheduledTask) => void;
   busy: boolean;
 }) {
   const navigate = useNavigate();
@@ -132,7 +136,16 @@ export function ScheduledTaskRow({
     </>
   );
 
-  const menuItemProps = { task, paused, triggerMode, onEdit, onPauseToggle, onRunNow, onDelete };
+  const menuItemProps = {
+    task,
+    paused,
+    triggerMode,
+    onEdit,
+    onPauseToggle,
+    onRunNow,
+    onDelete,
+    onShare,
+  };
 
   const card = (
     <div
@@ -244,6 +257,7 @@ function TaskMenuItems({
   onPauseToggle,
   onRunNow,
   onDelete,
+  onShare,
 }: {
   Item: ComponentType<TaskMenuItemProps>;
   task: ScheduledTask;
@@ -253,6 +267,7 @@ function TaskMenuItems({
   onPauseToggle: (task: ScheduledTask) => void;
   onRunNow: (task: ScheduledTask) => void;
   onDelete: (task: ScheduledTask) => void;
+  onShare?: (task: ScheduledTask) => void;
 }) {
   const { trackClick } = useOmnigentAnalytics();
   return (
@@ -279,6 +294,18 @@ function TaskMenuItems({
         <PencilIcon className="size-4" />
         Edit
       </Item>
+      {onShare && (
+        <Item
+          onSelect={() => {
+            trackClick("tasks.scheduled.share", "button");
+            onShare(task);
+          }}
+          data-testid="task-share"
+        >
+          <ShareIcon className="size-4" />
+          Share
+        </Item>
+      )}
       <Item
         onSelect={() => {
           trackClick("tasks.scheduled.pause_resume", "button");

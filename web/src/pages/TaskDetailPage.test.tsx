@@ -1,6 +1,7 @@
 // Tests for the scheduled-task DETAIL page (`/tasks/:taskId`): header + prompt
 // + configuration + run-history rendering from mocked hooks, the header actions
-// (Run now fires the mutation + shows a toast, delete navigates back, edit opens the dialog),
+// (Run now fires the mutation + shows a toast, delete navigates back, edit and
+// share open their dialogs),
 // and the run-row rendering rules: the LEFT status-icon column (failed triangle
 // > skipped calendar-off > running spinner > succeeded-unread brand-accent dot > succeeded-read grey dot),
 // duration, errorCode messages, and the whole-row click affordance (a run with a
@@ -33,6 +34,9 @@ import {
 } from "@/hooks/useUnseenConversations";
 import type * as UnseenModule from "@/hooks/useUnseenConversations";
 import { ScheduledTaskApiError } from "@/lib/scheduledTasksApi";
+import type { ServerInfo } from "@/lib/capabilities";
+import { useViewerId } from "@/hooks/useViewerId";
+import type { SharedAutomation } from "@/components/PermissionsModal";
 import type * as RoutingModule from "@/lib/routing";
 import type * as SavedWorkflowsModule from "@/hooks/useSavedWorkflows";
 import type {
@@ -159,6 +163,33 @@ vi.mock("@/components/scheduled/CreateScheduledTaskDialog", () => ({
     ) : null,
 }));
 
+// Who is viewing decides whether Share is offered; nobody until a test says so.
+vi.mock("@/hooks/useViewerId", () => ({ useViewerId: vi.fn(() => null) }));
+
+// Stub the share dialog to a marker reporting the automation it shares.
+vi.mock("@/components/PermissionsModal", () => ({
+  PermissionsModal: ({
+    automation,
+    open,
+    onOpenChange,
+  }: {
+    automation?: SharedAutomation;
+    open: boolean;
+    onOpenChange: (open: boolean) => void;
+  }) =>
+    open ? (
+      <div
+        data-testid="share-dialog-open"
+        data-automation-id={automation?.id ?? ""}
+        data-session-mode={automation?.sessionMode ?? ""}
+      >
+        <button type="button" onClick={() => onOpenChange(false)}>
+          Close share
+        </button>
+      </div>
+    ) : null,
+}));
+
 function task(overrides: Partial<ScheduledTask> = {}): ScheduledTask {
   return {
     id: "st_1",
@@ -241,6 +272,7 @@ function setRuns(
 
 beforeEach(() => {
   routeParams = { taskId: "st_1" };
+  vi.mocked(useViewerId).mockReturnValue(null);
   vi.mocked(useOptionalLoadedConversations).mockReturnValue(undefined);
   useAvailableAgents.mockImplementation(defaultAgentCatalog);
   navigate.mockReset();
@@ -267,7 +299,7 @@ beforeEach(() => {
 
 afterEach(cleanup);
 
-function pageTree() {
+function pageTree(initialEntries?: string[]) {
   // QueryClient required by other hooks in the tree (useScheduledTask, etc.).
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false, gcTime: 0 } },
@@ -275,7 +307,7 @@ function pageTree() {
   return (
     <QueryClientProvider client={queryClient}>
       <TooltipProvider>
-        <MemoryRouter>
+        <MemoryRouter initialEntries={initialEntries}>
           <TaskDetailPage />
         </MemoryRouter>
       </TooltipProvider>
@@ -887,6 +919,59 @@ describe("header actions", () => {
       "data-session-link",
       `${window.location.origin}/c/CONVERSATION_ID`,
     );
+  });
+});
+
+describe("sharing", () => {
+  const sharingInfo: ServerInfo = { ...SERVER_INFO_OFFLINE_FALLBACK, scheduled_task_sharing: true };
+
+  function renderSharingPage(info: ServerInfo, entry = "/tasks/st_1") {
+    setTask(task({ ownerUserId: "alice@example.com", sessionMode: "continue" }));
+    render(<CapabilitiesProvider info={info}>{pageTree([entry])}</CapabilitiesProvider>);
+  }
+
+  it.each([
+    ["the owner", sharingInfo, "alice@example.com", true],
+    ["another user", sharingInfo, "bob@example.com", false],
+    [
+      "a server that cannot share automations",
+      SERVER_INFO_OFFLINE_FALLBACK,
+      "alice@example.com",
+      false,
+    ],
+  ])("offers Share to %s", (_label, info, viewerId, offered) => {
+    vi.mocked(useViewerId).mockReturnValue(viewerId);
+    renderSharingPage(info);
+    expect(screen.queryByTestId("task-detail-share") !== null).toBe(offered);
+  });
+
+  it("opens the share dialog for this automation", () => {
+    vi.mocked(useViewerId).mockReturnValue("alice@example.com");
+    renderSharingPage(sharingInfo);
+    expect(screen.queryByTestId("share-dialog-open")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Share automation" }));
+
+    const dialog = screen.getByTestId("share-dialog-open");
+    expect(dialog).toHaveAttribute("data-automation-id", "st_1");
+    expect(dialog).toHaveAttribute("data-session-mode", "continue");
+    fireEvent.click(screen.getByRole("button", { name: "Close share" }));
+    expect(screen.queryByTestId("share-dialog-open")).toBeNull();
+  });
+
+  it("opens the share dialog from a session's link and closes it for good", () => {
+    vi.mocked(useViewerId).mockReturnValue("alice@example.com");
+    renderSharingPage(sharingInfo, "/tasks/st_1?share=1");
+
+    expect(screen.getByTestId("share-dialog-open")).toHaveAttribute("data-automation-id", "st_1");
+    fireEvent.click(screen.getByRole("button", { name: "Close share" }));
+    expect(screen.queryByTestId("share-dialog-open")).toBeNull();
+  });
+
+  it("ignores the link's request when the viewer cannot share", () => {
+    vi.mocked(useViewerId).mockReturnValue("bob@example.com");
+    renderSharingPage(sharingInfo, "/tasks/st_1?share=1");
+    expect(screen.queryByTestId("share-dialog-open")).toBeNull();
   });
 });
 

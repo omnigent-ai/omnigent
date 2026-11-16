@@ -1,11 +1,12 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { ServerInfo, SharingMode } from "@/lib/capabilities";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { basenamedRouting, RoutingProvider } from "@/lib/routing";
-import { PermissionsModal } from "./PermissionsModal";
+import { PermissionsModal, type SharedAutomation } from "./PermissionsModal";
 import type * as SessionsApiModule from "@/lib/sessionsApi";
 
 vi.mock("@/hooks/useSharing", () => ({
@@ -17,6 +18,10 @@ vi.mock("@/lib/permissionsApi", async (importOriginal) => ({
   listPermissions: vi.fn(),
   grantPermission: vi.fn(),
   revokePermission: vi.fn(),
+  listAutomationPermissions: vi.fn(),
+  grantAutomationPermission: vi.fn(),
+  revokeAutomationPermission: vi.fn(),
+  getSessionManagingAutomation: vi.fn(),
 }));
 
 // The workspace-files toggle reads the session snapshot for its current state
@@ -59,6 +64,10 @@ import type { Session } from "@/lib/types";
 const listMock = vi.mocked(api.listPermissions);
 const grantMock = vi.mocked(api.grantPermission);
 const revokeMock = vi.mocked(api.revokePermission);
+const listAutomationMock = vi.mocked(api.listAutomationPermissions);
+const grantAutomationMock = vi.mocked(api.grantAutomationPermission);
+const revokeAutomationMock = vi.mocked(api.revokeAutomationPermission);
+const managingAutomationMock = vi.mocked(api.getSessionManagingAutomation);
 const useSessionMock = vi.mocked(useSession);
 const updateSessionMock = vi.mocked(updateSession);
 
@@ -156,6 +165,10 @@ beforeEach(() => {
   listMock.mockReset();
   grantMock.mockReset();
   revokeMock.mockReset();
+  listAutomationMock.mockReset();
+  grantAutomationMock.mockReset();
+  revokeAutomationMock.mockReset();
+  managingAutomationMock.mockReset();
   // Default: standalone (no host providers). Combobox/transform tests opt in.
   userSearchMock.mockReturnValue(undefined);
   transformLinkMock.mockReturnValue(undefined);
@@ -1856,6 +1869,178 @@ describe("PermissionsModal", () => {
       await waitFor(() =>
         expect(updateSessionMock).toHaveBeenCalledWith("conv_abc", { shareWorkspaceFiles: false }),
       );
+    });
+  });
+
+  describe("sharing an automation", () => {
+    function renderAutomationDialog(overrides: Partial<SharedAutomation> = {}) {
+      const automation: SharedAutomation = {
+        id: "st_1",
+        name: "Nightly triage",
+        sessionMode: "new",
+        ...overrides,
+      };
+      render(<PermissionsModal automation={automation} open onOpenChange={() => {}} />, {
+        wrapper: createInfoWrapper({ scheduled_task_sharing: true }),
+      });
+    }
+
+    function grantee(userId: string, displayName = userId) {
+      return { user_id: userId, scheduled_task_id: "st_1", level: 1, display_name: displayName };
+    }
+
+    it("lists grantees by name with Read as the only level", async () => {
+      listAutomationMock.mockResolvedValue([
+        grantee("alice@example.com", "Alice Example"),
+        grantee("team-b"),
+      ]);
+
+      renderAutomationDialog();
+
+      expect(await screen.findByText("Alice Example")).toHaveAttribute(
+        "title",
+        "alice@example.com",
+      );
+      expect(screen.getByText("alice@example.com")).toBeInTheDocument();
+      expect(screen.getByText("team-b")).toBeInTheDocument();
+      expect(listAutomationMock).toHaveBeenCalledWith("st_1");
+      expect(listMock).not.toHaveBeenCalled();
+      // No level picker: both rows and the add form show a fixed Read.
+      expect(screen.queryAllByRole("combobox")).toHaveLength(0);
+      expect(screen.getAllByText("Read")).toHaveLength(3);
+    });
+
+    it("offers no public access, link or mobile sharing", async () => {
+      listAutomationMock.mockResolvedValue([]);
+
+      renderAutomationDialog();
+
+      expect(await screen.findByText("No grants yet.")).toBeInTheDocument();
+      expect(screen.getByRole("heading", { name: "Share this automation" })).toBeInTheDocument();
+      expect(screen.queryByText("General access")).toBeNull();
+      expect(screen.queryByRole("button", { name: /copy link/i })).toBeNull();
+      expect(screen.queryByRole("button", { name: /open in mobile app/i })).toBeNull();
+      expect(screen.getByRole("button", { name: "Done" })).toBeInTheDocument();
+    });
+
+    it("adds and removes grantees through the automation's endpoints", async () => {
+      listAutomationMock.mockResolvedValue([grantee("bob@example.com")]);
+      grantAutomationMock.mockResolvedValue(grantee("carol@example.com"));
+      revokeAutomationMock.mockResolvedValue(undefined);
+
+      renderAutomationDialog();
+
+      await screen.findByText("bob@example.com");
+      fireEvent.change(screen.getByPlaceholderText("alice@example.com"), {
+        target: { value: "carol@example.com" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: /grant/i }));
+      await waitFor(() =>
+        expect(grantAutomationMock).toHaveBeenCalledWith("st_1", "carol@example.com"),
+      );
+
+      const revokeButton = screen.getByRole("button", { name: /revoke/i });
+      await waitFor(() => expect(revokeButton).toBeEnabled());
+      fireEvent.click(revokeButton);
+      await waitFor(() =>
+        expect(revokeAutomationMock).toHaveBeenCalledWith("st_1", "bob@example.com"),
+      );
+      expect(grantMock).not.toHaveBeenCalled();
+      expect(revokeMock).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      "An automation's owner cannot be granted access to it",
+      "Sharing has been disabled for this Omnigent server",
+    ])("shows the server's refusal: %s", async (message) => {
+      listAutomationMock.mockResolvedValue([]);
+      grantAutomationMock.mockRejectedValue(new Error(message));
+
+      renderAutomationDialog();
+
+      await screen.findByText("No grants yet.");
+      fireEvent.change(screen.getByPlaceholderText("alice@example.com"), {
+        target: { value: "owner@example.com" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: /grant/i }));
+      expect(await screen.findByText(message)).toBeInTheDocument();
+    });
+
+    it.each([
+      ["new", false],
+      ["continue", true],
+    ] as const)(
+      "explains how a %s-session automation's sessions are shared",
+      async (sessionMode, keptInStep) => {
+        listAutomationMock.mockResolvedValue([]);
+
+        renderAutomationDialog({ sessionMode });
+
+        expect(
+          await screen.findByText(
+            "Each run's session is shared with the people below, with Read access.",
+          ),
+        ).toBeInTheDocument();
+        expect(screen.queryByText(/kept in step with this list/) !== null).toBe(keptInStep);
+      },
+    );
+  });
+
+  describe("a session an automation manages", () => {
+    function renderSessionDialog(info: Partial<ServerInfo>, onOpenChange = vi.fn()) {
+      render(
+        <MemoryRouter>
+          <PermissionsModal sessionId="conv_abc" open onOpenChange={onOpenChange} />
+        </MemoryRouter>,
+        { wrapper: createInfoWrapper(info) },
+      );
+      return onOpenChange;
+    }
+
+    it("warns that changes are overwritten and links to the automation's share dialog", async () => {
+      listMock.mockResolvedValue([
+        { user_id: "bob@example.com", conversation_id: "conv_abc", level: 1 },
+      ]);
+      managingAutomationMock.mockResolvedValue({ id: "st_1", name: "Nightly triage" });
+
+      const onOpenChange = renderSessionDialog({
+        scheduled_task_sharing: true,
+        features: { automations_v2: true },
+      });
+
+      const notice = await screen.findByTestId("share-managed-by-automation");
+      expect(managingAutomationMock).toHaveBeenCalledWith("conv_abc");
+      expect(notice).toHaveTextContent("Sharing is managed by an automation");
+      expect(notice).toHaveTextContent("Changes made here are overwritten on its next run.");
+      // A warning only: the grants stay editable.
+      expect(screen.getByRole("button", { name: /grant/i })).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: /revoke/i })).toBeEnabled();
+
+      const link = within(notice).getByRole("link", { name: "Nightly triage" });
+      expect(link).toHaveAttribute("href", "/tasks/st_1?share=1");
+      fireEvent.click(link);
+      expect(onOpenChange).toHaveBeenCalledWith(false);
+    });
+
+    it("shows no warning when no automation manages the session", async () => {
+      listMock.mockResolvedValue([]);
+      managingAutomationMock.mockResolvedValue(null);
+
+      renderSessionDialog({ scheduled_task_sharing: true });
+
+      await waitFor(() => expect(managingAutomationMock).toHaveBeenCalledWith("conv_abc"));
+      await screen.findByText("No grants yet.");
+      expect(screen.queryByTestId("share-managed-by-automation")).toBeNull();
+    });
+
+    it("does not ask a server that cannot share automations", async () => {
+      listMock.mockResolvedValue([]);
+
+      renderSessionDialog({});
+
+      await screen.findByText("No grants yet.");
+      expect(managingAutomationMock).not.toHaveBeenCalled();
+      expect(screen.queryByTestId("share-managed-by-automation")).toBeNull();
     });
   });
 });

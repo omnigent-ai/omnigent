@@ -351,6 +351,11 @@ export interface ServerInfo {
   scheduled_task_projects?: boolean;
   /** Latest sessionless automation failures can be listed for Inbox. */
   scheduled_task_inbox?: boolean;
+  /**
+   * Owners can share automations (``/v1/scheduled-tasks/{id}/permissions``);
+   * absent on older servers (off).
+   */
+  scheduled_task_sharing?: boolean;
   /** Scheduled permissions support native harnesses beyond Claude Code. */
   scheduled_task_harness_settings?: boolean;
   /** Automations accept modes that skip approval; older servers may reject them. */
@@ -707,6 +712,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           filesystem_attachments: parseFilesystemAttachments(data.filesystem_attachments),
           scheduled_task_projects: data.scheduled_task_projects === true,
           scheduled_task_inbox: data.scheduled_task_inbox === true,
+          scheduled_task_sharing: data.scheduled_task_sharing === true,
           scheduled_task_harness_settings: data.scheduled_task_harness_settings === true,
           scheduled_task_approval_skipping_modes:
             data.scheduled_task_approval_skipping_modes === true,

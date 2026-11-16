@@ -1,5 +1,5 @@
 // Tests for ScheduledTaskRow: the server-sourced next-run text and the ⋯ menu
-// actions (Run now / Pause-Resume / Edit / Delete) dispatching their callbacks.
+// actions (Run now / Pause-Resume / Edit / Share / Delete) dispatching their callbacks.
 //
 // The row is fully props-driven, so these render it directly with a built task
 // object — no hook mocking needed. The ⋯ menu is a Radix dropdown; opening it
@@ -128,6 +128,21 @@ describe("⋯ menu actions", () => {
     expect(runNow).toBeInTheDocument();
     fireEvent.click(runNow);
     expect(onRunNow).toHaveBeenCalledWith(t);
+  });
+
+  it("offers Share only when the page passes onShare, and dispatches it", () => {
+    const onShare = vi.fn();
+    const t = task();
+    renderRow(t, { onShare });
+    fireEvent.pointerDown(screen.getByTestId("task-row-menu"), { button: 0 });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Share" }));
+    expect(onShare).toHaveBeenCalledWith(t);
+
+    cleanup();
+    renderRow(t);
+    fireEvent.pointerDown(screen.getByTestId("task-row-menu"), { button: 0 });
+    expect(screen.getByTestId("task-edit")).toBeInTheDocument();
+    expect(screen.queryByTestId("task-share")).toBeNull();
   });
 
   it("disables the menu trigger while the row is busy", () => {

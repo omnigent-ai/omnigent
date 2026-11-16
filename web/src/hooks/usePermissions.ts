@@ -1,6 +1,6 @@
 import { useLoadedConversations } from "@/hooks/useSidebarData";
 /**
- * TanStack Query hooks for session permissions CRUD.
+ * TanStack Query hooks for session and automation permissions CRUD.
  * Wraps the fetch functions in `permissionsApi.ts`.
  */
 
@@ -9,32 +9,58 @@ import { type QueryClient, useMutation, useQuery, useQueryClient } from "@tansta
 import { PINNED_CONVERSATIONS_KEY } from "@/hooks/useConversations";
 import {
   type Permission,
+  type ShareGrant,
+  type ShareTarget,
   derivePermissionLevel,
+  getSessionManagingAutomation,
   getSessionOwner,
+  grantAutomationPermission,
   grantPermission,
   isOwnerLevel,
+  listAutomationPermissions,
   listPermissions,
+  revokeAutomationPermission,
   revokePermission,
 } from "@/lib/permissionsApi";
 import { isTempConvId } from "@/lib/tempConversationId";
 import { useSession } from "./useSession";
 
-function permissionsKey(sessionId: string) {
-  return ["permissions", sessionId] as const;
+const SESSION_SHARING_MANAGER_KEY = ["session-sharing-manager"] as const;
+
+function permissionsKey(target: ShareTarget) {
+  return target.kind === "session"
+    ? (["permissions", target.id] as const)
+    : (["automation-permissions", target.id] as const);
 }
 
 function sessionOwnerKey(sessionId: string) {
   return ["sessionOwner", sessionId] as const;
 }
 
-/** Fetch all permission grants for a session. */
-export function usePermissions(rawSessionId: string | null) {
+/** Fetch all permission grants for a session or an automation. */
+export function usePermissions(rawTarget: ShareTarget | null) {
   // A `temp:*` id (navigate-first new-chat window) has no server session.
-  const sessionId = isTempConvId(rawSessionId) ? null : rawSessionId;
+  const target = rawTarget?.kind === "session" && isTempConvId(rawTarget.id) ? null : rawTarget;
+  return useQuery<ShareGrant[]>({
+    queryKey: target ? permissionsKey(target) : ["permissions", ""],
+    queryFn: () =>
+      target!.kind === "session"
+        ? listPermissions(target!.id)
+        : listAutomationPermissions(target!.id),
+    enabled: !!target,
+  });
+}
+
+/**
+ * The viewer's automation that overwrites a session's sharing on each run, or
+ * `null`. Disabled until a sessionId is known.
+ */
+export function useSessionManagingAutomation(sessionId: string | null) {
+  const id = isTempConvId(sessionId) ? null : sessionId;
   return useQuery({
-    queryKey: permissionsKey(sessionId ?? ""),
-    queryFn: () => listPermissions(sessionId!),
-    enabled: !!sessionId,
+    queryKey: [...SESSION_SHARING_MANAGER_KEY, id ?? ""],
+    queryFn: () => getSessionManagingAutomation(id!),
+    enabled: !!id,
   });
 }
 
@@ -59,15 +85,24 @@ export function useSessionOwner(sessionId: string | null) {
  * Mark the grants and every session list stale after a share change, so active
  * lists refetch and pick up the server's `shared_with_others`.
  */
-function invalidateAfterShareChange(qc: QueryClient, sessionId: string): void {
-  void qc.invalidateQueries({ queryKey: permissionsKey(sessionId) });
+function invalidateAfterShareChange(qc: QueryClient, target: ShareTarget): void {
+  void qc.invalidateQueries({ queryKey: permissionsKey(target) });
+  if (target.kind === "automation") {
+    // The server shares its continued session at once, which can also start or
+    // stop the automation managing that session's sharing.
+    void qc.invalidateQueries({ queryKey: ["permissions"] });
+    void qc.invalidateQueries({ queryKey: SESSION_SHARING_MANAGER_KEY });
+  }
   void qc.invalidateQueries({ queryKey: ["conversations"] });
   void qc.invalidateQueries({ queryKey: ["project-sessions"] });
   void qc.invalidateQueries({ queryKey: PINNED_CONVERSATIONS_KEY });
 }
 
-/** Grant or update a permission. Invalidates the grants and session lists on success. */
-export function useGrantPermission(sessionId: string) {
+/**
+ * Grant or update a permission. Invalidates the grants and session lists on
+ * success. An automation is shared at read access whatever `level` says.
+ */
+export function useGrantPermission(target: ShareTarget) {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: ({
@@ -78,20 +113,25 @@ export function useGrantPermission(sessionId: string) {
       userId: string;
       level: number;
       ensureMinimum?: boolean;
-    }) =>
-      ensureMinimum
-        ? grantPermission(sessionId, userId, level, true)
-        : grantPermission(sessionId, userId, level),
-    onSuccess: () => invalidateAfterShareChange(qc, sessionId),
+    }): Promise<ShareGrant> => {
+      if (target.kind === "automation") return grantAutomationPermission(target.id, userId);
+      return ensureMinimum
+        ? grantPermission(target.id, userId, level, true)
+        : grantPermission(target.id, userId, level);
+    },
+    onSuccess: () => invalidateAfterShareChange(qc, target),
   });
 }
 
 /** Revoke a permission. Invalidates the grants and session lists on success. */
-export function useRevokePermission(sessionId: string) {
+export function useRevokePermission(target: ShareTarget) {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (userId: string) => revokePermission(sessionId, userId),
-    onSuccess: () => invalidateAfterShareChange(qc, sessionId),
+    mutationFn: (userId: string) =>
+      target.kind === "automation"
+        ? revokeAutomationPermission(target.id, userId)
+        : revokePermission(target.id, userId),
+    onSuccess: () => invalidateAfterShareChange(qc, target),
   });
 }
 
@@ -129,4 +169,4 @@ export function useCanStartSideChat(
   return session?.sideChatAllowed ?? (!isLoading && isOwnerLevel(permissionLevel));
 }
 
-export type { Permission };
+export type { Permission, ShareGrant, ShareTarget };
