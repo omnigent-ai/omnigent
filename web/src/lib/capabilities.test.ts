@@ -324,6 +324,17 @@ it.each([
   ).toBe(expected);
 });
 
+it.each([
+  [32000, 32000],
+  [undefined, undefined],
+  [0, undefined],
+  ["32000", undefined],
+])("parses the session message limit %j as %j", async (advertised, expected) => {
+  expect((await probe({ session_message_max_chars: advertised })).session_message_max_chars).toBe(
+    expected,
+  );
+});
+
 describe("resolveServerInfo scheduled_task_session_modes", () => {
   it("reads the advertised capability", async () => {
     expect((await probe({ scheduled_task_session_modes: true })).scheduled_task_session_modes).toBe(

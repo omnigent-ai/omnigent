@@ -18,6 +18,7 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import (
     CAP_HARNESS_ACCOUNTS,
     CAP_HARNESS_LOGIN,
+    CAP_LONG_SESSION_MESSAGES,
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     WORKSPACE_MISSING_ERROR_CODE,
     HostHelloFrame,
@@ -392,6 +393,33 @@ async def test_harness_accounts_are_live_only_and_login_support_is_explicit(
     assert detail["harness_accounts_supported"] is False
     assert disconnected["harness_login_supported"] is False
     assert detail["harness_login_supported"] is False
+
+
+@pytest.mark.parametrize(
+    ("capabilities", "supported"),
+    [([CAP_LONG_SESSION_MESSAGES], True), ([], False)],
+    ids=["current-host", "older-host"],
+)
+async def test_long_session_message_support_follows_the_live_host(
+    db_uri: str, capabilities: list[str], supported: bool
+) -> None:
+    """Automation forms size instructions by what the polling host's runners accept."""
+    app, registry, _hs, _cs = _build_host_api_app(db_uri)
+    _comm = await _connect_host(app, registry, capabilities=capabilities)
+    other_app, _other_registry, _other_store, _other_conversations = _build_host_api_app(db_uri)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        listed = (await client.get("/v1/hosts")).json()["hosts"][0]
+        detail = (await client.get(f"/v1/hosts/{_HOST_ID}")).json()
+    async with AsyncClient(
+        transport=ASGITransport(app=other_app), base_url="http://test"
+    ) as client:
+        unverified = (await client.get("/v1/hosts")).json()["hosts"][0]
+
+    assert listed["long_session_messages_supported"] is supported
+    assert detail["long_session_messages_supported"] is supported
+    # A replica without the tunnel can't confirm support.
+    assert unverified["long_session_messages_supported"] is False
 
 
 @pytest.mark.parametrize(
