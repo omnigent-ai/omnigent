@@ -905,7 +905,7 @@ export function ApprovalCard({
                 {acceptedWithExecPolicy && execPolicyAmendment && (
                   <span>
                     Remembered command prefix:{" "}
-                    <code className="rounded bg-muted px-1 font-mono text-sm">
+                    <code className="break-all rounded bg-muted px-1 font-mono text-sm">
                       {JSON.stringify(execPolicyAmendment)}
                     </code>
                   </span>

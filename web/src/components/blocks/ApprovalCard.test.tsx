@@ -362,7 +362,10 @@ describe("ApprovalCard — binary approve/reject", () => {
     );
 
     expect(screen.getByText("Approved and remembered")).toBeVisible();
-    expect(screen.getByText('[".venv/bin/python","-m","pytest"]')).toBeVisible();
+    const prefix = screen.getByText('[".venv/bin/python","-m","pytest"]');
+    expect(prefix).toBeVisible();
+    // The JSON prefix has no spaces to wrap at; without break-all it widens the card's grid.
+    expect(prefix).toHaveClass("break-all");
   });
 });
 
