@@ -59,11 +59,20 @@ vi.mock("@/components/workflows/WorkflowPlanningChat", () => ({
   WorkflowPlanningChat: ({
     workflow,
     onClose,
+    expanded,
+    onExpandedChange,
   }: {
     workflow: WorkflowDetail;
     onClose: () => void;
+    expanded?: boolean;
+    onExpandedChange?: (expanded: boolean) => void;
   }) => (
     <div data-testid="planning-chat" data-session={workflow.planning_session_id}>
+      {onExpandedChange && (
+        <button type="button" onClick={() => onExpandedChange(!expanded)}>
+          {expanded ? "Collapse planning chat" : "Expand planning chat"}
+        </button>
+      )}
       <button type="button" onClick={onClose}>
         Close planning chat
       </button>
@@ -338,6 +347,51 @@ describe("WorkflowDetailPage", () => {
       await waitFor(() => expect(stored.steps).toEqual(edited));
     },
   );
+
+  it("expands the planner over the page in place, on wide screens only", () => {
+    mockWorkflow({ data: { ...WORKFLOW, steps: [], is_draft: true } });
+    mockRuns([]);
+    const { rerender } = renderPage();
+    const setPhone = (phone: boolean) => {
+      vi.mocked(useIsMobileViewport).mockReturnValue(phone);
+      rerender(<WorkflowDetailPage />);
+    };
+    const page = screen.getByTestId("workflow-detail-page");
+    const planner = screen.getByRole("complementary", { name: "Workflow planning chat" });
+    const panel = screen.getByTestId("workflow-planner-panel");
+
+    fireEvent.click(screen.getByRole("button", { name: "Expand planning chat" }));
+    expect(panel).toHaveClass("absolute", "inset-0");
+    expect(page).toHaveClass("invisible");
+    // The aside still reserves its width, so the hidden page doesn't reflow.
+    expect(planner).toHaveClass("w-[42%]");
+    expect(planner).not.toHaveClass("absolute");
+    fireEvent.click(screen.getByRole("button", { name: "Collapse planning chat" }));
+    expect(panel).not.toHaveClass("absolute");
+    expect(page).not.toHaveClass("invisible");
+
+    // Every close path, including the phone sheet after the window narrows,
+    // reopens the planner beside the page.
+    const closeButton = () =>
+      fireEvent.click(screen.getByRole("button", { name: "Close planning chat" }));
+    const dismissSheet = () =>
+      fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
+    for (const [phone, close] of [
+      [false, closeButton],
+      [true, closeButton],
+      [true, dismissSheet],
+    ] as const) {
+      fireEvent.click(screen.getByRole("button", { name: "Expand planning chat" }));
+      setPhone(phone);
+      // Phones already show the planner as a near-full-screen sheet.
+      if (phone) expect(screen.queryByRole("button", { name: "Expand planning chat" })).toBeNull();
+      close();
+      expect(screen.queryByTestId("planning-chat")).toBeNull();
+      setPhone(false);
+      fireEvent.click(screen.getByRole("button", { name: "Create plan" }));
+      expect(page).not.toHaveClass("invisible");
+    }
+  });
 
   it("shows the workflow, its steps, and the sessions that ran it", () => {
     mockWorkflow({});
