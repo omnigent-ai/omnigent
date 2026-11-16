@@ -42,6 +42,7 @@ from omnigent.entities.session_journal import (
     normalize_status,
     normalize_step_id,
 )
+from omnigent.entities.workflow import Workflow
 from omnigent.entities.workflow_questions import (
     normalize_questions,
     question_form,
@@ -187,6 +188,107 @@ def entry_to_response(entry: JournalEntry) -> SessionJournalEntry:
     )
 
 
+async def load_workflow_for_run(
+    conversation_store: ConversationStore, workflow_id: str, *, user_id: str | None
+) -> Workflow:
+    """Load the caller's saved plan before creating a run."""
+    workflows = open_workflow_store(conversation_store)
+    try:
+        uuid_to_bytes(workflow_id)
+    except InvalidUuidError:
+        workflow = None
+    else:
+        workflow = (
+            await asyncio.to_thread(workflows.get, workflow_id, user_id=user_id)
+            if workflows is not None
+            else None
+        )
+    if workflow is None:
+        raise OmnigentError(
+            f"workflow_not_found: no saved workflow {workflow_id!r}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    if not workflow.steps:
+        raise OmnigentError(
+            "workflow_is_draft: save a plan before running this workflow",
+            code=ErrorCode.INVALID_INPUT,
+        )
+
+    return workflow
+
+
+async def initialize_workflow_plan(
+    conversation_store: ConversationStore,
+    session: Conversation,
+    workflow: Workflow,
+    *,
+    user_id: str | None,
+) -> None:
+    """Snapshot a saved plan before the session can receive its first input."""
+    store = open_store(conversation_store)
+    if store is None:
+        raise OmnigentError(
+            "Session journals are not available on this server", code=ErrorCode.NOT_FOUND
+        )
+    appended = await asyncio.to_thread(
+        store.append,
+        session.id,
+        "plan",
+        {"name": workflow.name, "steps": workflow.steps, "source": "workflow"},
+        idempotency_key="workflow:initial-plan",
+        workflow_id=workflow.id,
+        scheduled_task_run_id=_run_id(session),
+    )
+    await _observe_entry(conversation_store, store, session, appended, user_id=user_id)
+
+
+def _run_id(session: Conversation) -> str | None:
+    value = session.labels.get(SCHEDULED_TASK_RUN_LABEL_KEY)
+    if not value:
+        return None
+    try:
+        return uuid_to_bytes(value).hex()
+    except InvalidUuidError:
+        _logger.warning("Session %s names an invalid automation run", session.id)
+        return None
+
+
+async def _observe_entry(
+    conversation_store: ConversationStore,
+    store: SessionJournalStore,
+    session: Conversation,
+    appended: JournalAppend,
+    *,
+    user_id: str | None,
+) -> None:
+    session_id, entry = session.id, appended.entry
+    # Every attempt writes its marker: a retry after a failed first marker
+    # adds it, and the marker's stable ID keeps it to one.
+    if entry.kind not in ("status", "plan"):
+        await record_journal_checkpoint(conversation_store, session_id, entry)
+        return
+    try:
+        page = await asyncio.to_thread(
+            store.list_entries, session_id, kind="plan", order="desc", after=entry.id, limit=1
+        )
+        earlier_plan = page.entries[0] if page.entries else None
+        if appended.created:
+            await asyncio.to_thread(
+                log_journal_entry,
+                conversation_store,
+                session,
+                entry,
+                earlier_plan,
+                user_id=user_id,
+            )
+        if entry.kind == "status":
+            await record_status_marker(conversation_store, session_id, entry, earlier_plan)
+        else:
+            await record_plan_marker(conversation_store, session_id, entry, earlier_plan)
+    except Exception:  # markers are display metadata; the write already succeeded
+        _logger.warning("Could not mark %s in the chat of %s", entry.id, session_id, exc_info=True)
+
+
 def create_session_journal_router(
     conversation_store: ConversationStore,
     *,
@@ -221,16 +323,6 @@ def create_session_journal_router(
         if conversation is None:
             raise session_not_found()
         return conversation
-
-    def _run_id(session: Conversation) -> str | None:
-        value = session.labels.get(SCHEDULED_TASK_RUN_LABEL_KEY)
-        if not value:
-            return None
-        try:
-            return uuid_to_bytes(value).hex()
-        except InvalidUuidError:
-            _logger.warning("Session %s names an invalid automation run", session.id)
-            return None
 
     @router.get("/sessions/{session_id}/journal", response_model=SessionJournalPage)
     async def list_session_journal(
@@ -330,7 +422,7 @@ def create_session_journal_router(
             raise OmnigentError(f"journal_full: {exc}", code=ErrorCode.CONFLICT) from exc
         except InvalidJournalEntryError as exc:
             raise OmnigentError(f"invalid_entry: {exc}", code=ErrorCode.INVALID_INPUT) from exc
-        await _observe_entry(store, session, appended, user_id=user_id)
+        await _observe_entry(conversation_store, store, session, appended, user_id=user_id)
         return appended.entry
 
     @router.post("/sessions/{session_id}/journal", response_model=SessionJournalEntry)
@@ -340,7 +432,7 @@ def create_session_journal_router(
         """Append an entry written by the session's agent; only its runner calls this."""
         session = await _agent_session(request, session_id)
         if body.kind == "plan" and set(body.content) != {"name", "steps"}:
-            # The agent's plans are its own; copies of drawn workflows come later.
+            # Only the server can attribute a plan to a saved workflow snapshot.
             raise OmnigentError(
                 "invalid_entry: a plan's content has exactly two fields, name and steps",
                 code=ErrorCode.INVALID_INPUT,
@@ -365,28 +457,9 @@ def create_session_journal_router(
             raise OmnigentError(
                 "invalid_entry: only a plan names a workflow", code=ErrorCode.INVALID_INPUT
             )
-        workflows = open_workflow_store(conversation_store)
-        user_id = get_user_id(request, auth_provider)
-        try:
-            uuid_to_bytes(workflow_id)
-        except InvalidUuidError:
-            workflow = None
-        else:
-            workflow = (
-                await asyncio.to_thread(workflows.get, workflow_id, user_id=user_id)
-                if workflows is not None
-                else None
-            )
-        if workflow is None:
-            raise OmnigentError(
-                f"workflow_not_found: no saved workflow {workflow_id!r}",
-                code=ErrorCode.INVALID_INPUT,
-            )
-        if not workflow.steps:
-            raise OmnigentError(
-                "workflow_is_draft: save a plan before running this workflow",
-                code=ErrorCode.INVALID_INPUT,
-            )
+        await load_workflow_for_run(
+            conversation_store, workflow_id, user_id=get_user_id(request, auth_provider)
+        )
 
     @router.post(
         "/sessions/{session_id}/journal/input-requests",
@@ -451,41 +524,5 @@ def create_session_journal_router(
         return SessionJournalInputRequested(
             entry=entry_to_response(entry), elicitation_id=elicitation_id
         )
-
-    async def _observe_entry(
-        store: SessionJournalStore,
-        session: Conversation,
-        appended: JournalAppend,
-        *,
-        user_id: str | None,
-    ) -> None:
-        session_id, entry = session.id, appended.entry
-        # Every attempt writes its marker: a retry after a failed first marker
-        # adds it, and the marker's stable ID keeps it to one.
-        if entry.kind not in ("status", "plan"):
-            await record_journal_checkpoint(conversation_store, session_id, entry)
-            return
-        try:
-            page = await asyncio.to_thread(
-                store.list_entries, session_id, kind="plan", order="desc", after=entry.id, limit=1
-            )
-            earlier_plan = page.entries[0] if page.entries else None
-            if appended.created:
-                await asyncio.to_thread(
-                    log_journal_entry,
-                    conversation_store,
-                    session,
-                    entry,
-                    earlier_plan,
-                    user_id=user_id,
-                )
-            if entry.kind == "status":
-                await record_status_marker(conversation_store, session_id, entry, earlier_plan)
-            else:
-                await record_plan_marker(conversation_store, session_id, entry, earlier_plan)
-        except Exception:  # markers are display metadata; the write already succeeded
-            _logger.warning(
-                "Could not mark %s in the chat of %s", entry.id, session_id, exc_info=True
-            )
 
     return router

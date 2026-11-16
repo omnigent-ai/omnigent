@@ -14,9 +14,11 @@ from fastapi import FastAPI
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.server.feature_flags import resolve_feature_flags
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+from omnigent.stores.session_journal_store import SessionJournalStore
 from omnigent.tools.builtins.journal import JOURNAL_TOOLS
 from tests.debug_log_helpers import capture_debug_rows
 from tests.server.conftest import ControllableMockClient
+from tests.server.helpers import create_test_agent
 from tests.server.integration.test_scheduled_tasks_routes import (
     _build_app,
     _headers,
@@ -46,6 +48,153 @@ async def client(
 ) -> AsyncIterator[httpx.AsyncClient]:
     async with _serve(app, mock_llm, tmp_path) as client:
         yield client
+
+
+async def test_session_creation_snapshots_workflow_before_initial_items(
+    client: httpx.AsyncClient, db_uri: str
+) -> None:
+    agent = await create_test_agent(client, user=ALICE)
+    saved = await client.post(
+        "/v1/workflows",
+        json={"name": "Release", "description": "Build and test.", "steps": STEPS},
+        headers=_headers(),
+    )
+    assert saved.status_code == 200, saved.text
+    workflow = saved.json()
+    created = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "workflow_id": workflow["id"],
+            "initial_items": [
+                {
+                    "type": "message",
+                    "data": {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "Run this workflow."}],
+                    },
+                }
+            ],
+        },
+        headers=_headers(),
+    )
+    assert created.status_code == 201, created.text
+    session_id = created.json()["id"]
+    journal = f"/v1/sessions/{session_id}/journal"
+    entries = (await client.get(journal, headers=_headers())).json()["data"]
+    assert [entry["kind"] for entry in entries] == ["plan_status", "plan"]
+    plan = entries[1]
+    assert plan["author"] == {"type": "omnigent"}
+    assert plan["workflow_id"] == workflow["id"]
+    assert plan["content"] == {
+        "name": workflow["name"],
+        "steps": workflow["steps"],
+        "version": 1,
+        "source": "workflow",
+    }
+    conversations = SqlAlchemyConversationStore(db_uri)
+    items = conversations.list_items(session_id, order="asc").data
+    assert [item.type for item in items] == ["resource_event", "message"]
+    assert items[0].data.event_type == "session.journal.plan"
+
+    # The agent can start the existing steps without writing another plan.
+    conversations.set_runner_id(session_id, token_bound_runner_id("journal-test-runner"))
+    started = await client.post(
+        journal,
+        json=_write("status", {"status": "started"}, "start", step="build"),
+        headers=_runner(session_id),
+    )
+    assert started.status_code == 200, started.text
+    runs_url = f"/v1/workflows/{workflow['id']}/runs"
+    runs = (await client.get(runs_url, headers=_headers())).json()["data"]
+    assert len(runs) == 1
+    assert runs[0]["session_id"] == session_id and runs[0]["id"] == plan["id"]
+    assert runs[0]["progress"] == {
+        "total": 2,
+        "started": 1,
+        "done": 0,
+        "failed": 0,
+        "needs_input": 0,
+    }
+
+    changed = await client.patch(
+        f"/v1/workflows/{workflow['id']}",
+        json={"steps": [{"id": "deploy", "name": "Deploy"}]},
+        headers=_headers(),
+    )
+    assert changed.status_code == 200, changed.text
+    plans = (await client.get(journal, params={"kind": "plan"}, headers=_headers())).json()["data"]
+    assert plans == [plan]
+    next_run = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "workflow_id": workflow["id"]},
+        headers=_headers(),
+    )
+    assert next_run.status_code == 201, next_run.text
+    next_journal = f"/v1/sessions/{next_run.json()['id']}/journal"
+    next_plan = (await client.get(next_journal, headers=_headers())).json()["data"][1]
+    assert next_plan["content"]["steps"] == changed.json()["steps"]
+    assert len((await client.get(runs_url, headers=_headers())).json()["data"]) == 2
+
+
+async def test_workflow_journal_failure_removes_the_unreturned_session(
+    client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    agent = await create_test_agent(client, user=ALICE)
+    saved = await client.post(
+        "/v1/workflows",
+        json={"name": "Release", "description": "Build and test.", "steps": STEPS},
+        headers=_headers(),
+    )
+    assert saved.status_code == 200, saved.text
+    conversations = SqlAlchemyConversationStore(db_uri)
+    before = [session.id for session in conversations.list_conversations().data]
+
+    # Inject a journal storage failure after the conversation row has been created.
+    def unavailable(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("journal storage unavailable")
+
+    monkeypatch.setattr(SessionJournalStore, "append", unavailable)
+    with pytest.raises(RuntimeError, match="journal storage unavailable"):
+        await client.post(
+            "/v1/sessions",
+            json={"agent_id": agent["id"], "workflow_id": saved.json()["id"]},
+            headers=_headers(),
+        )
+    assert [session.id for session in conversations.list_conversations().data] == before
+
+
+@pytest.mark.parametrize("case", ["foreign", "missing", "invalid", "draft", "disabled"])
+async def test_invalid_workflow_creates_no_session(
+    client: httpx.AsyncClient, app: FastAPI, db_uri: str, case: str
+) -> None:
+    agent = await create_test_agent(client, user=ALICE)
+    saved = await client.post(
+        "/v1/workflows",
+        json={
+            "name": "Release",
+            "description": "Build and test.",
+            "steps": [] if case == "draft" else STEPS,
+        },
+        headers=_headers(BOB if case == "foreign" else ALICE),
+    )
+    assert saved.status_code == 200, saved.text
+    workflow_id = saved.json()["id"]
+    if case == "missing":
+        workflow_id = uuid4().hex
+    elif case == "invalid":
+        workflow_id = "not-a-workflow-id"
+    elif case == "disabled":
+        app.state.feature_flags = resolve_feature_flags({"OMNIGENT_FEATURES": "-workflows"})
+    conversations = SqlAlchemyConversationStore(db_uri)
+    before = [session.id for session in conversations.list_conversations().data]
+    response = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "workflow_id": workflow_id},
+        headers=_headers(),
+    )
+    assert response.status_code == (404 if case == "disabled" else 400), response.text
+    assert [session.id for session in conversations.list_conversations().data] == before
 
 
 @pytest.mark.parametrize("features", ["", "workflows,-workflows"])

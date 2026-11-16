@@ -210,6 +210,7 @@ describe("WorkflowSessionDialog", () => {
     fireEvent.click(submit());
     await waitFor(() => expect(attached).toHaveBeenCalledTimes(2));
     expect(createSession).toHaveBeenCalledOnce();
+    expect(vi.mocked(createSession).mock.calls[0]![2]?.workflowId).toBeUndefined();
     expect(attached).toHaveBeenLastCalledWith({ id: "conv_run" }, editWorkflowPlanPrompt(WORKFLOW));
     expect(navigate).not.toHaveBeenCalled();
     expect(consumePendingInitialPrompt("conv_run")).toBeNull();
@@ -297,6 +298,7 @@ describe("WorkflowSessionDialog", () => {
       expect.anything(),
     );
     expect(createSession).toHaveBeenCalledWith(CODEX.id, [], {
+      workflowId: WORKFLOW.id,
       hostId: "host_2",
       workspace: "/home/you/app",
       labels: nativeWrapperLabelsForAgent(CODEX),
@@ -604,6 +606,7 @@ describe("WorkflowSessionDialog", () => {
 
     await waitFor(() => expect(navigate).toHaveBeenCalledWith("/c/conv_run"));
     expect(createSession).toHaveBeenCalledWith(CLAUDE_CODE.id, [], {
+      workflowId: WORKFLOW.id,
       sandbox: {
         provider: "daytona",
         workspaces: ["https://github.com/example/app#main"],

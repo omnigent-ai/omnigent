@@ -6184,6 +6184,18 @@
             "default": null,
             "title": "Title"
           },
+          "workflow_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Workflow Id"
+          },
           "workspace": {
             "anyOf": [
               {
@@ -8824,6 +8836,18 @@
             ],
             "default": null,
             "title": "Title"
+          },
+          "workflow_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Workflow Id"
           },
           "workspace": {
             "anyOf": [

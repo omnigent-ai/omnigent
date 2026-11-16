@@ -181,7 +181,7 @@ export function runSavedWorkflowPrompt(
   workflow: { id: string; name: string },
   details = "",
 ): string {
-  const request = `Use the ${WORKFLOW_SKILL} skill to run the saved workflow "${workflow.name}" (ID ${workflow.id}).`;
+  const request = `Use the ${WORKFLOW_SKILL} skill to run the saved workflow "${workflow.name}" (ID ${workflow.id}).\n\nIf the session journal already contains this workflow's plan, continue that run without writing a second starting plan.`;
   return details.trim() ? `${request}\n\n${details.trim()}` : request;
 }
 
