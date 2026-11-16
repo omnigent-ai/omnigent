@@ -5645,17 +5645,23 @@ async def test_a_sessions_own_runner_keeps_and_cancels_its_timer(
         stored = (await client.get(f"/v1/scheduled-tasks/{task_id}", headers=_headers())).json()
         assert {key: stored[key] for key in ("kind", "rrule", "session_id", "prompt")} == {
             "kind": "timer",
-            "rrule": "FREQ=MINUTELY;INTERVAL=10",
+            # A week of firings, counted from when it was set.
+            "rrule": "FREQ=MINUTELY;INTERVAL=10;COUNT=1008",
             "session_id": session_id,
             "prompt": f"[System: timer {timer['timer_id']} fired]\nnote: 'workflow check-in'",
         }
         assert stored["next_run_at"] == timer["next_run_at"] is not None
-        # Timers stay off every task list, including the one agents read.
-        for kind in ("automation", "all"):
-            listed = await client.get(
-                "/v1/scheduled-tasks", params={"kind": kind}, headers=_headers()
-            )
-            assert listed.json()["scheduled_tasks"] == []
+        kept = SqlAlchemyScheduledTaskStore(db_uri).get(task_id)
+        assert kept is not None and kept.next_run_at == kept.created_at + 600
+        # The Automations page leaves it out; the list agents read includes it.
+        automations = await client.get("/v1/scheduled-tasks", headers=_headers())
+        assert automations.json()["scheduled_tasks"] == []
+        everything = await client.get(
+            "/v1/scheduled-tasks", params={"kind": "all"}, headers=_headers()
+        )
+        assert [(t["id"], t["kind"]) for t in everything.json()["scheduled_tasks"]] == [
+            (task_id, "timer")
+        ]
         # Only the session's agent changes it, with its timer tools.
         renamed = await client.patch(
             f"/v1/scheduled-tasks/{task_id}", json={"name": "renamed"}, headers=_headers()
@@ -5724,3 +5730,69 @@ async def test_only_a_sessions_own_runner_keeps_a_timer_the_server_can_keep(
             info = (await client.get("/v1/info", headers=_headers())).json()
             assert info["scheduled_task_timers"] is False
     assert [task.kind for task in SqlAlchemyScheduledTaskStore(db_uri).list()] == []
+
+
+async def test_a_session_keeps_at_most_ten_timers(
+    runtime_init: None, db_uri: str, tmp_path: Path
+) -> None:
+    app = _timer_app(db_uri, tmp_path)
+    session_id = _runner_session(db_uri)
+    url = f"/v1/sessions/{session_id}/timers"
+    async with _off_host_client(app) as client:
+        for _ in range(10):
+            kept = await client.post(
+                url, json={"seconds": 600, "repeat": True}, headers=_runner_headers(session_id)
+            )
+            assert kept.status_code == 200, kept.text
+        refused = await client.post(
+            url, json={"seconds": 600, "repeat": True}, headers=_runner_headers(session_id)
+        )
+        assert refused.status_code == 400
+        assert "already keeps 10 timers" in refused.json()["error"]["message"]
+        # Cancelling one makes room for another.
+        cancelled = await client.delete(
+            f"{url}/{kept.json()['timer_id']}", headers=_runner_headers(session_id)
+        )
+        assert cancelled.status_code == 200, cancelled.text
+        again = await client.post(
+            url, json={"seconds": 600, "repeat": True}, headers=_runner_headers(session_id)
+        )
+        assert again.status_code == 200, again.text
+
+
+@pytest.mark.parametrize(("delivered", "cancel_status"), [(False, 200), (True, 404)])
+async def test_cancelling_a_one_shot_timer_stops_a_firing_still_on_its_way(
+    runtime_init: None, db_uri: str, tmp_path: Path, delivered: bool, cancel_status: int
+) -> None:
+    app = _timer_app(db_uri, tmp_path)
+    session_id = _runner_session(db_uri)
+    async with _off_host_client(app) as client:
+        created = await client.post(
+            f"/v1/sessions/{session_id}/timers",
+            json={"seconds": 600},
+            headers=_runner_headers(session_id),
+        )
+        assert created.status_code == 200, created.text
+        timer = created.json()
+        # Claiming its only occurrence completes a one-shot timer.
+        tasks = SqlAlchemyScheduledTaskStore(db_uri)
+        tasks.configure_dispatch(True)
+        task = tasks.get(timer["scheduled_task_id"])
+        assert task is not None and task.next_run_at is not None
+        run = tasks.claim_scheduled_run(
+            task, now=task.next_run_at, next_run_at=None, host_id=task.host_id, lease_seconds=120
+        )
+        assert run is not None
+        assert tasks.get(task.id).state == "completed"
+        if delivered:
+            tasks.transition_starting_run(
+                run,
+                now=lambda: task.next_run_at + 1,
+                status="succeeded",
+                conversation_id=session_id,
+            )
+        cancelled = await client.delete(
+            f"/v1/sessions/{session_id}/timers/{timer['timer_id']}",
+            headers=_runner_headers(session_id),
+        )
+    assert cancelled.status_code == cancel_status, cancelled.text

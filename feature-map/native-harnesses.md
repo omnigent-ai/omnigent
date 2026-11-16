@@ -235,8 +235,8 @@ server with `automations_v2` and `durable_timers`, ask a native session to "chec
 back every 10 minutes": the tool result says `durable: true`, and after you stop
 the session's runner, the next firing still wakes the session with its hidden
 `[System: timer … fired]` message. While the session is busy or waiting on you, a
-repeating timer skips that firing. Timers shorter than ten minutes stay in the
-runner (`durable: false`).
+repeating timer skips that firing, and it ends on its own seven days after it was
+set. Timers shorter than ten minutes stay in the runner (`durable: false`).
 
 **Agent instructions:** supported native startup paths add Omnigent's guidance
 to embed existing workspace screenshots in replies using their real file paths.

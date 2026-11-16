@@ -132,6 +132,36 @@ def test_persisted_schedule_anchor_does_not_reset_count(
     assert next_scheduled_time(counted, after + interval) is None
 
 
+@pytest.mark.parametrize(
+    ("set_at", "minutes"), [("12:09:59", 10), ("12:59:30", 60), ("12:01:00", 11)]
+)
+def test_a_repeating_timer_counts_its_interval_from_when_it_was_set(
+    task, set_at: str, minutes: int
+) -> None:
+    """Unlike an automation on its midnight-anchored grid, a timer waits its full interval."""
+    from dataclasses import replace
+
+    created = int(datetime.fromisoformat(f"2026-11-16T{set_at}+00:00").timestamp())
+    rule = f"FREQ=MINUTELY;INTERVAL={minutes};COUNT=3"
+    timer = replace(
+        task,
+        created_at=created,
+        rrule=rule,
+        kind="timer",
+        session_mode="continue",
+        session_id=uuid.uuid4().hex,
+    )
+    firings, after = [], created
+    while (occurrence := next_scheduled_time(timer, after)) is not None:
+        firings.append(occurrence - created)
+        after = occurrence
+    assert firings == [minutes * 60, 2 * minutes * 60, 3 * minutes * 60]
+    # The same rule as an automation lands on the grid from midnight instead.
+    grid = next_scheduled_time(replace(timer, kind="automation"), created)
+    assert grid is not None
+    assert (grid - created) < minutes * 60
+
+
 def test_persisted_schedule_keeps_local_time_across_daylight_saving(task) -> None:
     from dataclasses import replace
 

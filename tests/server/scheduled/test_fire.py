@@ -48,6 +48,7 @@ from omnigent.server.routes._host_worktree import (
     WORKTREE_ROOT_LABEL_KEY,
     worktree_root_fingerprint,
 )
+from omnigent.server.routes._sessions.helpers import SessionLiveness
 from omnigent.server.scheduled import fire as fire_mod
 from omnigent.server.scheduled.fire import (
     BUSY_QUIET_SECONDS,
@@ -3834,6 +3835,29 @@ async def test_a_timer_wakes_a_session_whose_mode_skips_approval() -> None:
 
 
 @pytest.mark.asyncio
+async def test_a_timer_cancelled_after_its_firing_was_claimed_sends_nothing() -> None:
+    """An agent that cancelled its timer must not still get the firing it just stopped."""
+    from dataclasses import replace
+
+    store = FakeScheduledTaskStore(rows={"task_1": _timer()})
+
+    class _CancelledMidFire(_ExistingConversationStore):
+        def get_conversation(self, conversation_id: str) -> _FakeConversation | None:
+            # The cancel lands while the firing checks the session.
+            store._rows["task_1"] = replace(store._rows["task_1"], state="deleted")
+            return super().get_conversation(conversation_id)
+
+    conv_store = _CancelledMidFire(_continued_session())
+
+    launched = await _fire_once(_deps(store, conversation_store=conv_store))
+
+    assert launched == []
+    assert [(run["status"], run["error_code"]) for run in store.runs] == [
+        ("skipped", "task_deleted")
+    ]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("existing", "error_code"),
     [
@@ -5104,6 +5128,7 @@ def _busy_until_check(
     fired_at: int | None = None,
     status: str = "succeeded",
     pending: int | None = None,
+    liveness: SessionLiveness | None = None,
 ):
     """The busy check over one session's persisted status and the task's latest run."""
     session_id = "sess_busy_check"
@@ -5126,7 +5151,14 @@ def _busy_until_check(
     )
     sched_store = Mock(list_runs=Mock(return_value=(runs, None)))
     conversation_store = Mock(get_session_activity=Mock(return_value=activity))
-    return build_busy_until(_deps(sched_store, conversation_store=conversation_store))
+    app_state = (
+        None
+        if liveness is None
+        else SimpleNamespace(session_liveness_lookup=lambda ids: {session_id: liveness})
+    )
+    return build_busy_until(
+        _deps(sched_store, conversation_store=conversation_store, app_state=app_state)
+    )
 
 
 @pytest.mark.parametrize(
@@ -5247,29 +5279,40 @@ async def test_an_idle_session_is_polled_two_quiet_minutes_after_its_last_change
     assert await check(task, due) == (None if wait_seconds is None else due + wait_seconds)
 
 
+_RUNNER_UP = SessionLiveness(runner_online=True, host_online=True)
+_RUNNER_GONE = SessionLiveness(runner_online=False, host_online=True)
+_HOST_OFFLINE = SessionLiveness(runner_online=False, host_online=False)
+
+
 @pytest.mark.parametrize(
-    ("live_status", "pending", "status", "minutes_since_last_firing", "skips"),
+    ("live_status", "pending", "status", "quiet_seconds", "liveness", "skips"),
     [
-        pytest.param("running", None, "succeeded", 10, True, id="turn-in-progress"),
+        pytest.param("running", None, "succeeded", 10, _RUNNER_UP, True, id="turn-in-progress"),
         # A status that never left running can't hold the check-ins back for good.
-        pytest.param("running", None, "succeeded", 60, False, id="running-for-an-hour"),
-        pytest.param("idle", 1, "succeeded", 10, True, id="waiting-on-a-person"),
-        pytest.param("idle", 1, "succeeded", 180, True, id="waiting-on-a-person-for-hours"),
-        pytest.param("idle", 0, "starting", 10, True, id="last-firing-on-its-way"),
-        pytest.param("idle", 0, "succeeded", 10, False, id="idle"),
+        pytest.param("running", None, "succeeded", 3600, None, False, id="running-but-silent"),
+        pytest.param("running", None, "succeeded", 10, _RUNNER_GONE, False, id="runner-gone"),
+        pytest.param("idle", 1, "succeeded", 10, _RUNNER_UP, True, id="waiting-on-a-person"),
+        pytest.param("idle", 1, "succeeded", 3 * 3600, None, True, id="waiting-for-hours"),
+        # A runner that is gone can't still be waiting on its question.
+        pytest.param("idle", 1, "succeeded", 10, _RUNNER_GONE, False, id="count-left-behind"),
+        # A firing that can't reach the host waits for it instead of failing.
+        pytest.param("idle", 0, "succeeded", 10, _HOST_OFFLINE, True, id="host-offline"),
+        pytest.param("idle", 0, "starting", 10, None, True, id="last-firing-on-its-way"),
+        pytest.param("idle", 0, "succeeded", 10, _RUNNER_UP, False, id="idle"),
     ],
 )
 async def test_a_busy_session_skips_its_repeating_timers_firing(
-    live_status, pending, status, minutes_since_last_firing, skips
+    live_status, pending, status, quiet_seconds, liveness, skips
 ) -> None:
     due = 1_800_003_600
-    # Quiet for only ten seconds: unlike a trigger's poll, a timer doesn't wait for quiet.
+    # Unlike a trigger's poll, a timer doesn't wait for a quiet session.
     check = _busy_until_check(
         live_status,
-        due - minutes_since_last_firing * 60,
-        updated_at=due - 10,
+        due - 600,
+        updated_at=due - quiet_seconds,
         status=status,
         pending=pending,
+        liveness=liveness,
     )
     timer = _task(
         kind="timer",

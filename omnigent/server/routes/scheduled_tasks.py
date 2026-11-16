@@ -415,6 +415,8 @@ def _validate_timezone_or_400(timezone: str) -> None:
 _AGENT_AUTOMATION_ACTION = "Agent automation changes"
 _TIMER_ACTION = "Session timers"
 _TIMER_NAME_CHARS = 60
+# Bounds what one session's agent can keep firing into it.
+_MAX_TIMERS_PER_SESSION = 10
 # A note is echoed in every firing, so keep it a label, not a transcript.
 _TIMER_NOTE_MAX_CHARS = 1000
 
@@ -1169,9 +1171,9 @@ def create_scheduled_tasks_router(
     ) -> dict[str, list[dict[str, Any]]]:
         """List the caller's scheduled tasks.
 
-        Lists automations unless *kind* is ``all``, so the reminders agents set for
-        their own sessions stay off the Automations page. Timers are never listed: their
-        session's agent manages them with its timer tools. There is no reminders-only
+        Lists automations unless *kind* is ``all``, so the reminders and timers agents
+        set for their own sessions stay off the Automations page; ``all`` includes them,
+        so an agent can find one to cancel. There is no reminders-only
         view: this list reads every task the owner has, and a selective filter needs
         an indexed, paginated query first.
 
@@ -1189,8 +1191,7 @@ def create_scheduled_tasks_router(
         tasks = [
             t
             for t in store.list(owner_user_id=owner_id, exclude_agent_ids=PROACTIVE_AGENT_IDS)
-            if owns_scheduled_task(t, owner_id)
-            and (t.kind == "automation" or (kind == "all" and t.kind == "reminder"))
+            if owns_scheduled_task(t, owner_id) and (kind == "all" or t.kind == "automation")
         ]
         task_ids = [t.id for t in tasks]
         running = store.list_running_runs_for_tasks(task_ids)
@@ -1822,6 +1823,17 @@ def create_scheduled_tasks_router(
                 code=ErrorCode.INVALID_INPUT,
             )
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
+        kept = [
+            task
+            for task in await asyncio.to_thread(store.list, owner_user_id=owner_id)
+            if task.kind == "timer" and task.session_id == conv.id and task.state == "active"
+        ]
+        if len(kept) >= _MAX_TIMERS_PER_SESSION:
+            raise OmnigentError(
+                f"This session already keeps {_MAX_TIMERS_PER_SESSION} timers; cancel one with "
+                "sys_timer_cancel first",
+                code=ErrorCode.INVALID_INPUT,
+            )
         rrule, fire_at = durable_timer_rule(seconds, repeat, datetime.now(UTC))
         await _validate_rrule_or_400(rrule, "continue", "connected_host", allow_single_fire=True)
         name = _timer_name(note, seconds, repeat)
@@ -1898,11 +1910,17 @@ def create_scheduled_tasks_router(
             or task.kind != "timer"
             or task.session_id != source_id
             or not owns_scheduled_task(task, owner_id)
+            or task.state == "deleted"
             # A one-shot timer that fired has nothing left to cancel, as in memory.
-            or task.state in ("deleted", "completed")
+            or (task.state == "completed" and not await _firing_in_flight(task.id))
         ):
             raise OmnigentError("Timer not found", code=ErrorCode.NOT_FOUND)
         await asyncio.to_thread(store.delete, task.id)
         return {"timer_id": timer_id, "status": "cancelled"}
+
+    async def _firing_in_flight(task_id: str) -> bool:
+        """Whether a firing is claimed but not yet sent, which a cancel still stops."""
+        runs, _ = await asyncio.to_thread(store.list_runs, task_id, limit=1)
+        return bool(runs) and runs[0].status in ("scheduled", "starting")
 
     return router

@@ -278,8 +278,8 @@ when everything left waits on someone. It cancels the timer when the workflow
 concludes or on Stop, and sets it again on Continue, Run or Retry; a message
 from the user doesn't cancel it. On a server with the `durable_timers` release
 feature, the server keeps the timer, so a check-in still comes after the
-runner stops or the server restarts, and it skips a firing while the session
-is busy or waiting on the user. A check-in names no automation run on the
+runner stops or the server restarts, for up to seven days, and it skips a
+firing while the session is busy or waiting on the user. A check-in names no automation run on the
 session, so the journal keeps the run's progress. See
 [Automations](AUTOMATIONS.md) for timers the server keeps.
 

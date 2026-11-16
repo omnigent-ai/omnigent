@@ -3736,6 +3736,9 @@ def create_app(
             )
         return result
 
+    # The scheduler's busy check reads it for repeating timers.
+    app.state.session_liveness_lookup = _bulk_session_liveness
+
     @app.get("/health")
     async def health(
         session_id: str | None = Query(default=None),

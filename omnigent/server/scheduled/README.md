@@ -226,13 +226,18 @@ session, created through `POST /v1/sessions/{id}/timers` by that session's own
 runner. Its message is hidden (`is_meta`), like an in-memory timer's firing. It
 fires in the permission mode its session already runs, even one that skips
 approval. It never starts a session: when its session is gone or can no longer
-take it, the firing fails and the timer is cancelled. A repeating timer goes
-through the same busy check as a trigger, but while its session is running,
-waiting on an approval or question, or still taking the previous firing, it skips
-to its next occurrence instead of checking again two minutes later. A session that
-has shown as running for an hour since the timer's last firing gets the firing
-anyway (`TIMER_BUSY_SKIP_MAX_SECONDS`), so a stale status can't stall the
-check-ins meant to recover it; a pending approval or question always holds it back.
+take it, the firing fails and the timer is cancelled. A cancel that lands after a
+firing was claimed still stops it: the firing reads the timer again just before
+sending and records `skipped` (`task_deleted`). A timer counts its interval from
+when it was set, not from midnight, so it first fires a whole interval later, and
+a repeating timer's `COUNT` ends it seven days after it was set. It goes through
+the same busy check as a trigger, but while its session is running, waiting on an
+approval or question, or still taking the previous firing, or while its host is
+offline, it skips to its next occurrence instead of checking again two minutes
+later. A running status whose runner is gone, or that has shown no activity for an
+hour (`TIMER_BUSY_SKIP_MAX_SECONDS`), doesn't hold it back, and neither does a
+pending count left by a runner that is gone, so a stale status can't stall the
+check-ins meant to recover it.
 
 If the replica stops before recording, recovery finds no session on the run and
 records `failed`; it never resends. A first run of such a task records its

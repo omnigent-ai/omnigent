@@ -327,7 +327,7 @@ async def test_a_short_or_off_minute_timer_never_asks_the_server(args: dict[str,
         result = await _set_timer(server_client, **args)
         try:
             assert result["durable"] is False
-            assert "not_durable_because" not in result
+            assert "in whole minutes" in result["not_durable_because"]
         finally:
             await execute_tool(
                 tool_name="sys_timer_cancel",
@@ -350,8 +350,13 @@ async def test_a_timer_create_that_may_have_landed_is_not_doubled_in_the_runner(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("delete_status", "status"), [(200, "cancelled"), (404, "not_found")])
-async def test_cancelling_a_kept_timer_goes_to_the_server(delete_status: int, status: str) -> None:
+@pytest.mark.parametrize(
+    ("delete_status", "status"),
+    [(200, "cancelled"), (404, "not_found"), (405, "not_found"), (403, None), (503, None)],
+)
+async def test_cancelling_a_kept_timer_goes_to_the_server(
+    delete_status: int, status: str | None
+) -> None:
     from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 
     handler, calls = _timer_server(keeps=True, delete_status=delete_status)
@@ -364,7 +369,12 @@ async def test_cancelling_a_kept_timer_goes_to_the_server(delete_status: int, st
             conversation_id=_SESSION,
             server_client=server_client,
         )
-    assert json.loads(output) == {"timer_id": _KEPT_TIMER["timer_id"], "status": status}
+    result = json.loads(output)
+    if status is None:
+        # Anything but a missing timer leaves it possibly still set, so it isn't "not found".
+        assert "may still be set" in result["error"]
+    else:
+        assert result == {"timer_id": _KEPT_TIMER["timer_id"], "status": status}
     [delete] = calls
     assert delete.method == "DELETE"
     assert delete.url.path == f"/v1/sessions/{_SESSION}/timers/{_KEPT_TIMER['timer_id']}"

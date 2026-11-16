@@ -55,6 +55,9 @@ _logger = logging.getLogger(__name__)
 # which must be whole minutes: the scheduler fires continued sessions at most
 # every ten minutes.
 DURABLE_TIMER_MIN_SECONDS = 600
+# A repeating timer the server keeps ends this long after it is set, so one left
+# running after its work ended stops on its own.
+DURABLE_TIMER_MAX_LIFETIME = timedelta(days=7)
 _TIMER_ID_PREFIX = "timer_"
 _DURABLE_TIMER_TASK_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
 
@@ -132,12 +135,15 @@ def durable_timer_rule(seconds: float, repeat: bool, now: datetime) -> tuple[str
     :param seconds: A delay or interval :func:`is_durable_timer` accepts, e.g. ``600``.
     :param repeat: Whether the timer repeats.
     :param now: When the timer is set, timezone-aware.
-    :returns: ``("FREQ=MINUTELY;INTERVAL=10", None)`` for a timer repeating every
-        ten minutes from its creation, or a one-time rule and its UTC fire time:
-        the whole minute at or after ``now + seconds``.
+    :returns: ``("FREQ=MINUTELY;INTERVAL=10;COUNT=1008", None)`` for a timer
+        repeating every ten minutes, counted from its creation, for
+        :data:`DURABLE_TIMER_MAX_LIFETIME` (at least twice), or a one-time rule and
+        its UTC fire time: the whole minute at or after ``now + seconds``.
     """
     if repeat:
-        return f"FREQ=MINUTELY;INTERVAL={int(seconds) // 60}", None
+        minutes = int(seconds) // 60
+        firings = max(2, int(DURABLE_TIMER_MAX_LIFETIME.total_seconds()) // (minutes * 60))
+        return f"FREQ=MINUTELY;INTERVAL={minutes};COUNT={firings}", None
     when = (now + timedelta(seconds=seconds)).astimezone(UTC)
     if when.second or when.microsecond:
         when = when.replace(second=0, microsecond=0) + timedelta(minutes=1)
@@ -205,7 +211,8 @@ class SysTimerSetTool(Tool):
             "when it repeats) is kept by the server when it can be, so it "
             "still fires after this runner stops or the server restarts; "
             "the result says durable: true. A durable repeating timer skips "
-            "a firing while this session is busy or waiting on someone. "
+            "a firing while this session is busy or waiting on someone, and "
+            f"ends {DURABLE_TIMER_MAX_LIFETIME.days} days after it is set. "
             "Shorter timers end with the runner."
         )
 

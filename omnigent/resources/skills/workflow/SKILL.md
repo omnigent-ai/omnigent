@@ -455,10 +455,11 @@ Code, `sys_timer_set` is `mcp__omnigent__sys_timer_set`.
    cancel that one first with `sys_timer_cancel` and that `timer_id`, so
    only one runs.
 2. `durable: true` in the result means the server keeps the timer, so it
-   fires even after your runner stops, and skips a check-in while your
-   session is busy or waiting on the user. With `durable: false` it lasts
-   only as long as your runner, and `not_durable_because` says why; keep it
-   anyway.
+   fires even after your runner stops, skips a check-in while your session
+   is busy or waiting on the user, and ends on its own after seven days;
+   set it again then if the run is still going. With `durable: false` it
+   lasts only as long as your runner, and `not_durable_because` says why;
+   keep it anyway.
 3. A check-in arrives as a `[System: timer … fired]` message with that
    note. Read your journal with `sys_journal_read`, check on the work you're
    waiting for, write a status for anything that moved and continue the

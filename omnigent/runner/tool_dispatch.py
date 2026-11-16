@@ -137,6 +137,7 @@ from omnigent.tools.builtins.sys_terminal import (
     SysTerminalSendTool,
 )
 from omnigent.tools.builtins.timer import (
+    DURABLE_TIMER_MIN_SECONDS,
     durable_timer_task_id,
     is_durable_timer,
     timer_fired_text,
@@ -4780,8 +4781,13 @@ async def _execute_timer_set(
     if server_client is None or conversation_id is None:
         return json.dumps({"error": "timer requires server_client and conversation_id"})
 
-    not_kept: str | None = None
-    if is_durable_timer(seconds, repeat):
+    not_kept: str | None = (
+        None
+        if is_durable_timer(seconds, repeat)
+        else f"only timers of {DURABLE_TIMER_MIN_SECONDS} seconds or more, in whole minutes "
+        "when they repeat, can be kept by the server"
+    )
+    if not_kept is None:
         kept = await _keep_timer_on_server(
             server_client, conversation_id, seconds=seconds, repeat=repeat, note=note
         )
@@ -4996,11 +5002,15 @@ async def _execute_timer_cancel(
             )
         except Exception as exc:  # noqa: BLE001
             return json.dumps({"error": f"sys_timer_cancel failed: {exc}"})
-        if resp.status_code >= 500:
-            return json.dumps(
-                {"error": f"sys_timer_cancel: the server returned {resp.status_code}"}
-            )
         # An older server, or one that doesn't keep timers, has no such route.
+        if resp.status_code not in (404, 405) and resp.status_code >= 300:
+            return json.dumps(
+                {
+                    "error": f"sys_timer_cancel: the server returned {resp.status_code}, "
+                    "so the timer may still be set",
+                    "details": resp.text[:1000],
+                }
+            )
         cancelled = resp.status_code < 300
     return json.dumps({"timer_id": timer_id, "status": "cancelled" if cancelled else "not_found"})
 

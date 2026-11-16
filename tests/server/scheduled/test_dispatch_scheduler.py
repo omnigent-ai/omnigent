@@ -1405,13 +1405,13 @@ async def test_schedule_search_failure_preserves_next_run_at_and_retries(
             raise RRuleSearchError("RRULE validation exceeds the supported time limit")
         return original_validate(rule, **kwargs)
 
-    def calculate(rule, after, tz, *, anchor=None):
+    def calculate(rule, after, tz, *, anchor=None, phase_from_anchor=False):
         # Distinguish the task without replacing schedule error handling.
         if failing and failure != "validation" and rule == "FREQ=HOURLY":
             if failure == "unexpected":
                 raise OverflowError("invalid persisted timestamp")
             raise RRuleSearchError("RRULE search exceeds the supported time limit")
-        return original(rule, after, tz, anchor=anchor)
+        return original(rule, after, tz, anchor=anchor, phase_from_anchor=phase_from_anchor)
 
     store.update(healthy.id, rrule="FREQ=HOURLY;INTERVAL=1")
     monkeypatch.setattr(schedule, "get_next_fire_time", calculate)
@@ -2765,11 +2765,13 @@ async def test_a_repeating_timer_survives_a_restart_and_fires_once_each_time(
 ) -> None:
     task = _task(
         store,
-        rrule="FREQ=MINUTELY;INTERVAL=10",
+        rrule="FREQ=MINUTELY;INTERVAL=10;COUNT=1008",
         session_mode="continue",
         session_id=uuid.uuid4().hex,
         kind="timer",
     )
+    # It first fires a whole interval after it was set.
+    assert task.next_run_at == task.created_at + 600
     fired = []
 
     async def fire(snapshot, lease):

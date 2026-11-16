@@ -559,8 +559,8 @@ BUSY_RECHECK_SECONDS = 2 * 60
 # While its session looks busy, a trigger automation still gets a prompt this often, so a
 # stale "running" status cannot stall it.
 BUSY_SKIP_MAX_SECONDS = 10 * 60
-# A repeating timer still fires this long after its last firing while its session shows
-# as running, so a stale status can't hold back the check-ins meant to recover it.
+# A session that has shown as running with no activity for this long no longer holds back
+# its repeating timers, so a stale status can't stall the check-ins meant to recover it.
 TIMER_BUSY_SKIP_MAX_SECONDS = 60 * 60
 
 
@@ -573,10 +573,13 @@ def build_busy_until(deps: FireDeps) -> Callable[[ScheduledTask, int], Awaitable
     :data:`BUSY_RECHECK_SECONDS` from now while it shows as running (a turn in progress,
     or waiting on an approval or question), has an approval or question pending, or the
     previous poll is still being delivered. It never waits past
-    :data:`BUSY_SKIP_MAX_SECONDS` after the latest poll went out. A repeating timer skips
-    to its next occurrence instead while its session is busy, except that it fires once
-    its session has shown as running for :data:`TIMER_BUSY_SKIP_MAX_SECONDS` since its
-    last firing; an approval or question waiting on a person always holds it back.
+    :data:`BUSY_SKIP_MAX_SECONDS` after the latest poll went out.
+
+    A repeating timer skips to its next occurrence instead while its session is busy, or
+    while the session's host is offline, so a firing that can't arrive records no failed
+    run. A running status with no runner, or with no activity for
+    :data:`TIMER_BUSY_SKIP_MAX_SECONDS`, doesn't hold it back, and neither does a pending
+    approval count left by a runner that is gone.
     """
 
     async def busy_until(task: ScheduledTask, now: int) -> int | None:
@@ -610,9 +613,14 @@ def build_busy_until(deps: FireDeps) -> Callable[[ScheduledTask, int], Awaitable
             )
         sent_at = max((t for t in sent_times if t is not None), default=None)
         if is_repeating_timer(task):
-            last_fired = sent_at if sent_at is not None else task.created_at
-            stale = now - last_fired >= TIMER_BUSY_SKIP_MAX_SECONDS
-            if waiting or delivering or (running and not stale):
+            live = await _session_liveness(deps, session_id)
+            runner_up = live is None or live.runner_online
+            host_offline = live is not None and live.host_online is False
+            # A runner that is gone left the status and the count it last reported.
+            busy = runner_up and (
+                waiting or (running and now - session.updated_at < TIMER_BUSY_SKIP_MAX_SECONDS)
+            )
+            if busy or delivering or host_offline:
                 # Its next firing comes on schedule.
                 return await asyncio.to_thread(next_scheduled_time, task, now)
             return None
@@ -626,6 +634,18 @@ def build_busy_until(deps: FireDeps) -> Callable[[ScheduledTask, int], Awaitable
         return min(until, backstop) if backstop > now else None
 
     return busy_until
+
+
+async def _session_liveness(deps: FireDeps, session_id: str) -> Any | None:
+    """The session's runner and host liveness, or ``None`` when the server can't tell."""
+    lookup = getattr(deps.app_state, "session_liveness_lookup", None)
+    if lookup is None:
+        return None
+    try:
+        return (await asyncio.to_thread(lookup, [session_id])).get(session_id)
+    except Exception:
+        _logger.warning("Could not read the liveness of session %s", session_id, exc_info=True)
+        return None
 
 
 def build_run_now(
@@ -1215,7 +1235,7 @@ async def _continue_session(
     if task.kind in SESSION_MESSAGE_KINDS:
         # Naming the run on the session would start a new journal run, resetting its
         # plan's progress, and mark an attended session unattended.
-        await _send_session_message(conv, task, dispatch, recorder)
+        await _send_session_message(deps, conv, task, dispatch, recorder)
         return
     progress = _PromptSendProgress()
     progress_token = _PROMPT_SEND_PROGRESS.set(progress)
@@ -1260,9 +1280,23 @@ async def _continue_session(
 
 
 async def _send_session_message(
-    conv: Conversation, task: ScheduledTask, dispatch: LaunchDispatch, recorder: _FireRecorder
+    deps: FireDeps,
+    conv: Conversation,
+    task: ScheduledTask,
+    dispatch: LaunchDispatch,
+    recorder: _FireRecorder,
 ) -> None:
-    """Send a reminder's message into its session as part of its current work."""
+    """Send a reminder's or timer's message into its session as part of its current work."""
+    # Cancelled since this firing was claimed: an agent that cancelled it isn't told it fired.
+    current = await asyncio.to_thread(deps.scheduled_task_store.get, task.id)
+    if current is None or current.state == "deleted":
+        await recorder.finish(
+            "skipped",
+            conversation_id=conv.id,
+            error="cancelled before it was sent",
+            error_code="task_deleted",
+        )
+        return
     try:
         start_fire_stage("runner_start", session_id=conv.id)
         await dispatch(conv, task)

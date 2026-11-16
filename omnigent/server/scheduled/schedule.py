@@ -41,6 +41,8 @@ def next_scheduled_time(task: ScheduledTask, after: int) -> int | None:
             datetime.fromtimestamp(after, UTC),
             timezone,
             anchor=datetime.fromtimestamp(task.created_at, UTC),
+            # A timer repeats from when it was set, like one the runner keeps.
+            phase_from_anchor=task.kind == "timer",
         )
     except RRuleSearchError:
         raise
