@@ -395,7 +395,13 @@ def ask_on_add_policy(event: PolicyEvent) -> PolicyResponse:
 # ``ask_on_scheduled_task_change`` into every engine and exempts these names
 # from its no-policy fast path; both read this set so they cannot drift.
 SCHEDULED_TASK_APPROVAL_TOOLS: frozenset[str] = frozenset(
-    {"sys_scheduled_task_create", "sys_scheduled_task_update", "sys_reminder_set"}
+    {
+        "sys_scheduled_task_create",
+        "sys_scheduled_task_update",
+        "sys_reminder_set",
+        "sys_triggered_task_create",
+        "sys_triggered_task_update",
+    }
 )
 
 
@@ -488,11 +494,9 @@ def scheduled_task_review_error(
     return None
 
 
-def _scheduled_task_review(args: dict[str, object], *, action: str, subject: str) -> str:
-    """Render supplied instructions in full and identify legacy omissions."""
-    prompt = args.get("prompt", "(unchanged; not supplied by legacy caller)")
-    raw_permission_mode = args.get("permission_mode")
-    permission_mode = (
+def _permission_setting(raw_permission_mode: object) -> str:
+    """How a review names a task's permission mode, flagging one that skips approval."""
+    setting = (
         "agent default (no task override)"
         if raw_permission_mode is None
         else str(raw_permission_mode)
@@ -500,7 +504,14 @@ def _scheduled_task_review(args: dict[str, object], *, action: str, subject: str
     if isinstance(raw_permission_mode, str) and raw_permission_mode in (
         APPROVAL_SKIPPING_PERMISSION_MODES
     ):
-        permission_mode += " (skips approval prompts, so unattended runs act without asking)"
+        setting += " (skips approval prompts, so unattended runs act without asking)"
+    return setting
+
+
+def _scheduled_task_review(args: dict[str, object], *, action: str, subject: str) -> str:
+    """Render supplied instructions in full and identify legacy omissions."""
+    prompt = args.get("prompt", "(unchanged; not supplied by legacy caller)")
+    permission_mode = _permission_setting(args.get("permission_mode"))
     legacy_notice = ""
     if action == "update" and _SCHEDULED_TASK_REVIEW_FIELDS.difference(args):
         legacy_notice = (
@@ -564,6 +575,87 @@ def _reminder_review(args: dict[str, object]) -> PolicyResponse:
     }
 
 
+def _triggered_task_review(args: dict[str, object], *, action: str) -> PolicyResponse:
+    """ASK to create or change a triggered task, showing its trigger and instructions in full.
+
+    A create is checked as the runner will build it, so an invalid trigger is refused
+    before anyone is asked to approve it, and the sessions' inherited settings are shown.
+    """
+    from omnigent.tools.builtins.trigger_prompts import describe_trigger_watch
+    from omnigent.tools.builtins.triggered_tasks import (
+        TRIGGER_ARGUMENTS,
+        build_trigger_config,
+        default_worker,
+        describe_trigger_arguments,
+        triggered_task_review_error,
+    )
+
+    error = triggered_task_review_error(args, action=action, require_complete=False)
+    if error:
+        return {"result": "DENY", "reason": f"Cannot {action} a triggered task. {error}"}
+    sessions = "unchanged" if action == "update" and "worker" not in args else ""
+    # The compiled search the poller runs, e.g. its JQL; an update can't know it here.
+    watch = ""
+    if action == "create":
+        config = build_trigger_config(
+            args,
+            current=None,
+            worker_defaults=default_worker(
+                execution_target=args.get("execution_target"),
+                model_override=args.get("model_override"),
+                reasoning_effort=args.get("reasoning_effort"),
+                permission_mode=args.get("permission_mode"),
+                worker_permission_modes=True,
+            ),
+        )
+        if isinstance(config, str):
+            return {"result": "DENY", "reason": f"Cannot create a triggered task. {config}"}
+        watch = f"{describe_trigger_watch(config)}\n"
+        worker = config["worker"]
+        sessions = (
+            f"agent={worker['agentId'] or 'same as the task'}, "
+            f"model={worker['model'] or 'agent default'}, "
+            f"reasoning_effort={worker['effort'] or 'default'}, "
+            f"permission_mode={worker.get('permissionMode') or 'agent default'}, "
+            f"placement={worker['placement']}, "
+            + (
+                "each match starts its own session"
+                if config.get("taskSessionMode") != "continue"
+                else "every match goes to one task session"
+            )
+        )
+    elif "worker" in args:
+        sessions = "worker settings below"
+    subject = (
+        f"triggered task {_clip(str(args.get('name') or '(unnamed)'))!r}"
+        if action == "create"
+        else f"triggered task {_clip(str(args.get('triggered_task_id') or '(no id)'))}"
+    )
+    trigger = describe_trigger_arguments(args)
+    task_settings = {
+        key: value
+        for key, value in args.items()
+        if key not in TRIGGER_ARGUMENTS and key != "instructions"
+    }
+    settings = _scheduled_task_settings(task_settings, skip="instructions")
+    instructions = args.get("instructions", "(unchanged; not supplied)")
+    return {
+        "result": "ASK",
+        "reason": (
+            f"Agent wants to {action} {subject}. It starts a session, unattended, for "
+            "each new matching item and posts with your accounts.\n"
+            f"Task permission setting: {_permission_setting(args.get('permission_mode'))}\n"
+            f"Sessions it starts: {sessions}\n"
+            f"Settings: {settings or '(none)'}\n"
+            f"{watch}"
+            + ("Trigger:\n" + "\n".join(trigger) if trigger else "Trigger: unchanged")
+            + "\nFull instructions for each session:\n"
+            f"{instructions}\n"
+            "Approve?"
+        ),
+    }
+
+
 def ask_on_scheduled_task_change(event: PolicyEvent) -> PolicyResponse:
     """ASK for user approval before an agent creates or updates a scheduled task,
     or sets a reminder (a one-time task that continues the session).
@@ -588,6 +680,10 @@ def ask_on_scheduled_task_change(event: PolicyEvent) -> PolicyResponse:
         args = {}
     if tool == "sys_reminder_set":
         return _reminder_review(args)
+    if tool in ("sys_triggered_task_create", "sys_triggered_task_update"):
+        return _triggered_task_review(
+            args, action="create" if tool == "sys_triggered_task_create" else "update"
+        )
     action = "create" if tool == "sys_scheduled_task_create" else "update"
     # Older runners expose optional review fields. Current runners enforce the
     # complete contract before dispatch, including when paired with an old server.

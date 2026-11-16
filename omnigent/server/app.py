@@ -327,6 +327,9 @@ class ServerInfoResponse(BaseModel):
     # Scheduled-task runs drop a trigger prompt's ``<!-- omnigent-trigger ... -->`` header
     # before dispatch; older servers would send it to the model.
     scheduled_task_trigger_headers: bool = True
+    # The approval policy reviews the ``sys_triggered_task_*`` tools; runners refuse
+    # them on older servers, whose policy would let them through unreviewed.
+    triggered_task_tools: bool = True
     automation_trigger_poll_minutes: int = 10
     # Scheduled permissions use the selected native harness's vocabulary.
     scheduled_task_harness_settings: bool = True

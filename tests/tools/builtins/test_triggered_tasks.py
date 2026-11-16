@@ -1,0 +1,571 @@
+"""Tests for the ``sys_triggered_task_*`` tool definitions and trigger arguments.
+
+Rendering and the saved header are covered by ``test_trigger_prompts.py``; these
+cover what the tools accept: their schemas, how a call's arguments become the
+trigger the web form saves, and how a saved trigger is reported back.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+import jsonschema
+import pytest
+
+from omnigent.tools.builtins.trigger_prompts import (
+    MAX_INSTRUCTIONS_CHARS,
+    TRIGGER_TEMPLATES,
+    TriggerConfig,
+    TriggerWorkerConfig,
+    trigger_fields_complete,
+)
+from omnigent.tools.builtins.triggered_tasks import (
+    TRIGGERED_TASK_TOOLS,
+    SysTriggeredTaskCreateTool,
+    SysTriggeredTaskUpdateTool,
+    build_trigger_config,
+    default_worker,
+    describe_trigger_arguments,
+    polling_minutes,
+    trigger_rrule,
+    triggered_task_review_error,
+    triggered_task_view,
+)
+
+_WORKER: TriggerWorkerConfig = {
+    "placement": "same_host",
+    "agentId": None,
+    "model": "",
+    "effort": "",
+    "permissionMode": "",
+}
+
+
+def _create(**args: Any) -> TriggerConfig | str:
+    return build_trigger_config(
+        {"instructions": "Investigate it.", **args}, current=None, worker_defaults=_WORKER
+    )
+
+
+def _created(**args: Any) -> TriggerConfig:
+    config = _create(**args)
+    assert not isinstance(config, str), config
+    assert trigger_fields_complete(config)
+    return config
+
+
+@pytest.mark.parametrize("tool", TRIGGERED_TASK_TOOLS, ids=lambda tool: tool.name())
+def test_schemas_are_valid_json_schema(tool: Any) -> None:
+    schema = tool().get_schema()
+    assert schema["function"]["name"] == tool.name()
+    jsonschema.Draft202012Validator.check_schema(schema["function"]["parameters"])
+
+
+def test_create_schema_requires_the_trigger_and_review_fields() -> None:
+    parameters = SysTriggeredTaskCreateTool().get_schema()["function"]["parameters"]
+    assert set(parameters["required"]) == {
+        "name",
+        "provider",
+        "scope",
+        "instructions",
+        "agent_id",
+        "permission_mode",
+    }
+    # Schedules and session modes are implementation details of a trigger.
+    assert not {"rrule", "timezone", "session_mode", "session_id"} & set(parameters["properties"])
+    jsonschema.validate(
+        {
+            "name": "Triage new tickets",
+            "provider": "jira",
+            "event": "created",
+            "scope": ["ES"],
+            "conditions": [{"field": "custom_field", "operator": "is", "value": "x", "name": "y"}],
+            "instructions": "Investigate it.",
+            "agent_id": "ag_example",
+            "permission_mode": None,
+            "worker": {"model": None, "placement": "managed"},
+        },
+        parameters,
+    )
+
+
+def test_update_schema_requires_only_the_id_and_review_fields() -> None:
+    parameters = SysTriggeredTaskUpdateTool().get_schema()["function"]["parameters"]
+    assert set(parameters["required"]) == {"triggered_task_id", "instructions", "permission_mode"}
+    assert "rrule" not in parameters["properties"]
+
+
+def test_create_description_lists_every_condition_field() -> None:
+    conditions = SysTriggeredTaskCreateTool().get_schema()["function"]["parameters"]["properties"][
+        "conditions"
+    ]["description"]
+    for source, template in TRIGGER_TEMPLATES.items():
+        line = conditions.split(f"{source}: ", 1)[1].split(". ", 1)[0]
+        for field in template.fields:
+            assert field.id in line, (source, field.id)
+
+
+@pytest.mark.parametrize(
+    ("args", "expected"),
+    [
+        (
+            {"provider": "jira", "scope": ["ES"]},
+            {"event": "created", "scope": "ES", "scopeOperator": "is", "linkBack": True},
+        ),
+        (
+            {"provider": "jira", "scope": [" ES ", "OPS", ""]},
+            {"scope": "ES, OPS", "scopeOperator": "in"},
+        ),
+        (
+            {"provider": "slack", "scope": ["#eng-support", "C0123ABCD"]},
+            {"event": "posted", "scope": "eng-support, C0123ABCD"},
+        ),
+        (
+            {"provider": "slack", "event": "dm", "scope": ["@alice"]},
+            {"event": "dm", "scope": "alice", "scopeOperator": "is"},
+        ),
+        (
+            {"provider": "slack", "event": "group_dm", "scope": ["alice", "bob"]},
+            {"scopeOperator": "in"},
+        ),
+        (
+            {"provider": "github", "event": "review", "scope": ["octo-org/octo-repo"]},
+            {"target": "me", "linkBack": False},
+        ),
+        (
+            {
+                "provider": "github",
+                "event": "review",
+                "scope": ["octo-org/octo-repo"],
+                "target": "octo-org/reviewers",
+                "link_back": True,
+            },
+            {"target": "octo-org/reviewers", "linkBack": True, "linkBackTouched": True},
+        ),
+        (
+            {"provider": "jira", "event": "assigned", "scope": ["ES"], "target": ""},
+            {"target": ""},
+        ),
+        (
+            {"provider": "pagerduty", "scope": ["Checkout"], "scope_match": "contains"},
+            {"event": "triggered", "scopeOperator": "contains"},
+        ),
+        (
+            {"provider": "linear", "scope": ["ENG"], "session_per_match": False},
+            {"taskSessionMode": "continue"},
+        ),
+    ],
+    ids=[
+        "jira-default-event",
+        "several-projects",
+        "slack-channel-prefix",
+        "slack-dm-prefix",
+        "group-dm",
+        "github-review-defaults",
+        "github-team-reviewer",
+        "jira-anyone",
+        "pagerduty-contains",
+        "one-task-session",
+    ],
+)
+def test_create_builds_the_trigger_the_form_saves(
+    args: dict[str, Any], expected: dict[str, Any]
+) -> None:
+    config = _created(**args)
+    assert config["source"] == args["provider"]
+    for key, value in expected.items():
+        assert config.get(key) == value, key
+    assert config["instructions"] == "Investigate it."
+
+
+def test_create_reads_conditions() -> None:
+    config = _created(
+        provider="jira",
+        scope=["ES"],
+        conditions=[
+            {"field": "label", "operator": "is_not", "value": " wontfix "},
+            {"field": "assignee", "operator": "empty"},
+            {"field": "custom_field", "operator": "is", "value": "Backend", "name": "Team"},
+            {"field": "jql", "operator": "matches", "value": 'summary ~ "crash"'},
+        ],
+    )
+    assert config["conditions"] == [
+        {"field": "label", "operator": "is_not", "value": "wontfix"},
+        {"field": "assignee", "operator": "empty", "value": ""},
+        {"field": "custom_field", "operator": "is", "value": "Backend", "name": "Team"},
+        {"field": "jql", "operator": "matches", "value": 'summary ~ "crash"'},
+    ]
+
+
+@pytest.mark.parametrize(
+    ("args", "error"),
+    [
+        ({"provider": "asana", "scope": ["X"]}, "provider must be one of"),
+        ({"provider": "jira", "event": "closed", "scope": ["ES"]}, "event must be one of"),
+        ({"provider": "jira", "scope": []}, "scope needs at least one entry"),
+        ({"provider": "jira", "scope": "ES"}, "scope must be a list"),
+        ({"provider": "jira", "scope": ["ES,OPS"]}, "can't contain commas"),
+        ({"provider": "jira", "scope": ["ES"], "scope_match": "contains"}, "is for pagerduty"),
+        (
+            {"provider": "pagerduty", "scope": ["A", "B"], "scope_match": "contains"},
+            "exactly one scope entry",
+        ),
+        ({"provider": "slack", "event": "group_dm", "scope": ["alice"]}, "at least two people"),
+        ({"provider": "jira", "scope": ["ES"], "target": "me"}, "takes no target"),
+        (
+            {"provider": "github", "event": "review", "scope": ["o/r"], "target": ""},
+            "needs a target",
+        ),
+        (
+            {"provider": "github", "event": "review", "scope": ["o/r"], "target": "not a login"},
+            "GitHub username",
+        ),
+        (
+            {"provider": "jira", "scope": ["ES"], "conditions": [{"field": "status"}]},
+            "isn't available for jira 'created'",
+        ),
+        (
+            {
+                "provider": "jira",
+                "event": "assigned",
+                "scope": ["ES"],
+                "conditions": [{"field": "assignee", "operator": "empty"}],
+            },
+            "isn't available for jira 'assigned'",
+        ),
+        (
+            {
+                "provider": "jira",
+                "scope": ["ES"],
+                "conditions": [{"field": "label", "operator": "contains", "value": "x"}],
+            },
+            "takes the operators is, is_not",
+        ),
+        (
+            {
+                "provider": "jira",
+                "scope": ["ES"],
+                "conditions": [{"field": "label", "operator": "is"}],
+            },
+            "needs a value",
+        ),
+        (
+            {
+                "provider": "jira",
+                "scope": ["ES"],
+                "conditions": [{"field": "assignee", "operator": "empty", "value": "me"}],
+            },
+            "takes no value",
+        ),
+        (
+            {
+                "provider": "jira",
+                "scope": ["ES"],
+                "conditions": [{"field": "custom_field", "operator": "is", "value": "x"}],
+            },
+            "custom_field needs name",
+        ),
+        (
+            {
+                "provider": "jira",
+                "scope": ["ES"],
+                "conditions": [{"field": "label", "operator": "is", "value": "x", "name": "y"}],
+            },
+            "only custom_field takes a name",
+        ),
+        (
+            {
+                "provider": "github",
+                "event": "pr",
+                "scope": ["o/r"],
+                "conditions": [{"field": "reviewer", "operator": "is", "value": "a b"}],
+            },
+            "a reviewer is",
+        ),
+        ({"provider": "jira", "scope": ["ES"], "instructions": "  "}, "non-empty"),
+        (
+            {"provider": "jira", "scope": ["ES"], "worker": {"permission_mode": "bypass"}},
+            "skips approval",
+        ),
+        (
+            {"provider": "jira", "scope": ["ES"], "worker": {"placement": "cloud"}},
+            "worker.placement",
+        ),
+        ({"provider": "jira", "scope": ["ES"], "link_back": "yes"}, "link_back must be"),
+    ],
+)
+def test_create_explains_an_invalid_trigger(args: dict[str, Any], error: str) -> None:
+    result = _create(**args)
+    assert isinstance(result, str)
+    assert error in result
+
+
+def test_instructions_limit_counts_like_the_web_form() -> None:
+    # The form counts UTF-16 code units, so an astral emoji takes two.
+    fits = "x" * (MAX_INSTRUCTIONS_CHARS - 2) + "\U0001f600"
+    assert not isinstance(_create(provider="jira", scope=["ES"], instructions=fits), str)
+    result = _create(provider="jira", scope=["ES"], instructions=fits + "x")
+    assert isinstance(result, str) and "at most" in result
+
+
+def test_worker_settings_merge_over_the_defaults() -> None:
+    config = _created(
+        provider="jira",
+        scope=["ES"],
+        worker={"agent_id": "ag_worker", "model": "", "reasoning_effort": "high"},
+    )
+    assert config["worker"] == {**_WORKER, "agentId": "ag_worker", "effort": "high"}
+
+
+@pytest.mark.parametrize(
+    ("task", "worker_permission_modes", "expected"),
+    [
+        (
+            {"execution_target": None, "permission_mode": "acceptEdits"},
+            True,
+            {"placement": "same_host", "permissionMode": "acceptEdits"},
+        ),
+        (
+            {"execution_target": "managed_sandbox", "permission_mode": "bypassPermissions"},
+            True,
+            {"placement": "managed", "permissionMode": ""},
+        ),
+        (
+            {"execution_target": "connected_host", "permission_mode": "acceptEdits"},
+            False,
+            {"placement": "same_host", "permissionMode": ""},
+        ),
+    ],
+    ids=["inherits-mode", "never-skips-approval", "server-without-session-modes"],
+)
+def test_default_worker_follows_the_task(
+    task: dict[str, Any], worker_permission_modes: bool, expected: dict[str, Any]
+) -> None:
+    worker = default_worker(
+        model_override="model-a",
+        reasoning_effort=None,
+        worker_permission_modes=worker_permission_modes,
+        **task,
+    )
+    assert worker == {"agentId": None, "model": "model-a", "effort": "", **expected}
+
+
+def _update(current: TriggerConfig, **args: Any) -> TriggerConfig | str:
+    return build_trigger_config(
+        {"instructions": current["instructions"], **args},
+        current=current,
+        worker_defaults=current["worker"],
+    )
+
+
+def test_update_keeps_what_the_call_leaves_out() -> None:
+    current = _created(
+        provider="jira",
+        scope=["ES"],
+        conditions=[{"field": "label", "operator": "is", "value": "bug"}],
+        link_back=False,
+        worker={"agent_id": "ag_worker"},
+    )
+    # An "in" scope with one project stays "in" so an unrelated update renders the same.
+    current["scopeOperator"] = "in"
+    assert _update(current) == current
+    updated = _update(current, instructions="Fix it.")
+    assert updated == {**current, "instructions": "Fix it."}
+
+
+def test_update_to_another_event_keeps_what_the_form_keeps() -> None:
+    current = _created(
+        provider="github",
+        event="pr",
+        scope=["octo-org/octo-repo"],
+        conditions=[
+            {"field": "label", "operator": "is", "value": "bug"},
+            {"field": "reviewer", "operator": "is", "value": "me"},
+        ],
+    )
+    switched = _update(current, event="issue")
+    assert not isinstance(switched, str)
+    assert switched["scope"] == "octo-org/octo-repo"
+    # Issues have no reviewer, so that condition goes.
+    assert switched["conditions"] == [{"field": "label", "operator": "is", "value": "bug"}]
+
+
+def test_update_to_an_event_watching_other_things_needs_scope() -> None:
+    current = _created(provider="slack", scope=["eng-support"])
+    assert _update(current, event="dm") == "scope is required"
+    dm = _update(current, event="dm", scope=["alice"])
+    assert not isinstance(dm, str) and dm["scope"] == "alice"
+
+
+def test_update_to_another_provider_starts_from_its_empty_form() -> None:
+    current = _created(
+        provider="jira",
+        scope=["ES"],
+        conditions=[{"field": "label", "operator": "is", "value": "bug"}],
+        worker={"agent_id": "ag_worker"},
+    )
+    assert _update(current, provider="linear") == "pass scope when changing the provider"
+    switched = _update(current, provider="linear", scope=["ENG"])
+    assert not isinstance(switched, str)
+    assert (switched["source"], switched["event"], switched["conditions"]) == (
+        "linear",
+        "created",
+        [],
+    )
+    # The sessions it starts keep their settings, as when the form switches source.
+    assert switched["worker"]["agentId"] == "ag_worker"
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        {"provider": "jira", "scope": ["ES", "OPS"], "link_back": False},
+        {"provider": "slack", "event": "group_dm", "scope": ["alice", "bob"]},
+        {
+            "provider": "github",
+            "event": "review",
+            "scope": ["octo-org/octo-repo"],
+            "target": "@octocat",
+            "conditions": [{"field": "label", "operator": "is_not", "value": "draft"}],
+        },
+        {"provider": "pagerduty", "scope": ["Payments"], "scope_match": "contains"},
+        {
+            "provider": "linear",
+            "scope": ["ENG"],
+            "session_per_match": False,
+            "worker": {"model": "model-b", "placement": "managed"},
+        },
+    ],
+    ids=["jira", "slack-group-dm", "github-review", "pagerduty", "linear-task-session"],
+)
+def test_view_round_trips_through_create(args: dict[str, Any]) -> None:
+    """What the list reports can be passed back to create the same trigger."""
+    config = _created(**args)
+    view = triggered_task_view({"id": "t1", "name": "n"}, config)
+    trigger = {
+        key: view[key]
+        for key in (
+            "provider",
+            "event",
+            "scope",
+            "scope_match",
+            "target",
+            "conditions",
+            "link_back",
+            "session_per_match",
+        )
+        if key in view
+    }
+    worker = {key: value for key, value in view["worker"].items() if value is not None}
+    rebuilt = _created(instructions=view["instructions"], worker=worker, **trigger)
+    # Passing link_back explicitly marks it as the owner's choice; nothing else changes.
+    rebuilt.pop("linkBackTouched", None)
+    config.pop("linkBackTouched", None)
+    assert rebuilt == config
+
+
+def test_view_reports_the_task_without_its_schedule() -> None:
+    config = _created(provider="jira", scope=["ES"])
+    view = triggered_task_view(
+        {
+            "id": "t1",
+            "name": "Jira tickets",
+            "state": "active",
+            "prompt": "rendered",
+            "rrule": "FREQ=MINUTELY;INTERVAL=10",
+            "timezone": "UTC",
+            "next_run_at": 1,
+            "session_mode": "continue",
+            "session_id": "conv_watch",
+            "agent_id": "ag_example",
+            "last_run_at": 5,
+            "last_run_status": "succeeded",
+        },
+        config,
+    )
+    assert view["triggered_task_id"] == "t1"
+    assert (view["last_checked_at"], view["last_check_status"]) == (5, "succeeded")
+    assert view["watch_session_id"] == "conv_watch"
+    assert not {"prompt", "rrule", "timezone", "next_run_at", "session_mode"} & set(view)
+
+
+@pytest.mark.parametrize(
+    ("rrule", "minutes"),
+    [
+        ("FREQ=MINUTELY;INTERVAL=10", 10),
+        ("FREQ=MINUTELY;INTERVAL=90", 90),
+        ("FREQ=HOURLY;BYMINUTE=0", 60),
+        ("FREQ=MINUTELY;INTERVAL=10;COUNT=3", 60),
+        (None, 60),
+    ],
+)
+def test_polling_minutes_matches_the_form(rrule: str | None, minutes: int) -> None:
+    assert polling_minutes(rrule) == minutes
+
+
+@pytest.mark.parametrize(
+    ("info", "rrule"),
+    [
+        (
+            {
+                "features": {"automations_v2": True},
+                "scheduled_task_subhour": True,
+                "automation_trigger_poll_minutes": 15,
+            },
+            "FREQ=MINUTELY;INTERVAL=15",
+        ),
+        (
+            {"features": {"automations_v2": True}, "automation_trigger_poll_minutes": 120},
+            "FREQ=MINUTELY;INTERVAL=120",
+        ),
+        (
+            {"features": {"automations_v2": True}, "automation_trigger_poll_minutes": 10},
+            "FREQ=HOURLY;BYMINUTE=0",
+        ),
+        ({"scheduled_task_subhour": True}, "FREQ=HOURLY;BYMINUTE=0"),
+    ],
+    ids=["subhour", "hours", "no-subhour", "no-database-scheduler"],
+)
+def test_trigger_rrule_matches_the_form_default(info: dict[str, Any], rrule: str) -> None:
+    assert trigger_rrule(info) == rrule
+
+
+@pytest.mark.parametrize(
+    ("args", "action", "error"),
+    [
+        ({"permission_mode": None}, "create", "Missing review fields (instructions)"),
+        ({"instructions": "x"}, "update", "Missing review fields (permission_mode)"),
+        ({"instructions": "x", "permission_mode": "null"}, "create", "permission_mode must"),
+        ({"instructions": "x", "permission_mode": None}, "update", "triggered_task_id"),
+    ],
+)
+def test_review_error(args: dict[str, Any], action: str, error: str) -> None:
+    assert error in (triggered_task_review_error(args, action=action) or "")
+
+
+def test_review_error_accepts_complete_values() -> None:
+    assert (
+        triggered_task_review_error(
+            {"instructions": "x", "permission_mode": None, "triggered_task_id": "t1"},
+            action="update",
+        )
+        is None
+    )
+
+
+def test_describe_trigger_arguments_shows_every_value_in_full() -> None:
+    jql = 'summary ~ "crash" AND ' + "labels = x AND " * 40 + "END"
+    lines = describe_trigger_arguments(
+        {
+            "provider": "jira",
+            "scope": ["ES"],
+            "conditions": [{"field": "jql", "operator": "matches", "value": jql}],
+            "instructions": "not a trigger argument",
+        }
+    )
+    assert lines[0] == 'provider: "jira"'
+    assert lines[1] == 'scope: ["ES"]'
+    assert lines[2] == "conditions (all must match):"
+    # JSON-encoded, so quotes and line breaks stay inside the value.
+    assert lines[3].endswith('END"}') and '\\"crash\\"' in lines[3]
+    assert len(lines) == 4

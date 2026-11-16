@@ -973,7 +973,14 @@ def test_ask_on_scheduled_task_change_asks_for_update_naming_fields() -> None:
 
 
 @pytest.mark.parametrize(
-    "tool", ["sys_scheduled_task_list", "sys_scheduled_task_delete", "web_search"]
+    "tool",
+    [
+        "sys_scheduled_task_list",
+        "sys_scheduled_task_delete",
+        "sys_triggered_task_list",
+        "sys_triggered_task_delete",
+        "web_search",
+    ],
 )
 def test_ask_on_scheduled_task_change_allows_other_tools(tool: str) -> None:
     """Reads, deletes and unrelated tools pass through."""
@@ -1200,3 +1207,103 @@ def test_block_skills_alias_matching_does_not_over_block() -> None:
     assert policy(tc("load_skill", {"name": "deployer"}))["result"] == "ALLOW"
     assert policy(tc("load_skill", {"name": "myplugin:other"}))["result"] == "ALLOW"
     assert policy(tc("load_skill", {"name": "otherplugin:deploy"}))["result"] == "ALLOW"
+
+
+# ── triggered tasks ────────────────────────────────────────────
+
+
+def _triggered_review(tool: str, arguments: dict[str, object]):
+    from omnigent.policies.builtins.safety import ask_on_scheduled_task_change
+
+    return ask_on_scheduled_task_change(
+        {"type": "tool_call", "target": tool, "data": {"arguments": arguments}}
+    )
+
+
+_TRIGGER_CREATE: dict[str, object] = {
+    "name": "Triage ES",
+    "provider": "jira",
+    "scope": ["ES"],
+    "instructions": "Investigate the ticket.",
+    "agent_id": "ag_1",
+    "permission_mode": "acceptEdits",
+    "model_override": "model-a",
+}
+
+
+def test_triggered_task_create_asks_with_its_whole_trigger() -> None:
+    """Raw JQL runs with the owner's credentials, so the review never shortens it."""
+    jql = 'summary ~ "crash" AND ' + "labels != wontfix AND " * 20 + "END-SENTINEL"
+    instructions = "Investigate the ticket.\n" * 40 + "INSTRUCTIONS-END"
+    result = _triggered_review(
+        "sys_triggered_task_create",
+        {
+            **_TRIGGER_CREATE,
+            "instructions": instructions,
+            "conditions": [{"field": "jql", "operator": "matches", "value": jql}],
+        },
+    )
+    assert result["result"] == "ASK"
+    reason = result["reason"]
+    assert reason.startswith("Agent wants to create triggered task 'Triage ES'.")
+    assert 'provider: "jira"' in reason
+    assert "END-SENTINEL" in reason and "INSTRUCTIONS-END" in reason
+    assert "Task permission setting: acceptEdits" in reason
+    # The sessions it starts inherit the task's settings, which the approver sees.
+    assert (
+        "Sessions it starts: agent=same as the task, model=model-a, reasoning_effort=default, "
+        "permission_mode=acceptEdits, placement=same_host, each match starts its own session"
+    ) in reason
+    assert "agent_id=ag_1" in reason and "model_override=model-a" in reason
+    # The compiled search the poller will run, as well as the arguments behind it.
+    assert 'Watch: new Jira tickets matching this JQL:\nproject = "ES" AND (summary ~' in reason
+
+
+def test_triggered_task_create_denies_a_trigger_the_runner_would_refuse() -> None:
+    result = _triggered_review(
+        "sys_triggered_task_create",
+        {
+            **_TRIGGER_CREATE,
+            "conditions": [{"field": "label", "operator": "contains", "value": "x"}],
+        },
+    )
+    assert result["result"] == "DENY"
+    assert "jira label takes the operators is, is_not" in result["reason"]
+
+
+def test_triggered_task_update_names_what_it_changes() -> None:
+    unchanged = _triggered_review(
+        "sys_triggered_task_update",
+        {
+            "triggered_task_id": "0123456789abcdef0123456789abcdef",
+            "instructions": "Investigate the ticket.",
+            "permission_mode": None,
+            "state": "paused",
+        },
+    )
+    assert unchanged["result"] == "ASK"
+    assert "Trigger: unchanged" in unchanged["reason"]
+    assert "Sessions it starts: unchanged" in unchanged["reason"]
+    assert "state=paused" in unchanged["reason"]
+
+    changed = _triggered_review(
+        "sys_triggered_task_update",
+        {
+            "triggered_task_id": "0123456789abcdef0123456789abcdef",
+            "instructions": "Investigate the ticket.",
+            "permission_mode": None,
+            "scope": ["OPS"],
+            "worker": {"permission_mode": "acceptEdits"},
+        },
+    )
+    assert 'scope: ["OPS"]' in changed["reason"]
+    assert 'worker: {"permission_mode": "acceptEdits"}' in changed["reason"]
+
+
+def test_triggered_task_update_denies_an_unreviewable_mode() -> None:
+    result = _triggered_review(
+        "sys_triggered_task_update",
+        {"triggered_task_id": "t1", "instructions": "x", "permission_mode": "null"},
+    )
+    assert result["result"] == "DENY"
+    assert "permission_mode must be" in result["reason"]

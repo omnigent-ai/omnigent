@@ -1152,7 +1152,7 @@ byte-bounded provider counts every advertised tool against its limit.
 ```yaml
 tool_groups:
   browser: false          # browser_navigate / _snapshot / _click / _type / _screenshot
-  scheduled_tasks: false  # sys_scheduled_task_create / _list / _update / _delete, sys_reminder_set
+  scheduled_tasks: false  # sys_scheduled_task_* / sys_triggered_task_* (create / _list / _update / _delete), sys_reminder_set
   comments: false         # list_comments / update_comment
   policies: false         # sys_add_policy / sys_policy_registry
   agent_discovery: false  # sys_agent_get / sys_agent_download / sys_agent_list
@@ -1171,8 +1171,8 @@ disabling `journal` also drops the `/workflow` and `/save-workflow` skills (see
 `config.yaml` bundle and a single-file agent YAML.
 
 `agent_discovery: false` is rejected while `spawn: true` or the
-`scheduled_tasks` group is on: `sys_session_create` and
-`sys_scheduled_task_create` take an `agent_id` the model looks up with
+`scheduled_tasks` group is on: `sys_session_create`, `sys_scheduled_task_create`
+and `sys_triggered_task_create` take an `agent_id` the model looks up with
 `sys_agent_list` / `sys_agent_get`.
 
 The session read tools (`sys_session_list` / `sys_session_get_history` /

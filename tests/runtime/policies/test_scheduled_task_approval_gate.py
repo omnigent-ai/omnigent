@@ -59,8 +59,37 @@ def _no_guardrails_spec(
             {"message": "Check CI on PR #12.", "delay_seconds": 2700},
             PolicyAction.ASK,
         ),
+        (
+            "sys_triggered_task_create",
+            {
+                "name": "Triage ES",
+                "provider": "jira",
+                "scope": ["ES"],
+                "instructions": "Investigate the ticket.",
+                "agent_id": "ag_1",
+                "permission_mode": None,
+            },
+            PolicyAction.ASK,
+        ),
+        (
+            "sys_triggered_task_update",
+            {
+                "triggered_task_id": _TASK_ID,
+                "state": "paused",
+                "instructions": "Investigate the ticket.",
+                "permission_mode": None,
+            },
+            PolicyAction.ASK,
+        ),
     ],
-    ids=["add_policy_control", "create", "update", "reminder"],
+    ids=[
+        "add_policy_control",
+        "create",
+        "update",
+        "reminder",
+        "triggered_create",
+        "triggered_update",
+    ],
 )
 async def test_scheduled_task_mutation_asks_without_guardrails(
     tmp_path: Path,
@@ -92,6 +121,8 @@ async def test_scheduled_task_mutation_asks_without_guardrails(
         "sys_scheduled_task_create",
         "sys_scheduled_task_update",
         "sys_reminder_set",
+        "sys_triggered_task_create",
+        "sys_triggered_task_update",
     ],
 )
 def test_no_policy_fast_path_keeps_mutation_gates(
@@ -111,7 +142,15 @@ def test_no_policy_fast_path_keeps_mutation_gates(
     )
 
 
-@pytest.mark.parametrize("tool_name", ["sys_scheduled_task_list", "sys_scheduled_task_delete"])
+@pytest.mark.parametrize(
+    "tool_name",
+    [
+        "sys_scheduled_task_list",
+        "sys_scheduled_task_delete",
+        "sys_triggered_task_list",
+        "sys_triggered_task_delete",
+    ],
+)
 def test_no_policy_fast_path_skips_ungated_scheduled_task_tools(
     tmp_path: Path,
     conversation_store: SqlAlchemyConversationStore,

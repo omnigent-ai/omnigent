@@ -6,14 +6,17 @@ Covers the runner-side half:
   the correct ``/v1/scheduled-tasks`` REST verb + payload over ``server_client``,
   pass the JSON body through verbatim, and translate a server 4xx/5xx and a
   missing id into clean error JSON.
-- Registration: the ``sys_scheduled_task_*`` names and ``sys_reminder_set`` are
-  always registered by ``ToolManager`` (no spec opt-in) and are members of the local-dispatch and
-  native-relay tool sets.
+- ``sys_triggered_task_*``: a trigger compiles to the task the web form saves, lists
+  and changes through its header, and is refused where the server can't review it.
+- Registration: the ``sys_scheduled_task_*``, ``sys_triggered_task_*`` and
+  ``sys_reminder_set`` names are always registered by ``ToolManager`` (no spec
+  opt-in) and are members of the local-dispatch and native-relay tool sets.
 """
 
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import httpx
 import jsonschema
@@ -31,11 +34,14 @@ from omnigent.runner.tool_dispatch import (
     execute_tool,
 )
 from omnigent.server.scheduled.harness_settings import validate_scheduled_permission_mode
+from omnigent.server.scheduled.schedule import is_trigger_automation
 from omnigent.tools.base import Tool
 from omnigent.tools.builtins.scheduled_tasks import (
     SysScheduledTaskCreateTool,
     SysScheduledTaskUpdateTool,
 )
+from omnigent.tools.builtins.trigger_prompts import TriggerConfig, decode_trigger_prompt
+from omnigent.tools.builtins.triggered_tasks import build_trigger_config, default_worker
 
 _ALL_NAMES = {
     "sys_scheduled_task_create",
@@ -43,6 +49,10 @@ _ALL_NAMES = {
     "sys_scheduled_task_update",
     "sys_scheduled_task_delete",
     "sys_reminder_set",
+    "sys_triggered_task_create",
+    "sys_triggered_task_list",
+    "sys_triggered_task_update",
+    "sys_triggered_task_delete",
 }
 _TASK_ID = "0123456789abcdef0123456789abcdef"
 _REVIEW_FIELDS = {"prompt": "Review every issue.", "permission_mode": None}
@@ -335,7 +345,9 @@ async def test_update_patches_by_id(placement: dict[str, str | None]) -> None:
         server_client=client,
         conversation_id="conv_source",
     )
-    verb, url, body = client.calls[0]
+    # The task is read first, so a triggered task's prompt isn't overwritten.
+    assert client.calls[0] == ("GET", f"/v1/scheduled-tasks/{_TASK_ID}", None)
+    verb, url, body = client.calls[1]
     assert (verb, url) == ("PATCH", f"/v1/scheduled-tasks/{_TASK_ID}")
     assert body == {
         **_REVIEW_FIELDS,
@@ -523,7 +535,10 @@ async def test_calls_without_project_args_skip_the_capability_check() -> None:
         json.dumps({**_REVIEW_FIELDS, "scheduled_task_id": _TASK_ID, "name": "renamed"}),
         server_client=client,
     )
-    assert [url for _, url, _ in client.calls] == [f"/v1/scheduled-tasks/{_TASK_ID}"]
+    assert [call[:2] for call in client.calls] == [
+        ("GET", f"/v1/scheduled-tasks/{_TASK_ID}"),
+        ("PATCH", f"/v1/scheduled-tasks/{_TASK_ID}"),
+    ]
 
 
 @pytest.mark.parametrize("project_id", ["0123456789abcdef0123456789abcdef", None])
@@ -1038,3 +1053,353 @@ async def test_a_failed_lookup_before_creating_makes_no_such_warning() -> None:
     )
     assert out["error"].startswith("sys_reminder_set failed:")
     assert "may still have been created" not in out["error"]
+
+
+# ── sys_triggered_task_* ───────────────────────────────────────
+
+_TRIGGER_INFO: dict[str, object] = {
+    "triggered_task_tools": True,
+    "automations_enabled": True,
+    "features": {"session_orchestration": True, "automations_v2": True},
+    "scheduled_task_subhour": True,
+    "automation_trigger_poll_minutes": 10,
+    "scheduled_task_session_modes": True,
+    "scheduled_task_mcp_services": True,
+    "scheduled_task_projects": True,
+    "session_create_permission_modes": True,
+    "managed_sandboxes_enabled": False,
+}
+_JIRA_TRIGGER: dict[str, object] = {
+    "name": "Triage ES",
+    "provider": "jira",
+    "scope": ["ES"],
+    "conditions": [{"field": "label", "operator": "is", "value": "bug"}],
+    "instructions": "Investigate the ticket.",
+    "agent_id": "ag_1",
+    "permission_mode": "acceptEdits",
+}
+
+
+class _TaskServer:
+    """An in-memory ``/v1/scheduled-tasks`` API, so a created task can be listed and changed."""
+
+    def __init__(
+        self,
+        *,
+        info: dict[str, object] | None = None,
+        info_status: int = 200,
+        tasks: list[dict[str, object]] | None = None,
+    ) -> None:
+        self.info = {**_TRIGGER_INFO, **(info or {})}
+        self.info_status = info_status
+        self.tasks: dict[str, dict[str, object]] = {str(t["id"]): t for t in tasks or []}
+        self.calls: list[tuple[str, str, dict[str, object] | None]] = []
+        self.headers: list[dict[str, str] | None] = []
+        self.base_url = httpx.URL("http://127.0.0.1:6767")
+
+    def _task(self, url: str) -> dict[str, object] | None:
+        return self.tasks.get(url.rsplit("/", 1)[-1])
+
+    async def get(
+        self, url: str, *, params: dict[str, str] | None = None, timeout: object = None
+    ) -> _Resp:
+        self.calls.append(("GET", url, params))
+        if url == "/v1/info":
+            return _Resp(status_code=self.info_status, body=self.info)
+        if url == "/v1/scheduled-tasks":
+            return _Resp(body={"scheduled_tasks": list(self.tasks.values())})
+        task = self._task(url)
+        return _Resp(body=task) if task else _Resp(status_code=404, body={"detail": "not found"})
+
+    async def post(
+        self,
+        url: str,
+        *,
+        json: dict | None = None,
+        headers: dict[str, str] | None = None,
+        timeout: object = None,
+    ) -> _Resp:
+        self.calls.append(("POST", url, json))
+        self.headers.append(headers)
+        task = {"id": _TASK_ID, "state": "active", "session_id": None, **(json or {})}
+        self.tasks[_TASK_ID] = task
+        return _Resp(body=task)
+
+    async def patch(
+        self,
+        url: str,
+        *,
+        json: dict | None = None,
+        headers: dict[str, str] | None = None,
+        timeout: object = None,
+    ) -> _Resp:
+        self.calls.append(("PATCH", url, json))
+        self.headers.append(headers)
+        task = self._task(url)
+        assert task is not None
+        task.update(json or {})
+        return _Resp(body=task)
+
+    async def delete(self, url: str, *, timeout: object = None) -> _Resp:
+        self.calls.append(("DELETE", url, None))
+        self.tasks.pop(url.rsplit("/", 1)[-1], None)
+        return _Resp(body={"deleted": True})
+
+    def mutations(self) -> list[str]:
+        return [verb for verb, _url, _body in self.calls if verb in {"POST", "PATCH", "DELETE"}]
+
+
+async def _run(server: _TaskServer, tool: str, args: dict[str, object]) -> dict[str, object]:
+    out = await execute_tool(
+        tool_name=tool,
+        arguments=json.dumps(args),
+        server_client=server,
+        conversation_id="conv_source",
+    )
+    return json.loads(out)
+
+
+def _saved_trigger(server: _TaskServer) -> TriggerConfig:
+    config = decode_trigger_prompt(str(server.tasks[_TASK_ID]["prompt"]))
+    assert config is not None
+    return config
+
+
+@pytest.mark.asyncio
+async def test_triggered_task_create_saves_what_the_trigger_form_saves(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("RUNNER_SERVER_URL", "https://omnigent.example.com")
+    server = _TaskServer()
+    out = await _run(
+        server,
+        "sys_triggered_task_create",
+        {**_JIRA_TRIGGER, "model_override": "model-a", "mcp_services": ["jira"]},
+    )
+
+    verb, url, body = server.calls[-1]
+    assert (verb, url) == ("POST", "/v1/scheduled-tasks")
+    assert body is not None
+    prompt = body.pop("prompt")
+    assert body == {
+        "name": "Triage ES",
+        "rrule": "FREQ=MINUTELY;INTERVAL=10",
+        "timezone": "UTC",
+        "session_mode": "continue",
+        "agent_id": "ag_1",
+        "permission_mode": "acceptEdits",
+        "model_override": "model-a",
+        "mcp_services": ["jira"],
+    }
+    expected = build_trigger_config(
+        _JIRA_TRIGGER,
+        current=None,
+        worker_defaults=default_worker(
+            execution_target=None,
+            model_override="model-a",
+            reasoning_effort=None,
+            permission_mode="acceptEdits",
+            worker_permission_modes=True,
+        ),
+    )
+    assert decode_trigger_prompt(str(prompt)) == expected
+    # The server polls it as a trigger, and its sessions link back to the web UI.
+    assert is_trigger_automation(SimpleNamespace(session_mode="continue", prompt=prompt))
+    assert "https://omnigent.example.com/c/CONVERSATION_ID" in str(prompt)
+    assert server.headers[-1] == {
+        ORCHESTRATION_SOURCE_HEADER: "conv_source",
+        "x-omnigent-automation-source": "agent",
+        "x-omnigent-automation-template": "jira",
+    }
+    assert out["status"] == "created"
+    assert out["triggered_task_id"] == _TASK_ID
+    assert (out["provider"], out["scope"], out["conditions"]) == (
+        "jira",
+        ["ES"],
+        [{"field": "label", "operator": "is", "value": "bug"}],
+    )
+    assert not {"prompt", "rrule", "session_mode"} & set(out)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("info", "info_status", "error"),
+    [
+        ({"triggered_task_tools": None}, 200, "does not support triggered tasks"),
+        ({}, 503, "does not support triggered tasks"),
+        ({"automations_enabled": False}, 200, "automations are not enabled"),
+        ({"features": {"session_orchestration": False}}, 200, "session orchestration"),
+    ],
+    ids=["older-server", "info-unreadable", "automations-off", "orchestration-off"],
+)
+async def test_triggered_task_create_is_refused_where_it_cant_be_reviewed_or_run(
+    info: dict[str, object], info_status: int, error: str
+) -> None:
+    """An older server's approval policy wouldn't review it, so nothing is sent."""
+    server = _TaskServer(info=info, info_status=info_status)
+    out = await _run(server, "sys_triggered_task_create", _JIRA_TRIGGER)
+    assert error in str(out["error"])
+    assert server.mutations() == []
+
+
+@pytest.mark.asyncio
+async def test_triggered_task_create_explains_an_invalid_trigger() -> None:
+    server = _TaskServer()
+    out = await _run(
+        server,
+        "sys_triggered_task_create",
+        {
+            **_JIRA_TRIGGER,
+            "conditions": [{"field": "label", "operator": "contains", "value": "x"}],
+        },
+    )
+    assert "jira label takes the operators is, is_not" in str(out["error"])
+    assert server.mutations() == []
+
+
+@pytest.mark.asyncio
+async def test_triggered_task_managed_sessions_need_managed_sandboxes() -> None:
+    args = {**_JIRA_TRIGGER, "worker": {"placement": "managed"}}
+    server = _TaskServer()
+    out = await _run(server, "sys_triggered_task_create", args)
+    assert "needs managed sandboxes" in str(out["error"])
+    assert server.mutations() == []
+
+    server = _TaskServer(info={"managed_sandboxes_enabled": True})
+    await _run(server, "sys_triggered_task_create", args)
+    assert _saved_trigger(server)["worker"]["placement"] == "managed"
+    assert 'placement "managed"' in str(server.tasks[_TASK_ID]["prompt"])
+
+
+def _plain_task(task_id: str, prompt: str = "Summarize yesterday.") -> dict[str, object]:
+    return {"id": task_id, "name": "daily", "prompt": prompt, "rrule": "FREQ=DAILY"}
+
+
+@pytest.mark.asyncio
+async def test_triggered_tasks_and_scheduled_tasks_list_separately() -> None:
+    server = _TaskServer()
+    await _run(server, "sys_triggered_task_create", _JIRA_TRIGGER)
+    rendered = str(server.tasks[_TASK_ID]["prompt"])
+    # A trigger edited as text no longer decodes, so it stays a plain scheduled task.
+    edited = _plain_task("fedcba9876543210fedcba9876543210", rendered.replace("Jira", "JIRA", 2))
+    server.tasks[str(edited["id"])] = edited
+    plain = _plain_task("00000000000000000000000000000001")
+    server.tasks[str(plain["id"])] = plain
+
+    triggered = await _run(server, "sys_triggered_task_list", {})
+    assert [task["triggered_task_id"] for task in triggered["triggered_tasks"]] == [_TASK_ID]
+
+    scheduled = await _run(server, "sys_scheduled_task_list", {})
+    assert [task["id"] for task in scheduled["scheduled_tasks"]] == [edited["id"], plain["id"]]
+    assert scheduled["note"] == "1 triggered task not listed here; see sys_triggered_task_list"
+
+
+@pytest.mark.asyncio
+async def test_triggered_task_update_rerenders_from_the_saved_trigger() -> None:
+    server = _TaskServer()
+    await _run(server, "sys_triggered_task_create", _JIRA_TRIGGER)
+    server.tasks[_TASK_ID]["session_id"] = "conv_watch"
+    out = await _run(
+        server,
+        "sys_triggered_task_update",
+        {
+            "triggered_task_id": _TASK_ID,
+            "instructions": "Fix the ticket.",
+            "permission_mode": "acceptEdits",
+            "conditions": [{"field": "priority", "operator": "is", "value": "High"}],
+            "state": "paused",
+        },
+    )
+    verb, _url, body = server.calls[-1]
+    assert verb == "PATCH"
+    assert body is not None
+    assert set(body) == {"prompt", "permission_mode", "state"}
+    saved = _saved_trigger(server)
+    assert (saved["scope"], saved["instructions"]) == ("ES", "Fix the ticket.")
+    assert saved["conditions"] == [{"field": "priority", "operator": "is", "value": "High"}]
+    # The same provider keeps the session that holds its checkpoint.
+    assert server.tasks[_TASK_ID]["session_id"] == "conv_watch"
+    assert (out["status"], out["state"], out["watch_session_id"]) == (
+        "updated",
+        "paused",
+        "conv_watch",
+    )
+
+
+@pytest.mark.asyncio
+async def test_triggered_task_update_to_another_provider_starts_its_session_over() -> None:
+    server = _TaskServer()
+    await _run(server, "sys_triggered_task_create", _JIRA_TRIGGER)
+    server.tasks[_TASK_ID]["session_id"] = "conv_watch"
+    await _run(
+        server,
+        "sys_triggered_task_update",
+        {
+            "triggered_task_id": _TASK_ID,
+            "instructions": "Investigate the issue.",
+            "permission_mode": "acceptEdits",
+            "provider": "linear",
+            "scope": ["ENG"],
+            "name": "Triage ENG",
+        },
+    )
+    assert server.calls[-1][2] is not None and server.calls[-1][2]["session_id"] is None
+    saved = _saved_trigger(server)
+    assert (saved["source"], saved["scope"], saved["conditions"]) == ("linear", "ENG", [])
+    assert server.tasks[_TASK_ID]["name"] == "Triage ENG"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool", ["sys_triggered_task_update", "sys_triggered_task_delete"])
+async def test_triggered_task_tools_leave_other_tasks_alone(tool: str) -> None:
+    server = _TaskServer(tasks=[_plain_task(_TASK_ID)])
+    out = await _run(
+        server,
+        tool,
+        {"triggered_task_id": _TASK_ID, "instructions": "x", "permission_mode": None},
+    )
+    assert "isn't a triggered task" in str(out["error"])
+    assert server.mutations() == []
+
+
+@pytest.mark.asyncio
+async def test_triggered_task_delete() -> None:
+    server = _TaskServer()
+    await _run(server, "sys_triggered_task_create", _JIRA_TRIGGER)
+    out = await _run(server, "sys_triggered_task_delete", {"triggered_task_id": _TASK_ID})
+    assert out == {"status": "deleted", "triggered_task_id": _TASK_ID, "name": "Triage ES"}
+    assert server.calls[-1] == ("DELETE", f"/v1/scheduled-tasks/{_TASK_ID}", None)
+
+
+@pytest.mark.asyncio
+async def test_triggered_task_update_requires_the_review_fields() -> None:
+    server = _TaskServer()
+    await _run(server, "sys_triggered_task_create", _JIRA_TRIGGER)
+    out = await _run(server, "sys_triggered_task_update", {"triggered_task_id": _TASK_ID})
+    assert "Missing review fields (instructions, permission_mode)" in str(out["error"])
+    assert server.mutations() == ["POST"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("info", "patched"), [({}, False), ({"triggered_task_tools": None}, True)]
+)
+async def test_scheduled_task_update_keeps_a_triggered_tasks_prompt(
+    info: dict[str, object], patched: bool
+) -> None:
+    """Where the triggered tools exist, the plain update can't overwrite a trigger."""
+    server = _TaskServer()
+    await _run(server, "sys_triggered_task_create", _JIRA_TRIGGER)
+    server.info.update(info)
+    out = await _run(
+        server,
+        "sys_scheduled_task_update",
+        {
+            "scheduled_task_id": _TASK_ID,
+            "prompt": "Investigate the ticket.",
+            "permission_mode": None,
+        },
+    )
+    assert ("PATCH" in server.mutations()) is patched
+    if not patched:
+        assert "change it with sys_triggered_task_update" in str(out["error"])

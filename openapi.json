@@ -7563,6 +7563,11 @@
           "smart_routing_sources": {
             "$ref": "#/components/schemas/SmartRoutingSourcesInfo"
           },
+          "triggered_task_tools": {
+            "default": true,
+            "title": "Triggered Task Tools",
+            "type": "boolean"
+          },
           "workflows": {
             "default": false,
             "title": "Workflows",

@@ -87,13 +87,18 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         "sys_policy_registry",
         # Scheduled-task management tools are always auto-registered
         # so agents can create, list, update, and delete recurring
-        # runs, and set one-time reminders, without spec opt-in. They
-        # are runner-dispatched via the Omnigent server's REST API.
+        # runs and triggered tasks, and set one-time reminders, without
+        # spec opt-in. They are runner-dispatched via the Omnigent
+        # server's REST API.
         "sys_scheduled_task_create",
         "sys_scheduled_task_list",
         "sys_scheduled_task_update",
         "sys_scheduled_task_delete",
         "sys_reminder_set",
+        "sys_triggered_task_create",
+        "sys_triggered_task_list",
+        "sys_triggered_task_update",
+        "sys_triggered_task_delete",
         # The session journal's tools are always auto-registered so every
         # agent can keep a plan, step statuses and notes, and ask about a
         # task; runner-dispatched.

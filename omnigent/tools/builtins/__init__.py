@@ -82,6 +82,12 @@ from omnigent.tools.builtins.timer import (
     SysTimerCancelTool,
     SysTimerSetTool,
 )
+from omnigent.tools.builtins.triggered_tasks import (
+    SysTriggeredTaskCreateTool,
+    SysTriggeredTaskDeleteTool,
+    SysTriggeredTaskListTool,
+    SysTriggeredTaskUpdateTool,
+)
 from omnigent.tools.builtins.update_comment import UpdateCommentTool
 from omnigent.tools.builtins.web_read import WebReadTool
 from omnigent.tools.builtins.web_search import WebSearchTool
@@ -125,6 +131,10 @@ __all__ = [
     "SysSessionUpdateTool",
     "SysTimerCancelTool",
     "SysTimerSetTool",
+    "SysTriggeredTaskCreateTool",
+    "SysTriggeredTaskDeleteTool",
+    "SysTriggeredTaskListTool",
+    "SysTriggeredTaskUpdateTool",
     "UpdateCommentTool",
     "WebReadTool",
     "WebSearchTool",

@@ -138,6 +138,24 @@ from omnigent.tools.builtins.timer import (
     # schema advertises.
     validate_timer_set_args,
 )
+from omnigent.tools.builtins.trigger_prompts import (
+    SESSION_LINK_ID_PLACEHOLDER,
+    TriggerConfig,
+    decode_trigger_prompt,
+    encode_trigger_prompt,
+)
+from omnigent.tools.builtins.triggered_tasks import (
+    TRIGGERED_TASK_CREATE,
+    TRIGGERED_TASK_DELETE,
+    TRIGGERED_TASK_LIST,
+    TRIGGERED_TASK_TOOL_NAMES,
+    build_trigger_config,
+    default_worker,
+    polling_minutes,
+    trigger_rrule,
+    triggered_task_review_error,
+    triggered_task_view,
+)
 from omnigent.tools.builtins.ui import OpenFileRequest, UiOpenFileTool
 from omnigent.tools.builtins.update_comment import UpdateCommentTool
 from omnigent.tools.builtins.upload_file import UploadFileTool, safe_resolve
@@ -466,15 +484,19 @@ _POLICY_TOOLS = frozenset({"sys_add_policy", "sys_policy_registry"})
 
 # Priority 5l.1: Scheduled-task management — the runner proxies the Omnigent
 # server's /v1/scheduled-tasks REST endpoints (same posture as _POLICY_TOOLS).
-# sys_reminder_set creates a one-time task that continues the calling session.
-_SCHEDULED_TASK_TOOLS = frozenset(
-    {
-        "sys_scheduled_task_create",
-        "sys_scheduled_task_list",
-        "sys_scheduled_task_update",
-        "sys_scheduled_task_delete",
-        "sys_reminder_set",
-    }
+# sys_reminder_set creates a one-time task that continues the calling session,
+# and the sys_triggered_task_* tools compile a trigger into a task that polls.
+_SCHEDULED_TASK_TOOLS = (
+    frozenset(
+        {
+            "sys_scheduled_task_create",
+            "sys_scheduled_task_list",
+            "sys_scheduled_task_update",
+            "sys_scheduled_task_delete",
+            "sys_reminder_set",
+        }
+    )
+    | TRIGGERED_TASK_TOOL_NAMES
 )
 
 # Priority 5l.2: The session journal — the runner proxies the server's
@@ -5401,6 +5423,284 @@ async def _execute_reminder_set(
     )
 
 
+def _triggered_task_session_link(server_client: httpx.AsyncClient) -> str:
+    """The web link a trigger's sessions share, with the placeholder for their own id.
+
+    Built from the runner's server URL the way terminal status links are, so a
+    workspace-hosted server links to its web UI rather than its API mount.
+    """
+    from omnigent.conversation_browser import conversation_url
+
+    base_url = (os.environ.get("RUNNER_SERVER_URL") or "").strip() or str(server_client.base_url)
+    return conversation_url(base_url, SESSION_LINK_ID_PLACEHOLDER)
+
+
+async def _triggered_task_server_info(
+    server_client: httpx.AsyncClient, tool_name: str
+) -> _JsonObject | str:
+    """The server's ``/v1/info`` when it can run triggered tasks, else a refusal.
+
+    A server that doesn't advertise ``triggered_task_tools`` predates them: its
+    approval policy wouldn't review these calls, so nothing is sent to it.
+    """
+    info_response = await server_client.get("/v1/info", timeout=30.0)
+    info = _string_object_dict(info_response.json()) if info_response.status_code < 400 else None
+    if info is None or info.get("triggered_task_tools") is not True:
+        return json.dumps(
+            {"error": f"{tool_name}: this Omnigent server does not support triggered tasks"}
+        )
+    if info.get("automations_enabled") is not True:
+        return json.dumps(
+            {"error": f"{tool_name}: automations are not enabled on this Omnigent server"}
+        )
+    features = _string_object_dict(info.get("features")) or {}
+    if features.get("session_orchestration") is not True:
+        # Each match starts a session with sys_session_create.
+        return json.dumps(
+            {
+                "error": f"{tool_name}: triggered tasks start sessions for their matches, "
+                "and this server has session orchestration turned off"
+            }
+        )
+    return info
+
+
+@dataclass(frozen=True)
+class _SavedTrigger:
+    """
+    A triggered task as the server returned it, with the trigger its header holds.
+
+    :param url: The task's REST path, e.g. ``"/v1/scheduled-tasks/<id>"``.
+    :param task: The task response.
+    :param config: The trigger decoded from the task's prompt.
+    """
+
+    url: str
+    task: _JsonObject
+    config: TriggerConfig
+
+
+async def _read_triggered_task(
+    server_client: httpx.AsyncClient, tool_name: str, task_id: object
+) -> _SavedTrigger | str:
+    """Fetch a triggered task and its trigger, or an error saying why it can't be."""
+    task_url = _scheduled_task_url(task_id)
+    if task_url is None:
+        return json.dumps(
+            {"error": f"{tool_name} requires canonical 32-character hex triggered_task_id"}
+        )
+    response = await server_client.get(task_url, timeout=30.0)
+    if response.status_code >= 400:
+        return json.dumps(
+            {"error": f"server returned {response.status_code}", "details": response.text[:1000]}
+        )
+    task = _string_object_dict(response.json()) or {}
+    prompt = task.get("prompt")
+    config = decode_trigger_prompt(prompt) if isinstance(prompt, str) else None
+    if config is None:
+        return json.dumps(
+            {
+                "error": f"{tool_name}: {task_id} isn't a triggered task these tools can "
+                "read; manage it with the sys_scheduled_task_* tools"
+            }
+        )
+    return _SavedTrigger(url=task_url, task=task, config=config)
+
+
+# Task fields the triggered-task tools pass through to /v1/scheduled-tasks as given.
+_TRIGGERED_TASK_CREATE_FIELDS = (
+    "agent_id",
+    "model_override",
+    "reasoning_effort",
+    "permission_mode",
+    "mcp_services",
+    "workspace",
+    "host_id",
+    "execution_target",
+    "project_id",
+)
+_TRIGGERED_TASK_UPDATE_FIELDS = (*_TRIGGERED_TASK_CREATE_FIELDS, "name", "state")
+
+
+async def _execute_triggered_task_tool(
+    tool_name: str,
+    args: _JsonObject,
+    *,
+    server_client: httpx.AsyncClient,
+    conversation_id: str | None,
+) -> str:
+    """
+    Run a ``sys_triggered_task_*`` call as ``/v1/scheduled-tasks`` requests.
+
+    A triggered task is saved as the web form's trigger templates save one: a
+    prompt rendered from the trigger, on the server's polling schedule, continuing
+    one session that keeps the checkpoint. Create and update render that prompt
+    here; list and update read the trigger back from its header, so a task the web
+    form created works the same way.
+
+    :param tool_name: One of the ``sys_triggered_task_*`` names.
+    :param args: Parsed tool arguments.
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :param conversation_id: Session whose approved tool call is being dispatched.
+    :returns: Tool output JSON string.
+    """
+    if tool_name == TRIGGERED_TASK_LIST:
+        response = await server_client.get("/v1/scheduled-tasks", timeout=30.0)
+        if response.status_code >= 400:
+            return json.dumps(
+                {
+                    "error": f"server returned {response.status_code}",
+                    "details": response.text[:1000],
+                }
+            )
+        tasks = (_string_object_dict(response.json()) or {}).get("scheduled_tasks")
+        views = []
+        for task in tasks if isinstance(tasks, list) else []:
+            prompt = task.get("prompt") if isinstance(task, dict) else None
+            config = decode_trigger_prompt(prompt) if isinstance(prompt, str) else None
+            if config is not None:
+                views.append(triggered_task_view(task, config))
+        return json.dumps({"triggered_tasks": views})
+
+    if tool_name == TRIGGERED_TASK_DELETE:
+        saved = await _read_triggered_task(server_client, tool_name, args.get("triggered_task_id"))
+        if isinstance(saved, str):
+            return saved
+        response = await server_client.delete(saved.url, timeout=30.0)
+        if response.status_code >= 400:
+            return json.dumps(
+                {
+                    "error": f"server returned {response.status_code}",
+                    "details": response.text[:1000],
+                }
+            )
+        return json.dumps(
+            {
+                "status": "deleted",
+                "triggered_task_id": saved.task.get("id"),
+                "name": saved.task.get("name"),
+            }
+        )
+
+    action = "create" if tool_name == TRIGGERED_TASK_CREATE else "update"
+    error = triggered_task_review_error(args, action=action)
+    if error:
+        return json.dumps({"error": f"{tool_name}: {error}"})
+    if "project_name" in args and "project_id" in args:
+        return json.dumps({"error": f"{tool_name}: set project_id or project_name, not both"})
+    project_name = args.get("project_name")
+    if "project_name" in args and not isinstance(project_name, str):
+        return json.dumps(
+            {"error": f"{tool_name}: project_name must be a string; use project_id: null to clear"}
+        )
+    name = args.get("name")
+    if "name" in args and (not isinstance(name, str) or not name.strip()):
+        return json.dumps({"error": f"{tool_name}: name must be a non-empty string"})
+    info = await _triggered_task_server_info(server_client, tool_name)
+    if isinstance(info, str):
+        return info
+    if ("project_name" in args or "project_id" in args) and info.get(
+        "scheduled_task_projects"
+    ) is not True:
+        return json.dumps(
+            {
+                "error": f"{tool_name}: this server does not support automation projects; "
+                "retry without project_name or project_id"
+            }
+        )
+
+    if tool_name == TRIGGERED_TASK_CREATE:
+        existing: _SavedTrigger | None = None
+        worker_defaults = default_worker(
+            execution_target=args.get("execution_target"),
+            model_override=args.get("model_override"),
+            reasoning_effort=args.get("reasoning_effort"),
+            permission_mode=args.get("permission_mode"),
+            worker_permission_modes=info.get("session_create_permission_modes") is True,
+        )
+    else:
+        saved = await _read_triggered_task(server_client, tool_name, args.get("triggered_task_id"))
+        if isinstance(saved, str):
+            return saved
+        existing = saved
+        worker_defaults = saved.config["worker"]
+    task_url = existing.url if existing is not None else None
+    task: _JsonObject = existing.task if existing is not None else {}
+    current = existing.config if existing is not None else None
+    config = build_trigger_config(args, current=current, worker_defaults=worker_defaults)
+    if isinstance(config, str):
+        return json.dumps({"error": f"{tool_name}: {config}"})
+    if (
+        config["worker"]["placement"] == "managed"
+        and info.get("managed_sandboxes_enabled") is not True
+    ):
+        return json.dumps(
+            {
+                "error": f"{tool_name}: worker placement 'managed' needs managed sandboxes, "
+                "which this server doesn't offer; use 'same_host'"
+            }
+        )
+
+    task_name = name.strip() if isinstance(name, str) else str(task.get("name") or "")
+    rrule = trigger_rrule(info) if current is None else task.get("rrule")
+    prompt = encode_trigger_prompt(
+        config,
+        session_link=_triggered_task_session_link(server_client),
+        polling_interval_minutes=polling_minutes(rrule),
+        task_session_title=task_name,
+    )
+    fields = _TRIGGERED_TASK_CREATE_FIELDS if current is None else _TRIGGERED_TASK_UPDATE_FIELDS
+    payload: _JsonObject = {key: args[key] for key in fields if key in args}
+    payload["prompt"] = prompt
+    if current is None:
+        payload.update(
+            {"name": task_name, "rrule": rrule, "timezone": "UTC", "session_mode": "continue"}
+        )
+    else:
+        payload.pop("name", None)
+        if "name" in args:
+            payload["name"] = task_name
+        if config["source"] != current["source"]:
+            # The watch session's checkpoint tracks the old provider's items.
+            payload["session_id"] = None
+    refusal = await _scheduled_task_session_fields_refusal(server_client, tool_name, payload)
+    if refusal is not None:
+        return refusal
+    if isinstance(project_name, str):
+        payload["project_id"] = await _project_id_for_name(server_client, project_name)
+    mutation_headers = (
+        {ORCHESTRATION_SOURCE_HEADER: conversation_id} if conversation_id is not None else {}
+    )
+    if task_url is None:
+        response = await server_client.post(
+            "/v1/scheduled-tasks",
+            json=payload,
+            timeout=30.0,
+            headers={
+                **mutation_headers,
+                "x-omnigent-automation-source": "agent",
+                "x-omnigent-automation-template": config["source"],
+            },
+        )
+    else:
+        response = await server_client.patch(
+            task_url, json=payload, headers=mutation_headers, timeout=30.0
+        )
+    if response.status_code >= 400:
+        return json.dumps(
+            {"error": f"server returned {response.status_code}", "details": response.text[:1000]}
+        )
+    saved = _string_object_dict(response.json()) or {}
+    saved_prompt = saved.get("prompt")
+    saved_config = decode_trigger_prompt(saved_prompt) if isinstance(saved_prompt, str) else None
+    return json.dumps(
+        {
+            "status": "created" if current is None else "updated",
+            **triggered_task_view(saved, saved_config or config),
+        }
+    )
+
+
 async def _execute_scheduled_task_tool(
     tool_name: str,
     arguments: str,
@@ -5436,6 +5736,13 @@ async def _execute_scheduled_task_tool(
         return await _execute_reminder_set(
             args, server_client=server_client, conversation_id=conversation_id
         )
+    if tool_name in TRIGGERED_TASK_TOOL_NAMES:
+        try:
+            return await _execute_triggered_task_tool(
+                tool_name, args, server_client=server_client, conversation_id=conversation_id
+            )
+        except Exception as exc:  # noqa: BLE001
+            return json.dumps({"error": f"{tool_name} failed: {exc}"})
     if tool_name in ("sys_scheduled_task_create", "sys_scheduled_task_update"):
         action = "create" if tool_name == "sys_scheduled_task_create" else "update"
         error = scheduled_task_review_error(args, action=action)
@@ -5506,17 +5813,19 @@ async def _execute_scheduled_task_tool(
                 )
                 if refusal is not None:
                     return refusal
-                resp = None
-                if project_name is not None:
-                    # Confirm the task first so a bad id doesn't leave a new project behind.
-                    existing = await server_client.get(task_url, timeout=30.0)
-                    if existing.status_code >= 400:
-                        resp = existing
-                    else:
+                # Read the task first: a bad id mustn't leave a new project behind, and a
+                # triggered task's prompt mustn't be replaced with its instructions.
+                resp = await server_client.get(task_url, timeout=30.0)
+                if resp.status_code < 400:
+                    trigger_refusal = await _triggered_task_update_refusal(
+                        server_client, tool_name, resp.json()
+                    )
+                    if trigger_refusal is not None:
+                        return trigger_refusal
+                    if project_name is not None:
                         payload["project_id"] = await _project_id_for_name(
                             server_client, project_name
                         )
-                if resp is None:
                     resp = await server_client.patch(
                         task_url, json=payload, headers=mutation_headers, timeout=30.0
                     )
@@ -5529,7 +5838,62 @@ async def _execute_scheduled_task_tool(
         return json.dumps(
             {"error": f"server returned {resp.status_code}", "details": resp.text[:1000]}
         )
+    if tool_name == "sys_scheduled_task_list":
+        return json.dumps(_without_triggered_tasks(resp.json()))
     return json.dumps(resp.json())
+
+
+def _without_triggered_tasks(listing: object) -> object:
+    """A task list without the triggered tasks, which ``sys_triggered_task_list`` reports.
+
+    Their prompts are long renders of a trigger that this family can't edit safely;
+    a note says how many were left out so a caller knows where to find them.
+    """
+    body = _string_object_dict(listing)
+    tasks = body.get("scheduled_tasks") if body is not None else None
+    if body is None or not isinstance(tasks, list):
+        return listing
+    kept = [
+        task
+        for task in tasks
+        if not (
+            isinstance(task, dict)
+            and isinstance(task.get("prompt"), str)
+            and decode_trigger_prompt(task["prompt"]) is not None
+        )
+    ]
+    if len(kept) == len(tasks):
+        return listing
+    hidden = len(tasks) - len(kept)
+    return {
+        **body,
+        "scheduled_tasks": kept,
+        "note": f"{hidden} triggered task{'' if hidden == 1 else 's'} not listed here; "
+        "see sys_triggered_task_list",
+    }
+
+
+async def _triggered_task_update_refusal(
+    server_client: httpx.AsyncClient, tool_name: str, task: object
+) -> str | None:
+    """A refusal to rewrite a triggered task's prompt as plain text, or ``None``.
+
+    Refused only where ``sys_triggered_task_update`` can change it instead; an older
+    server keeps the plain update so the task can still be paused or edited.
+    """
+    body = _string_object_dict(task) or {}
+    prompt = body.get("prompt")
+    if not isinstance(prompt, str) or decode_trigger_prompt(prompt) is None:
+        return None
+    info = await server_client.get("/v1/info", timeout=30.0)
+    if info.status_code >= 400 or info.json().get("triggered_task_tools") is not True:
+        return None
+    return json.dumps(
+        {
+            "error": f"{tool_name}: {body.get('id')} is a triggered task; change it with "
+            "sys_triggered_task_update"
+        }
+    )
 
 
 @dataclass
