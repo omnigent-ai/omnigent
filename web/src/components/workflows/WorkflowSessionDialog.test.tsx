@@ -220,6 +220,21 @@ describe("WorkflowSessionDialog", () => {
   it("leaves a sandbox's durable planning prompt to the server", async () => {
     setHosts([]);
     localStorage.setItem("omnigent:last-host-choice", "sandbox");
+    const settings = { modelOverride: "reasoner", reasoningEffort: "minimal" };
+    localStorage.setItem(
+      CHOICES,
+      JSON.stringify({ create: { agentId: CODEX.id, settings: { [CODEX.id]: settings } } }),
+    );
+    setSandboxModels({
+      models: [
+        {
+          id: "reasoner",
+          displayName: "Reasoner",
+          isDefault: true,
+          supportedReasoningEfforts: [{ reasoningEffort: "minimal" }, { reasoningEffort: "high" }],
+        },
+      ],
+    });
     startedSession();
     const attached = vi.fn().mockResolvedValue(undefined);
     renderDialog(
@@ -227,8 +242,10 @@ describe("WorkflowSessionDialog", () => {
       { kind: "plan", workflow: WORKFLOW },
       attached,
     );
+    expect(screen.getByLabelText("Reasoning effort")).toHaveTextContent("Minimal");
     fireEvent.click(submit());
     await waitFor(() => expect(attached).toHaveBeenCalledWith({ id: "conv_run" }, null));
+    expect(vi.mocked(createSession).mock.calls[0]![2]).toMatchObject(settings);
     expect(vi.mocked(createSession).mock.calls[0]![2]?.initialInput).toMatchObject({
       type: "message",
       data: { content: [{ type: "input_text", text: editWorkflowPlanPrompt(WORKFLOW) }] },
@@ -272,6 +289,17 @@ describe("WorkflowSessionDialog", () => {
       JSON.stringify({ host_2: ["/home/you/app"] }),
     );
     localStorage.setItem("omnigent:last-agent-id", CODEX.id);
+    vi.mocked(useHostModelOptions).mockReturnValue({
+      data: [
+        {
+          id: "reasoner",
+          displayName: "Reasoner",
+          isDefault: true,
+          supportedReasoningEfforts: [{ reasoningEffort: "low" }, { reasoningEffort: "high" }],
+        },
+      ],
+      isLoading: false,
+    } as ReturnType<typeof useHostModelOptions>);
     vi.mocked(createSession).mockResolvedValue({ id: "conv_run" } as Awaited<
       ReturnType<typeof createSession>
     >);
@@ -289,6 +317,9 @@ describe("WorkflowSessionDialog", () => {
     );
     expect(submit()).toBeEnabled();
 
+    fireEvent.click(screen.getByLabelText("Reasoning effort"));
+    expect(screen.queryByRole("option", { name: "Max" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("option", { name: "High" }));
     fireEvent.change(instructions, { target: { value: "Run it on the flaky suite only." } });
     fireEvent.click(submit());
 
@@ -304,7 +335,7 @@ describe("WorkflowSessionDialog", () => {
       labels: nativeWrapperLabelsForAgent(CODEX),
       terminalLaunchArgs: undefined,
       modelOverride: undefined,
-      reasoningEffort: undefined,
+      reasoningEffort: "high",
     });
     expect(consumePendingInitialPrompt("conv_run")).toEqual({
       text: runSavedWorkflowPrompt(WORKFLOW, "Run it on the flaky suite only."),

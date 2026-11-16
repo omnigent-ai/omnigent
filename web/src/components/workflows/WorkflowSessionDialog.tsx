@@ -120,7 +120,7 @@ export function WorkflowSessionDialog({ request, open, onOpenChange }: WorkflowS
         data-testid="workflow-session-dialog"
         className="flex max-h-[85vh] flex-col gap-4 sm:max-w-lg"
       >
-        <DialogHeader>
+        <DialogHeader className="shrink-0">
           <DialogTitle className="flex items-center gap-2">
             <WorkflowIcon className="size-4" />
             <span>{request?.kind === "create" ? "New workflow" : "Run workflow"}</span>
@@ -596,274 +596,276 @@ export function WorkflowSessionForm({
   return (
     <>
       {/* The room keeps the scroll area from clipping the fields' focus rings. */}
-      <fieldset
-        disabled={submitting || launched !== null}
-        className="-mx-1 flex min-h-0 min-w-0 flex-1 flex-col gap-4 overflow-y-auto px-1"
-      >
-        {request.kind === "run" && (
-          <Field label="Project (optional)" htmlFor={projectFieldId}>
-            <DropdownMenu>
-              <DropdownMenuTrigger asChild>
-                <Button
-                  id={projectFieldId}
-                  type="button"
-                  variant="outline"
-                  className="w-full justify-start gap-2 text-sm"
-                  disabled={submitting}
-                  data-testid="workflow-session-project"
-                  componentId="workflows.run.project"
-                >
-                  <ProjectRowIcon icon={project?.icon} />
-                  <span className="flex-1 truncate text-left">
-                    {projectUnresolved
-                      ? projectsFailed
-                        ? "Project unavailable"
-                        : "Loading…"
-                      : (project?.name ?? "No project")}
-                  </span>
-                  <ChevronDownIcon className="size-4 text-muted-foreground" />
-                </Button>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent align="start" className="min-w-56">
-                {projectUnresolved && (
-                  <DropdownMenuItem onSelect={() => setPickedProject(null)}>
-                    No project
-                  </DropdownMenuItem>
-                )}
-                <ProjectPicker
-                  currentProject={project?.name ?? null}
-                  onSelect={(name) =>
-                    setPickedProject(
-                      name ? (projects.find((p) => p.name === name) ?? { id: null, name }) : null,
-                    )
-                  }
-                />
-              </DropdownMenuContent>
-            </DropdownMenu>
-          </Field>
-        )}
+      <div className="-mx-1 min-h-0 min-w-0 flex-1 overflow-y-auto px-1 pb-1">
+        <fieldset
+          disabled={submitting || launched !== null}
+          className="flex min-w-0 flex-col gap-4"
+        >
+          {request.kind === "run" && (
+            <Field label="Project (optional)" htmlFor={projectFieldId}>
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button
+                    id={projectFieldId}
+                    type="button"
+                    variant="outline"
+                    className="w-full justify-start gap-2 text-sm"
+                    disabled={submitting}
+                    data-testid="workflow-session-project"
+                    componentId="workflows.run.project"
+                  >
+                    <ProjectRowIcon icon={project?.icon} />
+                    <span className="flex-1 truncate text-left">
+                      {projectUnresolved
+                        ? projectsFailed
+                          ? "Project unavailable"
+                          : "Loading…"
+                        : (project?.name ?? "No project")}
+                    </span>
+                    <ChevronDownIcon className="size-4 text-muted-foreground" />
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="start" className="min-w-56">
+                  {projectUnresolved && (
+                    <DropdownMenuItem onSelect={() => setPickedProject(null)}>
+                      No project
+                    </DropdownMenuItem>
+                  )}
+                  <ProjectPicker
+                    currentProject={project?.name ?? null}
+                    onSelect={(name) =>
+                      setPickedProject(
+                        name ? (projects.find((p) => p.name === name) ?? { id: null, name }) : null,
+                      )
+                    }
+                  />
+                </DropdownMenuContent>
+              </DropdownMenu>
+            </Field>
+          )}
 
-        <Field label="Host" htmlFor={hostFieldId}>
-          {hosts === undefined ? (
-            <p className="text-sm text-muted-foreground">Loading hosts…</p>
-          ) : onlineHosts.length === 0 && sandboxRows.length === 0 ? (
-            <ConnectHostInstructions
-              serverUrl={getCliServerUrl()}
-              label={
-                hosts.length === 0
-                  ? "No hosts connected yet. Connect one from your terminal:"
-                  : "No hosts online. Reconnect one from your terminal:"
-              }
-              onSshConnected={selectTarget}
-            />
-          ) : (
+          <Field label="Host" htmlFor={hostFieldId}>
+            {hosts === undefined ? (
+              <p className="text-sm text-muted-foreground">Loading hosts…</p>
+            ) : onlineHosts.length === 0 && sandboxRows.length === 0 ? (
+              <ConnectHostInstructions
+                serverUrl={getCliServerUrl()}
+                label={
+                  hosts.length === 0
+                    ? "No hosts connected yet. Connect one from your terminal:"
+                    : "No hosts online. Reconnect one from your terminal:"
+                }
+                onSshConnected={selectTarget}
+              />
+            ) : (
+              <Select
+                value={target ?? ""}
+                onValueChange={selectTarget}
+                componentId={`workflows.${flow}.host`}
+              >
+                <SelectTrigger
+                  id={hostFieldId}
+                  className="w-full text-sm"
+                  data-testid="workflow-session-host"
+                >
+                  <SelectValue
+                    placeholder={
+                      sandboxRows.length > 0 ? "Select a host or sandbox" : "Select a host"
+                    }
+                  />
+                </SelectTrigger>
+                <SelectContent>
+                  {sandboxRows.map((provider) => (
+                    <SelectItem key={provider ?? "default"} value={sandboxHostChoice(provider)}>
+                      <span className="flex items-center gap-2">
+                        <MonitorCloudIcon className="size-4 text-muted-foreground" />
+                        <span className="text-sm">{sandboxOptionLabel(provider)}</span>
+                      </span>
+                    </SelectItem>
+                  ))}
+                  {sandboxRows.length > 0 && hosts.length > 0 && <SelectSeparator />}
+                  {[...onlineHosts, ...offlineHosts].map((host) => (
+                    <SelectItem
+                      key={host.host_id}
+                      value={host.host_id}
+                      disabled={host.status !== "online"}
+                    >
+                      <HostLabel host={host} />
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            )}
+            {sandboxProvider !== null && (
+              <SandboxProfilePicker
+                provider={sandboxProvider}
+                value={sandboxProfile}
+                onChange={setSandboxProfile}
+                rememberedProfileId={rememberedProfileId}
+              />
+            )}
+            {sandboxSelected && profileError !== null && (
+              <p role="status" className="text-sm text-muted-foreground">
+                {profileError}
+              </p>
+            )}
+          </Field>
+
+          {hostId !== null && hostOnline && (
+            <Field label="Working directory" htmlFor={directoryFieldId}>
+              <WorkspacePathField
+                hostId={hostId}
+                value={workspace}
+                onChange={setWorkspace}
+                onBrowse={() => setBrowsing((value) => !value)}
+                onCommit={(path) => {
+                  setWorkspace(path);
+                  setBrowsing(true);
+                }}
+                recent={recent}
+                dropdownDisabled={browsing}
+                inputId={directoryFieldId}
+                placeholder="Type a path or browse…"
+                invalid={workspaceInvalid}
+              />
+              {workspaceInvalid && (
+                <p className="text-sm text-destructive">
+                  Enter an absolute path, like /home/you/project or ~/project.
+                </p>
+              )}
+              <WorkspacePickerDialog
+                open={browsing}
+                onOpenChange={setBrowsing}
+                hostId={hostId}
+                initialPath={workspacePath ?? ""}
+                onConfirm={setWorkspace}
+              />
+            </Field>
+          )}
+
+          {sandboxSelected && (
+            <Field label={maxRepos > 1 ? "Repositories" : "Repository"}>
+              <SandboxRepositoryPicker
+                selections={sandboxRepos}
+                onChange={(repos) => setSandboxRepos(repos)}
+                maxRepos={maxRepos}
+                testIdPrefix="workflow-session-sandbox-repo"
+                pendingUrl={pendingRepoUrl}
+                onPendingUrlChange={setPendingRepoUrl}
+              />
+              {sandboxRepos.length === 0 && (
+                <p className="text-sm text-muted-foreground">
+                  With no repository, the session starts in an empty workspace.
+                </p>
+              )}
+              {repoUrlPending && (
+                <p className="text-sm text-muted-foreground">
+                  Add or clear the repository URL to run.
+                </p>
+              )}
+            </Field>
+          )}
+
+          <Field label="Agent" htmlFor={agentFieldId}>
             <Select
-              value={target ?? ""}
-              onValueChange={selectTarget}
-              componentId={`workflows.${flow}.host`}
+              value={agent?.id ?? ""}
+              onValueChange={setPickedAgentId}
+              componentId={`workflows.${flow}.agent`}
             >
               <SelectTrigger
-                id={hostFieldId}
+                id={agentFieldId}
                 className="w-full text-sm"
-                data-testid="workflow-session-host"
+                data-testid="workflow-session-agent"
               >
                 <SelectValue
-                  placeholder={
-                    sandboxRows.length > 0 ? "Select a host or sandbox" : "Select a host"
-                  }
+                  placeholder={agents === undefined ? "Loading agents…" : "Select an agent"}
                 />
               </SelectTrigger>
-              <SelectContent>
-                {sandboxRows.map((provider) => (
-                  <SelectItem key={provider ?? "default"} value={sandboxHostChoice(provider)}>
-                    <span className="flex items-center gap-2">
-                      <MonitorCloudIcon className="size-4 text-muted-foreground" />
-                      <span className="text-sm">{sandboxOptionLabel(provider)}</span>
-                    </span>
+              <SelectContent position="popper" align="start">
+                {harnesses.map((entry) => (
+                  <SelectItem key={entry.id} value={entry.id} className="text-sm">
+                    {entry.display_name}
                   </SelectItem>
                 ))}
-                {sandboxRows.length > 0 && hosts.length > 0 && <SelectSeparator />}
-                {[...onlineHosts, ...offlineHosts].map((host) => (
-                  <SelectItem
-                    key={host.host_id}
-                    value={host.host_id}
-                    disabled={host.status !== "online"}
-                  >
-                    <HostLabel host={host} />
+                {harnesses.length > 0 && composedAgents.length > 0 && <SelectSeparator />}
+                {composedAgents.map((entry) => (
+                  <SelectItem key={entry.id} value={entry.id} className="text-sm">
+                    {entry.display_name}
                   </SelectItem>
                 ))}
               </SelectContent>
             </Select>
-          )}
-          {sandboxProvider !== null && (
-            <SandboxProfilePicker
-              provider={sandboxProvider}
-              value={sandboxProfile}
-              onChange={setSandboxProfile}
-              rememberedProfileId={rememberedProfileId}
-            />
-          )}
-          {sandboxSelected && profileError !== null && (
-            <p role="status" className="text-sm text-muted-foreground">
-              {profileError}
-            </p>
-          )}
-        </Field>
-
-        {hostId !== null && hostOnline && (
-          <Field label="Working directory" htmlFor={directoryFieldId}>
-            <WorkspacePathField
-              hostId={hostId}
-              value={workspace}
-              onChange={setWorkspace}
-              onBrowse={() => setBrowsing((value) => !value)}
-              onCommit={(path) => {
-                setWorkspace(path);
-                setBrowsing(true);
-              }}
-              recent={recent}
-              dropdownDisabled={browsing}
-              inputId={directoryFieldId}
-              placeholder="Type a path or browse…"
-              invalid={workspaceInvalid}
-            />
-            {workspaceInvalid && (
-              <p className="text-sm text-destructive">
-                Enter an absolute path, like /home/you/project or ~/project.
-              </p>
-            )}
-            <WorkspacePickerDialog
-              open={browsing}
-              onOpenChange={setBrowsing}
-              hostId={hostId}
-              initialPath={workspacePath ?? ""}
-              onConfirm={setWorkspace}
-            />
-          </Field>
-        )}
-
-        {sandboxSelected && (
-          <Field label={maxRepos > 1 ? "Repositories" : "Repository"}>
-            <SandboxRepositoryPicker
-              selections={sandboxRepos}
-              onChange={(repos) => setSandboxRepos(repos)}
-              maxRepos={maxRepos}
-              testIdPrefix="workflow-session-sandbox-repo"
-              pendingUrl={pendingRepoUrl}
-              onPendingUrlChange={setPendingRepoUrl}
-            />
-            {sandboxRepos.length === 0 && (
-              <p className="text-sm text-muted-foreground">
-                With no repository, the session starts in an empty workspace.
-              </p>
-            )}
-            {repoUrlPending && (
-              <p className="text-sm text-muted-foreground">
-                Add or clear the repository URL to run.
-              </p>
+            {agentUnsupported !== null && (
+              <p className="text-sm text-destructive">{agentUnsupported}</p>
             )}
           </Field>
-        )}
 
-        <Field label="Agent" htmlFor={agentFieldId}>
-          <Select
-            value={agent?.id ?? ""}
-            onValueChange={setPickedAgentId}
-            componentId={`workflows.${flow}.agent`}
-          >
-            <SelectTrigger
-              id={agentFieldId}
-              className="w-full text-sm"
-              data-testid="workflow-session-agent"
-            >
-              <SelectValue
-                placeholder={agents === undefined ? "Loading agents…" : "Select an agent"}
-              />
-            </SelectTrigger>
-            <SelectContent position="popper" align="start">
-              {harnesses.map((entry) => (
-                <SelectItem key={entry.id} value={entry.id} className="text-sm">
-                  {entry.display_name}
-                </SelectItem>
-              ))}
-              {harnesses.length > 0 && composedAgents.length > 0 && <SelectSeparator />}
-              {composedAgents.map((entry) => (
-                <SelectItem key={entry.id} value={entry.id} className="text-sm">
-                  {entry.display_name}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-          {agentUnsupported !== null && (
-            <p className="text-sm text-destructive">{agentUnsupported}</p>
-          )}
-        </Field>
-
-        {/* Model, effort and permission settings for a native agent; remounts per agent. */}
-        {agent !== undefined && (
-          <ForkRunConfig
-            key={agent.id}
-            targetHarness={nativeCodingAgentForAvailableAgent(agent)?.harness ?? null}
-            targetAgent={agent}
-            sourceSession={null}
-            sameFamilyAsSource={false}
-            sameAgentAsSource={false}
-            selectedHostId={hostOnline ? hostId : null}
-            remembered={rememberedSettings}
-            modelCatalog={
-              sandboxSelected
-                ? { options: sandboxModels.data?.models ?? [], loading: sandboxModels.isLoading }
-                : undefined
-            }
-            onChange={setRunConfig}
-          />
-        )}
-
-        {request.kind !== "plan" && (
-          <Field
-            label={request.kind === "run" ? "Additional instructions" : "Instructions"}
-            htmlFor={instructionsId}
-          >
-            <Textarea
-              id={instructionsId}
-              value={instructions}
-              placeholder={
-                request.kind === "run"
-                  ? "Optional. Instructions to customize the workflow."
+          {/* Model, effort and permission settings for a native agent; remounts per agent. */}
+          {agent !== undefined && (
+            <ForkRunConfig
+              key={agent.id}
+              targetHarness={nativeCodingAgentForAvailableAgent(agent)?.harness ?? null}
+              targetAgent={agent}
+              sourceSession={null}
+              sameFamilyAsSource={false}
+              sameAgentAsSource={false}
+              selectedHostId={hostOnline ? hostId : null}
+              remembered={rememberedSettings}
+              modelCatalog={
+                sandboxSelected
+                  ? { options: sandboxModels.data?.models ?? [], loading: sandboxModels.isLoading }
                   : undefined
               }
-              onChange={(event) => setInstructions(event.currentTarget.value)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) void run();
-              }}
-              rows={4}
-              className="min-h-24 resize-y text-sm focus-visible:ring-0"
-              data-testid="workflow-session-instructions"
-              componentId={`workflows.${flow}.instructions`}
+              onChange={setRunConfig}
             />
-          </Field>
-        )}
+          )}
 
-        {request.kind === "run" && (
-          <div className="space-y-1">
-            <div className="flex items-center gap-2">
-              <Checkbox
-                id={reviewId}
-                checked={reviewPlanFirst}
-                onCheckedChange={(checked) => setReviewPlanFirst(checked === true)}
-                data-testid="workflow-session-review-plan"
-                componentId="workflows.run.review_plan_first"
+          {request.kind !== "plan" && (
+            <Field
+              label={request.kind === "run" ? "Additional instructions" : "Instructions"}
+              htmlFor={instructionsId}
+            >
+              <Textarea
+                id={instructionsId}
+                value={instructions}
+                placeholder={
+                  request.kind === "run"
+                    ? "Optional. Instructions to customize the workflow."
+                    : undefined
+                }
+                onChange={(event) => setInstructions(event.currentTarget.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) void run();
+                }}
+                rows={4}
+                className="min-h-24 resize-y text-sm focus-visible:ring-0"
+                data-testid="workflow-session-instructions"
+                componentId={`workflows.${flow}.instructions`}
               />
-              <label htmlFor={reviewId} className="cursor-pointer text-ui">
-                Review the plan before work starts
-              </label>
+            </Field>
+          )}
+
+          {request.kind === "run" && (
+            <div className="space-y-1">
+              <div className="flex items-center gap-2">
+                <Checkbox
+                  id={reviewId}
+                  checked={reviewPlanFirst}
+                  onCheckedChange={(checked) => setReviewPlanFirst(checked === true)}
+                  data-testid="workflow-session-review-plan"
+                  componentId="workflows.run.review_plan_first"
+                />
+                <label htmlFor={reviewId} className="cursor-pointer text-ui">
+                  Review the plan before work starts
+                </label>
+              </div>
+              <p className="pl-6 text-sm text-muted-foreground">
+                The agent shows you its plan and waits for your approval.
+              </p>
             </div>
-            <p className="pl-6 text-sm text-muted-foreground">
-              After exploring, the agent shows you its plan and waits for your approval.
-            </p>
-          </div>
-        )}
-      </fieldset>
+          )}
+        </fieldset>
+      </div>
 
       {error !== null && (
         <p role="alert" className="text-sm text-destructive" data-testid="workflow-session-error">
@@ -871,7 +873,7 @@ export function WorkflowSessionForm({
         </p>
       )}
 
-      <DialogFooter>
+      <DialogFooter className="shrink-0">
         <Button
           variant="ghost"
           onClick={onClose}

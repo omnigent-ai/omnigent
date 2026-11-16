@@ -1,6 +1,6 @@
 ---
 name: workflow
-description: Plan and run a multi-step workflow from a description or one of the user's saved workflows. Keeps the plan and every step's status in the session's journal, so people can follow along in the Tasks tab and the work resumes cleanly.
+description: Run a multi-step workflow from a description or one of the user's saved workflows. Keeps the plan and every step's status in the session's journal, so people can follow along in the Tasks tab and the work resumes cleanly.
 ---
 
 # Run a workflow
@@ -10,6 +10,11 @@ workflows. Turn it into a plan, then work through the plan, recording where
 each step stands as you go. The user watches
 the plan's steps as tasks in the session's Tasks tab and can steer or stop you
 in chat at any time.
+
+For a request to design, edit or save a reusable workflow, including a workflow
+page's planning chat, use the [save-workflow skill](../save-workflow/SKILL.md).
+Research the procedure and publish a proposal without executing it. The
+execution instructions below apply when the user asks to run the work.
 
 You need the `sys_journal_*` tools, plus `sys_workflow_load` and
 `sys_workflow_list` for a saved workflow. If a required tool is missing, report
@@ -109,7 +114,7 @@ so nothing in the run may wait for a person:
    plan does not block a new one.
    An explicit Stop still requires an explicit Continue for the stopped work.
 2. Use the current run's plan if one is already in the journal. Otherwise,
-   write the plan with `sys_journal_write_plan` before you start working. Name
+   write the plan with `sys_journal_write_plan` before executing its steps. Name
    the plan for its goal in a few words ("Cut GET /orders p95 by 20%"). Give
    each step a short, stable ID (`profile`, `opt-pool`), a name, and its
    dependencies. A new step needs an ID the journal hasn't used yet, since a
@@ -117,26 +122,25 @@ so nothing in the run may wait for a person:
 
    List the steps in the order you'll work on them. The Tasks tab numbers
    them in that order, so the user should see the work move steadily down the
-   list. Put each step right after the steps it depends on: a step that needs
-   only the exploration, such as a check, goes right after the exploration,
-   and steps that can run at the same time go next to each other. Steps that
-   would change the same files, or measure on the same machine, can't run at
-   the same time: make the later one depend on the earlier.
-3. Make the first step exploring the work: ID `explore` (`explore-2`,
-   `explore-3` and on when an earlier workflow in this session used it), and a
-   name that starts with "Explore" ("Explore the open PRs and pick 3"), so the
-   user can tell it apart in the Tasks tab. Explore without changing anything,
-   deeply enough that the steps you add from it are reasonably specific: each
-   a concrete piece of work, such as one change or one PR, rather than a broad
-   phase like "implement the changes". A small, clear task needs only a quick
-   look.
-4. Once you've explored, replan: keep the exploration first and add the work
-   after it, depending on it. A single goal is one step after the exploration.
+   list. Put each step after the steps whose results it needs, and steps that
+   can run at the same time next to each other. Steps that would change the
+   same files, or measure on the same machine, can't run at the same time:
+   make the later one depend on the earlier.
+3. Include a discovery step when the run needs new information, such as which
+   PRs to review or what causes today's failing tests. Name it for the result
+   it must produce, and investigate deeply enough to make dependent work
+   concrete. An already understood procedure does not need an initial
+   exploration step. Use the current instructions while doing each task;
+   rereading a known SOP is not itself a default workflow step.
+4. Replan when discovery or changed instructions affect the work. Preserve
+   completed results and add concrete steps, with dependencies only on the
+   results they need. Do not repeat research already completed while authoring
+   the saved workflow unless new evidence makes it necessary.
 5. Start once the goal is clear enough to make progress. Discover missing
-   details during exploration and record reasonable assumptions. If an
-   question meets "Before asking or declaring a blocker", ask it on a ready
-   step with `sys_workflow_request_input`; don't turn routine uncertainty into
-   a plan-review pause. In an unattended run, follow the automation rules.
+   run inputs as needed and record reasonable assumptions. If a question meets
+   "Before asking or declaring a blocker", ask it on a ready step with
+   `sys_workflow_request_input`; don't turn routine uncertainty into a
+   plan-review pause. In an unattended run, follow the automation rules.
 
 ## Run a saved workflow
 
@@ -176,16 +180,15 @@ tests" (ID …)", or "run my triage workflow" in chat):
 
 When the user asks to review the plan before the work starts:
 
-- Make the review the second step (`review`, numbered like the exploration
-  when an earlier workflow used it), depending on the exploration, and make
-  every step you add after it depend on the review. Keep those two steps first
-  in every version of the plan.
-- Once you've explored and added the work, ask the user to approve the plan
-  with `sys_workflow_request_input` on the review. Start none of the later
-  steps until they approve, then write `done` on the review.
-- If they ask for changes, write `started` on the review first, then restart
-  the exploration to look into what they asked, update the steps after the
-  review, and ask again.
+- Add a review step (`review`, or a new ID if that ID was used earlier) before
+  the work requiring approval. Any read-only discovery needed to form the plan
+  comes before it; when the plan is already concrete, review can be first.
+  Make the work requiring approval depend on the review.
+- Once the plan is concrete, ask the user to approve it with
+  `sys_workflow_request_input` on the review. Start none of the later steps
+  until they approve, then write `done` on the review.
+- If they ask for changes, write `started` on the review first, investigate
+  what the revision requires, update the affected steps and ask again.
 
 ## Work through it
 
