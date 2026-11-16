@@ -369,6 +369,23 @@ describe("sessionTaskList", () => {
 });
 
 describe("taskPreviewText", () => {
+  it.each([undefined, "started", "needs_input", "failed"])(
+    "summarizes a completed plan despite a stale upstream status (%s)",
+    (upstreamStatus) => {
+      const steps = planSteps(plan(0, ["work"], ["report", ["work"]]));
+      const entries = [
+        ...(upstreamStatus ? [status(1, "work", upstreamStatus)] : []),
+        status(2, "report", "done"),
+      ];
+      for (const working of [false, true]) {
+        const progress = stepProgress(steps, entries, working);
+        expect(taskPreviewText(progress)).toBe(
+          upstreamStatus === "failed" ? "Finished, 1 failed" : "All done",
+        );
+      }
+    },
+  );
+
   it("names the task in progress, else the next one, else how the list ended", () => {
     expect(taskPreviewText([])).toBeNull();
     expect(taskPreviewText(nativeTaskProgress(TODOS, true))).toBe("Documenting it");

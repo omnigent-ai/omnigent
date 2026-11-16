@@ -413,6 +413,9 @@ export function taskPreviewText(
   paused: PausedLabel | null = null,
 ): string | null {
   if (progress.length === 0) return null;
+  const failedCount = progress.filter((item) => item.state === "failed").length;
+  const finished = failedCount === 0 ? "All done" : `Finished, ${failedCount} failed`;
+  if (isPlanComplete(progress)) return finished;
   const order: StepState[] = ["needs_input", "running", "stopped", "ready", "waiting"];
   for (const state of order) {
     const item = progress.find((candidate) => candidate.state === state);
@@ -428,6 +431,5 @@ export function taskPreviewText(
     }
     return paused ? `${paused} · Next: ${item.step.name}` : `Next: ${item.step.name}`;
   }
-  const failed = progress.filter((item) => item.state === "failed").length;
-  return failed === 0 ? "All done" : `Finished, ${failed} failed`;
+  return finished;
 }
