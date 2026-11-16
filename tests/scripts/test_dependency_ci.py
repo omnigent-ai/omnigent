@@ -741,6 +741,8 @@ def test_workflows_connect_selection_to_jobs():
         validate = result["steps"][-1]
         assert validate["env"]["NEEDS"] == "${{ toJSON(needs) }}"
         assert validate["run"] == f"python3 .github/scripts/ci/require_results.py {suite}"
+        if suite == "web":
+            assert validate["env"]["EVENT_NAME"] == "${{ github.event_name }}"
 
 
 def _run_merge_gate(

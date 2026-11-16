@@ -156,6 +156,7 @@ def test_selection_failure_is_not_an_intentional_skip(suite, fault):
         ("pull_request", "true", "failure", False, False),
         ("pull_request", "true", "cancelled", False, False),
         ("pull_request", "true", None, False, False),
+        ("pull_request", "true", "skipped", False, False),
         ("pull_request", "false", "skipped", False, True),
         ("pull_request", "true", "skipped", True, True),
         ("push", "true", "skipped", False, True),
