@@ -256,9 +256,11 @@ describe("QuickPick accepting", () => {
     const { input, onAccept } = renderPicker();
     fireEvent.keyDown(input, { key: "Enter" });
     expect(onAccept).toHaveBeenLastCalledWith(expect.objectContaining({ id: "new-session" }));
-    fireEvent.click(screen.getByRole("option", { name: /Open settings/ }));
+    const settings = screen.getByRole("option", { name: /Open settings/ });
+    // jsdom never moves focus on click, so check the press can't take focus from the query.
+    expect(fireEvent.mouseDown(settings)).toBe(false);
+    fireEvent.click(settings);
     expect(onAccept).toHaveBeenLastCalledWith(expect.objectContaining({ id: "open-settings" }));
-    expect(document.activeElement).toBe(input);
   });
 
   it("leaves Enter to an IME composition", () => {
