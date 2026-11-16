@@ -96,8 +96,14 @@ describe("Files panel hidden-files preference", () => {
     act(() => writeFilesPanelShowHidden(false));
     expect(panel.result.current).toBe(false);
 
-    // Another window shows hidden files again, which clears the stored key.
+    // Clearing sessionStorage elsewhere says nothing about this choice.
     setItem.mockRestore();
+    act(() => {
+      window.dispatchEvent(new StorageEvent("storage", { key: null, storageArea: sessionStorage }));
+    });
+    expect(panel.result.current).toBe(false);
+
+    // Another window shows hidden files again, which clears the stored key.
     act(() => {
       window.dispatchEvent(
         new StorageEvent("storage", { key: FILES_PANEL_SHOW_HIDDEN_STORAGE_KEY, newValue: null }),

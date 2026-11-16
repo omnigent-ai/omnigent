@@ -85,10 +85,12 @@ function readStore(): Store {
 function serializeWithinBudget(store: Store): string {
   let json = JSON.stringify(store);
   while (json.length > MAX_STORE_CHARS && store.length > 0) {
-    if (store.length > 1) store.shift();
-    // A lone oversized location falls back to the tree's defaults rather than overflow.
-    else if (store[0].state.expanded.length > 0) store[0].state.expanded.shift();
-    else store.shift();
+    const newest = store[store.length - 1];
+    const newestFits = JSON.stringify([newest]).length <= MAX_STORE_CHARS;
+    if (newestFits && store.length > 1) store.shift();
+    // A session too big on its own loses its oldest locations, which fall back to defaults.
+    else if (newest.state.expanded.length > 0) newest.state.expanded.shift();
+    else store.splice(0);
     json = JSON.stringify(store);
   }
   return json;

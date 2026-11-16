@@ -91,6 +91,11 @@ if (typeof window !== "undefined") {
   window.addEventListener("storage", (event) => {
     if (unsavedShowHidden === undefined) return;
     if (event.key !== null && event.key !== FILES_PANEL_SHOW_HIDDEN_STORAGE_KEY) return;
+    try {
+      if (event.storageArea !== null && event.storageArea !== window.localStorage) return;
+    } catch {
+      // Unreadable storage: drop the unsaved choice and re-read, as the stored preference does.
+    }
     unsavedShowHidden = undefined;
     for (const listener of unsavedShowHiddenListeners) listener();
   });

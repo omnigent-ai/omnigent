@@ -93,6 +93,22 @@ describe("filesPanelTreeState", () => {
     expect(readFilesTreeExpandedPaths("conv_7", "")).toHaveLength(MAX_EXPANDED_PATHS);
   });
 
+  it("trims a session too big on its own before forgetting other sessions", () => {
+    writeFilesTreeBrowseLocation("conv_other", "/srv");
+    const bulkyPaths = Array.from(
+      { length: MAX_EXPANDED_PATHS },
+      (_, index) => `${"y".repeat(100)}/${index}`,
+    );
+    for (let location = 0; location < 10; location++) {
+      writeFilesTreeExpandedPaths("conv_big", `dir${location}`, bulkyPaths);
+    }
+
+    expect(localStorage.getItem(STORAGE_KEY)!.length).toBeLessThanOrEqual(MAX_STORE_CHARS);
+    expect(readFilesTreeBrowseLocation("conv_other")).toBe("/srv");
+    expect(readFilesTreeExpandedPaths("conv_big", "dir0")).toBeUndefined();
+    expect(readFilesTreeExpandedPaths("conv_big", "dir9")).toHaveLength(MAX_EXPANDED_PATHS);
+  });
+
   it("drops a single location too large for the budget but keeps the browsed folder", () => {
     const hugePaths = Array.from(
       { length: MAX_EXPANDED_PATHS },
