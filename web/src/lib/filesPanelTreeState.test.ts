@@ -93,6 +93,19 @@ describe("filesPanelTreeState", () => {
     expect(readFilesTreeExpandedPaths("conv_7", "")).toHaveLength(MAX_EXPANDED_PATHS);
   });
 
+  it("drops a single location too large for the budget but keeps the browsed folder", () => {
+    const hugePaths = Array.from(
+      { length: MAX_EXPANDED_PATHS },
+      (_, index) => `${"x".repeat(1_000)}/${index}`,
+    );
+    writeFilesTreeBrowseLocation("conv_a", "/srv");
+    writeFilesTreeExpandedPaths("conv_a", "", hugePaths);
+
+    expect(localStorage.getItem(STORAGE_KEY)!.length).toBeLessThanOrEqual(MAX_STORE_CHARS);
+    expect(readFilesTreeExpandedPaths("conv_a", "")).toBeUndefined();
+    expect(readFilesTreeBrowseLocation("conv_a")).toBe("/srv");
+  });
+
   it("keeps navigation on this page when storage refuses the write", () => {
     const setItem = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
       throw new Error("quota exceeded");
@@ -103,10 +116,19 @@ describe("filesPanelTreeState", () => {
     expect(readFilesTreeExpandedPaths("conv_a", "")).toEqual(["src"]);
     expect(localStorage.getItem(STORAGE_KEY)).toBeNull();
 
-    // Once storage accepts a write again, everything kept meanwhile is saved.
+    // Another tab saves its session meanwhile; this page still sees it.
     setItem.mockRestore();
+    localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify([{ id: "conv_c", state: { browseLocation: "/opt", expanded: [] } }]),
+    );
+    expect(readFilesTreeBrowseLocation("conv_c")).toBe("/opt");
+    expect(readFilesTreeBrowseLocation("conv_a")).toBe("/srv");
+
+    // The next accepted write saves this page's sessions without losing the other tab's.
     writeFilesTreeExpandedPaths("conv_b", "", ["docs"]);
-    expect(JSON.parse(localStorage.getItem(STORAGE_KEY)!)).toHaveLength(2);
+    const saved = JSON.parse(localStorage.getItem(STORAGE_KEY)!) as { id: string }[];
+    expect(saved.map((entry) => entry.id)).toEqual(["conv_c", "conv_a", "conv_b"]);
     expect(readFilesTreeBrowseLocation("conv_a")).toBe("/srv");
   });
 

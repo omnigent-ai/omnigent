@@ -86,6 +86,16 @@ function subscribeUnsavedShowHidden(listener: () => void): () => void {
   return () => unsavedShowHiddenListeners.delete(listener);
 }
 
+// Another window's choice, or storage accepting writes again, replaces this page's unsaved one.
+if (typeof window !== "undefined") {
+  window.addEventListener("storage", (event) => {
+    if (unsavedShowHidden === undefined) return;
+    if (event.key !== null && event.key !== FILES_PANEL_SHOW_HIDDEN_STORAGE_KEY) return;
+    unsavedShowHidden = undefined;
+    for (const listener of unsavedShowHiddenListeners) listener();
+  });
+}
+
 /** Read whether the Files panel shows hidden files; storage errors mean the default. */
 export function readFilesPanelShowHidden(): boolean {
   return unsavedShowHidden ?? showHiddenPreference.read() === "true";

@@ -87,4 +87,23 @@ describe("Files panel hidden-files preference", () => {
     expect(first.result.current).toBe(true);
     expect(second.result.current).toBe(true);
   });
+
+  it("lets another window's choice replace one storage refused here", () => {
+    const setItem = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new Error("quota exceeded");
+    });
+    const panel = renderHook(() => useFilesPanelShowHidden());
+    act(() => writeFilesPanelShowHidden(false));
+    expect(panel.result.current).toBe(false);
+
+    // Another window shows hidden files again, which clears the stored key.
+    setItem.mockRestore();
+    act(() => {
+      window.dispatchEvent(
+        new StorageEvent("storage", { key: FILES_PANEL_SHOW_HIDDEN_STORAGE_KEY, newValue: null }),
+      );
+    });
+    expect(panel.result.current).toBe(true);
+    expect(readFilesPanelShowHidden()).toBe(true);
+  });
 });

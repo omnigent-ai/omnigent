@@ -628,7 +628,7 @@ describe("FolderTree expansion across reloads", () => {
 
     // Collapsing is saved once its exit animation removes the folder's rows.
     fireEvent.click(screen.getByRole("button", { name: "guides/" }));
-    act(() => vi.advanceTimersByTime(180));
+    act(() => vi.runOnlyPendingTimers());
     expect(readFilesTreeExpandedPaths("conv_save_expansion", "docs")).toEqual([]);
   });
 

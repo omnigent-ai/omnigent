@@ -27,9 +27,9 @@ interface TreeState {
 /** Ordered array, least recently changed first, so order survives serialization. */
 type Store = { id: string; state: TreeState }[];
 
-// The latest store when localStorage refused it (quota, privacy mode), so this
-// page keeps its navigation until a write succeeds.
-let unsavedStore: Store | undefined;
+// Sessions changed while localStorage refused writes (quota, privacy mode), laid
+// over the stored ones so this page keeps its navigation until a write succeeds.
+const unsavedSessions = new Map<string, TreeState>();
 
 function stringArray(value: unknown): string[] | undefined {
   if (!Array.isArray(value)) return undefined;
@@ -55,8 +55,7 @@ function sanitizeState(value: unknown): TreeState {
   return state;
 }
 
-function readStore(): Store {
-  if (unsavedStore) return structuredClone(unsavedStore);
+function readPersistedStore(): Store {
   if (typeof window === "undefined") return [];
   try {
     const raw = window.localStorage.getItem(STORAGE_KEY);
@@ -76,27 +75,37 @@ function readStore(): Store {
   }
 }
 
+function readStore(): Store {
+  const store = readPersistedStore().filter((entry) => !unsavedSessions.has(entry.id));
+  for (const [id, state] of unsavedSessions) store.push({ id, state: structuredClone(state) });
+  return store;
+}
+
 /** Serialize `store`, dropping the least recently changed entries to fit the budget. */
 function serializeWithinBudget(store: Store): string {
   let json = JSON.stringify(store);
-  while (json.length > MAX_STORE_CHARS) {
+  while (json.length > MAX_STORE_CHARS && store.length > 0) {
     if (store.length > 1) store.shift();
-    else if (store.length === 1 && store[0].state.expanded.length > 1) {
-      store[0].state.expanded.shift();
-    } else break;
+    // A lone oversized location falls back to the tree's defaults rather than overflow.
+    else if (store[0].state.expanded.length > 0) store[0].state.expanded.shift();
+    else store.shift();
     json = JSON.stringify(store);
   }
   return json;
 }
 
-function writeStore(store: Store): void {
+function writeStore(store: Store, changedId: string, changedState: TreeState): void {
   if (typeof window === "undefined") return;
-  const json = serializeWithinBudget(store);
+  const changedSnapshot = structuredClone(changedState);
   try {
-    window.localStorage.setItem(STORAGE_KEY, json);
-    unsavedStore = undefined;
+    window.localStorage.setItem(STORAGE_KEY, serializeWithinBudget(store));
+    unsavedSessions.clear();
   } catch {
-    unsavedStore = store;
+    unsavedSessions.delete(changedId);
+    unsavedSessions.set(changedId, changedSnapshot);
+    if (unsavedSessions.size > MAX_SESSIONS) {
+      unsavedSessions.delete(unsavedSessions.keys().next().value!);
+    }
   }
 }
 
@@ -109,7 +118,7 @@ function updateSession(conversationId: string, update: (state: TreeState) => voi
   update(state);
   store.push({ id: conversationId, state });
   if (store.length > MAX_SESSIONS) store.splice(0, store.length - MAX_SESSIONS);
-  writeStore(store);
+  writeStore(store, conversationId, state);
 }
 
 function depth(path: string): number {

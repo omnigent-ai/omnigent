@@ -262,7 +262,10 @@ def test_expanded_folders_survive_reload_and_session_switch(
 
     # Another session keeps its own tree; coming back restores this one.
     rail = _files_rail(page, base_url, second_session)
+    alpha = rail.get_by_role("button", name="alpha/", exact=True)
+    expect(alpha).to_have_attribute("aria-expanded", "false")
     expect(rail.get_by_text("deep.txt", exact=True)).to_have_count(0)
     rail = _files_rail(page, base_url, first_session)
+    expect(alpha).to_have_attribute("aria-expanded", "true")
     expect(rail.get_by_text("deep.txt", exact=True)).to_be_visible(timeout=15_000)
     expect(rail.get_by_text("sibling.txt", exact=True)).to_have_count(0)
