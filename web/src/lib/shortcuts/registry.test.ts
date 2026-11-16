@@ -4,6 +4,7 @@ import type { KeyChordInput } from "./chord";
 import {
   activeShortcutChords,
   currentShortcutEnvironment,
+  matchedShortcutChordIndex,
   matchesShortcut,
   SHORTCUT_BINDINGS,
   shortcutBinding,
@@ -23,9 +24,16 @@ afterEach(() => {
 describe("shortcut registry", () => {
   it("looks up each binding by its id", () => {
     expect(SHORTCUT_BINDINGS.map((binding) => binding.id)).toEqual([
+      "palette.commands",
+      "palette.sessions",
+      "shortcuts.show",
       "session.new",
       "session.rename",
       "settings.open",
+      "history.back",
+      "history.forward",
+      "sessions.recent",
+      "session.number",
     ]);
     for (const binding of SHORTCUT_BINDINGS) expect(shortcutBinding(binding.id)).toBe(binding);
     expect(shortcutBinding("settings.open").label).toBe("Open Settings");
@@ -96,6 +104,122 @@ describe("shortcut registry", () => {
       altGraph: true,
     });
     expect(matchesShortcut(altGraph, "session.rename", other)).toBe(false);
+  });
+});
+
+describe("General and Navigation bindings", () => {
+  it("opens the palette with ⌘K and session search with ⌘⌥S, by the physical S", () => {
+    expect(matchesShortcut(press({ key: "K", metaKey: true }), "palette.commands", mac)).toBe(true);
+    expect(matchesShortcut(press({ key: "k", ctrlKey: true }), "palette.commands", mac)).toBe(
+      false,
+    );
+    expect(matchesShortcut(press({ key: "k", ctrlKey: true }), "palette.commands", other)).toBe(
+      true,
+    );
+    // Only k and K themselves: not the Kelvin sign, whose lowercase is k.
+    expect(matchesShortcut(press({ key: "\u212A", metaKey: true }), "palette.commands", mac)).toBe(
+      false,
+    );
+    expect(
+      matchesShortcut(press({ key: "\u212A", ctrlKey: true }), "palette.commands", other),
+    ).toBe(false);
+    const sessionSearch = press({ key: "ß", code: "KeyS", metaKey: true, altKey: true });
+    expect(matchesShortcut(sessionSearch, "palette.sessions", mac)).toBe(true);
+    expect(matchesShortcut(sessionSearch, "palette.commands", mac)).toBe(false);
+  });
+
+  it("goes back and forward with ⌘[ and ⌘] by physical key", () => {
+    const back = press({ key: "[", code: "BracketLeft", ctrlKey: true });
+    expect(matchesShortcut(back, "history.back", other)).toBe(true);
+    expect(matchesShortcut(back, "history.forward", other)).toBe(false);
+    expect(
+      matchesShortcut(
+        press({ key: "]", code: "BracketRight", metaKey: true }),
+        "history.forward",
+        mac,
+      ),
+    ).toBe(true);
+    expect(
+      matchesShortcut(
+        press({ key: "{", code: "BracketLeft", metaKey: true, shiftKey: true }),
+        "history.back",
+        mac,
+      ),
+    ).toBe(false);
+  });
+
+  it("switches recent sessions with Control+Tab on every platform, with or without Shift", () => {
+    for (const environment of [mac, other]) {
+      expect(
+        matchesShortcut(press({ key: "Tab", ctrlKey: true }), "sessions.recent", environment),
+      ).toBe(true);
+      expect(
+        matchesShortcut(
+          press({ key: "Tab", ctrlKey: true, shiftKey: true }),
+          "sessions.recent",
+          environment,
+        ),
+      ).toBe(true);
+    }
+    expect(matchesShortcut(press({ key: "Tab", metaKey: true }), "sessions.recent", mac)).toBe(
+      false,
+    );
+    for (const key of ["tab", "TAB"]) {
+      expect(matchesShortcut(press({ key, ctrlKey: true }), "sessions.recent", other)).toBe(false);
+    }
+  });
+
+  it("numbers sidebar sessions ⌘1–⌘9 then ⌘0, adding Alt in a browser", () => {
+    const native = { ...mac, native: true };
+    expect(
+      matchedShortcutChordIndex(press({ key: "1", metaKey: true }), "session.number", native),
+    ).toBe(0);
+    expect(
+      matchedShortcutChordIndex(press({ key: "0", metaKey: true }), "session.number", native),
+    ).toBe(9);
+    expect(
+      matchedShortcutChordIndex(press({ key: "1", metaKey: true }), "session.number", mac),
+    ).toBe(-1);
+    expect(
+      matchedShortcutChordIndex(
+        press({ key: "¡", code: "Digit1", metaKey: true, altKey: true }),
+        "session.number",
+        mac,
+      ),
+    ).toBe(0);
+    expect(
+      matchedShortcutChordIndex(
+        press({ key: "º", code: "Digit0", ctrlKey: true, altKey: true, altGraph: true }),
+        "session.number",
+        other,
+      ),
+    ).toBe(-1);
+  });
+
+  it("keeps firing under AltGr for the chords that never checked for it", () => {
+    const altGraph = { altGraph: true };
+    expect(
+      matchesShortcut(press({ key: "/", ctrlKey: true, ...altGraph }), "shortcuts.show", other),
+    ).toBe(true);
+    expect(
+      matchesShortcut(
+        press({ key: "[", code: "BracketLeft", ctrlKey: true, ...altGraph }),
+        "history.back",
+        other,
+      ),
+    ).toBe(true);
+    expect(
+      matchedShortcutChordIndex(press({ key: "2", ctrlKey: true, ...altGraph }), "session.number", {
+        ...other,
+        native: true,
+      }),
+    ).toBe(1);
+    expect(
+      matchesShortcut(press({ key: "k", ctrlKey: true, ...altGraph }), "palette.commands", other),
+    ).toBe(false);
+    expect(
+      matchesShortcut(press({ key: "Tab", ctrlKey: true, ...altGraph }), "sessions.recent", other),
+    ).toBe(false);
   });
 });
 
