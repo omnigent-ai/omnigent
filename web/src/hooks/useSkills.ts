@@ -1,5 +1,5 @@
-import { skipToken, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useCallback } from "react";
+import { skipToken, useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
+import { useCallback, useRef } from "react";
 import { authenticatedFetch } from "@/lib/identity";
 import { ApiError } from "@/lib/sessionsApi";
 import type { Session, SkillsCatalog, SkillSummary, SkillsStatus } from "@/lib/types";
@@ -59,6 +59,37 @@ export function skillsQueryKey(target: SkillsTarget | null) {
   return ["skills", target?.sessionId, target] as const;
 }
 
+/** Replace *target*'s cached catalog with a fresh disk scan. */
+async function rescanSkillsCatalog(queryClient: QueryClient, target: SkillsTarget): Promise<void> {
+  const queryKey = skillsQueryKey(target);
+  const rescan = async (): Promise<boolean> => {
+    // Cancel any stale fetch; later readers then share this rescan's request.
+    await queryClient.cancelQueries({ queryKey });
+    const previous = queryClient.getQueryState<SkillsCatalog>(queryKey);
+    let rescanned = false;
+    try {
+      await queryClient.fetchQuery({
+        queryKey,
+        queryFn: async ({ signal }) => {
+          const catalog = await fetchSkills(target, signal, { refresh: true });
+          rescanned = true;
+          return catalog;
+        },
+        staleTime: 0,
+      });
+    } catch (error) {
+      // A failed rescan leaves the loaded catalog usable, and as stale as it was.
+      if (previous?.data !== undefined)
+        queryClient.setQueryData(queryKey, previous.data, { updatedAt: previous.dataUpdatedAt });
+      throw error;
+    }
+    return rescanned;
+  };
+  // An invalidation (e.g. a session rebind) can swap the rescan for a cached read.
+  if (!(await rescan()) && !(await rescan()))
+    throw new Error("The skills rescan was replaced by a cached read");
+}
+
 interface SkillsOptions {
   /** Null until the composer has a complete discovery target. */
   target: SkillsTarget | null;
@@ -90,35 +121,16 @@ export function useSkills({ target, enabled = true, starting = false }: SkillsOp
       : query.isError
         ? "error"
         : "ready";
+  // One rescan at a time: a second would cancel the first mid-request.
+  const reloadQueue = useRef<Promise<void>>(Promise.resolve());
   /** Replace the catalog with a fresh disk scan, e.g. after `/reload-skills`. */
-  const reload = useCallback(async () => {
-    if (target === null || !available) return;
-    const queryKey = skillsQueryKey(target);
-    const rescan = async (): Promise<boolean> => {
-      // Cancel any stale fetch; later readers then share this rescan's request.
-      await queryClient.cancelQueries({ queryKey });
-      const previous = queryClient.getQueryState<SkillsCatalog>(queryKey);
-      let rescanned = false;
-      try {
-        await queryClient.fetchQuery({
-          queryKey,
-          queryFn: async ({ signal }) => {
-            const catalog = await fetchSkills(target, signal, { refresh: true });
-            rescanned = true;
-            return catalog;
-          },
-          staleTime: 0,
-        });
-      } catch (error) {
-        // A failed rescan leaves the loaded catalog usable, and as stale as it was.
-        if (previous?.data !== undefined)
-          queryClient.setQueryData(queryKey, previous.data, { updatedAt: previous.dataUpdatedAt });
-        throw error;
-      }
-      return rescanned;
-    };
-    // An invalidation (e.g. a session rebind) can swap the rescan for a cached read.
-    if (!(await rescan())) await rescan();
+  const reload = useCallback(() => {
+    if (target === null || !available) return Promise.resolve();
+    const run = reloadQueue.current
+      .catch(() => {})
+      .then(() => rescanSkillsCatalog(queryClient, target));
+    reloadQueue.current = run;
+    return run;
   }, [available, queryClient, target]);
   return {
     skills: available ? (query.data?.skills ?? []) : [],

@@ -127,6 +127,7 @@ import {
   releaseConversation,
   withoutFailedInputs,
 } from "./chatStore";
+import { subscribeReloadCommandRuns } from "./reloadCommandRuns";
 import { conversationRegistry } from "./conversationRegistry";
 import { markSessionCreated, resetInteractionTelemetryForTests } from "./interactionTelemetry";
 import {
@@ -10532,6 +10533,27 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       handleSessionEvent(event);
 
       expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+    });
+
+    it("reports a reload command run to the delivering conversation", () => {
+      const runs = vi.fn();
+      const unsubscribe = subscribeReloadCommandRuns("conv_reload_stream", runs);
+      onTestFinished(unsubscribe);
+      const event = (kind: "skill" | "command", name: string): StreamEvent => ({
+        type: "slash_command",
+        kind,
+        name,
+        arguments: "",
+        output: "Reloaded: 1 plugin · 2 skills",
+        agentName: "claude-native-ui",
+        itemId: `item_${name}`,
+        responseId: "resp_reload",
+      });
+      handleSessionEvent(event("command", "reload-skills"), "conv_reload_stream");
+      handleSessionEvent(event("command", "reload-plugins"), "conv_reload_stream");
+      handleSessionEvent(event("skill", "reload-skills"), "conv_reload_stream");
+      handleSessionEvent(event("command", "compact"), "conv_reload_stream");
+      expect(runs).toHaveBeenCalledTimes(2);
     });
   });
 

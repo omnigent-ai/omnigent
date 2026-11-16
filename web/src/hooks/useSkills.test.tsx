@@ -343,6 +343,63 @@ describe("useSkills", () => {
     await waitFor(() => expect(result.current.skills).toEqual(added));
   });
 
+  it("reports a rescan that invalidations replaced twice", async () => {
+    fetchMock.mockResolvedValueOnce(response());
+    const { client, result } = renderWithClient({ sessionId: "session-a" });
+    await waitFor(() => expect(result.current.skills).toEqual(skills));
+    fetchMock
+      .mockImplementationOnce(() => new Promise<Response>(() => {}))
+      .mockResolvedValueOnce(response())
+      .mockImplementationOnce(() => new Promise<Response>(() => {}))
+      .mockResolvedValueOnce(response());
+    let reloading!: Promise<void>;
+    act(() => {
+      reloading = result.current.reload();
+    });
+    const outcome = expect(reloading).rejects.toThrow("replaced by a cached read");
+    const invalidate = () => client.invalidateQueries({ queryKey: ["skills", "session-a"] });
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    await act(invalidate);
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(4));
+    await act(invalidate);
+    await outcome;
+  });
+
+  it("runs overlapping reloads one after another", async () => {
+    const added = [...skills, { name: "added", description: "Added on disk" }];
+    fetchMock.mockResolvedValueOnce(response());
+    const { result } = renderWithClient({ sessionId: "session-a" });
+    await waitFor(() => expect(result.current.skills).toEqual(skills));
+    let finishFirst!: (value: Response) => void;
+    fetchMock
+      .mockImplementationOnce(
+        () =>
+          new Promise<Response>((done) => {
+            finishFirst = done;
+          }),
+      )
+      .mockResolvedValueOnce(response(added));
+    let first!: Promise<void>;
+    act(() => {
+      first = result.current.reload();
+    });
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    let second!: Promise<void>;
+    act(() => {
+      second = result.current.reload();
+    });
+    await act(async () => {
+      finishFirst(response());
+      await Promise.all([first, second]);
+    });
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      "/v1/skills?session_id=session-a",
+      "/v1/skills?session_id=session-a&refresh=true",
+      "/v1/skills?session_id=session-a&refresh=true",
+    ]);
+    await waitFor(() => expect(result.current.skills).toEqual(added));
+  });
+
   it("lets a scheduled refetch share an in-flight reload instead of racing it", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     const added = [...skills, { name: "added", description: "Added on disk" }];

@@ -2,7 +2,7 @@ import { act, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Bubble, RenderItem } from "@/lib/renderItems";
 import type { RoutingScope } from "@/lib/routingDecision";
-import type { AnyBlock, ToolExecution } from "@/lib/blocks";
+import type { ToolExecution } from "@/lib/blocks";
 import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
 import type { Session } from "@/lib/types";
 import {
@@ -14,7 +14,6 @@ import { isSessionSharedWithOthers } from "@/lib/permissionsApi";
 import {
   buildPendingBubbles,
   buildSlashCommandMap,
-  appendsReloadCommand,
   composerOffersClear,
   composerOffersRewind,
   buildSlashCommandWithArgsSet,
@@ -1501,56 +1500,6 @@ describe("composer /clear and /rewind gating", () => {
     expect(composerOffersRewind(harness, info({ session_rewind: true }))).toBe(offered);
     expect(composerOffersRewind(harness, info({}))).toBe(false);
     expect(composerOffersRewind(harness, "loading")).toBe(false);
-  });
-});
-
-describe("appendsReloadCommand", () => {
-  const command = (name: string, kind: string, itemId: string | null) =>
-    ({
-      type: "slash_command",
-      ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId: "", itemId },
-      kind,
-      name,
-      arguments: "",
-      output: null,
-    }) as AnyBlock;
-  const tail = command("effort", "command", "item_tail");
-
-  it("detects a reload card appended after the last server item", () => {
-    expect(
-      appendsReloadCommand([tail], [tail, command("reload-skills", "command", "item_new")]),
-    ).toBe(true);
-    expect(
-      appendsReloadCommand([tail], [tail, command("reload-plugins", "command", "item_new")]),
-    ).toBe(true);
-  });
-
-  it("ignores prepended history and in-place updates of existing cards", () => {
-    const loaded = command("reload-skills", "command", "item_loaded");
-    expect(
-      appendsReloadCommand([tail], [command("reload-skills", "command", "item_old"), tail]),
-    ).toBe(false);
-    expect(appendsReloadCommand([loaded], [{ ...loaded, output: "Reloaded" } as AnyBlock])).toBe(
-      false,
-    );
-  });
-
-  it("counts every reload card when the previous tail is gone", () => {
-    expect(appendsReloadCommand([tail], [command("reload-skills", "command", "item_other")])).toBe(
-      true,
-    );
-    expect(appendsReloadCommand([], [command("reload-plugins", "command", "item_first")])).toBe(
-      true,
-    );
-  });
-
-  it("ignores other commands, skill invocations and unsaved cards", () => {
-    const appended = [
-      command("effort", "command", "item_b"),
-      command("reload-skills", "skill", "item_c"),
-      command("reload-plugins", "command", null),
-    ];
-    expect(appendsReloadCommand([tail], [tail, ...appended])).toBe(false);
   });
 });
 

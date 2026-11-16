@@ -197,6 +197,7 @@ import {
   onResponseEnd,
   onResponseStart,
 } from "./interactionTelemetry";
+import { isReloadCommand, noteReloadCommandRun } from "./reloadCommandRuns";
 import { getSessionHost, subscribeSessionHostChanges } from "@/lib/sessionHost";
 import {
   isClaudeAgentMessageContent,
@@ -9510,6 +9511,8 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         const [, ...rest] = s.pendingUserMessages;
         return { pendingUserMessages: rest };
       });
+      if (sourceConversationId !== null && isReloadCommand(event.kind, event.name))
+        noteReloadCommandRun(sourceConversationId);
       return;
     case "terminal_command": {
       // Shell inputs have no consumed receipt; remove only the matching sent bubble.

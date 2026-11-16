@@ -28,6 +28,7 @@ import { SideChatPane } from "@/components/chat/SideChatPane";
 import { toast } from "sonner";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { handleSessionEvent, useChatStore, type ChatState } from "@/store/chatStore";
+import { clearUndeliveredReloadCommandRuns, noteReloadCommandRun } from "@/store/reloadCommandRuns";
 import { useSessionTasksActions } from "@/store/sessionTasksActions";
 import {
   continuePlanMessage,
@@ -244,7 +245,7 @@ vi.mock("@/lib/goalApi", async (importOriginal) => ({
   ...(await importOriginal<typeof GoalApiModule>()),
   getGoal: vi.fn(),
 }));
-import type { AnyBlock, ElicitationBlock, UserMessageBlock } from "@/lib/blocks";
+import type { ElicitationBlock, UserMessageBlock } from "@/lib/blocks";
 import { getGoal } from "@/lib/goalApi";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { Composer, computeIsWorking } from "./ChatPage";
@@ -1449,15 +1450,6 @@ describe("Composer slash-command menu", () => {
       return props;
     };
 
-    const commandBlock = (name: string, itemId: string): AnyBlock => ({
-      type: "slash_command",
-      ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId: "", itemId },
-      kind: "command",
-      name,
-      arguments: "",
-      output: null,
-    });
-
     it.each(["/reload-skills", "/reload-plugins", "/reload-plugins --force"])(
       "claude-native sends %s to the terminal without rescanning before it runs",
       (command) => {
@@ -1478,70 +1470,51 @@ describe("Composer slash-command menu", () => {
       expect(props.onSend).toHaveBeenCalledExactlyOnceWith(`/${name}`);
     });
 
-    const renderInConversation = (blocks: AnyBlock[]) => {
-      const {
-        conversationId,
-        blocks: previousBlocks,
-        loadingConversation,
-      } = useChatStore.getState();
-      onTestFinished(() =>
-        useChatStore.setState({ conversationId, blocks: previousBlocks, loadingConversation }),
-      );
-      useChatStore.setState({ conversationId: "conv_reload", blocks, loadingConversation: false });
-      renderForHarness("claude-native");
-      return skillsFixture.getState().reload;
+    const renderInConversation = (conversationId = "conv_reload") => {
+      const { conversationId: previousId, sessionHarness } = useChatStore.getState();
+      onTestFinished(() => {
+        useChatStore.setState({ conversationId: previousId, sessionHarness });
+        clearUndeliveredReloadCommandRuns();
+      });
+      useChatStore.setState({ conversationId, sessionHarness: "claude-native" });
+      skillsFixture.setState({ skillsStatus: "ready" });
+      const view = render(<Composer {...composerProps({ isNativeWrapper: true })} />);
+      return { ...view, reload: skillsFixture.getState().reload };
     };
-    const setBlocks = (update: (blocks: AnyBlock[]) => AnyBlock[]) =>
-      act(() => useChatStore.setState((state) => ({ blocks: update(state.blocks) })));
 
-    it("rescans skills each time a reload card is appended", () => {
-      const reload = renderInConversation([commandBlock("effort", "item_history")]);
-      setBlocks((blocks) => [...blocks, commandBlock("effort", "item_effort")]);
-      expect(reload).not.toHaveBeenCalled();
-      setBlocks((blocks) => [...blocks, commandBlock("reload-skills", "item_skills")]);
+    it("rescans skills each time Claude runs a reload in this conversation", () => {
+      const { reload } = renderInConversation();
+      act(() => noteReloadCommandRun("conv_reload"));
       expect(reload).toHaveBeenCalledOnce();
-      setBlocks((blocks) => [...blocks, commandBlock("reload-plugins", "item_plugins")]);
+      act(() => noteReloadCommandRun("conv_reload"));
       expect(reload).toHaveBeenCalledTimes(2);
-      // Claude's result line lands on the card already shown.
-      setBlocks((blocks) => [...blocks.slice(0, -1), { ...blocks.at(-1)!, output: "Reloaded" }]);
-      // An older history page is prepended.
-      setBlocks((blocks) => [commandBlock("reload-skills", "item_older"), ...blocks]);
+      act(() => noteReloadCommandRun("conv_other"));
       expect(reload).toHaveBeenCalledTimes(2);
     });
 
-    it("does not rescan for reload cards loaded with a conversation", () => {
-      const reload = renderInConversation([]);
-      act(() => useChatStore.setState({ loadingConversation: true }));
-      act(() =>
-        useChatStore.setState({
-          blocks: [commandBlock("reload-skills", "item_history")],
-          loadingConversation: false,
-        }),
-      );
+    it("rescans once remounted for a reload that ran while the composer was hidden", () => {
+      const { unmount, reload } = renderInConversation();
+      unmount();
+      act(() => noteReloadCommandRun("conv_reload"));
       expect(reload).not.toHaveBeenCalled();
-      act(() =>
-        useChatStore.setState({
-          conversationId: "conv_other",
-          sessionHarness: "claude-native",
-          blocks: [commandBlock("reload-plugins", "item_other")],
-        }),
-      );
-      expect(reload).not.toHaveBeenCalled();
-      setBlocks((blocks) => [...blocks, commandBlock("reload-skills", "item_new_run")]);
+      render(<Composer {...composerProps({ isNativeWrapper: true })} />);
       expect(reload).toHaveBeenCalledOnce();
     });
 
-    it("rescans when a reconnect replaces the transcript window with a new reload", () => {
-      const reload = renderInConversation([commandBlock("reload-skills", "item_earlier")]);
-      setBlocks(() => [commandBlock("reload-skills", "item_new")]);
+    it("waits for the skills target before rescanning", () => {
+      const { reload } = renderInConversation();
+      act(() => skillsFixture.setState({ skillsStatus: "loading" }));
+      act(() => noteReloadCommandRun("conv_reload"));
+      expect(reload).not.toHaveBeenCalled();
+      act(() => skillsFixture.setState({ skillsStatus: "ready" }));
       expect(reload).toHaveBeenCalledOnce();
     });
 
     it("tells the user when the menu could not be refreshed", async () => {
       const error = vi.spyOn(toast, "error");
-      const reload = renderInConversation([]);
+      const { reload } = renderInConversation();
       reload.mockRejectedValueOnce(new Error("host offline"));
-      setBlocks((blocks) => [...blocks, commandBlock("reload-skills", "item_skills")]);
+      act(() => noteReloadCommandRun("conv_reload"));
       await waitFor(() =>
         expect(error).toHaveBeenCalledWith("Couldn't refresh the skills in the / menu"),
       );

@@ -2085,6 +2085,19 @@ def test_live_read_shows_a_reload_echo_whose_result_never_arrives(tmp_path: Path
     assert result.byte_offset == transcript_path.stat().st_size
 
 
+def test_live_read_does_not_defer_other_command_echoes(tmp_path: Path) -> None:
+    transcript_path = tmp_path / "session.jsonl"
+    caveat, echo, _stdout = _reload_command_records("effort", "high", "unused")
+    transcript_path.write_text(json.dumps(caveat) + "\n" + json.dumps(echo) + "\n")
+
+    result = read_transcript_items_from_offset(
+        transcript_path, 0, start_line=0, agent_name="claude-native-ui", defer_reload_echo=True
+    )
+
+    assert [item.data["name"] for item in result.items] == ["effort"]
+    assert result.byte_offset == transcript_path.stat().st_size
+
+
 def test_read_transcript_items_since_keeps_real_bash_local_command(tmp_path: Path) -> None:
     """
     A non-refusal ``local_command`` stdout is not mistaken for a compact noop.

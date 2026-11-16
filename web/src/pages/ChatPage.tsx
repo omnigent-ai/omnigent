@@ -68,11 +68,7 @@ import {
 } from "@/components/composer/ComposerControls";
 import { DropdownMenuItem, DropdownMenuSeparator } from "@/components/ui/dropdown-menu";
 import { useAppName } from "@/lib/branding";
-import {
-  hasPendingOwnElicitation,
-  isPendingBlockingElicitation,
-  type AnyBlock,
-} from "@/lib/blocks";
+import { hasPendingOwnElicitation, isPendingBlockingElicitation } from "@/lib/blocks";
 import { cn } from "@/lib/utils";
 import { isInlineRenameFocused } from "@/lib/inlineRename";
 import { QueuedMessagesStrip } from "@/pages/QueuedMessagesStrip";
@@ -126,6 +122,8 @@ import {
   type PendingUserMessage,
   useChatStore,
 } from "@/store/chatStore";
+import { subscribeReloadCommandRuns } from "@/store/reloadCommandRuns";
+import { isCancelledError } from "@tanstack/react-query";
 import {
   registerContinuePlan,
   registerSaveWorkflow,
@@ -2308,30 +2306,6 @@ interface ComposerProps {
 }
 
 /**
- * Whether *current* appends a Claude Code ``/reload-skills`` or ``/reload-plugins``
- * card after the last server item of *previous*. Prepended history pages don't
- * count; a replaced window whose old tail is gone counts every reload card.
- */
-export function appendsReloadCommand(
-  previous: readonly AnyBlock[],
-  current: readonly AnyBlock[],
-): boolean {
-  const previousTail = previous.findLast((block) => block.ctx.itemId)?.ctx.itemId;
-  for (let index = current.length - 1; index >= 0; index--) {
-    const block = current[index];
-    if (previousTail && block.ctx.itemId === previousTail) return false;
-    if (
-      block.type === "slash_command" &&
-      block.kind === "command" &&
-      (block.name === "reload-skills" || block.name === "reload-plugins") &&
-      block.ctx.itemId
-    )
-      return true;
-  }
-  return false;
-}
-
-/**
  * Build the full slash-command map for the composer: built-ins
  * first (so they top the menu), then one entry per session skill
  * keyed by the session's skill prefix and name. Insertion order matters — the
@@ -3227,31 +3201,23 @@ function ComposerImpl(
   // Claude Code built-ins that reload skills and plugins in place; they reach
   // the TUI as text, like /compact.
   const showReload = sessionHarness === "claude-native";
-  // Rescan the menu's skills when a reload card arrives, i.e. once Claude has run
-  // the command, so a queued reload also sees skills created before it ran.
-  // Hydration and conversation switches load existing cards, not new runs.
+  // Rescan the menu's skills once Claude has run a reload, so a queued reload also
+  // sees skills created before it ran. A run while this composer was unmounted is
+  // delivered when it mounts and the skills target is ready.
   const reloadSkillsRef = useRef(reloadSkills);
   useEffect(() => {
     reloadSkillsRef.current = reloadSkills;
   }, [reloadSkills]);
+  const skillsReloadable = skillsStatus === "ready" || skillsStatus === "error";
   useEffect(() => {
-    if (!showReload) return;
-    // A switch can set the id first and the new conversation's blocks in a later update.
-    let awaitingSwitchedBlocks = false;
-    return useChatStore.subscribe((state, previous) => {
-      if (state.conversationId !== previous.conversationId) {
-        awaitingSwitchedBlocks = state.blocks === previous.blocks;
-        return;
-      }
-      if (state.blocks === previous.blocks) return;
-      const loadedExisting = awaitingSwitchedBlocks || previous.loadingConversation;
-      awaitingSwitchedBlocks = false;
-      if (loadedExisting || !appendsReloadCommand(previous.blocks, state.blocks)) return;
-      void reloadSkillsRef.current().catch(() => {
-        toast.error("Couldn't refresh the skills in the / menu");
+    if (!showReload || !skillsReloadable || conversationId === null) return;
+    return subscribeReloadCommandRuns(conversationId, () => {
+      void reloadSkillsRef.current().catch((error: unknown) => {
+        // Cancelled only when the menu's skills query went away with the composer.
+        if (!isCancelledError(error)) toast.error("Couldn't refresh the skills in the / menu");
       });
     });
-  }, [showReload]);
+  }, [conversationId, showReload, skillsReloadable]);
   const skillPrefix = skillInvocationPrefix(sessionHarness);
   // /side is a Codex Code CLI built-in (ephemeral fork side chat), so offer it
   // only on codex-native sessions. Selected/typed, it sends as plaintext to the
