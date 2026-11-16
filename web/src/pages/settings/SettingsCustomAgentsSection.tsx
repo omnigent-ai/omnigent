@@ -26,10 +26,16 @@ import {
   type ManagedAgent,
 } from "@/hooks/useCustomAgents";
 import { CustomAgentConfigForm } from "./CustomAgentConfigForm";
-import { CUSTOM_AGENTS_LIST_ENTRY } from "@/pages/settings/search/catalog/customAgents";
+import {
+  CUSTOM_AGENT_DETAIL_ENTRY,
+  CUSTOM_AGENTS_LIST_ENTRY,
+} from "@/pages/settings/search/catalog/customAgents";
 import { SettingsItem } from "@/pages/settings/search/SettingsItem";
 import { settingsControlProps } from "@/pages/settings/search/settingsControl";
-import { SettingsDataRegion } from "@/pages/settings/search/settingsOwnership";
+import {
+  SettingsDataRegion,
+  settingsOverlayProps,
+} from "@/pages/settings/search/settingsOwnership";
 import { BackButton } from "./HarnessCatalog";
 import { ApiError } from "@/lib/sessionsApi";
 
@@ -111,7 +117,7 @@ export function SettingsCustomAgentsSection() {
   }
   if (detailId) {
     return (
-      <div className="@container">
+      <SettingsItem entry={CUSTOM_AGENT_DETAIL_ENTRY} className="@container">
         {!detail.data && back}
         {detail.isError && detail.data && (
           <p role="alert" className="mb-4 text-ui">
@@ -151,7 +157,7 @@ export function SettingsCustomAgentsSection() {
             </p>
           </>
         )}
-      </div>
+      </SettingsItem>
     );
   }
   return (
@@ -401,7 +407,12 @@ function AgentDetail({
               {agent.name}
             </h1>
             {owned === true && (
-              <Button variant="ghost" size="icon" aria-label="Delete agent" onClick={confirmDelete}>
+              <Button
+                {...settingsControlProps(CUSTOM_AGENT_DETAIL_ENTRY, "delete")}
+                variant="ghost"
+                size="icon"
+                onClick={confirmDelete}
+              >
                 <TrashIcon className="size-4" />
               </Button>
             )}
@@ -485,7 +496,10 @@ function AgentDetail({
           if (!remove.isPending) setConfirm(open);
         }}
       >
-        <DialogContent showCloseButton={!remove.isPending}>
+        <DialogContent
+          showCloseButton={!remove.isPending}
+          {...settingsOverlayProps(CUSTOM_AGENT_DETAIL_ENTRY, "delete")}
+        >
           <DialogHeader>
             <DialogTitle>Delete {agent.name}?</DialogTitle>
             <DialogDescription>
@@ -500,10 +514,20 @@ function AgentDetail({
             </p>
           )}
           <DialogFooter>
-            <Button variant="ghost" disabled={remove.isPending} onClick={() => setConfirm(false)}>
+            <Button
+              data-settings-dialog-action="Cancel"
+              variant="ghost"
+              disabled={remove.isPending}
+              onClick={() => setConfirm(false)}
+            >
               Cancel
             </Button>
             <Button
+              {...settingsControlProps(
+                CUSTOM_AGENT_DETAIL_ENTRY,
+                "confirmDelete",
+                inUse === null ? undefined : { alternative: "inUse" },
+              )}
               variant="destructive"
               loading={remove.isPending}
               disabled={remove.isPending}

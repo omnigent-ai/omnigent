@@ -24,4 +24,57 @@ export const CUSTOM_AGENTS_LIST_ENTRY = settingsEntry({
   focus: "search",
 });
 
-export const CUSTOM_AGENTS_SETTINGS = [CUSTOM_AGENTS_LIST_ENTRY] as const;
+/**
+ * One agent's page, reached from the list, so search reveals it through the list. Back and
+ * Retry aren't parts yet: Back's name would change, and Retry's is shared with other lists.
+ */
+export const CUSTOM_AGENT_DETAIL_ENTRY = settingsEntry({
+  id: "custom-agent-detail",
+  section: "custom-agents",
+  label: "Agent configuration",
+  description:
+    "One agent's description, harness, model and instructions, which you can edit for an agent you made.",
+  keywords: ["agent", "instructions", "model", "harness", "description", "delete agent", "edit"],
+  parts: {
+    delete: "Delete agent",
+    confirmDelete: "Delete",
+    name: "Name",
+    description: "Description",
+    harness: "Harness",
+    model: "Model",
+    instructions: "Instructions",
+    addServer: "Add server",
+    reloadLatest: "Reload latest",
+    cancel: "Cancel",
+    save: "Save changes",
+    discard: "Discard changes",
+  },
+  nameAlternatives: { confirmDelete: { inUse: "Remove anyway" } },
+  // An agent you made can be deleted; one you can edit shows its form once it loads.
+  presence: {
+    delete: { states: ["owned"] },
+    confirmDelete: { overlay: "delete" },
+    name: { states: ["editing"] },
+    description: { states: ["editing"] },
+    harness: { states: ["editing"] },
+    model: { states: ["editing"] },
+    instructions: { states: ["editing"] },
+    addServer: { states: ["editing"] },
+    reloadLatest: { states: ["edit conflict"] },
+    cancel: { states: ["editing"] },
+    save: { states: ["editing"] },
+    discard: { overlay: "cancel" },
+  },
+  overlays: {
+    delete: { dialogActions: ["Cancel"], captured: true },
+    // Back, Cancel and Reload latest ask before discarding a draft; Cancel names the dialog.
+    cancel: { dialogActions: ["Keep editing"], captured: true },
+  },
+  // Each agent's own page, so the list stands in for it.
+  revealedBy: "custom-agents-list",
+});
+
+export const CUSTOM_AGENTS_SETTINGS = [
+  CUSTOM_AGENTS_LIST_ENTRY,
+  CUSTOM_AGENT_DETAIL_ENTRY,
+] as const;
