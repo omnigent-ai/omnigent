@@ -7,8 +7,8 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { Link } from "@/lib/routing";
 import { getScheduledTask, type ScheduledTask } from "@/lib/scheduledTasksApi";
 
-/** Warns that deleting the session deletes the automations that run from it. */
-function AutomationDeleteCallout({
+/** A dialog's warning about an automation, e.g. that deleting a session deletes it. */
+export function AutomationCallout({
   title,
   children,
   testId,
@@ -31,14 +31,22 @@ function AutomationDeleteCallout({
   );
 }
 
-/** Links to the automation's page; following the link closes the dialog. */
-function AutomationLink({ task, onNavigate }: { task: ScheduledTask; onNavigate: () => void }) {
+/** Links to the automation's page, or `to`; following the link closes the dialog. */
+export function AutomationLink({
+  task,
+  to,
+  onNavigate,
+}: {
+  task: Pick<ScheduledTask, "id" | "name">;
+  to?: string;
+  onNavigate: () => void;
+}) {
   const info = useServerInfo();
   return (
     <span className="inline-flex max-w-full items-baseline whitespace-nowrap">
       “
       <Link
-        to={automationPagePath(info, task)}
+        to={to ?? automationPagePath(info, task)}
         onClick={onNavigate}
         className="min-w-0 truncate font-medium text-primary underline underline-offset-2 hover:text-primary/80"
       >
@@ -60,7 +68,7 @@ export function AutomationSourceDeleteNotice({
 }) {
   const { data: task } = useScheduledTask(taskId);
   return (
-    <AutomationDeleteCallout
+    <AutomationCallout
       title="This session runs an automation"
       testId="automation-source-delete-notice"
     >
@@ -72,7 +80,7 @@ export function AutomationSourceDeleteNotice({
         </>
       ) : null}
       .
-    </AutomationDeleteCallout>
+    </AutomationCallout>
   );
 }
 
@@ -84,7 +92,7 @@ export function WorkflowAutomationDeleteNotice({
   onNavigate: () => void;
 }) {
   return (
-    <AutomationDeleteCallout
+    <AutomationCallout
       title={
         tasks.length === 1
           ? "This workflow is used by an automation"
@@ -95,7 +103,7 @@ export function WorkflowAutomationDeleteNotice({
       Future runs of <AutomationLinks tasks={tasks} onNavigate={onNavigate} /> won’t be able to load
       this workflow. Edit or delete {tasks.length === 1 ? "the automation" : "these automations"}{" "}
       first.
-    </AutomationDeleteCallout>
+    </AutomationCallout>
   );
 }
 
@@ -119,7 +127,7 @@ export function AutomationSourcesDeleteNotice({
   const single = taskIds.length === 1;
   const allNamed = tasks.length === taskIds.length;
   return (
-    <AutomationDeleteCallout
+    <AutomationCallout
       title={
         single
           ? "1 of these sessions runs an automation"
@@ -137,7 +145,7 @@ export function AutomationSourcesDeleteNotice({
         </>
       ) : null}
       .
-    </AutomationDeleteCallout>
+    </AutomationCallout>
   );
 }
 

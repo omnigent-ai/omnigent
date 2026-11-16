@@ -149,7 +149,7 @@ export function WorkflowDialog({
                 </label>
               </div>
               <p className="pl-6 text-sm text-muted-foreground">
-                After exploring, the agent shows you its plan and waits for your approval.
+                The agent shows you its plan and waits for your approval.
               </p>
             </div>
             {blockedReason && <p className="text-ui text-muted-foreground">{blockedReason}</p>}

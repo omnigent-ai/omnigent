@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import builtins
 import json
+import uuid
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -96,6 +98,41 @@ class ScheduledTaskStore(ABC):
 
     # ── Scheduled tasks ──────────────────────────────────────────
 
+    def allocate_scheduled_task_id(self, *, user_id: str | None, name: str) -> str:
+        """
+        Return the ID for a task the create route is about to save with :meth:`create`.
+
+        Called in a worker thread before the task exists, since the ID labels the
+        task's source-session copy and derives its sandbox host IDs. If creation then
+        fails before the row is written, the route calls
+        :meth:`release_scheduled_task_id`. A deployment that allocates IDs in another
+        form, e.g. an external object's ID, must translate them for every ID column
+        itself: the SQL store keeps them as 16-byte UUIDs in ``scheduled_tasks.id``,
+        ``scheduled_task_runs.scheduled_task_id`` and
+        ``scheduled_task_shares.scheduled_task_id``. The runner's agent tools only
+        accept IDs matching ``[A-Za-z0-9_-]{1,128}``.
+
+        :param user_id: The task's owner; ``None`` in single-user mode.
+        :param name: The task's name, e.g. ``"nightly triage"``.
+        :returns: A new task ID; by default a bare 32-char hex UUID4.
+        """
+        del user_id, name
+        return uuid.uuid4().hex
+
+    def release_scheduled_task_id(self, scheduled_task_id: str) -> None:
+        """
+        Give back an ID from :meth:`allocate_scheduled_task_id` whose task was never saved.
+
+        Called in a worker thread at most once per ID, when :meth:`create` raised or
+        was never reached; never after it returned. A ``create`` that raises after its
+        commit succeeded (a dropped connection, say) leaves a saved task with the ID,
+        so a deployment should first check that no saved task has it. Best-effort: the
+        route logs what this raises and returns the original error. A no-op by default.
+
+        :param scheduled_task_id: The allocated ID.
+        """
+        del scheduled_task_id
+
     @abstractmethod
     def create(
         self,
@@ -128,7 +165,8 @@ class ScheduledTaskStore(ABC):
         """
         Insert a new scheduled task.
 
-        :param scheduled_task_id: Pre-generated unique task id (a UUID string).
+        :param scheduled_task_id: Unique task ID, e.g. from
+            :meth:`allocate_scheduled_task_id`.
         :param name: Human-readable task name.
         :param prompt: The instruction dispatched to the agent on each firing.
         :param rrule: The required RFC 5545 recurrence rule for the recurring
@@ -259,6 +297,7 @@ class ScheduledTaskStore(ABC):
         last_run_at: int | None = None,
         last_run_conversation_id: str | None = _UNSET,
         expected_schedule: ScheduledTask | None = None,
+        guard: Callable[[ScheduledTask], None] | None = None,
     ) -> ScheduledTask | None:
         """
         Update mutable fields of a task.
@@ -285,6 +324,10 @@ class ScheduledTaskStore(ABC):
         target, agent and MCP services read before validation. A mismatch raises
         a conflict before any changes are saved; callers must reload and
         revalidate before retrying.
+
+        ``guard`` is called with the task as locked for this update, before any
+        change. Whatever it raises aborts the update with nothing saved. It runs
+        while the task row is locked, so it should do bounded work.
 
         Returns ``None`` if the task does not exist.
 
