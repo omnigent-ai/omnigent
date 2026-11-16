@@ -1772,11 +1772,12 @@ def register_core_routes(
                     LEVEL_OWNER,
                 )
             resp.permission_level = grant.level
-        await _accept_initial_input(request, resp.id, body.initial_input, user_id)
         if launching_task is not None and conv is not None and source is not None:
             from omnigent.server.scheduled.run_sharing import share_launched_session
 
-            # Before any runner launches, so recipients can follow it from its first turn.
+            # Before the first input is saved: a sandbox host's recovery may deliver it at
+            # once, and the worker's own launches need these grants. A failed save deletes
+            # the session with its grants, and recipients' lists drop it.
             await share_launched_session(
                 launching_task,
                 conv,
@@ -1786,6 +1787,7 @@ def register_core_routes(
                 app_state=request.app.state,
                 host_registry=getattr(request.app.state, "host_registry", None),
             )
+        await _accept_initial_input(request, resp.id, body.initial_input, user_id)
         # Managed host: schedule a BACKGROUND sandbox provision bound
         # to this session and return immediately — provisioning takes
         # tens of seconds and must not block the create POST. The

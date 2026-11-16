@@ -868,11 +868,11 @@ def _as_run_session(db_uri, session_id, task, grantees):
         permissions.grant(grantee, session_id, LEVEL_READ)
 
 
-async def _launch_worker(auth_client, agent_id, launcher_id, placement="managed"):
+async def _launch_worker(auth_client, agent_id, launcher_id, placement="managed", **arguments):
     return json.loads(
         await execute_tool(
             tool_name="sys_session_create",
-            arguments=json.dumps({"agent_id": agent_id, "placement": placement}),
+            arguments=json.dumps({"agent_id": agent_id, "placement": placement, **arguments}),
             server_client=auth_client,
             conversation_id=launcher_id,
         )
@@ -1019,6 +1019,72 @@ async def test_restricted_sharing_shares_a_launch_without_a_workspace_only_as_a_
         "alice": LEVEL_OWNER,
         **({"bob": LEVEL_READ} if shared else {}),
     }
+
+
+@pytest.mark.parametrize("sharing_fails", [False, True], ids=["shared", "sharing_failed"])
+async def test_a_launch_is_shared_before_its_first_task_can_dispatch(
+    auth_client, auth_app, peers, db_uri, monkeypatch, sharing_fails
+):
+    """A sandbox host's startup recovery delivers a saved first task at once, and the
+    worker's own launches need its grants, so its task is saved only once sharing settles."""
+    from unittest.mock import AsyncMock
+
+    from omnigent.host.frames import HostHelloFrame
+    from omnigent.server.scheduled import run_sharing
+    from tests._helpers.polling import poll_until_async
+
+    source, _target, _captured = peers
+    task = _shared_automation(auth_app, db_uri, monkeypatch, source["agent_id"], ["bob"])
+    _as_run_session(db_uri, source["id"], task, ["bob"])
+    host_id = uuid4().hex
+    connection = auth_app.state.host_registry.register(
+        host_id,
+        AsyncMock(),
+        HostHelloFrame(version="test", frame_protocol_version=1, name="sandbox", runners=[]),
+        owner="alice",
+        registered_with_managed_token=True,
+    )
+    startup = auth_app.state.startup_inputs
+    dispatched = []
+
+    async def dispatch(context, session_id, event):
+        dispatched.append(session_id)
+        return {}
+
+    monkeypatch.setattr(startup, "dispatch", dispatch)
+    if sharing_fails:
+        monkeypatch.setattr(
+            SqlAlchemyPermissionStore,
+            "list_for_scheduled_task",
+            Mock(side_effect=RuntimeError("automation grants unavailable")),
+        )
+    share = run_sharing.share_launched_session
+    during_sharing = []
+
+    async def recover_while_sharing(task, session, **kwargs):
+        # The worker is on the connected sandbox host before its share settles.
+        SqlAlchemyConversationStore(db_uri).set_host_id(session.id, host_id, "/work")
+        during_sharing.append(await startup._recover_session(auth_app, session.id, connection))
+        await share(task, session, **kwargs)
+        during_sharing.append(list(dispatched))
+
+    monkeypatch.setattr(run_sharing, "share_launched_session", recover_while_sharing)
+
+    result = await _launch_worker(
+        auth_client, source["agent_id"], source["id"], "managed", message="Start"
+    )
+
+    worker_id = result.get("conversation_id")
+    assert worker_id, result
+    # Recovery found nothing to deliver, and nothing was dispatched, until sharing settled.
+    assert during_sharing == [False, []]
+    assert _session_levels(db_uri, worker_id) == {
+        "alice": LEVEL_OWNER,
+        **({} if sharing_fails else {"bob": LEVEL_READ}),
+    }
+    # The task was saved after sharing, failed or not, and recovery now delivers it.
+    assert await startup._recover_session(auth_app, worker_id, connection) is True
+    await poll_until_async(lambda: worker_id in dispatched, timeout_s=5)
 
 
 @pytest.mark.parametrize("case", ["no_automation", "unshared", "grant_read_fails"])
