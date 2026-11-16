@@ -5824,3 +5824,30 @@ async def test_the_local_user_has_no_automations_shared_with_them(
         listed = await client.get("/v1/scheduled-tasks/shared")
     assert listed.status_code == 200, listed.text
     assert listed.json() == {"scheduled_tasks": [], "next_cursor": None}
+
+
+@_SHARING
+async def test_a_shared_run_session_lists_with_its_run_labels(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    from omnigent.server.auth import LEVEL_READ
+    from omnigent.stores.conversation_store import (
+        SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY,
+        SCHEDULED_TASK_LAUNCH_LABEL_KEY,
+        SCHEDULED_TASK_ORIGIN_LABEL_KEY,
+    )
+
+    # The sidebar files a recipient's shared runs by these server-owned labels.
+    labels = {
+        SCHEDULED_TASK_ORIGIN_LABEL_KEY: "a" * 32,
+        SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY: "b" * 32,
+        SCHEDULED_TASK_LAUNCH_LABEL_KEY: "a" * 32,
+    }
+    session_id = _owned_session(db_uri, labels=labels)
+    _make_user(db_uri, "bob@example.com")
+    SqlAlchemyPermissionStore(db_uri).grant("bob@example.com", session_id, LEVEL_READ)
+    listed = await auth_client.get("/v1/sessions", params={"visibility": "shared"}, headers=_BOB)
+    assert listed.status_code == 200, listed.text
+    [item] = [row for row in listed.json()["data"] if row["id"] == session_id]
+    assert item["owner"] == "alice@example.com"
+    assert {key: item["labels"].get(key) for key in labels} == labels
