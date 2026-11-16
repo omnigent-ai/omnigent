@@ -346,6 +346,44 @@ async def test_subagent_activity_waits_for_final_idle_after_buffered_turns(
     assert items[-1].data.resource["status"] == outcome
 
 
+@pytest.mark.parametrize("outcome", ["completed", "failed", "cancelled"])
+@pytest.mark.asyncio
+async def test_relay_counts_the_usage_of_every_turn_end(db_uri: str, outcome: str) -> None:
+    """A turn's usage counts in the session's usage however the turn ends.
+
+    A turn that fails or is stopped made its model calls too, so the relay adds
+    the usage on ``response.failed`` and ``response.cancelled`` as it does on
+    ``response.completed``.
+    """
+    from omnigent.server.routes._sessions.orchestration import _relay_runner_stream_once
+
+    store = SqlAlchemyConversationStore(db_uri)
+    session = store.create_conversation()
+    release = asyncio.Event()
+    release.set()
+    events = [
+        {"type": "response.in_progress", "response": {"id": "turn", "model": "test"}},
+        {
+            "type": f"response.{outcome}",
+            "response": {
+                "id": "turn",
+                "status": outcome,
+                "usage": {"input_tokens": 300, "output_tokens": 40, "total_tokens": 340},
+            },
+        },
+        {"type": "session.status", "status": "failed" if outcome == "failed" else "idle"},
+    ]
+    await _relay_runner_stream_once(
+        session.id,
+        _ScriptedRunnerClient(release, events),
+        store,  # type: ignore[arg-type]
+    )
+    refreshed = store.get_conversation(session.id)
+    assert refreshed is not None
+    assert refreshed.session_usage.get("input_tokens") == 300
+    assert refreshed.session_usage.get("output_tokens") == 40
+
+
 @pytest.mark.parametrize(
     ("harness", "wrapper", "native"),
     [
