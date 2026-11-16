@@ -1,6 +1,7 @@
 """Conversation store — manages conversations and their items."""
 
 import hashlib
+import json
 import math
 import time
 from abc import ABC, abstractmethod
@@ -131,9 +132,43 @@ class DailyCostState(TypedDict):
 # mirrors the canonical key as ``PINNED_LABEL_KEY``.
 PINNED_LABEL_KEY = "omnigent.pinned"
 
-# The web Board's acceptance stamp: one second past the ``updated_at`` the user
-# reviewed, written only by session PATCH (see ``omnigent.server.session_board``).
+# The web Board's acceptance stamp: one second past the reviewed ``updated_at``,
+# written only by session PATCH (see ``omnigent.server.session_board``).
 BOARD_ACCEPTED_LABEL_KEY = "omnigent.board.accepted"
+
+
+def board_revision(conversation: Conversation) -> str:
+    """
+    Fingerprint the session state a web Board reviewer accepts.
+
+    Transcript appends advance ``item_revision`` and settings, title and
+    archive writes change their own fields, so the fingerprint tells those
+    apart within one ``updated_at`` second. It reads only conversation-row
+    fields, so a store can compute it inside that row's write transaction; an
+    external-session-id change (a metadata field) and a pending-input
+    replacement (which reuses its position) are therefore not distinguished
+    within a second, though both still drop an existing acceptance. Marker
+    appends advance ``item_revision`` without counting as activity, which can
+    make a review stale without new output.
+
+    :param conversation: The session row.
+    :returns: A short hex digest, e.g. ``"3f2a9c0d81b4e6f7"``.
+    """
+    state = [
+        conversation.updated_at,
+        conversation.item_revision,
+        conversation.title,
+        conversation.archived,
+        conversation.reasoning_effort,
+        conversation.model_override,
+        conversation.reported_model,
+        conversation.cost_control_mode_override,
+        conversation.subagent_routing_override,
+        conversation.harness_override,
+        conversation.share_workspace_files,
+    ]
+    return hashlib.sha256(json.dumps(state).encode()).hexdigest()[:16]
+
 
 # Marks a top-level fork created as a side chat. A side chat surfaces only as a
 # Workspace-rail tab, so a conversation carrying this label is hidden from the
@@ -1400,9 +1435,7 @@ class ConversationStore(ABC):
         """
         ...
 
-    def accept_board_review(
-        self, conversation_id: str, reviewed_updated_at: int, stamp: str
-    ) -> bool:
+    def accept_board_review(self, conversation_id: str, reviewed_revision: str) -> str | None:
         """
         Store a web Board acceptance unless the session changed since review.
 
@@ -1411,16 +1444,16 @@ class ConversationStore(ABC):
         (``BOARD_ACCEPTED_LABEL_KEY``) whenever they advance ``updated_at``.
 
         :param conversation_id: The session being accepted, e.g. ``"conv_abc123"``.
-        :param reviewed_updated_at: The ``updated_at`` the user reviewed.
-        :param stamp: The acceptance value to store, e.g. ``"1700000101"``.
-        :returns: ``False`` when the session is missing or its ``updated_at``
-            no longer matches; ``True`` once the label is stored.
+        :param reviewed_revision: The :func:`board_revision` the user reviewed.
+        :returns: The stored stamp, one second past the reviewed ``updated_at``,
+            or ``None`` when the session is missing or changed since review.
         """
         conversation = self.get_conversation(conversation_id)
-        if conversation is None or conversation.updated_at != reviewed_updated_at:
-            return False
+        if conversation is None or board_revision(conversation) != reviewed_revision:
+            return None
+        stamp = str(conversation.updated_at + 1)
         self.set_labels(conversation_id, {BOARD_ACCEPTED_LABEL_KEY: stamp})
-        return True
+        return stamp
 
     @abstractmethod
     def delete_label(

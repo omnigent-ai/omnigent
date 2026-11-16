@@ -444,6 +444,7 @@ from omnigent.stores.conversation_store import (
     ConversationNotFoundError,
     NameAlreadyExistsError,
     SpawnTreeUsage,
+    board_revision,
     pinned_label_key,
     runner_seen_is_fresh,
 )
@@ -1450,6 +1451,7 @@ def _build_session_list_item(
         project_id=conv.project_id,
         pull_request=pull_request,
         pull_requests_synced=pull_requests_synced,
+        board_revision=board_revision(conv),
     )
 
 

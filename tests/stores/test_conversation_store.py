@@ -324,18 +324,22 @@ def _user_message(text: str) -> NewConversationItem:
 def test_board_acceptance_needs_an_unchanged_review(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
-    from omnigent.stores.conversation_store import BOARD_ACCEPTED_LABEL_KEY
+    from omnigent.stores.conversation_store import BOARD_ACCEPTED_LABEL_KEY, board_revision
 
     session = conversation_store.create_conversation()
-    reviewed = session.updated_at
+    reviewed = board_revision(session)
 
-    assert not conversation_store.accept_board_review(session.id, reviewed - 1, "1")
-    assert not conversation_store.accept_board_review(uuid.uuid4().hex, reviewed, "1")
-    assert conversation_store.accept_board_review(session.id, reviewed, str(reviewed + 1))
+    assert conversation_store.accept_board_review(session.id, "stale") is None
+    assert conversation_store.accept_board_review(uuid.uuid4().hex, reviewed) is None
+    assert conversation_store.accept_board_review(session.id, reviewed) == str(
+        session.updated_at + 1
+    )
     saved = conversation_store.get_conversation(session.id)
     assert saved is not None
-    assert saved.labels[BOARD_ACCEPTED_LABEL_KEY] == str(reviewed + 1)
-    assert saved.updated_at == reviewed
+    assert saved.labels[BOARD_ACCEPTED_LABEL_KEY] == str(session.updated_at + 1)
+    assert saved.updated_at == session.updated_at
+    # Labels and the acceptance itself are not part of the reviewed state.
+    assert board_revision(saved) == reviewed
 
 
 def test_board_acceptance_uses_only_indexed_lookups(
@@ -343,6 +347,8 @@ def test_board_acceptance_uses_only_indexed_lookups(
 ) -> None:
     """Accept runs inside SQLite's write transaction, so none of its statements
     may scan a table (docs/DATABASE_BEST_PRACTICES.md, bounded queries)."""
+    from omnigent.stores.conversation_store import board_revision
+
     engine = conversation_store._conv_engine
     if engine.dialect.name != "sqlite":
         pytest.skip("SQLite query-plan check; other engines lock with SELECT ... FOR UPDATE")
@@ -357,9 +363,7 @@ def test_board_acceptance_uses_only_indexed_lookups(
 
     event.listen(engine, "before_cursor_execute", capture)
     try:
-        assert conversation_store.accept_board_review(
-            session.id, session.updated_at, str(session.updated_at + 1)
-        )
+        assert conversation_store.accept_board_review(session.id, board_revision(session))
     finally:
         event.remove(engine, "before_cursor_execute", capture)
 
@@ -370,23 +374,30 @@ def test_board_acceptance_uses_only_indexed_lookups(
             assert "SCAN " not in plan, (statement, plan)
 
 
-@pytest.mark.parametrize("writer", ["append", "update_title", "rename_if_matches"])
+@pytest.mark.parametrize(
+    "writer",
+    ["append", "update_title", "rename_if_matches", "archive", "model_override", "external_id"],
+)
 def test_activity_writers_drop_the_board_acceptance(
     conversation_store: SqlAlchemyConversationStore,
     writer: str,
 ) -> None:
     """Any write that advances updated_at reopens accepted Board work."""
-    from omnigent.stores.conversation_store import BOARD_ACCEPTED_LABEL_KEY
+    from omnigent.stores.conversation_store import BOARD_ACCEPTED_LABEL_KEY, board_revision
 
     session = conversation_store.create_conversation(title="Before")
-    assert conversation_store.accept_board_review(
-        session.id, session.updated_at, str(session.updated_at + 1)
-    )
+    assert conversation_store.accept_board_review(session.id, board_revision(session))
 
     if writer == "append":
         conversation_store.append(session.id, [_user_message("more work")])
     elif writer == "update_title":
         conversation_store.update_conversation(session.id, title="After")
+    elif writer == "archive":
+        conversation_store.update_conversation(session.id, archived=True)
+    elif writer == "model_override":
+        conversation_store.update_conversation(session.id, model_override="claude-sonnet-4-5")
+    elif writer == "external_id":
+        conversation_store.set_external_session_id(session.id, "external-1")
     else:
         assert conversation_store.rename_conversation_if_title_matches(
             session.id, "Before", "After"
@@ -397,31 +408,26 @@ def test_activity_writers_drop_the_board_acceptance(
     assert BOARD_ACCEPTED_LABEL_KEY not in saved.labels
 
 
-def test_stalled_append_committing_before_accept_blocks_it(
+def test_same_second_output_after_review_blocks_accept(
     conversation_store: SqlAlchemyConversationStore,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An append that sampled the reviewed second but committed later stamps its
-    commit time, so an Accept of the earlier review is refused."""
-    from omnigent.stores.conversation_store import sqlalchemy_store
+    """Output committed after the review but stamped in the reviewed second
+    leaves updated_at unchanged; the review's revision still differs, so the
+    Accept is refused."""
+    from omnigent.stores.conversation_store import board_revision, sqlalchemy_store
 
-    clock = [1_700_000_100]
-    monkeypatch.setattr(sqlalchemy_store, "now_epoch", lambda: clock[0])
+    monkeypatch.setattr(sqlalchemy_store, "now_epoch", lambda: 1_700_000_100)
     session = conversation_store.create_conversation()
-    assert session.updated_at == 1_700_000_100
-    encode = conversation_store._encode_item_data_batch
-
-    def stall_then_encode(raw: list[str]) -> list[Any]:
-        clock[0] = 1_700_000_103  # the append sampled 100; it commits at 103
-        return encode(raw)
-
-    monkeypatch.setattr(conversation_store, "_encode_item_data_batch", stall_then_encode)
-    conversation_store.append(session.id, [_user_message("late output")])
+    conversation_store.append(session.id, [_user_message("first output")])
+    reviewed = conversation_store.get_conversation(session.id)
+    assert reviewed is not None
+    conversation_store.append(session.id, [_user_message("more output")])
 
     saved = conversation_store.get_conversation(session.id)
     assert saved is not None
-    assert saved.updated_at == 1_700_000_103
-    assert not conversation_store.accept_board_review(session.id, 1_700_000_100, "1700000101")
+    assert saved.updated_at == reviewed.updated_at == 1_700_000_100
+    assert conversation_store.accept_board_review(session.id, board_revision(reviewed)) is None
 
 
 def test_delayed_activity_writer_reopens_the_board_acceptance(
@@ -430,7 +436,7 @@ def test_delayed_activity_writer_reopens_the_board_acceptance(
 ) -> None:
     """An append that sampled its timestamp before Accept but commits after it
     still reopens the work, whatever updated_at it writes."""
-    from omnigent.stores.conversation_store import BOARD_ACCEPTED_LABEL_KEY
+    from omnigent.stores.conversation_store import BOARD_ACCEPTED_LABEL_KEY, board_revision
 
     session = conversation_store.create_conversation()
     paused = threading.Event()
@@ -450,9 +456,7 @@ def test_delayed_activity_writer_reopens_the_board_acceptance(
     writer.start()
     try:
         assert paused.wait(timeout=10)
-        assert conversation_store.accept_board_review(
-            session.id, session.updated_at, str(session.updated_at + 1)
-        )
+        assert conversation_store.accept_board_review(session.id, board_revision(session))
     finally:
         release.set()
         writer.join(timeout=10)

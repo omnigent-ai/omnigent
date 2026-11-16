@@ -130,6 +130,7 @@ from omnigent.stores.conversation_store import (
     SessionConnectivity,
     SessionTodosUpdate,
     SpawnTreeUsage,
+    board_revision,
     family_pinned_label_key,
     pinned_label_key,
     runner_seen_is_fresh,
@@ -376,6 +377,7 @@ def _to_conversation(
         project_id=meta.project_id if meta else None,
         side_chat_parent_id=meta.side_chat_parent_id if meta else None,
         family_id=meta.family_id if meta else None,
+        item_revision=row.next_position,
     )
 
 
@@ -3289,9 +3291,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 for item in items
             )
             if conv_row is not None and has_new_conversation_activity:
-                # Stamp the commit, not the pre-encode sample: a stalled append
-                # must not look like activity a reviewer already saw.
-                conv_row.updated_at = max(now, now_epoch())
+                conv_row.updated_at = now
                 _drop_board_acceptance(session, conversation_id)
 
             # Allocate item positions from the conversation's maintained
@@ -3587,30 +3587,34 @@ class SqlAlchemyConversationStore(ConversationStore):
                     )
             return [row[0] for row in ap_sess.execute(stmt).all()]
 
-    def accept_board_review(
-        self, conversation_id: str, reviewed_updated_at: int, stamp: str
-    ) -> bool:
+    def accept_board_review(self, conversation_id: str, reviewed_revision: str) -> str | None:
         """
         Store a web Board acceptance unless the session changed since review.
 
-        Checks ``updated_at`` and writes the label under the conversation's
-        write lock, so it serializes with activity writers: one that commits
-        afterwards drops the label (see :func:`_drop_board_acceptance`).
+        Re-checks the reviewed :func:`board_revision` and writes the label under
+        the conversation's write lock, so it serializes with activity writers:
+        one that commits afterwards drops the label (see
+        :func:`_drop_board_acceptance`).
 
         :param conversation_id: The session being accepted, e.g. ``"conv_abc123"``.
-        :param reviewed_updated_at: The ``updated_at`` the user reviewed.
-        :param stamp: The acceptance value to store, e.g. ``"1700000101"``.
-        :returns: ``False`` when the session is missing or changed since review.
+        :param reviewed_revision: The :func:`board_revision` the user reviewed.
+        :returns: The stored stamp, or ``None`` when the session is missing or
+            changed since review.
         """
-        prepared = _prepare_label_updates({BOARD_ACCEPTED_LABEL_KEY: stamp})
 
-        def write(session: Session) -> bool:
+        def write(session: Session) -> str | None:
             self._lock_conversation(session, conversation_id)
             row = session.get(SqlConversation, (current_workspace_id(), conversation_id))
-            if row is None or row.updated_at != reviewed_updated_at:
-                return False
-            _upsert_prepared_labels(session, conversation_id, prepared, now_epoch())
-            return True
+            if row is None or board_revision(_to_conversation(row)) != reviewed_revision:
+                return None
+            stamp = str(row.updated_at + 1)
+            _upsert_prepared_labels(
+                session,
+                conversation_id,
+                _prepare_label_updates({BOARD_ACCEPTED_LABEL_KEY: stamp}),
+                now_epoch(),
+            )
+            return stamp
 
         return run_write_transaction(self._conv_session_immediate, "accept_board_review", write)
 

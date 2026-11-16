@@ -3,13 +3,14 @@
 // are unit-testable on their own.
 
 import type { Conversation } from "@/hooks/useConversations";
-import { getSessionState } from "@/hooks/useSessionState";
+import { getSessionState, type SessionState } from "@/hooks/useSessionState";
+import { latestErrorFromLabels } from "@/lib/sessionError";
 
 /**
  * Session label recording the user's acceptance of a session's work. The client
- * sends the `updated_at` it reviewed; the server stores one second past it if
- * that is still current, and every later write that advances `updated_at`
- * deletes the label, so new activity reopens the work.
+ * sends the `board_revision` it reviewed; the server stores a stamp one second
+ * past `updated_at` if that revision is still current, and every later write
+ * that advances `updated_at` deletes the label, so new activity reopens it.
  */
 export const BOARD_ACCEPTED_LABEL_KEY = "omnigent.board.accepted";
 
@@ -48,23 +49,35 @@ export function isBoardAccepted(row: Pick<Conversation, "labels" | "updated_at">
 }
 
 /**
+ * The row's badge state, including the persisted latest-activity error the
+ * sidebar also reads, so both surfaces flag the same sessions.
+ */
+export function boardSessionState(row: Conversation): SessionState | null {
+  return getSessionState(row, latestErrorFromLabels(row.labels, row.host_online));
+}
+
+/**
  * The column a session belongs in. Waiting on the user and running work win
- * over acceptance; a failed turn needs the user until it is accepted; any
- * other idle session needs review until the user accepts it.
+ * over acceptance; a failed turn, errored activity or a disconnected host needs
+ * the user until it is accepted; any other idle session needs review until the
+ * user accepts it.
  */
 export function boardColumn(row: Conversation): BoardColumnId {
-  const state = getSessionState(row);
+  const state = boardSessionState(row);
   if (state?.kind === "awaiting") return "needs_you";
   if (state?.kind === "running") return "running";
   if (isBoardAccepted(row)) return "done";
-  if (state?.kind === "error") return "needs_you";
+  if (state?.kind === "error" || state?.kind === "disconnected") return "needs_you";
   return "needs_review";
 }
 
 /** Whether a card offers Accept: the session is idle and not already accepted. */
 export function canAcceptOnBoard(row: Conversation): boolean {
   const column = boardColumn(row);
-  return column === "needs_review" || (column === "needs_you" && row.status === "failed");
+  return (
+    column === "needs_review" ||
+    (column === "needs_you" && boardSessionState(row)?.kind === "error")
+  );
 }
 
 /**

@@ -11,21 +11,21 @@ import {
 } from "./useConversations";
 
 /**
- * PATCH the board acceptance label. `reviewedAt` is the session `updated_at`
- * the user reviewed; the server refuses it (409) if the session has changed
- * since or changed under two seconds ago, and otherwise stores a stamp one
- * second past it. `null` reopens the session
- * by clearing the label to an empty value (labels are upsert-only).
+ * PATCH the board acceptance label. `reviewedRevision` is the session's
+ * `board_revision` the user reviewed; the server refuses it (409) once the
+ * session has changed, and otherwise stores a stamp one second past its
+ * `updated_at`. `null` reopens the session by clearing the label to an empty
+ * value (labels are upsert-only).
  */
 export async function setSessionBoardAccepted(
   id: string,
-  reviewedAt: number | null,
+  reviewedRevision: string | null,
 ): Promise<Conversation> {
   const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(id)}`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      labels: { [BOARD_ACCEPTED_LABEL_KEY]: reviewedAt === null ? "" : String(reviewedAt) },
+      labels: { [BOARD_ACCEPTED_LABEL_KEY]: reviewedRevision ?? "" },
     }),
   });
   if (!res.ok) throw await apiErrorFromResponse(res);
@@ -36,8 +36,8 @@ const BOARD_ACCEPT_MUTATION_KEY = ["board-accept"] as const;
 
 interface BoardAcceptVariables {
   row: Conversation;
-  /** The `updated_at` the user reviewed, or `null` to reopen. */
-  reviewedAt: number | null;
+  /** The `board_revision` the user reviewed, or `null` to reopen. */
+  reviewedRevision: string | null;
 }
 
 /**
@@ -56,10 +56,11 @@ export function useBoardAcceptPending(id: string): boolean {
 
 /**
  * Accept a session's work on the board, or reopen it. The card moves before the
- * PATCH returns: the overlay writes the stamp the server will store, and the
- * server's stored value replaces it on success. A failure restores the previous
- * value and says why. A label PATCH leaves the session's `updated_at` alone, so
- * accepting does not mark it as new activity.
+ * PATCH returns: the overlay writes the stamp the server stores for an unchanged
+ * session. On success the response's label is applied exactly, including its
+ * absence, which means later activity already reopened the session. A failure
+ * restores the previous value and says why. A label PATCH leaves the session's
+ * `updated_at` alone, so accepting does not mark it as new activity.
  */
 export function useSetBoardAccepted() {
   const queryClient = useQueryClient();
@@ -67,29 +68,29 @@ export function useSetBoardAccepted() {
     overlayLabelIntoCaches(queryClient, id, BOARD_ACCEPTED_LABEL_KEY, value);
   return useMutation({
     mutationKey: BOARD_ACCEPT_MUTATION_KEY,
-    mutationFn: ({ row, reviewedAt }: BoardAcceptVariables) =>
-      setSessionBoardAccepted(row.id, reviewedAt),
-    onMutate: async ({ row, reviewedAt }) => {
+    mutationFn: ({ row, reviewedRevision }: BoardAcceptVariables) =>
+      setSessionBoardAccepted(row.id, reviewedRevision),
+    onMutate: async ({ row, reviewedRevision }) => {
       // A refetch already in flight, of any cache the overlay writes, would land
       // without the new label.
       await Promise.all([
         ...LIST_ROW_QUERY_ROOTS.map((root) => queryClient.cancelQueries({ queryKey: [root] })),
         queryClient.cancelQueries({ queryKey: PINNED_CONVERSATIONS_KEY }),
       ]);
-      writeLabel(row.id, reviewedAt === null ? "" : String(reviewedAt + 1));
+      writeLabel(row.id, reviewedRevision === null ? "" : String(row.updated_at + 1));
     },
-    onSuccess: (updated, { row, reviewedAt }) => {
-      writeLabel(
-        row.id,
-        updated.labels?.[BOARD_ACCEPTED_LABEL_KEY] ??
-          (reviewedAt === null ? "" : String(reviewedAt + 1)),
-      );
+    onSuccess: (updated, { row }) => {
+      writeLabel(row.id, updated.labels?.[BOARD_ACCEPTED_LABEL_KEY]);
     },
-    onError: (error, { row, reviewedAt }) => {
+    onError: (error, { row, reviewedRevision }) => {
       writeLabel(row.id, row.labels?.[BOARD_ACCEPTED_LABEL_KEY]);
-      if (reviewedAt === null) showToast("Couldn't reopen the session.");
-      else if (error instanceof ApiError && error.status === 409) showToast(error.message);
-      else showToast("Couldn't accept the session.");
+      if (reviewedRevision === null) showToast("Couldn't reopen the session.");
+      else if (error instanceof ApiError && error.status === 409) {
+        showToast(error.message);
+        // Fetch the current revision so a retry reviews the session as it is now.
+        for (const root of LIST_ROW_QUERY_ROOTS)
+          void queryClient.invalidateQueries({ queryKey: [root] });
+      } else showToast("Couldn't accept the session.");
     },
   });
 }

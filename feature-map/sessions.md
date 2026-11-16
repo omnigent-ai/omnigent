@@ -771,20 +771,23 @@ plain `uv run pytest`, which starts a private server for the test.
   `web/src/lib/sessionBoard.test.ts`; the optimistic label write and rollback in
   `web/src/hooks/useBoardAcceptance.test.tsx`; and the route and sidebar gate in
   `web/src/App.test.tsx` and `web/src/shell/Sidebar.test.tsx`. The server's
-  acceptance stamp, which refuses a stale or too-recent review, has unit
-  coverage in `tests/server/test_session_board.py`; through the route,
-  `tests/server/routes/test_sessions_crud.py::test_patch_board_acceptance_stamps_server_time_and_keeps_activity_time`,
-  `tests/server/routes/test_sessions_crud.py::test_activity_in_the_acceptance_second_reopens_it`,
+  acceptance check, which refuses a review whose `board_revision` the session
+  has moved past, has unit coverage in `tests/server/test_session_board.py`;
+  through the route,
+  `tests/server/routes/test_sessions_crud.py::test_patch_board_acceptance_stores_a_stamp_and_keeps_activity_time`,
+  `tests/server/routes/test_sessions_crud.py::test_activity_after_board_acceptance_reopens_it`,
   `tests/server/routes/test_sessions_crud.py::test_board_acceptance_of_a_stale_review_is_refused`
   and
   `tests/server/routes/test_sessions_crud.py::test_new_session_starts_without_a_seeded_board_acceptance`
-  cover the stored stamp, same-second activity, the 409 and creation seeding;
+  cover the stored stamp, activity after Accept, the 409 and creation seeding;
   `tests/server/routes/test_sessions_crud.py::test_native_clear_replacement_keeps_creating_surface`
   covers a native `/clear` replacement of an accepted or reopened session. The
   store's locked accept and the activity writers that drop it, including an
   append paused before its transaction, are covered in
   `tests/stores/test_conversation_store.py::test_delayed_activity_writer_reopens_the_board_acceptance`
-  and its neighbours.
+  and its neighbours;
+  `tests/stores/test_conversation_store.py::test_same_second_output_after_review_blocks_accept`
+  covers output committed after review within the reviewed second.
   To check manually, enable `session_board` on the isolated server, run one
   session to idle, open **Board**, and confirm the card sits in Needs review.
   Choose **Accept**: it moves to Done and stays there after a reload. Send the
@@ -1400,8 +1403,10 @@ its discoverability.
   deleting one session. Shared compute means a shared filesystem, not history.
 
 - The Board's Done column needs the acceptance label to be present and newer
-  than the session's `updated_at`. **Accept** is refused with a message if the
-  session changed after the card was shown, or within the last two seconds.
+  than the session's `updated_at`. **Accept** sends the card's `board_revision`
+  and is refused with a message if the session changed after the card was
+  shown, including output in the same second. A server that sends no revision
+  offers no **Accept**. Errored activity the sidebar flags lands in Needs you.
   Every write that advances `updated_at` deletes the label, so new sessions,
   forks and native `/clear` replacements start unaccepted, and renaming,
   archiving, filing a session into a project, or changing its model, effort or

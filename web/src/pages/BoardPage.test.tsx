@@ -41,6 +41,7 @@ function conversation(overrides: Partial<Conversation> = {}): Conversation {
     status: "idle",
     pending_elicitations_count: 0,
     archived: false,
+    board_revision: "rev_review",
     ...overrides,
   };
 }
@@ -175,7 +176,7 @@ describe("BoardPage", () => {
       expect(patchBodies()).toEqual([
         {
           url: "/v1/sessions/conv_review",
-          body: { labels: { [BOARD_ACCEPTED_LABEL_KEY]: "1700000100" } },
+          body: { labels: { [BOARD_ACCEPTED_LABEL_KEY]: "rev_review" } },
         },
       ]),
     );
@@ -230,6 +231,27 @@ describe("BoardPage", () => {
     const card = column("done").getByTestId("board-card");
     expect(within(card).getByText("Accepted")).toBeInTheDocument();
     expect(within(card).queryByTestId("session-state-badge")).toBeNull();
+  });
+
+  it("offers no Accept when the server sends no revision to check", () => {
+    mockRows([conversation({ board_revision: undefined })]);
+    renderPage();
+
+    expect(column("needs_review").getByText("Review me")).toBeInTheDocument();
+    expect(column("needs_review").queryByRole("button", { name: "Accept Review me" })).toBeNull();
+  });
+
+  it("flags errored activity the sidebar flags, even on an idle session", () => {
+    mockRows([
+      conversation({
+        title: "Errored",
+        labels: { "omnigent.latest_activity_error": "error" },
+      }),
+    ]);
+    renderPage();
+
+    expect(column("needs_you").getByText("Last turn failed")).toBeInTheDocument();
+    expect(column("needs_you").getByRole("button", { name: "Accept Errored" })).toBeInTheDocument();
   });
 
   it("offers Accept on a failed turn but not on running work", () => {

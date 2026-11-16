@@ -283,6 +283,12 @@ export interface Conversation {
    */
   pull_requests_synced?: boolean | null;
   /**
+   * Fingerprint of the session state the Board accepts; Accept sends it back
+   * and the server refuses it once the session has changed. Absent on older
+   * servers.
+   */
+  board_revision?: string | null;
+  /**
    * Whether the viewer owns this session and has shared it with anyone else.
    * Absent for non-owners and on older servers; treat absent as "not shared".
    */

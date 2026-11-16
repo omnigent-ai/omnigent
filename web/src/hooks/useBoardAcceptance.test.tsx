@@ -75,14 +75,14 @@ describe("setSessionBoardAccepted", () => {
     vi.mocked(authenticatedFetch).mockImplementation(
       async () => new Response(JSON.stringify(row()), { status: 200 }),
     );
-    await setSessionBoardAccepted("conv a", 1_700_000_100);
+    await setSessionBoardAccepted("conv a", "rev_reviewed");
     await setSessionBoardAccepted("conv a", null);
 
     const calls = vi.mocked(authenticatedFetch).mock.calls;
     expect(calls[0][0]).toBe("/v1/sessions/conv%20a");
     expect(calls[0][1]?.method).toBe("PATCH");
     expect(JSON.parse(String(calls[0][1]?.body))).toEqual({
-      labels: { [BOARD_ACCEPTED_LABEL_KEY]: "1700000100" },
+      labels: { [BOARD_ACCEPTED_LABEL_KEY]: "rev_reviewed" },
     });
     expect(JSON.parse(String(calls[1][1]?.body))).toEqual({
       labels: { [BOARD_ACCEPTED_LABEL_KEY]: "" },
@@ -102,7 +102,7 @@ describe("useSetBoardAccepted", () => {
     const client = seededClient(row());
     const { result } = renderMutation(client);
 
-    act(() => result.current.mutate({ row: row(), reviewedAt: 1_700_000_100 }));
+    act(() => result.current.mutate({ row: row(), reviewedRevision: "rev_reviewed" }));
 
     // Optimistically just past the reviewed time, so the card reads as accepted.
     const optimistic = { keep: "1", [BOARD_ACCEPTED_LABEL_KEY]: "1700000101" };
@@ -116,6 +116,21 @@ describe("useSetBoardAccepted", () => {
     expect(cachedLabels(client, LIST_KEY)).toEqual(stored);
     expect(pinnedLabels(client)).toEqual(stored);
     expect(showToast).not.toHaveBeenCalled();
+  });
+
+  it("applies a successful response without the label as reopened", async () => {
+    // Later activity removed the acceptance before the response snapshot was read.
+    vi.mocked(authenticatedFetch).mockResolvedValue(
+      new Response(JSON.stringify(row()), { status: 200 }),
+    );
+    const client = seededClient(row());
+    const { result } = renderMutation(client);
+
+    act(() => result.current.mutate({ row: row(), reviewedRevision: "rev_reviewed" }));
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(cachedLabels(client, LIST_KEY)).toEqual({ keep: "1" });
+    expect(pinnedLabels(client)).toEqual({ keep: "1" });
   });
 
   it("keeps the acceptance when a pinned-list refetch started before Accept resolves", async () => {
@@ -138,7 +153,7 @@ describe("useSetBoardAccepted", () => {
       .catch(() => undefined);
     const { result } = renderMutation(client);
 
-    act(() => result.current.mutate({ row: row(), reviewedAt: 1_700_000_100 }));
+    act(() => result.current.mutate({ row: row(), reviewedRevision: "rev_reviewed" }));
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
     resolveStale({ conversations: [row()], filterHonored: true });
     await staleRefetch;
@@ -154,7 +169,7 @@ describe("useSetBoardAccepted", () => {
     const client = seededClient(before);
     const { result } = renderMutation(client);
 
-    act(() => result.current.mutate({ row: before, reviewedAt: null }));
+    act(() => result.current.mutate({ row: before, reviewedRevision: null }));
 
     await waitFor(() => expect(result.current.isError).toBe(true));
     expect(cachedLabels(client, LIST_KEY)).toEqual(before.labels);
@@ -170,10 +185,12 @@ describe("useSetBoardAccepted", () => {
     const client = seededClient(row());
     const { result } = renderMutation(client);
 
-    act(() => result.current.mutate({ row: row(), reviewedAt: 1_700_000_100 }));
+    act(() => result.current.mutate({ row: row(), reviewedRevision: "rev_reviewed" }));
 
     await waitFor(() => expect(result.current.isError).toBe(true));
     expect(cachedLabels(client, LIST_KEY)).toEqual(row().labels);
     expect(showToast).toHaveBeenCalledWith(message);
+    // The lists refetch so a retry carries the session's current revision.
+    expect(client.getQueryState(LIST_KEY)?.isInvalidated).toBe(true);
   });
 });

@@ -6,9 +6,9 @@
  * Columns derive from the shared sidebar rows (kept live by the
  * `WS /v1/sessions/updates` stream), so the board needs no extra list fetch.
  * A session reaches Done only when the user accepts it: Accept sends the
- * reviewed `updated_at`, the server stores a later stamp in the
- * `omnigent.board.accepted` label, and any later activity moves the card back
- * out (see `@/lib/sessionBoard`).
+ * reviewed `board_revision`, the server stores the `omnigent.board.accepted`
+ * label if it is still current, and any later activity deletes the label
+ * (see `@/lib/sessionBoard`).
  */
 
 import { useMemo } from "react";
@@ -25,7 +25,7 @@ import { SessionStateBadge } from "@/components/SessionStateBadge";
 import { Button } from "@/components/ui/button";
 import { useBoardAcceptPending, useSetBoardAccepted } from "@/hooks/useBoardAcceptance";
 import type { Conversation } from "@/hooks/useConversations";
-import { getSessionState, type SessionState } from "@/hooks/useSessionState";
+import type { SessionState } from "@/hooks/useSessionState";
 import { useSidebarData } from "@/hooks/useSidebarData";
 import { useConversationReadState } from "@/hooks/useUnseenConversations";
 import { useViewerId } from "@/hooks/useViewerId";
@@ -35,6 +35,7 @@ import { relativeTime } from "@/lib/relativeTime";
 import { Link } from "@/lib/routing";
 import {
   BOARD_COLUMNS,
+  boardSessionState,
   canAcceptOnBoard,
   groupBoardColumns,
   type BoardColumnId,
@@ -50,6 +51,7 @@ function statusLine(state: SessionState | null, column: BoardColumnId, unseen: b
   if (state?.kind === "running") return state.background ? "Working in the background" : "Working";
   if (column === "done") return "Accepted";
   if (state?.kind === "error") return "Last turn failed";
+  if (state?.kind === "disconnected") return "Host disconnected";
   return unseen ? "New messages" : "Ready for review";
 }
 
@@ -69,7 +71,7 @@ function BoardCard({
   );
   const setAccepted = useSetBoardAccepted();
   const acceptPending = useBoardAcceptPending(conversation.id);
-  const sessionState = getSessionState(conversation);
+  const sessionState = boardSessionState(conversation);
   // The column and status line already say a card is waiting or accepted, so
   // skip the wide "Needs response" tag and a stale failure icon on Done cards.
   const badgeState: SessionState | null =
@@ -78,7 +80,9 @@ function BoardCard({
       : (sessionState ?? (unseen ? { kind: "unseen" } : null));
   const title = conversationDisplayLabel(conversation);
   const prCopy = gitProviderCopy(pullRequest?.provider, undefined, pullRequest?.provider_display);
-  const canAccept = canAcceptOnBoard(conversation);
+  const reviewedRevision = conversation.board_revision ?? null;
+  // A server without revisions can't check the review, so it offers no Accept.
+  const canAccept = reviewedRevision !== null && canAcceptOnBoard(conversation);
 
   return (
     <li
@@ -138,9 +142,7 @@ function BoardCard({
               size="sm"
               variant="outline"
               disabled={acceptPending}
-              onClick={() =>
-                setAccepted.mutate({ row: conversation, reviewedAt: conversation.updated_at })
-              }
+              onClick={() => setAccepted.mutate({ row: conversation, reviewedRevision })}
               componentId="board.accept"
               aria-label={`Accept ${title}`}
             >
@@ -152,7 +154,7 @@ function BoardCard({
               size="sm"
               variant="ghost"
               disabled={acceptPending}
-              onClick={() => setAccepted.mutate({ row: conversation, reviewedAt: null })}
+              onClick={() => setAccepted.mutate({ row: conversation, reviewedRevision: null })}
               componentId="board.reopen"
               aria-label={`Reopen ${title}`}
             >

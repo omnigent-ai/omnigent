@@ -1,8 +1,9 @@
-"""Server-owned acceptance stamps for the web session Board.
+"""Server-owned acceptance for the web session Board.
 
 The Board treats a session as accepted while its acceptance label is present
 and newer than the session's ``updated_at``. The client sends the
-``updated_at`` it reviewed; the store writes the label only if that is still
+:func:`~omnigent.stores.conversation_store.board_revision` it reviewed (from
+the session list); the store writes the label only if that revision is still
 current, under the conversation's write lock. Every store write that later
 advances ``updated_at`` drops the label in its own transaction, so later
 activity reopens the work whatever timestamp its writer sampled.
@@ -11,20 +12,15 @@ activity reopens the work whatever timestamp its writer sampled.
 from __future__ import annotations
 
 import asyncio
-import time
-from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.stores.conversation_store import BOARD_ACCEPTED_LABEL_KEY
+from omnigent.stores.conversation_store import BOARD_ACCEPTED_LABEL_KEY, board_revision
 
 if TYPE_CHECKING:
     from omnigent.stores.conversation_store import ConversationStore
 
-# Writes sampled in the reviewed second may commit just before Accept with that
-# same updated_at; refusing a too-recent review narrows that window.
-_SETTLE_SECONDS = 2
 _CHANGED_MESSAGE = "The session changed since you reviewed it. Review it again before accepting."
 
 __all__ = [
@@ -38,10 +34,9 @@ __all__ = [
 
 @dataclass(frozen=True)
 class BoardAcceptance:
-    """A validated Accept (``reviewed`` set) or Reopen (``reviewed`` is ``None``)."""
+    """A validated Accept (``reviewed_revision`` set) or Reopen (``None``)."""
 
-    reviewed: int | None
-    stamp: str
+    reviewed_revision: str | None
 
 
 def drop_board_acceptance_seed(labels: dict[str, str] | None) -> None:
@@ -61,42 +56,26 @@ async def resolve_board_acceptance(
     conversation_store: ConversationStore,
     session_id: str,
     requested: str,
-    *,
-    clock: Callable[[], float] | None = None,
 ) -> BoardAcceptance:
     """
     Validate a client's acceptance label value before any write.
 
     :param conversation_store: Store used to read the session's current row.
     :param session_id: Session being accepted, e.g. ``"conv_abc123"``.
-    :param requested: The reviewed ``updated_at``, e.g. ``"1700000100"``, or
-        ``""`` to reopen.
-    :param clock: Wall clock in epoch seconds; defaults to :func:`time.time`.
-    :returns: The acceptance to write, stamped one second past the review.
-    :raises OmnigentError: 400 for a malformed value, 404 for a missing
-        session, 409 when the session changed after the reviewed time or that
-        activity is under two seconds old.
+    :param requested: The ``board_revision`` the user reviewed, e.g.
+        ``"3f2a9c0d81b4e6f7"``, or ``""`` to reopen.
+    :returns: The acceptance to write.
+    :raises OmnigentError: 404 for a missing session, 409 when the session
+        changed after the reviewed revision.
     """
     if requested == "":
-        return BoardAcceptance(reviewed=None, stamp="")
-    try:
-        reviewed = int(requested)
-    except ValueError as exc:
-        raise OmnigentError(
-            f"{BOARD_ACCEPTED_LABEL_KEY} must be the session's updated_at in epoch seconds",
-            code=ErrorCode.INVALID_INPUT,
-        ) from exc
+        return BoardAcceptance(reviewed_revision=None)
     conversation = await asyncio.to_thread(conversation_store.get_conversation, session_id)
     if conversation is None:
         raise OmnigentError(f"Session {session_id!r} not found", code=ErrorCode.NOT_FOUND)
-    if conversation.updated_at != reviewed:
+    if board_revision(conversation) != requested:
         raise OmnigentError(_CHANGED_MESSAGE, code=ErrorCode.CONFLICT)
-    if int((clock or time.time)()) < reviewed + _SETTLE_SECONDS:
-        raise OmnigentError(
-            "The session just changed. Review it again before accepting.",
-            code=ErrorCode.CONFLICT,
-        )
-    return BoardAcceptance(reviewed=reviewed, stamp=str(reviewed + 1))
+    return BoardAcceptance(reviewed_revision=requested)
 
 
 async def write_board_acceptance(
@@ -112,13 +91,13 @@ async def write_board_acceptance(
     :param acceptance: The value from :func:`resolve_board_acceptance`.
     :raises OmnigentError: 409 when the session changed after validation.
     """
-    if acceptance.reviewed is None:
+    if acceptance.reviewed_revision is None:
         await asyncio.to_thread(
             conversation_store.set_labels, session_id, {BOARD_ACCEPTED_LABEL_KEY: ""}
         )
         return
-    accepted = await asyncio.to_thread(
-        conversation_store.accept_board_review, session_id, acceptance.reviewed, acceptance.stamp
+    stamp = await asyncio.to_thread(
+        conversation_store.accept_board_review, session_id, acceptance.reviewed_revision
     )
-    if not accepted:
+    if stamp is None:
         raise OmnigentError(_CHANGED_MESSAGE, code=ErrorCode.CONFLICT)

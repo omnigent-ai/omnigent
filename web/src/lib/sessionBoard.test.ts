@@ -74,7 +74,24 @@ describe("boardColumn", () => {
 
   it("asks for attention on a failed turn until the user accepts it", () => {
     expect(boardColumn(row({ status: "failed" }))).toBe("needs_you");
+    // An idle row whose latest activity the server recorded as an error, as the sidebar reads it.
+    const errored = { "omnigent.latest_activity_error": "error" };
+    expect(boardColumn(row({ status: "idle", labels: errored }))).toBe("needs_you");
+    expect(canAcceptOnBoard(row({ status: "idle", labels: errored }))).toBe(true);
+    expect(
+      boardColumn(row({ status: "idle", labels: { ...errored, ...accepted(1_700_000_101) } })),
+    ).toBe("done");
     expect(boardColumn(row({ status: "failed", labels: accepted(1_700_000_101) }))).toBe("done");
+  });
+});
+
+describe("disconnected hosts", () => {
+  it("needs the user, without an Accept, until the host is back", () => {
+    const disconnected = { "omnigent.latest_activity_error": "disconnected" };
+    const row_ = row({ labels: disconnected, host_online: false });
+    expect(boardColumn(row_)).toBe("needs_you");
+    expect(canAcceptOnBoard(row_)).toBe(false);
+    expect(boardColumn(row({ labels: disconnected, host_online: true }))).toBe("needs_review");
   });
 });
 
