@@ -1628,6 +1628,8 @@ class _SessionCreateRequestBase(_SandboxProfileSelection):
         e.g. ``"ag_abc123"``. Must match a registered agent.
     :param initial_items: Initial queued events/inputs, typically a
         single user ``"message"``.
+    :param workflow_id: Saved workflow to copy into the session journal before
+        any initial input runs. Requires an owned workflow with a saved plan.
     :param title: Optional human-readable title for the session,
         e.g. ``"debugging auth flow"``.
     :param labels: Initial guardrails labels to set on the session.
@@ -1780,6 +1782,7 @@ class _SessionCreateRequestBase(_SandboxProfileSelection):
     project_id: str | None = None
     initial_items: list[SessionEventInput] = Field(default_factory=list)
     initial_input: SessionStartupInput | None = None
+    workflow_id: str | None = None
     mcp_registry_services: list[McpRegistryServiceId] = Field(
         default_factory=list, max_length=MAX_MCP_REGISTRY_SERVICES
     )
