@@ -7883,6 +7883,114 @@ async def test_prompt_too_long_fails_the_turn_without_another_replay(case) -> No
 
 
 @pytest.mark.asyncio
+async def test_failed_auto_compaction_then_rejected_replay_is_retried_once(tmp_path: Path) -> None:
+    """PreCompact starts, the compaction fails with no summary, and the replay is retried once.
+
+    The incident shape: a restarted client's replay makes Claude Code auto-compact,
+    the compaction fails (``too_few_groups``), and the turn ends "Prompt is too long".
+    """
+    from claude_agent_sdk.types import HookEventMessage as SDKHookEventMessage
+
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+    from omnigent.inner.executor import CompactionStarted
+
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    pre_compact = SDKHookEventMessage(
+        subtype="hook_started",
+        data={
+            "hook_event": "PreCompact",
+            "session_id": "s1",
+            "transcript_path": str(transcript_path),
+        },
+        hook_event_name="PreCompact",
+        session_id="s1",
+        uuid="hook-1",
+    )
+    too_long = _sdk_result("Prompt is too long", is_error=True)
+    fake_sdk = _make_recovery_fake_sdk([[pre_compact, too_long]])
+    executor = ClaudeSDKExecutor(model="claude-sonnet-4-5", context_window=1_000_000)
+    messages = [*_long_prior_messages(10), {"role": "user", "content": "What next?"}]
+    with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=fake_sdk):
+        events = [event async for event in executor.run_turn(messages, [], "")]
+
+    assert [event for event in events if isinstance(event, CompactionStarted)]
+    assert not [event for event in events if isinstance(event, ExecutorError)]
+    assert [event.response for event in events if isinstance(event, TurnComplete)] == ["recovered"]
+    # Exactly one retry: the rejected first client, then one fresh client.
+    rejected, retried = fake_sdk.created_clients
+    assert rejected.disconnected
+    [retried_prompt] = retried.prompts
+    marker = "[Earlier messages omitted to fit the model's context window: 8.]"
+    assert marker in retried_prompt
+    assert "turn-8 " in retried_prompt
+    assert "turn-7 " not in retried_prompt
+    assert "What next?" in retried_prompt
+
+
+@pytest.mark.asyncio
+async def test_completed_auto_compaction_then_rejected_replay_is_not_retried(
+    tmp_path: Path,
+) -> None:
+    """A compaction that wrote its summary keeps its checkpoint and is not replayed again."""
+    from types import SimpleNamespace
+
+    from claude_agent_sdk.types import HookEventMessage as SDKHookEventMessage
+
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+    from omnigent.inner.executor import CompactionComplete, ExecutorError
+
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    pre_compact = SDKHookEventMessage(
+        subtype="hook_started",
+        data={
+            "hook_event": "PreCompact",
+            "session_id": "s1",
+            "transcript_path": str(transcript_path),
+        },
+        hook_event_name="PreCompact",
+        session_id="s1",
+        uuid="hook-1",
+    )
+    too_long = _sdk_result("Prompt is too long", is_error=True)
+    summary_record = {
+        "type": "user",
+        "uuid": "compact-summary-1",
+        "isCompactSummary": True,
+        "message": {"role": "user", "content": "compacted summary"},
+    }
+
+    async def _receive_response(self):
+        yield pre_compact
+        with transcript_path.open("a", encoding="utf-8") as transcript:
+            transcript.write(json.dumps(summary_record) + "\n")
+        yield too_long
+
+    fake_sdk = _make_recovery_fake_sdk()
+    fake_sdk.ClaudeSDKClient.receive_response = _receive_response
+    executor = ClaudeSDKExecutor(model="claude-sonnet-4-5", context_window=1_000_000)
+    messages = [*_long_prior_messages(10), {"role": "user", "content": "What next?"}]
+    session_messages = [
+        SimpleNamespace(
+            type="assistant", message={"content": [{"type": "text", "text": "compacted"}]}
+        )
+    ]
+    with (
+        patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=fake_sdk),
+        patch("claude_agent_sdk.get_session_messages", return_value=session_messages),
+    ):
+        events = [event async for event in executor.run_turn(messages, [], "")]
+
+    assert len(fake_sdk.created_clients) == 1
+    assert [event.message for event in events if isinstance(event, ExecutorError)] == [
+        "Prompt is too long"
+    ]
+    assert [event for event in events if isinstance(event, CompactionComplete)]
+    assert not [event for event in events if isinstance(event, TurnComplete)]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("initial_effort", [None, "low"])
 @pytest.mark.parametrize(
     "compact_content",

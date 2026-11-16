@@ -4057,6 +4057,17 @@ class ClaudeSDKExecutor(Executor):
             )
             return False
 
+        def _compaction_may_have_completed() -> bool:
+            # PreCompact only says a compaction started. A failed one (for example
+            # ``too_few_groups``) leaves no summary record, so the rejected replay
+            # can still be retried. Without a transcript boundary we cannot tell,
+            # so keep the completed-compaction path.
+            if not compaction_occurred:
+                return False
+            if compaction_transcript_offset is None:
+                return True
+            return _new_compact_summary_visible()
+
         def _build_compaction_complete_event(
             *, require_new_compact_summary: bool = False
         ) -> ExecutorEvent | None:
@@ -4650,13 +4661,16 @@ class ClaudeSDKExecutor(Executor):
             if (
                 replayed_history_tokens > 0
                 and replay_budget_cap is None
-                and not (got_stream_events or got_unstreamed_reply or compaction_occurred)
+                and not (got_stream_events or got_unstreamed_reply)
             ):
                 retry_budget = _rejected_replay_retry_budget(
                     replayed_history_tokens, terminal_error
                 )
+            if retry_budget is not None and _compaction_may_have_completed():
+                retry_budget = None
             if retry_budget is not None:
-                # No model reply or compaction started, so the retry cannot repeat work.
+                # No model reply, and no completed compaction to checkpoint, so the
+                # retry cannot repeat visible work.
                 await self._close_live_client(session_key)
                 yield _RejectedReplay(retry_budget=retry_budget)
                 return
