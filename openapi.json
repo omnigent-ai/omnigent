@@ -2135,6 +2135,164 @@
         "title": "CompletedEvent",
         "type": "object"
       },
+      "ContextBreakdownAttachment": {
+        "description": "One attachment still in a session's live conversation history.",
+        "properties": {
+          "bytes": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Stored or inline-decoded size in bytes; `None` when unknown (the file is gone or the block is a remote URL).",
+            "title": "Bytes"
+          },
+          "content_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Stored MIME type, e.g. `\"image/png\"`.",
+            "title": "Content Type"
+          },
+          "delivery": {
+            "description": "`\"inline\"` (sent to the model), `\"workspace\"` (saved to disk, as a native harness does with each attachment it can decode; only its path reaches the model) or `\"missing\"` (not delivered: the file record is gone, or a native harness could not write the block to disk).",
+            "enum": [
+              "inline",
+              "workspace",
+              "missing"
+            ],
+            "title": "Delivery",
+            "type": "string"
+          },
+          "estimated_tokens": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Estimated prompt tokens for an inline attachment; `None` when its type has no reliable estimate (e.g. a PDF) or it is not inline.",
+            "title": "Estimated Tokens"
+          },
+          "file_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Uploaded file id, e.g. `\"file_abc123\"`; `None` for bytes sent inline in the message.",
+            "title": "File Id"
+          },
+          "filename": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Display name, e.g. `\"report.pdf\"`; `None` when unknown.",
+            "title": "Filename"
+          }
+        },
+        "required": [
+          "delivery"
+        ],
+        "title": "ContextBreakdownAttachment",
+        "type": "object"
+      },
+      "ContextBreakdownHistory": {
+        "description": "Estimated size of a session's live conversation history.",
+        "properties": {
+          "estimated_tokens": {
+            "default": 0,
+            "description": "Estimated tokens of the live history, including the latest compaction summary and excluding attachments.",
+            "format": "int64",
+            "title": "Estimated Tokens",
+            "type": "integer"
+          },
+          "item_count": {
+            "default": 0,
+            "description": "Messages and tool calls/results still sent in full.",
+            "format": "int64",
+            "title": "Item Count",
+            "type": "integer"
+          },
+          "partial": {
+            "default": false,
+            "description": "The scan stopped at its item cap before the summarized range, so the live counts are lower bounds.",
+            "title": "Partial",
+            "type": "boolean"
+          },
+          "summarized_item_count": {
+            "default": 0,
+            "description": "Earlier messages and tool calls/results replaced by a compaction summary.",
+            "format": "int64",
+            "title": "Summarized Item Count",
+            "type": "integer"
+          },
+          "summarized_partial": {
+            "default": false,
+            "description": "The scan stopped inside the summarized range, so `summarized_item_count` is a lower bound.",
+            "title": "Summarized Partial",
+            "type": "boolean"
+          },
+          "summary_tokens": {
+            "default": 0,
+            "description": "Estimated size of what replaces the compacted history: the checkpoint's retained messages when it has them, else the replayed summary and its prompt; `0` when never compacted.",
+            "format": "int64",
+            "title": "Summary Tokens",
+            "type": "integer"
+          }
+        },
+        "title": "ContextBreakdownHistory",
+        "type": "object"
+      },
+      "ContextBreakdownTools": {
+        "description": "Tool sources declared by a session's agent. Schemas are listed by the\nrunner at turn time, so their size is not estimated here.",
+        "properties": {
+          "builtin_tool_count": {
+            "default": 0,
+            "description": "Configured built-in tools, e.g. `1`.",
+            "format": "int64",
+            "title": "Builtin Tool Count",
+            "type": "integer"
+          },
+          "local_tool_count": {
+            "default": 0,
+            "description": "Agent-bundled tools, e.g. `2`.",
+            "format": "int64",
+            "title": "Local Tool Count",
+            "type": "integer"
+          },
+          "mcp_servers": {
+            "description": "Enabled MCP server names, e.g. `[\"github\"]`.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Mcp Servers",
+            "type": "array"
+          }
+        },
+        "title": "ContextBreakdownTools",
+        "type": "object"
+      },
       "ConversationDeleted": {
         "description": "Confirmation payload returned after deleting a conversation.",
         "properties": {
@@ -8796,6 +8954,71 @@
           "type"
         ],
         "title": "SessionContentBlock",
+        "type": "object"
+      },
+      "SessionContextBreakdown": {
+        "description": "Response for `GET /v1/sessions/{session_id}/context-breakdown`.\n\nEvery token figure is an estimate from content size; the measured total\nstays on the session snapshot (`last_total_tokens` / `context_window`).\nContent a harness adds itself (its own system prompt, tool schemas,\nproject instructions) is not visible here.",
+        "properties": {
+          "attachments": {
+            "description": "Attachments in the live history, oldest first.",
+            "items": {
+              "$ref": "#/components/schemas/ContextBreakdownAttachment"
+            },
+            "title": "Attachments",
+            "type": "array"
+          },
+          "bytes_per_token": {
+            "description": "Ratio behind the text estimates, e.g. `4`.",
+            "format": "int64",
+            "title": "Bytes Per Token",
+            "type": "integer"
+          },
+          "history": {
+            "$ref": "#/components/schemas/ContextBreakdownHistory",
+            "description": "Live conversation history estimate."
+          },
+          "session_id": {
+            "description": "The session, e.g. `\"conv_abc123\"`.",
+            "title": "Session Id",
+            "type": "string"
+          },
+          "skill_count": {
+            "default": 0,
+            "description": "Skills the agent bundles, e.g. `3`.",
+            "format": "int64",
+            "title": "Skill Count",
+            "type": "integer"
+          },
+          "skill_listing_tokens": {
+            "default": 0,
+            "description": "Estimated tokens of their name/description listing.",
+            "format": "int64",
+            "title": "Skill Listing Tokens",
+            "type": "integer"
+          },
+          "system_prompt_tokens": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Estimated agent instructions plus Omnigent's own guidance; `None` when the agent spec could not load.",
+            "title": "System Prompt Tokens"
+          },
+          "tools": {
+            "$ref": "#/components/schemas/ContextBreakdownTools",
+            "description": "Declared tool sources."
+          }
+        },
+        "required": [
+          "session_id",
+          "bytes_per_token"
+        ],
+        "title": "SessionContextBreakdown",
         "type": "object"
       },
       "SessionCreateMetadata": {
@@ -22778,6 +23001,50 @@
         "summary": "Update Comment",
         "tags": [
           "comments"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/context-breakdown": {
+      "get": {
+        "description": "Estimate what fills the session's context window.\n\nSplits the window into the agent's system prompt, skill listing,\ndeclared tool sources, attachments and conversation history. Every\ntoken figure is a size-based estimate; the measured total stays on\nthe session snapshot.\n\n**Returns:** The estimated `SessionContextBreakdown`.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if the session does not exist or the caller cannot read it.",
+        "operationId": "get_session_context_breakdown_v1_sessions__session_id__context_breakdown_get",
+        "parameters": [
+          {
+            "description": "Session identifier, e.g. `\"conv_abc123\"`.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionContextBreakdown"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Session Context Breakdown",
+        "tags": [
+          "sessions"
         ]
       }
     },

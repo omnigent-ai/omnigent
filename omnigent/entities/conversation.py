@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -434,6 +435,17 @@ class MessageData(BaseModel):
         return self
 
 
+def external_item_id(session_id: str, source_id: str) -> str:
+    """
+    Stable item id for an external item a harness forwarded with ``source_id``.
+
+    :param session_id: The session, e.g. ``"conv_abc123"``.
+    :param source_id: The harness's own record id, e.g. a transcript uuid.
+    :returns: A hex uuid5, so a re-forwarded item maps to the same id.
+    """
+    return uuid.uuid5(uuid.NAMESPACE_URL, f"omnigent-external-item:{session_id}:{source_id}").hex
+
+
 def synthesize_conversation_title(
     content: list[dict[str, Any]],
     *,
@@ -583,6 +595,10 @@ class ReasoningData(BaseModel):
     encrypted_content: str | None = None
 
 
+# Tail of the marker a compaction snapshot writes over a dropped binary payload.
+_OMITTED_PAYLOAD_SUFFIX = " content omitted from the compaction snapshot]"
+
+
 def _binary_payload_omitted(media_type: str, _payload_length: int) -> str:
     """
     Build the marker written over a dropped compaction-snapshot payload.
@@ -595,7 +611,28 @@ def _binary_payload_omitted(media_type: str, _payload_length: int) -> str:
     :param _payload_length: Unused.
     :returns: The replacement text.
     """
-    return f"[{media_type or 'binary'} content omitted from the compaction snapshot]"
+    return f"[{media_type or 'binary'}{_OMITTED_PAYLOAD_SUFFIX}"
+
+
+def is_omitted_binary_payload(value: object) -> bool:
+    """
+    Whether *value* is the marker a compaction snapshot stores over a binary payload.
+
+    :param value: A block's payload field, e.g. ``source.data`` or ``image_url``.
+    :returns: ``True`` for a marker written by the snapshot strip.
+    """
+    return (
+        isinstance(value, str)
+        and value.startswith("[")
+        and value.endswith(_OMITTED_PAYLOAD_SUFFIX)
+    )
+
+
+# User turn the runner replays before a summary-only compaction's summary.
+COMPACTION_SUMMARY_REPLAY_PROMPT = (
+    "[Automatically generated summary of prior conversation context.]\n\n"
+    "Please provide a summary of our conversation so far."
+)
 
 
 class CompactionData(BaseModel):

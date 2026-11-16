@@ -622,6 +622,56 @@ async def test_read_grant_allows_get_but_blocks_post_events(
     )
 
 
+async def test_context_breakdown_requires_read_access(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The context breakdown is readable with a read grant and hidden otherwise."""
+    from omnigent.entities import NewConversationItem
+    from omnigent.entities.conversation import MessageData
+    from omnigent.server.routes.sessions import routes_context
+
+    agent = await create_test_agent(auth_client, user="bryan")
+    session_id = (await _create_session_as(auth_client, agent["id"], "user-a"))["id"]
+    path = f"/v1/sessions/{session_id}/context-breakdown"
+    # Three items over two-item pages exercise the newest-first paging.
+    monkeypatch.setattr(routes_context, "_SCAN_PAGE_SIZE", 2)
+    SqlAlchemyConversationStore(db_uri).append(
+        session_id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_1",
+                data=MessageData(role="user", content=[{"type": "input_text", "text": "abcd"}]),
+            )
+            for _ in range(3)
+        ],
+    )
+
+    resp = await auth_client.get(path, headers={"X-Forwarded-Email": "user-b"})
+    assert resp.status_code == 404
+
+    resp = await _grant_permission(
+        auth_client, session_id, granter="user-a", target_user="user-b", level=LEVEL_READ
+    )
+    assert resp.status_code == 200
+    resp = await auth_client.get(path, headers={"X-Forwarded-Email": "user-b"})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["session_id"] == session_id
+    # The spec loaded through the real agent cache, so the prompt row is filled.
+    assert body["system_prompt_tokens"] > 0
+    assert body["history"] == {
+        "estimated_tokens": 3,
+        "item_count": 3,
+        "summarized_item_count": 0,
+        "summary_tokens": 0,
+        "partial": False,
+        "summarized_partial": False,
+    }
+
+
 async def test_edit_grant_blocked_from_stop_session_requires_owner(
     auth_client: httpx.AsyncClient,
 ) -> None:

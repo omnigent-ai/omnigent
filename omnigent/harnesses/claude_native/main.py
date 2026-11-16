@@ -90,6 +90,7 @@ from omnigent.databricks_ai_gateway import (
     is_ug_route,
     with_gateway_attribution_lines,
 )
+from omnigent.entities.conversation import external_item_id
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_ID_LABEL_KEY,
@@ -6352,7 +6353,7 @@ def _snapshot_source_ids(entry: _JsonObject) -> list[object]:
 def _snapshot_item_ids(session_id: str, source_ids: list[object]) -> set[str]:
     """Return the Omnigent item ids of forwarded items a snapshot already covers."""
     return {
-        uuid.uuid5(uuid.NAMESPACE_URL, f"omnigent-external-item:{session_id}:{source_id}").hex
+        external_item_id(session_id, source_id)
         for source_id in source_ids
         if isinstance(source_id, str)
     }

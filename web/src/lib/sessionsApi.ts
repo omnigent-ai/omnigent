@@ -1669,6 +1669,102 @@ export async function getSessionUsage(
   };
 }
 
+/** How an attachment reaches the model: sent inline, saved to disk, or not delivered. */
+export type ContextAttachmentDelivery = "inline" | "workspace" | "missing";
+
+export interface ContextBreakdownAttachment {
+  fileId: string | null;
+  filename: string | null;
+  contentType: string | null;
+  bytes: number | null;
+  delivery: ContextAttachmentDelivery;
+  /** Estimated tokens; null when the type has no reliable estimate or it is not inline. */
+  estimatedTokens: number | null;
+}
+
+/** Size-based estimates of what fills a session's context window. */
+export interface SessionContextBreakdown {
+  /** Null when the server could not load the agent spec. */
+  systemPromptTokens: number | null;
+  skillCount: number;
+  skillListingTokens: number;
+  mcpServers: string[];
+  localToolCount: number;
+  builtinToolCount: number;
+  attachments: ContextBreakdownAttachment[];
+  historyTokens: number;
+  historyItemCount: number;
+  summarizedItemCount: number;
+  summaryTokens: number;
+  /** The server stopped scanning at its item cap; history counts are lower bounds. */
+  historyPartial: boolean;
+  /** The scan stopped inside the summarized range; that count is a lower bound. */
+  summarizedPartial: boolean;
+  /** Ratio behind the text estimates, e.g. 4. */
+  bytesPerToken: number;
+}
+
+interface ContextBreakdownAttachmentWire {
+  file_id?: string | null;
+  filename?: string | null;
+  content_type?: string | null;
+  bytes?: number | null;
+  delivery: ContextAttachmentDelivery;
+  estimated_tokens?: number | null;
+}
+
+interface SessionContextBreakdownWire {
+  system_prompt_tokens?: number | null;
+  skill_count?: number;
+  skill_listing_tokens?: number;
+  tools?: { mcp_servers?: string[]; local_tool_count?: number; builtin_tool_count?: number };
+  attachments?: ContextBreakdownAttachmentWire[];
+  history?: {
+    estimated_tokens?: number;
+    item_count?: number;
+    summarized_item_count?: number;
+    summary_tokens?: number;
+    partial?: boolean;
+    summarized_partial?: boolean;
+  };
+  bytes_per_token?: number;
+}
+
+/** Estimate what fills a session's context window (system prompt, tools, attachments, history). */
+export async function getSessionContextBreakdown(
+  sessionId: string,
+  options: { signal?: AbortSignal } = {},
+): Promise<SessionContextBreakdown> {
+  const res = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(sessionId)}/context-breakdown`,
+    { signal: options.signal },
+  );
+  const wire = await readJsonOrThrow<SessionContextBreakdownWire>(res);
+  return {
+    systemPromptTokens: wire.system_prompt_tokens ?? null,
+    skillCount: wire.skill_count ?? 0,
+    skillListingTokens: wire.skill_listing_tokens ?? 0,
+    mcpServers: wire.tools?.mcp_servers ?? [],
+    localToolCount: wire.tools?.local_tool_count ?? 0,
+    builtinToolCount: wire.tools?.builtin_tool_count ?? 0,
+    attachments: (wire.attachments ?? []).map((attachment) => ({
+      fileId: attachment.file_id ?? null,
+      filename: attachment.filename ?? null,
+      contentType: attachment.content_type ?? null,
+      bytes: attachment.bytes ?? null,
+      delivery: attachment.delivery,
+      estimatedTokens: attachment.estimated_tokens ?? null,
+    })),
+    historyTokens: wire.history?.estimated_tokens ?? 0,
+    historyItemCount: wire.history?.item_count ?? 0,
+    summarizedItemCount: wire.history?.summarized_item_count ?? 0,
+    summaryTokens: wire.history?.summary_tokens ?? 0,
+    historyPartial: wire.history?.partial ?? false,
+    summarizedPartial: wire.history?.summarized_partial ?? false,
+    bytesPerToken: wire.bytes_per_token ?? 4,
+  };
+}
+
 /** One page of a session's committed items, in chronological order. */
 export interface SessionItemsPage {
   /** Items oldest-to-newest, ready to feed `itemsToBlocks`. */
