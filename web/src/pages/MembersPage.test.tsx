@@ -218,6 +218,22 @@ describe("MembersPage actions", () => {
     // The single-use invite URL renders in a readonly, copyable input.
     expect(await screen.findByDisplayValue(/register\?invite=tok/)).toBeInTheDocument();
   });
+
+  it("renders the invite and member rows from their Settings catalog entries", async () => {
+    vi.mocked(accountsApi.listUsers).mockResolvedValue([user({ id: "bob" })]);
+    renderPage();
+    await screen.findByText("bob");
+
+    expect(document.querySelector('[data-settings-item="members-invite"]')).not.toBeNull();
+    expect(document.querySelector('[data-settings-item="members-list"]')).not.toBeNull();
+    expect(
+      document.querySelector('[data-settings-control="members-invite:invite"]'),
+    ).toHaveAttribute("aria-label", "Invite member");
+    const bobRow = screen.getByText("bob").closest("tr")!;
+    expect(bobRow.querySelector('[data-settings-row-action="resetPassword"]')).not.toBeNull();
+    expect(bobRow.querySelector('[data-settings-row-action="remove"]')).not.toBeNull();
+    expect(document.querySelector('[data-settings-region="members-list:members"]')).not.toBeNull();
+  });
 });
 
 describe("MembersPage in plain header/single-user mode", () => {
