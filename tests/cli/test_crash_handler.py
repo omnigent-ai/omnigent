@@ -520,6 +520,7 @@ def test_scrub_home_directory_boundaries(
         f"Sibling paths: {home}é/module.py {home}+backup/module.py "
         f"{home}@backup/module.py {home}~backup/module.py\n"
         f"Sibling paths: {home}!backup/app.py {home};backup/app.py\n"
+        f"Sibling paths: {home})backup/app.py {home}]backup/app.py {home}}}backup/app.py\n"
         f"Home: \"{home}\" '{home}' `{home}` {home}\n"
         f"Home: ({home}) [{home}] {{{home}}} <{home}> {home}, {home}. {home}... {home}!!!\n"
     )
@@ -529,6 +530,9 @@ def test_scrub_home_directory_boundaries(
     assert f'File "{home}name/module.py"' in body
     assert f'File "{home}.backup/module.py"' in body
     assert f'File "{home} backup/module.py"' in body
+    assert f"{home})backup/app.py" in body
+    assert f"{home}]backup/app.py" in body
+    assert f"{home}}}backup/app.py" in body
     assert f"File '{home}, backup/native.py'" in body
     assert 'File "~/child directory/app.py"' in body
     assert 'File "~\\child directory\\native.py"' in body
@@ -717,8 +721,20 @@ def test_command_line_keeps_sibling_argument_with_spaces(
     )
     assert (
         ch._scrub(ch._command_line())
-        == "omnigent run '/home/example backup/config.yaml' ~/app.yaml"
+        == 'omnigent run "/home/example backup/config.yaml" ~/app.yaml'
     )
+
+
+def test_bearer_token_split_across_arguments_is_redacted(
+    data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Quoting must not stop a bearer pattern from matching the token that follows it."""
+    ch.install_crash_handler("omnigent", "omnigent-ai/omnigent")
+    monkeypatch.setattr(sys, "argv", ["example", "Authorization: Bearer", "synthetic.jwt.payload"])
+    url, _ = ch._issue_url(
+        _make_exc("failure"), "Traceback (most recent call last):\nValueError\n"
+    )
+    assert "synthetic.jwt.payload" not in urllib.parse.unquote_plus(url)
 
 
 def test_issue_url_redacts_multiline_bearer_before_truncation(data_dir: Path) -> None:
