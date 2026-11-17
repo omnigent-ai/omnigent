@@ -30,6 +30,8 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeAlias, cast
 
+import psutil
+
 from omnigent._platform import IS_WINDOWS
 from omnigent.cli_invocation import cli_invocation
 from omnigent.debug_logging import debug_event
@@ -1218,8 +1220,9 @@ class TerminalInstance:
     keep_alive_after_exit: bool = False
     running: bool = False
     launch_cwd: str | None = None
-    # Runtime-owned observation; never part of the portable terminal spec.
+    # Runner-owned observation and forwarding; never part of the portable terminal spec.
     program_status_app: str | None = None
+    program_status_forward_app: str | None = None
     program_status: ProgramStatusReader | None = field(default=None, init=False, repr=False)
     # Owned per-launch egress proxy. ``None`` when the sandbox
     # carries no ``egress_rules`` or the backend doesn't need a
@@ -1830,17 +1833,20 @@ class TerminalInstance:
             inner_cmd = [launcher_path, *self.args]
         else:
             inner_cmd = [self.command, *self.args]
-        if self.program_status_app is not None:
-            status_path = self.private_dir / "program-status.json"
-            status_path.unlink(missing_ok=True)
-            self.program_status = program_status.ProgramStatusReader(status_path)
+        status_app = self.program_status_app or self.program_status_forward_app
+        if status_app is not None:
+            snapshot_args = []
+            if self.program_status_app is not None:
+                status_path = self.private_dir / "program-status.json"
+                status_path.unlink(missing_ok=True)
+                self.program_status = program_status.ProgramStatusReader(status_path)
+                snapshot_args = ["--state-file", str(status_path)]
             inner_cmd = [
                 sys.executable,
                 str(Path(program_status.__file__)),
-                "--state-file",
-                str(status_path),
+                *snapshot_args,
                 "--app",
-                self.program_status_app,
+                status_app,
                 "--",
                 *inner_cmd,
             ]
@@ -1851,7 +1857,7 @@ class TerminalInstance:
         option_commands = [
             *_tmux_managed_option_commands(
                 self.scrollback,
-                allow_passthrough=self.tmux_allow_passthrough,
+                allow_passthrough=self.tmux_allow_passthrough or status_app is not None,
                 keep_alive_after_exit=self.keep_alive_after_exit,
             ),
             [
@@ -2795,11 +2801,9 @@ class TerminalInstance:
     def pane_pid_sync(self) -> int | None:
         """Return the pid of the pane's foreground process, or ``None``.
 
-        This is the pid tmux ``exec``'d into the pane — for a native agent
-        terminal that's the agent CLI itself (e.g. ``claude``). Used by the
-        claude-native status watcher to key Claude's ``sessions/<pid>.json``
-        metadata file. Synchronous sibling of the other ``*_sync`` probes so
-        the threaded watcher can call it without an event loop.
+        This is the pid tmux ``exec``'d into the pane, which may be a PTY
+        relay. Use :meth:`command_pid_sync` for the command behind that relay.
+        Synchronous so the threaded watcher can call it without an event loop.
 
         :returns: The pane pid, or ``None`` when tmux fails or reports no
             usable value (server gone, pane dead).
@@ -2815,6 +2819,20 @@ class TerminalInstance:
             return int(first[0])
         except ValueError:
             return None
+
+    def command_pid_sync(self) -> int | None:
+        """Return the command pid behind the optional single-child PTY relay."""
+        pid = self.pane_pid_sync()
+        if pid is None or (
+            self.program_status_app is None and self.program_status_forward_app is None
+        ):
+            return pid
+        try:
+            children = psutil.Process(pid).children()
+        except psutil.Error:
+            return None
+        # The relay forks exactly one command; do not guess if it has exited.
+        return children[0].pid if len(children) == 1 else None
 
     def _fire_watch_callback(self, callback: Callable[[], None], kind: str) -> bool:
         """

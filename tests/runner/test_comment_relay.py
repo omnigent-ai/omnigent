@@ -189,6 +189,7 @@ class _StubResourceRegistry:
         sandbox_override: str | None = None,
         parent_os_env: object | None = None,
         resource_role: str | None = None,
+        program_status_forward_app: str | None = None,
     ) -> SessionResourceView:
         """Return a required terminal resource view for a fake instance."""
         return await self._launch(
@@ -212,6 +213,7 @@ class _StubResourceRegistry:
         sandbox_override: str | None = None,
         parent_os_env: object | None = None,
         resource_role: str | None = None,
+        program_status_forward_app: str | None = None,
     ) -> SessionResourceView:
         """Return an auxiliary terminal resource view for a fake instance."""
         return await self._launch(

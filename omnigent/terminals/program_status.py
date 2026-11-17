@@ -104,17 +104,19 @@ class ProgramStatusParser:
         on_report: Callable[[ProgramStatus], None],
         on_query: Callable[[], None],
         on_reset: Callable[[bool], None],
+        tmux_passthrough: bool = False,
     ) -> None:
         self._report = on_report
         self._query = on_query
         self._reset = on_reset
+        self._tmux_passthrough = tmux_passthrough
         self._state = "ground"
         self._osc = False
         self._held = bytearray()
         self._overflow = False
 
     def feed(self, data: bytes) -> bytes:
-        """Return pass-through output, withholding only OSC 7501 queries."""
+        """Consume queries and optionally wrap valid reports for tmux, in order."""
         output = bytearray()
         for byte in data:
             if self._state == "ground":
@@ -157,12 +159,11 @@ class ProgramStatusParser:
                     self._osc and byte == 7
                 )
                 if terminated or cancelled:
-                    consumed = False
+                    replacement = None
                     if terminated and self._osc and not self._overflow:
                         end = -1 if byte == 7 else -2
-                        consumed = self._finish(bytes(self._held[2:end]))
-                    if not consumed:
-                        output.extend(self._held)
+                        replacement = self._finish(bytes(self._held[2:end]))
+                    output.extend(self._held if replacement is None else replacement)
                     self._held.clear()
                     self._state = "ground"
                 else:
@@ -176,17 +177,21 @@ class ProgramStatusParser:
         self._state = "ground"
         return pending
 
-    def _finish(self, body: bytes) -> bool:
+    def _finish(self, body: bytes) -> bytes | None:
         if body == b"7501;?":
             self._query()
-            return True
+            return b""
         if body.startswith(b"7501;"):
             report = parse_report(body[5:])
             if report is not None:
                 self._report(report)
+                if self._tmux_passthrough:
+                    return (
+                        b"\x1bPtmux;" + bytes(self._held).replace(b"\x1b", b"\x1b\x1b") + b"\x1b\\"
+                    )
         elif body == b"133;A" or body.startswith(b"133;A;"):
             self._reset(False)
-        return False
+        return None
 
 
 class ProgramStatusReader:
@@ -240,7 +245,7 @@ def _write_all(fd: int, data: bytes) -> None:
         data = data[os.write(fd, data) :]
 
 
-def relay(path: Path, app: str, command: list[str]) -> int:
+def relay(path: Path | None, app: str, command: list[str]) -> int:
     """Run a command in an inner PTY, answering queries before tmux can answer DA.
 
     The relay stays outside the command's existing sandbox wrapper. It owns no
@@ -274,6 +279,8 @@ def relay(path: Path, app: str, command: list[str]) -> int:
     unsent_input = bytearray()
 
     def save() -> None:
+        if path is None:
+            return
         temporary = path.with_suffix(".tmp")
         try:
             temporary.write_text(
@@ -328,7 +335,9 @@ def relay(path: Path, app: str, command: list[str]) -> int:
         with contextlib.suppress(ProcessLookupError, PermissionError):
             os.killpg(pid, signum)
 
-    parser = ProgramStatusParser(on_report=record, on_query=reply, on_reset=reset)
+    parser = ProgramStatusParser(
+        on_report=record, on_query=reply, on_reset=reset, tmux_passthrough=True
+    )
     try:
         os.set_blocking(master, False)
         tty.setraw(0)
@@ -392,8 +401,9 @@ def relay(path: Path, app: str, command: list[str]) -> int:
         os.close(master)
         with contextlib.suppress(OSError, termios.error):
             termios.tcsetattr(0, termios.TCSANOW, original)
-        with contextlib.suppress(OSError):
-            path.unlink(missing_ok=True)
+        if path is not None:
+            with contextlib.suppress(OSError):
+                path.unlink(missing_ok=True)
     return os.waitstatus_to_exitcode(exit_status)
 
 
@@ -403,7 +413,7 @@ def main() -> None:
     import signal
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--state-file", type=Path, required=True)
+    parser.add_argument("--state-file", type=Path)
     parser.add_argument("--app", required=True)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()

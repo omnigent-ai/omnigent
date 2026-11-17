@@ -398,3 +398,95 @@ def test_query_replies_stop_queueing_at_the_limit_and_resume(tmp_path: Path) -> 
     finally:
         os.close(master)
         os.close(slave)
+
+
+def _report(state: str, app: str = "codex", extra: str = "") -> bytes:
+    return f"\x1b]7501;state={state}:app={app}{extra}\x1b\\".encode()
+
+
+def _wrapped(data: bytes) -> bytes:
+    return b"\x1bPtmux;" + data.replace(b"\x1b", b"\x1b\x1b") + b"\x1b\\"
+
+
+@pytest.mark.parametrize("chunk_size", [1, 2, 17, 65536])
+def test_reports_are_wrapped_in_place_and_discovery_is_local(chunk_size: int) -> None:
+    reports, queries = [], []
+    parser = ProgramStatusParser(
+        on_report=reports.append,
+        on_query=lambda: queries.append(True),
+        on_reset=lambda full: None,
+        tmux_passthrough=True,
+    )
+    working = _report("working")
+    blocked = _report("blocked", extra=":kind=question")
+    clear = _report("clear")
+    stream = b"before" + working + b"middle\x1b]7501;?\x07" + blocked + clear + b"after"
+    output = b"".join(
+        parser.feed(stream[i : i + chunk_size]) for i in range(0, len(stream), chunk_size)
+    )
+    assert (
+        output + parser.finish()
+        == b"before"
+        + _wrapped(working)
+        + b"middle"
+        + _wrapped(blocked)
+        + _wrapped(clear)
+        + b"after"
+    )
+    assert [report.state for report in reports] == ["working", "blocked", "clear"]
+    assert queries == [True]
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        b"text\x1b[31mred\x1b[0m\x1b]0;title\x07",
+        b"\x1b]7501;state=invalid:app=codex\x07",
+        b"\x1b]7501;state=working:msg=A\x07",
+        b"\x1b]7501;state=working:" + b"x" * 5000 + b"\x07",
+        b"\x1b]7501;state=working\x18",
+        b"\x1b]7501;state=working",
+        _wrapped(_report("working")),
+        b"\x1bP" + _report("working") + b"\x1b\\",
+    ],
+    ids=[
+        "ordinary",
+        "unknown-state",
+        "bad-base64",
+        "oversized",
+        "cancelled",
+        "incomplete",
+        "wrapped",
+        "dcs",
+    ],
+)
+def test_other_output_is_unchanged(data: bytes) -> None:
+    reports = []
+    parser = ProgramStatusParser(
+        on_report=reports.append,
+        on_query=lambda: pytest.fail("unexpected query"),
+        on_reset=lambda full: None,
+        tmux_passthrough=True,
+    )
+    assert b"".join(parser.feed(bytes([byte])) for byte in data) + parser.finish() == data
+    assert reports == []
+
+
+def test_observer_parser_keeps_plain_reports() -> None:
+    parser = ProgramStatusParser(
+        on_report=lambda report: None, on_query=lambda: None, on_reset=lambda full: None
+    )
+    assert parser.feed(_report("working")) == _report("working")
+
+
+def test_bel_terminated_report_and_st_terminated_query() -> None:
+    queries = []
+    parser = ProgramStatusParser(
+        on_report=lambda report: None,
+        on_query=lambda: queries.append(True),
+        on_reset=lambda full: None,
+        tmux_passthrough=True,
+    )
+    report = b"\x1b]7501;state=working:app=codex\x07"
+    assert parser.feed(report + b"\x1b]7501;?\x1b\\") == _wrapped(report)
+    assert queries == [True]

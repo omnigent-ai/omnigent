@@ -170,8 +170,9 @@ async def test_claude_program_status_real_launch_and_fallback(
         reader = instance.program_status
         if protocol == "disabled":
             assert reader is None
-            status_pid = instance.pane_pid_sync()
-            assert status_pid is not None
+            async with asyncio.timeout(5):
+                while (status_pid := instance.command_pid_sync()) is None:
+                    await asyncio.sleep(0.02)
         else:
             assert reader is not None
             async with asyncio.timeout(5):

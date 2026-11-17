@@ -642,6 +642,11 @@ def register_resource_routes(
                 sandbox_override=sandbox_override,
                 parent_os_env=agent_os_env,
                 resource_role=(CLAUDE_NATIVE_TERMINAL_ROLE if bridge_inject else None),
+                program_status_forward_app=(
+                    "codex"
+                    if terminal_name == "codex" and body.get("forward_program_status")
+                    else None
+                ),
             )
         except RuntimeError as exc:
             if launched_relay is not None:

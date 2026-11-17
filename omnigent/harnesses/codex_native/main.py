@@ -3120,6 +3120,7 @@ async def _launch_codex_terminal(
     body = {
         "terminal": _TERMINAL_NAME,
         "session_key": _TERMINAL_SESSION_KEY,
+        "forward_program_status": True,
         "spec": {
             "command": command,
             "args": terminal_args,

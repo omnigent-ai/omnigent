@@ -220,6 +220,7 @@ class _CapturingResourceRegistry:
         sandbox_override: str | None = None,
         parent_os_env: Any | None = None,
         resource_role: str | None = None,
+        program_status_forward_app: str | None = None,
     ) -> SessionResourceView:
         """Capture a required terminal launch."""
         return await self._launch(
@@ -244,6 +245,7 @@ class _CapturingResourceRegistry:
         sandbox_override: str | None = None,
         parent_os_env: Any | None = None,
         resource_role: str | None = None,
+        program_status_forward_app: str | None = None,
     ) -> SessionResourceView:
         """Capture an auxiliary terminal launch."""
         return await self._launch(
@@ -1810,6 +1812,7 @@ class _LaunchReturningRegistry(TerminalRegistry):
         cwd_override: str | None = None,
         sandbox_override: str | None = None,
         program_status_app: str | None = None,
+        program_status_forward_app: str | None = None,
     ) -> TerminalInstance:
         """Return the fixed instance, ignoring the launch spec.
 
@@ -1832,6 +1835,7 @@ class _LaunchReturningRegistry(TerminalRegistry):
             sandbox_override,
         )
         self._instance.program_status_app = program_status_app
+        self._instance.program_status_forward_app = program_status_forward_app
         _seed_registry(self, conversation_id, [self._instance])
         return self._instance
 
