@@ -456,7 +456,7 @@ def _description_of(url: str) -> str:
 
 
 @pytest.mark.parametrize(
-    ("padding", "frame_template", "exception_type", "message", "last_frame"),
+    ("padding", "frame_template", "exception_type", "message", "last_frame", "candidate_size"),
     [
         pytest.param(
             "é",
@@ -464,6 +464,7 @@ def _description_of(url: str) -> str:
             ValueError,
             "crash",
             'File "répertoire/modèle_119.py", line 119, in échec',
+            None,
             id="unicode-encoding",
         ),
         pytest.param(
@@ -475,7 +476,17 @@ def _description_of(url: str) -> str:
             "/lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.33' not found",
             'File "/home/example/.cache/app/lib/python3.12/site-packages/pkg/'
             'module_119.py", line 119, in load',
+            None,
             id="realistic-frames",
+        ),
+        pytest.param(
+            "X",
+            '  File "{index}.py"\n',
+            ValueError,
+            "crash",
+            'File "119.py"',
+            8001,
+            id="one-over-url-limit",
         ),
     ],
 )
@@ -487,21 +498,34 @@ def test_issue_url_retains_tail_of_long_traceback(
     exception_type: type[Exception],
     message: str,
     last_frame: str,
+    candidate_size: int | None,
 ) -> None:
     """Encoded Unicode and deep library frames both retain their final diagnostics."""
     monkeypatch.setattr(Path, "home", lambda: data_dir / "home")
     ch.install_crash_handler("omnigent", "omnigent-ai/omnigent")
     frames = "".join(frame_template.format(index=index) for index in range(120))
     exception_line = f"{exception_type.__qualname__}: {message}"
+    padding_length = 0 if candidate_size else 30000
     tb_text = (
         "Traceback (most recent call last):\n"
-        + padding * 30000
+        + padding * padding_length
         + "\n"
         + frames
         + exception_line
         + "\n"
     )
     exc = exception_type(message)
+    if candidate_size:
+        seed_url, seed_included = ch._issue_url(exc, tb_text)
+        assert seed_included and "truncated" not in _description_of(seed_url)
+        padding_length = candidate_size - len(seed_url)
+        assert padding_length > 0
+        tb_text = tb_text.replace("\n", "\n" + padding * padding_length, 1)
+        parts = urllib.parse.urlparse(seed_url)
+        params = urllib.parse.parse_qs(parts.query)
+        params["description"] = [ch._issue_body(exc, tb_text)]
+        candidate_url = parts._replace(query=urllib.parse.urlencode(params, doseq=True)).geturl()
+        assert len(candidate_url) == candidate_size
     url, body_included = ch._issue_url(exc, tb_text)
     assert len(url) <= ch._MAX_URL_LENGTH
     assert body_included is True
@@ -511,6 +535,9 @@ def test_issue_url_retains_tail_of_long_traceback(
     traceback_body = body.split("**Traceback:**\n", 1)[1]
     assert last_frame in traceback_body
     assert exception_line in traceback_body
+    if candidate_size:
+        assert len(url) <= 8000 < len(candidate_url)
+        assert tb_text not in body
 
 
 @pytest.mark.parametrize("message_size", [30000, 5_000_000], ids=["oversized", "multi-megabyte"])
@@ -653,24 +680,14 @@ def test_scrub_replaces_home_at_path_boundaries(
     assert ch._scrub(text) == expected
 
 
-def test_issue_url_scrubs_encoded_windows_file_uri(
-    data_dir: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A Windows file URI with an encoded space in the home path is scrubbed everywhere."""
-    ch.install_crash_handler("omnigent", "omnigent-ai/omnigent")
-    monkeypatch.setattr(Path, "home", lambda: Path("C:\\Users\\example user"))
-    uri = "file:///C:/Users/example%20user/private.txt"
-    exc = ImportError(f"cannot open {uri}")
-    tb_text = f'Traceback (most recent call last):\n  File "{uri}", line 1\nImportError: x\n'
-    url, body_included = ch._issue_url(exc, tb_text)
-    assert body_included is True
-    assert "example" not in urllib.parse.unquote_plus(url)
-    assert "file:///~/private.txt" in _description_of(url)
-
-
 @pytest.mark.parametrize(
     ("home_directory", "uri", "expected"),
     [
+        (
+            "C:\\Users\\example user",
+            "file:///C:/Users/example%20user/private.txt",
+            "file:///~/private.txt",
+        ),
         (
             "/home/example-user",
             "file%3A%2F%2F%2Fhome%2Fexample-user%2Fprivate.txt",
@@ -687,7 +704,7 @@ def test_issue_url_scrubs_encoded_windows_file_uri(
             "file%3a%2F%2f~%2fprivate.txt",
         ),
     ],
-    ids=["fully-encoded", "fully-encoded-windows", "mixed-case-hex"],
+    ids=["encoded-space-windows", "fully-encoded", "fully-encoded-windows", "mixed-case-hex"],
 )
 def test_issue_url_scrubs_encoded_home_in_title_and_description(
     data_dir: Path, monkeypatch: pytest.MonkeyPatch, home_directory: str, uri: str, expected: str
@@ -886,11 +903,17 @@ def test_issue_url_redacts_multiline_bearer_before_truncation(data_dir: Path) ->
     assert "ValueError: failure" in _description_of(url)
 
 
-def test_issue_url_keeps_short_body_intact(data_dir: Path) -> None:
+@pytest.mark.parametrize("url_length", [None, 8000], ids=["short", "exact-url-limit"])
+def test_issue_url_keeps_short_body_intact(data_dir: Path, url_length: int | None) -> None:
     """A normal-sized traceback is kept in full, with no truncation note."""
     ch.install_crash_handler("omnigent", "omnigent-ai/omnigent")
     short_tb = 'Traceback (most recent call last):\n  File "app.py", line 10\nValueError: boom\n'
-    url, body_included = ch._issue_url(_make_exc("boom"), short_tb)
+    exc = _make_exc("boom")
+    url, body_included = ch._issue_url(exc, short_tb)
+    if url_length:
+        short_tb = short_tb.replace("app.py", "X" * (url_length - len(url)) + "app.py")
+        url, body_included = ch._issue_url(exc, short_tb)
+        assert len(url) == url_length
     assert len(url) <= ch._MAX_URL_LENGTH
     assert body_included is True
     body = _description_of(url)
