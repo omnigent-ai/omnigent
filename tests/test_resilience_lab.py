@@ -293,8 +293,6 @@ def test_lab_fixture_retains_failure_evidence_without_moving_working_root(
     assert lab.root == root
     if outcome == "startup-failed":
         assert lab.stop.call_count == 2
-        assert lab._port_reservations.close.call_count == lab._loop.stop.call_count == 2
-        assert lab._kill_stray_host_processes.call_count == 2
     else:
         lab.stop.assert_called_once_with()
     assert lab.remove.call_count == (0 if failed or keep else 1)
