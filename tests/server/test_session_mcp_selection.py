@@ -213,6 +213,7 @@ async def _inherit(
     worker_host_id=None,
     new_sandbox=False,
     new_sandbox_provider=None,
+    registry_services=None,
 ):
     # By default the source runs in a "box" sandbox, whose provider records services its own way.
     deployment = ManagedSandboxDeployment(
@@ -222,6 +223,8 @@ async def _inherit(
         deployment,
         {"source-host": "box", "box-host": "box", "plain-host": "plain", "laptop": None},
     )
+    if registry_services is not None:
+        state.mcp_registry = _request(registry_services).app.state.mcp_registry
     if source is None:
         source = _session(
             "source", host_id="source-host", labels={"deployment.mcp.source-only": "1"}
@@ -362,3 +365,12 @@ def test_services_from_several_providers_selections_are_read_once_each() -> None
     labels = {"box.mcp": '["slack", "github"]', "cube.mcp": '["github", "jira"]'}
     assert session_mcp_services(deployment, labels) == ("slack", "github", "jira")
     assert session_mcp_label_keys(deployment, labels) == {"box.mcp", "cube.mcp"}
+
+
+@pytest.mark.asyncio
+async def test_worker_on_a_connected_host_gets_the_registry_form_of_a_usable_service() -> None:
+    # The source's provider records "source-only" its own way; the registry offers it
+    # too, so a worker on a connected host gets the registry's labels instead.
+    assert await _inherit(
+        _PerServiceSelection(), {}, worker_host_id="laptop", registry_services={"source-only"}
+    ) == {"omnigent.mcp_service.source-only": "1"}

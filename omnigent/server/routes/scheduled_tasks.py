@@ -1740,10 +1740,15 @@ def create_scheduled_tasks_router(
                 )
         if "mcp_services" in fields or (
             existing.mcp_services
-            and (agent_changed or target_execution != existing.execution_target)
+            and (
+                agent_changed
+                or target_execution != existing.execution_target
+                or fields.get("session_mode", existing.session_mode) != existing.session_mode
+            )
         ):
-            # A rebound agent, or a sandbox provider in place of a host or the
-            # reverse, must still accept the services the task keeps.
+            # A rebound agent, or a change of where the next run lands (a sandbox
+            # in place of a host, or a new sandbox in place of the one a continuing
+            # task keeps), must still accept the services the task keeps.
             mcp_agent = await validate_session_agent(
                 user_id=owner_id,
                 agent_id=target_agent_id,

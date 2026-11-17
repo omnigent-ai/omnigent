@@ -1284,7 +1284,7 @@ class _RejectAll(_ProviderSelection):
         raise OmnigentError("not offered here", code=ErrorCode.INVALID_INPUT)
 
 
-@pytest.mark.parametrize("edit", ["unchanged-services", "new-agent"])
+@pytest.mark.parametrize("edit", ["unchanged-services", "new-agent", "new-session-each-run"])
 async def test_a_continuing_sandbox_task_is_checked_against_the_sandbox_it_keeps(
     auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str, edit: str
 ) -> None:
@@ -1324,14 +1324,19 @@ async def test_a_continuing_sandbox_task_is_checked_against_the_sandbox_it_keeps
     )
 
     # Resending the services, or changing the agent, revalidates the ones the task keeps.
-    patch = (
-        {"mcp_services": ["system.ai.github"]}
-        if edit == "unchanged-services"
-        else {"agent_id": builtin_agent_id(CODEX_NATIVE_AGENT_NAME)}
-    )
-    updated = await auth_client.patch(
-        f"/v1/scheduled-tasks/{task_id}", json=patch, headers=_headers()
-    )
+    patch = {
+        "unchanged-services": {"mcp_services": ["system.ai.github"]},
+        "new-agent": {"agent_id": builtin_agent_id(CODEX_NATIVE_AGENT_NAME)},
+        "new-session-each-run": {"session_mode": "new"},
+    }[edit]
+    task_url = f"/v1/scheduled-tasks/{task_id}"
+    updated = await auth_client.patch(task_url, json=patch, headers=_headers())
+    if edit == "new-session-each-run":
+        # Each run would start a new sandbox on the default, which doesn't offer them.
+        assert updated.status_code == 400, updated.text
+        kept = (await auth_client.get(task_url, headers=_headers())).json()
+        assert (kept["session_mode"], kept["mcp_services"]) == ("continue", ["system.ai.github"])
+        return
     assert updated.status_code == 200, updated.text
     assert updated.json()["mcp_services"] == ["system.ai.github"]
     assert len(older.checked) == 2

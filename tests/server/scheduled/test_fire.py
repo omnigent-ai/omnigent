@@ -3636,22 +3636,6 @@ async def test_only_a_sandbox_session_whose_launch_failed_unbound_is_replaced(
     assert continued.session_id == (None if released else "conv_prev")
 
 
-class _KeyedSelection:
-    """A provider that records the whole selection in one label of its own."""
-
-    def __init__(self, key: str) -> None:
-        self.key = key
-
-    def validate(self, *args: Any, **kwargs: Any) -> tuple[str, ...]:
-        raise AssertionError("firing does not revalidate")
-
-    def session_labels(self, services: Sequence[str]) -> dict[str, str]:
-        return {self.key: json.dumps(list(services))} if services else {}
-
-    def selected_services(self, labels: Mapping[str, str]) -> tuple[str, ...]:
-        return tuple(json.loads(labels.get(self.key, "[]")))
-
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize("path", ["joins", "relaunches"])
 async def test_a_run_on_the_tasks_existing_sandbox_keeps_its_providers_mcp_labels(
@@ -3673,8 +3657,8 @@ async def test_a_run_on_the_tasks_existing_sandbox_keeps_its_providers_mcp_label
     hosts = FakeHostStore({own: _FakeHost(own, "local", sandbox_provider="older")})
     # The default moved to "box" after the task's sandbox was launched on "older".
     deployment = _FakeSandboxConfig(
-        mcp_selection=_KeyedSelection("box.mcp"),
-        others={"older": _KeyedSelection("older.mcp")},
+        mcp_selection=_ListLabelSelection("box.mcp"),
+        others={"older": _ListLabelSelection("older.mcp")},
     )
 
     await _fire_once(
@@ -4742,7 +4726,8 @@ async def test_a_copied_run_uses_the_task_mcp_services_instead_of_the_source(
 class _ListLabelSelection:
     """A deployment that keeps the whole selection, even an empty one, in one label."""
 
-    key = "deployment.mcp_services"
+    def __init__(self, key: str = "deployment.mcp_services") -> None:
+        self.key = key
 
     async def validate(self, *args: Any, **kwargs: Any) -> tuple[str, ...]:
         raise AssertionError("firing does not revalidate")
