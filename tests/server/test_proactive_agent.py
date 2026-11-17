@@ -397,6 +397,8 @@ async def test_no_scheduled_task_route_reveals_the_proactive_task(
             url = path.replace("{scheduled_task_id}", hidden.id).replace(
                 "{target_user_id:path}", "someone@example.com"
             )
+            # An unfilled parameter would 404 for its own reason, not the task's.
+            assert "{" not in url, f"give {path} a value for each path parameter"
             resp = await client.request(
                 method, url, json=_PROBE_BODIES.get((method, path)), headers=as_user
             )
