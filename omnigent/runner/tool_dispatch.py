@@ -68,6 +68,7 @@ from omnigent.models.model_override import (
 )
 from omnigent.native.native_coding_agents import public_agent_name
 from omnigent.policies.builtins.safety import scheduled_task_review_error
+from omnigent.runner.automation_worker import execute_automation_start_worker
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 from omnigent.runner.journal_tools import (
     JOURNAL_TOOL_NAMES,
@@ -86,6 +87,7 @@ from omnigent.tools.builtins.async_inbox import (
     SysCancelTaskTool,
     SysReadInboxTool,
 )
+from omnigent.tools.builtins.automation_worker import SysAutomationStartWorkerTool
 from omnigent.tools.builtins.browser import BROWSER_TOOL_NAMES
 from omnigent.tools.builtins.download_file import DownloadFileTool
 from omnigent.tools.builtins.list_comments import ListCommentsTool
@@ -336,6 +338,9 @@ _TURN_ACTOR_LABEL = "omnigent.turn_actor"
 # as _execute_subagent_tool.
 _SESSION_CREATE_TOOLS = frozenset({"sys_session_create"})
 
+# A trigger automation's worker start: sys_session_create with the run's worker instructions.
+_AUTOMATION_WORKER_TOOLS = frozenset({SysAutomationStartWorkerTool.name()})
+
 # Priority 5f.0: Session query tools — peek/list/close/get_info/share. The
 # runner has no in-process ConversationStore, so these read/mutate session
 # state via the Omnigent server's existing REST endpoints (GET /items, GET
@@ -538,6 +543,7 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     | _LIST_MODELS_TOOLS
     | _ADVISE_MODELS_TOOLS
     | _SESSION_CREATE_TOOLS
+    | _AUTOMATION_WORKER_TOOLS
     | _TASK_LIFECYCLE_TOOLS
     | _AGENT_TOOLS
     | _POLICY_TOOLS
@@ -969,6 +975,7 @@ _ALL_LOCAL_TOOLS = (
     | _LIST_MODELS_TOOLS
     | _ADVISE_MODELS_TOOLS
     | _SESSION_CREATE_TOOLS
+    | _AUTOMATION_WORKER_TOOLS
     | _SESSION_QUERY_TOOLS
     | _SESSION_SELF_WRITE_TOOLS
     | _PROJECT_TOOLS
@@ -7961,6 +7968,24 @@ async def execute_tool(
                 publish_event=publish_event,
                 agent_spec=agent_spec,
                 runner_workspace=runner_workspace,
+            )
+        elif tool_name in _AUTOMATION_WORKER_TOOLS:
+
+            async def create_worker(create_args: _JsonObject) -> str:
+                return await _execute_session_create(
+                    create_args,
+                    server_client=server_client,
+                    conversation_id=conversation_id,
+                    publish_event=publish_event,
+                    agent_spec=agent_spec,
+                    runner_workspace=runner_workspace,
+                )
+
+            output = await execute_automation_start_worker(
+                args,
+                server_client=server_client,
+                conversation_id=conversation_id,
+                create_session=create_worker,
             )
         elif tool_name in _UI_TOOLS:
             output = await _open_file_via_rest(args, conversation_id, server_client)

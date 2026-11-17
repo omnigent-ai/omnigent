@@ -510,6 +510,7 @@ def test_spawn_flag_registers_write_tools_without_sub_agents() -> None:
     assert "sys_session_send" in names
     assert "sys_session_close" in names
     assert "sys_session_create" in names
+    assert "sys_automation_start_worker" in names
     # The dispatch grant brings model awareness along with it.
     assert "sys_list_models" in names
     # Intelligent routing advisor stays hidden when routing is disabled.
@@ -1753,6 +1754,15 @@ _TOOL_GROUP_MEMBERS: dict[str, frozenset[str]] = {
         {"sys_project_list", "sys_session_update", "sys_project_update", "sys_session_link_pr"}
     ),
 }
+
+
+def test_automation_worker_start_needs_spawn_and_the_automations_group() -> None:
+    """The automation worker start is a spawn write, so it follows both gates."""
+    automations_off = ToolGroupsConfig(scheduled_tasks=False)
+    assert "sys_automation_start_worker" not in _tool_names(AgentSpec(spec_version=1))
+    assert "sys_automation_start_worker" not in _tool_names(
+        AgentSpec(spec_version=1, spawn=True, tool_groups=automations_off)
+    )
 
 
 def _tool_names(spec: AgentSpec) -> set[str]:

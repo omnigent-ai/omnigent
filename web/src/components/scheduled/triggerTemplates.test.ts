@@ -1284,6 +1284,11 @@ describe("renderTriggerPrompt", () => {
     expect(prompt).toContain(
       "These sessions share your workspace, so the message also tells the session to make its own git worktree before changing any files.",
     );
+    // A runner with the automation worker tool adds the instructions itself.
+    expect(prompt).toMatch(
+      /If you have the sys_automation_start_worker tool, make that call with it instead, with the same arguments, message_max_chars \d+ and details in place of message: only the lines from <jira-ticket> to <\/jira-ticket>, since the tool adds the instructions, the workspace note and the untrusted-data line itself\./,
+    );
+    expect(readTriggerWorkerSettings(prompt)).not.toBeNull();
     expect(prompt).toContain(
       'Comment "Omnigent session: https://omni.example.com/c/CONVERSATION_ID" on each ticket',
     );

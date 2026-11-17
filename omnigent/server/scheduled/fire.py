@@ -90,6 +90,7 @@ from omnigent.native.permission_modes import (
     APPROVAL_SKIPPING_PERMISSION_MODES,
     PERMISSION_LAUNCH_ARGS,
 )
+from omnigent.scheduled_context import AUTOMATION_CONTEXT_OPEN
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
 from omnigent.server.bundles import agent_for_user
 from omnigent.server.host_registry import host_owner_scope
@@ -491,9 +492,6 @@ UNATTENDED_RUN_NOTE = (
 )
 
 
-_AUTOMATION_CONTEXT_OPEN = "<omnigent-automation-context>\n"
-
-
 def unattended_run_note(sent_at: float) -> str:
     """:data:`UNATTENDED_RUN_NOTE`, opening with the time the fire sent it.
 
@@ -502,8 +500,8 @@ def unattended_run_note(sent_at: float) -> str:
     seconds = int(sent_at)
     run_time = f"{datetime.fromtimestamp(seconds, UTC):%Y-%m-%dT%H:%M:%SZ}"
     return UNATTENDED_RUN_NOTE.replace(
-        _AUTOMATION_CONTEXT_OPEN,
-        f"{_AUTOMATION_CONTEXT_OPEN}Run time: {run_time} (Unix time {seconds}).\n",
+        AUTOMATION_CONTEXT_OPEN,
+        f"{AUTOMATION_CONTEXT_OPEN}Run time: {run_time} (Unix time {seconds}).\n",
         1,
     )
 

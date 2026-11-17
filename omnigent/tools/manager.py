@@ -540,6 +540,13 @@ class ToolManager:
         # alone only permits the specified sub-agent types.
         if self._spec.spawn:
             self._tools[SysSessionCreateTool.name()] = SysSessionCreateTool()
+            # Part of the automations group: it starts a trigger automation's workers.
+            if self._spec.tool_groups.scheduled_tasks:
+                from omnigent.tools.builtins.automation_worker import (
+                    SysAutomationStartWorkerTool,
+                )
+
+                self._tools[SysAutomationStartWorkerTool.name()] = SysAutomationStartWorkerTool()
 
     def _register_session_tools(self) -> None:
         """Register framework-owned tools for the current session."""

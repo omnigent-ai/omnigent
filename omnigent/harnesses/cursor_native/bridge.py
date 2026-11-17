@@ -50,6 +50,7 @@ _CURSOR_AUTO_APPROVE_TOOLS = [
     "sys_agent_download",
     "sys_agent_get",
     "sys_agent_list",
+    "sys_automation_start_worker",
     "sys_call_async",
     "sys_cancel_async",
     "sys_cancel_task",

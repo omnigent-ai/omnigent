@@ -14,6 +14,8 @@ from omnigent.debug_logging import current_session_id_scope, log_attributes_scop
 from omnigent.entities.scheduled_task import ScheduledRunLogContext
 
 SCHEDULED_RUN_HEADER = "x-omnigent-scheduled-run"
+# Opens the note a fire appends to every prompt it sends; only automation-sent messages carry it.
+AUTOMATION_CONTEXT_OPEN = "<omnigent-automation-context>\n"
 _current_run: ContextVar[ScheduledRunLogContext | None] = ContextVar(
     "scheduled_run_log_context", default=None
 )
