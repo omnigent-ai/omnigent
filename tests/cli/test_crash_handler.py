@@ -16,6 +16,7 @@ from __future__ import annotations
 import io
 import os
 import re
+import subprocess
 import sys
 import traceback
 import urllib.parse
@@ -484,35 +485,28 @@ def test_issue_url_drops_body_when_command_alone_is_too_long(
 
 
 @pytest.mark.parametrize(
-    ("prefix", "home_directory"),
+    "home_directory",
     [
-        ("", "/home/example-user"),
-        ("." * 132, "/home/example-user"),
-        ("", r"C:\Users\example-user"),
-        ("", "/home/example user"),
-        ("", r"C:\Users\example user"),
+        "/home/example-user",
+        r"C:\Users\example-user",
+        "/home/example user",
+        r"C:\Users\example user",
     ],
     ids=[
-        "short",
-        "crosses-title-cutoff",
+        "posix-home",
         "windows-home",
         "home-with-spaces",
         "windows-home-with-spaces",
     ],
 )
-def test_issue_url_scrubs_home_directory_and_tokens(
-    data_dir: Path, monkeypatch: pytest.MonkeyPatch, prefix: str, home_directory: str
+def test_scrub_home_directory_boundaries(
+    monkeypatch: pytest.MonkeyPatch, home_directory: str
 ) -> None:
-    """The title and body must not carry the user's home path or raw tokens."""
-    ch.install_crash_handler("omnigent", "omnigent-ai/omnigent")
+    """Redact genuine home paths without changing similarly named siblings."""
     home_path = Path(home_directory)
     monkeypatch.setattr(Path, "home", lambda: home_path)
     home = str(home_path)
-    token = "sk-abcdefghijklmnop"
-    monkeypatch.setattr(sys, "argv", ["omnigent", "run", "example.yaml"])
-    exc = ImportError(f"{prefix}{token} cannot open {home}/.config/app.toml")
-    tb_text = (
-        "Traceback (most recent call last):\n"
+    text = (
         f'  File "{home}/app.py", line 1\n'
         f'  File "{home}\\native.py", line 2\n'
         f'  File "{home}name/module.py", line 3\n'
@@ -529,11 +523,7 @@ def test_issue_url_scrubs_home_directory_and_tokens(
         f"Home: \"{home}\" '{home}' `{home}` {home}\n"
         f"Home: ({home}) [{home}] {{{home}}} <{home}> {home}, {home}. {home}... {home}!!!\n"
     )
-    url, _ = ch._issue_url(exc, tb_text + "ImportError: cannot open\n")
-    decoded_url = urllib.parse.unquote_plus(url)
-    body = _description_of(url)
-    assert f"{home}/.config/app.toml" not in decoded_url
-    assert "cannot open ~/.config/app.toml" in body
+    body = ch._scrub(text)
     assert 'File "~/app.py"' in body
     assert 'File "~\\native.py"' in body
     assert f'File "{home}name/module.py"' in body
@@ -552,11 +542,34 @@ def test_issue_url_scrubs_home_directory_and_tokens(
     assert "Home: \"~\" '~' `~` ~\n" in body
     assert "Home: (~) [~] {~} <~> ~, ~. ~... ~!!!\n" in body
     assert ch._scrub(home) == "~"
+
+
+def test_issue_url_redacts_tokens_before_title_cutoff(
+    data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ch.install_crash_handler("omnigent", "omnigent-ai/omnigent")
+    home = Path("/home/example-user")
+    monkeypatch.setattr(Path, "home", lambda: home)
+    monkeypatch.setattr(sys, "argv", ["omnigent", "run", "example.yaml"])
+    token = "sk-abcdefghijklmnop"
+    exc = ImportError(f"{'.' * 132}{token} cannot open {home}/.config/app.toml")
+    url, body_included = ch._issue_url(exc, "ImportError: cannot open\n")
+    assert body_included is True
+    decoded_url = urllib.parse.unquote_plus(url)
+    assert f"{home}/.config/app.toml" not in decoded_url
+    assert "cannot open ~/.config/app.toml" in _description_of(url)
     assert token not in decoded_url
     title = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)["title"][0]
     assert token[:8] not in title
     assert "sk-a***" in title
 
+
+def test_issue_url_scrubs_notes_before_truncation(
+    data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ch.install_crash_handler("omnigent", "omnigent-ai/omnigent")
+    home = Path("/home/example-user")
+    monkeypatch.setattr(Path, "home", lambda: home)
     noted_exc = _make_exc("failure")
     noted_exc.add_note("x" * 9000)
     noted_exc.add_note(f"Home: ({home})")
@@ -567,25 +580,87 @@ def test_issue_url_scrubs_home_directory_and_tokens(
     noted_url, body_included = ch._issue_url(noted_exc, noted_tb)
     assert body_included is True
     assert len(noted_url) <= ch._MAX_URL_LENGTH
-    assert home not in urllib.parse.unquote_plus(noted_url)
+    assert str(home) not in urllib.parse.unquote_plus(noted_url)
     noted_body = _description_of(noted_url)
     assert "truncated" in noted_body
     assert "Home: (~)" in noted_body
     assert "Home: ~... ~!!!" in noted_body
 
 
-def test_issue_url_scrubs_repr_escaped_windows_home(
-    data_dir: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Backslashes doubled by ``repr()`` in an exception message are still scrubbed."""
+def test_issue_url_oversized_final_note_leaves_empty_traceback(data_dir: Path) -> None:
     ch.install_crash_handler("omnigent", "omnigent-ai/omnigent")
-    home_path = Path(r"C:\Users\example-user")
-    monkeypatch.setattr(Path, "home", lambda: home_path)
-    exc = FileNotFoundError(2, "No such file or directory", r"C:\Users\example-user\private.txt")
-    url, body_included = ch._issue_url(exc, "Traceback (most recent call last):\nOSError\n")
+    exc = _make_exc("failure")
+    exc.add_note("x" * 9000)
+    tb_text = "".join(traceback.format_exception(exc))
+    url, body_included = ch._issue_url(exc, tb_text)
     assert body_included is True
-    assert "example-user" not in urllib.parse.unquote_plus(url)
-    assert "~" in _description_of(url)
+    assert len(url) <= ch._MAX_URL_LENGTH
+    body = _description_of(url)
+    assert "**Exception:** `ValueError: failure`" in body
+    assert "Traceback truncated to fit this link" in body
+    traceback_body = body.split("**Traceback:**\n", 1)[1].split("```\n", 1)[1]
+    assert traceback_body == "```\n"
+
+
+@pytest.mark.parametrize(
+    ("executable", "expected_executable"),
+    [
+        ("/home/example-user/.venv/bin/tool", "~/.venv/bin/tool"),
+        ("/home/example-user-old/bin/tool", "/home/example-user-old/bin/tool"),
+    ],
+    ids=["two-home-command", "sibling-first-command"],
+)
+def test_issue_url_scrubs_each_home_in_quoted_command(
+    data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    executable: str,
+    expected_executable: str,
+) -> None:
+    ch.install_crash_handler("omnigent", "omnigent-ai/omnigent")
+    home = Path("/home/example-user")
+    monkeypatch.setattr(Path, "home", lambda: home)
+    exc = subprocess.CalledProcessError(1, f"{executable} --config {home}/.config/app.toml")
+    url, body_included = ch._issue_url(exc, "".join(traceback.format_exception(exc)))
+    assert body_included is True
+    title = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)["title"][0]
+    summary = _description_of(url).split("**Exception:** ", 1)[1].split("\n\n", 1)[0]
+    expected_message = (
+        f"Command '{expected_executable} --config ~/.config/app.toml' "
+        "returned non-zero exit status 1."
+    )
+    assert title == f"[Crash] CalledProcessError: {expected_message}"
+    assert summary == f"`CalledProcessError: {expected_message}`"
+    assert f"{home}/.config/app.toml" not in _description_of(url)
+
+
+@pytest.mark.parametrize(
+    ("home_directory", "filename_suffix"),
+    [
+        (r"C:\Users\example-user", r"\private.txt"),
+        ("/home/example'user", '/private"file.txt'),
+        (r"C:\Users\example'user", r'\private"file.txt'),
+    ],
+    ids=["windows-backslashes", "posix-escaped-quote", "windows-backslashes-and-quote"],
+)
+def test_issue_url_scrubs_repr_escaped_home(
+    data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    home_directory: str,
+    filename_suffix: str,
+) -> None:
+    """Python's filename quoting must not expose the home in either public field."""
+    ch.install_crash_handler("omnigent", "omnigent-ai/omnigent")
+    home_path = Path(home_directory)
+    monkeypatch.setattr(Path, "home", lambda: home_path)
+    exc = FileNotFoundError(2, "missing", f"{home_path}{filename_suffix}")
+    url, body_included = ch._issue_url(exc, "".join(traceback.format_exception(exc)))
+    assert body_included is True
+    expected_message = str(FileNotFoundError(2, "missing", f"~{filename_suffix}"))
+    title = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)["title"][0]
+    summary = _description_of(url).split("**Exception:** ", 1)[1].split("\n\n", 1)[0]
+    assert title == f"[Crash] FileNotFoundError: {expected_message}"
+    assert summary == f"`FileNotFoundError: {expected_message}`"
+    assert "example" not in urllib.parse.unquote_plus(url)
 
 
 def test_issue_url_redacts_multiline_bearer_before_truncation(data_dir: Path) -> None:

@@ -466,11 +466,21 @@ def _scrub(text: str) -> str:
     with contextlib.suppress(Exception):
         home = str(Path.home())
         if home and home != os.sep:
-            home_variants = sorted({home, home.replace("\\", "\\\\")}, key=len, reverse=True)
+            escaped_home = home.replace("\\", "\\\\")
+            home_variants = sorted(
+                {
+                    home,
+                    escaped_home,
+                    escaped_home.replace("'", "\\'"),
+                    escaped_home.replace('"', '\\"'),
+                },
+                key=len,
+                reverse=True,
+            )
             home_pattern = "(?:" + "|".join(map(re.escape, home_variants)) + ")"
-            # Spaces inside a quoted path may belong to a sibling directory.
+            # Inspect spaced siblings without consuming later paths in the same quote.
             pattern = (
-                rf"""(?P<quote>['"`]){home_pattern}(?P<suffix>[^\r\n]*?)(?P=quote)"""
+                rf"""(?P<quote>['"`]){home_pattern}(?=(?P<suffix>[^\r\n]*?)(?P=quote))"""
                 + "|"
                 + home_pattern
                 + r"""(?=$|[/\\\s'"`)\]}>]|[.,;:!?]+(?=$|[\s'"`)\]}>]))"""
@@ -483,7 +493,7 @@ def _scrub(text: str) -> str:
                 suffix = match.group("suffix")
                 if suffix and not suffix.startswith(("/", "\\")):
                     return match.group(0)
-                return f"{quote}~{suffix}{quote}"
+                return f"{quote}~"
 
             text = re.sub(pattern, redact_home, text)
     return text
