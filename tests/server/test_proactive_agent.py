@@ -177,6 +177,7 @@ def _app(
     sandbox: bool = True,
     auth_provider: Any = None,
     permission_store: Any = None,
+    feature_flags: Any = None,
 ) -> FastAPI:
     artifacts = LocalArtifactStore(str(tmp_path / "artifacts"))
     agents = SqlAlchemyAgentStore(db_uri)
@@ -196,6 +197,7 @@ def _app(
         proactive_agent_settings_store=ProactiveAgentSettingsStore(db_uri),
         auth_provider=auth_provider,
         permission_store=permission_store,
+        feature_flags=feature_flags,
     )
     # The lifespan seeds built-in agents; these tests skip it.
     app.state.seed_builtin_agents = lambda: _ensure_default_agents(agents, artifacts, cache)
@@ -317,13 +319,15 @@ _PROBE_BODIES: dict[tuple[str, str], dict[str, Any]] = {
 
 
 _SHARING_USER = "alice@example.com"
+_RECIPIENT = "bob@example.com"
 
 
 @pytest_asyncio.fixture()
 async def sharing_client(db_uri: str, tmp_path: Path) -> AsyncIterator[httpx.AsyncClient]:
-    # A permission store takes the automation sharing routes past their 403; it
-    # needs a signed-in user.
+    # A permission store takes the automation sharing routes past their 403 (it
+    # needs signed-in users), and workflows take run steps past theirs.
     from omnigent.server.auth import UnifiedAuthProvider
+    from omnigent.server.feature_flags import resolve_feature_flags
 
     app = _app(
         db_uri,
@@ -331,6 +335,7 @@ async def sharing_client(db_uri: str, tmp_path: Path) -> AsyncIterator[httpx.Asy
         enabled=True,
         auth_provider=UnifiedAuthProvider(source="header", local_single_user=False),
         permission_store=SqlAlchemyPermissionStore(db_uri),
+        feature_flags=resolve_feature_flags({"OMNIGENT_FEATURES": "workflows"}),
     )
     app.state.seed_builtin_agents()
     async with httpx.AsyncClient(
@@ -343,7 +348,7 @@ async def sharing_client(db_uri: str, tmp_path: Path) -> AsyncIterator[httpx.Asy
 
 
 async def test_no_scheduled_task_route_reveals_the_proactive_task(
-    sharing_client: httpx.AsyncClient,
+    sharing_client: httpx.AsyncClient, db_uri: str
 ) -> None:
     # Tasks carry no "hidden" kind: each route must exclude the proactive agent's
     # task itself, so every route the app registers is checked, including new ones.
@@ -357,9 +362,13 @@ async def test_no_scheduled_task_route_reveals_the_proactive_task(
         visible = store.create(
             uuid.uuid4().hex, "mine", "go", "FREQ=DAILY;BYHOUR=9", _SHARING_USER, "e" * 32, "UTC"
         )
-    # A failed run with no session, which the automation Inbox lists.
+    # A failed run with no session, which the automation Inbox lists, and a read
+    # grant, which puts the task in the recipient's shared list.
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    permissions.ensure_user(_RECIPIENT, is_admin=False)
     for task in (hidden, visible):
         store.create_run(uuid.uuid4().hex, task.id, "failed", 1, finished_at=2, error="boom")
+        permissions.grant_for_scheduled_task(_RECIPIENT, task.id, 1)
     hidden_forms = (hidden.id, str(uuid.UUID(hidden.id)))
 
     routes = [
@@ -376,23 +385,35 @@ async def test_no_scheduled_task_route_reveals_the_proactive_task(
     list_probes = [(m, p) for m, p in probes if "{" not in p and m == "GET"]
     assert item_probes and list_probes
 
-    for method, path in item_probes:
-        url = path.replace("{scheduled_task_id}", hidden.id).replace(
-            "{target_user_id:path}", "someone@example.com"
-        )
-        resp = await client.request(method, url, json=_PROBE_BODIES.get((method, path)))
-        assert resp.status_code == 404, (method, path, resp.status_code, resp.text)
+    # The owner and the recipient each reach the task a different way.
+    for user in (_RECIPIENT, _SHARING_USER):
+        as_user = {"X-Forwarded-Email": user}
+        for method, path in item_probes:
+            url = path.replace("{scheduled_task_id}", hidden.id).replace(
+                "{target_user_id:path}", "someone@example.com"
+            )
+            resp = await client.request(
+                method, url, json=_PROBE_BODIES.get((method, path)), headers=as_user
+            )
+            assert resp.status_code == 404, (user, method, path, resp.status_code, resp.text)
 
-    for method, path in list_probes:
-        resp = await client.request(method, path)
-        assert resp.status_code == 200, (path, resp.status_code, resp.text)
-        assert not any(form in resp.text for form in hidden_forms), (path, resp.text)
+        for method, path in list_probes:
+            resp = await client.request(method, path, headers=as_user)
+            assert resp.status_code == 200, (user, path, resp.status_code, resp.text)
+            assert not any(form in resp.text for form in hidden_forms), (user, path, resp.text)
 
-    # The same reads do return the user's own automation and its failure.
+    # The same reads do return the user's own automation, its failure and its run
+    # steps, and the recipient's shared copy of it.
     listed = (await client.get("/v1/scheduled-tasks")).json()["scheduled_tasks"]
     assert [t["id"] for t in listed] == [visible.id]
     failures = (await client.get("/v1/scheduled-tasks/inbox")).json()["data"]
     assert [f["task_id"] for f in failures] == [visible.id]
+    steps = await client.get(f"/v1/scheduled-tasks/{visible.id}/run-steps")
+    assert steps.status_code == 200, steps.text
+    shared = await client.get(
+        "/v1/scheduled-tasks/shared", headers={"X-Forwarded-Email": _RECIPIENT}
+    )
+    assert [t["id"] for t in shared.json()["scheduled_tasks"]] == [visible.id]
     assert store.get(hidden.id).state != "deleted"
 
 
