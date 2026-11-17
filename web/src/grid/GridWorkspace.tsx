@@ -19,7 +19,14 @@ import {
   useSensors,
 } from "@dnd-kit/core";
 import { sortableKeyboardCoordinates } from "@dnd-kit/sortable";
-import { Grid2X2Icon, MoreHorizontalIcon, PencilIcon, Trash2Icon } from "lucide-react";
+import {
+  Grid2X2Icon,
+  MoreHorizontalIcon,
+  PanelRightCloseIcon,
+  PanelRightIcon,
+  PencilIcon,
+  Trash2Icon,
+} from "lucide-react";
 import { CanvasWorkspace } from "@/canvas/CanvasWorkspace";
 import { usePaneCycleHotkey } from "@/hooks/usePaneCycleHotkey";
 import { useQueries } from "@tanstack/react-query";
@@ -338,13 +345,41 @@ export function RearrangeableGrid({
           ref={(node) => {
             node?.toggleAttribute("inert", maximized);
           }}
-          className="flex min-h-0 min-w-0 flex-1 flex-col pt-[var(--mac-titlebar-height,0px)]"
+          className="flex min-h-0 min-w-0 flex-1 flex-col"
         >
+          {/* Shares the macOS title-bar strip, like the chat header. */}
+          <header
+            className={cn(
+              "flex h-12 shrink-0 items-center gap-2 px-4 py-3",
+              onOpenSidebar && "traffic-light-clearance",
+            )}
+          >
+            {onOpenSidebar && (
+              <SidebarOpenButton
+                size="icon-sm"
+                onOpenSidebar={onOpenSidebar}
+                componentId="grid.open_sidebar"
+              />
+            )}
+            <Grid2X2Icon className="size-4 shrink-0" />
+            <h1 className="truncate text-ui">{title}</h1>
+            <span className="flex-1" />
+            <Button
+              variant="ghost"
+              size="icon-xs"
+              aria-label={`${workspace.open ? "Collapse" : "Expand"} grid workspace`}
+              // aria-expanded={workspace.open}
+              onClick={toggleWorkspace}
+              className="text-muted-foreground hover:text-foreground border-none"
+            >
+              {workspace.open ? <PanelRightCloseIcon /> : <PanelRightIcon />}
+            </Button>
+          </header>
           <div
-            className="relative grid min-h-0 min-w-0 flex-1 grid-cols-2 grid-rows-2 gap-2 overflow-auto p-2"
+            className="relative grid min-h-0 min-w-0 flex-1 grid-cols-2 grid-rows-2 gap-2 overflow-auto p-2 pt-0"
             data-testid="session-grid"
           >
-            {gridPanes(layout).map(({ sessionId, area }, index) => (
+            {gridPanes(layout).map(({ sessionId, area }) => (
               <GridSessionPane
                 key={sessionId}
                 sessionId={sessionId}
@@ -355,9 +390,6 @@ export function RearrangeableGrid({
                 workspaceTarget={workspaceTarget}
                 workspacePanel={workspacePanel}
                 onOpenWorkspace={() => openWorkspace(sessionId)}
-                onToggleWorkspace={toggleWorkspace}
-                // The first pane is the top-left one.
-                onOpenSidebar={index === 0 ? onOpenSidebar : undefined}
               />
             ))}
             {rearrangeTargetId && typeof layout !== "string" && (

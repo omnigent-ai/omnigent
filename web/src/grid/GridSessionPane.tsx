@@ -14,7 +14,7 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled } from "@/lib/capabilities";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
-import { Maximize2Icon, PanelRightCloseIcon, PanelRightIcon, XIcon } from "lucide-react";
+import { Maximize2Icon, XIcon } from "lucide-react";
 import { SideChatPane } from "@/components/chat/SideChatPane";
 import { COMPOSER_COLLAPSED_LABEL_CLASS } from "@/components/composer/ChatComposer";
 import { ComposerPermissionPicker } from "@/components/composer/ComposerControls";
@@ -47,7 +47,6 @@ import { permissionChip, permissionChipKind } from "@/lib/permissionModeCycle";
 import { isOwnerLevel } from "@/lib/permissionsApi";
 import type { Session } from "@/lib/types";
 import { useChatStore } from "@/store/chatStore";
-import { SidebarOpenButton } from "@/shell/SidebarOpenButton";
 import { retrySession } from "@/lib/sessionsApi";
 import { readTranscriptViewDefault } from "@/lib/transcriptViewPreferences";
 import { MainTerminalView } from "@/shell/MainTerminalView";
@@ -93,8 +92,6 @@ export function GridSessionPane({
   workspaceTarget,
   workspacePanel,
   onOpenWorkspace,
-  onToggleWorkspace,
-  onOpenSidebar,
 }: {
   sessionId: string;
   area?: string;
@@ -105,8 +102,6 @@ export function GridSessionPane({
   workspaceTarget: HTMLDivElement | null;
   workspacePanel: GridWorkspacePanelProps;
   onOpenWorkspace: () => void;
-  onToggleWorkspace: () => void;
-  onOpenSidebar?: () => void;
 }) {
   const queryClient = useQueryClient();
   const { session, isLoading: sessionLoading } = useSession(sessionId);
@@ -418,9 +413,6 @@ export function GridSessionPane({
               selected && "bg-brand-accent/10",
             )}
           >
-            {onOpenSidebar && (
-              <SidebarOpenButton onOpenSidebar={onOpenSidebar} componentId="grid.open_sidebar" />
-            )}
             <button
               type="button"
               ref={setActivatorNodeRef}
@@ -436,21 +428,6 @@ export function GridSessionPane({
               {title}
             </button>
             <ViewModeToggle hotkeyEnabled={selected && !workspacePanel.maximized} alwaysVisible />
-            <Button
-              variant="ghost"
-              size="icon-xs"
-              aria-label={`${workspacePanel.open ? "Collapse" : "Expand"} grid workspace`}
-              onClick={onToggleWorkspace}
-              // Hidden, not removed: activating a cell must not shift its titlebar mid-click.
-              // No transition, or visibility stays "visible" while it fades out.
-              style={selected ? undefined : { visibility: "hidden", transition: "none" }}
-            >
-              {workspacePanel.open ? (
-                <PanelRightCloseIcon className="size-3.5" />
-              ) : (
-                <PanelRightIcon className="size-3.5" />
-              )}
-            </Button>
             <Button asChild variant="ghost" size="icon-xs">
               <Link
                 draggable={false}

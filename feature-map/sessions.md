@@ -315,15 +315,13 @@ its Rename menu action to edit it inline.
 Enter or blur saves; Escape cancels. Grid names persist locally. Click anywhere
 in a cell (or focus its controls) to activate it: its outline and inverted header
 identify the session shown in Workspace. ⌘/Ctrl+Alt+Shift+] / [ activate the
-next / previous cell and focus its terminal or composer. The grid has no header:
-cells start at the top, and the window title shows the grid's name or its session titles.
-The active cell's titlebar button
-(⌘/Ctrl+Alt+] in a browser tab, ⇧⌘B / Ctrl+Shift+B in the desktop app) toggles the shared panel, and ⌃1–9 (Alt+1–9 on Windows/Linux) shows the active cell's Nth fixed tab; it spans the full app height beside the cells. Its width
-is saved per grid and stays fixed when switching sessions; the cells shrink
-when the panel opens. With the sidebar collapsed, the top-left cell's titlebar has the
-open-sidebar button.
+next / previous cell and focus its terminal or composer. The grid header and window
+title show the grid's name or its sessions' titles. The grid header button
+(⌘/Ctrl+Alt+] in a browser tab, ⇧⌘B / Ctrl+Shift+B in the desktop app) toggles the shared panel, and ⌃1–9 (Alt+1–9 on Windows/Linux) shows the active cell's Nth fixed tab; it spans the full app height beside the grid header and cells. Its width
+is saved per grid and stays fixed when switching sessions; the header shrinks
+with the cells when the panel opens.
 Files, tabs, and unsaved edits remain session-specific. Maximizing Workspace
-fills the grid area. Drag a cell titlebar onto another cell
+fills the grid area, including its header. Drag a cell titlebar onto another cell
 to swap positions. With exactly two sessions side by side, drop a titlebar
 near the whole grid's top/bottom edge to stack them. When stacked, use the
 left/right edge to place them side by side, including along the dragged cell's

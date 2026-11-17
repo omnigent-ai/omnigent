@@ -267,9 +267,6 @@ it("shows each cell's session controls and targets that session's permission mod
   // Named from the cells' snapshots; neither session is on a loaded sidebar page.
   await waitFor(() => expect(document.title).toBe("first + second"));
   const second = within(screen.getByRole("region", { name: "second" }));
-  // An inactive cell keeps the toggle's slot, so activating it never shifts the titlebar.
-  expect(second.queryByRole("button", { name: /grid workspace$/ })).toBeNull();
-  expect(second.getByLabelText(/grid workspace$/)).toHaveStyle({ visibility: "hidden" });
   // Host and harness are read-only here; switch hosts and models full screen.
   expect(second.getByText("Host for second (status only)")).toBeInTheDocument();
   expect(second.getByTestId("grid-harness-status")).toHaveAccessibleName("Claude Code");
