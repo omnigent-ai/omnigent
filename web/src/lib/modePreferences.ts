@@ -25,6 +25,19 @@ export type HarnessOptions = Record<string, string>;
 
 type OptionsMap = Record<string, HarnessOptions>;
 
+const pendingModeChanges = new Map<string, object>();
+
+/** Remember a confirmed mode only while no newer choice has superseded it. */
+export function beginHarnessModeChange(harness: string): (mode: string) => boolean {
+  const change = {};
+  pendingModeChanges.set(harness, change);
+  return (mode) => {
+    if (pendingModeChanges.get(harness) !== change) return false;
+    writeHarnessOption(harness, { mode });
+    return true;
+  };
+}
+
 /**
  * Coerce one stored entry into a clean string->string options map. Returns an
  * empty map for anything that can't be salvaged (a corrupt shape — the caller
@@ -83,6 +96,7 @@ export function writeHarnessOption(
   patch: HarnessOptions,
 ): void {
   if (typeof window === "undefined" || !harness) return;
+  if ("mode" in patch) pendingModeChanges.delete(harness);
   try {
     const map = readMap();
     map[harness] = { ...map[harness], ...patch };
