@@ -14,8 +14,7 @@ import { useSessionModelLabel } from "@/hooks/useSessionModelLabel";
 import { MODEL_PICKER_KEYS } from "@/hooks/useModelPickerHotkey";
 import { codexEffortLevelsForModel, findNativeModelOption } from "@/lib/codexNativeModels";
 import { modelConfigurationSourceRows } from "@/lib/modelConfigurationSource";
-import { useChatStore, type ConversationState } from "@/store/chatStore";
-import { useConversationEntryValue } from "@/hooks/useConversationEntryState";
+import { useChatStore } from "@/store/chatStore";
 import { nativeCodingAgentForHarness } from "@/lib/nativeCodingAgents";
 import { nativeModelLabel } from "@/components/HarnessConfigControls";
 import {
@@ -37,20 +36,7 @@ import {
   type NativeModelPickerKind,
 } from "@/lib/composerCapabilities";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
-
-/**
- * A field of *sessionId*'s conversation, or of the active conversation when
- * omitted (the main composer's case, read straight from the root store).
- */
-function useSessionField<T>(
-  sessionId: string | undefined,
-  select: (state: ConversationState) => T,
-): T {
-  // Each half reads only its own source, so neither re-renders for the other's updates.
-  const active = useChatStore((state) => (sessionId === undefined ? select(state) : null));
-  const entry = useConversationEntryValue(sessionId ?? null, select);
-  return sessionId === undefined ? (active as T) : entry;
-}
+import { useSessionField } from "@/components/composer/sessionPickerInputs";
 
 /** The conversation a picker targets: *sessionId*, else whichever is active now. */
 function useTargetConversationId(sessionId: string | undefined): string | null {
