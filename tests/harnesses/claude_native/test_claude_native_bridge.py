@@ -13890,6 +13890,7 @@ async def test_model_command_selects_session_only_then_reads_fresh_status(
     "unsupported",
     [
         "version",
+        "invalid-version",
         "missing-owner",
         "missing-version",
         "missing-session",
@@ -13917,6 +13918,9 @@ def test_model_command_refuses_unsupported_or_unowned_input_before_keys(
     composer = _SessionModelComposer(draft="a person's draft" if unsupported == "draft" else "")
     if unsupported == "version":
         composer.version = "2.1.302"
+    if unsupported == "invalid-version":
+        composer.version = "2.1.323-unknown"
+        composer.model = composer.options[-1]
     if unsupported == "picker":
         composer.overlay = "picker"
     if unsupported == "status-view":
@@ -13926,6 +13930,7 @@ def test_model_command_refuses_unsupported_or_unowned_input_before_keys(
         composer.cache_cost_label = "Choice 1"
     if unsupported == "clipped":
         composer._visible_rows = 1
+    initial_model = composer.model
     bridge_dir = _session_model_bridge(tmp_path, composer)
     if unsupported == "missing-owner":
         path = bridge_dir / "bridge.json"
@@ -14005,7 +14010,7 @@ def test_model_command_refuses_unsupported_or_unowned_input_before_keys(
         assert claude_native_bridge.can_hold_input_refusal(caught.value)
     height_recovery.assert_not_called()
     assert composer.sends == []
-    assert composer.model == "claude-sonnet-5-5"
+    assert composer.model == initial_model
     if unsupported == "draft":
         assert composer.text == "a person's draft"
     if unsupported == "missing-version":
@@ -14179,19 +14184,37 @@ def test_managed_model_status_check_preserves_exact_context_identity(
 
 
 @pytest.mark.parametrize(
-    ("raw_target", "actual_target", "already_selected", "status_queries"),
-    [(True, True, True, 1), (True, False, False, 2), (False, True, False, 1)],
-    ids=["fresh-same-model", "stale-target-hint", "stale-other-hint"],
+    ("version", "raw_target", "actual_target", "already_selected", "status_queries"),
+    [
+        ("2.1.323", True, True, True, 1),
+        ("2.1.323", True, False, False, 2),
+        ("2.1.323", False, True, False, 1),
+        ("2.1.322", True, True, True, 1),
+        ("2.1.302", True, True, True, 1),
+        ("2.1.322", True, False, None, 1),
+        ("2.1.322", False, True, None, 0),
+    ],
+    ids=[
+        "fresh-same-model",
+        "stale-target-hint",
+        "stale-other-hint",
+        "older-fresh-same-model",
+        "earlier-fresh-same-model",
+        "older-stale-target-hint",
+        "older-stale-other-hint",
+    ],
 )
 def test_model_command_uses_a_fresh_status_for_same_model_requests(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    version: str,
     raw_target: bool,
     actual_target: bool,
-    already_selected: bool,
+    already_selected: bool | None,
     status_queries: int,
 ) -> None:
     composer = _SessionModelComposer()
+    composer.version = version
     bridge_dir = _session_model_bridge(tmp_path, composer)
     target = composer.options[-1]
     raw_path = bridge_dir / claude_native_bridge.CONTEXT_RAW_FILE
@@ -14202,15 +14225,32 @@ def test_model_command_uses_a_fresh_status_for_same_model_requests(
         composer.model = target
     composer.install(monkeypatch)
 
-    result = claude_native_bridge.inject_model_command(bridge_dir, model=target)
+    if already_selected is None:
+        with pytest.raises(claude_native_bridge.ClaudeModelSwitchRefused) as caught:
+            claude_native_bridge.inject_model_command(bridge_dir, model=target)
+        assert caught.value.unsupported
+        assert not caught.value.command_submitted
+        assert not caught.value.model_may_have_changed
+        assert "current model" in str(caught.value)
+        assert "automatic model changes" in str(caught.value)
+        assert composer.model == (target if actual_target else composer.options[0])
+    else:
+        result = claude_native_bridge.inject_model_command(bridge_dir, model=target)
+        assert result.already_selected is already_selected
+        assert result.resolved_model == result.status_model == composer.model == target
+        assert result.session_id == composer.session
 
-    assert result.already_selected is already_selected
     assert composer.status_queries == status_queries
-    assert composer.model == target
-    assert composer.submitted[-1] == "/status"
-    assert [args[-1] for args in composer.sends].count("s") == (0 if already_selected else 1)
+    if version != "2.1.323":
+        assert [args[-1] for args in composer.sends] == (
+            ["/status", "Enter", "Escape"] if status_queries else []
+        )
+    else:
+        assert composer.submitted[-1] == "/status"
+        assert [args[-1] for args in composer.sends].count("s") == (0 if already_selected else 1)
 
 
+@pytest.mark.parametrize("version", ["2.1.323", "2.1.322"], ids=["supported", "older"])
 @pytest.mark.parametrize(
     ("model", "picker_value", "reported"),
     [
@@ -14229,8 +14269,10 @@ def test_model_command_explicitly_selects_context_when_status_omits_the_marker(
     model: str,
     picker_value: str,
     reported: str,
+    version: str,
 ) -> None:
     composer = _SessionModelComposer()
+    composer.version = version
     composer.options[-1] = composer.model = model
     bridge_dir = _session_model_bridge(tmp_path, composer)
     claude_native_bridge.record_model_vocabulary(
@@ -14258,6 +14300,15 @@ def test_model_command_explicitly_selects_context_when_status_omits_the_marker(
 
     monkeypatch.setattr(claude_native_bridge, "_capture_pane", capture)
 
+    if version == "2.1.322":
+        with pytest.raises(claude_native_bridge.ClaudeModelSwitchRefused) as caught:
+            claude_native_bridge.inject_model_command(bridge_dir, model=model)
+        assert caught.value.unsupported and not caught.value.model_may_have_changed
+        assert composer.model == model
+        assert composer.status_queries == 1
+        assert [args[-1] for args in composer.sends] == ["/status", "Enter", "Escape"]
+        return
+
     result = claude_native_bridge.inject_model_command(bridge_dir, model=model)
 
     assert not result.already_selected
@@ -14268,7 +14319,15 @@ def test_model_command_explicitly_selects_context_when_status_omits_the_marker(
 
 
 @pytest.mark.parametrize(
-    "outcome", ["success", "unsupported", "cache-cost-success", "cache-cost-refused"]
+    "outcome",
+    [
+        "success",
+        "unsupported",
+        "cache-cost-success",
+        "cache-cost-refused",
+        "older-same-model",
+        "older-different-model",
+    ],
 )
 def test_model_command_leaves_default_settings_and_legacy_settings_paths_untouched(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str
@@ -14297,6 +14356,10 @@ def test_model_command_leaves_default_settings_and_legacy_settings_paths_untouch
             else None
         )
     )
+    if outcome.startswith("older-"):
+        composer.version = "2.1.322"
+        if outcome == "older-same-model":
+            composer.model = composer.options[-1]
     bridge_dir = _session_model_bridge(tmp_path, composer)
     metadata = json.loads((bridge_dir / "bridge.json").read_text())
     metadata["user_settings_path"] = str(legacy)
@@ -14309,17 +14372,20 @@ def test_model_command_leaves_default_settings_and_legacy_settings_paths_untouch
         assert snapshots() == baseline
 
     monkeypatch.setattr(claude_native_bridge, "_run_tmux", send)
-    if outcome in {"unsupported", "cache-cost-refused"}:
+    if outcome in {"unsupported", "cache-cost-refused", "older-different-model"}:
         with pytest.raises(claude_native_bridge.ClaudeModelSwitchRefused):
             claude_native_bridge.inject_model_command(
                 bridge_dir,
                 model="absent-model" if outcome == "unsupported" else "private-glm[1m]",
             )
         assert composer.confirmations == composer.status_queries == 0
-        if outcome == "unsupported":
+        if outcome in {"unsupported", "older-different-model"}:
             assert composer.sends == []
     else:
-        claude_native_bridge.inject_model_command(bridge_dir, model="private-glm[1m]")
+        result = claude_native_bridge.inject_model_command(bridge_dir, model="private-glm[1m]")
+        assert result.already_selected is (outcome == "older-same-model")
+        if outcome == "older-same-model":
+            assert [args[-1] for args in composer.sends] == ["/status", "Enter", "Escape"]
         assert composer.confirmations == int(outcome == "cache-cost-success")
     assert snapshots() == baseline
 
@@ -15353,11 +15419,17 @@ def test_model_command_rechecks_cache_cost_confirmation_before_enter(
     assert [args[-1] for args in composer.sends] == ["/model", "Enter", "Down", "s"]
 
 
-@pytest.mark.parametrize("changed", ["model", "session", "version", "clipped-status"])
-def test_model_command_requires_fresh_status_after_cache_cost_confirmation(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, changed: str
+@pytest.mark.parametrize("selection", ["cache-cost", "older-same-model"])
+@pytest.mark.parametrize(
+    "changed", ["model", "private-case", "session", "version", "clipped-status"]
+)
+def test_model_command_requires_fresh_matching_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, changed: str, selection: str
 ) -> None:
     composer = _SessionModelComposer(cache_cost_label="Choice 1")
+    if selection == "older-same-model":
+        composer.version = "2.1.322"
+        composer.model = composer.options[-1]
     bridge_dir = _session_model_bridge(tmp_path, composer)
     composer.install(monkeypatch)
 
@@ -15366,8 +15438,9 @@ def test_model_command_requires_fresh_status_after_cache_cost_confirmation(
         if composer.overlay == "status":
             original, replacement = {
                 "model": ("Model: private-glm[1m]", "Model: claude-sonnet-5-5"),
+                "private-case": ("Model: private-glm[1m]", "Model: private-GLM[1m]"),
                 "session": ("Session ID: native-session", "Session ID: replacement-session"),
-                "version": ("Version: 2.1.323", "Version: 2.1.324"),
+                "version": (f"Version: {composer.version}", "Version: 2.1.324"),
                 "clipped-status": ("   Esc to cancel\n", ""),
             }[changed]
             return pane.replace(original, replacement)
@@ -15377,10 +15450,21 @@ def test_model_command_requires_fresh_status_after_cache_cost_confirmation(
     with pytest.raises(claude_native_bridge.ClaudeModelSwitchRefused) as caught:
         claude_native_bridge.inject_model_command(bridge_dir, model="private-glm[1m]")
 
-    assert caught.value.phase == "status" and caught.value.model_may_have_changed
-    assert composer.confirmations == composer.status_queries == 1
-    assert composer.submitted == ["/model", "/status"]
-    assert [args[-1] for args in composer.sends].count("s") == 1
+    assert caught.value.phase == "status"
+    committed = selection == "cache-cost"
+    assert caught.value.command_submitted is committed
+    assert caught.value.model_may_have_changed is committed
+    assert composer.status_queries == 1
+    assert composer.confirmations == int(committed)
+    assert composer.submitted == (["/model", "/status"] if committed else ["/status"])
+    assert [args[-1] for args in composer.sends].count("s") == int(committed)
+    if not committed:
+        assert composer.model == "private-glm[1m]"
+        assert [args[-1] for args in composer.sends] == [
+            "/status",
+            "Enter",
+            *(["Escape"] if changed in {"model", "private-case"} else []),
+        ]
 
 
 @pytest.mark.parametrize(

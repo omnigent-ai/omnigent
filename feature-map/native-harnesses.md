@@ -761,9 +761,17 @@ Cross-harness journeys:
   `tests/inner/test_claude_native_executor.py::test_model_control_hold_preserves_user_changes_until_dismissal`.
   A fresh terminal still starts on the saved default.
   Run `OMNIGENT_E2E_CLAUDE_NATIVE=1 uv run --no-sync pytest tests/e2e/test_claude_native_managed_model_switch.py --reruns 0`.
-  Requires Claude Code 2.1.323 or newer and tmux; use a clean container if
-  machine-managed settings override the fixture's picker. It makes no model
-  calls and does not verify browser rendering or live gateway servability.
+  This switching journey requires Claude Code 2.1.323 or newer and tmux; use a
+  clean container if machine-managed settings override the fixture's picker.
+  It makes no model calls and does not verify browser rendering or live gateway
+  servability.
+  On an older CLI with a valid version and known session, pinned Chat can
+  continue when fresh local status confirms the exact current model. A different
+  or unconfirmed model is refused before opening the picker; keep using the
+  current model in Terminal or update and relaunch to enable automatic changes.
+  Same-model confirmation and stale-status refusal are covered by
+  `tests/harnesses/claude_native/test_claude_native_bridge.py::test_model_command_uses_a_fresh_status_for_same_model_requests`
+  and `tests/inner/test_claude_native_executor.py::test_run_turn_does_not_send_without_a_fresh_model_receipt`.
   Each switch keeps its initially resolved target descriptor; later catalog
   refreshes do not invalidate that selection. The live picker and fresh status
   must still confirm that target. The server advertises support for preserving

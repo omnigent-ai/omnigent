@@ -712,9 +712,10 @@ class SessionOnlyModelSwitch:
         )
         self.session = self.bridge.read_claude_session_id(self.bridge_dir) or ""
         raw: dict[str, object] = {}
+        can_change_model = False
 
         def ready(pane: str) -> bool:
-            nonlocal raw
+            nonlocal raw, can_change_model
             raw = self.bridge._read_json_file(self.bridge_dir / self.bridge.CONTEXT_RAW_FILE) or {}
             version = raw.get("version")
             session = raw.get("session_id")
@@ -723,12 +724,14 @@ class SessionOnlyModelSwitch:
                 if not hook_session or hook_session != session:
                     return False
                 parsed = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", version)
-                if parsed is None or tuple(map(int, parsed.groups())) < _MIN_PICKER_VERSION:
+                if parsed is None:
                     raise self.refuse(
-                        "Session-only model switching requires Claude Code 2.1.323 or newer. "
-                        "Update Claude Code and relaunch this terminal.",
+                        "Claude Code's version could not be verified. You can continue using "
+                        "the current model in Terminal. Update Claude Code and relaunch this "
+                        "terminal to enable automatic model changes.",
                         unsupported=True,
                     )
+                can_change_model = tuple(map(int, parsed.groups())) >= _MIN_PICKER_VERSION
                 self.session, self.version = session, version
                 surface = _model_control_surface(pane)
                 if surface is None:
@@ -762,6 +765,14 @@ class SessionOnlyModelSwitch:
             current = self.local_status()
             if self.status_matches(current, exact_context=True):
                 return self.result(current, already_selected=True)
+
+        if not can_change_model:
+            raise self.refuse(
+                "Automatic model changes require Claude Code 2.1.323 or newer. You can "
+                "continue using the current model in Terminal. Update Claude Code and "
+                "relaunch this terminal to enable automatic model changes.",
+                unsupported=True,
+            )
 
         self.phase = "picker"
         self.command("/model")
