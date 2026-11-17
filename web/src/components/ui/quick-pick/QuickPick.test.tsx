@@ -329,3 +329,93 @@ describe("QuickPick accepting", () => {
     expect(onAccept).not.toHaveBeenCalled();
   });
 });
+
+describe("QuickPick sidebar presentation", () => {
+  const sidebarSegments: QuickPickSegment<string>[] = [
+    {
+      sourceId: "settings",
+      ranking: "client",
+      items: [
+        item("steer", {
+          label: "Always steer",
+          description: "General",
+          accessory: <kbd>⌘S</kbd>,
+        }),
+        item("theme", { label: "Terminal theme", description: "Appearance" }),
+      ],
+    },
+  ];
+
+  function renderSidebar(props: Props = {}) {
+    render(
+      <Harness
+        label="Search settings"
+        segments={sidebarSegments}
+        emptyMessage="No results found"
+        presentation="sidebar"
+        autoFocus={false}
+        {...props}
+      />,
+    );
+    return screen.getByRole("combobox", { name: "Search settings" });
+  }
+
+  it("shows only its field until there is a query", () => {
+    const input = renderSidebar();
+    expect(input).toHaveAttribute("aria-expanded", "false");
+    expect(input).not.toHaveAttribute("aria-controls");
+    expect(screen.getByRole("listbox", { hidden: true }).closest(".hidden")).not.toBeNull();
+    expect(screen.queryByRole("button", { name: "Clear search" })).toBeNull();
+    expect(screen.getByRole("status")).toHaveTextContent("");
+
+    fireEvent.change(input, { target: { value: "steer" } });
+    expect(input).toHaveAttribute("aria-expanded", "true");
+    expect(input).toHaveAttribute("aria-controls", screen.getByRole("listbox").id);
+    expect(screen.getByRole("status")).toHaveTextContent("1 result");
+  });
+
+  it("accepts nothing while collapsed", () => {
+    const onAccept = vi.fn();
+    const input = renderSidebar({ onAccept });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(onAccept).not.toHaveBeenCalled();
+  });
+
+  it("lists two-line rows with their place and accessory", () => {
+    const input = renderSidebar();
+    fireEvent.change(input, { target: { value: "steer" } });
+    const option = screen.getByRole("option");
+    expect(option).toHaveTextContent("Always steer");
+    expect(option).toHaveTextContent("General");
+    expect(within(option).getByText("⌘S")).toBeInTheDocument();
+    expect(screen.getByRole("option").querySelector("[data-slot=quick-pick-label]")).not.toBeNull();
+  });
+
+  it("clears the query with its button and keeps focus in the field", () => {
+    const input = renderSidebar();
+    fireEvent.change(input, { target: { value: "theme" } });
+    fireEvent.click(screen.getByRole("button", { name: "Clear search" }));
+    expect(input).toHaveValue("");
+    expect(input).toHaveFocus();
+    expect(input).toHaveAttribute("aria-expanded", "false");
+  });
+
+  it("leaves Escape to the caller", () => {
+    const onKeyDown = vi.fn();
+    render(
+      <div onKeyDown={onKeyDown}>
+        <Harness
+          label="Search settings"
+          segments={sidebarSegments}
+          emptyMessage={null}
+          presentation="sidebar"
+          autoFocus={false}
+        />
+      </div>,
+    );
+    const input = screen.getByRole("combobox", { name: "Search settings" });
+    fireEvent.change(input, { target: { value: "theme" } });
+    fireEvent.keyDown(input, { key: "Escape" });
+    expect(onKeyDown).toHaveBeenCalledTimes(1);
+  });
+});
