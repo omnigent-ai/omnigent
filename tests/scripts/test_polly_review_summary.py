@@ -148,19 +148,25 @@ def test_incomplete_reviews_are_rejected_regardless_of_size(review: str) -> None
         "inline_details",
         "run_path",
         "oversized_field",
+        "terminal_remainder",
     ),
     [
-        (None, 0, "", False, "run", None),
-        ((20000, 45000, 20000), 0, "", False, "run", None),
-        ((3000,) * 30, 59194, "", False, "run", None),
-        (None, 0, "  ", False, "run", None),
-        ((70000,), 0, "", False, "run", None),
+        (None, 0, "", False, "run", None, None),
+        ((20000, 45000, 20000), 0, "", False, "run", None, None),
+        ((3000,) * 30, 59194, "", False, "run", None, None),
+        (None, 0, "  ", False, "run", None, None),
+        ((70000,), 0, "", False, "run", None, None),
         # Align an escaped pipe with the fully wrapped comment boundary.
-        (("y" * 69 + ("x" * 70 + r"\|") * 1100,), 0, "", False, "r" * 66, None),
-        (None, 0, "", True, "run", None),
-        (("Reason",), 0, "", False, "run", 0),
-        (("Reason",), 0, "", False, "run", 1),
-        (("Reason",), 0, "", False, "run", 2),
+        (("y" * 69 + ("x" * 70 + r"\|") * 1100,), 0, "", False, "r" * 66, None, None),
+        (None, 0, "", True, "run", None, None),
+        (("Reason",), 0, "", False, "run", 0, None),
+        (("Reason",), 0, "", False, "run", 1, None),
+        (("Reason",), 0, "", False, "run", 2, None),
+        ((177655, "Tail."), 0, "", False, "run", None, " | \t"),
+        ((177654, "Tail."), 0, "", False, "run", None, "| \t"),
+        ((177653, "Tail."), 0, "", False, "run", None, " \t"),
+        ((177652, "Tail."), 0, "", False, "run", None, "\t"),
+        ((177651, "Tail."), 0, "", False, "run", None, ""),
     ],
     ids=[
         "many-rows",
@@ -173,6 +179,11 @@ def test_incomplete_reviews_are_rejected_regardless_of_size(review: str) -> None
         "oversized-test",
         "oversized-behavior",
         "oversized-layer",
+        "terminal-before-space",
+        "terminal-before-delimiter",
+        "terminal-after-delimiter",
+        "terminal-in-whitespace",
+        "terminal-before-newline",
     ],
 )
 def test_long_review_parts_preserve_all_assessments_and_markdown_context(
@@ -182,6 +193,7 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
     inline_details: bool,
     run_path: str,
     oversized_field: int | None,
+    terminal_remainder: str | None,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -195,6 +207,8 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
         f"Empty input é🙂 | Unit | Keep | {rationale} |\n"
         for number, rationale in enumerate(rationales)
     )
+    if terminal_remainder is not None:
+        rows = rows.replace(" |\n", " | \t\n", 1)
     if oversized_field is not None:
         field = ("tests/test_parser.py::test_case[0]", "Empty input é🙂", "Unit")[oversized_field]
         rows = rows.replace(field, field + "x" * 130000, 1)
@@ -213,7 +227,7 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
     composed = _HELPERS["compose_review"](
         review, {"markdown": "Computed counts", "test_files": ["tests/test_parser.py"]}
     )
-    if oversized_field is not None:
+    if oversized_field is not None or terminal_remainder is not None:
         review_path = tmp_path / "review.md"
         review_path.write_text(composed, encoding="utf-8")
         receipt = tmp_path / "receipt.txt"
@@ -228,13 +242,26 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
         }.items():
             monkeypatch.setenv(name, value)
         posts = []
-        monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: posts.append(args))
+        monkeypatch.setattr(
+            subprocess, "run", lambda argv, **kwargs: posts.append(Path(argv[-1]).read_text())
+        )
+    if oversized_field is not None:
         with pytest.raises(ValueError, match="assessment fields exceed comment capacity"):
             _HELPERS["publish_review"](review_path, receipt)
         assert not posts
         assert not receipt.exists()
         assert not list(tmp_path.glob("comment*.md"))
         return
+
+    byte_limits = []
+    if terminal_remainder is not None:
+        split = _HELPERS["split_review"]
+
+        def record_limit(text: str, limit: int) -> list[str]:
+            byte_limits.append(limit)
+            return split(text, limit)
+
+        monkeypatch.setitem(_HELPERS["review_comments"].__globals__, "split_review", record_limit)
 
     if preceding_paragraph_length:
         header, delimiter = _REVIEW.split("### Tests\n", 1)[1].splitlines()[:2]
@@ -258,6 +285,22 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
     comments = _HELPERS["review_comments"](
         composed, head_sha="a" * 40, run_id="10-1", run_url=f"https://example.test/{run_path}"
     )
+    if terminal_remainder is not None:
+        _HELPERS["publish_review"](review_path, receipt)
+        assert posts == [*comments[1:], comments[0]]
+        assert receipt.read_text() == "a" * 40 + "\n"
+        assert _HELPERS["COMMENT_BYTE_LIMIT"] == 60000
+        # Pin the unadjusted byte cut independently of wrapper wording.
+        row = rows.splitlines()[0]
+        assert row.encode("utf-8")[3 * byte_limits[-1] :] == terminal_remainder.encode()
+
+    header, delimiter = _REVIEW.split("### Tests\n", 1)[1].splitlines()[:2]
+    for comment in comments:
+        for line in comment.splitlines():
+            if line.lstrip().startswith("|") and line.strip() not in {header, delimiter}:
+                cells = _HELPERS["split_table_row"](line.strip().strip("|"))
+                assert len(cells) == 5
+                assert all(cell.strip() for cell in cells)
 
     assert "".join(chunks) == composed
     assert all(len(comment.encode("utf-8")) <= 60000 for comment in comments)
@@ -292,6 +335,12 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
     assert "## Blocking issues\nNone." in comments[0]
     assert "### Scope\nAll changes support the parser fix." in comments[-1]
     assert all("\n\n---\n<sub>Automated review by Polly" in comment for comment in comments)
+    if terminal_remainder is not None:
+        row = rows.splitlines()[0]
+        context = _HELPERS["_markdown_context"](composed[: composed.index(row) + len(row)])
+        assert "tests/test_parser.py::test_case[0]" not in context[0]
+        assert not context[1].startswith(" |\n")
+        assert context[2] == header + "\n" + delimiter + "\n"
 
 
 def test_unicode_and_wrapper_bytes_are_included_in_comment_limit() -> None:

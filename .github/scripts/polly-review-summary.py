@@ -271,6 +271,7 @@ def split_review(review: str, byte_limit: int) -> list[str]:
     if byte_limit < 4:
         raise ValueError("Comment wrappers leave no room for review content.")
     parts = []
+    in_table_row = False
     while len(encoded := review.encode("utf-8")) > byte_limit:
         boundary = byte_limit
         while encoded[boundary] & 0xC0 == 0x80:
@@ -279,6 +280,7 @@ def split_review(review: str, byte_limit: int) -> list[str]:
         line_end = prefix.rfind("\n") + 1
         end = line_end or len(prefix)
         if line_end:
+            in_table_row = False
             header_start = prefix.rfind("\n", 0, end - 1) + 1
             next_line = review[end:].split("\n", 1)[0]
             if (
@@ -291,8 +293,18 @@ def split_review(review: str, byte_limit: int) -> list[str]:
                 )
             ):
                 end = header_start
-        elif review[end - 1 : end + 1] == r"\|":
-            end -= 1
+        else:
+            in_table_row = in_table_row or review.lstrip().startswith("|")
+            if in_table_row and re.fullmatch(r"\s*\|?\s*", review[end:].split("\n", 1)[0]):
+                # Keep nonblank rationale text with the terminal delimiter and whitespace.
+                content = prefix.rstrip()
+                if content.endswith("|") and not content.endswith(r"\|"):
+                    content = content[:-1].rstrip()
+                end = len(content) - 1
+                if end <= 0:
+                    raise ValueError("Polly review assessment tail exceeds comment capacity.")
+            if review[end - 1 : end + 1] == r"\|":
+                end -= 1
         parts.append(review[:end])
         review = review[end:]
     parts.append(review)
@@ -335,9 +347,12 @@ def _markdown_context(text: str) -> tuple[str, str, str]:
         suffix = "\n" + fence + "\n" + suffix
         table_header = ""
     if table_header and not text.endswith("\n"):
-        cells = split_table_row(previous.strip().strip("|"))
+        row = previous.strip()
+        cells = split_table_row(row.strip("|"))
         if len(cells) != TEST_FIELD_COUNT:
             raise ValueError("Polly review assessment fields exceed comment capacity.")
+        if row.endswith("|") and not row.endswith(r"\|"):
+            return prefix, suffix, table_header
         prefix += table_header + "|" + "|".join(cells[:-1]) + "| "
         suffix = " |\n" + suffix
         table_header = ""
