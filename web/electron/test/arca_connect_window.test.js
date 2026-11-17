@@ -109,10 +109,14 @@ const flushTimers = () =>
   new Promise((resolve) => {
     setTimeout(resolve, 0);
   });
-/** Resolves when `win` closes. */
+/** Resolves when `win` closes. The close timer is unref'd, so hold the event loop open meanwhile. */
 const whenClosed = (win) =>
   new Promise((resolve) => {
-    win.once("closed", resolve);
+    const keepAlive = setInterval(() => {}, 1000);
+    win.once("closed", () => {
+      clearInterval(keepAlive);
+      resolve();
+    });
   });
 
 // The default delay is long enough that the success close never fires unless a test asks.
