@@ -8,8 +8,8 @@ export interface StoredPreference<Value extends string | number | boolean> {
   readonly defaultValue: Value;
   /** Read the preference; storage errors and unknown values mean the default. */
   read: () => Value;
-  /** Persist the preference and notify readers already on screen. */
-  write: (value: Value) => void;
+  /** Persist the preference and notify readers already on screen; false when storage refused it. */
+  write: (value: Value) => boolean;
   /** Re-read after a same-tab storage write that bypassed `write` (import, reset). */
   notifyChanged: () => void;
   /** Call `listener` when the preference may have changed; returns the unsubscribe. */
@@ -41,7 +41,8 @@ export function createStoredPreference<Value extends string | number | boolean>(
   };
 
   const write = (value: Value) => {
-    if (typeof window === "undefined") return;
+    if (typeof window === "undefined") return false;
+    let saved = true;
     try {
       if (value === defaultValue) {
         window.localStorage.removeItem(storageKey);
@@ -50,8 +51,10 @@ export function createStoredPreference<Value extends string | number | boolean>(
       }
     } catch {
       // Ignore storage failures (quota, privacy mode); the stored value is left as it was.
+      saved = false;
     }
     notifyChanged();
+    return saved;
   };
 
   const subscribe = (listener: () => void) => {

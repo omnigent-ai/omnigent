@@ -2,6 +2,7 @@ import { act, renderHook } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
 import {
   CODE_BLOCK_WORD_WRAP_STORAGE_KEY,
+  notifyCodeBlockWordWrapChanged,
   readCodeBlockWordWrap,
   toggleCodeBlockWordWrap,
   useCodeBlockWordWrap,
@@ -74,5 +75,49 @@ it("shows the unsaved choice when saving it fails", () => {
   writeCodeBlockWordWrap(false);
   expect(localStorage.getItem(CODE_BLOCK_WORD_WRAP_STORAGE_KEY)).toBe("false");
   localStorage.removeItem(CODE_BLOCK_WORD_WRAP_STORAGE_KEY);
+  expect(readCodeBlockWordWrap()).toBe(true);
+});
+
+it("lets another window's write or an import replace an unsaved choice", () => {
+  const { result } = renderHook(() => useCodeBlockWordWrap());
+  const saveFails = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+    throw new Error("quota exceeded");
+  });
+  act(() => writeCodeBlockWordWrap(false));
+  expect(result.current).toBe(false);
+  saveFails.mockRestore();
+
+  // Another window clears the key, which means wrapping.
+  act(() => {
+    window.dispatchEvent(new StorageEvent("storage", { key: CODE_BLOCK_WORD_WRAP_STORAGE_KEY }));
+  });
+  expect(result.current).toBe(true);
+
+  vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+    throw new Error("quota exceeded");
+  });
+  act(() => writeCodeBlockWordWrap(false));
+  expect(result.current).toBe(false);
+  vi.restoreAllMocks();
+
+  // A settings import writes storage directly, then notifies.
+  act(() => notifyCodeBlockWordWrapChanged());
+  expect(result.current).toBe(true);
+});
+
+it("keeps an unsaved choice when reading storage also fails", () => {
+  writeCodeBlockWordWrap(false);
+  vi.spyOn(Storage.prototype, "getItem").mockImplementation(() => {
+    throw new Error("access denied");
+  });
+  vi.spyOn(Storage.prototype, "removeItem").mockImplementation(() => {
+    throw new Error("access denied");
+  });
+  writeCodeBlockWordWrap(true);
+  expect(readCodeBlockWordWrap()).toBe(true);
+
+  // Access returns with the earlier "off" still stored; this tab keeps its choice.
+  vi.restoreAllMocks();
+  expect(localStorage.getItem(CODE_BLOCK_WORD_WRAP_STORAGE_KEY)).toBe("false");
   expect(readCodeBlockWordWrap()).toBe(true);
 });
