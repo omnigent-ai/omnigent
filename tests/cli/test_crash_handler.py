@@ -18,7 +18,6 @@ import os
 import re
 import subprocess
 import sys
-import time
 import traceback
 import urllib.parse
 from pathlib import Path
@@ -514,11 +513,18 @@ def test_issue_url_retains_tail_of_long_traceback(
     assert exception_line in traceback_body
 
 
-def test_issue_url_drops_body_when_summary_alone_is_too_long(data_dir: Path) -> None:
+@pytest.mark.parametrize("message_size", [30000, 5_000_000], ids=["oversized", "multi-megabyte"])
+def test_issue_url_drops_body_when_summary_alone_is_too_long(
+    data_dir: Path, monkeypatch: pytest.MonkeyPatch, message_size: int
+) -> None:
     """If even the exception summary cannot fit, the body is dropped."""
     ch.install_crash_handler("omnigent", "omnigent-ai/omnigent")
-    huge_message = ValueError("m" * 30000)
-    url, body_included = ch._issue_url(huge_message, "Traceback...\n")
+    monkeypatch.setattr(
+        ch, "_tail", lambda *_args, **_kwargs: pytest.fail("oversized summary reached tail search")
+    )
+    huge_message = ValueError("m" * message_size)
+    tb_text = f"Traceback (most recent call last):\nValueError: {huge_message}\n"
+    url, body_included = ch._issue_url(huge_message, tb_text)
     assert len(url) <= ch._MAX_URL_LENGTH
     assert body_included is False
     assert "description=" not in url
@@ -762,31 +768,36 @@ def test_issue_url_scrubs_every_home_reference_in_command(
     assert "~/.config/app.toml" in _description_of(url)
 
 
-def test_command_line_scrubs_home_argument_and_keeps_argv_plain(
-    data_dir: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The public command keeps plain argv joining, with the home argument rewritten."""
-    ch.install_crash_handler("omnigent", "omnigent-ai/omnigent")
-    monkeypatch.setattr(Path, "home", lambda: Path("/home/example-user"))
-    monkeypatch.setattr(sys, "argv", ["omnigent", "run", "/home/example-user/app.yaml", "--flag"])
-    assert ch._scrub(ch._command_line()) == "omnigent run ~/app.yaml --flag"
-
-
 @pytest.mark.parametrize(
-    "argv",
+    ("argv", "expected_command"),
     [
-        ["example", "Authorization: Bearer", "synthetic.jwt.payload"],
-        ["tool", "--header", "/home/example-user/my dir Bearer", "synthetic.token.value"],
+        (
+            ["example", "Authorization: Bearer", "synthetic.jwt.payload"],
+            "example Authorization: Bear***",
+        ),
+        (
+            [
+                "omnigent",
+                "run",
+                "/home/example-user/app.yaml",
+                "--flag",
+                "--header",
+                "/home/example-user/my dir Bearer",
+                "synthetic.token.value",
+            ],
+            "omnigent run ~/app.yaml --flag --header ~/my dir Bear***",
+        ),
     ],
     ids=["plain-prefix", "home-containing-prefix"],
 )
 def test_bearer_token_split_across_arguments_is_redacted(
-    data_dir: Path, monkeypatch: pytest.MonkeyPatch, argv: list[str]
+    data_dir: Path, monkeypatch: pytest.MonkeyPatch, argv: list[str], expected_command: str
 ) -> None:
     """A bearer value in the next argument is redacted, and no home path leaks."""
     ch.install_crash_handler("omnigent", "omnigent-ai/omnigent")
     monkeypatch.setattr(Path, "home", lambda: Path("/home/example-user"))
     monkeypatch.setattr(sys, "argv", argv)
+    assert ch._scrub(ch._command_line()) == expected_command
     url, _ = ch._issue_url(
         _make_exc("failure"), "Traceback (most recent call last):\nValueError\n"
     )
@@ -794,22 +805,7 @@ def test_bearer_token_split_across_arguments_is_redacted(
     assert "synthetic.jwt.payload" not in decoded_url
     assert "synthetic.token.value" not in decoded_url
     assert "example-user" not in decoded_url
-
-
-def test_issue_url_large_exception_message_is_bounded(
-    data_dir: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A multi-megabyte summary is rejected without searching traceback suffixes."""
-    ch.install_crash_handler("omnigent", "omnigent-ai/omnigent")
-    monkeypatch.setattr(Path, "home", lambda: Path("/home/example-user"))
-    message = "x" * 5_000_000
-    tb_text = "Traceback (most recent call last):\n" + f"ValueError: {message}\n"
-    started = time.perf_counter()
-    url, body_included = ch._issue_url(ValueError(message), tb_text)
-    elapsed = time.perf_counter() - started
-    assert len(url) <= ch._MAX_URL_LENGTH
-    assert body_included is False
-    assert elapsed < 5.0
+    assert f"**Command:**\n```\n{expected_command}\n```" in _description_of(url)
 
 
 def test_issue_url_redacts_multiline_bearer_before_truncation(data_dir: Path) -> None:
