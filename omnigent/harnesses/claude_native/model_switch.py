@@ -7,6 +7,7 @@ import re
 import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 
 
@@ -169,6 +170,13 @@ def _cache_cost_model_label(model: object) -> str | None:
     if match is None:
         return None
     family, major, minor = match.groups()
+    if minor is not None and len(minor) == 8:
+        # Major-only releases carry a date where newer IDs carry a minor version.
+        try:
+            date.fromisoformat(minor)
+        except ValueError:
+            return None
+        minor = None
     version = f"{major}.{minor}" if minor is not None else major
     return f"{family.title()} {version}"
 

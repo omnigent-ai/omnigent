@@ -13583,6 +13583,18 @@ def _cache_cost_confirmation_pane(label: str) -> str:
     )
 
 
+_CAPTURED_DATED_MODEL_CONFIRMATION = (
+    "─────────────────────────────────────────────────────────────────────────────────────────────────────────\n"
+    "  Switch model?\n"
+    "  Your next response will be slower and use more tokens\n\n"
+    "  This conversation is cached for the current model. Switching to Sonnet 4 means "
+    "the full history gets\n"
+    "  re-read.\n\n"
+    "  ❯ 1. Yes, switch to Sonnet 4\n"
+    "    2. No, go back\n\n\n\n"
+)
+
+
 class _SessionModelComposer(_EditableComposer):
     """Editable composer with the recorded local model and status overlays."""
 
@@ -13736,6 +13748,35 @@ def _versioned_cache_cost_bridge(
     config["model_picker_options"][1]["display_name"] = "Sonnet"
     config_path.write_text(json.dumps(config))
     composer.install(monkeypatch)
+    return composer, bridge_dir
+
+
+def _dated_cache_cost_bridge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    pane: str = _CAPTURED_DATED_MODEL_CONFIRMATION,
+) -> tuple[_SessionModelComposer, Path]:
+    composer = _SessionModelComposer(cache_cost_label="Sonnet 4")
+    composer.options[1] = "sonnet"
+    composer.picker_labels["sonnet"] = "Sonnet 4"
+    composer.resolved_models["sonnet"] = "claude-sonnet-4-20250514"
+    bridge_dir = _session_model_bridge(tmp_path, composer)
+    config_path = bridge_dir / "bridge.json"
+    config = json.loads(config_path.read_text())
+    config["model_picker_options"][1]["display_name"] = "Sonnet 4"
+    config["model_env"] = {"ANTHROPIC_DEFAULT_SONNET_MODEL": composer.resolved_models["sonnet"]}
+    config_path.write_text(json.dumps(config))
+    composer.install(monkeypatch)
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_capture_pane",
+        lambda socket_path, target: (
+            pane
+            if composer.overlay == "cache-cost"
+            else composer._capture_pane(socket_path, target)
+        ),
+    )
     return composer, bridge_dir
 
 
@@ -14948,6 +14989,70 @@ def test_model_command_confirms_versioned_cache_cost_for_managed_row(
     ]
 
 
+def test_model_command_confirms_the_captured_dated_cache_cost_modal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    composer, bridge_dir = _dated_cache_cost_bridge(tmp_path, monkeypatch)
+
+    result = claude_native_bridge.inject_model_command(bridge_dir, model="sonnet")
+
+    assert result.requested_model == result.picker_value == "sonnet"
+    assert result.resolved_model == result.status_model == "claude-sonnet-4-20250514"
+    assert result.session_id == composer.session
+    assert composer.confirmations == composer.status_queries == 1
+    assert [args[-1] for args in composer.sends] == [
+        "/model",
+        "Enter",
+        "Down",
+        "s",
+        "Enter",
+        "/status",
+        "Enter",
+        "Escape",
+    ]
+
+
+@pytest.mark.parametrize(
+    "guard", ["catalog-date", "live-date", "private-target", "wrong-generation"]
+)
+def test_dated_cache_cost_modal_preserves_model_identity_guards(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, guard: str
+) -> None:
+    pane = _CAPTURED_DATED_MODEL_CONFIRMATION
+    if guard == "wrong-generation":
+        pane = pane.replace("Sonnet 4", "Sonnet 5")
+    composer, bridge_dir = _dated_cache_cost_bridge(tmp_path, monkeypatch, pane=pane)
+    config_path = bridge_dir / "bridge.json"
+    config = json.loads(config_path.read_text())
+    if guard == "catalog-date":
+        config["model_picker_options"].append(
+            {
+                "value": "other-date",
+                "model": "claude-sonnet-4-20250601",
+                "display_name": "Other release",
+                "enabled": True,
+                "provenance": "structured",
+            }
+        )
+    elif guard == "live-date":
+        composer.options.append("claude-sonnet-4-20250601")
+        composer.picker_labels[composer.options[-1]] = "Other release"
+    elif guard == "private-target":
+        private_model = "private-claude-sonnet-4-20250514"
+        config["model_picker_options"][1].update(
+            model=private_model, display_name="Private Sonnet"
+        )
+        config["model_env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"] = private_model
+    config_path.write_text(json.dumps(config))
+
+    with pytest.raises(claude_native_bridge.ClaudeModelSwitchRefused) as caught:
+        claude_native_bridge.inject_model_command(bridge_dir, model="sonnet")
+
+    assert caught.value.phase == "commit" and caught.value.model_may_have_changed
+    assert composer.confirmations == composer.status_queries == 0
+    assert [args[-1] for args in composer.sends] == ["/model", "Enter", "Down", "s"]
+
+
 @pytest.mark.parametrize(
     ("model", "label"),
     [
@@ -14958,6 +15063,10 @@ def test_model_command_confirms_versioned_cache_cost_for_managed_row(
         ("claude-haiku-5-5", "Haiku 5.5"),
         ("claude-fable-5-1", "Fable 5.1"),
         ("claude-opus-5", "Opus 5"),
+        ("claude-sonnet-4-20250514", "Sonnet 4"),
+        ("databricks-claude-opus-4-20250514[1m]", "Opus 4"),
+        ("claude-sonnet-4-20250230", None),
+        ("private-claude-sonnet-4-20250514", None),
         ("private-claude-sonnet-5-5", None),
         ("claude-other-claude-sonnet-5-5", None),
         ("system.ai.claude-sonnet-5-5-preview", None),
