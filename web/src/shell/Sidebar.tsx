@@ -2236,7 +2236,14 @@ function ConversationList({
   // persisted per-device preference. With the release flag off the sidebar
   // keeps its default layout and ignores any stored choice.
   const groupingUi = isFeatureEnabled(serverInfo, "sidebar_grouping_ui");
-  const { view, updateView: saveView, sortBy, customOrder, loadedRows } = useSidebarData();
+  const {
+    view,
+    updateView: saveView,
+    sortBy,
+    customOrder,
+    loadedRows,
+    sharedActive,
+  } = useSidebarData();
   const updateView = useStableCallback((patch: Partial<SidebarViewPreferences>) => {
     // Regrouping swaps which sections (and selection scopes) exist, so leave
     // selection the way a Display switch does.
@@ -2495,6 +2502,16 @@ function ConversationList({
     if (custom) saveView({ ordering: "custom", custom });
   });
   const reorderable = groupingUi && !selectionMode;
+  // Other users' automation runs join the default automation folder. My sessions
+  // takes them from the shared rows already loaded, so none show when those aren't.
+  const includeSharedRuns = activeTab !== "mine" || sharedActive;
+  const mineSharedRuns = useMemo(
+    () =>
+      activeTab === "mine" && includeSharedRuns
+        ? loadedRows.filter((c) => isSharedAutomationRun(c, viewerId))
+        : EMPTY_CONVERSATIONS,
+    [activeTab, includeSharedRuns, loadedRows, viewerId],
+  );
 
   // Build sections: Pinned and Archived are peeled off; the rest splits into
   // the viewer's own sessions (Chats) and ones shared with them. Archived
@@ -2539,10 +2556,11 @@ function ConversationList({
 
     // Folders use live members on All / My and archives on Archived. Filing is
     // owner-only, so Shared and grouped views omit folders; pins precede them.
-    const folderCandidates = activeTab === "archived" ? tabScoped : notArchived;
-    // Other users' automation runs join the default automation folder, except on
-    // My sessions, which lists only the viewer's own.
-    const includeSharedRuns = activeTab !== "mine";
+    // My sessions' own rows hold no shared runs, so they come from the loaded rows.
+    const folderCandidates =
+      activeTab === "archived"
+        ? tabScoped
+        : dedupeConversationsById([...notArchived, ...mineSharedRuns]);
     const sharedRunsToFile =
       includeSharedRuns &&
       folderCandidates.some((c) => isSharedAutomationRun(c, viewerId) && !pinnedIdSet.has(c.id));
@@ -2683,6 +2701,8 @@ function ConversationList({
     projects,
     projectOrder.data?.sort_mode,
     activeTab,
+    includeSharedRuns,
+    mineSharedRuns,
     viewerId,
     groupingUi,
     grouped,
@@ -3610,7 +3630,7 @@ function ConversationList({
                             <ProjectFolder
                               key={group.name}
                               placeholder={group.placeholder}
-                              includeSharedRuns={activeTab !== "mine"}
+                              includeSharedRuns={includeSharedRuns}
                               ordering={{
                                 disabled:
                                   group.placeholder ||

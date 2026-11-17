@@ -59,17 +59,19 @@ runs' sessions in their own Omnigent Automation folder.
   (if it's shared with the viewer) for the details: no session cost, error
   details, approvals, unread dots or tasks. The owner's host reads The owner's
   host, the Project field is hidden, and Starts from names no session.
-- `sidebar-folder`: in the sidebar's All sessions view (and Archived), another
-  user's run session shared with the viewer, or a session launched from a run's
-  session tree, sits in the viewer's Omnigent Automation folder instead of
-  Shared with me, wherever its owner filed it, with the owner on the row's
-  second line. A fork of a run's session stays under Shared with me. With no
-  project of that name, a folder with the same name shows where a new project
-  would go (by name, or last under a manual order) without creating one: it has
-  no project menu or New session button, takes no drops and can't be dragged.
-  The viewer's first own automation creates the project, which takes its place.
-  My sessions shows only the viewer's own sessions; the Shared with me filter
-  lists every shared session. Shared runs can't be moved to a project.
+- `sidebar-folder`: in the sidebar's All sessions and My sessions views (and
+  Archived), another user's run session shared with the viewer, or a session
+  launched from a run's session tree, sits in the viewer's Omnigent Automation
+  folder instead of Shared with me, wherever its owner filed it, with the owner
+  on the row's second line. A fork of a run's session stays under Shared with
+  me. With no project of that name, a folder with the same name shows where a
+  new project would go (by name, or last under a manual order) without creating
+  one: it has no project menu or New session button, takes no drops and can't be
+  dragged. The viewer's first own automation creates the project, which takes
+  its place. My sessions lists no other shared session, and a pinned run stays
+  in Pinned. The Shared with me filter lists every shared session flat. Grouped
+  views have no folders, so grouped My sessions leaves the runs out. Shared runs
+  can't be moved to a project.
 
 ## How to get to it (user POV)
 
@@ -86,8 +88,8 @@ runs' sessions in their own Omnigent Automation folder.
 - **Shared with me:** as someone an automation is shared with, open Automations
   and the Shared with me tab, or follow `/tasks?view=shared`. Select a card to
   open its read-only page.
-- **Sidebar folder:** as that person, choose All sessions in the sidebar's
-  filter menu and expand Omnigent Automation.
+- **Sidebar folder:** as that person, choose All sessions or My sessions in the
+  sidebar's filter menu and expand Omnigent Automation.
 - **Mobile web / managed embedded:** the same page, row menu and dialog, under the
   host's mount path.
 
@@ -146,9 +148,10 @@ uses, because the session Share button is disabled on a local server.
   read-only with the run listed, without the session cost alice's page shows.
   In the sidebar, choose All sessions: the run's session is in Omnigent
   Automation with alice on its row, and bob, who has no such project, sees the
-  folder anyway. Fork that session as bob: the fork is bob's own and lists with
-  his sessions. Remove bob from the automation: the automation leaves his list
-  and its page shows not found.
+  folder anyway. Choose My sessions: the run stays in that folder, and no other
+  session alice shared lists. Fork that session as bob: the fork is bob's own
+  and lists with his sessions. Remove bob from the automation: the automation
+  leaves his list and its page shows not found.
 
 ## Gotchas
 
@@ -177,4 +180,7 @@ uses, because the session Share button is disabled on a local server.
   store has no groups, so a grant to a group reaches nobody there.
 - The sidebar only places shared runs it has loaded: the Omnigent Automation
   folder's own page fetch is the viewer's sessions, so shared runs further down
-  the All sessions list appear as it loads.
+  the All sessions list appear as it loads. My sessions fetches nothing for
+  them: it places runs from the shared sessions already loaded for the inbox,
+  and pages only the viewer's own. An embedding host that sets
+  `inboxIncludesShared: false` loads none there, so My sessions shows none.
