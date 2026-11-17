@@ -548,6 +548,10 @@ def test_issue_url_scrubs_home_directory_and_tokens(
             "/home/example-user@backup/module.py",
             True,
         ),
+        ("File /home/example-user!backup/app.py\n", "/home/example-user!backup/app.py", True),
+        ("File /home/example-user,backup/app.py\n", "/home/example-user,backup/app.py", True),
+        ("File /home/example-user;backup/app.py\n", "/home/example-user;backup/app.py", True),
+        ("cannot write to /home/example-user.\n", "cannot write to ~.", False),
     ],
     ids=[
         "parenthesized",
@@ -557,6 +561,10 @@ def test_issue_url_scrubs_home_directory_and_tokens(
         "unicode-sibling",
         "plus-sibling",
         "at-sibling",
+        "bang-sibling",
+        "comma-sibling",
+        "semicolon-sibling",
+        "sentence-period",
     ],
 )
 def test_issue_url_scrubs_punctuation_bounded_home_path(
@@ -575,6 +583,20 @@ def test_issue_url_scrubs_punctuation_bounded_home_path(
     body = _description_of(url)
     assert expected_fragment in body
     assert ("/home/example-user" in body) is home_survives
+
+
+def test_issue_url_scrubs_repr_escaped_windows_home(
+    data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Backslashes doubled by ``repr()`` in an exception message are still scrubbed."""
+    ch.install_crash_handler("omnigent", "omnigent-ai/omnigent")
+    home_path = Path(r"C:\Users\example-user")
+    monkeypatch.setattr(Path, "home", lambda: home_path)
+    exc = FileNotFoundError(2, "No such file or directory", r"C:\Users\example-user\private.txt")
+    url, body_included = ch._issue_url(exc, "Traceback (most recent call last):\nOSError\n")
+    assert body_included is True
+    assert "example-user" not in urllib.parse.unquote_plus(url)
+    assert "~" in _description_of(url)
 
 
 def test_issue_url_redacts_multiline_bearer_before_truncation(data_dir: Path) -> None:

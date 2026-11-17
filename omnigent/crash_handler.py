@@ -460,14 +460,22 @@ def _issue_body(exc: BaseException, tb_text: str, *, truncated: bool = False) ->
     )
 
 
+# What may follow a home reference: end, whitespace, a path separator, a closing
+# bracket or quote, or sentence punctuation before whitespace. Any other character
+# continues a sibling name (``/home/user+backup``, ``/home/user!x``).
+_HOME_REFERENCE_END = r"(?=$|[\s/\\)\]}\"'`]|[.,;:!?](?=$|\s))"
+
+
 def _scrub(text: str) -> str:
     """Redact tokens and the home directory from text bound for a public issue."""
     text = _redact(text)
     with contextlib.suppress(Exception):
         home = str(Path.home())
         if home and home != os.sep:
-            # Only a whole path component: ``/home/al`` must not rewrite ``/home/alice``.
-            text = re.sub(re.escape(home) + r"(?![\w.+@~\-])", "~", text)
+            # Replace only whole references, so ``/home/al`` leaves ``/home/alice`` intact.
+            # ``repr()`` doubles backslashes, so the escaped form is scrubbed too.
+            for variant in {home, home.replace("\\", "\\\\")}:
+                text = re.sub(re.escape(variant) + _HOME_REFERENCE_END, "~", text)
     return text
 
 
