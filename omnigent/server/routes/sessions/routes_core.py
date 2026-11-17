@@ -2739,6 +2739,7 @@ def register_core_routes(
                     owned_by=owned_by_param,
                     shared_only=shared_only_param,
                     has_agent_id=True,
+                    exclude_side_chats=True,
                     # The store treats ``None`` as "no kind filter"; the API
                     # spells that ``kind=any`` to keep the param required-ish
                     # and pattern-validated.
@@ -2754,12 +2755,6 @@ def register_core_routes(
                     # Pins are per-user: filter to the caller's own pin key.
                     pinned_owner=user_id,
                 )
-                # Side chats surface only as Workspace-rail tabs, so drop any
-                # side-chat-labeled fork from the sidebar list (it is still a
-                # normal session, just not listed as a top-level one here).
-                page.data = [
-                    conv for conv in page.data if SIDE_CHAT_LABEL_KEY not in (conv.labels or {})
-                ]
                 boundary_row = page.data[-1] if page.data else None
                 page_boundary = (
                     {

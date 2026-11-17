@@ -118,6 +118,7 @@ from omnigent.stores.conversation_store import (
     SCHEDULED_TASK_PENDING_RUN_LABEL_PREFIX,
     SCHEDULED_TASK_RUN_LABEL_KEY,
     SIDE_CHAT_COPY_ID_PREFIX_LEN,
+    SIDE_CHAT_LABEL_KEY,
     ConversationAlreadyExistsError,
     ConversationNotFoundError,
     ConversationStore,
@@ -3886,6 +3887,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         agent_id: str | None = None,
         agent_name: str | None = None,
         has_agent_id: bool | None = None,
+        exclude_side_chats: bool = False,
         order: str = "desc",
         sort_by: str = "created_at",
         search_query: str | None = None,
@@ -3928,6 +3930,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             conversations whose ``agent_id`` column is not
             ``None``. Powers ``GET /v1/sessions`` — sessions
             always have an agent binding. ``None`` disables.
+        :param exclude_side_chats: Exclude sidebar-hidden side chats before
+            pagination, so ``has_more`` describes visible sessions.
         :param order: Sort direction, ``"desc"`` or ``"asc"``.
         :param sort_by: Column to sort on, ``"created_at"``,
             ``"updated_at"``, or ``"id"``.
@@ -4171,6 +4175,16 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
             if has_agent_id is True:
                 stmt = stmt.where(SqlConversation.agent_id.is_not(None))
+            if exclude_side_chats:
+                stmt = stmt.where(
+                    ~select(SqlConversationLabel.conversation_id)
+                    .where(
+                        SqlConversationLabel.workspace_id == SqlConversation.workspace_id,
+                        SqlConversationLabel.conversation_id == SqlConversation.id,
+                        SqlConversationLabel.key == SIDE_CHAT_LABEL_KEY,
+                    )
+                    .exists()
+                )
             if agent_ids_for_name is not None:
                 stmt = stmt.where(SqlConversation.agent_id.in_(agent_ids_for_name))
             if agent_id is not None:

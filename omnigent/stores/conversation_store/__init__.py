@@ -998,6 +998,7 @@ class ConversationStore(ABC):
         agent_id: str | None = None,
         agent_name: str | None = None,
         has_agent_id: bool | None = None,
+        exclude_side_chats: bool = False,
         order: str = "desc",
         sort_by: str = "created_at",
         search_query: str | None = None,
@@ -1075,6 +1076,8 @@ class ConversationStore(ABC):
             ``POST /v1/sessions``. When ``None`` (default), the
             filter is disabled. Powers the ``GET /v1/sessions``
             list endpoint.
+        :param exclude_side_chats: Exclude sidebar-hidden side chats before
+            applying the page limit and computing ``has_more``.
         :param order: Sort direction, ``"desc"`` or ``"asc"``.
         :param sort_by: Column to sort on, ``"created_at"`` or
             ``"updated_at"``, or ``"id"`` for index order, which bounds the
