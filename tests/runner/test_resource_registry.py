@@ -3735,15 +3735,24 @@ def test_session_workspace_uses_platform_temp_default(
             "if sys.argv[2] != 'default':\n"
             "    tempfile.gettempdir = unavailable_tempdir\n"
             "importlib.reload(resource_registry)\n"
-            "if sys.argv[2] == 'tmpdir':\n"
+            "if sys.argv[2] in ('tmpdir', 'empty-tmpdir'):\n"
             "    imported_workspace = resource_registry._session_workspace('conv_temp')\n"
             "    os.environ['TMPDIR'] += '-changed'\n"
             "    assert resource_registry._session_workspace('conv_temp') == imported_workspace\n"
             "    del os.environ['TMPDIR']\n"
             "    assert resource_registry._session_workspace('conv_temp') == imported_workspace\n"
+            "if sys.argv[2] == 'default' and _platform.IS_WINDOWS:\n"
+            "    os.environ['TMPDIR'] = sys.argv[3]\n"
+            "    expected = os.path.join(os.path.realpath(sys.argv[3]),\n"
+            "                            'omnigent-sessions', 'conv_temp', 'workspace')\n"
+            "    assert resource_registry._session_workspace('conv_temp') == expected\n"
+            "    del os.environ['TMPDIR']\n"
+            "    assert resource_registry._session_workspace('conv_temp') == expected\n"
+            "    tempfile.tempdir = None\n"
             "print(json.dumps(resource_registry._session_workspace('conv_temp')))\n",
             str(windows),
             root_source,
+            str(tmpdir),
         ],
         cwd=repo_root,
         env=env,
