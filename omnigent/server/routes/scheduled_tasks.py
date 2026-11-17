@@ -1421,6 +1421,9 @@ def create_scheduled_tasks_router(
                 # A disconnected runner's persisted count can outlive its approval requests.
                 if live is not None and not live.runner_online:
                     pending_approvals = 0
+                # Runs sharing a continued session report its live activity only on
+                # the run it's attributed to now; earlier runs keep their own outcome.
+                is_current_run = session.current_run_id in (None, r.id)
                 run_rows.append(
                     _run_to_response(
                         r,
@@ -1428,11 +1431,13 @@ def create_scheduled_tasks_router(
                         conversation_status=_list_status_with_starting(
                             _session_status_from_cache(r.conversation_id, session.live_status),
                             r.conversation_id,
-                        ),
+                        )
+                        if is_current_run
+                        else None,
                         viewer_last_seen=last_seen,
                         viewer_unread=explicit_unread,
                         session_cost_usd=session.total_cost_usd,
-                        conversation_pending_approvals=pending_approvals,
+                        conversation_pending_approvals=pending_approvals if is_current_run else 0,
                     )
                 )
             else:
