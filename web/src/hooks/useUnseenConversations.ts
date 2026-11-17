@@ -360,6 +360,20 @@ export function useUnseenTick(enabled = true): number {
   );
 }
 
+function subscribeToReadState(onChange: () => void): () => void {
+  subscribers.add(onChange);
+  return () => subscribers.delete(onChange);
+}
+
+/**
+ * Returns `read()`, re-evaluated on read-state mirror writes. Unlike
+ * `useUnseenTick`, a write re-renders the caller only when the result changes,
+ * so `read` must return a primitive or an otherwise stable value.
+ */
+export function useReadStateSnapshot<T>(read: () => T): T {
+  return useSyncExternalStore(subscribeToReadState, read, read);
+}
+
 export function useConversationReadState(
   conversationId: string,
   updatedAt: number,

@@ -51,6 +51,15 @@ function state(overrides: Partial<SharingState> = {}): SharingState {
     default_public_sessions: "off",
     default_public_sessions_editable: true,
     default_public_sessions_options: ["off", "sandbox", "all"],
+    peer_session_messaging_enabled: true,
+    peer_session_messaging_editable: true,
+    sibling_session_destinations: "any_host",
+    sibling_session_destinations_editable: true,
+    sibling_session_destinations_options: [
+      "current_host",
+      "current_host_or_new_sandbox",
+      "any_host",
+    ],
     ...overrides,
   };
 }
@@ -121,9 +130,7 @@ describe("SharingPage", () => {
     renderPage();
     await waitFor(() => expect(screen.getByText("On")).toBeInTheDocument());
 
-    expect(screen.getByText(/Control whether users on this server can share sessions/)).toHaveClass(
-      "max-md:hidden",
-    );
+    expect(screen.getByText(/Control sharing server-wide/)).toHaveClass("max-md:hidden");
     for (const testId of ["settings-group-sharing-mode", "settings-group-public-sharing"]) {
       expect(screen.getByTestId(testId).lastElementChild).toHaveClass(
         "rounded-xl",
@@ -133,14 +140,14 @@ describe("SharingPage", () => {
       );
     }
 
-    expect(screen.getByText(/Allow sharing a session with anyone who has the link/)).toHaveClass(
+    expect(screen.getByText(/Anyone with the link can access after signing in/)).toHaveClass(
       "max-md:hidden",
     );
     const help = screen.getByRole("button", { name: "About Public access" });
     expect(help).toHaveClass("md:hidden");
     fireEvent.click(help);
     expect(await screen.findByRole("tooltip")).toHaveTextContent(
-      /Allow sharing a session with anyone who has the link/,
+      /Anyone with the link can access after signing in/,
     );
   });
 
@@ -150,8 +157,7 @@ describe("SharingPage", () => {
     renderPage();
 
     const trigger = await screen.findByRole("combobox", { name: "Session sharing mode" });
-    const description =
-      "New shares are capped at read (view) access. Edit and manage grants are rejected.";
+    const description = "New shares allow Read access only; Edit and Manage grants are rejected.";
     expect(trigger).toHaveTextContent(/^Read only$/);
     expect(trigger).toHaveAccessibleDescription(description);
     expect(screen.getByText(description)).toBeVisible();
@@ -165,14 +171,14 @@ describe("SharingPage", () => {
     for (const [label, optionDescription] of [
       [
         "On",
-        "Anyone with manage access can share a session at any level (read, edit, or manage) and toggle public / workspace read.",
+        "Users with manage access can share at read, edit, or manage level and enable public or workspace read access.",
       ],
       ["Read only", description],
       [
         "Read only (restricted)",
-        "Read-only, and sessions whose working directory is a home directory or the filesystem root cannot be shared at all — not even read.",
+        "Read-only. Sessions in a home directory or the filesystem root cannot be shared.",
       ],
-      ["Off", "Sharing is disabled. No new grants can be created and the Share control is hidden."],
+      ["Off", "Block new shares and hide the Share control."],
     ]) {
       const option = screen.getByRole("option", { name: label });
       expect(option).toHaveAccessibleDescription(optionDescription);
@@ -203,7 +209,7 @@ describe("SharingPage", () => {
     );
     expect(trigger).toHaveTextContent(/^Read only \(restricted\)$/);
     expect(trigger).toHaveAccessibleDescription(
-      "Read-only, and sessions whose working directory is a home directory or the filesystem root cannot be shared at all — not even read.",
+      "Read-only. Sessions in a home directory or the filesystem root cannot be shared.",
     );
   });
 
@@ -243,7 +249,7 @@ describe("SharingPage", () => {
     expect(screen.getByText("Save failed")).toBeInTheDocument();
     expect(trigger).toHaveTextContent(/^On$/);
     expect(trigger).toHaveAccessibleDescription(
-      "Anyone with manage access can share a session at any level (read, edit, or manage) and toggle public / workspace read.",
+      "Users with manage access can share at read, edit, or manage level and enable public or workspace read access.",
     );
   });
 
@@ -329,7 +335,7 @@ describe("SharingPage", () => {
       expect(radios.map((r) => r.value)).toEqual(["sandbox", "all"]);
       expect(radios.find((r) => r.value === "sandbox")!.checked).toBe(true);
       expect(screen.getByRole("radio", { name: "Managed hosts only" })).toBeChecked();
-      expect(screen.getByText(/Sessions on local hosts start private/)).toBeInTheDocument();
+      expect(screen.getByText(/Local sessions start private/)).toBeInTheDocument();
     });
 
     it("hides scope while off and enables managed hosts only by default", async () => {
@@ -442,6 +448,76 @@ describe("SharingPage", () => {
       expect(radios.every((r) => !r.disabled)).toBe(true);
       expect(radios.find((r) => r.value === "all")!.checked).toBe(true);
       expect(screen.queryByText(/to change the default visibility/)).not.toBeInTheDocument();
+    });
+  });
+
+  describe("peer session messaging", () => {
+    const TOGGLE = "Message other sessions";
+
+    it.each([true, false])(
+      "changes messaging independently of sharing mode (enabled=%s)",
+      async (enabled) => {
+        setSharingState(state({ sharing_mode: "off", peer_session_messaging_enabled: enabled }));
+        renderPage();
+        const toggle = await screen.findByRole("switch", { name: TOGGLE });
+        expect(toggle).toBeEnabled();
+        expect(toggle).toHaveAttribute("aria-checked", String(enabled));
+        expect(toggle).toHaveAccessibleDescription(/child-session messaging is unchanged/);
+        fireEvent.click(toggle);
+        expect(setModeMutate).toHaveBeenCalledWith(
+          { peer_session_messaging: !enabled },
+          expect.anything(),
+        );
+      },
+    );
+
+    it.each(["deployment", "pending"])(
+      "disables messaging changes when %s blocks them",
+      async (blocker) => {
+        setSharingState(
+          state({
+            peer_session_messaging_enabled: false,
+            peer_session_messaging_editable: blocker !== "deployment",
+          }),
+        );
+        if (blocker === "pending") {
+          vi.mocked(sharingHook.useSetSharing).mockReturnValue({
+            mutate: setModeMutate,
+            isPending: true,
+          } as unknown as ReturnType<typeof sharingHook.useSetSharing>);
+        }
+        renderPage();
+        const toggle = await screen.findByRole("switch", { name: TOGGLE });
+        expect(toggle).toBeDisabled();
+        expect(toggle).not.toBeChecked();
+        if (blocker === "deployment") {
+          expect(toggle).toHaveAccessibleDescription(/Disabled by this deployment/);
+        }
+        fireEvent.click(toggle);
+        expect(setModeMutate).not.toHaveBeenCalled();
+      },
+    );
+
+    it("hides the control when the server does not support it", async () => {
+      setSharingState(
+        state({
+          peer_session_messaging_enabled: undefined,
+          peer_session_messaging_editable: undefined,
+        }),
+      );
+      renderPage();
+      await screen.findByRole("combobox", { name: "Session sharing mode" });
+      expect(screen.queryByRole("switch", { name: TOGGLE })).not.toBeInTheDocument();
+    });
+
+    it("keeps the saved setting and reports a failed update", async () => {
+      setSharingState(state());
+      setModeMutate.mockImplementation((_update, { onError }) => onError(new Error("Save failed")));
+      renderPage();
+      const toggle = await screen.findByRole("switch", { name: TOGGLE });
+      fireEvent.click(toggle);
+      expect(screen.getByText("Save failed")).toBeInTheDocument();
+      expect(toggle).toBeChecked();
     });
   });
 

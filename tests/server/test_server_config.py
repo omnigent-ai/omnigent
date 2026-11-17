@@ -23,6 +23,7 @@ from omnigent.server.server_config import (
     BRANDING_ASSET_MAX_DIMENSION,
     BRANDING_ASSET_MAX_FRAMES,
     BRANDING_ASSETS_DIRNAME,
+    automation_trigger_poll_minutes,
     branding_config,
     branding_logo_asset,
     config_str_list,
@@ -208,6 +209,18 @@ def test_config_str_list_none_is_empty() -> None:
 
 def test_config_str_list_strips_and_drops_empty() -> None:
     assert config_str_list(["  a@x.com  ", "", "  "]) == ["a@x.com"]
+
+
+@pytest.mark.parametrize("value", [10, 30, 60, 240])
+def test_automation_trigger_poll_minutes(value: int) -> None:
+    assert automation_trigger_poll_minutes({}) == 10
+    assert automation_trigger_poll_minutes({"automation_trigger_poll_minutes": value}) == value
+
+
+@pytest.mark.parametrize("value", [9, 241, 10.5, True, "30", None])
+def test_automation_trigger_poll_minutes_rejects_invalid_values(value: object) -> None:
+    with pytest.raises(ValueError, match="integer from 10 to 240"):
+        automation_trigger_poll_minutes({"automation_trigger_poll_minutes": value})
 
 
 def test_session_title_instructions_accepts_trimmed_string() -> None:

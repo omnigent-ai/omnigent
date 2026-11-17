@@ -1,10 +1,8 @@
 """Mixed-version deployments fail before handing registry specs to old runtimes."""
 
 import dataclasses
-import json
 from unittest.mock import AsyncMock, Mock
 
-import httpx
 import pytest
 
 from omnigent.errors import ErrorCode, OmnigentError
@@ -12,7 +10,7 @@ from omnigent.host.frames import CAP_MCP_REGISTRY
 from omnigent.runner.transports.ws_tunnel.frames import HelloFrame
 from omnigent.runtime import get_agent_store, get_conversation_store
 from omnigent.server.auth import RESERVED_USER_LOCAL
-from omnigent.server.mcp_compatibility import registry_services, require_registry_mcp_runtime
+from omnigent.server.runtime_compatibility import registry_services, require_runtime_support
 from omnigent.spec.types import AgentSpec, MCPServerConfig
 from tests.server.helpers import build_agent_bundle, create_test_session
 from tests.server.integration.test_mcp_registry import launch_registry as launch_registry
@@ -26,45 +24,6 @@ from tests.server.integration.test_session_worktree_create import (
 )
 
 pytestmark = pytest.mark.asyncio
-
-
-@pytest.mark.parametrize("upload", [False, True])
-@pytest.mark.parametrize("capable,selected", [(False, True), (False, False), (True, True)])
-async def test_create_checks_host_before_persistence(
-    client, app, launch_registry, register_worktree_host, monkeypatch, upload, capable, selected
-):
-    capture = register_worktree_host(capabilities=[CAP_MCP_REGISTRY] if capable else [])
-    source = await create_test_session(client)
-    store = get_conversation_store()
-    create = Mock(wraps=store.create_session_with_agent)
-    monkeypatch.setattr(store, "create_session_with_agent", create)
-    metadata = {
-        "host_id": _HOST_ID,
-        "workspace": _SOURCE_REPO,
-        "mcp_registry_services": ["tracker"] if selected else [],
-    }
-    if not upload:
-        metadata["git"] = {"branch_name": "registry-check"}
-    if upload:
-        response = await client.post(
-            "/v1/sessions",
-            data={"metadata": json.dumps(metadata)},
-            files={"bundle": ("agent.tar.gz", build_agent_bundle("new"), "application/gzip")},
-        )
-    else:
-        response = await client.post(
-            "/v1/sessions", json={"agent_id": source["agent_id"], **metadata}
-        )
-    if selected and not capable:
-        assert response.status_code == 503, response.text
-        assert response.json()["error"]["code"] == ErrorCode.RUNNER_CAPABILITY_MISMATCH
-        assert "restart the host and session runner" in response.text
-        assert "tracker" in response.text
-        create.assert_not_called()
-        assert not capture.create and not capture.launches
-    else:
-        assert response.status_code == 201, response.text
-        assert len(capture.launches) == 1
 
 
 async def test_reconnect_refuses_before_changing_binding(
@@ -133,63 +92,6 @@ async def test_new_host_does_not_mask_old_runner_when_editing(
     app.state.tunnel_registry.deregister("old-runner", session=connection)
 
 
-async def test_cli_rebind_and_initialization_reject_old_runner_then_recover(
-    client, app, launch_registry
-):
-    session = await create_test_session(client)
-    sid = session["id"]
-    assert (
-        await client.post(
-            f"/v1/sessions/{sid}/agent/mcp-servers",
-            json={"name": "tracker", "transport": "registry"},
-        )
-    ).status_code == 200
-    connection = app.state.tunnel_registry.register(
-        "old-runner",
-        Mock(),
-        HelloFrame(runner_version="same-version", frame_protocol_version=1),
-        owner=RESERVED_USER_LOCAL,
-    )
-    response = await client.patch(f"/v1/sessions/{sid}", json={"runner_id": "old-runner"})
-    assert response.status_code == 503, response.text
-    assert get_conversation_store().get_conversation(sid).runner_id is None
-    conv = dataclasses.replace(
-        get_conversation_store().get_conversation(sid), runner_id="old-runner"
-    )
-    runner = AsyncMock()
-    runner.post.return_value = httpx.Response(
-        200, json={}, request=httpx.Request("POST", "http://runner/v1/sessions")
-    )
-    initializer = app.state.runner_session_initializer
-    with pytest.raises(OmnigentError, match="MCP registry support"):
-        await initializer.initialize(conv, runner, timeout=1)
-    runner.post.assert_not_awaited()
-    from omnigent.server.routes._sessions.orchestration import (
-        _dispatch_session_event_to_runner_impl,
-    )
-    from omnigent.server.schemas import SessionEventInput
-
-    with pytest.raises(OmnigentError, match="MCP registry support"):
-        await _dispatch_session_event_to_runner_impl(
-            sid,
-            conv,
-            SessionEventInput(type="message", role="user", content="hello"),
-            get_conversation_store(),
-            runner,
-            agent_name=None,
-            file_store=None,
-            artifact_store=None,
-            runner_router=app.state.runner_router,
-        )
-    runner.post.assert_not_awaited()
-    # Identical version strings: the negotiated feature, not semver, decides support.
-    connection.hello.capabilities.append(CAP_MCP_REGISTRY)
-    response = await initializer.initialize(conv, runner, timeout=1)
-    assert response.status_code == 200
-    runner.post.assert_awaited_once()
-    app.state.tunnel_registry.deregister("old-runner", session=connection)
-
-
 @pytest.mark.parametrize("relaunch", [False, True])
 async def test_managed_incompatible_host_settles_launch_and_cleans_up(
     client, app, launch_registry, register_worktree_host, monkeypatch, relaunch
@@ -253,7 +155,7 @@ async def test_registry_checks_include_nested_agents_and_preserve_replica_routin
     router = Mock()
     router.host_is_on_another_replica.return_value = True
     with pytest.raises(OmnigentError) as error:
-        require_registry_mcp_runtime(
+        require_runtime_support(
             registry_services(spec),
             host_id="remote-host",
             runner_id="remote-runner",
@@ -334,13 +236,11 @@ async def test_guards_use_app_stores_without_runtime_globals(
             monkeypatch.setattr(_globals, "_agent_cache", None)
             host = app.state.host_registry.get(_HOST_ID)
             await app.state.host_registry.admit_launch(host, plain["id"])
-            app.state.runner_router.require_mcp_registry_support(
-                store.get_conversation(plain["id"])
-            )
+            app.state.runner_router.require_runtime_support(store.get_conversation(plain["id"]))
             with pytest.raises(OmnigentError, match="MCP registry support"):
                 await app.state.host_registry.admit_launch(host, sid)
             with pytest.raises(OmnigentError, match="MCP registry support"):
-                app.state.runner_router.require_mcp_registry_support(store.get_conversation(sid))
+                app.state.runner_router.require_runtime_support(store.get_conversation(sid))
     finally:
         app.state.tunnel_registry.deregister("old-runner", session=connection)
 

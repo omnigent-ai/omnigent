@@ -1,6 +1,7 @@
 // Tests for the scheduled-task DETAIL page (`/tasks/:taskId`): header + prompt
 // + configuration + run-history rendering from mocked hooks, the header actions
-// (Run now fires the mutation + shows a toast, delete navigates back, edit opens the dialog),
+// (Run now fires the mutation + shows a toast, delete navigates back, edit and
+// share open their dialogs),
 // and the run-row rendering rules: the LEFT status-icon column (failed triangle
 // > skipped calendar-off > running spinner > succeeded-unread brand-accent dot > succeeded-read grey dot),
 // duration, errorCode messages, and the whole-row click affordance (a run with a
@@ -11,11 +12,20 @@
 
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, useLocation, useNavigationType } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
 import { TaskDetailPage } from "./TaskDetailPage";
+import {
+  emptyTriggerFields,
+  encodeTriggerPrompt,
+  renderTriggerPrompt,
+} from "@/components/scheduled/triggerTemplates";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import * as hooks from "@/hooks/useScheduledTasks";
+import { useOptionalLoadedConversations } from "@/hooks/useSidebarData";
+import type * as SidebarDataModule from "@/hooks/useSidebarData";
 import {
   markConversationSeen,
   markConversationUnread,
@@ -24,8 +34,17 @@ import {
 } from "@/hooks/useUnseenConversations";
 import type * as UnseenModule from "@/hooks/useUnseenConversations";
 import { ScheduledTaskApiError } from "@/lib/scheduledTasksApi";
+import type { ServerInfo } from "@/lib/capabilities";
+import { useViewerId } from "@/hooks/useViewerId";
+import type { SharedAutomation } from "@/components/PermissionsModal";
 import type * as RoutingModule from "@/lib/routing";
-import type { ScheduledTask, ScheduledTaskRun } from "@/lib/scheduledTasksApi";
+import type * as SavedWorkflowsModule from "@/hooks/useSavedWorkflows";
+import type {
+  ScheduledTask,
+  ScheduledTaskRun,
+  ScheduledTaskRunSteps,
+} from "@/lib/scheduledTasksApi";
+import { conversation, conversationPage } from "@/test/sidebarMockHelpers";
 
 const navigate = vi.fn();
 let routeParams = { taskId: "st_1" };
@@ -39,15 +58,46 @@ vi.mock("@/lib/routing", async (importOriginal) => {
 });
 
 vi.mock("@/hooks/useScheduledTasks", () => ({
+  scheduledTaskRunsKey: (id: string) => ["scheduled-task-runs", id],
   useScheduledTask: vi.fn(),
   useScheduledTaskRuns: vi.fn(),
+  useScheduledTaskRunSteps: vi.fn(() => new Map()),
   useUpdateScheduledTask: vi.fn(),
   useDeleteScheduledTask: vi.fn(),
   useRunScheduledTaskNow: vi.fn(),
 }));
+vi.mock("@/hooks/useSidebarData", async (importOriginal) => ({
+  ...(await importOriginal<typeof SidebarDataModule>()),
+  useOptionalLoadedConversations: vi.fn(),
+}));
+// The graph has its own tests (React Flow runs out of memory in jsdom); here the
+// full-screen view lists where each task stands.
+vi.mock("@/components/workflows/WorkflowStepsGraph", () => ({
+  WorkflowGraphOverlay: (props: {
+    title: string;
+    progress?: { step: { id: string }; state: string }[];
+    onClose: () => void;
+  }) => (
+    <div data-testid="workflow-graph-overlay" data-title={props.title}>
+      {props.progress?.map((item) => `${item.step.id}:${item.state}`).join(" ")}
+      <button type="button" onClick={props.onClose}>
+        Close graph
+      </button>
+    </div>
+  ),
+}));
 
 const showToast = vi.fn();
 vi.mock("@/components/ui/toast", () => ({ showToast: (...args: unknown[]) => showToast(...args) }));
+
+// A session-based automation names the session copy its runs start from.
+vi.mock("@/hooks/useSession", () => ({
+  useSession: () => ({
+    session: { title: "Weekly rubric copy" },
+    isLoading: false,
+    error: null,
+  }),
+}));
 
 // Agent / host catalogs — return simple lists so labels resolve.
 const defaultAgentCatalog = (_options?: { pinnedAgentIds?: string[] }) => ({
@@ -82,17 +132,62 @@ vi.mock("@/hooks/useUnseenConversations", async (importOriginal) => {
 vi.mock("@/hooks/useNow", () => ({
   useNow: () => new Date("2026-07-27T12:00:00Z"),
 }));
+// A run's workflow button names its workflow from the saved ones.
+vi.mock("@/hooks/useSavedWorkflows", async (importOriginal) => ({
+  ...(await importOriginal<typeof SavedWorkflowsModule>()),
+  useSavedWorkflows: () => ({
+    workflows: [{ id: "9".repeat(32), name: "Triage", description: "" }],
+    isLoading: false,
+    isError: false,
+    refresh: () => undefined,
+  }),
+}));
 
 // Stub the edit dialog to a marker that reports open + the task it edits.
 vi.mock("@/components/scheduled/CreateScheduledTaskDialog", () => ({
   CreateScheduledTaskDialog: ({
     open,
     editingTask,
+    sessionLink,
   }: {
     open: boolean;
     editingTask?: ScheduledTask | null;
+    sessionLink?: string;
   }) =>
-    open ? <div data-testid="edit-dialog-open" data-editing-id={editingTask?.id ?? ""} /> : null,
+    open ? (
+      <div
+        data-testid="edit-dialog-open"
+        data-editing-id={editingTask?.id ?? ""}
+        data-session-link={sessionLink ?? ""}
+      />
+    ) : null,
+}));
+
+// Who is viewing decides whether Share is offered; nobody until a test says so.
+vi.mock("@/hooks/useViewerId", () => ({ useViewerId: vi.fn(() => null) }));
+
+// Stub the share dialog to a marker reporting the automation it shares.
+vi.mock("@/components/PermissionsModal", () => ({
+  PermissionsModal: ({
+    automation,
+    open,
+    onOpenChange,
+  }: {
+    automation?: SharedAutomation;
+    open: boolean;
+    onOpenChange: (open: boolean) => void;
+  }) =>
+    open ? (
+      <div
+        data-testid="share-dialog-open"
+        data-automation-id={automation?.id ?? ""}
+        data-session-mode={automation?.sessionMode ?? ""}
+      >
+        <button type="button" onClick={() => onOpenChange(false)}>
+          Close share
+        </button>
+      </div>
+    ) : null,
 }));
 
 function task(overrides: Partial<ScheduledTask> = {}): ScheduledTask {
@@ -109,6 +204,7 @@ function task(overrides: Partial<ScheduledTask> = {}): ScheduledTask {
     modelOverride: null,
     reasoningEffort: null,
     permissionMode: null,
+    mcpServices: [],
     sessionMode: "new",
     sessionId: null,
     workspace: null,
@@ -135,6 +231,7 @@ function run(overrides: Partial<ScheduledTaskRun> = {}): ScheduledTaskRun {
     firedAt: 1_700_000_000,
     finishedAt: 1_700_000_102,
     errorCode: null,
+    errorDetail: null,
     conversationUpdatedAt: 1_700_000_500,
     conversationStatus: "idle",
     viewerLastSeen: null,
@@ -176,6 +273,8 @@ function setRuns(
 
 beforeEach(() => {
   routeParams = { taskId: "st_1" };
+  vi.mocked(useViewerId).mockReturnValue(null);
+  vi.mocked(useOptionalLoadedConversations).mockReturnValue(undefined);
   useAvailableAgents.mockImplementation(defaultAgentCatalog);
   navigate.mockReset();
   updateMutate.mockReset();
@@ -201,7 +300,20 @@ beforeEach(() => {
 
 afterEach(cleanup);
 
-function pageTree() {
+/** Reports the current search and how the router last got there (push or replace). */
+function LocationProbe() {
+  const location = useLocation();
+  const navigationType = useNavigationType();
+  return (
+    <div
+      data-testid="location-probe"
+      data-search={location.search}
+      data-navigation={navigationType}
+    />
+  );
+}
+
+function pageTree(initialEntries?: string[]) {
   // QueryClient required by other hooks in the tree (useScheduledTask, etc.).
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false, gcTime: 0 } },
@@ -209,8 +321,9 @@ function pageTree() {
   return (
     <QueryClientProvider client={queryClient}>
       <TooltipProvider>
-        <MemoryRouter>
+        <MemoryRouter initialEntries={initialEntries}>
           <TaskDetailPage />
+          <LocationProbe />
         </MemoryRouter>
       </TooltipProvider>
     </QueryClientProvider>
@@ -221,16 +334,97 @@ function renderPage() {
   return render(pageTree());
 }
 
+/** Configuration starts collapsed; expand it to assert on saved launch settings. */
+function openConfiguration() {
+  fireEvent.click(screen.getByRole("button", { name: "Configuration" }));
+}
+
 describe("header, prompt, configuration", () => {
-  it("collapses and reopens configuration while keeping run history visible", () => {
+  it("shows where a session-based automation's runs start and its additional instructions", () => {
+    setTask(task({ prompt: "", sourceSessionId: "conv_copy" }));
+    renderPage();
+
+    const startsFrom = screen.getByTestId("task-detail-starts-from");
+    expect(startsFrom).toHaveAttribute("href", "/c/conv_copy");
+    expect(startsFrom).toHaveTextContent("Weekly rubric copy");
+    expect(screen.getByRole("heading", { name: "Additional instructions" })).toBeVisible();
+    expect(screen.getByTestId("task-detail-prompt")).toHaveTextContent("None");
+  });
+
+  it.each([false, true])(
+    "shows only a trigger's instructions, never its template text (header: %s)",
+    (withHeader) => {
+      const fields = {
+        ...emptyTriggerFields("slack"),
+        scope: "abc",
+        instructions: "Summarize new messages.",
+      };
+      const sessionLink = "https://example.test/c/CONVERSATION_ID";
+      const prompt = withHeader
+        ? encodeTriggerPrompt(
+            {
+              source: "slack",
+              ...fields,
+              worker: {
+                placement: "same_host",
+                agentId: null,
+                model: "",
+                effort: "",
+                permissionMode: "",
+              },
+            },
+            { sessionLink },
+          )
+        : renderTriggerPrompt("slack", fields, { placement: "same_host", sessionLink });
+      setTask(task({ prompt, sessionMode: "continue" }));
+      renderPage();
+      expect(screen.getByRole("heading", { name: "Instructions" })).toBeVisible();
+      expect(screen.getByTestId("task-detail-prompt").textContent).toBe("Summarize new messages.");
+      expect(screen.queryByRole("button", { name: "System prompt" })).not.toBeInTheDocument();
+      expect(screen.queryByText(/This automation watches Slack/)).not.toBeInTheDocument();
+      expect(screen.queryByText(/omnigent-trigger/)).not.toBeInTheDocument();
+    },
+  );
+
+  it.each([
+    [
+      "edited outside the form",
+      "continue",
+      (prompt: string) => prompt.replace("Summarize new messages.", "Do nothing."),
+    ],
+    ["on a task that starts new sessions", "new", (prompt: string) => prompt],
+  ] as const)("shows the full prompt for a header %s", (_case, sessionMode, mutate) => {
+    const prompt = mutate(
+      encodeTriggerPrompt(
+        {
+          source: "slack",
+          ...emptyTriggerFields("slack"),
+          scope: "abc",
+          instructions: "Summarize new messages.",
+          worker: {
+            placement: "same_host",
+            agentId: null,
+            model: "",
+            effort: "",
+            permissionMode: "",
+          },
+        },
+        { sessionLink: "https://example.test/c/CONVERSATION_ID" },
+      ),
+    );
+    setTask(task({ prompt, sessionMode }));
+    renderPage();
+    expect(screen.getByRole("heading", { name: "Prompt" })).toBeVisible();
+    const shown = screen.getByTestId("task-detail-prompt").textContent ?? "";
+    expect(shown).toContain("This automation watches Slack");
+    expect(shown).not.toContain("omnigent-trigger");
+  });
+
+  it("starts with configuration collapsed and toggles it while keeping run history visible", () => {
     setTask(task({ modelOverride: "opus" }));
     setRuns([run({ sessionCostUsd: 1.23 })]);
     renderPage();
     const toggle = screen.getByRole("button", { name: "Configuration" });
-    expect(toggle).toHaveAttribute("aria-expanded", "true");
-    expect(screen.getByTestId("task-detail-model")).toBeVisible();
-
-    fireEvent.click(toggle);
     expect(toggle).toHaveAttribute("aria-expanded", "false");
     expect(screen.queryByTestId("task-detail-model")).not.toBeInTheDocument();
     expect(screen.getByTestId("run-cost")).toBeVisible();
@@ -238,15 +432,22 @@ describe("header, prompt, configuration", () => {
     fireEvent.click(toggle);
     expect(toggle).toHaveAttribute("aria-expanded", "true");
     expect(screen.getByTestId("task-detail-model")).toHaveTextContent("Opus");
+
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByTestId("task-detail-model")).not.toBeInTheDocument();
+    expect(screen.getByTestId("run-cost")).toBeVisible();
   });
 
   it("renders the title, prompt, schedule, and agent/host config", () => {
     setTask(task());
     renderPage();
+    openConfiguration();
     expect(screen.getByTestId("task-detail-title")).toHaveTextContent("Nightly triage");
     expect(screen.getByTestId("task-detail-prompt")).toHaveTextContent(
       "Triage the inbox and summarize.",
     );
+    expect(screen.queryByRole("button", { name: "System prompt" })).not.toBeInTheDocument();
     expect(screen.getByTestId("task-detail-schedule").textContent).toContain("Weekdays at 8:00 AM");
     expect(screen.getByTestId("task-detail-agent")).toHaveTextContent("Polly");
     // Null hostId → resolve-at-fire label, not blank.
@@ -279,6 +480,7 @@ describe("header, prompt, configuration", () => {
       }),
     );
     renderPage();
+    openConfiguration();
     expect(screen.getByTestId("task-detail-model")).toHaveTextContent("Opus");
     expect(screen.getByTestId("task-detail-effort")).toHaveTextContent("High");
     expect(screen.getByTestId("task-detail-permission")).toHaveTextContent("Accept edits");
@@ -304,17 +506,32 @@ describe("header, prompt, configuration", () => {
       }),
     );
     renderPage();
+    openConfiguration();
     expect(screen.getByTestId("task-detail-model")).toHaveTextContent("custom-model");
     expect(screen.getByTestId("task-detail-effort")).toHaveTextContent("xHigh");
     expect(screen.getByTestId("task-detail-permission")).toHaveTextContent("Manual");
     expect(screen.getByTestId("task-detail-project")).toHaveTextContent("missing-project");
   });
 
+  it.each(["running", "succeeded"] as const)(
+    "shows current session approvals for a %s run",
+    (status) => {
+      setTask(task());
+      setRuns([run({ status, conversationId: "conv_approval", conversationPendingApprovals: 2 })]);
+      renderPage();
+      expect(screen.getByTestId("run-pending-approval")).toHaveTextContent(
+        "Session needs approval",
+      );
+      expect(screen.getByTestId("run-open")).toHaveAttribute("href", "/c/conv_approval");
+      expect(screen.queryByTestId("run-status-label")).not.toBeInTheDocument();
+    },
+  );
+
   it.each([
     ["codex-native", "default", "Agent default"],
     ["cursor-native", "default", "Agent default"],
     ["antigravity-native", "default", "Agent default"],
-    ["native-codex", "read-only", "Read only"],
+    ["native-codex", "read-only", "Read Only"],
     ["cursor-native", "auto-review", "Auto-review"],
     ["antigravity-native", "skip", "Skip permissions"],
     ["codex-native", "future-mode", "future-mode"],
@@ -326,6 +543,7 @@ describe("header, prompt, configuration", () => {
     });
     setTask(task({ permissionMode }));
     renderPage();
+    openConfiguration();
     expect(screen.getByTestId("task-detail-permission").textContent).toBe(label);
   });
 
@@ -346,12 +564,14 @@ describe("header, prompt, configuration", () => {
     }));
     setTask(task({ agentId: "ag_1" }));
     renderPage();
+    openConfiguration();
     expect(screen.getByTestId("task-detail-agent")).toHaveTextContent(/^Polly$/);
   });
 
   it("names the sandbox for a task that runs in a new sandbox each time", () => {
     setTask(task({ executionTarget: "managed_sandbox" }));
     renderPage();
+    openConfiguration();
     expect(screen.getByTestId("task-detail-host")).toHaveTextContent("New Sandbox");
     expect(screen.getByTestId("task-detail-workspace")).toHaveTextContent("Sandbox default");
   });
@@ -359,6 +579,7 @@ describe("header, prompt, configuration", () => {
   it("resolves a pinned host id to its name", () => {
     setTask(task({ hostId: "h_1" }));
     renderPage();
+    openConfiguration();
     expect(screen.getByTestId("task-detail-host")).toHaveTextContent("My Laptop");
   });
 
@@ -411,14 +632,38 @@ describe("loading / not-found states", () => {
 });
 
 describe("header actions", () => {
-  it("Run now shows 'Run started' toast on success", () => {
-    runNowMutate.mockImplementation(
-      (_id: string, opts?: { onSuccess?: () => void; onError?: () => void }) => opts?.onSuccess?.(),
+  it.each([{ isLoading: true }, { cached: true }, { isError: true }])(
+    "can trigger before history is ready without highlighting old history: %j",
+    (state) => {
+      setTask(task());
+      setRuns([], state);
+      runNowMutate.mockImplementation(
+        (_id: string, opts?: { onSuccess?: (runId: string) => void }) => opts?.onSuccess?.("new"),
+      );
+      const { rerender, container } = renderPage();
+      const button = screen.getByTestId("task-detail-run-now");
+      expect(button).not.toBeDisabled();
+      fireEvent.click(button);
+      expect(runNowMutate).toHaveBeenCalledOnce();
+
+      const oldRun = run({ id: "old" });
+      setRuns([oldRun]);
+      rerender(pageTree());
+      expect(container.querySelector(".animate-message-highlight")).toBeNull();
+    },
+  );
+
+  it("confirms Run now on an older server without highlighting a guessed row", () => {
+    runNowMutate.mockImplementation((_id: string, opts?: { onSuccess?: (runId: null) => void }) =>
+      opts?.onSuccess?.(null),
     );
     setTask(task());
-    renderPage();
+    const { rerender, container } = renderPage();
     fireEvent.click(screen.getByTestId("task-detail-run-now"));
-    expect(showToast).toHaveBeenCalledWith("Run started");
+    expect(showToast).toHaveBeenCalledWith("Run triggered, it will start shortly");
+    setRuns([run({ id: "unknown" })]);
+    rerender(pageTree());
+    expect(container.querySelector(".animate-message-highlight")).toBeNull();
   });
 
   it("Run now shows error toast on a generic (non-409) failure", () => {
@@ -541,6 +786,106 @@ describe("header actions", () => {
     }
   });
 
+  it.each([
+    { conversationId: null, delay: 0 },
+    { conversationId: "c_new", delay: 30_000 },
+  ])(
+    "briefly highlights a new run with $conversationId after $delay ms",
+    ({ conversationId, delay }) => {
+      vi.useFakeTimers();
+      try {
+        const oldRun = run({ id: "run_old", conversationId: null });
+        setTask(task());
+        setRuns([oldRun]);
+        runNowMutate.mockImplementation(
+          (_id: string, opts?: { onSuccess?: (runId: string) => void }) =>
+            opts?.onSuccess?.("run_new"),
+        );
+        const { rerender, container } = renderPage();
+        const highlighted = () =>
+          container.querySelectorAll<HTMLElement>(".animate-message-highlight");
+        expect(highlighted()).toHaveLength(0);
+        fireEvent.click(screen.getByTestId("task-detail-run-now"));
+        act(() => vi.advanceTimersByTime(delay));
+        expect(highlighted()).toHaveLength(0);
+
+        const newRun = run({ id: "run_new", status: "running", conversationId });
+        const unrelatedRun = run({ id: "scheduled_elsewhere" });
+        setRuns([unrelatedRun, oldRun]);
+        rerender(pageTree());
+        expect(highlighted()).toHaveLength(0);
+        setRuns([unrelatedRun, newRun, oldRun]);
+        rerender(pageTree());
+        expect(highlighted()).toHaveLength(1);
+        expect(screen.getAllByTestId("task-detail-run")[1]).toBe(highlighted()[0]);
+        expect(highlighted()[0]).toHaveStyle({ animationDuration: "3000ms" });
+        const highlightedRow = highlighted()[0];
+
+        act(() => vi.advanceTimersByTime(1_500));
+        setRuns([{ ...newRun, status: "succeeded", conversationId: "c_new" }, oldRun]);
+        rerender(pageTree());
+        expect(highlighted()).toHaveLength(1);
+        expect(highlighted()[0]).toBe(highlightedRow);
+        expect(within(highlightedRow).getByTestId("run-open")).toHaveAttribute("href", "/c/c_new");
+        act(() => vi.advanceTimersByTime(1_500));
+        expect(highlighted()).toHaveLength(0);
+        setRuns([{ ...newRun, status: "succeeded" }, oldRun]);
+        rerender(pageTree());
+        expect(highlighted()).toHaveLength(0);
+
+        // Opening a different task must not carry over the pending highlight.
+        if (delay === 0) {
+          fireEvent.click(screen.getByTestId("task-detail-run-now"));
+          routeParams = { taskId: "st_2" };
+          setTask(task({ id: "st_2" }));
+          setRuns([run({ id: "other_task_run" })]);
+          rerender(pageTree());
+          expect(highlighted()).toHaveLength(0);
+          routeParams = { taskId: "st_1" };
+          setTask(task());
+          setRuns([newRun]);
+          rerender(pageTree());
+          expect(highlighted()).toHaveLength(0);
+        }
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it.each(["expired", "failed retry"])(
+    "does not highlight even a matching run after %s tracking",
+    (reason) => {
+      vi.useFakeTimers();
+      try {
+        setTask(task());
+        setRuns([]);
+        runNowMutate.mockImplementation(
+          (_id: string, opts?: { onSuccess?: (runId: string) => void }) =>
+            opts?.onSuccess?.("run_new"),
+        );
+        const { rerender, container } = renderPage();
+        const button = screen.getByTestId("task-detail-run-now");
+        fireEvent.click(button);
+        act(() => vi.advanceTimersByTime(reason === "expired" ? 120_000 : 30_000));
+        if (reason === "failed retry") {
+          runNowMutate.mockImplementation(
+            (_id: string, opts?: { onError?: (error: Error) => void }) =>
+              opts?.onError?.(new Error("failed")),
+          );
+          fireEvent.click(button);
+          expect(runNowMutate).toHaveBeenCalledTimes(2);
+          expect(showToast).toHaveBeenCalledWith("Couldn't start the run");
+        }
+        setRuns([run({ id: "run_new" })]);
+        rerender(pageTree());
+        expect(container.querySelector(".animate-message-highlight")).toBeNull();
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
   it("toggling the Switch off pauses an active task (update to paused)", () => {
     setTask(task({ state: "active" }));
     renderPage();
@@ -556,20 +901,27 @@ describe("header actions", () => {
     expect(updateMutate).toHaveBeenCalledWith({ id: "st_1", input: { state: "active" } });
   });
 
-  it("delete fires the mutation and navigates back to the list on success", () => {
-    setTask(task());
-    // Make the delete mutation invoke its onSuccess callback synchronously.
-    deleteMutate.mockImplementation((_id: string, opts?: { onSuccess?: () => void }) =>
-      opts?.onSuccess?.(),
-    );
-    renderPage();
-    fireEvent.click(screen.getByTestId("task-detail-delete"));
-    expect(deleteMutate).toHaveBeenCalledWith(
-      "st_1",
-      expect.objectContaining({ onSuccess: expect.any(Function) }),
-    );
-    expect(navigate).toHaveBeenCalledWith("/tasks");
-  });
+  // An automation that starts from a session deletes right away, like any other.
+  it.each([
+    ["", null],
+    [" that starts from a session", "conv_copy"],
+  ])(
+    "delete of an automation%s fires the mutation and navigates back to the list on success",
+    (_kind, sourceSessionId) => {
+      setTask(task({ sourceSessionId }));
+      // Make the delete mutation invoke its onSuccess callback synchronously.
+      deleteMutate.mockImplementation((_id: string, opts?: { onSuccess?: () => void }) =>
+        opts?.onSuccess?.(),
+      );
+      renderPage();
+      fireEvent.click(screen.getByTestId("task-detail-delete"));
+      expect(deleteMutate).toHaveBeenCalledWith(
+        "st_1",
+        expect.objectContaining({ onSuccess: expect.any(Function) }),
+      );
+      expect(navigate).toHaveBeenCalledWith("/tasks");
+    },
+  );
 
   it("edit opens the reused create dialog in edit mode", () => {
     setTask(task());
@@ -577,6 +929,245 @@ describe("header actions", () => {
     expect(screen.queryByTestId("edit-dialog-open")).toBeNull();
     fireEvent.click(screen.getByTestId("task-detail-edit"));
     expect(screen.getByTestId("edit-dialog-open")).toHaveAttribute("data-editing-id", "st_1");
+    // A trigger edit can render a new source's template, whose workers post this link.
+    expect(screen.getByTestId("edit-dialog-open")).toHaveAttribute(
+      "data-session-link",
+      `${window.location.origin}/c/CONVERSATION_ID`,
+    );
+  });
+});
+
+describe("sharing", () => {
+  const sharingInfo: ServerInfo = { ...SERVER_INFO_OFFLINE_FALLBACK, scheduled_task_sharing: true };
+
+  function renderSharingPage(info: ServerInfo, entry = "/tasks/st_1") {
+    setTask(task({ ownerUserId: "alice@example.com", sessionMode: "continue" }));
+    render(<CapabilitiesProvider info={info}>{pageTree([entry])}</CapabilitiesProvider>);
+  }
+
+  it.each([
+    ["the owner", sharingInfo, "alice@example.com", true],
+    ["another user", sharingInfo, "bob@example.com", false],
+    [
+      "a server that cannot share automations",
+      SERVER_INFO_OFFLINE_FALLBACK,
+      "alice@example.com",
+      false,
+    ],
+  ])("offers Share to %s", (_label, info, viewerId, offered) => {
+    vi.mocked(useViewerId).mockReturnValue(viewerId);
+    renderSharingPage(info);
+    expect(screen.queryByTestId("task-detail-share") !== null).toBe(offered);
+  });
+
+  it("opens the share dialog for this automation", () => {
+    vi.mocked(useViewerId).mockReturnValue("alice@example.com");
+    renderSharingPage(sharingInfo);
+    expect(screen.queryByTestId("share-dialog-open")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Share automation" }));
+
+    const dialog = screen.getByTestId("share-dialog-open");
+    expect(dialog).toHaveAttribute("data-automation-id", "st_1");
+    expect(dialog).toHaveAttribute("data-session-mode", "continue");
+    fireEvent.click(screen.getByRole("button", { name: "Close share" }));
+    expect(screen.queryByTestId("share-dialog-open")).toBeNull();
+  });
+
+  it("opens the share dialog from a session's link and replaces the request on close", () => {
+    vi.mocked(useViewerId).mockReturnValue("alice@example.com");
+    renderSharingPage(sharingInfo, "/tasks/st_1?share=1");
+
+    expect(screen.getByTestId("share-dialog-open")).toHaveAttribute("data-automation-id", "st_1");
+    fireEvent.click(screen.getByRole("button", { name: "Close share" }));
+    expect(screen.queryByTestId("share-dialog-open")).toBeNull();
+    // Replaced, not pushed: Back leaves the page instead of reopening the dialog.
+    const probe = screen.getByTestId("location-probe");
+    expect(probe).toHaveAttribute("data-search", "");
+    expect(probe).toHaveAttribute("data-navigation", "REPLACE");
+  });
+
+  it.each([
+    ["the viewer cannot share", sharingInfo, "bob@example.com"],
+    ["sharing is off", { ...sharingInfo, sharing_mode: "off" as const }, "alice@example.com"],
+  ])("ignores the link's request when %s", (_label, info, viewerId) => {
+    vi.mocked(useViewerId).mockReturnValue(viewerId);
+    renderSharingPage(info, "/tasks/st_1?share=1");
+    expect(screen.queryByTestId("share-dialog-open")).toBeNull();
+  });
+
+  it("disables Share with the session Share's reason while sharing is off", () => {
+    vi.mocked(useViewerId).mockReturnValue("alice@example.com");
+    renderSharingPage({ ...sharingInfo, sharing_mode: "off" });
+
+    const share = screen.getByRole("button", { name: "Share automation" });
+    expect(share).toBeDisabled();
+    expect(
+      screen.getByLabelText(
+        "Share automation disabled: Sharing has been disabled for this Omnigent server.",
+      ),
+    ).toContainElement(share);
+    fireEvent.click(share);
+    expect(screen.queryByTestId("share-dialog-open")).toBeNull();
+  });
+});
+
+describe("an automation shared with the viewer", () => {
+  const sharingInfo: ServerInfo = {
+    ...SERVER_INFO_OFFLINE_FALLBACK,
+    scheduled_task_sharing: true,
+    features: { workflows: true },
+  };
+  const sharedTask = (overrides: Partial<ScheduledTask> = {}) =>
+    task({
+      ownerUserId: "alice@example.com",
+      viewerRole: "viewer",
+      ownerDisplayName: "Alice",
+      hostId: "h_owner",
+      projectId: "proj_owner",
+      ...overrides,
+    });
+
+  function renderShared(data: ScheduledTask, entry = "/tasks/st_1") {
+    vi.mocked(useViewerId).mockReturnValue("bob@example.com");
+    setTask(data);
+    render(<CapabilitiesProvider info={sharingInfo}>{pageTree([entry])}</CapabilitiesProvider>);
+  }
+
+  it("names its owner and shows every change disabled with why", () => {
+    renderShared(sharedTask(), "/tasks/st_1?share=1");
+    expect(screen.getByTestId("task-detail-owner")).toHaveTextContent("Shared by Alice");
+    const controls: [string, string][] = [
+      ["Share automation", "Only the automation's owner can share it."],
+      ["Edit automation", "Only the automation's owner can edit it."],
+      ["Delete automation", "Only the automation's owner can delete it."],
+      ["Run now", "Only the automation's owner can run it."],
+      ["Pause automation", "Only the automation's owner can pause it."],
+    ];
+    for (const [label, reason] of controls) {
+      const wrapper = screen.getByRole("group", { name: label });
+      expect(wrapper).toHaveAttribute("aria-disabled", "true");
+      const control = within(wrapper).getByRole(label === "Pause automation" ? "switch" : "button");
+      expect(control).toBeDisabled();
+      fireEvent.click(control);
+      fireEvent.focus(wrapper);
+      expect(screen.getByRole("tooltip")).toHaveTextContent(reason);
+      fireEvent.blur(wrapper);
+    }
+    expect(updateMutate).not.toHaveBeenCalled();
+    expect(deleteMutate).not.toHaveBeenCalled();
+    expect(runNowMutate).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("edit-dialog-open")).toBeNull();
+    // A share link the owner would follow opens nothing for a viewer.
+    expect(screen.queryByTestId("share-dialog-open")).toBeNull();
+  });
+
+  it("says Resume on a paused automation", () => {
+    renderShared(sharedTask({ state: "paused" }));
+    expect(screen.getByRole("group", { name: "Resume automation" })).toHaveAttribute(
+      "aria-disabled",
+      "true",
+    );
+  });
+
+  it("keeps the owner's host, project and source session private", () => {
+    renderShared(sharedTask({ sourceSessionId: "conv_copy" }));
+    expect(screen.getByTestId("task-detail-starts-from")).toHaveTextContent(
+      "Each run starts with a copy of a session the owner chose.",
+    );
+    expect(screen.queryByRole("link", { name: "Weekly rubric copy" })).toBeNull();
+    openConfiguration();
+    expect(screen.getByTestId("task-detail-host")).toHaveTextContent("The owner's host");
+    expect(screen.queryByTestId("task-detail-project")).toBeNull();
+  });
+
+  it("lists each run's outcome without its session's data or tasks", () => {
+    const steps: ScheduledTaskRunSteps = {
+      runId: "run_1",
+      planId: "plan_1",
+      planGraphRevision: "graph-0",
+      isCurrent: true,
+      workflowId: "9".repeat(32),
+      planName: "Triage",
+      steps: [
+        { id: "explore", name: "Explore", goal: null, depends_on: [] },
+        { id: "fix", name: "Fix", goal: null, depends_on: ["explore"] },
+      ],
+      statuses: [],
+    };
+    // The server leaves every session field of a viewer's runs empty.
+    const withoutSession = {
+      conversationUpdatedAt: null,
+      conversationStatus: null,
+      viewerLastSeen: null,
+      viewerUnread: null,
+      sessionCostUsd: null,
+      conversationPendingApprovals: 0,
+      errorDetail: null,
+    };
+    setRuns([
+      run({ id: "run_1", conversationId: "c_9", ...withoutSession }),
+      run({
+        id: "run_2",
+        status: "failed",
+        errorCode: "runner_start_failed",
+        conversationId: "c_7",
+        ...withoutSession,
+      }),
+      run({ id: "run_3", status: "skipped", errorCode: "no_online_host", ...withoutSession }),
+    ]);
+    // Even a session the viewer flagged unread shows no dot on its run.
+    markConversationUnread("c_9", 1_700_000_500);
+    vi.mocked(hooks.useScheduledTaskRunSteps).mockReturnValue(new Map([["run_1", steps]]));
+    renderShared(sharedTask());
+
+    expect(hooks.useScheduledTaskRunSteps).toHaveBeenLastCalledWith(
+      "st_1",
+      expect.any(Array),
+      false,
+    );
+    const [succeeded, failed, skipped] = screen.getAllByTestId("task-detail-run");
+    expect(within(succeeded!).getByTestId("run-open")).toHaveAttribute("href", "/c/c_9");
+    expect(succeeded).toHaveAttribute("data-run-unread", "false");
+    expect(within(succeeded!).getByTestId("run-status-dot")).toHaveAttribute(
+      "data-run-icon",
+      "read",
+    );
+    expect(within(failed!).getByTestId("run-open")).toHaveAttribute("href", "/c/c_7");
+    expect(within(failed!).getByTestId("run-failure")).toHaveTextContent(
+      "Runner · The agent didn't start.",
+    );
+    expect(within(skipped!).getByTestId("run-failure")).toHaveTextContent(
+      "Host · None of your hosts was online.",
+    );
+    for (const testId of [
+      "run-cost",
+      "run-pending-approval",
+      "run-failure-detail",
+      "run-status-label",
+      "tasks-progress-segment",
+      "run-graph-button",
+    ]) {
+      expect(screen.queryByTestId(testId)).toBeNull();
+    }
+    expect(screen.queryByText(/Session cost is each session/)).toBeNull();
+
+    // The owner's same row shows its tasks and their controls.
+    cleanup();
+    vi.mocked(useViewerId).mockReturnValue("alice@example.com");
+    setTask(sharedTask({ viewerRole: "owner", ownerDisplayName: null }));
+    setRuns([run({ id: "run_1", status: "succeeded", conversationId: "c_9" })]);
+    render(<CapabilitiesProvider info={sharingInfo}>{pageTree()}</CapabilitiesProvider>);
+    expect(hooks.useScheduledTaskRunSteps).toHaveBeenLastCalledWith(
+      "st_1",
+      expect.any(Array),
+      true,
+    );
+    const ownersRow = screen.getByTestId("task-detail-run");
+    expect(within(ownersRow).getAllByTestId("tasks-progress-segment")).toHaveLength(2);
+    expect(within(ownersRow).getByTestId("plan-continue")).toBeInTheDocument();
+    expect(within(ownersRow).getByTestId("run-workflow-button")).toBeInTheDocument();
+    expect(screen.queryByTestId("task-detail-owner")).toBeNull();
   });
 });
 
@@ -801,6 +1392,28 @@ describe("run history", () => {
     expect(within(row).getByTestId("run-failure")).toHaveTextContent(
       "Runner · The agent didn't start.",
     );
+    // A run that recorded no failure detail shows no detail line.
+    expect(within(row).queryByTestId("run-failure-detail")).toBeNull();
+  });
+
+  it("shows a failed run's detail under its reason", () => {
+    setTask(task());
+    setRuns([
+      run({
+        status: "failed",
+        errorCode: "sandbox_registration_timeout",
+        errorDetail: "the sandbox did not register within 720 seconds — refresh your credentials",
+        conversationId: "c_7",
+      }),
+    ]);
+    renderPage();
+    const row = screen.getByTestId("task-detail-run");
+    expect(within(row).getByTestId("run-failure")).toHaveTextContent(
+      "Sandbox · The sandbox didn't connect in time.",
+    );
+    expect(within(row).getByTestId("run-failure-detail")).toHaveTextContent(
+      "the sandbox did not register within 720 seconds — refresh your credentials",
+    );
   });
 
   it("labels a run that hasn't started yet as Queued", () => {
@@ -874,6 +1487,36 @@ describe("run history", () => {
     // Tooltip reads "Running".
     fireEvent.focus(icon);
     await waitFor(() => expect(screen.getAllByText("Running").length).toBeGreaterThan(0));
+  });
+
+  it("keeps spinning for a SUCCEEDED run whose session is still running", async () => {
+    setTask(task());
+    setRuns([
+      run({ status: "succeeded", conversationId: "conv_live", conversationStatus: "running" }),
+    ]);
+    renderPage();
+    const row = screen.getByTestId("task-detail-run");
+    const icon = within(row).getByTestId("run-status-icon");
+    expect(icon).toHaveAttribute("data-run-icon", "session-running");
+    expect(icon.getAttribute("class") ?? "").toContain("animate-spin");
+    expect(within(row).queryByTestId("run-status-dot")).toBeNull();
+    expect(within(row).getByTestId("run-status-label")).toHaveTextContent("Session running");
+    fireEvent.focus(icon);
+    await waitFor(() =>
+      expect(screen.getAllByText("Session still running").length).toBeGreaterThan(0),
+    );
+  });
+
+  it("shows Completed once the succeeded run's session is idle", () => {
+    setTask(task());
+    setRuns([
+      run({ status: "succeeded", conversationId: "conv_done", conversationStatus: "idle" }),
+    ]);
+    renderPage();
+    const row = screen.getByTestId("task-detail-run");
+    expect(within(row).queryByTestId("run-status-icon")).toBeNull();
+    expect(within(row).queryByTestId("run-status-label")).toBeNull();
+    expect(within(row).getByTestId("run-status-dot")).toHaveAttribute("data-run-icon", "read");
   });
 
   it("a RUNNING run with a conversationId renders a clickable link", () => {
@@ -1031,5 +1674,345 @@ describe("auto-mark runs unread", () => {
     rerender(pageTree());
 
     expect(seedRunUnreadBaseline).not.toHaveBeenCalled();
+  });
+});
+
+it.each(["continue", "new"] as const)(
+  "keeps manual controls for new-session template prompts: %s",
+  (sessionMode) => {
+    setTask(
+      task({
+        prompt: "This automation watches Jira and starts one Omnigent session",
+        rrule: "FREQ=MINUTELY;INTERVAL=10",
+        sessionMode,
+        nextRunAt: "2026-03-10T14:00:00Z",
+      }),
+    );
+    render(
+      <CapabilitiesProvider
+        info={{
+          ...SERVER_INFO_OFFLINE_FALLBACK,
+          features: { automations_v2: true },
+        }}
+      >
+        {pageTree()}
+      </CapabilitiesProvider>,
+    );
+    const schedule = screen.getByTestId("task-detail-schedule");
+    if (sessionMode === "continue") {
+      expect(schedule).toHaveTextContent("Runs when new items match");
+      expect(schedule).not.toHaveTextContent("Every 10 minutes");
+      expect(schedule).not.toHaveTextContent("Next run");
+      expect(screen.queryByTestId("task-detail-run-now")).not.toBeInTheDocument();
+    } else {
+      expect(schedule).toHaveTextContent("Every 10 minutes");
+      expect(schedule).toHaveTextContent("Next run");
+      expect(screen.getByTestId("task-detail-run-now")).toBeInTheDocument();
+    }
+  },
+);
+
+describe("runs of a saved workflow", () => {
+  const WORKFLOW_PROMPT = `/workflow Run the saved workflow "Triage" (ID ${"9".repeat(32)}).`;
+  const STEPS: ScheduledTaskRunSteps = {
+    runId: "run_1",
+    planId: "plan_1",
+    planGraphRevision: "graph-0",
+    isCurrent: true,
+    workflowId: "9".repeat(32),
+    planName: "Triage",
+    steps: [
+      { id: "explore", name: "Explore", goal: null, depends_on: [] },
+      { id: "fix", name: "Fix", goal: null, depends_on: ["explore"] },
+    ],
+    statuses: [
+      {
+        id: "s1",
+        position: 1,
+        created_at: 1_700_000_100,
+        scheduled_task_run_id: "run_1",
+        step: "explore",
+        author: { type: "agent" },
+        kind: "status",
+        content: { status: "done", text: "Found it", graph_revision: "graph-0" },
+      },
+    ],
+  };
+
+  beforeEach(() => {
+    vi.mocked(hooks.useScheduledTaskRunSteps).mockReturnValue(new Map());
+  });
+
+  it.each([false, true])("shows each run's tasks and graph (trigger header=%s)", (header) => {
+    const prompt = header
+      ? encodeTriggerPrompt(
+          {
+            ...emptyTriggerFields("github"),
+            source: "github",
+            scope: "example/project",
+            instructions: WORKFLOW_PROMPT,
+            worker: {
+              placement: "same_host",
+              agentId: null,
+              model: "",
+              effort: "",
+              permissionMode: "",
+            },
+          },
+          { sessionLink: "https://example.test/c/CONVERSATION_ID" },
+        )
+      : WORKFLOW_PROMPT;
+    setTask(task({ prompt }));
+    const completedRun = run({ id: "run_1", status: "succeeded", conversationId: "c_9" });
+    setRuns([completedRun]);
+    vi.mocked(hooks.useScheduledTaskRunSteps).mockReturnValue(new Map([["run_1", STEPS]]));
+    const renderWorkflowPage = () => (
+      <CapabilitiesProvider
+        info={{ ...SERVER_INFO_OFFLINE_FALLBACK, features: { workflows: true } }}
+      >
+        {pageTree()}
+      </CapabilitiesProvider>
+    );
+    const { rerender } = render(renderWorkflowPage());
+
+    expect(screen.getByRole("heading", { name: "Runs" })).toBeInTheDocument();
+    expect(hooks.useScheduledTaskRunSteps).toHaveBeenLastCalledWith(
+      "st_1",
+      expect.any(Array),
+      true,
+    );
+    const row = screen.getByTestId("task-detail-run");
+    // The row still opens its session.
+    expect(within(row).getByTestId("run-open")).toHaveAttribute("href", "/c/c_9");
+    const segments = within(row).getAllByTestId("tasks-progress-segment");
+    expect(segments.map((segment) => segment.getAttribute("aria-label"))).toEqual([
+      "Task 1, Explore: Done",
+      "Task 2, Fix: Ready",
+    ]);
+    // Its session went idle with Fix still to do, so the row can continue the plan.
+    expect(within(row).getByRole("button", { name: "Continue the plan" })).toBeInTheDocument();
+
+    fireEvent.click(within(row).getByTestId("run-graph-button"));
+    const overlay = screen.getByTestId("workflow-graph-overlay");
+    expect(overlay).toHaveAttribute("data-title", "Triage");
+    expect(overlay).toHaveTextContent("explore:done fix:ready");
+    fireEvent.click(within(overlay).getByRole("button", { name: "Close graph" }));
+    expect(screen.queryByTestId("workflow-graph-overlay")).toBeNull();
+
+    vi.mocked(hooks.useScheduledTaskRunSteps).mockReturnValue(
+      new Map([
+        [
+          "run_1",
+          {
+            ...STEPS,
+            statuses: [
+              ...STEPS.statuses,
+              {
+                ...STEPS.statuses[0]!,
+                id: "s2",
+                position: 2,
+                step: "fix",
+                content: { status: "started", text: "Working" },
+              },
+            ],
+          },
+        ],
+      ]),
+    );
+    for (const activity of [{ background_work_running: true }, { status: "running" as const }]) {
+      setRuns([completedRun]);
+      vi.mocked(useOptionalLoadedConversations).mockReturnValue({
+        ...conversationPage([conversation("c_9", activity)]).data!,
+        pageParams: [undefined],
+      });
+      rerender(renderWorkflowPage());
+      expect(within(row).getByRole("button", { name: "Stop" })).toBeInTheDocument();
+      expect(within(row).getAllByTestId("tasks-progress-segment")[1]).toHaveAttribute(
+        "aria-label",
+        "Task 2, Fix: Running",
+      );
+      fireEvent.click(within(row).getByTestId("run-graph-button"));
+      expect(screen.getByTestId("workflow-graph-overlay")).toHaveTextContent("fix:running");
+
+      // The sidebar settles before the next run-list refresh.
+      setRuns([{ ...completedRun, conversationStatus: "running" }]);
+      vi.mocked(useOptionalLoadedConversations).mockReturnValue({
+        ...conversationPage([conversation("c_9")]).data!,
+        pageParams: [undefined],
+      });
+      rerender(renderWorkflowPage());
+      expect(within(row).getByRole("button", { name: "Continue the plan" })).toBeInTheDocument();
+      expect(screen.getByTestId("workflow-graph-overlay")).toHaveTextContent("fix:stopped");
+      fireEvent.click(screen.getByRole("button", { name: "Close graph" }));
+    }
+
+    // A final result can finish the workflow without filling in every earlier status.
+    vi.mocked(hooks.useScheduledTaskRunSteps).mockReturnValue(
+      new Map([["run_1", { ...STEPS, statuses: [{ ...STEPS.statuses[0]!, step: "fix" }] }]]),
+    );
+    rerender(renderWorkflowPage());
+    expect(within(row).queryByTestId("plan-continue")).toBeNull();
+    expect(within(row).queryByTestId("plan-stop")).toBeNull();
+
+    vi.mocked(useOptionalLoadedConversations).mockReturnValue({
+      ...conversationPage([conversation("c_9", { background_work_running: true })]).data!,
+      pageParams: [undefined],
+    });
+    rerender(renderWorkflowPage());
+    expect(within(row).queryByTestId("plan-continue")).toBeNull();
+    expect(within(row).queryByTestId("plan-stop")).toBeNull();
+
+    vi.mocked(hooks.useScheduledTaskRunSteps).mockReturnValue(
+      new Map([
+        [
+          "run_1",
+          {
+            ...STEPS,
+            planGraphRevision: undefined,
+            statuses: [STEPS.statuses[0]!, { ...STEPS.statuses[0]!, id: "s2", step: "fix" }],
+          },
+        ],
+      ]),
+    );
+    rerender(renderWorkflowPage());
+    expect(within(row).getByRole("button", { name: "Stop" })).toBeInTheDocument();
+  });
+
+  it.each([false, true])(
+    "keeps earlier continuations read-only (completed=%s)",
+    async (completed) => {
+      setTask(task({ prompt: WORKFLOW_PROMPT }));
+      setRuns([
+        run({
+          id: "run_1",
+          status: "succeeded",
+          conversationId: "c_9",
+          conversationStatus: "running",
+        }),
+        run({
+          id: "run_2",
+          status: "running",
+          conversationId: "c_9",
+          conversationStatus: "running",
+        }),
+      ]);
+      const historical = {
+        ...STEPS,
+        isCurrent: false,
+        statuses: completed
+          ? [...STEPS.statuses, { ...STEPS.statuses[0]!, id: "s2", step: "fix" }]
+          : [{ ...STEPS.statuses[0]!, content: { status: "started", text: "Working" } }],
+      };
+      vi.mocked(hooks.useScheduledTaskRunSteps).mockReturnValue(
+        new Map([
+          ["run_1", historical],
+          ["run_2", { ...STEPS, runId: "run_2" }],
+        ]),
+      );
+      vi.mocked(useOptionalLoadedConversations).mockReturnValue({
+        ...conversationPage([conversation("c_9", { background_work_running: true })]).data!,
+        pageParams: [undefined],
+      });
+      render(
+        <CapabilitiesProvider
+          info={{ ...SERVER_INFO_OFFLINE_FALLBACK, features: { workflows: true } }}
+        >
+          {pageTree()}
+        </CapabilitiesProvider>,
+      );
+      const [old, current] = screen.getAllByTestId("task-detail-run");
+      expect(within(old!).queryByTestId("plan-stop")).toBeNull();
+      expect(within(old!).queryByTestId("plan-continue")).toBeNull();
+      expect(within(old!).queryByTestId("run-status-label")).toBeNull();
+      expect(within(current!).getByRole("button", { name: "Stop" })).toBeInTheDocument();
+      fireEvent.focus(within(old!).getAllByTestId("tasks-progress-segment")[0]!);
+      expect(await screen.findByTestId("tasks-progress-card")).toHaveTextContent("Explore");
+      expect(screen.queryByTestId("tasks-progress-menu")).toBeNull();
+      fireEvent.click(within(old!).getByTestId("run-graph-button"));
+      expect(screen.getByTestId("workflow-graph-overlay")).toHaveTextContent(
+        `explore:${completed ? "done" : "stopped"}`,
+      );
+    },
+  );
+
+  it("opens the run's workflow left of the graph button, with the Workflows page on", () => {
+    setTask(task({ prompt: WORKFLOW_PROMPT }));
+    setRuns([run({ id: "run_1", status: "succeeded", conversationId: "c_9" })]);
+    const renderRun = (steps: ScheduledTaskRunSteps, workflowsPage: boolean) => {
+      vi.mocked(hooks.useScheduledTaskRunSteps).mockReturnValue(new Map([["run_1", steps]]));
+      return render(
+        <CapabilitiesProvider
+          info={{ ...SERVER_INFO_OFFLINE_FALLBACK, features: { workflows: workflowsPage } }}
+        >
+          {pageTree()}
+        </CapabilitiesProvider>,
+      );
+    };
+
+    renderRun(STEPS, true);
+    const row = screen.getByTestId("task-detail-run");
+    const link = within(row).getByRole("link", { name: "Open workflow “Triage”" });
+    expect(link).toHaveAttribute("href", `/workflows/${"9".repeat(32)}`);
+    expect(link.nextElementSibling).toBe(within(row).getByTestId("run-graph-button"));
+    cleanup();
+
+    // Not without the Workflows page, nor for a run whose plan names no workflow.
+    renderRun(STEPS, false);
+    expect(screen.queryByTestId("run-graph-button")).toBeNull();
+    expect(screen.queryByTestId("run-workflow-button")).toBeNull();
+    expect(screen.queryByTestId("tasks-progress-segment")).toBeNull();
+    expect(hooks.useScheduledTaskRunSteps).toHaveBeenLastCalledWith(
+      "st_1",
+      expect.any(Array),
+      false,
+    );
+    cleanup();
+    renderRun({ ...STEPS, workflowId: null }, true);
+    expect(screen.getByTestId("run-graph-button")).toBeInTheDocument();
+    expect(screen.queryByTestId("run-workflow-button")).toBeNull();
+  });
+
+  it("asks for no plans when the server disables workflows", () => {
+    setTask(task());
+    setRuns([run({ id: "run_1", status: "succeeded", conversationId: "c_9" })]);
+    renderPage();
+
+    expect(hooks.useScheduledTaskRunSteps).toHaveBeenLastCalledWith(
+      "st_1",
+      expect.any(Array),
+      false,
+    );
+    expect(screen.queryByTestId("tasks-progress-segment")).toBeNull();
+    expect(screen.queryByTestId("run-graph-button")).toBeNull();
+  });
+
+  it.each([
+    "Summarize the new issues.",
+    `/workflow Run the saved workflow "Weekly report" (ID ${"8".repeat(32)}).`,
+  ])("keeps recorded workflow history after editing the prompt to %s", (prompt) => {
+    setTask(task({ prompt }));
+    setRuns([run({ id: "run_1", status: "succeeded", conversationId: "c_9" })]);
+    vi.mocked(hooks.useScheduledTaskRunSteps).mockReturnValue(new Map([["run_1", STEPS]]));
+    render(
+      <CapabilitiesProvider
+        info={{ ...SERVER_INFO_OFFLINE_FALLBACK, features: { workflows: true } }}
+      >
+        {pageTree()}
+      </CapabilitiesProvider>,
+    );
+
+    expect(hooks.useScheduledTaskRunSteps).toHaveBeenLastCalledWith(
+      "st_1",
+      expect.any(Array),
+      true,
+    );
+    const row = screen.getByTestId("task-detail-run");
+    expect(within(row).getAllByTestId("tasks-progress-segment")).toHaveLength(2);
+    expect(within(row).getByRole("link", { name: "Open workflow “Triage”" })).toHaveAttribute(
+      "href",
+      `/workflows/${"9".repeat(32)}`,
+    );
+    fireEvent.click(within(row).getByTestId("run-graph-button"));
+    expect(screen.getByTestId("workflow-graph-overlay")).toHaveAttribute("data-title", "Triage");
   });
 });

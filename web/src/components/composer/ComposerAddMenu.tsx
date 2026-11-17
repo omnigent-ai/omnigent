@@ -6,6 +6,7 @@ import {
   PaperclipIcon,
   PlusIcon,
   TargetIcon,
+  WorkflowIcon,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
@@ -14,8 +15,11 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { WorkflowPicker } from "@/components/composer/WorkflowPicker";
+import type { SavedWorkflow, WorkflowPagination } from "@/hooks/useSavedWorkflows";
 
 const EMPTY_PROJECTS: readonly { name: string }[] = [];
+const EMPTY_WORKFLOWS: readonly SavedWorkflow[] = [];
 
 function ActionText({ label, description }: { label: string; description: string }) {
   // A description that doesn't fit beside the label wraps onto the clipped
@@ -45,6 +49,11 @@ export function ComposerAddMenu({
   onPlan,
   planActive,
   onSideChat,
+  onWorkflow,
+  savedWorkflows = EMPTY_WORKFLOWS,
+  workflowPagination,
+  onRunSavedWorkflow,
+  onOpen,
   projects = EMPTY_PROJECTS,
   onProjectSelect,
 }: {
@@ -66,12 +75,24 @@ export function ComposerAddMenu({
   /** Start a new side chat (a fork of this conversation opened as a rail tab).
    *  Absent when the session can't host one. */
   onSideChat?: () => void;
+  /** Open the "Run a workflow" dialog, once the menu has closed, with an optional
+   *  description to start from. Absent when the agent has no `workflow` skill. */
+  onWorkflow?: (description?: string) => void;
+  /** The user's saved workflows; when there are some, Run a workflow lists them. */
+  savedWorkflows?: readonly SavedWorkflow[];
+  workflowPagination?: WorkflowPagination;
+  /** Open the dialog that runs a saved workflow, once the menu has closed. */
+  onRunSavedWorkflow?: (workflow: SavedWorkflow) => void;
+  /** Called as the menu opens, e.g. to refresh the saved workflows. */
+  onOpen?: () => void;
   projects?: readonly { name: string }[];
   onProjectSelect?: (name: string) => void;
 }) {
   const [open, setOpen] = useState(false);
   const [showProjects, setShowProjects] = useState(false);
-  const pendingGoalRef = useRef(false);
+  const [showWorkflows, setShowWorkflows] = useState(false);
+  const listsSavedWorkflows = savedWorkflows.length > 0 && onRunSavedWorkflow !== undefined;
+  const pendingActionRef = useRef<(() => void) | null>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const [geometry, setGeometry] = useState({ width: 456, alignOffset: 0, sideOffset: 6 });
   const measure = useCallback(() => {
@@ -103,8 +124,13 @@ export function ComposerAddMenu({
     <DropdownMenu
       open={open}
       onOpenChange={(nextOpen) => {
-        if (nextOpen) measure();
-        else setShowProjects(false);
+        if (nextOpen) {
+          measure();
+          onOpen?.();
+        } else {
+          setShowProjects(false);
+          setShowWorkflows(false);
+        }
         setOpen(nextOpen);
       }}
     >
@@ -117,6 +143,7 @@ export function ComposerAddMenu({
           className="size-8 mobile-touch-target rounded-lg data-[state=open]:bg-muted data-[state=open]:text-foreground md:size-7"
           disabled={disabled}
           aria-label="Add"
+          data-composer-action="add"
           title="Add"
           data-testid={`${testIdPrefix}-attach`}
           componentId={`${testIdPrefix}.add_menu`}
@@ -130,9 +157,10 @@ export function ComposerAddMenu({
       </DropdownMenuTrigger>
       <DropdownMenuContent
         onCloseAutoFocus={() => {
-          if (pendingGoalRef.current) {
-            pendingGoalRef.current = false;
-            requestAnimationFrame(() => onGoal?.());
+          const action = pendingActionRef.current;
+          pendingActionRef.current = null;
+          if (action !== null) {
+            requestAnimationFrame(action);
           }
         }}
         side="top"
@@ -141,7 +169,7 @@ export function ComposerAddMenu({
         sideOffset={geometry.sideOffset}
         collisionPadding={12}
         aria-label="Add"
-        className="composer-add-menu max-w-[calc(100vw-24px)] rounded-[16px]"
+        className="composer-add-menu max-w-[calc(100vw-24px)] rounded-[16px] max-md:p-1.5"
         style={{ width: geometry.width }}
         data-testid={`${testIdPrefix}-add-menu`}
       >
@@ -168,6 +196,17 @@ export function ComposerAddMenu({
               </DropdownMenuItem>
             ))}
           </div>
+        ) : showWorkflows ? (
+          <WorkflowPicker
+            workflows={savedWorkflows}
+            pagination={workflowPagination}
+            onSelect={(workflow) => {
+              pendingActionRef.current = () => onRunSavedWorkflow?.(workflow);
+            }}
+            onDescribe={(description) => {
+              pendingActionRef.current = () => onWorkflow?.(description);
+            }}
+          />
         ) : (
           <div className="flex flex-col gap-3">
             <div className="flex flex-col gap-0.5">
@@ -183,7 +222,7 @@ export function ComposerAddMenu({
                 <span>Files and images</span>
               </DropdownMenuItem>
             </div>
-            {(showGoal || showPlan || onProjectSelect || onSideChat) && (
+            {(showGoal || showPlan || onProjectSelect || onSideChat || onWorkflow) && (
               <div className="flex flex-col gap-0.5">
                 <div className="px-2 py-1 text-xs leading-4 text-muted-foreground">Session</div>
                 <div className="flex flex-col gap-px">
@@ -191,7 +230,9 @@ export function ComposerAddMenu({
                     <DropdownMenuItem
                       className="mobile-touch-target"
                       data-testid="composer-side-chat-action"
-                      onSelect={onSideChat}
+                      onSelect={() => {
+                        pendingActionRef.current = onSideChat;
+                      }}
                     >
                       <span className="flex size-4 shrink-0 items-center justify-center">
                         <MessagesSquareIcon className="size-3.5" />
@@ -199,6 +240,32 @@ export function ComposerAddMenu({
                       <ActionText
                         label="Start a new side chat"
                         description="Ask without affecting this conversation"
+                      />
+                    </DropdownMenuItem>
+                  )}
+                  {onWorkflow && (
+                    <DropdownMenuItem
+                      className="mobile-touch-target"
+                      data-testid="composer-workflow-action"
+                      onSelect={(event) => {
+                        if (listsSavedWorkflows) {
+                          event.preventDefault();
+                          setShowWorkflows(true);
+                          return;
+                        }
+                        pendingActionRef.current = () => onWorkflow();
+                      }}
+                    >
+                      <span className="flex size-4 shrink-0 items-center justify-center">
+                        <WorkflowIcon className="size-3.5" />
+                      </span>
+                      <ActionText
+                        label="Run a workflow"
+                        description={
+                          listsSavedWorkflows
+                            ? "Run a saved one, or describe a new one"
+                            : "Describe it, and the agent plans and runs it"
+                        }
                       />
                     </DropdownMenuItem>
                   )}
@@ -210,7 +277,7 @@ export function ComposerAddMenu({
                       data-testid="composer-goal-action"
                       data-active={goalActive || undefined}
                       onSelect={() => {
-                        pendingGoalRef.current = true;
+                        pendingActionRef.current = onGoal ?? null;
                       }}
                     >
                       <span className="flex size-4 shrink-0 items-center justify-center">

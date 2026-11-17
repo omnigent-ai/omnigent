@@ -14,7 +14,7 @@ import omnigent.harnesses.opencode_native.provider as provider
 import omnigent.runner._entry as runner_entry
 import omnigent.runner.native.orchestration as orchestration
 from omnigent.runner.resource_registry import SessionResourceRegistry
-from omnigent.spec import AgentSpec
+from omnigent.spec import AgentSpec, MCPServerConfig
 
 
 class _StopBeforeBoot(Exception):
@@ -123,6 +123,73 @@ async def test_launch_writes_v2_config_with_ask_all_permissions(
     assert launch_env["seeded"] == [bridge_dir]
 
 
+@pytest.mark.parametrize("declared_server", [False, True], ids=["minimal", "declared-tool"])
+async def test_launch_scopes_mcp_to_agent_and_omnigent_relay(
+    launch_env: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    declared_server: bool,
+) -> None:
+    """Ambient MCP tools must not consume a local model's first-turn budget."""
+    user_config_dir = tmp_path / "user-config" / "opencode"
+    user_config_dir.mkdir(parents=True)
+    (user_config_dir / "opencode.jsonc").write_text(
+        json.dumps(
+            {
+                "mcp": {
+                    "servers": {
+                        name: {"type": "remote", "url": f"https://mcp.test/{name}"}
+                        for name in (
+                            "aseprite",
+                            "blender",
+                            "chrome-devtools",
+                            "context7",
+                            "meshy",
+                            "playwright",
+                            "safari",
+                            "unrelated",
+                        )
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "user-config"))
+
+    async def _ensure_relay(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    bridge_dir = await _launch_until_boot(
+        server_client=object(),
+        ensure_comment_relay=_ensure_relay,
+        agent_spec=AgentSpec(
+            spec_version=1,
+            name="scoped-tools",
+            instructions="Be terse.",
+            mcp_servers=[
+                MCPServerConfig(
+                    name="task-tool", transport="http", url="https://mcp.test/task-tool"
+                )
+            ]
+            if declared_server
+            else [],
+        ),
+    )
+
+    written = json.loads(
+        (bridge_dir / "xdg-config" / "opencode" / "opencode.json").read_text(encoding="utf-8")
+    )
+    expected_servers = {"omnigent", "task-tool"} if declared_server else {"omnigent"}
+    assert set(written["mcp"]["servers"]) == expected_servers
+    if declared_server:
+        assert written["mcp"]["servers"]["task-tool"] == {
+            "type": "remote",
+            "url": "https://mcp.test/task-tool",
+            "codemode": False,
+        }
+
+
 async def test_launch_without_server_still_writes_ask_all_config(
     launch_env: dict[str, Any],
 ) -> None:
@@ -167,7 +234,7 @@ async def test_launch_adopts_managed_connect_providers_plugins_and_model(
     )
     assert written["providers"]["databricks-ws"]["models"]["served-model"]["headers"] == {
         "Databricks-Custom-Coding-Agent": "opencode",
-        "Databricks-Custom-Client-Surfaces": "omnigent, omnigent-desktop",
+        "Databricks-Custom-Client-Surfaces": "omnigent-desktop",
     }
     assert written["plugins"] == [ucode_plugin, str(bridge_dir / "omnigent-policy")]
     assert written["model"] == "databricks-ws/served-model"

@@ -12,8 +12,8 @@ class OriginsWorkspaceUiUrlTest {
     @Test
     fun `expands a bare workspace root`() {
         assertEquals(
-            "https://dbc-a5d4177a-49dc.cloud.databricks.com/omnigent",
-            databricksWorkspaceUiUrl("https://dbc-a5d4177a-49dc.cloud.databricks.com"),
+            "https://dbc-12345678-abcd.cloud.databricks.com/omnigent",
+            databricksWorkspaceUiUrl("https://dbc-12345678-abcd.cloud.databricks.com"),
         )
         assertEquals(
             "https://gtm-ai-agent.cloud.databricks.com/omnigent",

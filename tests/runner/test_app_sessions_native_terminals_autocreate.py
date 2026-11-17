@@ -78,9 +78,11 @@ from omnigent.runner.resource_registry import (
     SessionResourceRegistry,
 )
 from omnigent.runner.session_init_protocol import RunnerSessionInitEnvelope
+from omnigent.runtime.prompt import WORKSPACE_IMAGE_INSTRUCTION
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.stores.conversation_store import FORK_CARRY_HISTORY_LABEL_KEY
 from omnigent.terminals import TerminalRegistry
+from tests._helpers.managed_mcp import expand_entry_value
 from tests._helpers.pi_native import seed_pi_own_login_catalog
 from tests._helpers.providers import isolate_provider_resolution
 from tests.budgets import budget
@@ -218,6 +220,8 @@ def test_read_relay_policy_config_returns_none_when_session_id_absent(
         ("raw", None, []),
         ("resolved", None, []),
         ("resolved-replace", None, []),
+        ("sdk-missing-replace", None, []),
+        ("resolved-sdk-empty-replace", None, []),
     ],
 )
 async def test_auto_create_pi_terminal_launches_required_terminal(
@@ -312,15 +316,25 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
     published: list[dict[str, Any]] = []
 
     instructions = "  Follow the authored role. π\nKeep this whitespace.  "
+    reject_replace = instruction_spec in ("sdk-missing-replace", "resolved-sdk-empty-replace")
+    authored_instructions: str | None = instructions
+    if instruction_spec == "sdk-missing-replace":
+        authored_instructions = None
+    elif instruction_spec in ("empty", "resolved-sdk-empty-replace"):
+        authored_instructions = "   "
     agent_spec = None
     if instruction_spec != "missing":
         agent_spec = AgentSpec(
             spec_version=1,
             name="pi",
-            executor=ExecutorSpec(),
-            instructions=instructions if instruction_spec != "empty" else "   ",
+            executor=(
+                ExecutorSpec(type="omnigent", config={"harness": "pi"})
+                if reject_replace
+                else ExecutorSpec()
+            ),
+            instructions=authored_instructions,
         )
-        if instruction_spec == "resolved-replace":
+        if instruction_spec.endswith("replace"):
             agent_spec.executor.config.update(context_files=False, system_prompt_mode="replace")
         if instruction_spec.startswith("resolved"):
             agent_spec = ResolvedSpec(spec=agent_spec, workdir=tmp_path)
@@ -329,13 +343,24 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
     instructions_path = bridge_dir / "agent_instructions.md"
     instructions_path.write_text("Stale role")
 
-    await _auto_create_pi_terminal(
-        _PI_SESSION_ID,
-        _FakeResourceRegistry(),  # type: ignore[arg-type]
-        lambda _sid, evt: published.append(evt),
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-        agent_spec=agent_spec,
-    )
+    with (
+        pytest.raises(
+            ValueError, match="system_prompt_mode='replace' requires non-empty instructions"
+        )
+        if reject_replace
+        else contextlib.nullcontext()
+    ):
+        await _auto_create_pi_terminal(
+            _PI_SESSION_ID,
+            _FakeResourceRegistry(),  # type: ignore[arg-type]
+            lambda _sid, evt: published.append(evt),
+            server_client=NullServerClient(),  # type: ignore[arg-type]
+            agent_spec=agent_spec,
+        )
+    if reject_replace:
+        assert not captured
+        assert instructions_path.read_text() == "Stale role"
+        return
 
     # Required lifecycle (parity with claude-native), correct terminal identity.
     assert captured["terminal_name"] == "pi"
@@ -361,26 +386,24 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
 
     args = captured["spec"].args
     assert args[-2:] == ["--append-system-prompt", "User addition"]
-    if instruction_spec in {"raw", "resolved", "resolved-replace"}:
-        assert args.count("--append-system-prompt") == 2
-        prompt_flag = (
-            "--system-prompt"
-            if instruction_spec == "resolved-replace"
-            else "--append-system-prompt"
-        )
-        path = Path(args[args.index(prompt_flag) + 1])
-        assert ("--no-context-files" in args) is (instruction_spec == "resolved-replace")
-        if instruction_spec == "resolved-replace":
-            assert args[args.index("--append-system-prompt") + 1] == ""
-        assert (
-            path.parent
-            == Path(captured["spec"].env[pi_native_bridge.PI_NATIVE_CONFIG_ENV_VAR]).parent
-        )
-        assert path.read_text() == instructions
-        assert instructions not in args
-    else:
-        assert args.count("--append-system-prompt") == 1
-        assert not instructions_path.exists()
+    assert args.count("--append-system-prompt") == 2
+    prompt_flag = (
+        "--system-prompt" if instruction_spec == "resolved-replace" else "--append-system-prompt"
+    )
+    path = Path(args[args.index(prompt_flag) + 1])
+    assert ("--no-context-files" in args) is (instruction_spec == "resolved-replace")
+    if instruction_spec == "resolved-replace":
+        assert args[args.index("--append-system-prompt") + 1] == ""
+    assert (
+        path.parent == Path(captured["spec"].env[pi_native_bridge.PI_NATIVE_CONFIG_ENV_VAR]).parent
+    )
+    expected = (
+        f"{instructions}\n\n{WORKSPACE_IMAGE_INSTRUCTION}"
+        if instruction_spec in {"raw", "resolved", "resolved-replace"}
+        else WORKSPACE_IMAGE_INSTRUCTION
+    )
+    assert path.read_text() == expected
+    assert instructions not in args
 
 
 @pytest.mark.asyncio
@@ -400,6 +423,8 @@ async def test_auto_create_pi_terminal_surfaces_credential_warning(
     import omnigent.harnesses.pi_native.main as pi_native
 
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    monkeypatch.setenv("OMNIGENT_PI_ENV_UNSET", "SYNTH_EXCLUDED")
+    monkeypatch.setenv("SYNTH_EXCLUDED", "sentinel-excluded")
     monkeypatch.setattr(pi_native_bridge, "_BRIDGE_ROOT", tmp_path / "pi-bridge")
     monkeypatch.setattr(pi_native, "resolve_pi_executable", lambda: "pi")
 
@@ -415,15 +440,17 @@ async def test_auto_create_pi_terminal_surfaces_credential_warning(
     monkeypatch.setattr(
         pi_native_credentials, "resolve_pi_native_provider", lambda **_kwargs: provider
     )
-    # Avoid touching the real Pi settings/models writer; the launch env is not
-    # under test here — the credential-warning surfacing is.
-    monkeypatch.setattr(
-        pi_native_credentials,
-        "pi_native_provider_launch",
-        lambda _agent_dir, _provider, _effort=None, **_kwargs: (
-            pi_native_credentials.PiNativeLaunch(env={}, args=[])
-        ),
-    )
+    # Avoid touching the real Pi settings/models writer; record the env it is
+    # given to provision the agent dir.
+    provision_envs: list[dict[str, str]] = []
+
+    def _fake_provider_launch(
+        _agent_dir: Path, _provider: Any, _effort: str | None = None, **kwargs: Any
+    ) -> Any:
+        provision_envs.append(kwargs["pi_env"])
+        return pi_native_credentials.PiNativeLaunch(env={}, args=[])
+
+    monkeypatch.setattr(pi_native_credentials, "pi_native_provider_launch", _fake_provider_launch)
 
     async def _fake_launch_config(**_kwargs: Any) -> _PiNativeLaunchConfig:
         return _PiNativeLaunchConfig(
@@ -474,6 +501,11 @@ async def test_auto_create_pi_terminal_surfaces_credential_warning(
     assert data["item_type"] == "error"
     assert data["item_data"]["code"] == "pi_credentials_unresolved"
     assert "databricks auth login" in data["item_data"]["message"]
+    # The agent dir is provisioned against the env the Pi terminal will get.
+    [provision_env] = provision_envs
+    assert "SYNTH_EXCLUDED" not in provision_env
+    assert pi_native_bridge.PI_NATIVE_CONFIG_ENV_VAR in provision_env
+    assert provision_env["RUNNER_SERVER_URL"] == "http://127.0.0.1:8000"
 
 
 @pytest.mark.asyncio
@@ -1462,6 +1494,64 @@ def _stub_devin_launch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(main, "resolve_devin_launch_model", lambda _model, _effort: None)
 
 
+async def test_devin_image_guidance_leaves_the_rule_for_authored_sessions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.harnesses.devin_native import bridge
+    from omnigent.runner.native import orchestration
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda **_kwargs: None)
+    _stub_devin_launch(tmp_path, monkeypatch)
+
+    async def launch_config(**_kwargs: Any) -> _PiNativeLaunchConfig:
+        return _PiNativeLaunchConfig(
+            workspace=workspace,
+            server_url="http://127.0.0.1:8000",
+            terminal_launch_args=None,
+            external_session_id=None,
+        )
+
+    monkeypatch.setattr(orchestration, "_pi_native_launch_config", launch_config)
+
+    class Registry(SessionResourceRegistry):
+        async def launch_required_terminal(self, **_kwargs: Any) -> SessionResourceView:
+            raise _TerminalLaunchCaptured
+
+    rule = workspace / ".windsurf" / "rules" / "omnigent-agent-instructions.md"
+    for session_id, authored in (
+        ("plain-session", None),
+        ("authored-session", "Follow the authored role."),
+        ("fallback-session", "Follow the other role."),
+    ):
+        spec = AgentSpec(
+            spec_version=1, name="devin", executor=ExecutorSpec(), instructions=authored
+        )
+        with pytest.raises(_TerminalLaunchCaptured):
+            await orchestration._auto_create_devin_terminal(
+                session_id, Registry(), lambda *_args: None, server_client=None, agent_spec=spec
+            )
+        preamble = bridge.read_agent_instructions_preamble(
+            bridge.bridge_dir_for_session_id(session_id)
+        )
+        expected = (
+            f"{authored}\n\n{WORKSPACE_IMAGE_INSTRUCTION}"
+            if session_id == "fallback-session"
+            else WORKSPACE_IMAGE_INSTRUCTION
+        )
+        assert preamble == expected
+        if authored is None:
+            assert not rule.exists()
+        else:
+            text = rule.read_text()
+            assert "omnigent_session: authored-session" in text
+            assert "Follow the authored role." in text
+            assert WORKSPACE_IMAGE_INSTRUCTION not in text
+            assert "Follow the other role." not in text
+
+
 def _stub_qwen_launch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     import omnigent.harnesses.qwen_native.bridge as bridge
     import omnigent.harnesses.qwen_native.main as main
@@ -2306,17 +2396,17 @@ def test_agent_os_env_from_spec_unwraps_resolved_and_handles_none() -> None:
 
 
 @pytest.mark.asyncio
-async def test_auto_create_claude_terminal_passes_raw_instructions(
+async def test_auto_create_claude_terminal_passes_startup_instructions(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
     Host-spawned launch emits ``--append-system-prompt`` with the agent's
-    raw author instructions.
+    author instructions and stable image guidance.
 
     The managed-host wiring in ``runner/native/orchestration.py``
     (``augment_claude_args(..., append_system_prompt=
-    _native_startup_raw_instructions_from_spec(agent_spec))``), where
+    _native_startup_instructions_from_spec(agent_spec))``), where
     ``AgentSpec.instructions`` can become unreachable by claude-native.
     Drives the real ``_auto_create_claude_terminal`` →
     ``augment_claude_args`` integration rather than the helpers in isolation.
@@ -2382,7 +2472,9 @@ async def test_auto_create_claude_terminal_passes_raw_instructions(
     args = captured["spec"].args
     assert "--append-system-prompt" in args, f"missing --append-system-prompt in {args!r}"
     idx = args.index("--append-system-prompt")
-    assert args[idx + 1] == "Be a concise, careful coding assistant."
+    assert args[idx + 1] == (
+        f"Be a concise, careful coding assistant.\n\n{WORKSPACE_IMAGE_INSTRUCTION}"
+    )
 
 
 @pytest.mark.asyncio
@@ -2549,6 +2641,61 @@ async def test_auto_create_claude_terminal_subscription_ignores_inherited_api_cr
 
 
 @pytest.mark.asyncio
+async def test_auto_create_claude_terminal_points_a_managed_relay_entry_at_its_bridge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Under ``managed-mcp.json`` the relay entry reads the session's bridge from the env."""
+    config_home = isolate_provider_resolution(monkeypatch, tmp_path / "config")
+    (config_home / "config.yaml").write_text(
+        "providers:\n  claude:\n    kind: subscription\n    cli: claude\n    default: true\n"
+    )
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path))
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    socket_root = tmp_path / "harness-sockets"
+    monkeypatch.setenv("OMNIGENT_HARNESS_TMP_PARENT", str(socket_root))
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "bridge")
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.forwarder.supervise_forwarder", _no_op_forwarder
+    )
+    managed_dir = tmp_path / "etc-claude-code"
+    managed_dir.mkdir()
+    relay_entry = claude_native_bridge.managed_mcp_relay_entry()
+    (managed_dir / "managed-mcp.json").write_text(
+        json.dumps({"mcpServers": {"omnigent": relay_entry}})
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.ambient.CLAUDE_CODE_MANAGED_SETTINGS_PATHS",
+        (managed_dir / "managed-settings.json",),
+    )
+    captured: dict[str, Any] = {}
+
+    await _auto_create_claude_terminal(
+        "conv_managed_relay",
+        _RecordingClaudeRegistry(captured),
+        lambda _sid, _evt: None,
+        server_client=NullServerClient(),
+        agent_spec=AgentSpec(
+            spec_version=1,
+            name="claude",
+            executor=ExecutorSpec(config={"harness": "claude-native"}),
+        ),
+        auth_token_factory=lambda: None,
+    )
+
+    spec = captured["spec"]
+    assert "--mcp-config" not in spec.args
+    bridge_dir = Path(spec.env[claude_native_bridge.MANAGED_MCP_RELAY_BRIDGE_DIR_ENV])
+    assert (bridge_dir / "bridge.json").is_file()
+    assert spec.env[claude_native_bridge.MANAGED_MCP_RELAY_TMPDIR_ENV] == str(tmp_path)
+    # serve-mcp keeps the operator's harness socket root once Claude expands the entry.
+    assert expand_entry_value(relay_entry["env"]["OMNIGENT_HARNESS_TMP_PARENT"], spec.env) == str(
+        socket_root
+    )
+
+
+@pytest.mark.asyncio
 async def test_auto_create_claude_terminal_injects_ucode_gateway_config(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2584,6 +2731,7 @@ async def test_auto_create_claude_terminal_injects_ucode_gateway_config(
         "auth:\n  type: databricks\n  profile: test-profile\n"
     )
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
+    monkeypatch.delenv("API_TIMEOUT_MS", raising=False)
 
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
@@ -2642,6 +2790,7 @@ async def test_auto_create_claude_terminal_injects_ucode_gateway_config(
         "CLAUDE_CODE_DISABLE_AGENT_VIEW": "1",
         "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1",
         "CLAUDE_ENV_FILE": claude_tool_env_file(),
+        "API_TIMEOUT_MS": "120000",
         "CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK": "1",
     }
     assert spec.command == "claude"
@@ -3194,9 +3343,11 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
     else:
         assert len(synth_calls) == int(fork_carry_history)
 
-    # Session titles are generated by an isolated background job, so neither
-    # fresh nor resumed Claude terminals receive framework rename instructions.
-    assert "--append-system-prompt" not in launched_args
+    # Startup gets image guidance; session-title metadata stays out of it.
+    assert (
+        launched_args[launched_args.index("--append-system-prompt") + 1]
+        == WORKSPACE_IMAGE_INSTRUCTION
+    )
 
     permission_mode_index = launched_args.index("--permission-mode")
     assert launched_args[permission_mode_index + 1] == "auto"
@@ -5888,7 +6039,7 @@ async def test_auto_create_claude_terminal_registers_permission_hook(
     # early no longer cascades into "no server running" (#540).
     assert spec.keep_alive_after_exit is True
     args = spec.args
-    assert "--append-system-prompt" not in args
+    assert args[args.index("--append-system-prompt") + 1] == WORKSPACE_IMAGE_INSTRUCTION
     settings = _load_claude_invocation_settings(args)
     assert "PermissionRequest" in settings["hooks"]
     permission_hook = settings["hooks"]["PermissionRequest"][0]["hooks"][0]
@@ -6103,7 +6254,7 @@ async def test_a_routed_claude_native_launch_keeps_the_spawn_gate_and_the_pin(
     assert spec.env["ANTHROPIC_CUSTOM_MODEL_OPTION"] == "databricks-claude-opus-4-7"
     # A pinned session's spawns stay on the claude family, so it gets neither
     # the routed-spawn note nor the pre-approvals the cross-family hop needs.
-    assert "--append-system-prompt" not in spec.args
+    assert spec.args[spec.args.index("--append-system-prompt") + 1] == WORKSPACE_IMAGE_INSTRUCTION
 
 
 async def test_an_auto_harness_launch_without_a_cost_control_stamp_is_still_routed(

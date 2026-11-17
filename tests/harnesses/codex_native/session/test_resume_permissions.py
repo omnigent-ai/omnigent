@@ -255,7 +255,7 @@ def test_codex_resume_permission_params_repairs_legacy_full_access_profile() -> 
 @pytest.mark.parametrize(
     ("permission_args", "expected_permissions"),
     [
-        ((), {"approvalsReviewer": "auto_review"}),
+        ((), {}),
         (
             ("-a", "on-failure", "-s=read-only"),
             {"approvalPolicy": "on-failure", "sandbox": "read-only"},

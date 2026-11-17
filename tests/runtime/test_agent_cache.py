@@ -157,6 +157,38 @@ def test_load_memory_cache_hit(
     assert first.workdir == second.workdir
 
 
+def test_spec_metadata_hit_does_not_resolve_workdir(
+    agent_cache: AgentCache,
+    artifact_store: LocalArtifactStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A metadata-only memory hit never accesses the filesystem."""
+    loc = "agent-2/abc123"
+    _store_bundle(artifact_store, loc)
+    first = agent_cache.load_spec("agent-2", loc)
+
+    def reject_path(*args):
+        pytest.fail("metadata memory hit resolved a working directory")
+
+    monkeypatch.setattr(agent_cache, "_cache_path", reject_path)
+    assert agent_cache.load_spec("agent-2", loc) is first
+
+
+def test_spec_metadata_refreshes_when_bundle_location_changes(
+    agent_cache: AgentCache, artifact_store: LocalArtifactStore
+) -> None:
+    _store_bundle(artifact_store, "agent-2/old")
+    first = agent_cache.load_spec("agent-2", "agent-2/old")
+    _store_bundle(
+        artifact_store,
+        "agent-2/new",
+        {"config.yaml": _MINIMAL_CONFIG.replace("test-agent", "updated-agent")},
+    )
+    second = agent_cache.load_spec("agent-2", "agent-2/new")
+    assert second is not first
+    assert second.name == "updated-agent"
+
+
 def test_load_disk_cache_hit(
     artifact_store: LocalArtifactStore,
     cache_dir: Path,

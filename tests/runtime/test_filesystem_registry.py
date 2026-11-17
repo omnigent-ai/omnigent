@@ -11,6 +11,7 @@ Events are injected via :func:`_inject`, which calls :meth:`record_change` on
 the registry so tests exercise the same code path as real tool calls.
 """
 
+import asyncio
 import itertools
 import logging
 import os
@@ -22,6 +23,7 @@ from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -31,6 +33,7 @@ from omnigent.runtime.filesystem_registry import (
     GitFilesystemRegistry,
     GitStatusUnavailable,
     MultiRepositoryFilesystemRegistry,
+    _count_untracked_lines,
     _git_timeout_seconds,
     _normalize_path,
     _parse_git_porcelain_line,
@@ -349,18 +352,161 @@ def test_get_baseline_returns_none_when_no_snapshot(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("operation,original", [("created", ""), ("modified", None)])
-def test_first_observation_preserves_known_or_unknown_original(
+@pytest.mark.asyncio
+async def test_first_observation_preserves_known_or_unknown_original(
     tmp_path: Path, operation: str, original: str | None
 ) -> None:
     registry = AgentEditFilesystemRegistry(tmp_path)
     assert registry.needs_snapshot("file.txt")
     registry.record_change("file.txt", operation, "session")
     registry.seed_snapshot("file.txt", "intermediate", session_id="session")
-    registry.record_change("file.txt", "modified", "session")
+    assert registry.revert_generation("file.txt", session_id="session") is None
+    await registry.record_tracked_change(
+        "file.txt", "modified", "session", AsyncMock(return_value="intermediate")
+    )
     assert not registry.needs_snapshot("file.txt")
     assert registry.get_baseline("file.txt") == original
+    assert [entry["status"] for entry in registry.list_changed_files("session", limit=10)] == [
+        operation
+    ]
     registry.unregister_conversation("session")
     assert registry.needs_snapshot("file.txt")
+
+
+@pytest.mark.parametrize(
+    "original,changes,statuses",
+    [
+        pytest.param("a\n", [("modified", "b\n"), ("modified", "a\n")], [], id="reverted"),
+        pytest.param("a\n", [("modified", "a\n")], [], id="unchanged"),
+        pytest.param("a\n", [("deleted", None), ("created", "a\n")], [], id="recreated"),
+        pytest.param(
+            "a\nb\n",
+            [("modified", "x\ny\n"), ("modified", "a\ny\n")],
+            ["modified"],
+            id="partially-reverted",
+        ),
+        pytest.param(
+            "a\n", [("modified", "b\n"), ("modified", None)], ["modified"], id="text-not-read"
+        ),
+        pytest.param(
+            "a\n",
+            [("modified", "b\n"), ("modified", "a\n"), ("modified", "c\n")],
+            ["modified"],
+            id="changed-after-revert",
+        ),
+        pytest.param(
+            None, [("modified", "b\n"), ("modified", "a\n")], ["modified"], id="unknown-original"
+        ),
+        pytest.param(
+            "", [("created", "b\n"), ("modified", "")], ["created"], id="created-emptied"
+        ),
+        pytest.param("", [("modified", "b\n"), ("modified", "")], [], id="empty-original"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_tracked_change_restoring_the_session_original_leaves_changes(
+    tmp_path: Path,
+    original: str | None,
+    changes: list[tuple[str, str | None]],
+    statuses: list[str],
+) -> None:
+    registry = AgentEditFilesystemRegistry(tmp_path)
+    registry.seed_snapshot("file.txt", original, session_id="session")
+    for operation, current_text in changes:
+        read_text = AsyncMock(return_value=current_text)
+        await registry.record_tracked_change("file.txt", operation, "session", read_text)
+        if operation == "deleted":
+            read_text.assert_not_awaited()
+    listed = registry.list_changed_files("session", limit=10)
+    assert [entry["status"] for entry in listed] == statuses
+
+
+@pytest.mark.parametrize("newer_operation", ["modified", "deleted"])
+@pytest.mark.asyncio
+async def test_revert_read_overtaken_by_a_newer_change_keeps_the_path(
+    tmp_path: Path, newer_operation: str
+) -> None:
+    registry = AgentEditFilesystemRegistry(tmp_path)
+    registry.seed_snapshot("file.txt", "a\n", session_id="session")
+    await registry.record_tracked_change(
+        "file.txt", "modified", "session", AsyncMock(return_value="b\n")
+    )
+
+    async def read_then_let_another_writer_record() -> str:
+        registry.record_change("file.txt", newer_operation, "session")
+        return "a\n"
+
+    await registry.record_tracked_change(
+        "file.txt", "modified", "session", read_then_let_another_writer_record
+    )
+    listed = registry.list_changed_files("session", limit=10)
+    assert [entry["status"] for entry in listed] == [newer_operation]
+
+    await registry.record_tracked_change(
+        "file.txt", "modified", "session", AsyncMock(return_value="a\n")
+    )
+    assert registry.list_changed_files("session", limit=10) == []
+
+
+@pytest.mark.asyncio
+async def test_unreadable_original_stays_unknown_after_a_concurrent_seed(tmp_path: Path) -> None:
+    registry = AgentEditFilesystemRegistry(tmp_path)
+    registry.seed_snapshot("file.txt", None, session_id="session")
+    # A second writer reads the first writer's result before it is recorded.
+    registry.seed_snapshot("file.txt", "m\n", session_id="session")
+    read = AsyncMock(return_value="m\n")
+    for _ in range(2):
+        await registry.record_tracked_change("file.txt", "modified", "session", read)
+    read.assert_not_awaited()
+    listed = registry.list_changed_files("session", limit=10)
+    assert [entry["status"] for entry in listed] == ["modified"]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_revert_read_still_records_the_change(tmp_path: Path) -> None:
+    registry = AgentEditFilesystemRegistry(tmp_path)
+    registry.seed_snapshot("file.txt", "a\n", session_id="session")
+    read_started = asyncio.Event()
+
+    async def read_until_cancelled() -> str | None:
+        read_started.set()
+        await asyncio.Event().wait()
+        return "a\n"
+
+    record = asyncio.create_task(
+        registry.record_tracked_change("file.txt", "modified", "session", read_until_cancelled)
+    )
+    await read_started.wait()
+    record.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await record
+    listed = registry.list_changed_files("session", limit=10)
+    assert [entry["status"] for entry in listed] == ["modified"]
+
+
+@pytest.mark.asyncio
+async def test_each_session_reverts_to_the_original_it_saw(tmp_path: Path) -> None:
+    registry = AgentEditFilesystemRegistry(tmp_path)
+
+    async def record(session_id: str, current_text: str) -> None:
+        await registry.record_tracked_change(
+            "file.txt", "modified", session_id, AsyncMock(return_value=current_text)
+        )
+
+    registry.seed_snapshot("file.txt", "a\n", session_id="first")
+    await record("first", "b\n")
+    registry.seed_snapshot("file.txt", "b\n", session_id="second")
+    await record("second", "a\n")
+
+    assert len(registry.list_changed_files("second", limit=10)) == 1
+    await record("second", "b\n")
+    assert registry.list_changed_files("second", limit=10) == []
+    assert len(registry.list_changed_files("first", limit=10)) == 1
+    assert registry.get_baseline("file.txt") == "a\n"
+
+    registry.unregister_conversation("first")
+    assert registry.revert_generation("file.txt", session_id="first") is None
+    assert registry.revert_generation("file.txt", session_id="second") is not None
 
 
 def test_get_baseline_returns_snapshot_for_non_git_workspace(tmp_path: Path) -> None:
@@ -685,6 +831,26 @@ def test_git_get_changed_file_returns_none_when_unchanged(tmp_path: Path) -> Non
 
     reg = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
     assert reg.get_changed_file("any-conv", "a.txt") is None
+
+
+def test_git_changed_file_reads_never_write_the_index(tmp_path: Path) -> None:
+    """Panel reads must not take ``index.lock`` while the agent runs ``git commit``."""
+    _init_git_with_commit(tmp_path, "a.txt", "hello\n")
+    tracked = tmp_path / "a.txt"
+    stat = tracked.stat()
+    # A stat-only change (same content, older mtime) lets status/numstat rewrite the index.
+    os.utime(tracked, ns=(stat.st_atime_ns, stat.st_mtime_ns - 100 * 10**9))
+    index = tmp_path / ".git" / "index"
+    before = index.stat()
+
+    reg = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
+    assert reg.list_changed_files("any-conv", limit=100) == []
+    assert reg.get_changed_file("any-conv", "a.txt") is None
+
+    after = index.stat()
+    assert (after.st_ino, after.st_mtime_ns) == (before.st_ino, before.st_mtime_ns), (
+        "A changed-files read rewrote .git/index, so it held index.lock."
+    )
 
 
 def test_git_list_changed_files_expands_untracked_nested_dir(tmp_path: Path) -> None:
@@ -1366,6 +1532,8 @@ def test_create_filesystem_registry_linked_worktree(tmp_path: Path) -> None:
         ("D  staged_del.py", ("staged_del.py", "deleted")),
         # Unstaged deletion (worktree 'D') → deleted
         (" D unstaged_del.py", ("unstaged_del.py", "deleted")),
+        # Intent-to-add (`git add -N`, worktree 'A') has no HEAD version → created
+        (" A intent_to_add.py", ("intent_to_add.py", "created")),
         # Rename: destination path (after ' -> ') is used, operation is modified
         ("R  old.py -> new.py", ("new.py", "modified")),
         # git-quoted path (spaces in filename) → quotes are stripped
@@ -1397,6 +1565,7 @@ def test_create_filesystem_registry_linked_worktree(tmp_path: Path) -> None:
         "both-staged-and-unstaged-modified",
         "staged-deleted",
         "unstaged-deleted",
+        "intent-to-add",
         "rename",
         "quoted-path-with-spaces",
         "quoted-rename-destination",
@@ -1524,10 +1693,13 @@ def test_multi_repo_parent_preserves_head_changes_and_recovers_without_hooks(
 
     # Existing fallback events must neither override Git nor omit loose-file edits.
     registry.seed_snapshot("alpha/same.txt", "wrong original", session_id="session")
+    # Git owns the listing for repository paths, so writers skip the revert read there.
+    assert registry.revert_generation("alpha/same.txt", session_id="session") is None
     registry.record_change("alpha/same.txt", "created", "session")
     registry.record_change("alpha/phantom.txt", "modified", "session")
     (tmp_path / "notes.txt").write_text("after")
     registry.seed_snapshot("notes.txt", "before", session_id="session")
+    assert registry.revert_generation("notes.txt", session_id="session") is not None
     registry.record_change("notes.txt", "modified", "session")
     assert {r["path"]: r["status"] for r in reader.list_changed_files("session", limit=100)} == {
         **expected,
@@ -1602,6 +1774,71 @@ def test_nested_worktree_changes_follow_git_after_a_shell_rename(tmp_path: Path)
     record = cold.get_changed_file("session", new)
     assert record is not None and record["repository_root"] == "code/project-wt"
     assert cold.get_baseline(new) == "def greet():\n    return 'hello world'\n"
+
+
+@pytest.mark.parametrize(
+    ("outer", "inner"),
+    [
+        ("group/outer", "group/outer/inner"),
+        ("code/project", "code/project/.claude/worktrees/feat"),
+    ],
+    ids=["untracked-repository", "in-repository-worktree"],
+)
+def test_nested_repository_root_is_not_listed_as_a_parent_change(
+    tmp_path: Path, outer: str, inner: str
+) -> None:
+    outer_repo = tmp_path / outer
+    outer_repo.mkdir(parents=True)
+    _init_git_with_commit(outer_repo, "README.md", "outer\n")
+    if inner.endswith("/feat"):
+        _trusted_test_git(
+            ["worktree", "add", "-b", "feat", ".claude/worktrees/feat"], outer_repo, 5
+        ).check_returncode()
+    else:
+        (tmp_path / inner).mkdir()
+        _init_git_with_commit(tmp_path / inner, "README.md", "inner\n")
+    registry = create_filesystem_registry(tmp_path)
+    reader = registry.with_git_runner(_trusted_test_git)
+    for root in (outer, inner):
+        (tmp_path / root / "README.md").write_text("edited\n")
+        registry.record_change(f"{root}/README.md", "modified", "session")
+
+    changes = reader.list_changed_files("session", limit=100)
+    assert {(r["path"], r["status"], r.get("repository_root")) for r in changes} == {
+        (f"{inner}/README.md", "modified", inner),
+        (f"{outer}/README.md", "modified", outer),
+    }
+    assert len(changes) == 2
+
+
+@pytest.mark.parametrize("outer", ["outer", "group/outer"])
+@pytest.mark.parametrize(("gitlink", "status"), [("staged", "created"), ("moved", "modified")])
+def test_tracked_nested_repository_keeps_its_gitlink_change(
+    tmp_path: Path, outer: str, gitlink: str, status: str
+) -> None:
+    outer_repo = tmp_path / outer
+    inner_repo = outer_repo / "inner"
+    outer_repo.mkdir(parents=True)
+    _init_git_with_commit(outer_repo, "README.md", "outer\n")
+    inner_repo.mkdir()
+    _init_git_with_commit(inner_repo, "README.md", "inner\n")
+    _trusted_test_git(["add", "inner"], outer_repo, 5).check_returncode()
+    if gitlink == "moved":
+        _trusted_test_git(["commit", "-qm", "track inner"], outer_repo, 5).check_returncode()
+        (inner_repo / "README.md").write_text("moved\n")
+        _trusted_test_git(["commit", "-qam", "move inner"], inner_repo, 5).check_returncode()
+    registry = create_filesystem_registry(tmp_path)
+    reader = registry.with_git_runner(_trusted_test_git)
+    for root in (outer_repo, inner_repo):
+        (root / "README.md").write_text("edited\n")
+        registry.record_change(f"{root.relative_to(tmp_path)}/README.md", "modified", "session")
+
+    changes = reader.list_changed_files("session", limit=100)
+    assert {(r["path"], r["status"], r.get("repository_root")) for r in changes} == {
+        (f"{outer}/inner/README.md", "modified", f"{outer}/inner"),
+        (f"{outer}/inner", status, outer),
+        (f"{outer}/README.md", "modified", outer),
+    }
 
 
 def test_nested_repository_discovery_probes_each_ancestor_once(
@@ -1900,19 +2137,141 @@ def test_git_line_counts_modified(tmp_path: Path) -> None:
 
 
 def test_git_line_counts_untracked_is_none(tmp_path: Path) -> None:
-    """An untracked new file (absent from `git diff HEAD`) reports no counts.
+    """An untracked new file (absent from `git diff HEAD`) reports no diff counts.
 
     Counts come only from numstat; git doesn't diff untracked files, so the UI
-    omits the counter for them — matching VS Code / Cursor's source-control view.
+    omits the counter for them. Untracked text files count ``untracked_lines``.
     """
-    _init_git_with_commit(tmp_path, "committed.py", "x\n")
-    (tmp_path / "new.py").write_text("one\ntwo\nthree\n")
+    _init_git_with_commit(tmp_path, "tracked.py", "x\n")
+    (tmp_path / "tracked.py").write_text("x\ny\n")
+    (tmp_path / "new.py").write_text("one\ntwo\nthree")
+    (tmp_path / "empty.txt").write_text("")
+    (tmp_path / "blob.bin").write_bytes(b"a\0b\n")
+    os.symlink("new.py", tmp_path / "link.py")
 
     reg = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
-    rec = next(r for r in reg.list_changed_files("any-conv", limit=100) if r["path"] == "new.py")
+    records = {r["path"]: r for r in reg.list_changed_files("any-conv", limit=100)}
+    assert {path: r.get("untracked_lines") for path, r in records.items()} == {
+        "tracked.py": None,
+        "new.py": 3,
+        "empty.txt": 0,
+        "blob.bin": None,
+        "link.py": None,
+    }
+    assert "untracked_lines" not in records["tracked.py"]
+    rec = records["new.py"]
     assert rec["status"] == "created"
     assert rec["lines_added"] is None, rec
     assert rec["lines_removed"] is None, rec
+
+
+def test_git_untracked_lines_never_read_through_links_or_fifos(tmp_path: Path) -> None:
+    """Symlinks swapped in after ``git status`` (even the root) and ``..`` never redirect reads."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("a\nb\n")
+    workspace = tmp_path / "workspace"
+    (workspace / "real").mkdir(parents=True)
+    (workspace / "real" / "new.txt").write_text("a\nb\n")
+    os.symlink(outside, workspace / "swapped")
+    os.mkfifo(workspace / "pipe")
+    paths = ["real/new.txt", "swapped/secret.txt", "pipe", "../outside/secret.txt"]
+    records = [{"path": path, "bytes": 4} for path in paths]
+
+    _count_untracked_lines(workspace, records, set(paths))
+    assert [r["untracked_lines"] for r in records] == [2, None, None, None]
+
+    os.symlink(outside, tmp_path / "swapped_root")
+    swapped_root = [{"path": "secret.txt", "bytes": 4}]
+    _count_untracked_lines(tmp_path / "swapped_root", swapped_root, {"secret.txt"})
+    assert swapped_root[0]["untracked_lines"] is None
+
+
+def test_git_untracked_lines_read_past_short_reads(tmp_path: Path, monkeypatch) -> None:
+    """A short read is not EOF: the count and the NUL check cover the whole file."""
+    (tmp_path / "text.txt").write_bytes(b"one\ntwo\n")
+    (tmp_path / "late_nul.txt").write_bytes(b"one\n\0two\n")
+    real_read = os.read
+    monkeypatch.setattr(os, "read", lambda fd, size: real_read(fd, min(size, 4)))
+    records = [{"path": path, "bytes": 9} for path in ("text.txt", "late_nul.txt")]
+
+    _count_untracked_lines(tmp_path, records, {"text.txt", "late_nul.txt"})
+    assert [r["untracked_lines"] for r in records] == [2, None]
+
+
+def test_git_untracked_lines_reserve_reads_before_they_start(tmp_path: Path, monkeypatch) -> None:
+    """Failed and grown reads still spend their allowance, so the budget bounds every byte read."""
+    monkeypatch.setattr(
+        "omnigent.runtime.filesystem_registry._UNTRACKED_LINES_MAX_TOTAL_BYTES", 20
+    )
+    paths = ["grown.txt", *(f"fails_{index}.txt" for index in range(4))]
+    for path in paths:
+        (tmp_path / path).write_bytes(b"1\n2\n3\n4\n")
+    # grown.txt was listed before it doubled; the others fail after their first chunk.
+    records = [{"path": path, "bytes": 4 if path == "grown.txt" else 8} for path in paths]
+    consumed = 0
+    real_read = os.read
+
+    def read_one_chunk_then_fail(fd: int, size: int) -> bytes:
+        nonlocal consumed
+        if os.lseek(fd, 0, os.SEEK_CUR):
+            raise OSError("injected I/O error")
+        chunk = real_read(fd, size)
+        consumed += len(chunk)
+        return chunk
+
+    monkeypatch.setattr(os, "read", read_one_chunk_then_fail)
+
+    _count_untracked_lines(tmp_path, records, set(paths))
+    assert [r["untracked_lines"] for r in records] == [None] * len(paths)
+    assert consumed <= 20
+
+
+def test_multi_repo_untracked_lines_share_one_budget_newest_first(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Repositories share the listing's budget, spent on the newest file first."""
+    monkeypatch.setattr("omnigent.runtime.filesystem_registry._UNTRACKED_LINES_MAX_FILES", 1)
+    for age, name in enumerate(("beta", "alpha")):
+        repo = tmp_path / name
+        repo.mkdir()
+        _init_git_with_commit(repo, "same.txt", "x\n")
+        (repo / "new.txt").write_text("1\n2\n")
+        os.utime(repo / "new.txt", (1_000_000 - age, 1_000_000 - age))
+
+    registry = MultiRepositoryFilesystemRegistry(tmp_path).with_git_runner(_trusted_test_git)
+    records = registry.list_changed_files("session", limit=100)
+    assert [(r["path"], r["untracked_lines"]) for r in records] == [
+        ("beta/new.txt", 2),
+        ("alpha/new.txt", None),
+    ]
+
+
+def test_git_untracked_lines_stop_at_the_caps(tmp_path: Path, monkeypatch) -> None:
+    """Newest files are read first; per-file, total and file-count caps yield ``None``."""
+    monkeypatch.setattr("omnigent.runtime.filesystem_registry._UNTRACKED_LINES_MAX_FILE_BYTES", 10)
+    monkeypatch.setattr(
+        "omnigent.runtime.filesystem_registry._UNTRACKED_LINES_MAX_TOTAL_BYTES", 15
+    )
+    monkeypatch.setattr("omnigent.runtime.filesystem_registry._UNTRACKED_LINES_MAX_FILES", 2)
+    _init_git_with_commit(tmp_path, "committed.py", "x\n")
+    # Newest first: over the per-file cap, read, over the remaining total
+    # budget, read, then past the file-count cap.
+    files = [("c.txt", "x" * 11), ("a.txt", "1\n2\n3\n4\n"), ("b.txt", "1\n2\n3\n4\n")]
+    files += [("d.txt", "1\n"), ("e.txt", "1\n")]
+    for age, (name, content) in enumerate(files):
+        (tmp_path / name).write_text(content)
+        os.utime(tmp_path / name, (1_000_000 - age, 1_000_000 - age))
+
+    reg = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
+    records = reg.list_changed_files("any-conv", limit=100)
+    assert [(r["path"], r["untracked_lines"]) for r in records] == [
+        ("c.txt", None),
+        ("a.txt", 4),
+        ("b.txt", None),
+        ("d.txt", 1),
+        ("e.txt", None),
+    ]
 
 
 def test_git_line_counts_staged_new_file_added_only(tmp_path: Path) -> None:

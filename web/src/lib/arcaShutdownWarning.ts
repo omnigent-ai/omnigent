@@ -27,7 +27,7 @@ export function isWarningWindow(now: Date): boolean {
 
 export function offersWorkweek(now: Date): boolean {
   const day = now.getDay();
-  // Thursday and Friday have no useful workweek extension before Friday shutdown.
+  // From Thursday on, a workweek extension adds no useful time before the week ends.
   return day >= FIRST_WEEKDAY && day <= LAST_WORKWEEK_OFFER_DAY;
 }
 

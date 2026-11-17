@@ -573,16 +573,21 @@ def test_profile_emits_extra_read_roots(tmp_path: Path) -> None:
     assert expected in profile
 
 
+@pytest.mark.parametrize("broker_socket", [False, True])
 def test_profile_network_section_for_allow_network_true_no_egress(
     tmp_path: Path,
+    broker_socket: bool,
 ) -> None:
     """
-    ``allow_network=True`` and no egress rules → ``(allow network*)``
-    is emitted so the helper sees the host's full network stack.
+    A broker socket keeps direct networking denied even with allow_network enabled.
     """
+    socket_path = str(tmp_path / "broker.sock")
     policy = _make_policy(tmp_path, allow_network=True)
+    policy.tcp_egress_socket_path = socket_path if broker_socket else None
     profile = _build_profile(policy, tmp_path.resolve(strict=False))
-    assert "(allow network*)" in profile
+    assert ("(allow network*)" in profile) is not broker_socket
+    if broker_socket:
+        assert f'(path-literal "{socket_path}")' in profile
 
 
 def test_profile_network_section_for_allow_network_false_no_egress(

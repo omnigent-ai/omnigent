@@ -8,7 +8,7 @@ from collections.abc import Iterator
 from urllib.parse import parse_qs, urlparse
 
 import pytest
-from playwright.sync_api import Page, Request, expect
+from playwright.sync_api import Locator, Page, Request, expect
 
 from tests.browser_ui.conftest import BrowserContract
 
@@ -189,6 +189,101 @@ def test_custom_order_keeps_the_list_and_commits_on_drop(
     )
 
 
+@pytest.mark.parametrize("in_project", [False, True], ids=["sessions", "project"])
+@pytest.mark.parametrize("show_harness", [False, True], ids=["titles-only", "harness-icons"])
+def test_family_chevron_keeps_top_level_rows_in_one_column(
+    page: Page,
+    appearance_url: str,
+    appearance_features: dict[str, bool],
+    browser_contract: BrowserContract,
+    in_project: bool,
+    show_harness: bool,
+) -> None:
+    """A family's chevron sits left of the row, so only its members are indented."""
+    project = "Example project"
+    if show_harness:
+        appearance_features["sidebar_grouping_ui"] = True
+        page.add_init_script(
+            "localStorage.setItem('omnigent:sidebar-view', JSON.stringify("
+            "{grouping: 'default', ordering: 'updated', show: ['harness']}))"
+        )
+
+    def session(index: int, title: str, family: dict | None = None) -> dict:
+        return {
+            "id": f"{index:032x}",
+            "object": "conversation",
+            "title": title,
+            "created_at": 100 - index,
+            "updated_at": 100 - index,
+            "status": "idle",
+            "labels": {"omni_project": project} if in_project else {},
+            "permission_level": None,
+            "family": family,
+        }
+
+    family = {"id": "family", "representative_id": f"{2:032x}", "pinned": False}
+    rows = [
+        session(1, "Plain before"),
+        session(2, "Lead", family),
+        session(3, "Member", family),
+        session(4, "Plain after"),
+    ]
+
+    def session_list(request: Request) -> dict:
+        params = parse_qs(urlparse(request.url).query)
+        listed = [] if "pinned" in params or ("project" in params) != in_project else rows
+        return {
+            "object": "list",
+            "data": listed,
+            "has_more": False,
+            "first_id": listed[0]["id"] if listed else None,
+            "last_id": listed[-1]["id"] if listed else None,
+        }
+
+    browser_contract.json("/v1/sessions", session_list)
+    browser_contract.json("/v1/sessions/projects", [{"id": None, "name": project}])
+    page.goto(appearance_url)
+    if in_project:
+        page.get_by_role("button", name=re.compile(rf"^{project}")).click()
+    plain_before, lead, member, plain_after = (
+        page.locator(f"li[data-sidebar-session-id='{row['id']}']") for row in rows
+    )
+    expect(member.get_by_role("link")).to_be_visible()
+
+    def left(locator: Locator) -> float:
+        box = locator.bounding_box()
+        assert box
+        return box["x"]
+
+    def content_left(row: Locator, title: str) -> float:
+        if show_harness:
+            return left(row.get_by_test_id("session-row-harness"))
+        return left(row.get_by_text(title, exact=True))
+
+    column = content_left(plain_before, "Plain before")
+    assert content_left(lead, "Lead") == column
+    assert content_left(plain_after, "Plain after") == column
+    assert content_left(member, "Member") >= column + 16
+
+    chevron = lead.get_by_role("button", name="Collapse session family")
+    chevron_box = chevron.bounding_box()
+    nav_box = lead.locator("xpath=ancestor::nav[1]").bounding_box()
+    assert chevron_box and nav_box
+    assert chevron_box["x"] + chevron_box["width"] <= left(lead.get_by_role("link"))
+    assert chevron_box["x"] >= nav_box["x"]
+    chevron.click()
+    expect(member).to_have_count(0)
+    expand = lead.get_by_role("button", name="Expand session family")
+    expect(expand).to_be_visible()
+    assert content_left(lead, "Lead") == column
+    assert content_left(plain_after, "Plain after") == column
+
+    expand.click()
+    expect(member.get_by_role("link")).to_be_visible()
+    assert content_left(lead, "Lead") == column
+    assert content_left(member, "Member") >= column + 16
+
+
 @pytest.fixture
 def sessions_url(appearance_url: str, browser_contract: BrowserContract) -> tuple[str, str, str]:
     session_ids = ("appearance-session-a", "appearance-session-b")
@@ -240,6 +335,7 @@ def sessions_url(appearance_url: str, browser_contract: BrowserContract) -> tupl
             },
         )
         browser_contract.json(f"/v1/sessions/{session_id}/child_sessions", empty_list)
+        browser_contract.json(f"/v1/sessions/{session_id}/side_chats", empty_list)
         browser_contract.json(f"/v1/sessions/{session_id}/resources/terminals", empty_list)
         browser_contract.response(f"/v1/sessions/{session_id}/read-state", method="PUT")
         for resource in ("environments/default", "github"):
@@ -345,13 +441,13 @@ def test_appearance_reset_restores_defaults(page: Page, appearance_url: str) -> 
     terminal_dark = page.get_by_test_id("terminal-theme-dark")
 
     # Fresh context: the defaults are applied and nothing is persisted yet.
-    expect(font_size_input).to_have_value("13")
+    expect(font_size_input).to_have_value("14")
     expect(page.get_by_test_id("terminal-theme-auto")).to_have_attribute("aria-checked", "true")
     stored_font_size = page.evaluate("() => window.localStorage.getItem('omnigent:ui-font-size')")
     assert stored_font_size is None, "expected no persisted font size on a fresh load"
 
     # Change two unrelated appearance preferences away from their defaults.
-    for _ in range(5):
+    for _ in range(4):
         font_size_inc.click()
     expect(font_size_input).to_have_value("18")
     terminal_dark.click()
@@ -367,7 +463,7 @@ def test_appearance_reset_restores_defaults(page: Page, appearance_url: str) -> 
     page.get_by_test_id("reset-appearance-confirm").click()
 
     # Both choices are back to the product defaults.
-    expect(font_size_input).to_have_value("13")
+    expect(font_size_input).to_have_value("14")
     expect(page.get_by_test_id("terminal-theme-auto")).to_have_attribute("aria-checked", "true")
     assert page.evaluate("() => window.localStorage.getItem('omnigent:ui-font-size')") is None
     assert page.evaluate("() => window.localStorage.getItem('omnigent:terminal-theme')") is None
@@ -435,7 +531,7 @@ def test_ui_font_family_reset_restores_system_default(page: Page, appearance_url
 def test_ui_font_size_scales_and_persists(page: Page, appearance_url: str) -> None:
     """Stepping the size updates the token + value live and survives a reload.
 
-    A fresh context has no stored preference → default 13px. Increasing the
+    A fresh context has no stored preference and uses the 14px default. Increasing the
     size updates ``--desktop-ui-font-size`` and persists the px value; a page
     reload restores it (no reset, no flash back to the default).
     """
@@ -445,13 +541,13 @@ def test_ui_font_size_scales_and_persists(page: Page, appearance_url: str) -> No
     value = page.get_by_test_id("ui-font-size-input")
     increase = page.get_by_test_id("ui-font-size-inc")
 
-    # Fresh context → default 13px token, nothing stored.
-    expect(value).to_have_value("13")
+    # Fresh context uses the 14px token, with nothing stored.
+    expect(value).to_have_value("14")
     assert _stored_size(page) is None, "expected no persisted size on a fresh load"
-    assert _desktop_ui_font_size(page) == "13px", "fresh load should apply the default size"
+    assert _desktop_ui_font_size(page) == "14px", "fresh load should apply the default size"
 
-    # → 18px: five steps up. The value, applied token, and storage all move.
-    for _ in range(5):
+    # Four steps reach 18px. The value, applied token, and storage all move.
+    for _ in range(4):
         increase.click()
     expect(value).to_have_value("18")
     assert _stored_size(page) == "18"
@@ -514,8 +610,7 @@ def test_ui_font_size_input_allows_free_editing(page: Page, appearance_url: str)
 
     # Backspace to "1": the box holds the partial value; nothing clamps or
     # re-persists while the draft is out of range.
-    value.click()
-    value.press("End")
+    value.fill("13")
     value.press("Backspace")
     expect(value).to_have_value("1")
     assert _stored_size(page) == "13", "a mid-edit below-min draft must not persist"

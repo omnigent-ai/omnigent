@@ -37,7 +37,7 @@ function TooltipShortcutKeys({ shortcut }: { shortcut: TooltipShortcut }) {
 function TooltipProvider({
   // Keep incidental pointer movement from flashing tooltips. Callers can still
   // override the delay per provider.
-  delayDuration = 600,
+  delayDuration = 1000,
   ...props
 }: React.ComponentProps<typeof TooltipPrimitive.Provider>) {
   return (
@@ -57,18 +57,16 @@ function TooltipTrigger({ ...props }: React.ComponentProps<typeof TooltipPrimiti
   return <TooltipPrimitive.Trigger data-slot="tooltip-trigger" {...props} />;
 }
 
-function TooltipContent({
-  className,
-  sideOffset = 8,
-  children,
-  shortcut,
-  ...props
-}: React.ComponentProps<typeof TooltipPrimitive.Content> & {
-  shortcut?: TooltipShortcut;
-}) {
+const TooltipContent = React.forwardRef<
+  React.ElementRef<typeof TooltipPrimitive.Content>,
+  React.ComponentPropsWithoutRef<typeof TooltipPrimitive.Content> & {
+    shortcut?: TooltipShortcut;
+  }
+>(function TooltipContent({ className, sideOffset = 8, children, shortcut, ...props }, ref) {
   return (
     <TooltipPrimitive.Portal container={getEmbedRoot() ?? undefined}>
       <TooltipPrimitive.Content
+        ref={ref}
         data-slot="tooltip-content"
         sideOffset={sideOffset}
         className={cn(
@@ -82,6 +80,6 @@ function TooltipContent({
       </TooltipPrimitive.Content>
     </TooltipPrimitive.Portal>
   );
-}
+});
 
 export { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger };

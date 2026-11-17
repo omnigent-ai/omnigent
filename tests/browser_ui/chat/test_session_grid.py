@@ -161,6 +161,10 @@ def test_session_grid_drag_persist_live_updates_and_close(
             "**/resources/terminals/terminal_tui_main/attach*", attach_terminal
         )
         sessions[3].update_session(permission_level=1)
+        for session in sessions[:2]:
+            session.update_session(
+                family={"id": "grid-0", "representative_id": "grid-0", "pinned": False}
+            )
         browser_contract.json(
             "/v1/info", {"single_user": True, "features": {"grid_sessions_display_ui": True}}
         )
@@ -189,6 +193,9 @@ def test_session_grid_drag_persist_live_updates_and_close(
                 .right <= document.querySelector('aside[aria-label="Workspace"]')
                 .getBoundingClientRect().left"""
         )
+        expect(page.locator('aside [data-sidebar-session-id="grid-1"]')).to_have_attribute(
+            "data-sibling-session", "true"
+        )
         _drag_session(page, "grid-1", "grid-0", "right")
         expect(page).to_have_url(re.compile(r"/grid/[^/]+$"))
         expect(page.get_by_test_id("new-chat-button")).not_to_have_class(
@@ -207,7 +214,7 @@ def test_session_grid_drag_persist_live_updates_and_close(
         # dnd-kit suppresses click propagation for 50 ms after a drop.
         grid_nav.get_by_role("link").dblclick(delay=75)
         rename = page.get_by_role("textbox", name="Rename grid")
-        page.get_by_role("heading", name="Grid · 2 sessions", exact=True).click()
+        page.get_by_role("heading", name="Grid session 0 + Grid session 1", exact=True).click()
         _move_cell(page, "grid-0", "grid-1")
         expect(grid_nav.get_by_role("link")).to_have_text("Grid session 1 + Grid session 0")
         _move_cell(page, "grid-0", "grid-1")
@@ -224,7 +231,7 @@ def test_session_grid_drag_persist_live_updates_and_close(
         grid_nav.get_by_role("link").click(button="right")
         page.get_by_role("menuitem", name="Rename", exact=True).click()
         rename.fill("Research monitor")
-        page.get_by_role("heading", name="Research grid · 2 sessions", exact=True).click()
+        page.get_by_role("heading", name="Research grid", exact=True).click()
         expect(grid_nav.get_by_role("link", name="Research monitor")).to_be_visible()
         # One grid-wide workspace follows clicks in any cell, keeping its width and tabs.
         for index in range(2):

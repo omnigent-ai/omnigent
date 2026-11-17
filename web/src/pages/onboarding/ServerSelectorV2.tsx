@@ -5,7 +5,7 @@
  * `omnigentSetup` bridge via the `setup` prop.
  */
 
-import { type CSSProperties, useRef, useState } from "react";
+import { type CSSProperties, useEffect, useRef, useState } from "react";
 import { Settings } from "lucide-react";
 import { AnimatedOmnigentPanel } from "@/components/onboarding/AnimatedOmnigentPanel";
 import {
@@ -115,7 +115,9 @@ export interface ServerSelectorV2Setup {
   /** Subscribe to the CLI installer's output lines; returns an unsubscribe. */
   onInstallLog?: (cb: (line: string) => void) => () => void;
   /** Runners the "Where do you work today?" step offers for `url`, and whether
-   *  its host CLI comes bundled (no CLI install). Absent → this laptop only. */
+   *  its host CLI comes bundled (no CLI install). Neither, or absent → a remote
+   *  server opens without the runner step (a new user without the CLI may
+   *  install it first); the local install offers this laptop. */
   getRunnerOptions?: (url: string) => Promise<{ remote: boolean; bundledCli?: boolean }>;
   /** Connect the picked runner to `url` before opening it. Absent → the runner
    *  step just opens the server. */
@@ -180,28 +182,44 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
   const [colorScheme, setColorScheme] = useState<"system" | "light" | "dark">(
     setup.initialColorScheme ?? "system",
   );
-  // The server picked on the MDM landing, whether its runner step offers the
-  // remote environment, and whether its host CLI is bundled.
+  // The server picked for the runner step, the step it was picked from (Back),
+  // whether the step is just the optional "join or install the CLI" choice,
+  // whether it offers the remote environment, and whether its host CLI is bundled.
   const [runnerTarget, setRunnerTarget] = useState<{
     url: string;
+    from: "landing" | "server";
+    optional: boolean;
     remote: boolean;
     bundledCli: boolean;
   } | null>(null);
   const [runnerError, setRunnerError] = useState<string>();
-  // Bumped per pick, so a slow lookup can't replace a newer pick's runner step.
+  // Bumped per pick and on every step change, so a slow lookup can't act after a
+  // newer pick or after the user navigated away.
   const runnerPick = useRef(0);
-  const pickRunnerFor = async (url: string) => {
+  useEffect(() => {
+    runnerPick.current += 1;
+  }, [step]);
+  // Resolves false when `url` just opens. A server with no runner offers the
+  // optional install choice when the CLI is missing; from the landing, a server
+  // the shell offers a runner for (and the local install) gets the full step.
+  const pickRunnerFor = async (url: string, from: "landing" | "server" = "landing") => {
     const pick = ++runnerPick.current;
-    // A failed lookup falls back to this laptop only.
     const options = await setup.getRunnerOptions?.(url).catch(() => undefined);
-    if (pick !== runnerPick.current) return;
-    setRunnerTarget({
-      url,
-      remote: options?.remote === true,
-      bundledCli: options?.bundledCli === true,
-    });
+    if (pick !== runnerPick.current) return true;
+    const remote = options?.remote === true;
+    const bundledCli = options?.bundledCli === true;
+    const hasRunner = remote || bundledCli;
+    // Offer the choice only when the CLI can be installed: in-app, or by manual steps.
+    const canInstall =
+      setup.mockInstall === true ||
+      setup.onInstallCli !== undefined ||
+      setup.installSupported === false;
+    const optional = !hasRunner && !isLocalInstall(url) && setup.installed === false && canInstall;
+    if (!optional && !(from === "landing" && (hasRunner || isLocalInstall(url)))) return false;
+    setRunnerTarget({ url, from, optional, remote, bundledCli });
     setRunnerError(undefined);
     setStep("runner");
+    return true;
   };
   // What the terminal step runs after any install (Back → `back`): start the
   // local server (a picked local install's `url` opens as-is when up), or
@@ -290,12 +308,26 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
     }
     return connectToServer(url);
   };
-  // MDM landing: a new user picks a runner first; a returning user just opens it.
+  // MDM landing: a new user picks a runner first where the server offers one, or
+  // chooses to install the CLI when it's missing; a returning user just opens it.
   const joinFromLanding = async (url: string) => {
-    if (!returning) return pickRunnerFor(url);
+    if (!returning && (await pickRunnerFor(url))) return;
     setLandingError(undefined);
     const result = await connect(url, "landing");
     if (result.error) setLandingError(result.error);
+  };
+  // Server list: a new user without the CLI may install it first; anyone else just opens.
+  const joinFromServerList = async (url: string): Promise<ConnectResult> => {
+    // Skip the runner lookup when nothing could be offered, so the connect starts right away.
+    const mayOffer = !returning && setup.installed === false && !isLocalInstall(url);
+    if (mayOffer && (await pickRunnerFor(url, "server"))) return {};
+    return connect(url);
+  };
+  // Open the runner step's server without a runner, showing a rejection there.
+  const openFromRunner = async (url: string, installCli = false) => {
+    setRunnerError(undefined);
+    const result = await connect(url, "runner", installCli);
+    if (result.error) setRunnerError(result.error);
   };
   // Connect from the terminal: success navigates away, a rejection or cancel
   // shows there (with Retry/Back) instead of a "ready" that never opens.
@@ -332,9 +364,15 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
   const manualInstall =
     setup.installed === false && setup.installSupported === false && !skipInstall;
   const terminalUrl = terminalTarget.url;
+  // Laptop setup offered as an optional choice, so a failure can still open the server.
+  const optionalLaptop =
+    terminalTarget.kind === "connect" &&
+    terminalTarget.back === "runner" &&
+    runnerTarget?.optional &&
+    !skipInstall;
   const connectAnyway =
     terminalUrl !== undefined &&
-    (terminalTarget.kind === "local" || remoteRunnerFailed || manualInstall)
+    (terminalTarget.kind === "local" || remoteRunnerFailed || manualInstall || optionalLaptop)
       ? () =>
           setTerminalTarget({
             kind: "connect",
@@ -348,6 +386,9 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
     terminalTarget.kind,
     setup.localServerRunning === true,
   );
+  // Servers added on the server step this session; they survive Back from the join choice.
+  const [sessionServers, setSessionServers] = useState<string[]>([]);
+  const pickedFromList = runnerTarget?.from === "server" ? runnerTarget.url : undefined;
   // Whether the server step is showing its URL-input ("add") view vs the list —
   // reported up so the band can show the hero icons only in the add view.
   const [serverAddMode, setServerAddMode] = useState(false);
@@ -461,12 +502,11 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
             error={runnerError}
             connection={connection}
             onCancelConnect={cancelConnect}
-            onBack={() => setStep("landing")}
+            onBack={() => setStep(runnerTarget.from)}
+            onJustJoin={runnerTarget.optional ? () => openFromRunner(runnerTarget.url) : undefined}
             onInstall={async (runner) => {
               if (!setup.onConnectRunner) {
-                setRunnerError(undefined);
-                const result = await connect(runnerTarget.url, "runner", needsInstall);
-                if (result.error) setRunnerError(result.error);
+                await openFromRunner(runnerTarget.url, needsInstall || runnerTarget.optional);
                 return;
               }
               // No local install for a remote runner, or when the host CLI is bundled.
@@ -490,8 +530,8 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
             />
           ) : (
             <SetupTerminalStep
-              // Switching to server-only connect starts a fresh terminal run.
-              key={terminalRunner ?? terminalTarget.kind}
+              // Switching to server-only connect, or skipping the install, starts a fresh run.
+              key={`${terminalRunner ?? terminalTarget.kind}:${skipInstall}`}
               onInstallCli={needsInstall && !skipInstall ? setup.onInstallCli : undefined}
               onInstallLog={setup.onInstallLog}
               onRun={runTerminal}
@@ -509,12 +549,22 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
             initialUrl={setup.initialUrl}
             error={setup.error}
             recentServers={setup.recentServers}
+            initialAddedServers={sessionServers}
+            onAddedServersChange={setSessionServers}
+            initialSelected={
+              pickedFromList !== undefined &&
+              [...sessionServers, ...setup.managedServers, ...setup.recentServers].includes(
+                pickedFromList,
+              )
+                ? pickedFromList
+                : undefined
+            }
             managedServers={setup.managedServers}
             managedServerNames={setup.managedServerNames}
             serverNames={setup.serverNames}
             installed={setup.installed}
             onBack={() => setStep("landing")}
-            onConnect={connect}
+            onConnect={joinFromServerList}
             connection={connection}
             onCancelConnect={cancelConnect}
             onRemove={setup.onRemoveServer}

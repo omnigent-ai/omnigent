@@ -35,8 +35,18 @@ import pytest
 import yaml as _yaml
 
 from omnigent.errors import OmnigentError
+from omnigent.inner.codex_worker import BROKERED_CODEX_AUTH_COMMAND
+from omnigent.inner.datamodel import (
+    CredentialProxyEntry,
+    CredentialProxySpec,
+    CredentialSourceSpec,
+    OSEnvSandboxSpec,
+    OSEnvSpec,
+)
 from omnigent.onboarding import ambient, harness_install
 from omnigent.runtime.workflow import (
+    _apply_codex_provider_env,
+    _bind_codex_gateway_credential,
     _build_claude_sdk_spawn_env,
     _build_codex_spawn_env,
     _build_goose_spawn_env,
@@ -366,6 +376,182 @@ def test_codex_uses_openai_global_default(config_home: Path) -> None:
     assert env["HARNESS_CODEX_MODEL"] == "gpt-default-model"
     # Codex defaults to the Responses wire API when the family omits wire_api.
     assert env["HARNESS_CODEX_WIRE_API"] == "responses"
+
+
+def _brokered_codex_spec(
+    source: CredentialSourceSpec, *, host: str, response_path: str
+) -> tuple[AgentSpec, OSEnvSandboxSpec, CredentialProxyEntry]:
+    binding = CredentialProxyEntry(
+        host=host,
+        scheme="bearer",
+        source=source,
+        inject_env=["OMNIGENT_CODEX_GATEWAY_TOKEN"],
+    )
+    sandbox = OSEnvSandboxSpec(
+        type="darwin_seatbelt",
+        egress_rules=[f"POST {host}{response_path}"],
+        credential_proxy=CredentialProxySpec(entries=[binding]),
+    )
+    spec = _make_spec(harness="codex", os_env=OSEnvSpec(sandbox=sandbox))
+    spec.executor.config.update(web_search=False, disable_native_tools=True, broker_gateway=True)
+    return spec, sandbox, binding
+
+
+def test_codex_gateway_binding_uses_only_placeholder_auth(config_home: Path) -> None:
+    _write_config(config_home, _openai_default_config())
+    spec, _, binding = _brokered_codex_spec(
+        CredentialSourceSpec(
+            kind="unix_socket", path="/private/model-token.sock", refresh_interval_seconds=300
+        ),
+        host="openai.example.com",
+        response_path="/v1/responses",
+    )
+
+    env = _build_codex_spawn_env(spec)
+    assert env["HARNESS_CODEX_GATEWAY_AUTH_COMMAND"] == BROKERED_CODEX_AUTH_COMMAND
+    assert env["HARNESS_CODEX_BROKERED_GATEWAY"] == "true"
+    assert env["HARNESS_CODEX_ENABLE_WEB_SEARCH"] == "false"
+    assert env["HARNESS_CODEX_DISABLE_NATIVE_TOOLS"] == "true"
+    assert "/private/model-token.sock" not in env["HARNESS_CODEX_GATEWAY_AUTH_COMMAND"]
+
+    spec.executor.config.pop("broker_gateway")
+    with pytest.raises(OmnigentError, match=r"requires executor\.config\.broker_gateway: true"):
+        _build_codex_spawn_env(spec)
+    spec.executor.config["broker_gateway"] = False
+    with pytest.raises(OmnigentError, match=r"requires executor\.config\.broker_gateway: true"):
+        _build_codex_spawn_env(spec)
+    for value in (None, 0, 1, "true", "false"):
+        spec.executor.config["broker_gateway"] = value
+        with pytest.raises(OmnigentError, match="broker_gateway must be a boolean"):
+            _build_codex_spawn_env(spec)
+    spec.executor.config["broker_gateway"] = True
+
+    for key, unsafe_values in (
+        ("web_search", (None, True, "false", 0)),
+        ("disable_native_tools", (None, False, "true", 1)),
+    ):
+        safe_value = spec.executor.config.pop(key)
+        with pytest.raises(OmnigentError, match=r"requires executor\.config\.web_search: false"):
+            _build_codex_spawn_env(spec)
+        for value in unsafe_values:
+            spec.executor.config[key] = value
+            with pytest.raises(
+                OmnigentError, match=r"requires executor\.config\.web_search: false"
+            ):
+                _build_codex_spawn_env(spec)
+        spec.executor.config[key] = safe_value
+
+    config = _openai_default_config()
+    config["providers"]["vendor-openai"]["openai"]["base_url"] = (
+        "https://openai.example.com:443/v1"
+    )
+    _write_config(config_home, config)
+    assert _build_codex_spawn_env(spec)["HARNESS_CODEX_BROKERED_GATEWAY"] == "true"
+    config["providers"]["vendor-openai"]["openai"]["base_url"] = (
+        "https://openai.example.com:8443/v1"
+    )
+    _write_config(config_home, config)
+    with pytest.raises(OmnigentError, match="matching HTTPS bearer"):
+        _build_codex_spawn_env(spec)
+    _write_config(config_home, _openai_default_config())
+
+    binding.host = "other.example.com"
+    with pytest.raises(OmnigentError, match="matching HTTPS bearer"):
+        _build_codex_spawn_env(spec)
+    with pytest.raises(OmnigentError, match="gateway HTTPS provider"):
+        _bind_codex_gateway_credential({}, spec)
+    _write_config(config_home, {})
+    with pytest.raises(OmnigentError, match="gateway HTTPS provider"):
+        _apply_codex_provider_env({}, spec, None)
+
+
+def test_locked_codex_gateway_requires_private_renewable_source_and_exact_route(
+    config_home: Path,
+) -> None:
+    _write_config(config_home, _openai_default_config())
+    spec, sandbox, binding = _brokered_codex_spec(
+        CredentialSourceSpec(
+            kind="file", path="/private/model-token", refresh_interval_seconds=300
+        ),
+        host="openai.example.com",
+        response_path="/v1/responses",
+    )
+    assert _build_codex_spawn_env(spec)["HARNESS_CODEX_BROKERED_GATEWAY"] == "true"
+
+    sandbox.credential_proxy = None
+    with pytest.raises(OmnigentError, match="renewable file/socket binding"):
+        _build_codex_spawn_env(spec)
+    sandbox.credential_proxy = CredentialProxySpec(entries=[binding])
+
+    binding.source = CredentialSourceSpec(kind="command", command="token-command")
+    with pytest.raises(OmnigentError, match="renewable file/socket binding"):
+        _build_codex_spawn_env(spec)
+    binding.source = CredentialSourceSpec(kind="file", path="/private/model-token")
+    with pytest.raises(OmnigentError, match="renewable file/socket binding"):
+        _build_codex_spawn_env(spec)
+    binding.source.refresh_interval_seconds = 300
+
+    sandbox.egress_rules = ["POST openai.example.com/**"]
+    with pytest.raises(OmnigentError, match="exact POST Responses"):
+        _build_codex_spawn_env(spec)
+    sandbox.egress_rules = ["POST other.example.com/v1/responses"]
+    with pytest.raises(OmnigentError, match="exact POST Responses"):
+        _build_codex_spawn_env(spec)
+    sandbox.egress_rules = [
+        "POST openai.example.com/v1/responses",
+        "POST openai.example.com/v1/responses",
+    ]
+    with pytest.raises(OmnigentError, match="exact POST Responses"):
+        _build_codex_spawn_env(spec)
+
+    sandbox.egress_rules = [
+        "POST openai.example.com/v1/responses",
+        "POST *.example.com/v1/responses",
+    ]
+    with pytest.raises(OmnigentError, match="exact POST Responses"):
+        _build_codex_spawn_env(spec)
+
+    sandbox.egress_rules = ["POST openai.example.com/v1/responses"]
+    config = _openai_default_config()
+    config["providers"]["vendor-openai"]["openai"]["base_url"] = (
+        "https://openai.example.com:invalid/v1"
+    )
+    _write_config(config_home, config)
+    with pytest.raises(OmnigentError, match="invalid Codex gateway URL"):
+        _build_codex_spawn_env(spec)
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {},
+        {"web_search": False, "disable_native_tools": True},
+        {"web_search": "false", "disable_native_tools": 1},
+    ],
+)
+def test_codex_gateway_keeps_auth_for_ordinary_same_host_binding(
+    config_home: Path, settings: dict[str, object]
+) -> None:
+    _write_config(config_home, _openai_default_config())
+    binding = CredentialProxyEntry(
+        host="openai.example.com",
+        scheme="bearer",
+        source=CredentialSourceSpec(kind="env", env="PARENT_TOKEN"),
+        inject_env=["OTHER_TOKEN"],
+    )
+    sandbox = OSEnvSandboxSpec(
+        type="darwin_seatbelt",
+        egress_rules=["POST openai.example.com/v1/responses"],
+        credential_proxy=CredentialProxySpec(entries=[binding]),
+    )
+    spec = _make_spec(harness="codex", os_env=OSEnvSpec(sandbox=sandbox))
+    spec.executor.config.update(settings)
+
+    env = _build_codex_spawn_env(spec)
+
+    assert env["HARNESS_CODEX_GATEWAY_AUTH_COMMAND"] == "printf %s sk-oai-secret"
+    assert "HARNESS_CODEX_ENABLE_WEB_SEARCH" not in env
+    assert "HARNESS_CODEX_DISABLE_NATIVE_TOOLS" not in env
 
 
 @pytest.mark.parametrize("auth_source", ["spec", "global"])
@@ -1679,7 +1865,7 @@ def test_codex_cli_config_default_pins_model_provider(config_home: Path) -> None
     assert "HARNESS_CODEX_GATEWAY_BASE_URL" not in env
     assert "HARNESS_CODEX_GATEWAY_AUTH_COMMAND" not in env
     # No model pinned either — codex keeps its own default model against
-    # the pinned provider (matching how isaac configures it).
+    # the pinned provider (matching how a wrapper configures it).
     assert "HARNESS_CODEX_MODEL" not in env
 
 
@@ -1687,7 +1873,7 @@ def test_codex_subscription_default_pins_builtin_openai(config_home: Path) -> No
     """A codex ``subscription`` default pins the built-in ``openai`` provider.
 
     The executor bridges the user's ~/.codex/config.toml, whose custom
-    default model_provider (e.g. isaac's Databricks Unity Gateway) would
+    default model_provider (e.g. a Databricks Unity Gateway) would
     otherwise silently hijack a Subscription selection. Failure means
     "Subscription" stops meaning "ChatGPT login" on machines with a custom
     config.toml default.

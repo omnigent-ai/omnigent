@@ -47,7 +47,7 @@ export function useCommentInbox(rows: Conversation[]): CommentInbox {
   const queries = useQueries({
     queries: commentRows.map((row) => ({
       queryKey: commentsQueryKey(row.id),
-      queryFn: () => fetchComments(row.id),
+      queryFn: ({ signal }) => fetchComments(row.id, undefined, signal),
       // Match useComments so shared-key observers agree on freshness.
       staleTime: 2_000,
       // Absorb a transient blip without hammering a down server —

@@ -1,0 +1,182 @@
+# Omnigent on AWS Lambda MicroVMs
+
+[AWS Lambda MicroVMs](https://aws.amazon.com/about-aws/whats-new/2026/06/aws-lambda-microvms/)
+run Omnigent hosts inside Firecracker-isolated, snapshot-resumable microVMs
+(up to 8 hours) in your own AWS account. This is a **server-managed** provider:
+the server provisions a microVM when a session is created with
+`"host_type": "managed"` and terminates it when the session is deleted. There is
+no `omnigent sandbox` CLI flow for this provider.
+
+> [!IMPORTANT]
+> **Lambda MicroVMs boot from a pre-built *MicroVM image*, not a registry
+> reference.** Unlike the Modal / Daytona / CoreWeave launchers — which pull
+> `ghcr.io/omnigent-ai/omnigent-host` directly — Lambda MicroVMs start from an
+> image built ahead of time with `create-microvm-image` (a Dockerfile + zip in
+> S3, closer to the E2B template model). You build that image once; the
+> launcher's `image_identifier` config then names it. This directory is **not**
+> a server deploy target — it holds the image-build inputs.
+
+## Why this provider
+
+- **AWS-native isolation.** Sessions stay in your account, VPC, IAM, and
+  CloudWatch, with per-tenant Firecracker isolation.
+- **Sleep and wake.** A suspended microVM resumes in place with
+  the workspace intact. It is the first provider whose resume *preserves the
+  running host* (the `resume_preserves_host` capability): the thaw brings the
+  host back holding its launch token, the server keeps that token, and the host
+  reconnects without a fresh start. Early suspension is opt-in because the
+  provider cannot observe activity on Omnigent’s outbound tunnel.
+
+## Prerequisites
+
+```bash
+pip install 'omnigent[lambda-microvm]'   # installs the boto3 extra
+```
+
+The **server process** needs AWS credentials (profile, environment, or an
+instance role) that can call the `lambda-microvms` API and pass the execution
+role. Lambda MicroVMs is available in `us-east-1`, `us-east-2`, `us-west-2`,
+`ap-northeast-1` (Tokyo), and `eu-west-1` (Ireland); pin a region your server
+can reach.
+
+## IAM: two roles
+
+Lambda MicroVMs uses two roles (see the AWS docs for exact trust policies):
+
+- **Build role** (`buildRoleArn`) — assumed while `create-microvm-image` builds
+  the image. Needs `s3:GetObject` on your artifact bucket and CloudWatch Logs
+  write. Trusts `lambda.amazonaws.com` for both `sts:AssumeRole` **and**
+  `sts:TagSession` (the build fails without `sts:TagSession`); an
+  `aws:SourceAccount` condition adds confused-deputy prevention.
+- **Execution role** (`executionRoleArn`) — assumed by the running microVM.
+  Needs CloudWatch Logs write — without it the guest's stdout/stderr never
+  reach CloudWatch, so a host that fails to dial back leaves no trace. Add
+  `bedrock:InvokeModel` here if you want runners to reach Bedrock through the
+  role instead of a long-lived key in the microVM environment (see
+  "Credentials" below).
+
+## Build the MicroVM image
+
+The microVM runs the official Omnigent host image plus a tiny lifecycle-hooks
+shim. `Dockerfile` in this directory layers that shim on
+`ghcr.io/omnigent-ai/omnigent-host:latest` (the host image already publishes for
+arm64, which Lambda MicroVMs require, so no cross-build is needed on a Graviton
+builder; on an x86 host, register QEMU first).
+
+```bash
+# 1. Package the build context (Dockerfile at the zip root, alongside the files
+#    it COPYs) and upload to S3 in the same region as the image.
+zip -j omnigent-host-microvm.zip \
+  deploy/aws-lambda-microvm/Dockerfile \
+  deploy/aws-lambda-microvm/hooks_server.py \
+  deploy/aws-lambda-microvm/entrypoint.sh \
+  deploy/aws-lambda-microvm/start_host.sh
+aws s3 cp omnigent-host-microvm.zip s3://my-omnigent-artifacts/omnigent-host-microvm.zip
+
+# 2. Build the MicroVM image.
+# --hooks is REQUIRED: hooks are opt-in per image, and without it Lambda never
+# waits on /ready nor delivers the /run payload, so no host ever starts. The
+# resume hook lets the shim restart a host that stood down before a suspend.
+# The port must match the shim's (9000).
+aws lambda-microvms create-microvm-image \
+  --name omnigent-host \
+  --base-image-arn arn:aws:lambda:<region>:aws:microvm-image:al2023-1 \
+  --build-role-arn arn:aws:iam::<acct>:role/omnigent-microvm-build \
+  --code-artifact '{"uri":"s3://my-omnigent-artifacts/omnigent-host-microvm.zip"}' \
+  --hooks '{"port":9000,"microvmHooks":{"run":"ENABLED","resume":"ENABLED"},"microvmImageHooks":{"ready":"ENABLED"}}'
+```
+
+The launcher's `image_identifier` is the resulting image's ARN
+(`arn:aws:lambda:<region>:<acct>:microvm-image:omnigent-host`); `run-microvm`
+rejects a bare image name. Check that the image enables both runtime hooks with
+`aws lambda-microvms get-microvm-image-version` (look for `"run": "ENABLED"`
+and `"resume": "ENABLED"` under `microvmHooks`). Image versions incur storage cost even when idle; prune old ones with
+`delete-microvm-image-version`.
+
+The image bakes in `start_host.sh` and `hooks_server.py`, and they must match
+the server: the server sends the host config as `OMNIGENT_HOST_CONFIG_JSON` in
+the `/run` payload, and only the `start_host.sh` in this directory reads it.
+Rebuild the image (steps 1 and 2) when you upgrade the server. A stale image
+can start the host without its config.
+
+## Server config
+
+```yaml
+sandbox:
+  provider: lambda_microvm
+  server_url: https://omnigent.example.com   # the public URL the host dials back to
+  lambda_microvm:
+    region: us-east-1
+    image_identifier: arn:aws:lambda:us-east-1:<acct>:microvm-image:omnigent-host
+    image_version: "1.0"                      # optional; default: latest
+    execution_role_arn: arn:aws:iam::<acct>:role/omnigent-microvm-exec
+    env: [ANTHROPIC_API_KEY, GIT_TOKEN]       # SERVER env var NAMES → microVM env
+```
+
+`provider` + `server_url` + `image_identifier` + `execution_role_arn` is a
+complete config. Everything under `lambda_microvm:` also has an env-var fallback
+(`OMNIGENT_LAMBDA_MICROVM_*`) for deployments that prefer environment config.
+
+## Credentials
+
+Harness credentials (model keys, `GIT_TOKEN`) reach the microVM the same way
+Daytona and BoxLite inject them: the server reads the **named** environment
+variables from its own process at launch and passes their values into the
+microVM environment. Secret *values* never live in the config file — only the
+names do, and a name that is unset in the server environment fails the launch
+loud rather than starting a host that can't authenticate.
+
+For a key-free setup, grant the execution role `bedrock:InvokeModel` and point
+runners at Bedrock; the microVM then reaches the model through its role and no
+model key enters the sandbox.
+
+## Lifecycle and caveats
+
+- **8-hour cap.** A microVM lives at most 8 hours. The managed launch-token TTL
+  is derived above that cap (override the requested lifetime with
+  `OMNIGENT_LAMBDA_MICROVM_MAX_LIFETIME_S`, between 60 s and 8 h: the idle
+  window is capped at the lifetime and Lambda requires it to be at least 60 s).
+- **Host supervision.** `start_host.sh` runs `omnigent host` under the same
+  crash supervisor the other providers use, so a crash restarts it in place.
+  A clean exit or SIGTERM stands it down; the hooks server then restarts it on
+  the next `/resume`, unless it exited with the fatal status (a rejected
+  credential or a version mismatch).
+- **Idle suspend/resume.** The idle window defaults to the requested VM lifetime.
+  Lambda counts only inbound endpoint traffic, while this host uses an outbound
+  tunnel. A shorter timer can freeze an active agent, so there is no automatic
+  between-turn suspension by default. To opt in, set
+  `OMNIGENT_LAMBDA_MICROVM_MAX_IDLE_S` on the server (60 s up to the lifetime).
+  This timer runs from launch or the last resume regardless of agent activity.
+  The server explicitly resumes a suspended VM when the next message arrives;
+  the running host and its token survive the snapshot. `autoResumeEnabled`
+  remains enabled as a backstop for inbound traffic. `suspendedDurationSeconds`
+  matches the requested lifetime to avoid an earlier suspension expiry.
+- **Cold startup.** Set `OMNIGENT_MANAGED_HOST_ONLINE_TIMEOUT_S` on the server
+  when the first image pull needs more than the default 120 seconds. Valid
+  values are integer seconds from 1 to 1800; the shared launch rendezvous budget
+  grows with it. This setting applies to all managed providers.
+- **Snapshot uniqueness.** A resumed microVM restores memory state, so reseed
+  CSPRNGs and rotate any in-memory secrets on resume (the host does this on
+  restart). See the AWS "snapshots and uniqueness" docs.
+- **No self-suspend.** A microVM cannot suspend itself; suspension is driven by
+  the idle policy or an external `suspend-microvm` call.
+
+## Live lifecycle validation
+
+Use a quiet test account and a server plus host image built from the candidate
+revision. Run the manual driver with an existing configured agent:
+
+```sh
+python tests/e2e/integrations/deploy/lambda_microvm/e2e_managed.py \
+  --server https://your-test-server --suspend --timeout 600
+```
+
+The driver creates a workspace marker directory through the host API, explicitly
+suspends the identified VM, observes `SUSPENDED`, sends another turn, and checks
+`RUNNING` on the same AWS id, the marker's survival, and absence of a replacement.
+Deleting the session must terminate that VM. The `--suspend` mode requires AWS
+`SuspendMicrovm` permission in addition to list/get access. For an idle-policy
+check instead, configure an explicit short idle window on the test server and
+pass `--idle-wait` longer than that window. Neither mode changes server settings.
+Without these options the driver checks reuse and teardown only. AWS checks
+cannot be skipped in suspend/resume mode. This driver is manual, outside CI.

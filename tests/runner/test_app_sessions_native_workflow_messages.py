@@ -1697,6 +1697,7 @@ async def test_session_creation_auto_starts_turn_for_unanswered_user_message() -
     # The recovery turn's body must include the unanswered user
     # message in its content (loaded from server history).
     body_content = hc.posted_bodies[0].get("content", [])
+    assert body_content[0]["id"] == "item_1"
     assert any(
         item.get("type") == "message" and item.get("role") == "user" for item in body_content
     ), (
@@ -2128,6 +2129,7 @@ async def test_resume_sends_full_history_plus_new_message_to_harness() -> None:
                 "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
                 "model": "test-agent",
                 "content": [{"type": "input_text", "text": "Postresume"}],
+                "persisted_item_id": "msg_postresume",
             },
         )
         # 202 = turn started in background.
@@ -2167,6 +2169,7 @@ async def test_resume_sends_full_history_plus_new_message_to_harness() -> None:
     # Third item: the new user message sent after resume.
     assert content[2].get("type") == "message"
     assert content[2].get("role") == "user"
+    assert content[2]["id"] == "msg_postresume"
     user_content = content[2].get("content", [])
     # Verify the new message text made it through.
     assert any(
@@ -2661,3 +2664,43 @@ async def test_interrupt_forwards_to_harness_before_cancelling() -> None:
         f"interrupt must forward to the harness then finalize the turn with one "
         f"marker; got {len(markers)}."
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("external_item", [False, True], ids=["cold", "external-item-race"])
+async def test_cold_forward_keeps_initiating_item_id(external_item: bool) -> None:
+    """A later external item in history must not take over the forwarded prompt."""
+    from omnigent.runtime.harnesses._executor_adapter import _translate_input_to_messages
+
+    current = {
+        "id": "msg_current",
+        "type": "message",
+        "role": "user",
+        "content": [{"type": "input_text", "text": "same text"}],
+    }
+    external = {**current, "id": "msg_external"}
+    history = [current, external] if external_item else [current]
+    app, _pm, harness = _build_recovery_app(history)
+    async with _runner_client(app) as client:
+        # No initialized session/cache: forward loads the already-persisted items.
+        response = await client.post(
+            f"/v1/sessions/cold-input-id-{external_item}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "agent",
+                "content": current["content"],
+                "persisted_item_id": current["id"],
+            },
+        )
+        assert response.status_code == 202, response.text
+        await poll_until_async(
+            lambda: bool(harness.posted_bodies) and not app.state.active_turns, timeout_s=5
+        )
+    content = harness.posted_bodies[0]["content"]
+    user_items = [item for item in content if item.get("role") == "user"]
+    assert [item["id"] for item in user_items] == (
+        ["msg_external", "msg_current"] if external_item else ["msg_current"]
+    )
+    messages = _translate_input_to_messages(user_items)
+    assert messages[-1]["input_item_id"] == "msg_current"

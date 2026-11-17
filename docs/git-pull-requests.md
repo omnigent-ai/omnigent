@@ -21,8 +21,11 @@ loads facets without opening the panel.
 
 Declare supported controls through `ProviderCapabilities`: account switching,
 base remote selection, line counts, and diffs for linked requests outside the
-workspace's repository. Return authentication state and actionable host-side
-instructions in `auth`. A provider can authenticate without a CLI; the panel
+workspace's repository. A provider that merges and switches accounts can also
+implement the optional `AccountMergeFacet` and set `merge_as_account`. The merge
+dialog then offers the signed-in accounts, and `merge_as` must run as the chosen
+account for that call alone, never as a saved preference read back. Return
+authentication state and actionable host-side instructions in `auth`. A provider can authenticate without a CLI; the panel
 requires a CLI installation only while the provider is also signed out.
 
 Requests route to the selected association's provider. Without an association,

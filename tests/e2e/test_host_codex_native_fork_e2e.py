@@ -47,11 +47,13 @@ from pathlib import Path
 import httpx
 import pytest
 
+from tests.e2e._claude_host_support import (
+    _launch_runner,
+    _send_user_message,
+)
 from tests.e2e.test_host_claude_native_fork_e2e import (
     _fork_session,
     _init_git_repo,
-    _launch_runner,
-    _send_user_message,
     _wait_for_external_session_id,
 )
 from tests.e2e.test_host_codex_native_e2e import (

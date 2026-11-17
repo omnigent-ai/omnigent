@@ -6,7 +6,7 @@ name with `rg 'def test_name' tests/harnesses/claude_native/forwarder`.
 
 | Behavior | Test module |
 | --- | --- |
-| Clear, fork, resume and native session identity | `test_session_lifecycle.py` |
+| Clear, fork, resume, fresh-clear receipt handoff and native session identity | `test_session_lifecycle.py` |
 | Visible and web-injected transcript items | `test_transcript_delivery.py` |
 | Byte cursors, relocation, fingerprints and state writes | `test_transcript_cursors.py` |
 | Pending settlement, hook acknowledgement, restart recovery and scheduled wake turns | `test_settlement.py` |

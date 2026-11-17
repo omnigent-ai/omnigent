@@ -129,6 +129,9 @@ services:
       # Set to 0 for IdPs (e.g. Cloudflare Access) that omit auth_time on
       # forced re-authentication. Empty keeps the check; see .env.example.
       OMNIGENT_OIDC_REQUIRE_REAUTH: "${OMNIGENT_OIDC_REQUIRE_REAUTH:-}"
+      # Set to 0 (with REQUIRE_REAUTH=0) for IdPs (e.g. GitLab) that fail
+      # prompt=login. Empty keeps sending it; see .env.example.
+      OMNIGENT_OIDC_REAUTH_PROMPT: "${OMNIGENT_OIDC_REAUTH_PROMPT:-}"
       # Opt-in OIDC invites (admin pre-authorizes one off-domain email).
       # Off unless set. The admin list (/data/admins) and the optional
       # allowed-domains file (/data/allowed_domains) need no env var —

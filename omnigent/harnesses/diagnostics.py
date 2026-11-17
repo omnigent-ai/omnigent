@@ -259,7 +259,7 @@ class SignInPrompt:
     """A sign-in prompt a launcher printed to the terminal before the agent started.
 
     :param url: The address the user must open, e.g.
-        ``"https://dbcert.example.com/device"``.
+        ``"https://sso.example.com/device"``.
     :param code: The one-time code shown next to it, e.g. ``"HQ7M-2KPD"``, or
         ``None`` when the prompt shows only an address.
     """
@@ -285,7 +285,7 @@ _SIGN_IN_CUE = re.compile(
 _SIGN_IN_CODE_LINE = re.compile(r"\bcode\b", re.IGNORECASE)
 # Lines a prompt prints below its address: the code, "waiting for sign-in",
 # "press Enter". Any other output below the address means the launcher has
-# moved on (dbcert's success lines, the agent's own banner) and the address
+# moved on (the launcher's success lines, the agent's own banner) and the address
 # still on screen is stale.
 _SIGN_IN_TRAILER = re.compile(
     r"\bcode\b|waiting|wait for|press |browser|expire|sign[ -]?in|log[ -]?in|authenticat",

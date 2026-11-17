@@ -86,6 +86,10 @@ emit these input-delivery events.
   A later transcript match clears it without saving a missing-message error.
 - `reported_undelivered`: the runner explicitly reported that this particular
   input had not reached the harness.
+- `reported_undelivered_from_runner_copy`: as above, but the server's queued
+  copy had already expired, so the message was saved from the content the
+  runner reported with it. This happens when the runner's human-wait hold runs
+  out on messages queued behind an unanswered prompt.
 
 Skipped inputs also carry a bounded `cause_class`:
 

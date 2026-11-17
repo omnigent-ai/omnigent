@@ -11,18 +11,30 @@
 // without importing the block dispatcher that renders them.
 
 import type React from "react";
+import { useInRouterContext } from "react-router-dom";
+import { Link } from "@/lib/routing";
 import { useMemo } from "react";
-import { CopyIcon, GitPullRequestIcon } from "lucide-react";
+import {
+  BotIcon,
+  CopyIcon,
+  FileTextIcon,
+  FolderIcon,
+  GitPullRequestIcon,
+  MessageSquareIcon,
+} from "lucide-react";
 import { toast } from "sonner";
 import { defaultRemarkPlugins } from "streamdown";
 import remarkBreaks from "remark-breaks";
 import { normalizeExplicitMathDelimiters } from "@/components/ai-elements/mathMarkdown";
 import { MessageResponse } from "@/components/ai-elements/message";
 import {
+  sameServerSessionPath,
   shortFileCitationLabel,
   splitWorkspaceFileCitation,
   WORKSPACE_FILE_LINK_ATTR,
+  WORKSPACE_IMAGE_ATTR,
 } from "@/components/ai-elements/streamdown-security";
+import { WorkspaceMarkdownImage } from "./WorkspaceMarkdownImage";
 import { ZoomableImage } from "@/components/ImageLightbox";
 import {
   ContextMenu,
@@ -38,6 +50,7 @@ import { copyText } from "@/lib/clipboard";
 import { absoluteWorkspacePath } from "@/lib/composerContext";
 import { followLinkWithPopupFallback } from "@/lib/openLinkInApp";
 import { cn } from "@/lib/utils";
+import { parseMentionPillTitle } from "@/lib/mentionPills";
 import {
   useFileViewer,
   useFileViewerConversationId,
@@ -281,6 +294,37 @@ function PullRequestLinkLabel({ children }: { children: React.ReactNode }) {
 }
 
 /**
+ * The in-app chat path for an `omnigent://<host>/c/<id>` link to the server this
+ * page is on, or null. Links to other servers keep their deep-link href.
+ */
+function currentServerSessionPath(href: unknown): string | null {
+  if (typeof href !== "string" || typeof window === "undefined") return null;
+  return sameServerSessionPath(href, window.location);
+}
+
+/** A session link to this server, routed in the app like a session mention pill. */
+function ServerSessionLink({
+  path,
+  className,
+  children,
+  target: _target,
+  rel: _rel,
+  ...props
+}: React.ComponentPropsWithoutRef<"a"> & { path: string }) {
+  const linkClass = cn(STREAMDOWN_LINK_CLASS, className);
+  // Markdown also renders outside the router (stories, embeds); there the href navigates.
+  return useInRouterContext() ? (
+    <Link to={path} className={linkClass} data-streamdown="link" {...props}>
+      {children}
+    </Link>
+  ) : (
+    <a href={withBasePath(path)} className={linkClass} data-streamdown="link" {...props}>
+      {children}
+    </a>
+  );
+}
+
+/**
  * Anchor renderer for markdown links. A link to a workspace file, its href
  * parked on a fragment by `markWorkspaceFileLinks` and the real path moved to
  * `WORKSPACE_FILE_LINK_ATTR`, opens the FileViewer instead of navigating,
@@ -323,6 +367,14 @@ function WorkspaceFileLink({
           src={href}
           title={typeof children === "string" ? children : "Video recording"}
         />
+      );
+    }
+    const sessionPath = currentServerSessionPath(href);
+    if (sessionPath) {
+      return (
+        <ServerSessionLink path={sessionPath} className={className} title={title} {...props}>
+          {children}
+        </ServerSessionLink>
       );
     }
     // Rebase an app-internal link (e.g. an agent's `/clear` "the new chat"
@@ -507,18 +559,140 @@ function ZoomableMarkdownImage({
   src,
   alt,
   node: _node,
+  [WORKSPACE_IMAGE_ATTR]: workspacePath,
   ...props
-}: WithHastNode<React.ComponentProps<"img">>) {
+}: WithHastNode<React.ComponentProps<"img">> & { [WORKSPACE_IMAGE_ATTR]?: string }) {
+  if (workspacePath) {
+    return <WorkspaceMarkdownImage path={workspacePath} alt={alt ?? ""} />;
+  }
   const resolvedSrc = typeof src === "string" ? src : undefined;
   return <ZoomableImage {...props} src={resolvedSrc} alt={alt ?? ""} />;
 }
 
 // Stable module-level override map so MessageResponse's shallow prop compare
 // never sees a new `components` identity and re-parses needlessly.
+/** Same pink as the composer's mention tokens, so a tag looks alike before and after send. */
+const MENTION_PILL_CLASS =
+  "inline-flex max-w-full items-center gap-1 rounded-[4px] bg-brand-accent/10 px-1 align-baseline text-[0.95em] leading-snug text-brand-accent no-underline ring-2 ring-brand-accent/10 hover:bg-brand-accent/20";
+
+/** A tagged file in a sent message; opens it like a workspace file link. */
+function FileMentionPill({
+  path,
+  isDir,
+  lineSpan,
+  children,
+}: {
+  path: string;
+  isDir: boolean;
+  lineSpan?: string;
+  children: React.ReactNode;
+}) {
+  const { open } = useWorkspaceFileOpener(path, true);
+  const Icon = isDir ? FolderIcon : FileTextIcon;
+  return (
+    <button
+      type="button"
+      data-testid="mention-pill"
+      className={MENTION_PILL_CLASS}
+      // Disabled until the existence check says how to open the path.
+      aria-disabled={open ? undefined : true}
+      // The label can truncate; the hover title keeps the full path and line span.
+      title={lineSpan ? `${path}:${lineSpan}` : path}
+      onClick={(event) => {
+        event.stopPropagation();
+        open?.();
+      }}
+    >
+      <Icon className="size-3 shrink-0" />
+      <span className="truncate">{children}</span>
+    </button>
+  );
+}
+
+/** Links rendered as mention pills when their title carries the mention sentinel. */
+function MarkdownLink(props: WithHastNode<React.ComponentPropsWithoutRef<"a">>) {
+  const target = parseMentionPillTitle(props.title);
+  if (!target) return <WorkspaceFileLink {...props} />;
+  if (target.kind === "file") {
+    return (
+      <FileMentionPill path={target.path} isDir={target.isDir} lineSpan={target.lineSpan}>
+        {props.children}
+      </FileMentionPill>
+    );
+  }
+  return (
+    <SessionMentionPill id={target.id} isSubagent={target.isSubagent}>
+      {props.children}
+    </SessionMentionPill>
+  );
+}
+
+interface SessionMentionPillProps {
+  id: string;
+  isSubagent: boolean;
+  children: React.ReactNode;
+}
+
+/** A session pill (e.g. ``@Fix CI``) that opens session ``id`` without reloading the page. */
+export function SessionMentionPill(props: SessionMentionPillProps) {
+  // Markdown also renders outside the router (stories, embeds); there the href navigates.
+  return useInRouterContext() ? (
+    <RoutedSessionMentionPill {...props} />
+  ) : (
+    <SessionPillLink {...props} />
+  );
+}
+
+// The routing seam's Link rebases the href under an embed's mount, routes plain
+// clicks in-app and leaves modified clicks (new tab) to the browser.
+function RoutedSessionMentionPill({ id, isSubagent, children }: SessionMentionPillProps) {
+  return (
+    <Link
+      to={`/c/${encodeURIComponent(id)}`}
+      data-testid="mention-pill"
+      className={MENTION_PILL_CLASS}
+      title={isSubagent ? "Subagent" : "Session"}
+      onClick={(event) => event.stopPropagation()}
+    >
+      <SessionPillContent isSubagent={isSubagent}>{children}</SessionPillContent>
+    </Link>
+  );
+}
+
+function SessionPillLink({ id, isSubagent, children }: SessionMentionPillProps) {
+  return (
+    <a
+      data-testid="mention-pill"
+      href={withBasePath(`/c/${encodeURIComponent(id)}`)}
+      className={MENTION_PILL_CLASS}
+      title={isSubagent ? "Subagent" : "Session"}
+      onClick={(event) => event.stopPropagation()}
+    >
+      <SessionPillContent isSubagent={isSubagent}>{children}</SessionPillContent>
+    </a>
+  );
+}
+
+function SessionPillContent({
+  isSubagent,
+  children,
+}: {
+  isSubagent: boolean;
+  children: React.ReactNode;
+}) {
+  const Icon = isSubagent ? BotIcon : MessageSquareIcon;
+  return (
+    <>
+      <Icon className="size-3 shrink-0" />
+      <span className="truncate">{children}</span>
+    </>
+  );
+}
+
 const FILE_PATH_AWARE_COMPONENTS = {
   inlineCode: WorkspacePathInlineCode,
   img: ZoomableMarkdownImage,
-  a: WorkspaceFileLink,
+  a: MarkdownLink,
 };
 
 // How often the live (growing) assistant bubble re-parses its markdown. The
@@ -637,6 +811,7 @@ export function FilePathAwareMessageResponse({
   children,
   breaks = false,
   literalHtml = false,
+  isStreaming = false,
   ...props
 }: React.ComponentProps<typeof MessageResponse> & { breaks?: boolean; literalHtml?: boolean }) {
   const components = FILE_PATH_AWARE_COMPONENTS;
@@ -682,7 +857,14 @@ export function FilePathAwareMessageResponse({
   }
 
   return (
-    <MessageResponse {...props} components={components} remarkPlugins={remarkPlugins} markFileLinks>
+    <MessageResponse
+      {...props}
+      components={components}
+      remarkPlugins={remarkPlugins}
+      markFileLinks
+      // The shown text can trail the latest by one interval after the stream ends.
+      isStreaming={isStreaming || throttledText !== normalizedText}
+    >
       {isString ? throttledText : children}
     </MessageResponse>
   );

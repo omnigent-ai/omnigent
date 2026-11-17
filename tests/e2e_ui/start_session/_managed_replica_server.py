@@ -30,6 +30,8 @@ from omnigent.onboarding.sandboxes.base import SandboxHostLauncher
 from omnigent.onboarding.sandboxes.types import RepoWorkspace
 
 SLICE_KEY = "x-databricks-omnigent-slice-key"
+# Startup probes that always carry the browser's own key, never a host's.
+_CLIENT_KEY_PATHS = frozenset({"/v1/info", "/v1/me"})
 _HOP_HEADERS = {"host", "connection", "keep-alive", "transfer-encoding"}
 
 
@@ -58,7 +60,7 @@ class LocalManagedHost(SandboxHostLauncher):
         self.provisioning = threading.Event()
         # Set to make the next provision fail like a cloud allocation error.
         self.fail_provision = False
-        self.process: subprocess.Popen[bytes] | None = None
+        self.processes: dict[str, subprocess.Popen[bytes]] = {}
 
     def prepare(self) -> None:
         pass
@@ -88,12 +90,14 @@ class LocalManagedHost(SandboxHostLauncher):
         # Stands in for the ingress routing the host's tunnel by its key: a host
         # keyed by its id reaches B, an unkeyed one the default replica.
         url = self.keyed_url if keyed else self.unkeyed_url
-        workspace = self.root / "workspace"
+        host_root = self.root / "sandboxes" / sandbox_id
+        host_root.mkdir(parents=True, exist_ok=True)
+        workspace = host_root / "workspace"
         workspace.mkdir(exist_ok=True)
         if on_stage:
             on_stage("starting")
-        with (self.root / "host.log").open("w") as log:
-            self.process = subprocess.Popen(
+        with (host_root / "host.log").open("w") as log:
+            self.processes[sandbox_id] = subprocess.Popen(
                 [
                     sys.executable,
                     "-m",
@@ -105,6 +109,8 @@ class LocalManagedHost(SandboxHostLauncher):
                 ],
                 env={
                     **os.environ,
+                    "OMNIGENT_CONFIG_HOME": str(host_root / "config"),
+                    "OMNIGENT_DATA_DIR": str(host_root / "data"),
                     "OMNIGENT_HOST_ID": host_id,
                     "OMNIGENT_HOST_NAME": host_name,
                     "OMNIGENT_HOST_TOKEN": token,
@@ -116,9 +122,11 @@ class LocalManagedHost(SandboxHostLauncher):
         return str(workspace)
 
     def terminate(self, sandbox_id: str) -> None:
-        if self.process is not None:
-            terminate(self.process)
-            self.process = None
+        ids = [sandbox_id] if sandbox_id else list(self.processes)
+        for identifier in ids:
+            process = self.processes.pop(identifier, None)
+            if process is not None:
+                terminate(process)
 
 
 def replica_app(
@@ -128,12 +136,15 @@ def replica_app(
     from omnigent.runtime import init
     from omnigent.runtime.agent_cache import AgentCache
     from omnigent.server.app import create_app
+    from omnigent.server.auth import create_auth_provider
     from omnigent.server.managed_hosts import ManagedSandboxConfig, ManagedSandboxDeployment
     from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
     from omnigent.stores.artifact_store.local import LocalArtifactStore
     from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
     from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
     from omnigent.stores.host_store import HostStore
+    from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+    from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
     from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
         SqlAlchemyScheduledTaskStore,
     )
@@ -185,7 +196,10 @@ def replica_app(
         artifact_store=artifacts,
         agent_cache=cache,
         host_store=HostStore(uri),
+        auth_provider=create_auth_provider(),
+        permission_store=SqlAlchemyPermissionStore(uri),
         scheduled_task_store=SqlAlchemyScheduledTaskStore(uri),
+        project_store=SqlAlchemyProjectStore(uri),
         extra_routers=[(control, "/__test", ["test-control"])],
         sandbox_config=ManagedSandboxDeployment.single(
             ManagedSandboxConfig(
@@ -202,12 +216,16 @@ def replica_app(
 
 def ingress_app(replica_a: str, replica_b: str, *, strip_host_id: bool = False) -> FastAPI:
     """
-    Forward keyless traffic to A and host-keyed traffic to B, including SSE.
+    Forward host-keyed traffic to B and everything else to A, including SSE.
+
+    The browser keys every request; its own random key, learned from its startup
+    probes, stands for the client's replica, which here is A.
 
     With *strip_host_id*, a managed create loses its ``host_id`` and key, as
     one from a client that doesn't choose the id (the SDK, Slack).
     """
     exchanges: list[dict[str, Any]] = []
+    client_keys: set[str] = set()
 
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -226,6 +244,8 @@ def ingress_app(replica_a: str, replica_b: str, *, strip_host_id: bool = False) 
     @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
     async def forward(request: Request, path: str) -> StreamingResponse:
         key = request.headers.get(SLICE_KEY)
+        if key and request.url.path in _CLIENT_KEY_PATHS:
+            client_keys.add(key)
         body = await request.body()
         headers = {k: v for k, v in request.headers.items() if k not in _HOP_HEADERS}
         if strip_host_id and request.method == "POST" and request.url.path == "/v1/sessions":
@@ -257,12 +277,13 @@ def ingress_app(replica_a: str, replica_b: str, *, strip_host_id: bool = False) 
                 if k.lower() not in {SLICE_KEY, "content-length", "content-type"}
             }
             headers["content-type"] = content_type
-        target = replica_b if key else replica_a
+        host_keyed = bool(key) and key not in client_keys
+        target = replica_b if host_keyed else replica_a
         record: dict[str, Any] = {
             "path": request.url.path,
             "method": request.method,
             "key": key,
-            "replica": "b" if key else "a",
+            "replica": "b" if host_keyed else "a",
             "request": body.decode(errors="replace"),
             "status": None,
             "body": "",

@@ -20,6 +20,22 @@ function agent(overrides: Partial<AvailableAgent> & Pick<AvailableAgent, "name">
 }
 
 describe("selectableSessionAgents", () => {
+  it("applies deployment restrictions in configured order without restoring hidden agents", () => {
+    const agents = [
+      agent({ name: "claude-native-ui", harness: "claude-native" }),
+      agent({ name: "cursor-native-ui", harness: "cursor-native" }),
+      agent({ name: "pi-native-ui", harness: "pi-native" }),
+      agent({ name: "nessie" }),
+    ];
+    expect(
+      selectableSessionAgents(
+        agents,
+        new Set(["pi-native-ui", "nessie", "claude-native-ui", "missing"]),
+      ).map((entry) => entry.name),
+    ).toEqual(["pi-native-ui", "claude-native-ui"]);
+    expect(selectableSessionAgents(agents, new Set())).toEqual(selectableSessionAgents(agents));
+  });
+
   it("drops the hidden agents every session-creation surface must exclude", () => {
     // Shared by the composer picker AND project settings — filter parity is
     // what stops a project from pinning a default the composer can't show.

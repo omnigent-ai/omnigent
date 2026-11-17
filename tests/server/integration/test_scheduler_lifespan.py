@@ -77,8 +77,15 @@ def _build_app(
     )
 
 
+@pytest.fixture
+def legacy_timers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Opts out of the database scheduler, the default, to test the per-task timers."""
+    monkeypatch.setenv("OMNIGENT_FEATURES", "-automations_v2")
+
+
 async def test_lifespan_starts_and_stops_scheduler(
     runtime_init: None,
+    legacy_timers: None,
     db_uri: str,
     tmp_path: Path,
 ) -> None:
@@ -108,6 +115,7 @@ async def test_lifespan_starts_and_stops_scheduler(
 
 async def test_lifespan_arms_active_task_from_non_default_workspace(
     runtime_init: None,
+    legacy_timers: None,
     db_uri: str,
     tmp_path: Path,
 ) -> None:
@@ -134,6 +142,7 @@ async def test_lifespan_arms_active_task_from_non_default_workspace(
 
 async def test_lifespan_survives_scheduler_start_failure(
     runtime_init: None,
+    legacy_timers: None,
     db_uri: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -171,6 +180,7 @@ async def test_lifespan_without_store_has_no_scheduler(
 
 async def test_lifespan_skips_paused_task(
     runtime_init: None,
+    legacy_timers: None,
     db_uri: str,
     tmp_path: Path,
 ) -> None:
@@ -312,18 +322,15 @@ async def test_dispatch_hooks_pass_the_live_switch_and_interval_to_the_scheduler
         assert scheduler._poll_interval is poll_interval
 
 
-@pytest.mark.parametrize("features", [None, "-automations_v2", "automations_v2,-automations_v2"])
+@pytest.mark.parametrize("features", ["-automations_v2", "automations_v2,-automations_v2"])
 async def test_automations_v2_flag_off_keeps_timers_even_with_hooks(
     runtime_init: None,
     db_uri: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    features: str | None,
+    features: str,
 ) -> None:
-    if features is None:
-        monkeypatch.delenv("OMNIGENT_FEATURES", raising=False)
-    else:
-        monkeypatch.setenv("OMNIGENT_FEATURES", features)
+    monkeypatch.setenv("OMNIGENT_FEATURES", features)
     fire, recover = AsyncMock(), AsyncMock()
     store = SqlAlchemyScheduledTaskStore(db_uri)
     store.configure_dispatch(True)
@@ -370,22 +377,36 @@ async def test_automations_v2_flag_off_keeps_timers_even_with_hooks(
         recover.assert_not_awaited()
 
 
+async def test_the_database_scheduler_is_the_default(
+    runtime_init: None,
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("OMNIGENT_FEATURES", raising=False)
+    app = _build_app(db_uri, tmp_path, scheduled_task_store=SqlAlchemyScheduledTaskStore(db_uri))
+    async with app.router.lifespan_context(app):
+        assert isinstance(app.state.scheduled_task_scheduler, PersistentTaskScheduler)
+
+
 @pytest.mark.parametrize("has_hooks", [True, False])
-async def test_automations_v2_flag_requires_a_scheduled_task_store(
+async def test_automations_v2_without_a_scheduled_task_store_starts_no_scheduler(
     runtime_init: None,
     db_uri: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     has_hooks: bool,
 ) -> None:
+    """With no store there are no automations, so the app starts without a scheduler."""
     monkeypatch.setenv("OMNIGENT_FEATURES", "automations_v2")
-    with pytest.raises(ValueError, match="automations_v2 requires"):
-        _build_app(
-            db_uri,
-            tmp_path,
-            scheduled_task_store=None,
-            dispatch=ScheduledTaskDispatchHooks(AsyncMock(), AsyncMock()) if has_hooks else None,
-        )
+    app = _build_app(
+        db_uri,
+        tmp_path,
+        scheduled_task_store=None,
+        dispatch=ScheduledTaskDispatchHooks(AsyncMock(), AsyncMock()) if has_hooks else None,
+    )
+    async with app.router.lifespan_context(app):
+        assert getattr(app.state, "scheduled_task_scheduler", None) is None
 
 
 async def test_automations_v2_records_claims_with_the_built_in_executor(

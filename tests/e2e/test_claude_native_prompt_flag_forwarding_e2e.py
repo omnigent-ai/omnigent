@@ -61,6 +61,7 @@ Usage::
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -261,67 +262,101 @@ def test_local_launch_prompt_is_not_forwarded_as_a_value_flags_argument(
     )
 
 
-@pytest.mark.parametrize("with_caller_file", [False, True], ids=["inline-only", "file-and-inline"])
+@pytest.mark.parametrize(
+    ("with_caller_file", "with_caller_inline"),
+    [(False, True), (True, False), (True, True)],
+    ids=["inline-only", "file-only", "file-and-inline"],
+)
 def test_caller_prompt_file_and_inline_prompt_reach_claude_with_omnigent(
     isolated_mock_llm_server_url: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     with_caller_file: bool,
+    with_caller_inline: bool,
 ) -> None:
     """
-    Real Claude receives the caller's file, then Omnigent's instructions, then the caller's prompt.
+    Real Claude receives caller instructions and Omnigent's startup guidance once.
 
-    ``augment_claude_args`` leaves the caller's file flag and puts Omnigent's text before the
-    caller's inline prompt. Only the file case relies on Claude 2.1.295+ applying both flags.
+    Caller files remain native CLI inputs; Omnigent context reaches Claude through
+    its SessionStart hook. Inline-only input keeps the combined prompt ordering.
 
     :param isolated_mock_llm_server_url: Messages API that records Claude's requests.
     :param tmp_path: Holds the caller's file and Omnigent's bridge directory.
     :param monkeypatch: Points the bridge root at ``tmp_path``.
-    :param with_caller_file: Whether the caller also passes ``--append-system-prompt-file``.
+    :param with_caller_file: Whether the caller supplies a prompt file.
+    :param with_caller_inline: Whether the caller supplies inline prompt text.
     """
     from omnigent.harnesses.claude_native import bridge
+    from omnigent.runtime.prompt import WORKSPACE_IMAGE_INSTRUCTION
 
-    claude_version = _run_real_claude(["--version"]).split()[0]
-    if with_caller_file and release_tuple(claude_version) < (2, 1, 295):
-        pytest.skip(f"Claude Code {claude_version} refuses both prompt flags together")
+    if with_caller_file and with_caller_inline:
+        version = _run_real_claude(["--version"]).split()[0]
+        if release_tuple(version) < (2, 1, 295):
+            pytest.skip("Combined file and inline prompt flags require Claude Code 2.1.295+")
+
+    bridge_root = tmp_path / bridge._BRIDGE_ROOT.relative_to(bridge._TRUSTED_PARENT)
     monkeypatch.setattr(bridge, "_TRUSTED_PARENT", tmp_path)
-    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "claude-native")
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", bridge_root)
     profile = tmp_path / "profile.md"
     profile.write_text("FILE-MARKER caller profile\n", encoding="utf-8")
-    file_args = ["--append-system-prompt-file", str(profile)] if with_caller_file else []
-    caller_args = [*file_args, "--append-system-prompt", "INLINE-MARKER caller prompt"]
+    caller_args: list[str] = []
+    caller_markers: list[str] = []
+    if with_caller_file:
+        caller_args.extend(["--append-system-prompt-file", str(profile)])
+        caller_markers.append("FILE-MARKER")
+    if with_caller_inline:
+        caller_args.extend(["--append-system-prompt", "INLINE-MARKER caller prompt"])
+        caller_markers.append("INLINE-MARKER")
     augmented = bridge.augment_claude_args(
         tuple(caller_args),
-        bridge_dir=tmp_path / "claude-native" / "bridge",
+        bridge_dir=bridge_root / "bridge",
         workspace=tmp_path,
         python_executable=sys.executable,
-        append_system_prompt="OMNIGENT-MARKER session instructions",
+        append_system_prompt=(
+            f"OMNIGENT-MARKER session instructions\n\n{WORKSPACE_IMAGE_INSTRUCTION}"
+        ),
     )
 
-    # Omnigent's text joins the caller's inline flag; its bridge flags are not needed here.
+    prompt_args: list[str] = []
+    for prompt_flag, present in (
+        ("--append-system-prompt-file", with_caller_file),
+        ("--append-system-prompt", with_caller_inline),
+    ):
+        assert augmented.count(prompt_flag) == int(present), augmented
+        if present:
+            prompt_index = augmented.index(prompt_flag)
+            prompt_args.extend(augmented[prompt_index : prompt_index + 2])
+    if with_caller_file:
+        assert prompt_args == caller_args
+    settings_index = augmented.index("--settings")
+    # Keep the production SessionStart hook without starting the MCP server.
     output = _run_real_claude(
-        ["-p", "hello", *augmented[: len(caller_args)]],
+        [
+            "-p",
+            "hello",
+            *prompt_args,
+            *augmented[settings_index : settings_index + 2],
+        ],
         extra_env={
             "ANTHROPIC_BASE_URL": isolated_mock_llm_server_url,
             "ANTHROPIC_API_KEY": "sk-ant-e2e-placeholder",
         },
     )
 
-    systems = [
-        entry["body"].get("system") or []
-        for entry in get_mock_message_requests(isolated_mock_llm_server_url)
-    ]
-    system_texts = [
-        system if isinstance(system, str) else "\n".join(block.get("text", "") for block in system)
-        for system in systems
-    ]
-    markers = (*(["FILE-MARKER"] if with_caller_file else []), "OMNIGENT-MARKER", "INLINE-MARKER")
-    prompt = next(
-        (text for text in system_texts if any(marker in text for marker in markers)), None
+    assert profile.read_text(encoding="utf-8") == "FILE-MARKER caller profile\n"
+    body = next(
+        (
+            entry["body"]
+            for entry in get_mock_message_requests(isolated_mock_llm_server_url)
+            if caller_markers[0] in json.dumps(entry["body"].get("system"))
+        ),
+        None,
     )
-    assert prompt is not None, f"Claude sent no request carrying the prompt flags:\n{output}"
-    missing = [marker for marker in markers if marker not in prompt]
-    assert not missing, f"missing {missing} in system prompt:\n{prompt}\nclaude output:\n{output}"
-    positions = [prompt.index(marker) for marker in markers]
-    assert positions == sorted(positions), prompt
-    assert [prompt.count(marker) for marker in markers] == [1] * len(markers), prompt
+    assert body is not None, f"Claude sent no request carrying the prompt flags:\n{output}"
+    request_text = json.dumps(body)
+    for text in (*caller_markers, "OMNIGENT-MARKER", WORKSPACE_IMAGE_INSTRUCTION):
+        assert request_text.count(text) == 1, f"missing or repeated {text}:\n{body}\n{output}"
+    if with_caller_inline:
+        system_text = json.dumps(body["system"])
+        preceding_marker = "FILE-MARKER" if with_caller_file else "OMNIGENT-MARKER"
+        assert system_text.index(preceding_marker) < system_text.index("INLINE-MARKER")

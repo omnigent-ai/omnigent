@@ -68,7 +68,7 @@ final class ManagedConfigurationTests: XCTestCase {
     XCTAssertEqual(try decode(["serverUrls": entries]).serverURLs.count, entries.count)
   }
 
-  // MARK: Databricks-internal features
+  // MARK: Managed features
 
   func testInternalFeaturesDefaultToDisabled() throws {
     XCTAssertFalse(try decode([:]).databricksInternalFeaturesEnabled)

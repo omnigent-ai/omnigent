@@ -47,9 +47,15 @@ def test_databricks_gemini_requires_opt_in_and_preserves_existing_defaults() -> 
 
 
 def test_model_translation_keeps_version_and_role() -> None:
-    models = ("system.ai.gemini-3-1-pro", "system.ai.gemini-3-1-flash-lite")
+    models = (
+        "system.ai.gemini-3-1-pro",
+        "system.ai.gemini-3-1-flash-lite",
+        "system.ai.google-model-1-5",
+    )
     assert resolve_model("gemini-3.1-pro-preview", models) == models[0]
     assert resolve_model("gemini-3.1-flash-lite-preview", models) == models[1]
+    assert resolve_model("google-model-1.5-preview", models) == models[2]
+    assert resolve_model("Google-Model-1.5", models) == models[2]
     with pytest.raises(ValueError, match="unambiguous"):
         resolve_model("gemini-2.5-pro", models)
     with pytest.raises(ValueError, match="unambiguous"):

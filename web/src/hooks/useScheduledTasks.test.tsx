@@ -18,14 +18,18 @@ import {
   useRunScheduledTaskNow,
   useScheduledTask,
   useScheduledTaskRuns,
+  useScheduledTaskRunSteps,
   useScheduledTasks,
+  useSharedScheduledTasks,
   useUpdateScheduledTask,
 } from "./useScheduledTasks";
 
 vi.mock("@/lib/scheduledTasksApi", () => ({
   listScheduledTasks: vi.fn(),
+  listSharedScheduledTasks: vi.fn(),
   getScheduledTask: vi.fn(),
   listScheduledTaskRuns: vi.fn(),
+  listScheduledTaskRunSteps: vi.fn(),
   createScheduledTask: vi.fn(),
   updateScheduledTask: vi.fn(),
   deleteScheduledTask: vi.fn(),
@@ -45,6 +49,7 @@ const TASK: api.ScheduledTask = {
   modelOverride: null,
   reasoningEffort: null,
   permissionMode: null,
+  mcpServices: [],
   sessionMode: "new",
   sessionId: null,
   workspace: null,
@@ -77,6 +82,7 @@ const RUN: api.ScheduledTaskRun = {
   firedAt: 1_700_000_000,
   finishedAt: null,
   errorCode: null,
+  errorDetail: null,
   conversationUpdatedAt: 1_700_000_500,
   conversationStatus: "running",
   viewerLastSeen: null,
@@ -89,7 +95,7 @@ beforeEach(() => {
   vi.mocked(api.createScheduledTask).mockResolvedValue(TASK);
   vi.mocked(api.updateScheduledTask).mockResolvedValue({ ...TASK, state: "paused" });
   vi.mocked(api.deleteScheduledTask).mockResolvedValue(undefined);
-  vi.mocked(api.runScheduledTaskNow).mockResolvedValue(undefined);
+  vi.mocked(api.runScheduledTaskNow).mockResolvedValue("run_1");
 });
 
 afterEach(() => {
@@ -102,6 +108,41 @@ describe("useScheduledTasks", () => {
     const { result } = renderHook(() => useScheduledTasks(), { wrapper });
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
     expect(result.current.data).toEqual([TASK]);
+  });
+});
+
+describe("useSharedScheduledTasks", () => {
+  const SHARED = { ...TASK, id: "st_shared", viewerRole: "viewer" as const };
+
+  it("pages by cursor and paints the shared task's detail from its cache", async () => {
+    vi.mocked(api.listSharedScheduledTasks)
+      .mockResolvedValueOnce({ tasks: [], nextCursor: "st_0" })
+      .mockResolvedValueOnce({ tasks: [SHARED], nextCursor: null });
+    let resolveDetail: (task: api.ScheduledTask) => void = () => {};
+    vi.mocked(api.getScheduledTask).mockReturnValue(
+      new Promise((resolve) => {
+        resolveDetail = resolve;
+      }),
+    );
+    const { wrapper } = makeWrapper();
+    const { result } = renderHook(() => useSharedScheduledTasks(true), { wrapper });
+    await waitFor(() => expect(result.current.hasNextPage).toBe(true));
+    expect(api.listSharedScheduledTasks).toHaveBeenLastCalledWith(null);
+    await act(() => result.current.fetchNextPage());
+    await waitFor(() => expect(result.current.hasNextPage).toBe(false));
+    expect(api.listSharedScheduledTasks).toHaveBeenLastCalledWith("st_0");
+    expect(result.current.data?.pages.flatMap((page) => page.tasks)).toEqual([SHARED]);
+
+    const detail = renderHook(() => useScheduledTask("st_shared"), { wrapper });
+    expect(detail.result.current.data).toEqual(SHARED);
+    resolveDetail(SHARED);
+  });
+
+  it("does not fetch while disabled", () => {
+    vi.mocked(api.listSharedScheduledTasks).mockClear();
+    const { wrapper } = makeWrapper();
+    renderHook(() => useSharedScheduledTasks(false), { wrapper });
+    expect(api.listSharedScheduledTasks).not.toHaveBeenCalled();
   });
 });
 
@@ -133,6 +174,34 @@ describe("mutations invalidate the list", () => {
     const { result } = renderHook(() => useDeleteScheduledTask(), { wrapper });
     await result.current.mutateAsync("st_1");
     expect(spy).toHaveBeenCalledWith({ queryKey: SCHEDULED_TASKS_KEY });
+    expect(spy).not.toHaveBeenCalledWith({ queryKey: ["conversations"] });
+  });
+
+  // Either can stop the automation managing its session's sharing, which the
+  // session's grants list reports.
+  it("update and delete refresh every session's grants", async () => {
+    const { queryClient, wrapper } = makeWrapper();
+    const spy = vi.spyOn(queryClient, "invalidateQueries");
+    const update = renderHook(() => useUpdateScheduledTask(), { wrapper });
+    await update.result.current.mutateAsync({ id: "st_1", input: { sessionMode: "new" } });
+    expect(spy).toHaveBeenCalledWith({ queryKey: ["permissions"] });
+
+    spy.mockClear();
+    const remove = renderHook(() => useDeleteScheduledTask(), { wrapper });
+    await remove.result.current.mutateAsync("st_1");
+    expect(spy).toHaveBeenCalledWith({ queryKey: ["permissions"] });
+  });
+
+  it("deleting an automation that runs from a session refreshes the cached sessions", async () => {
+    const { queryClient, wrapper } = makeWrapper();
+    queryClient.setQueryData(SCHEDULED_TASKS_KEY, [{ ...TASK, sourceSessionId: "conv_copy" }]);
+    const spy = vi.spyOn(queryClient, "invalidateQueries");
+    const { result } = renderHook(() => useDeleteScheduledTask(), { wrapper });
+    await result.current.mutateAsync(TASK.id);
+    // The server cleared the copy's automation label; the sidebar must refetch it.
+    for (const queryKey of [["conversations"], ["project-sessions"], ["session", "conv_copy"]]) {
+      expect(spy).toHaveBeenCalledWith({ queryKey });
+    }
   });
 
   it("a deleted task's detail page refetches instead of rendering from cache", async () => {
@@ -156,9 +225,15 @@ describe("mutations invalidate the list", () => {
 
   it("run-now calls the API and immediately invalidates the list, detail + runs", async () => {
     const { queryClient, wrapper } = makeWrapper();
+    queryClient.setQueryData(scheduledTaskRunsKey("st_1"), [RUN]);
+    const runs = renderHook(() => useScheduledTaskRuns("st_1"), { wrapper });
+    expect(runs.result.current.isFetchedAfterMount).toBe(false);
+    expect(api.listScheduledTaskRuns).not.toHaveBeenCalled();
     const spy = vi.spyOn(queryClient, "invalidateQueries");
     const { result } = renderHook(() => useRunScheduledTaskNow(), { wrapper });
-    await result.current.mutateAsync("st_1");
+    expect(await result.current.mutateAsync("st_1")).toBe("run_1");
+    await waitFor(() => expect(runs.result.current.isFetchedAfterMount).toBe(true));
+    expect(api.listScheduledTaskRuns).toHaveBeenCalledTimes(1);
     expect(api.runScheduledTaskNow).toHaveBeenCalledWith("st_1");
     // Refreshes the list (so the completion badge updates)…
     expect(spy).toHaveBeenCalledWith({ queryKey: SCHEDULED_TASKS_KEY });
@@ -267,6 +342,118 @@ describe("hasUnsettledRun (the refetchInterval stop condition)", () => {
 });
 
 describe("useScheduledTaskRuns live refresh", () => {
+  it("refreshes steps when a run is replaced or its settled session advances", async () => {
+    const { wrapper } = makeWrapper();
+    const previous = Array.from({ length: 20 }, (_, index) => ({
+      ...SUCCEEDED_RUN,
+      id: `run-old-${index}`,
+    }));
+    const current = [{ ...SUCCEEDED_RUN, id: "run-new" }, ...previous.slice(0, 19)];
+    const stepsFor = (runs: api.ScheduledTaskRun[]) =>
+      runs.map((run) => ({
+        runId: run.id,
+        planId: `plan-${run.id}`,
+        isCurrent: true,
+        workflowId: null,
+        planName: null,
+        steps: [],
+        statuses: [],
+      }));
+    vi.mocked(api.listScheduledTaskRunSteps)
+      .mockResolvedValueOnce(stepsFor(previous))
+      .mockResolvedValueOnce(stepsFor(current));
+    const { result, rerender } = renderHook(
+      ({ runs }) => useScheduledTaskRunSteps("st_1", runs, true),
+      { wrapper, initialProps: { runs: previous } },
+    );
+    await waitFor(() => expect(result.current.has("run-old-0")).toBe(true));
+    rerender({ runs: current });
+    await waitFor(() => expect(result.current.has("run-new")).toBe(true));
+    expect(api.listScheduledTaskRunSteps).toHaveBeenCalledTimes(2);
+    const working = [{ ...RUNNING_RUN, id: "run-working" }, ...current.slice(0, 19)];
+    vi.mocked(api.listScheduledTaskRunSteps).mockResolvedValueOnce(stepsFor(working));
+    rerender({ runs: working });
+    await waitFor(() => expect(result.current.has("run-working")).toBe(true));
+    const finished: api.ScheduledTaskRunSteps = {
+      ...stepsFor(working)[0]!,
+      workflowId: "a".repeat(32),
+      steps: [{ id: "check", name: "Check results", goal: null, depends_on: [] }],
+      statuses: [
+        {
+          id: "status-started",
+          position: 1,
+          created_at: 1_700_000_500,
+          scheduled_task_run_id: "run-working",
+          step: "check",
+          author: { type: "agent" },
+          kind: "status",
+          content: { status: "started" },
+        },
+      ],
+    };
+    const settled = [{ ...SUCCEEDED_RUN, id: "run-working" }, ...current.slice(0, 19)];
+    vi.mocked(api.listScheduledTaskRunSteps).mockResolvedValueOnce([finished]);
+    rerender({ runs: settled });
+    await waitFor(() => expect(result.current.get("run-working")).toEqual(finished));
+    expect(api.listScheduledTaskRunSteps).toHaveBeenCalledTimes(4);
+
+    // A short continuation can finish between history polls; a visible busy/idle
+    // cycle must also avoid restoring the previous, still-fresh idle snapshot.
+    const refreshSession = async (conversationStatus: string, position: number) => {
+      const updatedAt = 1_700_000_510 + position;
+      const refreshed: api.ScheduledTaskRunSteps = {
+        ...finished,
+        statuses: [
+          {
+            ...finished.statuses[0]!,
+            id: `status-${position}`,
+            position,
+            created_at: updatedAt,
+            content: { status: conversationStatus === "running" ? "started" : "done" },
+          },
+        ],
+      };
+      vi.mocked(api.listScheduledTaskRunSteps).mockResolvedValueOnce([refreshed]);
+      rerender({
+        runs: [
+          { ...settled[0]!, conversationStatus, conversationUpdatedAt: updatedAt },
+          ...settled.slice(1),
+        ],
+      });
+      await waitFor(() => expect(result.current.get("run-working")).toEqual(refreshed));
+    };
+    await refreshSession("idle", 2);
+    await refreshSession("running", 3);
+    await refreshSession("idle", 4);
+    expect(api.listScheduledTaskRunSteps).toHaveBeenCalledTimes(7);
+  });
+
+  it("asks for no steps while disabled, even with a run in flight", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: false });
+    try {
+      const { wrapper } = makeWrapper();
+      // A viewer's history: in flight, with none of its session's data.
+      const runs = [{ ...RUNNING_RUN, conversationStatus: null, conversationUpdatedAt: null }];
+      vi.mocked(api.listScheduledTaskRunSteps).mockResolvedValueOnce([]);
+      const { rerender } = renderHook(
+        ({ enabled }) => useScheduledTaskRunSteps("st_1", runs, enabled),
+        { wrapper, initialProps: { enabled: false } },
+      );
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000);
+      });
+      expect(api.listScheduledTaskRunSteps).not.toHaveBeenCalled();
+
+      rerender({ enabled: true });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(api.listScheduledTaskRunSteps).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("keeps refetching a >20s run until it settles, WITHOUT a remount", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: false });
     try {

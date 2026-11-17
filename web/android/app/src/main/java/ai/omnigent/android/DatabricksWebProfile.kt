@@ -113,12 +113,15 @@ internal class DatabricksWebProfile(
         }.thenApply { true }
     }
 
-    fun hasSessionCookie(pageUri: java.net.URI): CompletableFuture<Boolean> {
-        val result = CompletableFuture<Boolean>()
+    fun hasSessionCookie(pageUri: java.net.URI): CompletableFuture<Boolean> =
+        sessionCookieValue(pageUri).thenApply { !it.isNullOrEmpty() }
+
+    /** The workspace `DBAUTH` value visible to [pageUri], or null when none is stored. */
+    fun sessionCookieValue(pageUri: java.net.URI): CompletableFuture<String?> {
+        val result = CompletableFuture<String?>()
         main.post {
             try {
-                val value = parseCookieHeader(backend.getCookie(pageUri.toString()))["DBAUTH"]
-                result.complete(!value.isNullOrEmpty())
+                result.complete(parseCookieHeader(backend.getCookie(pageUri.toString()))["DBAUTH"])
             } catch (error: Throwable) {
                 result.completeExceptionally(error)
             }

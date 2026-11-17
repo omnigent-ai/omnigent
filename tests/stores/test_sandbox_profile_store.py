@@ -103,6 +103,35 @@ def test_reference_survives_restart_without_schema_changes(store):
         assert profiles.get_session_snapshot(session.id) is None
 
 
+def test_profiled_host_binding_and_its_rollback_reset_the_background_flag(store):
+    """
+    Binding a profiled host's runner, and rolling that back, reset the flag.
+
+    Each runner's reports are compared only with its own, so the bound runner's
+    first report is accepted whatever its time.
+    """
+    from uuid import uuid4
+
+    conversation = store.create_conversation()
+    store.set_background_work_running(conversation.id, True, reported_at=4_000)
+    host_id = uuid4().hex
+
+    def flag():
+        return store.get_conversation(conversation.id).background_work_running
+
+    previous = store.bind_profiled_host(
+        conversation.id, host_id, "/workspace", PROFILE, runner_id="attempt"
+    )
+    assert flag() is None
+    store.set_background_work_running(conversation.id, True, runner_id="attempt", reported_at=10)
+    assert flag() is True
+
+    assert store.rollback_profiled_host(
+        previous, expected_host_id=host_id, expected_runner_id="attempt"
+    )
+    assert flag() is None
+
+
 def test_profile_binding_queries_stay_bounded_with_many_unrelated_labels(store):
     from uuid import uuid4
 

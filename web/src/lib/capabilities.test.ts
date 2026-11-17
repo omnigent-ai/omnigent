@@ -145,6 +145,40 @@ describe("resolveServerInfo sandbox_providers", () => {
     });
   });
 
+  it("keeps each provider's automation notice", async () => {
+    const result = await probe({
+      sandbox_provider_automation_notices: { agent_sandbox: "Keep your laptop signed in." },
+    });
+    expect(result.sandbox_provider_automation_notices).toEqual({
+      agent_sandbox: "Keep your laptop signed in.",
+    });
+  });
+
+  it.each([undefined, null, "invalid", ["note"]])(
+    "reads a missing or malformed notice map as no notices (%j)",
+    async (value) => {
+      expect(
+        (await probe({ sandbox_provider_automation_notices: value }))
+          .sandbox_provider_automation_notices,
+      ).toEqual({});
+    },
+  );
+
+  it("drops notices that aren't non-blank text", async () => {
+    const result = await probe({
+      sandbox_provider_automation_notices: {
+        kept: "Keep your laptop signed in.",
+        empty: "",
+        blank: "   ",
+        number: 42,
+        missing: null,
+      },
+    });
+    expect(result.sandbox_provider_automation_notices).toEqual({
+      kept: "Keep your laptop signed in.",
+    });
+  });
+
   it.each([undefined, false, "true", true])(
     "requires an explicit durable-input capability (%s)",
     async (value) => {
@@ -255,8 +289,15 @@ describe("resolveServerInfo session_search_scope", () => {
 describe.each([
   "scheduled_task_projects",
   "scheduled_task_harness_settings",
+  "scheduled_task_approval_skipping_modes",
+  "scheduled_task_subhour",
+  "scheduled_task_trigger_headers",
   "scheduled_task_sandbox_workspaces",
   "scheduled_task_inbox",
+  "scheduled_task_sharing",
+  "scheduled_task_shared_with_me",
+  "proactive_agent_available",
+  "session_create_workflow_id",
 ] as const)("resolveServerInfo %s", (capability) => {
   it.each([
     [true, true],
@@ -268,6 +309,33 @@ describe.each([
     const payload = advertised === undefined ? {} : { [capability]: advertised };
     expect((await probe(payload))[capability]).toBe(expected);
   });
+});
+
+it.each([
+  [undefined, 10],
+  [10, 10],
+  [30, 30],
+  [240, 240],
+  [9, 10],
+  [241, 10],
+  [10.5, 10],
+  ["30", 10],
+  [true, 10],
+])("parses trigger polling minutes %j as %j", async (advertised, expected) => {
+  expect(
+    (await probe({ automation_trigger_poll_minutes: advertised })).automation_trigger_poll_minutes,
+  ).toBe(expected);
+});
+
+it.each([
+  [32000, 32000],
+  [undefined, undefined],
+  [0, undefined],
+  ["32000", undefined],
+])("parses the session message limit %j as %j", async (advertised, expected) => {
+  expect((await probe({ session_message_max_chars: advertised })).session_message_max_chars).toBe(
+    expected,
+  );
 });
 
 describe("resolveServerInfo scheduled_task_session_modes", () => {
@@ -303,6 +371,32 @@ describe("resolveServerInfo request_managed_sandbox_host_id", () => {
   });
 });
 
+describe("resolveServerInfo session_bundle_workspaces", () => {
+  it.each([
+    [true, true],
+    [false, false],
+    [undefined, false],
+    ["true", false],
+  ])("requires explicit support for %s", async (value, expected) => {
+    expect((await probe({ session_bundle_workspaces: value })).session_bundle_workspaces).toBe(
+      expected,
+    );
+  });
+});
+
+describe("resolveServerInfo sibling_session_destinations", () => {
+  it.each([
+    ["current_host", "current_host"],
+    ["current_host_or_new_sandbox", "current_host_or_new_sandbox"],
+    ["any_host", "any_host"],
+    [undefined, "any_host"],
+    ["connected_hosts", "current_host"],
+  ])("parses %s as %s", async (advertised, expected) => {
+    const parsed = await probe({ sibling_session_destinations: advertised });
+    expect(parsed.sibling_session_destinations).toBe(expected);
+  });
+});
+
 describe("resolveServerInfo session_fork_workspaces", () => {
   it.each([
     [true, true],
@@ -314,6 +408,22 @@ describe("resolveServerInfo session_fork_workspaces", () => {
     expect(parsed.session_fork_workspaces).toBe(expected);
   });
 });
+
+describe.each(["session_claude_sdk_clear", "session_rewind"] as const)(
+  "resolveServerInfo %s",
+  (capability) => {
+    it.each([
+      [true, true],
+      [false, false],
+      [undefined, false],
+      ["true", false],
+      [1, false],
+    ])("parses %s strictly as %s", async (advertised, expected) => {
+      const parsed = await probe({ [capability]: advertised });
+      expect(parsed[capability]).toBe(expected);
+    });
+  },
+);
 
 describe("resolveServerInfo session_event_types", () => {
   it.each([
@@ -327,6 +437,17 @@ describe("resolveServerInfo session_event_types", () => {
     expect((await probe({ session_event_types: advertised })).session_event_types).toEqual(
       expected,
     );
+  });
+});
+
+describe("resolveServerInfo move_to_managed_sandbox", () => {
+  it.each([
+    [true, true],
+    [undefined, false],
+    ["true", false],
+  ])("parses %s strictly as %s", async (advertised, expected) => {
+    const parsed = await probe({ move_to_managed_sandbox: advertised });
+    expect(parsed.move_to_managed_sandbox).toBe(expected);
   });
 });
 
@@ -423,12 +544,26 @@ describe("custom agents settings capability", () => {
   );
 
   it.each([undefined, false, "true", true])(
+    "parses session_title_instructions strictly: %s",
+    async (stored) => {
+      const parsed = await probe({ session_title_instructions: stored });
+      expect(parsed.session_title_instructions).toBe(stored === true);
+    },
+  );
+
+  it.each([undefined, false, "true", true])(
+    "requires explicit support for PR comment anchors: %s",
+    async (supported) => {
+      expect((await probe({ comment_anchor_metadata: supported })).comment_anchor_metadata).toBe(
+        supported === true,
+      );
+    },
+  );
+
+  it.each([undefined, false, "true", true])(
     "requires a boolean install capability: %s",
     async (install) => {
-      const parsed = await probe({
-        features: { custom_agents_settings_ui: true },
-        agent_install: install,
-      });
+      const parsed = await probe({ agent_install: install });
       const { customAgentsSettingsEnabled } = await import("./capabilities");
       expect(customAgentsSettingsEnabled(parsed)).toBe(install === true);
     },
