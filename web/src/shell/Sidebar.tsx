@@ -5337,16 +5337,25 @@ function SessionErrorHint() {
   );
 }
 
+// Who a row's people icon says the session is shared with: others (the viewer owns
+// it) or the viewer (an automation run shared with them).
+type SessionSharing = "with_others" | "with_you";
+
+const SESSION_SHARING_LABEL: Record<SessionSharing, string> = {
+  with_others: "Shared with others",
+  with_you: "Shared with you",
+};
+
 // Explains the row's people icon, which can't hold a tooltip of its own: it
 // sits over the row link and fades out on hover.
-function SessionSharedHint() {
+function SessionSharedHint({ sharing }: { sharing: SessionSharing }) {
   return (
     <p
       data-testid="session-shared-hint"
       className="mt-1 flex items-center gap-1.5 text-sm text-muted-foreground"
     >
       <UsersIcon aria-hidden className="size-3.5 shrink-0" />
-      <span>Shared with others</span>
+      <span>{SESSION_SHARING_LABEL[sharing]}</span>
     </p>
   );
 }
@@ -5406,21 +5415,17 @@ function SessionUpdatedLabel({ updatedAt }: { updatedAt: number }) {
   return relativeTime(updatedAt * 1000, now.getTime());
 }
 
-// A row's second line: a shared automation run's owner, then the "Show"
-// environment and branch, each omitted when empty.
+// A row's second line: the "Show" environment and branch, each omitted when empty.
 function SessionMetaLine({
-  owner = null,
   environment,
   repo,
   branch,
 }: {
-  owner?: string | null;
   environment: ReactNode;
   repo: string | null;
   branch: string | null;
 }) {
   const parts: { key: string; icon: LucideIcon; value: ReactNode }[] = [];
-  if (owner !== null) parts.push({ key: "owner", icon: UserRoundIcon, value: owner });
   if (environment != null) parts.push({ key: "environment", icon: LaptopIcon, value: environment });
   if (repo !== null) parts.push({ key: "repo", icon: FolderGit2Icon, value: repo });
   if (branch !== null) parts.push({ key: "branch", icon: GitBranchIcon, value: branch });
@@ -5596,7 +5601,7 @@ function LegacySessionTooltipContent({
   conversation: Conversation;
   hostsById: ReadonlyMap<string, Host>;
   hasError: boolean;
-  shared: boolean;
+  shared: SessionSharing | null;
 }) {
   return (
     <TooltipContent
@@ -5631,7 +5636,7 @@ function LegacySessionTooltipContent({
           <span className="truncate">{conversation.git_branch}</span>
         </p>
       )}
-      {shared && <SessionSharedHint />}
+      {shared !== null && <SessionSharedHint sharing={shared} />}
       {hasError && <SessionErrorHint />}
     </TooltipContent>
   );
@@ -5646,7 +5651,7 @@ function SessionTooltipContent({
   conversation: Conversation;
   hostsById: ReadonlyMap<string, Host>;
   hasError: boolean;
-  shared: boolean;
+  shared: SessionSharing | null;
 }) {
   const serverInfo = useContext(ServerInfoContext);
   if (!isFeatureEnabled(serverInfo, "sidebar_grouping_ui")) {
@@ -5682,7 +5687,7 @@ function SessionTooltipContent({
         </span>
       </p>
       <SessionTooltipDetails conversation={conversation} />
-      {shared && <SessionSharedHint />}
+      {shared !== null && <SessionSharedHint sharing={shared} />}
       {hasError && <SessionErrorHint />}
     </TooltipContent>
   );
@@ -5935,7 +5940,14 @@ function ConversationRowImpl({
   // present; otherwise only an inactive row needs the draft marker.
   const showDraftIndicator = hasDraft && !isActive;
   // The server reports `shared_with_others` only to the owner; absent means not shared.
-  const showSharedIndicator = isOwner && conversation.shared_with_others === true;
+  // A shared automation run sits among the viewer's own, so it says it's shared too.
+  const sharing: SessionSharing | null =
+    isOwner && conversation.shared_with_others === true
+      ? "with_others"
+      : isSharedAutomationRun(conversation, viewerId)
+        ? "with_you"
+        : null;
+  const showSharedIndicator = sharing !== null;
   const hasSessionIndicator = sessionState !== null || showDraftIndicator;
   // The "Show → Updated" timestamp takes the indicator slot only when it's free.
   const show = useContext(SidebarShowContext);
@@ -5947,10 +5959,6 @@ function ConversationRowImpl({
     <SessionEnvironmentLabel conversation={conversation} hostsById={hostsById} />
   ) : null;
   const metaRepo = show.includes("repo") ? sessionRepoName(conversation) : null;
-  // Whose automation a shared run belongs to, since it sits among the viewer's own.
-  const metaOwner = isSharedAutomationRun(conversation, viewerId)
-    ? (conversation.owner ?? null)
-    : null;
   const loadBranch = show.includes("branch") && gitBranch === null;
   const { data: worktrees } = useSessionWorktrees(
     loadBranch ? conversation.id : null,
@@ -5967,7 +5975,7 @@ function ConversationRowImpl({
   // Overlays (checkbox, badges, controls; each also `-translate-y-1/2`) center on
   // the row, or on the title line — padding + half its 20px box — above a meta line.
   const overlayTop =
-    metaOwner !== null || metaEnvironment !== null || metaRepo !== null || metaBranch !== null
+    metaEnvironment !== null || metaRepo !== null || metaBranch !== null
       ? "top-4 md:top-3.5"
       : "top-1/2";
 
@@ -6229,12 +6237,7 @@ function ConversationRowImpl({
         </span>
       </div>
       {/* Row 2: the "Show" metadata, each part omitted when it has no value. */}
-      <SessionMetaLine
-        owner={metaOwner}
-        environment={metaEnvironment}
-        repo={metaRepo}
-        branch={metaBranch}
-      />
+      <SessionMetaLine environment={metaEnvironment} repo={metaRepo} branch={metaBranch} />
     </>
   );
 
@@ -6429,7 +6432,7 @@ function ConversationRowImpl({
               projectIcon={projectFlyoutIcon}
               gitBranch={gitBranch}
               hasError={sessionState?.kind === "error"}
-              shared={showSharedIndicator}
+              shared={sharing}
             />
           </HoverCard>
         ) : isMobile ? (
@@ -6441,7 +6444,7 @@ function ConversationRowImpl({
               conversation={conversation}
               hostsById={hostsById}
               hasError={sessionState?.kind === "error"}
-              shared={showSharedIndicator}
+              shared={sharing}
             />
           </Tooltip>
         )
@@ -6465,7 +6468,7 @@ function ConversationRowImpl({
             projectIcon={projectFlyoutIcon}
             gitBranch={gitBranch}
             hasError={sessionState?.kind === "error"}
-            shared={showSharedIndicator}
+            shared={sharing}
           />
         </HoverCard>
       ) : isMobile ? (
@@ -6499,7 +6502,7 @@ function ConversationRowImpl({
             conversation={conversation}
             hostsById={hostsById}
             hasError={sessionState?.kind === "error"}
-            shared={showSharedIndicator}
+            shared={sharing}
           />
         </Tooltip>
       )}
@@ -6553,11 +6556,11 @@ function ConversationRowImpl({
           <SessionUpdatedLabel updatedAt={conversation.updated_at} />
         </span>
       ) : null}
-      {!selectionMode && showSharedIndicator && (
+      {!selectionMode && sharing !== null && (
         <span
           role="img"
           // The row's hover surface carries the visible explanation.
-          aria-label="Shared with others"
+          aria-label={SESSION_SHARING_LABEL[sharing]}
           // Shares the state slot's classes so it fades on every trigger the
           // badge does (hover, focus, open menu, shortcut hint).
           className={cn(
@@ -7061,7 +7064,7 @@ function PinnedProjectFlyoutContent({
   projectIcon: string | null;
   gitBranch: string | null;
   hasError: boolean;
-  shared: boolean;
+  shared: SessionSharing | null;
 }) {
   return (
     <HoverCardContent
@@ -7088,7 +7091,7 @@ function PinnedProjectFlyoutContent({
           <span className="truncate">{gitBranch}</span>
         </p>
       )}
-      {shared && <SessionSharedHint />}
+      {shared !== null && <SessionSharedHint sharing={shared} />}
       {hasError && <SessionErrorHint />}
     </HoverCardContent>
   );

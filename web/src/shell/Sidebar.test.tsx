@@ -5571,11 +5571,13 @@ describe("sidebar_grouping_ui release flag", () => {
       expect(within(shared).getByText(id)).toBeInTheDocument();
       expect(within(folder).queryByText(id)).toBeNull();
     }
-    // A shared run names its owner; the viewer's own run doesn't.
+    // A shared run stays on one line with the people icon; the viewer's own run has neither.
     const sharedRow = within(folder).getByText("conv_shared_run").closest("li")!;
-    expect(within(sharedRow).getByTestId("session-row-meta")).toHaveTextContent(ALICE);
+    expect(within(sharedRow).queryByTestId("session-row-meta")).toBeNull();
+    expect(within(sharedRow).getByRole("img", { name: "Shared with you" })).toBeInTheDocument();
     const ownRow = within(folder).getByText("conv_own_run").closest("li")!;
     expect(within(ownRow).queryByTestId("session-row-meta")).toBeNull();
+    expect(within(ownRow).queryByRole("img", { name: /^Shared with/ })).toBeNull();
     // Filing stays the owner's: a shared run offers no Move to project.
     fireEvent.pointerDown(within(sharedRow).getByTestId("conversation-actions"), { button: 0 });
     expect(

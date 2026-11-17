@@ -62,8 +62,9 @@ runs' sessions in their own Omnigent Automation folder.
 - `sidebar-folder`: in the sidebar's All sessions and My sessions views (and
   Archived), another user's run session shared with the viewer, or a session
   launched from a run's session tree, sits in the viewer's Omnigent Automation
-  folder instead of Shared with me, wherever its owner filed it, with the owner
-  on the row's second line. A fork of a run's session stays under Shared with
+  folder instead of Shared with me, wherever its owner filed it. Its row stays
+  on one line with the people icon owners see on a shared session; hovering it
+  reads Shared with you. A fork of a run's session stays under Shared with
   me. With no project of that name, a folder with the same name shows where a
   new project would go (by name, or last under a manual order) without creating
   one: it has no project menu or New session button, takes no drops and can't be
