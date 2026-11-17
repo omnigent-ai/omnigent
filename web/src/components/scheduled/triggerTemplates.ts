@@ -663,7 +663,7 @@ const POSTING_INSTRUCTIONS = `Anything you post for this, such as a comment, rep
 /** How a Slack worker replies: one start reply with its session link, then only new results. */
 function slackWorkerPostingInstructions(linkBack: boolean, sessionLink: string): string {
   const start = linkBack
-    ? `As soon as you start working on a Slack message, call sys_session_get_info to obtain your session_id and substitute it for ${SESSION_LINK_ID_PLACEHOLDER} in the link below; if your Slack tool takes Markdown rather than Slack mrkdwn, write the link as [Omni Session](<url>) instead. Then reply once in the message's thread with exactly the lines between <slack-reply> and </slack-reply>, without those marker lines:\n<slack-reply>\n:hourglass_flowing_sand: Omnigent is working on it...\n\nTrack progress: <${sessionLink}|Omni Session>\n${OMNIGENT_ATTRIBUTION}\n</slack-reply>\n`
+    ? `As soon as you start working on a Slack message, use the session link below. If the link still ends with an uppercase placeholder word instead of a session ID, call sys_session_get_info to obtain your session_id and substitute it for that word. If your Slack tool takes Markdown rather than Slack mrkdwn, write the link as [Omni Session](<url>) instead. Then reply once in the message's thread with exactly the lines between <slack-reply> and </slack-reply>, without those marker lines:\n<slack-reply>\n:hourglass_flowing_sand: Omnigent is working on it...\n\nTrack progress: <${sessionLink}|Omni Session>\n${OMNIGENT_ATTRIBUTION}\n</slack-reply>\n`
     : "Do not send an acknowledgement or a session link. ";
   return `${POSTING_INSTRUCTIONS}\n${start}Reply in the same thread when you have a useful result or a blocker. Each later reply carries only what is new since your previous reply in that thread${linkBack ? ", without the session link" : ""}.`;
 }
@@ -740,6 +740,7 @@ const WORKER_SETTINGS_PATTERN = new RegExp(
     `(?:, model (${QUOTED_WORKER_VALUE}))?` +
     `(?:, reasoning_effort (${QUOTED_WORKER_VALUE}))?` +
     `(?:, permission_mode (${QUOTED_WORKER_VALUE}))?` +
+    `(?:, session_id_placeholder (${QUOTED_WORKER_VALUE}))?` +
     // Saved prompts may carry an older message limit; keep it as written.
     `, and a message under (\\d+) characters\\.`,
   "g",
@@ -778,7 +779,7 @@ export function readTriggerWorkerSettings(prompt: string): TriggerWorkerSettings
 /** The message limit a saved prompt's creation call asks for, e.g. 32000. */
 export function readTriggerMessageMaxChars(prompt: string): number | null {
   const parsed = workerSettingsMatch(prompt);
-  return parsed === null ? null : Number(parsed.match[6]);
+  return parsed === null ? null : Number(parsed.match[7]);
 }
 
 /** Placement remains part of the authored instructions when the poller moves. */
@@ -804,11 +805,13 @@ export function updateTriggerWorkerSettings(
     ...(settings.permissionMode
       ? [`permission_mode ${JSON.stringify(settings.permissionMode)}`]
       : []),
+    // Not a user setting, so it stays as the saved prompt wrote it.
+    ...(match[6] === undefined ? [] : [`session_id_placeholder ${match[6]}`]),
   ];
   const systemPrompt = parts.systemPrompt!.replace(
     match[0],
     () =>
-      `call sys_session_create with ${args.join(", ")}, and a message under ${match[6]} characters.`,
+      `call sys_session_create with ${args.join(", ")}, and a message under ${match[7]} characters.`,
   );
   return combineTriggerPrompt(parts.userPrompt, systemPrompt);
 }
@@ -1779,6 +1782,10 @@ export function renderTriggerPrompt(
     ...(ctx.model ? [`model ${JSON.stringify(ctx.model)}`] : []),
     ...(ctx.effort ? [`reasoning_effort ${JSON.stringify(ctx.effort)}`] : []),
     ...(ctx.permissionMode ? [`permission_mode ${JSON.stringify(ctx.permissionMode)}`] : []),
+    // The runner fills in the new session's ID, so the start reply's link is ready to post.
+    ...(source === "slack" && fields.linkBack
+      ? [`session_id_placeholder ${JSON.stringify(SESSION_LINK_ID_PLACEHOLDER)}`]
+      : []),
   ];
   const managerPostsLink = fields.linkBack && source !== "slack";
   const workerPostingInstructions =

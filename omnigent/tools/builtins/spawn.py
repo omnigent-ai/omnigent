@@ -1145,6 +1145,15 @@ class SysSessionCreateTool(Tool):
                                 "are refused. Omit to use the agent's default."
                             ),
                         },
+                        "session_id_placeholder": {
+                            "type": "string",
+                            "description": (
+                                "Optional text, e.g. 'CONVERSATION_ID', that appears in message. "
+                                "For placement same_host or host, the runner replaces each "
+                                "occurrence with the new session's ID before sending it. "
+                                "Omit to send message unchanged."
+                            ),
+                        },
                         "workflow_id": {
                             "type": "string",
                             "description": (
