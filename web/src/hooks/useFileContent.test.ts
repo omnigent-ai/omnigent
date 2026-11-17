@@ -17,7 +17,11 @@ const resolveMediaUrl = vi.fn();
 const authenticatedFetch = vi.fn();
 const isIOSShell = vi.fn(() => false);
 const isAndroidShell = vi.fn(() => false);
+const readFileViaWorkspaceApi = vi.fn(async (..._args: unknown[]): Promise<unknown> => null);
 
+vi.mock("@/lib/workspaceApi", () => ({
+  readFileViaWorkspaceApi: (...args: unknown[]) => readFileViaWorkspaceApi(...args),
+}));
 vi.mock("@/lib/host", () => ({
   isDatabricksWorkspace: () => isDatabricksWorkspace(),
   resolveMediaUrl: (p: string) => resolveMediaUrl(p),
@@ -84,14 +88,28 @@ describe("downloadWorkspaceFile base-path handling", () => {
 });
 
 describe("fetchFileContent", () => {
-  it("keeps the SSH alias for the desktop out of the REST request", async () => {
+  it("gives the SSH alias to the desktop, and keeps it out of the REST request", async () => {
     authenticatedFetch.mockResolvedValue(new Response("{}", { status: 200 }));
 
     await fetchFileContent("sess_abc", "src/main.py", undefined, { sshTarget: "my-box" });
 
+    expect(readFileViaWorkspaceApi).toHaveBeenCalledWith(
+      "sess_abc",
+      "src/main.py",
+      undefined,
+      "my-box",
+    );
     expect(authenticatedFetch).toHaveBeenCalledWith(
       "/v1/sessions/sess_abc/resources/environments/default/filesystem/src/main.py",
     );
+  });
+
+  it("skips REST when the workspace API answers", async () => {
+    const content = { path: "src/main.py", content: "x" };
+    readFileViaWorkspaceApi.mockResolvedValueOnce(content);
+
+    expect(await fetchFileContent("sess_abc", "src/main.py", undefined, {})).toBe(content);
+    expect(authenticatedFetch).not.toHaveBeenCalled();
   });
 });
 

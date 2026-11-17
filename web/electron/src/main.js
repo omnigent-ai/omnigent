@@ -363,6 +363,23 @@ const sshHosts = createSshHostStore(() => path.join(app.getPath("userData"), "ss
 const workspaceSshForwards = createWorkspaceSshForwards();
 const sshTargetChecks = createSshTargetChecks({ record: sshHosts.record });
 
+/** Ask, in a dialog the page can't draw over, before SSH runs with an alias the page suggested. */
+async function approveSshTarget(win, serverUrl, alias) {
+  if (!win || win.isDestroyed()) return false;
+  const { response } = await dialog.showMessageBox(win, {
+    type: "question",
+    buttons: ["Not now", "Allow"],
+    defaultId: 0,
+    cancelId: 0,
+    message: `Read this session's files over SSH with "${alias}"?`,
+    detail:
+      `${new URL(serverUrl).host} says this session's host runs on the machine your SSH config calls "${alias}". ` +
+      "Omnigent would connect with your SSH config and keys, check that the host is there, and read files from it directly instead of through the server.\n\n" +
+      `Allow only if you recognize "${alias}".`,
+  });
+  return response === 1;
+}
+
 function startArcaHostConnect(serverUrl, deps) {
   const finish = arcaIdentities.begin(serverUrl);
   const run = arca.startArcaConnect(serverUrl, {
@@ -5396,7 +5413,12 @@ function registerIpc() {
     return workspaceSocketRequest(request, {
       sshDestination: (hostId) => (serverUrl ? sshHosts.destination(serverUrl, hostId) : null),
       verifySshTarget: serverUrl
-        ? (hostId, alias, proves) => sshTargetChecks.verify(serverUrl, hostId, alias, proves)
+        ? (hostId, alias, proves) =>
+            sshTargetChecks.verify(serverUrl, hostId, alias, {
+              approve: () =>
+                approveSshTarget(BrowserWindow.fromWebContents(event.sender), serverUrl, alias),
+              proves,
+            })
         : undefined,
       forwards: workspaceSshForwards,
     });

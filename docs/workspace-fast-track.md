@@ -61,11 +61,11 @@ source with Rust.
    - **"Connect over SSH"** records the destination it started the host on.
    - **The host's SSH alias.** For a host with no record, the file viewer passes
      the alias the web app infers for it, the same one the "Open in" editor
-     links use (`web/src/hooks/useHostSshTarget.ts`). Main tries it only if the
-     user's own SSH config defines it (`ssh -G`), and records it only after a
-     token-checked `ListDirectory` call over it succeeds
-     (`web/electron/src/sshTargets.js`). A suggestion that fails isn't tried
-     again for five minutes.
+     links use (`web/src/hooks/useHostSshTarget.ts`). Main first asks the user
+     in a native dialog, and records the alias only after a token-checked
+     `ListDirectory` call over it succeeds (`web/electron/src/sshTargets.js`).
+     "Not now" isn't asked again until the app restarts. An allowed alias that
+     fails isn't tried again for five minutes.
 4. The host checks the token, then reads the file from the token's workspace.
 
 ## Security
@@ -77,10 +77,9 @@ source with Rust.
   workspace API methods and their own headers, with size limits.
 - **SSH destinations.** Main records which destination reaches each host
   (`ssh-hosts.json` in the app's data folder, mode 0600), per server. A page
-  can only suggest an alias the user's own SSH config defines, and main uses it
-  only after the host accepts that session's token over it. A malicious page
-  could make the desktop try the user's configured aliases, but tokens only work
-  on hosts connected to the same server, which can already read those files.
+  can only suggest a plain alias. Main runs no SSH for it, so no config, proxy or
+  `Match exec` either, until the user allows it. It records the alias only after
+  the host accepts that session's token over it. One question is open at a time.
 - **No password or host-key prompts.** SSH runs with `BatchMode=yes` and the
   user's own SSH config, so a password or an unknown host key fails, and the
   read goes through the server. An SSH agent's confirmation dialog, or a
@@ -101,7 +100,8 @@ source with Rust.
 |---|---|
 | `…/filesystem/…` requests only | Flags off, an old page, a confined session, or a path outside the workspace |
 | `ReadFile` instead of a direct read | Direct failed. Electron main logs why in its console. |
-| `not a workspace socket on this machine` in main's log | The host is on another machine, and it has no record and no working SSH alias |
+| `not a workspace socket on this machine` in main's log | The host is on another machine, and it has no record and no SSH alias |
+| `SSH alias not allowed or not verified` in main's log | The user chose "Not now", or the alias didn't reach the host |
 | `ReadFile` answers `unimplemented` | The host lacks `omnigent[workspace-api]` or predates the workspace API |
 
 ## Not covered yet

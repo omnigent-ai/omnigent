@@ -266,7 +266,8 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
         /**
          * Send one workspace API call to a session host's socket, named by the
          * server with a token: on this machine, or over SSH. `sshTarget` is an
-         * alias main may try, and record, if the host has none yet.
+         * alias main may ask the user to allow, then try and record, if the
+         * host has none yet.
          * Resolves `{ status, headers, body }`.
          * @param {{hostId: string, sshTarget?: string, socketPath: string, path: string, headers: Record<string, string>, body: Uint8Array}} request
          */

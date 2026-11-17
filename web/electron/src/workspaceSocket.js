@@ -65,7 +65,8 @@ function isWorkspaceSocket(socketPath) {
  *
  * The socket is this machine's, or one on the host's machine reached over SSH
  * through `forwards`: by the destination recorded for the host, or else by the
- * alias the page suggests once `verifySshTarget` proves it reaches the host.
+ * alias the page suggests once the user allows it and `verifySshTarget` proves
+ * it reaches the host.
  *
  * @param {{hostId?: string, sshTarget?: string, socketPath: string, path: string, headers: Record<string, string>, body: Uint8Array}} request
  * @param {{
@@ -113,14 +114,18 @@ function workspaceSocketRequest(request, routes = {}) {
       "content-length": String(PROBE_BODY.byteLength),
       ...(forwarded.authorization ? { authorization: forwarded.authorization } : {}),
     };
-    const { status } = await send(local, PROBE_PATH, probe, PROBE_BODY);
-    if (status !== 200) dropConnection();
-    return status === 200;
+    let ok = false;
+    try {
+      ok = (await send(local, PROBE_PATH, probe, PROBE_BODY)).status === 200;
+    } finally {
+      if (!ok) dropConnection();
+    }
+    return ok;
   };
   const forward = recorded
     ? forwards.localSocket(destination, socketPath)
     : routes.verifySshTarget(hostId, destination, proves).then((ok) => {
-        if (!ok) throw new Error("not a workspace socket on this machine");
+        if (!ok) throw new Error("SSH alias not allowed or not verified for this host");
         return forwards.localSocket(destination, socketPath);
       });
   return forward.then(({ socketPath: local, dropConnection, dropForward }) =>
