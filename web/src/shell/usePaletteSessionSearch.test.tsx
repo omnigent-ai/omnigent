@@ -1,6 +1,7 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, renderHook } from "@testing-library/react";
 import type { ReactNode } from "react";
+import type * as ConversationsModule from "@/hooks/useConversations";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { usePaletteSessionSearch } from "./usePaletteSessionSearch";
@@ -11,7 +12,8 @@ const useProjects = vi.fn();
 vi.mock("@/lib/CapabilitiesContext", () => ({
   useServerInfo: () => ({ session_search_scope: true }),
 }));
-vi.mock("@/hooks/useConversations", () => ({
+vi.mock("@/hooks/useConversations", async (importOriginal) => ({
+  ...(await importOriginal<typeof ConversationsModule>()),
   useConversations: (...args: unknown[]) => useConversations(...args),
   useSessionSearch: (...args: unknown[]) => useSessionSearch(...args),
   useProjects: (...args: unknown[]) => useProjects(...args),
