@@ -481,6 +481,8 @@ class _HelperProcessClient:
             if self._model_access != access:
                 self._stop_locked()
                 self._model_access = access
+            elif self._model_access is not None:
+                self._model_access._adopt_credential(access)
             self.sandbox = protected
             return protected
 

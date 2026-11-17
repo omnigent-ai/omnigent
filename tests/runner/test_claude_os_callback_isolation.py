@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import shlex
@@ -9,6 +10,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -17,7 +19,7 @@ import pytest
 
 from omnigent.inner import credential_proxy as credential_module
 from omnigent.inner import os_env as os_module
-from omnigent.inner.claude_model_access import ClaudeModelAccess
+from omnigent.inner.claude_model_access import ClaudeAuthRequired, ClaudeModelAccess
 from omnigent.inner.datamodel import (
     CredentialProxyEntry,
     CredentialProxySpec,
@@ -79,7 +81,7 @@ def _fake_policy(spec, cwd):
     return SandboxPolicy("darwin_seatbelt", True, [], [cwd], [], True)
 
 
-def test_isolation_restarts_the_helper_only_when_the_credential_boundary_changes(
+async def test_isolation_restarts_the_helper_only_when_the_credential_boundary_changes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(os_module, "resolve_sandbox", _fake_policy)
@@ -90,35 +92,117 @@ def test_isolation_restarts_the_helper_only_when_the_credential_boundary_changes
     environment._helper._proc = process
     secret = tmp_path.parent / "private-callback-credential"
 
-    def session_access(base_url: str = "https://model.test") -> ClaudeModelAccess:
-        return ClaudeModelAccess(
-            base_url, "authorization", lambda: "parent-only-secret", (secret,)
-        )
+    def session_access(
+        base_url: str = "https://model.test", token: str = "parent-only-first"
+    ) -> ClaudeModelAccess:
+        return ClaudeModelAccess(base_url, "authorization", lambda: token, (secret,))
 
     access = session_access()
+    cert, key = ensure_ca(cache_dir=tmp_path)
+    relay = access.create_proxy(
+        [], cert, key, upstream_ca_bundle=ensure_ca_bundle(cert, cache_dir=tmp_path)
+    )
     try:
         environment.isolate_model_credentials(access)
         process.terminate.assert_called_once()
         assert environment._helper._proc is None
         assert secret in environment.sandbox.credential_source_paths
         assert environment._helper._model_access is access
+        assert await relay._credential_source.token_for_request() == "parent-only-first"
 
         # Each callback derives a new access object with a fresh placeholder.
         process.reset_mock()
         environment._helper._proc = process
-        rederived = session_access()
+        rederived = session_access(token="parent-only-replacement")
         assert rederived.placeholder != access.placeholder
         environment.isolate_model_credentials(rederived)
         process.terminate.assert_not_called()
         assert environment._helper._proc is process
         assert environment._helper._model_access is access
+        assert environment._helper._model_access.placeholder == access.placeholder
+        assert access.credential() == "parent-only-replacement"
+        assert await relay._credential_source.token_for_request() == "parent-only-replacement"
+
+        rejected = Mock(return_value="parent-only-rejected")
+        environment.sandbox.read_roots.append(secret)
+        try:
+            with pytest.raises(ValueError, match="outside sandbox"):
+                environment.isolate_model_credentials(
+                    ClaudeModelAccess(access.base_url, "authorization", rejected, (secret,))
+                )
+        finally:
+            environment.sandbox.read_roots.remove(secret)
+        rejected.assert_not_called()
+        assert access.credential() == "parent-only-replacement"
+        assert await relay._credential_source.token_for_request() == "parent-only-replacement"
+
+        unavailable = Mock(
+            side_effect=[RuntimeError("parent-only-error"), "parent-only-recovered"]
+        )
+        environment.isolate_model_credentials(
+            ClaudeModelAccess(access.base_url, "authorization", unavailable, (secret,))
+        )
+        with pytest.raises(ClaudeAuthRequired) as error:
+            await relay._credential_source.token_for_request()
+        assert "parent-only" not in str(error.value)
+        assert error.value.__suppress_context__
+        assert await relay._credential_source.token_for_request() == "parent-only-recovered"
+        assert unavailable.call_count == 2
+        process.terminate.assert_not_called()
+        assert environment._helper._proc is process
 
         changed = session_access("https://other-model.test")
+        with pytest.raises(ValueError, match="unchanged authority"):
+            access._adopt_credential(changed)
         environment.isolate_model_credentials(changed)
         process.terminate.assert_called_once()
         assert environment._helper._model_access is changed
     finally:
         environment.close()
+
+
+@pytest.mark.parametrize("retired_fails", [False, True], ids=["retired-key", "retired-error"])
+async def test_equal_boundary_replacement_fences_an_outstanding_resolution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, retired_fails: bool
+) -> None:
+    monkeypatch.setattr(os_module, "resolve_sandbox", _fake_policy)
+    environment = os_module.create_os_environment(OSEnvSpec(cwd=str(tmp_path)))
+    assert environment is not None
+    started = asyncio.Event()
+    release = threading.Event()
+    loop = asyncio.get_running_loop()
+
+    def retired() -> str:
+        loop.call_soon_threadsafe(started.set)
+        assert release.wait(5), "credential replacement never released the old resolution"
+        if retired_fails:
+            raise RuntimeError("parent-only-retired-error")
+        return "parent-only-retired"
+
+    access = ClaudeModelAccess("https://model.test", "authorization", retired)
+    replacement = Mock(return_value="parent-only-current")
+    cert, key = ensure_ca(cache_dir=tmp_path)
+    relay = access.create_proxy(
+        [], cert, key, upstream_ca_bundle=ensure_ca_bundle(cert, cache_dir=tmp_path)
+    )
+    environment.isolate_model_credentials(access)
+    pending = asyncio.create_task(relay._credential_source.token_for_request())
+    try:
+        await asyncio.wait_for(started.wait(), timeout=5)
+        environment.isolate_model_credentials(
+            ClaudeModelAccess(access.base_url, "authorization", replacement)
+        )
+        release.set()
+        assert await asyncio.wait_for(pending, timeout=5) == "parent-only-current"
+        assert await relay._credential_source.token_for_request() == "parent-only-current"
+        replacement.assert_called_once_with()
+    finally:
+        release.set()
+        try:
+            if not pending.done():
+                await asyncio.wait_for(pending, timeout=5)
+        finally:
+            environment.close()
 
 
 async def test_callback_spawn_has_private_env_protected_bundle_and_authenticated_relay(

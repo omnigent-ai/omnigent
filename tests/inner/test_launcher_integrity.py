@@ -258,25 +258,6 @@ def test_isolated_import_snapshot_failure_is_closed(
         sb._isolated_launcher_import_roots(str(tmp_path / "uncached-interpreter"))
 
 
-@pytest.mark.parametrize("alias", [False, True])
-def test_launcher_rejects_tempfile_under_writable_workspace(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, alias: bool
-) -> None:
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
-    temporary = workspace
-    if alias:
-        temporary = tmp_path / "tmp-alias"
-        temporary.symlink_to(workspace, target_is_directory=True)
-    # tempfile caches its selected directory, so set the effective TMPDIR directly.
-    monkeypatch.setattr(sb.tempfile, "tempdir", str(temporary))
-    policy = _policy()
-    policy.write_roots = [workspace]
-    with pytest.raises(ValueError, match="exposes the host launcher directory"):
-        sb.create_exec_launcher("/bin/true", policy, env_overrides={"TOKEN": "placeholder"})
-    assert list(workspace.iterdir()) == [], "rejected launchers must be removed"
-
-
 def test_launcher_snapshot_rejects_group_or_world_readable_file() -> None:
     path = sb.create_exec_launcher(
         "/bin/true", _policy("none", active=False), env_overrides={"TOKEN": "placeholder"}

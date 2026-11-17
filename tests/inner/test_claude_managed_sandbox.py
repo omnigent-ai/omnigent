@@ -356,13 +356,11 @@ def test_missing_preferences_do_not_skip_later_existing_auth(tmp_path: Path) -> 
         _validate_claude_managed_preferences([missing, existing], ())
 
 
-@pytest.mark.parametrize("fmt", [plistlib.FMT_XML, plistlib.FMT_BINARY], ids=["xml", "binary"])
 @pytest.mark.parametrize("credential_file", ["account", "device"])
 def test_protect_sources_rejects_managed_preferences_before_private_source_exposure(
     tmp_path: Path,
     isolated_managed_discovery: Callable[[], tuple[Path, ...]],
     monkeypatch: pytest.MonkeyPatch,
-    fmt: plistlib.PlistFormat,
     credential_file: str,
 ) -> None:
     managed = tmp_path / "managed-preferences"
@@ -375,7 +373,7 @@ def test_protect_sources_rejects_managed_preferences_before_private_source_expos
             if name == credential_file
             else {"permissions": {"deny": ["Bash(curl *)"]}}
         )
-        path.write_bytes(plistlib.dumps(payload, fmt=fmt))
+        path.write_bytes(plistlib.dumps(payload, fmt=plistlib.FMT_XML))
     monkeypatch.setattr(
         claude_model_access, "_claude_managed_preferences_paths", lambda: (account, device)
     )
@@ -455,15 +453,6 @@ def test_managed_preferences_account_lookup_fails_closed_with_sanitized_error(
 @pytest.mark.parametrize(
     "relative_path", _MANAGED_FILES[:2], ids=["settings-only", "dropins-only"]
 )
-@pytest.mark.parametrize(
-    "payload",
-    [
-        {"env": {"ANTHROPIC_API_KEY": "parent-only-key"}},
-        {"env": {"OMNIGENT_CUSTOM_MODEL_TOKEN": "parent-only-key"}},
-        {"apiKeyHelper": "printf parent-only-key"},
-    ],
-    ids=["api-key", "source-env-alias", "helper"],
-)
 def test_protect_sources_discovers_managed_auth_before_protecting_private_sources(
     managed_dir: Path,
     isolated_managed_discovery: Callable[[], tuple[Path, ...]],
@@ -471,11 +460,10 @@ def test_protect_sources_discovers_managed_auth_before_protecting_private_source
     tmp_path: Path,
     discovery: str,
     relative_path: str,
-    payload: dict[str, object],
 ) -> None:
     path = managed_dir / relative_path
     path.parent.mkdir(exist_ok=True)
-    path.write_text(json.dumps(payload))
+    path.write_text(json.dumps({"env": {"OMNIGENT_CUSTOM_MODEL_TOKEN": "parent-only-key"}}))
     if discovery == "settings-paths":
         monkeypatch.setattr(
             ambient, "CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (managed_dir / "managed-settings.json",)

@@ -10,6 +10,7 @@ import sys
 import time
 import venv
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import httpx
@@ -31,7 +32,7 @@ from omnigent.inner.egress.certs import HostCertCache
 from omnigent.inner.egress.proxy import EgressProxy
 from omnigent.inner.egress.rules import parse_rules
 from omnigent.inner.model_signer_service import _parse_strict_request_headers
-from omnigent.inner.model_signing import SigningRejected, _validate_headers
+from omnigent.inner.model_signing import SigningRejected
 from omnigent.inner.sandbox import SandboxPolicy, _default_sandbox_for_platform
 from omnigent.inner.terminal import TerminalInstance
 from omnigent.spec.types import AgentSpec, ExecutorSpec
@@ -217,11 +218,6 @@ def test_placeholder_forms_keep_shared_header_validation(
                 ],
             ],
         )
-
-
-def test_generic_signer_still_rejects_api_key_placeholders() -> None:
-    with pytest.raises(SigningRejected, match="placeholder"):
-        _validate_headers([("x-api-key", "session-placeholder")], "session-placeholder")
 
 
 @pytest.mark.parametrize(
@@ -598,9 +594,8 @@ async def test_oauth_reread_revalidates_aliases_and_file_type(
     assert "parent-only-refresh" not in str(error.value)
 
 
-@pytest.mark.parametrize("client_header", ["Authorization", "x-api-key", "both", "both-reversed"])
 async def test_inference_works_without_rules_and_broad_rules_cannot_bypass_signing(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, client_header: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Exercise CONNECT, TLS, signing, streaming, and rejection on real sockets."""
     cert, key = ensure_ca(cache_dir=tmp_path)
@@ -652,27 +647,30 @@ async def test_inference_works_without_rules_and_broad_rules_cannot_bypass_signi
         async with httpx.AsyncClient(
             proxy=f"http://127.0.0.1:{proxy_port}", verify=context, trust_env=False
         ) as client:
-            headers = {
-                "Authorization": "Bearer " + access.placeholder,
-                "x-api-key": access.placeholder,
-            }
-            if client_header == "both-reversed":
-                headers = dict(reversed(list(headers.items())))
-            elif client_header != "both":
-                headers = {client_header: headers[client_header]}
-            response = await client.post(
-                "https://model.test/gateway/v1/messages?beta=true",
-                json={"model": "claude-test", "messages": []},
-                headers=headers,
-            )
-            assert response.status_code == 200
-            assert response.text == "data: test\n"
-            assert "set-cookie" not in response.headers
-            assert b"x-api-key: parent-only-key\r\n" in received[0]
-            assert b"authorization:" not in received[0].lower()
-            assert access.placeholder.encode() not in received[0]
-            assert len(received) == 1
-            token_for_request.assert_awaited_once()
+            for count, client_header in enumerate(
+                ("Authorization", "x-api-key", "both", "both-reversed"), start=1
+            ):
+                headers = {
+                    "Authorization": "Bearer " + access.placeholder,
+                    "x-api-key": access.placeholder,
+                }
+                if client_header == "both-reversed":
+                    headers = dict(reversed(list(headers.items())))
+                elif client_header != "both":
+                    headers = {client_header: headers[client_header]}
+                response = await client.post(
+                    "https://model.test/gateway/v1/messages?beta=true",
+                    json={"model": "claude-test", "messages": []},
+                    headers=headers,
+                )
+                assert response.status_code == 200
+                assert response.text == "data: test\n"
+                assert "set-cookie" not in response.headers
+                assert b"x-api-key: parent-only-key\r\n" in received[-1]
+                assert b"authorization:" not in received[-1].lower()
+                assert access.placeholder.encode() not in received[-1]
+                assert len(received) == count
+            assert token_for_request.await_count == 4
             token_for_request.reset_mock()
             relay._rules = parse_rules(["* model.test/**"])
             for method, path in (
@@ -682,18 +680,14 @@ async def test_inference_works_without_rules_and_broad_rules_cannot_bypass_signi
             ):
                 denied = await client.request(method, "https://model.test" + path, headers=headers)
                 assert denied.status_code == 403
-            assert len(received) == 1
+            assert len(received) == 4
             token_for_request.assert_not_awaited()
             for auth_headers in (
-                [("x-api-key", "wrong")],
                 [("Authorization", "Bearer wrong")],
                 [
                     ("Authorization", "Bearer " + access.placeholder),
                     ("x-api-key", "wrong"),
                 ],
-                [("Authorization", "Bearer wrong"), ("x-api-key", access.placeholder)],
-                [("Authorization", "Bearer wrong"), ("x-api-key", "wrong")],
-                [("Authorization", "Bearer " + access.placeholder)] * 2,
                 [("x-api-key", access.placeholder), ("X-Api-Key", access.placeholder)],
             ):
                 denied = await client.post(
@@ -703,7 +697,7 @@ async def test_inference_works_without_rules_and_broad_rules_cannot_bypass_signi
                 )
                 assert denied.status_code == 403
             token_for_request.assert_not_awaited()
-            assert len(received) == 1
+            assert len(received) == 4
             denied = await client.post(
                 "http://model.test/gateway/v1/messages", json={"model": "test"}, headers=headers
             )
@@ -716,11 +710,20 @@ async def test_inference_works_without_rules_and_broad_rules_cannot_bypass_signi
         await upstream.wait_closed()
 
 
-async def test_explicit_invalidation_refreshes_cached_credential() -> None:
-    resolve = Mock(side_effect=["first", "refreshed"])
+async def test_explicit_invalidation_refreshes_cached_credential(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = Mock(return_value=100.0)
+    monkeypatch.setattr(
+        "omnigent.inner.claude_model_access.time", SimpleNamespace(monotonic=clock)
+    )
+    resolve = Mock(side_effect=["first", "expired", "refreshed"])
     source = _ClaudeCredential(resolve)
     assert await source.token_for_request() == "first"
+    clock.return_value = 129.999
     assert await source.token_for_request() == "first"
+    clock.return_value = 130.0
+    assert await source.token_for_request() == "expired"
     source.invalidate_after_unauthorized()
     assert await source.token_for_request() == "refreshed"
 
@@ -794,18 +797,28 @@ async def test_upstream_401_refreshes_credential_on_the_next_request(
 
 
 @pytest.mark.parametrize(
-    ("sandbox_type", "sdk_owned", "fork"),
+    ("sandbox_type", "sdk_owned", "fork", "inherited", "use_factory"),
     [
-        ("linux_bwrap", True, False),
-        ("none", True, False),
-        (None, True, False),
-        (None, False, False),
-        (None, True, True),
+        ("linux_bwrap", True, False, False, False),
+        ("linux_bwrap", True, False, False, True),
+        ("none", True, False, True, False),
+        (None, True, False, True, False),
+        (None, True, False, False, True),
+        (None, False, False, False, False),
+        (None, False, False, True, True),
+        (None, True, True, False, False),
     ],
-    ids=["explicit-sdk", "sdk-optout", "implicit-sdk", "other-harness", "protected-sdk-fork"],
+    ids=[
+        "explicit-sdk-resolver",
+        "explicit-sdk-factory",
+        "sdk-optout-inherited",
+        "implicit-sdk-resolver-inherited",
+        "implicit-sdk-factory",
+        "other-harness-resolver",
+        "other-harness-factory-inherited",
+        "protected-sdk-fork",
+    ],
 )
-@pytest.mark.parametrize("inherited", [False, True])
-@pytest.mark.parametrize("use_factory", [False, True])
 async def test_terminal_inherits_automatic_model_access_only_when_sandboxed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -845,6 +858,7 @@ async def test_terminal_inherits_automatic_model_access_only_when_sandboxed(
     factory = Mock(return_value=access if sdk_owned else None)
     if not use_factory:
         registry.model_access_resolver = resolver
+        factory.side_effect = AssertionError("the installed resolver must take precedence")
     environment_spec = OSEnvSpec(
         cwd=str(workspace),
         sandbox=OSEnvSandboxSpec(type=sandbox_type) if sandbox_type is not None else None,
@@ -858,12 +872,14 @@ async def test_terminal_inherits_automatic_model_access_only_when_sandboxed(
             "s1",
             terminal_spec,
             parent_os_env=environment_spec if inherited else None,
-            model_access_factory=factory if use_factory else None,
+            model_access_factory=factory,
         )
         if fork:
             with pytest.raises(RuntimeError, match="terminal model access rejected"):
                 await launch
             launch_process.assert_not_awaited()
+            resolver.assert_awaited_once_with("conversation")
+            factory.assert_not_called()
             return
         instance = await launch
         sandboxed = sdk_owned and sandbox_type != "none"

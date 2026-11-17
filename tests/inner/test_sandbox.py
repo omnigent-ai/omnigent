@@ -54,19 +54,39 @@ def _noop_policy_arg() -> str:
     return base64.urlsafe_b64encode(raw).decode("ascii")
 
 
-@pytest.mark.parametrize("grant_field", ["write_roots", "write_files"])
-@pytest.mark.parametrize("grant_parent", [False, True])
+@pytest.mark.parametrize(
+    ("grant_field", "grant_parent", "alias", "env_overrides"),
+    [
+        ("write_roots", False, False, None),
+        ("write_files", False, False, None),
+        ("write_roots", True, False, None),
+        ("write_files", True, False, None),
+        ("write_roots", False, False, {"TOKEN": "placeholder"}),
+        ("write_roots", False, True, {"TOKEN": "placeholder"}),
+    ],
+    ids=["root", "file", "parent-root", "parent-file", "env-snapshot", "env-snapshot-alias"],
+)
 def test_exec_launcher_rejects_writable_launcher_directory(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, grant_field: str, grant_parent: bool
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    grant_field: str,
+    grant_parent: bool,
+    alias: bool,
+    env_overrides: dict[str, str] | None,
 ) -> None:
     launcher_dir = tmp_path / "launchers"
     launcher_dir.mkdir()
-    monkeypatch.setattr("omnigent.inner.sandbox.tempfile.tempdir", str(launcher_dir))
+    temporary = launcher_dir
+    if alias:
+        temporary = tmp_path / "tmp-alias"
+        temporary.symlink_to(launcher_dir, target_is_directory=True)
+    # tempfile caches the selected directory, including an effective TMPDIR alias.
+    monkeypatch.setattr("omnigent.inner.sandbox.tempfile.tempdir", str(temporary))
     policy = dataclasses.replace(_noop_policy(), active=True, backend_type="linux_bwrap")
     setattr(policy, grant_field, [tmp_path if grant_parent else launcher_dir])
 
     with pytest.raises(ValueError, match="Grant a dedicated scratch directory"):
-        create_exec_launcher(sys.executable, policy)
+        create_exec_launcher(sys.executable, policy, env_overrides=env_overrides)
     assert list(launcher_dir.iterdir()) == []
 
 

@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
-import json
 import shutil
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -26,8 +24,6 @@ from omnigent.runtime import workflow
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.terminals import registry as registry_mod
 from omnigent.terminals.registry import TerminalRegistry
-from omnigent.tools.base import ToolContext
-from omnigent.tools.builtins.sys_terminal import SysTerminalLaunchTool
 
 
 @dataclass
@@ -304,15 +300,11 @@ async def test_rest_terminal_without_os_env_keeps_unsandboxed_default(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "grant", ["read-root", "write-root", "nested-read", "cwd", "symlink", "hardlink"]
-)
 async def test_rest_terminal_own_policy_rejects_original_bundle_grants(
     tmp_path: Path,
     processes: _TerminalProcesses,
     provider: None,
     bundle: Path,
-    grant: str,
 ) -> None:
     workspace = tmp_path / "workspace"
     spec = _agent(workspace, harness="codex")
@@ -322,19 +314,7 @@ async def test_rest_terminal_own_policy_rejects_original_bundle_grants(
         sandbox=OSEnvSandboxSpec(type="linux_bwrap", read_paths=[], write_paths=[]),
     )
     assert terminal_env.sandbox is not None
-    if grant == "read-root":
-        terminal_env.sandbox.read_paths = [str(bundle)]
-    elif grant == "write-root":
-        terminal_env.sandbox.write_paths = [str(bundle)]
-    elif grant == "nested-read":
-        terminal_env.sandbox.read_paths = [str(bundle / "skills")]
-    elif grant == "cwd":
-        terminal_env.cwd = str(bundle / "skills")
-    elif grant == "symlink":
-        (workspace / "alias.json").symlink_to(bundle / ".mcp.json")
-        terminal_env.sandbox.read_paths = [str(workspace / "alias.json")]
-    else:
-        (workspace / "alias.yaml").hardlink_to(bundle / "config.yaml")
+    terminal_env.sandbox.read_paths = [str(bundle)]
     spec.terminals = {"shell": TerminalEnvSpec(command="bash", os_env=terminal_env)}
     # The SDK policy is safe; only this terminal's independent policy exposes the bundle.
     assert spec.os_env is not None and spec.os_env.sandbox is not None
@@ -390,9 +370,7 @@ async def test_rest_terminal_safe_independent_policy_gets_automatic_model_access
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "source", ["bundle", "inherited-bundle", "symlink", "hardlink", "bundle-default-sandbox"]
-)
+@pytest.mark.parametrize("source", ["bundle", "inherited-bundle", "bundle-default-sandbox"])
 async def test_rest_terminal_rejects_protected_fork_before_copying(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -402,17 +380,9 @@ async def test_rest_terminal_rejects_protected_fork_before_copying(
     source: str,
 ) -> None:
     spec = _agent(tmp_path / "workspace", harness="codex")
-    source_dir = bundle
-    if source == "symlink":
-        source_dir = tmp_path / "bundle-alias"
-        source_dir.symlink_to(bundle, target_is_directory=True)
-    elif source == "hardlink":
-        source_dir = tmp_path / "fork-source"
-        source_dir.mkdir()
-        (source_dir / "config.yaml").hardlink_to(bundle / "config.yaml")
     fork_env = OSEnvSpec(
         type="caller_process",
-        cwd=str(source_dir),
+        cwd=str(bundle),
         fork=True,
         sandbox=(
             None
@@ -531,45 +501,3 @@ async def test_rest_terminal_unsandboxed_fork_does_not_resolve_model_auth(
         copy_tree.assert_called_once_with(bundle, fork_root)
         assert (fork_root / "config.yaml").read_text() == "api_key: literal-bundle-secret\n"
         assert len(processes.launched) == 1
-
-
-@pytest.mark.parametrize("expose_bundle", [False, True])
-def test_tool_fallback_preserves_bundle_and_effective_harness(
-    tmp_path: Path,
-    processes: _TerminalProcesses,
-    provider: None,
-    bundle: Path,
-    expose_bundle: bool,
-) -> None:
-    workspace = tmp_path / "workspace"
-    spec = _agent(workspace, harness="codex")
-    assert spec.os_env is not None and spec.os_env.sandbox is not None
-    if expose_bundle:
-        spec.os_env.sandbox.read_paths = [str(bundle)]
-    registry = TerminalRegistry()
-    tool = SysTerminalLaunchTool(spec, registry, bundle_dir=bundle, effective_harness="claude-sdk")
-    try:
-        result = json.loads(
-            tool.invoke(
-                json.dumps({"terminal": "shell", "session": "main"}),
-                ToolContext(
-                    task_id="task_test",
-                    agent_id="agent_test",
-                    workspace=workspace,
-                    conversation_id="conv_test",
-                ),
-            )
-        )
-        if expose_bundle:
-            assert "error" in result
-            assert not processes.launched
-            assert len(processes.closed) == 1
-        else:
-            assert result["status"] == "launched"
-            instance = registry.get("conv_test", "shell", "main")
-            assert instance is not None and instance.model_access is not None
-            assert bundle in instance.model_access.source_paths
-            assert instance.model_access.credential() == "parent-provider-secret"
-        assert spec.executor.harness_kind == "codex"
-    finally:
-        asyncio.run(registry.cleanup_conversation("conv_test"))

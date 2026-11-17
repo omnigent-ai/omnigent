@@ -12,6 +12,7 @@ import shlex
 import stat
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Callable, Collection, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -222,6 +223,29 @@ class ClaudeAuthRequired(ProviderAuthRequired):
         super().__init__("Claude model authentication is unavailable; sign in again and retry.")
 
 
+class _CredentialResolver:
+    """Parent-only resolver shared by equal callback access and the running relay."""
+
+    def __init__(self, resolve: Callable[[], str]) -> None:
+        self._resolve = resolve
+        self._generation = 0
+        self._lock = threading.Lock()
+
+    def __call__(self) -> str:
+        with self._lock:
+            resolve = self._resolve
+        return resolve()
+
+    def replace(self, replacement: _CredentialResolver) -> None:
+        if replacement is self:
+            return
+        with replacement._lock:
+            resolve = replacement._resolve
+        with self._lock:
+            self._resolve = resolve
+            self._generation += 1
+
+
 @dataclass(frozen=True)
 class ClaudeModelAccess:
     """Trusted authority, never serialized into a sandbox policy or launcher.
@@ -240,6 +264,7 @@ class ClaudeModelAccess:
     auth_executable: _TrustedExecutable | None = field(default=None, repr=False)
     source_env_names: frozenset[str] = frozenset()
     _attribution_headers: tuple[tuple[str, str], ...] = field(init=False, default=(), repr=False)
+    _credential_resolver: _CredentialResolver = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         parsed = urlsplit(self.base_url)
@@ -259,6 +284,11 @@ class ClaudeModelAccess:
             raise ValueError("sandboxed Claude requires an exact HTTPS model endpoint on port 443")
         if self.auth_header not in ("authorization", "x-api-key"):
             raise ValueError("unsupported Claude credential type")
+        resolver = self.credential
+        if not isinstance(resolver, _CredentialResolver):
+            resolver = _CredentialResolver(resolver)
+        object.__setattr__(self, "_credential_resolver", resolver)
+        object.__setattr__(self, "credential", resolver)
         if is_databricks_ai_gateway_url(self.base_url):
             object.__setattr__(
                 self,
@@ -272,6 +302,11 @@ class ClaudeModelAccess:
                     )
                 ),
             )
+
+    def _adopt_credential(self, access: ClaudeModelAccess) -> None:
+        if self != access:
+            raise ValueError("model credential replacement requires unchanged authority")
+        self._credential_resolver.replace(access._credential_resolver)
 
     @property
     def host(self) -> str:
@@ -476,25 +511,43 @@ class ClaudeModelAccess:
 
 class _ClaudeCredential:
     def __init__(self, resolve: Callable[[], str]) -> None:
-        self._resolve = resolve
+        self._resolver = (
+            resolve if isinstance(resolve, _CredentialResolver) else _CredentialResolver(resolve)
+        )
         self._cached: str | None = None
         self._until = 0.0
+        self._generation = -1
         self._lock = asyncio.Lock()
 
     async def token_for_request(self) -> str:
         async with self._lock:
-            if self._cached is None or time.monotonic() >= self._until:
+            while True:
+                with self._resolver._lock:
+                    generation = self._resolver._generation
+                    if generation != self._generation:
+                        self._cached = None
+                    if self._cached is not None and time.monotonic() < self._until:
+                        return self._cached
+                    resolve = self._resolver._resolve
                 try:
-                    token = await asyncio.to_thread(self._resolve)
+                    token = await asyncio.to_thread(resolve)
                     _validate_secret_value(token, label="model credential")
                 except Exception:  # noqa: BLE001 — credential source errors must not expose secrets
+                    with self._resolver._lock:
+                        if generation != self._resolver._generation:
+                            continue
                     raise ClaudeAuthRequired() from None
-                self._cached = token
-                self._until = time.monotonic() + 30
-            return self._cached
+                with self._resolver._lock:
+                    if generation != self._resolver._generation:
+                        continue
+                    self._cached = token
+                    self._until = time.monotonic() + 30
+                    self._generation = generation
+                    return token
 
     def invalidate_after_unauthorized(self) -> None:
-        self._until = 0
+        with self._resolver._lock:
+            self._until = 0
 
 
 class _ClaudeRelay(_SignerRelay):

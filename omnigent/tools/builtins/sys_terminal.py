@@ -33,7 +33,6 @@ import json
 import logging
 import threading
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
@@ -513,9 +512,6 @@ class SysTerminalLaunchTool(Tool):
         self,
         spec: AgentSpec,
         registry: TerminalRegistry,
-        *,
-        bundle_dir: Path | None = None,
-        effective_harness: str | None = None,
     ) -> None:
         """
         :param spec: The agent spec — used to look up the terminal's
@@ -524,13 +520,9 @@ class SysTerminalLaunchTool(Tool):
             fallback.
         :param registry: The shared :class:`TerminalRegistry`
             singleton that owns per-conversation tmux instances.
-        :param bundle_dir: Original agent bundle kept outside terminal grants.
-        :param effective_harness: Session harness after routing overrides.
         """
         self._spec = spec
         self._registry = registry
-        self._bundle_dir = bundle_dir
-        self._effective_harness = effective_harness
 
     @classmethod
     def name(cls) -> str:
@@ -698,11 +690,7 @@ class SysTerminalLaunchTool(Tool):
                     validated.session_key,
                     terminal_spec,
                     parent_os_env=parent_os_env,
-                    model_access_factory=lambda: claude_terminal_model_access(
-                        self._spec,
-                        bundle_dir=self._bundle_dir,
-                        effective_harness=self._effective_harness,
-                    ),
+                    model_access_factory=lambda: claude_terminal_model_access(self._spec),
                     # cwd_override is reserved for LLM-supplied
                     # per-call overrides (already validated against
                     # allow_cwd_override above). The §4.6
