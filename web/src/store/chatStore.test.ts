@@ -9419,6 +9419,31 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       });
     });
 
+    it("hydrates sessionHostId from the session snapshot", async () => {
+      useChatStore.setState({
+        conversationId: "conv_host_hydrate",
+        sessionHostId: null,
+      });
+      fetchMock.mockImplementation(() =>
+        mockResponse({
+          id: "conv_host_hydrate",
+          agent_id: "agent_acp",
+          agent_name: "Antigravity",
+          host_id: "host_acp_1",
+          status: "idle",
+          created_at: 0,
+          items: [],
+          harness: "acp:antigravity",
+          labels: {},
+        }),
+      );
+      await useChatStore.getState().refreshSessionState("conv_host_hydrate");
+      expect(useChatStore.getState()).toMatchObject({
+        sessionHarness: "acp:antigravity",
+        sessionHostId: "host_acp_1",
+      });
+    });
+
     it("forces a fresh snapshot and applies runner-backed Codex model options", async () => {
       useChatStore.setState({
         conversationId: "conv_codex",

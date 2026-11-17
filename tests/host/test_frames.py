@@ -1351,10 +1351,24 @@ def test_harness_readiness_frame_gateway_inference_round_trip() -> None:
     original = HostHarnessReadinessFrame(
         configured_harnesses={"codex": True},
         gateway_inference={"codex": True, "native-codex": True},
+        workspace_file_mentions={"acp:coder": True, "acp:chat": False},
     )
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostHarnessReadinessFrame)
     assert decoded.gateway_inference == {"codex": True, "native-codex": True}
+    assert decoded.workspace_file_mentions == {"acp:coder": True, "acp:chat": False}
+
+
+def test_hello_frame_workspace_file_mentions_round_trip() -> None:
+    original = HostHelloFrame(
+        version="0.1.0",
+        frame_protocol_version=1,
+        name="corey-laptop",
+        workspace_file_mentions={"acp:coder": True},
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostHelloFrame)
+    assert decoded.workspace_file_mentions == {"acp:coder": True}
 
 
 def test_harness_readiness_frame_without_gateway_inference_is_none() -> None:

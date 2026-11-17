@@ -34,6 +34,11 @@ const ws = vi.hoisted(() => ({
 }));
 // Harness ids the server declares ``workspace_file_mentions`` for.
 const declaredMentions = vi.hoisted(() => ({ harnesses: new Set<string>() }));
+const hostMentionsState = vi.hoisted(() => ({
+  hosts: [] as UseHostsModule.Host[],
+  sessionAgent: undefined as UseAgentsModule.Agent | undefined,
+  sessionHostId: null as string | null,
+}));
 const ROOT_ENTRIES: WorkspaceFile[] = [
   { path: "src", name: "src", type: "directory", bytes: null, modified_at: null },
   { path: "readme.md", name: "readme.md", type: "file", bytes: 10, modified_at: null },
@@ -129,7 +134,7 @@ vi.mock("@/hooks/useSessionLiveMcpServers", async (importOriginal) => ({
 // so bare Composer renders don't need a QueryClientProvider.
 vi.mock("@/hooks/useAgents", async (importOriginal) => ({
   ...(await importOriginal<typeof UseAgentsModule>()),
-  useSessionAgent: () => ({ data: undefined, isError: false }),
+  useSessionAgent: () => ({ data: hostMentionsState.sessionAgent, isError: false }),
 }));
 vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
   ...(await importOriginal<typeof UseChildSessionsModule>()),
@@ -140,11 +145,15 @@ vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
 // (no host bound) without needing a QueryClient provider around these renders.
 vi.mock("@/hooks/useSession", async (importOriginal) => ({
   ...(await importOriginal<typeof UseSessionModule>()),
-  useSession: () => ({ session: { hostId: null }, isLoading: false, error: null }),
+  useSession: () => ({
+    session: { hostId: hostMentionsState.sessionHostId },
+    isLoading: false,
+    error: null,
+  }),
 }));
 vi.mock("@/hooks/useHosts", async (importOriginal) => ({
   ...(await importOriginal<typeof UseHostsModule>()),
-  useHosts: () => ({ data: [] }),
+  useHosts: () => ({ data: hostMentionsState.hosts }),
 }));
 vi.mock("@/hooks/RunnerHealthProvider", async (importOriginal) => ({
   ...(await importOriginal<typeof RunnerHealthProviderModule>()),
@@ -302,10 +311,14 @@ describe("Composer @-file-mention browser (native sessions)", () => {
   beforeEach(() => {
     resetWorkspaceMock();
     declaredMentions.harnesses = new Set();
+    hostMentionsState.hosts = [];
+    hostMentionsState.sessionAgent = undefined;
+    hostMentionsState.sessionHostId = null;
     localStorage.clear();
     useChatStore.setState({
       conversationId: `conv_test_${++convSeq}`,
       sessionHarness: "claude-native",
+      sessionHostId: null,
       pendingComposerAttachments: [],
     });
   });
@@ -441,6 +454,85 @@ describe("Composer @-file-mention browser (native sessions)", () => {
     append("now");
     fireEvent.submit(textarea().closest("form")!);
     expect(onSend).toHaveBeenCalledWith("check [Attached: src/server.ts] now", undefined);
+  });
+
+  it("delivers mentions on an acp:<slug> harness when the bound host advertises workspace_file_mentions", () => {
+    hostMentionsState.hosts = [
+      {
+        host_id: "host_acp_1",
+        name: "workstation",
+        owner: "me",
+        status: "online",
+        workspace_file_mentions: { "acp:demo": true },
+      },
+    ];
+    useChatStore.setState({ sessionHarness: "acp:demo", sessionHostId: "host_acp_1" });
+    const onSend = vi.fn();
+    renderWithTooltips(<Composer {...composerProps({ onSend })} />);
+    type("check @src");
+    fireEvent.click(screen.getByTitle("Open src"));
+    fireEvent.click(screen.getByTitle("Attach server.ts"));
+    append("now");
+    fireEvent.submit(textarea().closest("form")!);
+    expect(onSend).toHaveBeenCalledWith("check [Attached: src/server.ts] now", undefined);
+  });
+
+  it("does NOT show the mention menu on an acp:<slug> harness when the bound host disables workspace_file_mentions", () => {
+    hostMentionsState.hosts = [
+      {
+        host_id: "host_acp_1",
+        name: "workstation",
+        owner: "me",
+        status: "online",
+        workspace_file_mentions: { "acp:demo": false },
+      },
+    ];
+    declaredMentions.harnesses = new Set(["acp:demo"]);
+    useChatStore.setState({ sessionHarness: "acp:demo", sessionHostId: "host_acp_1" });
+    renderWithTooltips(<Composer {...composerProps()} />);
+    type("@src");
+    expect(screen.queryByTitle("Open src")).not.toBeInTheDocument();
+  });
+
+  it("recovers acp:<slug> from the bound agent on restored sessions reporting canonical acp", () => {
+    hostMentionsState.hosts = [
+      {
+        host_id: "host_acp_1",
+        name: "workstation",
+        owner: "me",
+        status: "online",
+        workspace_file_mentions: { "acp:demo": true },
+      },
+    ];
+    hostMentionsState.sessionAgent = { id: "ag_acp_1", name: "demo", harness: "acp:demo" };
+    hostMentionsState.sessionHostId = "host_acp_1";
+    useChatStore.setState({ sessionHarness: "acp", sessionHostId: null });
+    const onSend = vi.fn();
+    renderWithTooltips(<Composer {...composerProps({ onSend })} />);
+    type("check @src");
+    fireEvent.click(screen.getByTitle("Open src"));
+    fireEvent.click(screen.getByTitle("Attach server.ts"));
+    append("now");
+    fireEvent.submit(textarea().closest("form")!);
+    expect(onSend).toHaveBeenCalledWith("check [Attached: src/server.ts] now", undefined);
+  });
+
+  it("keeps mentions disabled on restored acp sessions when the bound host disables the slug", () => {
+    hostMentionsState.hosts = [
+      {
+        host_id: "host_acp_1",
+        name: "workstation",
+        owner: "me",
+        status: "online",
+        workspace_file_mentions: { "acp:demo": false },
+      },
+    ];
+    hostMentionsState.sessionAgent = { id: "ag_acp_1", name: "demo", harness: "acp:demo" };
+    declaredMentions.harnesses = new Set(["acp:demo"]);
+    useChatStore.setState({ sessionHarness: "acp", sessionHostId: "host_acp_1" });
+    renderWithTooltips(<Composer {...composerProps()} />);
+    type("@src");
+    expect(screen.queryByTitle("Open src")).not.toBeInTheDocument();
   });
 
   it("opens the menu on an aliased native harness (native-pi → pi-native)", () => {

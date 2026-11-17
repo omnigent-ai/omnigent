@@ -40,7 +40,11 @@ from omnigent.debug_logging import (
 )
 from omnigent.entities import Conversation
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.harness_aliases import canonicalize_harness, harness_account_key
+from omnigent.harness_aliases import (
+    canonicalize_harness,
+    harness_account_key,
+    resolve_acp_probe_harness,
+)
 from omnigent.host.frames import (
     CAP_CLONE_REPOSITORY,
     CAP_HARNESS_ACCOUNTS,
@@ -1032,6 +1036,7 @@ def create_hosts_router(
                 # emitted as-is so a client can tell "unknown" from "not
                 # gateway-backed".
                 "gateway_inference": host_registry.gateway_inference(host.host_id),
+                "workspace_file_mentions": host_registry.workspace_file_mentions(host.host_id),
                 "interactive_shells": host_registry.interactive_shells(host.host_id),
                 # False also when another replica holds the tunnel: unverified.
                 "long_session_messages_supported": bool(
@@ -1097,6 +1102,7 @@ def create_hosts_router(
             # Same semantics as list_hosts: reported on connect and held in
             # memory, so ``None`` is "no report on this replica yet".
             "gateway_inference": host_registry.gateway_inference(host.host_id),
+            "workspace_file_mentions": host_registry.workspace_file_mentions(host.host_id),
             "interactive_shells": host_registry.interactive_shells(host.host_id),
             "long_session_messages_supported": bool(
                 conn is not None and CAP_LONG_SESSION_MESSAGES in conn.hello.capabilities
@@ -1162,10 +1168,11 @@ def create_hosts_router(
             raise _host_absent_error(host)
         _require_harness_setup_support(conn, "pre-launch model listing")
 
+        resolved_harness = resolve_acp_probe_harness(harness)
         result = await _proxy_model_options(
             host_registry=host_registry,
             host_conn=conn,
-            harness=canonicalize_harness(harness) or harness,
+            harness=resolved_harness,
         )
         if result.get("status") != "ok":
             raise HTTPException(
@@ -2035,6 +2042,9 @@ def create_hosts_router(
         refreshed_gateway = optional_str_bool_map(result, "gateway_inference")
         if refreshed_gateway is not None:
             host_registry.record_gateway_inference(host.host_id, refreshed_gateway)
+        refreshed_file_mentions = optional_str_bool_map(result, "workspace_file_mentions")
+        if refreshed_file_mentions is not None:
+            host_registry.record_workspace_file_mentions(host.host_id, refreshed_file_mentions)
         refreshed_configured, refreshed_accounts = await apply_harness_snapshot(
             host.host_id, conn, result
         )
@@ -2042,6 +2052,7 @@ def create_hosts_router(
             "configured_harnesses": refreshed_configured,
             "harness_accounts": refreshed_accounts,
             "gateway_inference": refreshed_gateway,
+            "workspace_file_mentions": refreshed_file_mentions,
         }
 
     @router.post("/hosts/{host_id}/harnesses/accounts/refresh")

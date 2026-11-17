@@ -49,6 +49,13 @@ export interface Host {
    * or server — and must not gate anything away; only an explicit `false` does.
    */
   gateway_inference?: Record<string, boolean> | null;
+  /**
+   * Per-ACP-agent flag reported by the host indicating whether that agent
+   * opens workspace-relative `[Attached: <path>]` markers with its own file
+   * tools, e.g. `{"acp:claude-code": true}`. `null`/absent means unknown
+   * (older host or unreported).
+   */
+  workspace_file_mentions?: Record<string, boolean> | null;
 }
 
 export interface HarnessAccountProvider {
@@ -228,6 +235,7 @@ async function responseDetail(res: Response): Promise<string> {
 export interface RefreshHarnessesResult {
   configured_harnesses: Record<string, boolean | string>;
   gateway_inference: Record<string, boolean> | null;
+  workspace_file_mentions?: Record<string, boolean> | null;
   harness_accounts?: Record<string, HarnessAccount> | null;
 }
 

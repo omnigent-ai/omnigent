@@ -367,6 +367,7 @@ vi.mock("@/lib/agentLabels", async (importOriginal) => ({
     antigravity: "Antigravity",
     copilot: "Copilot",
   }),
+  useFileMentionHarnesses: () => new Set<string>(),
   // The setup dialog reads server-authored steps from here; stub codex-native's
   // two-step flow (install → login) so the dialog renders without a real fetch.
   useHarnessSetupSteps: () => ({
@@ -5309,6 +5310,122 @@ describe("NewChatLandingScreen", () => {
       }
     },
   );
+
+  it("probes live host models and per-model efforts for acp:<slug> without blocking launch while loading", async () => {
+    const agentLabels = await import("@/lib/agentLabels");
+    const catalog = vi.spyOn(agentLabels, "useBrainHarnessLabels").mockReturnValue({
+      ...agentLabels.BRAIN_HARNESS_LABELS,
+      "acp:antigravity": "Antigravity",
+    });
+    const agModels: NonNullable<ReturnType<typeof useHostModelOptions>["data"]> = [
+      {
+        id: "gemini-3-pro",
+        displayName: "Gemini 3 Pro",
+        isDefault: true,
+        supportedReasoningEfforts: [{ reasoningEffort: "low" }, { reasoningEffort: "high" }],
+        defaultReasoningEffort: "high",
+      },
+      {
+        id: "claude-opus-ag",
+        displayName: "Claude Opus (AG)",
+        supportedReasoningEfforts: [{ reasoningEffort: "max" }],
+        defaultReasoningEffort: "max",
+      },
+    ];
+    try {
+      mockAgents([
+        {
+          id: "a_ag",
+          name: "antigravity",
+          display_name: "Antigravity",
+          description: null,
+          harness: "acp:antigravity",
+          acpHarness: true,
+          skills: [],
+        },
+      ]);
+      // configured_harnesses intentionally omits "acp:antigravity" (only native SDKs appear there).
+      mockHosts([{ ...host("online"), configured_harnesses: { "claude-native": true } }]);
+
+      useHostModelOptionsMock.mockImplementation(
+        (_hostId, harness) =>
+          (harness === "acp:antigravity"
+            ? { data: undefined, isLoading: true, error: null }
+            : CLAUDE_MODEL_OPTIONS_RESULT) as unknown as ReturnType<typeof useHostModelOptions>,
+      );
+
+      authenticatedFetchMock.mockResolvedValue({
+        ok: true,
+        json: async () => ({ id: "conv_new" }),
+      } as unknown as Response);
+
+      renderLanding();
+
+      expect(useHostModelOptionsMock).toHaveBeenCalledWith("host_1", "acp:antigravity", true, {
+        poll: false,
+      });
+
+      // Slow cold ACP probe must not block typing or starting a new chat.
+      fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+        target: { value: "still booting" },
+      });
+      expect(screen.getByTestId("new-chat-landing-submit")).not.toBeDisabled();
+
+      // Once the host probe resolves, models & per-model efforts populate and submit cleanly.
+      useHostModelOptionsMock.mockImplementation(
+        (_hostId, harness) =>
+          (harness === "acp:antigravity"
+            ? { data: agModels, isLoading: false, error: null }
+            : CLAUDE_MODEL_OPTIONS_RESULT) as unknown as ReturnType<typeof useHostModelOptions>,
+      );
+      fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+        target: { value: "ready" },
+      });
+
+      openAgentModels("a_ag");
+      expect(screen.getByTestId("new-chat-landing-agent-model-gemini-3-pro")).toBeTruthy();
+      fireEvent.click(screen.getByTestId("new-chat-landing-agent-model-claude-opus-ag"));
+      expect(screen.getByTestId("new-chat-landing-agent-effort-max")).toBeTruthy();
+      expect(screen.queryByTestId("new-chat-landing-agent-effort-low")).toBeNull();
+      fireEvent.click(screen.getByTestId("new-chat-landing-agent-effort-max"));
+      closeMenu();
+
+      const { body } = await submitAndReadBody();
+      expect(body.agent_id).toBe("a_ag");
+      expect(body.model_override).toBe("claude-opus-ag");
+      expect(body.reasoning_effort).toBe("max");
+    } finally {
+      cleanup();
+      catalog.mockRestore();
+    }
+  });
+
+  it("keeps the agent label when an acp:<slug> probe returns no models", () => {
+    mockAgents([
+      {
+        id: "a_traex",
+        name: "traex",
+        display_name: "TraeX",
+        description: null,
+        harness: "acp:traex",
+        acpHarness: true,
+        skills: [],
+      },
+    ]);
+    mockHosts([{ ...host("online"), configured_harnesses: { acp: true, "acp:traex": true } }]);
+    useHostModelOptionsMock.mockImplementation(
+      (_hostId, harness) =>
+        (harness === "acp:traex"
+          ? { data: [], isLoading: false, error: null }
+          : CLAUDE_MODEL_OPTIONS_RESULT) as unknown as ReturnType<typeof useHostModelOptions>,
+    );
+
+    renderLanding();
+
+    const trigger = screen.getByTestId("new-chat-landing-agent-select");
+    expect(trigger).toHaveTextContent(/traex/i);
+    expect(trigger).not.toHaveTextContent("Models unavailable");
+  });
 
   it.each(catalogAgents)(
     "blocks $display_name's retained catalog while it needs setup",
@@ -10666,6 +10783,49 @@ describe("NewChatLandingScreen @-file-mention", () => {
       testAgent("sdk1", "my-sdk-agent", { display_name: "SDK Agent", harness: "claude-sdk" }),
     ]);
     renderLanding();
+    fireEvent.change(input(), { target: { value: "@", selectionStart: 1 } });
+    expect(screen.queryByTitle("Open omnigent")).not.toBeInTheDocument();
+  });
+
+  it("opens the menu and delivers [Attached: …] for an acp:<slug> agent when the host advertises workspace_file_mentions", async () => {
+    mockAgents([testAgent("acp1", "Demo ACP", { display_name: "Demo ACP", harness: "acp:demo" })]);
+    mockHosts([
+      {
+        ...host("online"),
+        configured_harnesses: { "acp:demo": true },
+        workspace_file_mentions: { "acp:demo": true },
+      },
+    ]);
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_acp" }),
+    } as unknown as Response);
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    fireEvent.change(input(), { target: { value: "Read @", selectionStart: 6 } });
+    expect(screen.getByTitle("Open omnigent")).toBeInTheDocument();
+    fireEvent.click(screen.getByTitle("Attach README.md"));
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(setPendingInitialPromptMock).toHaveBeenCalled());
+    const [, payload] = setPendingInitialPromptMock.mock.calls[0]!;
+    expect((payload as { text: string }).text).toBe("Read [Attached: README.md]");
+  });
+
+  it("does NOT open the file menu for an acp:<slug> agent when the host omits workspace_file_mentions", async () => {
+    mockAgents([testAgent("acp1", "Demo ACP", { display_name: "Demo ACP", harness: "acp:demo" })]);
+    mockHosts([
+      {
+        ...host("online"),
+        configured_harnesses: { "acp:demo": true },
+        workspace_file_mentions: { "acp:demo": false },
+      },
+    ]);
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
     fireEvent.change(input(), { target: { value: "@", selectionStart: 1 } });
     expect(screen.queryByTitle("Open omnigent")).not.toBeInTheDocument();
   });

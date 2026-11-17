@@ -62,9 +62,10 @@ from omnigent.errors import (
 from omnigent.gateway_inference import gateway_inference_map
 from omnigent.harness_accounts import HarnessAccount, HarnessAccounts
 from omnigent.harness_aliases import (
-    canonicalize_harness,
     harness_account_key,
+    is_acp_harness,
     is_claude_sdk_harness_name,
+    resolve_acp_probe_harness,
 )
 from omnigent.harness_availability import HARNESS_BINARY_MISSING, HarnessAvailability
 from omnigent.host import HOST_FATAL_EXIT_CODE
@@ -162,6 +163,7 @@ from omnigent.host.maintenance import HostMaintenanceJanitor
 from omnigent.host.runner_zygote import ZygoteManager, ZygoteRunnerProc, ZygoteUnavailable
 from omnigent.host.session_env import consume_session_env_handoff
 from omnigent.inner import _proc
+from omnigent.onboarding.acp_auth import acp_file_mentions_map
 from omnigent.onboarding.harness_accounts import (
     HARNESS_ACCOUNT_KEYS,
     probe_harness_account,
@@ -1383,6 +1385,7 @@ class HostProcess:
         self._server_capabilities: frozenset[str] = frozenset()
         self._harness_accounts: HarnessAccounts | None = None
         self._gateway_inference: dict[str, bool] | None = None
+        self._workspace_file_mentions: dict[str, bool] | None = None
         self._capabilities_initialized = False
         # Invalidates deferred probe results when an install or credential
         # write has already produced a fresher snapshot. Capability state is
@@ -1466,6 +1469,11 @@ class HostProcess:
         # lifetime. A tunnel reconnect retains successful or in-flight work;
         # a completed failed attempt may be retried.
         self._model_options_prewarm_task: asyncio.Task[bool] | None = None
+        # Short-lived in-memory cache + single-flight deduplication for live
+        # ACP pre-launch probes (avoids respawning external ACP binaries on UI
+        # polling/retries).
+        self._acp_model_options_cache: dict[str, tuple[float, list[dict[str, object]]]] = {}
+        self._acp_model_options_inflight: dict[str, asyncio.Task[ModelOptionsResult | None]] = {}
         # Discovery belongs to the daemon so connection retries share one
         # in-flight probe and registration waits for bounded discovery.
         self._capability_init_task: asyncio.Task[None] | None = None
@@ -3385,10 +3393,11 @@ class HostProcess:
         account_generation = self._account_generation
         try:
             invalidate_harness_probe_caches()
-            configured, accounts, gateway = await asyncio.gather(
+            configured, accounts, gateway, file_mentions = await asyncio.gather(
                 self._probe_configured_harnesses(startup=False),
                 self._probe_harness_accounts(explicit_refresh=True),
                 self._probe_gateway_inference(startup=False),
+                self._probe_workspace_file_mentions(startup=False),
             )
         except Exception as exc:
             _logger.exception("Forced harness readiness refresh failed")
@@ -3411,6 +3420,7 @@ class HostProcess:
             configured_harnesses=configured,
             harness_accounts=self._harness_accounts,
             gateway_inference=gateway,
+            workspace_file_mentions=file_mentions,
         )
 
     async def _handle_probe_harness_accounts(
@@ -4232,6 +4242,67 @@ class HostProcess:
         routable = list(config.routable_models) if config is not None else []
         return ModelOptionsResult(models=rows, routable_models=routable)
 
+    async def _probe_acp_model_options_once(self, harness: str) -> ModelOptionsResult | None:
+        """Spawn the configured ACP agent briefly to capture its live model catalog."""
+        from omnigent.inner.acp_executor import AcpExecutor
+        from omnigent.inner.acp_harness import acp_agent_config_from_entry
+        from omnigent.onboarding.acp_auth import resolve_acp_harness_entry
+
+        entry = await asyncio.to_thread(resolve_acp_harness_entry, harness)
+        if entry is None:
+            _logger.warning("ACP agent %r is not configured on this host", harness)
+            return None
+
+        config = acp_agent_config_from_entry(entry, omnigent_mcp=False)
+        executor = AcpExecutor(config, cwd=str(Path.home()), os_env=None)
+        try:
+            payload = await asyncio.wait_for(executor.live_model_options(), timeout=12.0)
+        except Exception:
+            _logger.warning("ACP model catalog probe failed for %s", harness, exc_info=True)
+            return None
+        finally:
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(executor.close(), timeout=3.0)
+
+        raw_models = payload.get("models") if isinstance(payload, dict) else None
+        rows = (
+            [dict(row) for row in raw_models if isinstance(row, dict)]
+            if isinstance(raw_models, list)
+            else []
+        )
+        routable = [row["id"] for row in rows if isinstance(row.get("id"), str) and row["id"]]
+        if rows:
+            self._acp_model_options_cache[harness] = (time.monotonic(), rows)
+        return ModelOptionsResult(models=rows, routable_models=routable)
+
+    async def _probed_acp_model_options(self, harness: str) -> ModelOptionsResult | None:
+        """Return TTL-cached + single-flight live ACP model options for *harness*."""
+        cache_ttl_s = 300.0
+        cached = self._acp_model_options_cache.get(harness)
+        if cached is not None:
+            cached_at, rows = cached
+            if (time.monotonic() - cached_at) < cache_ttl_s:
+                routable = [
+                    row["id"] for row in rows if isinstance(row.get("id"), str) and row["id"]
+                ]
+                return ModelOptionsResult(
+                    models=[dict(row) for row in rows],
+                    routable_models=routable,
+                )
+            self._acp_model_options_cache.pop(harness, None)
+
+        inflight = self._acp_model_options_inflight.get(harness)
+        if inflight is None:
+            inflight = asyncio.create_task(
+                self._probe_acp_model_options_once(harness),
+                name=f"host-acp-model-options-{harness}",
+            )
+            self._acp_model_options_inflight[harness] = inflight
+            inflight.add_done_callback(
+                lambda _t, key=harness: self._acp_model_options_inflight.pop(key, None)
+            )
+        return await asyncio.shield(inflight)
+
     async def _handle_model_options(
         self,
         frame: HostModelOptionsFrame,
@@ -4244,7 +4315,7 @@ class HostProcess:
         resolves its own catalog at launch, and the in-session picker
         re-reads that authoritative snapshot after bind.
         """
-        harness = canonicalize_harness(frame.harness) or frame.harness
+        harness = resolve_acp_probe_harness(frame.harness)
         with_source = functools.partial(_with_model_configuration_source, harness=harness)
         if harness == "codex-native":
             # Harness-truth lane: every launch shape is answered from the
@@ -4314,6 +4385,21 @@ class HostProcess:
                 request_id=frame.request_id,
                 status="ok",
                 models=with_source(devin_models),
+            )
+
+        if is_acp_harness(harness):
+            probed = await self._probed_acp_model_options(harness)
+            if probed is not None:
+                return HostModelOptionsResultFrame(
+                    request_id=frame.request_id,
+                    status="ok",
+                    models=with_source(probed.models),
+                    routable_models=probed.routable_models,
+                )
+            return HostModelOptionsResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error=f"the {harness} model probe failed — see the host log",
             )
 
         if is_claude_sdk_harness_name(harness):
@@ -4926,21 +5012,36 @@ class HostProcess:
                 )
             return None
 
+    async def _probe_workspace_file_mentions(self, *, startup: bool) -> dict[str, bool] | None:
+        """Collect per-ACP-agent workspace file-mention flags without breaking startup."""
+        try:
+            return await asyncio.to_thread(acp_file_mentions_map)
+        except Exception as exc:
+            _logger.exception("Host ACP file-mention probe failed")
+            if startup:
+                _print_host_status(
+                    "⚠ Could not inspect ACP workspace_file_mentions; connecting with "
+                    f"file-mention flags unknown: {exc}",
+                    stderr=True,
+                )
+            return None
+
     async def _initialize_capabilities(self) -> None:
         """Collect startup metadata before registration, with bounded fallback."""
         if self._capabilities_initialized:
             return
         generation = self._capability_generation
         try:
-            configured, gateway = await asyncio.wait_for(
+            configured, gateway, file_mentions = await asyncio.wait_for(
                 asyncio.gather(
                     self._probe_configured_harnesses(startup=True),
                     self._probe_gateway_inference(startup=True),
+                    self._probe_workspace_file_mentions(startup=True),
                 ),
                 timeout=_HOST_CAPABILITY_INIT_TIMEOUT_S,
             )
         except TimeoutError:
-            configured = gateway = None
+            configured = gateway = file_mentions = None
             _logger.error(
                 "Host capability discovery exceeded %.0fs; continuing with unknown metadata",
                 _HOST_CAPABILITY_INIT_TIMEOUT_S,
@@ -4950,7 +5051,7 @@ class HostProcess:
                 stderr=True,
             )
         if self._capability_generation == generation:
-            self._replace_capabilities(configured, gateway)
+            self._replace_capabilities(configured, gateway, file_mentions=file_mentions)
         self._capabilities_initialized = True
 
     def _replace_capabilities(
@@ -4958,13 +5059,19 @@ class HostProcess:
         configured: dict[str, HarnessAvailability] | None,
         gateway: dict[str, bool] | None,
         accounts: HarnessAccounts | None = None,
+        *,
+        file_mentions: dict[str, bool] | None = None,
     ) -> None:
         """Replace the advisory snapshot and invalidate older probe results."""
-        readiness_changed = configured is not None or gateway is not None
+        readiness_changed = (
+            configured is not None or gateway is not None or file_mentions is not None
+        )
         if configured is not None:
             self._configured_harnesses = dict(configured)
         if gateway is not None:
             self._gateway_inference = dict(gateway)
+        if file_mentions is not None:
+            self._workspace_file_mentions = dict(file_mentions)
         if accounts is not None:
             self._harness_accounts = dict(accounts)
             self._account_generation += 1
@@ -5278,6 +5385,9 @@ class HostProcess:
             model_options_prewarm_task = self._model_options_prewarm_task
             if model_options_prewarm_task is not None:
                 model_options_prewarm_task.cancel()
+            acp_probe_tasks = list(self._acp_model_options_inflight.values())
+            for task in acp_probe_tasks:
+                task.cancel()
             # Stop accepting lifecycle work before draining teardown tasks.
             # Cancelling an in-flight launch retains its shielded spawn in
             # _runner_stop_tasks, so quiescing frame handlers first closes the
@@ -5293,6 +5403,10 @@ class HostProcess:
                     with contextlib.suppress(asyncio.CancelledError, Exception):
                         await model_options_prewarm_task
                 self._model_options_prewarm_task = None
+                for task in acp_probe_tasks:
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await task
+                self._acp_model_options_inflight.clear()
                 from omnigent.models.model_catalog_store import shutdown_catalog_probes
 
                 await shutdown_catalog_probes()
@@ -5757,6 +5871,7 @@ class HostProcess:
             configured_harnesses=self._configured_harnesses,
             harness_accounts=self._harness_accounts,
             gateway_inference=self._gateway_inference,
+            workspace_file_mentions=self._workspace_file_mentions,
             interactive_shells=self._interactive_shells,
             telemetry_opt_out=_tel_opt_out,
             installation_id=_tel_install_id,
@@ -5831,6 +5946,7 @@ class HostProcess:
         """Refresh advisory capabilities without endangering the tunnel."""
         published_configured = self._configured_harnesses
         published_gateway = self._gateway_inference
+        published_file_mentions = self._workspace_file_mentions
         loop = asyncio.get_running_loop()
         next_quick = loop.time() + HARNESS_READINESS_REFRESH_INTERVAL_S
         next_full = loop.time() + HARNESS_READINESS_FULL_REFRESH_INTERVAL_S
@@ -5840,6 +5956,7 @@ class HostProcess:
             generation = self._capability_generation
             configured = self._configured_harnesses
             gateway = self._gateway_inference
+            file_mentions = self._workspace_file_mentions
             refresh_full = configured is None or now >= next_full
             if now >= next_quick:
                 next_quick = now + HARNESS_READINESS_REFRESH_INTERVAL_S
@@ -5853,17 +5970,28 @@ class HostProcess:
             if refresh_full:
                 latest = await self._probe_configured_harnesses(startup=False)
                 latest_gateway = await self._probe_gateway_inference(startup=False)
+                latest_file_mentions = await self._probe_workspace_file_mentions(startup=False)
                 next_full = now + HARNESS_READINESS_FULL_REFRESH_INTERVAL_S
                 new_configured = latest if latest is not None else configured
                 new_gateway = latest_gateway if latest_gateway is not None else gateway
+                new_file_mentions = (
+                    latest_file_mentions if latest_file_mentions is not None else file_mentions
+                )
                 if self._capability_generation == generation and (
-                    new_configured != configured or new_gateway != gateway
+                    new_configured != configured
+                    or new_gateway != gateway
+                    or new_file_mentions != file_mentions
                 ):
-                    self._replace_capabilities(new_configured, new_gateway)
+                    self._replace_capabilities(
+                        new_configured, new_gateway, file_mentions=new_file_mentions
+                    )
             configured = self._configured_harnesses
             gateway = self._gateway_inference
+            file_mentions = self._workspace_file_mentions
             if configured is not None and (
-                configured != published_configured or gateway != published_gateway
+                configured != published_configured
+                or gateway != published_gateway
+                or file_mentions != published_file_mentions
             ):
                 await self._send_text(
                     ws,
@@ -5872,11 +6000,13 @@ class HostProcess:
                             configured_harnesses=configured,
                             harness_accounts=self._harness_accounts,
                             gateway_inference=gateway,
+                            workspace_file_mentions=file_mentions,
                         )
                     ),
                 )
                 published_configured = configured
                 published_gateway = gateway
+                published_file_mentions = file_mentions
 
     def _raise_connection_error(self, frame: HostConnectionErrorFrame) -> None:
         """Raise the lifecycle exception requested by a server error frame."""
@@ -6119,6 +6249,7 @@ class HostProcess:
                 self._replace_capabilities(
                     refresh_result.configured_harnesses,
                     refresh_result.gateway_inference,
+                    file_mentions=refresh_result.workspace_file_mentions,
                 )
             await self._send_text(ws, self._encode_frame(refresh_result))
         elif isinstance(frame, HostHarnessLoginFrame):

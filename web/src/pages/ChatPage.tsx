@@ -82,6 +82,7 @@ import { agentDisplayLabel } from "@/components/AgentInfo";
 import {
   BRAIN_HARNESS_LABELS,
   SMART_ROUTING_LABEL,
+  useAcpHarnessIds,
   useBrainHarnessLabels,
   useFileMentionHarnesses,
   useHarnessEffortFamilies,
@@ -170,6 +171,7 @@ import {
   parseMentionToken,
   rankMentionEntries,
   recallFileMentions,
+  resolveMentionHarness,
 } from "@/lib/composerMentions";
 import { useChildSessions } from "@/hooks/useChildSessions";
 import {
@@ -338,8 +340,10 @@ import { ReconnectSessionDialog } from "@/shell/ReconnectSessionDialog";
 import { useTerminalFirst } from "@/shell/TerminalFirstContext";
 import { readOnlyReasonForSessionLabels } from "@/lib/sessionCapabilities";
 import {
+  acpEffortLevelsForModel,
   effortAfterModelChange,
   effortLevelsForConv,
+  resolveHostProbeTarget,
   sdkEffortFamilyForHarness,
   selectedModelForPicker,
   modelPickerKindForConv,
@@ -1013,20 +1017,26 @@ export function ChatPage() {
     labels: activeSession ? (activeSession.labels ?? {}) : (activeConv?.labels ?? {}),
     harness: activeSession?.harness ?? null,
   });
-  const hostProbeHarness =
-    fallbackPickerKind === "codex"
-      ? "codex-native"
-      : fallbackPickerKind === "claude"
-        ? "claude-native"
-        : fallbackPickerKind === "devin"
-          ? "devin-native"
-          : null;
+  const acpHarnessIds = useAcpHarnessIds(
+    !activeSession?.inferenceConfigured &&
+      (fallbackPickerKind === null || fallbackPickerKind === "acp") &&
+      !activeSession?.agentId,
+  );
+  const { probeHarness: hostProbeHarness, isAcp: hostProbeIsAcp } = resolveHostProbeTarget({
+    pickerKind: fallbackPickerKind,
+    boundAgent: boundAgentBySession,
+    agentId: activeSession?.agentId,
+    harness: activeSession?.harness,
+    acpHarnessIds,
+  });
+  const acpPollOpts: [] | [{ poll?: boolean }] = hostProbeIsAcp ? [{ poll: false }] : [];
   const { data: hostProbeOptions } = useHostModelOptions(
     activeSession?.hostId ?? null,
     hostProbeHarness ?? "",
     !activeSession?.inferenceConfigured &&
       hostProbeHarness !== null &&
       sessionModelOptions.length === 0,
+    ...acpPollOpts,
   );
   // A launching sandbox has no host to probe until it is bound, so fall back to
   // its provider's preview for the harnesses sandboxes run.
@@ -2985,8 +2995,16 @@ function ComposerImpl(
   // menu, so the workspace listing is never fetched for them. Codex's marker
   // says "Attached file:" while the others say "Attached:" - see
   // ``mentionMarkerFor``. FileViewer's "Attach to agent" gate uses the same helper.
+  const sessionHostId = useChatStore((s) => s.sessionHostId) ?? composerSession?.hostId ?? null;
+  const { data: composerHostRows } = useHosts({ enabled: !!sessionHostId, includeSandbox: true });
+  const composerHost = composerHostRows?.find((row) => row.host_id === sessionHostId) ?? null;
   const fileMentionHarnesses = useFileMentionHarnesses();
-  const mentionEnabled = harnessSupportsFileMentions(sessionHarness, fileMentionHarnesses);
+  const mentionHarness = resolveMentionHarness(sessionHarness, sessionAgent?.harness);
+  const mentionEnabled = harnessSupportsFileMentions(
+    mentionHarness,
+    fileMentionHarnesses,
+    composerHost?.workspace_file_mentions,
+  );
   const workspaceFilesQuery = useWorkspaceAllFiles(composerSessionId ?? undefined, {
     enabled: mentionEnabled,
   });
@@ -3437,7 +3455,7 @@ function ComposerImpl(
   // Depends on mentionedItems (from the hook above), so it's computed here.
   // Tagged items whose token is still in the draft; deleting a token untags it.
   const liveMentions = presentMentions(
-    composerInlineMentions(mentionedItems, mentionedSessions, sessionHarness),
+    composerInlineMentions(mentionedItems, mentionedSessions, mentionHarness),
     [draft.text, ...draft.quotes.map((quote) => quote.before)],
   );
   const hasMentions = liveMentions.length > 0;
@@ -5684,7 +5702,9 @@ function SessionHarnessPicker({
   const availableEfforts =
     modelPickerKind === "codex"
       ? codexEffortLevelsForModel(codexModelOptions, pickerSelectedModel)
-      : effortLevels;
+      : modelPickerKind === "acp" || sessionHarness === "acp"
+        ? acpEffortLevelsForModel(codexModelOptions, pickerSelectedModel)
+        : effortLevels;
   useEffect(() => {
     if (!openNonce || openNonce === appliedOpenNonce.current) return;
     appliedOpenNonce.current = openNonce;
@@ -5726,10 +5746,13 @@ function SessionHarnessPicker({
       selectedEffort !== null &&
       (isFusionModelUid(modelId) ||
         (nextEffort === undefined &&
-          modelPickerKind === "codex" &&
+          (modelPickerKind === "codex" || modelPickerKind === "acp") &&
           effortAfterModelChange(
             selectedEffort,
-            codexEffortLevelsForModel(codexModelOptions, modelId),
+            (modelPickerKind === "acp" ? acpEffortLevelsForModel : codexEffortLevelsForModel)(
+              codexModelOptions,
+              modelId,
+            ),
           ) === null))
     )
       await store.setEffort(null);
@@ -5860,7 +5883,9 @@ function SessionHarnessPicker({
   const cycleEffortLevels =
     modelPickerKind === "codex" || modelPickerKind === "devin"
       ? codexEffortLevelsForModel(codexModelOptions, cycleModel)
-      : availableEfforts;
+      : modelPickerKind === "acp" || sessionHarness === "acp"
+        ? acpEffortLevelsForModel(codexModelOptions, cycleModel)
+        : availableEfforts;
   const stageModel = (
     key: string,
     id = key === appliedModelKey ? appliedModelId : modelValueForKey(key),
@@ -5869,7 +5894,9 @@ function SessionHarnessPicker({
     const levels =
       modelPickerKind === "codex" || modelPickerKind === "devin"
         ? codexEffortLevelsForModel(codexModelOptions, id)
-        : availableEfforts;
+        : modelPickerKind === "acp" || sessionHarness === "acp"
+          ? acpEffortLevelsForModel(codexModelOptions, id)
+          : availableEfforts;
     const effort = previous?.sessionId === conversationId ? previous.effort : undefined;
     const next = {
       sessionId: conversationId,

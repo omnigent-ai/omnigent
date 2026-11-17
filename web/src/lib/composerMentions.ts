@@ -88,15 +88,37 @@ function spacedMention(before: string, sessionTitles: readonly string[]): RegExp
 
 /**
  * Whether a session's agent opens an "@"-mentioned workspace path: native
- * wrappers via the agent registry, other harnesses when the server declares
+ * wrappers via the agent registry, per-host ACP agent advertisements
+ * (``hostFileMentions``), or catalog harnesses when the server declares
  * ``workspace_file_mentions`` for them (``useFileMentionHarnesses``).
  */
+export function resolveMentionHarness(
+  sessionHarness: string | null | undefined,
+  boundAgentHarness: string | null | undefined,
+): string | null {
+  // Snapshots canonicalize "acp:<slug>" to "acp", so recover the per-agent
+  // slug from the bound agent when resolving host file-mention capabilities.
+  if (
+    (sessionHarness == null || sessionHarness === "acp") &&
+    boundAgentHarness &&
+    boundAgentHarness.startsWith("acp:")
+  ) {
+    return boundAgentHarness;
+  }
+  return sessionHarness ?? null;
+}
+
 export function harnessSupportsFileMentions(
   harness: string | null | undefined,
   declared: ReadonlySet<string>,
+  hostFileMentions?: Record<string, boolean> | null,
 ): boolean {
   if (harness == null) return false;
-  return nativeCodingAgentForHarness(harness) !== undefined || declared.has(harness);
+  if (nativeCodingAgentForHarness(harness) !== undefined) return true;
+  if (hostFileMentions && harness in hostFileMentions) {
+    return hostFileMentions[harness] === true;
+  }
+  return declared.has(harness);
 }
 
 /**

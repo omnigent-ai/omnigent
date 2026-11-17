@@ -141,6 +141,7 @@ def efforts_for_harness(harness: str | None) -> frozenset[str] | None:
         EffortFamily.COPILOT: COPILOT_EFFORTS,
         EffortFamily.PI: PI_EFFORTS,
         EffortFamily.CODEX_NATIVE: CODEX_NATIVE_EFFORTS,
+        EffortFamily.ACP: EFFORT_VALUES,
     }.get(capabilities.effort, frozenset())
 
 

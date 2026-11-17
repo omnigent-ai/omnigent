@@ -306,6 +306,26 @@ export function harnessUnconfiguredOnHost(
 }
 
 /**
+ * Whether live host model probing should be blocked for *harness* on *host*.
+ * A CLI that missed its version check (``cli-unresponsive``) and custom
+ * ``acp:<slug>`` entries omitted from ``configured_harnesses`` stay eligible.
+ */
+export function hostModelsBlockedOnHost(
+  harness: string | null | undefined,
+  host: Host | undefined | null,
+): boolean {
+  if (!harness || !host?.configured_harnesses) return false;
+  if (harness.startsWith("acp:")) {
+    const availability = host.configured_harnesses[harness];
+    return (
+      availability !== undefined && availability !== true && availability !== "cli-unresponsive"
+    );
+  }
+  const unavailableReason = harnessUnavailableReasonOnHost(harness, host);
+  return unavailableReason !== null && unavailableReason !== "cli-unresponsive";
+}
+
+/**
  * Amber-badge text for a not-ready harness in the picker rows.
  *
  * When the setup feature is OFF this is the label — per-reason, matching the

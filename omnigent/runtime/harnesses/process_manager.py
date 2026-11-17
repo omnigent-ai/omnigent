@@ -38,7 +38,9 @@ from typing import Any
 import httpx
 
 from omnigent._platform import IS_WINDOWS
+from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
 from omnigent.debug_logging import debug_event
+from omnigent.harness_aliases import is_acp_harness
 from omnigent.harness_plugins import missing_install_packages
 from omnigent.inner import _proc
 from omnigent.inner._subprocess_lifecycle import await_cleanup_task, close_subprocess_transport
@@ -529,7 +531,7 @@ def _model_env_key(harness: str) -> str:
     return f"HARNESS_{harness.upper().replace('-', '_')}_MODEL"
 
 
-_LIVE_MODEL_CONFIG_HARNESSES = frozenset({"qwen"})
+_LIVE_MODEL_CONFIG_HARNESSES = frozenset({"qwen", "acp", *ACP_CLI_HARNESSES})
 
 
 def _acp_startup_config(env: dict[str, str] | None) -> dict[str, str]:
@@ -899,7 +901,7 @@ class HarnessProcessManager:
                 respawn_reason = "harness_respawn_agent_switch"
             if (
                 entry is not None
-                and harness == "acp"
+                and is_acp_harness(harness)
                 and env is not None
                 and entry.acp_config != _acp_startup_config(env)
             ):
@@ -912,9 +914,10 @@ class HarnessProcessManager:
                 self._in_flight_response_ids.pop(conversation_id, None)
                 entry = None
                 respawn_reason = "harness_respawn_agent_switch"
-            if entry is not None and not (
-                harness in _LIVE_MODEL_CONFIG_HARNESSES
-                or (harness == "acp" and entry.acp_config.get("HARNESS_ACP_MODEL_LIST"))
+            if (
+                entry is not None
+                and harness not in _LIVE_MODEL_CONFIG_HARNESSES
+                and not is_acp_harness(harness)
             ):
                 # Most harnesses bake the model into the subprocess env. A
                 # later model change respawns them; curated ACP and harnesses

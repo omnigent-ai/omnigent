@@ -539,13 +539,20 @@ def _codex_update_unconfirmed(result: _RunnerForwardResult) -> bool:
 
 
 def _unsupported_model_detail(result: _RunnerForwardResult | None) -> str | None:
-    """Return the runner's reason when the terminal has no way to select the requested model."""
-    if result is None or _runner_reply_field(result.body, "error") != (
-        "claude_native_model_unsupported"
-    ):
+    """Return the runner's reason when the runtime rejected the requested model."""
+    if result is None:
+        return None
+    err = _runner_reply_field(result.body, "error")
+    if err not in ("claude_native_model_unsupported", "session_settings_rejected"):
         return None
     detail = _runner_reply_field(result.body, "detail")
-    return detail if isinstance(detail, str) and detail else "This terminal cannot use that model."
+    if isinstance(detail, str) and detail:
+        return detail
+    return (
+        "This terminal cannot use that model."
+        if err == "claude_native_model_unsupported"
+        else "This session cannot use that model."
+    )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -4573,6 +4580,25 @@ def register_core_routes(
                         code=ErrorCode.RUNNER_UNAVAILABLE,
                     )
             else:
+                unsupported = (
+                    _unsupported_model_detail(_model_forward)
+                    if _model_forward is not None and _model_forward.status_code == 400
+                    else None
+                )
+                if unsupported is not None:
+                    if conv is not None:
+                        await _restore_refused_settings(
+                            conversation_store,
+                            session_id,
+                            previous=conv,
+                            attempted=updated,
+                            restore_model=True,
+                            restore_effort=False,
+                            live_change=live_change,
+                            began=began,
+                            saved=saved,
+                        )
+                    raise OmnigentError(unsupported, code=ErrorCode.INVALID_INPUT)
                 await _persist_model_change_note(
                     session_id,
                     updated.model_override,

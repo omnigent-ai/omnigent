@@ -171,6 +171,7 @@ import {
   harnessUnavailableReasonOnHost,
   harnessUnconfiguredOnHost,
   harnessWarningBadgeText,
+  hostModelsBlockedOnHost,
   isCodexHarness,
   isNativeCursorHarness,
   isNativeOpenCodeHarness,
@@ -281,6 +282,7 @@ import {
   isAutoHarness,
   SMART_ROUTING_LABEL,
   useBrainHarnessLabels,
+  useFileMentionHarnesses,
 } from "@/lib/agentLabels";
 import {
   SMART_ROUTING_ARMS,
@@ -292,6 +294,7 @@ import {
 } from "@/lib/smartRoutingAvailability";
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
 import {
+  isAcpHarnessAgent,
   partitionAgentsByKind,
   partitionPickerEntries,
   selectableSessionAgents,
@@ -406,6 +409,7 @@ import {
   composerInlineMentions,
   expandMentionTokens,
   findMentionTokens,
+  harnessSupportsFileMentions,
   presentMentions,
   type TaggedMentions,
   withSessionMentionHint,
@@ -3589,18 +3593,33 @@ function NewChatLandingContent({
   // The selected native harness persists and restores harness-specific model,
   // effort, and permission knobs.
   const selectedNativeHarness = nativeCodingAgentForAvailableAgent(selectedAgent)?.harness ?? null;
+  const effectiveAgentHarness =
+    agentHasAdvancedSettings(selectedAgent, brainHarnessLabelsAll) && pickedHarness !== null
+      ? pickedHarness
+      : (selectedAgent?.harness ?? null);
+  const selectedAcpHarness =
+    selectedNativeHarness === null &&
+    selectedAgent != null &&
+    effectiveAgentHarness != null &&
+    (effectiveAgentHarness === selectedAgent.harness
+      ? isAcpHarnessAgent(selectedAgent)
+      : effectiveAgentHarness.startsWith("acp:"))
+      ? effectiveAgentHarness
+      : null;
   // Probe only the selected, available harness. Older hosts without readiness
   // metadata remain eligible, matching the picker's setup warnings. A CLI that
   // missed its version check still launches, so its catalog stays loadable.
-  const hostModelsBlocked = (harness: string) => {
-    const unavailableReason = harnessUnavailableReasonOnHost(harness, selectedHost);
-    return unavailableReason !== null && unavailableReason !== "cli-unresponsive";
-  };
+  const hostModelsBlocked = (harness: string) => hostModelsBlockedOnHost(harness, selectedHost);
   const canLoadHostModels = (harness: string) =>
     selectedNativeHarness === harness &&
     hostSelected &&
     selectedHost?.status === "online" &&
     !hostModelsBlocked(harness);
+  const canLoadAcpHostModels =
+    selectedAcpHarness !== null &&
+    hostSelected &&
+    selectedHost?.status === "online" &&
+    !hostModelsBlocked(selectedAcpHarness);
   const {
     data: hostClaudeModelOptions,
     isLoading: hostClaudeModelsLoading,
@@ -3621,6 +3640,13 @@ function NewChatLandingContent({
     canLoadHostModels("pi-native"),
     { poll: selectedNativeHarness === "pi-native" },
   );
+  const {
+    data: hostAcpModelOptions,
+    isLoading: hostAcpModelsLoading,
+    error: hostAcpModelsError,
+  } = useHostModelOptions(selectedHostId, selectedAcpHarness ?? "", canLoadAcpHostModels, {
+    poll: false,
+  });
   // Keep this host's cached choices while requests wait for readiness.
   // A fetched catalog, including an empty one, takes precedence.
   const cachedHostModels =
@@ -3842,6 +3868,21 @@ function NewChatLandingContent({
           })),
     [availablePiModels, sandboxSelected, sandboxCatalog],
   );
+  const acpModelOptions = useMemo(
+    () =>
+      sandboxSelected
+        ? (sandboxCatalog ?? [])
+        : (hostAcpModelOptions ?? []).map((option) => ({
+            id: option.id,
+            model: option.model,
+            displayName: nativeModelLabel(option),
+            isDefault: option.isDefault,
+            source: option.source,
+            supportedReasoningEfforts: option.supportedReasoningEfforts,
+            defaultReasoningEffort: option.defaultReasoningEffort,
+          })),
+    [hostAcpModelOptions, sandboxSelected, sandboxCatalog],
+  );
   const supportsPermissionMode = nativeAgentHasCapability(selectedAgent, "permissionMode");
   const supportsDevinMode = nativeAgentHasCapability(selectedAgent, "devinMode");
   const supportsApprovalMode = nativeAgentHasCapability(selectedAgent, "approvalMode");
@@ -3893,6 +3934,7 @@ function NewChatLandingContent({
   const isEntryConfigurable = (agent: AvailableAgent) =>
     (sandboxHasModelCatalog && agent.id === effectiveAgentId) ||
     nativeAgentHasModelSettings(agent) ||
+    isAcpHarnessAgent(agent) ||
     agentHasAdvancedSettings(agent, brainHarnessLabelsAll);
   // Only an eligible harness can display active per-turn Smart Routing.
   const routingOn = smartRoutingEligible && costControlMode === "on";
@@ -4026,6 +4068,19 @@ function NewChatLandingContent({
         devinPermissionMode;
       return [{ label: "Permission mode", value: devinValue }, ...routingRow];
     }
+    if (selectedAcpHarness !== null) {
+      if (acpModelOptions.length === 0) return [];
+      const pickedAcpRow = acpModelOptions.find((option) => option.id === pickedModel);
+      const modelValue = pickedAcpRow
+        ? nativeModelLabel(pickedAcpRow)
+        : defaultModelLabel(acpModelOptions);
+      const effortValue = normalizeEffortLabel(pickedEffort);
+      return [
+        { label: "Model", value: visibleModelLabel(modelValue) },
+        ...(effortValue ? [{ label: "Effort", value: effortValue }] : []),
+        ...sourceRows(acpModelOptions),
+      ];
+    }
     if (selectedAgent?.harness != null && selectedAgent.harness in brainHarnessLabelsAll) {
       const active = pickedHarness ?? selectedAgent.harness;
       return [{ label: "SDK", value: brainHarnessLabelsAll[active] ?? active }, ...routingRow];
@@ -4050,6 +4105,7 @@ function NewChatLandingContent({
     claudeModelOptions,
     codexModelOptions,
     piModelOptions,
+    acpModelOptions,
     pickedEffort,
     permissionMode,
     approvalMode,
@@ -4058,6 +4114,7 @@ function NewChatLandingContent({
     agySkipMode,
     pickedHarness,
     selectedNativeHarness,
+    selectedAcpHarness,
   ]);
   const harnessTriggerDetails = configSummary.filter(
     (row) =>
@@ -4079,7 +4136,9 @@ function NewChatLandingContent({
           ? piModelOptions
           : selectedNativeHarness === "codex-native"
             ? codexModelOptions
-            : [];
+            : selectedAcpHarness !== null
+              ? acpModelOptions
+              : [];
   const pickerModelsLoading =
     sandboxCatalogPending ||
     (!sandboxSelected &&
@@ -4092,7 +4151,9 @@ function NewChatLandingContent({
             ? hostPiModelsLoading
             : selectedNativeHarness === "devin-native"
               ? hostDevinModelsLoading
-              : false));
+              : selectedAcpHarness !== null
+                ? hostAcpModelsLoading
+                : false));
   const pickerModelsError = sandboxSelected
     ? sandboxCatalogError || sandboxDefaultCatalogError
       ? new Error((sandboxCatalogError ?? sandboxDefaultCatalogError)!)
@@ -4103,10 +4164,14 @@ function NewChatLandingContent({
         ? hostCodexModelsError
         : selectedNativeHarness === "devin-native"
           ? hostDevinModelsError
-          : null;
+          : selectedAcpHarness !== null
+            ? hostAcpModelsError
+            : null;
   const modelCatalogLookupEnabled = sandboxSelected
     ? sandboxPreviewEnabled && sandboxInferenceConfigured
-    : selectedNativeHarness !== null && canLoadHostModels(selectedNativeHarness);
+    : selectedNativeHarness !== null
+      ? canLoadHostModels(selectedNativeHarness)
+      : canLoadAcpHostModels;
   const modelCatalogAvailability: ModelCatalogAvailability | undefined =
     harnessTriggerDetails.some((row) => row.label === "Model") && !routingOn
       ? pickerModelOptions.length > 0
@@ -4128,7 +4193,7 @@ function NewChatLandingContent({
       !autoRoutingSelected &&
       !routingOn &&
       harnessTriggerDetails.some((row) => row.label === "Model") &&
-      (hostsLoading || info === "loading" || pickerModelsLoading));
+      (hostsLoading || info === "loading" || (selectedAcpHarness === null && pickerModelsLoading)));
   const pickerDataLoading = sandboxCatalogPending || pickerDataLoadingBesidesCatalog;
   const pickerTarget = JSON.stringify([
     projectParam,
@@ -4228,7 +4293,12 @@ function NewChatLandingContent({
         value,
         label: normalizeEffortLabel(value),
       }))
-    : (nativeEffortOptions(selectedNativeHarness, pickerModelOptions, pickedModel) ?? []);
+    : (nativeEffortOptions(
+        selectedNativeHarness ?? selectedAcpHarness,
+        pickerModelOptions,
+        pickedModel,
+        { isAcp: selectedAcpHarness !== null },
+      ) ?? []);
   const rememberPickerOptions = (harness: string, options: HarnessOptions) => {
     const picked = pickedOptionKeysRef.current.get(harness) ?? new Set<string>();
     for (const key of Object.keys(options)) picked.add(key);
@@ -4249,7 +4319,7 @@ function NewChatLandingContent({
   };
   const selectPickerModel = (model: string) => {
     const selectionHarness =
-      selectedNativeHarness ?? (sandboxHasModelCatalog ? previewHarness : null);
+      selectedNativeHarness ?? (sandboxHasModelCatalog ? previewHarness : selectedAcpHarness);
     if (!selectionHarness) return;
     // Every model-picker commit also settles the effort (routing and Fusion clear it).
     userPickedModelRef.current = true;
@@ -4279,13 +4349,22 @@ function NewChatLandingContent({
     // Gateway catalogs carry no default row, so Default keeps no effort.
     const effortModel = sandboxDefaultModelsEnabled
       ? picked
-      : picked || codexModelOptions.find((option) => option.isDefault)?.id;
+      : picked || pickerModelOptions.find((option) => option.isDefault)?.id;
     const effort =
-      (sandboxDefaultModelsEnabled || selectedNativeHarness === "codex-native") &&
+      (sandboxDefaultModelsEnabled ||
+        selectedNativeHarness === "codex-native" ||
+        selectedAcpHarness !== null) &&
       !(
         sandboxDefaultModelsEnabled
           ? sandboxEffortLevels(pickerModelOptions, effortModel)
-          : codexEffortLevelsForModel(codexModelOptions, effortModel)
+          : (
+              nativeEffortOptions(
+                selectedNativeHarness ?? selectedAcpHarness,
+                selectedAcpHarness !== null ? pickerModelOptions : codexModelOptions,
+                effortModel,
+                { isAcp: selectedAcpHarness !== null },
+              ) ?? []
+            ).map((option) => option.value)
       ).includes(pickedEffort)
         ? ""
         : pickedEffort;
@@ -4296,7 +4375,7 @@ function NewChatLandingContent({
   };
   const selectPickerEffort = (effort: string) => {
     const selectionHarness =
-      selectedNativeHarness ?? (sandboxHasModelCatalog ? previewHarness : null);
+      selectedNativeHarness ?? (sandboxHasModelCatalog ? previewHarness : selectedAcpHarness);
     if (!selectionHarness) return;
     const picked = effort === EFFORT_SELECT_NONE ? "" : effort;
     userPickedEffortRef.current = true;
@@ -4358,7 +4437,9 @@ function NewChatLandingContent({
     supportsModelPicker ||
     supportsPermissionMode ||
     supportsDevinMode ||
-    selectedNativeHarness === "codex-native"
+    selectedNativeHarness === "codex-native" ||
+    (selectedAcpHarness !== null &&
+      (acpModelOptions.length > 0 || hostAcpModelsLoading || hostAcpModelsError != null))
       ? {
           testId: "new-chat-landing-agent-models",
           header: "Models",
@@ -4548,6 +4629,32 @@ function NewChatLandingContent({
       const native = nativeCodingAgentForAvailableAgent(agent);
       if (!native) {
         const harness = agent.id === effectiveAgentId ? pickedHarness : readLastHarness(agent.id);
+        const effectiveRowHarness = harness ?? agent.harness ?? null;
+        const rowIsAcp =
+          effectiveRowHarness != null &&
+          (effectiveRowHarness === agent.harness
+            ? isAcpHarnessAgent(agent)
+            : effectiveRowHarness.startsWith("acp:"));
+        if (rowIsAcp && effectiveRowHarness) {
+          const saved = readRememberedHarnessOptions(effectiveRowHarness);
+          const catalog =
+            sandboxHasModelCatalog && effectiveRowHarness !== previewHarness
+              ? []
+              : effectiveRowHarness === selectedAcpHarness
+                ? acpModelOptions
+                : [];
+          const hostCatalogUnavailable =
+            !sandboxSelected &&
+            (effectiveRowHarness !== selectedAcpHarness || hostAcpModelOptions === undefined);
+          const model =
+            catalog.find((option) => option.id === saved.model) ??
+            (hostCatalogUnavailable && saved.model ? { id: saved.model } : undefined);
+          const label = visibleModelLabel(
+            model ? nativeModelLabel(model) : defaultModelLabel(catalog),
+          );
+          const effort = normalizeEffortLabel(saved.effort ?? "");
+          return [agent.id, [compactModelTriggerLabel(label), effort].filter(Boolean).join(" ")];
+        }
         return [agent.id, brainHarnessLabelsAll[harness ?? agent.harness ?? ""] ?? "Default"];
       }
       const saved = readRememberedHarnessOptions(native.harness);
@@ -4670,7 +4777,9 @@ function NewChatLandingContent({
           ? devinModelOptions
           : selectedNativeHarness === "codex-native"
             ? codexModelOptions
-            : [];
+            : selectedAcpHarness !== null
+              ? acpModelOptions
+              : [];
   const projectDefaultModelValid =
     projectDefaultModel != null && projectModelVocab.some((m) => m.id === projectDefaultModel)
       ? projectDefaultModel
@@ -4686,7 +4795,12 @@ function NewChatLandingContent({
   const projectDefaultEffortValid =
     projectDefaultEffort != null &&
     (
-      nativeEffortOptions(selectedNativeHarness, projectModelVocab, projectDefaultModelValid) ?? []
+      nativeEffortOptions(
+        selectedNativeHarness ?? selectedAcpHarness,
+        projectModelVocab,
+        projectDefaultModelValid,
+        { isAcp: selectedAcpHarness !== null },
+      ) ?? []
     ).some((option) => option.value === projectDefaultEffort)
       ? projectDefaultEffort
       : null;
@@ -4696,14 +4810,15 @@ function NewChatLandingContent({
   // default. Keyed on the harness so an in-composer edit isn't clobbered on
   // re-render — only a harness switch reseeds.
   useEffect(() => {
-    if (!selectedNativeHarness) return;
+    const activeHarness = selectedNativeHarness ?? selectedAcpHarness;
+    if (!activeHarness) return;
     // In-memory edits survive late catalogs even when persistence is unavailable.
     const editedOptions =
-      pickerEdits?.agentId === effectiveAgentId && pickerEdits.harness === selectedNativeHarness
+      pickerEdits?.agentId === effectiveAgentId && pickerEdits.harness === activeHarness
         ? pickerEdits.options
         : {};
     const stored = {
-      ...readRememberedHarnessOptions(selectedNativeHarness),
+      ...readRememberedHarnessOptions(activeHarness),
       ...editedOptions,
     };
     // Resolve the mode to the stored value when it's still valid for this
@@ -4738,9 +4853,11 @@ function NewChatLandingContent({
     ): string | null =>
       !userPickedEffortRef.current &&
       projectDefaultEffort != null &&
-      (nativeEffortOptions(selectedNativeHarness, modelOptions, model) ?? []).some(
-        (option) => option.value === projectDefaultEffort,
-      )
+      (
+        nativeEffortOptions(selectedNativeHarness ?? selectedAcpHarness, modelOptions, model, {
+          isAcp: selectedAcpHarness !== null,
+        }) ?? []
+      ).some((option) => option.value === projectDefaultEffort)
         ? projectDefaultEffort
         : null;
     // A seeded project effort is an explicit pin like the project model, so it
@@ -4829,6 +4946,24 @@ function NewChatLandingContent({
       setDevinPermissionMode(
         resolve(DEVIN_NATIVE_PERMISSION_MODES, DEVIN_NATIVE_DEFAULT_PERMISSION_MODE),
       );
+    } else if (selectedAcpHarness !== null) {
+      const seededAcpModel =
+        projectSeed(acpModelOptions) ??
+        (stored.model != null && acpModelOptions.some((m) => m.id === stored.model)
+          ? stored.model
+          : "");
+      setPickedModel(seededAcpModel);
+      seedEffort(
+        projectEffortSeed(acpModelOptions, seededAcpModel),
+        stored.effort != null &&
+          (
+            nativeEffortOptions(selectedAcpHarness, acpModelOptions, seededAcpModel, {
+              isAcp: true,
+            }) ?? []
+          ).some((option) => option.value === stored.effort)
+          ? stored.effort
+          : "",
+      );
     }
     // Reseed on harness, host-catalog, and async project model/effort or
     // last-start changes; capability flags derive from the harness.
@@ -4836,9 +4971,11 @@ function NewChatLandingContent({
   }, [
     sandboxInferenceConfigured,
     selectedNativeHarness,
+    selectedAcpHarness,
     claudeModelOptions,
     codexModelOptions,
     piModelOptions,
+    acpModelOptions,
     projectDefaultModel,
     projectDefaultEffort,
     readRememberedHarnessOptions,
@@ -5487,8 +5624,17 @@ function NewChatLandingContent({
   // workspace API; each tagged path is delivered as an "[Attached: …]" marker
   // prepended to the first message, which the runner reads from that workspace.
   const [mention, setMention] = useState<MentionState | null>(null);
+  const fileMentionHarnesses = useFileMentionHarnesses();
   const mentionEnabled =
-    isNativeTerminalAgent && !sandboxSelected && !!selectedHostId && workspaceValid;
+    (isNativeTerminalAgent ||
+      harnessSupportsFileMentions(
+        effectiveAgentHarness,
+        fileMentionHarnesses,
+        selectedHost?.workspace_file_mentions,
+      )) &&
+    !sandboxSelected &&
+    !!selectedHostId &&
+    workspaceValid;
   const { dir: mentionDir, filter: mentionFilter } = parseMentionToken(mention?.query ?? "");
   const workspaceRoot = workspaceTrimmed.replace(/\/+$/, "");
   // Absolute dir to list = workspace root + the drilled sub-path.
@@ -6305,7 +6451,8 @@ function NewChatLandingContent({
         (sandboxHasModelCatalog ||
           agentSupportsModelPicker ||
           nativeAgent?.harness === "codex-native" ||
-          nativeAgent?.harness === "devin-native") &&
+          nativeAgent?.harness === "devin-native" ||
+          (!nativeAgent && agent != null && isAcpHarnessAgent(agent))) &&
         submittedModel
           ? submittedModel
           : null;
@@ -6316,7 +6463,8 @@ function NewChatLandingContent({
           agentSupportsPermissionMode ||
           selectedNativeHarness === "pi-native" ||
           nativeAgent?.harness === "codex-native" ||
-          nativeAgent?.harness === "devin-native") &&
+          nativeAgent?.harness === "devin-native" ||
+          (!nativeAgent && agent != null && isAcpHarnessAgent(agent))) &&
         pickedEffort
           ? pickedEffort
           : null;
@@ -6332,7 +6480,7 @@ function NewChatLandingContent({
       // Computed BEFORE the create so `smart_routing_message` classifies the
       // prompt the agent actually receives, not the raw textarea value.
       const liveMentions = presentMentions(
-        composerInlineMentions(mentionedItems, mentionedSessions, selectedAgent?.harness ?? null),
+        composerInlineMentions(mentionedItems, mentionedSessions, effectiveAgentHarness),
         [message],
       );
       const initialPrompt = withSessionMentionHint(

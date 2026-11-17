@@ -203,12 +203,14 @@ class ExecutorAdapter(HarnessApp):
         executor_factory: Callable[[], Executor],
         session_key: str | None = None,
         harness_label: str = "Claude",
+        supports_model_options: bool = False,
     ) -> None:
         super().__init__()
         self._executor_factory = executor_factory
         self._session_key = session_key or uuid.uuid4().hex
         # Harness label used in elicitation messages, e.g. "Claude wants to call **Bash**".
         self._harness_label = harness_label
+        self._supports_model_options = supports_model_options
         # Lazily-constructed inner executor, reused across turns for the conversation lifetime.
         self._executor: Executor | None = None
         # Per-turn turn context. The stable tool/elicitation/policy bridges read this at call
@@ -1194,6 +1196,35 @@ class ExecutorAdapter(HarnessApp):
             raise LiveMcpHarnessNotRunning
         await self._executor.reconnect_live_mcp_server(self._session_key, name)
 
+    def supports_live_model_options(self) -> bool:
+        """Whether the inner executor supports live model/effort discovery and switching."""
+        if self._executor is not None:
+            return self._executor.supports_live_model_options()
+        return self._supports_model_options
+
+    async def live_model_options(self) -> dict[str, Any] | None:
+        """Query the inner executor's discovered model and effort options."""
+        executor = self._ensure_executor()
+        return await executor.live_model_options()
+
+    async def apply_live_settings(
+        self,
+        *,
+        model: str | None = None,
+        effort: str | None = None,
+        apply_model: bool = False,
+        apply_effort: bool = False,
+    ) -> dict[str, Any]:
+        """Apply model/effort changes to the live inner executor session if active."""
+        if self._executor is None:
+            return {"active_model": None, "active_effort": None, "applied": False}
+        return await self._executor.apply_live_settings(
+            model=model,
+            effort=effort,
+            apply_model=apply_model,
+            apply_effort=apply_effort,
+        )
+
     def _ensure_executor(self) -> Executor:
         """
         Construct the inner executor on first use; return cached
@@ -1350,6 +1381,11 @@ class ExecutorAdapter(HarnessApp):
             # Capture provider-reported usage for the response.completed payload.
             if event.usage is not None:
                 ctx.provider_usage = event.usage
+            active_model = self._executor.reported_model() if self._executor is not None else None
+            if isinstance(active_model, str) and active_model:
+                ctx.reported_model = active_model
+            elif isinstance(event.usage, dict) and isinstance(event.usage.get("model"), str):
+                ctx.reported_model = event.usage["model"]
         elif isinstance(event, CompactionStarted):
             from omnigent.server.schemas import CompactionInProgressEvent
 

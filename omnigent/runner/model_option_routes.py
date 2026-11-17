@@ -16,6 +16,7 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from omnigent.harness_aliases import is_acp_harness
 from omnigent.runner.app_support import (
     _client_safe_error_detail,
     _SpecEntry,
@@ -62,6 +63,7 @@ def register_model_option_routes(
     _session_harness_name: Callable[[str], str | None],
     _session_spec_cache: dict[str, _SpecEntry | None],
     server_client: httpx.AsyncClient,
+    _acp_model_options: Callable[[str], Coroutine[Any, Any, list[_JsonObject]]] | None = None,
 ) -> None:
     """Register the ``/models``, ``/*-model-options``, and ``/skills/resolve`` routes on *app*.
 
@@ -383,6 +385,27 @@ def register_model_option_routes(
             return await get_session_kiro_model_options(session_id)
         if harness == "devin-native":
             return await get_session_devin_model_options(session_id)
+        if is_acp_harness(harness) and _acp_model_options is not None:
+            try:
+                models = await _acp_model_options(session_id)
+                return JSONResponse(
+                    status_code=200,
+                    content={"models": _with_model_configuration_source(session_id, models)},
+                )
+            except Exception as exc:
+                _logger.warning(
+                    "ACP model discovery failed for session=%s",
+                    session_id,
+                    exc_info=True,
+                    extra={"session_id": session_id},
+                )
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "error": "acp_model_options_failed",
+                        "detail": _client_safe_error_detail(exc, context="acp model options"),
+                    },
+                )
         return JSONResponse(status_code=200, content={"models": []})
 
     @app.post("/v1/sessions/{session_id}/skills/resolve")

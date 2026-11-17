@@ -1836,20 +1836,11 @@ def _build_acp_cli_spawn_env(
         ACP wrap consumes no bundle dir.
     :returns: A dict of ``HARNESS_ACP_*`` env-var overrides for the spawn.
     """
-    from omnigent._platform import resolve_cli_binary
     from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
-    from omnigent.harness_startup_config import (
-        config_harness_path_override,
-        resolve_harness_path,
-    )
+    from omnigent.onboarding.acp_auth import resolve_acp_cli_executable
 
     row = ACP_CLI_HARNESSES[harness]
-    executable = (
-        resolve_harness_path(harness)
-        or config_harness_path_override(harness, load_config())
-        or resolve_cli_binary(row.binary)
-        or row.binary
-    )
+    executable = resolve_acp_cli_executable(harness, load_config())
     env = {
         "HARNESS_ACP_COMMAND": shlex.join([executable, *row.args]),
         "HARNESS_ACP_NAME": row.label,
@@ -1985,9 +1976,8 @@ def _build_acp_spawn_env(
     )
     from omnigent.onboarding.acp_auth import (
         AcpAgentEntry,
-        acp_agents,
         parse_env_passthrough,
-        resolve_acp_agent,
+        resolve_acp_harness_entry,
     )
 
     has_embedded = isinstance(cfg, dict) and "acp_agent" in cfg
@@ -2032,16 +2022,20 @@ def _build_acp_spawn_env(
             env_passthrough=parse_env_passthrough(embedded.get("env_passthrough")),
         )
     else:
-        agent = resolve_acp_agent(slug) if slug else None
+        from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
+
+        entry_harness = (
+            raw_harness
+            if raw_harness.startswith("acp:") or raw_harness in ACP_CLI_HARNESSES
+            else "acp"
+        )
+        agent = resolve_acp_harness_entry(entry_harness)
         if raw_harness.startswith("acp:") and agent is None:
             raise OmnigentError(
                 f"ACP agent {slug!r} is not configured on this runner. "
                 "Check the selected host's ACP configuration.",
                 code=ErrorCode.INVALID_INPUT,
             )
-        if agent is None:
-            agents = acp_agents()
-            agent = agents[0] if agents else None
 
     if agent is not None:
         env["HARNESS_ACP_COMMAND"] = agent.command

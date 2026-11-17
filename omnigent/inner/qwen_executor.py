@@ -1297,6 +1297,10 @@ class QwenExecutor(Executor):
             return True
         return False
 
+    def reported_model(self) -> str | None:
+        """Return the active Qwen ACP model, if reported by session updates."""
+        return self._active_model
+
     def preserves_empty_initiating_message(self) -> bool:
         """Keep the initiating item identity even when its ACP prompt is empty."""
         return True

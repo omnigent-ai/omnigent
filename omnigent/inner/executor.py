@@ -69,6 +69,10 @@ def describe_exception(exc: BaseException) -> str:
     return str(exc) or repr(exc)
 
 
+class LiveSettingsRejectedError(ValueError):
+    """Raised when a live runtime rejects a requested session settings change."""
+
+
 @runtime_checkable
 class _ClosableIterator(Protocol):
     """Iterator that may optionally expose a ``close`` method.
@@ -832,6 +836,29 @@ class Executor:
         :raises TimeoutError: The harness did not answer in time.
         """
         raise NotImplementedError
+
+    def supports_live_model_options(self) -> bool:
+        """Whether ``live_model_options()`` and ``apply_live_settings()`` are implemented."""
+        return False
+
+    async def live_model_options(self) -> dict[str, Any] | None:
+        """Return discovered model/effort options for the session, or ``None`` if unavailable."""
+        raise NotImplementedError
+
+    async def apply_live_settings(
+        self,
+        *,
+        model: str | None = None,
+        effort: str | None = None,
+        apply_model: bool = False,
+        apply_effort: bool = False,
+    ) -> dict[str, Any]:
+        """Apply model and/or reasoning effort changes to a live session, if active."""
+        raise NotImplementedError
+
+    def reported_model(self) -> str | None:
+        """Return the model identifier actively reported by this executor, if known."""
+        return None
 
     def preserves_message_content_blocks(self) -> bool:
         """Whether fresh and queued input must retain original content block boundaries."""

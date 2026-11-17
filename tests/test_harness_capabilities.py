@@ -9,6 +9,8 @@ drift.
 
 from __future__ import annotations
 
+import pytest
+
 from omnigent import harness_plugins as hp
 from omnigent.harness_availability import CODEX_CANONICAL_HARNESSES
 from omnigent.harness_capabilities import (
@@ -446,3 +448,31 @@ def test_sdk_harnesses_only_advertise_effort_their_executor_applies() -> None:
     ):
         assert caps[harness].effort is not EffortFamily.NONE, harness
         assert "reasoning_effort" in inspect.getsource(module), harness
+
+
+def test_catalog_dynamic_acp_agents_include_workspace_file_mentions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.onboarding.acp_auth import AcpAgentEntry
+
+    monkeypatch.setattr(
+        "omnigent.onboarding.acp_auth.acp_agents",
+        lambda config=None: (
+            AcpAgentEntry(
+                slug="enabled-acp",
+                name="Enabled ACP",
+                command="acp-enabled",
+                workspace_file_mentions=True,
+            ),
+            AcpAgentEntry(
+                slug="disabled-acp",
+                name="Disabled ACP",
+                command="acp-disabled",
+                workspace_file_mentions=False,
+            ),
+        ),
+    )
+
+    rows = {row["id"]: row for row in harness_catalog()}
+    assert rows["acp:enabled-acp"]["capabilities"]["workspace_file_mentions"] is True
+    assert rows["acp:disabled-acp"]["capabilities"]["workspace_file_mentions"] is False

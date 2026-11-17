@@ -160,3 +160,57 @@ def test_shadowed_builtin_acp_rows_matches_row_ids_only() -> None:
 def test_shadowed_builtin_acp_rows_empty_without_config() -> None:
     """No configured agents → no rows suppressed (the common case)."""
     assert shadowed_builtin_acp_rows([]) == frozenset()
+
+
+def test_resolve_acp_harness_entry_honors_path_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Builtin ACP CLI entries use the shared env -> config -> binary lookup."""
+    from omnigent.onboarding.acp_auth import resolve_acp_harness_entry
+
+    monkeypatch.delenv("OMNIGENT_GROK_PATH", raising=False)
+    cfg = {"harness": {"grok": {"command": "/opt/cfg/grok"}}}
+    cfg_entry = resolve_acp_harness_entry("grok", config=cfg)
+    assert cfg_entry is not None
+    assert cfg_entry.command.startswith("/opt/cfg/grok ")
+
+    monkeypatch.setenv("OMNIGENT_GROK_PATH", "/opt/env/grok")
+    env_entry = resolve_acp_harness_entry("grok", config=cfg)
+    assert env_entry is not None
+    assert env_entry.command.startswith("/opt/env/grok ")
+
+
+def test_acp_agents_workspace_file_mentions_parsing_and_map() -> None:
+    """``workspace_file_mentions`` defaults to False, validates booleans, and serializes."""
+    from omnigent.onboarding.acp_auth import acp_agents, acp_file_mentions_map
+
+    cfg = {
+        "acp": {
+            "agents": [
+                {"name": "Coder", "command": "coder acp", "workspace_file_mentions": True},
+                {"name": "Chat", "command": "chat acp"},
+            ]
+        }
+    }
+    entries = acp_agents(cfg)
+    assert [e.workspace_file_mentions for e in entries] == [True, False]
+    assert acp_file_mentions_map(cfg) == {"acp:coder": True, "acp:chat": False}
+    assert acp_agents_settings(entries) == {
+        "acp": {
+            "agents": [
+                {"name": "Coder", "command": "coder acp", "workspace_file_mentions": True},
+                {"name": "Chat", "command": "chat acp"},
+            ]
+        }
+    }
+
+    with pytest.raises(ValueError, match="workspace_file_mentions"):
+        acp_agents(
+            {
+                "acp": {
+                    "agents": [
+                        {"name": "Bad", "command": "bad acp", "workspace_file_mentions": "yes"}
+                    ]
+                }
+            }
+        )

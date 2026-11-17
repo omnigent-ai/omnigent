@@ -764,6 +764,9 @@ _model_options_inflight: WorkspaceScopedCache[str, asyncio.Task[None]] = Workspa
 _model_options_stale: WorkspaceScopedSet[str] = WorkspaceScopedSet()
 
 
+_acp_dynamic_options_probed: WorkspaceScopedSet[str] = WorkspaceScopedSet()
+
+
 _MODEL_OPTIONS_RETRY_DELAYS_S = (0.25, 0.5, 1.0, 2.0, 2.0)
 
 
@@ -1274,6 +1277,7 @@ __all__ = [
     "_RelayHandle",
     "_RelayStatusSnapshot",
     "_RunnerStatusProbeBackoff",
+    "_acp_dynamic_options_probed",
     "_browser_action_claim_events",
     "_browser_action_claims",
     "_browser_action_owners",

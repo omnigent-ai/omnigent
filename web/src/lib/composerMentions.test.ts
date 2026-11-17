@@ -14,6 +14,7 @@ import {
   rankSessionMentions,
   readableSentText,
   replaceSentMentions,
+  resolveMentionHarness,
   SESSION_MENTION_HINT,
   sessionMentionMarker,
   sessionMentionToken,
@@ -303,7 +304,32 @@ describe("harnessSupportsFileMentions", () => {
     expect(harnessSupportsFileMentions("openai-agents", declared)).toBe(false);
   });
 
+  it("prefers per-host workspace_file_mentions over server declarations", () => {
+    const serverWithAcp = new Set(["acp:demo"]);
+    expect(harnessSupportsFileMentions("acp:demo", new Set(), { "acp:demo": true })).toBe(true);
+    expect(harnessSupportsFileMentions("acp:demo", serverWithAcp, { "acp:demo": false })).toBe(
+      false,
+    );
+    expect(harnessSupportsFileMentions("acp:demo", serverWithAcp, {})).toBe(true);
+    expect(
+      harnessSupportsFileMentions("claude-native", new Set(), { "claude-native": false }),
+    ).toBe(true);
+  });
+
   it("is false before the session's harness is known", () => {
     expect(harnessSupportsFileMentions(null, declared)).toBe(false);
+  });
+});
+
+describe("resolveMentionHarness", () => {
+  it("recovers acp:<slug> from the bound agent when the session snapshot canonicalized to acp", () => {
+    expect(resolveMentionHarness("acp", "acp:demo")).toBe("acp:demo");
+    expect(resolveMentionHarness(null, "acp:demo")).toBe("acp:demo");
+  });
+
+  it("preserves explicit session harnesses and falls back cleanly without a slug", () => {
+    expect(resolveMentionHarness("codex-native", "acp:demo")).toBe("codex-native");
+    expect(resolveMentionHarness("acp", null)).toBe("acp");
+    expect(resolveMentionHarness("acp", "claude-sdk")).toBe("acp");
   });
 });

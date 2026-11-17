@@ -677,6 +677,7 @@ class HostRegistry:
         # answer) and lost with the process, which is the point — a restarted
         # server re-learns it from the reconnect handshake.
         self._gateway_inference: dict[str, dict[str, bool]] = {}
+        self._workspace_file_mentions: dict[str, dict[str, bool]] = {}
         self._interactive_shells: dict[str, list[str]] = {}
         self.launch_authorizer: (
             Callable[[str, str, str | None, str | None, bool, str | None], None] | None
@@ -923,6 +924,30 @@ class HostRegistry:
             return True
         return capability in conn.hello.capabilities
 
+    def _record_host_bool_map(
+        self,
+        store: dict[str, dict[str, bool]],
+        host_id: str,
+        values: Mapping[str, bool] | None,
+    ) -> None:
+        """Store or clear a per-host boolean capability map under the registry lock."""
+        key = _canonical_host_id(host_id)
+        with self._lock:
+            if values is None:
+                store.pop(key, None)
+            else:
+                store[key] = dict(values)
+
+    def _get_host_bool_map(
+        self,
+        store: dict[str, dict[str, bool]],
+        host_id: str,
+    ) -> dict[str, bool] | None:
+        """Return a defensive copy of a host's reported boolean map, or ``None``."""
+        with self._lock:
+            reported = store.get(_canonical_host_id(host_id))
+        return dict(reported) if reported is not None else None
+
     def record_gateway_inference(
         self,
         host_id: str,
@@ -940,12 +965,7 @@ class HostRegistry:
         :param gateway_inference: Harness spelling → gateway-backed flag, e.g.
             ``{"claude-native": True, "codex": False}``, or ``None``.
         """
-        key = _canonical_host_id(host_id)
-        with self._lock:
-            if gateway_inference is None:
-                self._gateway_inference.pop(key, None)
-            else:
-                self._gateway_inference[key] = dict(gateway_inference)
+        self._record_host_bool_map(self._gateway_inference, host_id, gateway_inference)
 
     def gateway_inference(self, host_id: str) -> dict[str, bool] | None:
         """Return the gateway-inference map *host_id* last reported here.
@@ -955,9 +975,19 @@ class HostRegistry:
             never had a report from the host — unknown, which readers treat as
             gateway-backed rather than unavailable.
         """
-        with self._lock:
-            reported = self._gateway_inference.get(_canonical_host_id(host_id))
-        return dict(reported) if reported is not None else None
+        return self._get_host_bool_map(self._gateway_inference, host_id)
+
+    def record_workspace_file_mentions(
+        self,
+        host_id: str,
+        workspace_file_mentions: Mapping[str, bool] | None,
+    ) -> None:
+        """Store the per-ACP-agent workspace file-mention map a host just reported."""
+        self._record_host_bool_map(self._workspace_file_mentions, host_id, workspace_file_mentions)
+
+    def workspace_file_mentions(self, host_id: str) -> dict[str, bool] | None:
+        """Return the workspace file-mention map *host_id* last reported here."""
+        return self._get_host_bool_map(self._workspace_file_mentions, host_id)
 
     def interactive_shells(self, host_id: str) -> list[str] | None:
         """Return the ordered shell inventory last reported by *host_id*."""

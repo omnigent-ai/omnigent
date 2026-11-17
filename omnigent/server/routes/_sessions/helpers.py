@@ -241,6 +241,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _UPLOAD_READ_CHUNK_BYTES,
     COST_CONTROL_OVERRIDE_VALUES,
     SUBAGENT_ROUTING_OVERRIDE_VALUES,
+    _acp_dynamic_options_probed,
     _catalog_prefetch_tasks,
     _logger,
     _managed_launch_tasks,
@@ -5786,6 +5787,7 @@ def _invalidate_runner_backed_snapshot_state(
     if drop_model_options:
         _model_options_cache.pop(session_id, None)
         _model_options_stale.discard(session_id)
+        _acp_dynamic_options_probed.discard(session_id)
     else:
         _model_options_stale.add(session_id)
     if cancel_inflight:
@@ -12644,6 +12646,9 @@ async def _load_model_options(
     session_id: str,
     path: str,
     fallback_path: str | None = None,
+    *,
+    empty_is_authoritative: bool = False,
+    timeout_s: float = 5.0,
 ) -> None:
     """
     Background single-flight fetch of a session's native model catalog.
@@ -12656,6 +12661,10 @@ async def _load_model_options(
         *path* 404s (an older runner without the unified route), e.g.
         ``"/v1/sessions/conv_abc/cursor-model-options"``. ``None`` disables
         the fallback.
+    :param empty_is_authoritative: When ``True``, a 200 response with ``[]``
+        means the agent cleanly reported no options rather than still booting,
+        so it is cached without retry sleep.
+    :param timeout_s: Per-attempt HTTP request timeout in seconds.
     """
     # Read the retry schedule off the facade so tests patching
     # ``sessions._MODEL_OPTIONS_RETRY_DELAYS_S`` reach this impl.
@@ -12664,8 +12673,18 @@ async def _load_model_options(
     delays = _facade._MODEL_OPTIONS_RETRY_DELAYS_S
     for attempt in range(len(delays) + 1):
         try:
-            resp = await runner_client.get(path, timeout=5.0)
-        except (httpx.HTTPError, ConnectionError):
+            resp = await runner_client.get(path, timeout=timeout_s)
+        except (httpx.TimeoutException, httpx.TransportError, ConnectionError):
+            if attempt < len(delays):
+                await asyncio.sleep(delays[attempt])
+                continue
+            _logger.debug(
+                "Runner model-options query failed for %s",
+                session_id,
+                extra={"session_id": session_id},
+            )
+            return
+        except httpx.HTTPError:
             _logger.debug(
                 "Runner model-options query failed for %s",
                 session_id,
@@ -12695,6 +12714,11 @@ async def _load_model_options(
             )
             return
         if not options:
+            if empty_is_authoritative:
+                _model_options_cache[session_id] = []
+                _model_options_stale.discard(session_id)
+                _acp_dynamic_options_probed.add(session_id)
+                return
             # Older runners returned 200 + [] for the same not-ready window.
             # Do not cache that empty catalog; retry, then leave the cache
             # cold so a later snapshot can try again.
@@ -12704,6 +12728,8 @@ async def _load_model_options(
             return
         _model_options_cache[session_id] = options
         _model_options_stale.discard(session_id)
+        if empty_is_authoritative:
+            _acp_dynamic_options_probed.add(session_id)
         _publish_model_options(session_id)
         return
 
@@ -12837,6 +12863,77 @@ def prefetch_session_routing_catalogs(
     task.add_done_callback(_catalog_prefetch_tasks.discard)
 
 
+async def _prefetch_acp_model_options_task(
+    session_id: str,
+    conv: Conversation,
+    runner_client: httpx.AsyncClient,
+    agent_store: AgentStore | None,
+    store_slots: asyncio.Semaphore | None = None,
+) -> None:
+    """Resolve and publish live ACP model/effort options when a runner binds."""
+    from omnigent.server.routes._sessions.orchestration import (
+        _load_acp_model_options,
+        _resolve_harness_impl_is_acp,
+    )
+
+    slot_ctx = store_slots if store_slots is not None else contextlib.nullcontext()
+    async with slot_ctx:
+        is_acp = await asyncio.to_thread(_resolve_harness_impl_is_acp, conv, agent_store)
+        if not is_acp:
+            return
+        if session_id not in _model_options_stale and session_id not in _model_options_cache:
+            curated = await _load_acp_model_options(session_id, conv, agent_store)
+            if curated:
+                return
+    _acp_dynamic_options_probed.discard(session_id)
+    await _load_model_options(
+        runner_client,
+        session_id,
+        f"/v1/sessions/{session_id}/model-options",
+        empty_is_authoritative=True,
+        timeout_s=20.0,
+    )
+
+
+def prefetch_session_acp_model_options(
+    session_id: str,
+    conv: Conversation,
+    runner_client: httpx.AsyncClient,
+    *,
+    agent_store: AgentStore | None = None,
+    store_slots: asyncio.Semaphore | None = None,
+) -> None:
+    """Eagerly fetch and publish ACP model/effort options when a runner connects."""
+    if conv.archived:
+        return
+    wrapper = conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY) or ""
+    if wrapper in _MODEL_OPTIONS_ENDPOINT_BY_WRAPPER:
+        return
+    if conv.harness_override:
+        from omnigent.harness_aliases import is_acp_harness
+
+        if not is_acp_harness(conv.harness_override):
+            return
+    elif conv.agent_id is None:
+        return
+    cached = _model_options_cache.get(session_id)
+    if cached and session_id not in _model_options_stale:
+        return
+    if session_id in _model_options_inflight:
+        return
+
+    task = asyncio.create_task(
+        _run_catalog_prefetch(
+            _prefetch_acp_model_options_task(
+                session_id, conv, runner_client, agent_store, store_slots=store_slots
+            ),
+            session_id,
+        )
+    )
+    _model_options_inflight[session_id] = task
+    task.add_done_callback(lambda _task, sid=session_id: _model_options_inflight.pop(sid, None))
+
+
 async def _host_model_options_via_registry(
     host_id: str, harness: str = "claude-native"
 ) -> list[dict[str, Any]] | None:
@@ -12873,6 +12970,59 @@ async def _host_model_options_via_registry(
         return None
     models = result.get("models")
     return models if isinstance(models, list) else None
+
+
+def _resolve_acp_probe_harness_impl(
+    conv: Conversation | None,
+    *,
+    agent_store: AgentStore | None = None,
+    agent_cache: AgentCache | None = None,
+    agents_by_id: Mapping[str, Agent] | None = None,
+    agent: Agent | None = None,
+) -> str | None:
+    """Resolve the raw ACP harness id for *conv* without collapsing ``acp:<slug>``."""
+    if conv is None:
+        return None
+    if conv.harness_override:
+        from omnigent.harness_aliases import resolve_acp_probe_harness
+
+        return resolve_acp_probe_harness(conv.harness_override)
+    if conv.agent_id is None:
+        return None
+    try:
+        from omnigent.harness_aliases import resolve_acp_probe_harness
+        from omnigent.runtime import get_agent_cache
+
+        if agents_by_id is not None:
+            agent = agents_by_id.get(conv.agent_id)
+        elif agent is None or agent.id != conv.agent_id:
+            if agent_store is None:
+                from omnigent.runtime._globals import _agent_store
+
+                agent_store = _agent_store
+            if agent_store is None:
+                return None
+            agent = agent_store.get(conv.agent_id)
+        if agent is None:
+            return None
+        if agent_cache is None:
+            agent_cache = get_agent_cache()
+        spec = agent_cache.load_spec(
+            agent.id, agent.bundle_location, expand_env=agent.operator_authored
+        )
+        executor = spec.executor
+        if conv.sub_agent_name:
+            from omnigent.runtime.workflow import _find_spec_by_name
+
+            sub = _find_spec_by_name(spec, conv.sub_agent_name)
+            if sub is not None:
+                executor = sub.executor
+        raw = (
+            executor.config.get("harness") or spec.executor.config.get("harness") or executor.type
+        )
+        return resolve_acp_probe_harness(raw) if isinstance(raw, str) else None
+    except (OSError, ValueError, RuntimeError, LookupError):
+        return None
 
 
 async def _load_model_options_from_host(
@@ -13107,6 +13257,7 @@ __all__ = [
     "_require_filesystem_attachment_harness",
     "_require_host_conn_for_worktree",
     "_require_permission_mode_forward",
+    "_resolve_acp_probe_harness_impl",
     "_resolve_harness",
     "_resolve_llm_model",
     "_resolve_skill_meta_text_via_runner",
@@ -13150,5 +13301,6 @@ __all__ = [
     "_wait_for_runner_client",
     "announce_hosts_changed",
     "cancel_managed_launch_tasks",
+    "prefetch_session_acp_model_options",
     "prefetch_session_routing_catalogs",
 ]

@@ -644,6 +644,26 @@ def test_gateway_inference_returns_a_copy() -> None:
     assert registry.gateway_inference(bare) == {"codex": True}
 
 
+def test_workspace_file_mentions_tracks_latest_report_and_returns_copy() -> None:
+    """HostRegistry stores and defensively copies workspace_file_mentions per host."""
+    bare = "0f1e2d3c4b5a69788796a5b4c3d2e1f1"
+    registry = HostRegistry()
+    assert registry.workspace_file_mentions(bare) is None
+
+    reported = {"acp:coder": True, "acp:chat": False}
+    registry.record_workspace_file_mentions(bare, reported)
+    reported["acp:coder"] = False
+
+    read = registry.workspace_file_mentions(f"host_{bare}")
+    assert read == {"acp:coder": True, "acp:chat": False}
+    assert read is not None
+    read["acp:coder"] = False
+    assert registry.workspace_file_mentions(bare) == {"acp:coder": True, "acp:chat": False}
+
+    registry.record_workspace_file_mentions(bare, None)
+    assert registry.workspace_file_mentions(bare) is None
+
+
 def test_legacy_prefixed_id_resolves_to_bare_registration() -> None:
     """
     Every ``uuid_to_bytes``-accepted spelling of a host id must key

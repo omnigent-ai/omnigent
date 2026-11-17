@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  acpEffortLevelsForModel,
   effortAfterModelChange,
   effortLevelsForConv,
   modelPickerKindForConv,
@@ -307,5 +308,85 @@ describe("shouldShowEffortPicker for SDK harnesses (declared effort family)", ()
         "anthropic",
       ),
     ).toBe(false);
+  });
+});
+
+describe("ACP dynamic model & thought-effort controls", () => {
+  const acpConv = { labels: {}, harness: "acp" };
+  const acpOptions = [
+    {
+      id: "ag-pro",
+      model: "ag-pro",
+      isDefault: true,
+      supportedReasoningEfforts: [
+        { reasoningEffort: "low" },
+        { reasoningEffort: "medium" },
+        { reasoningEffort: "high" },
+        { reasoningEffort: "xhigh" },
+      ],
+      defaultReasoningEffort: "medium",
+    },
+    {
+      id: "ag-flash",
+      model: "ag-flash",
+      isDefault: false,
+      supportedReasoningEfforts: [{ reasoningEffort: "none" }, { reasoningEffort: "low" }],
+      defaultReasoningEffort: "none",
+    },
+    {
+      id: "ag-plain",
+      model: "ag-plain",
+      isDefault: false,
+    },
+  ];
+
+  it("enables the effort picker for top-level ACP sessions and hides it for ACP subagents", () => {
+    expect(shouldShowEffortPicker(acpConv)).toBe(true);
+    expect(shouldShowEffortPicker({ labels: {}, harness: "antigravity" }, "acp")).toBe(true);
+    expect(
+      shouldShowEffortPicker({ labels: {}, harness: "acp", parentSessionId: "parent_1" }),
+    ).toBe(false);
+  });
+
+  it("resolves ACP efforts per selected model and falls back to default/sole model before turn 1", () => {
+    expect(acpEffortLevelsForModel(acpOptions, "ag-pro")).toEqual([
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+    ]);
+    expect(acpEffortLevelsForModel(acpOptions, "ag-flash")).toEqual(["none", "low"]);
+    // Matched model with no declared efforts returns [] without falling back to default.
+    expect(acpEffortLevelsForModel(acpOptions, "ag-plain")).toEqual([]);
+    // Pre-Turn-1 unset model falls back to the isDefault row's efforts.
+    expect(acpEffortLevelsForModel(acpOptions, null)).toEqual(["low", "medium", "high", "xhigh"]);
+    expect(effortLevelsForConv(acpConv, acpOptions, "ag-flash", "acp")).toEqual(["none", "low"]);
+    expect(effortLevelsForConv(acpConv, [], null, "acp")).toEqual([]);
+  });
+
+  it("exposes effort levels for a single-model ACP session even when the model dropdown is hidden", () => {
+    const single = [acpOptions[0]];
+    expect(shouldShowModelPicker(acpConv, single)).toBe(false);
+    expect(shouldShowEffortPicker(acpConv, "acp")).toBe(true);
+    expect(effortLevelsForConv(acpConv, single, null, "acp")).toEqual([
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+    ]);
+  });
+
+  it("resolves selectedModelForPicker for acp using requested override then reportedModel", () => {
+    expect(selectedModelForPicker("acp", acpOptions, null, "ag-flash")).toBe("ag-flash");
+    expect(selectedModelForPicker("acp", acpOptions, "ag-pro", "ag-flash")).toBe("ag-pro");
+    expect(selectedModelForPicker("acp", acpOptions, null, null)).toBeNull();
+  });
+
+  it("recognizes acp:<slug> harnesses in modelPickerKindForConv, shouldShowEffortPicker, and effortLevelsForConv", () => {
+    const slugConv = { labels: {}, harness: "acp:antigravity" };
+    expect(modelPickerKindForConv(slugConv, acpOptions)).toBe("acp");
+    expect(shouldShowModelPicker(slugConv, acpOptions)).toBe(true);
+    expect(shouldShowEffortPicker(slugConv)).toBe(true);
+    expect(effortLevelsForConv(slugConv, acpOptions, "ag-flash")).toEqual(["none", "low"]);
   });
 });

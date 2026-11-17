@@ -112,8 +112,10 @@ import {
 import { CommentSenderProvider, useOptionalCommentSender } from "@/hooks/CommentSenderContext";
 import { markCommentsSeen } from "@/hooks/useSeenComments";
 import { useChatStore } from "@/store/chatStore";
+import { useHosts } from "@/hooks/useHosts";
+import { useSessionAgent } from "@/hooks/useAgents";
 import { useFileMentionHarnesses } from "@/lib/agentLabels";
-import { harnessSupportsFileMentions } from "@/lib/composerMentions";
+import { harnessSupportsFileMentions, resolveMentionHarness } from "@/lib/composerMentions";
 import { useResizablePanel } from "@/hooks/useResizablePanel";
 import { useIOSNativeKeyboardInset } from "@/hooks/useIOSNativeKeyboardInset";
 import { useWorkspaceChangedFiles } from "@/hooks/useWorkspaceChangedFiles";
@@ -436,7 +438,19 @@ function FileViewerBody({
   // Same gate as the composer's "@"-mention menu, so "Attach to agent" only
   // shows when the session's agent will open the attached path.
   const sessionHarness = useChatStore((s) => s.sessionHarness);
-  const attachToAgent = harnessSupportsFileMentions(sessionHarness, useFileMentionHarnesses());
+  const { data: sessionAgent } = useSessionAgent(
+    sessionHarness == null || sessionHarness === "acp" ? conversationId || null : null,
+  );
+  const storeSessionHostId = useChatStore((s) => s.sessionHostId);
+  const fileViewerSessionHostId = useContext(FileViewerContext)?.sessionHostId;
+  const sessionHostId = fileViewerSessionHostId ?? storeSessionHostId;
+  const { data: hostRows } = useHosts({ enabled: !!sessionHostId, includeSandbox: true });
+  const sessionHost = hostRows?.find((row) => row.host_id === sessionHostId) ?? null;
+  const attachToAgent = harnessSupportsFileMentions(
+    resolveMentionHarness(sessionHarness, sessionAgent?.harness),
+    useFileMentionHarnesses(),
+    sessionHost?.workspace_file_mentions,
+  );
   const [searchParams, setSearchParams] = useSearchParams();
   const rebasePath = useRebasePath();
   const isMobile = useIsMobileViewport();

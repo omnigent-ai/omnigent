@@ -7187,6 +7187,18 @@
             "description": "Reasoning configuration, e.g. `{\"effort\": \"medium\"}`.",
             "title": "Reasoning"
           },
+          "reported_model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Reported Model"
+          },
           "status": {
             "description": "Lifecycle status, one of `\"queued\"`, `\"in_progress\"`, `\"completed\"`, `\"failed\"`, `\"incomplete\"`, `\"cancelled\"`.",
             "title": "Status",
