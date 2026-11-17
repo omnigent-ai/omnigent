@@ -147,6 +147,8 @@ class _SubagentWorkEntry:
     :param child_start_reported: Whether the child itself reported a
         running/waiting edge for this dispatch, or the dispatch joined a turn
         already in flight.
+    :param child_start_response_id: Identity of a reported native start; ``None``
+        preserves unidentified or restart-recovered start evidence.
     :param awaiting_child_start_since: Unix timestamp when a harness that
         reports its own turn start accepted the prompt, or ``None`` when no
         such report is awaited.
@@ -168,6 +170,7 @@ class _SubagentWorkEntry:
     corrected_status: str | None = None
     launch_timed_out: bool = False
     child_start_reported: bool = False
+    child_start_response_id: str | None = None
     awaiting_child_start_since: float | None = None
     native_acceptance: NativeTurnAcceptance | None = None
 
@@ -430,6 +433,10 @@ def note_subagent_child_start_reported(
         or entry.native_acceptance is None
         or entry.native_acceptance.response_id == response_id
     ):
+        if entry.child_start_reported and entry.child_start_response_id != response_id:
+            entry.child_start_response_id = None
+        else:
+            entry.child_start_response_id = response_id
         entry.child_start_reported = True
         entry.awaiting_child_start_since = None
 
@@ -454,6 +461,13 @@ def note_subagent_child_turn_settled(
     ):
         _children_accepted_turns.pop(child_session_id, None)
     entry = _subagent_work_by_child.get(child_session_id)
+    if (
+        entry is not None
+        and response_id is not None
+        and entry.child_start_response_id == response_id
+    ):
+        entry.child_start_reported = False
+        entry.child_start_response_id = None
     if entry is not None and (
         response_id is None
         or (
@@ -477,11 +491,16 @@ def apply_child_start_evidence(entry: _SubagentWorkEntry) -> None:
     if accepted is not None:
         entry.native_acceptance = accepted.acceptance
         entry.child_start_reported = accepted.start_reported or reported
+        if entry.child_start_reported:
+            entry.child_start_response_id = (
+                _children_reporting_start[child_id] if reported else None
+            )
         entry.awaiting_child_start_since = (
             None if entry.child_start_reported else accepted.accepted_at
         )
     elif reported:
         entry.child_start_reported = True
+        entry.child_start_response_id = _children_reporting_start[child_id]
         entry.awaiting_child_start_since = None
 
 
@@ -542,6 +561,11 @@ def arm_subagent_child_start_timeout(
         return
     if reported:
         entry.child_start_reported = True
+        entry.child_start_response_id = (
+            acceptance.response_id
+            if _children_reporting_start.get(child_session_id) == acceptance.response_id
+            else None
+        )
         entry.awaiting_child_start_since = None
     elif entry.native_acceptance != acceptance or entry.awaiting_child_start_since is None:
         entry.awaiting_child_start_since = stamp

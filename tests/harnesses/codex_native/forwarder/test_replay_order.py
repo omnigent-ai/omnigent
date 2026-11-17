@@ -1156,7 +1156,8 @@ def _fail_first_running_publish(monkeypatch: pytest.MonkeyPatch, mode: str) -> l
     """Make the first ``running`` status publish fail, then pass later publishes through.
 
     ``mode`` is how the failed publish fails: ``"rejected"`` answers HTTP 500 without
-    raising, ``"raised"`` raises, and ``"cancelled"`` is cancelled mid-publish.
+    raising, ``"raised"`` raises, ``"cancelled"`` is cancelled mid-publish, and
+    ``"missing"`` returns no response.
 
     :returns: The outcome of each ``running`` publish attempt, in order.
     """
@@ -1171,6 +1172,8 @@ def _fail_first_running_publish(monkeypatch: pytest.MonkeyPatch, mode: str) -> l
                 raise RuntimeError("credential resolution failed")
             if mode == "cancelled":
                 raise asyncio.CancelledError()
+            if mode == "missing":
+                return None
             return httpx.Response(500, json={"error": "server unavailable"})
         if is_running:
             outcomes.append("accepted")
@@ -1204,7 +1207,7 @@ def _live_item(item_id: str) -> dict:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("mode", ["rejected", "raised", "cancelled"])
+@pytest.mark.parametrize("mode", ["rejected", "raised", "cancelled", "missing"])
 async def test_failed_running_publish_is_retried_by_the_next_live_item(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, mode: str
 ) -> None:
@@ -1263,10 +1266,11 @@ async def test_failed_running_publish_is_retried_by_the_next_live_item(
 
 
 @pytest.mark.asyncio
-async def test_failed_resume_running_publish_does_not_suppress_live_recovery(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.parametrize("initial_source", ["resume", "observed-start"])
+async def test_failed_start_publication_does_not_suppress_live_recovery(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, initial_source: str
 ) -> None:
-    """A resume replay whose running publish is rejected leaves the turn for live recovery."""
+    """A rejected resume or observed-start publication permits exactly one live recovery."""
     write_bridge_state(
         tmp_path,
         CodexNativeBridgeState(
@@ -1274,7 +1278,7 @@ async def test_failed_resume_running_publish_does_not_suppress_live_recovery(
             socket_path=str(tmp_path / "app-server.sock"),
             thread_id="thread_1",
             codex_home=str(tmp_path / "codex-home"),
-            active_turn_id="turn_1",
+            active_turn_id="turn_1" if initial_source == "resume" else None,
         ),
     )
     outcomes = _fail_first_running_publish(monkeypatch, "rejected")
@@ -1282,65 +1286,34 @@ async def test_failed_resume_running_publish_does_not_suppress_live_recovery(
     state = fwd._CodexForwarderState()
     locks_token = fwd._conversation_item_locks.set({})
     try:
-        await fwd._post_resume_turn_status(
-            client,  # type: ignore[arg-type]
-            session_id="conv_x",
-            bridge_dir=tmp_path,
-            thread_id="thread_1",
-            turns=[{"id": "turn_1", "status": "inProgress", "items": []}],
-            forwarder_state=state,
-        )
-        assert state.running_reported_turn_id is None
-        await fwd._post_missed_turn_start(
-            client,  # type: ignore[arg-type]
-            session_id="conv_x",
-            bridge_dir=tmp_path,
-            thread_id="thread_1",
-            event=_live_item("item_1"),
-            forwarder_state=state,
-        )
-    finally:
-        fwd._conversation_item_locks.reset(locks_token)
-
-    assert outcomes == ["rejected", "accepted"]
-    assert _running_statuses(client) == ["running"]
-
-
-@pytest.mark.asyncio
-async def test_failed_turn_started_publish_does_not_suppress_live_recovery(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """A turn/started whose running publish is rejected leaves the turn for live recovery."""
-    write_bridge_state(
-        tmp_path,
-        CodexNativeBridgeState(
-            session_id="conv_x",
-            socket_path=str(tmp_path / "app-server.sock"),
-            thread_id="thread_1",
-            codex_home=str(tmp_path / "codex-home"),
-        ),
-    )
-    outcomes = _fail_first_running_publish(monkeypatch, "rejected")
-    client = _RecordingClient()
-    state = fwd._CodexForwarderState()
-    locks_token = fwd._conversation_item_locks.set({})
-    try:
-        await fwd._handle_event(
-            client,  # type: ignore[arg-type]
-            session_id="conv_x",
-            bridge_dir=tmp_path,
-            event={
-                "method": "turn/started",
-                "params": {
-                    "threadId": "thread_1",
-                    "turn": {"id": "turn_1", "status": "inProgress"},
+        if initial_source == "resume":
+            await fwd._post_resume_turn_status(
+                client,  # type: ignore[arg-type]
+                session_id="conv_x",
+                bridge_dir=tmp_path,
+                thread_id="thread_1",
+                turns=[{"id": "turn_1", "status": "inProgress", "items": []}],
+                forwarder_state=state,
+            )
+        else:
+            await fwd._handle_event(
+                client,  # type: ignore[arg-type]
+                session_id="conv_x",
+                bridge_dir=tmp_path,
+                event={
+                    "method": "turn/started",
+                    "params": {
+                        "threadId": "thread_1",
+                        "turn": {"id": "turn_1", "status": "inProgress"},
+                    },
                 },
-            },
-            usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_x"),  # type: ignore[arg-type]
-            elicitation_tracker=fwd._CodexElicitationTaskTracker(),
-            expected_thread_id="thread_1",
-            forwarder_state=state,
-        )
+                usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_x"),  # type: ignore[arg-type]
+                elicitation_tracker=fwd._CodexElicitationTaskTracker(),
+                expected_thread_id="thread_1",
+                forwarder_state=state,
+            )
+        assert outcomes == ["rejected"]
+        assert _running_statuses(client) == []
         assert state.running_reported_turn_id is None
         await fwd._post_missed_turn_start(
             client,  # type: ignore[arg-type]
@@ -1355,3 +1328,4 @@ async def test_failed_turn_started_publish_does_not_suppress_live_recovery(
 
     assert outcomes == ["rejected", "accepted"]
     assert _running_statuses(client) == ["running"]
+    assert state.running_reported_turn_id == "turn_1"

@@ -1197,8 +1197,10 @@ async def test_recovered_pending_child_outlives_launch_timeout_and_delivers_orig
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("settle_reported_start", [False, True])
 async def test_recovered_child_steered_after_restart_is_not_start_bounded(
     _clean_subagent_registry: None,
+    settle_reported_start: bool,
 ) -> None:
     """A steer into a turn that survived the restart reports no new start, so it is not bounded."""
     server = _RecoveryServerClient([_child_summary(current_task_status="in_progress")])
@@ -1206,6 +1208,13 @@ async def test_recovered_child_steered_after_restart_is_not_start_bounded(
     await app.state.recover_undrained_subagent_results(PARENT_SESSION_ID)
     entry = subagent_work.get_subagent_work(CHILD_SESSION_ID)
     assert entry is not None and entry.status == "waiting"
+    if settle_reported_start:
+        subagent_work.note_subagent_child_start_reported(
+            CHILD_SESSION_ID, response_id="codex_previous"
+        )
+        subagent_work.note_subagent_child_turn_settled(
+            CHILD_SESSION_ID, response_id="codex_previous"
+        )
 
     # What a codex-native steer's clean delivery end does to the reused entry.
     subagent_work.mark_subagent_work_started(CHILD_SESSION_ID)

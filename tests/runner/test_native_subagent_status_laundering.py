@@ -536,12 +536,16 @@ def _drive_steer_lifecycle(
                     request=previous_request,
                     now=_PREVIOUS_ACCEPTED_AT,
                 )
-            elif event == "run_prev" or event == "run_steer":
+            elif event in ("run_prev", "run_steer", "run_unidentified"):
                 subagent_work.note_subagent_child_start_reported(
                     child_id,
                     response_id=(
-                        previous_acceptance if event == "run_prev" else steer_acceptance
-                    ).response_id,
+                        None
+                        if event == "run_unidentified"
+                        else (
+                            previous_acceptance if event == "run_prev" else steer_acceptance
+                        ).response_id
+                    ),
                 )
             elif event in ("settle_prev", "settle_unidentified"):
                 subagent_work.note_subagent_child_turn_settled(
@@ -665,6 +669,16 @@ def _drive_steer_lifecycle(
             _STEER_ACCEPTED_AT,
             id="stale-settlement-after-current-acceptance",
         ),
+        pytest.param(
+            ["register", "run_prev", "settle_prev", "accept_steer"],
+            _STEER_ACCEPTED_AT,
+            id="previous-start-settled-before-current-acceptance",
+        ),
+        pytest.param(
+            ["run_prev", "register", "settle_prev", "accept_steer"],
+            _STEER_ACCEPTED_AT,
+            id="retained-previous-start-settled-before-current-acceptance",
+        ),
     ],
 )
 @pytest.mark.asyncio
@@ -718,6 +732,14 @@ async def test_steered_turn_is_bounded_from_its_own_acceptance(
         ["register", "accept_steer", "run_steer"],
         ["accept_steer", "register", "run_steer"],
         ["accept_steer", "drain_old", "run_steer", "register"],
+        pytest.param(
+            ["run_steer", "register", "accept_steer"],
+            id="running-before-registration-and-acceptance",
+        ),
+        pytest.param(
+            ["register", "run_unidentified", "settle_unidentified", "accept_steer"],
+            id="unidentified-start-remains-unbounded",
+        ),
     ],
 )
 @pytest.mark.asyncio
