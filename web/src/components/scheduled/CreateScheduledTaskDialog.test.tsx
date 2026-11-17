@@ -4704,7 +4704,7 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     type("task-trigger-instructions", "Reproduce it.");
     fireEvent.click(
       screen.getByRole("checkbox", {
-        name: "Include the session link with the result in the thread",
+        name: "Reply in the thread with the session link when work starts",
       }),
     );
 

@@ -386,6 +386,44 @@ describe("TasksPanel", () => {
     expect(screen.queryByTestId("tasks-plan-workflow")).toBeNull();
   });
 
+  it("shows the workflow runs below a workflow's run after its tasks", () => {
+    const workflowId = "0123456789abcdef0123456789abcdef";
+    vi.mocked(useSavedWorkflows).mockReturnValue({
+      workflows: [],
+      isLoading: false,
+      isError: false,
+      refresh: vi.fn(),
+      pagination: { hasMore: false, loadingMore: false, loadMore: vi.fn() },
+    });
+    const renderWorkflowRuns = vi.fn((id: string) => <p data-testid="workflow-runs-slot">{id}</p>);
+    const renderTasks = (active = true) =>
+      render(
+        <TasksPanel
+          conversationId="conv"
+          active={active}
+          renderWorkflowRuns={renderWorkflowRuns}
+        />,
+        { wrapper: ({ children }) => <MemoryRouter>{children}</MemoryRouter> },
+      );
+    showJournal([{ ...journalPlan(0, ["explore"]), workflow_id: workflowId }]);
+    // A hidden panel leaves the runs out, so their list doesn't keep refreshing.
+    renderTasks(false);
+    expect(renderWorkflowRuns).not.toHaveBeenCalled();
+    cleanup();
+    renderTasks();
+    const slot = screen.getByTestId("workflow-runs-slot");
+    expect(slot).toHaveTextContent(workflowId);
+    const lastTask = screen.getAllByTestId("tasks-row").at(-1)!;
+    expect(lastTask.compareDocumentPosition(slot) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    cleanup();
+
+    // A plan of the agent's own names no workflow, so it has no runs to list.
+    renderWorkflowRuns.mockClear();
+    showJournal([journalPlan(0, ["explore"])]);
+    renderTasks();
+    expect(renderWorkflowRuns).not.toHaveBeenCalled();
+  });
+
   it("says on hover which task a progress segment is and where it stands", async () => {
     showJournal([
       journalPlan(0, ["profile"], ["cache", ["profile"]], ["ship", ["cache"]]),

@@ -2141,9 +2141,8 @@ async def test_run_now_records_a_manual_run_that_the_next_poll_starts(store) -> 
     scheduler = PersistentTaskScheduler(store, fire, AsyncMock(), now=clock.now, poll_seconds=3600)
     await scheduler.start()
     try:
-        # Keep the background poller out until the deferred-start checks finish.
+        # Keep the background poll from consuming the run before these assertions.
         async with scheduler._poll_lock:
-            # The request only records the run, even on the replica that owns its host.
             run = await scheduler.run_now(task)
             assert run.status == "scheduled"
             assert scheduler._startups == {}

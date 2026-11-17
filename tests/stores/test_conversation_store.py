@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import re
 import threading
 import uuid
 from collections.abc import Callable, Iterator
@@ -37,7 +38,10 @@ from omnigent.session_import import (
     IMPORT_SOURCE_LABEL_KEY,
 )
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
-from omnigent.stores.conversation_store import ConversationUpdateResult
+from omnigent.stores.conversation_store import (
+    SCHEDULED_TASK_RUN_LABEL_KEY,
+    ConversationUpdateResult,
+)
 from omnigent.stores.conversation_store.activity_error import (
     LATEST_ACTIVITY_ERROR_LABEL_KEY,
     LATEST_ACTIVITY_ERROR_RESPONSE_LABEL_KEY,
@@ -603,7 +607,9 @@ def test_get_session_activity(
     conversation_store.set_session_live_status(a.id, "waiting")
     conversation_store.set_runner_id(a.id, "runner_activity")
     conversation_store.set_pending_elicitation_count(a.id, 2)
-    conversation_store.set_labels(a.id, {"omnigent.ui": "terminal"})
+    conversation_store.set_labels(
+        a.id, {"omnigent.ui": "terminal", SCHEDULED_TASK_RUN_LABEL_KEY: "run_current"}
+    )
     conversation_store.set_session_usage(a.id, {"total_cost_usd": cost})
     child = conversation_store.create_conversation(
         kind="sub_agent", title="child", parent_conversation_id=a.id
@@ -625,8 +631,11 @@ def test_get_session_activity(
         event.remove(conversation_store._engine, "before_cursor_execute", record_query)
 
     reads = [statement for statement in statements if statement.startswith("select")]
-    assert len(reads) == 2
-    assert all("conversation_labels" not in statement for statement in reads)
+    # Only the current-run label is read, never the session's full label set.
+    assert len(reads) == 3
+    label_reads = [statement for statement in reads if "conversation_labels" in statement]
+    assert len(label_reads) == 1
+    assert re.search(r"\bkey\W* = ", label_reads[0])
 
     assert set(result) == {a.id, b.id, child.id}
     assert result[a.id].updated_at == conversation_store.get_conversation(a.id).updated_at  # type: ignore[union-attr]
@@ -641,6 +650,8 @@ def test_get_session_activity(
     assert result[b.id].total_cost_usd is None
     assert result[a.id].archived is False
     assert result[b.id].archived is True
+    assert result[a.id].current_run_id == "run_current"
+    assert result[b.id].current_run_id is None
     assert conversation_store.get_session_activity([]) == {}
 
 

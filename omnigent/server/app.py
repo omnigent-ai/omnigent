@@ -419,6 +419,10 @@ class ServerInfoResponse(BaseModel):
     # ``automations_v2`` and a store that keeps them. Listing and removing need only the
     # store, through the API; the automation pages need the flag.
     scheduled_task_sharing: bool = False
+    # ``GET /v1/scheduled-tasks/shared`` lists the automations shared with the caller,
+    # under the same conditions as ``scheduled_task_sharing``. Older servers that
+    # advertise sharing lack the route.
+    scheduled_task_shared_with_me: bool = False
     # Session PATCH and project create check the agent tool's calling session;
     # absent on older servers, where moves must not run.
     session_move_source_checks: bool = False
@@ -4059,6 +4063,9 @@ def create_app(
         dictation_available, _ = engine_availability()
         filesystem_attachment_policy = app.state.filesystem_attachment_policy()
         automations_enabled = app.state.automations_available()
+        automation_sharing = automations_enabled and scheduled_task_sharing_supported(
+            app.state, permission_store
+        )
         return ServerInfoResponse.model_validate(
             {
                 "accounts_enabled": accounts_enabled,
@@ -4118,8 +4125,8 @@ def create_app(
                 "scheduled_task_inbox": automations_enabled,
                 "scheduled_task_one_time": automations_enabled
                 and bool(app.state.one_time_automations_enabled),
-                "scheduled_task_sharing": automations_enabled
-                and scheduled_task_sharing_supported(app.state, permission_store),
+                "scheduled_task_sharing": automation_sharing,
+                "scheduled_task_shared_with_me": automation_sharing,
                 "session_move_source_checks": True,
                 "session_organize_source_checks": True,
                 "sibling_other_project_standalone": True,

@@ -16,7 +16,7 @@ import contextlib
 import logging
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Query, Request
 from fastapi.responses import Response
@@ -107,6 +107,41 @@ def owns_scheduled_task(task: ScheduledTask, owner_id: str | None) -> bool:
             or task.account_generation == account_generation(owner_id or RESERVED_USER_LOCAL)
         )
     )
+
+
+ScheduledTaskViewerRole = Literal["owner", "viewer"]
+
+
+def scheduled_task_viewer_role(
+    request: Request,
+    task: ScheduledTask,
+    caller_id: str | None,
+    permission_store: PermissionStore | None,
+) -> ScheduledTaskViewerRole | None:
+    """The caller's role on *task*: its owner, a recipient (``"viewer"``), or neither.
+
+    A recipient holds a grant through any of their principals and may only read.
+    Recipients need a person's request, not an agent tool's, on a server that shares
+    automations; the local user is only ever an owner. Blocking: call off the loop.
+
+    :param caller_id: The caller, or ``None`` for the local user.
+    :returns: The role, or ``None`` when the caller may not see the task.
+    """
+    if owns_scheduled_task(task, caller_id):
+        return "owner"
+    if (
+        caller_id is None
+        or task.state == "deleted"
+        or task.kind != "automation"
+        or request_from_agent(request)
+        or not scheduled_task_sharing_supported(request.app.state, permission_store)
+    ):
+        return None
+    assert permission_store is not None
+    principals = permission_store.caller_principals(caller_id)
+    if permission_store.resolve_scheduled_task_access(principals, task.id) is None:
+        return None
+    return "viewer"
 
 
 def stores_scheduled_task_grants(permission_store: PermissionStore | None) -> bool:
@@ -279,12 +314,12 @@ def _restore_task_grant(
         _logger.exception("automation %s: could not restore %r's grant", task_id, user_id)
 
 
-def _display_names(store: PermissionStore, user_ids: Sequence[str]) -> dict[str, str]:
+def display_names_or_ids(store: PermissionStore, user_ids: Sequence[str]) -> dict[str, str]:
     """The store's display names, or the IDs themselves when the lookup fails."""
     try:
         return store.display_names(user_ids)
     except Exception:
-        _logger.exception("could not look up display names for %d grantees", len(user_ids))
+        _logger.exception("could not look up display names for %d users", len(user_ids))
         return {user_id: user_id for user_id in user_ids}
 
 
@@ -370,7 +405,7 @@ def register_scheduled_task_permissions_routes(
         grants, next_cursor = await asyncio.to_thread(
             store.list_for_scheduled_task, task.id, limit=limit, after_user_id=after
         )
-        names = await asyncio.to_thread(_display_names, store, [g.user_id for g in grants])
+        names = await asyncio.to_thread(display_names_or_ids, store, [g.user_id for g in grants])
         return ScheduledTaskPermissionList(
             permissions=[
                 ScheduledTaskPermissionObject(
@@ -404,8 +439,8 @@ def register_scheduled_task_permissions_routes(
         :returns: The resulting grant.
         :raises OmnigentError: 404 when the caller does not own the automation, 403
             for an agent, a server that cannot share automations or the sharing
-            policy, 400 for an empty or over-long ID, the owner, ``__public__`` or a
-            level other than read.
+            policy, 400 for an empty or over-long ID, the owner,
+            ``__public__`` or a level other than read.
         """
         store = require_sharing(request, granting=True)
         task = await owned_task(request, scheduled_task_id)
@@ -465,7 +500,7 @@ def register_scheduled_task_permissions_routes(
             await sync_session(request, current)
         add_audit_attrs(target_user_id=grantee, level=level)
         # The grant is committed, so a failed name lookup must not fail the request.
-        names = await asyncio.to_thread(_display_names, store, [perm.user_id])
+        names = await asyncio.to_thread(display_names_or_ids, store, [perm.user_id])
         return ScheduledTaskPermissionObject(
             user_id=perm.user_id,
             scheduled_task_id=perm.scheduled_task_id,

@@ -575,6 +575,7 @@ describe("Slack DM triggers", () => {
     );
     expect(prompt).toContain('title "Slack <channel> <message ts>"');
     expect(prompt).toContain("the sender, the direct message's channel ID");
+    expect(prompt).not.toContain("Slack IDs:");
     const parts = splitTriggerPrompt(prompt);
     expect(combineTriggerPrompt(parts.userPrompt, parts.systemPrompt)).toBe(prompt);
   });
@@ -594,6 +595,7 @@ describe("Slack DM triggers", () => {
     expect(prompt).toContain("Every other top-level message counts.");
     expect(prompt).toContain("the names resolve to fewer than two people besides you");
     expect(prompt).toContain("that can read your group DMs.");
+    expect(prompt).not.toContain("Slack IDs:");
   });
 
   it("prefixes bare channel names with # in a channel trigger", () => {
@@ -603,6 +605,92 @@ describe("Slack DM triggers", () => {
       CTX,
     );
     expect(prompt).toContain("Watch: new Slack messages in #eng-support, C0123ABCD\n");
+  });
+
+  it("saves a channel trigger's Slack lookups in its reply and bounds history reads", () => {
+    const prompt = renderTriggerPrompt(
+      "slack",
+      slack({ scope: "eng-support", scopeOperator: "is" }),
+      CTX,
+    );
+
+    // Later runs read the saved IDs from the previous reply instead of looking them up again.
+    expect(prompt).toContain(
+      "Your most recent reply's \"Slack IDs:\" line, when there is one, gives each channel's ID, the workspace URL",
+    );
+    expect(prompt).toContain('Above it, write a "Slack IDs:" line followed by one-line JSON');
+    expect(prompt).toContain("users.conversations");
+    expect(prompt).toContain(
+      "use your Slack tools to read the top-level messages posted in #eng-support",
+    );
+    expect(prompt).toContain("If you read a channel with conversations.history, call it once");
+    expect(prompt).toContain('pass "Output one JSON object per line for every message');
+    expect(prompt).toContain("archives/<channel ID>/p<ts without its dot>");
+    expect(prompt).toContain(
+      "read every page, following the cursor only while has_more is true, before handling any message, then handle them oldest first",
+    );
+    // A partial run keeps its window instead of skipping pages it never read.
+    expect(prompt).toContain("otherwise the previous check time");
+    expect(prompt).toContain("If a saved ID stops working, for example with channel_not_found");
+    expect(prompt).toContain("users.list for a handle or display name");
+    // A channel list saved to a file is searched with one command instead of several tries.
+    expect(prompt).toContain(
+      `get the IDs by running one command on that file with your shell tool, jq -c '.result | fromjson | (.channels[] | select(.name == "eng-support") | {id, name}), .response_metadata.next_cursor' <file>`,
+    );
+  });
+
+  it("filters the channel lookup to every named channel and skips it for channel IDs", () => {
+    const named = renderTriggerPrompt(
+      "slack",
+      slack({ scope: "eng-support, #bugs, C0123ABCD", scopeOperator: "in" }),
+      CTX,
+    );
+    const idsOnly = renderTriggerPrompt(
+      "slack",
+      slack({ scope: "C0123ABCD", scopeOperator: "is" }),
+      CTX,
+    );
+
+    expect(named).toContain('select(.name == "eng-support" or .name == "bugs")');
+    expect(idsOnly).not.toContain("select(.name ==");
+  });
+
+  it("lowercases channel names and gives no command for a name Slack can't have", () => {
+    const mixedCase = renderTriggerPrompt(
+      "slack",
+      slack({ scope: "#Eng-Support", scopeOperator: "is" }),
+      CTX,
+    );
+    // A quote in the scope must not end the command's shell quoting.
+    const quoted = renderTriggerPrompt(
+      "slack",
+      slack({ scope: "x' ; touch pwned ; '", scopeOperator: "is" }),
+      CTX,
+    );
+
+    expect(mixedCase).toContain('select(.name == "eng-support")');
+    expect(quoted).not.toContain("jq -c");
+    expect(quoted).not.toContain("touch pwned ;'");
+  });
+
+  it("asks a privacy filter for author columns only when a condition names an author", () => {
+    const withAuthor = renderTriggerPrompt(
+      "slack",
+      slack({
+        scope: "eng-support",
+        scopeOperator: "is",
+        conditions: [{ field: "author", operator: "is", value: "Example Person" }],
+      }),
+      CTX,
+    );
+    const withoutAuthor = renderTriggerPrompt(
+      "slack",
+      slack({ scope: "eng-support", scopeOperator: "is" }),
+      CTX,
+    );
+
+    expect(withAuthor).toContain("adding one yes/no column per author ID the conditions name");
+    expect(withoutAuthor).not.toContain("yes/no column per author ID");
   });
 });
 
@@ -1220,26 +1308,37 @@ describe("renderTriggerPrompt", () => {
     expect(sorted).not.toContain("ORDER BY created DESC");
   });
 
-  it.each([true, false])("puts Slack links in the worker result with linkBack=%s", (linkBack) => {
-    const prompt = renderTriggerPrompt(
-      "slack",
-      fields({ event: "posted", scope: "#support", linkBack }),
-      CTX,
-    );
-    const [manager, worker] = prompt.split("Instructions for each session:\n");
-    expect(manager).not.toContain("Link-back pending:");
-    expect(manager).not.toContain('Reply "Omnigent session:');
-    expect(worker).toContain(
-      "Reply in the source thread when you have a useful result or a blocker",
-    );
-    expect(worker).toContain("Do not send an acknowledgement or a separate session-link message");
-    expect(worker).toContain(
-      linkBack ? "Include your own session link at the bottom" : "Do not add a session link",
-    );
-    const parts = splitTriggerPrompt(prompt);
-    expect(parts.userPrompt).toBe(fields().instructions);
-    expect(combineTriggerPrompt(parts.userPrompt, parts.systemPrompt)).toBe(prompt);
-  });
+  it.each([true, false])(
+    "posts the Slack session link once, at start, with linkBack=%s",
+    (linkBack) => {
+      const prompt = renderTriggerPrompt(
+        "slack",
+        fields({ event: "posted", scope: "#support", linkBack }),
+        CTX,
+      );
+      const [manager, worker] = prompt.split("Instructions for each session:\n");
+      expect(manager).not.toContain("Link-back pending:");
+      expect(manager).not.toContain('Reply "Omnigent session:');
+      const startReply =
+        "<slack-reply>\n:hourglass_flowing_sand: Omnigent is working on it...\n\nTrack progress: <https://omni.example.com/c/CONVERSATION_ID|Omni Session>\nSent with Omnigent\n</slack-reply>\nReply in the same thread";
+      if (linkBack) {
+        expect(worker).toContain(startReply);
+      } else {
+        expect(worker).not.toContain("Track progress:");
+        expect(worker).toContain("Do not send an acknowledgement or a session link.");
+      }
+      expect(worker).toContain('ends with a line "Sent with Omnigent"');
+      expect(worker).toContain(
+        "Reply in the same thread when you have a useful result or a blocker",
+      );
+      expect(worker).toContain(
+        `Each later reply carries only what is new since your previous reply in that thread${linkBack ? ", without the session link" : ""}.`,
+      );
+      const parts = splitTriggerPrompt(prompt);
+      expect(parts.userPrompt).toBe(fields().instructions);
+      expect(combineTriggerPrompt(parts.userPrompt, parts.systemPrompt)).toBe(prompt);
+    },
+  );
 
   it("signs what it posts and stops when it can't reach the service", () => {
     const prompt = renderTriggerPrompt("jira", fields(), CTX);
@@ -1409,7 +1508,7 @@ describe("renderTriggerPrompt", () => {
     );
     expect(filtered).toContain("Only messages that are about bug reports count.");
     expect(filtered).toContain('title "Slack <channel> <message ts>"');
-    expect(filtered).toContain("Reply in the source thread when you have a useful result");
+    expect(filtered).toContain("Reply in the same thread when you have a useful result");
 
     const unfiltered = renderTriggerPrompt(
       "slack",
@@ -1418,6 +1517,8 @@ describe("renderTriggerPrompt", () => {
     );
     expect(unfiltered).toContain("Watch: new Slack messages in #eng-support\n");
     expect(unfiltered).toContain("Every top-level message counts.");
+    // Bot posts still count, so a channel of alerts or a bot author can match.
+    expect(unfiltered).not.toContain("bot_id set");
   });
 
   it("renders the Linear search, reading every newest-first page before starting sessions", () => {

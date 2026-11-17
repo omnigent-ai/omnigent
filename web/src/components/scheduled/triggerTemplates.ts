@@ -296,7 +296,7 @@ export const TRIGGER_TEMPLATES: Record<TriggerSource, TriggerTemplate> = {
       { id: "author", label: "Author", operators: ["is", "is_not"], placeholder: "@alerts-bot" },
     ],
     instructionsPlaceholder: "Answer the question, or investigate the reported bug.",
-    linkBackLabel: "Include the session link with the result in the thread",
+    linkBackLabel: "Reply in the thread with the session link when work starts",
     itemPlural: "messages",
     toolsExample: "a Slack MCP server",
   },
@@ -659,6 +659,14 @@ function triggerPromptHeadings(prompt: string): TriggerPromptHeadings {
 }
 
 const POSTING_INSTRUCTIONS = `Anything you post for this, such as a comment, reply, message, issue or pull request, ends with a line "${OMNIGENT_ATTRIBUTION}", since it posts with the owner's account.`;
+
+/** How a Slack worker replies: one start reply with its session link, then only new results. */
+function slackWorkerPostingInstructions(linkBack: boolean, sessionLink: string): string {
+  const start = linkBack
+    ? `As soon as you start working on a Slack message, call sys_session_get_info to obtain your session_id and substitute it for ${SESSION_LINK_ID_PLACEHOLDER} in the link below; if your Slack tool takes Markdown rather than Slack mrkdwn, write the link as [Omni Session](<url>) instead. Then reply once in the message's thread with exactly the lines between <slack-reply> and </slack-reply>, without those marker lines:\n<slack-reply>\n:hourglass_flowing_sand: Omnigent is working on it...\n\nTrack progress: <${sessionLink}|Omni Session>\n${OMNIGENT_ATTRIBUTION}\n</slack-reply>\n`
+    : "Do not send an acknowledgement or a session link. ";
+  return `${POSTING_INSTRUCTIONS}\n${start}Reply in the same thread when you have a useful result or a blocker. Each later reply carries only what is new since your previous reply in that thread${linkBack ? ", without the session link" : ""}.`;
+}
 
 /** Separate saved template instructions without guessing at free-form prompts. */
 export function splitTriggerPrompt(prompt: string): {
@@ -1330,6 +1338,8 @@ export function compileGithubQuery(fields: TriggerFields): string {
 
 /** Slack IDs, e.g. `C0123ABCD` or `U0123ABCD`, which take no `#` or `@`. */
 const SLACK_ID = /^[CDGUW][A-Z0-9]{6,}$/;
+/** The characters a Slack channel name can hold, e.g. `eng-support`. */
+const SLACK_CHANNEL_NAME = /^[a-z0-9._-]+$/;
 
 /** Slack channels as `#name`, keeping IDs bare, e.g. `"eng, C0123ABCD"` → `"#eng, C0123ABCD"`. */
 export function slackChannels(scope: string): string {
@@ -1465,7 +1475,19 @@ interface SourceText {
   skip?: string;
   /** Replaces the checkpoint after an incomplete run, which defaults to the last handled item. */
   partialCheckpoint?: string;
+  /** Extra state line the reply carries above its check time, so later runs skip lookups. */
+  stateLine?: string;
 }
+
+/** Reply line that saves a Slack channel trigger's lookups for later runs. */
+const SLACK_IDS = "Slack IDs:";
+
+/**
+ * The analysis_prompt a privacy-filtering Slack tool answers for each history read: just the
+ * fields the manager needs, one JSON line per message.
+ */
+const SLACK_HISTORY_ANALYSIS_PROMPT =
+  '"Output one JSON object per line for every message, oldest first, with exactly these keys: ts, thread_ts, user, bot_id, subtype, text (verbatim). Use null for a missing key. End with one line giving has_more (true or false) and next_cursor. Output nothing else."';
 
 const GITHUB_ACCOUNT_INSTRUCTIONS =
   "Before using GitHub.com, verify which authenticated account can access the target repository. " +
@@ -1606,13 +1628,32 @@ function sourceText(source: TriggerSource, fields: TriggerFields, shared: boolea
       };
     }
     const channels = slackChannels(fields.scope);
+    // The channel list can be too large to return, so give one command that finds the IDs.
+    // Slack names are lowercase; a name that couldn't be a channel gets no command to run.
+    const channelNames = scopeList(stripScopePrefix(fields.scope, "#"))
+      .filter((channel) => !SLACK_ID.test(channel))
+      .map((channel) => channel.toLowerCase())
+      .filter((channel) => SLACK_CHANNEL_NAME.test(channel));
+    const nameMatch = channelNames.map((name) => `.name == ${JSON.stringify(name)}`).join(" or ");
+    const lookupProgram = `.result | fromjson | (.channels[] | select(${nameMatch}) | {id, name}), .response_metadata.next_cursor`;
+    const channelLookupFilter = channelNames.length
+      ? ` The list is large; if your tool saves it to a file instead of returning it, get the IDs by running one command on that file with your shell tool, jq -c ${shellQuote(lookupProgram)} <file>, and read the next page with that cursor only while a channel is still missing.`
+      : "";
+    // The privacy filter can redact user IDs, so it answers author conditions as columns.
+    const authorColumns = fields.conditions.some((condition) => condition.field === "author")
+      ? ", adding one yes/no column per author ID the conditions name, such as author_U0123ABCD, and apply author conditions with those columns, since the filter may hide the user field"
+      : "";
     return {
       ...slack,
       watch: () => `Watch: new Slack messages in ${channels}${filter !== "" ? ` ${filter}` : ""}`,
       search: () =>
-        `Use your Slack tools to read the top-level messages posted in ${channels} since that time, oldest first. Replies inside a thread don't start a new session.` +
-        (only || " Every top-level message counts."),
+        `Your most recent reply's "${SLACK_IDS}" line, when there is one, gives each channel's ID, the workspace URL and the Slack user ID of each author the conditions name: use them and skip those lookups. Otherwise look up only what's missing, once: find each channel's ID with your Slack tool's users.conversations (types public_channel,private_channel, exclude_archived true, limit 1000), which lists only your channels, rather than a full conversations.list.${channelLookupFilter} Call auth.test for the workspace URL and your own user ID; and find any other author with users.lookupByEmail for an email, users.info for a user ID, or users.list for a handle or display name. An author who matches no one or more than one person counts as no match: say so in your reply and save no ID for them. If a saved ID stops working, for example with channel_not_found, look it up again. Then use your Slack tools to read the top-level messages posted in ${channels} since that time, oldest first. If you read a channel with conversations.history, call it once with the channel ID, oldest set to that time as a Unix timestamp, inclusive false, limit 200 and caching off, and if your Slack tool takes an analysis_prompt (it filters message data for privacy), pass ${SLACK_HISTORY_ANALYSIS_PROMPT}${authorColumns}. History pages come newest first, so read every page, following the cursor only while has_more is true, before handling any message, then handle them oldest first. Don't pass a bash_query to a message read, and don't repeat a read. Replies inside a thread (thread_ts set and different from ts) don't start a new session.` +
+        (only || " Every top-level message counts.") +
+        " When a message has no permalink, build it as the workspace URL followed by archives/<channel ID>/p<ts without its dot>.",
       details: "the channel, author, message text and permalink",
+      // An unread history page can hold older messages, so a partial run keeps its window.
+      partialCheckpoint: "the previous check time",
+      stateLine: `Above it, write a "${SLACK_IDS}" line followed by one-line JSON with channel_ids (each channel name mapped to its ID), workspace_url, and author_ids (each author the conditions name mapped to their Slack user ID): carry over your previous reply's values and add what you looked up this run.`,
     };
   }
   if (source === "linear") {
@@ -1742,7 +1783,7 @@ export function renderTriggerPrompt(
   const managerPostsLink = fields.linkBack && source !== "slack";
   const workerPostingInstructions =
     source === "slack"
-      ? `${POSTING_INSTRUCTIONS}\nDo not send an acknowledgement or a separate session-link message. Reply in the source thread when you have a useful result or a blocker.${fields.linkBack ? ` Include your own session link at the bottom of that reply: call sys_session_get_info to obtain your session_id and substitute it for ${SESSION_LINK_ID_PLACEHOLDER} in ${ctx.sessionLink}.` : " Do not add a session link."}`
+      ? slackWorkerPostingInstructions(fields.linkBack, ctx.sessionLink)
       : POSTING_INSTRUCTIONS;
   const pendingLines = [
     `"${DELIVERY_PENDING}"`,
@@ -1786,7 +1827,7 @@ export function renderTriggerPrompt(
             ` End each one with a line "${OMNIGENT_ATTRIBUTION}", since it posts with the owner's account. Replace ${SESSION_LINK_ID_PLACEHOLDER} with ${shared ? "the conversation_id of the task session that item went to, which differs from the current one if it was replaced later in the run" : "the conversation_id that sys_session_create returned"}, and post each link with its own command or tool call so a permission rule for that command can allow it. If posting fails, don't retry it in this run: list it as "<title> <conversation_id>" on a "${LINK_BACK_PENDING}" line in your reply.`,
         ]
       : []),
-    `${shared ? `Reply with the title of each ${text.item} you sent to the task session, and of any an earlier run sent without recording it, each with the conversation_id of the task session it went to, a "${TASK_SESSION} <conversation_id>" line for your task session once you have one,` : "Reply with the title and session ID of each session you started,"} and a ${pendingLines.join(" or ")} line for anything still pending. End with "${CHECKED_THROUGH} <time>" in ISO 8601 UTC: the time you noted before searching if you read every result and handled every match; otherwise ${text.partialCheckpoint ?? `the time the last ${text.item} you handled (${shared ? "sent" : "started"} or skipped) before you stopped was ${text.createdAt}, or the previous check time if you handled none`}, and say why you stopped.${text.watermark ? ` Above it, repeat the "${WATCHING_SINCE} <time>" line unchanged.` : ""}`,
+    `${shared ? `Reply with the title of each ${text.item} you sent to the task session, and of any an earlier run sent without recording it, each with the conversation_id of the task session it went to, a "${TASK_SESSION} <conversation_id>" line for your task session once you have one,` : "Reply with the title and session ID of each session you started,"} and a ${pendingLines.join(" or ")} line for anything still pending. End with "${CHECKED_THROUGH} <time>" in ISO 8601 UTC: the time you noted before searching if you read every result and handled every match; otherwise ${text.partialCheckpoint ?? `the time the last ${text.item} you handled (${shared ? "sent" : "started"} or skipped) before you stopped was ${text.createdAt}, or the previous check time if you handled none`}, and say why you stopped.${text.watermark ? ` Above it, repeat the "${WATCHING_SINCE} <time>" line unchanged.` : ""}${text.stateLine ? ` ${text.stateLine}` : ""}`,
   ];
   const opening = text.opening ?? `newly created ${text.item}`;
   const instructions = `${headings.instructions.trimStart()}${fields.instructions.trim()}`;

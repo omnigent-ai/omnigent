@@ -131,6 +131,7 @@ from omnigent.runtime.policies.builder import (
     ancestor_ids_from_tree,
     load_session_tree,
     load_session_usage,
+    load_session_usage_and_tree,
 )
 from omnigent.runtime.policies.engine import PolicyEngine
 from omnigent.runtime.workflow import _find_spec_by_name
@@ -1495,6 +1496,31 @@ def _publish_subtree_cost_to_ancestors(
         conv_store,
         conv.root_conversation_id if conv is not None else None,
     )
+    _publish_ancestor_subtree_costs(tree, session_id)
+
+
+def _publish_ancestor_subtree_costs(tree: list[Conversation], session_id: str) -> None:
+    """
+    Publish each ancestor's subtree cost from an already-loaded spawn tree.
+
+    The store-free half of :func:`_publish_subtree_cost_to_ancestors`, for a
+    usage flush that has just loaded this session's tree to sum its own
+    subtree: reusing that tree keeps a flush to one tree load, which dominates
+    its cost on a large spawn tree. Whether the session has ancestors at all
+    is read from *tree*, never from a row the caller holds, because a stale
+    row can name a parent the session no longer has. A top-level session
+    publishes nothing.
+
+    Sync (sums the tree once per ancestor + SSE fan-out); call via
+    :func:`asyncio.to_thread`.
+
+    :param tree: The session's spawn tree as returned by
+        :func:`load_session_tree` or :func:`load_session_usage_and_tree`,
+        which verify that it is the tree the session currently belongs to.
+    :param session_id: The session whose usage just changed, e.g.
+        ``"conv_child123"``.
+    :returns: None.
+    """
     for ancestor_id in ancestor_ids_from_tree(tree, session_id):
         ancestor_usage = _sum_subtree_usage(tree, ancestor_id)
         subtree_cost = _priced_cost_for_display(ancestor_usage)
@@ -2365,12 +2391,12 @@ async def _persist_external_session_usage(
     :param conversation_store: Store used to upsert the labels.
     :param conv: The session's already-loaded conversation row, when the
         caller holds one (the events route's access check reads it). Supplies
-        the tree root to the subtree roll-up and the ancestor publish — both
-        read-only, and both verify a supplied root against the tree it
-        produces — so those steps don't re-read the row. NOT passed to the
-        own-usage persist: its monotonic-clamp baseline must be a fresh read
-        (see :func:`_persist_native_cumulative_usage`). ``None`` makes each
-        step resolve the row itself.
+        the tree root to the one tree load the subtree roll-up and the
+        ancestor publish share — read-only, and it verifies a supplied root
+        against the tree it produces — so that load doesn't re-read the row.
+        NOT passed to the own-usage persist: its monotonic-clamp baseline must
+        be a fresh read (see :func:`_persist_native_cumulative_usage`).
+        ``None`` makes each step resolve the row itself.
     :param user_id: The flush POST's authenticated caller, hashed into the
         usage telemetry event. ``None`` falls back to the ambient request user.
     :param host_installation_id: Installation ID of the machine that posted the
@@ -2457,8 +2483,8 @@ async def _persist_external_session_usage(
     # oscillate own ⇄ subtree). For a childless session the subtree is just
     # itself, so this equals own cost — one indexed tree query per flush. The
     # caller's row supplies the root so the tree scan needs no extra row read.
-    subtree_usage = await asyncio.to_thread(
-        load_session_usage,
+    subtree_usage, tree = await asyncio.to_thread(
+        load_session_usage_and_tree,
         session_id,
         conversation_store,
         root_conversation_id=conv.root_conversation_id if conv is not None else None,
@@ -2487,14 +2513,9 @@ async def _persist_external_session_usage(
     # This session's usage also moves its ANCESTORS' subtree cost (its spend
     # rolls up into every ancestor), so re-publish each ancestor's subtree cost
     # too — otherwise a grandparent's badge wouldn't reflect a deep descendant.
-    # No-op for a top-level session (no ancestors). Threaded: it pages the
-    # conversation tree per ancestor.
-    await asyncio.to_thread(
-        _publish_subtree_cost_to_ancestors,
-        conversation_store,
-        session_id,
-        conv,
-    )
+    # Reuses the tree summed above, so a flush loads it once. No-op for a
+    # top-level session (no ancestors). Threaded: it sums the tree per ancestor.
+    await asyncio.to_thread(_publish_ancestor_subtree_costs, tree, session_id)
     return raw_tokens
 
 
@@ -10736,22 +10757,13 @@ async def _relay_runner_stream_once(
                             # surfaces tokens). context_tokens/window ride on the
                             # same event so the ring updates live. Threaded: store
                             # reads + SSE fan-out.
-                            # One row read serves both the subtree sum and
-                            # the ancestor publish below (each would
-                            # otherwise re-derive the tree root itself).
-                            _usage_conv = await asyncio.to_thread(
-                                conversation_store.get_conversation,
-                                session_id,
-                            )
-                            _subtree_usage = await asyncio.to_thread(
-                                load_session_usage,
+                            # One tree load (which resolves the root with one
+                            # row read) serves both the subtree sum and the
+                            # ancestor publish below.
+                            _subtree_usage, _usage_tree = await asyncio.to_thread(
+                                load_session_usage_and_tree,
                                 session_id,
                                 conversation_store,
-                                root_conversation_id=(
-                                    _usage_conv.root_conversation_id
-                                    if _usage_conv is not None
-                                    else None
-                                ),
                             )
                             _subtree_cost = _priced_cost_for_display(_subtree_usage)
                             _usage_by_model = _usage_by_model_for_display(_subtree_usage)
@@ -10788,10 +10800,9 @@ async def _relay_runner_stream_once(
                                 # context-only publish — keep the roll-up gated.
                                 if _subtree_cost is not None or _usage_by_model is not None:
                                     await asyncio.to_thread(
-                                        _publish_subtree_cost_to_ancestors,
-                                        conversation_store,
+                                        _publish_ancestor_subtree_costs,
+                                        _usage_tree,
                                         session_id,
-                                        _usage_conv,
                                     )
 
                     failed_response = event.get("response")
