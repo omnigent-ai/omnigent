@@ -2,6 +2,7 @@ import { settingsEntry } from "./types";
 
 export const MCP_SERVICES_ENTRY = settingsEntry({
   id: "mcp-services",
+  available: (availability) => availability.mcpServices,
   section: "mcp",
   label: "Managed MCP services",
   description:
