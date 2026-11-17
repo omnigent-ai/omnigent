@@ -928,6 +928,22 @@ describe("WorkspacePanel shell tabs", () => {
     expect(screen.getByTestId("content-search-stub").parentElement).toHaveClass("hidden");
   });
 
+  it("shows a selected shell over an open file, and the file while its terminal is missing", async () => {
+    useTerminalsMock.mockReturnValue({ terminals: [term], isLoading: false, error: null });
+    const { rerender } = renderWorkspace({
+      rightRailTab: "files",
+      selectedFilePath: "src/App.tsx",
+      selectedTerminalKey: termKey,
+      openTerminals: [termKey],
+    });
+    expect(await screen.findByTestId("terminal-view-stub")).toHaveTextContent("terminal_zsh_s1");
+    expect(screen.queryByTestId("file-viewer-stub")).toBeNull();
+
+    rerender({ openTerminals: [] });
+    expect(screen.queryByTestId("terminal-view-stub")).toBeNull();
+    expect(screen.getByTestId("file-viewer-stub")).toHaveTextContent("src/App.tsx");
+  });
+
   it("keeps the Files tab panel mounted but hidden behind the active shell", async () => {
     useTerminalsMock.mockReturnValue({ terminals: [term], isLoading: false, error: null });
     const { rerender } = renderWorkspace({ rightRailTab: "files", openTerminals: [termKey] });
