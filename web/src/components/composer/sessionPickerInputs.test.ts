@@ -54,3 +54,18 @@ it("reads a background session's options and model, not the active conversation'
   expect(result.current.modelLabelOptions).toBe(CELL_OPTIONS);
   expect(result.current.effortLevels).toEqual(["high"]);
 });
+
+it("uses the launch preview only while the active conversation has no catalog", () => {
+  const PREVIEW = [codexModel("gpt-preview", "medium")];
+  const launchPreviewOptions = { launchPreviewOptions: PREVIEW };
+  useChatStore.setState({ conversationId: "active", codexModelOptions: [] });
+
+  const preview = renderHook(() => useSessionPickerInputs(undefined, null, launchPreviewOptions));
+  expect(preview.result.current.codexModelOptions).toBe(PREVIEW);
+  expect(preview.result.current.modelsFromLaunchPreview).toBe(true);
+
+  useChatStore.setState({ codexModelOptions: ACTIVE_OPTIONS });
+  const stored = renderHook(() => useSessionPickerInputs(undefined, null, launchPreviewOptions));
+  expect(stored.result.current.codexModelOptions).toBe(ACTIVE_OPTIONS);
+  expect(stored.result.current.modelsFromLaunchPreview).toBe(false);
+});

@@ -2286,7 +2286,7 @@ export function buildSlashCommandWithArgsSet(
 // Re-exported here so ChatPage's existing named exports keep resolving for
 // consumers (e.g. ChatPage.statusLine.test).
 export { formatStatusModelLabel, formatModelEffortStatusLabel };
-// Moved to components/composer/sessionPickerInputs; re-exported for existing importers.
+// Re-exported for existing importers.
 export {
   composerHarnessLabel,
   isCostRoutingEligible,

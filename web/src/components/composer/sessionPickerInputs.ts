@@ -192,6 +192,13 @@ export interface SessionPickerInputs {
   inferenceError: string | null | undefined;
 }
 
+/** The catalog harness a pre-launch host probe reads, per native picker family. */
+const HOST_PROBE_HARNESS: Partial<Record<NativeModelPickerKind, string>> = {
+  codex: "codex-native",
+  claude: "claude-native",
+  devin: "devin-native",
+};
+
 /**
  * The picker inputs for *sessionId*'s conversation, or the active one when
  * omitted. *session* is that conversation's snapshot; the full-screen view
@@ -223,13 +230,7 @@ export function useSessionPickerInputs(
     harness: session?.harness ?? null,
   });
   const hostProbeHarness =
-    fallbackPickerKind === "codex"
-      ? "codex-native"
-      : fallbackPickerKind === "claude"
-        ? "claude-native"
-        : fallbackPickerKind === "devin"
-          ? "devin-native"
-          : null;
+    fallbackPickerKind === null ? null : (HOST_PROBE_HARNESS[fallbackPickerKind] ?? null);
   const { data: hostProbeOptions } = useHostModelOptions(
     session?.hostId ?? null,
     hostProbeHarness ?? "",
