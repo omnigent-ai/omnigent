@@ -274,9 +274,11 @@ While a run has work left, the workflow skill keeps one repeating check-in
 timer: `sys_timer_set` every ten minutes with the note `workflow check-in`,
 its `timer_id` recorded in a journal note. Each firing wakes the agent to read
 its journal, update statuses and continue ready steps, or end its turn quietly
-when everything left waits on someone. It cancels the timer when the workflow
-concludes or on Stop, and sets it again on Continue, Run or Retry; a message
-from the user doesn't cancel it. On a server with the `durable_timers` release
+when everything left waits on another session or slow external work. It
+cancels the timer when everything left waits only on the user, when the
+workflow concludes and on Stop, and sets it again when it picks the run back up
+after Continue, Run, Retry or the user's answer; a message from the user
+doesn't cancel it. On a server with the `durable_timers` release
 feature, the server keeps the timer, so a check-in still comes after the
 runner stops or the server restarts, for up to seven days, and it skips a
 firing while the session is busy or waiting on the user. A check-in names no automation run on the

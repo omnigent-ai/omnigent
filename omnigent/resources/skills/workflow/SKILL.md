@@ -448,8 +448,9 @@ wakes you to pick the plan back up. In a native harness such as Claude Code
 or Codex, the timer tools come from the `omnigent` MCP server: in Claude
 Code, `sys_timer_set` is `mcp__omnigent__sys_timer_set`.
 
-1. When you write the run's first `started`, and again after Continue, Run
-   or Retry, call `sys_timer_set` with `seconds: 600`, `repeat: true` and
+1. When you write the run's first `started`, and again whenever you pick
+   the run back up after Continue, Run, Retry or the user's answer, call
+   `sys_timer_set` with `seconds: 600`, `repeat: true` and
    `note: "workflow check-in"`. Record the returned `timer_id` in a note
    with `sys_journal_write_note`. If a note already names a check-in timer,
    cancel that one first with `sys_timer_cancel` and that `timer_id`, so
@@ -463,12 +464,14 @@ Code, `sys_timer_set` is `mcp__omnigent__sys_timer_set`.
 3. A check-in arrives as a `[System: timer … fired]` message with that
    note. Read your journal with `sys_journal_read`, check on the work you're
    waiting for, write a status for anything that moved and continue the
-   ready steps. If everything left waits on the user, another session or
-   slow external work, end your turn without a reply.
-4. When the workflow concludes, with every step done or failed, or the rest
-   unable to start because of a failed step, cancel the timer with
-   `sys_timer_cancel` before your final reply. Cancel it on Stop too. A
-   message from the user doesn't cancel it.
+   ready steps. If everything left waits on another session or slow
+   external work, end your turn without a reply.
+4. When everything left waits only on the user, cancel the timer with
+   `sys_timer_cancel`: their answer or Continue wakes you, and you set it
+   again then. Cancel it too when the workflow concludes, with every step
+   done or failed, or the rest unable to start because of a failed step,
+   before your final reply, and on Stop. A message from the user doesn't
+   cancel it.
 
 If `sys_timer_set` isn't available, keep checking with a background timer of
 your own tools, as for a session you start.
