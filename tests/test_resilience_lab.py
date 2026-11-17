@@ -601,7 +601,15 @@ def test_lab_diagnostics_project_records_and_upload_only_safe_file(
 
 @pytest.mark.parametrize(
     "invalid",
-    ["file-link", "directory-link", "oversize", "malformed", "nested", "identity-mismatch"],
+    [
+        "file-link",
+        "directory-link",
+        "oversize",
+        "malformed",
+        "nested",
+        "events-object",
+        "identity-mismatch",
+    ],
 )
 def test_lab_diagnostics_reject_outside_or_invalid_native_records(
     tmp_path: Path, invalid: str
@@ -638,6 +646,8 @@ def test_lab_diagnostics_reject_outside_or_invalid_native_records(
         path.write_text("private-invalid-json")
     elif invalid == "nested":
         path.write_text('{"payload":' + "[" * 16000 + "0" + "]" * 16000 + "}")
+    elif invalid == "events-object":
+        path.write_text(json.dumps({**value, "events": {}}))
     else:
         path.write_text(json.dumps({**value, "launch_id": "a" * 32}))
     destination = tmp_path / "pytest-base" / "resilience-diagnostics" / "lab-0.json"

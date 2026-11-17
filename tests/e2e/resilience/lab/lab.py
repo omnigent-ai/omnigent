@@ -491,6 +491,8 @@ class Lab:
                 ):
                     continue
                 hooks = data.get("events", [])
+                if not isinstance(hooks, list):
+                    continue
                 record["events"] = [
                     safe
                     for hook in hooks[-16:]
