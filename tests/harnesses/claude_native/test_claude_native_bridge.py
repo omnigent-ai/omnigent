@@ -14193,23 +14193,8 @@ def test_model_command_leaves_default_settings_and_legacy_settings_paths_untouch
 @pytest.mark.parametrize(
     ("requested", "picker_value", "concrete", "pins", "reported", "confirmed"),
     [
-        (
-            "opus",
-            "opus",
-            "system.ai.claude-opus-5-5[1m]",
-            {"ANTHROPIC_DEFAULT_OPUS_MODEL": "system.ai.claude-opus-5-5[1m]"},
-            "claude-opus-5-5",
-            True,
-        ),
         ("opus[1m]", "opus[1m]", "system.ai.claude-opus-5-5[1m]", {}, "claude-opus-5-5", True),
-        (
-            "OPUS[1M]",
-            "opus[1m]",
-            "system.ai.claude-opus-5-5[1m]",
-            {},
-            "claude-opus-5-5[1m]",
-            True,
-        ),
+        ("OPUS[1M]", "opus[1m]", "system.ai.claude-opus-5-5[1m]", {}, "claude-opus-5-5[1m]", True),
         (
             "opus[1m]",
             "opus[1m]",
@@ -14218,14 +14203,7 @@ def test_model_command_leaves_default_settings_and_legacy_settings_paths_untouch
             "claude-opus-5-5",
             True,
         ),
-        (
-            "OPUS[1M]",
-            "opus[1m]",
-            "system.ai.claude-opus-5-5[1m]",
-            {},
-            "claude-opus-5-5",
-            True,
-        ),
+        ("OPUS[1M]", "opus[1m]", "system.ai.claude-opus-5-5[1m]", {}, "claude-opus-5-5", True),
         (
             "SYSTEM.AI.CLAUDE-OPUS-5-5[1M]",
             "opus[1m]",
@@ -14274,7 +14252,6 @@ def test_model_command_leaves_default_settings_and_legacy_settings_paths_untouch
             "claude-opus",
             False,
         ),
-        ("Private/Model-B", "Private/Model-B", "Private/Model-B", {}, "private/model-b", False),
         (
             "claude-private-A",
             "claude-private-A",
@@ -14316,14 +14293,6 @@ def test_model_command_leaves_default_settings_and_legacy_settings_paths_untouch
             False,
         ),
         (
-            "opus",
-            "opus",
-            "system.ai.claude-opus-4-8[1m]",
-            {"ANTHROPIC_DEFAULT_OPUS_MODEL": "system.ai.claude-opus-4-8[1m]"},
-            "opus (system.ai.claude-opus-4-8)",
-            True,
-        ),
-        (
             "sonnet",
             "sonnet",
             "claude-sonnet-4-20250514",
@@ -14349,14 +14318,7 @@ def test_model_command_leaves_default_settings_and_legacy_settings_paths_untouch
         ),
         ("opus", "opus", "PrivateModel", {}, "opus (PrivateModel)", False),
         ("opus", "opus", "claude-private-A", {}, "opus (claude-private-A)", False),
-        (
-            "opus",
-            "opus",
-            "system.ai.claude-opus-4-8[1m]",
-            {},
-            "opus (Choice 1)",
-            False,
-        ),
+        ("opus", "opus", "system.ai.claude-opus-4-8[1m]", {}, "opus (Choice 1)", False),
         (
             "opus",
             "opus",
@@ -14383,7 +14345,6 @@ def test_model_command_leaves_default_settings_and_legacy_settings_paths_untouch
         ),
     ],
     ids=[
-        "pinned-alias",
         "context-alias",
         "uppercase-bracket-alias",
         "uppercase-pin-marker",
@@ -14394,13 +14355,11 @@ def test_model_command_leaves_default_settings_and_legacy_settings_paths_untouch
         "exact-private-id",
         "private-context-marker-is-literal",
         "private-prefix-is-not-public",
-        "private-case-is-exact",
         "public-prefix-private-case-is-exact",
         "public-suffix-private-case-is-exact",
         "different-public-generation",
         "unmarked-different-public-generation",
         "marked-status-for-plain-public-pin",
-        "captured-opus-wrapper",
         "sonnet-wrapper",
         "wrapper-wrong-alias",
         "wrapper-wrong-generation",
@@ -14411,6 +14370,63 @@ def test_model_command_leaves_default_settings_and_legacy_settings_paths_untouch
         "wrapper-nested-parentheses",
         "wrapper-unknown-alias",
     ],
+)
+def test_model_target_and_status_preserve_alias_context_and_private_identity(
+    requested: str,
+    picker_value: str,
+    concrete: str,
+    pins: dict[str, str],
+    reported: str,
+    confirmed: bool,
+) -> None:
+    switch = claude_model_switch.SessionOnlyModelSwitch(
+        Path("unused"),
+        model=requested,
+        deadline=claude_model_switch.ModelSwitchDeadline(1.0, None, time.monotonic),
+        ready_timeout_s=None,
+        owned_draft=None,
+    )
+    switch.choice = claude_model_switch._target(
+        requested,
+        [
+            {
+                "value": picker_value,
+                "model": concrete,
+                "display_name": "Choice 1",
+                "enabled": True,
+                "provenance": "structured",
+            }
+        ],
+        [picker_value],
+        pins,
+    )
+
+    assert (switch.choice.value, switch.choice.model) == (picker_value, concrete)
+    assert switch.status_matches(reported, exact_context=False) is confirmed
+
+
+@pytest.mark.parametrize(
+    ("requested", "picker_value", "concrete", "pins", "reported", "confirmed"),
+    [
+        (
+            "opus",
+            "opus",
+            "system.ai.claude-opus-5-5[1m]",
+            {"ANTHROPIC_DEFAULT_OPUS_MODEL": "system.ai.claude-opus-5-5[1m]"},
+            "claude-opus-5-5",
+            True,
+        ),
+        ("Private/Model-B", "Private/Model-B", "Private/Model-B", {}, "private/model-b", False),
+        (
+            "opus",
+            "opus",
+            "system.ai.claude-opus-4-8[1m]",
+            {"ANTHROPIC_DEFAULT_OPUS_MODEL": "system.ai.claude-opus-4-8[1m]"},
+            "opus (system.ai.claude-opus-4-8)",
+            True,
+        ),
+    ],
+    ids=["pinned-alias", "private-case-is-exact", "captured-opus-wrapper"],
 )
 def test_model_command_verifies_alias_context_and_private_model_identity(
     tmp_path: Path,
@@ -14554,18 +14570,20 @@ def test_model_target_refuses_descriptors_without_one_proven_ordinary_choice(
 
 
 @pytest.mark.parametrize(
-    "models",
+    ("models", "custom_slot"),
     [
-        ("claude-private-A", "claude-private-a"),
-        ("system.ai.claude-opus-4-8-Private", "system.ai.claude-opus-4-8-private"),
+        (("claude-private-A", "claude-private-a"), False),
+        (("system.ai.claude-opus-4-8-Private", "system.ai.claude-opus-4-8-private"), False),
+        (("Private/CustomSlot[1M]", "private/customslot[1M]"), True),
     ],
-    ids=["private-family", "private-suffix"],
+    ids=["private-family", "private-suffix", "configured-custom-slot"],
 )
 @pytest.mark.parametrize("selected", [0, 1])
 def test_model_command_selects_the_exact_case_distinct_private_row(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     models: tuple[str, str],
+    custom_slot: bool,
     selected: int,
 ) -> None:
     requested = models[selected]
@@ -14573,6 +14591,50 @@ def test_model_command_selects_the_exact_case_distinct_private_row(
     composer.options = ["private-initial-model", *models]
     composer.model = composer.options[0]
     bridge_dir = _session_model_bridge(tmp_path, composer)
+    if custom_slot:
+        from omnigent.harnesses.claude_native import main as claude_native
+        from omnigent.onboarding.provider_config import FamilyConfig, ProviderEntry
+
+        config = claude_native._provider_config_for_native_claude(
+            ProviderEntry(
+                name="custom-slot",
+                kind="key",
+                families={
+                    "anthropic": FamilyConfig(
+                        base_url="https://api.anthropic.com",
+                        auth_command="printf test-token",
+                        models={"sonnet": "claude-sonnet-5-5"},
+                    )
+                },
+            )
+        )
+        config = claude_native.claude_config_with_launch_model_pinned(config, requested)
+        assert config is not None
+        assert config.env["ANTHROPIC_CUSTOM_MODEL_OPTION"] == requested
+        assert claude_native.resolve_claude_native_model_selection("sonnet_5", config) == requested
+        custom_row = next(
+            row
+            for row in claude_native.claude_native_model_options(config)
+            if row["id"] == "sonnet_5"
+        )
+        assert custom_row["model"] == requested
+        label = str(custom_row["displayName"])
+        composer.picker_labels[requested] = label
+        claude_native_bridge.record_model_vocabulary(
+            bridge_dir,
+            launch_env=config.env,
+            launch_model=config.model,
+            picker_values=[str(custom_row["id"])],
+            picker_options=[
+                {
+                    "value": requested,
+                    "model": requested,
+                    "display_name": label,
+                    "enabled": True,
+                    "provenance": "structured",
+                }
+            ],
+        )
     composer.install(monkeypatch)
 
     result = claude_native_bridge.inject_model_command(bridge_dir, model=requested)
@@ -14586,10 +14648,7 @@ def test_model_command_selects_the_exact_case_distinct_private_row(
 @pytest.mark.parametrize(
     ("requested", "value", "concrete", "pins"),
     [
-        ("opus[1m]", "opus", "claude-opus-5-5", {}),
-        ("opus", "opus", "claude-opus-4-8", {"ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-opus-5-5"}),
         ("claude-opus-5-5", "private-claude-opus-5-5", "private-claude-opus-5-5", {}),
-        ("Private/model", "private/model", "private/model", {}),
         ("Private/model[1M]", "Private/model[1m]", "Private/model[1m]", {}),
         ("claude-private-A", "claude-private-a", "claude-private-a", {}),
         (
@@ -14604,19 +14663,11 @@ def test_model_command_selects_the_exact_case_distinct_private_row(
             "databricks-claude-private-a",
             {},
         ),
-        (
-            "claude-opus-4-8-Private",
-            "claude-opus-4-8-private",
-            "claude-opus-4-8-private",
-            {},
-        ),
+        ("claude-opus-4-8-Private", "claude-opus-4-8-private", "claude-opus-4-8-private", {}),
         ("claude-sonnet-5-5", "opusplan", "claude-sonnet-5-5", {}),
     ],
     ids=[
-        "missing-context-variant",
-        "stale-pin-resolution",
         "private-prefix",
-        "private-case",
         "private-context-case",
         "public-prefix-private-case",
         "gateway-prefix-private-case",
@@ -14624,6 +14675,37 @@ def test_model_command_selects_the_exact_case_distinct_private_row(
         "public-suffix-private-case",
         "plan-mode-is-not-an-ordinary-model",
     ],
+)
+def test_model_target_refuses_unproven_model_equivalence(
+    requested: str, value: str, concrete: str, pins: dict[str, str]
+) -> None:
+    with pytest.raises(claude_native_bridge.ClaudeModelSwitchRefused) as caught:
+        claude_model_switch._target(
+            requested,
+            [
+                {
+                    "value": value,
+                    "model": concrete,
+                    "display_name": "Choice 1",
+                    "enabled": True,
+                    "provenance": "structured",
+                }
+            ],
+            [value],
+            pins,
+        )
+
+    assert caught.value.unsupported
+
+
+@pytest.mark.parametrize(
+    ("requested", "value", "concrete", "pins"),
+    [
+        ("opus[1m]", "opus", "claude-opus-5-5", {}),
+        ("opus", "opus", "claude-opus-4-8", {"ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-opus-5-5"}),
+        ("Private/model", "private/model", "private/model", {}),
+    ],
+    ids=["missing-context-variant", "stale-pin-resolution", "private-case"],
 )
 def test_model_command_refuses_unproven_model_equivalence_before_keys(
     tmp_path: Path,
@@ -14660,7 +14742,9 @@ def test_model_command_refuses_unproven_model_equivalence_before_keys(
     assert composer.sends == []
 
 
-@pytest.mark.parametrize("surface", ["queued", "absent", "unsupported-footer", "clipped-picker"])
+@pytest.mark.parametrize(
+    "surface", ["queued", "queued-hint", "absent", "unsupported-footer", "clipped-picker"]
+)
 def test_model_command_refuses_queued_or_unrecognized_pickers_without_selecting(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, surface: str
 ) -> None:
@@ -14681,6 +14765,15 @@ def test_model_command_refuses_queued_or_unrecognized_pickers_without_selecting(
 
     def capture(socket_path: str, target: str) -> str:
         pane = composer._capture_pane(socket_path, target)
+        if surface == "queued-hint":
+            return "\n".join(
+                [
+                    "────────────────────────────────────────",
+                    "❯ Press up to edit queued messages",
+                    "────────────────────────────────────────",
+                    "  Opus 4.8 (1M context) | effort:high",
+                ]
+            )
         if composer.overlay == "picker":
             if surface == "unsupported-footer":
                 return pane.replace("s to use this session only", "s is unavailable")
@@ -14694,6 +14787,14 @@ def test_model_command_refuses_queued_or_unrecognized_pickers_without_selecting(
     with pytest.raises(claude_native_bridge.ClaudeModelSwitchRefused) as caught:
         claude_native_bridge.inject_model_command(bridge_dir, model="private-glm[1m]", timeout_s=4)
 
+    if surface == "queued-hint":
+        assert caught.value.phase == "preflight" and not caught.value.command_submitted
+        assert not caught.value.model_may_have_changed
+        assert "unrelated draft" in str(caught.value)
+        assert composer.sends == composer.submitted == []
+        assert composer.model == composer.options[0]
+        assert composer.text == ""
+        return
     assert caught.value.phase == "picker" and caught.value.command_submitted
     assert not caught.value.model_may_have_changed
     assert composer.submitted == ["/model"]
@@ -14939,10 +15040,26 @@ def test_model_command_confirms_cache_cost_at_most_once(
     assert [args[-1] for args in composer.sends] == ["/model", "Enter", "Down", "s", "Enter"]
 
 
+@pytest.mark.parametrize(
+    "disabled_collision", [False, True], ids=["unique", "disabled-catalog-version"]
+)
 def test_model_command_confirms_versioned_cache_cost_for_managed_row(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, disabled_collision: bool
 ) -> None:
     composer, bridge_dir = _versioned_cache_cost_bridge(tmp_path, monkeypatch)
+    if disabled_collision:
+        config_path = bridge_dir / "bridge.json"
+        config = json.loads(config_path.read_text())
+        config["model_picker_options"].append(
+            {
+                "value": "other-picker-choice",
+                "model": "databricks-claude-sonnet-5-5",
+                "display_name": "Other Sonnet",
+                "enabled": False,
+                "provenance": "structured",
+            }
+        )
+        config_path.write_text(json.dumps(config))
 
     result = claude_native_bridge.inject_model_command(
         bridge_dir, model="system.ai.claude-sonnet-5-5"
@@ -14992,47 +15109,6 @@ def test_model_command_confirms_the_captured_dated_cache_cost_modal(
 
 
 @pytest.mark.parametrize(
-    "guard", ["catalog-date", "live-date", "private-target", "wrong-generation"]
-)
-def test_dated_cache_cost_modal_preserves_model_identity_guards(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, guard: str
-) -> None:
-    pane = _CAPTURED_DATED_MODEL_CONFIRMATION
-    if guard == "wrong-generation":
-        pane = pane.replace("Sonnet 4", "Sonnet 5")
-    composer, bridge_dir = _dated_cache_cost_bridge(tmp_path, monkeypatch, pane=pane)
-    config_path = bridge_dir / "bridge.json"
-    config = json.loads(config_path.read_text())
-    if guard == "catalog-date":
-        config["model_picker_options"].append(
-            {
-                "value": "other-date",
-                "model": "claude-sonnet-4-20250601",
-                "display_name": "Other release",
-                "enabled": True,
-                "provenance": "structured",
-            }
-        )
-    elif guard == "live-date":
-        composer.options.append("claude-sonnet-4-20250601")
-        composer.picker_labels[composer.options[-1]] = "Other release"
-    elif guard == "private-target":
-        private_model = "private-claude-sonnet-4-20250514"
-        config["model_picker_options"][1].update(
-            model=private_model, display_name="Private Sonnet"
-        )
-        config["model_env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"] = private_model
-    config_path.write_text(json.dumps(config))
-
-    with pytest.raises(claude_native_bridge.ClaudeModelSwitchRefused) as caught:
-        claude_native_bridge.inject_model_command(bridge_dir, model="sonnet")
-
-    assert caught.value.phase == "commit" and caught.value.model_may_have_changed
-    assert composer.confirmations == composer.status_queries == 0
-    assert [args[-1] for args in composer.sends] == ["/model", "Enter", "Down", "s"]
-
-
-@pytest.mark.parametrize(
     ("model", "label"),
     [
         ("system.ai.claude-sonnet-5-5", "Sonnet 5.5"),
@@ -15063,116 +15139,121 @@ def test_cache_cost_model_label_requires_an_exact_versioned_claude_id(
 
 
 @pytest.mark.parametrize(
-    "collision",
+    ("scenario", "guard"),
     [
-        "catalog-version",
-        "disabled-catalog-version",
-        "catalog-confirmation-label",
-        "catalog-target-label",
-        "live-selected-label",
-        "live-confirmation-label",
-        "live-version",
-        "live-label-before-commit",
+        ("dated", "catalog-date"),
+        ("dated", "live-date"),
+        ("dated", "private-target"),
+        ("dated", "wrong-generation"),
+        ("labels", "catalog-version"),
+        ("labels", "catalog-confirmation-label"),
+        ("labels", "catalog-target-label"),
+        ("labels", "live-selected-label"),
+        ("labels", "live-confirmation-label"),
+        ("labels", "live-version"),
+        ("labels", "live-label-before-commit"),
+        ("dialog", "Sonnet"),
+        ("dialog", "Sonnet 5.6"),
+        ("dialog", "Opus 5.5"),
+        ("dialog", "foreign-permission"),
+        ("private", "legacy"),
+        ("private", "duplicate-label"),
+        ("private", "unselected-label"),
     ],
 )
-def test_model_command_requires_unique_cache_cost_labels(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, collision: str
-) -> None:
-    composer, bridge_dir = _versioned_cache_cost_bridge(tmp_path, monkeypatch)
-    config_path = bridge_dir / "bridge.json"
-    config = json.loads(config_path.read_text())
-    options = config["model_picker_options"]
-    if collision in {"catalog-version", "disabled-catalog-version"}:
-        options.append(
-            {
-                "value": "other-picker-choice",
-                "model": "databricks-claude-sonnet-5-5",
-                "display_name": "Other Sonnet",
-                "enabled": collision == "catalog-version",
-                "provenance": "structured",
-            }
-        )
-    elif collision == "catalog-confirmation-label":
-        options[0]["display_name"] = "Sonnet 5.5"
-    elif collision == "catalog-target-label":
-        options[0]["display_name"] = "Sonnet"
-    elif collision == "live-selected-label":
-        composer.picker_labels[composer.options[0]] = "Sonnet"
-    elif collision == "live-confirmation-label":
-        composer.picker_labels[composer.options[0]] = "Sonnet 5.5"
-    elif collision == "live-version":
-        composer.options.append("databricks-claude-sonnet-5-5")
-        composer.picker_labels[composer.options[-1]] = "Other Sonnet"
-    else:
-        selected_reads = 0
-
-        def capture(socket_path: str, target: str) -> str:
-            nonlocal selected_reads
-            if composer.overlay == "picker" and composer.highlight == 1:
-                selected_reads += 1
-                if selected_reads == 2:
-                    composer.picker_labels[composer.options[0]] = "Sonnet"
-            return composer._capture_pane(socket_path, target)
-
-        monkeypatch.setattr(claude_native_bridge, "_capture_pane", capture)
-    config_path.write_text(json.dumps(config))
-
-    if collision == "disabled-catalog-version":
-        claude_native_bridge.inject_model_command(bridge_dir, model="system.ai.claude-sonnet-5-5")
-        assert composer.confirmations == composer.status_queries == 1
-        return
-    with pytest.raises(claude_native_bridge.ClaudeModelSwitchRefused) as caught:
-        claude_native_bridge.inject_model_command(bridge_dir, model="system.ai.claude-sonnet-5-5")
-
-    assert caught.value.phase == "commit" and caught.value.model_may_have_changed
-    assert composer.confirmations == composer.status_queries == 0
-    assert [args[-1] for args in composer.sends] == ["/model", "Enter", "Down", "s"]
-
-
-@pytest.mark.parametrize("dialog", ["Sonnet", "Sonnet 5.6", "Opus 5.5", "foreign-permission"])
-def test_model_command_refuses_a_different_versioned_cache_cost_dialog(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dialog: str
-) -> None:
-    composer, bridge_dir = _versioned_cache_cost_bridge(tmp_path, monkeypatch)
-    if dialog == "foreign-permission":
-
-        def capture(socket_path: str, target: str) -> str:
-            pane = composer._capture_pane(socket_path, target)
-            return pane + _PERMISSION_PROMPT_PANE if composer.overlay == "cache-cost" else pane
-
-        monkeypatch.setattr(claude_native_bridge, "_capture_pane", capture)
-    else:
-        composer.cache_cost_label = dialog
-
-    with pytest.raises(claude_native_bridge.ClaudeModelSwitchRefused) as caught:
-        claude_native_bridge.inject_model_command(bridge_dir, model="system.ai.claude-sonnet-5-5")
-
-    assert caught.value.model_may_have_changed
-    assert composer.confirmations == composer.status_queries == 0
-    assert [args[-1] for args in composer.sends] == ["/model", "Enter", "Down", "s"]
-
-
-@pytest.mark.parametrize("metadata", ["legacy", "duplicate-label", "unselected-label"])
 def test_model_command_does_not_confirm_an_unproven_cache_cost_target(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, metadata: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scenario: str, guard: str
 ) -> None:
-    label = "Catalog name" if metadata == "unselected-label" else "Choice 1"
-    composer = _SessionModelComposer(cache_cost_label=label)
-    bridge_dir = _session_model_bridge(tmp_path, composer)
+    if scenario == "dated":
+        pane = _CAPTURED_DATED_MODEL_CONFIRMATION
+        if guard == "wrong-generation":
+            pane = pane.replace("Sonnet 4", "Sonnet 5")
+        composer, bridge_dir = _dated_cache_cost_bridge(tmp_path, monkeypatch, pane=pane)
+        model = "sonnet"
+    elif scenario == "private":
+        label = "Catalog name" if guard == "unselected-label" else "Choice 1"
+        composer = _SessionModelComposer(cache_cost_label=label)
+        bridge_dir = _session_model_bridge(tmp_path, composer)
+        composer.install(monkeypatch)
+        model = "private-glm[1m]"
+    else:
+        composer, bridge_dir = _versioned_cache_cost_bridge(tmp_path, monkeypatch)
+        model = "system.ai.claude-sonnet-5-5"
     config_path = bridge_dir / "bridge.json"
     config = json.loads(config_path.read_text())
     options = config["model_picker_options"]
-    if metadata == "legacy":
+    if scenario == "dated":
+        if guard == "catalog-date":
+            options.append(
+                {
+                    "value": "other-date",
+                    "model": "claude-sonnet-4-20250601",
+                    "display_name": "Other release",
+                    "enabled": True,
+                    "provenance": "structured",
+                }
+            )
+        elif guard == "live-date":
+            composer.options.append("claude-sonnet-4-20250601")
+            composer.picker_labels[composer.options[-1]] = "Other release"
+        elif guard == "private-target":
+            private_model = "private-claude-sonnet-4-20250514"
+            options[1].update(model=private_model, display_name="Private Sonnet")
+            config["model_env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"] = private_model
+    elif scenario == "labels":
+        if guard == "catalog-version":
+            options.append(
+                {
+                    "value": "other-picker-choice",
+                    "model": "databricks-claude-sonnet-5-5",
+                    "display_name": "Other Sonnet",
+                    "enabled": True,
+                    "provenance": "structured",
+                }
+            )
+        elif guard == "catalog-confirmation-label":
+            options[0]["display_name"] = "Sonnet 5.5"
+        elif guard == "catalog-target-label":
+            options[0]["display_name"] = "Sonnet"
+        elif guard == "live-selected-label":
+            composer.picker_labels[composer.options[0]] = "Sonnet"
+        elif guard == "live-confirmation-label":
+            composer.picker_labels[composer.options[0]] = "Sonnet 5.5"
+        elif guard == "live-version":
+            composer.options.append("databricks-claude-sonnet-5-5")
+            composer.picker_labels[composer.options[-1]] = "Other Sonnet"
+        else:
+            selected_reads = 0
+
+            def capture(socket_path: str, target: str) -> str:
+                nonlocal selected_reads
+                if composer.overlay == "picker" and composer.highlight == 1:
+                    selected_reads += 1
+                    if selected_reads == 2:
+                        composer.picker_labels[composer.options[0]] = "Sonnet"
+                return composer._capture_pane(socket_path, target)
+
+            monkeypatch.setattr(claude_native_bridge, "_capture_pane", capture)
+    elif scenario == "dialog":
+        if guard == "foreign-permission":
+
+            def capture(socket_path: str, target: str) -> str:
+                pane = composer._capture_pane(socket_path, target)
+                return pane + _PERMISSION_PROMPT_PANE if composer.overlay == "cache-cost" else pane
+
+            monkeypatch.setattr(claude_native_bridge, "_capture_pane", capture)
+        else:
+            composer.cache_cost_label = guard
+    elif guard == "legacy":
         options[1]["provenance"] = "legacy"
-    elif metadata == "duplicate-label":
+    elif guard == "duplicate-label":
         options[0]["display_name"] = label
     else:
         options[1]["display_name"] = label
     config_path.write_text(json.dumps(config))
-    composer.install(monkeypatch)
 
     with pytest.raises(claude_native_bridge.ClaudeModelSwitchRefused) as caught:
-        claude_native_bridge.inject_model_command(bridge_dir, model="private-glm[1m]")
+        claude_native_bridge.inject_model_command(bridge_dir, model=model)
 
     assert caught.value.phase == "commit" and caught.value.model_may_have_changed
     assert composer.confirmations == composer.status_queries == 0
