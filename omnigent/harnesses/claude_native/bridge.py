@@ -2991,8 +2991,16 @@ def build_hook_settings(
     # Pasted attachments are cached outside the workspace, so Claude would ask
     # before reading them. Deny/ask rules and Omnigent policy hooks still apply.
     attachment_read_rule = _claude_read_rule(attachment_cache_dir(bridge_dir))
-    if attachment_read_rule is not None:
-        permissions["allow"] = [attachment_read_rule]
+    allow_rules = [attachment_read_rule] if attachment_read_rule is not None else []
+    # Omnigent reviews the full change and requires human approval server-side.
+    # Don't let a second native prompt or classifier prevent that review.
+    allow_rules.extend(
+        (
+            "mcp__omnigent__sys_scheduled_task_create",
+            "mcp__omnigent__sys_scheduled_task_update",
+        )
+    )
+    permissions["allow"] = allow_rules
     if permissions:
         settings["permissions"] = permissions
     if launch_bypass_permissions:

@@ -1,6 +1,7 @@
 // Tests for the scheduled-task DETAIL page (`/tasks/:taskId`): header + prompt
 // + configuration + run-history rendering from mocked hooks, the header actions
-// (Run now fires the mutation + shows a toast, delete navigates back, edit opens the dialog),
+// (Run now fires the mutation + shows a toast, delete navigates back, edit and
+// share open their dialogs),
 // and the run-row rendering rules: the LEFT status-icon column (failed triangle
 // > skipped calendar-off > running spinner > succeeded-unread brand-accent dot > succeeded-read grey dot),
 // duration, errorCode messages, and the whole-row click affordance (a run with a
@@ -11,7 +12,7 @@
 
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, useLocation, useNavigationType } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
@@ -33,6 +34,9 @@ import {
 } from "@/hooks/useUnseenConversations";
 import type * as UnseenModule from "@/hooks/useUnseenConversations";
 import { ScheduledTaskApiError } from "@/lib/scheduledTasksApi";
+import type { ServerInfo } from "@/lib/capabilities";
+import { useViewerId } from "@/hooks/useViewerId";
+import type { SharedAutomation } from "@/components/PermissionsModal";
 import type * as RoutingModule from "@/lib/routing";
 import type * as SavedWorkflowsModule from "@/hooks/useSavedWorkflows";
 import type {
@@ -159,6 +163,33 @@ vi.mock("@/components/scheduled/CreateScheduledTaskDialog", () => ({
     ) : null,
 }));
 
+// Who is viewing decides whether Share is offered; nobody until a test says so.
+vi.mock("@/hooks/useViewerId", () => ({ useViewerId: vi.fn(() => null) }));
+
+// Stub the share dialog to a marker reporting the automation it shares.
+vi.mock("@/components/PermissionsModal", () => ({
+  PermissionsModal: ({
+    automation,
+    open,
+    onOpenChange,
+  }: {
+    automation?: SharedAutomation;
+    open: boolean;
+    onOpenChange: (open: boolean) => void;
+  }) =>
+    open ? (
+      <div
+        data-testid="share-dialog-open"
+        data-automation-id={automation?.id ?? ""}
+        data-session-mode={automation?.sessionMode ?? ""}
+      >
+        <button type="button" onClick={() => onOpenChange(false)}>
+          Close share
+        </button>
+      </div>
+    ) : null,
+}));
+
 function task(overrides: Partial<ScheduledTask> = {}): ScheduledTask {
   return {
     id: "st_1",
@@ -173,6 +204,7 @@ function task(overrides: Partial<ScheduledTask> = {}): ScheduledTask {
     modelOverride: null,
     reasoningEffort: null,
     permissionMode: null,
+    mcpServices: [],
     sessionMode: "new",
     sessionId: null,
     workspace: null,
@@ -241,6 +273,7 @@ function setRuns(
 
 beforeEach(() => {
   routeParams = { taskId: "st_1" };
+  vi.mocked(useViewerId).mockReturnValue(null);
   vi.mocked(useOptionalLoadedConversations).mockReturnValue(undefined);
   useAvailableAgents.mockImplementation(defaultAgentCatalog);
   navigate.mockReset();
@@ -267,7 +300,20 @@ beforeEach(() => {
 
 afterEach(cleanup);
 
-function pageTree() {
+/** Reports the current search and how the router last got there (push or replace). */
+function LocationProbe() {
+  const location = useLocation();
+  const navigationType = useNavigationType();
+  return (
+    <div
+      data-testid="location-probe"
+      data-search={location.search}
+      data-navigation={navigationType}
+    />
+  );
+}
+
+function pageTree(initialEntries?: string[]) {
   // QueryClient required by other hooks in the tree (useScheduledTask, etc.).
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false, gcTime: 0 } },
@@ -275,8 +321,9 @@ function pageTree() {
   return (
     <QueryClientProvider client={queryClient}>
       <TooltipProvider>
-        <MemoryRouter>
+        <MemoryRouter initialEntries={initialEntries}>
           <TaskDetailPage />
+          <LocationProbe />
         </MemoryRouter>
       </TooltipProvider>
     </QueryClientProvider>
@@ -890,6 +937,240 @@ describe("header actions", () => {
   });
 });
 
+describe("sharing", () => {
+  const sharingInfo: ServerInfo = { ...SERVER_INFO_OFFLINE_FALLBACK, scheduled_task_sharing: true };
+
+  function renderSharingPage(info: ServerInfo, entry = "/tasks/st_1") {
+    setTask(task({ ownerUserId: "alice@example.com", sessionMode: "continue" }));
+    render(<CapabilitiesProvider info={info}>{pageTree([entry])}</CapabilitiesProvider>);
+  }
+
+  it.each([
+    ["the owner", sharingInfo, "alice@example.com", true],
+    ["another user", sharingInfo, "bob@example.com", false],
+    [
+      "a server that cannot share automations",
+      SERVER_INFO_OFFLINE_FALLBACK,
+      "alice@example.com",
+      false,
+    ],
+  ])("offers Share to %s", (_label, info, viewerId, offered) => {
+    vi.mocked(useViewerId).mockReturnValue(viewerId);
+    renderSharingPage(info);
+    expect(screen.queryByTestId("task-detail-share") !== null).toBe(offered);
+  });
+
+  it("opens the share dialog for this automation", () => {
+    vi.mocked(useViewerId).mockReturnValue("alice@example.com");
+    renderSharingPage(sharingInfo);
+    expect(screen.queryByTestId("share-dialog-open")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Share automation" }));
+
+    const dialog = screen.getByTestId("share-dialog-open");
+    expect(dialog).toHaveAttribute("data-automation-id", "st_1");
+    expect(dialog).toHaveAttribute("data-session-mode", "continue");
+    fireEvent.click(screen.getByRole("button", { name: "Close share" }));
+    expect(screen.queryByTestId("share-dialog-open")).toBeNull();
+  });
+
+  it("opens the share dialog from a session's link and replaces the request on close", () => {
+    vi.mocked(useViewerId).mockReturnValue("alice@example.com");
+    renderSharingPage(sharingInfo, "/tasks/st_1?share=1");
+
+    expect(screen.getByTestId("share-dialog-open")).toHaveAttribute("data-automation-id", "st_1");
+    fireEvent.click(screen.getByRole("button", { name: "Close share" }));
+    expect(screen.queryByTestId("share-dialog-open")).toBeNull();
+    // Replaced, not pushed: Back leaves the page instead of reopening the dialog.
+    const probe = screen.getByTestId("location-probe");
+    expect(probe).toHaveAttribute("data-search", "");
+    expect(probe).toHaveAttribute("data-navigation", "REPLACE");
+  });
+
+  it.each([
+    ["the viewer cannot share", sharingInfo, "bob@example.com"],
+    ["sharing is off", { ...sharingInfo, sharing_mode: "off" as const }, "alice@example.com"],
+  ])("ignores the link's request when %s", (_label, info, viewerId) => {
+    vi.mocked(useViewerId).mockReturnValue(viewerId);
+    renderSharingPage(info, "/tasks/st_1?share=1");
+    expect(screen.queryByTestId("share-dialog-open")).toBeNull();
+  });
+
+  it("disables Share with the session Share's reason while sharing is off", () => {
+    vi.mocked(useViewerId).mockReturnValue("alice@example.com");
+    renderSharingPage({ ...sharingInfo, sharing_mode: "off" });
+
+    const share = screen.getByRole("button", { name: "Share automation" });
+    expect(share).toBeDisabled();
+    expect(
+      screen.getByLabelText(
+        "Share automation disabled: Sharing has been disabled for this Omnigent server.",
+      ),
+    ).toContainElement(share);
+    fireEvent.click(share);
+    expect(screen.queryByTestId("share-dialog-open")).toBeNull();
+  });
+});
+
+describe("an automation shared with the viewer", () => {
+  const sharingInfo: ServerInfo = {
+    ...SERVER_INFO_OFFLINE_FALLBACK,
+    scheduled_task_sharing: true,
+    features: { workflows: true },
+  };
+  const sharedTask = (overrides: Partial<ScheduledTask> = {}) =>
+    task({
+      ownerUserId: "alice@example.com",
+      viewerRole: "viewer",
+      ownerDisplayName: "Alice",
+      hostId: "h_owner",
+      projectId: "proj_owner",
+      ...overrides,
+    });
+
+  function renderShared(data: ScheduledTask, entry = "/tasks/st_1") {
+    vi.mocked(useViewerId).mockReturnValue("bob@example.com");
+    setTask(data);
+    render(<CapabilitiesProvider info={sharingInfo}>{pageTree([entry])}</CapabilitiesProvider>);
+  }
+
+  it("names its owner and shows every change disabled with why", () => {
+    renderShared(sharedTask(), "/tasks/st_1?share=1");
+    expect(screen.getByTestId("task-detail-owner")).toHaveTextContent("Shared by Alice");
+    const controls: [string, string][] = [
+      ["Share automation", "Only the automation's owner can share it."],
+      ["Edit automation", "Only the automation's owner can edit it."],
+      ["Delete automation", "Only the automation's owner can delete it."],
+      ["Run now", "Only the automation's owner can run it."],
+      ["Pause automation", "Only the automation's owner can pause it."],
+    ];
+    for (const [label, reason] of controls) {
+      const wrapper = screen.getByRole("group", { name: label });
+      expect(wrapper).toHaveAttribute("aria-disabled", "true");
+      const control = within(wrapper).getByRole(label === "Pause automation" ? "switch" : "button");
+      expect(control).toBeDisabled();
+      fireEvent.click(control);
+      fireEvent.focus(wrapper);
+      expect(screen.getByRole("tooltip")).toHaveTextContent(reason);
+      fireEvent.blur(wrapper);
+    }
+    expect(updateMutate).not.toHaveBeenCalled();
+    expect(deleteMutate).not.toHaveBeenCalled();
+    expect(runNowMutate).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("edit-dialog-open")).toBeNull();
+    // A share link the owner would follow opens nothing for a viewer.
+    expect(screen.queryByTestId("share-dialog-open")).toBeNull();
+  });
+
+  it("says Resume on a paused automation", () => {
+    renderShared(sharedTask({ state: "paused" }));
+    expect(screen.getByRole("group", { name: "Resume automation" })).toHaveAttribute(
+      "aria-disabled",
+      "true",
+    );
+  });
+
+  it("keeps the owner's host, project and source session private", () => {
+    renderShared(sharedTask({ sourceSessionId: "conv_copy" }));
+    expect(screen.getByTestId("task-detail-starts-from")).toHaveTextContent(
+      "Each run starts with a copy of a session the owner chose.",
+    );
+    expect(screen.queryByRole("link", { name: "Weekly rubric copy" })).toBeNull();
+    openConfiguration();
+    expect(screen.getByTestId("task-detail-host")).toHaveTextContent("The owner's host");
+    expect(screen.queryByTestId("task-detail-project")).toBeNull();
+  });
+
+  it("lists each run's outcome without its session's data or tasks", () => {
+    const steps: ScheduledTaskRunSteps = {
+      runId: "run_1",
+      planId: "plan_1",
+      planGraphRevision: "graph-0",
+      isCurrent: true,
+      workflowId: "9".repeat(32),
+      planName: "Triage",
+      steps: [
+        { id: "explore", name: "Explore", goal: null, depends_on: [] },
+        { id: "fix", name: "Fix", goal: null, depends_on: ["explore"] },
+      ],
+      statuses: [],
+    };
+    // The server leaves every session field of a viewer's runs empty.
+    const withoutSession = {
+      conversationUpdatedAt: null,
+      conversationStatus: null,
+      viewerLastSeen: null,
+      viewerUnread: null,
+      sessionCostUsd: null,
+      conversationPendingApprovals: 0,
+      errorDetail: null,
+    };
+    setRuns([
+      run({ id: "run_1", conversationId: "c_9", ...withoutSession }),
+      run({
+        id: "run_2",
+        status: "failed",
+        errorCode: "runner_start_failed",
+        conversationId: "c_7",
+        ...withoutSession,
+      }),
+      run({ id: "run_3", status: "skipped", errorCode: "no_online_host", ...withoutSession }),
+    ]);
+    // Even a session the viewer flagged unread shows no dot on its run.
+    markConversationUnread("c_9", 1_700_000_500);
+    vi.mocked(hooks.useScheduledTaskRunSteps).mockReturnValue(new Map([["run_1", steps]]));
+    renderShared(sharedTask());
+
+    expect(hooks.useScheduledTaskRunSteps).toHaveBeenLastCalledWith(
+      "st_1",
+      expect.any(Array),
+      false,
+    );
+    const [succeeded, failed, skipped] = screen.getAllByTestId("task-detail-run");
+    expect(within(succeeded!).getByTestId("run-open")).toHaveAttribute("href", "/c/c_9");
+    expect(succeeded).toHaveAttribute("data-run-unread", "false");
+    expect(within(succeeded!).getByTestId("run-status-dot")).toHaveAttribute(
+      "data-run-icon",
+      "read",
+    );
+    expect(within(failed!).getByTestId("run-open")).toHaveAttribute("href", "/c/c_7");
+    expect(within(failed!).getByTestId("run-failure")).toHaveTextContent(
+      "Runner · The agent didn't start.",
+    );
+    expect(within(skipped!).getByTestId("run-failure")).toHaveTextContent(
+      "Host · None of your hosts was online.",
+    );
+    for (const testId of [
+      "run-cost",
+      "run-pending-approval",
+      "run-failure-detail",
+      "run-status-label",
+      "tasks-progress-segment",
+      "run-graph-button",
+    ]) {
+      expect(screen.queryByTestId(testId)).toBeNull();
+    }
+    expect(screen.queryByText(/Session cost is each session/)).toBeNull();
+
+    // The owner's same row shows its tasks and their controls.
+    cleanup();
+    vi.mocked(useViewerId).mockReturnValue("alice@example.com");
+    setTask(sharedTask({ viewerRole: "owner", ownerDisplayName: null }));
+    setRuns([run({ id: "run_1", status: "succeeded", conversationId: "c_9" })]);
+    render(<CapabilitiesProvider info={sharingInfo}>{pageTree()}</CapabilitiesProvider>);
+    expect(hooks.useScheduledTaskRunSteps).toHaveBeenLastCalledWith(
+      "st_1",
+      expect.any(Array),
+      true,
+    );
+    const ownersRow = screen.getByTestId("task-detail-run");
+    expect(within(ownersRow).getAllByTestId("tasks-progress-segment")).toHaveLength(2);
+    expect(within(ownersRow).getByTestId("plan-continue")).toBeInTheDocument();
+    expect(within(ownersRow).getByTestId("run-workflow-button")).toBeInTheDocument();
+    expect(screen.queryByTestId("task-detail-owner")).toBeNull();
+  });
+});
+
 describe("run history", () => {
   it.each([
     [1.234, "$1.23"],
@@ -1402,6 +1683,7 @@ it.each(["continue", "new"] as const)(
     setTask(
       task({
         prompt: "This automation watches Jira and starts one Omnigent session",
+        rrule: "FREQ=MINUTELY;INTERVAL=10",
         sessionMode,
         nextRunAt: "2026-03-10T14:00:00Z",
       }),
@@ -1416,14 +1698,15 @@ it.each(["continue", "new"] as const)(
         {pageTree()}
       </CapabilitiesProvider>,
     );
+    const schedule = screen.getByTestId("task-detail-schedule");
     if (sessionMode === "continue") {
-      expect(screen.getByTestId("task-detail-schedule")).toHaveTextContent(
-        "Runs when new items match",
-      );
-      expect(screen.getByTestId("task-detail-schedule")).not.toHaveTextContent("Next run");
+      expect(schedule).toHaveTextContent("Runs when new items match");
+      expect(schedule).not.toHaveTextContent("Every 10 minutes");
+      expect(schedule).not.toHaveTextContent("Next run");
       expect(screen.queryByTestId("task-detail-run-now")).not.toBeInTheDocument();
     } else {
-      expect(screen.getByTestId("task-detail-schedule")).toHaveTextContent("Next run");
+      expect(schedule).toHaveTextContent("Every 10 minutes");
+      expect(schedule).toHaveTextContent("Next run");
       expect(screen.getByTestId("task-detail-run-now")).toBeInTheDocument();
     }
   },
@@ -1434,6 +1717,7 @@ describe("runs of a saved workflow", () => {
   const STEPS: ScheduledTaskRunSteps = {
     runId: "run_1",
     planId: "plan_1",
+    planGraphRevision: "graph-0",
     isCurrent: true,
     workflowId: "9".repeat(32),
     planName: "Triage",
@@ -1450,7 +1734,7 @@ describe("runs of a saved workflow", () => {
         step: "explore",
         author: { type: "agent" },
         kind: "status",
-        content: { status: "done", text: "Found it" },
+        content: { status: "done", text: "Found it", graph_revision: "graph-0" },
       },
     ],
   };
@@ -1561,6 +1845,37 @@ describe("runs of a saved workflow", () => {
       expect(screen.getByTestId("workflow-graph-overlay")).toHaveTextContent("fix:stopped");
       fireEvent.click(screen.getByRole("button", { name: "Close graph" }));
     }
+
+    // A final result can finish the workflow without filling in every earlier status.
+    vi.mocked(hooks.useScheduledTaskRunSteps).mockReturnValue(
+      new Map([["run_1", { ...STEPS, statuses: [{ ...STEPS.statuses[0]!, step: "fix" }] }]]),
+    );
+    rerender(renderWorkflowPage());
+    expect(within(row).queryByTestId("plan-continue")).toBeNull();
+    expect(within(row).queryByTestId("plan-stop")).toBeNull();
+
+    vi.mocked(useOptionalLoadedConversations).mockReturnValue({
+      ...conversationPage([conversation("c_9", { background_work_running: true })]).data!,
+      pageParams: [undefined],
+    });
+    rerender(renderWorkflowPage());
+    expect(within(row).queryByTestId("plan-continue")).toBeNull();
+    expect(within(row).queryByTestId("plan-stop")).toBeNull();
+
+    vi.mocked(hooks.useScheduledTaskRunSteps).mockReturnValue(
+      new Map([
+        [
+          "run_1",
+          {
+            ...STEPS,
+            planGraphRevision: undefined,
+            statuses: [STEPS.statuses[0]!, { ...STEPS.statuses[0]!, id: "s2", step: "fix" }],
+          },
+        ],
+      ]),
+    );
+    rerender(renderWorkflowPage());
+    expect(within(row).getByRole("button", { name: "Stop" })).toBeInTheDocument();
   });
 
   it.each([false, true])(

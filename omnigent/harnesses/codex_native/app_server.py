@@ -22,6 +22,7 @@ from collections.abc import (
     Callable,
     Collection,
     Iterable,
+    Iterator,
     Mapping,
     Sequence,
 )
@@ -317,7 +318,12 @@ def _format_codex_version(version: tuple[int, int, int] | None) -> str:
 #: Omnigent tools the framework calls on every session's behalf, pre-approved
 #: so codex never raises an interactive prompt for them. The rename keeps a
 #: session's title current, which the framework does unprompted on any session.
-_FRAMEWORK_APPROVED_TOOLS: tuple[str, ...] = ("sys_session_rename",)
+# Automation mutations still require Omnigent's server-side human approval.
+_FRAMEWORK_APPROVED_TOOLS: tuple[str, ...] = (
+    "sys_session_rename",
+    "sys_scheduled_task_create",
+    "sys_scheduled_task_update",
+)
 
 #: Additionally pre-approved for an auto-harness Smart Routing session, whose
 #: spawns the router may move onto the counterpart harness family: these four
@@ -4313,8 +4319,10 @@ def build_codex_native_server(
         pinned_model = codex_spawn_model(databricks.model) or databricks.model
     if extra_config_overrides:
         config_overrides.extend(extra_config_overrides)
-    # The --remote TUI's launch args do not configure this app-server's MCP tools.
+    # The --remote TUI's launch args do not configure this app-server's MCP tools
+    # or context window, which govern the turns it runs.
     config_overrides.extend(codex_mcp_tool_approval_overrides(terminal_launch_args))
+    config_overrides.extend(codex_model_window_overrides(terminal_launch_args))
     if bypass_sandbox:
         # Mirror the --remote TUI's --dangerously-bypass-approvals-and-sandbox
         # on the app-server threads: never prompt for approval, and run
@@ -5200,20 +5208,11 @@ def _codex_config_string(raw_value: str) -> str:
     return value if isinstance(value, str) else ""
 
 
-def codex_mcp_tool_approval_overrides(
+def _codex_config_assignments(
     terminal_launch_args: Sequence[str] | None,
-) -> list[str]:
-    """Return the launch args' explicit approval modes for Omnigent ``sys_*`` tools.
-
-    These ``mcp_servers.omnigent.tools.<tool>.approval_mode`` assignments must
-    also reach the app-server that runs web-chat turns. Other MCP servers,
-    config keys, and the global approval policy are left untouched.
-
-    :param terminal_launch_args: Persisted Codex launch arguments.
-    :returns: ``-c`` assignment strings for :func:`build_codex_native_server`.
-    """
+) -> Iterator[tuple[str, str]]:
+    """Yield each ``-c``/``--config`` assignment in the launch args as ``(key, raw_value)``."""
     args = canonical_codex_launch_args(terminal_launch_args or ())
-    modes: dict[str, str | None] = {}
     index = 0
     while index < len(args):
         arg = args[index]
@@ -5227,13 +5226,60 @@ def codex_mcp_tool_approval_overrides(
             assignment = arg.split("=", 1)[1]
         if assignment is not None:
             key, _, raw_value = assignment.partition("=")
-            key = key.strip()
-            # Codex applies overrides in order: a later key or parent-table assignment wins.
-            for tracked_key in [tracked for tracked in modes if tracked.startswith(f"{key}.")]:
-                del modes[tracked_key]
-            if re.fullmatch(r"mcp_servers\.omnigent\.tools\.sys_[a-z_]+\.approval_mode", key):
-                modes[key] = _codex_config_string(raw_value)
+            yield key.strip(), raw_value
         index += 1
+
+
+# Model-window keys sized per session: the thread's context window and the
+# token count that triggers auto-compaction.
+_CODEX_MODEL_WINDOW_KEYS = ("model_context_window", "model_auto_compact_token_limit")
+
+
+def codex_model_window_overrides(terminal_launch_args: Sequence[str] | None) -> list[str]:
+    """Return the launch args' context-window overrides for the app-server.
+
+    The ``--remote`` TUI does not run turns, so a ``-c model_context_window=N``
+    on its argv alone leaves the thread at the model catalog's default window.
+    Only positive integers are carried; the last assignment of a key wins.
+
+    :param terminal_launch_args: Persisted Codex launch arguments, e.g.
+        ``["-c", "model_context_window=872000"]``.
+    :returns: ``-c`` assignment strings, e.g. ``["model_context_window=872000"]``.
+    """
+    windows: dict[str, int] = {}
+    for key, raw_value in _codex_config_assignments(terminal_launch_args):
+        if key not in _CODEX_MODEL_WINDOW_KEYS:
+            continue
+        try:
+            value = tomlkit.parse(f"value = {raw_value}")["value"]
+        except Exception:  # noqa: BLE001 - not a TOML value; Codex would reject it too.
+            value = None
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            windows[key] = int(value)
+        else:
+            windows.pop(key, None)
+    return [f"{key}={value}" for key, value in windows.items()]
+
+
+def codex_mcp_tool_approval_overrides(
+    terminal_launch_args: Sequence[str] | None,
+) -> list[str]:
+    """Return the launch args' explicit approval modes for Omnigent ``sys_*`` tools.
+
+    These ``mcp_servers.omnigent.tools.<tool>.approval_mode`` assignments must
+    also reach the app-server that runs web-chat turns. Other MCP servers,
+    config keys, and the global approval policy are left untouched.
+
+    :param terminal_launch_args: Persisted Codex launch arguments.
+    :returns: ``-c`` assignment strings for :func:`build_codex_native_server`.
+    """
+    modes: dict[str, str | None] = {}
+    for key, raw_value in _codex_config_assignments(terminal_launch_args):
+        # Codex applies overrides in order: a later key or parent-table assignment wins.
+        for tracked_key in [tracked for tracked in modes if tracked.startswith(f"{key}.")]:
+            del modes[tracked_key]
+        if re.fullmatch(r"mcp_servers\.omnigent\.tools\.sys_[a-z_]+\.approval_mode", key):
+            modes[key] = _codex_config_string(raw_value)
     # Only explicit grants and prompts are carried; Codex rejects "deny" at startup.
     return [
         f"{key}={json.dumps(mode)}" for key, mode in modes.items() if mode in {"approve", "prompt"}

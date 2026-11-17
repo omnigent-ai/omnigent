@@ -31,6 +31,7 @@ import * as identity from "@/lib/identity";
 import * as sandboxModelsHook from "@/hooks/useSandboxModelOptions";
 import * as hostsHook from "@/hooks/useHosts";
 import * as scheduledHooks from "@/hooks/useScheduledTasks";
+import { authorizeRegistryService, registryRequest, type RegistryService } from "@/lib/mcpRegistry";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
@@ -71,6 +72,10 @@ vi.mock("@/hooks/useHostWorktrees", () => ({
   },
 }));
 vi.mock("@/hooks/useAvailableAgents", () => ({ useAvailableAgents: vi.fn() }));
+vi.mock("@/lib/mcpRegistry", () => ({
+  registryRequest: vi.fn(),
+  authorizeRegistryService: vi.fn(),
+}));
 // useHostModelOptions is consumed by the ModelEffortFields sub-form (model
 // dropdown source). Returning no data makes it fall back to the static Claude
 // alias list, which is what a no-host-pinned scheduled task uses anyway.
@@ -381,6 +386,11 @@ function chooseTriggerSessionMode(label: "New session for each match" | "One tas
   fireEvent.click(screen.getByRole("menuitemradio", { name: new RegExp(`^${label}`) }));
 }
 
+/** A trigger saves a polling schedule but never shows it ("Every N minutes" or "Hourly"). */
+function expectNoPollingInterval() {
+  expect(document.body).not.toHaveTextContent(/Every \d+ minutes|Hourly/);
+}
+
 function closeTopLevelPopovers() {
   for (const testId of ["task-schedule-trigger", "task-ending-trigger"]) {
     const trigger = screen.queryByTestId(testId);
@@ -505,6 +515,7 @@ function scheduledTask(overrides: Partial<ScheduledTasksApiModule.ScheduledTask>
     modelOverride: null,
     reasoningEffort: null,
     permissionMode: null,
+    mcpServices: [],
     sessionMode: "new",
     sessionId: null,
     workspace: null,
@@ -3360,13 +3371,13 @@ describe("CreateScheduledTaskDialog session mode", () => {
         expect(screen.queryByTestId("task-schedule-trigger")).toBeNull();
         expect(screen.queryByTestId("custom-schedule-trigger")).toBeNull();
         expect(screen.queryByTestId("schedule-preset-trigger")).toBeNull();
-        expect(screen.queryByTestId("task-trigger-cadence")).toBeNull();
         expect(screen.queryByTestId("task-session-mode-trigger")).toBeNull();
         if (!supported) {
           expect(submit).toBeDisabled();
           fireEvent.click(screen.getByRole("button", { name: "Use supported schedule" }));
         }
         await waitFor(() => expect(submit).toBeEnabled());
+        expectNoPollingInterval();
         fireEvent.click(submit);
         await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
         expect(updateMutateAsync.mock.calls[0][0].input.rrule).toBe(
@@ -3864,6 +3875,29 @@ describe("automation trigger type", () => {
       expect(input).not.toHaveProperty("sessionId");
     });
 
+    it("keeps the instructions a chosen workflow hides when the worker changes", async () => {
+      savedWorkflowsList.current = [
+        { id: "0123456789abcdef0123456789abcdef", name: "Triage", description: "Triages." },
+      ];
+      try {
+        render(
+          dialog(
+            { editingTask: slackTask },
+            { features: { automations_v2: true, session_orchestration: true, workflows: true } },
+          ),
+        );
+        fireEvent.pointerDown(screen.getByTestId("task-workflow-trigger"), { button: 0 });
+        fireEvent.click(screen.getByTestId("composer-saved-workflow"));
+        expect(screen.queryByTestId("task-prompt-input")).toBeNull();
+        await choose("Polly", "task-worker-agent-trigger");
+        fireEvent.pointerDown(screen.getByTestId("task-workflow-trigger"), { button: 0 });
+        fireEvent.click(screen.getByTestId("workflow-picker-clear"));
+        expect(screen.getByTestId("task-prompt-input")).toHaveValue("Answer the question.");
+      } finally {
+        savedWorkflowsList.current = [];
+      }
+    });
+
     it("keeps a worker permission mode chosen while switched when switching back", async () => {
       render(dialog({ editingTask: slackTask }, { session_create_permission_modes: true }));
       await choose("Jira");
@@ -4107,7 +4141,7 @@ describe("CreateScheduledTaskDialog trigger template", () => {
       fillJira();
       expect(screen.queryByLabelText("Frequency")).not.toBeInTheDocument();
       expect(screen.queryByTestId("task-schedule-trigger")).not.toBeInTheDocument();
-      expect(screen.queryByTestId("task-trigger-cadence")).not.toBeInTheDocument();
+      expectNoPollingInterval();
       const prompt = await submittedPrompt();
       expect(prompt).toContain(
         `On the first run, use ${minutes > 60 ? `${minutes} minutes` : "one hour"} ago and nothing pending.`,
@@ -4128,13 +4162,13 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     );
     expect(sessionMode).toHaveTextContent("New session for each match");
     expect(screen.getByLabelText("Instructions for each session")).toHaveValue("Triage it.");
-    expect(screen.queryByTestId("task-trigger-cadence")).not.toBeInTheDocument();
+    expectNoPollingInterval();
     expect(screen.queryByTestId("task-schedule-trigger")).not.toBeInTheDocument();
 
     chooseTriggerSessionMode("One task session");
     expect(sessionMode).toHaveTextContent("One task session for all matches");
     expect(screen.getByLabelText("Instructions for the task session")).toHaveValue("Triage it.");
-    expect(screen.queryByTestId("task-trigger-cadence")).not.toBeInTheDocument();
+    expectNoPollingInterval();
     expect(screen.queryByTestId("task-schedule-trigger")).not.toBeInTheDocument();
     type("task-name-input", "Ticket triage");
 
@@ -4262,8 +4296,23 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     expect(screen.getByTestId("task-trigger-untrusted-note")).toBeInTheDocument();
   });
 
+  function mockLaptop(longSessionMessagesSupported: boolean) {
+    vi.mocked(hostsHook.useHosts).mockReturnValue({
+      data: [
+        {
+          host_id: "host_1",
+          name: "laptop",
+          owner: "me",
+          status: "online",
+          long_session_messages_supported: longSessionMessagesSupported,
+        },
+      ],
+    } as unknown as ReturnType<typeof hostsHook.useHosts>);
+  }
+
   it("keeps submit disabled until the scope, every condition and the instructions are filled", () => {
-    renderTrigger("jira");
+    mockLaptop(true);
+    renderTrigger("jira", { session_message_max_chars: 32_000 });
     const submit = screen.getByTestId("create-scheduled-task-submit");
     expect(submit).toBeDisabled();
     expect(screen.queryByTestId("task-trigger-preview")).toBeNull();
@@ -4299,10 +4348,13 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     expect(submit).toBeEnabled();
 
     // Over-long instructions would crowd the item out of a worker's first message.
-    type("task-trigger-instructions", "x".repeat(2001));
+    type("task-trigger-instructions", "x".repeat(16_000));
+    expect(submit).toBeEnabled();
+    expect(screen.queryByTestId("task-trigger-too-long")).toBeNull();
+    type("task-trigger-instructions", "x".repeat(16_001));
     expect(submit).toBeDisabled();
     expect(screen.getByTestId("task-trigger-too-long")).toHaveTextContent(
-      "Keep instructions to 2,000 characters or fewer",
+      "Keep instructions to 16,000 characters or fewer",
     );
     // The Instructions panel is hidden behind the Trigger tab, so the reason stays visible here.
     expect(screen.getByRole("tab", { name: "Trigger" })).toHaveAttribute("aria-selected", "true");
@@ -4310,7 +4362,7 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     expect(screen.getByTestId("task-trigger-instructions-invalid")).toBeInTheDocument();
     expect(screen.getByTestId("task-trigger-instructions-too-long-notice")).toBeVisible();
     expect(screen.getByTestId("task-trigger-instructions-too-long-notice")).toHaveTextContent(
-      "Keep instructions to 2,000 characters or fewer",
+      "Keep instructions to 16,000 characters or fewer",
     );
     fireEvent.click(screen.getByRole("button", { name: "Edit instructions" }));
     expect(screen.getByRole("tab", { name: "Instructions" })).toHaveAttribute(
@@ -4319,6 +4371,243 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     );
     expect(screen.getByTestId("task-trigger-too-long")).toBeVisible();
     expect(screen.queryByTestId("task-trigger-instructions-too-long-notice")).toBeNull();
+  });
+
+  it.each([
+    [
+      "an older host",
+      { session_message_max_chars: 32_000 },
+      false,
+      'Update Omnigent on "laptop" and keep it online to allow up to 16,000.',
+    ],
+    ["an older server", {}, true, "Update the Omnigent server to allow up to 16,000."],
+  ])(
+    "keeps the 2,000-character instructions limit on %s",
+    async (_case, extraInfo, hostSupported, upgradeHint) => {
+      mockLaptop(hostSupported);
+      renderTrigger("jira", extraInfo);
+      const submit = screen.getByTestId("create-scheduled-task-submit");
+      fillJira();
+
+      // Its runner or server would refuse each worker message over 8,000 characters.
+      type("task-trigger-instructions", "x".repeat(9_000));
+      expect(submit).toBeDisabled();
+      expect(screen.getByTestId("task-trigger-instructions-too-long-notice")).toHaveTextContent(
+        "Keep instructions to 2,000 characters or fewer so each session's first message has " +
+          `room for the item. ${upgradeHint}`,
+      );
+
+      type("task-trigger-instructions", "x".repeat(2_000));
+      expect(submit).toBeEnabled();
+      const prompt = await submittedPrompt();
+      expect(prompt).toContain("and a message under 8000 characters.");
+      expect(prompt).not.toContain("32000");
+    },
+  );
+
+  function mockLaptopAndOldBox() {
+    vi.mocked(hostsHook.useHosts).mockReturnValue({
+      data: [
+        {
+          host_id: "host_1",
+          name: "laptop",
+          owner: "me",
+          status: "online",
+          long_session_messages_supported: true,
+        },
+        {
+          host_id: "host_2",
+          name: "old-box",
+          owner: "me",
+          status: "online",
+          long_session_messages_supported: false,
+        },
+      ],
+    } as unknown as ReturnType<typeof hostsHook.useHosts>);
+  }
+
+  /** Pick a host by name, or the managed sandbox. */
+  async function pickTarget(name: string | "sandbox") {
+    const hostTrigger = screen.getByTestId("task-host-trigger");
+    fireEvent.pointerDown(hostTrigger, new MouseEvent("pointerdown", { bubbles: true, button: 0 }));
+    fireEvent.click(hostTrigger);
+    fireEvent.click(
+      name === "sandbox"
+        ? screen.getByTestId("task-host-sandbox-option")
+        : await screen.findByRole("option", { name }),
+    );
+  }
+
+  const longInstructions = "x".repeat(12_000);
+  const longTriggerTask = scheduledTask({
+    prompt: encodeTriggerPrompt(
+      {
+        source: "jira",
+        ...emptyTriggerFields("jira"),
+        scope: "ES",
+        instructions: longInstructions,
+        worker: {
+          placement: "same_host",
+          agentId: null,
+          model: "",
+          effort: "",
+          permissionMode: "",
+        },
+      },
+      { sessionLink: "https://example.test/c/CONVERSATION_ID" },
+    ),
+    sessionMode: "continue",
+    sessionId: "poller",
+    hostId: "host_1",
+  });
+
+  it.each([
+    ["is loading", "loading" as const],
+    ["is the boot fallback", SERVER_INFO_OFFLINE_FALLBACK],
+  ])("doesn't flag a saved trigger's long instructions while server info %s", (_case, info) => {
+    mockLaptop(false);
+    const dialog = (
+      <CreateScheduledTaskDialog open onOpenChange={vi.fn()} editingTask={longTriggerTask} />
+    );
+    const { rerender } = render(<CapabilitiesProvider info={info}>{dialog}</CapabilitiesProvider>);
+    const submit = screen.getByTestId("create-scheduled-task-submit");
+    expect(screen.getByTestId("task-trigger-instructions")).toHaveValue(longInstructions);
+    expect(screen.queryByTestId("task-trigger-instructions-too-long-notice")).toBeNull();
+    expect(screen.queryByText(/Update the Omnigent server/)).toBeNull();
+    expect(submit).toBeDisabled();
+
+    rerender(
+      <CapabilitiesProvider
+        info={{
+          ...SERVER_INFO_OFFLINE_FALLBACK,
+          scheduled_task_session_modes: true,
+          scheduled_task_trigger_headers: true,
+          session_message_max_chars: 32_000,
+        }}
+      >
+        {dialog}
+      </CapabilitiesProvider>,
+    );
+    expect(submit).toBeEnabled();
+    expect(screen.queryByTestId("task-trigger-instructions-too-long-notice")).toBeNull();
+  });
+
+  it("keeps a saved trigger's long instructions on its own target only", async () => {
+    // The saved host reads as unsupported, e.g. offline or on another replica.
+    mockLaptopAndOldBox();
+    vi.mocked(sandboxModelsHook.useSandboxModelOptions).mockReturnValue({
+      data: { models: [], configured: false, status: "ready" },
+    } as unknown as ReturnType<typeof sandboxModelsHook.useSandboxModelOptions>);
+    render(
+      <CapabilitiesProvider
+        info={{
+          ...SERVER_INFO_OFFLINE_FALLBACK,
+          scheduled_task_session_modes: true,
+          scheduled_task_trigger_headers: true,
+          session_message_max_chars: 32_000,
+          managed_sandboxes_enabled: true,
+          sandbox_provider: "modal",
+          sandbox_provider_capabilities: { modal: { default_models: true } },
+        }}
+      >
+        <CreateScheduledTaskDialog
+          open
+          onOpenChange={vi.fn()}
+          editingTask={{ ...longTriggerTask, hostId: "host_2" }}
+        />
+      </CapabilitiesProvider>,
+    );
+    const submit = screen.getByTestId("create-scheduled-task-submit");
+    const notice = () => screen.queryByTestId("task-trigger-instructions-too-long-notice");
+    expect(screen.getByTestId("task-trigger-instructions")).toHaveValue(longInstructions);
+    expect(notice()).toBeNull();
+
+    await pickTarget("sandbox");
+    expect(submit).toBeDisabled();
+    expect(notice()).toHaveTextContent("Run it on a host with the current Omnigent");
+    await pickTarget("laptop");
+    expect(submit).toBeEnabled();
+    expect(notice()).toBeNull();
+    await pickTarget("old-box");
+    expect(notice()).toBeNull();
+    expect(screen.getByTestId("task-trigger-instructions")).toHaveValue(longInstructions);
+
+    type("task-trigger-instructions", `${longInstructions} Then triage it.`);
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    const prompt = updateMutateAsync.mock.calls[0][0].input.prompt;
+    expect(prompt).toContain("and a message under 32000 characters.");
+    expect(prompt).toContain(`${longInstructions} Then triage it.`);
+  });
+
+  it("keeps a sandbox trigger saved under the older limit at that limit on an unrelated edit", async () => {
+    vi.mocked(sandboxModelsHook.useSandboxModelOptions).mockReturnValue({
+      data: { models: [], configured: false, status: "ready" },
+    } as unknown as ReturnType<typeof sandboxModelsHook.useSandboxModelOptions>);
+    const saved = encodeTriggerPrompt(
+      {
+        source: "jira",
+        ...emptyTriggerFields("jira"),
+        scope: "ES",
+        instructions: "Triage it.",
+        worker: {
+          placement: "same_host",
+          agentId: null,
+          model: "",
+          effort: "",
+          permissionMode: "",
+        },
+      },
+      { sessionLink: "https://example.test/c/CONVERSATION_ID", messageMaxChars: 8000 },
+    );
+    const task = scheduledTask({
+      prompt: saved,
+      sessionMode: "continue",
+      sessionId: "poller",
+      executionTarget: "managed_sandbox",
+    });
+    render(
+      <CapabilitiesProvider
+        info={{
+          ...SERVER_INFO_OFFLINE_FALLBACK,
+          scheduled_task_session_modes: true,
+          scheduled_task_trigger_headers: true,
+          session_message_max_chars: 32_000,
+          managed_sandboxes_enabled: true,
+          sandbox_provider: "modal",
+          sandbox_provider_capabilities: { modal: { default_models: true } },
+        }}
+      >
+        <CreateScheduledTaskDialog open onOpenChange={vi.fn()} editingTask={task} />
+      </CapabilitiesProvider>,
+    );
+    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "Renamed" } });
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    const prompt = updateMutateAsync.mock.calls[0][0].input.prompt;
+    expect(prompt).toContain("and a message under 8000 characters.");
+    expect(prompt).not.toContain("32000");
+  });
+
+  it("checks instructions against the host picked, keeping them across a switch", async () => {
+    mockLaptopAndOldBox();
+    renderTrigger("jira", { session_message_max_chars: 32_000 });
+    const submit = screen.getByTestId("create-scheduled-task-submit");
+    fillJira();
+    type("task-trigger-instructions", "x".repeat(9_000));
+    expect(submit).toBeEnabled();
+
+    await pickTarget("old-box");
+    expect(submit).toBeDisabled();
+    expect(screen.getByTestId("task-trigger-instructions-too-long-notice")).toHaveTextContent(
+      'Update Omnigent on "old-box" and keep it online to allow up to 16,000.',
+    );
+    expect(screen.getByTestId("task-trigger-instructions")).toHaveValue("x".repeat(9_000));
+
+    await pickTarget("laptop");
+    expect(submit).toBeEnabled();
+    expect(screen.queryByTestId("task-trigger-instructions-too-long-notice")).toBeNull();
+    expect(await submittedPrompt()).toContain("and a message under 32000 characters.");
   });
 
   it("compiles the builder rows into the saved hourly continue-mode task", async () => {
@@ -4415,7 +4704,7 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     type("task-trigger-instructions", "Reproduce it.");
     fireEvent.click(
       screen.getByRole("checkbox", {
-        name: "Include the session link with the result in the thread",
+        name: "Reply in the thread with the session link when work starts",
       }),
     );
 
@@ -6747,28 +7036,34 @@ describe("CreateScheduledTaskDialog workflow", () => {
     fireEvent.click(screen.getByTestId("composer-saved-workflow"));
   }
 
-  it("runs a saved workflow, with the instructions as each run's details", async () => {
+  it("runs a saved workflow as saved, without the automation's instructions", async () => {
     renderWithWorkflows(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} />);
     expect(screen.getByTestId("task-workflow-trigger")).toHaveTextContent("No workflow");
     fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "Nightly" } });
+    fireEvent.change(screen.getByTestId("task-prompt-input"), {
+      target: { value: "Summarize the day." },
+    });
     chooseWorkflow();
 
     expect(screen.getByTestId("task-workflow-trigger")).toHaveTextContent("Triage flaky tests");
     // Once chosen, the field shows the workflow's name only.
     expect(screen.queryByText(/Give it: the test suite/)).toBeNull();
-    expect(screen.getByLabelText("Additional instructions")).toBe(
-      screen.getByTestId("task-prompt-input"),
+    // Text typed before choosing the workflow is hidden and not sent to its runs.
+    expect(screen.queryByTestId("task-prompt-input")).toBeNull();
+    expect(screen.getByTestId("task-workflow-note")).toHaveTextContent(
+      "Each run follows this workflow as saved.",
     );
-    // The workflow alone is enough; details are optional.
+    // Clearing the workflow brings the draft back.
+    fireEvent.pointerDown(screen.getByTestId("task-workflow-trigger"), { button: 0 });
+    fireEvent.click(screen.getByTestId("workflow-picker-clear"));
+    expect(screen.getByTestId("task-prompt-input")).toHaveValue("Summarize the day.");
+    chooseWorkflow();
     const submit = screen.getByTestId("create-scheduled-task-submit");
     await waitFor(() => expect(submit).toBeEnabled());
-    fireEvent.change(screen.getByTestId("task-prompt-input"), {
-      target: { value: "The upload tests" },
-    });
     fireEvent.click(submit);
 
     await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
-    expect(mutateAsync.mock.calls[0][0].prompt).toBe(run("The upload tests"));
+    expect(mutateAsync.mock.calls[0][0].prompt).toBe(run(""));
   });
 
   it("keeps the workflow it was opened from: the field has no menu, and runs follow it", async () => {
@@ -6785,9 +7080,7 @@ describe("CreateScheduledTaskDialog workflow", () => {
     expect(field).toBeDisabled();
     fireEvent.pointerDown(field, { button: 0 });
     expect(screen.queryByTestId("composer-workflow-picker")).toBeNull();
-    expect(screen.getByLabelText("Additional instructions")).toBe(
-      screen.getByTestId("task-prompt-input"),
-    );
+    expect(screen.queryByTestId("task-prompt-input")).toBeNull();
 
     const submit = screen.getByTestId("create-scheduled-task-submit");
     await waitFor(() => expect(submit).toBeEnabled());
@@ -6799,7 +7092,7 @@ describe("CreateScheduledTaskDialog workflow", () => {
     });
   });
 
-  it("opens a workflow automation with its workflow chosen and its details", () => {
+  it("keeps instructions an automation already saved with its workflow editable", async () => {
     renderWithWorkflows(
       <CreateScheduledTaskDialog
         open
@@ -6808,68 +7101,488 @@ describe("CreateScheduledTaskDialog workflow", () => {
       />,
     );
     expect(screen.getByTestId("task-workflow-trigger")).toHaveTextContent("Triage flaky tests");
-    expect(screen.getByTestId("task-prompt-input")).toHaveValue("The upload tests");
+    const instructions = screen.getByLabelText("Additional instructions (optional)");
+    expect(instructions).toHaveValue("The upload tests");
+    expect(screen.queryByTestId("task-workflow-note")).toBeNull();
+    fireEvent.change(instructions, { target: { value: "The download tests" } });
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input.prompt).toBe(run("The download tests"));
   });
 
-  it.each([false, true])(
-    "creates and edits a workflow trigger with header support %s",
-    async (headersSupported) => {
-      const view = render(
-        <CreateScheduledTaskDialog
-          open
-          onOpenChange={vi.fn()}
-          initialTrigger="github"
-          initialTemplateId="github"
-        />,
-        {
-          info: {
-            scheduled_task_session_modes: true,
-            scheduled_task_subhour: true,
-            scheduled_task_trigger_headers: headersSupported,
-            automation_trigger_poll_minutes: 30,
-            features: { automations_v2: true, session_orchestration: true, workflows: true },
-          },
+  it("stops showing saved instructions once they're saved empty", async () => {
+    const view = renderWithWorkflows(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({ prompt: run("The upload tests") })}
+      />,
+    );
+    fireEvent.change(screen.getByLabelText("Additional instructions (optional)"), {
+      target: { value: "" },
+    });
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    const saved = updateMutateAsync.mock.calls[0][0].input.prompt as string;
+    expect(saved).toBe(run(""));
+
+    const props = { onOpenChange: vi.fn(), editingTask: scheduledTask({ prompt: saved }) };
+    view.rerender(<CreateScheduledTaskDialog open={false} {...props} />);
+    view.rerender(<CreateScheduledTaskDialog open {...props} />);
+    expect(screen.queryByTestId("task-prompt-input")).toBeNull();
+    expect(screen.getByTestId("task-workflow-note")).toBeInTheDocument();
+  });
+
+  it("runs another chosen workflow as saved, without the first one's saved instructions", async () => {
+    const weeklyReport = {
+      id: "fedcba9876543210fedcba9876543210",
+      name: "Weekly report",
+      description: "Summarizes the week.",
+    };
+    savedWorkflowsList.current = [WORKFLOW, weeklyReport];
+    renderWithWorkflows(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({ prompt: run("The upload tests") })}
+      />,
+    );
+    fireEvent.pointerDown(screen.getByTestId("task-workflow-trigger"), { button: 0 });
+    fireEvent.click(screen.getByText(weeklyReport.name));
+    expect(screen.queryByTestId("task-prompt-input")).toBeNull();
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input.prompt).toBe(
+      `/workflow Run the saved workflow "Weekly report" (ID ${weeklyReport.id}).`,
+    );
+  });
+
+  function renderGithubTrigger(headersSupported: boolean) {
+    return render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        initialTrigger="github"
+        initialTemplateId="github"
+      />,
+      {
+        info: {
+          scheduled_task_session_modes: true,
+          scheduled_task_subhour: true,
+          scheduled_task_trigger_headers: headersSupported,
+          automation_trigger_poll_minutes: 30,
+          features: { automations_v2: true, session_orchestration: true, workflows: true },
         },
-      );
+      },
+    );
+  }
+
+  /** Reopen a saved trigger to edit it, on its Instructions tab. */
+  function reopenTrigger(
+    view: ReturnType<typeof render>,
+    prompt: string,
+    headersSupported: boolean,
+  ) {
+    const props = {
+      onOpenChange: vi.fn(),
+      editingTask: scheduledTask({ prompt, sessionMode: "continue" }),
+    };
+    view.rerender(<CreateScheduledTaskDialog open={false} {...props} />);
+    view.rerender(<CreateScheduledTaskDialog open {...props} />);
+    // A trigger saved without a header reopens as its prompt, with no tabs.
+    if (headersSupported) {
+      fireEvent.mouseDown(screen.getByRole("tab", { name: "Instructions" }), { button: 0 });
+    }
+  }
+
+  const triggerInstructions = (prompt: string, headersSupported: boolean) =>
+    headersSupported
+      ? decodeTriggerPrompt(prompt)?.instructions
+      : splitTriggerPrompt(prompt).userPrompt;
+
+  it.each([false, true])(
+    "keeps a trigger's instructions saved with its workflow editable (header support %s)",
+    async (headersSupported) => {
+      const view = renderGithubTrigger(headersSupported);
       fireEvent.change(screen.getByTestId("task-trigger-scope"), { target: { value: "acme/app" } });
       fireEvent.mouseDown(screen.getByRole("tab", { name: "Instructions" }), { button: 0 });
-      chooseWorkflow();
-      expect(screen.getByLabelText("Additional instructions")).toBe(
-        screen.getByTestId("task-trigger-instructions"),
-      );
+      // The shape older forms saved for a workflow with instructions.
       fireEvent.change(screen.getByTestId("task-trigger-instructions"), {
-        target: { value: "Only bugs" },
+        target: { value: run("Only bugs") },
       });
       fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
-
       await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
-      const prompt = mutateAsync.mock.calls[0][0].prompt as string;
-      expect(prompt).toContain("repo:acme/app");
-      expect(prompt).toContain(run("Only bugs"));
-      expect(hasTriggerHeader(prompt)).toBe(headersSupported);
 
-      const props = {
-        onOpenChange: vi.fn(),
-        editingTask: scheduledTask({ prompt, sessionMode: "continue" }),
-      };
-      view.rerender(<CreateScheduledTaskDialog open={false} {...props} />);
-      view.rerender(<CreateScheduledTaskDialog open {...props} />);
-      if (headersSupported) {
-        fireEvent.mouseDown(screen.getByRole("tab", { name: "Instructions" }), { button: 0 });
-      }
+      reopenTrigger(view, mutateAsync.mock.calls[0][0].prompt as string, headersSupported);
       expect(screen.getByTestId("task-workflow-trigger")).toHaveTextContent(WORKFLOW.name);
-      const instructions = screen.getByLabelText("Additional instructions");
+      const instructions = screen.getByLabelText("Additional instructions (optional)");
       expect(instructions).toHaveValue("Only bugs");
       fireEvent.change(instructions, { target: { value: "Only upload bugs" } });
       fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
 
       await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
       const updated = updateMutateAsync.mock.calls[0][0].input.prompt as string;
-      const updatedInstructions = headersSupported
-        ? decodeTriggerPrompt(updated)?.instructions
-        : splitTriggerPrompt(updated).userPrompt;
-      expect(updatedInstructions).toBe(run("Only upload bugs"));
+      expect(triggerInstructions(updated, headersSupported)).toBe(run("Only upload bugs"));
+    },
+  );
+
+  it.each([false, true])(
+    "creates and edits a workflow trigger with header support %s",
+    async (headersSupported) => {
+      const view = renderGithubTrigger(headersSupported);
+      const instructionsOf = (text: string) => triggerInstructions(text, headersSupported);
+      fireEvent.change(screen.getByTestId("task-trigger-scope"), { target: { value: "acme/app" } });
+      fireEvent.mouseDown(screen.getByRole("tab", { name: "Instructions" }), { button: 0 });
+      expect(screen.getByTestId("task-trigger-instructions-required")).toBeInTheDocument();
+      chooseWorkflow();
+      // Each session follows the workflow as saved, so there are no instructions to require.
+      expect(screen.queryByTestId("task-trigger-instructions-required")).toBeNull();
+      expect(screen.queryByTestId("task-trigger-instructions")).toBeNull();
+      // A draft typed without the workflow comes back when it's cleared, and stays out of its runs.
+      fireEvent.pointerDown(screen.getByTestId("task-workflow-trigger"), { button: 0 });
+      fireEvent.click(screen.getByTestId("workflow-picker-clear"));
+      fireEvent.change(screen.getByTestId("task-trigger-instructions"), {
+        target: { value: "Only bugs" },
+      });
+      chooseWorkflow();
+      fireEvent.pointerDown(screen.getByTestId("task-workflow-trigger"), { button: 0 });
+      fireEvent.click(screen.getByTestId("workflow-picker-clear"));
+      expect(screen.getByTestId("task-trigger-instructions")).toHaveValue("Only bugs");
+      chooseWorkflow();
+      fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+
+      await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+      const prompt = mutateAsync.mock.calls[0][0].prompt as string;
+      expect(prompt).toContain("repo:acme/app");
+      expect(instructionsOf(prompt)).toBe(run(""));
+      expect(hasTriggerHeader(prompt)).toBe(headersSupported);
+
+      reopenTrigger(view, prompt, headersSupported);
+      expect(screen.getByTestId("task-workflow-trigger")).toHaveTextContent(WORKFLOW.name);
+      expect(screen.queryByLabelText("Additional instructions (optional)")).toBeNull();
+      fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "Bug triage" } });
+      fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+
+      await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+      const updated = updateMutateAsync.mock.calls[0][0].input.prompt as string;
+      expect(instructionsOf(updated)).toBe(run(""));
       expect(updated).toContain("repo:acme/app");
     },
   );
+});
+
+describe("CreateScheduledTaskDialog MCP services", () => {
+  const github: RegistryService = {
+    id: "github",
+    title: "GitHub",
+    description: "",
+    auth: "oauth",
+    connected: true,
+    tools: [],
+    connect_provider: "oauth",
+  };
+  const linear: RegistryService = { ...github, id: "linear", title: "Linear", connected: false };
+
+  const registryInfo = {
+    ...SERVER_INFO_OFFLINE_FALLBACK,
+    features: { automations_v2: true },
+    scheduled_task_harness_settings: true,
+    scheduled_task_mcp_services: true,
+    enabled_connections: ["mcp"],
+  };
+
+  function renderWithRegistry(ui: React.ReactElement) {
+    const view = render(<CapabilitiesProvider info={registryInfo}>{ui}</CapabilitiesProvider>);
+    return {
+      ...view,
+      rerender: (next: React.ReactElement) =>
+        view.rerender(<CapabilitiesProvider info={registryInfo}>{next}</CapabilitiesProvider>),
+    };
+  }
+
+  beforeEach(() => {
+    vi.mocked(registryRequest).mockResolvedValue({ data: [github, linear] });
+    vi.mocked(authorizeRegistryService).mockReset();
+  });
+
+  /** The MCP row lives under Advanced settings, so expand it first. */
+  async function mcpTrigger() {
+    if (!screen.queryByTestId("task-mcp-services-trigger")) {
+      fireEvent.click(screen.getByTestId("task-advanced-settings-trigger"));
+    }
+    return screen.findByTestId("task-mcp-services-trigger");
+  }
+
+  /** Open the MCP row's menu and return a service's switch. */
+  async function mcpSwitch(name: string) {
+    fireEvent.click(await mcpTrigger());
+    return screen.findByRole("switch", { name });
+  }
+
+  it("is hidden without the registry or on a server that rejects task MCP services", () => {
+    renderDialog();
+    expect(screen.queryByTestId("task-mcp-services-trigger")).not.toBeInTheDocument();
+    cleanup();
+    render(
+      <CapabilitiesProvider
+        info={{ ...SERVER_INFO_OFFLINE_FALLBACK, enabled_connections: ["mcp"] }}
+      >
+        <CreateScheduledTaskDialog open onOpenChange={vi.fn()} />
+      </CapabilitiesProvider>,
+    );
+    expect(screen.queryByTestId("task-mcp-services-trigger")).not.toBeInTheDocument();
+    expect(registryRequest).not.toHaveBeenCalled();
+  });
+
+  it("saves the services a new automation starts with", async () => {
+    renderWithRegistry(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} />);
+    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "Nightly" } });
+    fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "Triage" } });
+    expect(screen.getByTestId("task-mcp-services-trigger")).toHaveTextContent("No MCPs");
+    fireEvent.click(await mcpSwitch("GitHub"));
+    await waitFor(() =>
+      expect(screen.getByTestId("task-mcp-services-trigger")).toHaveTextContent("MCPs · 1"),
+    );
+    fireEvent.click(screen.getByTestId("task-mcp-services-trigger"));
+    const hostTrigger = screen.getByTestId("task-host-trigger");
+    fireEvent.pointerDown(hostTrigger, new MouseEvent("pointerdown", { bubbles: true, button: 0 }));
+    fireEvent.click(hostTrigger);
+    fireEvent.click(screen.getByRole("option", { name: /laptop/ }));
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    expect(mutateAsync.mock.calls[0][0].mcpServices).toEqual(["github"]);
+  });
+
+  it("starts a new automation with no services, whatever a new chat last picked", async () => {
+    localStorage.setItem("omnigent:last-mcp-services", JSON.stringify(["github"]));
+    renderWithRegistry(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} />);
+    expect(await mcpSwitch("GitHub")).not.toBeChecked();
+    expect(screen.getByTestId("task-mcp-services-trigger")).toHaveTextContent("No MCPs");
+  });
+
+  it("blocks saving until every selected service is signed in", async () => {
+    renderWithRegistry(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({ mcpServices: ["linear"] })}
+      />,
+    );
+    expect(await screen.findByTestId("task-mcp-services-blocked")).toHaveTextContent(
+      "Sign in to each selected MCP service",
+    );
+    expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
+
+    fireEvent.click(await mcpSwitch("Linear"));
+    expect(screen.queryByTestId("task-mcp-services-blocked")).not.toBeInTheDocument();
+    expect(screen.getByTestId("create-scheduled-task-submit")).toBeEnabled();
+  });
+
+  it.each([
+    ["unchanged", false, undefined],
+    ["turned off", true, []],
+  ])("sends the services on edit only when they change (%s)", async (_, turnOff, expected) => {
+    renderWithRegistry(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({ mcpServices: ["github"] })}
+      />,
+    );
+    const toggle = await mcpSwitch("GitHub");
+    expect(toggle).toBeChecked();
+    if (turnOff) fireEvent.click(toggle);
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input.mcpServices).toEqual(expected);
+  });
+
+  const triggerInfo = {
+    ...SERVER_INFO_OFFLINE_FALLBACK,
+    features: { session_orchestration: true },
+    scheduled_task_session_modes: true,
+    scheduled_task_trigger_headers: true,
+    scheduled_task_mcp_services: true,
+    enabled_connections: ["mcp"],
+  };
+
+  function renderTrigger(source: "slack" | "jira", services: RegistryService[]) {
+    vi.mocked(registryRequest).mockResolvedValue({ data: services });
+    return render(
+      <CapabilitiesProvider info={triggerInfo}>
+        <CreateScheduledTaskDialog open onOpenChange={vi.fn()} initialTrigger={source} />
+      </CapabilitiesProvider>,
+    );
+  }
+  const slack: RegistryService = { ...github, id: "slack", title: "Slack" };
+
+  it("leaves the services alone when a trigger is picked or switched", async () => {
+    renderTrigger("slack", [github, slack, { ...github, id: "jira", title: "Jira" }]);
+    const add = await screen.findByTestId("task-trigger-mcp-add");
+    const chip = await mcpTrigger();
+    // A signed-in service is offered, not turned on.
+    expect(add).toHaveTextContent("Add Slack MCP");
+    expect(chip).toHaveTextContent("No MCPs");
+    expect(screen.queryByTestId("task-trigger-tools-note")).not.toBeInTheDocument();
+
+    fireEvent.click(add);
+    await waitFor(() => expect(chip).toHaveTextContent("MCPs · 1"));
+    expect(screen.getByTestId("task-trigger-mcp-note")).toHaveTextContent("Uses Slack MCP");
+    expect(authorizeRegistryService).not.toHaveBeenCalled();
+
+    // Switching triggers keeps what the owner added, and offers the new trigger's service.
+    fireEvent.keyDown(screen.getByTestId("task-trigger-type"), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: /Jira/ }));
+    await waitFor(() =>
+      expect(screen.getByTestId("task-trigger-mcp-add")).toHaveTextContent("Add Jira MCP"),
+    );
+    expect(chip).toHaveTextContent("MCPs · 1");
+  });
+
+  it("signs in to a trigger's MCP service from the trigger without blocking the save", async () => {
+    vi.mocked(authorizeRegistryService).mockResolvedValue(undefined);
+    renderTrigger("slack", [github, { ...slack, connected: false }]);
+    const add = await screen.findByTestId("task-trigger-mcp-add");
+    expect(add).toHaveTextContent("Add Slack MCP");
+    // Nothing is picked for the owner, so nothing needs sign-in to save.
+    expect(screen.getByTestId("task-mcp-services-trigger")).toHaveTextContent("No MCPs");
+    expect(screen.queryByTestId("task-mcp-services-blocked")).not.toBeInTheDocument();
+    expect(authorizeRegistryService).not.toHaveBeenCalled();
+
+    vi.mocked(registryRequest).mockResolvedValue({ data: [github, slack] });
+    fireEvent.click(add);
+    await waitFor(() =>
+      expect(screen.getByTestId("task-mcp-services-trigger")).toHaveTextContent("MCPs · 1"),
+    );
+    expect(authorizeRegistryService).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId("task-trigger-mcp-note")).toHaveTextContent("Uses Slack MCP");
+  });
+
+  it("says why a trigger's MCP sign-in failed, and lets the owner retry", async () => {
+    vi.mocked(authorizeRegistryService).mockRejectedValueOnce(
+      new Error("Allow popups for this site to sign in."),
+    );
+    renderTrigger("slack", [github, { ...slack, connected: false }]);
+    fireEvent.click(await screen.findByTestId("task-trigger-mcp-add"));
+    expect(await screen.findByTestId("task-trigger-mcp-sign-in-error")).toHaveTextContent(
+      "Allow popups for this site to sign in.",
+    );
+    expect(screen.getByTestId("task-mcp-services-trigger")).toHaveTextContent("No MCPs");
+
+    vi.mocked(authorizeRegistryService).mockResolvedValueOnce(undefined);
+    vi.mocked(registryRequest).mockResolvedValue({ data: [github, slack] });
+    fireEvent.click(screen.getByTestId("task-trigger-mcp-add"));
+    await waitFor(() =>
+      expect(screen.getByTestId("task-mcp-services-trigger")).toHaveTextContent("MCPs · 1"),
+    );
+    expect(screen.queryByTestId("task-trigger-mcp-sign-in-error")).not.toBeInTheDocument();
+  });
+
+  it("drops a trigger sign-in still pending when its draft closes", async () => {
+    let finish!: () => void;
+    vi.mocked(authorizeRegistryService).mockImplementation(
+      (_service, signal) =>
+        new Promise<void>((done, reject) => {
+          finish = done;
+          signal.addEventListener("abort", () => reject(new Error("Sign-in cancelled.")), {
+            once: true,
+          });
+        }),
+    );
+    const view = renderTrigger("slack", [github, { ...slack, connected: false }]);
+    fireEvent.click(await screen.findByTestId("task-trigger-mcp-add"));
+    expect(screen.getByTestId("task-trigger-mcp-add")).toHaveTextContent("Signing in to Slack");
+
+    const reopen = (open: boolean) =>
+      view.rerender(
+        <CapabilitiesProvider info={triggerInfo}>
+          <CreateScheduledTaskDialog open={open} onOpenChange={vi.fn()} initialTrigger="slack" />
+        </CapabilitiesProvider>,
+      );
+    reopen(false);
+    reopen(true);
+    vi.mocked(registryRequest).mockResolvedValue({ data: [github, slack] });
+    await act(async () => finish());
+
+    // The new draft neither gains the old draft's service nor waits on its sign-in.
+    expect(await screen.findByTestId("task-trigger-mcp-add")).toHaveTextContent("Add Slack MCP");
+    expect(await mcpTrigger()).toHaveTextContent("No MCPs");
+    expect(screen.queryByTestId("task-trigger-mcp-sign-in-error")).not.toBeInTheDocument();
+  });
+
+  it("sends a pasted-token trigger service to settings rather than a sign-in popup", async () => {
+    renderTrigger("slack", [github, { ...slack, auth: "bearer", connected: false }]);
+    const add = await screen.findByTestId("task-trigger-mcp-add");
+    expect(add).toHaveTextContent("Add Slack MCP");
+    expect(add).toHaveAttribute("href", "/settings/mcp");
+    fireEvent.click(add);
+    expect(authorizeRegistryService).not.toHaveBeenCalled();
+  });
+
+  it("keeps the tools warning for a trigger the server has no MCP service for", async () => {
+    renderTrigger("jira", [github, slack]);
+    await waitFor(() => expect(registryRequest).toHaveBeenCalled());
+    expect(screen.getByTestId("task-trigger-tools-note")).toHaveTextContent("MCP required");
+    expect(screen.queryByTestId("task-trigger-mcp-add")).not.toBeInTheDocument();
+    expect(screen.getByTestId("task-mcp-services-trigger")).toHaveTextContent("No MCPs");
+  });
+
+  it("leaves a continued session's services alone", async () => {
+    renderWithRegistry(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({
+          sessionMode: "continue",
+          sessionId: "conv_kept",
+          mcpServices: ["linear"],
+        })}
+      />,
+    );
+    const trigger = await screen.findByTestId("task-mcp-services-trigger");
+    expect(trigger).toBeDisabled();
+    expect(trigger).toHaveTextContent("Session's MCPs");
+    // An unsigned service it can't add to the session does not block saving.
+    expect(screen.queryByTestId("task-mcp-services-blocked")).not.toBeInTheDocument();
+    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "Renamed" } });
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input).not.toHaveProperty("mcpServices");
+  });
+
+  it.each([
+    ["loading", () => new Promise<never>(() => {}), null],
+    ["failed", () => Promise.reject(new Error("down")), "Could not load MCP services"],
+  ])("blocks saving while the catalog is %s", async (_, response, message) => {
+    vi.mocked(registryRequest).mockImplementation(response);
+    renderWithRegistry(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({ mcpServices: ["github"] })}
+      />,
+    );
+    if (message === null) {
+      // The reason waits for the catalog, but saving is held until then.
+      await waitFor(() => expect(registryRequest).toHaveBeenCalled());
+      expect(screen.queryByTestId("task-mcp-services-blocked")).not.toBeInTheDocument();
+    } else {
+      expect(await screen.findByTestId("task-mcp-services-blocked")).toHaveTextContent(message);
+    }
+    expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
+  });
+
+  it("closes the MCP menu when the dialog is reopened", async () => {
+    const view = renderWithRegistry(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} />);
+    await mcpSwitch("GitHub");
+    expect(screen.getByTestId("task-mcp-services-menu")).toBeInTheDocument();
+    view.rerender(<CreateScheduledTaskDialog open={false} onOpenChange={vi.fn()} />);
+    view.rerender(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} />);
+    expect(await screen.findByTestId("task-mcp-services-trigger")).toBeInTheDocument();
+    expect(screen.queryByTestId("task-mcp-services-menu")).not.toBeInTheDocument();
+  });
 });
