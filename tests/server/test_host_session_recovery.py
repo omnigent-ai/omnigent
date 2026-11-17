@@ -630,6 +630,32 @@ async def test_opt_out_then_reenable_does_not_revive_old_episode(recovery: Any) 
     assert recovery.store.get_session_recovery(recovery.conv.id).phase == "stopped"
 
 
+@pytest.mark.parametrize("stopped", [False, True])
+@pytest.mark.parametrize("input_kind", ["echo", "new-turn", "authored"])
+def test_native_input_echo_preserves_turn_evidence(
+    recovery: Any, stopped: bool, input_kind: str
+) -> None:
+    store, conv = recovery.store, recovery.conv
+    if stopped:
+        recovery.service.stop_recovery(conv)
+    before = store.get_session_recovery(conv.id)
+    store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="turn-2" if input_kind == "new-turn" else "turn-1",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": "Continue the task"}],
+                    user_authored=input_kind == "authored",
+                ),
+            )
+        ],
+    )
+    assert store.get_session_recovery(conv.id) == (before if input_kind == "echo" else None)
+
+
 def test_delayed_terminal_cannot_close_a_new_turn(recovery: Any) -> None:
     store, conv = recovery.store, recovery.conv
     user_input(store, conv.id)

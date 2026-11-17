@@ -5661,10 +5661,12 @@ async def test_malformed_native_failure_context_does_not_reject_status(
 
 
 @pytest.mark.parametrize("recovery_configured", [False, True])
+@pytest.mark.parametrize("wrapper", [None, "claude-code-native-ui", "codex-native-ui"])
 async def test_post_external_session_status_carries_response_id(
     client: httpx.AsyncClient,
     app: FastAPI,
     recovery_configured: bool,
+    wrapper: str | None,
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -5684,6 +5686,12 @@ async def test_post_external_session_status_carries_response_id(
     store = SqlAlchemyConversationStore(db_uri)
     store.set_host_id(session["id"], "a" * 32, workspace="/workspace")
     store.set_runner_id(session["id"], "turn-runner")
+    if wrapper is not None:
+        store.set_labels(session["id"], {"omnigent.wrapper": wrapper})
+        store.update_conversation_with_changes(
+            session["id"],
+            harness_override="codex-native" if wrapper == "codex-native-ui" else "claude-native",
+        )
     assert app.state.host_session_recoverer is None
     if recovery_configured:
         app.state.host_session_recoverer = HostSessionRecoverer(
@@ -5723,7 +5731,11 @@ async def test_post_external_session_status_carries_response_id(
         )
         assert resp.status_code == 202, resp.text
         state = store.get_session_recovery(session["id"])
-        expected = ("stopped" if completed else "active") if recovery_configured else None
+        expected = (
+            ("stopped" if completed or wrapper == "codex-native-ui" else "active")
+            if recovery_configured
+            else None
+        )
         assert (state.phase if state else None) == expected
 
 

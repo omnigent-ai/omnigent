@@ -3482,8 +3482,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                         and not item.data.is_meta
                         and recovery is not None
                         and index not in interruption_notices
+                        and (item.data.user_authored or item.response_id != recovery.response_id)
                     ):
-                        # Real input supersedes recovery and any later echo in this batch.
+                        # A native turn's delayed input echo must retain its lifecycle fence.
                         _write_session_recovery(session, conversation_id, None)
                         recovery = None
                     if item.stable_id is not None:

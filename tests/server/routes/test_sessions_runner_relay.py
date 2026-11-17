@@ -4589,12 +4589,13 @@ async def test_relay_leaves_a_turn_on_an_offline_host_to_the_disconnect_hold(
 
 
 @pytest.mark.parametrize("configured", [False, True])
+@pytest.mark.parametrize("native", [False, True])
 @pytest.mark.parametrize(
     "outcome", ["unfinished", "idle", "completed", "failed", "cancelled", "waiting"]
 )
 @pytest.mark.asyncio
 async def test_relay_persists_recoverable_turn_and_terminal_fence(
-    db_uri: str, outcome: str, configured: bool, monkeypatch: pytest.MonkeyPatch
+    db_uri: str, outcome: str, configured: bool, native: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from unittest.mock import Mock
 
@@ -4609,7 +4610,12 @@ async def test_relay_persists_recoverable_turn_and_terminal_fence(
     monkeypatch.setattr(
         session_live_state, "_host_session_recoverer", recoverer if configured else None
     )
-    conv = store.create_conversation(host_id="a" * 32, runner_id="runner", workspace="/workspace")
+    conv = store.create_conversation(
+        host_id="a" * 32,
+        runner_id="runner",
+        workspace="/workspace",
+        labels={"omnigent.wrapper": "codex-native-ui"} if native else None,
+    )
     release = asyncio.Event()
     release.set()
     events = [{"type": "response.in_progress", "response": {"id": "turn"}}]
@@ -4621,7 +4627,7 @@ async def test_relay_persists_recoverable_turn_and_terminal_fence(
         conv.id, _ScriptedRunnerClient(release, events), store, runner_id="runner"
     )
     state = store.get_session_recovery(conv.id)
-    if not configured:
+    if not configured or native:
         assert state is None
         return
     assert state.response_id == "turn"

@@ -42,6 +42,7 @@ from omnigent.entities.conversation import (
     parse_item_data,
 )
 from omnigent.errors import ErrorCode, OmnigentError, WrongReplicaError
+from omnigent.harness_aliases import is_native_harness
 from omnigent.harness_plugins import NativeCodingAgent
 from omnigent.harnesses.codex_native.shell_input import shell_command_from_input
 from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
@@ -2781,15 +2782,32 @@ def register_events_routes(
             # succeeded, so the earlier failure must not outlive it.
             turn_completed = status == "idle" and data.get("turn_completed") is True
             recoverer = getattr(request.app.state, "host_session_recoverer", None)
+            recovery_terminal = turn_completed
+            if recoverer is not None and status == "idle":
+                harness = await asyncio.to_thread(
+                    _native_pane_harness, conv, agent_store=agent_store, agent_cache=agent_cache
+                )
+                recovery_terminal = turn_completed or (
+                    is_native_harness(harness)
+                    and native_subagent_terminal_status(
+                        status,
+                        harness=harness,
+                        turn_outcome=data.get("turn_outcome"),
+                        turn_completed=data.get("turn_completed"),
+                    )
+                    is not None
+                )
             if recoverer is not None and (
-                status in {"running", "failed", "waiting"} or turn_completed
+                status in {"running", "failed", "waiting"} or recovery_terminal
             ):
                 await asyncio.to_thread(
                     recoverer.record_turn,
                     session_id,
                     conv.runner_id,
                     response_id,
-                    finished=status in {"failed", "waiting"} or turn_completed or bool(blocked_on),
+                    finished=status in {"failed", "waiting"}
+                    or recovery_terminal
+                    or bool(blocked_on),
                 )
             recovered_from_failure = (
                 turn_completed and _session_status_cache.get(session_id) == "failed"
