@@ -1,6 +1,7 @@
 # Sandbox providers
 
-Sandbox providers manage remote environments for Omnigent agent hosts. Use a built-in provider or add one through the `omnigent.sandbox_providers` entry-point group.
+Sandbox providers manage isolated environments for Omnigent agent sessions.
+They create or connect to a sandbox and start its Omnigent host.
 
 ## Harness providers and model lists
 
