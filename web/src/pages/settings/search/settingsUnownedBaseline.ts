@@ -88,26 +88,6 @@ export const UNOWNED_CONTROLS: Readonly<Record<string, { count: number; reason: 
     count: 1,
     reason: "Sharing page's select, input or note, not yet catalog-owned.",
   },
-  "src/pages/settings/CustomAgentConfigForm.tsx › CustomAgentConfigForm › Button": {
-    count: 1,
-    reason: "Retry button; owning it would rename it.",
-  },
-  "src/pages/settings/CustomAgentConfigForm.tsx › MCPFields › Button": {
-    count: 5,
-    reason: "MCP server row in the agent form, the same rows as the create page's.",
-  },
-  "src/pages/settings/CustomAgentConfigForm.tsx › MCPFields › Input": {
-    count: 7,
-    reason: "MCP server row in the agent form, the same rows as the create page's.",
-  },
-  "src/pages/settings/CustomAgentConfigForm.tsx › MCPFields › option": {
-    count: 5,
-    reason: "MCP server row in the agent form, the same rows as the create page's.",
-  },
-  "src/pages/settings/CustomAgentConfigForm.tsx › MCPFields › select": {
-    count: 2,
-    reason: "MCP server row in the agent form, the same rows as the create page's.",
-  },
   "src/pages/settings/GlobalShortcutControl.tsx › GlobalShortcutControl › Button": {
     count: 1,
     reason: "Global shortcut row's control, not yet catalog-owned.",
@@ -202,18 +182,6 @@ export const UNOWNED_CONTROLS: Readonly<Record<string, { count: number; reason: 
     count: 1,
     reason: "Picker visibility filter input, not yet catalog-owned.",
   },
-  "src/pages/settings/SettingsCustomAgentsSection.tsx › ListStatus › Button": {
-    count: 1,
-    reason: "Retry button; owning it would rename it.",
-  },
-  "src/pages/settings/SettingsCustomAgentsSection.tsx › SettingsCustomAgentsSection › Button": {
-    count: 2,
-    reason: "Retry button; owning it would rename it.",
-  },
-  "src/pages/settings/SettingsCustomAgentsSection.tsx › SettingsCustomAgentsSection › Link": {
-    count: 1,
-    reason: "Region row template link, not yet catalog-owned.",
-  },
   "src/pages/settings/SettingsHarnessesSection.tsx › CredentialCard › button": {
     count: 1,
     reason: "Credential choice card.",
@@ -239,58 +207,6 @@ export const UNOWNED_CONTROLS: Readonly<Record<string, { count: number; reason: 
       count: 1,
       reason: "Fix dialog's owner is picked at runtime, which the guard can't read.",
     },
-  "src/shell/CreateAgentDialog.tsx › AgentFormFields › Button": {
-    count: 1,
-    reason: "Create form button, not yet catalog-owned.",
-  },
-  "src/shell/CreateAgentDialog.tsx › AgentFormFields › Input": {
-    count: 3,
-    reason: 'Create form field whose accessible name includes "*".',
-  },
-  "src/shell/CreateAgentDialog.tsx › AgentFormFields › SelectContent": {
-    count: 1,
-    reason: "Overlay of the create form's select, not yet catalog-owned.",
-  },
-  "src/shell/CreateAgentDialog.tsx › AgentFormFields › SelectItem": {
-    count: 1,
-    reason: "Option of the create form's select, not yet catalog-owned.",
-  },
-  "src/shell/CreateAgentDialog.tsx › AgentFormFields › SelectTrigger": {
-    count: 1,
-    reason: "Create form field, not yet catalog-owned.",
-  },
-  "src/shell/CreateAgentDialog.tsx › AgentFormFields › Textarea": {
-    count: 1,
-    reason: "Create form field, not yet catalog-owned.",
-  },
-  "src/shell/CreateAgentDialog.tsx › CreateAgentForm › Button": {
-    count: 2,
-    reason: "Create form button, not yet catalog-owned.",
-  },
-  "src/shell/CreateAgentDialog.tsx › MCPServerRow › Button": {
-    count: 1,
-    reason: "Create page's MCP server row.",
-  },
-  "src/shell/CreateAgentDialog.tsx › MCPServerRow › Input": {
-    count: 4,
-    reason: "Create page's MCP server row.",
-  },
-  "src/shell/CreateAgentDialog.tsx › MCPServerRow › SelectContent": {
-    count: 1,
-    reason: "Create page's MCP server row.",
-  },
-  "src/shell/CreateAgentDialog.tsx › MCPServerRow › SelectItem": {
-    count: 2,
-    reason: "Create page's MCP server row.",
-  },
-  "src/shell/CreateAgentDialog.tsx › MCPServerRow › SelectTrigger": {
-    count: 1,
-    reason: "Create page's MCP server row.",
-  },
-  "src/shell/CreateAgentDialog.tsx › MCPServerRow › Textarea": {
-    count: 2,
-    reason: "Create page's MCP server row.",
-  },
   "src/shell/HarnessCredentialForm.tsx › AdoptRow › Button": {
     count: 1,
     reason: "Credential form control; its owner is picked at runtime, which the guard can't read.",
