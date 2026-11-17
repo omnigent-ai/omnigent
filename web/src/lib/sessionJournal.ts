@@ -72,6 +72,29 @@ export async function fetchJournalPage(
   return (await response.json()) as JournalPage;
 }
 
+/**
+ * Where an entry sits in the session's journal, from the entry just before it: positions run
+ * 0, 1, 2, … without gaps.
+ *
+ * @returns The entry's position, or null when the journal doesn't hold it.
+ */
+export async function fetchJournalEntryPosition(
+  conversationId: string,
+  entryId: string,
+  signal?: AbortSignal,
+): Promise<number | null> {
+  const params = new URLSearchParams({ order: "desc", after: entryId, limit: "1" });
+  const response = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(conversationId)}/journal?${params}`,
+    { signal },
+  );
+  if (response.status === 400 && (await response.clone().text()).includes("stale_cursor"))
+    return null;
+  if (!response.ok) throw new Error(`Couldn't place the journal entry (${response.status})`);
+  const page = (await response.json()) as JournalPage;
+  return page.data.length > 0 ? page.data[0].position + 1 : 0;
+}
+
 /** Entries in position order, without duplicates; later copies of an entry win. */
 export function mergeJournalEntries(...lists: readonly JournalEntry[][]): JournalEntry[] {
   const byId = new Map<string, JournalEntry>();
