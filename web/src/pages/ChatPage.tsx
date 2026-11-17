@@ -1,5 +1,5 @@
 import { clearLocalReviewContexts, usePendingLocalReviewContexts } from "@/lib/localReviewContext";
-import { formatLocalReviewComments } from "@/lib/localReviewComments";
+import { buildOutgoingMessage, carriesMessageContext } from "@/lib/outgoingComposerMessage";
 import { SelectionPopup } from "@/components/chat/SelectionPopup";
 import {
   EditSentMessageContext,
@@ -151,7 +151,6 @@ import { skillInvocationPrefix } from "@/lib/harnessSetup";
 import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import {
   composerInlineMentions,
-  expandMentionTokens,
   fileMentionToken,
   findMentionTokens,
   newFileMentionToken,
@@ -160,7 +159,6 @@ import {
   recallSessionMentions,
   type SessionMention,
   type TaggedMentions,
-  withSessionMentionHint,
   detectMentionAt,
   harnessSupportsFileMentions,
   type MentionItem,
@@ -4225,12 +4223,10 @@ function ComposerImpl(
       ? matchSlashCommandInvocation(trimmed, slashCommandNames)
       : null;
     let goalMessage: string | null = null;
+    const sendContext = { mentions: liveMentions, reviewComments: localReviewComments };
     if (
-      draft.quotes.length === 0 &&
       (skill !== null || isSlashCommandText(trimmed)) &&
-      files.length === 0 &&
-      !hasMentions &&
-      localReviewComments.length === 0
+      !carriesMessageContext(draft, files, sendContext)
     ) {
       const parts = trimmed.split(/\s+/);
       const cmd = parts[0].toLowerCase();
@@ -4317,14 +4313,11 @@ function ComposerImpl(
     // the harness's "[Attached: <path>]" wording (the vendor reads the on-disk
     // path; no upload), sessions as "[Session: …]". A tagged session also adds
     // one tool hint at the end.
-    const hasAuthoredText =
-      !!draft.text.trim() || draft.quotes.some((quote) => quote.before.trim());
-    const reviewContext =
-      localReviewComments.length > 0
-        ? formatLocalReviewComments(localReviewComments, { includeInstruction: !hasAuthoredText })
-        : "";
-    const tagsSessions = liveMentions.some((m) => m.marker.startsWith("[Session: "));
-    const expand = (text: string) => expandMentionTokens(text, liveMentions);
+    const outgoing = buildOutgoingMessage(
+      draft,
+      goalMessage ?? (isSlashCommandText(trimmed) ? trimmed : fullText.trimEnd()),
+      sendContext,
+    );
     // Sending while a prior response is streaming is fine — the
     // server queues the message and delivers it to the running task
     // (or starts a fresh one once the current drains). Escape still
@@ -4332,26 +4325,9 @@ function ComposerImpl(
     if (trimmed) appendEntry(fullText, storedReplyDraft);
     const sendFiles = files.length > 0 ? files : undefined;
     if (draft.quotes.length > 0) {
-      // Preserve authored whitespace and quote provenance, including mention markers.
-      const outgoing = appendReplyDraft(
-        {
-          ...draft,
-          text: expand(draft.text),
-          quotes: draft.quotes.map((quote) => ({ ...quote, before: expand(quote.before) })),
-        },
-        { quotes: [], text: reviewContext },
-      );
-      outgoing.text = withSessionMentionHint(outgoing.text, tagsSessions);
-      onSend(serializeReplyDraft(outgoing), sendFiles, snapshotReplyDraft(outgoing));
+      onSend(outgoing.text, sendFiles, outgoing.replyDraft);
     } else {
-      const message = goalMessage ?? (isSlashCommandText(trimmed) ? trimmed : fullText.trimEnd());
-      onSend(
-        withSessionMentionHint(
-          [expand(message), reviewContext].filter(Boolean).join("\n\n"),
-          tagsSessions,
-        ),
-        sendFiles,
-      );
+      onSend(outgoing.text, sendFiles);
       if (goalMessage) refreshGoalAfterActivity();
     }
     dirtyRef.current = true;
