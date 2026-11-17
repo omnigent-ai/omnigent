@@ -296,7 +296,7 @@ def split_review(review: str, byte_limit: int) -> list[str]:
                 end = header_start
         else:
             in_table_row = in_table_row or review.lstrip().startswith("|")
-            if in_table_row and re.fullmatch(r"\s*\|?\s*", review[end:].split("\n", 1)[0]):
+            if in_table_row and review[end:].split("\n", 1)[0].strip() in {"", "|"}:
                 # Keep nonblank rationale text with the terminal delimiter and whitespace.
                 content = prefix.rstrip()
                 if content.endswith("|") and not content.endswith(r"\|"):
@@ -421,7 +421,7 @@ def review_comments(review: str, *, head_sha: str, run_id: str, run_url: str) ->
             before += chunk
             context = _markdown_context(before)
             _, suffix, _ = context
-            if chunk.lstrip().startswith("|"):
+            if chunk.lstrip(" \t").startswith("|"):
                 prefix += table_header
             comments.append(wrap(prefix + chunk + suffix, part, len(chunks)))
         overflow = max(len(comment.encode("utf-8")) for comment in comments) - COMMENT_BYTE_LIMIT
