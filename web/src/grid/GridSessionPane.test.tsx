@@ -83,6 +83,7 @@ vi.mock("@/components/HostBadge", () => ({
       Host for {sessionId}
       {readOnly && " (status only)"}
       {launch && ` (launch ${launch.stage})`}
+      {launch === undefined && " (launch omitted)"}
     </span>
   ),
 }));
@@ -332,9 +333,10 @@ it("gives each cell its own host-switch access and launch progress", () => {
   fixture.readOnlySessions = ["first"];
   fixture.launches = { second: { stage: "provisioning", error: null } };
   render(twoCellGrid());
-  // The active cell is named "first (active)".
+  // The active cell's name gains an " (active)" suffix, hence the prefix match.
   const first = within(screen.getByRole("region", { name: /^first/ }));
   const second = within(screen.getByRole("region", { name: "second" }));
+  // A cell with no launch passes null, so its badge never shows the open session's.
   expect(first.getByText("Host for first (status only)")).toBeInTheDocument();
   expect(second.getByText("Host for second (launch provisioning)")).toBeInTheDocument();
 });
