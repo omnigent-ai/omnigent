@@ -8,6 +8,7 @@ import json
 import os
 import sys
 import textwrap
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -19,6 +20,7 @@ from omnigent.harnesses.claude_native import main as claude_native
 from omnigent.inner import _proc
 from omnigent.models import model_catalog_store
 from omnigent.models.claude_model_vocabulary import picker_model_options
+from omnigent.onboarding.provider_config import FamilyConfig, ProviderEntry
 from tests._helpers.polling import poll_until_async
 from tests._helpers.providers import isolate_provider_resolution
 
@@ -298,6 +300,21 @@ def test_stored_catalog_does_not_validate_launch_credentials(
     assert not claude_native.claude_launch_catalog_is_stale(config)
     with pytest.raises(RuntimeError, match="apiKeyHelper is configured"):
         claude_native._claude_model_probe_invocation(config)
+
+
+def _provider_launch_config(*, env: dict[str, str], model: str | None = None):
+    entry = ProviderEntry(
+        name="catalog",
+        kind="key",
+        families={
+            "anthropic": FamilyConfig(
+                base_url="https://api.anthropic.com", auth_command="printf test-token"
+            )
+        },
+    )
+    config = claude_native._provider_config_for_native_claude(entry)
+    assert config is not None
+    return replace(config, env={**config.env, **env}, model=model)
 
 
 def _stub_picker(
@@ -724,7 +741,7 @@ async def test_structured_alias_preserves_its_exact_public_context_pin(
     contextual = f"{plain}[1m]"
     pin = {"ANTHROPIC_DEFAULT_OPUS_MODEL": contextual}
     if configured:
-        config = claude_native.ClaudeNativeUcodeConfig(env=pin, model=contextual)
+        config = _provider_launch_config(env=pin, model=contextual)
     else:
         config = None
         monkeypatch.setenv("ANTHROPIC_DEFAULT_OPUS_MODEL", contextual)
@@ -756,9 +773,7 @@ async def test_structured_alias_cannot_infer_context_from_a_mismatched_or_privat
 
     env = {"ANTHROPIC_DEFAULT_OPUS_MODEL": pin}
     _stub_picker(monkeypatch, [{"value": "opus", "resolvedModel": resolved}], default=resolved)
-    rows = await claude_native.claude_model_catalog(
-        claude_native.ClaudeNativeUcodeConfig(env=env, model=pin)
-    )
+    rows = await claude_native.claude_model_catalog(_provider_launch_config(env=env, model=pin))
     assert rows is not None
     options = picker_model_options(rows)
     assert options[0]["model"] == resolved
@@ -841,7 +856,7 @@ def test_catalog_cache_tracks_effective_alias_pins(
     monkeypatch.setenv(env_var, "claude-opus-4-8[1m]")
     assert claude_native.claude_catalog_fingerprint(None) != old_key
 
-    config = claude_native.ClaudeNativeUcodeConfig(env={env_var: "configured-model"})
+    config = _provider_launch_config(env={env_var: "configured-model"})
     configured_key = claude_native.claude_catalog_fingerprint(config)
     monkeypatch.setenv(env_var, "another-ambient-model")
     assert claude_native.claude_catalog_fingerprint(config) == configured_key

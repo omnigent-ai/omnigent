@@ -1357,9 +1357,8 @@ def _parse_claude_legacy_models(stdout: str) -> list[dict[str, Any]]:
     return []
 
 
-def _claude_alias_pins(claude_config: ClaudeNativeUcodeConfig | None) -> dict[str, str]:
+def _claude_alias_pins(configured_env: Mapping[str, str]) -> dict[str, str]:
     """Read alias pins with configured values overriding inherited ones."""
-    configured_env = claude_config.env if claude_config is not None else {}
     return {
         alias: configured_env.get(env_var, os.environ.get(env_var, ""))
         for alias, env_var in ALIAS_MODEL_ENV_VARS.items()
@@ -1388,7 +1387,7 @@ async def probe_claude_model_options(
     :param claude_config: The resolved native launch config, or ``None``.
     :returns: The probe result, or ``None`` when both discovery methods fail.
     """
-    launch_pins = _claude_alias_pins(claude_config)
+    launch_pins = _claude_alias_pins(claude_config.env if claude_config is not None else {})
     text = await _run_claude_model_probe(claude_config, stream_input=True)
     models = _parse_claude_picker_models(text) if text is not None else None
     structured = models is not None
@@ -1496,7 +1495,7 @@ def claude_catalog_fingerprint(claude_config: ClaudeNativeUcodeConfig | None) ->
     return fingerprint_of(
         "claude-native",
         "control-picker-v6",
-        sorted(_claude_alias_pins(claude_config).items()),
+        sorted(_claude_alias_pins(claude_config.env if claude_config is not None else {}).items()),
         sorted(claude_config.env.items()) if claude_config is not None else None,
         claude_config.api_key_helper if claude_config is not None else None,
         claude_config.model if claude_config is not None else None,
