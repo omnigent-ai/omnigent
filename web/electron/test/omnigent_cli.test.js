@@ -6,6 +6,7 @@
 
 const { describe, it, mock, afterEach } = require("node:test");
 const assert = require("node:assert/strict");
+const { execFileSync } = require("child_process");
 const fs = require("fs");
 const http = require("http");
 const os = require("os");
@@ -97,7 +98,7 @@ describe("runCli", () => {
     const controller = new AbortController();
     const pending = runCli(
       nodeScript(
-        'require("fs").writeFileSync(process.argv[1], "up"); setTimeout(() => {}, 60000);',
+        'require("fs").writeFileSync(process.argv[1], String(process.pid)); setTimeout(() => {}, 60000);',
       ),
       [readyFile],
       { signal: controller.signal },
@@ -119,6 +120,18 @@ describe("runCli", () => {
       controller.abort();
       const res = await pending;
       assert.notEqual(res.code, 0);
+      const pid = Number(fs.readFileSync(readyFile, "utf8"));
+      // An unreaped zombie still answers signal 0, so ask `ps` for the process state.
+      const state = (() => {
+        try {
+          return execFileSync("ps", ["-o", "stat=", "-p", String(pid)])
+            .toString()
+            .trim();
+        } catch {
+          return "";
+        }
+      })();
+      assert.ok(state === "" || state.startsWith("Z"), `the child is still running (${state})`);
       assert.ok(Date.now() - started < 5000, "the abort ended the run before its 60s sleep");
     } finally {
       // A child that never reported ready must not outlive a failed test.
