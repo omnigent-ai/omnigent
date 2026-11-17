@@ -62,10 +62,12 @@ describe("a shared control's ownership", () => {
         <SharedControl />
       </SettingsOwner>,
     );
-    expect(screen.getByRole("button", { name: "Copy" })).toHaveAttribute(
-      "data-settings-control",
-      "fixture-row",
-    );
+    const control = screen.getByRole("button");
+    expect(control).toHaveAttribute("data-settings-control", "fixture-row:");
+    expect(control).toHaveAttribute("aria-labelledby", "settings-fixture-row-label");
+    expect(control).toHaveAttribute("aria-describedby", "settings-fixture-row-description");
+    expect(control).not.toHaveAttribute("aria-label");
+    expect(control).not.toHaveAttribute("title");
   });
 
   it("names its label and description after the owner's row, inside an owner", () => {

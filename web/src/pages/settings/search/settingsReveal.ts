@@ -79,7 +79,7 @@ function ownedControls(row: HTMLElement): HTMLElement[] {
 
 /** The control a part (or `""`, the main control) names, as the row shows it. */
 function partControl(row: HTMLElement, entry: SettingsEntry, part: string): HTMLElement | null {
-  const id = part === "" ? entry.id : settingsControlId(entry, part);
+  const id = settingsControlId(entry, part);
   return (
     ownedControls(row).find(
       (control) =>
@@ -217,10 +217,8 @@ function focusControlWhenReady(
     if (movedAway || focusIfReady()) stop();
   });
   const timer = window.setTimeout(stop, Math.max(0, windowEndsAt - Date.now()));
-  // Pressing a key or the pointer once the reveal has landed makes the focus the user's own.
-  const userActed = () => {
-    if (standIn) stop();
-  };
+  // Pressing a key or the pointer while the reveal waits makes the focus the user's own.
+  const userActed = () => stop();
   function stop() {
     observer.disconnect();
     window.clearTimeout(timer);

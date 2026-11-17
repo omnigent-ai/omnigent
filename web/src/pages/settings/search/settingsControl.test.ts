@@ -33,7 +33,7 @@ describe("settingsControlProps", () => {
     expect(settingsControlProps(row)).toEqual({
       "aria-labelledby": "settings-fixture-row-label",
       "aria-describedby": "settings-fixture-row-description",
-      "data-settings-control": "fixture-row",
+      "data-settings-control": "fixture-row:",
     });
   });
 
@@ -98,6 +98,21 @@ describe("settingsItemPath", () => {
     expect(settingsItemPath(row, SETTINGS_MAIN_CONTROL)).toBe("/settings/general#fixture-row:");
   });
 
+  it("round-trips an id and part that the hash encodes", () => {
+    const odd = settingsEntry({
+      id: "odd%id",
+      section: "general",
+      label: "Odd",
+      description: "d",
+      parts: { "a b": "A b" },
+    });
+    const hash = `#${settingsItemPath(odd, "a b").split("#")[1]}`;
+    expect(parseSettingsHash(hash)).toEqual({
+      id: "odd%id",
+      part: "a b",
+    });
+  });
+
   it("adds the harness page for a harness's row", () => {
     const harnessRow = { ...row, harness: "fixture harness" } as SettingsEntry;
     expect(settingsItemPath(harnessRow, "reset")).toBe(
@@ -121,6 +136,10 @@ describe("parseSettingsHash", () => {
     });
   });
 
+  it("splits an encoded separator out of the id, so it can't move the part", () => {
+    expect(parseSettingsHash("#a%3Ab:part")).toEqual({ id: "a:b", part: "part" });
+  });
+
   it("ignores hashes that name nothing", () => {
     expect(parseSettingsHash("")).toBeNull();
     expect(parseSettingsHash("#")).toBeNull();
@@ -134,6 +153,12 @@ describe("settingsRevealPart", () => {
     expect(settingsRevealPart(row)).toBeUndefined();
     expect(settingsRevealPart(row, "reset")).toBe("reset");
     expect(settingsRevealPart(row, "file")).toBe("reset");
+  });
+
+  it("doesn't read a part a hash names from the object's prototype", () => {
+    const redirected = { ...row, reachedBy: { note: "fix" } } as SettingsEntry;
+    expect(settingsRevealPart(redirected, "constructor")).toBe("constructor");
+    expect(settingsRevealPart(redirected, "toString")).toBe("toString");
   });
 
   it("follows an explicit redirect", () => {

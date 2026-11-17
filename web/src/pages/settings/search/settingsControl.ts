@@ -3,7 +3,7 @@
 
 import { settingsSectionPath } from "@/shell/settingsNav";
 
-import type { SettingsEntry } from "./catalog/types";
+import { SETTINGS_MAIN_CONTROL, type SettingsEntry } from "./catalog/types";
 
 type PartOf<Entry extends SettingsEntry> =
   Entry["parts"] extends Readonly<Record<infer Part, string>> ? Part & string : never;
@@ -16,9 +16,20 @@ export function settingsDescriptionId(entry: SettingsEntry): string {
   return `settings-${entry.id}-description`;
 }
 
-/** The value of `data-settings-control`: the entry id, then `:part` for one of its parts. */
+/**
+ * The value of `data-settings-control`: `:part` after the entry id, where `""` names the main
+ * control. With no part, the bare id names the row, not a control.
+ */
 export function settingsControlId(entry: SettingsEntry, part?: string): string {
   return part === undefined ? entry.id : `${entry.id}:${part}`;
+}
+
+/** Reads `key` only when the record declares it, so `constructor` from a hash finds nothing. */
+function declared<Value>(
+  record: Readonly<Record<string, Value>> | undefined,
+  key: string,
+): Value | undefined {
+  return record !== undefined && Object.hasOwn(record, key) ? record[key] : undefined;
 }
 
 export interface SettingsControlProps {
@@ -68,9 +79,9 @@ export function settingsTemplatedName(
   part: string,
   { runtime, variant }: SettingsRuntimeName,
 ): string | undefined {
-  const template = entry.nameTemplates?.[part];
-  const affix = variant === undefined ? template : template?.variants?.[variant];
-  if (!affix || runtime.trim() === "") return entry.parts?.[part];
+  const template = declared(entry.nameTemplates, part);
+  const affix = variant === undefined ? template : declared(template?.variants, variant);
+  if (!affix || runtime.trim() === "") return declared(entry.parts, part);
   return `${affix.before}${runtime}${affix.after ?? ""}`;
 }
 
@@ -91,12 +102,12 @@ export function settingsControlProps<
     return {
       "aria-labelledby": settingsLabelId(entry),
       "aria-describedby": settingsDescriptionId(entry),
-      "data-settings-control": entry.id,
+      "data-settings-control": settingsControlId(entry, SETTINGS_MAIN_CONTROL),
     };
   }
   const label =
     name === undefined
-      ? entry.parts?.[part]
+      ? declared(entry.parts, part)
       : "alternative" in name
         ? settingsAlternativeName(entry, part, name.alternative)
         : settingsTemplatedName(entry, part, name);
@@ -105,7 +116,7 @@ export function settingsControlProps<
 
 /** A part's declared alternative name; a key the part doesn't declare is a programming error. */
 function settingsAlternativeName(entry: SettingsEntry, part: string, key: string): string {
-  const alternative = entry.nameAlternatives?.[part]?.[key];
+  const alternative = declared(declared(entry.nameAlternatives, part), key);
   if (alternative === undefined) {
     throw new Error(`"${key}" is not a declared alternative name of ${entry.id}:${part}`);
   }
@@ -118,9 +129,9 @@ function settingsAlternativeName(entry: SettingsEntry, part: string, key: string
  */
 export function settingsRevealPart(entry: SettingsEntry, part?: string): string | undefined {
   if (part === undefined) return undefined;
-  const presence = entry.presence?.[part];
+  const presence = declared(entry.presence, part);
   if (presence && "overlay" in presence) return presence.overlay;
-  return entry.reachedBy?.[part] ?? part;
+  return declared(entry.reachedBy, part) ?? part;
 }
 
 /**
@@ -132,7 +143,9 @@ export function settingsItemPath(entry: SettingsEntry, part?: string): string {
     entry.harness === undefined
       ? settingsSectionPath(entry.section)
       : `${settingsSectionPath(entry.section)}/${encodeURIComponent(entry.harness)}`;
-  return `${page}#${settingsControlId(entry, part)}`;
+  // Each segment is encoded alone, so an encoded separator can't be mistaken for one.
+  const id = encodeURIComponent(entry.id);
+  return part === undefined ? `${page}#${id}` : `${page}#${id}:${encodeURIComponent(part)}`;
 }
 
 export interface SettingsRevealTarget {
@@ -144,15 +157,20 @@ export interface SettingsRevealTarget {
 export function parseSettingsHash(hash: string): SettingsRevealTarget | null {
   const value = hash.startsWith("#") ? hash.slice(1) : hash;
   if (!value) return null;
-  let decoded: string;
+  // Split on the raw separator first, then decode each segment.
+  const separator = value.indexOf(":");
+  const id = decodeSegment(separator === -1 ? value : value.slice(0, separator));
+  if (!id) return null;
+  if (separator === -1) return { id };
+  const part = decodeSegment(value.slice(separator + 1));
+  // An empty part (`#id:`) is the row's main control, not the row.
+  return part === null ? null : { id, part };
+}
+
+function decodeSegment(segment: string): string | null {
   try {
-    decoded = decodeURIComponent(value);
+    return decodeURIComponent(segment);
   } catch {
     return null;
   }
-  const separator = decoded.indexOf(":");
-  if (separator === -1) return { id: decoded };
-  const id = decoded.slice(0, separator);
-  // An empty part (`#id:`) is the row's main control, not the row.
-  return id ? { id, part: decoded.slice(separator + 1) } : null;
 }
