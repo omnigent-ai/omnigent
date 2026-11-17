@@ -339,14 +339,21 @@ function AddDefaultPolicyDialog({
                         return (
                           <div className="mt-0.5 space-y-1.5">
                             {current.length > 0 && (
-                              <div className="flex flex-wrap gap-1">
+                              <SettingsDataRegion
+                                entry={POLICIES_ADD_ENTRY}
+                                region="values"
+                                className="flex flex-wrap gap-1"
+                              >
                                 {current.map((v) => (
                                   <span
                                     key={v}
+                                    data-settings-region-row
                                     className="inline-flex items-center gap-0.5 rounded-md bg-muted px-1.5 py-0.5 text-sm"
                                   >
                                     {v}
                                     <button
+                                      data-settings-row-action="remove"
+                                      aria-label={`Remove ${v}`}
                                       type="button"
                                       onClick={() => {
                                         const next = current.filter((x) => x !== v);
@@ -361,7 +368,7 @@ function AddDefaultPolicyDialog({
                                     </button>
                                   </span>
                                 ))}
-                              </div>
+                              </SettingsDataRegion>
                             )}
                             <ModelValueCombobox
                               inputProps={{
@@ -425,6 +432,7 @@ function AddDefaultPolicyDialog({
           )}
           <div className="flex justify-end gap-2 pt-1">
             <Button
+              data-settings-dialog-action="Cancel"
               type="button"
               variant="outline"
               onClick={() => {

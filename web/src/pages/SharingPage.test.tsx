@@ -67,7 +67,7 @@ function state(overrides: Partial<SharingState> = {}): SharingState {
 
 /** Scope options within the automatic-sharing fieldset. */
 function radiosIn(group: string): HTMLInputElement[] {
-  return within(screen.getByRole("group", { name: group })).getAllByRole(
+  return within(screen.getByRole("radiogroup", { name: group })).getAllByRole(
     "radio",
   ) as HTMLInputElement[];
 }

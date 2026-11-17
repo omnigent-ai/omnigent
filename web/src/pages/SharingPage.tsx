@@ -38,31 +38,26 @@ import {
   SHARING_TIERS as TIERS,
 } from "@/pages/settings/search/catalog/sharing";
 import { SettingsEntryLabel, SettingsItem } from "@/pages/settings/search/SettingsItem";
+import { settingsControlProps } from "@/pages/settings/search/settingsControl";
 import {
-  type SettingsControlProps,
-  settingsControlProps,
-} from "@/pages/settings/search/settingsControl";
+  SettingsOwner,
+  settingsOverlayProps,
+  useSettingsOwnership,
+} from "@/pages/settings/search/settingsOwnership";
 
 /**
  * Greys out a control another setting overrides and explains why on hover.
  * Renders children untouched when ``reason`` is null.
  */
-function BlockedBy({
-  reason,
-  control,
-  children,
-}: {
-  reason: string | null;
-  /** The reason's own part, which focus reaches. */
-  control: SettingsControlProps;
-  children: ReactNode;
-}) {
+/** Greys out a control another setting overrides; under its owner, the focusable reason is that part. */
+function BlockedBy({ reason, children }: { reason: string | null; children: ReactNode }) {
+  const owned = useSettingsOwnership();
   if (reason === null) return children;
   return (
     <Tooltip>
       <TooltipTrigger asChild>
         <div
-          data-settings-control={control["data-settings-control"]}
+          {...owned.control({ title: "" })}
           tabIndex={0}
           className="cursor-not-allowed opacity-50"
           data-blocked="true"
@@ -73,6 +68,27 @@ function BlockedBy({
       </TooltipTrigger>
       <TooltipContent side="top">{reason}</TooltipContent>
     </Tooltip>
+  );
+}
+
+/** The default-visibility row, greyed out behind whichever setting overrides it. */
+function DefaultPublicBlocked({
+  sharingOff,
+  reason,
+  children,
+}: {
+  sharingOff: boolean;
+  reason: string | null;
+  children: ReactNode;
+}) {
+  return sharingOff ? (
+    <SettingsOwner entry={DEFAULT_PUBLIC_SESSIONS_ENTRY} part="blockedBySharing">
+      <BlockedBy reason={reason}>{children}</BlockedBy>
+    </SettingsOwner>
+  ) : (
+    <SettingsOwner entry={DEFAULT_PUBLIC_SESSIONS_ENTRY} part="blockedByPublicAccess">
+      <BlockedBy reason={reason}>{children}</BlockedBy>
+    </SettingsOwner>
   );
 }
 
@@ -210,6 +226,7 @@ export function SharingPage() {
                       <SelectValue>{currentTier?.label}</SelectValue>
                     </SelectTrigger>
                     <SelectContent
+                      {...settingsOverlayProps(SHARING_MODE_ENTRY, "mode")}
                       position="popper"
                       align="end"
                       className="w-[28rem] max-w-[calc(100vw-2rem)]"
@@ -249,34 +266,33 @@ export function SharingPage() {
 
               <SettingsGroup title="Public sharing" testId="settings-group-public-sharing">
                 <SettingsItem entry={PUBLIC_ACCESS_ENTRY}>
-                  <BlockedBy
-                    reason={publicBlockedReason}
-                    control={settingsControlProps(PUBLIC_ACCESS_ENTRY, "blocked")}
-                  >
-                    <div className="flex items-center justify-between gap-4">
-                      <SettingsEntryLabel
-                        entry={PUBLIC_ACCESS_ENTRY}
-                        className="flex-1"
-                        description={
-                          <>
-                            {PUBLIC_ACCESS_ENTRY.description}
-                            {!publicEditable && (
-                              <span className="mt-1 block">
-                                Managed by this deployment and can&apos;t be changed here.
-                              </span>
-                            )}
-                          </>
-                        }
-                      />
-                      <Switch
-                        {...settingsControlProps(PUBLIC_ACCESS_ENTRY)}
-                        checked={effectivePublic}
-                        onCheckedChange={togglePublic}
-                        disabled={publicDisabled}
-                        componentId="settings.sharing.public_access"
-                      />
-                    </div>
-                  </BlockedBy>
+                  <SettingsOwner entry={PUBLIC_ACCESS_ENTRY} part="blocked">
+                    <BlockedBy reason={publicBlockedReason}>
+                      <div className="flex items-center justify-between gap-4">
+                        <SettingsEntryLabel
+                          entry={PUBLIC_ACCESS_ENTRY}
+                          className="flex-1"
+                          description={
+                            <>
+                              {PUBLIC_ACCESS_ENTRY.description}
+                              {!publicEditable && (
+                                <span className="mt-1 block">
+                                  Managed by this deployment and can&apos;t be changed here.
+                                </span>
+                              )}
+                            </>
+                          }
+                        />
+                        <Switch
+                          {...settingsControlProps(PUBLIC_ACCESS_ENTRY)}
+                          checked={effectivePublic}
+                          onCheckedChange={togglePublic}
+                          disabled={publicDisabled}
+                          componentId="settings.sharing.public_access"
+                        />
+                      </div>
+                    </BlockedBy>
+                  </SettingsOwner>
                 </SettingsItem>
 
                 <SettingsItem
@@ -314,7 +330,7 @@ export function SharingPage() {
                     >
                       <SelectValue />
                     </SelectTrigger>
-                    <SelectContent>
+                    <SelectContent {...settingsOverlayProps(PUBLIC_MAX_PERMISSION_ENTRY)}>
                       <SelectItem value="read">Read</SelectItem>
                       {state?.public_sharing_max_level_options?.includes("edit") && (
                         <SelectItem value="edit">Edit</SelectItem>
@@ -327,13 +343,7 @@ export function SharingPage() {
                   entry={DEFAULT_PUBLIC_SESSIONS_ENTRY}
                   className="mt-4 border-t border-border pt-4"
                 >
-                  <BlockedBy
-                    reason={defaultPublicBlockedReason}
-                    control={settingsControlProps(
-                      DEFAULT_PUBLIC_SESSIONS_ENTRY,
-                      defaultPublicBlockedByPart ?? undefined,
-                    )}
-                  >
+                  <DefaultPublicBlocked sharingOff={sharingOff} reason={defaultPublicBlockedReason}>
                     <div className="flex items-center justify-between gap-4">
                       <SettingsEntryLabel
                         entry={DEFAULT_PUBLIC_SESSIONS_ENTRY}
@@ -362,12 +372,15 @@ export function SharingPage() {
                     </div>
                     {effectiveDefaultPublic !== "off" && (
                       <fieldset
-                        {...settingsControlProps(DEFAULT_PUBLIC_SESSIONS_ENTRY, "scope")}
                         className="mt-4 ml-1 border-l-2 border-border pl-4"
                         disabled={defaultPublicDisabled}
                       >
                         <legend className="mb-3 text-ui font-medium">Automatically share</legend>
-                        <div className="flex flex-col gap-4">
+                        <div
+                          role="radiogroup"
+                          {...settingsControlProps(DEFAULT_PUBLIC_SESSIONS_ENTRY, "scope")}
+                          className="flex flex-col gap-4"
+                        >
                           {DEFAULT_PUBLIC_SCOPES.map((option) => (
                             <label
                               key={option.id}
@@ -400,7 +413,7 @@ export function SharingPage() {
                         </div>
                       </fieldset>
                     )}
-                  </BlockedBy>
+                  </DefaultPublicBlocked>
                 </SettingsItem>
               </SettingsGroup>
               {state?.peer_session_messaging_enabled !== undefined && (

@@ -28,38 +28,6 @@ export const UNOWNED_CONTROLS: Readonly<Record<string, { count: number; reason: 
     count: 2,
     reason: "Theme color picker popover internals, not named by a row.",
   },
-  "src/pages/AdminGeneralPage.tsx › AdminGeneralPage › SelectContent": {
-    count: 1,
-    reason: "Admin general page's select, not yet catalog-owned.",
-  },
-  "src/pages/AdminGeneralPage.tsx › AdminGeneralPage › SelectItem": {
-    count: 1,
-    reason: "Admin general page's select, not yet catalog-owned.",
-  },
-  "src/pages/AdminGeneralPage.tsx › AdminGeneralPage › SelectTrigger": {
-    count: 1,
-    reason: "Admin general page's select, not yet catalog-owned.",
-  },
-  "src/pages/MembersPage.tsx › CopyableValue › Button": {
-    count: 1,
-    reason: "Members copy control and invite-result Done button, not yet catalog-owned.",
-  },
-  "src/pages/MembersPage.tsx › CopyableValue › Input": {
-    count: 1,
-    reason: "Members copy control and invite-result Done button, not yet catalog-owned.",
-  },
-  "src/pages/MembersPage.tsx › MembersPage › Button": {
-    count: 2,
-    reason: "Members copy control and invite-result Done button, not yet catalog-owned.",
-  },
-  "src/pages/PoliciesPage.tsx › AddDefaultPolicyDialog › Button": {
-    count: 1,
-    reason: "Add default policy dialog's actions, not yet catalog-owned.",
-  },
-  "src/pages/PoliciesPage.tsx › AddDefaultPolicyDialog › button": {
-    count: 1,
-    reason: "Add default policy dialog's actions, not yet catalog-owned.",
-  },
   "src/pages/SettingsPage.tsx › AppearanceSection › Button": {
     count: 2,
     reason: "Reset dialog's Cancel button, a dialog action not yet declared.",
@@ -71,22 +39,6 @@ export const UNOWNED_CONTROLS: Readonly<Record<string, { count: number; reason: 
   "src/pages/SettingsPage.tsx › StepperButton › button": {
     count: 1,
     reason: "Number stepper's button, not yet catalog-owned.",
-  },
-  "src/pages/SharingPage.tsx › BlockedBy › div": {
-    count: 1,
-    reason: "Sharing page's select, input or note, not yet catalog-owned.",
-  },
-  "src/pages/SharingPage.tsx › SharingPage › SelectContent": {
-    count: 2,
-    reason: "Sharing page's select, input or note, not yet catalog-owned.",
-  },
-  "src/pages/SharingPage.tsx › SharingPage › SelectItem": {
-    count: 3,
-    reason: "Sharing page's select, input or note, not yet catalog-owned.",
-  },
-  "src/pages/SharingPage.tsx › SharingPage › input": {
-    count: 1,
-    reason: "Sharing page's select, input or note, not yet catalog-owned.",
   },
   "src/pages/settings/GlobalShortcutControl.tsx › GlobalShortcutControl › Button": {
     count: 1,
