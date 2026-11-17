@@ -56,7 +56,6 @@ from omnigent.tools.builtins import (
 from omnigent.tools.builtins.trigger_dispatch import (
     SysTriggerDispatchTool,
     SysTriggerStateTool,
-    trigger_dispatch_tools_enabled,
 )
 from omnigent.tools.client_specified import ClientSideTool, ClientSideToolSpec
 from omnigent.tools.local import load_local_python_tools
@@ -535,10 +534,9 @@ class ToolManager:
         # alone only permits the specified sub-agent types.
         if self._spec.spawn:
             self._tools[SysSessionCreateTool.name()] = SysSessionCreateTool()
-            # Slack trigger managers hand per-message dispatch to these; the flag keeps them off.
-            if trigger_dispatch_tools_enabled():
-                self._tools[SysTriggerStateTool.name()] = SysTriggerStateTool()
-                self._tools[SysTriggerDispatchTool.name()] = SysTriggerDispatchTool()
+            # Slack trigger managers hand per-message dispatch to these.
+            self._tools[SysTriggerStateTool.name()] = SysTriggerStateTool()
+            self._tools[SysTriggerDispatchTool.name()] = SysTriggerDispatchTool()
 
     def _register_session_tools(self) -> None:
         """Register framework-owned tools for the current session."""

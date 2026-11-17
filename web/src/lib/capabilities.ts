@@ -71,8 +71,7 @@ export type FeatureKey =
   | "session_orchestration"
   | "workflows"
   | "session_overview"
-  | "project_repository_creation"
-  | "trigger_dispatch_tools";
+  | "project_repository_creation";
 
 /** Deployment-wide release-feature values advertised by the server. */
 export type FeatureValues = Record<string, boolean>;

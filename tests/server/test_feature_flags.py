@@ -52,7 +52,6 @@ def test_unset_or_empty_uses_feature_defaults(environ: dict[str, str]) -> None:
         "session_orchestration": True,
         "sibling_sessions": True,
         "codex_plan_at_launch": True,
-        "trigger_dispatch_tools": False,
     }
 
 
@@ -188,18 +187,6 @@ def test_backend_features_are_not_frontend_visible(feature: Feature) -> None:
     assert flags.enabled(feature)
     assert feature.value in flags.enabled_names()
     assert feature.value not in flags.frontend_dict()
-
-
-def test_trigger_dispatch_tools_are_frontend_visible_and_default_off() -> None:
-    definition = next(
-        item for item in FEATURE_DEFINITIONS if item.feature is Feature.TRIGGER_DISPATCH_TOOLS
-    )
-
-    assert definition.frontend_visible is True
-    assert definition.default_enabled is False
-    assert not resolve_feature_flags({}).enabled(Feature.TRIGGER_DISPATCH_TOOLS)
-    enabled = resolve_feature_flags({FEATURES_ENV_VAR: "trigger_dispatch_tools"})
-    assert enabled.frontend_dict()["trigger_dispatch_tools"] is True
 
 
 def test_session_orchestration_is_frontend_visible_so_trigger_templates_can_gate_on_it() -> None:

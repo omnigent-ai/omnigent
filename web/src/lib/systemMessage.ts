@@ -281,7 +281,7 @@ export const EARLIER_AUTOMATION_CONTEXT_NOTES: readonly string[] = [
 
 // The config block a Slack trigger prompt carries for its dispatch tools, always last in the prompt.
 const TRIGGER_DISPATCH_CONFIG_SUFFIX =
-  /\n*<omnigent-trigger-dispatch v\d+>\n[\s\S]*?\n<\/omnigent-trigger-dispatch>\s*$/;
+  /\n*<omnigent-trigger-dispatch v\d+>\n(?:(?!<omnigent-trigger-dispatch v)[\s\S])*?\n<\/omnigent-trigger-dispatch>\s*$/;
 
 /** `text` without a trailing dispatch config block, which is for the tools, not for people. */
 export function stripTriggerDispatchConfig(text: string): string {

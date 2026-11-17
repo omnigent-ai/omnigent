@@ -18,7 +18,6 @@ import httpx
 
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 from omnigent.stores.conversation_store import CREATED_BY_SESSION_LABEL_KEY
-from omnigent.tools.builtins.trigger_dispatch import trigger_dispatch_tools_enabled
 
 CONFIG_BLOCK_VERSION = 1
 READ_FROM_KEY_PREFIX = "omnigent.trigger_dispatch.read_from."
@@ -248,16 +247,19 @@ def worker_message(
 
 
 def parse_dispatch_config(prompt_text: str) -> DispatchConfig:
-    """Decode the newest config block in *prompt_text*.
+    """Decode the last config block in *prompt_text*, the one the template appends.
+
+    Starts from the last opening tag, so tags quoted in the instructions above it are ignored.
 
     :raises TriggerDispatchError: If there is no block, or the block is malformed.
     """
-    matches = list(_CONFIG_BLOCK_PATTERN.finditer(prompt_text))
-    if not matches:
-        if _CONFIG_BLOCK_OPEN in prompt_text:
-            raise TriggerDispatchError("the trigger dispatch config block is malformed")
+    start = prompt_text.rfind(_CONFIG_BLOCK_OPEN)
+    if start < 0:
         raise TriggerDispatchError("no trigger dispatch config block in this session's history")
-    version, body = int(matches[-1].group(1)), matches[-1].group(2)
+    match = _CONFIG_BLOCK_PATTERN.match(prompt_text, start)
+    if match is None:
+        raise TriggerDispatchError("the trigger dispatch config block is malformed")
+    version, body = int(match.group(1)), match.group(2)
     if version != CONFIG_BLOCK_VERSION:
         raise TriggerDispatchError(f"unsupported trigger dispatch config version {version}")
     try:
@@ -433,8 +435,6 @@ async def execute_trigger_state(
     *, server_client: httpx.AsyncClient | None, conversation_id: str | None
 ) -> str:
     """Report each configured channel's ID and read time, plus the conditions the model applies."""
-    if not trigger_dispatch_tools_enabled():
-        return _error("Trigger dispatch tools are disabled on this runner")
     if server_client is None or conversation_id is None:
         return _error("sys_trigger_state requires an authenticated runner")
     try:
@@ -707,8 +707,6 @@ async def execute_trigger_dispatch(
         Returns its JSON.
     :returns: JSON with created, skipped, failed, read_from per channel and stopped_at_cap.
     """
-    if not trigger_dispatch_tools_enabled():
-        return _error("Trigger dispatch tools are disabled on this runner")
     if server_client is None or conversation_id is None:
         return _error("sys_trigger_dispatch requires an authenticated runner")
     learned_ids: dict[str, str] = {}

@@ -30,7 +30,6 @@ class Feature(StrEnum):
     SCRIPTED_SESSIONS = "scripted_sessions"
     SIBLING_SESSIONS = "sibling_sessions"
     PEER_SESSION_MESSAGING = "peer_session_messaging"
-    TRIGGER_DISPATCH_TOOLS = "trigger_dispatch_tools"
     CODEX_PLAN_AT_LAUNCH = "codex_plan_at_launch"
     USAGE_PAGE = "usage_page"
     HARNESS_INSTALL = "harness_install"
@@ -114,15 +113,6 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         review_by_release="0.24.0",
         frontend_visible=False,
         default_enabled=True,
-    ),
-    FeatureDefinition(
-        feature=Feature.TRIGGER_DISPATCH_TOOLS,
-        description=(
-            "Slack trigger managers read messages and hand dispatch to sys_trigger_state and "
-            "sys_trigger_dispatch; the server and the runner must both enable it"
-        ),
-        owner="server",
-        review_by_release="0.24.0",
     ),
     FeatureDefinition(
         feature=Feature.AUTOMATIONS_V2,

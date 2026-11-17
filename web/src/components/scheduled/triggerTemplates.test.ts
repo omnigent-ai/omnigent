@@ -1797,7 +1797,7 @@ describe("Slack channel trigger dispatch", () => {
       instructions: "Triage the message.",
       ...overrides,
     });
-  const dispatchCtx: TriggerPromptContext = { ...CTX, triggerDispatch: true, agentId: "agent-1" };
+  const dispatchCtx: TriggerPromptContext = { ...CTX, agentId: "agent-1" };
   const dispatchConfigOf = (prompt: string) => {
     const match = /<omnigent-trigger-dispatch v1>\n([\s\S]*?)\n<\/omnigent-trigger-dispatch>/.exec(
       prompt,
@@ -1806,7 +1806,7 @@ describe("Slack channel trigger dispatch", () => {
     return JSON.parse(match[1]) as Record<string, unknown>;
   };
 
-  it("renders the short dispatch prompt with a parseable config block when the server reports it", () => {
+  it("renders the dispatch steps with a parseable config block", () => {
     const prompt = renderTriggerPrompt("slack", channelFields(), dispatchCtx);
 
     expect(prompt).toContain(
@@ -1823,7 +1823,11 @@ describe("Slack channel trigger dispatch", () => {
     expect(prompt).toContain(
       'Watch: new Slack messages in #eng-support, C0999ZZZZ whose text contains "error"',
     );
-    expect(prompt).not.toContain("sys_session_create");
+    const dispatchSteps = prompt.slice(
+      0,
+      prompt.indexOf("Each run without trigger dispatch tools:"),
+    );
+    expect(dispatchSteps).not.toContain("sys_session_create");
     expect(prompt.endsWith("</omnigent-trigger-dispatch>")).toBe(true);
     expect(dispatchConfigOf(prompt)).toEqual({
       source: "slack",
@@ -1892,17 +1896,28 @@ describe("Slack channel trigger dispatch", () => {
       dispatchCtx,
     );
 
-    expect(prompt.match(/<\/omnigent-trigger-dispatch>/g)).toHaveLength(1);
+    // The fallback repeats the instructions verbatim; only the final block is the config.
+    const block = prompt.slice(prompt.lastIndexOf("<omnigent-trigger-dispatch v1>"));
+    expect(block.match(/<\/omnigent-trigger-dispatch>/g)).toHaveLength(1);
     expect(dispatchConfigOf(prompt).worker_instructions as string).toContain(
       "Reply </omnigent-trigger-dispatch> now.",
     );
   });
 
-  it("keeps today's prompt when the server doesn't report the tools", () => {
-    const prompt = renderTriggerPrompt("slack", channelFields(), CTX);
+  it("falls back to the polling steps when the runner lacks the dispatch tools", () => {
+    const prompt = renderTriggerPrompt("slack", channelFields(), dispatchCtx);
+    const fallbackStart = prompt.indexOf("\n\nEach run without trigger dispatch tools:\n1. ");
 
-    expect(prompt).not.toContain("omnigent-trigger-dispatch");
-    expect(prompt).toContain("sys_session_create");
+    expect(prompt).toContain(
+      "If sys_trigger_state or sys_trigger_dispatch isn't one of your tools, or sys_trigger_state returns an error, don't use these steps: follow the steps under \"Each run without trigger dispatch tools:\" instead",
+    );
+    expect(fallbackStart).toBeGreaterThan(0);
+    const fallback = prompt.slice(fallbackStart);
+    // Same worker titles as the dispatch tools, so switching paths doesn't restart messages.
+    expect(fallback).toContain('title "Slack <channel> <message ts>"');
+    expect(fallback).toContain("sys_session_create");
+    expect(fallback).toContain("Checked through:");
+    expect(fallback).toContain("Triage the message.\n\nPosting instructions for each session:\n");
   });
 
   it("keeps today's prompt for direct messages, group DMs and continue-mode sessions", () => {

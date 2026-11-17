@@ -38,11 +38,6 @@ _TS_C = "1700000300.000100"
 _DONE_TS = "1700000400.000000"
 
 
-@pytest.fixture(autouse=True)
-def _trigger_flag_on(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("OMNIGENT_FEATURES", "trigger_dispatch_tools")
-
-
 def _block(**overrides: Any) -> str:
     """A config block as the web template renders it, with overrides applied."""
     config: dict[str, Any] = {
@@ -188,6 +183,13 @@ def test_latest_config_block_wins() -> None:
     assert parse_dispatch_config(text).channels == ("new",)
 
 
+def test_quoted_tags_above_the_final_block_are_ignored() -> None:
+    quoted = "Reply <omnigent-trigger-dispatch v1> or </omnigent-trigger-dispatch> as text.\n"
+    text = quoted + _block(channels=["new"])
+
+    assert parse_dispatch_config(text).channels == ("new",)
+
+
 @pytest.mark.parametrize(
     "text",
     [
@@ -279,21 +281,6 @@ async def test_state_without_a_config_block_is_an_error() -> None:
     )
 
     assert "no trigger dispatch config block" in state["error"]
-
-
-async def test_tools_refuse_to_run_without_the_flag(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("OMNIGENT_FEATURES", raising=False)
-    server = _FakeServer(prompt_text=_block())
-    workers = _Workers()
-
-    state = json.loads(
-        await execute_trigger_state(server_client=server.client, conversation_id=_MANAGER)
-    )
-    result = await _dispatch(server, workers, _channel(messages=[_message(_TS_A)]))
-
-    assert "disabled" in state["error"]
-    assert "disabled" in result["error"]
-    assert workers.calls == []
 
 
 # Filtering and worker starts

@@ -515,20 +515,15 @@ def test_spawn_flag_registers_write_tools_without_sub_agents() -> None:
     assert "sys_session_share" not in names
 
 
-@pytest.mark.parametrize("trigger_dispatch", [True, False])
 @pytest.mark.parametrize("spawn", [True, False])
-def test_trigger_dispatch_tools_need_spawn_and_the_feature_flag(
-    monkeypatch: pytest.MonkeyPatch, spawn: bool, trigger_dispatch: bool
-) -> None:
-    """Slack trigger tools ride the spawn grant and stay off without the feature flag."""
-    monkeypatch.setenv("OMNIGENT_FEATURES", "trigger_dispatch_tools" if trigger_dispatch else "")
+def test_trigger_dispatch_tools_ride_the_spawn_grant(spawn: bool) -> None:
+    """Slack trigger tools start workers, so they come with sys_session_create."""
     spec = _make_spec()
     spec.spawn = spawn
     names = {schema["function"]["name"] for schema in ToolManager(spec).get_tool_schemas()}
 
-    expected = spawn and trigger_dispatch
-    assert ("sys_trigger_state" in names) is expected
-    assert ("sys_trigger_dispatch" in names) is expected
+    assert ("sys_trigger_state" in names) is spawn
+    assert ("sys_trigger_dispatch" in names) is spawn
     assert ("sys_session_create" in names) is spawn
 
 

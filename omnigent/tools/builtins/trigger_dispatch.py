@@ -2,13 +2,7 @@
 
 from typing import Any
 
-from omnigent.server.feature_flags import Feature, resolve_feature_flags
 from omnigent.tools.base import Tool
-
-
-def trigger_dispatch_tools_enabled() -> bool:
-    """Whether this process's ``OMNIGENT_FEATURES`` leaves trigger dispatch enabled."""
-    return resolve_feature_flags().enabled(Feature.TRIGGER_DISPATCH_TOOLS)
 
 
 class SysTriggerStateTool(Tool):

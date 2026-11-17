@@ -351,4 +351,11 @@ describe("stripTriggerDispatchConfig", () => {
     expect(stripTriggerDispatchConfig(quoted)).toBe(quoted);
     expect(stripTriggerDispatchConfig("plain text")).toBe("plain text");
   });
+
+  it("hides only the final block when an open tag is quoted above it", () => {
+    const prompt = `Quote <omnigent-trigger-dispatch v1>\nin the steps.\n\n${block}`;
+    expect(stripTriggerDispatchConfig(prompt)).toBe(
+      "Quote <omnigent-trigger-dispatch v1>\nin the steps.",
+    );
+  });
 });
