@@ -816,39 +816,46 @@ def _encode_discovery_cursor(
     return cursor if len(cursor) <= _DISCOVERY_CURSOR_MAX_CHARS else None
 
 
+_MALFORMED_DISCOVERY_PAGE = "the server returned a malformed list response"
+
+
 @dataclass(frozen=True)
 class _DiscoveryPage:
-    """Rows and continuation state from one discovery source."""
+    """Rows and continuation state from one discovery source, or why its read failed."""
 
     rows: list[_JsonObject]
     has_more: bool
     next_after: str | None = None
-    failed: bool = False
+    failure: str | None = None
+
+    @property
+    def failed(self) -> bool:
+        return self.failure is not None
 
 
 def _parse_discovery_page(body: object) -> _DiscoveryPage:
     """Validate the server envelope before trusting its continuation state."""
     if not isinstance(body, dict):
-        return _DiscoveryPage([], False, failed=True)
+        return _DiscoveryPage([], False, failure=_MALFORMED_DISCOVERY_PAGE)
     data = body.get("data")
     if not isinstance(data, list):
-        return _DiscoveryPage([], False, failed=True)
+        return _DiscoveryPage([], False, failure=_MALFORMED_DISCOVERY_PAGE)
     rows: list[_JsonObject] = []
     for row in data:
         if not isinstance(row, dict):
-            return _DiscoveryPage([], False, failed=True)
+            return _DiscoveryPage([], False, failure=_MALFORMED_DISCOVERY_PAGE)
         row_id = row.get("id")
         if not isinstance(row_id, str) or not row_id:
-            return _DiscoveryPage([], False, failed=True)
+            return _DiscoveryPage([], False, failure=_MALFORMED_DISCOVERY_PAGE)
         rows.append(row)
     has_more = body.get("has_more", False)
     last_id = body.get("last_id")
     if not isinstance(has_more, bool):
-        return _DiscoveryPage([], False, failed=True)
+        return _DiscoveryPage([], False, failure=_MALFORMED_DISCOVERY_PAGE)
     if last_id is not None and (not isinstance(last_id, str) or not last_id):
-        return _DiscoveryPage([], False, failed=True)
+        return _DiscoveryPage([], False, failure=_MALFORMED_DISCOVERY_PAGE)
     if has_more and last_id is None:
-        return _DiscoveryPage([], False, failed=True)
+        return _DiscoveryPage([], False, failure=_MALFORMED_DISCOVERY_PAGE)
     return _DiscoveryPage(rows, has_more, cast(str | None, last_id))
 
 
@@ -869,11 +876,14 @@ def _bounded_discovery_result(
     ``default_limit`` caps paged rows when the caller passes no ``limit``.
     """
     paged = page_sections or tuple(sections)
+    failures = [
+        f"{name} ({source_pages[name].failure})" for name in paged if source_pages[name].failed
+    ]
     complete = json.dumps(sections)
     if (
         limit is None
         and not continued
-        and not any(page.failed for page in source_pages.values())
+        and not failures
         and not any(page.has_more for page in source_pages.values())
         and (default_limit is None or all(len(sections[name]) <= default_limit for name in paged))
         and len(complete) <= _DISCOVERY_LIST_OUTPUT_MAX_CHARS
@@ -918,7 +928,14 @@ def _bounded_discovery_result(
             if cursor is None:
                 return None
             metadata["next_cursor"] = cursor
-        return json.dumps({**page, "page": metadata})
+        result: dict[str, object] = {**page, "page": metadata}
+        if failures:
+            # Otherwise a persistently failing read looks like endless empty pages.
+            result["error"] = (
+                f"Could not read {'; '.join(failures)}. page.next_cursor retries the same "
+                "position; if the read keeps failing, report this error instead of retrying."
+            )
+        return json.dumps(result)
 
     # Cursor size depends on the last returned row, so serialized page size is
     # not monotonic in the row limit. Check the bounded public range directly.
@@ -6506,6 +6523,37 @@ async def _agent_download_via_rest(
     )
 
 
+async def _fetch_discovery_page(
+    server_client: httpx.AsyncClient,
+    path: str,
+    params: dict[str, str | int],
+) -> _DiscoveryPage:
+    """
+    Read one server list page, describing why it is unusable on failure.
+
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :param path: The list endpoint path, e.g. ``"/v1/sessions"``.
+    :param params: Query parameters, including any ``after`` cursor.
+    :returns: The parsed page, or an empty page whose ``failure`` carries the
+        transport error, HTTP status and server message.
+    """
+    try:
+        resp = await server_client.get(path, params=params, timeout=30.0)
+    except Exception as exc:  # noqa: BLE001
+        return _DiscoveryPage([], False, failure=f"the request failed: {type(exc).__name__}")
+    if resp.status_code != 200:
+        message = _omnigent_error_message(resp)
+        detail = f": {message}" if message else ""
+        return _DiscoveryPage(
+            [], False, failure=f"the server returned HTTP {resp.status_code}{detail}"
+        )
+    try:
+        body = resp.json()
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError):
+        return _DiscoveryPage([], False, failure=_MALFORMED_DISCOVERY_PAGE)
+    return _parse_discovery_page(body)
+
+
 async def _agent_list_fetch(
     path: str,
     server_client: httpx.AsyncClient,
@@ -6517,9 +6565,8 @@ async def _agent_list_fetch(
     """
     Fetch one cursor page of a paginated list endpoint.
 
-    Best-effort: returns ``[]`` on transport error or non-200 so a single
-    failing source degrades ``sys_agent_list`` to "that section is empty"
-    rather than failing the whole call.
+    Best-effort: a failed read returns an empty failed page, so the other
+    ``sys_agent_list`` sections still list alongside the reported failure.
 
     :param path: The list endpoint path, e.g. ``"/v1/agents"`` or
         ``"/v1/sessions"``.
@@ -6531,22 +6578,12 @@ async def _agent_list_fetch(
     """
     if exhausted:
         return _DiscoveryPage([], False)
-    try:
-        params: dict[str, str | int] = {"limit": limit, "order": "desc"}
-        if path == "/v1/sessions":
-            params["visibility"] = "all"
-        if after is not None:
-            params["after"] = after
-        resp = await server_client.get(path, params=params, timeout=30.0)
-    except Exception:  # noqa: BLE001
-        return _DiscoveryPage([], False, failed=True)
-    if resp.status_code != 200:
-        return _DiscoveryPage([], False, failed=True)
-    try:
-        body = resp.json()
-    except (UnicodeDecodeError, ValueError, json.JSONDecodeError):
-        return _DiscoveryPage([], False, failed=True)
-    return _parse_discovery_page(body)
+    params: dict[str, str | int] = {"limit": limit, "order": "desc"}
+    if path == "/v1/sessions":
+        params["visibility"] = "all"
+    if after is not None:
+        params["after"] = after
+    return await _fetch_discovery_page(server_client, path, params)
 
 
 def _scan_local_agent_configs(configs_dir: Path) -> list[_JsonObject]:
@@ -7241,8 +7278,8 @@ async def _collect_global_sessions(
     :func:`_fill_returned_runner_online` resolves it for the rows that
     survive paging. An optional ``agent_name``
     filters the list server-side. Permission-bounded by the server (the
-    runner's request carries the owning user's identity). Best-effort:
-    returns ``[]`` on a fetch failure.
+    runner's request carries the owning user's identity). A failed fetch
+    returns an empty page whose ``failure`` describes it.
 
     An archive-inclusive ``mine``/``shared`` listing against a server that does
     not advertise ``session_list_scoped_archives`` lists ``all`` and keeps the
@@ -7274,7 +7311,9 @@ async def _collect_global_sessions(
         # session as before and apply the scope here, as the sidebar does.
         resolved, viewer_id = await _session_list_viewer(server_client)
         if not resolved:
-            return _DiscoveryPage([], False, failed=True)
+            return _DiscoveryPage(
+                [], False, failure="the caller's identity could not be read to scope archives"
+            )
         server_visibility = "all"
         scope_locally = True
         limit = _AGENT_LIST_PAGE_LIMIT
@@ -7291,17 +7330,7 @@ async def _collect_global_sessions(
         params["include_archived"] = "true"
     if after is not None:
         params["after"] = after
-    try:
-        resp = await server_client.get("/v1/sessions", params=params, timeout=30.0)
-    except Exception:  # noqa: BLE001
-        return _DiscoveryPage([], False, failed=True)
-    if resp.status_code != 200:
-        return _DiscoveryPage([], False, failed=True)
-    try:
-        body = resp.json()
-    except (UnicodeDecodeError, ValueError, json.JSONDecodeError):
-        return _DiscoveryPage([], False, failed=True)
-    page = _parse_discovery_page(body)
+    page = await _fetch_discovery_page(server_client, "/v1/sessions", params)
     if page.failed:
         return page
     rows = page.rows

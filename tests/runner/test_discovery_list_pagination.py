@@ -31,7 +31,7 @@ def _agent_rows(*, large: bool) -> list[dict[str, object]]:
     ]
 
 
-def _session_rows(*, large: bool) -> list[dict[str, object]]:
+def _session_rows(*, large: bool, count: int = _ROW_COUNT) -> list[dict[str, object]]:
     return [
         {
             "id": f"conv_{index:02d}",
@@ -42,7 +42,7 @@ def _session_rows(*, large: bool) -> list[dict[str, object]]:
             "runner_id": None,
             "parent_session_id": None,
         }
-        for index in range(_ROW_COUNT)
+        for index in range(count)
     ]
 
 
@@ -235,6 +235,8 @@ async def test_failed_first_source_read_remains_retryable(tmp_path: Path) -> Non
 
     assert first["builtins"] == []
     assert first["page"]["has_more"]["builtins"] is True
+    assert "builtins (the server returned HTTP 503)" in first["error"]
+    assert "error" not in second
     assert [row["agent_id"] for row in second["builtins"]] == [
         "ag_00",
         "ag_01",
@@ -518,6 +520,67 @@ async def test_sys_session_list_continues_server_catalog_with_cursor() -> None:
     assert received_visibilities == ["mine", "mine", "mine"]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure", "reason"),
+    [
+        (
+            httpx.Response(
+                400,
+                json={
+                    "error": {
+                        "code": "stale_cursor",
+                        "message": "pagination cursor 'conv_49' no longer exists; "
+                        "restart the enumeration without it",
+                    }
+                },
+            ),
+            "HTTP 400: pagination cursor 'conv_49' no longer exists",
+        ),
+        (httpx.Response(503), "HTTP 503"),
+        (httpx.ReadTimeout("timed out"), "the request failed: ReadTimeout"),
+    ],
+    ids=["stale-cursor", "server-unavailable", "timeout"],
+)
+async def test_sys_session_list_continuation_reports_failed_server_read(
+    failure: httpx.Response | httpx.TransportError, reason: str
+) -> None:
+    """A failed continuation read reports its cause and keeps a cursor that retries it."""
+    rows = _session_rows(large=False, count=60)
+    failing = True
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions/conv_caller/child_sessions":
+            return httpx.Response(200, json={"data": []})
+        if request.url.path == "/v1/sessions/conv_caller":
+            return httpx.Response(200, json={"id": "conv_caller", "parent_session_id": None})
+        if request.url.path == "/v1/sessions":
+            if failing and request.url.params.get("after") is not None:
+                if isinstance(failure, Exception):
+                    raise failure
+                return failure
+            return _server_page(request, rows)
+        raise AssertionError(f"unexpected path {request.url.path}")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server"
+    ) as client:
+        first = await _call_session(client, {})
+        continuation = await _call_session(client, {"cursor": first["page"]["next_cursor"]})
+        failing = False
+        retried = await _call_session(client, {"cursor": continuation["page"]["next_cursor"]})
+
+    assert len(first["sessions"]) == 50
+    assert first["page"]["has_more"] == {"sessions": True}
+    assert continuation["sessions"] == []
+    assert reason in continuation["error"]
+    assert continuation["page"]["has_more"] == {"sessions": True}
+    assert [row["session_id"] for row in retried["sessions"]] == [
+        f"conv_{index:02d}" for index in range(50, 60)
+    ]
+    assert "error" not in retried
+
+
 _VIEWER = "alice@example.com"
 _OTHER_USER = "bob@example.com"
 
@@ -738,6 +801,7 @@ async def test_sys_session_list_archive_fallback_fails_closed_without_identity(
         )
 
     assert result["sessions"] == []
+    assert "identity could not be read" in result["error"]
     # A failed read keeps its position, so the continuation retries it.
     assert result["page"]["has_more"] == {"sessions": True}
     assert "/v1/sessions" not in failed_paths
@@ -1157,6 +1221,8 @@ async def test_unusable_server_envelope_remains_retryable(
 
     assert failed["builtins"] == []
     assert failed["page"]["has_more"]["builtins"] is True
+    assert failed["error"].startswith("Could not read builtins (the server returned ")
+    assert "error" not in retried
     assert [row["agent_id"] for row in retried["builtins"]] == ["ag_03", "ag_04", "ag_05"]
 
 
