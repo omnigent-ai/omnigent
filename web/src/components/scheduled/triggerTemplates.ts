@@ -1338,6 +1338,8 @@ export function compileGithubQuery(fields: TriggerFields): string {
 
 /** Slack IDs, e.g. `C0123ABCD` or `U0123ABCD`, which take no `#` or `@`. */
 const SLACK_ID = /^[CDGUW][A-Z0-9]{6,}$/;
+/** The characters a Slack channel name can hold, e.g. `eng-support`. */
+const SLACK_CHANNEL_NAME = /^[a-z0-9._-]+$/;
 
 /** Slack channels as `#name`, keeping IDs bare, e.g. `"eng, C0123ABCD"` → `"#eng, C0123ABCD"`. */
 export function slackChannels(scope: string): string {
@@ -1626,6 +1628,17 @@ function sourceText(source: TriggerSource, fields: TriggerFields, shared: boolea
       };
     }
     const channels = slackChannels(fields.scope);
+    // The channel list can be too large to return, so give one command that finds the IDs.
+    // Slack names are lowercase; a name that couldn't be a channel gets no command to run.
+    const channelNames = scopeList(stripScopePrefix(fields.scope, "#"))
+      .filter((channel) => !SLACK_ID.test(channel))
+      .map((channel) => channel.toLowerCase())
+      .filter((channel) => SLACK_CHANNEL_NAME.test(channel));
+    const nameMatch = channelNames.map((name) => `.name == ${JSON.stringify(name)}`).join(" or ");
+    const lookupProgram = `.result | fromjson | (.channels[] | select(${nameMatch}) | {id, name}), .response_metadata.next_cursor`;
+    const channelLookupFilter = channelNames.length
+      ? ` The list is large; if your tool saves it to a file instead of returning it, get the IDs by running one command on that file with your shell tool, jq -c ${shellQuote(lookupProgram)} <file>, and read the next page with that cursor only while a channel is still missing.`
+      : "";
     // The privacy filter can redact user IDs, so it answers author conditions as columns.
     const authorColumns = fields.conditions.some((condition) => condition.field === "author")
       ? ", adding one yes/no column per author ID the conditions name, such as author_U0123ABCD, and apply author conditions with those columns, since the filter may hide the user field"
@@ -1634,7 +1647,7 @@ function sourceText(source: TriggerSource, fields: TriggerFields, shared: boolea
       ...slack,
       watch: () => `Watch: new Slack messages in ${channels}${filter !== "" ? ` ${filter}` : ""}`,
       search: () =>
-        `Your most recent reply's "${SLACK_IDS}" line, when there is one, gives each channel's ID, the workspace URL and the Slack user ID of each author the conditions name: use them and skip those lookups. Otherwise look up only what's missing, once: find each channel's ID with your Slack tool's users.conversations (types public_channel,private_channel, exclude_archived true), which lists only your channels, rather than a full conversations.list; call auth.test for the workspace URL and your own user ID; and find any other author with users.lookupByEmail for an email, users.info for a user ID, or users.list for a handle or display name. An author who matches no one or more than one person counts as no match: say so in your reply and save no ID for them. If a saved ID stops working, for example with channel_not_found, look it up again. Then use your Slack tools to read the top-level messages posted in ${channels} since that time, oldest first. If you read a channel with conversations.history, call it once with the channel ID, oldest set to that time as a Unix timestamp, inclusive false, limit 200 and caching off, and if your Slack tool takes an analysis_prompt (it filters message data for privacy), pass ${SLACK_HISTORY_ANALYSIS_PROMPT}${authorColumns}. History pages come newest first, so read every page, following the cursor only while has_more is true, before handling any message, then handle them oldest first. Don't use bash_query, and don't repeat a read. Replies inside a thread (thread_ts set and different from ts) don't start a new session.` +
+        `Your most recent reply's "${SLACK_IDS}" line, when there is one, gives each channel's ID, the workspace URL and the Slack user ID of each author the conditions name: use them and skip those lookups. Otherwise look up only what's missing, once: find each channel's ID with your Slack tool's users.conversations (types public_channel,private_channel, exclude_archived true, limit 1000), which lists only your channels, rather than a full conversations.list.${channelLookupFilter} Call auth.test for the workspace URL and your own user ID; and find any other author with users.lookupByEmail for an email, users.info for a user ID, or users.list for a handle or display name. An author who matches no one or more than one person counts as no match: say so in your reply and save no ID for them. If a saved ID stops working, for example with channel_not_found, look it up again. Then use your Slack tools to read the top-level messages posted in ${channels} since that time, oldest first. If you read a channel with conversations.history, call it once with the channel ID, oldest set to that time as a Unix timestamp, inclusive false, limit 200 and caching off, and if your Slack tool takes an analysis_prompt (it filters message data for privacy), pass ${SLACK_HISTORY_ANALYSIS_PROMPT}${authorColumns}. History pages come newest first, so read every page, following the cursor only while has_more is true, before handling any message, then handle them oldest first. Don't pass a bash_query to a message read, and don't repeat a read. Replies inside a thread (thread_ts set and different from ts) don't start a new session.` +
         (only || " Every top-level message counts.") +
         " When a message has no permalink, build it as the workspace URL followed by archives/<channel ID>/p<ts without its dot>.",
       details: "the channel, author, message text and permalink",

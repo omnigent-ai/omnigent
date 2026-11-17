@@ -633,6 +633,44 @@ describe("Slack DM triggers", () => {
     expect(prompt).toContain("otherwise the previous check time");
     expect(prompt).toContain("If a saved ID stops working, for example with channel_not_found");
     expect(prompt).toContain("users.list for a handle or display name");
+    // A channel list saved to a file is searched with one command instead of several tries.
+    expect(prompt).toContain(
+      `get the IDs by running one command on that file with your shell tool, jq -c '.result | fromjson | (.channels[] | select(.name == "eng-support") | {id, name}), .response_metadata.next_cursor' <file>`,
+    );
+  });
+
+  it("filters the channel lookup to every named channel and skips it for channel IDs", () => {
+    const named = renderTriggerPrompt(
+      "slack",
+      slack({ scope: "eng-support, #bugs, C0123ABCD", scopeOperator: "in" }),
+      CTX,
+    );
+    const idsOnly = renderTriggerPrompt(
+      "slack",
+      slack({ scope: "C0123ABCD", scopeOperator: "is" }),
+      CTX,
+    );
+
+    expect(named).toContain('select(.name == "eng-support" or .name == "bugs")');
+    expect(idsOnly).not.toContain("select(.name ==");
+  });
+
+  it("lowercases channel names and gives no command for a name Slack can't have", () => {
+    const mixedCase = renderTriggerPrompt(
+      "slack",
+      slack({ scope: "#Eng-Support", scopeOperator: "is" }),
+      CTX,
+    );
+    // A quote in the scope must not end the command's shell quoting.
+    const quoted = renderTriggerPrompt(
+      "slack",
+      slack({ scope: "x' ; touch pwned ; '", scopeOperator: "is" }),
+      CTX,
+    );
+
+    expect(mixedCase).toContain('select(.name == "eng-support")');
+    expect(quoted).not.toContain("jq -c");
+    expect(quoted).not.toContain("touch pwned ;'");
   });
 
   it("asks a privacy filter for author columns only when a condition names an author", () => {
