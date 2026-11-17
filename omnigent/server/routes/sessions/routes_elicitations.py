@@ -128,7 +128,7 @@ def register_elicitations_routes(
         :returns: ``{"queued": False}`` — resolution is synchronous
             and persists no conversation item. An answer to a question on
             a session whose runner is gone returns the message path's
-            acknowledgement, or ``{"queued": True}`` while that answer is in flight.
+            acknowledgement; a second accept gets the first one's result or error.
         :raises OmnigentError: 404 if no session exists.
         """
         user_id = _get_user_id(request, auth_provider)

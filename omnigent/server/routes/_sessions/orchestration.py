@@ -17,6 +17,7 @@ import secrets
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any, Literal, cast
 
 import httpx
@@ -34,7 +35,7 @@ from omnigent.db.utils import (
     rollback_shared_reads,
     shared_read_scope,
 )
-from omnigent.db.workspace_cache import WorkspaceScopedCache, WorkspaceScopedSet
+from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.debug_logging import debug_event, runner_log_scope
 from omnigent.entities import (
     Agent,
@@ -205,6 +206,7 @@ from omnigent.server.routes._session_create_validation import (
 from omnigent.server.routes._sessions.common import (  # noqa: F401
     _CLAUDE_NATIVE_MESSAGE_TIMEOUT_S,
     _CLAUDE_NATIVE_MODEL,
+    _CLAUDE_NATIVE_PERMISSION_HOOK_TIMEOUT_S,
     _CLAUDE_NATIVE_UI_LABEL_KEY,
     _CLAUDE_NATIVE_UI_LABEL_VALUE,
     _CLAUDE_NATIVE_WRAPPER_LABEL_KEY,
@@ -2853,8 +2855,20 @@ def _harness_elicitation_fingerprint_or_none(params: Any) -> str | None:
         return None
 
 
-# Answers on a stopped session that are being delivered as a message, per replica.
-_stopped_session_answers_in_flight: WorkspaceScopedSet[tuple[str, str]] = WorkspaceScopedSet()
+@dataclass
+class _StoppedSessionAnswer:
+    """One question's recovery on this replica: a running delivery, then its acknowledgement."""
+
+    started_at: float
+    fingerprint: str | None
+    delivery: asyncio.Future[Any] | None = None
+    acknowledgement: dict[str, Any] | None = None
+
+
+# Questions answered on a stopped session, by (session id, elicitation id), per replica.
+_stopped_session_answers: WorkspaceScopedCache[tuple[str, str], _StoppedSessionAnswer] = (
+    WorkspaceScopedCache()
+)
 _STOPPED_SESSION_ANSWER_HEADER = (
     "[System: the user answered your earlier AskUserQuestion on the question card after this "
     "session stopped. That tool call was interrupted, so its result was not recorded. "
@@ -2895,24 +2909,40 @@ async def _deliver_answer_to_stopped_session(
     """
     Send an AskUserQuestion answer as a user message when the session's runner is gone.
 
-    The message path relaunches the runner; the card closes only after it accepts the message,
-    so its errors propagate and leave the card open.
-    :returns: The message path's acknowledgement, ``{"queued": True}`` while the same answer is
-        in flight, or ``None`` when out of scope.
+    The message path relaunches the runner; the card closes only after it accepts the message.
+    :returns: The message path's acknowledgement (also for a later answer to the same question),
+        or ``None`` when out of scope. A second accept gets the first one's result or error.
     """
     elicitation_id = data.get("elicitation_id")
-    if post_event is None or not isinstance(request, Request) or data.get("action") != "accept":
+    if post_event is None or not isinstance(request, Request):
         return None
     if not isinstance(elicitation_id, str) or not elicitation_id:
         return None
+    key = (session_id, elicitation_id)
+    _prune_stopped_session_answers()
+    entry = pending_elicitations.lookup(elicitation_id, conversation_id=session_id)
+    params = entry[1].get("params") if entry is not None else None
+    record = _stopped_session_answers.get(key)
+    if record is not None and isinstance(params, dict):
+        fingerprint = _harness_elicitation_fingerprint_or_none(params)
+        if fingerprint is None or fingerprint != record.fingerprint:
+            # A new question under a reused id: the earlier recovery does not apply.
+            _stopped_session_answers.pop(key, None)
+            record = None
+    if record is not None and record.delivery is None and record.acknowledgement is not None:
+        if isinstance(params, dict):
+            _close_answered_card(session_id, elicitation_id, params)
+        return record.acknowledgement
+    if data.get("action") != "accept":
+        return None
     try:
         result = ElicitationResult.model_validate(
-            {key: value for key, value in data.items() if key != "elicitation_id"}
+            {name: value for name, value in data.items() if name != "elicitation_id"}
         )
     except ValidationError:
         return None
-    entry = pending_elicitations.lookup(elicitation_id, conversation_id=session_id)
-    params = entry[1].get("params") if entry is not None else None
+    if record is not None and record.delivery is not None:
+        return await asyncio.shield(record.delivery)
     if not isinstance(params, dict) or params.get("target_session_id") not in (None, session_id):
         return None
     ask = params.get("ask_user_question")
@@ -2924,12 +2954,39 @@ async def _deliver_answer_to_stopped_session(
         or not _is_native_terminal_session(conv)
     ):
         return None
-    if await _get_runner_client(session_id, runner_router, conversation=conv) is not None:
-        return None
-    key = (session_id, elicitation_id)
-    if key in _stopped_session_answers_in_flight:
-        return {"queued": True}
-    _stopped_session_answers_in_flight.add(key)
+    if record is None:
+        runner = await _get_runner_client(session_id, runner_router, conversation=conv)
+        record = _stopped_session_answers.get(key)
+        if record is not None:
+            # Another request started this question's recovery during the lookup.
+            return await _deliver_answer_to_stopped_session(
+                request, session_id, conv, data, runner_router, post_event
+            )
+        if runner is not None:
+            return None
+        record = _StoppedSessionAnswer(
+            started_at=time.time(), fingerprint=_harness_elicitation_fingerprint_or_none(params)
+        )
+        _stopped_session_answers[key] = record
+    return await _run_stopped_session_delivery(
+        record, request, session_id, elicitation_id, params, questions, result, post_event
+    )
+
+
+async def _run_stopped_session_delivery(
+    record: _StoppedSessionAnswer,
+    request: Any,
+    session_id: str,
+    elicitation_id: str,
+    params: dict[str, Any],
+    questions: list[dict[str, Any]],
+    result: ElicitationResult,
+    post_event: Callable[..., Awaitable[Any]],
+) -> dict[str, Any]:
+    """Deliver one answer as a message; every waiting request gets this run's result or error."""
+    delivery: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+    delivery.add_done_callback(lambda done: done.cancelled() or done.exception())
+    record.delivery = delivery
     _logger.info(
         "Delivering an answer to %s as a message: the session's runner is gone",
         elicitation_id,
@@ -2950,10 +3007,31 @@ async def _deliver_answer_to_stopped_session(
         )
         with contextlib.ExitStack() as in_flight:
             acknowledgement = await post_event(request, session_id, message, in_flight=in_flight)
+        record.acknowledgement = acknowledgement
+        delivery.set_result(acknowledgement)
         _close_answered_card(session_id, elicitation_id, params)
         return acknowledgement
+    except Exception as exc:
+        if not delivery.done():
+            delivery.set_exception(exc)
+        raise
     finally:
-        _stopped_session_answers_in_flight.discard(key)
+        record.delivery = None
+        if not delivery.done():
+            delivery.set_exception(
+                OmnigentError(
+                    "The answer was not delivered. Answer the question again.",
+                    code=ErrorCode.RUNNER_UNAVAILABLE,
+                )
+            )
+
+
+def _prune_stopped_session_answers() -> None:
+    """Drop finished recoveries older than the longest hook wait (no such card is open)."""
+    cutoff = time.time() - _CLAUDE_NATIVE_PERMISSION_HOOK_TIMEOUT_S
+    for key, record in list(_stopped_session_answers.items()):
+        if record.started_at < cutoff and record.delivery is None:
+            _stopped_session_answers.pop(key, None)
 
 
 def _close_answered_card(session_id: str, elicitation_id: str, params: dict[str, Any]) -> None:
