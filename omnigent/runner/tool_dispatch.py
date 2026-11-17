@@ -5931,11 +5931,14 @@ async def _execute_session_query_tool(
                     )
                 }
             )
+        created_by_this_session = args.get("created_by_this_session") is True
         window = _discovery_list_window(
             args,
             tool_name,
             ("sessions",),
-            _session_list_filters(agent_name, include_archived, visibility, project),
+            _session_list_filters(
+                agent_name, include_archived, visibility, project, created_by_this_session
+            ),
         )
         if isinstance(window, str):
             return window
@@ -5947,6 +5950,7 @@ async def _execute_session_query_tool(
             include_archived=include_archived,
             visibility=visibility,
             project=project,
+            created_by_this_session=created_by_this_session,
             limit=limit,
             cursor_state=cursor_state,
             continued=continued,
@@ -6894,6 +6898,7 @@ def _session_list_filters(
     include_archived: bool,
     visibility: str = _SESSION_LIST_DEFAULT_VISIBILITY,
     project: str | None = None,
+    created_by_this_session: bool = False,
 ) -> _JsonObject:
     """
     The ``sys_session_list`` filters a continuation cursor is bound to.
@@ -6905,6 +6910,7 @@ def _session_list_filters(
     :param agent_name: The caller's ``agent_name`` argument, e.g. ``"researcher"``.
     :param include_archived: Whether archived sessions are listed.
     :param visibility: Which sessions the global view covers, e.g. ``"mine"``.
+    :param created_by_this_session: Whether only the caller's workers are listed.
     :returns: The filter mapping, e.g. ``{"agent_name": None}``.
     """
     filters: _JsonObject = {
@@ -6916,6 +6922,8 @@ def _session_list_filters(
         filters["visibility"] = visibility
     if project is not None:
         filters["project"] = project
+    if created_by_this_session:
+        filters["created_by_this_session"] = True
     return filters
 
 
@@ -6927,6 +6935,7 @@ async def _session_list_via_rest(
     include_archived: bool = False,
     visibility: str = _SESSION_LIST_DEFAULT_VISIBILITY,
     project: str | None = None,
+    created_by_this_session: bool = False,
     limit: int | None,
     cursor_state: dict[str, _DiscoveryState],
     continued: bool,
@@ -6951,6 +6960,7 @@ async def _session_list_via_rest(
     :param include_archived: Also list archived sessions in the global view.
     :param visibility: ``"mine"``, ``"shared"`` or ``"all"`` — the server's
         ownership filter for the global view.
+    :param created_by_this_session: List only sessions the caller started.
     :param limit: Optional maximum rows returned from the global sessions view;
         :data:`_SESSION_LIST_DEFAULT_LIMIT` when omitted.
     :param cursor_state: Opaque continuation position for the global sessions view.
@@ -6968,6 +6978,7 @@ async def _session_list_via_rest(
             include_archived=include_archived,
             visibility=visibility,
             project=project,
+            created_by_session_id=conversation_id if created_by_this_session else None,
             after=cursor_state["sessions"][1],
             limit=limit or _SESSION_LIST_DEFAULT_LIMIT,
         )
@@ -6978,7 +6989,9 @@ async def _session_list_via_rest(
         cursor_state=cursor_state,
         continued=continued,
         tool_name="sys_session_list",
-        filters=_session_list_filters(agent_name, include_archived, visibility, project),
+        filters=_session_list_filters(
+            agent_name, include_archived, visibility, project, created_by_this_session
+        ),
         source_pages={"sessions": sessions_page},
         page_sections=("sessions",),
         default_limit=_SESSION_LIST_DEFAULT_LIMIT,
@@ -7229,6 +7242,7 @@ async def _collect_global_sessions(
     include_archived: bool = False,
     visibility: str = _SESSION_LIST_DEFAULT_VISIBILITY,
     project: str | None = None,
+    created_by_session_id: str | None = None,
     after: str | None,
     limit: int,
 ) -> _DiscoveryPage:
@@ -7257,6 +7271,9 @@ async def _collect_global_sessions(
     :param visibility: The server's ownership filter. ``"mine"`` (the
         sidebar's default) keeps other users' sessions out of an agent's
         view; ``"shared"`` / ``"all"`` rows also carry ``owner``.
+    :param created_by_session_id: Keep only sessions this session started. The
+        server filters when it supports it; rows are also checked here so an
+        older server that ignores the parameter can't widen the result.
     :param after: Server cursor from the previous page, if any.
     :param limit: Maximum number of source rows to fetch.
     :returns: Projected global session entries and continuation metadata.
@@ -7289,6 +7306,8 @@ async def _collect_global_sessions(
         params["agent_name"] = agent_name
     if include_archived:
         params["include_archived"] = "true"
+    if created_by_session_id is not None:
+        params["created_by_session_id"] = created_by_session_id
     if after is not None:
         params["after"] = after
     try:
@@ -7307,6 +7326,13 @@ async def _collect_global_sessions(
     rows = page.rows
     if scope_locally:
         rows = [r for r in rows if _session_row_in_scope(r, viewer_id, visibility)]
+    if created_by_session_id is not None:
+        rows = [
+            r
+            for r in rows
+            if (_string_mapping(r.get("labels")) or {}).get(CREATED_BY_SESSION_LABEL_KEY)
+            == created_by_session_id
+        ]
     return _DiscoveryPage(
         [
             {

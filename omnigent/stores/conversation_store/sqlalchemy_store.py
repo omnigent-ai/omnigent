@@ -3795,6 +3795,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         pinned: bool = False,
         pinned_owner: str | None = None,
         title: str | None = None,
+        created_by_session_id: str | None = None,
     ) -> PagedList[Conversation]:
         """
         List conversations with cursor-based pagination.
@@ -4075,6 +4076,19 @@ class SqlAlchemyConversationStore(ConversationStore):
                 stmt = stmt.where(SqlConversation.agent_id == agent_id)
             if title is not None:
                 stmt = stmt.where(SqlConversation.title == title)
+            if created_by_session_id is not None:
+                # Correlated on the label primary key, so each candidate row is a
+                # point lookup rather than a scan of every creator label.
+                stmt = stmt.where(
+                    select(SqlConversationLabel.conversation_id)
+                    .where(
+                        SqlConversationLabel.workspace_id == SqlConversation.workspace_id,
+                        SqlConversationLabel.conversation_id == SqlConversation.id,
+                        SqlConversationLabel.key == CREATED_BY_SESSION_LABEL_KEY,
+                        SqlConversationLabel.value == created_by_session_id,
+                    )
+                    .exists()
+                )
             if search_query:
                 pattern = _like_contains_pattern(search_query)
                 title_match = func.lower(SqlConversation.title).like(pattern, escape=_LIKE_ESCAPE)

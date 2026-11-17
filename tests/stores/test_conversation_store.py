@@ -8151,6 +8151,33 @@ def test_list_conversations_filters_by_pinned_label(
     assert conversation_store.list_conversations(pinned=True, pinned_owner=user_id).data == []
 
 
+def test_list_conversations_filters_by_creator_session(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """``created_by_session_id`` keeps only sessions whose creator label names that
+    session, archived ones included when asked; other creators and unlabeled rows drop out."""
+    from omnigent.stores.conversation_store import CREATED_BY_SESSION_LABEL_KEY
+
+    worker = conversation_store.create_conversation(title="worker")
+    archived_worker = conversation_store.create_conversation(title="archived worker")
+    other_worker = conversation_store.create_conversation(title="other manager's worker")
+    conversation_store.create_conversation(title="unlabeled")
+    for conv, creator in (
+        (worker, "conv_manager"),
+        (archived_worker, "conv_manager"),
+        (other_worker, "conv_other"),
+    ):
+        conversation_store.set_labels(conv.id, {CREATED_BY_SESSION_LABEL_KEY: creator})
+    conversation_store.update_conversation(archived_worker.id, archived=True)
+
+    active = conversation_store.list_conversations(created_by_session_id="conv_manager")
+    assert [c.id for c in active.data] == [worker.id]
+    everything = conversation_store.list_conversations(
+        created_by_session_id="conv_manager", include_archived=True
+    )
+    assert {c.id for c in everything.data} == {worker.id, archived_worker.id}
+
+
 @pytest.mark.parametrize("length", [105, 106, 112, 113, 128, 200])
 @pytest.mark.parametrize("family", [False, True])
 def test_pinned_label_key_fits_column_for_long_user_ids(length, family) -> None:

@@ -7,7 +7,7 @@ import base64
 import json
 from collections.abc import Callable, Coroutine
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import httpx
 import pytest
@@ -562,11 +562,13 @@ def _archive_scope_server(
     *,
     scoped_archives: bool,
     me: dict[str, Any] | None = None,
+    filters_created_by: bool = False,
 ) -> Callable[[httpx.Request], Coroutine[None, None, httpx.Response]]:
     """A ``/v1/sessions`` fake with current or older archive semantics.
 
     An older server ignores ``include_archived`` unless ``visibility=all`` and
-    does not advertise ``session_list_scoped_archives``. ``me`` holds the
+    does not advertise ``session_list_scoped_archives``. Only a server with
+    ``filters_created_by`` honors ``created_by_session_id``. ``me`` holds the
     ``/v1/me`` answer as ``{"status": ..., "body": ...}`` and may change between
     calls; omitted, the caller is signed in.
     """
@@ -600,6 +602,14 @@ def _archive_scope_server(
                 if (archived or not row["archived"])
                 and (visibility == "all" or (row["owner"] == _VIEWER) == (visibility == "mine"))
             ]
+            creator = request.url.params.get("created_by_session_id")
+            if filters_created_by and creator is not None:
+                scoped = [
+                    row
+                    for row in scoped
+                    if cast(dict[str, str], row["labels"]).get("omnigent.created_by_session_id")
+                    == creator
+                ]
             return _server_page(request, scoped)
         raise AssertionError(f"unexpected path {path}")
 
@@ -671,6 +681,64 @@ async def test_sys_session_list_include_archived_lists_archived_rows_on_every_pa
     ] == [(listing, "true"), (listing, "true"), ("mine", None), (shared_listing, "true")]
     # Only an older server needs the caller's identity.
     assert ("/v1/me" in [path for path, _ in requests]) is not scoped_archives
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "filters_created_by", [True, False], ids=["current-server", "older-server"]
+)
+async def test_sys_session_list_created_by_this_session_lists_only_its_workers(
+    filters_created_by: bool,
+) -> None:
+    """``created_by_this_session`` lists only the caller's workers, archived ones included.
+
+    The runner asks the server to filter by creator and also checks each row, so
+    an older server that ignores the parameter can't return another session's workers.
+    """
+    rows = _archive_scope_rows()[:120]
+    for row in rows[::3]:
+        if row["owner"] == _VIEWER:
+            row["labels"] = {"omnigent.created_by_session_id": "conv_other_manager"}
+    requests: list[tuple[str, dict[str, str]]] = []
+    handler = _archive_scope_server(
+        rows, requests, scoped_archives=True, filters_created_by=filters_created_by
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server"
+    ) as client:
+        arguments: dict[str, object] = {"include_archived": True, "created_by_this_session": True}
+        listed: list[dict[str, Any]] = []
+        while True:
+            result = await _call_session(client, arguments)
+            listed += result["sessions"]
+            if "page" not in result or not result["page"]["has_more"]["sessions"]:
+                break
+            arguments = {**arguments, "cursor": result["page"]["next_cursor"]}
+        unfiltered_cursor = (await _call_session(client, {"limit": 1}))["page"]["next_cursor"]
+        mismatched = await _call_session(
+            client, {"created_by_this_session": True, "cursor": unfiltered_cursor, "limit": 1}
+        )
+
+    workers = [
+        row["id"]
+        for row in rows
+        if row["owner"] == _VIEWER
+        and cast(dict[str, str], row["labels"]).get("omnigent.created_by_session_id")
+        == "conv_caller"
+    ]
+    assert workers
+    assert [row["session_id"] for row in listed] == workers
+    assert {row["archived"] for row in listed} == {True, False}
+    session_requests = [params for path, params in requests if path == "/v1/sessions"]
+    filtered_requests = [
+        params for params in session_requests if "created_by_session_id" in params
+    ]
+    assert {params["created_by_session_id"] for params in filtered_requests} == {"conv_caller"}
+    # The current server answers in one page; an older one is paged through.
+    assert (len(filtered_requests) == 1) is filters_created_by
+    # A cursor minted without the filter can't continue a filtered listing.
+    assert mismatched == {"error": "sys_session_list: cursor uses different filter arguments"}
 
 
 @pytest.mark.asyncio

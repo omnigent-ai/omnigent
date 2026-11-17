@@ -1011,6 +1011,7 @@ class ConversationStore(ABC):
         pinned: bool = False,
         pinned_owner: str | None = None,
         title: str | None = None,
+        created_by_session_id: str | None = None,
     ) -> PagedList[Conversation]:
         """
         List conversations with cursor-based pagination.
@@ -1130,6 +1131,10 @@ class ConversationStore(ABC):
             Powers the ``(agent, title)`` child-session lookup in
             ``sys_session_send`` so the server can resolve the target
             in a single indexed query instead of fetching all children.
+        :param created_by_session_id: When set, only return conversations
+            whose ``omnigent.created_by_session_id`` label names this
+            session, e.g. the independent workers a trigger manager started.
+            ``None`` disables the filter.
         :returns: A :class:`PagedList` of :class:`Conversation`
             objects.
         :raises omnigent.errors.StaleCursorError: If the ``after``/``before``
