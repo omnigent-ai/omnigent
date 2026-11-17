@@ -771,7 +771,7 @@ function useRunUnread(run: ScheduledTaskRun): boolean {
  * Runs without a conversation (e.g. skipped) render as a plain, non-interactive
  * row: no hover highlight, no pointer, not focusable.
  */
-// Read before a run's status text, since the words alone don't say how the work went.
+// Shown before a run's status text, since the words alone don't say how the work went.
 const STATUS_TEXT_LABELS: Record<StepStatus, string> = {
   started: "Started: ",
   done: "Done: ",
@@ -887,7 +887,7 @@ function RunRow({
             data-run-status={statusText.status}
             title={statusText.text}
           >
-            <span className="sr-only">{STATUS_TEXT_LABELS[statusText.status]}</span>
+            <span className="font-medium">{STATUS_TEXT_LABELS[statusText.status]}</span>
             {statusText.text}
           </span>
         )}

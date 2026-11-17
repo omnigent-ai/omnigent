@@ -1835,8 +1835,9 @@ describe("runs of a saved workflow", () => {
       .map((row) => within(row).getByTestId("run-status-text"));
     expect(first).toHaveTextContent("Done: Found it");
     expect(first!.className).not.toContain("text-amber");
-    // A failed step stands out, and the words are read after what happened.
+    // A failed step stands out, and what happened is shown before the words.
     expect(second).toHaveTextContent("Failed: CI is down");
+    expect(within(second!).getByText("Failed:")).not.toHaveClass("sr-only");
     expect(second).toHaveAttribute("data-run-status", "failed");
     expect(second!.className).toContain("text-amber-700");
     expect(second).toHaveAttribute("title", "CI is down");
