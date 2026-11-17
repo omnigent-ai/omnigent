@@ -161,6 +161,39 @@ describe("UserBubble markdown rendering", () => {
   });
 });
 
+const PR_REF_FILE_VIEWER = { ...FILE_VIEWER_NOOP, conversationId: "conv_pr" };
+
+describe("UserBubble pull request references", () => {
+  it("links a PR reference to the session repo", () => {
+    // GitHub info never arrives over the network; the test seeds the cache.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => new Promise<Response>(() => {})),
+    );
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    queryClient.setQueryData(["github-info", "conv_pr"], {
+      object: "session.github.info",
+      available: true,
+      repo: { name_with_owner: "acme/app" },
+    });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <FileViewerContext.Provider value={PR_REF_FILE_VIEWER}>
+          <BubbleView bubble={userBubble("See #4242 and acme/lib#7")} />
+        </FileViewerContext.Provider>
+      </QueryClientProvider>,
+    );
+    expect(screen.getByRole("link", { name: /#4242/ })).toHaveAttribute(
+      "href",
+      "https://github.com/acme/app/pull/4242",
+    );
+    expect(screen.getByRole("link", { name: /acme\/lib#7/ })).toHaveAttribute(
+      "href",
+      "https://github.com/acme/lib/pull/7",
+    );
+  });
+});
+
 describe("UserBubble system messages", () => {
   it("keeps hook order stable when a system message becomes a regular message", () => {
     const { rerender } = renderBubble(userBubble("[System: timer build fired]"));

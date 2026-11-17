@@ -2868,3 +2868,59 @@ describe("BlockRenderer inline file-path linkification", () => {
     expect(url).toContain("base=host");
   });
 });
+
+describe("BlockRenderer pull request references", () => {
+  beforeEach(() => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => new Promise<Response>(() => {})),
+    );
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("links references in assistant text but not in tool output", async () => {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    qc.setQueryData(["github-info", "conv_1"], {
+      object: "session.github.info",
+      available: true,
+      repo: { name_with_owner: "acme/app" },
+    });
+    const items: RenderItem[] = [
+      { kind: "text", itemId: "t1", text: "Landed in #4242.", final: true },
+      {
+        kind: "tool",
+        itemId: "fc_1",
+        execution: {
+          name: "read_file",
+          arguments: {},
+          argsSummary: "",
+          callId: "call_1",
+          agentName: "test",
+          executedBy: "server",
+          output: "Merged #5551234",
+        },
+        output: "Merged #5551234",
+        state: "output-available",
+        startedAt: null,
+        duration: undefined,
+      },
+    ];
+    render(
+      <TestProviders
+        queryClient={qc}
+        fileViewerContext={{ ...FILE_VIEWER_NOOP, conversationId: "conv_1" }}
+      >
+        <BlockRenderer items={items} sessionStatus="running" />
+      </TestProviders>,
+    );
+
+    expect(await screen.findByRole("link", { name: /#4242/ })).toHaveAttribute(
+      "href",
+      "https://github.com/acme/app/pull/4242",
+    );
+    expect(screen.queryByRole("link", { name: /#5551234/ })).not.toBeInTheDocument();
+  });
+});

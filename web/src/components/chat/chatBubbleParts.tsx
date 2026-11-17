@@ -1251,6 +1251,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
                           className="text-message"
                           breaks
                           mode="static"
+                          linkPullRequestRefs
                           remarkRehypeOptions={USER_MESSAGE_REMARK_REHYPE_OPTIONS}
                           renderLocalReviewComment={renderLocalReviewComment}
                         >

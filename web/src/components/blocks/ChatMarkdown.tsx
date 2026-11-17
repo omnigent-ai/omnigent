@@ -13,7 +13,7 @@
 import type React from "react";
 import { useInRouterContext } from "react-router-dom";
 import { Link } from "@/lib/routing";
-import { useMemo } from "react";
+import { useContext, useMemo } from "react";
 import {
   BotIcon,
   CopyIcon,
@@ -28,6 +28,12 @@ import remarkBreaks from "remark-breaks";
 import { normalizeExplicitMathDelimiters } from "@/components/ai-elements/mathMarkdown";
 import { MessageResponse } from "@/components/ai-elements/message";
 import {
+  parsePullRequestRefHref,
+  pullRequestRefUrl,
+  remarkPullRequestRefs,
+  type PullRequestRef,
+} from "@/components/ai-elements/pullRequestRefs";
+import {
   sameServerSessionPath,
   shortFileCitationLabel,
   splitWorkspaceFileCitation,
@@ -35,6 +41,7 @@ import {
   WORKSPACE_IMAGE_ATTR,
 } from "@/components/ai-elements/streamdown-security";
 import { WorkspaceMarkdownImage } from "./WorkspaceMarkdownImage";
+import { ConversationScopeContext } from "@/components/chat/conversationScope";
 import { ZoomableImage } from "@/components/ImageLightbox";
 import {
   ContextMenu,
@@ -59,6 +66,7 @@ import {
   useWorkspacePaths,
 } from "@/shell/FileViewerContext";
 import { resolveChatFilePath, useWorkspaceFileExists } from "@/hooks/useWorkspaceChangedFiles";
+import { usePullRequestInfoSnapshot } from "@/hooks/usePullRequests";
 import { showToast } from "@/components/ui/toast";
 
 // Streamdown hands each component override the source hast node alongside the
@@ -360,6 +368,19 @@ function WorkspaceFileLink({
   const { root, home } = useWorkspacePaths();
 
   if (!path) {
+    const pullRequestRef = parsePullRequestRefHref(href);
+    if (pullRequestRef) {
+      return (
+        <PullRequestRefLink
+          pullRequestRef={pullRequestRef}
+          className={className}
+          title={title}
+          {...props}
+        >
+          {children}
+        </PullRequestRefLink>
+      );
+    }
     if (typeof href === "string" && isRemoteVideoUrl(href)) {
       return (
         <VideoPlayer
@@ -511,6 +532,44 @@ function WorkspaceFileLink({
         {shortLabel ?? children}
       </a>
     </FileLinkContextMenu>
+  );
+}
+
+/**
+ * A `#1234` / `owner/repo#12` reference parked by `remarkPullRequestRefs`.
+ * Renders as plain text until the session repo loads, and when the reference
+ * can't be resolved safely.
+ */
+function PullRequestRefLink({
+  pullRequestRef,
+  children,
+  className,
+  title,
+  ...props
+}: React.ComponentPropsWithoutRef<"a"> & { pullRequestRef: PullRequestRef }) {
+  // A side chat inherits its parent's file viewer but may sit in another repo.
+  const scopedConversationId = useContext(ConversationScopeContext);
+  const fileViewerConversationId = useFileViewerConversationId();
+  const conversationId = scopedConversationId ?? fileViewerConversationId;
+  const { data } = usePullRequestInfoSnapshot(conversationId);
+  const url = data ? pullRequestRefUrl(pullRequestRef, data) : null;
+  if (!url) return <span className={className}>{children}</span>;
+  return (
+    <a
+      {...props}
+      href={url}
+      target="_blank"
+      rel="noopener noreferrer"
+      className={cn(STREAMDOWN_LINK_CLASS, className)}
+      title={title ?? url}
+      data-streamdown="link"
+      onClick={(event) => {
+        props.onClick?.(event);
+        followLinkWithPopupFallback(event, url, conversationId);
+      }}
+    >
+      <PullRequestLinkLabel>{children}</PullRequestLinkLabel>
+    </a>
   );
 }
 
@@ -806,28 +865,37 @@ function remarkHtmlAsText() {
  *
  * When `literalHtml` is set, raw HTML shows as written instead of rendering,
  * so markup or comments in a tool's text can't hide part of it.
+ *
+ * When `linkPullRequestRefs` is set, `#1234` and `owner/repo#12` link to the
+ * PR in the session's repo. Opt-in because tool output often contains non-PR `#N`.
  */
 export function FilePathAwareMessageResponse({
   children,
   breaks = false,
   literalHtml = false,
   isStreaming = false,
+  linkPullRequestRefs = false,
   ...props
-}: React.ComponentProps<typeof MessageResponse> & { breaks?: boolean; literalHtml?: boolean }) {
+}: React.ComponentProps<typeof MessageResponse> & {
+  breaks?: boolean;
+  literalHtml?: boolean;
+  linkPullRequestRefs?: boolean;
+}) {
   const components = FILE_PATH_AWARE_COMPONENTS;
 
   // Extend (don't replace) Streamdown's defaults so remark-gfm survives. With
   // neither option set we pass `undefined` so Streamdown uses its defaults unchanged.
   const remarkPlugins = useMemo(
     () =>
-      breaks || literalHtml
+      breaks || literalHtml || linkPullRequestRefs
         ? [
             ...Object.values(defaultRemarkPlugins),
+            ...(linkPullRequestRefs ? [remarkPullRequestRefs] : []),
             ...(literalHtml ? [remarkHtmlAsText] : []),
             ...(breaks ? [remarkBreaks] : []),
           ]
         : undefined,
-    [breaks, literalHtml],
+    [breaks, literalHtml, linkPullRequestRefs],
   );
 
   // Throttle the markdown so the live (still-growing) bubble re-parses a few

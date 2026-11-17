@@ -596,6 +596,21 @@ export function usePullRequestInfo(
   return useQuery(pullRequestInfoQueryOptions(context, options));
 }
 
+/**
+ * Read-only view of the session's GitHub info for per-item renderers. Shares the
+ * cache entry but leaves refreshing to {@link usePullRequestInfo} subscribers.
+ */
+export function usePullRequestInfoSnapshot(rawConversationId: string | undefined) {
+  const context = usePullRequestQueryContext(rawConversationId);
+  return useQuery({
+    ...pullRequestInfoQueryOptions(context),
+    refetchOnMount: false,
+    // Otherwise every newly mounted reader refetches a failed query.
+    retryOnMount: false,
+    refetchOnWindowFocus: false,
+  });
+}
+
 /** Linked PR details at the list cadence; the session's base query handles turn-end refresh. */
 export function usePullRequestInfos(rawConversationId: string | undefined, prUrls: string[]) {
   const context = usePullRequestQueryContext(rawConversationId);
