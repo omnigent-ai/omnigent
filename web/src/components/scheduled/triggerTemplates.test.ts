@@ -166,6 +166,24 @@ describe("saved trigger prompts", () => {
     expect(syncTriggerWorkflowId("A handwritten automation.", true)).toBe(
       "A handwritten automation.",
     );
+    // Instructions that repeat the heading keep a prompt from splitting; the call still
+    // follows the workflow they open with.
+    const unsplittable = (instructions: string) =>
+      renderTriggerPrompt(
+        "jira",
+        fields({ instructions: `${instructions}\n\nInstructions for each session:\nfirst.` }),
+        supported,
+      );
+    const seeded = unsplittable(WORKFLOW_RUN);
+    expect(splitTriggerPrompt(seeded).systemPrompt).toBeNull();
+    expect(seeded).toContain(`workflow_id "${WORKFLOW_ID}"`);
+    expect(syncTriggerWorkflowId(seeded, true)).toBe(seeded);
+    expect(syncTriggerWorkflowId(seeded.replace(WORKFLOW_RUN, otherRun), true)).toBe(
+      unsplittable(otherRun),
+    );
+    expect(
+      syncTriggerWorkflowId(seeded.replace(WORKFLOW_RUN, "Investigate the ticket."), true),
+    ).toBe(unsplittable("Investigate the ticket."));
   });
 
   it.each(SOURCE_MODES)(

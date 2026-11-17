@@ -1,13 +1,7 @@
-"""Automations that run a saved workflow, read from the prompt their runs send.
+"""Keep an automation that runs a saved workflow from reusing a session.
 
-Every run of a saved workflow that an automation starts gets its own new session: such
-an automation can't continue one session, and a trigger that runs one can't send every
-match to one task session. An automation runs a saved workflow when its prompt, or a
-trigger's instructions, is the message ``savedWorkflowMessage`` in web/src/lib/workflow.ts
-writes, read back as ``parseSavedWorkflowMessage`` there reads it. A trigger's
-instructions come from the prompt below its header, split as ``splitTriggerPrompt`` in
-web/src/components/scheduled/triggerTemplates.ts splits it. The header itself is left
-out: one can disagree with the prompt below it, and only that prompt runs.
+It reads the prompt a run sends, below any trigger header: a header can disagree with
+that prompt, and only the prompt runs.
 """
 
 from __future__ import annotations

@@ -10,9 +10,15 @@ const SAVED_WORKFLOW_RUN =
 const SAVED_WORKFLOW_RUN_OPENING =
   /^[/$]workflow Run the saved workflow "(.+)" \(ID ([0-9a-f]{32})\)\.(?:\n|$)/;
 
+/** The saved workflow *text* opens with a run of, whatever follows that first line. */
+export function savedWorkflowRunOpening(text: string): { id: string; name: string } | null {
+  const match = SAVED_WORKFLOW_RUN_OPENING.exec(text.trimStart());
+  return match ? { id: match[2], name: match[1] } : null;
+}
+
 /** Whether *text* opens with a saved workflow's run, whatever follows that first line. */
 export function opensWithSavedWorkflowRun(text: string): boolean {
-  return SAVED_WORKFLOW_RUN_OPENING.test(text.trimStart());
+  return savedWorkflowRunOpening(text) !== null;
 }
 
 /**

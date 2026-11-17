@@ -8,7 +8,11 @@ import {
   PagerDutyIcon,
   SlackIcon,
 } from "@/components/icons/IntegrationIcons";
-import { opensWithSavedWorkflowRun, parseSavedWorkflowRun } from "@/lib/savedWorkflowRun";
+import {
+  opensWithSavedWorkflowRun,
+  parseSavedWorkflowRun,
+  savedWorkflowRunOpening,
+} from "@/lib/savedWorkflowRun";
 
 export type TriggerSource = "jira" | "slack" | "github" | "linear" | "pagerduty";
 
@@ -778,10 +782,8 @@ const WORKER_SETTINGS_PATTERN = new RegExp(
   "g",
 );
 
-function workerSettingsMatch(prompt: string) {
-  const parts = splitTriggerPrompt(stripTriggerHeader(prompt));
-  if (parts.systemPrompt === null) return null;
-  const manager = parts.systemPrompt.split(triggerPromptHeadings(parts.systemPrompt).posting)[0];
+/** The manager text's one generated creation call, or null when there's none or more. */
+function generatedCreationCall(manager: string): RegExpMatchArray | null {
   const matches = [...manager.matchAll(WORKER_SETTINGS_PATTERN)];
   if (matches.length !== 1) return null;
   const match = matches[0];
@@ -789,7 +791,15 @@ function workerSettingsMatch(prompt: string) {
   const otherInstructions = manager
     .replace(match[0], "")
     .replace(/\bthat\s+`?sys_session_create`?\s+returned\b/gi, "");
-  if (/\bsys_session_create\b/i.test(otherInstructions)) return null;
+  return /\bsys_session_create\b/i.test(otherInstructions) ? null : match;
+}
+
+function workerSettingsMatch(prompt: string) {
+  const parts = splitTriggerPrompt(stripTriggerHeader(prompt));
+  if (parts.systemPrompt === null) return null;
+  const manager = parts.systemPrompt.split(triggerPromptHeadings(parts.systemPrompt).posting)[0];
+  const match = generatedCreationCall(manager);
+  if (match === null) return null;
   try {
     const settings: TriggerWorkerSettings = {
       agentId: match[1] === "set to your agent ID" ? null : JSON.parse(match[1]),
@@ -860,21 +870,27 @@ const WORKFLOW_ID_ARGUMENT = /, workflow_id "[0-9a-f]{32}"$/;
  * @returns The prompt with that call updated, or unchanged when no generated call is found.
  */
 export function syncTriggerWorkflowId(prompt: string, workflowIdSupported: boolean): string {
-  const parsed = workerSettingsMatch(prompt);
-  if (parsed === null) return prompt;
-  const { parts, match } = parsed;
+  if (!startsLikeTemplatePrompt(prompt)) return prompt;
+  // The generated text, and its call, end at the first instructions heading.
+  const [manager, ...rest] = prompt.split(triggerPromptHeadings(prompt).instructions);
+  const match = rest.length > 0 ? generatedCreationCall(manager) : null;
+  if (match === null) return prompt;
+  const parts = splitTriggerPrompt(prompt);
+  // Instructions that repeat a heading keep a prompt from splitting; theirs start at the first.
   const workflowRun =
-    workflowIdSupported && !isTaskSessionTriggerPrompt(prompt)
+    parts.systemPrompt !== null
       ? parseSavedWorkflowRun(parts.userPrompt)
-      : null;
+      : savedWorkflowRunOpening(rest[0]);
+  const workflowId =
+    workflowIdSupported && !isTaskSessionTriggerPrompt(prompt) ? workflowRun?.id : undefined;
   const placement =
     match[2].replace(WORKFLOW_ID_ARGUMENT, "") +
-    (workflowRun ? `, workflow_id ${JSON.stringify(workflowRun.id)}` : "");
+    (workflowId ? `, workflow_id ${JSON.stringify(workflowId)}` : "");
   if (placement === match[2]) return prompt;
   const start = `call sys_session_create with agent_id ${match[1]}, `.length;
   const call = `${match[0].slice(0, start)}${placement}${match[0].slice(start + match[2].length)}`;
-  const systemPrompt = parts.systemPrompt!.replace(match[0], () => call);
-  return combineTriggerPrompt(parts.userPrompt, systemPrompt);
+  // The call is the first of its text: it sits in the generated text, which opens the prompt.
+  return prompt.replace(match[0], () => call);
 }
 
 const SERVICE_NAMES: Record<TriggerSource, string> = {
