@@ -53,7 +53,6 @@ describe("splitPullRequestRefs", () => {
     ["PR #1234: done", ["#omnigent-pr-1234"]],
     ["omnigent-ai/omnigent#9882", ["#omnigent-pr-omnigent-ai/omnigent/9882"]],
     ["socketio/socket.io#7", ["#omnigent-pr-socketio/socket.io/7"]],
-    ["vercel/next.js#123", ["#omnigent-pr-vercel/next.js/123"]],
     // Accepted: an all-digit hex color reads the same as a PR number.
     ["#123456", ["#omnigent-pr-123456"]],
   ])("links %j", (text, hrefs) => {
@@ -81,6 +80,8 @@ describe("splitPullRequestRefs", () => {
     "styles/main.css#1234",
     "docs/index.html#1234",
     "config/app.toml#1234",
+    "src/app.js#12",
+    "vercel/next.js#123",
   ])("leaves %j as text", (text) => {
     expect(splitPullRequestRefs(text)).toEqual([{ type: "text", value: text }]);
   });
