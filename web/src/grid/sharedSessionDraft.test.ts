@@ -8,10 +8,11 @@ import {
   setSessionDraft,
   type SessionDraft,
 } from "@/lib/sessionDrafts";
-import { useChatStore, type SideChatComposerDraft } from "@/store/chatStore";
+import { gridCellComposerKey, useChatStore, type SideChatComposerDraft } from "@/store/chatStore";
 import { useSharedSessionDraft } from "./sharedSessionDraft";
 
 const sessionId = "conv_cell";
+const cellKey = gridCellComposerKey(sessionId);
 const initialComposers = useChatStore.getState().sideChatComposers;
 
 const reviewComment = {
@@ -37,15 +38,13 @@ const reviewComment = {
 
 /** The cell's composer entry, as the cell's composer edits it. */
 function cellComposer(): SideChatComposerDraft | undefined {
-  return useChatStore.getState().sideChatComposers[sessionId];
+  return useChatStore.getState().sideChatComposers[cellKey];
 }
 
 /** Edit the cell's composer the way its textarea and attachment controls do. */
 function editCell(next: Partial<SideChatComposerDraft>): void {
   act(() =>
-    useChatStore
-      .getState()
-      .updateSideChatComposer(sessionId, (current) => ({ ...current, ...next })),
+    useChatStore.getState().updateSideChatComposer(cellKey, (current) => ({ ...current, ...next })),
   );
 }
 
@@ -118,6 +117,34 @@ describe("a grid cell's shared draft", () => {
     });
   });
 
+  it("keeps the cell's composer as it is when only the session's review comments change", () => {
+    seedDraft({
+      text: serializeReplyDraft({ quotes: [{ before: "Intro", text: "Quoted" }], text: "Reply" }),
+      replyDraft: { version: 1, quotes: [{ before: "Intro", text: "Quoted" }], text: "Reply" },
+      files: [],
+    });
+    renderHook(() => useSharedSessionDraft(sessionId));
+    const composer = cellComposer();
+
+    act(() => {
+      const draft = getSessionDraft(sessionId)!;
+      setSessionDraft(sessionId, { ...draft, reviewComments: [reviewComment] });
+    });
+
+    expect(cellComposer()).toBe(composer);
+  });
+
+  it("shows a session draft that another writer changes while the cell is mounted", () => {
+    seedDraft({ text: "Shared draft", files: [] });
+    renderHook(() => useSharedSessionDraft(sessionId));
+
+    act(() => setSessionDraft(sessionId, { text: "Rewound prompt", files: [] }));
+    expect(cellComposer()?.text).toBe("Rewound prompt");
+
+    editCell({ text: "Rewound prompt, edited" });
+    expect(getSessionDraft(sessionId)?.text).toBe("Rewound prompt, edited");
+  });
+
   it("drops a tag once its token is deleted, so retyping the token stays literal", () => {
     seedDraft({
       text: "Read @src/app.ts first",
@@ -165,28 +192,45 @@ describe("a grid cell's shared draft", () => {
     });
     renderHook(() => useSharedSessionDraft(sessionId));
 
-    act(() => useChatStore.getState().clearSideChatComposer(sessionId));
+    act(() => useChatStore.getState().clearSideChatComposer(cellKey));
 
     expect(getSessionDraft(sessionId)).toBeUndefined();
   });
 
-  it("puts back the composer entry a sub-agent tab keeps when the cell unmounts", () => {
+  it("leaves a sub-agent tab's own composer entry alone while the cell is mounted and after", () => {
     const subAgentDraft: SideChatComposerDraft = { text: "Sub-agent question", files: [] };
     useChatStore.setState({ sideChatComposers: { [sessionId]: subAgentDraft } });
     seedDraft({ text: "Shared draft", files: [] });
 
     const { unmount } = renderHook(() => useSharedSessionDraft(sessionId));
-    expect(cellComposer()?.text).toBe("Shared draft");
+    editCell({ text: "Shared draft, edited" });
+    expect(useChatStore.getState().sideChatComposers[sessionId]).toBe(subAgentDraft);
 
     unmount();
 
-    expect(cellComposer()).toBe(subAgentDraft);
+    expect(useChatStore.getState().sideChatComposers[sessionId]).toBe(subAgentDraft);
   });
 
-  it("leaves no composer entry behind when the cell unmounts and none existed before", () => {
+  it("keeps a sub-agent tab's edits made while the cell is mounted", () => {
+    seedDraft({ text: "Shared draft", files: [] });
+    const { unmount } = renderHook(() => useSharedSessionDraft(sessionId));
+
+    // The sub-agent's Workspace composer edits its own entry while the cell is open.
+    act(() =>
+      useChatStore
+        .getState()
+        .updateSideChatComposer(sessionId, (current) => ({ ...current, text: "Workspace edit" })),
+    );
+    unmount();
+
+    expect(useChatStore.getState().sideChatComposers[sessionId]?.text).toBe("Workspace edit");
+  });
+
+  it("removes the cell's composer entry when the cell unmounts", () => {
     seedDraft({ text: "Shared draft", files: [] });
 
     const { unmount } = renderHook(() => useSharedSessionDraft(sessionId));
+    expect(cellComposer()?.text).toBe("Shared draft");
     unmount();
 
     expect(cellComposer()).toBeUndefined();

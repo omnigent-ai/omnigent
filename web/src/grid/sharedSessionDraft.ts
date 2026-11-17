@@ -1,8 +1,13 @@
 import { useLayoutEffect } from "react";
 import { presentTaggedMentions } from "@/lib/composerMentions";
 import { restoreReplyDraft, serializeReplyDraft, snapshotReplyDraft } from "@/lib/replyDraft";
-import { getSessionDraft, setSessionDraft, type SessionDraft } from "@/lib/sessionDrafts";
-import { useChatStore, type SideChatComposerDraft } from "@/store/chatStore";
+import {
+  getSessionDraft,
+  setSessionDraft,
+  subscribeSessionDrafts,
+  type SessionDraft,
+} from "@/lib/sessionDrafts";
+import { gridCellComposerKey, useChatStore, type SideChatComposerDraft } from "@/store/chatStore";
 
 /** The composer entry a session draft seeds: its text, quote cards and attachments. */
 function composerFromSessionDraft(draft: SessionDraft): SideChatComposerDraft {
@@ -29,13 +34,28 @@ function saveComposerToSessionDraft(
   });
 }
 
-function setComposerEntry(sessionId: string, composer: SideChatComposerDraft | undefined): void {
+function setComposerEntry(key: string, composer: SideChatComposerDraft | undefined): void {
   useChatStore.setState((state) => {
     const others = Object.fromEntries(
-      Object.entries(state.sideChatComposers).filter(([key]) => key !== sessionId),
+      Object.entries(state.sideChatComposers).filter(([id]) => id !== key),
     );
-    return { sideChatComposers: composer ? { ...others, [sessionId]: composer } : others };
+    return { sideChatComposers: composer ? { ...others, [key]: composer } : others };
   });
+}
+
+/** Whether the composer already shows the session draft's text and attachments. */
+function sameDraftContent(
+  draft: SessionDraft | undefined,
+  composer: SideChatComposerDraft | undefined,
+): boolean {
+  const files = composer?.files ?? [];
+  const draftFiles = draft?.files ?? [];
+  const text = serializeReplyDraft({ quotes: composer?.quotes ?? [], text: composer?.text ?? "" });
+  return (
+    (draft?.text ?? "") === text &&
+    files.length === draftFiles.length &&
+    files.every((file, index) => file === draftFiles[index])
+  );
 }
 
 function sameComposerContent(
@@ -50,27 +70,33 @@ function sameComposerContent(
 }
 
 /**
- * Makes a grid cell's composer and its session's draft one draft, the same one the
- * full-screen composer keeps: the cell starts from it and writes its text, quotes
- * and attachments back as they change. The cell edits the composer entry that a
- * sub-agent tab of the same id also uses, so that entry is put back on unmount.
+ * Keeps a grid cell's composer and its session's draft one draft, the same one the
+ * full-screen composer keeps. The cell edits its own composer entry: it starts from
+ * the session draft, writes edits back, and re-reads the draft when another writer
+ * changes it.
  */
 export function useSharedSessionDraft(sessionId: string): void {
   useLayoutEffect(() => {
-    const previous = useChatStore.getState().sideChatComposers[sessionId];
-    const draft = getSessionDraft(sessionId);
-    const seeded = draft ? composerFromSessionDraft(draft) : undefined;
-    setComposerEntry(sessionId, seeded);
-    let written = seeded;
-    const unsubscribe = useChatStore.subscribe((state) => {
-      const composer = state.sideChatComposers[sessionId];
+    const key = gridCellComposerKey(sessionId);
+    let written: SideChatComposerDraft | undefined;
+    const reseed = () => {
+      const draft = getSessionDraft(sessionId);
+      if (sameDraftContent(draft, useChatStore.getState().sideChatComposers[key])) return;
+      written = draft ? composerFromSessionDraft(draft) : undefined;
+      setComposerEntry(key, written);
+    };
+    reseed();
+    const unsubscribeDrafts = subscribeSessionDrafts(reseed);
+    const unsubscribeComposer = useChatStore.subscribe((state) => {
+      const composer = state.sideChatComposers[key];
       if (sameComposerContent(composer, written)) return;
       written = composer;
       saveComposerToSessionDraft(sessionId, composer);
     });
     return () => {
-      unsubscribe();
-      setComposerEntry(sessionId, previous);
+      unsubscribeDrafts();
+      unsubscribeComposer();
+      setComposerEntry(key, undefined);
     };
   }, [sessionId]);
 }

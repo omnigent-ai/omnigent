@@ -98,6 +98,11 @@ function subscribe(listener: () => void): () => void {
   return () => listeners.delete(listener);
 }
 
+/** Call `listener` after any session draft is written, so it can compare the draft it holds. */
+export function subscribeSessionDrafts(listener: () => void): () => void {
+  return subscribe(listener);
+}
+
 function notifyListeners(): void {
   for (const listener of listeners) listener();
 }

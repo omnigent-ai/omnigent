@@ -1,4 +1,14 @@
-import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  renderHook,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
+import { useSharedSessionDraft } from "@/grid/sharedSessionDraft";
 import { createPortal } from "react-dom";
 import { StrictMode } from "react";
 import userEvent from "@testing-library/user-event";
@@ -19,7 +29,7 @@ import { clearSessionDrafts, getSessionDraft, setSessionDraft } from "@/lib/sess
 import * as sessionsApi from "@/lib/sessionsApi";
 import type { Session } from "@/lib/types";
 import type * as ChatStoreModule from "@/store/chatStore";
-import { useChatStore, type ChatState } from "@/store/chatStore";
+import { gridCellComposerKey, useChatStore, type ChatState } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
 import { SideChatPane } from "./SideChatPane";
@@ -1557,7 +1567,9 @@ describe("grid cell composer shares its session's draft", () => {
     text: string,
     shared: Parameters<typeof setSessionDraft>[1] = { text, files: [] },
   ) {
-    useChatStore.setState({ sideChatComposers: { [childId]: { text, files: [] } } });
+    useChatStore.setState({
+      sideChatComposers: { [gridCellComposerKey(childId)]: { text, files: [] } },
+    });
     setSessionDraft(childId, shared);
   }
 
@@ -1581,7 +1593,7 @@ describe("grid cell composer shares its session's draft", () => {
       undefined,
       { pinnedConversationId: childId },
     );
-    expect(useChatStore.getState().sideChatComposers[childId]).toBeUndefined();
+    expect(useChatStore.getState().sideChatComposers[gridCellComposerKey(childId)]).toBeUndefined();
   });
 
   it("sends a tagged skill command as an ordinary message, not as a local command", () => {
@@ -1658,14 +1670,14 @@ describe("grid cell composer shares its session's draft", () => {
       quotes: [{ before: "Intro", text: "Quoted line" }],
       text: "Reply",
     };
-    seedCell("Reply", {
+    setSessionDraft(childId, {
       text: serializeReplyDraft(replyDraft),
       files: [],
       replyDraft,
     });
     useChatStore.setState({
       sideChatComposers: {
-        [childId]: {
+        [gridCellComposerKey(childId)]: {
           text: "Reply",
           files: [],
           quotes: [{ id: "q", before: "Intro", text: "Quoted line" }],
@@ -1730,6 +1742,49 @@ describe("grid cell composer shares its session's draft", () => {
     expect(send).toHaveBeenCalledExactlyOnceWith("Ping @Fix CI", "agent_side", undefined, {
       pinnedConversationId: childId,
     });
+  });
+
+  it("restores a failed grid send with its session tag as a token, and resends it unchanged", () => {
+    const sent = `Compare [Session: "Fix CI" id=sess_fix subagent=no]\n\n${SESSION_MENTION_HINT}`;
+    conversationRegistry.acquire(childId).setState({
+      sessionStatus: "idle",
+      abortController: new AbortController(),
+      failedSendDraft: {
+        conversationId: childId,
+        text: sent,
+        files: [],
+        stableId: "retry-stable",
+      },
+    });
+    renderHook(() => useSharedSessionDraft(childId));
+    renderPane(<SideChatPane childId={childId} fullSession gridComposer={{}} />);
+
+    expect(screen.getByTestId("side-chat-input")).toHaveValue("Compare @Fix CI");
+    fireEvent.click(screen.getByTestId("side-chat-send"));
+    expect(send).toHaveBeenCalledExactlyOnceWith(sent, "agent_side", undefined, {
+      pinnedConversationId: childId,
+    });
+  });
+
+  it("sends a built-in command with a review comment as a message, not a menu pick on Enter", () => {
+    conversationRegistry
+      .acquire(childId)
+      .setState({ sessionHarness: "claude-sdk", sessionStatus: "idle" });
+    seedCell("", { text: "", files: [], reviewComments: [reviewComment] });
+    gridCell();
+    const input = screen.getByTestId("side-chat-input");
+
+    fireEvent.focus(input);
+    fireEvent.change(input, { target: { value: "/help" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    expect(screen.queryByTestId("side-chat-command-notice")).toBeNull();
+    expect(send).toHaveBeenCalledExactlyOnceWith(
+      expect.stringMatching(/^\/help\n\n```local-review-comment\n/),
+      "agent_side",
+      undefined,
+      { pinnedConversationId: childId },
+    );
   });
 
   it("leaves a side chat alone when its session has a shared draft", () => {
