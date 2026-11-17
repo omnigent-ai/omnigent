@@ -12,6 +12,8 @@ export interface StoredPreference<Value extends string | number | boolean> {
   write: (value: Value) => void;
   /** Re-read after a same-tab storage write that bypassed `write` (import, reset). */
   notifyChanged: () => void;
+  /** Call `listener` when the preference may have changed; returns the unsubscribe. */
+  subscribe: (listener: () => void) => () => void;
   /** Live value of the preference. */
   use: () => Value;
 }
@@ -72,7 +74,7 @@ export function createStoredPreference<Value extends string | number | boolean>(
 
   const use = () => useSyncExternalStore(subscribe, read, () => defaultValue);
 
-  return { storageKey, defaultValue, read, write, notifyChanged, use };
+  return { storageKey, defaultValue, read, write, notifyChanged, subscribe, use };
 }
 
 /** A preference holding one choice from a fixed list. */

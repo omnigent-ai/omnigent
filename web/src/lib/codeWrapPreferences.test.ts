@@ -1,5 +1,5 @@
 import { act, renderHook } from "@testing-library/react";
-import { afterEach, expect, it } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 import {
   CODE_BLOCK_WORD_WRAP_STORAGE_KEY,
   readCodeBlockWordWrap,
@@ -10,6 +10,8 @@ import {
 
 // Covers the key and boolean mapping; storedChoicePreference.test.ts covers shared storage.
 afterEach(() => {
+  vi.restoreAllMocks();
+  writeCodeBlockWordWrap(true);
   localStorage.clear();
 });
 
@@ -42,4 +44,35 @@ it("updates every mounted reader on a toggle and on another window's write", () 
   });
   expect(first.result.current).toBe(true);
   expect(second.result.current).toBe(true);
+});
+
+it("keeps the toggle working for this tab when storage is unavailable", () => {
+  vi.spyOn(Storage.prototype, "getItem").mockImplementation(() => {
+    throw new Error("access denied");
+  });
+  vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+    throw new Error("access denied");
+  });
+  const { result } = renderHook(() => useCodeBlockWordWrap());
+  expect(result.current).toBe(true);
+
+  act(() => toggleCodeBlockWordWrap());
+  expect(result.current).toBe(false);
+  act(() => toggleCodeBlockWordWrap());
+  expect(result.current).toBe(true);
+});
+
+it("shows the unsaved choice when saving it fails", () => {
+  vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+    throw new Error("quota exceeded");
+  });
+  writeCodeBlockWordWrap(false);
+  expect(localStorage.getItem(CODE_BLOCK_WORD_WRAP_STORAGE_KEY)).toBeNull();
+  expect(readCodeBlockWordWrap()).toBe(false);
+
+  vi.restoreAllMocks();
+  writeCodeBlockWordWrap(false);
+  expect(localStorage.getItem(CODE_BLOCK_WORD_WRAP_STORAGE_KEY)).toBe("false");
+  localStorage.removeItem(CODE_BLOCK_WORD_WRAP_STORAGE_KEY);
+  expect(readCodeBlockWordWrap()).toBe(true);
 });

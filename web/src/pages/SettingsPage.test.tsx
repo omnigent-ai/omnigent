@@ -33,6 +33,11 @@ import * as adminView from "@/lib/adminView";
 import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
 import { UI_FONT_SIZE_MOBILE_QUERY } from "@/lib/uiFontPreferences";
 import {
+  CODE_BLOCK_WORD_WRAP_STORAGE_KEY,
+  useCodeBlockWordWrap,
+  writeCodeBlockWordWrap,
+} from "@/lib/codeWrapPreferences";
+import {
   readTerminalClipboardPreference,
   writeTerminalClipboardPreference,
 } from "@/lib/terminalClipboardPreferences";
@@ -1321,6 +1326,10 @@ describe("SettingsPage", () => {
     });
     fireEvent.click(screen.getByTestId("heavier-code-text-toggle"));
     localStorage.setItem("omnigent:hidden-picker-agents", '["polly"]');
+    // Code block wrap is toggled from a code block, not this page.
+    act(() => writeCodeBlockWordWrap(false));
+    const codeWrap = renderHook(() => useCodeBlockWordWrap());
+    expect(codeWrap.result.current).toBe(false);
 
     // Sanity: the non-default choices were persisted.
     expect(localStorage.getItem("omnigent:terminal-theme")).toBe("dark");
@@ -1359,6 +1368,8 @@ describe("SettingsPage", () => {
     expect(localStorage.getItem("omnigent:ui-font-size")).toBeNull();
     expect(localStorage.getItem("omnigent:code-font-size")).toBeNull();
     expect(localStorage.getItem("omnigent:code-font-weight")).toBeNull();
+    expect(localStorage.getItem(CODE_BLOCK_WORD_WRAP_STORAGE_KEY)).toBeNull();
+    expect(codeWrap.result.current).toBe(true);
 
     // Color theme is back to Omnigent.
     expect((screen.getByTestId("color-theme-select") as HTMLSelectElement).value).toBe("omni");

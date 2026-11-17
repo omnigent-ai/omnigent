@@ -2,6 +2,7 @@
 // code panels. One toggle drives every block in every session and survives a
 // refresh; the file editor's "Wrap lines" setting is separate.
 
+import { useSyncExternalStore } from "react";
 import { createStoredChoicePreference } from "./storedChoicePreference";
 
 export const CODE_BLOCK_WORD_WRAP_STORAGE_KEY = "omnigent:code-block-word-wrap";
@@ -14,14 +15,19 @@ const preference = createStoredChoicePreference(
   DEFAULT_CODE_BLOCK_WORD_WRAP ? "true" : "false",
 );
 
-/** Read the preference; storage errors and unknown values mean the default. */
+// This tab's choice while storage refuses to save it, so the toggle still works.
+let unsavedWrap: boolean | undefined;
+
+/** Read the preference; unknown values, and unreadable storage with no unsaved choice, mean the default. */
 export function readCodeBlockWordWrap(): boolean {
-  return preference.read() === "true";
+  return unsavedWrap ?? preference.read() === "true";
 }
 
 /** Persist the preference and re-render every code block on screen. */
 export function writeCodeBlockWordWrap(wrap: boolean): void {
+  unsavedWrap = wrap;
   preference.write(wrap ? "true" : "false");
+  if ((preference.read() === "true") === wrap) unsavedWrap = undefined;
 }
 
 /** Flip the preference from its current stored value. */
@@ -34,5 +40,9 @@ export const notifyCodeBlockWordWrapChanged = preference.notifyChanged;
 
 /** Live value of the preference, including changes made in other windows. */
 export function useCodeBlockWordWrap(): boolean {
-  return preference.use() === "true";
+  return useSyncExternalStore(
+    preference.subscribe,
+    readCodeBlockWordWrap,
+    () => DEFAULT_CODE_BLOCK_WORD_WRAP,
+  );
 }
