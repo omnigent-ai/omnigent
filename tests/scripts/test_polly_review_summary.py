@@ -147,16 +147,20 @@ def test_incomplete_reviews_are_rejected_regardless_of_size(review: str) -> None
         "row_indentation",
         "inline_details",
         "run_path",
+        "oversized_field",
     ),
     [
-        (None, 0, "", False, "run"),
-        ((20000, 45000, 20000), 0, "", False, "run"),
-        ((3000,) * 30, 59194, "", False, "run"),
-        (None, 0, "  ", False, "run"),
-        ((70000,), 0, "", False, "run"),
+        (None, 0, "", False, "run", None),
+        ((20000, 45000, 20000), 0, "", False, "run", None),
+        ((3000,) * 30, 59194, "", False, "run", None),
+        (None, 0, "  ", False, "run", None),
+        ((70000,), 0, "", False, "run", None),
         # Align an escaped pipe with the fully wrapped comment boundary.
-        (("y" * 69 + ("x" * 70 + r"\|") * 1100,), 0, "", False, "r" * 66),
-        (None, 0, "", True, "run"),
+        (("y" * 69 + ("x" * 70 + r"\|") * 1100,), 0, "", False, "r" * 66, None),
+        (None, 0, "", True, "run", None),
+        (("Reason",), 0, "", False, "run", 0),
+        (("Reason",), 0, "", False, "run", 1),
+        (("Reason",), 0, "", False, "run", 2),
     ],
     ids=[
         "many-rows",
@@ -166,6 +170,9 @@ def test_incomplete_reviews_are_rejected_regardless_of_size(review: str) -> None
         "oversized-row",
         "escaped-pipe-boundary",
         "inline-details",
+        "oversized-test",
+        "oversized-behavior",
+        "oversized-layer",
     ],
 )
 def test_long_review_parts_preserve_all_assessments_and_markdown_context(
@@ -174,6 +181,9 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
     row_indentation: str,
     inline_details: bool,
     run_path: str,
+    oversized_field: int | None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     rationales = (
         ["Guards the regression without a second setup."] * 1200
@@ -185,6 +195,9 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
         f"Empty input é🙂 | Unit | Keep | {rationale} |\n"
         for number, rationale in enumerate(rationales)
     )
+    if oversized_field is not None:
+        field = ("tests/test_parser.py::test_case[0]", "Empty input é🙂", "Unit")[oversized_field]
+        rows = rows.replace(field, field + "x" * 130000, 1)
     review = _REVIEW.replace(
         "| tests/test_parser.py::test_empty | Empty input | Unit | Keep |"
         " Guards the regression. |\n",
@@ -200,6 +213,47 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
     composed = _HELPERS["compose_review"](
         review, {"markdown": "Computed counts", "test_files": ["tests/test_parser.py"]}
     )
+    if oversized_field is not None:
+        review_path = tmp_path / "review.md"
+        review_path.write_text(composed, encoding="utf-8")
+        receipt = tmp_path / "receipt.txt"
+        receipt.write_text("stale receipt\n")
+        for name, value in {
+            "HEAD_SHA": "a" * 40,
+            "GITHUB_RUN_ID": "10",
+            "GITHUB_RUN_ATTEMPT": "1",
+            "RUN_URL": "https://example.test/run",
+            "PR_NUMBER": "1",
+            "REPO": "test/repo",
+        }.items():
+            monkeypatch.setenv(name, value)
+        posts = []
+        monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: posts.append(args))
+        with pytest.raises(ValueError, match="assessment fields exceed comment capacity"):
+            _HELPERS["publish_review"](review_path, receipt)
+        assert not posts
+        assert not receipt.exists()
+        assert not list(tmp_path.glob("comment*.md"))
+        return
+
+    if preceding_paragraph_length:
+        header, delimiter = _REVIEW.split("### Tests\n", 1)[1].splitlines()[:2]
+        header, delimiter = header + "\n", delimiter + "\n"
+        header_start = composed.index(header)
+        limit = len(composed[: header_start + len(header)].encode("utf-8"))
+        boundary_chunks = _HELPERS["split_review"](composed, limit)
+        assert boundary_chunks[0] == composed[:header_start]
+        assert boundary_chunks[1].startswith(header + delimiter)
+        assert "".join(boundary_chunks) == composed
+    if any(isinstance(spec, str) and r"\|" in spec for spec in rationale_specs or ()):
+        row = rows.splitlines()[0]
+        boundary = row.index(r"\|") + 1
+        limit = len(row[:boundary].encode("utf-8"))
+        boundary_chunks = _HELPERS["split_review"](row, limit)
+        assert boundary_chunks[0] == row[: boundary - 1]
+        assert boundary_chunks[1].startswith(r"\|")
+        assert "".join(boundary_chunks) == row
+        assert all(len(chunk.encode("utf-8")) <= limit for chunk in boundary_chunks)
     chunks = _HELPERS["split_review"](composed, 58000)
     comments = _HELPERS["review_comments"](
         composed, head_sha="a" * 40, run_id="10-1", run_url=f"https://example.test/{run_path}"

@@ -336,10 +336,11 @@ def _markdown_context(text: str) -> tuple[str, str, str]:
         table_header = ""
     if table_header and not text.endswith("\n"):
         cells = split_table_row(previous.strip().strip("|"))
-        if len(cells) == TEST_FIELD_COUNT:
-            prefix += table_header + "|" + "|".join(cells[:-1]) + "| "
-            suffix = " |\n" + suffix
-            table_header = ""
+        if len(cells) != TEST_FIELD_COUNT:
+            raise ValueError("Polly review assessment fields exceed comment capacity.")
+        prefix += table_header + "|" + "|".join(cells[:-1]) + "| "
+        suffix = " |\n" + suffix
+        table_header = ""
     return prefix, suffix, table_header
 
 
