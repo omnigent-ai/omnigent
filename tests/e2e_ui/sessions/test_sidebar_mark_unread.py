@@ -137,3 +137,33 @@ def test_unread_dot_survives_reload_from_localStorage_when_server_seed_is_empty(
     reloaded = _row(page, session_id)
     expect(reloaded).to_be_visible()
     expect(_unread_dot(reloaded)).to_be_visible()
+
+
+def test_shortcut_toggles_the_open_session_unread_and_back(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """Cmd/Ctrl+Alt+U marks the open session unread, and pressing it again marks it read.
+
+    Playwright sends the physical ``KeyU`` code with the modifiers, so this
+    covers the real browser keydown the mocked unit tests synthesize.
+
+    :param page: Playwright page fixture (fresh context per test).
+    :param seeded_session: ``(base_url, session_id)`` for a pre-created
+        runner-bound (idle) session.
+    """
+    base_url, session_id = seeded_session
+
+    page.goto(f"{base_url}/c/{session_id}")
+    row = _row(page, session_id)
+    expect(row).to_be_visible()
+    expect(_unread_dot(row)).to_have_count(0)
+
+    toasts = page.locator("[data-sonner-toast]")
+    page.keyboard.press("ControlOrMeta+Alt+KeyU")
+    expect(toasts.filter(has_text="Marked as unread")).to_be_visible()
+    expect(_unread_dot(row)).to_be_visible()
+
+    page.keyboard.press("ControlOrMeta+Alt+KeyU")
+    expect(toasts.filter(has_text="Marked as read")).to_be_visible()
+    expect(_unread_dot(row)).to_have_count(0)
