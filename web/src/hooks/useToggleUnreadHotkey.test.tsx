@@ -52,7 +52,9 @@ describe("useToggleUnreadHotkey", () => {
     expect(press().defaultPrevented).toBe(false);
 
     rerender({ target: { id: "conv-2", updatedAt: 7_000 } });
-    press({ ctrlKey: false, metaKey: true, key: "Dead" });
+    // Consuming the press matters here: Chrome and Safari bind ⌘⌥U to View Source.
+    expect(press({ ctrlKey: false, metaKey: true, key: "Dead" }).defaultPrevented).toBe(true);
+    expect(showToast).toHaveBeenLastCalledWith("Marked as unread");
     expect(isExplicitlyUnread("conv-1")).toBe(false);
     expect(isExplicitlyUnread("conv-2")).toBe(true);
   });

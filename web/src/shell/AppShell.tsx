@@ -918,14 +918,26 @@ function AppShellImpl() {
   // including a shared one missing from the loaded sidebar rows.
   const readStateSnapshot = isKnownTopLevel && activeSessionMatchesRoute ? activeSession : null;
   const readStateId = activeConv?.id ?? readStateSnapshot?.id;
-  const readStateUpdatedAt =
-    activeConv?.updated_at ?? readStateSnapshot?.updatedAt ?? readStateSnapshot?.createdAt;
+  const snapshotUpdatedAt =
+    readStateSnapshot && readStateSnapshot.id === readStateId
+      ? (readStateSnapshot.updatedAt ?? readStateSnapshot.createdAt)
+      : undefined;
+  // The row and the snapshot refresh separately, so either may be newer.
+  const readStateUpdatedAt = activeConv?.updated_at ?? snapshotUpdatedAt;
+  const latestReadStateUpdatedAt = Math.max(
+    activeConv?.updated_at ?? -Infinity,
+    snapshotUpdatedAt ?? -Infinity,
+  );
   const readStateTarget = useMemo<ReadStateTarget | null>(
     () =>
       readStateId !== undefined && readStateUpdatedAt !== undefined
-        ? { id: readStateId, updatedAt: readStateUpdatedAt }
+        ? {
+            id: readStateId,
+            updatedAt: readStateUpdatedAt,
+            latestUpdatedAt: latestReadStateUpdatedAt,
+          }
         : null,
-    [readStateId, readStateUpdatedAt],
+    [readStateId, readStateUpdatedAt, latestReadStateUpdatedAt],
   );
   useToggleUnreadHotkey(readStateTarget);
   // Header action gating, hoisted so the desktop buttons and the mobile

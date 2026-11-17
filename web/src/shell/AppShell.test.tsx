@@ -685,6 +685,7 @@ function mockConversations(
     runner_id?: string | null;
     workspace?: string | null;
     created_at?: number;
+    updated_at?: number;
     provisional?: boolean;
   }[],
 ) {
@@ -697,7 +698,7 @@ function mockConversations(
             object: "conversation" as const,
             title: null,
             created_at: c.created_at ?? 0,
-            updated_at: 0,
+            updated_at: c.updated_at ?? 0,
             labels: c.labels ?? {},
             permission_level: c.permission_level,
             host_id: c.host_id ?? null,
@@ -6915,6 +6916,31 @@ describe("mark-unread shortcut", () => {
       pressShortcut();
       expect(isExplicitlyUnread("conv_linked")).toBe(false);
       expect(isConversationUnseen("conv_linked", 6_000, "idle")).toBe(false);
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  it("keeps the dot below the row's time and the read mark above the newest one", () => {
+    resetReadStateForTests();
+    // The snapshot saw activity the sidebar row hasn't polled yet, and the
+    // client clock lags both.
+    const now = vi.spyOn(Date, "now").mockReturnValue(5_000_000);
+    mockConversations([{ id: "conv_shared", permission_level: 1, updated_at: 5_000 }]);
+    useSessionMock.mockReturnValue({
+      session: sessionSnapshot({ id: "conv_shared", permissionLevel: 1, updatedAt: 6_000 }),
+      isLoading: false,
+      error: null,
+    });
+    renderShell("/c/conv_shared");
+    const pressShortcut = () =>
+      fireEvent.keyDown(window, { key: "u", code: "KeyU", ctrlKey: true, altKey: true });
+    try {
+      pressShortcut();
+      expect(isConversationUnseen("conv_shared", 5_000, "idle")).toBe(true);
+      pressShortcut();
+      expect(isExplicitlyUnread("conv_shared")).toBe(false);
+      expect(isConversationUnseen("conv_shared", 6_000, "idle")).toBe(false);
     } finally {
       now.mockRestore();
     }

@@ -344,10 +344,17 @@ export function markConversationRead(conversationId: string, updatedAt: number):
 /**
  * Flips the explicit unread flag of the session being viewed, where opening it
  * already counted as reading it. Returns whether the session is now unread.
+ *
+ * @param updatedAt - Update time the sidebar row shows; unread anchors below it.
+ * @param latestUpdatedAt - Newest update time known from any source; read covers it.
  */
-export function toggleConversationUnread(conversationId: string, updatedAt: number): boolean {
+export function toggleConversationUnread(
+  conversationId: string,
+  updatedAt: number,
+  latestUpdatedAt = updatedAt,
+): boolean {
   if (explicitlyUnread.has(conversationId)) {
-    markConversationRead(conversationId, updatedAt);
+    markConversationRead(conversationId, Math.max(updatedAt, latestUpdatedAt));
     return false;
   }
   markConversationUnread(conversationId, updatedAt);
