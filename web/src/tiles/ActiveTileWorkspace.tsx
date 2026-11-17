@@ -2,6 +2,7 @@
 // only, so a single session loads workspace data at a time.
 
 import { useEffect, type ContextType } from "react";
+import { PauseCircleIcon } from "lucide-react";
 import { useChildSessions } from "@/hooks/useChildSessions";
 import { useConversationEntryState } from "@/hooks/useConversationEntryState";
 import { useCanEdit } from "@/hooks/usePermissions";
@@ -28,7 +29,37 @@ interface ActiveTileWorkspaceProps {
   onSwitchGuard: (guard: TileSwitchGuard | null) => void;
 }
 
-export function ActiveTileWorkspace({
+export function ActiveTileWorkspace(props: ActiveTileWorkspaceProps) {
+  const { session } = useSession(props.sessionId);
+  if (!session) return null;
+  // The server answers 409 for every workspace request until the session is
+  // bound to a runner (an imported or dormant agent), so don't ask yet.
+  if (!session.runnerId) {
+    return props.workspacePanel.open ? (
+      <NotRunningPanel width={props.workspacePanel.width} />
+    ) : null;
+  }
+  return <BoundTileWorkspace {...props} />;
+}
+
+function NotRunningPanel({ width }: { width: number }) {
+  return (
+    <aside
+      aria-label="Workspace"
+      data-testid="tiles-workspace-not-running"
+      style={{ width }}
+      className="flex shrink-0 flex-col gap-1 border-l px-3 py-2 text-muted-foreground text-sm"
+    >
+      <span className="flex items-center gap-1.5 font-medium text-foreground">
+        <PauseCircleIcon className="size-3.5 shrink-0" aria-hidden />
+        Agent isn't running
+      </span>
+      <span>Send it a message to start it, then its files appear here.</span>
+    </aside>
+  );
+}
+
+function BoundTileWorkspace({
   sessionId,
   workspacePanel,
   onOpenWorkspace,
