@@ -120,6 +120,7 @@ import {
   SESSION_READ_TIMEOUT_MS,
   SSE_MAX_STREAM_AGE_MS,
   SSE_STALE_RECYCLE_MS,
+  sendableQueuedHead,
   setPendingInitialPrompt,
   startStreamPump,
   useChatStore,
@@ -6998,6 +6999,7 @@ describe("chatStore — delivered-but-unacked send", () => {
 
     const sent = useChatStore.getState().send("summarize the deploy status", "agent_xyz");
     await vi.advanceTimersByTimeAsync(SEND_UNANSWERED_GIVE_UP_MS - 1);
+    useChatStore.getState().enqueueMessage("check the rollback plan", undefined);
     expect(pending()).toEqual([expect.objectContaining({ stillSending: true })]);
     expect(useChatStore.getState().failedSendDraft).toBeNull();
     await vi.advanceTimersByTimeAsync(1);
@@ -7005,6 +7007,9 @@ describe("chatStore — delivered-but-unacked send", () => {
     expect(pending()).toEqual([]);
     await sent;
     expect(useChatStore.getState().status).toBe("idle");
+    expect(useChatStore.getState().queuedMessages).toEqual([
+      expect.objectContaining({ text: "check the rollback plan", requiresRetry: true }),
+    ]);
     const draft = useChatStore.getState().failedSendDraft;
     expect(draft).toMatchObject({ text: "summarize the deploy status", serverRefused: false });
     const stableId = draft?.stableId;
@@ -7033,7 +7038,22 @@ describe("chatStore — delivered-but-unacked send", () => {
     expect(errorCards()).toEqual([]);
   });
 
-  it("keeps waiting on an unanswered POST whose message the runner already took", async () => {
+  it.each([
+    ["a receipt under its stable id", false, () => commitMirror("stable_taken", "deploy")],
+    [
+      "a native receipt under its transcript id",
+      true,
+      () => commitMirror("0".repeat(32), "deploy"),
+    ],
+    [
+      "a snapshot holding its item",
+      false,
+      () =>
+        useChatStore.setState({
+          blocks: itemsToBlocks([{ ...userMessage("resp_taken", "deploy"), id: "stable_taken" }]),
+        }),
+    ],
+  ])("keeps waiting on an unanswered POST once %s shows it was taken", async (_, native, take) => {
     vi.useFakeTimers();
     onTestFinished(() => {
       vi.useRealTimers();
@@ -7041,31 +7061,28 @@ describe("chatStore — delivered-but-unacked send", () => {
     useChatStore.setState({
       conversationId: "conv_existing",
       abortController: new AbortController(),
+      isNativeTerminalSession: native,
     });
     const post = holdEventPosts();
     let settled = false;
 
     const sent = useChatStore
       .getState()
-      .send("summarize the deploy status", "agent_xyz", undefined, { stableId: "stable_taken" })
+      .send("deploy", "agent_xyz", undefined, { stableId: "stable_taken" })
       .then(() => {
         settled = true;
       });
     await vi.advanceTimersByTimeAsync(0);
-    handleSessionEvent({
-      type: "session_input_consumed",
-      itemId: "stable_taken",
-      itemType: "message",
-      data: {
-        role: "user",
-        content: [{ type: "input_text", text: "summarize the deploy status" }],
-      },
-    });
+    useChatStore.getState().enqueueMessage("check the rollback plan", undefined);
+    take();
     await vi.advanceTimersByTimeAsync(SEND_UNANSWERED_GIVE_UP_MS);
 
     expect(settled).toBe(false);
     expect(useChatStore.getState().failedSendDraft).toBeNull();
     expect(errorCards()).toEqual([]);
+    expect(useChatStore.getState().status).toBe("streaming");
+    const queued = useChatStore.getState().queuedMessages;
+    expect(sendableQueuedHead(queued, "conv_existing")?.text).toBe("check the rollback plan");
     post.answer();
     await sent;
     expect(errorCards()).toEqual([]);

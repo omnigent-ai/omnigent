@@ -1815,6 +1815,8 @@ const sendChains = new Map<string | symbol, SendChain>();
  * lost and an earlier refused attempt's item already sits in the transcript.
  */
 const inFlightSends = new Map<string, boolean>();
+// Optimistic bubble temp id -> stable id of the in-flight send it shows.
+const inFlightSendBubbles = new Map<string, string>();
 
 // Sends with no conversation id yet (brand-new chat) serialize together: the
 // session is created inside the chained work, so they can't key by id. A
@@ -3044,9 +3046,12 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         }));
         initialDispatched = true;
       }
+      inFlightSendBubbles.set(tempId, stableId);
       const postResult = await withStillSendingMark(sessionId, tempId, () =>
         giveUpOnUnansweredSend(
-          stableId,
+          () =>
+            inFlightSends.get(stableId) === true ||
+            hasCommittedItem(setterForState(sessionId)?.blocks ?? [], stableId),
           postEvent(
             sessionId,
             {
@@ -3156,13 +3161,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // (`failedSendDraft` is conversation-scoped); the composer reads whichever
       // conversation is active and guards on the id before restoring.
       const draftSessionId = postedSessionId ?? submitConversationId;
-      // A first message that never left the browser, or a send the server may still
-      // be holding, goes back to the composer; what was queued behind it waits for
-      // an explicit retry rather than going first.
-      if (
-        draftSessionId !== null &&
-        ((initialDraft && !initialDispatched) || err instanceof UnansweredSendError)
-      ) {
+      // A first message that never left the browser goes back to the composer;
+      // what was queued behind it waits for an explicit retry rather than going first.
+      if (initialDraft && !initialDispatched && draftSessionId !== null) {
         suspendQueuedMessages(draftSessionId);
       }
       // A coded error confirms refusal; a transport failure leaves delivery
@@ -3193,6 +3194,14 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         else if (verdict === "refused") serverRefused = true;
         else if (verdict === "delivered") deliveredDespiteFailure = true;
         else unsettled = true;
+      }
+      // What was queued behind a send the server may still be holding waits too.
+      if (
+        err instanceof UnansweredSendError &&
+        !deliveredDespiteFailure &&
+        draftSessionId !== null
+      ) {
+        suspendQueuedMessages(draftSessionId);
       }
       if (
         !callerHandlesError &&
@@ -3273,6 +3282,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       }
     } finally {
       inFlightSends.delete(stableId);
+      inFlightSendBubbles.delete(tempId);
       if (postedSessionId !== null) forgetUnsentSend(postedSessionId, stableId);
       // Release the next queued send regardless of success/failure so one
       // failed POST can't stall the chain forever.
@@ -4188,16 +4198,32 @@ async function withStillSendingMark<T>(
 class UnansweredSendError extends Error {}
 
 /**
+ * Snapshot a native session's pending bubbles; the returned call acknowledges each
+ * in-flight send whose bubble a receipt has since taken. Native receipts carry a
+ * transcript-derived item id, so the bubble is their only link to the send.
+ */
+function watchNativeSendBubbles(conversationId: string | null): () => void {
+  const state = () => (conversationId === null ? null : setterForState(conversationId));
+  const before = state();
+  if (before?.isNativeTerminalSession !== true) return () => {};
+  const pendingBefore = new Set(before.pendingUserMessages.map((p) => p.tempId));
+  return () => {
+    const pendingAfter = new Set((state() ?? before).pendingUserMessages.map((p) => p.tempId));
+    for (const [tempId, stableId] of inFlightSendBubbles) {
+      if (pendingBefore.has(tempId) && !pendingAfter.has(tempId)) inFlightSends.set(stableId, true);
+    }
+  };
+}
+
+/**
  * Fail a message send whose POST goes unanswered for SEND_UNANSWERED_GIVE_UP_MS,
- * unless a live acknowledgement shows the runner took it. The POST keeps running;
+ * unless `taken` shows the server or runner has the message. The POST keeps running;
  * an unedited retry reuses the send's stable id, which the server deduplicates.
  */
-function giveUpOnUnansweredSend<T>(stableId: string, post: Promise<T>): Promise<T> {
+function giveUpOnUnansweredSend<T>(taken: () => boolean, post: Promise<T>): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const timer = setTimeout(() => {
-      if (inFlightSends.get(stableId) !== true) {
-        reject(new UnansweredSendError(SEND_UNANSWERED_MESSAGE));
-      }
+      if (!taken()) reject(new UnansweredSendError(SEND_UNANSWERED_MESSAGE));
     }, SEND_UNANSWERED_GIVE_UP_MS);
     post.then(resolve, reject).finally(() => clearTimeout(timer));
   });
@@ -9392,6 +9418,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       //   3. No pending entry — render the event payload as a fresh
       //      committed bubble (TUI-typed message, marker, or another
       //      client).
+      const acknowledgeTakenSends = watchNativeSendBubbles(sourceConversationId);
       applyToConversation((s) => {
         const eventContent = userContentFromEvent(event);
         const pendingHead = s.pendingUserMessages[0];
@@ -9524,6 +9551,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           ],
         };
       });
+      acknowledgeTakenSends();
       return;
     }
     case "slash_command":
