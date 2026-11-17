@@ -558,7 +558,10 @@ def arm_subagent_child_start_timeout(
             )
         return
     if entry.child_start_reported:
-        return
+        if entry.child_start_response_id in (None, acceptance.response_id):
+            return
+        entry.child_start_reported = False
+        entry.child_start_response_id = None
     if reported:
         entry.child_start_reported = True
         entry.child_start_response_id = (

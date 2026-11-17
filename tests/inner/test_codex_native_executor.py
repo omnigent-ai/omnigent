@@ -1174,6 +1174,12 @@ async def test_native_refusal_recovers_with_real_client(
     state = read_bridge_state(tmp_path)
     assert state is not None
     assert state.active_turn_id == "turn_accepted"
+    assert isinstance(events[0], TurnComplete)
+    assert events[0].native_acceptance == NativeTurnAcceptance(
+        session_id=state.session_id,
+        thread_id=state.thread_id,
+        response_id="codex_turn_accepted",
+    )
 
 
 @pytest.mark.parametrize("active_turn_id", [None, "turn_existing"])
@@ -2946,6 +2952,12 @@ def test_stale_completed_turn_steer_retries_once_as_new_turn(
     ]
     assert outcomes[1]["requested_native_turn_id"] is None
     assert all(a["input_stable_id"] == "a" * 32 for a in outcomes)
+    assert isinstance(events[0], TurnComplete)
+    assert events[0].native_acceptance == NativeTurnAcceptance(
+        session_id=state.session_id,
+        thread_id=state.thread_id,
+        response_id="codex_turn_1",
+    )
 
 
 @pytest.mark.parametrize(

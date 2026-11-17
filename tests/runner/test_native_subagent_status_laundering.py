@@ -665,6 +665,11 @@ def _drive_steer_lifecycle(
             id="stale-running-after-current-acceptance",
         ),
         pytest.param(
+            ["register", "run_prev", "accept_steer"],
+            _STEER_ACCEPTED_AT,
+            id="stale-running-before-current-acceptance",
+        ),
+        pytest.param(
             ["register", "accept_steer", "settle_prev"],
             _STEER_ACCEPTED_AT,
             id="stale-settlement-after-current-acceptance",
@@ -719,6 +724,14 @@ async def test_steered_turn_is_bounded_from_its_own_acceptance(
         notice = inbox.get_nowait()
         assert notice["status"] == "failed"
         assert "no turn start" in notice["output"]
+        assert inbox.empty()
+        assert (
+            subagent_work.reap_stalled_subagent_launches(
+                now=expected_start + 2 * _START_BUDGET_S, timeout_s=_START_BUDGET_S
+            )
+            == []
+        )
+        assert inbox.empty()
     finally:
         subagent_work.unregister_subagent_work_for_session(child_id)
         subagent_work._session_inboxes_ref.pop(parent_id, None)
