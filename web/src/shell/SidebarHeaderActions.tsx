@@ -1,6 +1,7 @@
 import {
   ArrowLeftIcon,
   ArrowRightIcon,
+  GlobeIcon,
   HomeIcon,
   PanelLeftOpenIcon,
   PanelRightOpenIcon,
@@ -13,6 +14,7 @@ import {
   BACK_KEYS,
   COMMAND_PALETTE_KEYS,
   FORWARD_KEYS,
+  OPEN_IN_BROWSER_KEYS,
   settingsAriaShortcut,
   settingsShortcutKeys,
   sidebarToggleAriaShortcut,
@@ -26,6 +28,7 @@ import {
   useHistoryNavigationAvailability,
 } from "@/hooks/useHistoryNavigation";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { isElectronShell } from "@/lib/nativeBridge";
 import { Link } from "@/lib/routing";
 import { cn } from "@/lib/utils";
 import { MobileHeaderButton } from "./MobileHeaderButton";
@@ -134,6 +137,7 @@ export function SidebarHeaderActions({
         <SidebarSettingsButton onSettingsClick={onSettingsClick} className="max-md:hidden" />
       )}
       {showSearch && <SidebarSearchButton onOpenSearch={onOpenSearch} />}
+      {isElectronShell() && <OpenInBrowserButton />}
       <div
         className={cn("flex items-center gap-1 max-md:hidden", !hasNavigationHistory && "hidden")}
         data-testid="history-navigation-buttons"
@@ -278,6 +282,34 @@ export function SidebarSettingsButton({
       </TooltipTrigger>
       <TooltipContent side="bottom" shortcut={opensSettings ? settingsShortcutKeys() : undefined}>
         <span>{label}</span>
+      </TooltipContent>
+    </Tooltip>
+  );
+}
+
+/**
+ * Desktop shell only: open the current page in the default browser. The shell
+ * sends a page's plain `window.open` of a web URL to the system browser.
+ */
+function OpenInBrowserButton() {
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon-xs"
+          aria-label="Open in browser"
+          aria-keyshortcuts={`${ARIA_MOD_KEY}+Alt+B`}
+          data-testid="open-in-browser-button"
+          onClick={() => window.open(window.location.href, "_blank", "noopener,noreferrer")}
+          className="size-6 text-muted-foreground hover:text-foreground max-md:hidden"
+        >
+          <GlobeIcon className="size-4" />
+        </Button>
+      </TooltipTrigger>
+      <TooltipContent side="bottom" shortcut={[...OPEN_IN_BROWSER_KEYS]}>
+        <span>Open in browser</span>
       </TooltipContent>
     </Tooltip>
   );

@@ -205,6 +205,10 @@ the header menu), and each place is a separate entry point.
   uses the latest summary, retained context and subsequent turns.
 - `recent-switcher`: the desktop app opens the five most recent sessions with
   Control+Tab; Tab and Shift+Tab cycle, releasing Control switches, and Escape cancels.
+- `open-in-browser`: in the desktop app, the globe button by the sidebar
+  controls, View → Open in Browser, or ⌥⌘B (Ctrl+Alt+B on Windows/Linux) opens
+  the current page, query included, in the default browser. Only pages on the
+  window's server open; setup and connection pages do nothing.
 - `browser-storage`: browser soft tabs, including one opened by the agent, share
   cookies within a session; different sessions stay isolated. Navigation stays
   per-tab. On macOS the browser toolbar can also import the current site's

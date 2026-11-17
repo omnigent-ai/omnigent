@@ -48,6 +48,8 @@ export const COMMAND_PALETTE_KEYS = [MOD_KEY, "K"] as const;
 export const SIDEBAR_TOGGLE_KEYS = [MOD_KEY, ALT_KEY, "["] as const;
 export const RIGHT_SIDEBAR_TOGGLE_KEYS = [MOD_KEY, ALT_KEY, "]"] as const;
 export const SETTINGS_KEYS = [MOD_KEY, ALT_KEY, ","] as const;
+/** Desktop shell only: View → Open in Browser (CmdOrCtrl+Alt+B in electron/src/main.js). */
+export const OPEN_IN_BROWSER_KEYS = [MOD_KEY, ALT_KEY, "B"] as const;
 
 /** A chord as plain text for native `title` tooltips: "⌘R" on macOS, "Ctrl+R" elsewhere. */
 export function shortcutText(keys: readonly string[]): string {

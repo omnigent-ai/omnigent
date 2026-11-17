@@ -23,6 +23,7 @@ import {
   NEW_TERMINAL_KEYS,
   newSessionShortcutKeys,
   NEXT_TAB_KEYS,
+  OPEN_IN_BROWSER_KEYS,
   PIN_SESSION_KEYS,
   PREVIOUS_TAB_KEYS,
   sessionNumberShortcutKeys,
@@ -281,6 +282,7 @@ export function shortcutGroupsFor({
           .concat(
             desktopCommands ? DESKTOP_TAB_SHORTCUTS : [],
             desktopCommands && browser ? DESKTOP_BROWSER_SHORTCUTS : [],
+            electron ? [{ label: "Open in browser", keys: [...OPEN_IN_BROWSER_KEYS] }] : [],
           ),
       };
     }
