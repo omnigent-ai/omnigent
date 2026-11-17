@@ -2038,8 +2038,8 @@ export const SESSION_READ_TIMEOUT_MS = 15_000;
 export const ACTIVE_SESSION_STATUS_RECONCILE_TIMEOUT_MS = SESSION_READ_TIMEOUT_MS;
 // A send whose POST is still open after this says so on its bubble.
 export const SEND_STILL_SENDING_AFTER_MS = 10_000;
-// A message send still unanswered after this hands its message back for a retry.
-// Longer than the server's own runner waits (a sandbox wake gives up after 240s).
+// A client recovery deadline: a message send still unanswered after this hands its
+// message back for a retry. It exceeds the server's default runner waits.
 export const SEND_UNANSWERED_GIVE_UP_MS = 300_000;
 export const SEND_UNANSWERED_TITLE = "No answer from the server";
 export const SEND_UNANSWERED_MESSAGE =
@@ -3253,7 +3253,17 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
               ? {}
               : { unansweredSend: { stableId, ...(sentText ? { text: sentText } : {}) } }),
           };
-      if (!alreadyStreaming) {
+      if (err instanceof UnansweredSendError) {
+        // Never taken, so a response or running turn seen since belongs to
+        // another turn; settle only this send's own latch.
+        if (!callerHandlesError && failureCard !== null) {
+          failSet((s) => ({ blocks: [...s.blocks, failureCard] }));
+        }
+        const now = failGet();
+        if (!alreadyStreaming && now.activeResponse === null && now.sessionStatus !== "running") {
+          failSet({ status: "idle" });
+        }
+      } else if (!alreadyStreaming) {
         if (failGet().activeResponse !== null) {
           // A response bubble already exists (the turn started, then failed)
           // — mark it failed so the error rides on that bubble.

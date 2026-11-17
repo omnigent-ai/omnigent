@@ -7100,6 +7100,53 @@ describe("chatStore — delivered-but-unacked send", () => {
     expect(errorCards()).toEqual([]);
   });
 
+  it.each([
+    ["still running", false, ["running"], "streaming", "running"],
+    // A non-native turn end clears pending bubbles, so only a native send outlives it.
+    ["finished", true, ["running", "idle"], "completed", "idle"],
+  ] as const)(
+    "hands back an unanswered message without settling a turn that started after it and is %s",
+    async (_, native, edges, responseState, status) => {
+      vi.useFakeTimers();
+      onTestFinished(() => {
+        vi.useRealTimers();
+      });
+      useChatStore.setState({
+        conversationId: "conv_existing",
+        abortController: new AbortController(),
+        isNativeTerminalSession: native,
+        sessionStatus: "waiting",
+        backgroundTaskCount: 1,
+      });
+      holdEventPosts();
+
+      const sent = useChatStore.getState().send("summarize the deploy status", "agent_xyz");
+      await vi.advanceTimersByTimeAsync(0);
+      // A background task's wake starts its own turn; the send's bubble stays pending.
+      for (const edge of edges) {
+        handleSessionEvent({
+          type: "session_status",
+          conversationId: "conv_existing",
+          status: edge,
+          responseId: "resp_background",
+        });
+      }
+      await vi.advanceTimersByTimeAsync(SEND_UNANSWERED_GIVE_UP_MS);
+      await sent;
+
+      const state = useChatStore.getState();
+      expect(state.activeResponse).toMatchObject({
+        responseId: "resp_background",
+        state: responseState,
+      });
+      expect(state.status).toBe(responseState === "streaming" ? "streaming" : "idle");
+      expect(state.sessionStatus).toBe(status);
+      expect(state.backgroundTaskCount).toBe(1);
+      expect(state.failedSendDraft).toMatchObject({ text: "summarize the deploy status" });
+      expect(errorCards()).toEqual([expect.objectContaining({ title: SEND_UNANSWERED_TITLE })]);
+    },
+  );
+
   it("hands back a native send whose POST fails after another message's receipt took its bubble", async () => {
     useChatStore.setState({
       conversationId: "conv_existing",
