@@ -414,6 +414,7 @@ from omnigent.server.schemas import (
     SessionStatusEvent,
     SessionUsageEvent,
 )
+from omnigent.server.session_board import drop_board_acceptance_seed
 from omnigent.server.session_mcp_selection import session_mcp_selection
 from omnigent.server.startup_inputs import (
     STARTUP_LABEL,
@@ -444,6 +445,7 @@ from omnigent.stores.conversation_store import (
     ConversationNotFoundError,
     NameAlreadyExistsError,
     SpawnTreeUsage,
+    board_revision,
     pinned_label_key,
     runner_seen_is_fresh,
 )
@@ -1450,6 +1452,7 @@ def _build_session_list_item(
         project_id=conv.project_id,
         pull_request=pull_request,
         pull_requests_synced=pull_requests_synced,
+        board_revision=board_revision(conv),
     )
 
 
@@ -12537,6 +12540,7 @@ async def _create_session_from_existing_agent(
 
     _reject_reserved_cost_control_label_seed(body.labels)
     _reject_server_reserved_label_seed(body.labels, at_creation=True)
+    drop_board_acceptance_seed(body.labels)
     from omnigent.tools.browser_agent_tools import apply_browser_agent_tools_creation_labels
 
     apply_browser_agent_tools_creation_labels(body.labels, request.headers)

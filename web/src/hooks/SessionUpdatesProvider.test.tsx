@@ -13,6 +13,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   clearSessionTombstones,
+  markLabelWrite,
   useArchiveConversation,
   useConversations,
   useMoveToProject,
@@ -871,6 +872,70 @@ describe("SessionUpdatesProvider move-to-project in flight", () => {
       json: async () => ({ ...moving, project_id: "p_new", updated_at: 10 }),
     });
     await waitFor(() => expect(move.result.current.isSuccess).toBe(true));
+  });
+});
+
+describe("SessionUpdatesProvider label write in flight", () => {
+  it("keeps an in-flight label write on frames read before it committed", () => {
+    const client = new QueryClient();
+    const key = ["conversations", "", false];
+    const at = (revision: string, labels: Record<string, string> = {}) => ({
+      ...conv("conv_a"),
+      board_revision: revision,
+      labels,
+    });
+    client.setQueryData<ConversationsInfiniteData>(key, {
+      pages: [
+        {
+          data: [at("rev_a", { accepted: "1" })],
+          first_id: "conv_a",
+          last_id: "conv_a",
+          has_more: false,
+        },
+      ],
+      pageParams: [undefined],
+    });
+    markLabelWrite("conv_a", {
+      key: "accepted",
+      before: undefined,
+      value: "1",
+      boardRevision: "rev_a",
+      updatedAt: 0,
+    });
+    renderProvider(client, ["/"]);
+    const labels = () =>
+      client.getQueryData<ConversationsInfiniteData>(key)!.pages[0].data[0].labels;
+
+    act(() => frameHandler()({ type: "changed", items: [{ ...at("rev_a"), title: "Late" }] }));
+    expect(labels()).toEqual({ accepted: "1" });
+    // Newer activity is the server's answer, not a stale read.
+    act(() => frameHandler()({ type: "changed", items: [at("rev_b")] }));
+    expect(labels()).toEqual({});
+  });
+
+  it("lets frames after a label write landed restore the earlier value", () => {
+    const client = new QueryClient();
+    const key = ["conversations", "", false];
+    const accepted = { ...conv("conv_a"), board_revision: "rev_a", labels: { accepted: "1" } };
+    client.setQueryData<ConversationsInfiniteData>(key, {
+      pages: [{ data: [accepted], first_id: "conv_a", last_id: "conv_a", has_more: false }],
+      pageParams: [undefined],
+    });
+    // This tab's Reopen landed; another tab then accepted again at the same revision.
+    markLabelWrite("conv_a", {
+      key: "accepted",
+      before: "1",
+      value: "",
+      boardRevision: "rev_a",
+      updatedAt: 0,
+      landed: true,
+    });
+    renderProvider(client, ["/"]);
+
+    act(() => frameHandler()({ type: "changed", items: [{ ...accepted, title: "Later" }] }));
+    expect(client.getQueryData<ConversationsInfiniteData>(key)!.pages[0].data[0].labels).toEqual({
+      accepted: "1",
+    });
   });
 });
 

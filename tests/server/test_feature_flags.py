@@ -50,6 +50,7 @@ def test_unset_or_empty_uses_feature_defaults(environ: dict[str, str]) -> None:
         "sidebar_windowed_rows": False,
         "workflows": False,
         "session_overview": False,
+        "session_board": False,
         "project_repository_creation": True,
         "session_orchestration": True,
         "sibling_sessions": True,

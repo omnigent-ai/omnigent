@@ -37,6 +37,7 @@ import {
   findCachedListRow,
   lastIdAfterFiltering,
   insertNewRowsIntoPages,
+  LIST_ROW_QUERY_ROOTS,
   markRecentlyCreated,
   mergeItemsIntoPages,
   overlayArchivedIntoCaches,
@@ -282,6 +283,12 @@ export interface Conversation {
    */
   pull_requests_synced?: boolean | null;
   /**
+   * Fingerprint of the session state the Board accepts; Accept sends it back
+   * and the server refuses it once the session has changed. Absent on older
+   * servers.
+   */
+  board_revision?: string | null;
+  /**
    * Whether the viewer owns this session and has shared it with anyone else.
    * Absent for non-owners and on older servers; treat absent as "not shared".
    */
@@ -463,11 +470,87 @@ export function withMoveTombstone<
   return { ...row, project_id: entry.projectId, labels };
 }
 
+// ── Label-write tombstones ────────────────────────────────────────────
+//
+// A label PATCH reaches `GET /v1/sessions` only after the async reindex, so a
+// list fetch while it is in flight, or soon after it lands, would repaint the
+// old value. The latest write of each session's label keeps its value on rows
+// that still show the label it replaced, at the session state it was made
+// against. Any other label value, or newer activity, is left alone.
+export interface LabelWriteTombstone {
+  key: string;
+  /** The label the write replaces; only rows still showing it are overridden. */
+  before: string | undefined;
+  value: string | undefined;
+  /** The acted-on `board_revision`, or `null` on servers without one. */
+  boardRevision: string | null | undefined;
+  /** The acted-on activity time, matched when there is no revision. */
+  updatedAt: number;
+  /** The server answered; streamed rows, read after the commit, then win. */
+  landed?: boolean;
+}
+
+const labelWrites = new Map<string, Map<string, LabelWriteTombstone>>();
+
+/** Keep `entry` on fetched rows of this session, replacing an earlier write of its label. */
+export function markLabelWrite(id: string, entry: LabelWriteTombstone): void {
+  let entries = labelWrites.get(id);
+  if (!entries) labelWrites.set(id, (entries = new Map()));
+  entries.set(entry.key, entry);
+}
+
+/** Whether `entry` is still the latest write of its label on this session. */
+export function isLatestLabelWrite(id: string, entry: LabelWriteTombstone): boolean {
+  return labelWrites.get(id)?.get(entry.key) === entry;
+}
+
+/** Drop `entry`, unless a newer write replaced it. */
+export function unmarkLabelWrite(id: string, entry: LabelWriteTombstone): void {
+  const entries = labelWrites.get(id);
+  if (entries?.get(entry.key) !== entry) return;
+  entries.delete(entry.key);
+  if (entries.size === 0) labelWrites.delete(id);
+}
+
+/** Drop a landed write once the server's reindex has caught up. */
+export function expireLabelWrite(id: string, entry: LabelWriteTombstone): void {
+  setTimeout(() => unmarkLabelWrite(id, entry), DELETED_TOMBSTONE_MS);
+}
+
+/**
+ * Give a fetched row the labels of its in-flight or recent writes. A streamed
+ * row (`streamed`) comes from the database, so only in-flight writes apply.
+ */
+export function withLabelWrite<
+  T extends {
+    id: string;
+    labels?: Record<string, string> | null;
+    board_revision?: string | null;
+    updated_at?: number;
+  },
+>(row: T, streamed = false): T {
+  const entries = labelWrites.get(row.id);
+  if (!entries || row.labels == null) return row;
+  let labels = row.labels;
+  for (const entry of entries.values()) {
+    const sameState =
+      entry.boardRevision != null
+        ? row.board_revision === entry.boardRevision
+        : row.updated_at === entry.updatedAt;
+    if (!sameState || (streamed && entry.landed)) continue;
+    if (labels[entry.key] !== entry.before || entry.before === entry.value) continue;
+    labels = Object.fromEntries(Object.entries(labels).filter(([key]) => key !== entry.key));
+    if (entry.value !== undefined) labels[entry.key] = entry.value;
+  }
+  return labels === row.labels ? row : { ...row, labels };
+}
+
 /** Wipe module-level tombstones between tests. */
 export function clearSessionTombstones(): void {
   unmarkSessionsDeleting();
   unmarkSessionsArchiving();
   for (const id of [...movingSessions.keys()]) unmarkSessionMoving(id);
+  labelWrites.clear();
 }
 
 /**
@@ -481,7 +564,12 @@ function applySessionTombstones(
   originalPage = page,
   project?: string,
 ): ConversationsPage {
-  if (deletingSessionIds.size === 0 && archivingSessions.size === 0 && movingSessions.size === 0)
+  if (
+    deletingSessionIds.size === 0 &&
+    archivingSessions.size === 0 &&
+    movingSessions.size === 0 &&
+    labelWrites.size === 0
+  )
     return page;
   let changed = false;
   let lastDroppedId: string | null = null;
@@ -491,7 +579,7 @@ function applySessionTombstones(
       changed = true;
       continue;
     }
-    const conv = withMoveTombstone(fetched);
+    const conv = withMoveTombstone(withLabelWrite(fetched));
     if (conv !== fetched) changed = true;
     const move = movingSessions.get(conv.id);
     if (project && move !== undefined && move.project !== project) {
@@ -1987,32 +2075,67 @@ function refuseOverlappingPinWrite(queryClient: QueryClient) {
   }
 }
 
-// Restore only the pin label across rendered caches (each row's own copy).
-function restorePinLabelInCaches(queryClient: QueryClient, id: string, pin: string | undefined) {
-  const withPin = (labels: Record<string, string> | undefined) => {
-    const rest = Object.fromEntries(
-      Object.entries(labels ?? {}).filter(([k]) => k !== PINNED_LABEL_KEY),
-    );
-    return pin === undefined ? rest : { ...rest, [PINNED_LABEL_KEY]: pin };
+/** The fields of a cached session copy an overlay can check before writing. */
+export interface CachedLabelCopy {
+  labels?: Record<string, string>;
+  board_revision?: string | null;
+  updated_at?: number;
+}
+
+/**
+ * Set one label on every cached copy of a session row — list pages, project
+ * folders, the pinned list, the open-session row and its snapshot — keeping
+ * each copy's other labels. `value` undefined removes the label. `isCurrent`,
+ * when given, skips copies it rejects (e.g. ones newer data already replaced).
+ */
+export function overlayLabelIntoCaches(
+  queryClient: QueryClient,
+  id: string,
+  key: string,
+  value: string | undefined,
+  isCurrent: (copy: CachedLabelCopy) => boolean = () => true,
+): void {
+  const withLabel = (labels: Record<string, string> | undefined) => {
+    const rest = Object.fromEntries(Object.entries(labels ?? {}).filter(([k]) => k !== key));
+    return value === undefined ? rest : { ...rest, [key]: value };
   };
-  for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
-    queryKey: ["conversations"],
-  })) {
-    const row = data?.pages.flatMap((p) => p.data).find((c) => c.id === id);
-    if (!row) continue;
-    const { data: next } = mergeItemsIntoPages(
-      data,
-      new Map([[id, { id, labels: withPin(row.labels) } satisfies SessionListWireItem]]),
-      filtersFromConversationQueryKey(key),
-    );
-    if (next !== data) queryClient.setQueryData(key, next);
+  for (const root of LIST_ROW_QUERY_ROOTS) {
+    for (const [queryKey, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
+      queryKey: [root],
+    })) {
+      const row = data?.pages.flatMap((p) => p.data).find((c) => c.id === id);
+      if (!row || !isCurrent(row)) continue;
+      const { data: next } = mergeItemsIntoPages(
+        data,
+        new Map([[id, { id, labels: withLabel(row.labels) } satisfies SessionListWireItem]]),
+        root === "conversations"
+          ? filtersFromConversationQueryKey(queryKey)
+          : filtersFromProjectQueryKey(queryKey),
+      );
+      if (next !== data) queryClient.setQueryData(queryKey, next);
+    }
   }
+  queryClient.setQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY, (old) =>
+    old?.conversations.some((c) => c.id === id)
+      ? {
+          ...old,
+          conversations: old.conversations.map((c) =>
+            c.id === id && isCurrent(c) ? { ...c, labels: withLabel(c.labels) } : c,
+          ),
+        }
+      : old,
+  );
   queryClient.setQueryData<Conversation | null>(["conversation-backfill", id], (old) =>
-    old ? { ...old, labels: withPin(old.labels) } : old,
+    old && isCurrent(old) ? { ...old, labels: withLabel(old.labels) } : old,
   );
   queryClient.setQueryData<Session>(["session", id], (old) =>
-    old ? { ...old, labels: withPin(old.labels) } : old,
+    old && isCurrent(old) ? { ...old, labels: withLabel(old.labels) } : old,
   );
+}
+
+// Restore only the pin label across rendered caches (each row's own copy).
+function restorePinLabelInCaches(queryClient: QueryClient, id: string, pin: string | undefined) {
+  overlayLabelIntoCaches(queryClient, id, PINNED_LABEL_KEY, pin);
 }
 
 // Apply a pin/unpin to every cache that renders the row. `labels` is the

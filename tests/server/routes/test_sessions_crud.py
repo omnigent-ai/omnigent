@@ -86,18 +86,28 @@ async def test_creating_client_surface_survives_create_child_and_fork(
     assert fork_row.labels[CLIENT_SURFACE_LABEL_KEY] == "web"
 
 
+@pytest.mark.parametrize("board_acceptance", [None, "1700000101", ""])
 async def test_native_clear_replacement_keeps_creating_surface(
     client: httpx.AsyncClient,
     db_uri: str,
+    board_acceptance: str | None,
 ) -> None:
-    """A runner-side ``/clear`` replacement keeps the desktop session's surface."""
+    """A runner-side ``/clear`` replacement keeps the desktop session's surface.
+
+    The hook copies every label, including a Board acceptance from an accepted
+    or reopened source; the replacement is created and starts unaccepted."""
     from omnigent.native._native_supersession import clear_replacement_create_body
+    from omnigent.stores.conversation_store import BOARD_ACCEPTED_LABEL_KEY
     from omnigent.telemetry.request_headers import client_user_agent
 
     store = SqlAlchemyConversationStore(db_uri)
     client.headers["X-Omnigent-Client"] = "desktop"
     agent = await create_test_agent(client, name="clear-surface")
+    if board_acceptance is not None:
+        store.set_labels(agent["_session_id"], {BOARD_ACCEPTED_LABEL_KEY: board_acceptance})
     old = (await client.get(f"/v1/sessions/{agent['_session_id']}")).json()
+    if board_acceptance is not None:
+        assert old["labels"][BOARD_ACCEPTED_LABEL_KEY] == board_acceptance
     assert old["labels"][CLIENT_SURFACE_LABEL_KEY] == "desktop"
     del client.headers["X-Omnigent-Client"]
 
@@ -109,6 +119,7 @@ async def test_native_clear_replacement_keeps_creating_surface(
     replacement = store.get_conversation(response.json()["id"])
     assert replacement is not None
     assert replacement.labels[CLIENT_SURFACE_LABEL_KEY] == "desktop"
+    assert BOARD_ACCEPTED_LABEL_KEY not in replacement.labels
 
     # A non-Omnigent caller can't claim a surface through the body label; curl is main's web.
     response = await client.post("/v1/sessions", json=body, headers={"User-Agent": "curl/8"})
@@ -946,6 +957,131 @@ async def test_patch_session_pins_and_unpins(
     conv = conv_store.get_conversation(session_id)
     assert conv is not None
     assert user_key not in conv.labels
+
+
+async def _listed_session(client: httpx.AsyncClient, session_id: str) -> dict:
+    resp = await client.get("/v1/sessions")
+    assert resp.status_code == 200, resp.text
+    return next(row for row in resp.json()["data"] if row["id"] == session_id)
+
+
+async def test_patch_board_acceptance_stores_a_stamp_and_keeps_activity_time(
+    client: httpx.AsyncClient,
+    session_id: str,
+    db_uri: str,
+) -> None:
+    """The web Board sends the listed ``board_revision`` it reviewed; the server
+    stores a stamp one second past ``updated_at`` in ``omnigent.board.accepted``.
+    Writing or clearing that label must not count as session activity."""
+    from sqlalchemy import update
+
+    from omnigent.db.db_models import SqlConversation
+
+    # Age the row so a same-second bump can't hide a regression.
+    reviewed_at = 1_700_000_000
+    with make_managed_session_maker(get_or_create_engine(db_uri))() as session:
+        session.execute(
+            update(SqlConversation)
+            .where(SqlConversation.id == session_id)
+            .values(updated_at=reviewed_at)
+        )
+        session.commit()
+    reviewed = await _listed_session(client, session_id)
+
+    resp = await client.patch(
+        f"/v1/sessions/{session_id}",
+        json={"labels": {"omnigent.board.accepted": reviewed["board_revision"]}},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["labels"]["omnigent.board.accepted"] == str(reviewed_at + 1)
+    row = await _listed_session(client, session_id)
+    assert row["labels"]["omnigent.board.accepted"] == str(reviewed_at + 1)
+    assert row["updated_at"] == reviewed_at
+    assert row["board_revision"] == reviewed["board_revision"]
+
+    # Reopening clears the value without bumping the activity time either.
+    resp = await client.patch(
+        f"/v1/sessions/{session_id}",
+        json={"labels": {"omnigent.board.accepted": ""}},
+    )
+    assert resp.status_code == 200, resp.text
+    row = await _listed_session(client, session_id)
+    assert row["labels"].get("omnigent.board.accepted", "") == ""
+    assert row["updated_at"] == reviewed_at
+
+
+async def test_activity_after_board_acceptance_reopens_it(
+    client: httpx.AsyncClient,
+    session_id: str,
+) -> None:
+    """A rename after Accept drops the acceptance in its own write (the store
+    tests cover a delayed writer and same-second output)."""
+    reviewed = await _listed_session(client, session_id)
+    resp = await client.patch(
+        f"/v1/sessions/{session_id}",
+        json={"labels": {"omnigent.board.accepted": reviewed["board_revision"]}},
+    )
+    assert resp.status_code == 200, resp.text
+    resp = await client.patch(f"/v1/sessions/{session_id}", json={"title": "Renamed after accept"})
+    assert resp.status_code == 200, resp.text
+
+    row = await _listed_session(client, session_id)
+    assert "omnigent.board.accepted" not in row["labels"]
+
+
+async def test_new_session_starts_without_a_seeded_board_acceptance(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A new session has had no review, so a copied acceptance label is dropped."""
+    agent = await create_test_agent(client, name="board-seed")
+    resp = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "labels": {"omnigent.board.accepted": "9999999999", "kept": "yes"},
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    created = SqlAlchemyConversationStore(db_uri).get_conversation(resp.json()["id"])
+    assert created is not None
+    assert created.labels["kept"] == "yes"
+    assert "omnigent.board.accepted" not in created.labels
+
+
+async def test_board_acceptance_must_be_its_own_request(
+    client: httpx.AsyncClient,
+    session_id: str,
+) -> None:
+    """Mixed with other changes, an Accept could half-apply, so it is refused whole."""
+    current = await _listed_session(client, session_id)
+    accept = {"omnigent.board.accepted": current["board_revision"]}
+    for body in (
+        {"title": "Renamed", "labels": accept},
+        {"labels": {**accept, "other": "x"}},
+    ):
+        resp = await client.patch(f"/v1/sessions/{session_id}", json=body)
+        assert resp.status_code == 400, resp.text
+    row = await _listed_session(client, session_id)
+    assert row.get("title") == current.get("title")
+    assert "other" not in row["labels"]
+
+
+async def test_board_acceptance_of_a_stale_review_is_refused(
+    client: httpx.AsyncClient,
+    session_id: str,
+) -> None:
+    """Accepting a revision the session has moved past is a conflict."""
+    reviewed = await _listed_session(client, session_id)
+    resp = await client.patch(f"/v1/sessions/{session_id}", json={"title": "Changed"})
+    assert resp.status_code == 200, resp.text
+    resp = await client.patch(
+        f"/v1/sessions/{session_id}",
+        json={"labels": {"omnigent.board.accepted": reviewed["board_revision"]}},
+    )
+    assert resp.status_code == 409, resp.text
+    row = await _listed_session(client, session_id)
+    assert "omnigent.board.accepted" not in row["labels"]
 
 
 async def test_archiving_clears_the_callers_pin(

@@ -300,6 +300,177 @@ def test_fork_drops_the_automation_source_label(
     assert SCHEDULED_TASK_SOURCE_LABEL_KEY not in fork.labels
 
 
+def test_fork_drops_the_board_acceptance(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Acceptance covers the source's reviewed work, so a fork starts unaccepted."""
+    from omnigent.stores.conversation_store import BOARD_ACCEPTED_LABEL_KEY
+
+    source = conversation_store.create_conversation()
+    conversation_store.set_labels(
+        source.id, {BOARD_ACCEPTED_LABEL_KEY: "9999999999", "kept": "yes"}
+    )
+
+    fork = conversation_store.fork_conversation(source.id)
+
+    assert fork.labels["kept"] == "yes"
+    assert BOARD_ACCEPTED_LABEL_KEY not in fork.labels
+
+
+def _user_message(text: str) -> NewConversationItem:
+    return NewConversationItem(
+        type="message",
+        response_id="resp_board",
+        data=MessageData(role="user", content=[{"type": "input_text", "text": text}]),
+    )
+
+
+def test_board_acceptance_needs_an_unchanged_review(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    from omnigent.stores.conversation_store import BOARD_ACCEPTED_LABEL_KEY, board_revision
+
+    session = conversation_store.create_conversation()
+    reviewed = board_revision(session)
+
+    assert conversation_store.accept_board_review(session.id, "stale") is None
+    assert conversation_store.accept_board_review(uuid.uuid4().hex, reviewed) is None
+    assert conversation_store.accept_board_review(session.id, reviewed) == str(
+        session.updated_at + 1
+    )
+    saved = conversation_store.get_conversation(session.id)
+    assert saved is not None
+    assert saved.labels[BOARD_ACCEPTED_LABEL_KEY] == str(session.updated_at + 1)
+    assert saved.updated_at == session.updated_at
+    # Labels and the acceptance itself are not part of the reviewed state.
+    assert board_revision(saved) == reviewed
+
+
+def test_board_acceptance_uses_only_indexed_lookups(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Accept runs inside SQLite's write transaction, so none of its statements
+    may scan a table (docs/DATABASE_BEST_PRACTICES.md, bounded queries)."""
+    from omnigent.stores.conversation_store import board_revision
+
+    engine = conversation_store._conv_engine
+    if engine.dialect.name != "sqlite":
+        pytest.skip("SQLite query-plan check; other engines lock with SELECT ... FOR UPDATE")
+    for _ in range(3):
+        conversation_store.create_conversation()
+    session = conversation_store.create_conversation()
+    statements: list[tuple[str, Any]] = []
+
+    def capture(_conn, _cursor, statement, parameters, _context, _executemany):
+        if statement.lstrip().upper().startswith(("SELECT", "UPDATE", "DELETE")):
+            statements.append((statement, parameters))
+
+    event.listen(engine, "before_cursor_execute", capture)
+    try:
+        assert conversation_store.accept_board_review(session.id, board_revision(session))
+    finally:
+        event.remove(engine, "before_cursor_execute", capture)
+
+    assert any(s.lstrip().upper().startswith("UPDATE CONVERSATIONS") for s, _ in statements)
+    with engine.connect() as conn:
+        for statement, parameters in statements:
+            plan = str(conn.exec_driver_sql("EXPLAIN QUERY PLAN " + statement, parameters).all())
+            assert "SCAN " not in plan, (statement, plan)
+
+
+@pytest.mark.parametrize(
+    "writer",
+    ["append", "update_title", "rename_if_matches", "archive", "model_override", "external_id"],
+)
+def test_activity_writers_drop_the_board_acceptance(
+    conversation_store: SqlAlchemyConversationStore,
+    writer: str,
+) -> None:
+    """Any write that advances updated_at reopens accepted Board work."""
+    from omnigent.stores.conversation_store import BOARD_ACCEPTED_LABEL_KEY, board_revision
+
+    session = conversation_store.create_conversation(title="Before")
+    assert conversation_store.accept_board_review(session.id, board_revision(session))
+
+    if writer == "append":
+        conversation_store.append(session.id, [_user_message("more work")])
+    elif writer == "update_title":
+        conversation_store.update_conversation(session.id, title="After")
+    elif writer == "archive":
+        conversation_store.update_conversation(session.id, archived=True)
+    elif writer == "model_override":
+        conversation_store.update_conversation(session.id, model_override="claude-sonnet-4-5")
+    elif writer == "external_id":
+        conversation_store.set_external_session_id(session.id, "external-1")
+    else:
+        assert conversation_store.rename_conversation_if_title_matches(
+            session.id, "Before", "After"
+        )
+
+    saved = conversation_store.get_conversation(session.id)
+    assert saved is not None
+    assert BOARD_ACCEPTED_LABEL_KEY not in saved.labels
+
+
+def test_same_second_output_after_review_blocks_accept(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Output committed after the review but stamped in the reviewed second
+    leaves updated_at unchanged; the review's revision still differs, so the
+    Accept is refused."""
+    from omnigent.stores.conversation_store import board_revision, sqlalchemy_store
+
+    monkeypatch.setattr(sqlalchemy_store, "now_epoch", lambda: 1_700_000_100)
+    session = conversation_store.create_conversation()
+    conversation_store.append(session.id, [_user_message("first output")])
+    reviewed = conversation_store.get_conversation(session.id)
+    assert reviewed is not None
+    conversation_store.append(session.id, [_user_message("more output")])
+
+    saved = conversation_store.get_conversation(session.id)
+    assert saved is not None
+    assert saved.updated_at == reviewed.updated_at == 1_700_000_100
+    assert conversation_store.accept_board_review(session.id, board_revision(reviewed)) is None
+
+
+def test_delayed_activity_writer_reopens_the_board_acceptance(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An append that sampled its timestamp before Accept but commits after it
+    still reopens the work, whatever updated_at it writes."""
+    from omnigent.stores.conversation_store import BOARD_ACCEPTED_LABEL_KEY, board_revision
+
+    session = conversation_store.create_conversation()
+    paused = threading.Event()
+    release = threading.Event()
+    encode = conversation_store._encode_item_data_batch
+
+    def pause_then_encode(raw: list[str]) -> list[Any]:
+        paused.set()
+        assert release.wait(timeout=10)
+        return encode(raw)
+
+    # Encoding runs after append samples its timestamp and before its transaction.
+    monkeypatch.setattr(conversation_store, "_encode_item_data_batch", pause_then_encode)
+    writer = threading.Thread(
+        target=conversation_store.append, args=(session.id, [_user_message("late output")])
+    )
+    writer.start()
+    try:
+        assert paused.wait(timeout=10)
+        assert conversation_store.accept_board_review(session.id, board_revision(session))
+    finally:
+        release.set()
+        writer.join(timeout=10)
+    assert not writer.is_alive()
+
+    saved = conversation_store.get_conversation(session.id)
+    assert saved is not None
+    assert BOARD_ACCEPTED_LABEL_KEY not in saved.labels
+
+
 @pytest.mark.parametrize("closed_by", ["label", "legacy_title"])
 def test_fork_of_a_closed_child_is_open(
     conversation_store: SqlAlchemyConversationStore,

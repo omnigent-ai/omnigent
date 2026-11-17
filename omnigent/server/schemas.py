@@ -3846,6 +3846,8 @@ class SessionListItem(BaseModel):
     :param pull_requests_synced: Whether the server has imported the session's
         PRs from its host, so a missing ``pull_request`` means "none" rather than
         "not known yet". ``None`` on servers without PR storage.
+    :param board_revision: Fingerprint of the session state the web Board
+        accepts; a Board Accept sends it back and is refused once it changes.
     """
 
     family: SessionFamily | None = None
@@ -3885,6 +3887,7 @@ class SessionListItem(BaseModel):
     project_id: str | None = None
     pull_request: SessionPullRequestSummary | None = None
     pull_requests_synced: bool | None = None
+    board_revision: str | None = None
 
 
 class SessionPageBoundary(BaseModel):

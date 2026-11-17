@@ -277,6 +277,12 @@ from omnigent.server.schemas import (
     SupersessionReason,
     UpdateSessionRequest,
 )
+from omnigent.server.session_board import (
+    BOARD_ACCEPTED_LABEL_KEY,
+    drop_board_acceptance_seed,
+    resolve_board_acceptance,
+    write_board_acceptance,
+)
 from omnigent.server.session_orchestration import (
     require_archive_outside_source_lineage,
     require_named_source_private,
@@ -1988,6 +1994,7 @@ def register_core_routes(
         )
         _reject_reserved_cost_control_label_seed(parsed_metadata.labels)
         _reject_server_reserved_label_seed(parsed_metadata.labels, at_creation=True)
+        drop_board_acceptance_seed(parsed_metadata.labels)
         from omnigent.tools.browser_agent_tools import apply_browser_agent_tools_creation_labels
 
         apply_browser_agent_tools_creation_labels(parsed_metadata.labels, request.headers)
@@ -3835,6 +3842,17 @@ def register_core_routes(
             )
             family_pin_value = str(int(time.time() * 1000)) if body.family_pinned else ""
         labels_to_set = dict(body.labels or {})
+        # Validated before other writes; stored last, through the store's check.
+        board_acceptance = None
+        if BOARD_ACCEPTED_LABEL_KEY in labels_to_set:
+            if body.model_fields_set != {"labels"} or len(labels_to_set) != 1:
+                raise OmnigentError(
+                    f"{BOARD_ACCEPTED_LABEL_KEY} must be the only change in its request",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            board_acceptance = await resolve_board_acceptance(
+                conversation_store, session_id, labels_to_set.pop(BOARD_ACCEPTED_LABEL_KEY)
+            )
         if PROJECT_LABEL_KEY in labels_to_set and (
             not set_project or labels_to_set[PROJECT_LABEL_KEY]
         ):
@@ -4703,6 +4721,8 @@ def register_core_routes(
                 await asyncio.to_thread(conversation_store.delete_label, session_id, _clear_key)
         if labels_to_set:
             await asyncio.to_thread(conversation_store.set_labels, session_id, labels_to_set)
+        if board_acceptance is not None:
+            await write_board_acceptance(conversation_store, session_id, board_acceptance)
         # Only when the switch was forwarded: a silent PATCH writes no label,
         # and an unconfirmed mode must not reach the picker.
         if _CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY in labels_to_set:

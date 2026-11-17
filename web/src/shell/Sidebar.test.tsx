@@ -1335,6 +1335,26 @@ describe("Sidebar session list", () => {
     expect(workflows).toHaveClass("bg-[var(--sidebar-active)]");
   });
 
+  it("hides Board navigation while the release feature is off", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar(true, "/board");
+
+    expect(screen.queryByTestId("board-nav")).toBeNull();
+  });
+
+  it("shows and highlights Board navigation without lighting New session", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar(true, "/board", undefined, {
+      ...FALLBACK_SERVER_INFO,
+      features: { session_board: true },
+    });
+
+    const board = screen.getByTestId("board-nav");
+    expect(board).toHaveAttribute("href", "/board");
+    expect(board).toHaveAttribute("aria-current", "page");
+    expect(screen.getByTestId("new-chat-button")).not.toHaveClass("bg-[var(--sidebar-active)]");
+  });
+
   it("hides Canvas navigation while the release feature is off", () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
     renderSidebar(true, "/canvas");
