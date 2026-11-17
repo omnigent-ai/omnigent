@@ -86,6 +86,7 @@ from omnigent.inner.datamodel import (
     OSEnvSandboxSpec,
 )
 from omnigent.inner.native_attachments import materialize_attachment
+from omnigent.models.claude_model_vocabulary import picker_command_values, picker_model_options
 from omnigent.native import native_cost_popup, policy_allow_cache
 from omnigent.util.reasoning_effort import CLAUDE_EFFORTS
 from tests._helpers.live_server import terminate_process
@@ -13829,15 +13830,21 @@ def test_managed_model_status_check_preserves_exact_context_identity(
 
 
 @pytest.mark.parametrize(
-    ("version", "raw_target", "actual_target", "already_selected", "status_queries"),
+    ("version", "raw_target", "actual_target", "already_selected", "status_queries", "catalog"),
     [
-        ("2.1.323", True, True, True, 1),
-        ("2.1.323", True, False, False, 2),
-        ("2.1.323", False, True, False, 1),
-        ("2.1.322", True, True, True, 1),
-        ("2.1.302", True, True, True, 1),
-        ("2.1.322", True, False, None, 1),
-        ("2.1.322", False, True, None, 0),
+        ("2.1.323", True, True, True, 1, "picker"),
+        ("2.1.323", True, False, False, 2, "picker"),
+        ("2.1.323", False, True, False, 1, "picker"),
+        ("2.1.322", True, True, True, 1, "picker"),
+        ("2.1.302", True, True, True, 1, "picker"),
+        ("2.1.322", True, False, None, 1, "picker"),
+        ("2.1.322", False, True, None, 0, "picker"),
+        ("2.1.323", True, True, True, 1, "observed-default"),
+        ("2.1.311", True, True, True, 1, "observed-default"),
+        ("2.1.311", True, True, True, 1, "configured-default"),
+        ("2.1.323", True, False, None, 1, "observed-default"),
+        ("2.1.311", True, False, None, 1, "observed-default"),
+        ("2.1.323", False, True, None, 0, "observed-default"),
     ],
     ids=[
         "fresh-same-model",
@@ -13847,6 +13854,12 @@ def test_managed_model_status_check_preserves_exact_context_identity(
         "earlier-fresh-same-model",
         "older-stale-target-hint",
         "older-stale-other-hint",
+        "descriptorless-observed-current",
+        "older-descriptorless-observed-current",
+        "older-descriptorless-configured-current",
+        "descriptorless-stale-target-hint",
+        "older-descriptorless-stale-target-hint",
+        "descriptorless-stale-other-hint",
     ],
 )
 def test_model_command_uses_a_fresh_status_for_same_model_requests(
@@ -13857,14 +13870,34 @@ def test_model_command_uses_a_fresh_status_for_same_model_requests(
     actual_target: bool,
     already_selected: bool | None,
     status_queries: int,
+    catalog: str,
 ) -> None:
-    composer = _SessionModelComposer()
+    owned_draft = "blocked prompt" if catalog == "configured-default" else None
+    composer = _SessionModelComposer(draft=owned_draft or "")
     composer.version = version
+    if catalog == "observed-default":
+        composer.options[-1] = "system.ai.claude-sonnet-4-6"
     bridge_dir = _session_model_bridge(tmp_path, composer)
     target = composer.options[-1]
+    if catalog != "picker":
+        descriptors = claude_native_bridge.read_model_picker_options(bridge_dir)
+        assert descriptors is not None
+        rows = [
+            {"id": composer.options[0], "_claude_picker_options": descriptors[:1]},
+            {"id": target, "model": target, "displayName": "Current model", "isDefault": True},
+        ]
+        claude_native_bridge.record_model_vocabulary(
+            bridge_dir,
+            launch_env=None,
+            launch_model=target if catalog == "configured-default" else None,
+            picker_values=picker_command_values(rows),
+            picker_options=picker_model_options(rows),
+        )
+        assert target in claude_native_bridge.read_model_picker_values(bridge_dir)
+        assert claude_native_bridge.read_model_picker_options(bridge_dir) == descriptors[:1]
     raw_path = bridge_dir / claude_native_bridge.CONTEXT_RAW_FILE
     raw = json.loads(raw_path.read_text())
-    raw["model"] = {"id": target if raw_target else composer.options[0]}
+    raw["model"] = {"id": target if raw_target else composer.options[0], "display_name": "Opus"}
     raw_path.write_text(json.dumps(raw))
     if actual_target:
         composer.model = target
@@ -13872,27 +13905,149 @@ def test_model_command_uses_a_fresh_status_for_same_model_requests(
 
     if already_selected is None:
         with pytest.raises(claude_native_bridge.ClaudeModelSwitchRefused) as caught:
-            claude_native_bridge.inject_model_command(bridge_dir, model=target)
+            claude_native_bridge.inject_model_command(
+                bridge_dir, model=target, owned_draft=owned_draft
+            )
         assert caught.value.unsupported
         assert not caught.value.command_submitted
         assert not caught.value.model_may_have_changed
-        assert "current model" in str(caught.value)
-        assert "automatic model changes" in str(caught.value)
+        if catalog == "picker":
+            assert "current model" in str(caught.value)
+            assert "automatic model changes" in str(caught.value)
         assert composer.model == (target if actual_target else composer.options[0])
     else:
-        result = claude_native_bridge.inject_model_command(bridge_dir, model=target)
+        result = claude_native_bridge.inject_model_command(
+            bridge_dir, model=target, owned_draft=owned_draft
+        )
         assert result.already_selected is already_selected
         assert result.resolved_model == result.status_model == composer.model == target
         assert result.session_id == composer.session
+        assert composer.text == ""
 
     assert composer.status_queries == status_queries
-    if version != "2.1.323":
+    if version != "2.1.323" or catalog != "picker":
         assert [args[-1] for args in composer.sends] == (
-            ["/status", "Enter", "Escape"] if status_queries else []
+            ([_CLEAR_ONE_ROW_COMPOSER] if owned_draft else [])
+            + (["/status", "Enter", "Escape"] if status_queries else [])
         )
     else:
         assert composer.submitted[-1] == "/status"
         assert [args[-1] for args in composer.sends].count("s") == (0 if already_selected else 1)
+
+
+@pytest.mark.parametrize(
+    "unproven",
+    [
+        "different-model",
+        "missing-model",
+        "private-case",
+        "public-looking-private-case",
+        "missing-context",
+        "extra-context",
+        "invalid-version",
+        "missing-owner",
+        "disabled-descriptor",
+        "alias-without-descriptor",
+        "plan-mode-without-descriptor",
+    ],
+)
+def test_model_command_refuses_descriptorless_models_before_mutating_an_owned_draft(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, unproven: str
+) -> None:
+    composer = _SessionModelComposer(draft="blocked prompt")
+    if unproven == "public-looking-private-case":
+        composer.options[-1] = "system.ai.claude-opus-4-8-Private"
+    if unproven == "alias-without-descriptor":
+        composer.options[-1] = "opus"
+    if unproven == "plan-mode-without-descriptor":
+        composer.options[-1] = "OPUSPLAN"
+    if unproven == "extra-context":
+        composer.options[-1] = "private-glm"
+    target = composer.model = composer.options[-1]
+    bridge_dir = _session_model_bridge(tmp_path, composer)
+    path = bridge_dir / "bridge.json"
+    metadata = json.loads(path.read_text())
+    if unproven == "disabled-descriptor":
+        metadata["model_picker_options"][-1]["enabled"] = False
+    else:
+        metadata["model_picker_options"].pop()
+    if unproven == "missing-owner":
+        metadata.pop("active_session_id")
+    path.write_text(json.dumps(metadata))
+    raw_path = bridge_dir / claude_native_bridge.CONTEXT_RAW_FILE
+    raw = json.loads(raw_path.read_text())
+    if unproven == "different-model":
+        raw["model"] = {"id": composer.options[0]}
+    if unproven == "missing-model":
+        raw.pop("model")
+    if unproven in {"private-case", "public-looking-private-case"}:
+        raw["model"] = {"id": target.swapcase()}
+    if unproven == "missing-context":
+        raw["model"] = {"id": target.removesuffix("[1m]")}
+    if unproven == "extra-context":
+        raw["model"] = {"id": target + "[1m]"}
+    if unproven == "invalid-version":
+        raw["version"] = "2.1.323-unknown"
+    raw_path.write_text(json.dumps(raw))
+    composer.install(monkeypatch)
+
+    with pytest.raises(claude_native_bridge.ClaudeModelSwitchRefused) as caught:
+        claude_native_bridge.inject_model_command(
+            bridge_dir, model=target, owned_draft="blocked prompt"
+        )
+
+    assert caught.value.unsupported or unproven == "missing-owner"
+    assert not caught.value.command_submitted
+    assert not caught.value.model_may_have_changed
+    assert composer.sends == []
+    assert composer.text == "blocked prompt"
+    assert composer.model == target
+
+
+@pytest.mark.parametrize(
+    ("field", "reported"),
+    [
+        ("Model", "PRIVATE-GLM[1m]"),
+        ("Model", "private-glm"),
+        ("Session ID", "another-native-session"),
+        ("Version", "2.1.322"),
+    ],
+    ids=["private-case", "missing-context", "different-session", "different-version"],
+)
+def test_model_command_requires_exact_fresh_status_for_a_descriptorless_current_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field: str, reported: str
+) -> None:
+    composer = _SessionModelComposer()
+    composer.model = composer.options[-1]
+    bridge_dir = _session_model_bridge(tmp_path, composer)
+    path = bridge_dir / "bridge.json"
+    metadata = json.loads(path.read_text())
+    metadata["model_picker_options"].pop()
+    path.write_text(json.dumps(metadata))
+    composer.install(monkeypatch)
+
+    def capture(socket_path: str, target: str) -> str:
+        pane = composer._capture_pane(socket_path, target)
+        if composer.overlay == "status":
+            original = {
+                "Model": composer.model,
+                "Session ID": composer.session,
+                "Version": composer.version,
+            }
+            return pane.replace(f"{field}: {original[field]}", f"{field}: {reported}")
+        return pane
+
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", capture)
+    with pytest.raises(claude_native_bridge.ClaudeModelSwitchRefused) as caught:
+        claude_native_bridge.inject_model_command(bridge_dir, model=composer.model)
+
+    assert not caught.value.command_submitted
+    assert not caught.value.model_may_have_changed
+    assert composer.status_queries == 1
+    assert [args[-1] for args in composer.sends] == ["/status", "Enter"] + (
+        ["Escape"] if field == "Model" else []
+    )
+    assert composer.model == "private-glm[1m]"
 
 
 @pytest.mark.parametrize("version", ["2.1.323", "2.1.322"], ids=["supported", "older"])
@@ -14392,7 +14547,7 @@ def test_model_target_refuses_descriptors_without_one_proven_ordinary_choice(
                 {"value": value, "model": concrete, "display_name": value, "enabled": True}
                 for value, concrete in descriptors
             ],
-            [],
+            [requested],
             {},
         )
     assert caught.value.unsupported

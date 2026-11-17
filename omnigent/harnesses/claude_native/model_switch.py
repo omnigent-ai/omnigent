@@ -82,6 +82,7 @@ class _Target:
     label: str | None
     structured: bool
     confirmation_label: str | None = None
+    status_only: bool = False
 
 
 @dataclass(frozen=True)
@@ -368,9 +369,22 @@ def _target(
                     option.get("provenance") == "structured",
                     confirmation_label,
                 )
-    # Old bridges can select an exact canonical row, never a guessed family label.
-    if options is None and resolved in values and base not in pins and resolved == requested:
-        return _Target(resolved, resolved, None, False)
+    if resolved in values and base not in pins and resolved == requested:
+        # Old bridges can select an exact canonical row, never a guessed family label.
+        if options is None:
+            return _Target(resolved, resolved, None, False)
+        described = {
+            public_claude_model_id(identity) or claude_picker_model_key(identity)
+            for option in options
+            for field in ("value", "model")
+            if isinstance(identity := option.get(field), str)
+        }
+        # Synthetic defaults have no picker descriptor; only their current status is usable.
+        if (
+            base.lower() not in (*CLAUDE_MODEL_ALIASES, "default", "opusplan")
+            and (canonical or requested) not in described
+        ):
+            return _Target(resolved, resolved, None, False, status_only=True)
     raise ClaudeModelSwitchRefused(
         f"This Claude terminal has no unambiguous session-only picker choice for {requested}. "
         "Refresh its model options or choose a model offered by the terminal.",
@@ -751,6 +765,15 @@ class SessionOnlyModelSwitch:
             return False
 
         self.wait(ready, seconds=self.ready_timeout_s)
+        raw_model = raw.get("model")
+        hint = raw_model.get("id") if isinstance(raw_model, dict) else raw_model
+        hinted_current = isinstance(hint, str) and self.status_matches(hint, exact_context=True)
+        if self.choice.status_only and not hinted_current:
+            raise self.refuse(
+                f"Claude's current model does not exactly match {self.model}, which has no "
+                "session-only picker choice. The dependent prompt was not sent.",
+                unsupported=True,
+            )
         pane = self.pane()
         draft = _draft(pane)
         if draft:
@@ -759,12 +782,16 @@ class SessionOnlyModelSwitch:
                     "An unrelated draft occupies Claude's input box. Finish it, then retry."
                 )
             self.clear_owned_draft(self.owned_draft)
-        raw_model = raw.get("model")
-        hint = raw_model.get("id") if isinstance(raw_model, dict) else raw_model
-        if isinstance(hint, str) and self.status_matches(hint, exact_context=True):
+        if hinted_current:
             current = self.local_status()
             if self.status_matches(current, exact_context=True):
                 return self.result(current, already_selected=True)
+        if self.choice.status_only:
+            raise self.refuse(
+                f"Claude's fresh status did not confirm the current model {self.model}. "
+                "The dependent prompt was not sent.",
+                unsupported=True,
+            )
 
         if not can_change_model:
             raise self.refuse(
