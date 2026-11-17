@@ -329,7 +329,7 @@ describe("Harnesses grid", () => {
     renderHarnesses("claude-native", "?host=host%20%26%20two&tab=settings");
     expect(startupCalls).toHaveBeenCalledWith("host & two", "claude-native");
     fireEvent.click(screen.getByRole("link", { name: /Harnesses/ }));
-    expect(screen.getByRole("button", { name: "session-host" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Machine: session-host" })).toBeInTheDocument();
   });
 
   it("asks for a session's linked host even when it is a sandbox the picker hides", () => {
@@ -544,8 +544,15 @@ describe("Harnesses grid catalog rows", () => {
       "data-settings-control",
       "harness-claude-native:open",
     );
-    // The link keeps the name its content gives it: no name of its own is added.
-    expect(card("claude-native")).not.toHaveAttribute("aria-label");
+    // The link is named by its harness, as the card's open part.
+    expect(card("claude-native")).toHaveAttribute("aria-label", "Claude Code");
+    // Its status and description stay available to screen readers as its description.
+    expect(card("claude-native")).toHaveAccessibleDescription(
+      expect.stringContaining("Configured"),
+    );
+    expect(card("claude-native")).toHaveAccessibleDescription(
+      expect.stringContaining("Anthropic’s agent for coding and development workflows."),
+    );
     expect(screen.getByRole("button", { name: "Claude Code settings" })).toHaveAttribute(
       "data-settings-control",
       "harness-claude-native:settings",
@@ -767,7 +774,7 @@ describe("Harness details", () => {
     expect(screen.getByText("2 skills · 1 MCP")).toBeTruthy();
     expect(screen.getByText("lint")).toBeTruthy();
 
-    fireEvent.click(screen.getByRole("button", { name: "Plugins" }));
+    fireEvent.click(screen.getByRole("button", { name: "Back to Plugins" }));
     expect(screen.getByRole("tab", { name: "Plugins · 1" }).getAttribute("aria-selected")).toBe(
       "true",
     );
@@ -1344,11 +1351,11 @@ describe("Launch settings compatibility", () => {
   it("uses the host selected on the grid", () => {
     hosts = [ONLINE, { ...ONLINE, host_id: "h2", name: "second-host" }];
     renderHarnesses();
-    fireEvent.pointerDown(screen.getByRole("button", { name: "my-laptop" }), {
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Machine: my-laptop" }), {
       button: 0,
       ctrlKey: false,
     });
-    fireEvent.click(screen.getByRole("menuitem", { name: "second-host" }));
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "second-host" }));
     fireEvent.click(screen.getByTestId("harness-settings-claude-native"));
     expect(startupCalls).toHaveBeenLastCalledWith("h2", "claude-native");
   });
@@ -1385,7 +1392,7 @@ it("shows installed plugin metadata and disabled bundled servers", () => {
   expect(screen.getByText(/v1\.2\.3 · market · Disabled/)).toBeTruthy();
   selectTab("MCPs · 1");
   expect(screen.getByTestId("catalog-row-bundled")).toBeTruthy();
-  fireEvent.click(screen.getByRole("button", { name: "Plugins" }));
+  fireEvent.click(screen.getByRole("button", { name: "Back to Plugins" }));
   expect(screen.getByRole("tab", { name: "Plugins · 1" }).getAttribute("aria-selected")).toBe(
     "true",
   );
@@ -1414,7 +1421,7 @@ it("opens skill markdown only on demand and returns to Skills", () => {
   expect(screen.getByRole("link", { name: "docs" }).getAttribute("href")).toBe(
     "https://example.test/docs",
   );
-  fireEvent.click(screen.getByRole("button", { name: "Skills" }));
+  fireEvent.click(screen.getByRole("button", { name: "Back to Skills" }));
   expect(screen.getByRole("tab", { name: "Skills · 1" }).getAttribute("aria-selected")).toBe(
     "true",
   );
@@ -1429,7 +1436,7 @@ it("opens a namespaced plugin skill and returns to that plugin", () => {
   fireEvent.click(screen.getByTestId("catalog-row-lint"));
   expect(contentLookup).toEqual([ONLINE.host_id, "claude-native", "toolkit:lint"]);
   expect(screen.getByText(/Contents truncated/)).toBeTruthy();
-  fireEvent.click(screen.getByRole("button", { name: "toolkit" }));
+  fireEvent.click(screen.getByRole("button", { name: "Back to toolkit" }));
   expect(screen.getByRole("heading", { name: "toolkit" })).toBeTruthy();
 });
 
@@ -1628,7 +1635,7 @@ it.each([false, true])("uses installed MCP identity and honors enabled=%s", asyn
   selectTab("Plugins · 2");
   fireEvent.click(screen.getAllByTestId("catalog-row-toolkit")[1]);
   selectTab("MCPs · 1");
-  const toggle = screen.getByRole("switch", { name: "Enable docs for claude" });
+  const toggle = screen.getByRole("switch", { name: "Enable MCP server: docs for claude" });
   expect(toggle).toHaveAttribute("aria-checked", "true");
   expect(screen.queryByText("toolkit plugin · host")).toBeNull();
   const row = screen.getByTestId("catalog-row-docs");
@@ -1690,10 +1697,9 @@ it("requests a host update instead of guessing installed MCP identity", () => {
   expect(screen.getByText("Update my-laptop to inspect installed plugin MCP tools.")).toBeTruthy();
   expect(screen.getByTestId("catalog-row-docs").tagName).not.toBe("BUTTON");
   expect(mcpSources).toEqual([]);
-  expect(screen.getByRole("switch", { name: "Enable docs for claude" })).toHaveAttribute(
-    "aria-checked",
-    "false",
-  );
+  expect(
+    screen.getByRole("switch", { name: "Enable MCP server: docs for claude" }),
+  ).toHaveAttribute("aria-checked", "false");
 });
 
 it("keeps old-host and unsupported harness rows without a switch", () => {
@@ -1712,10 +1718,9 @@ it.each([false, true])("renders MCP enabled=%s and suppresses off probes", (enab
     },
   };
   renderHarnesses("claude-native");
-  expect(screen.getByRole("switch", { name: "Enable docs for claude" })).toHaveAttribute(
-    "aria-checked",
-    String(enabled),
-  );
+  expect(
+    screen.getByRole("switch", { name: "Enable MCP server: docs for claude" }),
+  ).toHaveAttribute("aria-checked", String(enabled));
   fireEvent.click(screen.getByTestId("catalog-row-docs"));
   if (!enabled) {
     expect(screen.getByText("Off")).toBeInTheDocument();
@@ -1734,7 +1739,7 @@ it("locks managed MCP switches", () => {
     },
   };
   renderHarnesses("claude-native");
-  expect(screen.getByRole("switch", { name: "Enable docs for claude" })).toBeDisabled();
+  expect(screen.getByRole("switch", { name: "Enable MCP server: docs for claude" })).toBeDisabled();
   expect(setEnabled).not.toHaveBeenCalled();
 });
 
@@ -1780,7 +1785,7 @@ it.each([false, true])(
     client.setQueryData(["host-mcp-servers", "h1"], [server]);
     fireEvent.click(screen.getByTestId("catalog-row-docs"));
     expect(screen.getByTestId("catalog-row-docs")).toHaveAttribute("aria-expanded", "true");
-    const toggle = screen.getByRole("switch", { name: "Enable docs for claude" });
+    const toggle = screen.getByRole("switch", { name: "Enable MCP server: docs for claude" });
     fireEvent.click(toggle);
     await waitFor(() => expect(toggle).toHaveAttribute("aria-checked", "false"));
     expect(toggle).toBeDisabled();
@@ -1815,7 +1820,7 @@ it("retains the enablement switch when tool discovery is unavailable", () => {
   renderHarnesses("claude-native");
   fireEvent.click(screen.getByTestId("catalog-row-docs"));
   expect(screen.getByTestId("catalog-row-docs").tagName).not.toBe("BUTTON");
-  expect(screen.getByRole("switch", { name: "Enable docs for claude" })).toBeEnabled();
+  expect(screen.getByRole("switch", { name: "Enable MCP server: docs for claude" })).toBeEnabled();
 });
 
 it.each([
@@ -1835,6 +1840,6 @@ it.each([
   };
   setEnabled.mockRejectedValue(error);
   renderHarnesses("claude-native");
-  fireEvent.click(screen.getByRole("switch", { name: "Enable docs for claude" }));
+  fireEvent.click(screen.getByRole("switch", { name: "Enable MCP server: docs for claude" }));
   await waitFor(() => expect(toast.error).toHaveBeenCalledWith(message));
 });

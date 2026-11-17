@@ -36,8 +36,8 @@ export const HARNESS_DESCRIPTIONS: Readonly<Record<string, string>> = {
 };
 
 /**
- * The Harnesses page's header: its search, its All/Configured filter. The machine picker isn't
- * a part yet, so it keeps its own name.
+ * The Harnesses page's header: its search, its All/Configured filter and the machine it shows.
+ * The machine's menu lists the hosts by name, so its options are runtime choices.
  */
 export const HARNESSES_GRID_ENTRY = settingsEntry({
   id: "harnesses",
@@ -48,8 +48,14 @@ export const HARNESSES_GRID_ENTRY = settingsEntry({
   parts: {
     search: "Search agent harnesses",
     filter: "Harness filter",
+    machine: "Machine",
   },
   partChoices: { filter: ["All", "Configured"] },
+  // Named by the host it shows, or "Select a host" when none is selected.
+  nameTemplates: { machine: { before: "Machine: " } },
+  // The picker shows only once a machine is connected.
+  presence: { machine: { states: ["has hosts"] } },
+  overlays: { machine: { runtimeChoices: {} } },
   focus: "search",
 });
 
@@ -141,7 +147,7 @@ export type HarnessCredentialActionName = "switch" | "signInAgain";
 
 /** A harness's own page: the setup warning's fix, and its title row. */
 export type HarnessDetailEntry = SettingsEntry & {
-  readonly parts: Readonly<Record<"fixAction", string>>;
+  readonly parts: Readonly<Record<"back" | "fixAction", string>>;
   readonly nameAlternatives: {
     readonly fixAction: Readonly<Record<HarnessFixActionName, string>>;
   };
@@ -149,7 +155,7 @@ export type HarnessDetailEntry = SettingsEntry & {
 
 /** A harness page that lists its host's inventory, which also has the tab list. */
 export type InventoryHarnessDetailEntry = HarnessDetailEntry & {
-  readonly parts: Readonly<Record<"fixAction" | "tab", string>>;
+  readonly parts: Readonly<Record<"back" | "fixAction" | "tab", string>>;
 };
 
 /** A harness's Credential card, whose button signs in again or switches account. */
@@ -166,7 +172,7 @@ function inventoryFamilyOf(harness: NativeHarnessId): InventoryHarness | undefin
 
 /** A harness's plugin page, reached from its Plugins tab: its own Skills and MCPs tabs. */
 export type HarnessPluginEntry = SettingsEntry & {
-  readonly parts: Readonly<Record<"tab", string>>;
+  readonly parts: Readonly<Record<"back" | "tab", string>>;
 };
 
 /** A harness's skill page, reached from its Skills tab or from a plugin: the skill's document. */
@@ -175,9 +181,11 @@ export type HarnessSkillEntry = SettingsEntry;
 /** The entries of one inventory harness's pages; only the families with skill contents have `skill`. */
 export interface InventoryPageEntries {
   readonly family: InventoryHarness;
+  readonly harness: InventoryPageHarnessId;
   readonly detail: InventoryHarnessDetailEntry;
   readonly plugin: HarnessPluginEntry;
   readonly skill?: HarnessSkillEntry;
+  readonly mcp: SettingsEntry;
 }
 
 /**
@@ -186,13 +194,15 @@ export interface InventoryPageEntries {
  */
 export function harnessInventoryPage(harness: NativeHarnessId): InventoryPageEntries | undefined {
   const family = inventoryFamilyOf(harness);
-  if (family === undefined) return undefined;
+  if (family === undefined || !isInventoryPageHarness(harness)) return undefined;
   return {
     family,
+    harness,
     // Only the inventory pages' builds add the tab list, so this is the one place that names it.
     detail: HARNESS_DETAIL_ENTRIES.entry(harness) as InventoryHarnessDetailEntry,
     plugin: HARNESS_PLUGIN_ENTRIES.entry(harness),
     skill: hasSkillPage(family) ? HARNESS_SKILL_ENTRIES.entry(harness) : undefined,
+    mcp: MCP_SERVER_LIST_ENTRIES.entry(harness),
   };
 }
 
@@ -217,7 +227,7 @@ export const HARNESS_DETAIL_ENTRIES = settingsEntryFamily({
       label: name,
       description: `${name} on a machine: its MCP servers, skills and plugins, and its setup.`,
       keywords: ["harness", "agent", "setup"],
-      parts: { fixAction: "Set up", ...FIX_DIALOG_PARTS },
+      parts: { back: "Back to Harnesses", fixAction: "Set up", ...FIX_DIALOG_PARTS },
       nameAlternatives: {
         fixAction: {
           install: "Install",
@@ -285,6 +295,38 @@ export const HARNESS_CREDENTIAL_ENTRIES = settingsEntryFamily({
 });
 
 /** The families whose skills open a page of their own, which also show their contents. */
+/** The skill-page harnesses by native id, which their skill entries are built for. */
+export const SKILL_PAGE_HARNESSES = [
+  "claude-native",
+  "codex-native",
+  "cursor-native",
+] as const satisfies readonly NativeHarnessId[];
+
+export type SkillPageHarnessId = (typeof SKILL_PAGE_HARNESSES)[number];
+
+export function isSkillPageHarness(harness: string): harness is SkillPageHarnessId {
+  return (SKILL_PAGE_HARNESSES as readonly string[]).includes(harness);
+}
+
+/** The harnesses whose page lists their inventory, by native id; their entries are built for these. */
+export const INVENTORY_PAGE_HARNESSES = [
+  "claude-native",
+  "codex-native",
+  "cursor-native",
+  "pi-native",
+] as const satisfies readonly NativeHarnessId[];
+
+export type InventoryPageHarnessId = (typeof INVENTORY_PAGE_HARNESSES)[number];
+
+/** An MCP server list's entry, whose switch is its `enabled` part; only Claude's and Codex's lists have one. */
+export type McpServerListEntry = SettingsEntry & {
+  readonly parts: Readonly<Record<"enabled", string>>;
+};
+
+export function isInventoryPageHarness(harness: string): harness is InventoryPageHarnessId {
+  return (INVENTORY_PAGE_HARNESSES as readonly string[]).includes(harness);
+}
+
 export const SKILL_PAGE_FAMILIES = [
   "claude",
   "codex",
@@ -316,7 +358,7 @@ export const HARNESS_PLUGIN_ENTRIES = settingsEntryFamily({
       label: "Plugin",
       description: `A plugin's skills and MCP servers in ${harnessName(harness)}.`,
       keywords: ["plugin", "skills", "mcp"],
-      parts: { tab: "Plugin view" },
+      parts: { back: "Back to Plugins", tab: "Plugin view" },
       partChoices: { tab: [...PLUGIN_KINDS] },
       choiceTemplates: {
         tab: Object.fromEntries(
@@ -340,9 +382,57 @@ export const HARNESS_SKILL_ENTRIES = settingsEntryFamily({
       label: "Skill",
       description: `A skill's own instructions in ${harnessName(harness)}.`,
       keywords: ["skill", "instructions"],
+      // Back to Skills, or, opened from a plugin, back to that plugin.
+      parts: { back: "Back to Skills" },
+      nameTemplates: { back: { before: "Back to " } },
       contentAreas: ["skill"],
       revealedBy: { entry: `harness-${harness}-detail`, part: "tab", choice: "Skills" },
     }),
+});
+
+/**
+ * Each inventory harness's MCP list on its page. Claude Code's and Codex's turn each server on
+ * or off for Omnigent sessions; the other harnesses' only list them.
+ */
+export const MCP_SERVER_LIST_ENTRIES = settingsEntryFamily({
+  key: "mcp-server-lists",
+  members: INVENTORY_NATIVE_IDS,
+  build: (harness): SettingsEntry => {
+    const name = harnessName(harness);
+    const family = inventoryFamilyOf(harness)!;
+    const list = {
+      id: `mcp-servers-${family}`,
+      section: "harnesses" as const,
+      harness,
+      label: `MCP servers for ${name}`,
+      regions: { servers: OPENS_BY_NAME, listed: {} },
+    };
+    if (harness === "claude-native" || harness === "codex-native") {
+      return {
+        ...list,
+        description: `Turn each MCP server on or off for Omnigent sessions in ${name}.`,
+        keywords: [
+          "mcp",
+          "model context protocol",
+          "tools",
+          "plugins",
+          "servers",
+          "enable",
+          "disable",
+        ],
+        parts: { enabled: "Enable MCP server" },
+        // Named by the server it switches, and the harness it's for.
+        nameTemplates: { enabled: { before: "Enable MCP server: ", after: ` for ${family}` } },
+        // Only a server whose host reports it on or off has a switch; a plugin's may not.
+        presence: { enabled: { states: ["lists a switchable server"] } },
+      };
+    }
+    return {
+      ...list,
+      description: `The MCP servers ${name} uses on a machine, and their tools.`,
+      keywords: ["mcp", "model context protocol", "tools", "servers"],
+    };
+  },
 });
 
 /** The entry whose overlay is the fix dialog a harness opens from `opener`. */
@@ -359,4 +449,5 @@ export const HARNESS_SETTINGS: readonly SettingsEntry[] = [
   ...HARNESS_CREDENTIAL_ENTRIES.entries,
   ...HARNESS_PLUGIN_ENTRIES.entries,
   ...HARNESS_SKILL_ENTRIES.entries,
+  ...MCP_SERVER_LIST_ENTRIES.entries,
 ];

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useId, useMemo, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import {
   CheckCircle2Icon,
@@ -14,7 +14,8 @@ import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
   DropdownMenuContent,
-  DropdownMenuItem,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -65,12 +66,13 @@ import {
   harnessFixOwner,
 } from "./search/catalog/harnesses";
 import { SettingsItem } from "./search/SettingsItem";
-import { SettingsOverlayOwner } from "./search/settingsOwnership";
 import {
-  type SettingsControlProps,
-  settingsControlId,
-  settingsControlProps,
-} from "./search/settingsControl";
+  SettingsOverlayOwner,
+  SettingsOwner,
+  settingsOverlayProps,
+  settingsRuntimeChoiceProps,
+} from "./search/settingsOwnership";
+import { type SettingsControlProps, settingsControlProps } from "./search/settingsControl";
 
 interface HarnessEntry {
   /** Native harness slug (e.g. "claude-native") — the readiness/install key. */
@@ -375,30 +377,42 @@ function HostSelect({
             className="h-8 shrink-0 gap-1.5"
             data-testid="harness-host-select"
             componentId="settings.harnesses.host"
+            {...settingsControlProps(HARNESSES_GRID_ENTRY, "machine", {
+              runtime: selected?.name ?? "Select a host",
+            })}
           >
             <HostStatusDot online={selected?.status === "online"} />
             <span className="max-w-40 truncate">{selected?.name ?? "Select a host"}</span>
             <ChevronDownIcon className="size-3.5 shrink-0 text-muted-foreground" />
           </Button>
         </DropdownMenuTrigger>
-        <DropdownMenuContent align="start" className="min-w-52">
-          {hosts.map((h) => {
-            const online = h.status === "online";
-            return (
-              <DropdownMenuItem
-                key={h.host_id}
-                disabled={!online}
-                onSelect={() => online && onSelect(h.host_id)}
-                data-active={h.host_id === selected?.host_id ? "true" : undefined}
-                data-testid={`harness-host-${h.host_id}`}
-                className="gap-1.5 data-[active=true]:bg-muted dark:data-[active=true]:bg-muted/50"
-              >
-                <HostStatusDot online={online} />
-                <span className="min-w-0 flex-1 truncate">{h.name}</span>
-                {!online && <span className="text-xs text-muted-foreground">Offline</span>}
-              </DropdownMenuItem>
-            );
-          })}
+        <DropdownMenuContent
+          align="start"
+          className="min-w-52"
+          {...settingsOverlayProps(HARNESSES_GRID_ENTRY, "machine")}
+        >
+          {/* One host is the selected one, so its item is checked. */}
+          <DropdownMenuRadioGroup value={selected?.host_id ?? ""}>
+            {hosts.map((h) => {
+              const online = h.status === "online";
+              return (
+                <DropdownMenuRadioItem
+                  key={h.host_id}
+                  value={h.host_id}
+                  disabled={!online}
+                  onSelect={() => online && onSelect(h.host_id)}
+                  data-active={h.host_id === selected?.host_id ? "true" : undefined}
+                  data-testid={`harness-host-${h.host_id}`}
+                  {...settingsRuntimeChoiceProps(HARNESSES_GRID_ENTRY, "machine")}
+                  className="gap-1.5 data-[active=true]:bg-muted dark:data-[active=true]:bg-muted/50"
+                >
+                  <HostStatusDot online={online} />
+                  <span className="min-w-0 flex-1 truncate">{h.name}</span>
+                  {!online && <span className="text-xs text-muted-foreground">Offline</span>}
+                </DropdownMenuRadioItem>
+              );
+            })}
+          </DropdownMenuRadioGroup>
         </DropdownMenuContent>
       </DropdownMenu>
     </div>
@@ -598,6 +612,9 @@ function HarnessCard({
   const opensDetail = status.ready || (needsAttention && canFix);
   const navigate = useNavigate();
   const card = HARNESS_CARD_ENTRIES.entry(entry.harness);
+  // The link is named by the harness; its status and description are its description.
+  const statusId = useId();
+  const descriptionId = useId();
   const body = (
     <>
       <div className="flex items-start justify-between gap-2">
@@ -605,16 +622,18 @@ function HarnessCard({
           <HarnessIcon entry={entry} />
           <div className="flex min-w-0 flex-col">
             <span className="truncate text-ui font-medium text-foreground">{entry.name}</span>
-            <HarnessStatusText
-              status={status}
-              enhanced={canSetup}
-              configuredCredential={
-                status.ready && canSetup
-                  ? (configuredAccountLabel(host, entry.harness) ??
-                    credentialPresentation(host, entry.harness, credentialKind).label)
-                  : undefined
-              }
-            />
+            <div id={statusId}>
+              <HarnessStatusText
+                status={status}
+                enhanced={canSetup}
+                configuredCredential={
+                  status.ready && canSetup
+                    ? (configuredAccountLabel(host, entry.harness) ??
+                      credentialPresentation(host, entry.harness, credentialKind).label)
+                    : undefined
+                }
+              />
+            </div>
           </div>
         </div>
         {(status.ready || (needsAttention && canFix && mode !== "install")) && (
@@ -638,7 +657,9 @@ function HarnessCard({
           <SetupButton entry={entry} onSetup={() => onFix("install")} />
         )}
       </div>
-      <p className="line-clamp-2 text-sm text-muted-foreground">{entry.description}</p>
+      <p id={descriptionId} className="line-clamp-2 text-sm text-muted-foreground">
+        {entry.description}
+      </p>
     </>
   );
   const className =
@@ -648,8 +669,8 @@ function HarnessCard({
     <SettingsItem entry={card} className="grid">
       {opensDetail ? (
         <Link
-          // Named by its content, as before; the id only lets search find the link.
-          data-settings-control={settingsControlId(card, "open")}
+          {...settingsControlProps(card, "open")}
+          aria-describedby={`${statusId} ${descriptionId}`}
           to={`/settings/harnesses/${entry.harness}${status.ready ? "" : "?tab=settings"}`}
           // Only cards that open a details page get the hover, so it reads as clickable.
           className={cn(
@@ -731,7 +752,9 @@ function HarnessDetail({
   });
   const header = (
     <SettingsItem entry={detail}>
-      <BackButton label="Harnesses" to="/settings/harnesses" />
+      <SettingsOwner entry={HARNESS_DETAIL_ENTRIES.entry(entry.harness)} part="back">
+        <BackButton label="Harnesses" to="/settings/harnesses" />
+      </SettingsOwner>
       <div className="flex items-start justify-between gap-4">
         <div className="flex min-w-0 items-center gap-3">
           <HarnessIcon entry={entry} />
