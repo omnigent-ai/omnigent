@@ -3,7 +3,7 @@
 // refresh; the file editor's "Wrap lines" setting is separate.
 
 import { useSyncExternalStore } from "react";
-import { createStoredChoicePreference } from "./storedChoicePreference";
+import { createStoredChoicePreference, isStorageEventFor } from "./storedChoicePreference";
 
 export const CODE_BLOCK_WORD_WRAP_STORAGE_KEY = "omnigent:code-block-word-wrap";
 
@@ -29,7 +29,7 @@ export function writeCodeBlockWordWrap(wrap: boolean): void {
   if (preference.write(wrap ? "true" : "false")) unsavedWrap = undefined;
 }
 
-/** Flip the preference from its current stored value. */
+/** Flip the value in effect, which may be an unsaved choice. */
 export function toggleCodeBlockWordWrap(): void {
   writeCodeBlockWordWrap(!readCodeBlockWordWrap());
 }
@@ -44,13 +44,7 @@ export function notifyCodeBlockWordWrapChanged(): void {
 // Registered at load, so it runs before any reader's listener re-reads.
 if (typeof window !== "undefined") {
   window.addEventListener("storage", (event) => {
-    if (event.key !== null && event.key !== CODE_BLOCK_WORD_WRAP_STORAGE_KEY) return;
-    try {
-      if (event.storageArea !== null && event.storageArea !== window.localStorage) return;
-    } catch {
-      // Unreadable storage: readers re-read too, as in the preference's own listener.
-    }
-    unsavedWrap = undefined;
+    if (isStorageEventFor(event, CODE_BLOCK_WORD_WRAP_STORAGE_KEY)) unsavedWrap = undefined;
   });
 }
 

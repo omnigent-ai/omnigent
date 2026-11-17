@@ -18,6 +18,17 @@ export interface StoredPreference<Value extends string | number | boolean> {
   use: () => Value;
 }
 
+/** Whether another window's storage event may have changed `storageKey` in localStorage. */
+export function isStorageEventFor(event: StorageEvent, storageKey: string): boolean {
+  if (event.key !== null && event.key !== storageKey) return false;
+  try {
+    if (event.storageArea !== null && event.storageArea !== window.localStorage) return false;
+  } catch {
+    // Unreadable storage: re-read, which falls back to the default.
+  }
+  return true;
+}
+
 /** `parse` maps a stored string to its value, or to undefined when it names none. */
 export function createStoredPreference<Value extends string | number | boolean>(
   storageKey: string,
@@ -59,13 +70,7 @@ export function createStoredPreference<Value extends string | number | boolean>(
 
   const subscribe = (listener: () => void) => {
     const onStorage = (event: StorageEvent) => {
-      if (event.key !== null && event.key !== storageKey) return;
-      try {
-        if (event.storageArea !== null && event.storageArea !== window.localStorage) return;
-      } catch {
-        // Unreadable storage: re-read, which falls back to the default.
-      }
-      listener();
+      if (isStorageEventFor(event, storageKey)) listener();
     };
     window.addEventListener(changeEvent, listener);
     window.addEventListener("storage", onStorage);

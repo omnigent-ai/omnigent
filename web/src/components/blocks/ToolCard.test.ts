@@ -5,7 +5,11 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { FileViewerContext } from "@/shell/FileViewerContext";
 import type { RenderItem } from "@/lib/renderItems";
 import { writeTerminalThemeMode } from "@/lib/terminalThemePreferences";
-import { CODE_BLOCK_WORD_WRAP_STORAGE_KEY } from "@/lib/codeWrapPreferences";
+import {
+  CODE_BLOCK_WORD_WRAP_STORAGE_KEY,
+  readCodeBlockWordWrap,
+  writeCodeBlockWordWrap,
+} from "@/lib/codeWrapPreferences";
 import { ToolCard, ToolGroupSummary, formatToolDuration } from "./ToolCard";
 import { getOutputPreview } from "./ToolCodePanel";
 import type * as ToolViewsModule from "./toolViews";
@@ -913,6 +917,11 @@ describe("ToolCard shell terminal panel", () => {
     fireEvent.click(toggle);
     expect(screen.getByRole("button", { name: "Enable word wrap" })).toBe(toggle);
     expect(document.activeElement).toBe(toggle);
+
+    // The shell card shares the code wrap preference with every other block.
+    expect(readCodeBlockWordWrap()).toBe(false);
+    act(() => writeCodeBlockWordWrap(true));
+    expect(screen.getByRole("button", { name: "Disable word wrap" })).toBe(toggle);
   });
 
   it("shows a running status while the command has no output yet", () => {
