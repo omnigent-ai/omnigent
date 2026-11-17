@@ -494,11 +494,12 @@ async def test_persisted_running_session_does_not_receive_a_fresh_deadline(
     await recovery.service.recover(recovery.connection, [])
     state = recovery.store.get_session_recovery(recovery.conv.id)
     if age is None:
-        assert state.phase == "active"
+        assert state.interrupted_at == 1000
+        assert state.phase == "submitted"
     else:
         assert state.interrupted_at == recovery.clock[0] - age
         assert state.phase == ("failed" if age > RECOVERY_MAX_AGE_S else "submitted")
-    assert recovery.initializer.initialize.await_count == (age == 60)
+    assert recovery.initializer.initialize.await_count == (age in {60, None})
 
 
 @pytest.mark.asyncio

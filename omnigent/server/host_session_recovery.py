@@ -111,8 +111,9 @@ def _record_interruption(
                 if conv.live_status != "failed"
                 else store.get_session_interruption_time(conv.id)
             )
+        # Disconnect cleanup can clear liveness; witnessed turn start bounds its age.
         if interrupted_at is None:
-            return
+            interrupted_at = previous.interrupted_at
         recovery = replace(previous, phase="pending", interrupted_at=interrupted_at)
     elif previous.phase == "submitted" and previous.runner_id == conv.runner_id:
         recovery = replace(previous, phase="pending", attempt_id=None)
