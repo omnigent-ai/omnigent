@@ -1154,6 +1154,8 @@ function SupportedForkSessionForm({
   // stranded. Only fills an empty slot, so an explicit pick always wins.
   useEffect(() => {
     if (!isCodingSource || sandboxSelected || selectedHostId !== null) return;
+    // An unloaded picker list is not "no host online"; a sandbox chosen now would stick.
+    if (hosts === undefined) return;
     // The source's provider and the offered providers decide a sandbox
     // source's default; a connected host chosen first would stick.
     if (sourceHostId && sourceHostLoading) return;
@@ -1173,6 +1175,7 @@ function SupportedForkSessionForm({
     isCodingSource,
     sandboxSelected,
     selectedHostId,
+    hosts,
     sourceHostId,
     sourceHostOnline,
     sourceHostLoading,

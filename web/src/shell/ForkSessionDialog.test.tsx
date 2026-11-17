@@ -2471,6 +2471,32 @@ describe("ForkSessionDialog", () => {
       expect(screen.getByTestId("fork-session-host-select")).toHaveTextContent("Arclet Sandbox");
     });
 
+    it("keeps an online source host as the default when the picker's hosts arrive after the full list", async () => {
+      const laptop = host({ name: "laptop" });
+      let pickerLoaded = false;
+      // The full list is already cached by the chat header; the picker's own list loads later.
+      useHostsMock.mockImplementation(
+        (options) =>
+          (options?.includeSandbox || pickerLoaded
+            ? { data: [laptop], isLoading: false }
+            : { data: undefined, isLoading: true }) as ReturnType<typeof useHosts>,
+      );
+      const { refresh } = renderDialog({
+        ...CODING,
+        info: { managed_sandboxes_enabled: true, sandbox_provider: "modal" },
+      });
+
+      await act(async () => {});
+      expect(screen.queryByTestId("fork-session-sandbox-hint")).not.toBeInTheDocument();
+
+      pickerLoaded = true;
+      refresh();
+      await act(async () => {});
+      expect(screen.getByTestId("fork-session-host-select")).toHaveTextContent("laptop");
+      expect(screen.getByTestId("fork-session-reuse-dir-hint")).toBeInTheDocument();
+      expect(screen.queryByTestId("fork-session-sandbox-hint")).not.toBeInTheDocument();
+    });
+
     it("keeps the same-provider default when server capabilities arrive after hosts", async () => {
       useSessionMock.mockReturnValue({
         session: { hostId: "host_1", labels: {} },
