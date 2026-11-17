@@ -147,7 +147,9 @@ from omnigent.server._elicitation_registry import (
 from omnigent.server.auth import (
     LEVEL_EDIT,
     LEVEL_READ,
+    RESERVED_USER_LOCAL,
     RESERVED_USER_PUBLIC,
+    local_single_user_enabled,
 )
 from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
@@ -8081,8 +8083,12 @@ async def _forward_event_to_runner(
     }
     if agent_revision is not None:
         runner_body["agent_revision"] = agent_revision
-    if created_by is not None:
-        runner_body["caller_user_id"] = created_by
+    caller_user_id = created_by
+    if caller_user_id is None and local_single_user_enabled():
+        # Attribution drops the single-user identity; it is still the caller.
+        caller_user_id = RESERVED_USER_LOCAL
+    if caller_user_id is not None:
+        runner_body["caller_user_id"] = caller_user_id
     # Persist the turn-initiating actor so /policies/evaluate and MCP
     # tools/call can read it back on any server replica.  Skip system-driven
     # forwards (sub-agent results, parent-wake carry created_by=None) — they

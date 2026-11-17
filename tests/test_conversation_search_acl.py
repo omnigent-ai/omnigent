@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import httpx
+import pytest
 from sqlalchemy import event, text
 
 from omnigent.db.db_models import SqlSessionPermission, workspace_scope
@@ -300,7 +301,9 @@ def test_runner_local_dispatch_preserves_authenticated_caller(tmp_path: Path) ->
     assert [ctx.caller_user_id for ctx in captured_contexts] == ["caller@example.com"]
 
 
-def test_forward_event_sends_only_authenticated_caller_to_runner(tmp_path: Path) -> None:
+def test_forward_event_sends_only_authenticated_caller_to_runner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     store = SqlAlchemyConversationStore(f"sqlite:///{tmp_path / 'forward.db'}")
     conversation = store.create_conversation(workspace=str(tmp_path), title="Existing title")
     posted_bodies = []
@@ -325,8 +328,14 @@ def test_forward_event_sends_only_authenticated_caller_to_runner(tmp_path: Path)
                 created_by=created_by,
             )
 
+    # A multi-user server forwards no caller for a turn without an actor.
+    monkeypatch.delenv("OMNIGENT_LOCAL_SINGLE_USER", raising=False)
     asyncio.run(forward("caller@example.com"))
+    asyncio.run(forward(None))
+    # A single-user server's attribution has no actor, yet its user is the caller.
+    monkeypatch.setenv("OMNIGENT_LOCAL_SINGLE_USER", "1")
     asyncio.run(forward(None))
 
     assert posted_bodies[0]["caller_user_id"] == "caller@example.com"
     assert "caller_user_id" not in posted_bodies[1]
+    assert posted_bodies[2]["caller_user_id"] == "local"
