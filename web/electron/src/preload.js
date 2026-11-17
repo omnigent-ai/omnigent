@@ -543,7 +543,7 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    * tree the conversation's view is currently on. Metadata only (profile name +
    * per-scope counts): no Keychain access and no cookie values. macOS only.
    * @param {string} conversationId
-   * @returns {Promise<{ ok: boolean, host?: string, scopes?: string[], profiles?: Array<{ id: string, name: string, cookieCount: number, scopes?: Array<{ host: string, cookieCount: number }> }>, error?: string }>}
+   * @returns {Promise<{ ok: boolean, host?: string, openedHost?: string, scopes?: string[], profiles?: Array<{ id: string, name: string, cookieCount: number, scopes?: Array<{ host: string, cookieCount: number, openedCookieCount?: number }> }>, error?: string }>}
    */
   browserChromeCookiePreview: (conversationId) =>
     ipcRenderer.invoke("omnigent:browser-chrome-cookie-preview", { conversationId }),
@@ -554,9 +554,10 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    * the view's site.
    * @param {string} conversationId
    * `scope` is the site tree to copy (the page's host or a parent domain); main
-   * rejects anything that isn't an ancestor of the page.
-   * @param {{ profileId: string, expectedHost: string, scope?: string }} args
-   * @returns {Promise<{ ok: boolean, imported?: number, skipped?: number, failed?: number, error?: string }>}
+   * rejects anything that isn't an ancestor of the page. `openedHost` echoes the
+   * preview's opened site to include it; main re-derives and checks it.
+   * @param {{ profileId: string, expectedHost: string, scope?: string, openedHost?: string }} args
+   * @returns {Promise<{ ok: boolean, imported?: number, skipped?: number, failed?: number, openedUrl?: string, error?: string }>}
    */
   browserChromeCookieImport: (conversationId, args) =>
     ipcRenderer.invoke("omnigent:browser-chrome-cookie-import", {
@@ -564,6 +565,7 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
       profileId: args?.profileId,
       expectedHost: args?.expectedHost,
       scope: args?.scope,
+      openedHost: args?.openedHost,
     }),
   /**
    * Subscribe to URL and title changes, including background views, so the

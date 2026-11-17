@@ -161,6 +161,30 @@ function cookieInScope(hostKey, scope) {
   return key.startsWith(".") && cookieAppliesToScope(scope, key.slice(1));
 }
 
+/**
+ * The site a tab opened before it was redirected elsewhere (a sign-in page),
+ * when the page's own scope doesn't already cover it; otherwise null.
+ *
+ * @param {string} pageHost normalized
+ * @param {unknown} openedHost
+ * @returns {string | null}
+ */
+function openedSiteScope(pageHost, openedHost) {
+  if (openedHost === undefined || openedHost === null || openedHost === "") return null;
+  let normalized;
+  try {
+    normalized = normalizeHost(openedHost);
+  } catch {
+    return null;
+  }
+  return cookieAppliesToScope(normalized, pageHost) ? null : normalized;
+}
+
+/** Opened-site rows that `scope` doesn't already import. */
+function openedRowsOutsideScope(openedRows, scope) {
+  return (openedRows ?? []).filter((row) => !cookieInScope(row.hostKey, scope));
+}
+
 /** Escape a value for a SQLite `LIKE ... ESCAPE '\\'` pattern. */
 function escapeLike(value) {
   return String(value).replace(/[\\%_]/g, (char) => `\\${char}`);
@@ -403,17 +427,21 @@ async function withCookieSnapshot({ cookieDbPath, fsImpl = fs }, fn) {
 /**
  * Select the rows inside the given scopes' trees: each scope host, its
  * subdomains, and the dot-prefixed domain cookies for any of them. Rows outside
- * those trees are never read, and partitioned cookies are left behind.
+ * those trees are never read, and partitioned cookies are left behind. With
+ * `subdomains: false`, only the cookies Chrome sends to each host itself.
  *
- * @param {{ snapshot: string, scopes: string[], run?: Function }} options
+ * @param {{ snapshot: string, scopes: string[], subdomains?: boolean, run?: Function }} options
  * @returns {Promise<object[]>}
  */
-async function queryCookieRows({ snapshot, scopes, run = execFileAsync }) {
+async function queryCookieRows({ snapshot, scopes, subdomains = true, run = execFileAsync }) {
   const treeFilters = (scopes ?? []).map((scope) => {
     const literal = escapeSqlLiteral(scope);
     const ancestors = cookieAncestorDomains(scope).map((domain) => `'${escapeSqlLiteral(domain)}'`);
     const inherited = ancestors.length > 0 ? ` OR host_key IN (${ancestors.join(", ")})` : "";
-    return `(host_key = '${literal}' OR host_key LIKE '%.${escapeLike(literal)}' ESCAPE '\\'${inherited})`;
+    const own = subdomains
+      ? `host_key = '${literal}' OR host_key LIKE '%.${escapeLike(literal)}' ESCAPE '\\'`
+      : `host_key IN ('${literal}', '.${literal}')`;
+    return `(${own}${inherited})`;
   });
   if (treeFilters.length === 0) return [];
   const where = treeFilters.join(" OR ");
@@ -465,12 +493,20 @@ async function scopeCandidatesWithCookies({ snapshot, candidates, run = execFile
 /**
  * Read `host`'s own tree plus every parent-domain scope Chrome holds a domain
  * cookie for, in one snapshot. The returned rows belong to the widest available
- * scope, which contains the narrower scopes' trees.
+ * scope, which contains the narrower scopes' trees. `openedRows` holds the
+ * cookies Chrome sends to `openedHost` itself, from the same snapshot.
  *
- * @param {{ cookieDbPath: string, host: string, run?: Function, fsImpl?: typeof fs }} options
- * @returns {Promise<{ scopes: string[], rows: object[] }>}
+ * @param {{ cookieDbPath: string, host: string, openedHost?: string | null, run?: Function,
+ *           fsImpl?: typeof fs }} options
+ * @returns {Promise<{ scopes: string[], rows: object[], openedRows: object[] }>}
  */
-async function readScopeTrees({ cookieDbPath, host, run = execFileAsync, fsImpl = fs }) {
+async function readScopeTrees({
+  cookieDbPath,
+  host,
+  openedHost = null,
+  run = execFileAsync,
+  fsImpl = fs,
+}) {
   const candidates = cookieScopeCandidates(host);
   try {
     return await withCookieSnapshot({ cookieDbPath, fsImpl }, async (snapshot) => {
@@ -479,7 +515,10 @@ async function readScopeTrees({ cookieDbPath, host, run = execFileAsync, fsImpl 
         scopes.length === 0
           ? []
           : await queryCookieRows({ snapshot, scopes: [scopes[scopes.length - 1]], run });
-      return { scopes, rows };
+      const openedRows = openedHost
+        ? await queryCookieRows({ snapshot, scopes: [openedHost], subdomains: false, run })
+        : [];
+      return { scopes, rows, openedRows };
     });
   } catch (err) {
     // Snapshot copies and the ancestor query fail outside `queryCookieRows`, so
@@ -543,13 +582,17 @@ async function readSafeStoragePassword({ run = execFileAsync } = {}) {
 
 /**
  * How many of `host`'s cookies each installed Chrome profile holds. No Keychain
- * access, so this is safe to call as soon as the dialog opens.
+ * access, so this is safe to call as soon as the dialog opens. With an
+ * `openedHost` outside the page's tree, each scope also counts the cookies
+ * Chrome sends to that host which the scope doesn't already include.
  *
- * @param {{ host: string, rootDir?: string, run?: Function, fsImpl?: typeof fs, nowMs?: number }} options
- * @returns {Promise<{ ok: boolean, host: string, profiles: Array<{ id: string, name: string, cookieCount: number }> }>}
+ * @param {{ host: string, openedHost?: string, rootDir?: string, run?: Function,
+ *           fsImpl?: typeof fs, nowMs?: number }} options
+ * @returns {Promise<{ ok: boolean, host: string, openedHost?: string, profiles: Array<{ id: string, name: string, cookieCount: number }> }>}
  */
 async function previewSiteCookies({
   host,
+  openedHost,
   rootDir,
   run = execFileAsync,
   fsImpl = fs,
@@ -568,19 +611,23 @@ async function previewSiteCookies({
     };
   }
   const candidates = cookieScopeCandidates(normalized);
+  const opened = openedSiteScope(normalized, openedHost);
   const profiles = await listChromeProfiles({ rootDir, fsImpl });
   const found = [];
+  let openedHasCookies = false;
   // Profiles can hold different parent-domain cookies, so the picker offers the
   // union; each profile still reports counts only for the scopes it has.
   const offered = new Set();
   for (const profile of profiles) {
     let scopes;
     let rows;
+    let openedRows;
     try {
       // oxlint-disable-next-line no-await-in-loop -- one Chrome DB at a time keeps disk reads small
-      ({ scopes, rows } = await readScopeTrees({
+      ({ scopes, rows, openedRows } = await readScopeTrees({
         cookieDbPath: profile.cookieDbPath,
         host: normalized,
+        openedHost: opened,
         run,
         fsImpl,
       }));
@@ -589,11 +636,21 @@ async function previewSiteCookies({
     }
     if (scopes.length === 0) continue;
     for (const scope of scopes) offered.add(scope);
-    const scopeCounts = scopes.map((scope) => ({
-      host: scope,
-      cookieCount: selectCookiesForScope(rows, scope, nowMs).length,
-    }));
-    if (scopeCounts.some((entry) => entry.cookieCount > 0)) {
+    const scopeCounts = scopes.map((scope) => {
+      const counts = {
+        host: scope,
+        cookieCount: selectCookiesForScope(rows, scope, nowMs).length,
+      };
+      if (!opened) return counts;
+      const openedCookieCount = selectCookiesForScope(
+        openedRowsOutsideScope(openedRows, scope),
+        opened,
+        nowMs,
+      ).length;
+      if (openedCookieCount > 0) openedHasCookies = true;
+      return { ...counts, openedCookieCount };
+    });
+    if (scopeCounts.some((entry) => entry.cookieCount > 0 || entry.openedCookieCount > 0)) {
       found.push({
         id: profile.id,
         name: profile.name,
@@ -605,16 +662,25 @@ async function previewSiteCookies({
   // Candidates are ordered from the page host outward, so filtering keeps that
   // order instead of the profiles' discovery order.
   const scopes = candidates.filter((scope) => offered.has(scope));
-  return { ok: true, host: normalized, scopes, profiles: found };
+  return {
+    ok: true,
+    host: normalized,
+    ...(openedHasCookies ? { openedHost: opened } : {}),
+    scopes,
+    profiles: found,
+  };
 }
 
 /**
  * Decrypt `host`'s cookies for one Chrome profile and write them into the given
- * session, returning counts only (never values).
+ * session, returning counts only (never values). `openedHost` adds the cookies
+ * Chrome sends to the site the tab opened before a redirect, with the same
+ * Keychain approval.
  *
  * @param {{
  *   host: string,
  *   scope?: string,
+ *   openedHost?: string,
  *   profileId: string,
  *   cookiesApi: { set: (cookie: object) => Promise<unknown> },
  *   rootDir?: string,
@@ -628,6 +694,7 @@ async function previewSiteCookies({
 async function importSiteCookies({
   host,
   scope,
+  openedHost,
   profileId,
   cookiesApi,
   rootDir,
@@ -644,12 +711,17 @@ async function importSiteCookies({
   if (!cookieScopeCandidates(pageHost).includes(target)) {
     return { ok: false, error: "That site scope isn't available for this tab." };
   }
+  const opened = openedSiteScope(pageHost, openedHost);
+  if (openedHost !== undefined && openedHost !== null && !opened) {
+    return { ok: false, error: "That site isn't available for this tab." };
+  }
   const profiles = await listChromeProfiles({ rootDir, fsImpl });
   const profile = profiles.find((candidate) => candidate.id === profileId);
   if (!profile) return { ok: false, error: "That Chrome profile wasn't found on this machine." };
-  const { scopes, rows } = await readScopeTrees({
+  const { scopes, rows, openedRows } = await readScopeTrees({
     cookieDbPath: profile.cookieDbPath,
     host: pageHost,
+    openedHost: opened,
     run,
     fsImpl,
   });
@@ -671,9 +743,17 @@ async function importSiteCookies({
     };
   }
   const plan = buildCookiePlan({ rows, scope: target, key, nowMs });
+  const openedPlan = opened
+    ? buildCookiePlan({
+        rows: openedRowsOutsideScope(openedRows, target),
+        scope: opened,
+        key,
+        nowMs,
+      })
+    : { cookies: [], skippedCount: 0, selectedCount: 0 };
   let imported = 0;
   let failed = 0;
-  for (const cookie of plan.cookies) {
+  for (const cookie of [...plan.cookies, ...openedPlan.cookies]) {
     try {
       // oxlint-disable-next-line no-await-in-loop -- one failure must not abort the rest
       await cookiesApi.set(cookie);
@@ -686,11 +766,12 @@ async function importSiteCookies({
     ok: true,
     host: pageHost,
     scope: target,
+    ...(opened ? { openedHost: opened } : {}),
     profileId: profile.id,
     profileName: profile.name,
-    found: plan.selectedCount,
+    found: plan.selectedCount + openedPlan.selectedCount,
     imported,
-    skipped: plan.skippedCount,
+    skipped: plan.skippedCount + openedPlan.skippedCount,
     failed,
   };
 }
@@ -706,6 +787,7 @@ module.exports = {
   // Pure helpers, exported for unit tests.
   normalizeHost,
   cookieScopeCandidates,
+  openedSiteScope,
   cookieAppliesToScope,
   cookieInScope,
   chromeExpirySeconds,

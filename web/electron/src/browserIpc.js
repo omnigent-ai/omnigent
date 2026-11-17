@@ -58,18 +58,22 @@ function flattenProfileLabel(value, fallback) {
  * Consent text for the native prompt. Pure, so the wording and the flattening
  * of Chrome-supplied names are testable without Electron.
  *
- * @param {{ host: string, scope: string, profileName: string, cookieCount: number }} request
+ * @param {{ host: string, scope: string, openedHost?: string, profileName: string,
+ *           cookieCount: number }} request
  * @returns {{ message: string, detail: string }}
  */
-function buildCookieImportPrompt({ host, scope, profileName, cookieCount }) {
+function buildCookieImportPrompt({ host, scope, openedHost, profileName, cookieCount }) {
   const count = Number.isFinite(cookieCount) && cookieCount > 0 ? cookieCount : 0;
   const what = count > 0 ? `${count} cookie${count === 1 ? "" : "s"}` : "Chrome's cookies";
   // The scope is usually the tab's own host; name the tab too when an ancestor
   // was picked, so the prompt says which page the copy lands in.
-  const where =
+  const pageSite =
     host && host !== scope
       ? `${scope} and its subdomains (this tab is on ${host})`
       : `${scope} and its subdomains`;
+  const where = openedHost
+    ? `${pageSite}, plus ${openedHost} (the site this tab opened)`
+    : pageSite;
   return {
     message: `Import ${what} into Omnigent?`,
     detail:
@@ -83,11 +87,18 @@ function buildCookieImportPrompt({ host, scope, profileName, cookieCount }) {
  * Ask the user, from the main process, before Chrome's key is touched: the pane's
  * dialog is not proof a human asked, since the connected page holds the bridge.
  *
- * @param {{ host: string, scope: string, profileName: string, cookieCount: number,
- *           parentWindow?: object | null }} request
+ * @param {{ host: string, scope: string, openedHost?: string, profileName: string,
+ *           cookieCount: number, parentWindow?: object | null }} request
  * @returns {Promise<boolean>}
  */
-async function askToImportChromeCookies({ host, scope, profileName, cookieCount, parentWindow }) {
+async function askToImportChromeCookies({
+  host,
+  scope,
+  openedHost,
+  profileName,
+  cookieCount,
+  parentWindow,
+}) {
   const { dialog } = require("electron");
   if (!dialog || typeof dialog.showMessageBox !== "function") return false;
   const options = {
@@ -96,7 +107,7 @@ async function askToImportChromeCookies({ host, scope, profileName, cookieCount,
     defaultId: 0,
     cancelId: 0,
     noLink: true,
-    ...buildCookieImportPrompt({ host, scope, profileName, cookieCount }),
+    ...buildCookieImportPrompt({ host, scope, openedHost, profileName, cookieCount }),
   };
   // Parented like the shell's other consent dialogs: an unparented alert can be
   // approved while the window it describes is behind another app or on another
@@ -861,6 +872,8 @@ function registerBrowserIpc({
   // Copies only the current site's cookies into this conversation's in-memory
   // partition: a metadata-only preview (no Keychain), then the import. The site
   // comes from the view's real URL in main and is re-checked before writing.
+  // When a redirect moved the tab off the site it opened, that site can be
+  // included too.
 
   const siteForEntry = (entry) => {
     let parsed;
@@ -876,6 +889,19 @@ function registerBrowserIpc({
     return { host: parsed.hostname };
   };
 
+  // The address this tab was asked to open, which a sign-in redirect to another
+  // site doesn't change. Main-owned, so the renderer can't substitute a site.
+  const openedSiteForEntry = (entry) => {
+    let parsed;
+    try {
+      parsed = new URL(entry.lastRequestedUrl ?? "");
+    } catch {
+      return null;
+    }
+    if (parsed.protocol !== "https:" && parsed.protocol !== "http:") return null;
+    return parsed.hostname ? { host: parsed.hostname, url: parsed.href } : null;
+  };
+
   ipcMain.handle("omnigent:browser-chrome-cookie-preview", async (event, args) => {
     const g = gateRegistry(event);
     if (g.error) return { ok: false, error: g.error };
@@ -886,8 +912,12 @@ function registerBrowserIpc({
     if (!entry) return { ok: false, error: "No browser view" };
     const site = siteForEntry(entry);
     if (site.error) return { ok: false, error: site.error };
+    const opened = openedSiteForEntry(entry);
     try {
-      return await chromeCookieStore.previewSiteCookies({ host: site.host });
+      return await chromeCookieStore.previewSiteCookies({
+        host: site.host,
+        ...(opened ? { openedHost: opened.host } : {}),
+      });
     } catch (e) {
       return { ok: false, error: e && e.message ? e.message : String(e) };
     }
@@ -899,7 +929,7 @@ function registerBrowserIpc({
     if (platform !== "darwin") {
       return { ok: false, error: CHROME_COOKIE_IMPORT_PLATFORM_ERROR };
     }
-    const { conversationId, profileId, expectedHost, scope } = args ?? {};
+    const { conversationId, profileId, expectedHost, scope, openedHost } = args ?? {};
     const entry = g.registry.get(conversationId);
     if (!entry) return { ok: false, error: "No browser view" };
     const site = siteForEntry(entry);
@@ -917,7 +947,17 @@ function registerBrowserIpc({
       const normalized = safeNormalize(value);
       return normalized !== null && normalized === safeNormalize(site.host);
     };
-    if (typeof expectedHost !== "string" || !hostMatches(expectedHost)) {
+    const wantsOpenedSite = openedHost !== undefined && openedHost !== null;
+    const opened = wantsOpenedSite ? openedSiteForEntry(entry) : null;
+    const openedMatches = (value) => {
+      const normalized = safeNormalize(value);
+      return normalized !== null && normalized === safeNormalize(opened?.host);
+    };
+    if (
+      typeof expectedHost !== "string" ||
+      !hostMatches(expectedHost) ||
+      (wantsOpenedSite && (typeof openedHost !== "string" || !openedMatches(openedHost)))
+    ) {
       return {
         ok: false,
         error: "This tab is no longer on that site. Reopen the import dialog to retry.",
@@ -929,7 +969,10 @@ function registerBrowserIpc({
     try {
       // Counts and scope for the confirmation come from main's own preview, so
       // a renderer string can't understate what the user approves.
-      const preview = await chromeCookieStore.previewSiteCookies({ host: site.host });
+      const preview = await chromeCookieStore.previewSiteCookies({
+        host: site.host,
+        ...(opened ? { openedHost: opened.host } : {}),
+      });
       // Counts, name and scope for the confirmation all come from main's own
       // preview, so refuse before the prompt whenever it can't supply them.
       if (!preview?.ok) {
@@ -947,28 +990,39 @@ function registerBrowserIpc({
       if (!offered) {
         return { ok: false, error: "That site scope isn't available for this tab." };
       }
+      const openedCookieCount = opened ? (offered.openedCookieCount ?? 0) : 0;
+      if (opened && (!preview.openedHost || openedCookieCount === 0)) {
+        return { ok: false, error: "That site isn't available for this tab." };
+      }
+      const openedSite = opened ? { openedHost: preview.openedHost } : {};
       const approved = await confirmCookieImport({
         host: site.host,
         scope: offered.host,
+        ...openedSite,
         profileName: profile.name,
-        cookieCount: offered.cookieCount,
+        cookieCount: offered.cookieCount + openedCookieCount,
         parentWindow: getWindowForEvent(event) ?? null,
       });
       if (!approved) return { ok: false, cancelled: true };
-      return await chromeCookieStore.importSiteCookies({
+      const result = await chromeCookieStore.importSiteCookies({
         host: site.host,
         // Normalized and taken from the preview above; the store re-validates
         // it against the page host's own ancestors.
         scope: offered.host,
+        ...openedSite,
         profileId,
         cookiesApi: entry.view.webContents.session.cookies,
         // The tab can navigate while the Keychain prompt is up; bail before any
         // cookie is written so the import can't land on the new site.
         beforeWrite: () => {
           const current = siteForEntry(entry);
-          return !current.error && hostMatches(current.host);
+          if (current.error || !hostMatches(current.host)) return false;
+          return !opened || openedMatches(openedSiteForEntry(entry)?.host);
         },
       });
+      // Reloading the sign-in page would only repeat its challenge; the opened
+      // site can use its own imported session instead.
+      return opened && result?.ok ? { ...result, openedUrl: opened.url } : result;
     } catch (e) {
       const msg = e && e.message ? e.message : String(e);
       if (msg.includes("Object has been destroyed")) return { ok: false, error: "browser closed" };

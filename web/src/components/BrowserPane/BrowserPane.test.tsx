@@ -723,6 +723,87 @@ describe("BrowserPane Chrome cookie import", () => {
     expect(toast.success).toHaveBeenCalledWith("Imported 4 cookies from Chrome.");
   });
 
+  const SIGN_IN_HOST = "idp.example.net";
+  const OPENED_HOST = "workspace.example.com";
+  const SIGN_IN_PREVIEW = {
+    ok: true as const,
+    host: SIGN_IN_HOST,
+    openedHost: OPENED_HOST,
+    scopes: [SIGN_IN_HOST],
+    profiles: [
+      {
+        id: "Default",
+        name: "Work",
+        cookieCount: 1,
+        scopes: [{ host: SIGN_IN_HOST, cookieCount: 1, openedCookieCount: 2 }],
+      },
+    ],
+  };
+  const openedSiteCheckbox = (dialog: HTMLElement) =>
+    within(dialog).getByRole("checkbox", {
+      name: new RegExp(`Also import 2 cookies for ${OPENED_HOST}`),
+    });
+
+  it("includes the site a sign-in redirect left and goes back there after importing", async () => {
+    const bridge = installCookieBridge({
+      preview: SIGN_IN_PREVIEW,
+      importResult: {
+        ok: true as const,
+        host: SIGN_IN_HOST,
+        openedHost: OPENED_HOST,
+        openedUrl: `https://${OPENED_HOST}/start`,
+        profileId: "Default",
+        imported: 3,
+        skipped: 0,
+        failed: 0,
+      },
+    });
+    render(<BrowserPane conversationId="conv_opened" />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Import cookies from Chrome" }));
+    const dialog = await screen.findByRole("dialog");
+    expect(openedSiteCheckbox(dialog)).toBeChecked();
+    fireEvent.click(within(dialog).getByRole("button", { name: "Import cookies" }));
+
+    await waitFor(() =>
+      expect(bridge.browserChromeCookieImport).toHaveBeenCalledWith("conv_opened", {
+        profileId: "Default",
+        expectedHost: SIGN_IN_HOST,
+        scope: SIGN_IN_HOST,
+        openedHost: OPENED_HOST,
+      }),
+    );
+    await waitFor(() =>
+      expect(bridge.browserOpenOrNavigate).toHaveBeenCalledWith(
+        "conv_opened",
+        `https://${OPENED_HOST}/start`,
+        undefined,
+        { force: true },
+      ),
+    );
+    expect(bridge.browserReload).not.toHaveBeenCalled();
+  });
+
+  it("imports only the sign-in page's cookies when the opened site is unchecked", async () => {
+    const bridge = installCookieBridge({ preview: SIGN_IN_PREVIEW });
+    render(<BrowserPane conversationId="conv_opened_off" />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Import cookies from Chrome" }));
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.click(openedSiteCheckbox(dialog));
+    expect(openedSiteCheckbox(dialog)).not.toBeChecked();
+    fireEvent.click(within(dialog).getByRole("button", { name: "Import cookies" }));
+
+    await waitFor(() =>
+      expect(bridge.browserChromeCookieImport).toHaveBeenCalledWith("conv_opened_off", {
+        profileId: "Default",
+        expectedHost: SIGN_IN_HOST,
+        scope: SIGN_IN_HOST,
+      }),
+    );
+    await waitFor(() => expect(bridge.browserReload).toHaveBeenCalledWith("conv_opened_off"));
+  });
+
   it("offers the page's host and its parent domain, and imports the picked one", async () => {
     const bridge = installCookieBridge();
     render(<BrowserPane conversationId="conv_scope" />);

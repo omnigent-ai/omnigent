@@ -23,7 +23,7 @@ import {
   SquareDashedMousePointerIcon,
   WrenchIcon,
 } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { toast } from "sonner";
 import {
   ADDRESS_BAR_KEYS,
@@ -32,6 +32,7 @@ import {
   shortcutText,
 } from "@/components/KeyboardShortcut";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import {
   Dialog,
   DialogContent,
@@ -110,7 +111,7 @@ interface BrowserPaneBridge {
   /** Copy the current site's Chrome cookies into this conversation's session. */
   browserChromeCookieImport?: (
     conversationId: string,
-    args: { profileId: string; expectedHost: string; scope?: string },
+    args: { profileId: string; expectedHost: string; scope?: string; openedHost?: string },
   ) => Promise<ChromeCookieImportResult>;
   browserEnableDesignMode?: (conversationId: string) => Promise<{ ok: boolean; error?: string }>;
   browserDisableDesignMode?: (conversationId: string) => Promise<{ ok: boolean; error?: string }>;
@@ -158,6 +159,18 @@ function cookieScopeOptions(
   }
   if (preview?.scopes && preview.scopes.length > 0) return preview.scopes;
   return preview?.host ? [preview.host] : [];
+}
+
+/** The opened site's cookies that one profile and scope would add (0 when not offered). */
+function openedSiteCookieCount(
+  preview: ChromeCookiePreviewResult | null,
+  profileId: string,
+  scope: string,
+): number {
+  if (!preview?.openedHost) return 0;
+  const profile =
+    preview.profiles?.find((candidate) => candidate.id === profileId) ?? preview.profiles?.[0];
+  return profile?.scopes?.find((entry) => entry.host === scope)?.openedCookieCount ?? 0;
 }
 
 export interface BrowserPaneProps {
@@ -220,7 +233,9 @@ export function BrowserPane({
   const [cookiePreview, setCookiePreview] = useState<ChromeCookiePreviewResult | null>(null);
   const [cookieProfileId, setCookieProfileId] = useState("");
   const [cookieScope, setCookieScope] = useState("");
+  const [cookieIncludeOpened, setCookieIncludeOpened] = useState(true);
   const [cookieBusy, setCookieBusy] = useState(false);
+  const openedSiteCheckboxId = useId();
 
   // Switching profiles can drop the scope the previous one offered; keep the
   // state (and therefore the import request) on a scope that is still offered.
@@ -293,34 +308,41 @@ export function BrowserPane({
 
   // ── Toolbar handlers ─────────────────────────────────────────────────────
 
-  // Submit the URL bar. Normalize the typed value (add scheme) and reuse the
-  // relay's own navigate path with force:true so it reloads even if the typed
-  // URL matches the current one (explicit "go there" intent).
-  const submitUrl = useCallback(() => {
-    const bridge = getBridge();
-    if (!bridge?.browserOpenOrNavigate) return;
-    const raw = currentUrl.trim();
-    if (!raw) return;
-    const navUrl = normalizeTypedUrl(raw);
-    setNavigationError(null);
-    const sequence = ++submitSequenceRef.current;
-    void fetchSessionHostId(browserViewOwnerId(conversationId))
-      .then((hostId) => {
-        if (sequence !== submitSequenceRef.current) return null;
-        return bridge.browserOpenOrNavigate!(conversationId, navUrl, undefined, {
-          force: true,
-          ...navigationHostOptions(hostId),
+  // Reuse the relay's own navigate path with force:true so it reloads even if
+  // the URL matches the current one (explicit "go there" intent).
+  const navigateTo = useCallback(
+    (navUrl: string) => {
+      const bridge = getBridge();
+      if (!bridge?.browserOpenOrNavigate) return;
+      setNavigationError(null);
+      const sequence = ++submitSequenceRef.current;
+      void fetchSessionHostId(browserViewOwnerId(conversationId))
+        .then((hostId) => {
+          if (sequence !== submitSequenceRef.current) return null;
+          return bridge.browserOpenOrNavigate!(conversationId, navUrl, undefined, {
+            force: true,
+            ...navigationHostOptions(hostId),
+          });
+        })
+        .then((result) => {
+          if (!result || sequence !== submitSequenceRef.current) return;
+          if (result.ok) setCurrentUrl(navUrl);
+          else setNavigationError(result.error ?? "Unable to open this page.");
+        })
+        .catch(() => {
+          if (sequence === submitSequenceRef.current) {
+            setNavigationError("Unable to open this page.");
+          }
         });
-      })
-      .then((result) => {
-        if (!result || sequence !== submitSequenceRef.current) return;
-        if (result.ok) setCurrentUrl(navUrl);
-        else setNavigationError(result.error ?? "Unable to open this page.");
-      })
-      .catch(() => {
-        if (sequence === submitSequenceRef.current) setNavigationError("Unable to open this page.");
-      });
-  }, [conversationId, currentUrl]);
+    },
+    [conversationId],
+  );
+
+  // Submit the URL bar, normalizing the typed value (add scheme).
+  const submitUrl = useCallback(() => {
+    const raw = currentUrl.trim();
+    if (raw) navigateTo(normalizeTypedUrl(raw));
+  }, [currentUrl, navigateTo]);
 
   const handleBack = useCallback(() => {
     const bridge = getBridge();
@@ -428,6 +450,7 @@ export function BrowserPane({
       const preferred = profiles.find((profile) => (profile.cookieCount ?? 0) > 0) ?? profiles[0];
       setCookieProfileId(preferred.id);
       setCookieScope(preview.host);
+      setCookieIncludeOpened(true);
       setCookiePreview({ ...preview, profiles });
     } catch {
       toast.error("Couldn't look for Chrome cookies.");
@@ -436,8 +459,8 @@ export function BrowserPane({
     }
   }, [conversationId]);
 
-  // Step 2: the user confirmed in the dialog — copy and reload so the site
-  // picks the session up immediately.
+  // Step 2: the user confirmed in the dialog — copy and reload (or return to
+  // the opened site) so the site picks the session up immediately.
   const handleImportChromeCookies = useCallback(async () => {
     const bridge = getBridge();
     const preview = cookiePreview;
@@ -445,12 +468,15 @@ export function BrowserPane({
     const scope = cookieScopeOptions(preview, cookieProfileId).includes(cookieScope)
       ? cookieScope
       : preview.host;
+    const includeOpened =
+      cookieIncludeOpened && openedSiteCookieCount(preview, cookieProfileId, scope) > 0;
     setCookieBusy(true);
     try {
       const result = await bridge.browserChromeCookieImport(conversationId, {
         profileId: cookieProfileId,
         expectedHost: preview.host,
         scope,
+        ...(includeOpened ? { openedHost: preview.openedHost } : {}),
       });
       if (!result?.ok) {
         // Declining the shell's own confirmation is not an error.
@@ -461,11 +487,12 @@ export function BrowserPane({
       const imported = result.imported ?? 0;
       const unusable = (result.skipped ?? 0) + (result.failed ?? 0);
       if (imported === 0) {
+        const sites = includeOpened ? `${scope} or ${preview.openedHost}` : scope;
         // Keep the dialog open — another Chrome profile may hold the session.
         toast.error(
           (result.failed ?? 0) > 0
-            ? `Chrome's cookies for ${scope} couldn't be saved in this browser session.`
-            : `Chrome had no usable cookies for ${scope}.`,
+            ? `Chrome's cookies for ${sites} couldn't be saved in this browser session.`
+            : `Chrome had no usable cookies for ${sites}.`,
         );
         return;
       }
@@ -474,13 +501,22 @@ export function BrowserPane({
       toast.success(
         `Imported ${imported} ${suffix} from Chrome${unusable > 0 ? ` (${unusable} couldn't be used)` : ""}.`,
       );
-      void bridge.browserReload?.(conversationId);
+      // Reloading a sign-in page would just repeat its challenge.
+      if (result.openedUrl) navigateTo(result.openedUrl);
+      else void bridge.browserReload?.(conversationId);
     } catch {
       toast.error("Couldn't import cookies from Chrome.");
     } finally {
       setCookieBusy(false);
     }
-  }, [conversationId, cookiePreview, cookieProfileId, cookieScope]);
+  }, [
+    conversationId,
+    cookiePreview,
+    cookieProfileId,
+    cookieScope,
+    cookieIncludeOpened,
+    navigateTo,
+  ]);
 
   // If the view goes away (closed) while design mode is on, drop the pressed
   // state so the button doesn't lie — the injected picker died with the view.
@@ -643,6 +679,11 @@ export function BrowserPane({
     cookieProfiles.find((profile) => profile.id === cookieProfileId) ?? cookieProfiles[0];
   const cookieScopes = cookieScopeOptions(cookiePreview, cookieProfileId);
   const activeCookieScope = cookieScope || cookieScopes[0] || "";
+  const openedCookieCount = openedSiteCookieCount(
+    cookiePreview,
+    cookieProfileId,
+    activeCookieScope,
+  );
   /** Cookies the selected profile holds for one scope. */
   const countForScope = (scope: string) =>
     selectedCookieProfile?.scopes?.find((entry) => entry.host === scope)?.cookieCount ??
@@ -842,6 +883,20 @@ export function BrowserPane({
               {activeCookieScope} and its subdomains. Other sites' cookies stay out of Omnigent
               entirely.
             </p>
+            {openedCookieCount > 0 && (
+              <div className="flex items-start gap-2">
+                <Checkbox
+                  id={openedSiteCheckboxId}
+                  checked={cookieIncludeOpened}
+                  onCheckedChange={(checked) => setCookieIncludeOpened(checked === true)}
+                />
+                <label htmlFor={openedSiteCheckboxId} className="cursor-pointer text-sm">
+                  Also import {openedCookieCount} {openedCookieCount === 1 ? "cookie" : "cookies"}{" "}
+                  for {cookiePreview?.openedHost}, the site this tab opened before it was sent to{" "}
+                  {cookiePreview?.host}. The tab goes back there afterwards.
+                </label>
+              </div>
+            )}
             {activeCookieScope !== cookiePreview?.host && (
               <p className="text-muted-foreground text-xs">
                 Cookies from other subdomains stay bound to their own host, so they only apply once

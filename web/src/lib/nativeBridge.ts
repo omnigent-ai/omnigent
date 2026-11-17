@@ -278,11 +278,12 @@ interface ElectronDesktopApi extends NativeShellApi {
   /**
    * Copy that site's cookies out of one Chrome profile into the conversation's
    * own in-memory browser session. Decrypts via the Keychain (system prompt on
-   * the first import); `expectedHost` must still match the view's current site.
+   * the first import); `expectedHost` must still match the view's current site,
+   * and `openedHost` the preview's opened site when it is included.
    */
   browserChromeCookieImport?: (
     conversationId: string,
-    args: { profileId: string; expectedHost: string; scope?: string },
+    args: { profileId: string; expectedHost: string; scope?: string; openedHost?: string },
   ) => Promise<ChromeCookieImportResult>;
   /** Subscribe to native menu commands for this window; returns an unsubscribe. */
   onDesktopCommand?: (
@@ -372,6 +373,8 @@ export interface ChromeCookieScopeCount {
   host: string;
   /** Cookies on that domain and its subdomains, plus inherited domain cookies. */
   cookieCount: number;
+  /** The opened site's cookies this scope doesn't already include. */
+  openedCookieCount?: number;
 }
 
 /** One local Chrome profile that holds cookies for the current site. */
@@ -391,6 +394,9 @@ export interface ChromeCookiePreviewResult {
   ok: boolean;
   /** Host whose page asked for the import (main-derived from the real URL). */
   host?: string;
+  /** The site this tab opened before a redirect moved it to `host` (main-derived),
+   *  present when Chrome holds cookies for it. */
+  openedHost?: string;
   /** Scopes the user may pick: `host`, then each parent domain Chrome holds
    *  a domain cookie for. */
   scopes?: string[];
@@ -406,6 +412,10 @@ export interface ChromeCookieImportResult {
   host?: string;
   /** The site tree actually copied (the page's host unless the user widened it). */
   scope?: string;
+  /** The opened site copied alongside `scope`, if any. */
+  openedHost?: string;
+  /** Where to send the tab afterwards, set when the opened site was imported. */
+  openedUrl?: string;
   profileId?: string;
   profileName?: string;
   /** Cookies matching the site tree (before decryption). */
