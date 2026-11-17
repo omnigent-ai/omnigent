@@ -1197,6 +1197,45 @@ describe("trigger header", () => {
     expect(decodeTriggerPrompt(older)).toEqual(saved);
   });
 
+  it("still saves the workflow trigger prompts the server's tests read", async () => {
+    // tests/server/scheduled/test_workflow_automations.py checks that the server reads
+    // these as the form does. After changing how triggers save, update this snapshot
+    // with `vitest -u` and run those tests again.
+    const scopes: Record<TriggerConfig["source"], string> = {
+      jira: "ES",
+      slack: "triage",
+      github: "example/project",
+      linear: "ENG",
+      pagerduty: "Checkout",
+    };
+    const save = (source: TriggerConfig["source"], taskSession: boolean, details = "Only bugs") =>
+      encodeTriggerPrompt(
+        {
+          ...emptyTriggerFields(source),
+          source,
+          scope: scopes[source],
+          instructions: `/workflow Run the saved workflow "Triage" (ID 0123456789abcdef0123456789abcdef).\n\n${details}`,
+          ...(taskSession ? { taskSessionMode: "continue" as const } : {}),
+          worker: WORKER,
+        },
+        { ...CTX, workflowIdSupported: true },
+      );
+    const prompts: Record<string, string> = {};
+    for (const source of TRIGGER_SOURCES) {
+      prompts[`${source}_task_session`] = save(source, true);
+      prompts[`${source}_per_match`] = save(source, false);
+    }
+    // Instructions that repeat the heading keep the saved prompt from splitting.
+    prompts.jira_task_session_unsplittable = save(
+      "jira",
+      true,
+      "Read the notes under\n\nInstructions for the task session:\nfirst.",
+    );
+    await expect(`${JSON.stringify(prompts, null, 2)}\n`).toMatchFileSnapshot(
+      "../../../../tests/server/scheduled/fixtures/workflow_trigger_prompts.json",
+    );
+  });
+
   it("reads a header saved without the newer optional settings", () => {
     // Headers written before worker permissions existed have no permissionMode key.
     const saved = encodeTriggerPrompt(config("slack"), CTX);

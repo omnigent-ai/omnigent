@@ -236,9 +236,10 @@ automation's **Workflow (optional)** field. Each run follows the workflow as
 saved, without a plan review. No one is watching the run, so nothing in it
 waits for you.
 Each run gets its own new session: a schedule can't continue one session, and
-a trigger starts a session for each match rather than one task session. A
-trigger's session starts as a run of the workflow, so the workflow's page lists
-it right away.
+a trigger starts a session for each match rather than one task session. On a
+server that advertises `session_create_workflow_id` in `/v1/info`, a trigger's
+session starts as a run of the workflow, so the workflow's page lists it right
+away; otherwise the session loads the workflow when it starts work.
 The agent first looks up missing inputs, chooses reversible defaults and tries
 bounded recovery within your existing authorization. It records its choices
 in the journal. Missing input or approval justifies a failure only with the

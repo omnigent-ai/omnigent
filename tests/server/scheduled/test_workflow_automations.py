@@ -1,9 +1,9 @@
 """Which automations run a saved workflow, read the way the web form reads them.
 
 ``fixtures/workflow_trigger_prompts.json`` holds prompts ``encodeTriggerPrompt`` in
-web/src/components/scheduled/triggerTemplates.ts saved for triggers whose instructions
-run a saved workflow, in Jira's, Slack's and GitHub's layouts, so these tests check the
-server against what the form writes.
+web/src/components/scheduled/triggerTemplates.ts saves for triggers whose instructions
+run a saved workflow, for every source in both modes, so these tests check the server
+against what the form writes. A web test keeps the file in step with the form.
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ PROMPTS: dict[str, str] = json.loads(
     (Path(__file__).parent / "fixtures" / "workflow_trigger_prompts.json").read_text()
 )
 WORKFLOW_RUN = '/workflow Run the saved workflow "Triage" (ID 0123456789abcdef0123456789abcdef).'
-SOURCES = ["jira", "slack", "github"]
+SOURCES = ["jira", "slack", "github", "linear", "pagerduty"]
 
 
 @pytest.mark.parametrize("session_mode", ["new", "continue"])

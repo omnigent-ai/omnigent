@@ -7019,6 +7019,16 @@ describe("CreateScheduledTaskDialog workflow", () => {
     return render(ui, { info: { features: { automations_v2: true, workflows: true } } });
   }
 
+  const SESSION_MODE_INFO = {
+    scheduled_task_session_modes: true,
+    features: { automations_v2: true, workflows: true },
+  };
+
+  function openSessionModeMenu(testId = "task-session-mode-trigger") {
+    closeTopLevelPopovers();
+    fireEvent.keyDown(screen.getByTestId(testId), { key: "Enter" });
+  }
+
   it("hides the workflow field while preserving an existing automation prompt when disabled", () => {
     render(
       <CreateScheduledTaskDialog
@@ -7067,13 +7077,14 @@ describe("CreateScheduledTaskDialog workflow", () => {
   });
 
   it("keeps the workflow it was opened from: the field has no menu, and runs follow it", async () => {
-    renderWithWorkflows(
+    render(
       <CreateScheduledTaskDialog
         open
         onOpenChange={vi.fn()}
         initialName={WORKFLOW.name}
         lockedWorkflow={WORKFLOW}
       />,
+      { info: SESSION_MODE_INFO },
     );
     const field = screen.getByTestId("task-workflow-trigger");
     expect(field).toHaveTextContent("Triage flaky tests");
@@ -7081,6 +7092,17 @@ describe("CreateScheduledTaskDialog workflow", () => {
     fireEvent.pointerDown(field, { button: 0 });
     expect(screen.queryByTestId("composer-workflow-picker")).toBeNull();
     expect(screen.queryByTestId("task-prompt-input")).toBeNull();
+    // Each run of the workflow starts a new session.
+    expect(screen.getByTestId("task-session-mode-trigger")).toHaveTextContent(
+      "New session each run",
+    );
+    expect(screen.getByTestId("task-session-mode-workflow-note")).toBeInTheDocument();
+    openSessionModeMenu();
+    expect(screen.getByRole("menuitemradio", { name: "Continue one session" })).toHaveAttribute(
+      "aria-disabled",
+      "true",
+    );
+    fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" });
 
     const submit = screen.getByTestId("create-scheduled-task-submit");
     await waitFor(() => expect(submit).toBeEnabled());
@@ -7276,16 +7298,6 @@ describe("CreateScheduledTaskDialog workflow", () => {
     },
   );
 
-  const SESSION_MODE_INFO = {
-    scheduled_task_session_modes: true,
-    features: { automations_v2: true, workflows: true },
-  };
-
-  function openSessionModeMenu(testId = "task-session-mode-trigger") {
-    closeTopLevelPopovers();
-    fireEvent.keyDown(screen.getByTestId(testId), { key: "Enter" });
-  }
-
   it("runs a workflow in a new session each time, even after Continue one session was picked", async () => {
     render(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} />, { info: SESSION_MODE_INFO });
     fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "Nightly" } });
@@ -7319,27 +7331,6 @@ describe("CreateScheduledTaskDialog workflow", () => {
     await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
     expect(mutateAsync.mock.calls[0][0].prompt).toBe(run(""));
     expect(mutateAsync.mock.calls[0][0]).not.toHaveProperty("sessionMode");
-  });
-
-  it("can't continue one session from a workflow's page either", () => {
-    render(
-      <CreateScheduledTaskDialog
-        open
-        onOpenChange={vi.fn()}
-        initialName={WORKFLOW.name}
-        lockedWorkflow={WORKFLOW}
-      />,
-      { info: SESSION_MODE_INFO },
-    );
-    expect(screen.getByTestId("task-session-mode-trigger")).toHaveTextContent(
-      "New session each run",
-    );
-    expect(screen.getByTestId("task-session-mode-workflow-note")).toBeInTheDocument();
-    openSessionModeMenu();
-    expect(screen.getByRole("menuitemradio", { name: "Continue one session" })).toHaveAttribute(
-      "aria-disabled",
-      "true",
-    );
   });
 
   it.each([
@@ -7394,6 +7385,13 @@ describe("CreateScheduledTaskDialog workflow", () => {
       screen.getByRole("menuitemradio", { name: "One task session for all matches" }),
     ).toHaveAttribute("aria-disabled", "true");
     fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" });
+    // Without the workflow, the earlier choice is back; with it again, it isn't.
+    fireEvent.pointerDown(screen.getByTestId("task-workflow-trigger"), { button: 0 });
+    fireEvent.click(screen.getByTestId("workflow-picker-clear"));
+    expect(sessionMode).toHaveTextContent("One task session for all matches");
+    expect(screen.queryByTestId("task-trigger-session-mode-workflow-note")).toBeNull();
+    chooseWorkflow();
+    expect(sessionMode).toHaveTextContent("New session for each match");
     fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
 
     await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
@@ -7438,7 +7436,7 @@ describe("CreateScheduledTaskDialog workflow", () => {
     expect(updated).toContain(`workflow_id "${WORKFLOW.id}"`);
   });
 
-  it("won't save a workflow into a trigger edited as its prompt that uses one task session", () => {
+  it("won't save a workflow into a trigger edited as its prompt that uses one task session", async () => {
     const view = renderGithubTrigger(false);
     const saved = renderTriggerPrompt(
       "github",
@@ -7454,6 +7452,9 @@ describe("CreateScheduledTaskDialog workflow", () => {
     fireEvent.pointerDown(screen.getByTestId("task-workflow-trigger"), { button: 0 });
     fireEvent.click(screen.getByTestId("workflow-picker-clear"));
     expect(screen.queryByTestId("task-workflow-task-session-note")).toBeNull();
+    // Without the workflow, the trigger saves with instructions of its own.
+    fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "Triage it." } });
+    await waitFor(() => expect(screen.getByTestId("create-scheduled-task-submit")).toBeEnabled());
   });
 });
 
