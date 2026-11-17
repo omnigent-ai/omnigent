@@ -836,7 +836,7 @@ def _build_interrupt_app(
         name="t",
         executor=ExecutorSpec(type="omnigent", config={"harness": "runner-test-default"}),
     )
-    sse_frames = sse_frames or [
+    default_frames = [
         _sse({"type": "response.created", "response": {"id": "resp_int"}}),
         _sse(
             {
@@ -863,7 +863,9 @@ def _build_interrupt_app(
         ),
         _sse({"type": "response.completed", "response": {"id": "resp_int"}}),
     ]
-    harness_client = _BlockingHarnessClient(sse_frames, gate)
+    harness_client = _BlockingHarnessClient(
+        default_frames if sse_frames is None else sse_frames, gate
+    )
     pm = _FakeProcessManager(harness_client)
 
     async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
