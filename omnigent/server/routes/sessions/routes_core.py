@@ -4532,7 +4532,7 @@ def register_core_routes(
             # full rationale. live_forward (== not silent) already excludes
             # bind-time auto-applies, so only an explicit /model lands a note.
             if _is_native_terminal_session(updated):
-                # A lost Claude reply may follow a committed selection.
+                # Keep Claude intent when forwarding or confirmation fails.
                 if (_model_forward is None and wake_for_model_change and claude_native) or (
                     _model_forward is not None
                     and _runner_reply_field(_model_forward.body, "error")
@@ -4546,8 +4546,13 @@ def register_core_routes(
                         session_id, updated.runner_id, conversation_store
                     )
                     raise OmnigentError(
-                        "Claude may have changed the session model, but the selection could "
-                        "not be confirmed. Check the terminal's current model before retrying.",
+                        (
+                            "Could not reach the terminal, so the model change was not sent. "
+                            "Your requested model is saved. Reconnect the terminal before retrying."
+                            if _model_forward is None
+                            else "Claude may have changed the session model, but the selection could "
+                            "not be confirmed. Check the terminal's current model before retrying."
+                        ),
                         code=ErrorCode.RUNNER_UNAVAILABLE,
                     )
                 # Neither a lost request nor a refusal confirms a model switch, but an

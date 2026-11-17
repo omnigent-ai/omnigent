@@ -1897,7 +1897,7 @@ async def test_events_model_change_requires_the_same_immediate_picker_receipt(
 
 
 @pytest.mark.parametrize("receipt_kind", ["absent", "different-target"])
-async def test_events_model_change_does_not_accept_old_status_or_ack_without_a_receipt(
+async def test_events_model_change_does_not_accept_old_status_without_a_receipt(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     receipt_kind: str,
@@ -1905,7 +1905,6 @@ async def test_events_model_change_does_not_accept_old_status_or_ack_without_a_r
     monkeypatch.setattr(
         claude_native_bridge, "read_claude_status_model", lambda _: "claude-opus-4-7"
     )
-    monkeypatch.setattr(claude_native_bridge, "model_switch_acknowledged", lambda *a, **k: True)
 
     def select(*args: Any, **kwargs: Any) -> Any:
         if receipt_kind == "absent":

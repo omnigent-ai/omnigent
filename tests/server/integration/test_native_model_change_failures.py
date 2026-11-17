@@ -340,7 +340,6 @@ async def native_session(
         for module in ("omnigent.runner.native", "omnigent.runner.native.orchestration"):
             monkeypatch.setattr(f"{module}._launch_claude", launch_stub)
             monkeypatch.setattr(f"{module}._auto_create_claude_terminal", refuse_auto_create)
-        monkeypatch.setattr(claude_bridge, "confirm_dialog_if_open", lambda *_a, **_k: False)
         # No pane behind this bridge dir: the prompt wait ahead of the injection
         # would only time out, so it passes at once as in the runner suite.
         monkeypatch.setattr(claude_bridge, "wait_for_input_ready", lambda *_a, **_k: None)
@@ -678,7 +677,12 @@ async def test_cancelled_claude_model_change_keeps_intent_after_losing_the_reply
 
 @pytest.mark.parametrize(
     "native_session",
-    ["inherited-claude-native", "inherited-custom-claude-native"],
+    [
+        "claude-native",
+        "custom-claude-native",
+        "inherited-claude-native",
+        "inherited-custom-claude-native",
+    ],
     indirect=True,
 )
 async def test_claude_model_change_without_a_runner_saves_intent_without_forwarding(
@@ -688,15 +692,30 @@ async def test_claude_model_change_without_a_runner_saves_intent_without_forward
 ) -> None:
     session = native_session
     assert session.claude is not None
+    direct_host = session.store.get_conversation(session.session_id).host_id is not None
+    forward = routes_core._forward_session_change_to_runner
+
+    async def lose_client_before_forward(*args: Any, **kwargs: Any) -> Any:
+        monkeypatch.setattr(
+            "omnigent.server.routes.sessions._get_runner_client", AsyncMock(return_value=None)
+        )
+        monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: None)
+        return await forward(*args, **kwargs)
+
     monkeypatch.setattr(
-        "omnigent.server.routes.sessions._get_runner_client", AsyncMock(return_value=None)
+        routes_core, "_forward_session_change_to_runner", lose_client_before_forward
     )
-    monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: None)
     session.tunnel.frames.clear()
 
     response = await _pick_model(client, session)
 
-    assert response.status_code == 200, response.text
+    if direct_host:
+        assert response.status_code == 503, response.text
+        assert "Could not reach the terminal" in response.text
+        assert "model change was not sent" in response.text
+        assert "may have changed" not in response.text
+    else:
+        assert response.status_code == 200, response.text
     saved = session.store.get_conversation(session.session_id)
     assert saved.model_override == session.requested_model
     assert saved.reasoning_effort == "high"
@@ -705,7 +724,10 @@ async def test_claude_model_change_without_a_runner_saves_intent_without_forward
         session.previous_model
     )
     assert session.runner_replies == []
-    assert session.tunnel.frames == []
+    requests = [frame for frame in session.tunnel.frames if isinstance(frame, RequestFrame)]
+    assert [frame for frame in requests if frame.path.endswith("/events")] == []
+    if not direct_host:
+        assert session.tunnel.frames == []
     assert session.errors == []
     assert session.notices == []
 

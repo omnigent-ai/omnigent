@@ -1011,35 +1011,83 @@ def test_settle_probe_reads_the_pane_for_claude_and_the_turn_id_for_codex(
 async def test_replay_switches_the_claude_pane_before_delivering(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from omnigent.harnesses.claude_native.bridge import ClaudeModelSwitchResult
-
-    _mark(tmp_path)
-    turn_routing.write_pending_replay(
-        tmp_path, session_id="conv_1", prompt="hello", blocked_turn_id=None, model="private-model"
+    from omnigent.harnesses.claude_native import bridge
+    from omnigent.inner import claude_native_executor
+    from omnigent.inner.executor import ExecutorConfig, TurnComplete
+    from tests.harnesses.claude_native._model_switch_support import (
+        _session_model_bridge,
+        _SessionModelComposer,
     )
-    selections: list[tuple[str, str | None]] = []
+
+    monkeypatch.setattr(bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path)
+    monkeypatch.setenv(bridge.REQUEST_SESSION_ID_ENV_VAR, "web-session")
+    composer = _SessionModelComposer(draft="hello")
+    model = composer.options[-1]
+    bridge_dir = _session_model_bridge(tmp_path, composer)
+    composer.install(monkeypatch)
+    _mark(bridge_dir, session_id="web-session")
+    turn_routing.write_pending_replay(
+        bridge_dir, session_id="web-session", prompt="hello", blocked_turn_id=None, model=model
+    )
     client = _FakeServerClient()
+    executor = claude_native_executor.ClaudeNativeExecutor(bridge_dir)
+    delivered: list[str] = []
+    status_queries_at_handoff: list[int] = []
 
-    def select(_bridge: Path, *, model: str, owned_draft: str | None) -> ClaudeModelSwitchResult:
-        assert not client.posts
-        selections.append((model, owned_draft))
-        return ClaudeModelSwitchResult(model, model, model, model, "native-session")
+    def deliver(_bridge: Path, *, content: str, timeout_s: float = 30.0) -> None:
+        assert composer.model == model
+        assert composer.status_queries > status_queries_at_handoff[0]
+        delivered.append(content)
 
-    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge.inject_model_command", select)
+    def publish_current_status() -> None:
+        # The CLI publishes its selected model; this hint still cannot authorize delivery.
+        path = bridge_dir / bridge.CONTEXT_RAW_FILE
+        current = json.loads(path.read_text())
+        current["model"]["id"] = composer.model
+        path.write_text(json.dumps(current))
+
+    original_post = client.post
+
+    async def enter_executor(url: str, *, json: dict[str, Any], timeout: float) -> _FakeResponse:
+        assert json["type"] == "message"
+        assert json["model_override"] == model
+        assert composer.model == model
+        assert composer.text == ""
+        assert sum(args[-1] == "s" for args in composer.sends) == 1
+        status_queries_at_handoff.append(composer.status_queries)
+        publish_current_status()
+        response = await original_post(url, json=json, timeout=timeout)
+        events = [
+            event
+            async for event in executor.run_turn(
+                messages=[{"role": "user", "content": json["data"]["content"][0]["text"]}],
+                tools=[],
+                system_prompt="",
+                config=ExecutorConfig(model=json["model_override"]),
+            )
+        ]
+        assert events == [TurnComplete(response=None)]
+        return response
+
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", deliver)
+    monkeypatch.setattr(client, "post", enter_executor)
     await schedule_replay(
-        "conv_1",
+        "web-session",
         prompt="hello",
-        bridge_dir=tmp_path,
+        bridge_dir=bridge_dir,
         blocked_turn_id=None,
         server_client=client,
         harness="claude-native",
-        model="private-model",
+        model=model,
         idle=lambda _: True,
     )
 
-    assert selections == [("private-model", "hello")]
-    assert len(client.posts) == 1
-    assert turn_routing.read_pending_replay(tmp_path) is None
+    assert len(status_queries_at_handoff) == 1
+    assert sum(args[-1] == "s" for args in composer.sends) == 1
+    assert delivered == ["hello"]
+    assert len(client.messages) == 1
+    assert turn_routing.read_pending_replay(bridge_dir) is None
 
 
 @pytest.mark.parametrize("actuator_result", [False, None])

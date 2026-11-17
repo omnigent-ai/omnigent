@@ -281,7 +281,6 @@ def test_watchers_leave_scrollback_alone_when_nothing_is_on_screen(pane: _Pane) 
     """Polling helpers that find nothing to act on keep the reader's scrollback position."""
     pane.scroll_back()
 
-    assert bridge.confirm_dialog_if_open(pane.bridge_dir, hint="Not on screen") is False
     assert bridge.dismiss_btw_overlay(pane.bridge_dir) is False
 
     assert pane.in_mode(), "A watcher with nothing to confirm must not leave copy mode."

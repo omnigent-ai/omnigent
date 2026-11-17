@@ -6269,40 +6269,6 @@ def set_permission_mode(
     )
 
 
-def confirm_dialog_if_open(bridge_dir: Path, *, hint: str) -> bool:
-    """
-    Accept the *hint* dialog iff it is on screen RIGHT NOW; never blind-Enter.
-
-    Loop-safe building block for watchers that outlive a single injection
-    (a mid-turn ``/model`` queues in Claude's composer and pops its confirm
-    dialog only when the turn settles — minutes later). Unlike
-    :func:`_confirm_tui_dialog` there is no timeout fallback Enter, so
-    calling this every few seconds can never type into a surface that is
-    not the named dialog.
-
-    :param bridge_dir: Bridge directory path.
-    :param hint: Text the dialog renders, e.g.
-        :data:`SWITCH_MODEL_DIALOG_HINT`.
-    :returns: ``True`` when the dialog was on screen and confirmed.
-    """
-    try:
-        info = _wait_for_tmux_info(bridge_dir, timeout_s=1.0)
-    except (RuntimeError, OSError):
-        return False
-    socket_path = info["socket_path"]
-    tmux_target = info["tmux_target"]
-    try:
-        pane = _capture_pane(socket_path, tmux_target)
-        if hint not in pane:
-            return False
-        _confirm_and_verify_dialog_closed(
-            socket_path, tmux_target, hint=hint, bridge_dir=bridge_dir
-        )
-    except (RuntimeError, OSError):
-        return False
-    return True
-
-
 def _confirm_and_verify_dialog_closed(
     socket_path: str,
     tmux_target: str,
@@ -7054,39 +7020,6 @@ def terminal_dialog_pending(bridge_dir: Path) -> bool:
         return False
     pane = _capture_pane(socket_path, target)
     return _terminal_dialog_headline(pane) is not None or launcher_install_prompt(pane)
-
-
-# Claude Code echoes a ``/model`` command, then prints this acknowledgement
-# under it ("Set model to Opus 5.5 and saved as your default for new sessions").
-_MODEL_SWITCH_ACKNOWLEDGEMENT = "Set model to "
-
-
-def model_switch_acknowledged(bridge_dir: Path, *, command: str) -> bool:
-    """
-    Check whether Claude Code acknowledged a ``/model`` command on the pane.
-
-    A second confirmation source next to the statusLine snapshot: the
-    acknowledgement Claude Code prints under the echoed command says the
-    switch took effect even when the snapshot spells the model differently
-    or has not been rewritten yet.
-
-    :param bridge_dir: The session's native bridge directory.
-    :param command: The injected command, e.g. ``"/model opus[1m]"``.
-    :returns: ``True`` when the acknowledgement follows the command's last
-        echo on the pane; ``False`` when it does not, the echo is not on
-        screen, or the pane cannot be read.
-    """
-    info = _read_json_file(bridge_dir / _TMUX_FILE)
-    if not isinstance(info, dict):
-        return False
-    socket_path, target = info.get("socket_path"), info.get("tmux_target")
-    if not isinstance(socket_path, str) or not isinstance(target, str):
-        return False
-    lines = _capture_pane(socket_path, target).splitlines()
-    echoes = [index for index, line in enumerate(lines) if command in line]
-    if not echoes:
-        return False
-    return any(_MODEL_SWITCH_ACKNOWLEDGEMENT in line for line in lines[echoes[-1] + 1 :])
 
 
 def auto_mode_billing_notice_visible(pane: str) -> bool:
