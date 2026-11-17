@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Literal, Protocol
 
 from cachetools import TTLCache
 
+from omnigent._platform import IS_WINDOWS
 from omnigent.debug_logging import debug_event, runner_primary_session_id
 from omnigent.entities.pagination import PagedList
 from omnigent.entities.session_resources import (
@@ -62,7 +63,7 @@ if TYPE_CHECKING:
 _logger = logging.getLogger(__name__)
 
 _DEFAULT_WORKSPACE_ROOT = os.path.join(
-    os.environ.get("TMPDIR", "/tmp"),
+    os.environ.get("TMPDIR", tempfile.gettempdir() if IS_WINDOWS else "/tmp"),
     "omnigent-sessions",
 )
 
