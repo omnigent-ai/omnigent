@@ -1403,6 +1403,18 @@ async def probe_claude_model_options(
         resolved = model.get("resolvedModel")
         if isinstance(resolved, str) and resolved:
             resolution["model"] = resolved
+            # The structured picker can omit the explicit context from resolvedModel.
+            if (
+                structured
+                and re.fullmatch(
+                    r"(?:system\.ai\.|databricks-)?claude-(?:opus|sonnet|haiku|fable)-"
+                    r"\d+(?:-\d+)*\[1m\]",
+                    alias,
+                    re.IGNORECASE,
+                )
+                and alias[:-4].lower() == resolved.lower()
+            ):
+                resolution["model"] = f"{resolved}[1m]"
         label = model.get("displayName")
         if isinstance(label, str) and label:
             resolution["label"] = label
@@ -1458,7 +1470,7 @@ def claude_catalog_fingerprint(claude_config: ClaudeNativeUcodeConfig | None) ->
     ambient_transport = claude_ambient_transport() if uses_cli_settings else None
     return fingerprint_of(
         "claude-native",
-        "control-picker-v4",
+        "control-picker-v5",
         sorted(claude_config.env.items()) if claude_config is not None else None,
         claude_config.api_key_helper if claude_config is not None else None,
         claude_config.model if claude_config is not None else None,

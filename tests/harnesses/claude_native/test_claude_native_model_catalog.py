@@ -658,6 +658,81 @@ async def test_catalog_keeps_enabled_fable_and_future_picker_models(
     ]
 
 
+@pytest.mark.parametrize("prefix", ["", "system.ai.", "databricks-"])
+async def test_structured_picker_preserves_explicit_context_before_deduplication(
+    monkeypatch: pytest.MonkeyPatch, prefix: str
+) -> None:
+    from omnigent.harnesses.claude_native.model_switch import ClaudeModelSwitchRefused, _target
+
+    plain = f"{prefix}claude-opus-4-8"
+    contextual = f"{plain}[1m]"
+    _stub_picker(
+        monkeypatch,
+        [
+            {"value": plain, "resolvedModel": plain, "displayName": "Opus"},
+            {"value": contextual, "resolvedModel": plain, "displayName": "Opus (1M)"},
+        ],
+        default=contextual,
+    )
+    rows = await claude_native.claude_model_catalog(None)
+    assert rows is not None
+    assert [(row["id"], row["model"]) for row in rows] == [
+        (plain, plain),
+        (contextual, contextual),
+    ]
+    options = picker_model_options(rows)
+    assert [option["model"] for option in options] == [plain, contextual]
+    target = _target("opus", options, [], {"ANTHROPIC_DEFAULT_OPUS_MODEL": contextual})
+    assert (target.value, target.model) == (contextual, contextual)
+    with pytest.raises(ClaudeModelSwitchRefused, match="no unambiguous"):
+        _target(
+            "opus", options, [], {"ANTHROPIC_DEFAULT_OPUS_MODEL": f"{prefix}claude-opus-5[1m]"}
+        )
+
+
+@pytest.mark.parametrize(
+    ("value", "resolved"),
+    [
+        ("system.ai.claude-opus-4-8[1m]", "system.ai.claude-opus-5"),
+        ("private-claude-opus-4-8[1m]", "private-claude-opus-4-8"),
+        ("PrivateModel[1m]", "PrivateModel"),
+        ("PrivateModel[1m]", "privatemodel[1m]"),
+        ("PrivateModel[1M]", "PrivateModel[1m]"),
+        ("system.ai.claude-opus-4-8[other]", "system.ai.claude-opus-4-8"),
+    ],
+)
+async def test_structured_picker_does_not_infer_context_or_private_identity(
+    monkeypatch: pytest.MonkeyPatch, value: str, resolved: str
+) -> None:
+    _stub_picker(
+        monkeypatch,
+        [{"value": value, "resolvedModel": resolved, "displayName": "Opus (1M context)"}],
+        default=resolved,
+    )
+    rows = await claude_native.claude_model_catalog(None)
+    assert rows is not None
+    assert picker_model_options(rows)[0]["model"] == resolved
+
+
+async def test_disabled_context_choice_cannot_become_an_enabled_plain_choice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plain = "system.ai.claude-opus-4-8"
+    _stub_picker(
+        monkeypatch,
+        [
+            {"value": plain, "resolvedModel": plain},
+            {"value": f"{plain}[1m]", "resolvedModel": plain, "disabled": True},
+        ],
+        default=plain,
+    )
+    probe = await claude_native.probe_claude_model_options(None)
+    assert probe is not None
+    # The CLI marks the concrete resolution disabled as well as its picker value.
+    assert probe.alias_rows == []
+    assert probe.disabled_models == frozenset({plain, f"{plain}[1m]"})
+
+
 async def test_picker_descriptors_preserve_raw_labels_and_deduplicated_aliases(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

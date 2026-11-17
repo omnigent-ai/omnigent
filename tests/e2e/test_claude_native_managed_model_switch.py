@@ -109,7 +109,9 @@ async def test_runner_switches_managed_glm_in_a_real_claude_terminal(
     config_dir.mkdir()
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "bridges")
+    bridge_root = tmp_path / bridge._BRIDGE_ROOT.relative_to(bridge._TRUSTED_PARENT)
+    monkeypatch.setattr(bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", bridge_root)
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_dir))
     for key in tuple(os.environ):
@@ -312,8 +314,7 @@ async def test_runner_switches_managed_glm_in_a_real_claude_terminal(
             )
 
         # No invocation model leaves the saved model as the fresh pane's default.
-        fresh_bridge_dir = tmp_path / "fresh-bridge"
-        fresh_bridge_dir.mkdir()
+        fresh_bridge_dir = bridge.prepare_bridge_dir(uuid.uuid4().hex, workspace=workspace)
         fresh_augmented = bridge.augment_claude_args(
             (), bridge_dir=fresh_bridge_dir, python_executable=sys.executable
         )
