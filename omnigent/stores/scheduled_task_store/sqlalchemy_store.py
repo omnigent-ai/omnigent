@@ -9,7 +9,7 @@ from collections.abc import Callable
 from functools import partial
 from typing import Any, cast
 
-from sqlalchemy import and_, asc, desc, or_, select, tuple_, update
+from sqlalchemy import and_, asc, desc, func, or_, select, tuple_, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session
 from sqlalchemy.sql.elements import ColumnElement
@@ -1101,6 +1101,31 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 .limit(1)
             )
             return session.execute(stmt).first() is not None
+
+    def list_run_starts_for_conversations(
+        self, conversation_ids: builtins.list[str]
+    ) -> dict[str, builtins.list[tuple[str, int]]]:
+        """Return every run of each conversation as ``(run_id, started_at)``, oldest first.
+
+        One query over ``ix_scheduled_task_runs_conversation_status``, reading three
+        columns per run, so a long-continued session costs a row per run, not a page.
+        """
+        if not conversation_ids:
+            return {}
+        started_at = func.coalesce(SqlScheduledTaskRun.fired_at, SqlScheduledTaskRun.scheduled_at)
+        with self._session("list_run_starts_for_conversations") as session:
+            stmt = (
+                select(SqlScheduledTaskRun.conversation_id, SqlScheduledTaskRun.id, started_at)
+                .where(SqlScheduledTaskRun.workspace_id == current_workspace_id())
+                .where(
+                    SqlScheduledTaskRun.conversation_id.in_(list(dict.fromkeys(conversation_ids)))
+                )
+                .order_by(started_at, SqlScheduledTaskRun.id)
+            )
+            starts: dict[str, builtins.list[tuple[str, int]]] = {}
+            for conversation_id, run_id, start in session.execute(stmt).all():
+                starts.setdefault(conversation_id, []).append((run_id, int(start)))
+            return starts
 
     def get_running_run_by_conversation(self, conversation_id: str) -> ScheduledTaskRun | None:
         """Return the ``running`` run for a conversation, or ``None``.

@@ -517,6 +517,13 @@ export interface ScheduledTaskRunPullRequests {
   pullRequests: ScheduledTaskRunPullRequest[];
 }
 
+/** One page of runs' PRs. */
+export interface ScheduledTaskRunPullRequestsPage {
+  runs: ScheduledTaskRunPullRequests[];
+  /** The server started refreshing a session on the page, so a later read may show more. */
+  refreshPending: boolean;
+}
+
 /**
  * The PRs of one page of a task's runs, most recent first, paged like
  * {@link listScheduledTaskRuns}. Runs without PRs are left out.
@@ -526,7 +533,7 @@ export interface ScheduledTaskRunPullRequests {
 export async function listScheduledTaskRunPullRequests(
   id: string,
   { limit, after }: { limit: number; after?: string },
-): Promise<ScheduledTaskRunPullRequests[]> {
+): Promise<ScheduledTaskRunPullRequestsPage> {
   const params = new URLSearchParams({ limit: String(limit) });
   if (after) params.set("after", after);
   const res = await authenticatedFetch(
@@ -534,11 +541,15 @@ export async function listScheduledTaskRunPullRequests(
   );
   const body = await readJsonOrThrow<{
     runs?: { run_id: string; pull_requests?: ScheduledTaskRunPullRequest[] }[];
+    refresh_pending?: boolean;
   }>(res);
-  return (body.runs ?? []).map((run) => ({
-    runId: run.run_id,
-    pullRequests: run.pull_requests ?? [],
-  }));
+  return {
+    runs: (body.runs ?? []).map((run) => ({
+      runId: run.run_id,
+      pullRequests: run.pull_requests ?? [],
+    })),
+    refreshPending: body.refresh_pending === true,
+  };
 }
 
 /**

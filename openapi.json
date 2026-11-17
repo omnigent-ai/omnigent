@@ -7995,6 +7995,11 @@
             "title": "Scheduled Task Projects",
             "type": "boolean"
           },
+          "scheduled_task_run_pull_requests": {
+            "default": false,
+            "title": "Scheduled Task Run Pull Requests",
+            "type": "boolean"
+          },
           "scheduled_task_sandbox_workspaces": {
             "default": true,
             "title": "Scheduled Task Sandbox Workspaces",
@@ -21148,6 +21153,79 @@
           }
         },
         "summary": "Run Scheduled Task Now",
+        "tags": [
+          "scheduled_tasks"
+        ]
+      }
+    },
+    "/v1/scheduled-tasks/{scheduled_task_id}/run-pull-requests": {
+      "get": {
+        "description": "The pull requests each of one page of a scheduled task's runs created or worked on.\n\nPages and authorizes like `GET /scheduled-tasks/{id}/runs`, most recent first,\nand reads only what the server stores, so it answers while hosts are offline.\nA run that created its session and is its only run gets that session's PRs.\nOtherwise a run gets those first seen from its start until two minutes after\nit finished, but before its session's next run started, so a PR shows on\none run however the history is paged and whatever session mode the task\nhas now. Branch-inferred PRs are left out unless one is the only PR of a\nrun's own session. Each PR carries the state its host last fetched, with\n`state_checked_at`. A session that isn't imported yet, or has an open or\nunknown state older than five minutes, is refreshed in the background, and\n`refresh_pending` says a later read may show more. The response is\n`{\"runs\": [{\"run_id\", \"pull_requests\": [...]}], \"refresh_pending\", \"next_cursor\"}`, listing only runs with PRs. PRs are session content, so\nsomeone it is shared with always gets no runs.",
+        "operationId": "list_scheduled_task_run_pull_requests_v1_scheduled_tasks__scheduled_task_id__run_pull_requests_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scheduled_task_id",
+            "required": true,
+            "schema": {
+              "title": "Scheduled Task Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 20,
+              "maximum": 50,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Scheduled Task Run Pull Requests V1 Scheduled Tasks  Scheduled Task Id  Run Pull Requests Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Scheduled Task Run Pull Requests",
         "tags": [
           "scheduled_tasks"
         ]

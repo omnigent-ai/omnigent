@@ -16,7 +16,7 @@ import asyncio
 import logging
 import threading
 import time
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Annotated, Any
 
@@ -46,6 +46,8 @@ _ATTEMPTS_MAX = 10_000
 # A PR first seen this soon after its run finished still belongs to it: the runner
 # reports what it saw after the turn's last tool call.
 RUN_ATTRIBUTION_GRACE_S = 120.0
+# A session created this soon before its run's recorded start still came from that run.
+RUN_SESSION_CREATION_SLACK_S = 5.0
 
 # custom-lint: disable-next=workspace-scoped-cache -- keyed by database URL; queries scope rows
 _stores: dict[str, SessionPullRequestStore] = {}
@@ -333,14 +335,54 @@ class RunWindow:
     :ivar run_id: The run's id.
     :ivar started_at: Epoch seconds the run was dispatched.
     :ivar finished_at: Epoch seconds the run ended, or ``None`` while it runs.
-    :ivar owns_session: Whether the run's session is its own, as in a task that starts
-        a new session per run; a continued session is shared by many runs.
+    :ivar next_started_at: Epoch seconds the session's next run started, or ``None``.
+    :ivar owns_session: Whether the run created its session and is its only run.
     """
 
     run_id: str
     started_at: float
     finished_at: float | None
+    next_started_at: float | None
     owns_session: bool
+
+
+def run_window(
+    run_id: str,
+    *,
+    started_at: float,
+    finished_at: float | None,
+    session_runs: Sequence[tuple[str, float]],
+    session_created_at: float | None,
+) -> RunWindow:
+    """Place one run among every run of its session, from what the server recorded.
+
+    Ownership depends only on the session's runs and creation time, not on which
+    runs a page lists or on the task's current session mode, which can change
+    after its runs.
+
+    :param session_runs: Every run of the session, of any task, as
+        ``(run_id, started_at)``, oldest first.
+    :param session_created_at: Epoch seconds the session was created, or ``None``.
+    """
+    ids = [session_run for session_run, _ in session_runs]
+    position = ids.index(run_id) if run_id in ids else None
+    next_started_at = (
+        session_runs[position + 1][1]
+        if position is not None and position + 1 < len(session_runs)
+        else None
+    )
+    owns_session = (
+        ids == [run_id]
+        and session_created_at is not None
+        and session_created_at >= started_at - RUN_SESSION_CREATION_SLACK_S
+    )
+    return RunWindow(
+        run_id=run_id,
+        started_at=started_at,
+        finished_at=finished_at,
+        next_started_at=next_started_at,
+        owns_session=owns_session,
+    )
 
 
 def run_pull_requests(
@@ -348,12 +390,13 @@ def run_pull_requests(
 ) -> list[StoredPullRequest]:
     """Pick the PRs one automation run created or worked on from its session's PRs.
 
-    A run that owns its session gets all of them. A run in a continued session
-    gets the PRs first seen while it ran, so each PR shows on the run that
-    linked it and not on later ones that only touched it. Branch-inferred PRs
-    are left out, since being checked out on a branch is not work on its PR,
-    except when one is the only PR of a session the run owns: that is most
-    likely the run's own branch.
+    A run that owns its session gets all of them. Otherwise a run gets the PRs
+    first seen from its start until :data:`RUN_ATTRIBUTION_GRACE_S` after it
+    finished, but before the session's next run started, so each PR shows on
+    exactly the run that linked it and not on later ones that only touched it.
+    Branch-inferred PRs are left out, since being checked out on a branch is not
+    work on its PR, except when one is the only PR of a session the run owns:
+    that is most likely the run's own branch.
 
     :param window: The run.
     :param stored: Its session's PRs.
@@ -367,7 +410,10 @@ def run_pull_requests(
             RUN_ATTRIBUTION_GRACE_S
         )
         picked = [
-            entry for entry in stored.entries if window.started_at <= entry.first_seen_at <= end
+            entry
+            for entry in stored.entries
+            if window.started_at <= entry.first_seen_at <= end
+            and (window.next_started_at is None or entry.first_seen_at < window.next_started_at)
         ]
     explicit = [entry for entry in picked if entry.relationship != "inferred"]
     if not explicit and window.owns_session and len(picked) == 1:

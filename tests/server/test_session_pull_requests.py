@@ -335,9 +335,18 @@ def _stored(url: str, **overrides: Any) -> StoredPullRequest:
     return StoredPullRequest(**{**fields, **overrides})
 
 
-def _run(*, owns_session: bool, finished_at: float | None = 2_000.0) -> server_prs.RunWindow:
+def _run(
+    *,
+    owns_session: bool,
+    finished_at: float | None = 2_000.0,
+    next_started_at: float | None = None,
+) -> server_prs.RunWindow:
     return server_prs.RunWindow(
-        run_id="run", started_at=1_000.0, finished_at=finished_at, owns_session=owns_session
+        run_id="run",
+        started_at=1_000.0,
+        finished_at=finished_at,
+        next_started_at=next_started_at,
+        owns_session=owns_session,
     )
 
 
@@ -364,6 +373,48 @@ def test_a_run_in_a_continued_session_gets_the_prs_first_seen_while_it_ran() -> 
         "https://github.com/example/four/pull/4",
         B,
     ]
+
+
+def test_a_pr_seen_after_the_next_run_started_is_only_that_runs() -> None:
+    """The grace after a run ends never reaches into the session's next run."""
+    entries = (
+        _stored(A, first_seen_at=1_990.0),
+        _stored(B, first_seen_at=2_050.0),
+        _stored(C, first_seen_at=2_060.0),
+    )
+    assert _picked(_run(owns_session=False, next_started_at=2_050.0), *entries) == [A]
+    assert _picked(_run(owns_session=False), *entries) == [A, B, C]
+
+
+@pytest.mark.parametrize(
+    ("session_runs", "created_at", "owns", "next_started_at"),
+    [
+        # The run created its session and is its only run.
+        ([("run", 1_000.0)], 1_002.0, True, None),
+        # Creation is a little before the recorded start on legacy timers.
+        ([("run", 1_000.0)], 1_000.0 - server_prs.RUN_SESSION_CREATION_SLACK_S, True, None),
+        # A session the run continued existed before it.
+        ([("run", 1_000.0)], 500.0, False, None),
+        ([("run", 1_000.0)], None, False, None),
+        # Several runs share the session, whichever of them a page lists.
+        ([("run", 1_000.0), ("later", 3_000.0)], 1_002.0, False, 3_000.0),
+        ([("earlier", 200.0), ("run", 1_000.0)], 150.0, False, None),
+    ],
+)
+def test_a_runs_window_comes_from_every_run_of_its_session(
+    session_runs: list[tuple[str, float]],
+    created_at: float | None,
+    owns: bool,
+    next_started_at: float | None,
+) -> None:
+    window = server_prs.run_window(
+        "run",
+        started_at=1_000.0,
+        finished_at=1_100.0,
+        session_runs=session_runs,
+        session_created_at=created_at,
+    )
+    assert (window.owns_session, window.next_started_at) == (owns, next_started_at)
 
 
 def test_a_run_that_owns_its_session_gets_its_prs_created_first() -> None:

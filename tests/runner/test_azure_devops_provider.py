@@ -1656,33 +1656,31 @@ def test_pr_status_reads_the_state_with_the_title(
     assert (result.title, result.state, result.is_draft) == ("Add the pipeline", expected, True)
 
 
-def test_pr_status_timeout_reports_the_deadline(
-    facet: AzureDevOpsPullRequests, tmp_path: Path, ado_transport: RecordingTransport
-) -> None:
-    def hang(request: httpx.Request) -> httpx.Response:
-        raise httpx.ReadTimeout("timed out", request=request)
-
-    ado_transport.route("GET", PULL, handler=hang)
-
-    assert facet.pr_status(str(tmp_path), reference(), time.monotonic() + 1.5) == (None, True)
-    assert facet.pr_status(str(tmp_path), reference(), time.monotonic() - 1) == (None, True)
-
-
+@pytest.mark.parametrize("lookup", ["pr_title", "pr_status"])
 def test_pr_title_timeout_reports_the_deadline(
-    facet: AzureDevOpsPullRequests, tmp_path: Path, ado_transport: RecordingTransport
+    facet: AzureDevOpsPullRequests,
+    tmp_path: Path,
+    ado_transport: RecordingTransport,
+    lookup: str,
 ) -> None:
     def hang(request: httpx.Request) -> httpx.Response:
         raise httpx.ReadTimeout("timed out", request=request)
 
     ado_transport.route("GET", PULL, handler=hang)
 
-    assert facet.pr_title(str(tmp_path), reference(), time.monotonic() + 1.5) == (None, True)
+    result = getattr(facet, lookup)(str(tmp_path), reference(), time.monotonic() + 1.5)
+    assert result == (None, True)
 
 
+@pytest.mark.parametrize("lookup", ["pr_title", "pr_status"])
 def test_pr_title_after_the_deadline_sends_nothing(
-    facet: AzureDevOpsPullRequests, tmp_path: Path, ado_transport: RecordingTransport
+    facet: AzureDevOpsPullRequests,
+    tmp_path: Path,
+    ado_transport: RecordingTransport,
+    lookup: str,
 ) -> None:
-    assert facet.pr_title(str(tmp_path), reference(), time.monotonic() - 1) == (None, True)
+    result = getattr(facet, lookup)(str(tmp_path), reference(), time.monotonic() - 1)
+    assert result == (None, True)
     assert ado_transport.requests == []
 
 

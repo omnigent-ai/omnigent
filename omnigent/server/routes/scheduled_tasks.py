@@ -21,7 +21,6 @@ import contextlib
 import logging
 import time
 import uuid
-from collections import Counter
 from collections.abc import AsyncIterator, Callable
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -1568,45 +1567,55 @@ def create_scheduled_tasks_router(
 
         Pages and authorizes like ``GET /scheduled-tasks/{id}/runs``, most recent first,
         and reads only what the server stores, so it answers while hosts are offline.
-        A run that started its own session gets that session's PRs; a run in a
-        continued session gets those first seen while it ran. Branch-inferred PRs
-        are left out unless one is the only PR of a run's own session. Each PR
-        carries the state its host last fetched, with ``state_checked_at``; a
-        session with an open or unknown state older than five minutes is
-        refreshed in the background for a later read. The response is
-        ``{"runs": [{"run_id", "pull_requests": [...]}], "next_cursor"}``, listing
-        only runs with PRs. PRs are session content, so someone it is shared with
-        always gets ``{"runs": [], "next_cursor": null}``.
+        A run that created its session and is its only run gets that session's PRs.
+        Otherwise a run gets those first seen from its start until two minutes after
+        it finished, but before its session's next run started, so a PR shows on
+        one run however the history is paged and whatever session mode the task
+        has now. Branch-inferred PRs are left out unless one is the only PR of a
+        run's own session. Each PR carries the state its host last fetched, with
+        ``state_checked_at``. A session that isn't imported yet, or has an open or
+        unknown state older than five minutes, is refreshed in the background, and
+        ``refresh_pending`` says a later read may show more. The response is
+        ``{"runs": [{"run_id", "pull_requests": [...]}], "refresh_pending",
+        "next_cursor"}``, listing only runs with PRs. PRs are session content, so
+        someone it is shared with always gets no runs.
         """
         from omnigent.server import session_pull_requests as server_prs
 
-        task, role = await _require_readable(request, scheduled_task_id)
+        _, role = await _require_readable(request, scheduled_task_id)
+        empty: dict[str, Any] = {"runs": [], "refresh_pending": False, "next_cursor": None}
         if role == "viewer":
-            return {"runs": [], "next_cursor": None}
+            return empty
         runs, next_cursor = store.list_runs(scheduled_task_id, limit=limit, after_id=after)
         pull_request_store = server_prs.open_store(conversation_store)
         served = [run for run in runs if run.conversation_id is not None]
         if pull_request_store is None or not served:
-            return {"runs": [], "next_cursor": next_cursor}
-        stored = await asyncio.to_thread(
-            pull_request_store.read_many, [run.conversation_id or "" for run in served]
+            return {**empty, "next_cursor": next_cursor}
+        conversation_ids = list(dict.fromkeys(run.conversation_id or "" for run in served))
+        stored, session_runs, sessions = await asyncio.gather(
+            asyncio.to_thread(pull_request_store.read_many, conversation_ids),
+            asyncio.to_thread(store.list_run_starts_for_conversations, conversation_ids),
+            asyncio.to_thread(conversation_store.get_conversations, conversation_ids),
         )
         now = time.time()
+        refresh_pending = False
         for conversation_id, prs in stored.items():
             if server_prs.has_stale_state(prs, now=now):
                 server_prs.request_refresh(conversation_id)
-        runs_per_session = Counter(run.conversation_id for run in served)
+                refresh_pending = True
         rows: list[dict[str, Any]] = []
         for run in served:
-            prs = stored.get(run.conversation_id or "")
+            conversation_id = run.conversation_id or ""
+            prs = stored.get(conversation_id)
             if prs is None:
                 continue
-            window = server_prs.RunWindow(
-                run_id=run.id,
+            session = sessions.get(conversation_id)
+            window = server_prs.run_window(
+                run.id,
                 started_at=float(run.fired_at if run.fired_at is not None else run.scheduled_at),
                 finished_at=float(run.finished_at) if run.finished_at is not None else None,
-                owns_session=task.session_mode != "continue"
-                and runs_per_session[run.conversation_id] == 1,
+                session_runs=session_runs.get(conversation_id, []),
+                session_created_at=float(session.created_at) if session is not None else None,
             )
             picked = server_prs.run_pull_requests(window, prs, now=now)
             if picked:
@@ -1616,7 +1625,7 @@ def create_scheduled_tasks_router(
                         "pull_requests": [server_prs.entry_payload(entry) for entry in picked],
                     }
                 )
-        return {"runs": rows, "next_cursor": next_cursor}
+        return {"runs": rows, "refresh_pending": refresh_pending, "next_cursor": next_cursor}
 
     @router.post("/scheduled-tasks/{scheduled_task_id}/run", status_code=202)
     async def run_scheduled_task_now(

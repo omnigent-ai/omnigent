@@ -625,37 +625,89 @@ describe("useScheduledTaskRunPullRequests", () => {
     relationship: "created",
     state,
   });
+  const page = (
+    states: (string | null)[],
+    refreshPending = false,
+  ): api.ScheduledTaskRunPullRequestsPage => ({
+    runs: states.length ? [{ runId: "run_1", pullRequests: states.map(pullRequest) }] : [],
+    refreshPending,
+  });
+  // Settled long ago, so a late PR report can't still arrive.
+  const runs = [{ ...SUCCEEDED_RUN, id: "run_1" }];
+  const tick = (ms: number) =>
+    act(async () => {
+      await vi.advanceTimersByTimeAsync(ms);
+    });
+  const cachedStates = (queryClient: QueryClient) =>
+    queryClient
+      .getQueriesData<api.ScheduledTaskRunPullRequestsPage>({
+        queryKey: ["scheduled-task-run-pull-requests", "st_1"],
+      })[0]?.[1]
+      ?.runs.flatMap((run) => run.pullRequests.map((pr) => pr.state));
 
   it("asks again each minute only while a settled run has an open or unknown PR", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: false });
     try {
       const { wrapper, queryClient } = makeWrapper();
-      const runs = [{ ...SUCCEEDED_RUN, id: "run_1" }];
       vi.mocked(api.listScheduledTaskRunPullRequests)
-        .mockResolvedValueOnce([{ runId: "run_1", pullRequests: [pullRequest("OPEN")] }])
-        .mockResolvedValue([{ runId: "run_1", pullRequests: [pullRequest("MERGED")] }]);
+        .mockResolvedValueOnce(page(["OPEN"]))
+        .mockResolvedValueOnce(page([null]))
+        .mockResolvedValue(page(["MERGED"]));
       const { result } = renderHook(() => useScheduledTaskRunPullRequests("st_1", runs, true), {
         wrapper,
       });
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(0);
-      });
+      await tick(0);
       expect(result.current.get("run_1")?.pullRequests[0]?.state).toBe("OPEN");
       expect(api.listScheduledTaskRunPullRequests).toHaveBeenCalledWith("st_1", { limit: 20 });
-
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(60_000);
-      });
-      expect(api.listScheduledTaskRunPullRequests).toHaveBeenCalledTimes(2);
-      const [cached] = queryClient.getQueriesData<api.ScheduledTaskRunPullRequests[]>({
-        queryKey: ["scheduled-task-run-pull-requests", "st_1"],
-      });
-      expect(cached?.[1]?.[0]?.pullRequests[0]?.state).toBe("MERGED");
+      // An unknown state keeps asking too.
+      await tick(60_000);
+      expect(cachedStates(queryClient)).toEqual([null]);
+      await tick(60_000);
+      expect(cachedStates(queryClient)).toEqual(["MERGED"]);
       // Every PR has settled, so nothing asks again.
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(180_000);
-      });
+      await tick(180_000);
+      expect(api.listScheduledTaskRunPullRequests).toHaveBeenCalledTimes(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("finds PRs a background refresh stores after an empty answer, with the runs unchanged", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: false });
+    try {
+      const { wrapper, queryClient } = makeWrapper();
+      vi.mocked(api.listScheduledTaskRunPullRequests)
+        .mockResolvedValueOnce(page([], true))
+        .mockResolvedValue(page(["MERGED"]));
+      renderHook(() => useScheduledTaskRunPullRequests("st_1", runs, true), { wrapper });
+      await tick(0);
+      expect(cachedStates(queryClient)).toEqual([]);
+      await tick(60_000);
+      expect(cachedStates(queryClient)).toEqual(["MERGED"]);
+      await tick(180_000);
       expect(api.listScheduledTaskRunPullRequests).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps asking for a few minutes after a run finishes, for its last PR report", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: false });
+    try {
+      const { wrapper } = makeWrapper();
+      const finished = [
+        { ...SUCCEEDED_RUN, id: "run_1", finishedAt: Math.floor(Date.now() / 1000) },
+      ];
+      vi.mocked(api.listScheduledTaskRunPullRequests).mockResolvedValue(page([]));
+      renderHook(() => useScheduledTaskRunPullRequests("st_1", finished, true), { wrapper });
+      await tick(0);
+      await tick(4 * 60_000);
+      const asked = vi.mocked(api.listScheduledTaskRunPullRequests).mock.calls.length;
+      expect(asked).toBeGreaterThanOrEqual(4);
+      await tick(5 * 60_000);
+      expect(vi.mocked(api.listScheduledTaskRunPullRequests).mock.calls.length).toBeLessThanOrEqual(
+        asked + 1,
+      );
     } finally {
       vi.useRealTimers();
     }
@@ -668,9 +720,7 @@ describe("useScheduledTaskRunPullRequests", () => {
       renderHook(() => useScheduledTaskRunPullRequests("st_1", [RUNNING_RUN], false), {
         wrapper,
       });
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(30_000);
-      });
+      await tick(30_000);
       expect(api.listScheduledTaskRunPullRequests).not.toHaveBeenCalled();
     } finally {
       vi.useRealTimers();

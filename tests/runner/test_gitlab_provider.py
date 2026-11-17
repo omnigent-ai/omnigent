@@ -759,18 +759,13 @@ def test_status_lookup_maps_merge_request_states(
     assert (status.title, status.state, status.is_draft) == (mr["title"], expected, True)
 
 
-def test_status_lookup_timeout_contract(root: str, api: Mock) -> None:
+@pytest.mark.parametrize("lookup", ["pr_title", "pr_status"])
+def test_title_timeout_contract(root: str, api: Mock, lookup: str) -> None:
+    look_up = getattr(module.PULL_REQUESTS, lookup)
     api.object.side_effect = GitLabTimeoutError()
-    assert module.PULL_REQUESTS.pr_status(root, ref(), time.monotonic()) == (None, True)
+    assert look_up(root, ref(), time.monotonic()) == (None, True)
     api.object.side_effect = GitLabError("denied")
-    assert module.PULL_REQUESTS.pr_status(root, ref(), time.monotonic()) == (None, False)
-
-
-def test_title_timeout_contract(root: str, api: Mock) -> None:
-    api.object.side_effect = GitLabTimeoutError()
-    assert module.PULL_REQUESTS.pr_title(root, ref(), time.monotonic()) == (None, True)
-    api.object.side_effect = GitLabError("denied")
-    assert module.PULL_REQUESTS.pr_title(root, ref(), time.monotonic()) == (None, False)
+    assert look_up(root, ref(), time.monotonic()) == (None, False)
 
 
 @pytest.mark.parametrize("expired", [True, False], ids=["deadline", "subprocess"])

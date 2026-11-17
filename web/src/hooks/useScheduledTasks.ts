@@ -33,6 +33,7 @@ import {
   type SharedScheduledTasksPage,
   type ScheduledTaskRun,
   type ScheduledTaskRunPullRequests,
+  type ScheduledTaskRunPullRequestsPage,
   type ScheduledTaskRunSteps,
   type UpdateScheduledTaskInput,
 } from "@/lib/scheduledTasksApi";
@@ -259,14 +260,37 @@ export function useScheduledTaskRunSteps(
   });
 }
 
-/** How often a page with an open PR asks again, after the server refreshed stale states. */
-const RUN_PULL_REQUESTS_OPEN_REFETCH_MS = 60_000;
+/** How often a page whose PRs may still change asks again. */
+const RUN_PULL_REQUESTS_REFETCH_MS = 60_000;
+/** A run's last PR report can reach the server this long after the run finished. */
+const RUN_PULL_REQUESTS_LATE_REPORT_MS = 5 * 60_000;
+
+/**
+ * Whether a page's PRs may still change without its runs changing: the server is
+ * refreshing one of its sessions, a PR is open or of unknown state, or a run
+ * finished recently enough that its last PR report may not have arrived.
+ */
+function runPullRequestsMayChange(
+  runs: readonly ScheduledTaskRun[],
+  page: ScheduledTaskRunPullRequestsPage | undefined,
+  nowMs: number,
+): boolean {
+  if (page?.refreshPending) return true;
+  if (
+    page?.runs.some((run) => run.pullRequests.some((pr) => pr.state == null || pr.state === "OPEN"))
+  )
+    return true;
+  return runs.some(
+    (run) =>
+      run.finishedAt != null && nowMs - run.finishedAt * 1000 < RUN_PULL_REQUESTS_LATE_REPORT_MS,
+  );
+}
 
 /**
  * The PRs each of an automation's runs created or worked on, by run ID. Pages
  * 20 runs at a time like {@link useScheduledTaskRunSteps}. The server refreshes
- * stale states in the background when asked, so a page with an open PR asks
- * again each minute to pick them up.
+ * sessions in the background and its PR reports don't change the runs, so a
+ * page asks again each minute while its PRs may still change.
  *
  * @param runs - The task's runs, most recent first, from `useScheduledTaskRuns`.
  * @param enabled - Whether to fetch: the server lists run PRs and the caller owns
@@ -295,18 +319,16 @@ export function useScheduledTaskRunPullRequests(
         queryFn: () => listScheduledTaskRunPullRequests(id, { limit: RUN_STEPS_PAGE, after }),
         enabled,
         staleTime: 30_000,
-        refetchInterval: (query: { state: { data?: ScheduledTaskRunPullRequests[] } }) =>
+        refetchInterval: (query: { state: { data?: ScheduledTaskRunPullRequestsPage } }) =>
           index === 0 && newestUnsettled
             ? RUNS_REFETCH_INTERVAL_MS
-            : query.state.data?.some((run) =>
-                  run.pullRequests.some((pr) => pr.state == null || pr.state === "OPEN"),
-                )
-              ? RUN_PULL_REQUESTS_OPEN_REFETCH_MS
+            : runPullRequestsMayChange(page, query.state.data, Date.now())
+              ? RUN_PULL_REQUESTS_REFETCH_MS
               : false,
       };
     }),
     combine: (results) =>
-      new Map(results.flatMap((result) => result.data ?? []).map((prs) => [prs.runId, prs])),
+      new Map(results.flatMap((result) => result.data?.runs ?? []).map((prs) => [prs.runId, prs])),
   });
 }
 

@@ -6060,7 +6060,11 @@ async def test_recipients_read_an_automation_its_runs_and_their_steps(
 async def test_each_run_lists_the_prs_it_created_or_worked_on(
     workflows_client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A run's own session gives it all its PRs; runs sharing a session split them by time."""
+    """A run's own session gives it all its PRs; runs sharing a session split them by time.
+
+    Each PR lands on one run however the history is paged, and switching the task
+    from continuing a session to new sessions doesn't move historical PRs.
+    """
     from omnigent.server import session_pull_requests as server_prs
     from omnigent.stores.session_pull_request_store import (
         FetchedState,
@@ -6069,7 +6073,8 @@ async def test_each_run_lists_the_prs_it_created_or_worked_on(
     )
 
     client = workflows_client
-    task_id = await _create_task(client)
+    shared = _owned_session(db_uri)
+    task_id = await _create_task(client, session_mode="continue", session_id=shared)
     prs = SessionPullRequestStore(db_uri)
 
     def link(session: str, number: int, seen_at: float, relationship: str = "worked_on") -> str:
@@ -6088,40 +6093,30 @@ async def test_each_run_lists_the_prs_it_created_or_worked_on(
         prs.apply_report(session, [report], complete=True)
         return url
 
-    own, shared = _owned_session(db_uri), _owned_session(db_uri)
+    # The newest run started a session of its own, created after it started.
+    own = _owned_session(db_uri)
     newest, later, earlier = uuid.uuid4().hex, uuid.uuid4().hex, uuid.uuid4().hex
-    _seed_run(
-        db_uri,
-        task_id,
-        newest,
-        scheduled_at=3000,
-        fired_at=3000,
-        finished_at=3100,
-        conversation_id=own,
-    )
-    _seed_run(
-        db_uri,
-        task_id,
-        later,
-        scheduled_at=2000,
-        fired_at=2000,
-        finished_at=2100,
-        conversation_id=shared,
-    )
-    _seed_run(
-        db_uri,
-        task_id,
-        earlier,
-        scheduled_at=1000,
-        fired_at=1000,
-        finished_at=1100,
-        conversation_id=shared,
-    )
+    for run_id, start, finish, session in (
+        (newest, 3000, 3100, own),
+        (later, 2000, 2100, shared),
+        (earlier, 1000, 1990, shared),
+    ):
+        _seed_run(
+            db_uri,
+            task_id,
+            run_id,
+            scheduled_at=start,
+            fired_at=start,
+            finished_at=finish,
+            conversation_id=session,
+        )
     _seed_run(db_uri, task_id, uuid.uuid4().hex, status="skipped", conversation_id=None)
     created = link(own, 1, 3050, "created")
     link(own, 2, 3060, "inferred")
     first = link(shared, 3, 1050)
     second = link(shared, 4, 2050)
+    # Seen within the earlier run's grace, but after the later run started.
+    overlap = link(shared, 5, 2010)
     # The shared session's states were fetched just now; the other session's never were.
     prs.apply_report(
         shared,
@@ -6129,31 +6124,56 @@ async def test_each_run_lists_the_prs_it_created_or_worked_on(
         fetched=[
             FetchedState(url=first, number=3, state="OPEN", is_draft=False),
             FetchedState(url=second, number=4, state="MERGED", is_draft=False),
+            FetchedState(url=overlap, number=5, state="CLOSED", is_draft=False),
         ],
         requested_at=time.time(),
     )
     refreshed: list[str] = []
     monkeypatch.setattr(server_prs, "request_refresh", refreshed.append)
-
     url = f"/v1/scheduled-tasks/{task_id}/run-pull-requests"
-    response = await client.get(url, headers=_headers())
-    assert response.status_code == 200, response.text
-    body = response.json()
-    assert body["next_cursor"] is None
-    assert [
-        (run["run_id"], [(pr["url"], pr["state"]) for pr in run["pull_requests"]])
-        for run in body["runs"]
-    ] == [(newest, [(created, None)]), (later, [(second, "MERGED")]), (earlier, [(first, "OPEN")])]
-    assert body["runs"][0]["pull_requests"][0]["relationship"] == "created"
-    assert refreshed == [own]
 
-    # A page covers only its runs.
-    paged = (await client.get(f"{url}?limit=1&after={newest}", headers=_headers())).json()
-    assert [run["run_id"] for run in paged["runs"]] == [later]
+    async def attribution(limit: int) -> list[tuple[str, list[tuple[str, str | None]]]]:
+        rows: list[tuple[str, list[tuple[str, str | None]]]] = []
+        after: str | None = None
+        while True:
+            query = f"?limit={limit}" + (f"&after={after}" if after else "")
+            response = await client.get(url + query, headers=_headers())
+            assert response.status_code == 200, response.text
+            page = response.json()
+            rows += [
+                (run["run_id"], [(pr["url"], pr["state"]) for pr in run["pull_requests"]])
+                for run in page["runs"]
+            ]
+            after = page["next_cursor"]
+            if after is None:
+                return rows
+
+    expected = [
+        (newest, [(created, None)]),
+        (later, [(overlap, "CLOSED"), (second, "MERGED")]),
+        (earlier, [(first, "OPEN")]),
+    ]
+    assert await attribution(20) == expected
+    assert await attribution(1) == expected
+    assert set(refreshed) == {own}
+    body = (await client.get(url, headers=_headers())).json()
+    assert body["refresh_pending"] is True
+    assert body["runs"][0]["pull_requests"][0]["relationship"] == "created"
+
+    switched = await client.patch(
+        f"/v1/scheduled-tasks/{task_id}", json={"session_mode": "new"}, headers=_headers()
+    )
+    assert switched.json()["session_mode"] == "new", switched.text
+    assert await attribution(20) == expected
+    assert await attribution(1) == expected
+
     # PRs are session content, which a recipient's history leaves out.
     assert (await _share(client, task_id, "bob@example.com")).status_code == 200
     viewer = await client.get(url, headers=_BOB)
-    assert (viewer.status_code, viewer.json()) == (200, {"runs": [], "next_cursor": None})
+    assert (viewer.status_code, viewer.json()) == (
+        200,
+        {"runs": [], "refresh_pending": False, "next_cursor": None},
+    )
 
 
 async def test_a_shared_reminder_is_not_shown_to_recipients(

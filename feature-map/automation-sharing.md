@@ -57,8 +57,9 @@ runs' sessions in their own Omnigent Automation folder.
   it. The page shows Shared by and the owner under the title. Its run history
   lists every run's time, outcome and error code, and a run opens its session
   (if it's shared with the viewer) for the details: no session cost, error
-  details, approvals, unread dots or tasks. The owner's host reads The owner's
-  host, the Project field is hidden, and Starts from names no session.
+  details, approvals, unread dots, tasks or pull requests. The owner's host
+  reads The owner's host, the Project field is hidden, and Starts from names no
+  session.
 - `sidebar-folder`: in the sidebar's All sessions and My sessions views (and
   Archived), another user's run session shared with the viewer, or a session
   launched from a run's session tree, sits in the viewer's Omnigent Automation
