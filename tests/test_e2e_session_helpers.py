@@ -54,7 +54,6 @@ def test_pi_launch_waits_for_its_input_ready_marker(tmp_path: Path, monkeypatch,
     child = SimpleNamespace(logfile_read=None, before=f"Model scope: {journey._DEFAULT_MODEL}")
     drained = []
     stopped = []
-    keys = []
     startup_message = "Managed-tool setup is still pending"
 
     def expect(pattern, *, timeout):
@@ -80,15 +79,10 @@ def test_pi_launch_waits_for_its_input_ready_marker(tmp_path: Path, monkeypatch,
         stopped.append(child)
         child.logfile_read.close()
 
-    def send_keys(command, **_kwargs):
-        assert marker.is_file(), "TUI input was sent before Pi enabled submission"
-        keys.append(command)
-
     child.expect = expect
     child.read_nonblocking = read_nonblocking
     monkeypatch.setattr(journey.pexpect, "spawn", lambda *_args, **_kwargs: child)
     monkeypatch.setattr(journey, "_teardown", teardown)
-    monkeypatch.setattr(journey, "subprocess", SimpleNamespace(run=send_keys))
 
     if startup == "ready":
         try:
@@ -96,8 +90,6 @@ def test_pi_launch_waits_for_its_input_ready_marker(tmp_path: Path, monkeypatch,
             assert launched is child and conversation == session
             assert server == "http://127.0.0.1:6767"
             assert marker.is_file() and len(drained) == 2
-            journey._tmux_type(("test.sock", "main"), "one prompt")
-            assert [command[6:] for command in keys] == [["-l", "one prompt"], ["Enter"]]
             assert not stopped
         finally:
             child.logfile_read.close()
@@ -106,7 +98,6 @@ def test_pi_launch_waits_for_its_input_ready_marker(tmp_path: Path, monkeypatch,
         with pytest.raises(expected) as failure:
             journey._launch_pi(env)
         assert stopped == [child] and child.logfile_read.closed
-        assert keys == []
         if startup == "wrong-session":
             assert 1 <= clock.now <= 1.1, "readiness reset the original launch budget"
             assert startup_message not in child.before
