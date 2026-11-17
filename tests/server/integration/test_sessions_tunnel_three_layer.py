@@ -84,6 +84,7 @@ from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from tests.budgets import budget
 from tests.runner.helpers import NullServerClient
 from tests.runtime.harnesses._test_scaffold_harnesses import _EchoHarness
+from tests.server.helpers import wait_for_tunnel_registration
 
 # ``claude-sdk`` is one of the harness names the agent spec validator
 # accepts. The fixture rewrites its registry entry to point at the
@@ -258,13 +259,7 @@ async def _send_hello_and_wait(
     await communicator.send_input(
         {"type": "websocket.receive", "text": encode_frame(hello)},
     )
-    registry = app.state.tunnel_registry
-
-    async def _registered() -> None:
-        while registry.get(runner_id) is None:
-            await asyncio.sleep(0.01)
-
-    await asyncio.wait_for(_registered(), timeout=budget(2.0))
+    await wait_for_tunnel_registration(communicator, app.state.tunnel_registry, runner_id)
 
 
 async def _forward_requests_to_runner(
@@ -2038,6 +2033,7 @@ async def test_server_retired_tunnel_never_fails_the_turn(
     from omnigent.runtime import get_conversation_store
     from omnigent.server import session_live_state, shutdown_state
     from omnigent.server.routes import sessions as sessions_module
+    from tests._helpers.polling import poll_until_async
 
     ap_client = tunnel_three_layer_stack.ap_client
     ap_app = tunnel_three_layer_stack.ap_app
@@ -2095,6 +2091,11 @@ async def test_server_retired_tunnel_never_fails_the_turn(
         reconnect_communicator = await _connect_runner_tunnel(ap_app, runner_id)
         await _send_hello_and_wait(
             reconnect_communicator, ap_app, runner_id, harnesses=[_TEST_HARNESS_NAME]
+        )
+        # Registration precedes the reconnect callback that clears the handoff.
+        await poll_until_async(
+            lambda: shutdown_state.runner_handoff_reason(runner_id) is None,
+            timeout_s=budget(2.0),
         )
         assert shutdown_state.runner_handoff_reason(runner_id) is None
     finally:

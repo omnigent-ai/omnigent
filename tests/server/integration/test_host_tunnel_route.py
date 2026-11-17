@@ -62,7 +62,7 @@ from omnigent.server.routes.skill_content import create_skill_content_router
 from omnigent.stores.host_store import HostStore
 from tests._helpers.polling import poll_until_async
 from tests.budgets import budget
-from tests.server.helpers import FakeSandboxLauncher
+from tests.server.helpers import FakeSandboxLauncher, wait_for_tunnel_registration
 
 pytestmark = pytest.mark.asyncio
 
@@ -172,10 +172,7 @@ async def _send_hello_and_wait(
     await communicator.send_input(
         {"type": "websocket.receive", "text": _make_hello(name, runners, connection_id)},
     )
-    await asyncio.wait_for(
-        _wait_registered(registry, host_id),
-        timeout=budget(2.0),
-    )
+    await wait_for_tunnel_registration(communicator, registry, host_id)
 
 
 async def _receive_ping_and_pong(communicator: ApplicationCommunicator) -> PingFrame:
@@ -194,19 +191,6 @@ async def _receive_ping_and_pong(communicator: ApplicationCommunicator) -> PingF
             }
         )
         return frame
-
-
-async def _wait_registered(
-    registry: HostRegistry,
-    host_id: str,
-) -> None:
-    """Poll until the host appears in the registry.
-
-    :param registry: Host registry to poll.
-    :param host_id: Host id to wait for.
-    """
-    while registry.get(host_id) is None:
-        await asyncio.sleep(0.01)
 
 
 async def _wait_offline(
@@ -1023,7 +1007,7 @@ async def test_host_tunnel_refreshes_harness_readiness_without_reconnect(
             ),
         }
     )
-    await asyncio.wait_for(_wait_registered(registry, _HOST_ID), timeout=budget(2.0))
+    await wait_for_tunnel_registration(comm, registry, _HOST_ID)
 
     await comm.send_input(
         {
@@ -1037,7 +1021,11 @@ async def test_host_tunnel_refreshes_harness_readiness_without_reconnect(
     async def _wait_until_ready() -> None:
         while True:
             host = store.get_host(_HOST_ID)
-            if host is not None and host.configured_harnesses == {"pi": True}:
+            if (
+                host is not None
+                and host.configured_harnesses == {"pi": True}
+                and updates == [_HOST_ID]
+            ):
                 return
             await asyncio.sleep(0.01)
 

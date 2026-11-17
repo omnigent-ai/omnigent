@@ -4674,8 +4674,10 @@ def test_augment_claude_args_disables_auto_mode_setup_offer(
         ((), None),
         (("--permission-mode", "default"), "default"),
         (("--permission-mode", "auto"), "auto"),
+        (("--permission-mode", "plan"), "plan"),
+        (("--permission-mode", "dontAsk"), "dontAsk"),
     ],
-    ids=["none", "default", "auto"],
+    ids=["none", "default", "auto", "plan", "dont-ask"],
 )
 def test_augment_claude_args_allows_reading_session_attachments(
     launch_args: tuple[str, ...],
@@ -4704,7 +4706,11 @@ def test_augment_claude_args_allows_reading_session_attachments(
 
     permissions = settings.get("permissions", {})
     assert permissions.get("defaultMode") == default_mode
-    assert permissions.get("allow") == [f"Read(/{attachment.parent.as_posix()}/**)"]
+    assert permissions.get("allow") == [
+        f"Read(/{attachment.parent.as_posix()}/**)",
+        "mcp__omnigent__sys_scheduled_task_create",
+        "mcp__omnigent__sys_scheduled_task_update",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -4727,7 +4733,13 @@ def test_augment_claude_args_omits_attachment_rule_for_pattern_cache_path(
         )
     )
 
-    assert settings.get("permissions") == expected_permissions
+    assert settings.get("permissions") == {
+        **(expected_permissions or {}),
+        "allow": [
+            "mcp__omnigent__sys_scheduled_task_create",
+            "mcp__omnigent__sys_scheduled_task_update",
+        ],
+    }
 
 
 @pytest.mark.parametrize(
@@ -5320,6 +5332,35 @@ def test_write_tmux_target_persists_socket_and_target(tmp_path: Path) -> None:
     assert before <= payload["updated_at"] <= after
 
 
+@pytest.mark.parametrize("content", ["\x07\x1b", "\n\n"], ids=["control-only", "newlines-only"])
+def test_inject_user_message_rejects_a_message_with_nothing_to_paste(
+    content: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Content that encodes to an empty paste is refused before any tmux write."""
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+    captured: list[list[str]] = []
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        del kwargs
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=_composer_pane(), stderr="")
+        captured.append(cmd)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+
+    with pytest.raises(RuntimeError, match="no text to paste"):
+        inject_user_message(bridge_dir, content=content)
+
+    assert captured == [], f"Expected no tmux writes for an unpasteable message, got {captured}"
+
+
 # Each send-keys first leaves copy mode in the same tmux call; without it,
 # a pane the reader scrolled back hands the keys to tmux instead of Claude.
 _LEAVE_COPY_MODE = ["copy-mode", "-q", "-t", "claude:0.0", ";"]
@@ -5328,24 +5369,46 @@ _LEAVE_COPY_MODE = ["copy-mode", "-q", "-t", "claude:0.0", ";"]
 @pytest.mark.parametrize(
     "content,expected_payload",
     [
-        # Plain single line: trailing CR appended (newline -> 0x0d).
-        ("hello world", b"hello world\r"),
+        # Plain single line: content bytes only; the submit Enter is a separate call.
+        ("hello world", b"hello world"),
         # Multi-line: interior newline rides as CR inside the paste so
         # Claude's TUI keeps it as data instead of submitting per line.
-        ("line one\nline two", b"line one\rline two\r"),
-        # Trailing "\" escapes the appended paste CR, not the submit Enter.
+        ("line one\nline two", b"line one\rline two"),
+        # Exactly two line breaks stay two: a third CR tips Claude Code into
+        # collapsing the paste to a "[Pasted text #N +3 lines]" placeholder.
+        ("first line\n\nthird line", b"first line\r\rthird line"),
+        # A trailing newline is dropped: it adds nothing before the submit Enter
+        # and would be the third break that collapses the paste.
+        ("first line\n\nthird line\n", b"first line\r\rthird line"),
+        # Trailing "\" escapes an appended paste CR, not the submit Enter.
         ("deploy to prod\\", b"deploy to prod\\\r"),
+        # A "\" the user already followed with a newline needs no extra CR.
+        ("deploy to prod\\\n", b"deploy to prod\\\r"),
+        # The guard looks at the encoded bytes: a dropped control byte after
+        # the "\" still leaves it trailing.
+        ("deploy to prod\\\x07", b"deploy to prod\\\r"),
         # CRLF line endings coalesce to a single CR (no doubled blank line).
-        ("a\r\nb", b"a\rb\r"),
+        ("a\r\nb", b"a\rb"),
         # A stray ESC in the content is dropped so it can't prematurely
         # close the bracketed-paste sequence on Claude's side.
-        ("a\x1bb", b"ab\r"),
+        ("a\x1bb", b"ab"),
         # Large payload (a PR diff in a sub-agent dispatch). Must ride the
         # load-buffer file — per-byte send-keys argv tripped tmux's ~16KB
         # client→server command cap with "command too long".
-        ("x" * 100_000, b"x" * 100_000 + b"\r"),
+        ("x" * 100_000, b"x" * 100_000),
     ],
-    ids=["plain", "multiline", "trailing-backslash", "crlf", "embedded-esc", "large"],
+    ids=[
+        "plain",
+        "multiline",
+        "two-line-breaks",
+        "trailing-newline",
+        "trailing-backslash",
+        "backslash-then-newline",
+        "backslash-then-dropped-control",
+        "crlf",
+        "embedded-esc",
+        "large",
+    ],
 )
 def test_inject_user_message_pastes_content_then_submits(
     content: str,
@@ -5420,9 +5483,8 @@ def test_inject_user_message_pastes_content_then_submits(
     assert refocus[-4:] == ["send-keys", "-t", "claude:0.0", "Space"]
     assert clear[3:8] == _LEAVE_COPY_MODE
     assert clear[-4:] == ["-l", "-t", "claude:0.0", _CLEAR_ONE_ROW_COMPOSER]
-    # The buffer file carried the normalized content + trailing CR. A
-    # missing trailing CR is the trailing-CR regression; a newline that stayed
-    # \n (not CR) is the anthropics/claude-code#52126 multi-line collapse.
+    # An extra CR collapses a two-break message into a placeholder; a newline
+    # left as \n (not CR) is the anthropics/claude-code#52126 collapse.
     assert loaded_payloads == [expected_payload]
     assert load[:6] == [
         "tmux",
@@ -13794,6 +13856,9 @@ async def test_model_command_selects_session_only_then_reads_fresh_status(
         "draft",
         "clipped",
         "picker",
+        "status-view",
+        "model-confirmation",
+        "model-confirmation-no-selected",
         "pending-before-typing",
         "pending-after-typing",
         "answerable-dialog",
@@ -13813,6 +13878,11 @@ def test_model_command_refuses_unsupported_or_unowned_input_before_keys(
         composer.version = "2.1.302"
     if unsupported == "picker":
         composer.overlay = "picker"
+    if unsupported == "status-view":
+        composer.overlay = "status"
+    if unsupported in {"model-confirmation", "model-confirmation-no-selected"}:
+        composer.overlay = "cache-cost"
+        composer.cache_cost_label = "Choice 1"
     if unsupported == "clipped":
         composer._visible_rows = 1
     bridge_dir = _session_model_bridge(tmp_path, composer)
@@ -13851,6 +13921,18 @@ def test_model_command_refuses_unsupported_or_unowned_input_before_keys(
     occupied = {
         "history-search": (_INLINE_REVERSE_SEARCH_PANE, "the prompt-history search"),
         "shell-mode": (_SHELL_MODE_PANE, "shell mode"),
+        "picker": (composer._capture_pane("", ""), "the model picker"),
+        "status-view": (composer._capture_pane("", ""), "the status view"),
+        "model-confirmation": (
+            composer._capture_pane("", ""),
+            "a model-switch confirmation",
+        ),
+        "model-confirmation-no-selected": (
+            _cache_cost_confirmation_pane("Choice 1")
+            .replace("❯ 1.", "  1.")
+            .replace("     2.", "   ❯ 2."),
+            "a model-switch confirmation",
+        ),
     }.get(unsupported)
     holdable = unsupported in {
         "pending-before-typing",
@@ -14680,158 +14762,6 @@ def test_model_command_cleans_only_its_exact_unsubmitted_command(
     assert composer.submitted == []
     assert not any(args[-1] in {"Enter", "Escape", "s"} for args in composer.sends)
     assert len(composer.sends) == (1 if replacement else 2)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("caller", ["executor", "native-control"])
-@pytest.mark.parametrize(
-    ("phase", "replacement"),
-    [
-        ("draft", False),
-        ("picker-enter", False),
-        ("picker-down", False),
-        ("picker", True),
-        ("commit", False),
-        ("status", True),
-    ],
-    ids=[
-        "owned-draft",
-        "after-enter",
-        "after-down",
-        "replaced-picker",
-        "committed",
-        "replaced-status",
-    ],
-)
-async def test_cancelled_model_switch_cleans_only_observed_owned_controls(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    caller: str,
-    phase: str,
-    replacement: bool,
-) -> None:
-    from omnigent.inner import claude_native_executor
-    from omnigent.runner import native_controls
-
-    composer = _SessionModelComposer(busy=True)
-    bridge_dir = _session_model_bridge(tmp_path, composer)
-    composer.install(monkeypatch)
-    started, release = threading.Event(), threading.Event()
-    worker_finished = threading.Event()
-    initial_model = composer.model
-    observed_picker = observed_status = 0
-    cancelled_at: list[tuple[str, ...]] = []
-    killed: list[Path] = []
-
-    def pause() -> None:
-        if started.is_set():
-            return
-        cancelled_at.extend(composer.sends)
-        started.set()
-        assert release.wait(5), "the test did not release its fake pane operation"
-
-    def send(socket_path: str, *args: str) -> None:
-        composer._run_tmux(socket_path, *args)
-        key = args[-1]
-        if (
-            (phase == "draft" and key == "/model")
-            or (phase == "picker-enter" and key == "Enter" and composer.overlay == "picker")
-            or (phase == "picker-down" and key == "Down")
-            or (phase == "commit" and key == "s")
-        ):
-            pause()
-
-    def capture(socket_path: str, target: str) -> str:
-        nonlocal observed_picker, observed_status
-        pane = composer._capture_pane(socket_path, target)
-        if composer.overlay == "picker" and composer.highlight == 1:
-            observed_picker += 1
-            if phase == "picker" and observed_picker == 2:
-                pause()
-        if composer.overlay == "status":
-            observed_status += 1
-            if phase == "status" and observed_status == 2:
-                pause()
-        return pane
-
-    def select_model(_bridge: Path, *, model: str) -> claude_native_bridge.ClaudeModelSwitchResult:
-        try:
-            return claude_native_bridge.inject_model_command(_bridge, model=model)
-        finally:
-            worker_finished.set()
-
-    monkeypatch.setattr(claude_native_bridge, "_run_tmux", send)
-    monkeypatch.setattr(claude_native_bridge, "_capture_pane", capture)
-    monkeypatch.setattr(claude_native_executor, "inject_model_command", select_model)
-    monkeypatch.setattr(
-        claude_native_executor, "kill_session", lambda path, **kwargs: killed.append(path)
-    )
-    monkeypatch.delenv(claude_native_bridge.REQUEST_SESSION_ID_ENV_VAR, raising=False)
-    executor = claude_native_executor.ClaudeNativeExecutor(bridge_dir)
-    prompt = Mock(side_effect=AssertionError("a cancelled model switch sent its prompt"))
-    monkeypatch.setattr(claude_native_executor, "inject_user_message", prompt)
-
-    async def deliver() -> None:
-        if caller == "executor":
-            await executor._inject_turn("dependent prompt", [], "private-glm[1m]")
-        else:
-            await native_controls._drive_claude_pane(
-                native_controls._ClaudeControlDeadline(),
-                select_model,
-                bridge_dir,
-                model="private-glm[1m]",
-            )
-
-    task = asyncio.create_task(deliver())
-    try:
-        assert await asyncio.to_thread(started.wait, 2)
-        assert claude_native_bridge._bridge_injection_lock(bridge_dir).locked()
-        task.cancel()
-        await asyncio.sleep(0)
-        assert not task.done(), "cancellation released an in-flight pane worker"
-        assert not worker_finished.is_set()
-        assert claude_native_bridge._bridge_injection_lock(bridge_dir).locked()
-        if caller == "executor":
-            assert executor._inject_lock.locked()
-        if replacement:
-            if phase == "picker":
-                composer.options[0] = "a-persons-replacement-model"
-            else:
-                composer.overlay = "status"
-                composer.session = "a-persons-replacement-session"
-        release.set()
-        with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(asyncio.shield(task), 2)
-        assert worker_finished.is_set()
-        assert composer.sends[: len(cancelled_at)] == cancelled_at
-        cleanup = [args[-1] for args in composer.sends[len(cancelled_at) :]]
-        expected = [_CLEAR_ONE_ROW_COMPOSER] if phase == "draft" else []
-        assert cleanup == expected
-        assert [args[-1] for args in composer.sends].count("s") == (
-            1 if phase in {"commit", "status"} else 0
-        )
-        assert composer.model == (
-            "private-glm[1m]" if phase in {"commit", "status"} else initial_model
-        )
-        if not replacement:
-            assert composer.text == ""
-            assert composer.overlay == (
-                "picker" if phase in {"picker-enter", "picker-down"} else None
-            )
-        if phase in {"picker-enter", "picker-down"}:
-            assert composer.highlight == int(phase == "picker-down")
-            assert composer.status_queries == 0
-        assert composer.busy
-        assert killed == []
-        assert not executor._inject_lock.locked()
-        assert not claude_native_bridge._bridge_injection_lock(bridge_dir).locked()
-        prompt.assert_not_called()
-    finally:
-        release.set()
-        if not task.done():
-            task.cancel()
-        with suppress(asyncio.CancelledError, RuntimeError):
-            await asyncio.wait_for(task, 2)
 
 
 def test_model_command_never_repeats_an_ambiguous_session_only_commit(

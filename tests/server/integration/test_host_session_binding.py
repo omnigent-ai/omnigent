@@ -2612,6 +2612,8 @@ async def test_message_sent_as_the_move_detaches_waits_for_the_sandbox(
     await poll_until_async(
         lambda: (
             [item.status for item in env.conv_store.list_pending_inputs(session_id)] == ["failed"]
+            and (current := env.conv_store.get_conversation(session_id)) is not None
+            and current.runner_id is None
         )
     )
     conv = env.conv_store.get_conversation(session_id)

@@ -29,6 +29,10 @@ vi.mock("@/pages/ChatPage", () => ({
 vi.mock("@/pages/NotFoundPage", () => ({ NotFoundPage: () => <div>not found</div> }));
 vi.mock("@/pages/UsagePage", () => ({ UsagePage: () => <div>usage page</div> }));
 vi.mock("@/pages/TaskDetailPage", () => ({ TaskDetailPage: () => <div>task detail page</div> }));
+vi.mock("@/pages/WorkflowsPage", () => ({ WorkflowsPage: () => <div>workflows page</div> }));
+vi.mock("@/pages/WorkflowDetailPage", () => ({
+  WorkflowDetailPage: () => <div>workflow detail page</div>,
+}));
 vi.mock("@/pages/SettingsPage", async () => {
   const { useLocation, useNavigationType } = await import("react-router-dom");
   return {
@@ -257,6 +261,21 @@ function renderRoute(
   );
 }
 
+describe("Workflow routes", () => {
+  it.each([
+    ["/workflows", "workflows page"],
+    ["/workflows/saved", "workflow detail page"],
+  ])("gates %s with the server workflows flag", async (path, page) => {
+    renderRoute(path);
+    expect(await screen.findByText("not found")).toBeInTheDocument();
+    expect(screen.queryByText(page)).toBeNull();
+    cleanup();
+
+    renderRoute(path, { workflows: true });
+    expect(await screen.findByText(page)).toBeInTheDocument();
+  });
+});
+
 describe("Canvas route", () => {
   it("preserves healthy chat state across pathname changes", () => {
     renderRoute("/c/first");
@@ -349,7 +368,32 @@ describe("Usage release feature route", () => {
   });
 });
 
-describe("Automation detail release feature route", () => {
+describe("Automation routes", () => {
+  it.each(["/tasks", "/tasks/templates", "/tasks/st_1"])(
+    "blocks %s when automations are disabled",
+    async (path) => {
+      renderRoute(
+        path,
+        {},
+        {
+          ...FALLBACK_SERVER_INFO,
+          automations_enabled: false,
+          features: { automations_v2: true },
+        },
+      );
+      expect(await screen.findByText("not found")).toBeInTheDocument();
+      expect(screen.queryByText("task detail page")).toBeNull();
+      expect(screen.queryByText("Tasks recovered")).toBeNull();
+    },
+  );
+
+  it("waits for server info before loading automations", () => {
+    renderRoute("/tasks", {}, "loading");
+    expect(screen.getByRole("status")).toHaveTextContent("Loading Omnigent");
+    expect(screen.queryByText("not found")).toBeNull();
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
   it("does not register /tasks/:taskId while automations_v2 is off", async () => {
     renderRoute("/tasks/st_1");
     expect(await screen.findByText("not found")).toBeInTheDocument();

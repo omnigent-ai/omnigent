@@ -4,7 +4,8 @@
  * and tabs for existing automations and reusable templates.
  *
  * Data comes from `useScheduledTasks`. Pause/resume and delete go through the
- * update/delete mutations, which invalidate the list.
+ * update/delete mutations, which invalidate the list. Share opens the shared
+ * permissions dialog for an automation the viewer owns.
  * The human-readable schedule and next-run text are computed client-side from
  * each task's stored RRULE (`scheduleText`) — there is no backend next-run
  * endpoint.
@@ -20,6 +21,7 @@ import {
   TriangleAlertIcon,
 } from "lucide-react";
 import { PageScroll } from "@/components/PageScroll";
+import { PermissionsModal } from "@/components/PermissionsModal";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -31,7 +33,7 @@ import { ScheduledTaskRow } from "@/components/scheduled/ScheduledTaskRow";
 import { AUTOMATION_TEMPLATES } from "@/components/scheduled/automationTemplates";
 import { SESSION_LINK_ID_PLACEHOLDER } from "@/components/scheduled/triggerTemplates";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { isFeatureEnabled } from "@/lib/capabilities";
+import { isFeatureEnabled, isSharingOff, SHARING_OFF_REASON } from "@/lib/capabilities";
 import { useNavigate, useRebasePath, useSearchParams } from "@/lib/routing";
 import { getShareableSessionLink } from "@/lib/shareLink";
 import {
@@ -41,6 +43,8 @@ import {
   useUpdateScheduledTask,
 } from "@/hooks/useScheduledTasks";
 import { useNow } from "@/hooks/useNow";
+import { useViewerId } from "@/hooks/useViewerId";
+import { canShareAutomation } from "@/lib/permissionsApi";
 import { ScheduledTaskApiError, type ScheduledTask } from "@/lib/scheduledTasksApi";
 import { nextRunAtMs } from "@/lib/scheduleText";
 import { cn } from "@/lib/utils";
@@ -73,6 +77,10 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
   const [filter, setFilter] = useState<FilterTab>("all");
   const [manualOpen, setManualOpen] = useState(false);
   const [editingTask, setEditingTask] = useState<ScheduledTask | null>(null);
+  // Kept after closing so the dialog can animate out.
+  const [sharingTask, setSharingTask] = useState<ScheduledTask | null>(null);
+  const [shareOpen, setShareOpen] = useState(false);
+  const viewerId = useViewerId();
   const [templateId, setTemplateId] = useState<string | null>(null);
   const selectedTemplate = AUTOMATION_TEMPLATES.find((template) => template.id === templateId);
   const navigate = useNavigate();
@@ -148,10 +156,15 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
       if (q && !t.name.toLowerCase().includes(q)) return false;
       return true;
     });
+    // The server's next run is authoritative (it counts COUNT from the task's
+    // creation, which the client can't); the local estimate is only a fallback.
     const nextRunByTaskId = new Map(
       matches
         .filter((t) => t.state === "active")
-        .map((t) => [t.id, nextRunAtMs(t.rrule, t.timezone)]),
+        .map((t) => {
+          const server = t.nextRunAt != null ? Date.parse(t.nextRunAt) : Number.NaN;
+          return [t.id, Number.isNaN(server) ? nextRunAtMs(t.rrule, t.timezone) : server];
+        }),
     );
     // Sort: ACTIVE first (soonest next-run at the top), PAUSED last. The
     // least-actionable (paused) rows sink to the bottom rather than leading the
@@ -215,6 +228,11 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
     setTemplateId(null);
     setEditingTask(task);
     setManualOpen(true);
+  }
+
+  function handleShare(task: ScheduledTask) {
+    setSharingTask(task);
+    setShareOpen(true);
   }
 
   const hasAnyTasks = (tasks ?? []).length > 0;
@@ -395,6 +413,10 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
                   onPauseToggle={handlePauseToggle}
                   onRunNow={handleRunNow}
                   onDelete={handleDelete}
+                  onShare={
+                    canShareAutomation(info, viewerId, task.ownerUserId) ? handleShare : undefined
+                  }
+                  shareDisabledReason={isSharingOff(info) ? SHARING_OFF_REASON : undefined}
                 />
               ))}
             </div>
@@ -413,6 +435,14 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
       </Tabs>
 
       {createDialog}
+      {sharingTask && (
+        <PermissionsModal
+          key={sharingTask.id}
+          automation={sharingTask}
+          open={shareOpen}
+          onOpenChange={setShareOpen}
+        />
+      )}
     </PageScroll>
   );
 }

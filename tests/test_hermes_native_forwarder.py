@@ -70,6 +70,39 @@ def _seed_db(path: Path, *, cwd: str, started_at: float, session_id: str = "2026
     con.close()
 
 
+def test_observer_does_not_create_or_initialize_store(tmp_path: Path) -> None:
+    db = tmp_path / "state.db"
+    assert f._connect_ro(db) is None
+    assert not db.exists()
+    db.touch()
+    assert f._connect_ro(db) is None
+    assert db.stat().st_size == 0
+    assert list(tmp_path.iterdir()) == [db]
+
+
+def test_observer_reads_live_wal_without_write_access(tmp_path: Path) -> None:
+    db = tmp_path / "state #1.db"
+    _seed_db(db, cwd=str(tmp_path), started_at=0.0)
+    writer = sqlite3.connect(db)
+    try:
+        writer.execute("PRAGMA journal_mode=WAL")
+        writer.execute("PRAGMA wal_autocheckpoint=0")
+        writer.execute("INSERT INTO sessions (id, source, started_at) VALUES ('new', 'cli', 1)")
+        writer.commit()
+        observer = f._connect_ro(db)
+        assert observer is not None
+        try:
+            assert observer.execute("SELECT id FROM sessions WHERE id='new'").fetchone() == (
+                "new",
+            )
+            with pytest.raises(sqlite3.OperationalError, match="readonly"):
+                observer.execute("DELETE FROM sessions")
+        finally:
+            observer.close()
+    finally:
+        writer.close()
+
+
 def test_discover_session_id_by_cwd_and_floor(tmp_path: Path) -> None:
     workspace = str(tmp_path)
     db = tmp_path / "state.db"

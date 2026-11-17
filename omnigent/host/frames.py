@@ -19,6 +19,8 @@ see.
 
 from __future__ import annotations
 
+import base64
+import importlib.util
 import json
 import math
 from collections.abc import Iterator
@@ -84,6 +86,7 @@ CAP_MCP_INVENTORY = "mcp_inventory"
 CAP_HARNESS_STARTUP = "harness_startup"
 CAP_PLUGINS = "plugins"
 CAP_SKILL_CONTENT = "skill_content"
+CAP_WORKFLOWS = "workflows"
 CAP_MCP_TOOLS = "mcp_tools"
 CAP_MCP_SERVER_ENABLED = "mcp_server_enabled"
 CAP_REFRESH_HARNESSES = "refresh_harnesses"
@@ -93,6 +96,13 @@ CAP_MCP_REGISTRY = "mcp_registry"
 CAP_TCP_EGRESS = "tcp_egress"
 # The host bounds a whole worktree create by ``HostCreateWorktreeFrame.timeout_s``:
 CAP_WORKTREE_CREATE_BUDGET = "worktree_create_budget"
+# The host clones a git repository into a new directory (``host.clone_repository``):
+CAP_CLONE_REPOSITORY = "clone_repository"
+# The host answers ``host.workspace_call`` (the workspace API through the server).
+CAP_WORKSPACE_API = "workspace_api"
+# The host's runners accept session messages up to ``SESSION_MESSAGE_MAX_CHARS``
+# (32,000) instead of 8,000, so automations can send long instructions:
+CAP_LONG_SESSION_MESSAGES = "long_session_messages"
 
 # Every capability THIS build supports; reported verbatim in the hello frame.
 HOST_CAPABILITIES: list[str] = [
@@ -102,6 +112,7 @@ HOST_CAPABILITIES: list[str] = [
     CAP_FILESYSTEM_ATTACHMENT_DELIVERY,
     CAP_PLUGINS,
     CAP_SKILL_CONTENT,
+    CAP_WORKFLOWS,
     CAP_MCP_TOOLS,
     CAP_MCP_SERVER_ENABLED,
     CAP_MCP_REGISTRY,
@@ -112,7 +123,12 @@ HOST_CAPABILITIES: list[str] = [
     CAP_WORKTREE_CREATE_BUDGET,
     CAP_HARNESS_ACCOUNTS,
     CAP_HARNESS_LOGIN,
+    CAP_CLONE_REPOSITORY,
+    CAP_LONG_SESSION_MESSAGES,
 ]
+# The workspace API needs the optional `omnigent[workspace-api]` extra.
+if importlib.util.find_spec("connectrpc") is not None:
+    HOST_CAPABILITIES.append(CAP_WORKSPACE_API)
 
 # Server capabilities, advertised on the tunnel's WebSocket upgrade response (the
 # server sends no frame before the host's hello). Older servers send no header.
@@ -241,6 +257,8 @@ class HostFrameKind(str, Enum):
     LIST_WORKTREES_RESULT = "host.list_worktrees_result"
     CREATE_DIR = "host.create_dir"
     CREATE_DIR_RESULT = "host.create_dir_result"
+    CLONE_REPOSITORY = "host.clone_repository"
+    CLONE_REPOSITORY_RESULT = "host.clone_repository_result"
     INSTALL_HARNESS = "host.install_harness"
     INSTALL_HARNESS_RESULT = "host.install_harness_result"
     REFRESH_HARNESSES = "host.refresh_harnesses"
@@ -260,6 +278,8 @@ class HostFrameKind(str, Enum):
     DETECT_CREDENTIALS_RESULT = "host.detect_credentials_result"
     FS_REQUEST = "host.fs_request"
     FS_RESULT = "host.fs_result"
+    WORKSPACE_CALL = "host.workspace_call"
+    WORKSPACE_REPLY = "host.workspace_reply"
     FS_WRITE_REQUEST = "host.fs_write_request"
     MODEL_OPTIONS = "host.model_options"
     MODEL_OPTIONS_RESULT = "host.model_options_result"
@@ -322,6 +342,12 @@ class HostHelloFrame:
         supported" without a version check.
     :param connection_id: Host-minted identifier for this socket, shared with
         server diagnostics. Absent from older hosts.
+    :param workspace_socket: Path of the host's workspace API socket, e.g.
+        ``"/tmp/omnigent-workspace-ab12/workspace.sock"``. ``None`` when the host
+        serves no direct workspace access.
+    :param workspace_token_key: Key the server signs direct-access tokens with
+        (see :mod:`omnigent.host.workspace_tokens`). Sent with
+        ``workspace_socket``; never logged.
     """
 
     version: str
@@ -336,6 +362,8 @@ class HostHelloFrame:
     installation_id: str | None = None
     capabilities: list[str] = field(default_factory=list)
     connection_id: str | None = None
+    workspace_socket: str | None = None
+    workspace_token_key: str | None = field(default=None, repr=False)
 
 
 @dataclass
@@ -884,6 +912,46 @@ class HostCreateDirResultFrame:
 
 
 @dataclass
+class HostCloneRepositoryFrame:
+    """Server → host: clone a git repository into a new directory.
+
+    Backs ``POST /v1/hosts/{id}/repositories/clone``. The host refuses any
+    existing path at ``path`` so a clone never overwrites user files.
+
+    :param request_id: Correlates the result, e.g. ``"req_clone_1"``.
+    :param url: Clone URL, e.g. ``"https://git.example.com/team/app.git"``.
+    :param path: Absolute or tilde-prefixed destination, e.g.
+        ``"~/code/app"``. Its parent must already exist.
+    :param branch: Branch to check out, or ``None`` for the remote default.
+    """
+
+    request_id: str
+    url: str
+    path: str
+    branch: str | None = None
+
+
+@dataclass
+class HostCloneRepositoryResultFrame:
+    """Host → server: outcome of a clone-repository request.
+
+    :param request_id: Correlates to the :class:`HostCloneRepositoryFrame`.
+    :param status: ``"ok"`` or ``"failed"``.
+    :param path: Absolute path of the new checkout on success.
+    :param error: Human-readable failure message, ``None`` on success.
+    :param error_code: Stable failure class: ``"invalid_input"``,
+        ``"clone_destination_conflict"``, ``"clone_timeout"``, or
+        ``"clone_failed"`` for any other git failure.
+    """
+
+    request_id: str
+    status: str
+    path: str | None = None
+    error: str | None = None
+    error_code: str | None = None
+
+
+@dataclass
 class HostInstallHarnessFrame:
     """Server → host: install a harness CLI on the host.
 
@@ -1231,6 +1299,40 @@ class HostFsWriteFrame:
 
 
 @dataclass
+class HostWorkspaceCallFrame:
+    """Server → host: one workspace API call (``omnigent.api.workspace.v1alpha1``).
+
+    :param request_id: Correlates the call's replies.
+    :param workspace: The session's workspace on the host, chosen by the server.
+    :param method: Method name, e.g. ``"ReadFile"``.
+    :param request: The serialized request message.
+    """
+
+    request_id: str
+    workspace: str
+    method: str
+    request: bytes = b""
+
+
+@dataclass
+class HostWorkspaceReplyFrame:
+    """Host → server: one response message of a workspace call, or its end.
+
+    :param request_id: The call this answers.
+    :param message: A serialized response message, or ``None``.
+    :param done: Whether this is the call's last frame.
+    :param error_code: On a failed call's last frame, its Connect code, e.g. ``"not_found"``.
+    :param error_message: The failure's message.
+    """
+
+    request_id: str
+    message: bytes | None = None
+    done: bool = False
+    error_code: str | None = None
+    error_message: str | None = None
+
+
+@dataclass
 class HostFsResultFrame:
     """Host → server: outcome of a workspace filesystem request (read or write).
 
@@ -1294,6 +1396,7 @@ class HostSkillsFrame:
     agent_version: str | None = None
     sub_agent_name: str | None = None
     skills_filter: str | list[str] = "all"
+    workflows_enabled: bool = False
 
 
 @dataclass
@@ -1577,6 +1680,8 @@ HostFrame = (
     | HostListWorktreesResultFrame
     | HostCreateDirFrame
     | HostCreateDirResultFrame
+    | HostCloneRepositoryFrame
+    | HostCloneRepositoryResultFrame
     | HostInstallHarnessFrame
     | HostInstallHarnessResultFrame
     | HostRefreshHarnessesFrame
@@ -1596,6 +1701,8 @@ HostFrame = (
     | HostDetectCredentialsResultFrame
     | HostFsRequestFrame
     | HostFsResultFrame
+    | HostWorkspaceCallFrame
+    | HostWorkspaceReplyFrame
     | HostFsWriteFrame
     | HostModelOptionsFrame
     | HostModelOptionsResultFrame
@@ -1705,6 +1812,8 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "installation_id": frame.installation_id,
                 "capabilities": list(frame.capabilities),
                 "connection_id": frame.connection_id,
+                "workspace_socket": frame.workspace_socket,
+                "workspace_token_key": frame.workspace_token_key,
             }
         )
     if isinstance(frame, HostConnectionErrorFrame):
@@ -1930,6 +2039,27 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "error": frame.error,
             }
         )
+    if isinstance(frame, HostCloneRepositoryFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.CLONE_REPOSITORY.value,
+                "request_id": frame.request_id,
+                "url": frame.url,
+                "path": frame.path,
+                "branch": frame.branch,
+            }
+        )
+    if isinstance(frame, HostCloneRepositoryResultFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.CLONE_REPOSITORY_RESULT.value,
+                "request_id": frame.request_id,
+                "status": frame.status,
+                "path": frame.path,
+                "error": frame.error,
+                "error_code": frame.error_code,
+            }
+        )
     if isinstance(frame, HostInstallHarnessFrame):
         return _encode_payload(
             {
@@ -2121,6 +2251,29 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "params": frame.params,
             }
         )
+    if isinstance(frame, HostWorkspaceCallFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.WORKSPACE_CALL.value,
+                "request_id": frame.request_id,
+                "workspace": frame.workspace,
+                "method": frame.method,
+                "request": base64.b64encode(frame.request).decode(),
+            }
+        )
+    if isinstance(frame, HostWorkspaceReplyFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.WORKSPACE_REPLY.value,
+                "request_id": frame.request_id,
+                "message": None
+                if frame.message is None
+                else base64.b64encode(frame.message).decode(),
+                "done": frame.done,
+                "error_code": frame.error_code,
+                "error_message": frame.error_message,
+            }
+        )
     if isinstance(frame, HostFsResultFrame):
         return _encode_payload(
             {
@@ -2164,6 +2317,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "agent_version": frame.agent_version,
                 "sub_agent_name": frame.sub_agent_name,
                 "skills_filter": frame.skills_filter,
+                "workflows_enabled": frame.workflows_enabled,
             }
         )
     if isinstance(frame, HostSkillsResultFrame):
@@ -2620,6 +2774,10 @@ def _decode_known_host_frame(
             return _decode_create_dir(msg)
         case HostFrameKind.CREATE_DIR_RESULT:
             return _decode_create_dir_result(msg)
+        case HostFrameKind.CLONE_REPOSITORY:
+            return _decode_clone_repository(msg)
+        case HostFrameKind.CLONE_REPOSITORY_RESULT:
+            return _decode_clone_repository_result(msg)
         case HostFrameKind.INSTALL_HARNESS:
             return _decode_install_harness(msg)
         case HostFrameKind.INSTALL_HARNESS_RESULT:
@@ -2703,6 +2861,22 @@ def _decode_known_host_frame(
             return _decode_fs_request(msg)
         case HostFrameKind.FS_RESULT:
             return _decode_fs_result(msg)
+        case HostFrameKind.WORKSPACE_CALL:
+            return HostWorkspaceCallFrame(
+                request_id=_required_str(msg, "request_id"),
+                workspace=_required_str(msg, "workspace"),
+                method=_required_str(msg, "method"),
+                request=base64.b64decode(_optional_nullable_str(msg, "request") or ""),
+            )
+        case HostFrameKind.WORKSPACE_REPLY:
+            message = _optional_nullable_str(msg, "message")
+            return HostWorkspaceReplyFrame(
+                request_id=_required_str(msg, "request_id"),
+                message=None if message is None else base64.b64decode(message),
+                done=_optional_bool(msg, "done"),
+                error_code=_optional_nullable_str(msg, "error_code"),
+                error_message=_optional_nullable_str(msg, "error_message"),
+            )
         case HostFrameKind.FS_WRITE_REQUEST:
             return _decode_fs_write_request(msg)
         case HostFrameKind.MODEL_OPTIONS:
@@ -2727,6 +2901,7 @@ def _decode_known_host_frame(
                 agent_version=_optional_nullable_str(msg, "agent_version"),
                 sub_agent_name=_optional_nullable_str(msg, "sub_agent_name"),
                 skills_filter=skills_filter,
+                workflows_enabled=msg.get("workflows_enabled") is True,
             )
         case HostFrameKind.SKILLS_RESULT:
             return _decode_skills_result(msg)
@@ -2829,6 +3004,8 @@ def _decode_host_hello(msg: _JsonObject) -> HostHelloFrame:
         installation_id=_optional_nullable_str(msg, "installation_id"),
         capabilities=_optional_str_list(msg, "capabilities"),
         connection_id=_optional_nullable_str(msg, "connection_id"),
+        workspace_socket=_optional_nullable_str(msg, "workspace_socket"),
+        workspace_token_key=_optional_nullable_str(msg, "workspace_token_key"),
     )
 
 
@@ -3192,6 +3369,35 @@ def _decode_create_dir_result(msg: _JsonObject) -> HostCreateDirResultFrame:
         status=_required_str(msg, "status"),
         path=_optional_nullable_str(msg, "path"),
         error=_optional_nullable_str(msg, "error"),
+    )
+
+
+def _decode_clone_repository(msg: _JsonObject) -> HostCloneRepositoryFrame:
+    """Decode a host.clone_repository request frame.
+
+    :param msg: Decoded frame object.
+    :returns: Typed host.clone_repository frame.
+    """
+    return HostCloneRepositoryFrame(
+        request_id=_required_str(msg, "request_id"),
+        url=_required_str(msg, "url"),
+        path=_required_str(msg, "path"),
+        branch=_optional_nullable_str(msg, "branch"),
+    )
+
+
+def _decode_clone_repository_result(msg: _JsonObject) -> HostCloneRepositoryResultFrame:
+    """Decode a host.clone_repository_result frame.
+
+    :param msg: Decoded frame object.
+    :returns: Typed host.clone_repository_result frame.
+    """
+    return HostCloneRepositoryResultFrame(
+        request_id=_required_str(msg, "request_id"),
+        status=_required_str(msg, "status"),
+        path=_optional_nullable_str(msg, "path"),
+        error=_optional_nullable_str(msg, "error"),
+        error_code=_optional_nullable_str(msg, "error_code"),
     )
 
 

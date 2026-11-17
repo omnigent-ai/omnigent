@@ -27,6 +27,7 @@ from omnigent.spec.types import (
 )
 from omnigent.tools import ToolManager
 from omnigent.tools.base import Tool, ToolContext
+from omnigent.tools.browser_agent_tools import ADVANCED_BROWSER_TOOL_NAMES
 from omnigent.tools.client_specified import ClientSideTool, ClientSideToolSpec
 from omnigent.tools.manager import _UCFunctionSchemaTool
 from omnigent.tools.mcp import clear_discovery_cache
@@ -87,12 +88,24 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         "sys_policy_registry",
         # Scheduled-task management tools are always auto-registered
         # so agents can create, list, update, and delete recurring
-        # runs without spec opt-in. They are runner-dispatched via
-        # the Omnigent server's REST API.
+        # runs, and set one-time reminders, without spec opt-in. They
+        # are runner-dispatched via the Omnigent server's REST API.
         "sys_scheduled_task_create",
         "sys_scheduled_task_list",
         "sys_scheduled_task_update",
         "sys_scheduled_task_delete",
+        "sys_reminder_set",
+        # The session journal's tools are always auto-registered so every
+        # agent can keep a plan, step statuses and notes, and ask about a
+        # task; runner-dispatched.
+        "sys_journal_read",
+        "sys_journal_write_note",
+        "sys_journal_write_plan",
+        "sys_journal_write_status",
+        "sys_workflow_request_input",
+        "sys_workflow_save",
+        "sys_workflow_load",
+        "sys_workflow_list",
         # Embedded-browser tools are always auto-registered (framework-
         # owned) so any agent can drive the desktop app's browser without
         # the spec opting in. Schema-only; runner-dispatched.
@@ -102,6 +115,7 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         "browser_type",
         "browser_screenshot",
     }
+    | ADVANCED_BROWSER_TOOL_NAMES
 )
 
 
@@ -1725,6 +1739,7 @@ _TOOL_GROUP_MEMBERS: dict[str, frozenset[str]] = {
             "sys_scheduled_task_list",
             "sys_scheduled_task_update",
             "sys_scheduled_task_delete",
+            "sys_reminder_set",
         }
     ),
     "comments": frozenset({"list_comments", "update_comment"}),
@@ -1771,7 +1786,7 @@ def test_tool_groups_all_false_keeps_the_load_bearing_tools() -> None:
     """
     names = _tool_names(_grouped_spec(**dict.fromkeys(_TOOL_GROUP_MEMBERS, False)))
     gated = frozenset().union(*_TOOL_GROUP_MEMBERS.values())
-    assert len(gated) == 20
+    assert len(gated) == 21
     assert not (gated & names)
     assert {
         "sys_session_list",

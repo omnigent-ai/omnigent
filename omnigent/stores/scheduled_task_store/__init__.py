@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import builtins
 import json
+import uuid
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -63,6 +65,20 @@ class AutomationFailure:
     error_code: str | None
 
 
+class ScheduledTaskFirstRunMismatchError(ValueError):
+    """A new task's first run would not fall at the time its creator required.
+
+    Raised by :meth:`ScheduledTaskStore.create` before anything is saved, for
+    example when a one-time reminder is created after its minute has passed and
+    its rule would next match a year later.
+    """
+
+    def __init__(self, expected: int, actual: int | None) -> None:
+        self.expected = expected
+        self.actual = actual
+        super().__init__(f"first run would be at {actual}, not {expected}")
+
+
 class ScheduledTaskStore(ABC):
     """
     Abstract base for scheduled-task persistence.
@@ -81,6 +97,41 @@ class ScheduledTaskStore(ABC):
         self.storage_location = storage_location
 
     # ── Scheduled tasks ──────────────────────────────────────────
+
+    def allocate_scheduled_task_id(self, *, user_id: str | None, name: str) -> str:
+        """
+        Return the ID for a task the create route is about to save with :meth:`create`.
+
+        Called in a worker thread before the task exists, since the ID labels the
+        task's source-session copy and derives its sandbox host IDs. If creation then
+        fails before the row is written, the route calls
+        :meth:`release_scheduled_task_id`. A deployment that allocates IDs in another
+        form, e.g. an external object's ID, must translate them for every ID column
+        itself: the SQL store keeps them as 16-byte UUIDs in ``scheduled_tasks.id``,
+        ``scheduled_task_runs.scheduled_task_id`` and
+        ``scheduled_task_shares.scheduled_task_id``. The runner's agent tools only
+        accept IDs matching ``[A-Za-z0-9_-]{1,128}``.
+
+        :param user_id: The task's owner; ``None`` in single-user mode.
+        :param name: The task's name, e.g. ``"nightly triage"``.
+        :returns: A new task ID; by default a bare 32-char hex UUID4.
+        """
+        del user_id, name
+        return uuid.uuid4().hex
+
+    def release_scheduled_task_id(self, scheduled_task_id: str) -> None:
+        """
+        Give back an ID from :meth:`allocate_scheduled_task_id` whose task was never saved.
+
+        Called in a worker thread at most once per ID, when :meth:`create` raised or
+        was never reached; never after it returned. A ``create`` that raises after its
+        commit succeeded (a dropped connection, say) leaves a saved task with the ID,
+        so a deployment should first check that no saved task has it. Best-effort: the
+        route logs what this raises and returns the original error. A no-op by default.
+
+        :param scheduled_task_id: The allocated ID.
+        """
+        del scheduled_task_id
 
     @abstractmethod
     def create(
@@ -108,11 +159,14 @@ class ScheduledTaskStore(ABC):
         execution_target: str = "connected_host",
         state: str = "active",
         delegation_ref: str | None = None,
+        first_run_at: int | None = None,
+        kind: str = "automation",
     ) -> ScheduledTask:
         """
         Insert a new scheduled task.
 
-        :param scheduled_task_id: Pre-generated unique task id (a UUID string).
+        :param scheduled_task_id: Unique task ID, e.g. from
+            :meth:`allocate_scheduled_task_id`.
         :param name: Human-readable task name.
         :param prompt: The instruction dispatched to the agent on each firing.
         :param rrule: The required RFC 5545 recurrence rule for the recurring
@@ -144,8 +198,16 @@ class ScheduledTaskStore(ABC):
             once a schedule has no remaining occurrences.
         :param delegation_ref: Names the authorization grant a deployment uses to
             act as the owner when the task fires; never a credential.
+        :param first_run_at: Epoch seconds the first run must fall at, checked
+            against the schedule computed from the task's recorded creation timestamp, in
+            the same write. ``None`` skips the check.
+        :param kind: ``"automation"`` (default), or ``"reminder"`` for a one-time
+            (``COUNT=1``) task that continues ``session_id``.
         :returns: The newly created :class:`ScheduledTask`.
-        :raises ValueError: If ``state`` is not a recognized value.
+        :raises ScheduledTaskFirstRunMismatchError: If ``first_run_at`` is set and
+            the first run differs; nothing is saved.
+        :raises ValueError: If ``state`` or ``kind`` is not a recognized value, or a
+            reminder's rule, session mode or session doesn't fit one.
         """
         ...
 
@@ -160,11 +222,17 @@ class ScheduledTaskStore(ABC):
         ...
 
     @abstractmethod
-    def list(self, *, owner_user_id: str | None = None) -> list[ScheduledTask]:
+    def list(
+        self,
+        *,
+        owner_user_id: str | None = None,
+        exclude_agent_ids: frozenset[str] = frozenset(),
+    ) -> list[ScheduledTask]:
         """
         List non-deleted scheduled tasks ordered by ``created_at ASC, id ASC``.
 
         :param owner_user_id: When given, return only tasks owned by this user.
+        :param exclude_agent_ids: Leave out tasks bound to these agents.
         :returns: List of :class:`ScheduledTask` instances.
         """
         ...
@@ -177,13 +245,30 @@ class ScheduledTaskStore(ABC):
         check_generation: bool = False,
         after: tuple[int, str] | None = None,
         limit: int = 50,
+        exclude_agent_ids: frozenset[str] = frozenset(),
     ) -> tuple[builtins.list[AutomationFailure], tuple[int, str] | None]:
         """Page owned tasks and return their latest failures without a session.
 
         The cursor advances over examined tasks, including healthy/deleted tasks,
         so an empty page can still have a continuation. Legacy stores return empty.
+        Tasks bound to ``exclude_agent_ids`` are left out.
         """
-        del owner_user_id, generation, check_generation, after, limit
+        del owner_user_id, generation, check_generation, after, limit, exclude_agent_ids
+        return [], None
+
+    def list_for_agent(
+        self, agent_id: str, *, after: str | None = None, limit: int = 100
+    ) -> tuple[builtins.list[ScheduledTask], str | None]:
+        """Page the non-deleted tasks bound to *agent_id*, across owners, by id.
+
+        :param agent_id: The agent, e.g. a built-in agent's fixed id.
+        :param after: Continue after this task id, from a previous page.
+        :param limit: Most tasks to examine, 1 to 500.
+        :returns: The page and the id to continue after, or ``None`` at the end.
+            The cursor advances over examined deleted tasks too, so a page can be
+            empty and still continue. Stores without an agent index return empty.
+        """
+        del agent_id, after, limit
         return [], None
 
     @abstractmethod
@@ -235,6 +320,7 @@ class ScheduledTaskStore(ABC):
         last_run_at: int | None = None,
         last_run_conversation_id: str | None = _UNSET,
         expected_schedule: ScheduledTask | None = None,
+        guard: Callable[[ScheduledTask], None] | None = None,
     ) -> ScheduledTask | None:
         """
         Update mutable fields of a task.
@@ -261,6 +347,10 @@ class ScheduledTaskStore(ABC):
         target, agent and MCP services read before validation. A mismatch raises
         a conflict before any changes are saved; callers must reload and
         revalidate before retrying.
+
+        ``guard`` is called with the task as locked for this update, before any
+        change. Whatever it raises aborts the update with nothing saved. It runs
+        while the task row is locked, so it should do bounded work.
 
         Returns ``None`` if the task does not exist.
 
@@ -359,6 +449,10 @@ class ScheduledTaskStore(ABC):
         :returns: The newly created :class:`ScheduledTaskRun`.
         """
         ...
+
+    def get_run(self, run_id: str) -> ScheduledTaskRun | None:
+        """Read one run by ID in the current workspace."""
+        raise NotImplementedError
 
     @abstractmethod
     def list_runs(

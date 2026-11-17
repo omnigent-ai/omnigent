@@ -181,16 +181,35 @@ def _cache_cost_row_labels(row: _PickerRow) -> set[str]:
     return labels
 
 
-def _cache_cost_confirmation(pane: str, label: str) -> bool:
+def _cache_cost_confirmation(pane: str, label: str, *, yes_selected: bool = True) -> bool:
     titles = list(_CACHE_COST_TITLE.finditer(pane))
     if len(titles) != 1:
         return False
+    choices = (
+        f"❯ 1. Yes, switch to {label} 2. No, go back"
+        if yes_selected
+        else f"1. Yes, switch to {label} ❯ 2. No, go back"
+    )
     return " ".join(pane[titles[0].end() :].split()) == (
         "Your next response will be slower and use more tokens "
         "This conversation is cached for the current model. "
         f"Switching to {label} means the full history gets re-read. "
-        f"❯ 1. Yes, switch to {label} 2. No, go back"
+        f"{choices}"
     )
+
+
+def _model_control_surface(pane: str) -> str | None:
+    """Recognize controls the person must dismiss before a held turn resumes."""
+    if _picker(pane) is not None:
+        return "the model picker"
+    if _status(pane) is not None:
+        return "the status view"
+    choice = re.search(r"(?m)^[ \t]*(❯[ \t]+)?1\. Yes, switch to (.+?)[ \t]*$", pane)
+    if choice is not None and _cache_cost_confirmation(
+        pane, choice[2], yes_selected=choice[1] is not None
+    ):
+        return "a model-switch confirmation"
+    return None
 
 
 def _draft(pane: str) -> str | None:
@@ -701,8 +720,15 @@ class SessionOnlyModelSwitch:
                         unsupported=True,
                     )
                 self.session, self.version = session, version
-                surface = self.bridge._occupying_surface(pane)
-                if surface in {self.bridge._SHELL_MODE_SURFACE, "the prompt-history search"}:
+                surface = _model_control_surface(pane)
+                if surface is None:
+                    occupying = self.bridge._occupying_surface(pane)
+                    if occupying in {
+                        self.bridge._SHELL_MODE_SURFACE,
+                        "the prompt-history search",
+                    }:
+                        surface = occupying
+                if surface is not None:
                     raise self.bridge.ClaudeInputBoxOccupied(
                         f"Claude Code's input box is occupied by {surface}, so the model "
                         "command was not sent. Open the terminal and dismiss it to resume.",

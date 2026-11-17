@@ -7,6 +7,7 @@ import logging
 import os
 import shlex
 import subprocess
+import threading
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
@@ -450,6 +451,113 @@ def test_update_conversation_id_returns_false_and_warns_when_no_state(
         record.levelno == logging.WARNING and "agy_conv_new" in record.getMessage()
         for record in caplog.records
     )
+
+
+def test_update_conversation_id_expect_placeholder_replaces_a_placeholder(
+    bridge_dir: Path,
+) -> None:
+    """With ``expect_placeholder`` an ``agy_conv_*`` placeholder is still replaced."""
+    write_bridge_state(
+        bridge_dir,
+        AntigravityNativeBridgeState(session_id="conv_test", conversation_id="agy_conv_seed"),
+    )
+    assert update_conversation_id(bridge_dir, "conv_agy_real", expect_placeholder=True) is True
+    state = read_bridge_state(bridge_dir)
+    assert state is not None
+    assert state.conversation_id == "conv_agy_real"
+
+
+def test_update_conversation_id_expect_placeholder_keeps_a_real_id(bridge_dir: Path) -> None:
+    """
+    With ``expect_placeholder`` a real id already in state is never replaced.
+
+    Guards the race between a cold-start and the reader's placeholder recovery:
+    the writer that loses must not clobber the other's live binding.
+    """
+    _seed_active_turn(bridge_dir, "turn_live")
+    assert update_conversation_id(bridge_dir, "conv_agy_other", expect_placeholder=True) is False
+    state = read_bridge_state(bridge_dir)
+    assert state is not None
+    assert state.conversation_id == "conv_agy_test"
+    assert state.active_turn_id == "turn_live"
+
+
+@pytest.mark.parametrize(
+    ("second_writer", "expected_results", "expected_conversation_id"),
+    [
+        pytest.param(
+            "update", {"first": True, "second": False}, "conv_agy_first", id="racing-update"
+        ),
+        pytest.param("recreate", {"first": True}, "agy_conv_relaunch", id="terminal-recreation"),
+    ],
+)
+def test_update_conversation_id_expect_placeholder_serializes_racing_writers(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    second_writer: str,
+    expected_results: dict[str, bool],
+    expected_conversation_id: str,
+) -> None:
+    """
+    A guarded update paused before its write holds off other bridge-state writers.
+    A second update waits and keeps the first's id; a terminal recreation waits,
+    then clears and reseeds, so its new placeholder survives.
+
+    Guards cold-start vs reader recovery, and a recovery worker that outlives its
+    cancelled reader: all are threads of one process.
+    """
+    write_bridge_state(
+        bridge_dir,
+        AntigravityNativeBridgeState(session_id="conv_test", conversation_id="agy_conv_seed"),
+    )
+    first_is_writing = threading.Event()
+    release_first = threading.Event()
+    original_write = _mod.write_bridge_state
+
+    def paused_write(path: Path, state: AntigravityNativeBridgeState) -> None:
+        if state.conversation_id == "conv_agy_first":
+            first_is_writing.set()
+            assert release_first.wait(5), "the first writer was never released"
+        original_write(path, state)
+
+    monkeypatch.setattr(_mod, "write_bridge_state", paused_write)
+    results: dict[str, bool] = {}
+
+    def write(name: str) -> None:
+        results[name] = update_conversation_id(
+            bridge_dir, f"conv_agy_{name}", expect_placeholder=True
+        )
+
+    def recreate_terminal() -> None:
+        clear_bridge_state(bridge_dir)
+        write_bridge_state(
+            bridge_dir,
+            AntigravityNativeBridgeState(
+                session_id="conv_test", conversation_id="agy_conv_relaunch"
+            ),
+        )
+
+    first = threading.Thread(target=write, args=("first",))
+    if second_writer == "update":
+        second = threading.Thread(target=write, args=("second",))
+    else:
+        second = threading.Thread(target=recreate_terminal)
+    try:
+        first.start()
+        assert first_is_writing.wait(5)
+        second.start()
+        second.join(0.3)
+        assert second.is_alive(), "the second writer must wait for the first to finish"
+    finally:
+        release_first.set()
+        first.join(5)
+        if second.ident is not None:
+            second.join(5)
+
+    assert results == expected_results
+    state = read_bridge_state(bridge_dir)
+    assert state is not None
+    assert state.conversation_id == expected_conversation_id
 
 
 # ---------------------------------------------------------------------------
@@ -997,31 +1105,45 @@ def test_inject_user_message_via_tui_raises_when_session_dies_before_submit(
         inject_user_message_via_tui(bridge_dir, content="draft message", timeout_s=0.5)
 
 
+@pytest.mark.parametrize("background_widget", [False, True])
 def test_inject_user_message_via_tui_raises_when_paste_never_renders(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     _fast_tmux_timeouts: None,
+    background_widget: bool,
 ) -> None:
     """A successful tmux paste command is not enough; the draft must render."""
     bridge_dir = tmp_path / "bridge"
     write_tmux_target(bridge_dir, socket_path=Path("/tmp/ex/tmux.sock"), tmux_target="main")
 
+    sep = "─" * 60
+    pane = f"draft message\n{sep}\n> \n{sep}"
+    if background_widget:
+        pane += f"\n  ● pytest running\n{sep}"
+    pane += "\n? for shortcuts"
+    enters: list[str] = []
+
     def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
         """Pane stays empty even after paste-buffer returns successfully."""
         del kwargs
+        if cmd[-1] == "Enter":
+            enters.append("Enter")
         if "capture-pane" in cmd:
-            return SimpleNamespace(returncode=0, stdout="> \n? for shortcuts", stderr="")
+            return SimpleNamespace(returncode=0, stdout=pane, stderr="")
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("subprocess.run", _fake_run)
     with pytest.raises(RuntimeError, match="did not render the pasted message"):
         inject_user_message_via_tui(bridge_dir, content="draft message", timeout_s=0.5)
+    assert not enters
 
 
+@pytest.mark.parametrize("wrapped_tail", [False, True])
 def test_inject_user_message_via_tui_raises_when_turn_never_starts(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     _fast_tmux_timeouts: None,
+    wrapped_tail: bool,
 ) -> None:
     """
     If no turn ever starts after the submit attempts, the delivery raises.
@@ -1032,7 +1154,21 @@ def test_inject_user_message_via_tui_raises_when_turn_never_starts(
     """
     bridge_dir = tmp_path / "bridge"
     write_tmux_target(bridge_dir, socket_path=Path("/tmp/ex/tmux.sock"), tmux_target="main")
-    tui = {"pane": "> \n? for shortcuts"}
+    sep = "─" * 60
+    footer = (
+        f"\n{sep}\n  ● pytest running\n{sep}\n? for shortcuts"
+        if wrapped_tail
+        else "\n? for shortcuts"
+    )
+    content = (
+        "Inspect these observations "
+        + "compare temperature and humidity " * 12
+        + "then summarize the final observations."
+        if wrapped_tail
+        else "draft message"
+    )
+    tui = {"pane": f"{sep}\n> {footer}"}
+    enters: list[str] = []
 
     def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
         """Pane never leaves idle — the submit never starts a turn."""
@@ -1040,12 +1176,20 @@ def test_inject_user_message_via_tui_raises_when_turn_never_starts(
         if "capture-pane" in cmd:
             return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
         if "paste-buffer" in cmd:
-            tui["pane"] = "> draft message\n? for shortcuts"
+            draft = (
+                "> then summarize the final\n  observations."
+                if wrapped_tail
+                else "> draft message"
+            )
+            tui["pane"] = f"{sep}\n{draft}{footer}"
+        if cmd[-1] == "Enter":
+            enters.append("Enter")
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("subprocess.run", _fake_run)
     with pytest.raises(RuntimeError, match="draft is still visible"):
-        inject_user_message_via_tui(bridge_dir, content="draft message", timeout_s=0.5)
+        inject_user_message_via_tui(bridge_dir, content=content, timeout_s=0.5)
+    assert enters
 
 
 def test_inject_user_message_via_tui_rejects_empty_content(tmp_path: Path) -> None:
@@ -1076,23 +1220,77 @@ def test_draft_in_input_region_detects_collapsed_paste_placeholder() -> None:
     assert not _mod._draft_in_input_region(submitted, "Find the current weather", baseline)
 
 
+_LONG_PASTE_CONTENT = "\n".join(
+    ["Find the current weather and inspect these observations"]
+    + [f"Observation {index}: compare temperature and humidity" for index in range(16)]
+    + ["Summarize the observations and finish the report"]
+)
+_LONG_PASTE_TAIL = _LONG_PASTE_CONTENT.splitlines()[-1]
+_PASTE_COMPOSERS = {
+    "ordinary": f"> {_LONG_PASTE_CONTENT.splitlines()[0]}",
+    "collapsed": "  [Pasted text #1 +18 lines]",
+    "scrolled": f"> ↑ 17 more lines\n  {_LONG_PASTE_TAIL}",
+    "wrapped-tail": f"> {_LONG_PASTE_TAIL[:14]}\n  {_LONG_PASTE_TAIL[14:]}",
+}
+
+
+def _paste_pane(composer: str, *, background_widget: bool, footer: str = "? for shortcuts") -> str:
+    """Render a composer below transcript history and above an optional task widget."""
+    sep = "─" * 60
+    pane = f"{sep}\n> previous prompt\n{sep}\n{composer}\n{sep}"
+    if background_widget:
+        pane += f"\n  ● pytest running\n{sep}"
+    return pane + "\n" + footer
+
+
+@pytest.mark.parametrize("draft_style", list(_PASTE_COMPOSERS))
+@pytest.mark.parametrize("background_widget", [False, True])
+def test_draft_in_input_region_detects_hidden_and_wrapped_pastes(
+    draft_style: str, background_widget: bool
+) -> None:
+    """Layout variants recognize a changed draft and reject unchanged or cleared regions."""
+    empty = _paste_pane("> ", background_widget=background_widget)
+    baseline = _mod._agy_input_region(empty)
+    rendered = _PASTE_COMPOSERS[draft_style]
+    pane = _paste_pane(rendered, background_widget=background_widget)
+    assert _mod._agy_input_region(pane) == rendered
+    needles = _mod._submit_needles(_LONG_PASTE_CONTENT)
+    extra_needles = tuple(needles[1:])
+    assert _mod._draft_in_input_region(pane, needles[0], baseline, extra_needles)
+    assert not _mod._draft_in_input_region(pane, needles[0], rendered, extra_needles)
+    assert not _mod._draft_in_input_region(empty, needles[0], baseline, extra_needles)
+    if draft_style == "wrapped-tail":
+        assert not _mod._draft_in_input_region(pane, needles[0], baseline)
+    elif draft_style == "ordinary":
+        assert _mod._draft_in_input_region(pane, needles[0], baseline)
+
+
+@pytest.mark.parametrize(("needle", "matches"), [("temperature", True), ("temperament", False)])
+def test_needle_matches_candidates_across_a_mid_word_wrap(needle: str, matches: bool) -> None:
+    assert _mod._needle_matches_candidates(needle, ["The tempe", "rature is stable"]) is matches
+
+
+@pytest.mark.parametrize(
+    ("draft_style", "background_widget"),
+    [
+        pytest.param("collapsed", True, id="collapsed-widget"),
+        pytest.param("wrapped-tail", False, id="wrapped-tail"),
+    ],
+)
 def test_inject_user_message_via_tui_submits_a_collapsed_paste(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     _fast_tmux_timeouts: None,
+    draft_style: str,
+    background_widget: bool,
 ) -> None:
-    """
-    A multi-line prompt agy collapses is still submitted, not reported as lost.
-
-    Reproduces the polly sub-agent dispatch: the task prompt is long enough that
-    agy shows only the placeholder, which previously failed the render gate and
-    raised "did not render the pasted message" while the draft sat in the
-    composer.
-    """
+    """Hidden or wrapped draft text submits once even above a background widget."""
     bridge_dir = tmp_path / "bridge"
     write_tmux_target(bridge_dir, socket_path=Path("/tmp/ex/tmux.sock"), tmux_target="main")
-    content = "\n".join(f"Find the current weather line {i}" for i in range(1, 19))
-    tui = {"pane": "> \n? for shortcuts"}
+    rendered = _paste_pane(_PASTE_COMPOSERS[draft_style], background_widget=background_widget)
+    submitted = _paste_pane("> ", background_widget=background_widget, footer="esc to cancel")
+    tui = {"pane": _paste_pane("> ", background_widget=background_widget)}
+    captures: list[str] = []
     enters = {"n": 0}
 
     def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
@@ -1101,18 +1299,21 @@ def test_inject_user_message_via_tui_submits_a_collapsed_paste(
         if "has-session" in cmd:
             return SimpleNamespace(returncode=0, stdout="", stderr="")
         if "capture-pane" in cmd:
+            captures.append(tui["pane"])
             return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
         if "paste-buffer" in cmd:
-            tui["pane"] = "> [Pasted text #1 +18 lines]\n? for shortcuts"
+            tui["pane"] = rendered
         if cmd[-1] == "Enter":
+            assert rendered in captures, "observe the rendered draft before Enter"
             enters["n"] += 1
-            tui["pane"] = "> \nesc to cancel"
+            tui["pane"] = submitted
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("subprocess.run", _fake_run)
-    inject_user_message_via_tui(bridge_dir, content=content, timeout_s=0.5)
+    inject_user_message_via_tui(bridge_dir, content=_LONG_PASTE_CONTENT, timeout_s=0.5)
 
-    assert enters["n"] == 1, "the collapsed draft should submit on the first Enter"
+    assert enters["n"] == 1, "the rendered draft should submit on the first Enter"
+    assert captures[-1] == submitted, "observe the consumed draft after Enter"
 
 
 # ---------------------------------------------------------------------------
@@ -2841,3 +3042,42 @@ def test_prune_orphaned_bridge_dirs_keeps_live_and_unmarked_bridges(
     assert not dead_dir.exists()
     assert live_dir.exists()
     assert unmarked_dir.exists()
+
+
+def test_submit_needles_for_long_single_paragraph() -> None:
+    """A long single-line paragraph yields both head and tail needles."""
+    content = (
+        "Here is a long prompt that tests how agy handles text when a single "
+        "long paragraph overflows the composer viewport and scrolls. "
+        "Some technical parameters and instructions are included to ensure "
+        "multiple chunks can be sampled across the entire prompt body."
+    )
+    needles = _mod._submit_needles(content)
+    assert len(needles) >= 2
+    assert needles[0] == "Here is a long prompt th"
+    assert needles[-1] == "the entire prompt body."
+    assert _mod._submit_needle(content) == needles[0]
+
+
+def test_draft_detected_when_single_long_paragraph_scrolled_with_more_lines() -> None:
+    """A single long paragraph whose start scrolled out behind '↑ 2 more lines' is detected."""
+    sep = "─" * 60
+    baseline = _mod._agy_input_region(f"{sep}\n>\n{sep}\n? for shortcuts")
+    content = (
+        "Here is a long prompt that tests how agy handles text when a single "
+        "long paragraph overflows the composer viewport and scrolls. "
+        "Some technical parameters and instructions are included to ensure "
+        "multiple chunks can be sampled across the entire prompt body."
+    )
+    needles = _mod._submit_needles(content)
+    pane = (
+        f"{sep}\n"
+        f"> ↑ 2 more lines\n"
+        f"  multiple chunks can be sampled\n"
+        f"{sep}\n"
+        f"Gemini 3.8 Flash · high"
+    )
+    region = _mod._agy_input_region(pane)
+    assert all(needle not in region for needle in needles)
+    assert _mod._draft_in_input_region(pane, needles[0], baseline, tuple(needles[1:]))
+    assert not _mod._draft_in_input_region(pane, needles[0], region, tuple(needles[1:]))

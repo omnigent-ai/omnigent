@@ -44,10 +44,15 @@ MCP independent creation.
   Neither side can override a disable on the other. Child messaging and already
   accepted work continue; session creation keeps its separate orchestration gate.
 - `create`: `sys_session_create` retains child creation by default; `same_host`
-  and `managed` placements create independent, initially private sessions.
+  and `managed` placements create independent, initially private sessions,
+  except that a shared automation's run shares them (see `scheduled`).
   An optional `permission_mode` starts the session in a mode of its harness;
   modes that skip approval are refused, and on a server that doesn't advertise
   `session_create_permission_modes` the tool refuses the call before creating anything.
+  An optional `workflow_id` (agent_id only) starts the session as a run of one
+  of the owner's saved workflows, with that workflow's plan already in its
+  journal. With workflows disabled, or on a server that doesn't advertise
+  `session_create_workflow_id`, the tool refuses it before creating anything.
   With `sibling_sessions` enabled they share one sidebar family and do not appear
   as child agents; with it disabled they remain standalone.
   Managed creation uses the server's configured default sandbox provider. A
@@ -61,7 +66,14 @@ MCP independent creation.
   `project_name`. Project defaults do not override the worker's agent or placement.
 - `destinations`: Settings → Admin → General → **Nested agent destinations** limits new
   agents to the current host, the current host or a fresh managed sandbox, or
-  any available host. The server enforces the same choice for the composer,
+  any available host. The Admin → General page itself appears whenever the
+  server offers nested agents or Omni Advisor; on an Advisor-only deploy it
+  carries the Advisor workspace switch and no destinations group. Settings →
+  Admin → General → **Omni Advisor** turns the agent off for the whole
+  workspace: every viewer's Settings → General → **Omni Advisor** switch then
+  shows off and locked with a note that an admin turned it off, and the Inbox
+  drops its Omni Advisor tab. Turning it back on restores each viewer's own
+  choice. The server enforces the same choice for the composer,
   uploaded custom agents, direct API calls, MCP, later host launches, and runner reassignment. Failed
   relaunches retain the prior host so restricted sessions can retry. Any available host is the
   behavior-preserving default. For a standalone session in another project, the policy
@@ -77,7 +89,14 @@ MCP independent creation.
   independent creates like any private session their owner owns, so an
   automation can message the owner's other sessions or start workers. The
   Automations page's Jira/Slack/GitHub trigger templates rely on this: their
-  kept session starts one worker per match (`docs/AUTOMATIONS.md`).
+  kept session starts one worker per match (`docs/AUTOMATIONS.md`). A worker
+  started from a run's session tree, or from a worker started that way, is
+  labeled `omnigent.scheduled_task_launch` with the automation and shared at
+  read access, before it starts, with the automation's current grantees who can
+  still see the session it was launched from; a fork of a run's session shares
+  nothing. Covered by
+  `tests/server/integration/test_session_orchestration.py::test_launches_from_a_run_tree_are_shared_with_the_automation_grantees`
+  and `tests/server/scheduled/test_run_sharing.py`.
 - `projects`: `sys_project_list` pages the owner's projects oldest first and
   their own sessions with each one's project, marking the calling session; a
   legacy label folder shows only as a session's project. It also forwards the
@@ -353,8 +372,8 @@ tests/server/integration/test_session_orchestration.py --reruns 0` checks the
   normal destination permissions and policy checks. The check and subsequent
   dispatch/save are not one atomic transaction. Unsharing does not erase history.
 - For peer messages, an explicit wrong-replica refusal permits a bounded re-address.
-  If the subsequent host lookup fails, the task was not delivered. A successful
-  lookup with no host may still attempt legacy keyless delivery; uncertainty on
+  A failed or hostless lookup permits one legacy keyless delivery attempt.
+  Only its final outcome determines delivery; uncertainty on
   that POST remains uncertain. Timeouts,
   other refusals and unparseable delivery acknowledgements are never retried.
 - Scheduled origin is recorded before launch, cannot be edited by clients, and

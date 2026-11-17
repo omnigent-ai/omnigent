@@ -776,8 +776,12 @@ function SideChatComposer({
     if (!autoFocus || !ready) return;
     // The user may already be typing elsewhere, e.g. during a slow fork before
     // this pane mounted; leave that field alone and just drop the request.
-    if (!isOtherTextInput(document.activeElement, tailTextareaRef.current)) {
-      tailTextareaRef.current?.focus();
+    const input = tailTextareaRef.current;
+    const active = document.activeElement;
+    if (input && active !== input && !isOtherTextInput(active, input)) {
+      input.focus();
+      // Continue a restored draft from its end, not before its first word.
+      input.setSelectionRange(input.value.length, input.value.length);
     }
     dropFocusRequest();
   }, [autoFocus, ready, dropFocusRequest]);

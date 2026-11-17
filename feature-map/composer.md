@@ -25,7 +25,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   **Copy message to new session** opens it with a one-time `?handoff=` token
   instead, naming an in-memory copy of the message's text and attachments. That
   copy replaces the whole parked draft, even with no text or no attachments; the
-  token leaves the URL and is released once the composer takes it.
+  token leaves the URL and is released once the composer takes it. An agent
+  suggestion's action button in the Inbox uses the same handoff with the action's
+  prompt, so the viewer edits and sends it.
 - `offline-hosts`: the new-session host picker keeps other offline hosts collapsed,
   revealing five at a time in server recency order in a scrollable list. The selected
   offline host and desktop reconnect action stay visible. Closing the menu resets it.
@@ -76,7 +78,10 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 - `project-session-defaults`: Project settings store a default agent and, for
   Claude Code, Codex, and Pi, a default model and reasoning effort; the
   new-session composer opened in that project (`/?project=<name>`) starts with
-  them. The Fork dialog and CLI, API, and scheduled creates don't apply model
+  them. A project created with a repository seeds its sandbox provider and
+  repository into a sandbox pick, and a managed create without those fields takes
+  them from the project. A malformed saved repository (for example a legacy bare
+  string) is ignored. The Fork dialog and CLI, API, and scheduled creates don't apply model
   or effort. States: no default, a Codex
   effort the pinned model lacks (or, with no project model, the remembered
   model lacks), an explicit composer pick, remembered Smart Routing, another
@@ -146,6 +151,44 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   harness as text. A claude-sdk `/clear` continues in a new, empty session on
   the same machine and the view follows it. States: loading, error/retry,
   unavailable while disconnected, and an incomplete catalog.
+- `goal-command`: in sessions with a Goal control, bare `/goal` or its slash-menu
+  row opens the same dialog as **+ → Goal**. `/goal <objective>` keeps its
+  existing message path. Sessions without the control keep sending the text
+  or invoking a same-named skill. States: no goal, existing goal, read-only.
+  Drafts with attachments are sent as ordinary messages and do not set a goal.
+  Leading `/goal` takes precedence over a same-named slash skill; inline goal
+  skills and Codex native `$goal` skills remain available. For plain-text drafts
+  without quotes, mentions or review comments, mixed-case and newline-separated
+  goal commands use the same canonical message path. Drafts carrying that
+  context retain their existing handling.
+  In Codex native Chat, the goal indicator follows commands and native goal
+  changes without reopening the dialog. Sending an objective or resuming native
+  activity promptly retries the goal while setup finishes. Automatic refresh
+  runs while the runner is online and Chat is visible, without starting an idle
+  native session. Failed or unavailable reads keep the last goal and slow down
+  refreshes; returning to the tab retries immediately. Confirmed deletion clears
+  the indicator. Opening the dialog shows read errors, and goal creation and
+  editing remain available while runner status is offline or unknown.
+  Refreshes preserve edited dialog fields while untouched fields follow current
+  goal state. Reopening or switching sessions discards old drafts, including when
+  the opening read fails. Earlier reads and updates cannot replace another
+  session's goal fields. Reconnecting retains this session's last goal, edited
+  fields and operation errors in the same open dialog. A fresh goal response
+  releases opening-read loading even if an earlier read is still pending.
+  A pending Save, Clear, Pause or Resume stays busy after closing and reopening
+  the same session until the request and its refresh attempt finish. An
+  acknowledged Clear removes the indicator even if the dialog was closed and
+  the next refresh fails. Other sessions remain independently editable.
+  A timed-out update may already have taken effect; refresh the goal before
+  retrying.
+  Older runner versions may leave the indicator stale after clearing a goal
+  in the native terminal, or show a read error when no goal exists. Inspect the
+  native goal, then update and reconnect the session's owning runner on its
+  existing host/workspace binding and refresh. Repeating refresh against the
+  same older runner cannot resolve this ambiguity. With older servers, an
+  unavailable session can also appear to have no goal. See the
+  [Goal API compatibility notes](../omnigent/server/codex-API.md) for version
+  requirements.
 - `slash-rewind`: in claude-sdk and Claude Code native sessions, `/rewind` opens
   a searchable list of the session's prompts, newest first. Choosing one
   continues the conversation in a new session holding only the history before
@@ -321,6 +364,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 
 ## How to get to it (user POV)
 
+- In a Codex native chat or a Polly session with a Goal control, send `/goal`,
+  choose `/goal` from the slash menu, or open **+ → Goal**.
+
 **In-session composer** (open any session):
 
 - Hover the model/effort pill to see the tooltip; click it to open configuration.
@@ -414,6 +460,11 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   deployment stays under its mount path. Browser proof:
   `tests/browser_ui/chat/test_prompt_url.py`; router and draft edge cases:
   `web/src/shell/NewChatDialog.test.tsx` (`prompt URL handoff`).
+- From the Inbox, expand an Omni Advisor suggestion and click one of its action
+  buttons. The New Chat composer opens with the action's prompt as an editable
+  draft, through the same one-time handoff token; nothing is sent until Send.
+  Component proof: `web/src/pages/InboxPage.test.tsx` (`takes an agent action
+  and opens the composer with its prompt`).
 
 - In the managed desktop app, choose **Arclet Sandbox** and submit a task with
   missing or expired laptop credentials. Click **Refresh dbcert** in the yellow
@@ -553,6 +604,13 @@ Other connection providers alone do not enable the managed MCP picker.
   uses the built SPA with mocked APIs (no server required), comparing touch and
   mouse input at phone, tablet, and desktop widths.
 
+- **`prompt-link`, Inbox action handoff:** with an Omni Advisor suggestion in
+  the Inbox, expand it and click an action. The New Chat composer should open
+  with the action's prompt filled in and editable, the handoff token gone from
+  the URL, and no session created until Send. Component coverage:
+  `web/src/pages/InboxPage.test.tsx` (`takes an agent action and opens the
+  composer with its prompt`).
+
 - **`blocked-start`:** on a fresh new-session page with no working directory,
   enter a prompt or attach a file. Hover disabled Start, click it, then move
   away: its tooltip should stay visible. Check dismissal by outside click,
@@ -608,6 +666,16 @@ Other connection providers alone do not enable the managed MCP picker.
   reply once, with no model-change error. Requires Claude Code and tmux. Use
   a clean container when machine-managed Claude settings override the mock
   endpoint; this does not establish live gateway compatibility.
+- **`model-picker`, paused Pi after server restart (own environment):**
+  Start a Pi session on a host with a configured local catalog, pause the
+  session, restart only the server, and reload the session. Open the model
+  picker through the gear, model pill, and Ctrl+Shift+M; the host models must
+  appear while the runner remains offline. Repeat for a sub-agent that inherits
+  its host from an ancestor. The component scenario
+  `tests/server/routes/test_sessions_snapshot.py::test_session_snapshot_fills_cold_pi_catalog_from_host`
+  covers direct and inherited hosts, concurrent reads and refresh publication.
+  Direct-host browser evidence is in the PR Demo; inherited-host browser and
+  live-provider resume checks remain manual gaps.
 - **`model-picker`, row hover (both composers):** no browser-level coverage;
   `web/src/lib/composerModelLabel.test.ts`. Manually: hover a row labeled with
   a family name and expect its full model ID; the Fusion row shows none.
@@ -762,6 +830,26 @@ Other connection providers alone do not enable the managed MCP picker.
   incomplete catalog:
   `tests/e2e_ui/chat/test_codex_skills_menu_inventory_failure.py::test_failed_plugin_inventory_is_not_shown_as_an_empty_catalog`.
   claude-sdk `/clear` is in the `/clear` and `slash-rewind` recipe above.
+- **`goal-command`:**
+  `tests/e2e_ui/chat/test_codex_goal_mode.py::test_codex_goal_mode_processes_first_message_with_untrusted_hooks`
+  drives a real Codex native session through **+ → Goal**, bare `/goal`, and
+  the slash-menu row. Component coverage in `web/src/pages/ChatPage.composer.test.tsx`
+  also checks Polly's command-backed dialog, full objective forwarding, and
+  same-named skills when Goal is unavailable. New-session and side-chat
+  composers do not expose this session Goal dialog.
+  `web/src/components/goal/useGoalState.test.tsx` covers external goal changes,
+  session switches, and polling races; `GoalDialog.test.tsx` in that directory
+  covers preserving drafts during background updates. Manually, in a started
+  Codex native Chat, send `/goal <objective>` while idle and during work. The
+  goal indicator should appear within a few seconds without reopening controls.
+  Open Goal, change the objective, budget, and mode, and wait ten seconds:
+  the unsaved edits should remain. Pause or resume the goal and confirm the
+  indicator follows its status; then delete the test goal. During a temporary
+  goal-read failure, the indicator should remain. Restore connectivity and
+  return to the tab to confirm it refreshes without reopening Goal.
+  If goal setup times out or loses its reply, the goal may already have been
+  saved even though the objective message was not delivered. Inspect Goal
+  before resending: another `/goal <objective>` sets that objective again.
 - **`session-mcp-status`, in-session composer:** component coverage lives in
   `web/src/pages/ChatPage.composer.test.tsx`. Manually open a started session,
   select `/mcp`, and expect the effective MCP names and descriptions under

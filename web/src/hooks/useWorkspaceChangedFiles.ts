@@ -114,6 +114,8 @@ export interface WorkspaceChangedFile {
   lines_added: number | null;
   /** Lines removed, or null when unknown. */
   lines_removed: number | null;
+  /** An untracked file's own lines; absent from runners that don't count them. */
+  untracked_lines?: number | null;
 }
 
 export interface WorkspaceChangedFilesResult {
@@ -246,6 +248,7 @@ interface ChangedFilesResponse {
     modified_at: number | null;
     lines_added: number | null;
     lines_removed: number | null;
+    untracked_lines?: number | null;
   }[];
   has_more: boolean;
 }
@@ -291,6 +294,7 @@ async function fetchWorkspaceChangedFiles(
     modified_at: e.modified_at,
     lines_added: e.lines_added ?? null,
     lines_removed: e.lines_removed ?? null,
+    untracked_lines: e.untracked_lines ?? null,
   }));
   return { available: true, data };
 }
@@ -566,6 +570,13 @@ export interface WorkspaceFileSearchResult {
    * definitive "no match".
    */
   truncated: boolean;
+  /** True when the server returned its full result limit, so more matches may exist. */
+  hasMore: boolean;
+  /**
+   * True when the workspace couldn't be searched (no OS environment, or the runner
+   * is unavailable). `files` is then empty, which doesn't mean nothing matched.
+   */
+  unavailable: boolean;
 }
 
 async function fetchWorkspaceFileSearch(
@@ -590,11 +601,17 @@ async function fetchWorkspaceFileSearch(
   // 404 means the runner has no OS environment for this session (cloud-only
   // agent).  Mirror the behaviour of useWorkspaceAllFiles: return empty
   // results rather than surfacing an error.
-  if (res.status === 404) return { files: [], truncated: false };
-  if (await isRunnerUnavailable503(res)) return { files: [], truncated: false };
+  const unavailable = { files: [], truncated: false, hasMore: false, unavailable: true };
+  if (res.status === 404) return unavailable;
+  if (await isRunnerUnavailable503(res)) return unavailable;
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   const json = (await res.json()) as FilesystemListResponse;
-  return { files: mapFilesystemEntries(json, location), truncated: !!json.truncated };
+  return {
+    files: mapFilesystemEntries(json, location),
+    truncated: !!json.truncated,
+    hasMore: !!json.has_more,
+    unavailable: false,
+  };
 }
 
 /**

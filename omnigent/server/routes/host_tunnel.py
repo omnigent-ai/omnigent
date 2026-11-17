@@ -39,6 +39,7 @@ from omnigent.host.frames import (
     IMPORT_SESSION_MAX_CONNECTION_REASSEMBLED_CHARS,
     SERVER_CAPABILITIES,
     SERVER_CAPABILITIES_HEADER,
+    HostCloneRepositoryResultFrame,
     HostConnectionErrorFrame,
     HostCreateDirResultFrame,
     HostCreateWorktreeResultFrame,
@@ -74,6 +75,7 @@ from omnigent.host.frames import (
     HostStatResultFrame,
     HostStopRunnerResultFrame,
     HostStoreSecretResultFrame,
+    HostWorkspaceReplyFrame,
     ImportLocalSessionChunkAssembler,
     decode_host_frame,
     encode_host_frame,
@@ -92,6 +94,7 @@ from omnigent.server.host_registry import (
     HostConnection,
     HostRegistry,
     RunnerExitReports,
+    deliver_workspace_reply,
     update_harness_accounts,
 )
 from omnigent.server.tunnel_handshake import receive_tunnel_hello
@@ -1046,6 +1049,19 @@ async def _receive_loop(
                 )
             continue
 
+        if isinstance(frame, HostCloneRepositoryResultFrame):
+            clone_future = conn.pending_clones.pop(frame.request_id, None)
+            if clone_future is not None and not clone_future.done():
+                clone_future.set_result(
+                    {
+                        "status": frame.status,
+                        "path": frame.path,
+                        "error": frame.error,
+                        "error_code": frame.error_code,
+                    }
+                )
+            continue
+
         if isinstance(frame, HostInstallHarnessResultFrame):
             install_future = conn.pending_installs.pop(frame.request_id, None)
             if install_future is not None and not install_future.done():
@@ -1175,6 +1191,10 @@ async def _receive_loop(
             detect_future = conn.pending_credential_detects.pop(frame.request_id, None)
             if detect_future is not None and not detect_future.done():
                 detect_future.set_result({"credentials": frame.credentials})
+            continue
+
+        if isinstance(frame, HostWorkspaceReplyFrame):
+            deliver_workspace_reply(conn, frame)
             continue
 
         if isinstance(frame, HostFsResultFrame):

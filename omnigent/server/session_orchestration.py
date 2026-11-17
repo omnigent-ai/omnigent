@@ -20,6 +20,7 @@ from omnigent.stores.conversation_store import (
     ConversationStore,
 )
 from omnigent.stores.permission_store import PermissionStore
+from omnigent.tools.builtins.session_message import SESSION_MESSAGE_MAX_CHARS
 from omnigent.util.session_lifecycle import is_session_closed
 
 
@@ -187,8 +188,15 @@ def require_orchestration_source(
 
 def orchestration_message(source_id: str, message: object) -> SessionStartupInput:
     """Build a text-only task with a display label, not proof of message origin."""
-    if not isinstance(message, str) or not message.strip() or len(message) > 8000:
-        raise OmnigentError("Provide a message of 1–8000 characters", code=ErrorCode.INVALID_INPUT)
+    if (
+        not isinstance(message, str)
+        or not message.strip()
+        or len(message) > SESSION_MESSAGE_MAX_CHARS
+    ):
+        raise OmnigentError(
+            f"Provide a message of 1–{SESSION_MESSAGE_MAX_CHARS} characters",
+            code=ErrorCode.INVALID_INPUT,
+        )
     return SessionStartupInput(
         type="message",
         data={

@@ -1,5 +1,11 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { MESSAGE_QUERY_PARAM, buildMessageDeepLink, findMessageElement } from "./messageDeepLink";
+import {
+  MESSAGE_QUERY_PARAM,
+  MESSAGE_REQUEST_PARAM,
+  buildMessageDeepLink,
+  findMessageElement,
+  messageDeepLinkParams,
+} from "./messageDeepLink";
 
 afterEach(() => {
   document.body.innerHTML = "";
@@ -29,5 +35,19 @@ describe("findMessageElement", () => {
     document.body.innerHTML = `<div data-message-id="m1">hi</div>`;
     expect(findMessageElement("m1")?.textContent).toBe("hi");
     expect(findMessageElement("missing")).toBeNull();
+  });
+});
+
+describe("messageDeepLinkParams", () => {
+  it("names the message and marks each request, so asking again scrolls again", () => {
+    const first = messageDeepLinkParams(new URLSearchParams("panel=tasks"), "journal-e2");
+    expect(first.get(MESSAGE_QUERY_PARAM)).toBe("journal-e2");
+    expect(first.get("panel")).toBe("tasks");
+    expect(first.get(MESSAGE_REQUEST_PARAM)).toMatch(/^\d+$/);
+  });
+
+  it("finds the newest of several markers with one ID", () => {
+    document.body.innerHTML = `<div data-message-id="todo-7-started">old</div><div data-message-id="todo-7-started">new</div>`;
+    expect(findMessageElement("todo-7-started")?.textContent).toBe("new");
   });
 });

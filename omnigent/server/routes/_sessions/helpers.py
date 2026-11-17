@@ -95,6 +95,7 @@ from omnigent.native.native_coding_agents import (
     native_coding_agent_for_harness,
     native_coding_agent_for_wrapper_label,
 )
+from omnigent.native.permission_modes import PERMISSION_LAUNCH_ARGS
 from omnigent.native.session_todos import validate_session_todos
 from omnigent.policies.types import EvaluationContext
 from omnigent.runner.identity import (
@@ -133,6 +134,7 @@ from omnigent.server.host_registry import (
     HostRegistry,
     RunnerExitReports,
 )
+from omnigent.server.journal_markers import record_todo_markers
 from omnigent.server.managed_hosts import (
     MANAGED_SANDBOX_LABEL_NAMESPACE,
     ManagedHostLaunch,
@@ -2093,10 +2095,10 @@ def _resolve_harness_impl(
             return None
         if agent_cache is None:
             agent_cache = get_agent_cache()
-        loaded = agent_cache.load(
+        spec = agent_cache.load_spec(
             agent.id, agent.bundle_location, expand_env=agent.operator_authored
         )
-        executor = loaded.spec.executor
+        executor = spec.executor
         # For a bundled-agent head sub-agent, report the HEAD's own harness,
         # not the bundle brain's — `harness` is this session's provider family
         # (a gpt head runs codex, not the claude-sdk brain). Falls back to the
@@ -2104,13 +2106,11 @@ def _resolve_harness_impl(
         if conv.sub_agent_name:
             from omnigent.runtime.workflow import _find_spec_by_name
 
-            sub = _find_spec_by_name(loaded.spec, conv.sub_agent_name)
+            sub = _find_spec_by_name(spec, conv.sub_agent_name)
             if sub is not None:
                 executor = sub.executor
         harness = (
-            executor.config.get("harness")
-            or loaded.spec.executor.config.get("harness")
-            or executor.type
+            executor.config.get("harness") or spec.executor.config.get("harness") or executor.type
         )
         return canonicalize_harness(harness) or harness
     # UUID bind failures are wrapped by SQLAlchemy; do not hide broader DB errors.
@@ -2655,7 +2655,7 @@ def _persist_external_model_options(
     Stores into :data:`_pushed_model_options_cache` (which a browser reload
     does NOT clear — the extension only pushes on session start) and publishes
     ``session.model_options`` so open clients re-read the snapshot. An empty
-    list evicts the entry rather than caching nothing.
+    list is cached as an authoritative clear so host recovery cannot refill it.
 
     :param session_id: Session/conversation identifier, e.g.
         ``"conv_abc123"``.
@@ -2691,10 +2691,7 @@ def _persist_external_model_options(
                 "isDefault": bool(raw.get("isDefault", False)) if isinstance(raw, dict) else False,
             }
         )
-    if options:
-        _pushed_model_options_cache[session_id] = options
-    else:
-        _pushed_model_options_cache.pop(session_id, None)
+    _pushed_model_options_cache[session_id] = options
     _publish_model_options(session_id)
 
 
@@ -3225,6 +3222,9 @@ async def _handle_external_session_todos(
     )
     if not persisted:
         return
+    await record_todo_markers(
+        conversation_store, session_id, persisted.previous, validated, update_id=persisted.id
+    )
     event = SessionTodosEvent(
         type="session.todos",
         conversation_id=session_id,
@@ -5044,8 +5044,18 @@ def _publish_child_status_to_parent(session_id: str, status: str) -> None:
     if store is None:
         return
 
+    handoffs = session_live_state.handoff_count(session_id)
+
     def _fan_out() -> None:
         conv = store.get_conversation(session_id)
+        if store is not session_live_state.conversation_store():
+            return
+        session_live_state.record_child_status(
+            session_id,
+            conv.parent_conversation_id if conv else None,
+            _session_status_cache.get(session_id),
+            handoffs=handoffs,
+        )
         if conv is None or conv.parent_conversation_id is None:
             return
         parent_id = conv.parent_conversation_id
@@ -5220,6 +5230,10 @@ def _publish_status(
         return
     previous_status = _session_status_cache.get(session_id)
     _session_status_cache[session_id] = status
+    if status not in ("running", "waiting"):
+        session_live_state.record_child_status(
+            session_id, None, status, handoffs=session_live_state.handoff_count(session_id)
+        )
     _set_blocked_on(session_id, blocked_on)
     # Only a ``waiting`` edge names background agents; any other edge ends that wait.
     if status != "waiting":
@@ -5257,7 +5271,9 @@ def _publish_status(
             error="runner disappeared before the turn reached a terminal state",
         )
     elif status == "idle":
-        session_live_state.persist_scheduled_run_completion(session_id, "succeeded")
+        session_live_state.persist_scheduled_run_completion(
+            session_id, "succeeded", turn_completed=turn_completed
+        )
     elif status == "failed":
         # Canonical server-side broken-turn signal: every server-originated
         # failed turn (runner disconnect mid-turn, setup/dispatch failure,
@@ -8517,6 +8533,8 @@ async def _dispatch_skill_slash_command_to_runner(
         conversation_store,
     )
 
+    from omnigent.tools.browser_agent_tools import browser_agent_tools_turn_flag
+
     runner_body: dict[str, Any] = {
         "type": "message",
         "role": "user",
@@ -8528,6 +8546,7 @@ async def _dispatch_skill_slash_command_to_runner(
         # Live-renderer hint: the runner drops ``browser_*`` schemas for
         # the turn when no renderer is subscribed to the session stream.
         "browser_renderer_available": session_stream.has_subscribers(session_id),
+        **browser_agent_tools_turn_flag(conv.labels),
         # The forwarded message carries ``meta_content`` — i.e. the
         # META item (persisted_items[1]), not the user-visible item.
         # Hand the runner that id so a cold-cache reload drops the
@@ -10981,7 +11000,12 @@ def _derive_terminal_launch_args_from_spec(
       is the real boundary, matching claude-native's ``bypassPermissions``
       and the codex-sdk executor's ``approvalPolicy="never"``). An explicit
       ``executor.config.yolo: false`` opts back out for a read-only / must
-      -keep-prompting sub-agent. See issue #171.
+      -keep-prompting sub-agent. See issue #171. An
+      ``executor.config.permission_mode`` naming a codex-native mode in
+      :data:`~omnigent.native.permission_modes.PERMISSION_LAUNCH_ARGS`
+      (e.g. ``approve-for-me``) maps to that mode's args instead and takes
+      precedence over ``yolo`` and the headless default; ``default`` leaves
+      args unset. ``bypass`` is not mapped here; use ``yolo: true``.
     - cursor-native -> ``["--yolo"]`` by DEFAULT. Headless cursor workers
       otherwise stall on cursor-agent's in-terminal approval prompts (also
       mirrored as web elicitation cards). ``--yolo`` is cursor-agent's
@@ -11006,7 +11030,8 @@ def _derive_terminal_launch_args_from_spec(
     verbatim pass-through and the runner's exact ``bypassPermissions``
     comparison (``should_skip_permissions`` in
     :mod:`omnigent.harnesses.antigravity_native.launch`). A present-but-unrecognized
-    value logs at debug and leaves args unset.
+    value logs at debug and leaves args unset, except codex-native, which
+    falls back to its ``yolo`` / headless default.
 
     Only those native harnesses are translated; for any other harness
     (e.g. ``claude-sdk`` / ``cursor``, whose bypass is set via the SDK
@@ -11051,6 +11076,17 @@ def _derive_terminal_launch_args_from_spec(
         # approval/sandbox). Without the flag the thread is created at
         # codex's on-request + own-sandbox default and a headless worker
         # stalls. An explicit ``yolo: false`` is the opt-out. See #171.
+        # An explicit permission_mode, the harness default included, wins.
+        mode = spec.executor.config.get("permission_mode")
+        codex_modes = PERMISSION_LAUNCH_ARGS[_CODEX_NATIVE_HARNESS]
+        if isinstance(mode, str) and mode in codex_modes and mode != "bypass":
+            return _validate_terminal_launch_args(list(codex_modes[mode]) or None)
+        if mode is not None:
+            _logger.debug(
+                "codex-native spec has unsupported permission_mode=%r; "
+                "falling back to the yolo / headless default.",
+                mode,
+            )
         if _spec_config_flag_explicitly_disabled(spec, "yolo"):
             return None
         if not headless_defaults and not _spec_config_flag_explicitly_enabled(spec, "yolo"):
@@ -11206,7 +11242,9 @@ def _reject_reserved_cost_control_label_seed(labels: dict[str, str]) -> None:
         )
 
 
-def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
+def _reject_server_reserved_label_seed(
+    labels: dict[str, str] | None, *, at_creation: bool = False
+) -> None:
     """
     Reject a client-supplied label map that touches server-internal keys.
 
@@ -11215,6 +11253,9 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
     critical metadata (e.g. the policy-evaluation actor identity).
 
     :param labels: The client-supplied label mapping, or ``None``.
+    :param at_creation: Whether a session is being created, when a continuation
+        (a native ``/clear`` replacement) may carry its predecessor's browser-tool
+        label.
     :raises OmnigentError: 400 when any reserved key is present.
     """
     if not labels:
@@ -11236,7 +11277,12 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
     from omnigent.stores.conversation_store import (
         CREATED_BY_SESSION_LABEL_KEY,
         FAMILY_PIN_LABEL_PREFIX,
+        SCHEDULED_TASK_ACTIVITY_LABEL_KEY,
+        SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY,
+        SCHEDULED_TASK_LAUNCH_LABEL_KEY,
         SCHEDULED_TASK_ORIGIN_LABEL_KEY,
+        SCHEDULED_TASK_PENDING_RUN_LABEL_PREFIX,
+        SCHEDULED_TASK_RUN_LABEL_KEY,
         SCHEDULED_TASK_SOURCE_LABEL_KEY,
         SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY,
         SIDE_CHAT_SOURCE_LABEL_KEY,
@@ -11244,11 +11290,20 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
 
     if any(key.startswith(FAMILY_PIN_LABEL_PREFIX) for key in labels):
         raise OmnigentError("Family pins are server-owned", code=ErrorCode.INVALID_INPUT)
+    if any(key.startswith(SCHEDULED_TASK_PENDING_RUN_LABEL_PREFIX) for key in labels):
+        raise OmnigentError(
+            "Scheduled run labels are server-internal", code=ErrorCode.INVALID_INPUT
+        )
     for key in (
         SCHEDULED_TASK_ORIGIN_LABEL_KEY,
+        SCHEDULED_TASK_RUN_LABEL_KEY,
+        SCHEDULED_TASK_ACTIVITY_LABEL_KEY,
+        SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY,
         # Deleting a session also deletes the automation this label names.
         SCHEDULED_TASK_SOURCE_LABEL_KEY,
         SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY,
+        # Launches from a session carrying it are shared with that automation's grantees.
+        SCHEDULED_TASK_LAUNCH_LABEL_KEY,
         CREATED_BY_SESSION_LABEL_KEY,
     ):
         if key in labels:
@@ -11272,6 +11327,18 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
     if _TURN_ACTOR_LABEL in labels:
         raise OmnigentError(
             f"label {_TURN_ACTOR_LABEL!r} is server-internal and cannot be set by clients",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    # The browser-tool mode is fixed at creation: from the app's header, or the
+    # label a continuation copies from its source.
+    from omnigent.tools.browser_agent_tools import BROWSER_AGENT_TOOLS_CREATION_LABEL_KEYS
+
+    if not at_creation and (
+        reserved := sorted(BROWSER_AGENT_TOOLS_CREATION_LABEL_KEYS & labels.keys())
+    ):
+        raise OmnigentError(
+            f"label {reserved[0]!r} is set only when a session is created"
+            " and cannot be set by clients",
             code=ErrorCode.INVALID_INPUT,
         )
     # The archive timestamp is stamped by the server on the archive transition
@@ -11837,9 +11904,10 @@ def _child_session_summary_from_conversation(
         child-message lookup, or ``None`` when no visible message exists.
     :param cached_status: Session status to derive ``busy`` /
         ``current_task_status`` from, e.g. ``"running"``. ``None`` reads the
-        live ``_session_status_cache``; a status-edge publisher passes the
-        edge's own value so a burst of transitions fans out one summary per
-        edge instead of the latest status repeated.
+        live ``_session_status_cache``, then the row's ``live_status``; a
+        status-edge publisher passes the edge's own value so a burst of
+        transitions fans out one summary per edge instead of the latest status
+        repeated.
     :returns: A populated :class:`ChildSessionSummary`.
     """
     display_title = title_without_closed_marker(conv.title)
@@ -11886,9 +11954,12 @@ def _child_session_summary_from_conversation(
         tool = display_title or None
         session_name = None
 
-    # Derive busy from the relay-fed cache; tasks table is gone.
+    # Derive busy from the relay-fed cache, falling back to the persisted row
+    # status on a replica without the runner's tunnel.
     if cached_status is None:
         cached_status = _session_status_cache.get(conv.id)
+    if cached_status is None:
+        cached_status = conv.live_status
     if cached_status in ("running", "waiting"):
         busy = True
     else:
@@ -12766,15 +12837,18 @@ def prefetch_session_routing_catalogs(
     task.add_done_callback(_catalog_prefetch_tasks.discard)
 
 
-async def _host_model_options_via_registry(host_id: str) -> list[dict[str, Any]] | None:
+async def _host_model_options_via_registry(
+    host_id: str, harness: str = "claude-native"
+) -> list[dict[str, Any]] | None:
     """
-    Resolve a host's pre-launch claude catalog over its live tunnel.
+    Resolve a host's pre-launch catalog for *harness* over its live tunnel.
 
     Session-side reuse of the new-session picker's source
     (``get_host_model_options`` in ``routes/hosts.py``): the host resolves
     the catalog locally, so no runner is needed.
 
     :param host_id: Host identifier, e.g. ``"host_a1b2c3"``.
+    :param harness: Harness whose catalog to resolve, e.g. ``"pi-native"``.
     :returns: Raw model rows, or ``None`` when the host is not connected,
         rejects the request, or times out.
     """
@@ -12791,7 +12865,7 @@ async def _host_model_options_via_registry(host_id: str) -> list[dict[str, Any]]
         result = await _proxy_model_options(
             host_registry=registry,
             host_conn=conn,
-            harness="claude-native",
+            harness=harness,
         )
     except HTTPException:
         return None
@@ -12801,25 +12875,27 @@ async def _host_model_options_via_registry(host_id: str) -> list[dict[str, Any]]
     return models if isinstance(models, list) else None
 
 
-async def _load_model_options_from_host(session_id: str, host_id: str) -> None:
+async def _load_model_options_from_host(
+    session_id: str, host_id: str, harness: str = "claude-native"
+) -> None:
     """
-    Background catalog fill for an asleep claude-native session.
+    Fill a sleeping native session's cold catalog from its host.
 
-    With no runner bound and a cold cache (e.g. the server restarted while
-    the session slept), the session's host can still resolve the claude
-    catalog — the same pre-launch source the new-session picker uses. Fills
-    the cache stale-marked so the next live runner replaces it with its
-    launch-exact snapshot, and publishes ``session.model_options`` so open
-    tabs re-read.
+    Reuse the new-session picker's source and notify open clients. Claude's
+    preview is stale-marked until the live runner refreshes it; Pi's
+    extension replaces its preview when the session resumes.
 
     :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
     :param host_id: The session's bound host, e.g. ``"host_a1b2c3"``.
+    :param harness: Harness whose catalog to resolve. ``"pi-native"`` fills the
+        extension-pushed cache (the only store its picker reads) and is never
+        stale-marked: the extension's own push replaces it.
     """
     # Read through the facade so tests patching
     # ``sessions._host_model_options_via_registry`` reach this impl.
     import omnigent.server.routes.sessions as _facade
 
-    raw = await _facade._host_model_options_via_registry(host_id)
+    raw = await _facade._host_model_options_via_registry(host_id, harness)
     if not raw:
         return
     try:
@@ -12827,6 +12903,11 @@ async def _load_model_options_from_host(session_id: str, host_id: str) -> None:
     except ValueError:
         return
     if not options:
+        return
+    if harness == "pi-native":
+        # Respect a catalog or explicit clear the extension pushed while we awaited.
+        _pushed_model_options_cache.setdefault(session_id, options)
+        _publish_model_options(session_id)
         return
     _model_options_cache[session_id] = options
     _model_options_stale.add(session_id)

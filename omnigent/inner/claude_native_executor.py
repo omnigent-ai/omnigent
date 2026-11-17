@@ -282,11 +282,10 @@ class ClaudeNativeExecutor(Executor):
         """
         Hold a turn whose message an input box kept in another mode refused.
 
-        The person left the box in shell mode or the prompt-history search in
-        the embedded terminal, often while still typing there, and the reclaim
-        could not take it back. Nothing was typed, so the message can go once
-        the box takes chat input again (:func:`claude_pane_ready`). Nothing is
-        typed while the message is held.
+        A shell/history mode or an open model control keeps the input box.
+        The person dismisses it in the embedded terminal. Nothing was typed,
+        so the message can go once the box takes chat input again
+        (:func:`claude_pane_ready`). Nothing is typed while the message is held.
 
         :param surface: What kept the box, e.g. ``"shell mode"``.
         :param deadline: Event-loop time the hold ends at, shared by every

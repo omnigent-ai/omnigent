@@ -46,6 +46,34 @@ function makeRegistry() {
   return { registry, sent, attached, detached, visibility };
 }
 
+describe("browserViewRegistry — view cap", () => {
+  it("opens 20 views per window by default and refuses the 21st until one closes", () => {
+    const { registry, sent } = makeRegistry();
+    assert.equal(registry.cap, 20);
+    const ids = Array.from({ length: 20 }, (_, index) => `browser-tab:conv_1:tab${index}`);
+    for (const id of ids) {
+      assert.equal(registry.openOrNavigate(id, "https://example.com").ok, true, id);
+    }
+    assert.equal(registry.size(), 20);
+
+    const refused = registry.openOrNavigate("browser-tab:conv_1:extra", "https://example.com");
+    assert.deepEqual(refused, {
+      ok: false,
+      error: "browser view cap reached — close one",
+      cap: 20,
+    });
+    assert.equal(registry.has("browser-tab:conv_1:extra"), false);
+    assert.equal(sent.filter((s) => s.channel === "browser-view-created").length, 20);
+
+    registry.close(ids[0]);
+    assert.equal(
+      registry.openOrNavigate("browser-tab:conv_1:extra", "https://example.com").ok,
+      true,
+    );
+    assert.equal(registry.size(), 20);
+  });
+});
+
 describe("browserViewRegistry — first-navigate activation signal", () => {
   let ctx;
   beforeEach(() => {

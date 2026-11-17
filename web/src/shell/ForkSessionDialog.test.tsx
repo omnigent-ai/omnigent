@@ -1018,6 +1018,100 @@ describe("ForkSessionDialog", () => {
     });
   });
 
+  describe("Codex run settings", () => {
+    const models = [
+      {
+        id: "reasoner",
+        displayName: "Reasoner",
+        isDefault: true,
+        supportedReasoningEfforts: [{ reasoningEffort: "minimal" }, { reasoningEffort: "high" }],
+      },
+      {
+        id: "quick",
+        displayName: "Quick",
+        supportedReasoningEfforts: [{ reasoningEffort: "low" }],
+      },
+      { id: "basic", displayName: "Basic", supportedReasoningEfforts: [] },
+    ];
+
+    beforeEach(() => {
+      useHostModelOptionsMock.mockReturnValue({
+        data: models,
+        isLoading: false,
+      } as ReturnType<typeof useHostModelOptions>);
+      forkSessionMock.mockResolvedValue({ id: "conv_fork" } as ForkResponse);
+    });
+
+    it("sends a chosen Codex effort without changing approval settings", async () => {
+      renderDialog();
+      openAgentSelect();
+      fireEvent.click(screen.getByTestId("fork-session-agent-option-ag_codex_native"));
+      fireEvent.click(screen.getByLabelText("Reasoning effort"));
+      expect(screen.queryByRole("option", { name: "Max" })).not.toBeInTheDocument();
+      fireEvent.click(screen.getByRole("option", { name: "Minimal" }));
+      fireEvent.click(screen.getByTestId("fork-session-submit"));
+
+      await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
+      expect(forkSessionMock.mock.calls[0]![1]?.config).toEqual({ reasoningEffort: "minimal" });
+    });
+
+    it.each(["Quick", "Basic"])(
+      "clears an unsupported effort when switching to %s",
+      async (nextModel) => {
+        renderDialog();
+        openAgentSelect();
+        fireEvent.click(screen.getByTestId("fork-session-agent-option-ag_codex_native"));
+        fireEvent.click(screen.getByLabelText("Reasoning effort"));
+        fireEvent.click(screen.getByRole("option", { name: "High" }));
+        fireEvent.click(screen.getByTestId("fork-session-config-model"));
+        fireEvent.click(screen.getByRole("option", { name: nextModel }));
+
+        if (nextModel === "Quick") {
+          expect(screen.getByLabelText("Reasoning effort")).toHaveTextContent("Default");
+          fireEvent.click(screen.getByLabelText("Reasoning effort"));
+          expect(screen.queryByRole("option", { name: "High" })).not.toBeInTheDocument();
+          expect(screen.getByRole("option", { name: "Low" })).toBeInTheDocument();
+          fireEvent.click(screen.getByRole("option", { name: "Default" }));
+        } else {
+          expect(screen.queryByLabelText("Reasoning effort")).not.toBeInTheDocument();
+        }
+        fireEvent.click(screen.getByTestId("fork-session-submit"));
+
+        await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
+        expect(forkSessionMock.mock.calls[0]![1]?.config).toEqual({
+          modelOverride: nextModel.toLowerCase(),
+          reasoningEffort: "default",
+        });
+      },
+    );
+
+    it("preserves untouched inherited settings while the catalog loads", async () => {
+      setAgents(AVAILABLE_AGENTS, "codex-native");
+      useSessionMock.mockReturnValue({
+        session: { modelOverride: "reasoner", reasoningEffort: "minimal" },
+        isLoading: false,
+        error: null,
+      } as ReturnType<typeof useSession>);
+      useHostModelOptionsMock.mockReturnValue({
+        data: undefined,
+        isLoading: true,
+      } as ReturnType<typeof useHostModelOptions>);
+      const { refresh } = renderDialog();
+      expect(screen.queryByLabelText("Reasoning effort")).not.toBeInTheDocument();
+
+      useHostModelOptionsMock.mockReturnValue({
+        data: models,
+        isLoading: false,
+      } as ReturnType<typeof useHostModelOptions>);
+      refresh();
+      expect(screen.getByLabelText("Reasoning effort")).toHaveTextContent("Minimal");
+      fireEvent.click(screen.getByTestId("fork-session-submit"));
+
+      await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
+      expect(forkSessionMock.mock.calls[0]![1]?.config).toEqual({});
+    });
+  });
+
   it("arms Codex bypass only on an explicit pick, with a danger banner", async () => {
     forkSessionMock.mockResolvedValue({
       id: "conv_fork",

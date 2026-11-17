@@ -97,6 +97,17 @@ class _StubResourceRegistry:
         """
         self._terminal_activity_publisher = publisher
 
+    def wake_session_terminal_watchers(self, session_id: str) -> None:
+        """
+        Accept the turn-start wake the runner issues for every running status.
+
+        The stub owns no terminals, so there is no idle watcher to wake.
+
+        :param session_id: Session whose terminal watchers would be woken.
+        :returns: None.
+        """
+        del session_id
+
     def set_session_background_publisher(
         self,
         publisher: Callable[[str, bool], None],
@@ -733,8 +744,19 @@ class _ReapableStubResourceRegistry(_StubResourceRegistry):
 
 
 @pytest.mark.asyncio
-async def test_idle_pane_reap_closes_comment_relay(tmp_path: Path) -> None:
+async def test_idle_pane_reap_closes_comment_relay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Reaping an idle pane closes its relay; the next launch starts a fresh one."""
+    started_relays: list[bridge.ClaudeNativeToolRelay] = []
+    start_tool_relay = bridge.start_tool_relay
+
+    def start(**kwargs):
+        relay = start_tool_relay(**kwargs)
+        started_relays.append(relay)
+        return relay
+
+    monkeypatch.setattr(bridge, "start_tool_relay", start)
     app = create_runner_app(
         resource_registry=_ReapableStubResourceRegistry(tmp_path),
         server_client=NullServerClient(),  # type: ignore[arg-type]
@@ -753,15 +775,14 @@ async def test_idle_pane_reap_closes_comment_relay(tmp_path: Path) -> None:
         try:
             resp = await _launch_terminal(client, session_id, bridge_inject_dir=True)
             assert resp.status_code == 200, resp.text
-            relay_url = json.loads(relay_file.read_text())["url"]
+            relay_socket = started_relays[0]._httpd.socket
 
             await reaper._reap(pane)
             # A surviving relay keeps a listening socket per reaped session
             # until the session is deleted, exhausting the runner's descriptors.
             assert not relay_file.exists(), "tool_relay.json survived the idle reap"
-            with pytest.raises(httpx.ConnectError):
-                async with httpx.AsyncClient() as probe:
-                    await probe.get(relay_url, timeout=2.0)
+            # Another worker may already have reused the released pool port.
+            assert relay_socket.fileno() == -1
 
             resp = await _launch_terminal(client, session_id, bridge_inject_dir=True)
             assert resp.status_code == 200, resp.text
@@ -1257,6 +1278,7 @@ class _SwitchableServerClient:
         """
         self.agent_id = agent_id
         self.bridge_id = bridge_id
+        self.workflows_enabled = False
 
     class _Response:
         """Stub 200 response carrying a caller-supplied JSON body."""
@@ -1287,6 +1309,8 @@ class _SwitchableServerClient:
         :returns: Stub 200 response.
         """
         del kwargs
+        if url == "/v1/info":
+            return self._Response({"features": {"workflows": self.workflows_enabled}})
         if url.endswith("/labels"):
             labels = {BRIDGE_ID_LABEL_KEY: self.bridge_id} if self.bridge_id else {}
             return self._Response({"labels": labels})
@@ -1674,6 +1698,37 @@ async def test_native_revision_refreshes_relay_before_turn_without_reset(
                     assert current_relay["url"] == initial_relay["url"]
                     assert current_relay["token"] == initial_relay["token"]
                 assert manager.released == []
+            finally:
+                await client.delete(f"/v1/sessions/{session_id}")
+    finally:
+        shutil.rmtree(bridge_dir, ignore_errors=True)
+
+
+@pytest.mark.asyncio
+async def test_native_relay_updates_workflow_tools_after_server_reconnect(
+    tmp_path: Path,
+) -> None:
+    from omnigent.runner.journal_tools import JOURNAL_TOOL_NAMES
+
+    agent_id = "ag_workflows"
+    server_client = _SwitchableServerClient(agent_id)
+    app = _switch_app(tmp_path, server_client, {agent_id: _spec_without_terminals()})
+    session_id = f"conv_{uuid.uuid4().hex[:12]}"
+    bridge_dir = prepare_bridge_dir(session_id, workspace=tmp_path)
+    relay_file = bridge_dir / _TOOL_RELAY_FILE
+
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://runner"
+        ) as client:
+            try:
+                for enabled in (False, True, False):
+                    server_client.workflows_enabled = enabled
+                    await app.state.catch_up_scan()
+                    await _launch_bridged(client, session_id)
+                    names = _relay_tool_names(relay_file)
+                    assert names & JOURNAL_TOOL_NAMES == (JOURNAL_TOOL_NAMES if enabled else set())
+                    assert "list_comments" in names
             finally:
                 await client.delete(f"/v1/sessions/{session_id}")
     finally:

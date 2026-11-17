@@ -2131,6 +2131,7 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
         "goose",
         "hermes",
         "host",
+        "host-service-entry",
         "import",
         "integration",
         "_internal",
@@ -4758,6 +4759,10 @@ def server(
         # below is the server path for the bare ``server`` group.
         return
 
+    # Socket binds use bare IPv6 addresses; URLs use brackets.
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
+
     # --base-path is sugar for OMNIGENT_WEB_BASE_PATH, which create_app reads.
     # An env var (not a create_app kwarg) so the same toggle reaches every
     # startup path (Docker entrypoint, canonical local server, e2e harness)
@@ -4867,7 +4872,9 @@ def server(
         SqlAlchemyConversationStore,
     )
     from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+    from omnigent.stores.inbox_item_store.sqlalchemy_store import SqlAlchemyInboxItemStore
     from omnigent.stores.policy_store.sqlalchemy_store import SqlAlchemyPolicyStore
+    from omnigent.stores.proactive_agent_settings_store import ProactiveAgentSettingsStore
     from omnigent.util.tunnel_limits import uvicorn_tunnel_kwargs
 
     cfg = _load_config(config_path)
@@ -4926,6 +4933,8 @@ def server(
     file_store = SqlAlchemyFileStore(db_uri)
     conversation_store = SqlAlchemyConversationStore(db_uri, conv_db_uri)
     comment_store = SqlAlchemyCommentStore(db_uri)
+    inbox_item_store = SqlAlchemyInboxItemStore(db_uri)
+    proactive_agent_settings_store = ProactiveAgentSettingsStore(db_uri)
     policy_store = SqlAlchemyPolicyStore(db_uri)
     permission_store = SqlAlchemyPermissionStore(db_uri)
     scheduled_task_store = SqlAlchemyScheduledTaskStore(db_uri)
@@ -5072,19 +5081,9 @@ def server(
 
             databricks_store = DatabricksConnectionStore(db_uri, dbx_cipher)
 
-    from omnigent.server.mcp_registry import McpRegistry, McpRegistryConfig
+    from omnigent.server.mcp_registry import build_mcp_registry_from_env
 
-    mcp_registry = None
-    registry_config = McpRegistryConfig.from_env()
-    if registry_config is not None:
-        from omnigent.stores.credential_store import build_secret_cipher
-        from omnigent.stores.credential_store.sqlalchemy_store import CredentialStore
-
-        registry_cipher = build_secret_cipher()
-        mcp_registry = McpRegistry(
-            registry_config,
-            CredentialStore(db_uri, registry_cipher) if registry_cipher else None,
-        )
+    mcp_registry = build_mcp_registry_from_env(db_uri)
 
     # Accounts mode ergonomics: when accounts mode is selected
     # (OMNIGENT_AUTH_ENABLED=1 without OIDC config, or an explicit
@@ -5110,7 +5109,11 @@ def server(
             "OMNIGENT_ACCOUNTS_COOKIE_SECRET",
             load_or_generate_cookie_secret(art_loc),
         )
-        os.environ.setdefault("OMNIGENT_ACCOUNTS_BASE_URL", f"http://{host}:{port}")
+        from omnigent.util.server_url import format_host_port
+
+        os.environ.setdefault(
+            "OMNIGENT_ACCOUNTS_BASE_URL", f"http://{format_host_port(host, port)}"
+        )
 
     auth_provider = create_auth_provider()
 
@@ -5138,6 +5141,8 @@ def server(
         file_store=file_store,
         conversation_store=conversation_store,
         comment_store=comment_store,
+        inbox_item_store=inbox_item_store,
+        proactive_agent_settings_store=proactive_agent_settings_store,
         policy_store=policy_store,
         artifact_store=artifact_store,
         agent_cache=agent_cache,
@@ -11129,6 +11134,19 @@ def host_enable(
             non_interactive=non_interactive or not _stdin_is_tty(),
         )
 
+    from omnigent.host.service import (
+        HostServiceError,
+        enable_user_host_service,
+        validate_user_host_service,
+    )
+
+    environment = _build_host_daemon_env(server_url=resolved_server)
+    try:
+        # Keep a running host if its replacement service cannot be defined.
+        validate_user_host_service(resolved_server, environment=environment)
+    except HostServiceError as exc:
+        raise click.ClickException(str(exc)) from exc
+
     target = _normalize_daemon_target(resolved_server)
     record = _find_daemon_record(target)
     if record is not None:
@@ -11141,13 +11159,8 @@ def host_enable(
         _record_daemon_stop_requested(record, reason="host_enable", force=False)
         _terminate_daemon(record, force=False)
 
-    from omnigent.host.service import HostServiceError, enable_user_host_service
-
     try:
-        service = enable_user_host_service(
-            resolved_server,
-            environment=_build_host_daemon_env(server_url=resolved_server),
-        )
+        service = enable_user_host_service(resolved_server, environment=environment)
     except HostServiceError as exc:
         raise click.ClickException(str(exc)) from exc
 
@@ -11173,6 +11186,23 @@ def host_disable() -> None:
             _delete_daemon_record(record)
     click.echo("Disabled the Omnigent host user service.")
     click.echo(f"Removed service definition: {_display_path(service.path)}")
+
+
+# Top-level lifecycle commands pass through wrappers that validate host subcommands.
+@cli.command("host-service-entry", hidden=True)
+@click.option("--server", default=None, help="Remote Omnigent server URL.")
+@click.option("--local", is_flag=True, default=False, help="Run a local Omnigent server.")
+def host_service_entry(server: str | None, local: bool) -> None:
+    """Run the host under a service manager that launches it through a CLI wrapper.
+
+    :param server: Remote Omnigent server URL; ``None`` with ``--local``.
+    :param local: Run a local Omnigent server instead of a remote one.
+    """
+    if local == (server is not None):
+        raise click.UsageError("Pass exactly one of --server or --local.")
+    from omnigent.host.service_entry import run
+
+    raise SystemExit(run(server or ""))
 
 
 @host.command("status")

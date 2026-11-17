@@ -151,8 +151,10 @@ async def test_failed_refresh_keeps_the_old_socket_responsive(
         calls += 1
         if calls == 1:
             return "bootstrap"
+        # Announcing this attempt can let the test enable the next refresh.
+        refresh_allowed = allow_refresh.is_set()
         loop.call_soon_threadsafe(attempted.set)
-        if allow_refresh.is_set():
+        if refresh_allowed:
             return "renewed"
         if failure == "error":
             raise OSError("credential provider unavailable")

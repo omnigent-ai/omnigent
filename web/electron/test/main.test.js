@@ -158,6 +158,7 @@ function loadNavigationHarness({
   internalFeatures = false,
   cliPath = null,
   hostConnectResult = { ok: true },
+  sshConnectResult = { ok: true, shownInConsole: true },
   serverAuthResult = { ok: true },
   managedServerNames = {},
   // A createWorkspaceNetwork() to run the real session module against.
@@ -442,7 +443,7 @@ function loadNavigationHarness({
       createSshConnectFlow: () => ({
         run: async (_parentWin, sshServerUrl, destination) => {
           calls.sshConnects.push({ serverUrl: sshServerUrl, destination });
-          return { ok: true, shownInConsole: true };
+          return sshConnectResult;
         },
       }),
     },
@@ -703,6 +704,7 @@ function loadNavigationHarness({
   const mainRequire = createRequire(mainPath);
   const source =
     fs.readFileSync(mainPath, "utf8") +
+    "\nmodule.exports.sshHosts = sshHosts;" +
     "\nmodule.exports.testApi = { handleDeepLink, buildMenu, openFindBar, signOutOfServer, createWindow, createBrowserRegistryForWindow, loadServerUrl, loadSetupPage, pinWindow, setWindowServerUrl, startArcaHostConnect, pickWorkspaceForBridge, registerIpc, registerPermissions, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, SERVER_SELECTOR_V2_PAGE, disposeAuth: () => { databricksAuth?.dispose(); oidcAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; }, reconnectDelaysMs: () => reconnectDelaysMs, setReconnectSlowDelayMs: (ms) => { reconnectSlowDelayMs = ms; }, reconnectSlowDelayMs: () => reconnectSlowDelayMs, setBlockedHintDelayMs: (ms) => { blockedHintDelayMs = ms; }, blockedHintDelayMs: () => blockedHintDelayMs, setServerResponseTimeoutMs: (ms) => { serverResponseTimeoutMs = ms; }, serverResponseTimeoutMs: () => serverResponseTimeoutMs, cancelReconnect };";
   const module = { exports: {} };
   const sandbox = {
@@ -745,6 +747,7 @@ function loadNavigationHarness({
 
   return {
     api,
+    sshHosts: module.exports.sshHosts,
     calls,
     overlay,
     bannerCalls,
@@ -2513,67 +2516,122 @@ describe("browser permission wiring", () => {
     assert.equal(ses.check(h.webContents, "fullscreen", serverUrl), false);
   });
 
-  it("installs isolated consent handlers before construction and only prompts for the visible pane", async () => {
-    const h = loadNavigationHarness({ registerFallbacks: false, realBrowserRegistry: true });
+  for (const [platform, cookieImport] of [
+    ["linux", false],
+    ["darwin", true],
+  ]) {
+    it(`installs isolated consent handlers before construction and only prompts for the visible pane on ${platform}`, async () => {
+      const h = loadNavigationHarness({
+        registerFallbacks: false,
+        realBrowserRegistry: true,
+        platform,
+      });
+      try {
+        const sessions = new Map();
+        const prompts = h.permissionPromptCalls.show;
+        h.win.isVisible = () => true;
+        h.win.isMinimized = () => false;
+        h.electron.dialog.showMessageBox = () => assert.fail("must not use the OS alert");
+        h.electron.session.fromPartition = (partition) => {
+          if (!sessions.has(partition)) {
+            const ses = {
+              setPermissionRequestHandler: (handler) => (ses.request = handler),
+              setPermissionCheckHandler: (handler) => (ses.check = handler),
+              webRequest: {
+                onBeforeRequest() {},
+                onBeforeSendHeaders() {},
+                onHeadersReceived() {},
+              },
+            };
+            sessions.set(partition, ses);
+          }
+          return sessions.get(partition);
+        };
+        h.electron.createWebContentsView = function (opts) {
+          const ses = sessions.get(opts.webPreferences.partition);
+          assert.equal(typeof ses.request, "function");
+          assert.equal(typeof ses.check, "function");
+          assert.equal(path.basename(opts.webPreferences.preload), "browser_view_preload.js");
+          const wc = new EventEmitter();
+          let url = "about:blank";
+          Object.assign(wc, {
+            ipc: new EventEmitter(),
+            mainFrame: {},
+            session: ses,
+            getURL: () => url,
+            isDestroyed: () => false,
+            setWindowOpenHandler() {},
+            loadURL: (value) => (url = value),
+          });
+          return { webContents: wc, setVisible() {}, setBounds() {}, getBounds: () => ({}) };
+        };
+        const registry = h.api.createBrowserRegistryForWindow(h.win);
+        const a = registry.openOrNavigate("a", "https://login.example").entry.view.webContents;
+        const b = registry.openOrNavigate("b", "https://login.example").entry.view.webContents;
+        assert.notEqual(a.session, b.session);
+        const check = (wc) =>
+          wc.session.check(wc, "loopback-network", wc.getURL(), { isMainFrame: true });
+        assert.equal(check(a), false, "detached panes cannot prompt");
+        registry.setActive("a");
+        registry.setSuppressed(true);
+        assert.equal(check(a), false, "overlaid panes cannot prompt");
+        registry.setSuppressed(false);
+        assert.equal(check(b), false, "background conversations cannot prompt");
+        await new Promise(setImmediate);
+        assert.equal(prompts.length, 0);
+        assert.equal(check(a), false);
+        await new Promise(setImmediate);
+        assert.equal(prompts.length, 1);
+        assert.equal(prompts[0].parent, h.win);
+        assert.equal(prompts[0].origin, "https://login.example");
+        assert.equal(prompts[0].reload, true);
+        assert.equal(check(b), false, "Deny is shared across conversations");
+        const dismissals = h.permissionPromptCalls.dismiss.length;
+        registry.setSuppressed(true);
+        registry.setActive("b");
+        assert.equal(h.permissionPromptCalls.dismiss.length, dismissals + 2);
+        registry.setSuppressed(false);
+        registry.setActive("a");
+        a.ipc.emit("omnigent:browser-webauthn-pending", { senderFrame: a.mainFrame }, true);
+        await until(() => prompts.length === 2, "a waiting security-key request shows the notice");
+        assert.equal(prompts[1].kind, "security-key");
+        assert.equal(prompts[1].parent, h.win);
+        assert.equal(prompts[1].origin, "https://login.example");
+        assert.equal(prompts[1].cookieImport, cookieImport);
+        assert.equal(h.electron.session.defaultSession.request, undefined);
+        assert.equal(h.electron.session.defaultSession.check, undefined);
+      } finally {
+        h.cleanup();
+      }
+    });
+  }
+
+  it("leaves WebAuthn in Windows Browser tabs to the system dialog", () => {
+    const h = loadNavigationHarness({
+      registerFallbacks: false,
+      realBrowserRegistry: true,
+      platform: "win32",
+    });
     try {
-      const sessions = new Map();
-      const prompts = h.permissionPromptCalls.show;
-      h.win.isVisible = () => true;
-      h.win.isMinimized = () => false;
-      h.electron.dialog.showMessageBox = () => assert.fail("must not use the OS alert");
-      h.electron.session.fromPartition = (partition) => {
-        if (!sessions.has(partition)) {
-          const ses = {
-            setPermissionRequestHandler: (handler) => (ses.request = handler),
-            setPermissionCheckHandler: (handler) => (ses.check = handler),
-            webRequest: { onBeforeRequest() {}, onBeforeSendHeaders() {}, onHeadersReceived() {} },
-          };
-          sessions.set(partition, ses);
-        }
-        return sessions.get(partition);
-      };
-      h.electron.createWebContentsView = function (opts) {
-        const ses = sessions.get(opts.webPreferences.partition);
-        assert.equal(typeof ses.request, "function");
-        assert.equal(typeof ses.check, "function");
-        const wc = new EventEmitter();
-        let url = "about:blank";
-        Object.assign(wc, {
-          session: ses,
-          getURL: () => url,
-          isDestroyed: () => false,
+      h.electron.session.fromPartition = () => ({
+        setPermissionRequestHandler() {},
+        setPermissionCheckHandler() {},
+        webRequest: { onBeforeRequest() {}, onBeforeSendHeaders() {}, onHeadersReceived() {} },
+      });
+      const preloads = [];
+      h.electron.createWebContentsView = (opts) => {
+        preloads.push(opts.webPreferences.preload);
+        const wc = Object.assign(new EventEmitter(), {
+          ipc: new EventEmitter(),
           setWindowOpenHandler() {},
-          loadURL: (value) => (url = value),
+          loadURL() {},
         });
         return { webContents: wc, setVisible() {}, setBounds() {}, getBounds: () => ({}) };
       };
       const registry = h.api.createBrowserRegistryForWindow(h.win);
-      const a = registry.openOrNavigate("a", "https://login.example").entry.view.webContents;
-      const b = registry.openOrNavigate("b", "https://login.example").entry.view.webContents;
-      assert.notEqual(a.session, b.session);
-      const check = (wc) =>
-        wc.session.check(wc, "loopback-network", wc.getURL(), { isMainFrame: true });
-      assert.equal(check(a), false, "detached panes cannot prompt");
-      registry.setActive("a");
-      registry.setSuppressed(true);
-      assert.equal(check(a), false, "overlaid panes cannot prompt");
-      registry.setSuppressed(false);
-      assert.equal(check(b), false, "background conversations cannot prompt");
-      await new Promise(setImmediate);
-      assert.equal(prompts.length, 0);
-      assert.equal(check(a), false);
-      await new Promise(setImmediate);
-      assert.equal(prompts.length, 1);
-      assert.equal(prompts[0].parent, h.win);
-      assert.equal(prompts[0].origin, "https://login.example");
-      assert.equal(prompts[0].reload, true);
-      assert.equal(check(b), false, "Deny is shared across conversations");
-      const dismissals = h.permissionPromptCalls.dismiss.length;
-      registry.setSuppressed(true);
-      registry.setActive("b");
-      assert.equal(h.permissionPromptCalls.dismiss.length, dismissals + 2);
-      assert.equal(h.electron.session.defaultSession.request, undefined);
-      assert.equal(h.electron.session.defaultSession.check, undefined);
+      const tab = registry.openOrNavigate("browser-tab:conv:t1", "https://login.example/").entry;
+      assert.deepEqual(preloads, [undefined]);
+      assert.equal(tab.view.webContents.ipc.listenerCount("omnigent:browser-webauthn-pending"), 0);
     } finally {
       h.cleanup();
     }
@@ -2615,6 +2673,8 @@ describe("browser permission wiring", () => {
         partitions.push(opts.webPreferences.partition);
         const wc = Object.assign(new EventEmitter(), {
           id: nextId++,
+          ipc: new EventEmitter(),
+          mainFrame: {},
           setWindowOpenHandler() {},
           loadURL() {},
         });
@@ -5809,6 +5869,36 @@ describe("SSH connect IPC", () => {
     assert.deepEqual(h.calls.sshConnects, [{ serverUrl: server, destination: "devbox" }]);
   });
 
+  it("records the host a connect reached, for that server only", async (t) => {
+    const hostId = "0123456789abcdef0123456789abcdef";
+    const h = sshHarness(t, {
+      sshConnectResult: { ok: true, shownInConsole: true, identity: { hostId } },
+    });
+
+    assert.equal((await h.ipc.get("omnigent:ssh-connect")(fromServer(h), "devbox")).ok, true);
+
+    assert.equal(h.sshHosts.destination(server, hostId), "devbox");
+    assert.equal(h.sshHosts.destination("https://elsewhere.example/", hostId), null);
+  });
+
+  it("records nothing for a connect that failed", async (t) => {
+    const hostId = "0123456789abcdef0123456789abcdef";
+    const h = sshHarness(t, { sshConnectResult: { ok: false, error: "Permission denied" } });
+
+    await h.ipc.get("omnigent:ssh-connect")(fromServer(h), "devbox");
+
+    assert.equal(h.sshHosts.destination(server, hostId), null);
+  });
+
+  it("records nothing for a connect that reached no host identity", async (t) => {
+    const hostId = "0123456789abcdef0123456789abcdef";
+    const h = sshHarness(t, { sshConnectResult: { ok: true, shownInConsole: true } });
+
+    await h.ipc.get("omnigent:ssh-connect")(fromServer(h), "devbox");
+
+    assert.equal(h.sshHosts.destination(server, hostId), null);
+  });
+
   it("refuses on Windows before opening anything", async (t) => {
     const h = sshHarness(t, { platform: "win32" });
 
@@ -5976,5 +6066,18 @@ describe("Close menu item", () => {
     clickClose();
     assert.equal(sentCloses(), 1);
     assert.equal(closes, 1);
+  });
+});
+
+describe("New Window keeps its source's server (src/main.js)", () => {
+  it("gives a window cloned on a conversation the source's server, not the conversation's URL", (t) => {
+    const h = loadNavigationHarness();
+    t.after(h.cleanup);
+    h.api.createWindow("https://host.example/ml/omnigents");
+    h.setUrl("https://host.example/ml/omnigents/c/conv_1");
+    h.electron.BrowserWindow.getFocusedWindow = () => h.win;
+    h.api.buildMenu();
+    h.calls.appMenu.getMenuItemById("new_window").click();
+    assert.equal(h.api.windows.get(h.win).serverUrl, "https://host.example/ml/omnigents");
   });
 });
