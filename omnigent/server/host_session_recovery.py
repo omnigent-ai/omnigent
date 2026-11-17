@@ -481,6 +481,17 @@ class HostSessionRecoverer:
             expected_conversation=fresh,
         ):
             return
+        if (
+            not await asyncio.to_thread(self.enabled, connection.host_id)
+            or self.hosts.get(connection.host_id) is not connection
+        ):
+            await asyncio.to_thread(
+                self.store.replace_session_recovery,
+                conv.id,
+                dispatch,
+                replace(dispatch, phase="stopped"),
+            )
+            return
         try:
             response = await self.initializer.initialize(
                 conv,

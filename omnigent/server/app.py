@@ -1973,6 +1973,8 @@ def create_app(
         When off, ``/v1/inbox/items`` returns 404, runners drop the Inbox tools,
         the proactive agent is off too, and ``GET /v1/info`` reports
         ``inbox_items_available`` false.
+    :param host_session_recovery: Live permission for explicitly opted-in hosts
+        to continue interrupted tasks. Embedded deployments default to disabled.
     :param proactive_agent: Whether the deployment offers the proactive agent to
         this request's caller. A static bool or a zero-arg callable resolved per
         request; ``None`` follows the ``proactive_agent`` release feature (off by

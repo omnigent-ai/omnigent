@@ -696,3 +696,25 @@ def test_embedded_default_is_off_and_server_prompt_is_generic(recovery: Any) -> 
     assert embedded.prompt(recovery.conv.host_id) == f"{RECOVERY_NOTICE}\nCheck the checkpoint."
     embedded.deployment_gate = lambda: True
     assert embedded.enabled(recovery.conv.host_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("disabled", ["deployment", "host", "connection"])
+async def test_policy_is_rechecked_after_dispatch_claim(recovery: Any, disabled: str) -> None:
+    claim = recovery.store.replace_session_recovery
+
+    def disable_after_claim(*args: Any, **kwargs: Any) -> bool:
+        result = claim(*args, **kwargs)
+        if result and args[2].phase == "dispatching":
+            if disabled == "deployment":
+                recovery.service.deployment_gate = False
+            elif disabled == "host":
+                recovery.connection.hello.recover_interrupted_sessions = False
+            else:
+                recovery.service.hosts.get = Mock(return_value=None)
+        return result
+
+    recovery.store.replace_session_recovery = disable_after_claim
+    await recovery.service.recover(recovery.connection, [])
+    recovery.initializer.initialize.assert_not_awaited()
+    assert recovery.store.get_session_recovery(recovery.conv.id).phase == "stopped"
