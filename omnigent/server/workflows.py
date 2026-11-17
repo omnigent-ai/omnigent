@@ -20,7 +20,7 @@ import asyncio
 import logging
 import threading
 from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query, Request
@@ -76,6 +76,8 @@ _DEFAULT_PAGE = 50
 # Each run on a page costs one status lookup per step, so pages stay small.
 _DEFAULT_RUNS_PAGE = 20
 _RUNS_PAGE_MAX = 50
+_DESCENDANT_RUNS_PAGE = 20
+_DESCENDANT_RUNS_PAGE_MAX = 50
 
 # custom-lint: disable-next=workspace-scoped-cache -- keyed by database URL; queries scope rows
 _stores: dict[str, WorkflowStore] = {}
@@ -165,6 +167,17 @@ def _sessions_below(
         ordered.append(session.id)
         stack.extend(reversed(started.get(session.id, ())))
     return ordered
+
+
+def _started_during(
+    members: Sequence[Conversation], start: int, end: int | None
+) -> list[Conversation]:
+    """Those of *members* created while a run was current: from its start until the next run's."""
+    return [
+        member
+        for member in members
+        if member.created_at >= start and (end is None or member.created_at < end)
+    ]
 
 
 def require_workflows(request: Request) -> None:
@@ -427,21 +440,15 @@ def create_workflows_router(
             )
         return runs
 
-    def _link_runs(
-        journal: SessionJournalStore,
-        runs: list[WorkflowRun],
-        plans: Sequence[JournalEntry],
-        user_id: str | None,
-    ) -> list[WorkflowRun]:
-        """Add who started each run and the workflow runs below it.
+    def _family(
+        session_ids: Sequence[str],
+    ) -> tuple[dict[str, Conversation], dict[str, list[Conversation]]]:
+        """The sessions' families, by ID, and the sessions each one started, oldest first.
 
-        The sessions a run's session starts join its family, so one family read
-        finds them, and a creator label records which session started each one.
-        Each of those sessions adds the workflow run it began with.
-
-        :param plans: The plans that started *runs*, among others.
+        The sessions a session starts join its family, so one family read finds
+        them, and a creator label records which session started each one.
         """
-        sessions = conversation_store.get_conversations([run.session_id for run in runs])
+        sessions = conversation_store.get_conversations(list(session_ids))
         families = conversation_store.get_session_families(
             list(dict.fromkeys(s.family_id for s in sessions.values() if s.family_id))
         )
@@ -453,27 +460,63 @@ def create_workflows_router(
                 started.setdefault(starter, []).append(member)
         for members in started.values():
             members.sort(key=lambda member: (member.created_at, member.id))
-        # A run ends when its session begins its next run, so an automation that
-        # reuses its session lists each run's sessions under that run only.
-        by_id = {plan.id: plan for plan in plans}
-        ends = journal.next_run_starts([by_id[run.id] for run in runs])
-        below: dict[str, list[str]] = {}
-        for run, end in zip(runs, ends, strict=True):
-            direct = [
-                member
-                for member in started.get(run.session_id, ())
-                if member.created_at >= run.started_at and (end is None or member.created_at < end)
-            ]
-            below[run.id] = _sessions_below(direct, started)
-        first_runs = journal.first_workflow_runs(
-            list(dict.fromkeys(session_id for ids in below.values() for session_id in ids))
-        )
-        descendants = {
-            descendant.session_id: descendant
-            for descendant in (
-                _runs(journal, list(first_runs.values()), user_id) if first_runs else ()
-            )
+        return known, started
+
+    def _below(
+        journal: SessionJournalStore,
+        plans: Sequence[JournalEntry],
+        known: Mapping[str, Conversation],
+        started: Mapping[str, Sequence[Conversation]],
+        user_id: str | None,
+    ) -> tuple[dict[str, list[str]], dict[str, JournalEntry]]:
+        """Each run's readable descendant sessions that began workflow runs, and those runs.
+
+        A run ends when its session begins its next run, so a session that
+        reruns lists each run's sessions under that run only. That holds at
+        every level: a session below a run follows only the sessions it started
+        during the workflow run it began with, and a session with no workflow
+        run follows all of its own.
+
+        :param plans: The plans that started the runs.
+        :returns: The session IDs below each run, in order, by the run's ID, and
+            each such session's first plan, by session ID.
+        """
+        ends = journal.next_run_starts(plans)
+        direct = {
+            plan.id: _started_during(started.get(plan.conversation_id, ()), plan.created_at, end)
+            for plan, end in zip(plans, ends, strict=True)
         }
+        children: dict[str, list[Conversation]] = {}
+        first_runs: dict[str, JournalEntry] = {}
+        frontier = [member.id for members in direct.values() for member in members]
+        while frontier and len(children) < MAX_SESSION_FAMILY_MEMBERS:
+            level = [
+                session_id for session_id in dict.fromkeys(frontier) if session_id not in children
+            ][: MAX_SESSION_FAMILY_MEMBERS - len(children)]
+            found = journal.first_workflow_runs(level)
+            first_runs.update(found)
+            run_ends = dict(zip(found, journal.next_run_starts(list(found.values())), strict=True))
+            frontier = []
+            for session_id in level:
+                own = list(started.get(session_id, ()))
+                if (plan := found.get(session_id)) is not None:
+                    own = _started_during(own, plan.created_at, run_ends[session_id])
+                children[session_id] = own
+                frontier.extend(member.id for member in own)
+        below = {
+            run_id: [
+                session_id
+                for session_id in _sessions_below(members, children)
+                if session_id in first_runs and _readable(user_id, known[session_id])
+            ]
+            for run_id, members in direct.items()
+        }
+        return below, first_runs
+
+    def _started_by(
+        known: dict[str, Conversation], user_id: str | None
+    ) -> Callable[[str], WorkflowRunStarter | None]:
+        """Name the session that started each session, when the caller can read it."""
         starter_ids = {
             starter
             for member in known.values()
@@ -494,15 +537,68 @@ def create_workflows_router(
                 return None
             return WorkflowRunStarter(session_id=starter.id, title=starter.title or "")
 
+        return started_by
+
+    def _descendant_page(
+        journal: SessionJournalStore,
+        below: Sequence[str],
+        first_runs: Mapping[str, JournalEntry],
+        user_id: str | None,
+        *,
+        after: str | None,
+        limit: int,
+    ) -> tuple[list[WorkflowRun], str | None]:
+        """One page of a run's descendant runs, after the session *after* names.
+
+        :raises OmnigentError: 400 if *after* isn't below the run.
+        """
+        start = 0
+        if after is not None:
+            if after not in below:
+                raise OmnigentError("Invalid descendant runs cursor", code=ErrorCode.INVALID_INPUT)
+            start = below.index(after) + 1
+        page = below[start : start + limit]
+        runs = _runs(journal, [first_runs[session_id] for session_id in page], user_id)
+        more = start + limit < len(below)
+        return runs, page[-1] if more and page else None
+
+    def _name_workflows(runs: Sequence[WorkflowRun], user_id: str | None) -> None:
+        """Name each run's workflow, and its descendants', if the caller owns it."""
+        every = [*runs, *(descendant for run in runs for descendant in run.descendant_runs)]
+        names = _store().names([run.workflow_id for run in every], user_id=user_id)
+        for run in every:
+            run.workflow_name = names.get(run.workflow_id)
+
+    def _link_runs(
+        journal: SessionJournalStore,
+        runs: list[WorkflowRun],
+        plans: Sequence[JournalEntry],
+        user_id: str | None,
+    ) -> list[WorkflowRun]:
+        """Add who started each run and the first page of the workflow runs below it.
+
+        :param plans: The plans that started *runs*, among others.
+        """
+        known, started = _family([run.session_id for run in runs])
+        by_id = {plan.id: plan for plan in plans}
+        below, first_runs = _below(
+            journal, [by_id[run.id] for run in runs], known, started, user_id
+        )
+        started_by = _started_by(known, user_id)
         for run in runs:
             run.started_by = started_by(run.session_id)
-            run.descendant_runs = [
-                descendants[session_id]
-                for session_id in below[run.id]
-                if session_id in descendants
-            ]
+            run.descendant_run_count = len(below[run.id])
+            run.descendant_runs, run.descendant_runs_cursor = _descendant_page(
+                journal,
+                below[run.id],
+                first_runs,
+                user_id,
+                after=None,
+                limit=_DESCENDANT_RUNS_PAGE,
+            )
             for descendant in run.descendant_runs:
                 descendant.started_by = started_by(descendant.session_id)
+        _name_workflows(runs, user_id)
         return runs
 
     def _readable_session(user_id: str | None, session_id: str) -> Conversation | None:
@@ -570,5 +666,59 @@ def create_workflows_router(
 
         data = await asyncio.to_thread(runs, journal)
         return WorkflowRunList(data=data, next_cursor=next_cursor)
+
+    @router.get(
+        "/workflows/{workflow_id}/runs/{run_id}/descendant_runs", response_model=WorkflowRunList
+    )
+    async def list_workflow_run_descendants(
+        request: Request,
+        workflow_id: str,
+        run_id: str,
+        session_id: str,
+        after: str | None = None,
+        limit: int = Query(default=_DESCENDANT_RUNS_PAGE, ge=1, le=_DESCENDANT_RUNS_PAGE_MAX),
+    ) -> WorkflowRunList:
+        """List the workflow runs below a run, in the order its ``descendant_runs`` start.
+
+        Read access to the run's session stands in for owning the workflow, as
+        with the runs list's ``session_id``.
+
+        :param run_id: The run's ID.
+        :param session_id: The session that ran it.
+        :param after: The previous page's cursor, e.g. the run's ``descendant_runs_cursor``.
+        :param limit: Page size, e.g. ``20``.
+        :raises OmnigentError: 401 if unauthenticated in multi-user mode, 404 if
+            the caller can't read the session or it has no such run of this
+            workflow, 400 for an invalid cursor.
+        """
+        from omnigent.server.session_journal import open_store as open_journal_store
+
+        user_id = require_user(request, auth_provider)
+        session = await asyncio.to_thread(_readable_session, user_id, session_id)
+        journal = open_journal_store(conversation_store)
+        if session is None or journal is None:
+            raise _not_found()
+
+        def page(store: SessionJournalStore) -> WorkflowRunList:
+            plan = store.get_entry(session.id, run_id)
+            if (
+                plan is None
+                or plan.kind != "plan"
+                or plan.workflow_id is None
+                or plan.workflow_id != normalize_uuid(workflow_id)
+            ):
+                raise _not_found()
+            known, started = _family([session.id])
+            below, first_runs = _below(store, [plan], known, started, user_id)
+            runs, cursor = _descendant_page(
+                store, below[plan.id], first_runs, user_id, after=after, limit=limit
+            )
+            started_by = _started_by(known, user_id)
+            for run in runs:
+                run.started_by = started_by(run.session_id)
+            _name_workflows(runs, user_id)
+            return WorkflowRunList(data=runs, next_cursor=cursor)
+
+        return await asyncio.to_thread(page, journal)
 
     return router

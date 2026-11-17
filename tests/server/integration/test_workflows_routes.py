@@ -595,6 +595,8 @@ async def test_runs_list_the_workflow_runs_their_sessions_started(
     # A session's later runs aren't what its starter began it for.
     clock[0] = 140
     await _run(client, first, ready, "ready-1-again")
+    later_fix = start(first, "Ready #1 later fix", 150)
+    await _run(client, later_fix, ready, "ready-1-later-fix")
     # An automation's next occurrence starts a run without naming a workflow.
     clock[0] = 200
     conversations.set_labels(root, {SCHEDULED_TASK_RUN_LABEL_KEY: "next-occurrence"})
@@ -609,12 +611,17 @@ async def test_runs_list_the_workflow_runs_their_sessions_started(
     url = f"/v1/workflows/{stack['id']}/runs"
     (run,) = (await client.get(url, headers=_headers())).json()["data"]
     # Each run below another follows the session that started it, and the
-    # session's next run, named or not, ends the sessions that count as its own.
+    # session's next run, named or not, ends the sessions that count as its own,
+    # at every level: "Ready #1 later fix" belongs to Ready #1's later run.
     assert [below["title"] for below in run["descendant_runs"]] == [
         "Ready #1",
         "Ready #1 fix",
         "Ready #2",
     ]
+    assert run["descendant_run_count"] == 3 and run["descendant_runs_cursor"] is None
+    # Workflow names come from the server, so ownership doesn't depend on a loaded list.
+    assert run["workflow_name"] == "Land a stack"
+    assert {below["workflow_name"] for below in run["descendant_runs"]} == {"Ready a PR"}
     assert len(run["descendant_runs"]) == 3 and unrun not in {
         below["session_id"] for below in run["descendant_runs"]
     }
@@ -635,7 +642,7 @@ async def test_runs_list_the_workflow_runs_their_sessions_started(
     again, original = first_runs
     assert original["started_by"] == {"session_id": root, "title": "Land stack"}
     assert [below["session_id"] for below in original["descendant_runs"]] == [deeper]
-    assert again["descendant_runs"] == []
+    assert [below["session_id"] for below in again["descendant_runs"]] == [later_fix]
 
     # Someone the session is shared with can't read its starter or the runs below it.
     SqlAlchemyPermissionStore(db_uri).grant(BOB, second, LEVEL_READ)
@@ -645,6 +652,81 @@ async def test_runs_list_the_workflow_runs_their_sessions_started(
     assert shared.status_code == 200, shared.text
     (viewed,) = shared.json()["data"]
     assert viewed["session_id"] == second and viewed["started_by"] is None
+    assert viewed["workflow_name"] is None
+
+
+async def test_a_runs_descendants_continue_page_by_page_in_order(
+    client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("omnigent.server.workflows._DESCENDANT_RUNS_PAGE", 2)
+    clock = [100]
+    for module in ("session_journal_store", "conversation_store.sqlalchemy_store"):
+        monkeypatch.setattr(f"omnigent.stores.{module}.now_epoch", lambda: clock[0])
+    stack = await _save_workflow(client, "Land a stack")
+    ready = await _save_workflow(client, "Ready a PR")
+    conversations = SqlAlchemyConversationStore(db_uri)
+
+    async def start(starter: str, title: str, at: int) -> str:
+        clock[0] = at
+        session_id = _session(db_uri, title=title, labels={CREATED_BY_SESSION_LABEL_KEY: starter})
+        conversations.add_new_sibling(starter, session_id, user_id=ALICE)
+        await _run(client, session_id, ready, title)
+        return session_id
+
+    root = _session(db_uri, title="Land stack")
+    await _run(client, root, stack, "root-run")
+    first = await start(root, "Ready #1", 110)
+    fix = await start(first, "Ready #1 fix", 120)
+    await start(root, "Ready #2", 130)
+    titles = ["Ready #1", "Ready #1 fix", "Ready #2"]
+
+    (run,) = (await client.get(f"/v1/workflows/{stack['id']}/runs", headers=_headers())).json()[
+        "data"
+    ]
+    assert run["descendant_run_count"] == 3
+    assert [below["title"] for below in run["descendant_runs"]] == titles[:2]
+    assert run["descendant_runs_cursor"] == fix
+    url = f"/v1/workflows/{stack['id']}/runs/{run['id']}/descendant_runs"
+    rest = await client.get(
+        url,
+        params={"session_id": root, "after": run["descendant_runs_cursor"]},
+        headers=_headers(),
+    )
+    assert rest.status_code == 200, rest.text
+    (last,) = rest.json()["data"]
+    assert last["title"] == "Ready #2" and rest.json()["next_cursor"] is None
+    assert last["started_by"] == {"session_id": root, "title": "Land stack"}
+    assert last["workflow_name"] == "Ready a PR"
+
+    paged: list[str] = []
+    cursor: str | None = None
+    while True:
+        params = {"session_id": root, "limit": 1, **({"after": cursor} if cursor else {})}
+        page = (await client.get(url, params=params, headers=_headers())).json()
+        paged += [below["title"] for below in page["data"]]
+        if (cursor := page["next_cursor"]) is None:
+            break
+    assert paged == titles
+
+    refused = await client.get(
+        url, params={"session_id": root, "after": uuid4().hex}, headers=_headers()
+    )
+    assert refused.status_code == 400, refused.text
+    for missing in (
+        f"/v1/workflows/{ready['id']}/runs/{run['id']}/descendant_runs",
+        f"/v1/workflows/{stack['id']}/runs/{uuid4().hex}/descendant_runs",
+    ):
+        response = await client.get(missing, params={"session_id": root}, headers=_headers())
+        assert response.status_code == 404, missing
+    # Reading the run's session stands in for owning the workflow; the sessions
+    # below it stay Alice's own.
+    assert (
+        await client.get(url, params={"session_id": root}, headers=_headers(BOB))
+    ).status_code == 404
+    SqlAlchemyPermissionStore(db_uri).grant(BOB, root, LEVEL_READ)
+    shared = await client.get(url, params={"session_id": root}, headers=_headers(BOB))
+    assert shared.status_code == 200, shared.text
+    assert shared.json() == {**shared.json(), "data": [], "next_cursor": None}
 
 
 async def test_a_session_filter_lists_its_current_run_for_anyone_who_can_read_it(

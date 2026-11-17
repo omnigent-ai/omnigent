@@ -13,11 +13,11 @@ import {
   RunWorkflowButton,
   useRunTaskMenus,
 } from "@/components/workflows/RunTasks";
+import { Button } from "@/components/ui/button";
 import { WorkflowGraphOverlay } from "@/components/workflows/WorkflowStepsGraph";
 import { useNow } from "@/hooks/useNow";
-import { useSavedWorkflows } from "@/hooks/useSavedWorkflows";
 import { useSessionWorking } from "@/hooks/useSessionWorking";
-import { useWorkflowRuns } from "@/hooks/useWorkflow";
+import { useWorkflowRunDescendants, useWorkflowRuns } from "@/hooks/useWorkflow";
 import { Link } from "@/lib/routing";
 import { formatRunTimestamp } from "@/lib/scheduleText";
 import type { StepState } from "@/lib/sessionJournal";
@@ -146,7 +146,9 @@ export function WorkflowRunRow({
             className="relative -my-1"
           />
         )}
-        {nested && owned && run.workflowId && <RunWorkflowButton workflowId={run.workflowId} />}
+        {nested && owned && run.workflowId && (
+          <RunWorkflowButton workflowId={run.workflowId} className="relative -my-1" />
+        )}
         <RunGraphButton
           runName={title}
           className="relative -my-1"
@@ -212,9 +214,20 @@ export function DescendantRuns({
   className?: string;
 }) {
   const [open, setOpen] = useState<boolean | null>(null);
-  // Runs below this one can follow other workflows; only their owner can open them.
-  const { workflows } = useSavedWorkflows();
-  const descendants = run.descendantRuns ?? [];
+  const [loadMore, setLoadMore] = useState(false);
+  const more = useWorkflowRunDescendants(run.workflowId ?? workflowId, run, loadMore);
+  // A later page can repeat a run when runs start between pages; list it once.
+  const descendants = [
+    ...new Map(
+      [...(run.descendantRuns ?? []), ...(more.data?.pages.flatMap((page) => page.runs) ?? [])].map(
+        (descendant) => [descendant.id, descendant],
+      ),
+    ).values(),
+  ];
+  const count = run.descendantRunCount ?? descendants.length;
+  const hasMore = loadMore
+    ? more.hasNextPage || more.isFetching || (more.isError && !more.data)
+    : !!run.descendantRunsCursor;
   const active =
     isWorkflowRunWorking(run) ||
     descendants.some(
@@ -234,27 +247,44 @@ export function DescendantRuns({
           aria-hidden
           className={cn("size-3.5 transition-transform", shown && "rotate-90")}
         />
-        Ran {descendants.length} {descendants.length === 1 ? "workflow" : "workflows"}
+        Ran {count} {count === 1 ? "workflow" : "workflows"}
       </button>
       {shown && (
         <ul
           className="mt-1 flex flex-col gap-1 border-l-2 border-border pl-3"
           data-testid="workflow-run-descendants"
         >
-          {descendants.map((descendant) => {
-            const own = workflows.find((workflow) => workflow.id === descendant.workflowId);
-            return (
-              <WorkflowRunRow
-                key={descendant.id}
-                run={descendant}
-                now={now}
-                workflowId={workflowId}
-                workflowName={own?.name ?? null}
-                owned={own !== undefined}
-                parentSessionId={run.sessionId}
-              />
-            );
-          })}
+          {descendants.map((descendant) => (
+            // The server names a workflow only for its owner, who alone can open it.
+            <WorkflowRunRow
+              key={descendant.id}
+              run={descendant}
+              now={now}
+              workflowId={workflowId}
+              workflowName={descendant.workflowName ?? null}
+              owned={descendant.workflowName != null}
+              parentSessionId={run.sessionId}
+            />
+          ))}
+          {hasMore && (
+            <li>
+              <Button
+                variant="ghost"
+                size="xs"
+                className="text-xs text-muted-foreground"
+                loading={more.isFetching}
+                disabled={more.isFetching}
+                onClick={() => {
+                  if (!loadMore) setLoadMore(true);
+                  else if (more.data) void more.fetchNextPage();
+                  else void more.refetch();
+                }}
+                data-testid="workflow-run-descendants-more"
+              >
+                Show more
+              </Button>
+            </li>
+          )}
         </ul>
       )}
     </div>

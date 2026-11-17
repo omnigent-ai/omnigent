@@ -207,8 +207,11 @@ interface RawRun {
   steps?: JournalPlanStep[];
   statuses?: JournalEntry[];
   workflow_id?: string;
+  workflow_name?: string | null;
   started_by?: { session_id: string; title: string } | null;
   descendant_runs?: RawRun[];
+  descendant_run_count?: number;
+  descendant_runs_cursor?: string | null;
 }
 
 function toWorkflowRun(run: RawRun): WorkflowRun {
@@ -235,7 +238,20 @@ function toWorkflowRun(run: RawRun): WorkflowRun {
     startedBy: run.started_by
       ? { sessionId: run.started_by.session_id, title: run.started_by.title }
       : undefined,
+    workflowName: run.workflow_name,
     descendantRuns: (run.descendant_runs ?? []).map(toWorkflowRun),
+    descendantRunCount: run.descendant_run_count,
+    descendantRunsCursor: run.descendant_runs_cursor ?? null,
+  };
+}
+
+async function runsPage(url: string, signal: AbortSignal): Promise<RunsPage> {
+  const res = await authenticatedFetch(url, { signal });
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  const body = (await res.json()) as { data?: RawRun[]; next_cursor?: string | null };
+  return {
+    runs: (body.data ?? []).map(toWorkflowRun),
+    nextCursor: body.next_cursor ?? null,
   };
 }
 
@@ -253,15 +269,7 @@ export function useWorkflowRuns(workflowId: string, sessionId?: string) {
       const params = new URLSearchParams({ limit: String(RUNS_PAGE) });
       if (pageParam) params.set("before", pageParam);
       if (sessionId) params.set("session_id", sessionId);
-      const res = await authenticatedFetch(`${workflowPath(workflowId)}/runs?${params}`, {
-        signal,
-      });
-      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-      const body = (await res.json()) as { data?: RawRun[]; next_cursor?: string | null };
-      return {
-        runs: (body.data ?? []).map(toWorkflowRun),
-        nextCursor: body.next_cursor ?? null,
-      };
+      return runsPage(`${workflowPath(workflowId)}/runs?${params}`, signal);
     },
     initialPageParam: null as string | null,
     getNextPageParam: (page) => page.nextCursor,
@@ -269,5 +277,29 @@ export function useWorkflowRuns(workflowId: string, sessionId?: string) {
     staleTime: 10_000,
     // Other sessions and automations can start runs while this page stays open.
     refetchInterval: 10_000,
+  });
+}
+
+/**
+ * The workflow runs below *run* after the page it came with, a page at a time.
+ *
+ * @param workflowId - The workflow *run* follows.
+ * @param run - The run, with its `descendantRunsCursor`.
+ * @param enabled - Whether to load them, e.g. once asked to show more.
+ */
+export function useWorkflowRunDescendants(workflowId: string, run: WorkflowRun, enabled: boolean) {
+  const cursor = run.descendantRunsCursor ?? null;
+  return useInfiniteQuery({
+    queryKey: ["workflow-run-descendants", workflowId, run.id, cursor],
+    queryFn: ({ pageParam, signal }): Promise<RunsPage> => {
+      const params = new URLSearchParams({ session_id: run.sessionId, limit: String(RUNS_PAGE) });
+      if (pageParam) params.set("after", pageParam);
+      const path = `${workflowPath(workflowId)}/runs/${encodeURIComponent(run.id)}/descendant_runs`;
+      return runsPage(`${path}?${params}`, signal);
+    },
+    initialPageParam: cursor,
+    getNextPageParam: (page) => page.nextCursor,
+    enabled: enabled && cursor !== null,
+    staleTime: 10_000,
   });
 }

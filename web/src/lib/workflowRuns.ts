@@ -39,8 +39,14 @@ export interface WorkflowRun {
   workflowId?: string;
   /** The session that started the run, when another session did and you can read it. */
   startedBy?: WorkflowRunStarter;
-  /** The workflow runs below this one, each right after the run that started it. */
+  /** Its workflow's name when the workflow is yours; `null` for someone else's or a deleted one. */
+  workflowName?: string | null;
+  /** The first page of the workflow runs below this one, each right after the run that started it. */
   descendantRuns?: WorkflowRun[];
+  /** How many workflow runs are below this one, on every page. */
+  descendantRunCount?: number;
+  /** Continues `descendantRuns`; `null` when they are all here. */
+  descendantRunsCursor?: string | null;
 }
 
 /** The session that started a workflow run. */

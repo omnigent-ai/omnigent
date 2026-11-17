@@ -10,6 +10,7 @@ import type { SavedWorkflow } from "@/hooks/useSavedWorkflows";
 import { useDeleteWorkflow, useSavedWorkflows } from "@/hooks/useSavedWorkflows";
 import {
   useWorkflow,
+  useWorkflowRunDescendants,
   useWorkflowRuns,
   type WorkflowDetail,
   WorkflowNotFoundError,
@@ -43,7 +44,12 @@ import { WorkflowDetailPage } from "./WorkflowDetailPage";
 
 vi.mock("@/hooks/useWorkflow", async (importOriginal) => {
   const actual = await importOriginal<typeof WorkflowHooks>();
-  return { ...actual, useWorkflow: vi.fn(), useWorkflowRuns: vi.fn() };
+  return {
+    ...actual,
+    useWorkflow: vi.fn(),
+    useWorkflowRuns: vi.fn(),
+    useWorkflowRunDescendants: vi.fn(),
+  };
 });
 vi.mock("@/hooks/useSessionJournal", () => ({ useSessionJournal: vi.fn() }));
 vi.mock("@/hooks/useSession", () => ({ useSession: vi.fn() }));
@@ -198,7 +204,25 @@ function mockWorkflow(state: Partial<ReturnType<typeof useWorkflow>>) {
   return refetch;
 }
 
+function mockDescendantPages(pages: WorkflowRun[][] | null) {
+  vi.mocked(useWorkflowRunDescendants).mockImplementation(
+    (_workflowId, _run, enabled) =>
+      ({
+        data:
+          enabled && pages
+            ? { pages: pages.map((runs) => ({ runs, nextCursor: null })), pageParams: [] }
+            : undefined,
+        hasNextPage: false,
+        isFetching: false,
+        isError: false,
+        fetchNextPage: vi.fn(),
+        refetch: vi.fn(),
+      }) as unknown as ReturnType<typeof useWorkflowRunDescendants>,
+  );
+}
+
 function mockRuns(runs: WorkflowRun[], state: Record<string, unknown> = {}) {
+  mockDescendantPages(null);
   const fetchNextPage = vi.fn();
   vi.mocked(useWorkflowRuns).mockReturnValue({
     data: { pages: [{ runs, nextCursor: null }], pageParams: [null] },
@@ -1313,7 +1337,8 @@ describe("WorkflowDetailPage", () => {
   it("lists the workflow runs below a run, saying who started the ones further down", () => {
     mockWorkflow({});
     const calledId = "c".repeat(32);
-    mockSavedWorkflows([{ id: calledId, name: "Ready a PR", description: "Readies one PR." }]);
+    // The server names the workflows you own, loaded in the saved list or not.
+    mockSavedWorkflows([]);
     const root = "a".repeat(32);
     const ready = "b".repeat(32);
     mockRuns([
@@ -1324,11 +1349,13 @@ describe("WorkflowDetailPage", () => {
           {
             ...run(ready, "Ready #1", { done: 1 }, [status("explore", "done")]),
             workflowId: calledId,
+            workflowName: "Ready a PR",
             startedBy: { sessionId: root, title: "Land stack" },
           },
           {
             ...run("d".repeat(32), "Fix flaky test", { done: 1 }, [status("explore", "done")]),
             workflowId: "e".repeat(32),
+            workflowName: null,
             startedBy: { sessionId: ready, title: "" },
           },
         ],
@@ -1370,6 +1397,39 @@ describe("WorkflowDetailPage", () => {
     fireEvent.click(earlier!);
     expect(earlier).toHaveAttribute("aria-expanded", "true");
     expect(screen.getAllByTestId("workflow-run-descendants")).toHaveLength(2);
+  });
+
+  it("shows the rest of the workflow runs below a run on request", () => {
+    mockWorkflow({});
+    mockSavedWorkflows([]);
+    const listed = {
+      ...run("a".repeat(32), "Land stack", { done: 1 }),
+      descendantRuns: [run("b".repeat(32), "Ready #1", {})],
+      descendantRunCount: 3,
+      descendantRunsCursor: "b".repeat(32),
+    };
+    mockRuns([listed]);
+    mockDescendantPages([
+      [run("c".repeat(32), "Ready #2", {})],
+      [run("d".repeat(32), "Ready #3", {})],
+    ]);
+    renderPage();
+
+    const toggle = screen.getByTestId("workflow-run-descendants-toggle");
+    expect(toggle).toHaveTextContent("Ran 3 workflows");
+    fireEvent.click(toggle);
+    const list = screen.getByTestId("workflow-run-descendants");
+    const titles = () =>
+      within(list)
+        .getAllByTestId("workflow-run")
+        .map((row) => row.querySelector("a")?.textContent);
+    expect(titles()).toEqual(["Ready #1"]);
+    expect(useWorkflowRunDescendants).toHaveBeenLastCalledWith(WORKFLOW.id, listed, false);
+
+    fireEvent.click(within(list).getByTestId("workflow-run-descendants-more"));
+    expect(useWorkflowRunDescendants).toHaveBeenLastCalledWith(WORKFLOW.id, listed, true);
+    expect(titles()).toEqual(["Ready #1", "Ready #2", "Ready #3"]);
+    expect(within(list).queryByTestId("workflow-run-descendants-more")).toBeNull();
   });
 
   it("links a run another session started back to that session", () => {

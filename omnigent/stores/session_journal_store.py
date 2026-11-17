@@ -922,6 +922,23 @@ class SessionJournalStore:
             plans=plans, next_cursor=_run_cursor(plans[-1]) if len(rows) > limit else None
         )
 
+    def get_entry(self, conversation_id: str, entry_id: str) -> JournalEntry | None:
+        """One of a session's entries by its ID, e.g. the plan that started a run."""
+        with self._session("read_journal_entry") as session:
+            row = session.execute(
+                _using(
+                    select(SqlSessionJournalEntry)
+                    .where(
+                        SqlSessionJournalEntry.workspace_id == current_workspace_id(),
+                        SqlSessionJournalEntry.conversation_id == conversation_id,
+                        SqlSessionJournalEntry.id == entry_id,
+                    )
+                    .limit(1),
+                    "ix_session_journal_entries_id",
+                )
+            ).scalar_one_or_none()
+        return None if row is None else self._entries([row])[0]
+
     def next_run_starts(self, plans: Sequence[JournalEntry]) -> list[int | None]:
         """When each plan's session began its next run, if it has.
 
