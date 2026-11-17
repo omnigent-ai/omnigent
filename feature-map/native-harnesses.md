@@ -781,8 +781,10 @@ Cross-harness journeys:
   metadata. Older servers may roll back intent or report the prior
   model after uncertainty. Older runners retain their existing CLI actuator and
   saved-default behavior. Legacy requests and both peer directions are covered by
-  `tests/runner/test_app_sessions_native_events_options.py::test_events_legacy_model_change_requires_a_receipt_and_preserves_refusal_semantics`,
-  `tests/server/integration/test_native_model_change_failures.py::test_legacy_claude_model_request_preserves_outcomes_and_newer_metadata`,
+  `tests/runner/test_app_sessions_native_events_options.py::test_events_model_change_requires_the_same_immediate_picker_receipt`,
+  `tests/runner/test_app_sessions_native_events_options.py::test_events_model_change_refuses_unsupported_queued_or_unconfirmed_states`,
+  `tests/server/integration/test_native_model_change_failures.py::test_claude_model_confirmation_controls_public_patch_and_rollback`,
+  `tests/server/integration/test_native_model_change_failures.py::test_refused_model_change_preserves_newer_silent_selection`,
   and `tests/server/integration/test_native_model_change_failures.py::test_new_server_accepts_legacy_runner_replies_without_losing_newer_metadata`.
 - **`model-and-effort`, Claude browser selection and refusal (nightly):**
   `tests/e2e_ui/chat/test_claude_model_picker.py::test_claude_native_picker_repeated_pins_reach_the_real_terminal`
