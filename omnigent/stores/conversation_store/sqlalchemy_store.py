@@ -1325,7 +1325,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     "insert_conversation_metadata",
                     insert_metadata,
                 )
-            except OmnigentError:
+            except Exception:
                 self._discard_unbound_conversation(new_id)
                 raise
             return _to_conversation(row, meta, creation_labels)
@@ -1358,7 +1358,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             raise
 
     def _discard_unbound_conversation(self, conversation_id: str) -> None:
-        """Undo an unpublished conversation when metadata admission was rejected."""
+        """Undo an unpublished conversation when its metadata write failed."""
 
         def write(session: Session) -> bool:
             keys = list(
@@ -6188,7 +6188,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 "create_session_with_agent_metadata",
                 insert_metadata,
             )
-        except OmnigentError:
+        except Exception:
             self._discard_unbound_conversation(conversation_id)
             raise
 

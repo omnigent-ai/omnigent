@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from sqlalchemy import event
+from sqlalchemy.exc import OperationalError
 
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
@@ -121,6 +123,50 @@ def test_create_sub_agent_conversation(
     # title and parent link live in AP
     parent_id_col = _col(conv_db, "conversations", "parent_conversation_id", f"id=X'{child.id}'")
     assert parent_id_col == [parent.id]
+
+
+@pytest.mark.parametrize("create_path", ["create_conversation", "create_session_with_agent"])
+def test_failed_child_metadata_write_releases_title(
+    omnigent_db: Path, conv_db: Path, store: SqlAlchemyConversationStore, create_path: str
+) -> None:
+    parent = store.create_conversation(kind="default", title="parent")
+
+    def fail_metadata_insert(_connection: Any, _cursor: Any, statement: str, *_args: Any) -> None:
+        if statement.startswith("INSERT INTO omnigent_conversation_metadata"):
+            raise OperationalError(statement, None, sqlite3.OperationalError("database is locked"))
+
+    event.listen(store._engine, "before_cursor_execute", fail_metadata_insert)
+    try:
+        with pytest.raises(OperationalError, match="database is locked"):
+            if create_path == "create_conversation":
+                store.create_conversation(
+                    kind="sub_agent",
+                    title="worker:worker-1",
+                    parent_conversation_id=parent.id,
+                    sub_agent_name="worker",
+                )
+            else:
+                store.create_session_with_agent(
+                    agent_id="5f1c2a8e9b3d4c7a8e6f0b1d2c3a4e5f",
+                    agent_name="worker",
+                    agent_bundle_location="5f1c2a8e9b3d4c7a8e6f0b1d2c3a4e5f/bundle",
+                    agent_description=None,
+                    title="worker:worker-1",
+                    parent_conversation_id=parent.id,
+                )
+    finally:
+        event.remove(store._engine, "before_cursor_execute", fail_metadata_insert)
+
+    assert _col(conv_db, "conversations", "title") == ["parent"]
+    assert _count(omnigent_db, "omnigent_conversation_metadata") == 1
+    retried = store.create_conversation(
+        kind="sub_agent",
+        title="worker:worker-1",
+        parent_conversation_id=parent.id,
+        sub_agent_name="worker",
+    )
+    children = store.list_conversations(kind="sub_agent", parent_conversation_id=parent.id)
+    assert [child.id for child in children.data] == [retried.id]
 
 
 # ── get / list ─────────────────────────────────────────
