@@ -10,9 +10,19 @@ interface TileColorPickerProps {
   sessionId: string;
   title: string;
   color: TileColor;
+  /** The active tile's edge is wider. */
+  active?: boolean;
+  /** Quiet agents show a grey edge. */
+  muted?: boolean;
 }
 
-export function TileColorPicker({ sessionId, title, color }: TileColorPickerProps) {
+export function TileColorPicker({
+  sessionId,
+  title,
+  color,
+  active = false,
+  muted = false,
+}: TileColorPickerProps) {
   const [open, setOpen] = useState(false);
   const pick = (hue: number | null) => {
     setTileHue(sessionId, hue);
@@ -26,8 +36,12 @@ export function TileColorPicker({ sessionId, title, color }: TileColorPickerProp
           aria-label={`Tile color for ${title}`}
           title="Tile color"
           data-testid="tile-color-stripe"
-          className="h-5 w-1.5 shrink-0 cursor-pointer rounded-full transition-[width] hover:w-2.5"
-          style={{ backgroundColor: color.solid }}
+          className={cn(
+            "shrink-0 cursor-pointer self-stretch transition-[width] hover:w-[9px]",
+            active ? "w-[7px]" : "w-[5px]",
+            muted && "bg-muted-foreground/50",
+          )}
+          style={muted ? undefined : { backgroundColor: color.solid }}
         />
       </PopoverTrigger>
       <PopoverContent

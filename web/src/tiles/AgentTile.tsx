@@ -3,6 +3,7 @@
 
 import {
   memo,
+  useEffect,
   useId,
   useRef,
   useState,
@@ -12,12 +13,13 @@ import {
 } from "react";
 import {
   AppWindowIcon,
-  ChevronDownIcon,
+  ChevronRightIcon,
   EllipsisIcon,
   ExternalLinkIcon,
   GripVerticalIcon,
   Maximize2Icon,
   Minimize2Icon,
+  PencilIcon,
   FolderIcon,
   GitBranchIcon,
   LayersIcon,
@@ -33,7 +35,6 @@ import {
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuLabel,
-  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import type { Conversation } from "@/hooks/useConversations";
@@ -42,6 +43,8 @@ import { cn } from "@/lib/utils";
 import { conversationDisplayLabel } from "@/shell/sidebarNav";
 import { TileColorPicker } from "./TileColorPicker";
 import { TileDetails } from "./TileDetails";
+import { TileRenameInput } from "./TileRenameInput";
+import { isQuiet } from "./tileStack";
 import {
   DEFAULT_TILE_TEXT_SIZE,
   setTileTextSize,
@@ -109,6 +112,20 @@ function AgentTileComponent({
   const color = useTileColor(conversation.id);
   const [detailsOpen, setDetailsOpen] = useState(false);
   const detailsId = useId();
+  const [renaming, setRenaming] = useState(false);
+  const canRename = !conversation.parent_session_id;
+  const quiet = isQuiet(conversation, Date.now());
+  // A double-click on the title is full screen, so a single click waits a beat before toggling details.
+  const detailsTimer = useRef<number | undefined>(undefined);
+  useEffect(() => () => window.clearTimeout(detailsTimer.current), []);
+  const toggleDetailsSoon = () => {
+    if (!onToggleFullScreen) {
+      setDetailsOpen((open) => !open);
+      return;
+    }
+    window.clearTimeout(detailsTimer.current);
+    detailsTimer.current = window.setTimeout(() => setDetailsOpen((open) => !open), 250);
+  };
   const textSize = useTileTextSize(conversation.id);
   const bodyZoom = textSize === DEFAULT_TILE_TEXT_SIZE ? undefined : { zoom: textSize };
   const sectionRef = useRef<HTMLElement>(null);
@@ -170,9 +187,27 @@ function AgentTileComponent({
       style={active || waiting ? undefined : { borderColor: color.border }}
     >
       <header
-        className="@container flex h-10 shrink-0 items-center gap-2 border-b pr-2 pl-2"
-        style={{ backgroundColor: color.tint }}
+        className={cn(
+          "group/header @container flex shrink-0 items-center gap-1.5 border-b pr-1.5",
+          variant === "strip" ? "h-9" : "h-10",
+          quiet && "bg-muted",
+        )}
+        style={
+          quiet
+            ? {
+                backgroundImage:
+                  "repeating-linear-gradient(135deg, transparent 0 8px, rgb(127 127 127 / 0.08) 8px 16px)",
+              }
+            : { backgroundColor: color.tint }
+        }
       >
+        <TileColorPicker
+          sessionId={conversation.id}
+          title={title}
+          color={color}
+          active={active}
+          muted={quiet}
+        />
         {reorder && (
           <button
             type="button"
@@ -196,40 +231,125 @@ function AgentTileComponent({
             <GripVerticalIcon aria-hidden className="size-3.5" />
           </button>
         )}
-        <TileColorPicker sessionId={conversation.id} title={title} color={color} />
-        {state ? (
-          <SessionStateBadge state={state} />
+        {renaming ? (
+          <div className="flex min-w-0 flex-1 items-center">
+            <TileRenameInput
+              sessionId={conversation.id}
+              title={title}
+              onDone={() => setRenaming(false)}
+            />
+          </div>
         ) : (
-          <span aria-hidden className="size-2 shrink-0 rounded-full bg-muted-foreground" />
-        )}
-        <button
-          type="button"
-          data-testid="agent-tile-title"
-          aria-expanded={detailsOpen}
-          aria-controls={detailsOpen ? detailsId : undefined}
-          title={`${title} · ${detailsOpen ? "Hide details" : "Show details"}`}
-          onClick={() => setDetailsOpen((open) => !open)}
-          onDoubleClick={() => onToggleFullScreen?.(conversation.id)}
-          className="mr-auto flex min-w-0 cursor-pointer items-center gap-1 rounded-sm text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-        >
-          <strong className="min-w-0 truncate text-sm font-semibold tracking-tight text-foreground">
-            {title}
-          </strong>
-          <ChevronDownIcon
-            aria-hidden
-            className={cn(
-              "size-3.5 shrink-0 text-muted-foreground transition-transform",
-              detailsOpen && "rotate-180",
+          <button
+            type="button"
+            data-testid="agent-tile-title"
+            aria-expanded={detailsOpen}
+            aria-controls={detailsOpen ? detailsId : undefined}
+            title={`${title} · ${detailsOpen ? "Hide details" : "Show details"}${canRename ? " · F2 to rename" : ""}`}
+            onClick={toggleDetailsSoon}
+            onDoubleClick={() => {
+              window.clearTimeout(detailsTimer.current);
+              onToggleFullScreen?.(conversation.id);
+            }}
+            onKeyDown={(event) => {
+              if (event.key === "F2" && canRename) {
+                event.preventDefault();
+                setRenaming(true);
+              }
+            }}
+            className="flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 self-stretch rounded-sm pl-0.5 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            <ChevronRightIcon
+              aria-hidden
+              className={cn(
+                "size-3.5 shrink-0 text-muted-foreground transition-transform",
+                detailsOpen && "rotate-90",
+              )}
+            />
+            {state ? (
+              <SessionStateBadge state={state} />
+            ) : (
+              <span aria-hidden className="size-2 shrink-0 rounded-full bg-muted-foreground" />
             )}
-          />
-        </button>
-        <span
-          data-testid="agent-tile-subline"
-          className="hidden min-w-0 flex-1 truncate text-xs text-muted-foreground @[34rem]:block"
-          title={subline}
-        >
-          {subline}
-        </span>
+            <strong
+              className={cn(
+                "min-w-0 shrink truncate text-sm font-semibold tracking-tight text-foreground",
+                quiet && "opacity-70",
+              )}
+            >
+              {title}
+            </strong>
+            {quiet && (
+              <span className="shrink-0 rounded-full border bg-background px-1.5 text-[11px] text-muted-foreground">
+                Quiet
+              </span>
+            )}
+            <span
+              data-testid="agent-tile-subline"
+              className="hidden min-w-0 shrink-[2] truncate text-xs text-muted-foreground @[34rem]:block"
+              title={subline}
+            >
+              {subline}
+            </span>
+          </button>
+        )}
+        {canRename && !renaming && (
+          <Button
+            variant="ghost"
+            size="icon-xs"
+            aria-label={`Rename ${title}`}
+            title="Rename (F2)"
+            onClick={() => setRenaming(true)}
+            className="-ml-1 opacity-0 transition-opacity group-hover/header:opacity-100 focus-visible:opacity-100"
+          >
+            <PencilIcon className="size-3" />
+          </Button>
+        )}
+        {variant !== "card" && (
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button
+                variant="ghost"
+                size="icon-xs"
+                aria-label={`Text size for ${title}`}
+                title={`Text size · ${Math.round(textSize * 100)}%`}
+                className="text-[11px] font-semibold"
+              >
+                Aa
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" className="min-w-40">
+              <DropdownMenuLabel className="text-xs text-muted-foreground">
+                Text size · {Math.round(textSize * 100)}%
+              </DropdownMenuLabel>
+              {/* Size steps keep the menu open, so several can be applied in a row. */}
+              <DropdownMenuItem
+                disabled={textSize === TILE_TEXT_SIZES[0]}
+                onSelect={(event) => {
+                  event.preventDefault();
+                  setTileTextSize(conversation.id, stepTextSize(textSize, -1));
+                }}
+              >
+                Smaller text
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                disabled={textSize === TILE_TEXT_SIZES[TILE_TEXT_SIZES.length - 1]}
+                onSelect={(event) => {
+                  event.preventDefault();
+                  setTileTextSize(conversation.id, stepTextSize(textSize, 1));
+                }}
+              >
+                Larger text
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                disabled={textSize === DEFAULT_TILE_TEXT_SIZE}
+                onSelect={() => setTileTextSize(conversation.id, DEFAULT_TILE_TEXT_SIZE)}
+              >
+                Reset text size
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+        )}
         {onToggleStar && (
           <Button
             variant="ghost"
@@ -282,35 +402,6 @@ function AgentTileComponent({
                 Move to the Stack
               </DropdownMenuItem>
             )}
-            <DropdownMenuSeparator />
-            <DropdownMenuLabel className="text-xs text-muted-foreground">
-              Text size · {Math.round(textSize * 100)}%
-            </DropdownMenuLabel>
-            {/* Size steps keep the menu open, so several can be applied in a row. */}
-            <DropdownMenuItem
-              disabled={textSize === TILE_TEXT_SIZES[0]}
-              onSelect={(event) => {
-                event.preventDefault();
-                setTileTextSize(conversation.id, stepTextSize(textSize, -1));
-              }}
-            >
-              Smaller text
-            </DropdownMenuItem>
-            <DropdownMenuItem
-              disabled={textSize === TILE_TEXT_SIZES[TILE_TEXT_SIZES.length - 1]}
-              onSelect={(event) => {
-                event.preventDefault();
-                setTileTextSize(conversation.id, stepTextSize(textSize, 1));
-              }}
-            >
-              Larger text
-            </DropdownMenuItem>
-            <DropdownMenuItem
-              disabled={textSize === DEFAULT_TILE_TEXT_SIZE}
-              onSelect={() => setTileTextSize(conversation.id, DEFAULT_TILE_TEXT_SIZE)}
-            >
-              Reset text size
-            </DropdownMenuItem>
           </DropdownMenuContent>
         </DropdownMenu>
       </header>

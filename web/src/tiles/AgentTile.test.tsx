@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -14,6 +14,11 @@ vi.mock("@/components/chat/SideChatPane", () => ({
   ),
 }));
 
+vi.mock("./TileRenameInput", () => ({
+  TileRenameInput: ({ title }: { title: string }) => (
+    <input aria-label="Session name" defaultValue={title} />
+  ),
+}));
 vi.mock("./TileDetails", () => ({
   TileDetails: ({ id }: { id: string }) => <div id={id} data-testid="tile-details" />,
 }));
@@ -163,5 +168,53 @@ describe("AgentTile", () => {
     fireEvent.doubleClick(screen.getByTestId("agent-tile-title"));
     expect(onToggleFullScreen).toHaveBeenCalledTimes(2);
     expect(onActivate).not.toHaveBeenCalled();
+  });
+
+  it("renames from the header with F2 or its pencil", () => {
+    renderTile();
+    fireEvent.keyDown(screen.getByTestId("agent-tile-title"), { key: "F2" });
+    expect(screen.getByRole("textbox", { name: "Session name" })).toHaveValue("Fix authentication");
+  });
+
+  it("keeps a sub-agent's title read-only", () => {
+    renderTile({ conversation: conversation({ parent_session_id: "conv_parent" }) });
+    expect(
+      screen.queryByRole("button", { name: "Rename Fix authentication" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("marks an agent quiet for a day as Quiet", () => {
+    renderTile({ conversation: conversation({ updated_at: Date.now() / 1000 - 2 * 86_400 }) });
+    expect(screen.getByText("Quiet")).toBeInTheDocument();
+  });
+
+  it("waits before opening details, so a double-click goes full screen instead", () => {
+    vi.useFakeTimers();
+    try {
+      const onToggleFullScreen = vi.fn();
+      renderTile({ onToggleFullScreen });
+      const title = screen.getByTestId("agent-tile-title");
+      fireEvent.click(title);
+      fireEvent.doubleClick(title);
+      act(() => vi.advanceTimersByTime(500));
+      expect(onToggleFullScreen).toHaveBeenCalledTimes(1);
+      expect(title).toHaveAttribute("aria-expanded", "false");
+
+      fireEvent.click(title);
+      act(() => vi.advanceTimersByTime(500));
+      expect(title).toHaveAttribute("aria-expanded", "true");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("sets text size from the Aa menu", async () => {
+    const user = userEvent.setup();
+    renderTile();
+    await user.click(screen.getByRole("button", { name: "Text size for Fix authentication" }));
+    await user.click(screen.getByRole("menuitem", { name: "Larger text" }));
+    expect(JSON.parse(localStorage.getItem("omnigent:tiles-text-size") ?? "{}")).toEqual({
+      conv_1: 1.15,
+    });
   });
 });

@@ -5,14 +5,14 @@ import { useState, type ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { GitPullRequestIcon, PencilIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { useRenameConversation, type Conversation } from "@/hooks/useConversations";
+import type { Conversation } from "@/hooks/useConversations";
 import { useSession } from "@/hooks/useSession";
 import { getSessionState } from "@/hooks/useSessionState";
 import { formatSessionCostUsd, formatTokenCount } from "@/lib/formatCost";
 import { fetchLastAssistantText } from "@/lib/lastAssistantText";
 import { getSessionUsage } from "@/lib/sessionsApi";
 import { cn } from "@/lib/utils";
-import { HeaderTitleInput } from "@/shell/HeaderTitle";
+import { TileRenameInput } from "./TileRenameInput";
 import { activityNotes, projectName, relativeAge, statusLabel, usageTotals } from "./tileSummary";
 
 const DETAILS_STALE_MS = 30_000;
@@ -55,25 +55,18 @@ function Row({ label, value, mono = false }: { label: string; value: ReactNode; 
   );
 }
 
-/** The session's title with the header's inline rename; sub-agents keep their name. */
+/** The session's title with inline rename; sub-agents keep their name. */
 function TitleRow({ conversation, title }: { conversation: Conversation; title: string }) {
-  const rename = useRenameConversation();
   const [editing, setEditing] = useState(false);
   const canRename = !conversation.parent_session_id;
   return (
     <div className="flex min-w-0 items-center gap-2 text-xs">
       <span className="shrink-0 text-muted-foreground">Title</span>
       {editing ? (
-        <HeaderTitleInput
-          initialTitle={title}
-          pending={rename.isPending}
-          onCommit={(next) => {
-            const trimmed = next.trim();
-            if (trimmed && trimmed !== title)
-              rename.mutate({ id: conversation.id, title: trimmed });
-            setEditing(false);
-          }}
-          onCancel={() => setEditing(false)}
+        <TileRenameInput
+          sessionId={conversation.id}
+          title={title}
+          onDone={() => setEditing(false)}
         />
       ) : (
         <>
