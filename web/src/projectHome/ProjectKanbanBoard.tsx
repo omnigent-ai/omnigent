@@ -27,12 +27,15 @@ import {
   GitBranchIcon,
   LaptopIcon,
   ListChevronsUpDownIcon,
+  SendHorizontalIcon,
   type LucideIcon,
 } from "lucide-react";
+import { RunningDot } from "@/components/RunningDot";
 import { SessionStateBadge } from "@/components/SessionStateBadge";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useProjectSessions, useProjects, type Conversation } from "@/hooks/useConversations";
 import { useHosts, type Host } from "@/hooks/useHosts";
 import { getSessionState } from "@/hooks/useSessionState";
@@ -127,11 +130,17 @@ function columnOf(row: Conversation): StatusBucket {
 export function ProjectKanbanBoard({
   projectName,
   searchQuery = "",
+  quickViewHref,
+  selectedSessionId = null,
   overlayClearance,
 }: {
   projectName: string;
   /** Shows only cards with a session whose title or id contains it. */
   searchQuery?: string;
+  /** Where each card's quick-view button links; without it, cards have none. */
+  quickViewHref?: (conversationId: string) => string;
+  /** The session open in quick view, marked on its card. */
+  selectedSessionId?: string | null;
   /** Room below each lane's last card, so it can scroll clear of an overlay such as the composer. */
   overlayClearance?: string;
 }) {
@@ -169,14 +178,14 @@ export function ProjectKanbanBoard({
 
   if (query.isPending) {
     return (
-      <div className="flex justify-center py-10">
+      <div className="flex flex-1 justify-center py-10">
         <Spinner className="size-5 text-muted-foreground" aria-label="Loading sessions" />
       </div>
     );
   }
   if (query.isError) {
     return (
-      <div role="alert" className="flex flex-col items-center gap-3 p-6">
+      <div role="alert" className="flex flex-1 flex-col items-center gap-3 p-6">
         <p className="text-muted-foreground">Couldn’t load this project’s sessions.</p>
         <Button variant="outline" size="sm" onClick={() => void query.refetch()}>
           Try again
@@ -208,7 +217,7 @@ export function ProjectKanbanBoard({
             }
           }}
         >
-          <div className="flex min-h-0 flex-1 flex-col">
+          <div className="flex min-h-0 min-w-0 flex-1 flex-col">
             <div
               role="region"
               aria-label={`${projectName} kanban board`}
@@ -223,6 +232,8 @@ export function ProjectKanbanBoard({
                   emptyLabel={searchQuery.trim() ? "No matching sessions" : "No sessions"}
                   dropAllowed={dragged !== null && kanbanDropAction(dragged, column) !== null}
                   suppressClick={() => Date.now() - dragEndedAt.current < DRAG_CLICK_SUPPRESS_MS}
+                  quickViewHref={quickViewHref}
+                  selectedSessionId={selectedSessionId}
                   overlayClearance={overlayClearance}
                 />
               ))}
@@ -241,7 +252,7 @@ export function ProjectKanbanBoard({
             )}
           </div>
           <DragOverlay dropAnimation={null}>
-            {dragged && <KanbanCardBody card={dragged} className="w-64 rotate-1 shadow-md" />}
+            {dragged && <KanbanCardBody card={dragged} className="w-64 rotate-1 shadow-xl" />}
           </DragOverlay>
         </DndContext>
       </ArrivedIdsContext.Provider>
@@ -255,6 +266,8 @@ function KanbanColumn({
   emptyLabel,
   dropAllowed,
   suppressClick,
+  quickViewHref,
+  selectedSessionId,
   overlayClearance,
 }: {
   column: StatusBucket;
@@ -263,6 +276,8 @@ function KanbanColumn({
   /** Whether the card being dragged can drop here. */
   dropAllowed: boolean;
   suppressClick: () => boolean;
+  quickViewHref?: (conversationId: string) => string;
+  selectedSessionId: string | null;
   overlayClearance?: string;
 }) {
   const { setNodeRef, isOver } = useDroppable({ id: `column:${column}`, data: { column } });
@@ -288,7 +303,12 @@ function KanbanColumn({
       >
         {cards.map((card) => (
           <li key={card.conversation.id}>
-            <DraggableKanbanCard card={card} suppressClick={suppressClick} />
+            <DraggableKanbanCard
+              card={card}
+              suppressClick={suppressClick}
+              quickViewHref={quickViewHref?.(card.conversation.id)}
+              selected={card.conversation.id === selectedSessionId}
+            />
           </li>
         ))}
         {cards.length === 0 && (
@@ -302,32 +322,68 @@ function KanbanColumn({
 function DraggableKanbanCard({
   card,
   suppressClick,
+  quickViewHref,
+  selected,
 }: {
   card: KanbanCard;
   suppressClick: () => boolean;
+  quickViewHref?: string;
+  selected: boolean;
 }) {
   const { setNodeRef, listeners, isDragging } = useDraggable({
     id: card.conversation.id,
     data: { card },
   });
   return (
-    // Listeners only: the card keeps its link semantics rather than dnd-kit's button role.
-    <Link
-      ref={setNodeRef}
-      {...listeners}
-      to={`/c/${card.conversation.id}`}
-      draggable={false}
-      data-testid="kanban-card"
-      onClick={(event) => {
-        if (suppressClick()) event.preventDefault();
-      }}
-      className={cn(
-        "block rounded-xl focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none",
-        isDragging && "opacity-40",
+    <div className={cn("group/card relative", isDragging && "opacity-40")}>
+      {/* Listeners only: the card keeps its link semantics rather than dnd-kit's button role. */}
+      <Link
+        ref={setNodeRef}
+        {...listeners}
+        to={`/c/${card.conversation.id}`}
+        draggable={false}
+        data-testid="kanban-card"
+        onClick={(event) => {
+          if (suppressClick()) event.preventDefault();
+        }}
+        className="block rounded-xl focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
+      >
+        <KanbanCardBody
+          card={card}
+          reserveCornerAction={quickViewHref !== undefined}
+          className={cn(
+            "group-hover/card:border-foreground/25",
+            selected && "border-foreground/40 group-hover/card:border-foreground/40",
+          )}
+        />
+      </Link>
+      {/* A sibling of the card's link, since links can't nest interactive content. */}
+      {quickViewHref !== undefined && !isDragging && (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              asChild
+              variant="ghost"
+              size="icon-sm"
+              className={cn(
+                "absolute right-2 bottom-2 text-muted-foreground",
+                !selected && "opacity-0 group-hover/card:opacity-100 focus-visible:opacity-100",
+              )}
+            >
+              <Link
+                to={quickViewHref}
+                draggable={false}
+                aria-label={`Quick view ${conversationDisplayLabel(card.conversation)}`}
+                data-testid="kanban-card-quick-view"
+              >
+                <SendHorizontalIcon />
+              </Link>
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent side="bottom">Quick view</TooltipContent>
+        </Tooltip>
       )}
-    >
-      <KanbanCardBody card={card} className="hover:border-foreground/20" />
-    </Link>
+    </div>
   );
 }
 
@@ -346,10 +402,20 @@ function useLastResponsePreview(conversation: Conversation): string | undefined 
   return data ? leadingSentences(data, RESPONSE_PREVIEW_SENTENCES) : undefined;
 }
 
-function KanbanCardBody({ card, className }: { card: KanbanCard; className?: string }) {
+function KanbanCardBody({
+  card,
+  reserveCornerAction = false,
+  className,
+}: {
+  card: KanbanCard;
+  /** Keeps the bottom-right corner clear for a button laid over the card. */
+  reserveCornerAction?: boolean;
+  className?: string;
+}) {
   const { conversation, members } = card;
   const state =
     getSessionState(conversation) ?? (isUnseen(conversation) ? { kind: "unseen" as const } : null);
+  const working = state?.kind === "running";
   const nestedCount = members.length - 1;
   const responsePreview = useLastResponsePreview(conversation);
   const show = useOptionalSidebarShow();
@@ -379,7 +445,7 @@ function KanbanCardBody({ card, className }: { card: KanbanCard; className?: str
   return (
     <div
       className={cn(
-        "flex flex-col gap-1.5 rounded-xl border bg-card p-3 text-ui text-foreground shadow-sm transition-[color,background-color,border-color,box-shadow] duration-700",
+        "flex flex-col gap-1.5 rounded-xl border border-border/60 bg-card p-3 text-ui text-foreground shadow-[0_6px_20px_-8px_rgb(var(--ui-shadow-neutral-rgb)_/_0.12)] transition-[color,background-color,box-shadow] duration-700",
         arrived && "border-primary/60 ring-2 ring-primary/20",
         className,
       )}
@@ -394,21 +460,37 @@ function KanbanCardBody({ card, className }: { card: KanbanCard; className?: str
             />
           </span>
         )}
-        <span className="line-clamp-2 min-w-0 flex-1 font-medium">
+        <span className="min-w-0 flex-1 truncate font-medium">
           {conversationDisplayLabel(conversation)}
         </span>
-        {state && <SessionStateBadge state={state} />}
+        {state && !working && <SessionStateBadge state={state} />}
       </div>
-      {responsePreview && (
-        <p
-          data-testid="kanban-card-response"
-          className="line-clamp-2 text-sm text-muted-foreground"
+      {/* Always two lines tall, so every card keeps one shape. */}
+      <div className="h-[2lh] text-sm text-muted-foreground">
+        {working ? (
+          <span
+            role="status"
+            aria-label="Working"
+            data-testid="kanban-card-working"
+            className="flex h-full items-center"
+          >
+            <RunningDot className="size-4" />
+          </span>
+        ) : (
+          responsePreview && (
+            <p data-testid="kanban-card-response" className="line-clamp-2">
+              {responsePreview}
+            </p>
+          )
+        )}
+      </div>
+      {(metaParts.length > 0 || reserveCornerAction) && (
+        <div
+          className={cn(
+            "mt-0.5 flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-0.5 text-sm text-primary-cta",
+            reserveCornerAction && "min-h-4 pr-7",
+          )}
         >
-          {responsePreview}
-        </p>
-      )}
-      {metaParts.length > 0 && (
-        <div className="flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-0.5 text-sm text-primary-cta">
           {metaParts.map(({ key, icon: Icon, value }, index) => (
             <Fragment key={key}>
               {index > 0 && <span aria-hidden>·</span>}

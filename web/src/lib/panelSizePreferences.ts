@@ -13,6 +13,8 @@ export interface PanelSizePreferences {
   sidebarWidthPx?: number;
   /** Width for the comments panel inside the file viewer. */
   commentsPanelWidthPx?: number;
+  /** Width for the session panel beside every project's board. */
+  projectSessionPanelWidthPx?: number;
 }
 
 export type PanelSizePreferenceKey = keyof PanelSizePreferences;
@@ -45,6 +47,8 @@ export function readPanelSizePreferences(): PanelSizePreferences {
     if (isValidWidth(record.sidebarWidthPx)) prefs.sidebarWidthPx = record.sidebarWidthPx;
     if (isValidWidth(record.commentsPanelWidthPx))
       prefs.commentsPanelWidthPx = record.commentsPanelWidthPx;
+    if (isValidWidth(record.projectSessionPanelWidthPx))
+      prefs.projectSessionPanelWidthPx = record.projectSessionPanelWidthPx;
     return prefs;
   } catch {
     return {};

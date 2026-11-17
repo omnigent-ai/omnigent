@@ -7,14 +7,12 @@ import {
 } from "lucide-react";
 import { useQueryClient } from "@tanstack/react-query";
 
-import { SideChatPane } from "@/components/chat/SideChatPane";
+import { FullSessionChat } from "@/components/chat/FullSessionChat";
 import { Button } from "@/components/ui/button";
 import { WorkflowSessionForm } from "@/components/workflows/WorkflowSessionDialog";
-import { useCanEdit } from "@/hooks/usePermissions";
 import { useSession } from "@/hooks/useSession";
 import { type WorkflowDetail, useSetWorkflowPlanningSession } from "@/hooks/useWorkflow";
 import { Link } from "@/lib/routing";
-import { readOnlyReasonForSessionLabels } from "@/lib/sessionCapabilities";
 import { ApiError } from "@/lib/sessionsApi";
 import { cn } from "@/lib/utils";
 import { useChatStore } from "@/store/chatStore";
@@ -104,28 +102,8 @@ export function WorkflowPlanningChat({
           </Button>
         </div>
       ) : (
-        <PlanningSession key={sessionId} sessionId={sessionId} />
+        <FullSessionChat key={sessionId} sessionId={sessionId} />
       )}
     </div>
-  );
-}
-
-function PlanningSession({ sessionId }: { sessionId: string }) {
-  const { session } = useSession(sessionId);
-  const canEdit = useCanEdit(sessionId);
-  const readOnlyReason = readOnlyReasonForSessionLabels(session, null);
-  return (
-    <>
-      <div className="min-h-0 flex-1">
-        <SideChatPane
-          childId={sessionId}
-          fullSession
-          readOnly={!canEdit || session === null || readOnlyReason !== null}
-        />
-      </div>
-      {readOnlyReason && (
-        <p className="px-4 py-2 text-sm text-muted-foreground">{readOnlyReason}</p>
-      )}
-    </>
   );
 }

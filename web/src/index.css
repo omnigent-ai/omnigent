@@ -812,6 +812,11 @@
   background: none;
 }
 
+/* The project board's session panel has no glow. */
+[data-project-session-panel] .side-chat-backdrop {
+  background: none;
+}
+
 /* Fixed default icon geometry: a 14px glyph centered in a 16px SVG box. */
 .ui-icon {
   box-sizing: border-box;
