@@ -903,7 +903,9 @@ describe("WorkflowDetailPage", () => {
         created_at: 600,
         content: { steps: WORKFLOW.steps, description: "Fixes flaky tests." },
       };
-      await renderWith(newer, () => stored);
+      const actual = await vi.importActual<typeof WorkflowHooks>("@/hooks/useWorkflow");
+      vi.mocked(useWorkflow).mockImplementation(actual.useWorkflow);
+      mockRuns([]);
       vi.mocked(useSessionJournal).mockReturnValue({
         entries: [newer],
         isLoading: false,
@@ -914,7 +916,6 @@ describe("WorkflowDetailPage", () => {
         retry: vi.fn(),
       });
       serve(() => stored, notInJournal);
-      cleanup();
       renderPage();
       await screen.findByTestId("workflow-detail-title");
       await waitFor(() => expect(description()).toBe("Fixes flaky tests."));
@@ -962,11 +963,17 @@ describe("WorkflowDetailPage", () => {
 
       // A source the journal doesn't hold came from another planning chat: the workflow's
       // last write is newer than the proposal, so the description stays.
-      serve(() => stored, notInJournal);
+      let answered = false;
+      serve(
+        () => stored,
+        () => notInJournal().finally(() => (answered = true)),
+      );
       cleanup();
       vi.mocked(useSessionJournal).mockReturnValue(page(false));
       renderPage();
       await screen.findByTestId("workflow-detail-title");
+      await waitFor(() => expect(answered).toBe(true));
+      await act(async () => {});
       expect(description()).toBe("Fixes one flaky test.");
       expect(screen.getByRole("status")).toHaveTextContent("Saved plan");
     });
@@ -999,27 +1006,23 @@ describe("WorkflowDetailPage", () => {
       };
 
       // Until the server places "p2", the cached proposal isn't offered.
+      let place = () => {};
+      const placed = new Response(
+        JSON.stringify({ object: "list", data: [{ position: saved.position }] }),
+      );
       serve(
         () => stored,
-        () => new Promise<Response>(() => {}),
+        () =>
+          new Promise<Response>((resolve) => {
+            place = () => resolve(placed);
+          }),
       );
       renderPage();
       await screen.findByTestId("workflow-detail-title");
       expectSaved();
       // Placed after the cached proposal, it keeps the saved description.
-      serve(
-        () => stored,
-        () => placedAfter(saved.position),
-      );
-      cleanup();
-      renderPage();
-      await screen.findByTestId("workflow-detail-title");
-      await waitFor(() =>
-        expect(authenticatedFetch).toHaveBeenCalledWith(
-          expect.stringContaining("/journal?"),
-          expect.anything(),
-        ),
-      );
+      await act(async () => place());
+      await act(async () => {});
       expectSaved();
     });
   });
