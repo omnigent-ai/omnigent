@@ -3236,6 +3236,12 @@ class _KeptSessionExecutor(Executor):
                 yield ExecutorError(message="native session crashed")
             elif self.stop_outcome == "cancels_with_usage":
                 yield TurnCancelled(usage=dict(_INTERRUPTED_TURN_USAGE))
+            elif self.stop_outcome == "completes_with_usage":
+                yield TurnComplete(response="partial", usage=dict(_INTERRUPTED_TURN_USAGE))
+            elif self.stop_outcome == "errors_with_usage":
+                yield ExecutorError(
+                    message="native session crashed", usage=dict(_INTERRUPTED_TURN_USAGE)
+                )
             elif self.stop_outcome == "streams_then_cancels_with_usage":
                 yield TextChunk(text=" more")
                 yield TurnCancelled(usage=dict(_INTERRUPTED_TURN_USAGE))
@@ -3313,6 +3319,8 @@ async def _interrupt_kept_session_turn(
     [
         ("cancels_with_usage", _KeptSessionExecutor),
         ("streams_then_cancels_with_usage", _KeptSessionExecutor),
+        ("completes_with_usage", _KeptSessionExecutor),
+        ("errors_with_usage", _KeptSessionExecutor),
         ("cancels_with_usage", _DroppedSessionExecutor),
     ],
 )
@@ -3321,9 +3329,10 @@ async def test_interrupted_turn_keeps_the_usage_it_reports_as_it_ends(
 ) -> None:
     """The usage that an interrupted turn reports as it ends reaches its terminal event.
 
-    A stop interrupts the turn; the native turn then ends with the usage of the
-    model calls it made, at once or after more output. Those calls were spent, so
-    ``response.cancelled`` carries it, whether or not the executor keeps its session.
+    A stop interrupts the turn; the native turn then ends, by cancelling, completing
+    or failing, with the usage of the model calls it made, at once or after more output.
+    Those calls were spent, so ``response.cancelled`` carries it, whether or not the
+    executor keeps its session.
     """
     adapter, _, run_task, response = await _interrupt_kept_session_turn(
         stop_outcome, executor_type=executor_type

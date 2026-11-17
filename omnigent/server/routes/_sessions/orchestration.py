@@ -10651,11 +10651,8 @@ async def _relay_runner_stream_once(
                                 conversation_store,
                             )
                     if evt_type in _TERMINAL_RESPONSE_EVENT_TYPES:
-                        # Persist the turn's usage (cost + token buckets) so
-                        # policy callables can read
-                        # event["context"]["usage"]["total_cost_usd"] and the
-                        # subtree roll-up below sees the new totals. A failed or
-                        # stopped turn also made model calls, so every terminal counts.
+                        # Persist every terminal turn's usage (failed/stopped turns also made
+                        # model calls) for policy callables and the subtree roll-up below.
                         _accumulate_session_usage(
                             event.get("response", {}),
                             session_id,
