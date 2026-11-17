@@ -148,6 +148,10 @@ async def test_isolation_restarts_the_helper_only_when_the_credential_boundary_c
         assert error.value.__suppress_context__
         assert await relay._credential_source.token_for_request() == "parent-only-recovered"
         assert unavailable.call_count == 2
+        unavailable.side_effect = None
+        unavailable.return_value = "parent-only-next-callback"
+        environment.isolate_model_credentials(access)
+        assert await relay._credential_source.token_for_request() == "parent-only-next-callback"
         process.terminate.assert_not_called()
         assert environment._helper._proc is process
 

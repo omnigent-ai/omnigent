@@ -237,8 +237,6 @@ class _CredentialResolver:
         return resolve()
 
     def replace(self, replacement: _CredentialResolver) -> None:
-        if replacement is self:
-            return
         with replacement._lock:
             resolve = replacement._resolve
         with self._lock:
