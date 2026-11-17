@@ -10,20 +10,13 @@ const SECURITY_KEY_PAGE = `<!doctype html><title>Sign In</title>
 <h2>Verify with Security Key or Biometric Authenticator</h2>
 <p id="status">You will be prompted to use a security key or biometric verification.</p>
 <script>
-window.verifyState = { outcome: "idle" };
-setTimeout(async () => {
-  window.verifyState.outcome = "pending";
-  try {
-    await navigator.credentials.get({ publicKey: {
-      challenge: crypto.getRandomValues(new Uint8Array(32)),
-      allowCredentials: [{ type: "public-key", id: crypto.getRandomValues(new Uint8Array(16)) }],
-      userVerification: "preferred",
-      timeout: 120000,
-    } });
-    window.verifyState.outcome = "signed-in";
-  } catch (error) {
-    window.verifyState.outcome = error.name;
-  }
+setTimeout(() => {
+  navigator.credentials.get({ publicKey: {
+    challenge: crypto.getRandomValues(new Uint8Array(32)),
+    allowCredentials: [{ type: "public-key", id: crypto.getRandomValues(new Uint8Array(16)) }],
+    userVerification: "preferred",
+    timeout: 120000,
+  } }).catch(() => {});
 }, 500);
 </script>`;
 

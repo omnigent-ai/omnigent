@@ -992,12 +992,13 @@ function registerBrowserIpc({
       if (opened && !preview.openedHost) {
         return { ok: false, error: "That site isn't available for this tab." };
       }
-      const openedSite = opened ? { openedHost: preview.openedHost } : {};
+      // Imported and named only when it adds cookies (the scope may already hold
+      // its session); the tab goes back there either way.
+      const openedSite = openedCookieCount > 0 ? { openedHost: preview.openedHost } : {};
       const approved = await confirmCookieImport({
         host: site.host,
         scope: offered.host,
-        // Named only when it adds cookies; the scope may already hold its session.
-        ...(openedCookieCount > 0 ? openedSite : {}),
+        ...openedSite,
         profileName: profile.name,
         cookieCount: offered.cookieCount + openedCookieCount,
         parentWindow: getWindowForEvent(event) ?? null,

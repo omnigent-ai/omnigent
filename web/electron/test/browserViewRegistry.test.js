@@ -555,8 +555,12 @@ describe("browserViewRegistry — opened site for the Chrome cookie import", () 
       "a click in the page": afterInput("mouseDown"),
       "a key press in the page": afterInput("keyDown"),
       "a raw key press in the page": afterInput("rawKeyDown"),
-      "a page navigation whose frame is gone": (tab) =>
+      "a back/forward step or a page navigation whose frame is gone": (tab) =>
         tab.emit("did-start-navigation", ...start("https://other.example.org/")),
+      "a popup loaded into the tab": (tab) => {
+        tab.windowOpen("https://other.example.org/", "foreground-tab");
+        tab.emit("did-start-navigation", ...start("https://other.example.org/"));
+      },
       "an event without details": (tab) =>
         tab.emit("did-start-navigation", {}, "https://other.example.org/", false, true),
     };
@@ -570,13 +574,34 @@ describe("browserViewRegistry — opened site for the Chrome cookie import", () 
   });
 
   it("keeps the earlier opened site when an explicit open never commits", () => {
-    for (const end of ["did-stop-loading", "did-fail-load"]) {
+    const endings = {
+      "a download or empty response": (tab) => tab.emit("did-stop-loading"),
+      "a failed load": (tab) =>
+        tab.emit(
+          "did-fail-load",
+          {},
+          -105,
+          "ERR_NAME_NOT_RESOLVED",
+          "https://files.example.org/report.zip",
+          true,
+        ),
+      "a back step on the sign-in host": (tab) =>
+        tab.emit("did-start-navigation", ...start("https://idp.example.net/authorize")),
+      "a link click on the sign-in host": (tab) => {
+        tab.emit("input-event", {}, { type: "mouseDown" });
+        tab.emit(
+          "did-start-navigation",
+          ...start("https://idp.example.net/help", { initiator: pageFrame }),
+        );
+      },
+    };
+    for (const [name, end] of Object.entries(endings)) {
       const tab = signInRedirect();
       tab.registry.openOrNavigate("conv_1", "https://files.example.org/report.zip");
       tab.emit("did-start-navigation", ...start("https://files.example.org/report.zip"));
-      tab.emit(end, {}, -3, "ERR_ABORTED", "https://files.example.org/report.zip", true);
+      end(tab);
       tab.emit("did-navigate", {}, "https://idp.example.net/authorize");
-      assert.equal(opened(tab), "https://workspace.example.com/start", end);
+      assert.equal(opened(tab), "https://workspace.example.com/start", name);
     }
   });
 

@@ -833,8 +833,9 @@ Scope is deliberately narrow:
 - When a sign-in redirect moved the tab to another site (an IdP challenge), the
   dialog also offers the site the tab opened, checked by default. Only a load
   the pane asks main for (the address bar, an agent, or a link opened from the
-  app) sets that site, once the load commits; the page can't choose it. Server
-  and page redirects keep it, and so do sign-in steps on the same host. Any
+  app) sets that site, once the load commits and unless another load replaces
+  it first; the page can't choose it. Server and page
+  redirects keep it, and so do sign-in steps on the same host. Any
   other way of leaving its host clears it, including a page navigation within
   five seconds of a click or key press, a back/forward step, or a popup loaded
   into the tab. Only the cookies Chrome sends to that host itself are read (its
@@ -842,8 +843,8 @@ Scope is deliberately narrow:
   minus those the picked scope already copies. The site is offered even when
   that leaves none, because afterwards the tab goes back to the opened address
   instead of reloading the sign-in page, which would only repeat its challenge.
-  The native prompt names it when it adds cookies, and `beforeWrite` re-checks
-  it.
+  Its cookies are copied, and the native prompt names it, only when it adds
+  some; either way `beforeWrite` re-checks it before anything is written.
 - `browser-chrome-cookie-preview` reports only counts and profile names, and
   touches no Keychain, so the confirmation dialog opens without a system prompt.
   The import re-derives the host from the view's own URL main-side and refuses if

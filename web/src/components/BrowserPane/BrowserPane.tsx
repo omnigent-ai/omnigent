@@ -338,7 +338,6 @@ export function BrowserPane({
     [conversationId],
   );
 
-  // Submit the URL bar, normalizing the typed value (add scheme).
   const submitUrl = useCallback(() => {
     const raw = currentUrl.trim();
     if (raw) navigateTo(normalizeTypedUrl(raw));
@@ -486,7 +485,9 @@ export function BrowserPane({
       const imported = result.imported ?? 0;
       const unusable = (result.skipped ?? 0) + (result.failed ?? 0);
       if (imported === 0) {
-        const sites = includeOpened ? `${scope} or ${preview.openedHost}` : scope;
+        const importedOpened =
+          includeOpened && openedSiteCookieCount(preview, cookieProfileId, scope) > 0;
+        const sites = importedOpened ? `${scope} or ${preview.openedHost}` : scope;
         // Keep the dialog open — another Chrome profile may hold the session.
         toast.error(
           (result.failed ?? 0) > 0

@@ -1310,12 +1310,12 @@ describe("browserIpc — Chrome cookie import", () => {
     });
     assert.equal(r.ok, true);
     assert.equal(r.openedUrl, "https://workspace.example.com/start");
-    // The prompt names only sites whose cookies are copied.
+    // Only sites the prompt names have cookies copied.
     assert.equal(confirmations.length, 1);
     assert.equal("openedHost" in confirmations[0], false);
     assert.equal(confirmations[0].cookieCount, 3);
     const importCall = store.calls.find((call) => call.fn === "import");
-    assert.equal(importCall.args.openedHost, "workspace.example.com");
+    assert.equal("openedHost" in importCall.args, false);
   });
 
   it("imports only the page's site unless the opened site is requested", async () => {

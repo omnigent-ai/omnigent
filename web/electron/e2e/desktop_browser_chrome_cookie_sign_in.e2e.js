@@ -98,7 +98,7 @@ it(
           `requests ${JSON.stringify(sites.requests)}`,
       );
       assert.equal(landing?.url, sites.workspaceUrl);
-      // The user approved a prompt that named the workspace and counted its cookie.
+      // The approved prompt named the opened workspace and counted both sites' cookies.
       const prompts = await electronApp.evaluate(() => globalThis.cookieImportPrompts);
       assert.deepEqual(
         prompts.map(({ host, openedHost, cookieCount }) => ({ host, openedHost, cookieCount })),

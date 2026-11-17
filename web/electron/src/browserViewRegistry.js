@@ -366,13 +366,12 @@ function createBrowserViewRegistry({
       const targetHost = hostnameOf(details?.url ?? positionalUrl);
       const pending = entry.pendingOpenedSite;
       if (pending && !details?.initiator && targetHost === hostnameOf(pending.url)) return;
+      // Any other main-frame load replaces the pending open before it commits.
+      entry.pendingOpenedSite = null;
       const pageRedirect =
         Boolean(details?.initiator) &&
         Date.now() - entry.lastPageInputAt > PAGE_INPUT_NAVIGATION_WINDOW_MS;
-      if (!pageRedirect && targetHost !== hostnameOf(wc.getURL?.())) {
-        entry.openedSite = null;
-        entry.pendingOpenedSite = null;
-      }
+      if (!pageRedirect && targetHost !== hostnameOf(wc.getURL?.())) entry.openedSite = null;
     });
     wc.on("did-navigate", () => {
       if (entry.pendingOpenedSite) entry.openedSite = entry.pendingOpenedSite;

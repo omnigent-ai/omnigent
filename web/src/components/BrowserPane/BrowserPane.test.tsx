@@ -869,6 +869,37 @@ describe("BrowserPane Chrome cookie import", () => {
     expect(bridge.browserReload).not.toHaveBeenCalled();
   });
 
+  it.each([
+    [2, `${SIGN_IN_HOST} or ${OPENED_HOST}`],
+    [0, SIGN_IN_HOST],
+  ])(
+    "names the opened site in a zero-cookie import only when it had %i cookies to add",
+    async (openedCookieCount, sites) => {
+      installCookieBridge({
+        preview: {
+          ...SIGN_IN_PREVIEW,
+          profiles: [
+            {
+              ...SIGN_IN_PREVIEW.profiles[0],
+              scopes: [{ host: SIGN_IN_HOST, cookieCount: 1, openedCookieCount }],
+            },
+          ],
+        },
+        importResult: { ...SIGN_IN_IMPORT_RESULT, imported: 0, skipped: 1 },
+      });
+      render(<BrowserPane conversationId="conv_opened_zero" />);
+
+      fireEvent.click(await screen.findByRole("button", { name: "Import cookies from Chrome" }));
+      fireEvent.click(
+        within(await screen.findByRole("dialog")).getByRole("button", { name: "Import cookies" }),
+      );
+
+      await waitFor(() =>
+        expect(toast.error).toHaveBeenCalledWith(`Chrome had no usable cookies for ${sites}.`),
+      );
+    },
+  );
+
   it("offers the page's host and its parent domain, and imports the picked one", async () => {
     const bridge = installCookieBridge();
     render(<BrowserPane conversationId="conv_scope" />);
