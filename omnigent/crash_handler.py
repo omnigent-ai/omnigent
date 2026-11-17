@@ -308,16 +308,32 @@ def _redact(text: str) -> str:
     return text
 
 
-def _quote_path_argument(arg: str) -> str:
-    """Quote home-path arguments so spaced sibling paths stay distinguishable."""
+def _quote_path_argument(arg: str, *, public: bool = False) -> str:
+    """Scrub public paths before shell quoting can obscure argument boundaries."""
     with contextlib.suppress(Exception):
         home = str(Path.home())
         if home and home != os.sep and home in arg:
-            return shlex.quote(arg)
-    return arg
+            needs_quoting = shlex.quote(arg) != arg
+            if public:
+                prefix, separator, value = arg.partition("=")
+                if arg.startswith((home, "file://")) or not separator:
+                    prefix, value = "", arg
+                else:
+                    prefix += separator
+                if value.startswith("file://"):
+                    prefix += "file://"
+                    value = value[len("file://") :]
+                suffix = value[len(home) :] if value.startswith(home) else ""
+                if suffix and not suffix.startswith(("/", "\\")):
+                    # Preserve a sibling's home-like prefix, then scrub later references.
+                    arg = _scrub(prefix) + home + _scrub(suffix)
+                else:
+                    arg = _scrub(arg)
+            return shlex.quote(arg) if needs_quoting else arg
+    return _scrub(arg) if public else arg
 
 
-def _command_line() -> str:
+def _command_line(*, public: bool = False) -> str:
     try:
         args = list(sys.argv)
         # Match before shell quoting, preserving argument boundaries when
@@ -335,7 +351,7 @@ def _command_line() -> str:
                             args[index][: start - offset] + "***" + args[index][stop - offset :]
                         )
                 offset = end + 1
-        return " ".join(_quote_path_argument(arg) for arg in args)
+        return " ".join(_quote_path_argument(arg, public=public) for arg in args)
     except Exception:  # noqa: BLE001  pragma: no cover
         return "(unavailable)"
 
@@ -471,18 +487,20 @@ def _issue_body(exc: BaseException, tb_text: str, *, truncated: bool = False) ->
     """
     exc_type = type(exc).__qualname__
     msg = str(exc).strip() or "(no message)"
+    summary = _scrub(f"{exc_type}: {msg}")
     note = (
         "_Traceback truncated to fit this link; the full report was saved locally._\n"
         if truncated
         else ""
     )
-    return _scrub(
+    # Scrubbing the rendered command would discard its argument boundaries.
+    return (
         "This crash was auto-reported by Omnigent's crash handler.\n\n"
-        f"**Exception:** `{exc_type}: {msg}`\n\n"
+        f"**Exception:** `{summary}`\n\n"
         "**Command:**\n"
-        f"```\n{_command_line()}\n```\n\n"
+        f"```\n{_command_line(public=True)}\n```\n\n"
         "**Traceback:**\n"
-        f"{note}```\n{tb_text}```\n"
+        f"{note}```\n{_scrub(tb_text)}```\n"
     )
 
 

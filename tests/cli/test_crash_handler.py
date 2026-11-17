@@ -772,20 +772,45 @@ def test_scrub_redacts_home_in_file_url(monkeypatch: pytest.MonkeyPatch) -> None
 
 
 @pytest.mark.parametrize(
-    "home_directory",
-    ["/home/example", "/home/O'Brien", r"C:\Users\O'Brien"],
-    ids=["plain-home", "posix-apostrophe", "windows-apostrophe"],
+    ("home_directory", "sibling_suffix"),
+    [
+        ("/home/example", " backup/config.yaml"),
+        ("/home/O'Brien", " backup/config.yaml"),
+        (r"C:\Users\O'Brien", " backup/config.yaml"),
+        ("/home/example", "'backup/config.yaml"),
+        ("/home/example", "=backup/config.yaml"),
+        ("/home/example", "%backup/config.yaml"),
+    ],
+    ids=[
+        "plain-home",
+        "posix-apostrophe",
+        "windows-apostrophe",
+        "apostrophe-sibling",
+        "equals-sibling",
+        "percent-sibling",
+    ],
 )
 def test_command_line_keeps_sibling_argument_with_spaces(
     data_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
     home_directory: str,
+    sibling_suffix: str,
 ) -> None:
     """Public shell quoting preserves siblings and redacts homes, including apostrophes."""
     ch.install_crash_handler("omnigent", "omnigent-ai/omnigent")
     home_path = Path(home_directory)
     monkeypatch.setattr(Path, "home", lambda: home_path)
-    argv = ["omnigent", "run", f"{home_path} backup/config.yaml", f"{home_path}/project/file.py"]
+    sibling = f"{home_path}{sibling_suffix}"
+    argv = [
+        "omnigent",
+        "run",
+        sibling,
+        f"--config={sibling}",
+        f"file://{sibling}",
+        f"{sibling} --config {home_path}/.config/app.toml",
+        f"{home_path}/project/file.py",
+        f"Home: ({home_path})",
+    ]
     monkeypatch.setattr(sys, "argv", argv)
     exc = _make_exc()
     tb_text = "".join(traceback.format_exception(exc))
@@ -797,7 +822,16 @@ def test_command_line_keeps_sibling_argument_with_spaces(
     assert body_included is True
     assert len(url) <= ch._MAX_URL_LENGTH
     command = _description_of(url).split("**Command:**\n```\n", 1)[1].split("\n```", 1)[0]
-    assert shlex.split(command) == ["omnigent", "run", argv[2], "~/project/file.py"]
+    assert shlex.split(command) == [
+        "omnigent",
+        "run",
+        sibling,
+        f"--config={sibling}",
+        f"file://{sibling}",
+        f"{sibling} --config ~/.config/app.toml",
+        "~/project/file.py",
+        "Home: (~)",
+    ]
 
 
 @pytest.mark.parametrize(
