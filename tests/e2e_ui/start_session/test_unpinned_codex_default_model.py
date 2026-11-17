@@ -1,9 +1,9 @@
-"""E2E: an unpinned native Codex session launches on Omnigent's Codex default.
+"""E2E: an unpinned native Codex session launches on Codex's own default.
 
 With a provider that pins no model and a Codex catalog whose own default
-marker sits on ``gpt-6-astra`` while ``gpt-5.6-sol`` (Omnigent's
-``CODEX_DEFAULT_MODEL``) is also servable, a new native Codex session without
-a model pick must launch on Sol, not adopt the catalog's Astra default row.
+marker sits on ``gpt-6-astra`` while ``gpt-5.6-sol`` is also servable, a new
+native Codex session without a model pick must launch on Astra: Omnigent
+keeps Codex's default rather than substituting an arm of its own.
 """
 
 from __future__ import annotations
@@ -26,7 +26,6 @@ import httpx
 import pytest
 from playwright.sync_api import Page
 
-from omnigent.models.model_fallbacks import CODEX_DEFAULT_MODEL
 from omnigent.runner.identity import token_bound_runner_id
 from tests.e2e_ui.conftest import (
     _REPO_ROOT,
@@ -40,6 +39,8 @@ from tests.e2e_ui.messages.test_native_codex_render_parity import (
 )
 
 _CODEX_CATALOG_DEFAULT = "gpt-6-astra"
+# A servable non-default row: the launch must not prefer it over Codex's pick.
+_CODEX_CATALOG_OTHER = "gpt-5.6-sol"
 _HEALTH_TIMEOUT_S = 60.0
 _HEALTH_POLL_INTERVAL_S = 0.5
 # A cold launch pays a codex catalog probe before the session's own codex
@@ -79,7 +80,7 @@ def _write_source_codex_home(codex_path: str, source_home: Path) -> None:
             "upgrade": None,
             "priority": index * 2,
         }
-        for index, slug in enumerate((_CODEX_CATALOG_DEFAULT, CODEX_DEFAULT_MODEL))
+        for index, slug in enumerate((_CODEX_CATALOG_DEFAULT, _CODEX_CATALOG_OTHER))
     ]
     catalog = source_home / "models.json"
     catalog.write_text(json.dumps({**bundled, "models": rows}), encoding="utf-8")
@@ -280,11 +281,11 @@ def unpinned_codex_astra_session(
 
 
 @pytest.mark.timeout(420)
-def test_unpinned_native_codex_session_launches_on_omnigent_default(
+def test_unpinned_native_codex_session_launches_on_codex_default(
     page: Page,
     unpinned_codex_astra_session: tuple[str, str, Path],
 ) -> None:
-    """A Default (unpinned) launch runs Sol, not Codex's Astra catalog default."""
+    """A Default (unpinned) launch runs Codex's Astra catalog default."""
     base_url, session_id, tmp_dir = unpinned_codex_astra_session
     page.goto(f"{base_url}/c/{session_id}")
 
@@ -312,7 +313,7 @@ def test_unpinned_native_codex_session_launches_on_omnigent_default(
     assert launched is not None, (
         f"Codex TUI never painted its model banner; last pane text:\n{pane_text}"
     )
-    assert launched == CODEX_DEFAULT_MODEL, (
+    assert launched == _CODEX_CATALOG_DEFAULT, (
         f"unpinned native Codex session launched on {launched!r} instead of "
-        f"Omnigent's default {CODEX_DEFAULT_MODEL!r}; pane text:\n{pane_text}"
+        f"Codex's default {_CODEX_CATALOG_DEFAULT!r}; pane text:\n{pane_text}"
     )

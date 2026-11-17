@@ -38,6 +38,8 @@ def test_queued_attachments_keep_their_real_layout_contract(
     """Keep chips compact and editable without uploading queued files."""
     chat = chat_session_contract
     expected_names = [screenshot_name or "image.png", "after.png", "notes.txt"]
+    # Queue busy follow-ups instead of steering them (Always steer defaults on).
+    page.add_init_script("localStorage.setItem('omnigent:always-steer', 'false')")
     page.set_viewport_size({"width": width, "height": 844})
     page.goto(chat.url)
     chat.wait_for_stream()

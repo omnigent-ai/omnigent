@@ -200,4 +200,10 @@ describe("reconnect overlay page (reconnect-overlay/index.html)", () => {
     document.dispatchEvent(new window.KeyboardEvent("keydown", { key: "Escape" }));
     assert.deepEqual(calls, ["cancel", "cancel"]);
   });
+
+  it("keeps Cancel clear of the title when there is no hint", () => {
+    const { document, window } = render("");
+    assert.equal(window.getComputedStyle(document.getElementById("hint")).display, "none");
+    assert.equal(window.getComputedStyle(document.querySelector(".actions")).marginTop, "16px");
+  });
 });

@@ -292,6 +292,153 @@ describe("HarnessFixDialog", () => {
     );
   });
 
+  it("guides tmux repair without the CLI installer and finishes after Check again", async () => {
+    const refreshed = [
+      { "claude-native": "tmux-unavailable" },
+      { "claude-native": true, "claude-sdk": true },
+    ];
+    vi.mocked(authenticatedFetch).mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url === "/v1/harnesses") return json(catalog);
+      if (url.endsWith("/harnesses/refresh")) {
+        expect(init).toEqual({ method: "POST" });
+        return json({ configured_harnesses: refreshed.shift(), gateway_inference: null });
+      }
+      throw new Error(`Unexpected URL: ${url}`);
+    });
+    const props = renderDialog({
+      mode: "tmux",
+      harness: "claude-native",
+      harnessLabel: "Claude Code",
+    });
+    const user = userEvent.setup();
+
+    expect(screen.getByRole("heading", { name: "Set up tmux on Local laptop" })).toBeVisible();
+    expect(screen.getByText("brew install tmux")).toBeVisible();
+    expect(screen.getByText("brew upgrade tmux")).toBeVisible();
+    expect(screen.getByText(/quit and reopen the Omnigent app/)).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Install" })).toBeNull();
+
+    await user.click(screen.getByRole("button", { name: "Check again" }));
+    expect(await screen.findByText("Claude Code still isn’t ready on Local laptop.")).toBeVisible();
+    expect(props.onFixed).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole("button", { name: "Check again" }));
+    await waitFor(() =>
+      expect(props.onFixed).toHaveBeenCalledWith({
+        configuredHarnesses: { "claude-native": true, "claude-sdk": true },
+        credentialKind: undefined,
+        gatewayInference: null,
+      }),
+    );
+    expect(
+      vi.mocked(authenticatedFetch).mock.calls.some(([url]) => String(url).includes("install")),
+    ).toBe(false);
+  });
+
+  it("moves from tmux repair to sign-in when Check again reports needs-auth", async () => {
+    const refreshed = [{ "claude-native": "needs-auth" }, { "claude-native": true }];
+    vi.mocked(authenticatedFetch).mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === "/v1/harnesses") return json(catalog);
+      if (url.endsWith("/harnesses/refresh")) {
+        return json({ configured_harnesses: refreshed.shift(), gateway_inference: null });
+      }
+      throw new Error(`Unexpected URL: ${url}`);
+    });
+    const props = renderDialog({
+      mode: "tmux",
+      harness: "claude-native",
+      harnessLabel: "Claude Code",
+    });
+    const user = userEvent.setup();
+
+    await user.click(screen.getByRole("button", { name: "Check again" }));
+    await user.click(await screen.findByRole("radio", { name: /Personal subscription/ }));
+    expect(screen.queryByText(/still isn’t ready/)).toBeNull();
+    await user.click(screen.getByRole("button", { name: "Authenticate" }));
+    expect(screen.getByText("claude auth login --claudeai")).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "Check again" }));
+
+    await waitFor(() =>
+      expect(props.onFixed).toHaveBeenCalledWith({
+        configuredHarnesses: { "claude-native": true },
+        credentialKind: "personal",
+        gatewayInference: null,
+      }),
+    );
+    expect(
+      vi.mocked(authenticatedFetch).mock.calls.some(([url]) => String(url).endsWith("/install")),
+    ).toBe(false);
+  });
+
+  it("enters tmux repair when an install leaves the harness waiting on tmux", async () => {
+    vi.mocked(authenticatedFetch).mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === "/v1/harnesses") return json(catalog);
+      if (url.endsWith("/install")) {
+        return json({
+          object: "harness_install",
+          harness: "claude-native",
+          configured_harnesses: { "claude-native": "tmux-unavailable" },
+          version: "2.0.0",
+        });
+      }
+      if (url.endsWith("/harnesses/refresh")) {
+        return json({ configured_harnesses: { "claude-native": true }, gateway_inference: null });
+      }
+      throw new Error(`Unexpected URL: ${url}`);
+    });
+    const props = renderDialog({
+      mode: "install",
+      harness: "claude-native",
+      harnessLabel: "Claude Code",
+    });
+    const user = userEvent.setup();
+
+    await user.click(await screen.findByRole("button", { name: "Install" }));
+    expect(
+      await screen.findByRole("heading", { name: "Set up tmux on Local laptop" }),
+    ).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "Check again" }));
+
+    await waitFor(() =>
+      expect(props.onFixed).toHaveBeenCalledWith({
+        configuredHarnesses: { "claude-native": true },
+        credentialKind: undefined,
+        gatewayInference: null,
+      }),
+    );
+    const installCalls = vi
+      .mocked(authenticatedFetch)
+      .mock.calls.filter(([url]) => String(url).endsWith("/install"));
+    expect(installCalls).toHaveLength(1);
+  });
+
+  it("offers Update instead of re-running setup when tmux repair reveals an outdated CLI", async () => {
+    vi.mocked(authenticatedFetch).mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === "/v1/harnesses") return json(catalog);
+      if (url.endsWith("/harnesses/refresh")) {
+        return json({
+          configured_harnesses: { "claude-native": "version-too-low" },
+          gateway_inference: null,
+        });
+      }
+      throw new Error(`Unexpected URL: ${url}`);
+    });
+    renderDialog({ mode: "tmux", harness: "claude-native", harnessLabel: "Claude Code" });
+    const user = userEvent.setup();
+
+    await user.click(screen.getByRole("button", { name: "Check again" }));
+
+    expect(await screen.findByRole("heading", { name: "Update Claude Code" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Update" })).toBeVisible();
+    expect(
+      vi.mocked(authenticatedFetch).mock.calls.some(([url]) => String(url).endsWith("/install")),
+    ).toBe(false);
+  });
+
   it("shows persistent guidance when copying a command fails", async () => {
     vi.mocked(copyText).mockRejectedValueOnce(new Error("clipboard unavailable"));
     renderDialog();
@@ -426,6 +573,45 @@ describe("HarnessFixDialog", () => {
     expect(showToast).toHaveBeenCalledWith(
       "Codex is ready on Local laptop. Signed in as codex@example.com · Plus.",
     );
+  });
+
+  it("continues to the tmux step when sign-in leaves tmux as the blocker", async () => {
+    vi.mocked(authenticatedFetch).mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url === "/v1/harnesses") return json(catalog);
+      if (url.endsWith("/login") && init?.method === "POST") {
+        return json({
+          login_id: "login/1",
+          verification_url: "https://auth.example.test/device",
+          user_code: "WQ7K-3XPM",
+          expires_at: Math.floor(Date.now() / 1000) + 15 * 60,
+        });
+      }
+      if (url.endsWith("/login/login%2F1")) {
+        return json({
+          status: "succeeded",
+          error: null,
+          configured_harnesses: { "codex-native": "tmux-unavailable" },
+          harness_accounts: {},
+        });
+      }
+      throw new Error(`Unexpected URL: ${url}`);
+    });
+    const props = renderDialog();
+    const user = userEvent.setup();
+
+    await user.click(screen.getByRole("radio", { name: /Personal subscription/ }));
+    vi.useFakeTimers();
+    fireEvent.click(screen.getByRole("button", { name: "Authenticate" }));
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    await act(async () => vi.advanceTimersByTime(2_000));
+
+    expect(screen.getByRole("heading", { name: "Set up tmux on Local laptop" })).toBeVisible();
+    expect(props.onFixed).not.toHaveBeenCalled();
+    expect(showToast).not.toHaveBeenCalled();
   });
 
   it("cancels an active Codex device login", async () => {
@@ -1441,6 +1627,38 @@ describe("HarnessFixDialog", () => {
         .mocked(authenticatedFetch)
         .mock.calls.every(([input]) => !String(input).endsWith("/refresh")),
     ).toBe(true);
+  });
+
+  it("continues from a saved credential to tmux repair when tmux is the remaining blocker", async () => {
+    vi.mocked(authenticatedFetch).mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url === "/v1/harnesses") return json(catalog);
+      if (url.endsWith("/credentials/detected")) return json({ credentials: [] });
+      if (url.endsWith("/credential")) {
+        expect(init?.method).toBe("POST");
+        return json({
+          object: "harness_credential",
+          harness: "codex-native",
+          configured_harnesses: { "codex-native": "tmux-unavailable" },
+        });
+      }
+      throw new Error(`Unexpected URL: ${url}`);
+    });
+    const props = renderDialog();
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "Use an API key or gateway URL instead" }));
+    await user.type(screen.getByPlaceholderText("Paste an API key"), "secret");
+    await user.click(screen.getAllByRole("button", { name: "Save" })[0]);
+
+    expect(
+      await screen.findByRole("heading", { name: "Set up tmux on Local laptop" }),
+    ).toBeVisible();
+    expect(screen.getByText("brew install tmux")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Check again" })).toBeVisible();
+    expect(props.onFixed).not.toHaveBeenCalled();
+    expect(showToast).toHaveBeenCalledWith(
+      "Saved. Codex still needs tmux 3.3 or newer on Local laptop.",
+    );
   });
 
   it("disables Check again while the readiness request is in flight", async () => {

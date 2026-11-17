@@ -6,6 +6,7 @@ All durably checkpointed for crash recovery.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -13,6 +14,7 @@ import shlex
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
+from urllib.parse import urlparse
 
 import yaml
 
@@ -39,6 +41,8 @@ from omnigent.errors import (
     restart_on_stale_cursor,
 )
 from omnigent.harness_aliases import is_claude_sdk_harness_name
+from omnigent.inner.codex_worker import BROKERED_CODEX_AUTH_COMMAND, CODEX_GATEWAY_TOKEN_ENV
+from omnigent.inner.egress.rules import parse_rules
 from omnigent.inner.model_egress import (
     UCODE_SIGNER_BINDING_ID,
     registered_model_provider_binding,
@@ -392,9 +396,9 @@ def _configure_brokered_codex_with_ucode(
         else:
             # In place, so the session's OS tools share the worker's sandbox.
             spec.os_env.sandbox = sandbox
-    if sandbox.egress_rules:
+    if sandbox.egress_rules or sandbox.tcp_egress:
         raise OmnigentError(
-            "signer-backed Codex does not support os_env.sandbox.egress_rules; "
+            "signer-backed Codex does not support os_env.sandbox.egress_rules or tcp_egress; "
             "brokered sessions are model-only",
             code=ErrorCode.INVALID_INPUT,
         )
@@ -684,7 +688,7 @@ def configure_agent_harness_with_provider(
         if harness_type == "codex":
             # The codex executor symlinks the user's ~/.codex/config.toml
             # into the per-session CODEX_HOME, so a custom default
-            # ``model_provider`` there (e.g. isaac's Databricks Unity Gateway)
+            # ``model_provider`` there (e.g. a Databricks Unity Gateway)
             # would silently hijack a Subscription selection. Pin codex's
             # built-in ``openai`` provider so "Subscription" always means
             # the ChatGPT login — a no-op when the user's config sets no
@@ -1357,6 +1361,11 @@ def _build_claude_sdk_spawn_env(
             if binding_for_harness(load_runtime_inference_config(), "claude-sdk") is not None
             else model.removeprefix("anthropic/")
         )
+    # Always set, so an inherited window never sizes another agent's history replay.
+    context_window = spec.executor.context_window
+    env["HARNESS_CLAUDE_SDK_CONTEXT_WINDOW"] = (
+        "" if context_window is None else str(context_window)
+    )
     # Session workspace (the selected working folder), not the bundle workdir.
     # Without this the SDK subprocess inherits the runner's launch cwd — see
     # ``HARNESS_CLAUDE_SDK_CWD`` in ``omnigent/inner/claude_sdk_harness.py``.
@@ -1428,11 +1437,8 @@ def _build_claude_sdk_spawn_env(
     retry_payload = _serialize_retry_policy(_resolve_retry_policy(spec))
     if retry_payload is not None:
         env["HARNESS_CLAUDE_SDK_RETRY_POLICY"] = retry_payload
-    # Permission mode: controls whether Claude asks for approval before
-    # calling native tools. When set to anything other than the default
-    # ``"bypassPermissions"``, the SDK's ``can_use_tool`` callback is
-    # active and approval requests surface via Omnigent elicitation. Read from
-    # Omitted when not set — harness falls back to ``"bypassPermissions"``.
+    # Forward an explicit spec permission mode; unset, the harness default (``"auto"``)
+    # applies. Any mode but ``"bypassPermissions"`` routes approvals through elicitation.
     permission_mode = spec.executor.config.get("permission_mode")
     if permission_mode is not None:
         env["HARNESS_CLAUDE_SDK_PERMISSION_MODE"] = str(permission_mode)
@@ -1470,6 +1476,118 @@ def _apply_harness_path_override(
         env[_harness_path_env_var(canonicalize_harness(harness) or harness)] = path
 
 
+def _apply_codex_provider_env(
+    env: dict[str, str],
+    spec: AgentSpec,
+    provider: ProviderEntry | None,
+) -> None:
+    """Set the ``HARNESS_CODEX_*`` routing a Codex launch on *provider* uses.
+
+    :param env: The spawn-env dict being built (mutated in place).
+    :param spec: The agent spec.
+    :param provider: The launch's resolved provider, or ``None`` when none resolved.
+    """
+    if provider is not None:
+        if provider.kind == DATABRICKS_KIND:
+            _configure_brokered_codex_with_ucode(env, spec, provider)
+        else:
+            configure_agent_harness_with_provider(env, provider, harness_type="codex")
+    elif codex_config_provider_dismissed(load_config()):
+        # No credential resolved. If the user Removed codex's custom
+        # ~/.codex/config.toml provider (dismissed), pin the built-in ``openai``
+        # provider so the dismissal holds at run time — the executor's bridged
+        # config.toml would otherwise still route this launch through that removed
+        # default model_provider. (Gateway mode never reaches here: it resolves a
+        # provider above, and the executor rejects a double pin.)
+        env["HARNESS_CODEX_MODEL_PROVIDER"] = "openai"
+    _bind_codex_gateway_credential(env, spec)
+
+
+def _bind_codex_gateway_credential(env: dict[str, str], spec: AgentSpec) -> None:
+    """Use a host-bound placeholder for an explicitly brokered Codex gateway."""
+    locked = spec.executor.config.get("broker_gateway", False)
+    if not isinstance(locked, bool):
+        raise OmnigentError(
+            "executor.config.broker_gateway must be a boolean", code=ErrorCode.INVALID_INPUT
+        )
+    base_url = env.get("HARNESS_CODEX_GATEWAY_BASE_URL")
+    sandbox = spec.os_env.sandbox if spec.os_env is not None else None
+    proxy = sandbox.credential_proxy if sandbox is not None else None
+    reserved_bindings = (
+        [entry for entry in proxy.entries if CODEX_GATEWAY_TOKEN_ENV in entry.inject_env]
+        if proxy is not None
+        else []
+    )
+    if not locked and not reserved_bindings:
+        return
+    if not base_url:
+        raise OmnigentError(
+            "Codex gateway credential_proxy requires a gateway HTTPS provider",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    try:
+        parsed = urlparse(base_url)
+        host = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        raise OmnigentError("invalid Codex gateway URL", code=ErrorCode.INVALID_INPUT) from None
+    if not locked:
+        raise OmnigentError(
+            "Codex gateway reserved binding requires executor.config.broker_gateway: true",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    if (
+        spec.executor.config.get("web_search") is not False
+        or spec.executor.config.get("disable_native_tools") is not True
+    ):
+        raise OmnigentError(
+            "brokered Codex gateway requires executor.config.web_search: false "
+            "and executor.config.disable_native_tools: true",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    binding = reserved_bindings[0] if len(reserved_bindings) == 1 else None
+    model_path = parsed.path.rstrip("/") + "/responses"
+    try:
+        rules = parse_rules(sandbox.egress_rules or []) if sandbox is not None else []
+    except ValueError as exc:
+        raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+    model_rules = [rule for rule in rules if host and rule._host_matches(host)]
+    if (
+        len(reserved_bindings) != 1
+        or parsed.scheme != "https"
+        or port not in (None, 443)
+        or parsed.username is not None
+        or not host
+        or parsed.query
+        or parsed.fragment
+        or binding is None
+        or binding.host != host
+        or binding.scheme != "bearer"
+        or binding.inject_env != [CODEX_GATEWAY_TOKEN_ENV]
+        or binding.source.kind not in ("file", "unix_socket")
+        or binding.source.refresh_interval_seconds is None
+        or sandbox is None
+        or sandbox.type not in ("linux_bwrap", "darwin_seatbelt")
+        or len(model_rules) != 1
+        or any(
+            rule.host_pattern != host
+            or rule.methods != frozenset({"POST"})
+            or rule.path_pattern != model_path
+            for rule in model_rules
+        )
+    ):
+        raise OmnigentError(
+            "Codex gateway credential_proxy requires one matching HTTPS bearer "
+            "renewable file/socket binding with env OMNIGENT_CODEX_GATEWAY_TOKEN "
+            "and the exact POST Responses egress rule",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    env["HARNESS_CODEX_GATEWAY_AUTH_COMMAND"] = BROKERED_CODEX_AUTH_COMMAND
+    env["HARNESS_CODEX_BROKERED_GATEWAY"] = "true"
+    env["HARNESS_CODEX_ENABLE_WEB_SEARCH"] = "false"
+    env["HARNESS_CODEX_DISABLE_NATIVE_TOOLS"] = "true"
+
+
 def _build_codex_spawn_env(
     spec: AgentSpec,
     *,
@@ -1482,17 +1600,7 @@ def _build_codex_spawn_env(
     Maps spec.executor fields → the ``HARNESS_CODEX_*`` env vars
     defined in ``omnigent/inner/codex_harness.py``. Mirrors
     :func:`_build_claude_sdk_spawn_env` — same per-spawn env-var
-    pattern from §Step 5a. The codex-specific env vars
-    (``HARNESS_CODEX_PATH``, ``HARNESS_CODEX_ENABLE_WEB_SEARCH``,
-    ``HARNESS_CODEX_DISABLE_NATIVE_TOOLS``) are not threaded
-    through here in v1: the legacy
-    :func:`omnigent.inner.executor_factory.create_executor`
-    path doesn't surface them either, so AP-side parity is
-    preserved by leaving them at the inner executor's defaults.
-    Operators who want non-default values set those env vars
-    on the Omnigent server directly (they propagate to the subprocess
-    through normal env inheritance — the wrap's per-spawn
-    overrides only override, they don't filter).
+    pattern from §Step 5a.
 
     :param spec: The agent spec.
     :param workdir: The bundle's on-disk path (extracted by the
@@ -1514,19 +1622,7 @@ def _build_codex_spawn_env(
     # :func:`_resolve_provider_for_build`. Otherwise the existing path is
     # unchanged.
     provider = _resolve_provider_for_build(spec, harness_type="codex", for_launch=True)
-    if provider is not None:
-        if provider.kind == DATABRICKS_KIND:
-            _configure_brokered_codex_with_ucode(env, spec, provider)
-        else:
-            configure_agent_harness_with_provider(env, provider, harness_type="codex")
-    elif codex_config_provider_dismissed(load_config()):
-        # No credential resolved. If the user Removed codex's custom
-        # ~/.codex/config.toml provider (dismissed), pin the built-in ``openai``
-        # provider so the dismissal holds at run time — the executor's bridged
-        # config.toml would otherwise still route this launch through that removed
-        # default model_provider. (Gateway mode never reaches here: it resolves a
-        # provider above, and the executor rejects a double pin.)
-        env["HARNESS_CODEX_MODEL_PROVIDER"] = "openai"
+    _apply_codex_provider_env(env, spec, provider)
     # Skills bridge — same shape as the claude-sdk variant. Always
     # set so the harness wrap doesn't fall back to its ``"all"``
     # default and override an explicit ``skills: none`` spec.
@@ -1762,6 +1858,11 @@ def _build_acp_cli_spawn_env(
         # Omnigent MCP server.
         "HARNESS_ACP_OMNIGENT_MCP": "1" if row.omnigent_mcp else "0",
     }
+    # A vendor CLI authenticating from its own key reads it out of the spawn
+    # env, which forwards only passthrough-named vars, so a row that
+    # advertises one has to name it or the key never reaches the CLI.
+    if row.env_passthrough:
+        env["HARNESS_ACP_ENV_PASSTHROUGH"] = ",".join(sorted(set(row.env_passthrough)))
     # Session workspace (selected working folder). ``None`` lets the wrap fall
     # back to OMNIGENT_RUNNER_WORKSPACE — see HARNESS_ACP_CWD.
     if cwd is not None:
@@ -3118,7 +3219,7 @@ async def compact_conversation_now(
         task_id=task_id,
         llm_client=_get_llm_client(),
         connection=compaction_state.connection,
-        runner_client=_get_runner_client_for_compaction(conversation_id),
+        runner_client=await asyncio.to_thread(_get_runner_client_for_compaction, conversation_id),
         force=True,
         fail_on_summary_error=True,
         conversation_id=conversation_id,

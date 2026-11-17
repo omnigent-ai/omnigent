@@ -21,6 +21,7 @@ function harness() {
       this.webContents.sent = [];
       this.webContents.send = (channel, payload) => this.webContents.sent.push([channel, payload]);
       this.destroyed = false;
+      this.focused = 0;
       world.windows.push(this);
     }
     setContentSize() {}
@@ -32,7 +33,9 @@ function harness() {
       return this.destroyed;
     }
     show() {}
-    focus() {}
+    focus() {
+      this.focused += 1;
+    }
     close() {
       this.destroyed = true;
       this.emit("closed");
@@ -171,6 +174,37 @@ describe("createSshConnectFlow", () => {
       error: "Connecting over SSH wasn't approved.",
     });
     assert.equal(world.connects.length, 0);
+  });
+
+  it("re-attaches a repeat connect to the same machine and shares its result", async () => {
+    const { world, flow } = harness();
+    const first = flow.run(null, SERVER, "my-ec2");
+    const [win] = world.windows;
+    world.sendFrom(win.webContents.id, "ssh-connect:confirm");
+
+    // The page asks again (say, after a reload): same window focused, no second connect.
+    const second = flow.run(null, SERVER, "my-ec2");
+    assert.equal(world.windows.length, 1);
+    assert.equal(win.focused, 1);
+    assert.equal(world.connects.length, 1);
+
+    world.connects[0].finish({
+      ok: true,
+      alreadyRunning: false,
+      identity: { serverUrl: SERVER, hostId: "h1" },
+    });
+    const expected = {
+      ok: true,
+      alreadyRunning: false,
+      identity: { serverUrl: SERVER, hostId: "h1" },
+      shownInConsole: true,
+    };
+    assert.deepEqual(await first, expected);
+    assert.deepEqual(await second, expected);
+
+    // Once it settles, the next connect opens a fresh window.
+    void flow.run(null, SERVER, "my-ec2");
+    assert.equal(world.windows.length, 2);
   });
 });
 

@@ -41,6 +41,10 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Mapping, Sequence
     from pathlib import Path
 
+    from omnigent.onboarding.sandboxes.profiles import (
+        ProviderSandboxProfile,
+        SandboxProfileContext,
+    )
     from omnigent.onboarding.sandboxes.types import RepoWorkspace
 
 
@@ -370,7 +374,7 @@ def render_host_config_write_command(host_config: dict[str, object]) -> str:
     in the destination directory followed by :func:`os.replace`, so an
     interrupted write cannot expose a truncated destination file. A pre-existing
     ``config.yaml`` symlink is replaced by a real file — durability of the write
-    is favored over following the link, which an internal sandbox config never
+    is favored over following the link, which a sandbox config never
     relies on.
 
     The payload travels as base64-encoded JSON substituted into a fixed
@@ -500,8 +504,8 @@ class SandboxLifecycle(ABC):
 
     # Package index URL exported as ``UV_INDEX_URL`` for the local wheel
     # build, or ``None`` to use ambient uv configuration. Providers tied
-    # to networks where public PyPI is unreachable (Lakebox on the
-    # Databricks corp network) override this.
+    # to networks where public PyPI is unreachable (for example, Lakebox on a
+    # restricted network) override this.
     wheel_build_index_url: ClassVar[str | None] = None
 
     # Legacy class vars — kept for backward compat while providers migrate
@@ -553,6 +557,9 @@ class SandboxLifecycle(ABC):
         if base_method is None:
             return False
         return self_method is not base_method
+
+    # Provider ID learned during start; managed launch persists it over the reserved ID.
+    started_sandbox_id: str | None = None
 
     @abstractmethod
     def prepare(self) -> None:
@@ -613,9 +620,10 @@ class SandboxLifecycle(ABC):
         ``True`` otherwise.
 
         Called BOTH once after a CLI bootstrap provision AND periodically
-        by the managed path for as long as the sandbox has a live runner
-        (:mod:`omnigent.server.managed_host_keepalive`), so an implementation
-        must be idempotent and cheap enough to repeat. Either shape
+        by the managed path while the sandbox's runner does work, and for the
+        runner idle timeout after (:mod:`omnigent.server.managed_host_keepalive`),
+        so an implementation must be idempotent and cheap enough to repeat.
+        Either shape
         satisfies it: "configure once to maximize lifetime" (disable idle
         autostop, restate a cap) or "push a deadline forward" (refresh an
         absolute expiry). Managed-only launchers that cannot extend a
@@ -708,6 +716,25 @@ class SandboxLifecycle(ABC):
         :raises click.ClickException: If the stop fails.
         """
         raise self._capability_error("stop a sandbox without deleting it")
+
+    def stop_when_archived(self, *, owner: str, configured: bool) -> bool:
+        """
+        Whether to :meth:`stop` a managed sandbox whose session was archived.
+
+        Asked only for a sandbox this provider can resume. If this returns
+        ``True``, the server then checks that no other session uses the sandbox
+        before it stops it. The default follows the provider's
+        ``stop_on_archive`` server setting. Override it to decide per owner at
+        archive time, for example from a feature flag, so a rollout or rollback
+        needs no server restart. Runs in a worker thread, after the archive
+        request has returned. An exception leaves the sandbox running.
+
+        :param owner: The host owner (the session creator), e.g.
+            ``"alice@example.com"``.
+        :param configured: The provider's ``stop_on_archive`` setting.
+        :returns: ``True`` to stop the sandbox.
+        """
+        return configured
 
     def resume(self, sandbox_id: str) -> None:
         """
@@ -957,6 +984,45 @@ class SandboxHostLauncher(SandboxLifecycle):
     transport.
     """
 
+    manages_profiles: ClassVar[bool] = False
+    """Own profile discovery, permissions, and configuration; mirror in registry metadata."""
+
+    supports_sandbox_profile_lookup: ClassVar[bool] = False
+    """Whether sandbox-scoped discovery returns the durable assigned revision."""
+
+    automation_notice: ClassVar[str | None] = None
+    """User-safe note on what this provider's unattended runs need from their owner.
+
+    ``/v1/info`` reports it in ``sandbox_provider_automation_notices``, and the
+    automation form shows it while a new sandbox is the run target, e.g. for a
+    credential that must stay fresh on the owner's machine. ``None`` shows nothing.
+    """
+
+    def list_profiles(self, context: SandboxProfileContext) -> list[ProviderSandboxProfile] | None:
+        """Return only profiles currently authorized for the trusted caller context.
+
+        Use bounded provider I/O, including explicit network timeouts. This
+        synchronous hook must not provision resources or perform launch preflight.
+        Return public metadata only; keep configuration and access rules private.
+        For sandbox-scoped lookup only, None confirms an authorized legacy sandbox
+        has no profile. Denied access must raise SandboxProfileAccessDenied.
+        """
+        raise self._capability_error("list provider-managed sandbox profiles")
+
+    def select_profile(
+        self, context: SandboxProfileContext, profile: ProviderSandboxProfile
+    ) -> None:
+        """Re-authorize an exact revision and configure this launcher for its use.
+
+        Re-read current access and settings using bounded provider I/O. Raise
+        SandboxProfileAccessDenied for revoked access or SandboxProfileChanged
+        if the requested revision is unavailable; never silently use a newer one.
+        Configure this instance before prepare_for_launch, prepare, provision,
+        or resume. Do not provision resources or perform launch preflight here.
+        A previous list_profiles result is not proof of current authorization.
+        """
+        raise self._capability_error("select provider-managed sandbox profiles")
+
     def prepare_for_launch(self, *, agent_name: str | None = None) -> None:
         """Set request context before provider preparation, allocation, or resume.
 
@@ -994,6 +1060,20 @@ class SandboxHostLauncher(SandboxLifecycle):
         :param resolve: Zero-argument resolver for this host's owner.
         """
         del resolve
+
+    def host_online_failure_hint(self, sandbox_id: str) -> str | None:
+        """Suggest recovery when a scheduled launch times out before registration.
+
+        Called off the event loop, before cancellation and teardown. Prefer
+        cached observations; bound any I/O because a caller timeout cannot stop
+        a worker thread. Return user-safe guidance, never credentials, and keep
+        unconfirmed causes conditional. ``None`` preserves the generic error.
+
+        :param sandbox_id: The provisioned sandbox that has not registered.
+        :returns: Recovery instructions, or ``None`` when none are available.
+        """
+        del sandbox_id
+        return None
 
     def capture_logs(self, sandbox_id: str) -> str | None:
         """

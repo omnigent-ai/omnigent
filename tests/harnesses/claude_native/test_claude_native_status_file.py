@@ -19,12 +19,14 @@ import pytest
 from omnigent.harnesses.claude_native.status_file import (
     IDLE,
     RUNNING,
+    WAITING,
     BackgroundHolder,
     SessionStatusPoller,
     find_background_holder,
     read_session_status,
     resolve_status_file,
     session_has_live_process,
+    session_pids,
     sessions_dir,
 )
 
@@ -195,8 +197,11 @@ def test_poller_publishes_edges_only(tmp_path: Path) -> None:
     assert published == [RUNNING, IDLE]
 
 
-def test_resync_during_tick_survives_the_in_flight_read(tmp_path: Path, monkeypatch) -> None:
-    """A forwarded idle edge cannot be lost to a concurrent file poll."""
+@pytest.mark.parametrize("transition", ["resync", "retire"])
+def test_lifecycle_change_during_tick_survives_the_in_flight_read(
+    tmp_path: Path, monkeypatch, transition: str
+) -> None:
+    """Reconnect survives an in-flight read; retirement prevents its publication."""
     path = _write_session_file(tmp_path / "sessions", pid=1, session_id="s", status="busy")
     published: list[str] = []
     poller = SessionStatusPoller(
@@ -208,7 +213,13 @@ def test_resync_during_tick_survives_the_in_flight_read(tmp_path: Path, monkeypa
     poller.tick()
     assert published == [RUNNING]
 
-    _write_session_file(tmp_path / "sessions", pid=1, session_id="s", status="busy")
+    _write_session_file(
+        tmp_path / "sessions",
+        pid=1,
+        session_id="s",
+        status="waiting" if transition == "retire" else "busy",
+        blocked_on="input needed" if transition == "retire" else None,
+    )
     old_mtime = path.stat().st_mtime
     os.utime(path, (old_mtime + 2, old_mtime + 2))
     entered = threading.Event()
@@ -227,16 +238,53 @@ def test_resync_during_tick_survives_the_in_flight_read(tmp_path: Path, monkeypa
     worker.start()
     try:
         assert entered.wait(5), "poller did not reach the file read"
-        poller.resync()
+        getattr(poller, transition)()
     finally:
         release.set()
         worker.join(timeout=5)
     assert not worker.is_alive()
     assert published == [RUNNING]
+    if transition == "retire":
+        poller.resync()
+        poller.tick()
+        assert poller.active is False
+        assert poller.blocked_on is None
+        assert published == [RUNNING]
+        return
     poller.tick()
     assert published == [RUNNING, RUNNING]
     poller.tick()
     assert published == [RUNNING, RUNNING]
+
+
+def test_poller_reports_idle_tracks_last_read_status(tmp_path: Path) -> None:
+    """``reports_idle`` mirrors the last read so backoff waits for a real idle."""
+    sessions = tmp_path / "sessions"
+    _write_session_file(sessions, pid=1, session_id="s", status="busy")
+    poller = SessionStatusPoller(
+        on_status=lambda status, _reason: None,
+        pane_pid_getter=_StubPidGetter(1),
+        session_id_getter=lambda: "s",
+        config_dir=tmp_path,
+    )
+
+    # Nothing read yet: unknown is not idle.
+    assert poller.reports_idle is False
+    poller.tick()  # busy → running
+    assert poller.reports_idle is False
+    _write_session_file(sessions, pid=1, session_id="s", status="idle")
+    poller.tick()
+    assert poller.reports_idle is True
+    _write_session_file(sessions, pid=1, session_id="s", status="busy")
+    poller.tick()
+    assert poller.reports_idle is False
+    _write_session_file(sessions, pid=1, session_id="s", status="idle")
+    poller.tick()
+    assert poller.reports_idle is True
+    # A vanished file (Claude exited) is no longer authoritative.
+    (sessions / "1.json").unlink()
+    poller.tick()
+    assert poller.reports_idle is False
 
 
 def test_poller_gives_up_when_file_never_appears(tmp_path: Path) -> None:
@@ -288,6 +336,75 @@ def test_shell_status_maps_to_idle(tmp_path: Path) -> None:
     assert status is not None
     assert status.runner_status == IDLE
     assert status.raw_status == "shell"
+
+
+def _background_poller(
+    tmp_path: Path, statuses: list[str], background: list[bool]
+) -> SessionStatusPoller:
+    return SessionStatusPoller(
+        on_status=lambda status, _reason: statuses.append(status),
+        pane_pid_getter=_StubPidGetter(1),
+        session_id_getter=lambda: "s",
+        config_dir=tmp_path,
+        on_background=background.append,
+    )
+
+
+def test_background_signal_follows_shell_and_idle_only(tmp_path: Path) -> None:
+    """``shell`` turns the signal on and ``idle`` off; a turn or dialog leaves it alone.
+
+    The sequence is what Claude writes when a turn starts a background shell,
+    the shell's completion triggers a follow-up turn, and that turn ends.
+    """
+    sessions = tmp_path / "sessions"
+    statuses: list[str] = []
+    background: list[bool] = []
+    poller = _background_poller(tmp_path, statuses, background)
+    for status in ("busy", "shell", "waiting", "shell", "busy", "idle"):
+        _write_session_file(sessions, pid=1, session_id="s", status=status)
+        poller.tick()
+    assert background == [True, False]
+    assert statuses == [RUNNING, IDLE, RUNNING, IDLE, RUNNING, IDLE]
+
+
+def test_observe_reports_background_without_status_edges(tmp_path: Path) -> None:
+    """While OSC owns status the file contributes only the background signal."""
+    sessions = tmp_path / "sessions"
+    statuses: list[str] = []
+    background: list[bool] = []
+    poller = _background_poller(tmp_path, statuses, background)
+    _write_session_file(sessions, pid=1, session_id="s", status="shell")
+    poller.observe()
+    _write_session_file(sessions, pid=1, session_id="s", status="busy")
+    poller.observe()
+    assert background == [True]
+    assert statuses == []
+
+    # Handing status back to the file republishes its current value.
+    poller.resync()
+    poller.tick()
+    assert statuses == [RUNNING]
+
+
+def test_background_signal_is_reasserted_after_resync_and_cleared_on_retire(
+    tmp_path: Path,
+) -> None:
+    """A reconnected server relearns the value; a dead pane clears it."""
+    sessions = tmp_path / "sessions"
+    statuses: list[str] = []
+    background: list[bool] = []
+    poller = _background_poller(tmp_path, statuses, background)
+    _write_session_file(sessions, pid=1, session_id="s", status="shell")
+    poller.observe()
+    poller.observe()
+    assert background == [True]
+
+    poller.resync()
+    poller.observe()
+    assert background == [True, True]
+
+    poller.retire()
+    assert background == [True, True, False]
 
 
 def test_unknown_status_clears_dedup_so_next_read_publishes(tmp_path: Path) -> None:
@@ -377,6 +494,7 @@ def test_retire_stops_the_file_owning_status(tmp_path: Path) -> None:
 
     poller.retire()
     assert poller.active is False
+    assert poller.blocked_on is None
 
     # The file is still there and still readable; a retired poller reads it no
     # more, so its stale value cannot keep owning the session's status.
@@ -415,6 +533,57 @@ def test_resync_republishes_an_unchanged_file(tmp_path: Path) -> None:
     # Still reading the same resolved file — a resync re-asserts a working
     # poller rather than restarting resolution.
     assert poller.active is True
+
+
+def test_busy_left_by_a_background_agent_reads_waiting(tmp_path: Path) -> None:
+    """A busy file reads waiting while a settled turn's background agent works.
+
+    Claude keeps the file ``busy`` for the agent's lifetime without rewriting
+    it, so the bridge's mark is rechecked on every tick of an unchanged file.
+    """
+    sessions = tmp_path / "sessions"
+    _write_session_file(sessions, pid=1, session_id="s", status="busy")
+    agent_after_turn = [False]
+    published: list[tuple[str, str | None]] = []
+    poller = SessionStatusPoller(
+        on_status=lambda status, reason: published.append((status, reason)),
+        pane_pid_getter=_StubPidGetter(1),
+        session_id_getter=lambda: "s",
+        config_dir=tmp_path,
+        background_agents_after_turn=lambda: agent_after_turn[0],
+    )
+    poller.tick()
+    assert published == [(RUNNING, None)]
+
+    # The turn's Stop lists a running agent; the forwarded idle edge resyncs.
+    agent_after_turn[0] = True
+    poller.tick()
+    poller.resync()
+    poller.tick()
+    assert published == [(RUNNING, None), (WAITING, None), (WAITING, None)]
+    assert poller.holding_background_agents is True
+
+    # A follow-up prompt starts a turn the same busy file now reports.
+    agent_after_turn[0] = False
+    poller.tick()
+    assert published[-1] == (RUNNING, None)
+    assert poller.holding_background_agents is False
+
+    # A dialog still needs the user, whatever the agent is doing.
+    agent_after_turn[0] = True
+    poller.tick()
+    _write_session_file(
+        sessions, pid=1, session_id="s", status="waiting", blocked_on="permission prompt"
+    )
+    poller.tick()
+    assert published[-2:] == [(WAITING, None), (RUNNING, "permission prompt")]
+    assert poller.holding_background_agents is False
+
+    # The agent finishing lets Claude go idle, which ends the wait.
+    _write_session_file(sessions, pid=1, session_id="s", status="idle")
+    poller.tick()
+    assert published[-1] == (IDLE, None)
+    assert poller.holding_background_agents is False
 
 
 def test_resync_does_not_revive_a_retired_poller(tmp_path: Path) -> None:
@@ -613,6 +782,19 @@ def test_session_has_live_process_counts_interactive_holders(tmp_path: Path) -> 
     assert session_has_live_process("SID-1", config_dir=tmp_path) is True
     assert session_has_live_process("sid-2", config_dir=tmp_path) is False
     assert session_has_live_process("sid-3", config_dir=tmp_path) is False
+
+
+def test_session_pids_names_the_live_processes_holding_a_session(tmp_path: Path) -> None:
+    """Every live record naming the session counts; dead and other sessions don't."""
+    sessions = tmp_path / "sessions"
+    _write_registry_record(
+        sessions, str(os.getppid()), {"sessionId": "sid-1", "kind": "interactive"}
+    )
+    _write_registry_record(sessions, "999999999", {"sessionId": "sid-1", "kind": "interactive"})
+    _write_registry_record(sessions, "1", {"sessionId": "sid-2", "kind": "interactive"})
+
+    assert session_pids("SID-1", config_dir=tmp_path) == [os.getppid()]
+    assert session_pids("sid-3", config_dir=tmp_path) == []
 
 
 @pytest.mark.skipif(not Path("/proc/self/stat").exists(), reason="needs procfs")

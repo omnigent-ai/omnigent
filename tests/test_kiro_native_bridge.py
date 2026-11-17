@@ -127,6 +127,32 @@ def test_build_terminal_env_adds_bridge_dir_and_acp_record_path(
     assert env["PATH"] == "/usr/bin"
 
 
+def test_build_terminal_env_keeps_variables_forwarded_for_the_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "bridge-root")
+
+    env = build_kiro_native_terminal_env(
+        "conv_kiro",
+        source_env={
+            "PATH": "/usr/bin",
+            "OMNIGENT_RUNNER_SESSION_ENV_NAMES": (
+                "ARCATERM_CAPABILITY,MACTERM_SOCKET,ARCATERM_PROJECTS_ROOT"
+            ),
+            "ARCATERM_CAPABILITY": "capability-for-pane-1",
+            "MACTERM_SOCKET": "/tmp/mt.sock",
+            "ARCATERM_PROJECTS_ROOT": "",
+            "UNLISTED_SECRET": "nope",
+        },
+    )
+
+    assert env["ARCATERM_CAPABILITY"] == "capability-for-pane-1"
+    assert env["MACTERM_SOCKET"] == "/tmp/mt.sock"
+    assert env["ARCATERM_PROJECTS_ROOT"] == ""
+    assert "UNLISTED_SECRET" not in env
+
+
 def test_send_kiro_permission_verdict_accepts_default_option(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -1,6 +1,6 @@
 import { useMemo, useRef } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { useTheme } from "next-themes";
+import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 import { resolveIdentity } from "@/lib/identity";
 import { getOmnigentServerIdentity } from "@/lib/host";
 import { fetchPullRequestInfo, type PullRequest } from "@/hooks/usePullRequests";
@@ -82,10 +82,9 @@ function pageSearch(value: unknown): string {
 
 export function useExtensionHostServices(extension: ExtensionCatalogItem) {
   const navigate = useNavigate();
-  const { resolvedTheme } = useTheme();
+  const theme = useResolvedThemeMode();
   const queryClient = useQueryClient();
   const storedPullRequests = storesSessionPullRequests(useServerInfo());
-  const theme = resolvedTheme === "dark" ? "dark" : "light";
   const writeLimiter = useMemo(() => new ExtensionStorageWriteLimiter(), []);
   const sessionListLimiter = useMemo(() => new SessionReadLimiter(), []);
   const pullRequestLimiter = useMemo(() => new SessionReadLimiter(), []);

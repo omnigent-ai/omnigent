@@ -8,6 +8,7 @@ from typing import Any
 
 import pytest
 
+from omnigent.db.db_models import current_workspace_id, workspace_scope
 from omnigent.server import session_pull_requests as server_prs
 from omnigent.server.routes._sessions import helpers
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -244,6 +245,34 @@ async def test_listed_sessions_refresh_at_most_once_per_window() -> None:
     refresher.turn_ended("other")
     await asyncio.sleep(0)
     assert started == [SESSION]
+
+
+async def test_the_same_session_id_is_refreshed_separately_in_each_workspace() -> None:
+    started: list[tuple[int, str]] = []
+
+    async def refresh(session_id: str) -> None:
+        started.append((current_workspace_id(), session_id))
+
+    refresher = server_prs.PullRequestRefresher(turn_end_delay_s=0)
+    refresher.bind(refresh)
+    # Session ids are unique only within a workspace.
+    for workspace_id in (1, 2):
+        with workspace_scope(workspace_id):
+            refresher.request(SESSION)
+    while refresher._running:
+        await asyncio.gather(*refresher._running.values())
+    assert sorted(started) == [(1, SESSION), (2, SESSION)]
+
+    # A read in one workspace covers only that workspace's turn end.
+    started.clear()
+    with workspace_scope(1):
+        refresher.turn_ended(SESSION)
+    with workspace_scope(2):
+        refresher.turn_ended(SESSION)
+        refresher.note_read(SESSION, time.time())
+    while refresher._running:
+        await asyncio.gather(*refresher._running.values())
+    assert started == [(1, SESSION)]
 
 
 def test_refreshes_are_noops_outside_an_event_loop() -> None:

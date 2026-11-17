@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gzip
 import hashlib
 import io
 import json
@@ -184,7 +185,49 @@ def agent_needs_own_copy(agent: Agent, user_id: str | None) -> bool:
     return agent.created_by != user_id
 
 
-def copy_agent_bundle(artifact_store: ArtifactStore, location: str, new_agent_id: str) -> str:
+def redacted_agent_bundle(
+    agent_name: str, source_bundle: bytes, *, operator_authored: bool = False
+) -> bytes:
+    """Retain the agent name and validated harness without copying source content."""
+    try:
+        spec = validate_agent_bundle(
+            source_bundle, enforce_handler_allowlist=not operator_authored
+        )
+    except Exception:  # noqa: BLE001 - any parser error can echo source config, incl. secrets
+        raise OmnigentError(
+            "Agent bundle cannot be redacted", code=ErrorCode.INTERNAL_ERROR
+        ) from None
+
+    executor: dict[str, object] = {"type": spec.executor.type}
+    if spec.executor.type == "omnigent":
+        executor["config"] = {"harness": spec.executor.config["harness"]}
+    config = json.dumps(
+        {
+            "spec_version": 1,
+            "name": agent_name,
+            "executor": executor,
+        }
+    ).encode("utf-8")
+    output = io.BytesIO()
+    with (
+        gzip.GzipFile(fileobj=output, mode="wb", mtime=0) as compressed,
+        tarfile.open(fileobj=compressed, mode="w") as archive,
+    ):
+        member = tarfile.TarInfo("config.yaml")
+        member.size = len(config)
+        member.mode = 0o644
+        archive.addfile(member, io.BytesIO(config))
+    return output.getvalue()
+
+
+def copy_agent_bundle(
+    artifact_store: ArtifactStore,
+    location: str,
+    new_agent_id: str,
+    *,
+    redacted_name: str | None = None,
+    operator_authored: bool = False,
+) -> str:
     """Store a copy of the bundle at *location* under *new_agent_id*; return its location."""
     try:
         data = artifact_store.get(location)
@@ -195,6 +238,8 @@ def copy_agent_bundle(artifact_store: ArtifactStore, location: str, new_agent_id
         raise OmnigentError(
             SESSION_AGENT_BUNDLE_MISSING_MESSAGE, code=ErrorCode.SESSION_AGENT_MISSING
         ) from exc
+    if redacted_name is not None:
+        data = redacted_agent_bundle(redacted_name, data, operator_authored=operator_authored)
     new_location = bundle_location(new_agent_id, data)
     artifact_store.put(new_location, data)
     return new_location
@@ -295,6 +340,27 @@ def content_bundle_location(agent_id: str, bundle_bytes: bytes) -> str:
     return f"{agent_id}/{digest}"
 
 
+def _blob_confirmed(artifact_store: ArtifactStore, location: str) -> bool:
+    """
+    Return whether the store confirms a blob at *location*.
+
+    The check only lets a caller skip rewriting a content-addressed blob it
+    already holds, so a failed check reads as unconfirmed: the rewrite is
+    harmless, and its own failure is the one that should reach the caller.
+
+    :returns: ``False`` when the blob is absent or the check failed.
+    """
+    try:
+        return artifact_store.exists(location)
+    except Exception:
+        _logger.warning(
+            "Could not confirm bundle %s in the artifact store; rewriting it",
+            location,
+            exc_info=True,
+        )
+        return False
+
+
 # An MCP edit moves a row off its upload's content, so later uploads of that
 # content take the next id; past this many edited rows they get fresh rows.
 _UPLOADED_AGENT_ATTEMPTS = 3
@@ -350,7 +416,7 @@ def uploaded_agent_for(
         ):
             # The blob can vanish while the row survives (pruned artifacts, a DB
             # restored without its store); this upload holds the same files.
-            if not artifact_store.exists(location):
+            if not _blob_confirmed(artifact_store, location):
                 artifact_store.put(location, bundle_bytes)
             return agent
     return None

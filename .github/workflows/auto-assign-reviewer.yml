@@ -42,6 +42,9 @@ concurrency:
   group: auto-assign-reviewer-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
+env:
+  OMNIGENT_CI_PIPELINE: auto-assign-reviewer
+
 jobs:
   assign:
     # Fork PRs only (precise: head repo differs from this repo). The
@@ -67,7 +70,10 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           ref: ${{ github.event.repository.default_branch }}
-          sparse-checkout: .github
+          sparse-checkout: |
+            .github
+            dev
+            omnigent
           persist-credentials: false
 
       # Optional LLM ranking of an area's owners by fit for this change. Writes a
@@ -116,6 +122,7 @@ jobs:
             echo "::notice::Could not list PR files; reviewer ranking skipped."
             exit 0
           fi
+          python3 -m dev.ci_usage validate
           # Fail-open: any exception leaves no rank file and the assigner falls back.
           python3 <<'PYEOF' || echo "::notice::Reviewer ranking failed; load-balanced fallback."
           import json, os, pathlib, re, urllib.request
@@ -150,12 +157,8 @@ jobs:
               "\n\nOutput the ranked JSON array of owner logins now."
           )
 
-          # The Databricks gateway is OpenAI-compatible (its adapter extends the
-          # OpenAI adapter): POST {gateway}/chat/completions with a Bearer token
-          # and the chat-completions body/response shape. (The Anthropic-native
-          # /anthropic/messages + x-api-key path 401s / 400s on this gateway.)
-          url = os.environ["GATEWAY_BASE_URL"].rstrip("/") + "/chat/completions"
-          payload = json.dumps({
+          from dev.ci_usage import chat_request
+          payload = {
               "model": os.environ["ROUTER_MODEL"],
               "max_tokens": 512,
               "temperature": 0,
@@ -163,11 +166,8 @@ jobs:
                   {"role": "system", "content": system},
                   {"role": "user", "content": user},
               ],
-          }).encode()
-          req = urllib.request.Request(url, data=payload, method="POST", headers={
-              "Content-Type": "application/json",
-              "Authorization": "Bearer " + os.environ["LLM_API_KEY"].strip(),
-          })
+          }
+          req = chat_request(os.environ["GATEWAY_BASE_URL"], os.environ["LLM_API_KEY"], payload)
           with urllib.request.urlopen(req, timeout=60) as resp:
               data = json.loads(resp.read().decode())
           text = data["choices"][0]["message"]["content"]

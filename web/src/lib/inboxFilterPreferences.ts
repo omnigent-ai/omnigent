@@ -1,15 +1,15 @@
 // Persisted, per-device preference for which Inbox tab is selected ("All" /
-// "Unread" / "Awaiting response"), so a viewer who only wants approvals — or
-// only new agent replies — lands on that view after a reload.
+// "Unread" / "Awaiting response" / "Omni Advisor"), so a viewer who only wants
+// approvals — or only new agent replies — lands on that view after a reload.
 
 const STORAGE_KEY = "omnigent:inbox-filter";
 
 /** Which slice of the Inbox is shown. */
-export type InboxFilter = "all" | "unread" | "awaiting";
+export type InboxFilter = "all" | "unread" | "awaiting" | "advisor";
 
 export const DEFAULT_INBOX_FILTER: InboxFilter = "all";
 
-const INBOX_FILTERS = new Set<string>(["all", "unread", "awaiting"]);
+const INBOX_FILTERS = new Set<string>(["all", "unread", "awaiting", "advisor"]);
 
 /** Return whether a string is a known Inbox tab value. */
 export function isInboxFilter(value: string): value is InboxFilter {

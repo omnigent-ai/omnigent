@@ -6,6 +6,7 @@ import httpx
 from playwright.sync_api import Locator, Page, expect
 
 _PILL = '[data-testid="background-task-pill"]'
+_CHAT_INDICATOR = '[data-testid="background-tasks-indicator"]'
 _MONITOR_TASK = {
     "id": "monitor-ci",
     "type": "shell",
@@ -61,6 +62,7 @@ def test_badge_survives_reload_and_tracks_updates_after_reconnect(
     )
     page.goto(f"{base_url}/c/{session_id}")
     expect(_pill_badge(page, 1)).to_have_text("1", timeout=15_000)
+    expect(page.locator(_CHAT_INDICATOR)).to_have_text("1 background task running")
     _pill_badge(page, 1).click()
     expect(page.get_by_role("dialog", name="1 background task", exact=True)).to_be_visible()
 
@@ -73,6 +75,7 @@ def test_badge_survives_reload_and_tracks_updates_after_reconnect(
 
     _publish_status(base_url, session_id, background_task_count=2)
     expect(_pill_badge(page, 2)).to_have_text("2", timeout=15_000)
+    expect(page.locator(_CHAT_INDICATOR)).to_have_text("2 background tasks running")
     _pill_badge(page, 2).click()
     panel = page.get_by_role("dialog", name="2 background tasks", exact=True)
     expect(panel).to_contain_text("details unavailable")
@@ -80,4 +83,5 @@ def test_badge_survives_reload_and_tracks_updates_after_reconnect(
 
     _publish_status(base_url, session_id, background_task_count=0)
     expect(page.locator(_PILL)).to_have_count(0, timeout=15_000)
+    expect(page.locator(_CHAT_INDICATOR)).to_have_count(0)
     expect(panel).to_have_count(0)

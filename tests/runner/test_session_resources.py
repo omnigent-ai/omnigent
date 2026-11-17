@@ -155,9 +155,23 @@ class _CapturingResourceRegistry:
         """
         self._terminal_activity_publisher = publisher
 
+    def set_session_background_publisher(
+        self,
+        publisher: Callable[[str, bool], None],
+    ) -> None:
+        """
+        Accept the background-shell publisher installed by the runner app.
+
+        :param publisher: Callable ``(session_id, running) -> None``.
+        :returns: None.
+        """
+        self._session_background_publisher = publisher
+
     def set_session_status_publisher(
         self,
         publisher: Callable[[str, str], None],
+        *,
+        accepts_inferred_status: Callable[[], bool] | None = None,
     ) -> None:
         """
         Accept the session-status publisher installed by the runner app.
@@ -166,9 +180,14 @@ class _CapturingResourceRegistry:
         callback (unused) to satisfy ``create_runner_app``'s wiring.
 
         :param publisher: Callable ``(session_id, status) -> None``.
+        :param accepts_inferred_status: Unused server capability check.
         :returns: None.
         """
+        del accepts_inferred_status
         self._session_status_publisher = publisher
+
+    def set_session_failure_publisher(self, publisher: Callable[[str, str], None]) -> None:
+        self._session_failure_publisher = publisher
 
     def set_terminal_exit_publisher(
         self,
@@ -302,6 +321,39 @@ def test_terminal_activity_refreshes_harness_idle_lease(tmp_path: Path) -> None:
     assert process_manager.activity_noted == ["conv_native"]
 
 
+@pytest.mark.asyncio
+async def test_background_shell_reports_reach_the_server_as_session_events(
+    tmp_path: Path,
+) -> None:
+    """The runner posts the flag as a session event, never into its session stream."""
+    posts: list[tuple[str, Any]] = []
+
+    class _RecordingServerClient(NullServerClient):
+        async def post(self, url: str, **kwargs: Any) -> httpx.Response:
+            posts.append((url, kwargs.get("json")))
+            return httpx.Response(202, json={"queued": False}, request=httpx.Request("POST", url))
+
+    resource_registry = _CapturingResourceRegistry(tmp_path)
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        resource_registry=resource_registry,  # type: ignore[arg-type]
+        server_client=_RecordingServerClient(),  # type: ignore[arg-type]
+    )
+    session_id = "conv_background_report"
+
+    resource_registry._session_background_publisher(session_id, True)
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+    assert len(posts) == 1
+    url, body = posts[0]
+    assert url == f"/v1/sessions/{session_id}/events"
+    assert body["type"] == "external_background_work"
+    assert body["data"]["running"] is True
+    assert isinstance(body["data"]["reported_at"], int)
+    assert session_id not in app.state.session_event_queues
+
+
 @pytest.fixture
 def registry(tmp_path: Path) -> TerminalRegistry:
     terminal_registry = TerminalRegistry(
@@ -345,6 +397,40 @@ async def client(app: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://runner") as c:
         yield c
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "targets,status",
+    [
+        ([{"url": "https://github.com/org/repo", "path": ""}], 200),
+        ([{"url": "https://github.com/org/repo", "path": "../outside"}], 400),
+        ([{"url": "https://github.com/org/repo", "path": ""}] * 11, 400),
+        ([{"path": ""}], 400),
+    ],
+)
+async def test_repository_branches_runner_contract(
+    tmp_path: Path, targets: object, status: int
+) -> None:
+    app = create_runner_app(
+        runner_workspace=tmp_path,
+        per_session_workspace=False,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://runner"
+    ) as client:
+        response = await client.get(
+            "/v1/sessions/session/resources/repository-branches",
+            params={"repositories": json.dumps(targets)},
+        )
+    assert response.status_code == status, response.text
+    if status == 200:
+        assert response.json() == {
+            "repositories": [
+                {"url": "https://github.com/org/repo", "branch": None, "pushed": None}
+            ]
+        }
 
 
 @pytest.mark.asyncio
@@ -1633,6 +1719,8 @@ class _WatcherCapture:
         was wired.
     :param on_tick: The per-tick callback the registry passed (drives the
         claude-native status-file poller), or ``None`` if none was wired.
+    :param idle_poll_backoff_allowed: The native idle-poll backoff gate the
+        registry passed, or ``None`` when no backoff gate was wired.
     :param idle_threshold_s: The per-watcher idle threshold the registry
         passed, or ``None`` for the module default.
     :param poll_interval_s: The per-watcher poll interval the registry
@@ -1644,6 +1732,7 @@ class _WatcherCapture:
     on_idle: Callable[[], None] | None = None
     on_exit: Callable[[], None] | None = None
     on_tick: Callable[[], None] | None = None
+    idle_poll_backoff_allowed: Callable[[], bool] | None = None
     idle_threshold_s: float | None = None
     poll_interval_s: float | None = None
     replace: bool = False
@@ -1679,6 +1768,7 @@ def _make_capturing_instance(
         on_activity: Callable[[], None] | None = None,
         on_exit: Callable[[], None] | None = None,
         on_tick: Callable[[], None] | None = None,
+        idle_poll_backoff_allowed: Callable[[], bool] | None = None,
         idle_threshold_s: float | None = None,
         poll_interval_s: float | None = None,
         replace: bool = False,
@@ -1688,6 +1778,7 @@ def _make_capturing_instance(
         capture.on_activity = on_activity
         capture.on_exit = on_exit
         capture.on_tick = on_tick
+        capture.idle_poll_backoff_allowed = idle_poll_backoff_allowed
         capture.idle_threshold_s = idle_threshold_s
         capture.poll_interval_s = poll_interval_s
         capture.replace = replace
@@ -1698,18 +1789,14 @@ def _make_capturing_instance(
     return instance
 
 
-class _LaunchReturningRegistry:
-    """Terminal-registry stub whose ``launch`` returns a fixed instance.
-
-    The real terminal launch helpers only call
-    ``launch`` on its terminal registry; returning a prepared instance
-    lets the test exercise the real ``_start_terminal_activity_watcher``
-    wiring without spawning a terminal.
+class _LaunchReturningRegistry(TerminalRegistry):
+    """Register a prepared instance using the real registry's ownership lookups.
 
     :param instance: The instance every ``launch`` returns.
     """
 
     def __init__(self, instance: TerminalInstance) -> None:
+        super().__init__()
         self._instance = instance
 
     async def launch(
@@ -1726,7 +1813,7 @@ class _LaunchReturningRegistry:
     ) -> TerminalInstance:
         """Return the fixed instance, ignoring the launch spec.
 
-        :param conversation_id: Session/conversation id (unused).
+        :param conversation_id: Session/conversation id that owns the instance.
         :param terminal_name: Terminal name (unused).
         :param session_key: Per-launch key (unused).
         :param spec: Terminal env spec (unused).
@@ -1737,7 +1824,6 @@ class _LaunchReturningRegistry:
         :returns: The prepared terminal instance.
         """
         del (
-            conversation_id,
             terminal_name,
             session_key,
             spec,
@@ -1746,6 +1832,7 @@ class _LaunchReturningRegistry:
             sandbox_override,
         )
         self._instance.program_status_app = program_status_app
+        _seed_registry(self, conversation_id, [self._instance])
         return self._instance
 
 

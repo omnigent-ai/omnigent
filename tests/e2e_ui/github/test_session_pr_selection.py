@@ -9,6 +9,7 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 from playwright.sync_api import Page, Route, expect
 
+from tests._helpers.pull_request_ui import open_session_pull_requests
 from tests.e2e_ui.conftest import stub_session_pull_requests
 from tests.e2e_ui.github.test_github_tab import _INFO
 
@@ -184,7 +185,7 @@ def test_session_pr_selection_and_unlink(
     link.click()
     expect(rail.get_by_role("textbox", name="Pull request URL")).to_have_value(two)
     rail.get_by_role("button", name="Link", exact=True).click()
-    expect(rail.get_by_role("button", name="All pull requests (1)")).to_be_visible()
+    expect(rail.get_by_role("button", name=re.compile("All pull requests"))).to_have_count(0)
     expect(indicator).to_have_accessible_name("#42")
     expect(rail.get_by_text("Second repository", exact=True)).to_be_visible()
 
@@ -228,7 +229,7 @@ def test_session_pr_list_long_title(
     stub_session_pull_requests(page, lambda: info["prs"], lambda _url: None)
     page.set_viewport_size({"width": viewport_width, "height": 900})
     page.goto(f"{base_url}/c/{session_id}")
-    page.get_by_test_id("composer-pr-link").click()
+    open_session_pull_requests(page, mobile=viewport_width < 768)
     panel = (
         page.get_by_test_id("github-panel-drawer")
         if viewport_width < 768
@@ -302,7 +303,6 @@ def test_session_pr_account_fallback(
     page.goto(f"{base_url}/c/{session_id}")
     page.get_by_test_id("composer-pr-link").click()
     rail = page.get_by_role("complementary", name="Workspace")
-    rail.get_by_role("button", name="example/one #42", exact=True).click()
     expect(rail.get_by_text("Can’t reach the upstream repo", exact=True)).to_be_visible()
     account = rail.get_by_role("combobox", name="GitHub account")
     alternative = rail.get_by_text("or", exact=True)

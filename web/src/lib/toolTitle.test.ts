@@ -33,6 +33,14 @@ describe("formatToolTitle", () => {
     });
   });
 
+  it("links the image path reported by Codex view_image", () => {
+    expect(formatToolTitle("view_image", { path: "/repo/screenshot.png" })).toEqual({
+      verb: "View image",
+      body: "/repo/screenshot.png",
+      filePath: "/repo/screenshot.png",
+    });
+  });
+
   it("formats sys_os_read / write / edit with the verb bold and path as body", () => {
     expect(formatToolTitle("sys_os_read", { path: "/tmp/foo.py" })).toEqual({
       verb: "Read",
@@ -113,6 +121,16 @@ describe("formatToolTitle", () => {
     expect(formatToolTitle("sys_timer_set", { seconds: 5, repeat: true })).toEqual({
       verb: "Set timer:",
       body: "5s (repeat)",
+    });
+  });
+
+  it("formats sys_reminder_set with its time", () => {
+    expect(
+      formatToolTitle("sys_reminder_set", { message: "x", at: "2026-11-12T15:00:00-08:00" }),
+    ).toEqual({ verb: "Set reminder:", body: "2026-11-12T15:00:00-08:00" });
+    expect(formatToolTitle("sys_reminder_set", { message: "x", delay_seconds: 2700 })).toEqual({
+      verb: "Set reminder:",
+      body: "in 2700s",
     });
   });
 

@@ -12,6 +12,7 @@ from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 import tomlkit
+from ftfy.fixes import fix_surrogates
 from tomlkit.exceptions import ParseError, TOMLKitError
 
 from omnigent.errors import ErrorCode, OmnigentError
@@ -341,7 +342,8 @@ def _write_private_config(path: Path, content: str) -> None:
     descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            handle.write(content)
+            # TOML requires Unicode scalars; preserve paired UTF-16 characters.
+            handle.write(fix_surrogates(content))
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)

@@ -2,13 +2,15 @@
 
 GitLab sessions show their merge requests in the shared pull request panel,
 composer controls, and Canvas cards. The execution host's authenticated `glab`
-reads the MR; agent CLI and MCP writes associate it with the session.
+or GitLab token reads the MR; agent CLI and MCP writes associate it with the session.
 
 ## Sub-features
 
 - `summary`: MR identity, nested project, description, and checks.
 - `comments`: MR comments on their own tab, whose label shows the count.
-- `changes`: changed files and diff, with exact-revision expanded context.
+- `changes`: changed files and diff, with exact-revision expanded context, a path filter, and copy-path and open actions. Find searches the fetched patch from the toolbar search button, or Cmd/Ctrl+F while focus is in the Changes tab.
+- `local-review`: submit session-local Agent comments from Changes and send their
+  context chips together through chat; hover to preview and click to return.
 - `associations`: link, select, and unlink MRs across projects.
 - `partial`: incomplete comments, checks, files, and omitted diff explanations.
 - `auth`: missing CLI or denied access retains checkout context and a useful hint.
@@ -16,18 +18,28 @@ reads the MR; agent CLI and MCP writes associate it with the session.
   including alongside GitHub and Azure DevOps remotes.
 - `tracking`: successful mutations persist; reads, comments, failures, and replay
   do not create extra associations.
+- `render-recovery`: Panel render failures offer **Try again** without removing
+  chat, Workspace tabs or mobile Close.
 
 ## How to get to it (user POV)
 
 - `desktop-rail`: open a session's Workspace sidepanel and choose Pull Requests.
-- `desktop-composer`: click the MR number beside the session composer.
+- `desktop-composer`: click the MR number beside the session composer. Hover it
+  to open an MR in a new tab from the status preview; see
+  [pull-request-conversations.md](pull-request-conversations.md).
 - `mobile-composer`: tap the MR number to open its full-screen panel.
 - `canvas`: enable Canvas, open it, and follow an MR link on a session card.
 - `native-hook`: create or update an MR through a Claude or Codex native session.
 
-Select a row in the PR list to open its details; **All pull requests** returns
-to the list. Stored metadata and row actions remain available while the host
-is offline; checks and merge controls resume after reconnection.
+A session with one MR opens its details directly under **Pull Requests**.
+With multiple MRs, select a row in the list to open its details;
+**All pull requests** returns to the list. Stored metadata and unlinking remain
+available while the host is offline; checks and merge controls resume after
+reconnection.
+On desktop, mobile and Canvas, **Try again** retries failed panel content;
+switching sessions also clears a failed panel. Healthy chat drafts stay mounted.
+All four panel entry points also offer local Agent review in **Changes**; see
+the [local-review flow](pull-request-conversations.md#driving-it-with-the-repro-environment).
 
 ## Driving it with the repro environment
 
@@ -35,13 +47,20 @@ Preconditions: use the [Verify Omnigent skill](skills/verify-omnigent/SKILL.md)
 and start an isolated instance. Browser fixtures replace GitLab resource
 responses; they exercise the actual shared UI without contacting GitLab.
 
+Shared render recovery has component coverage in
+`web/src/components/RenderErrorBoundary.test.tsx` and
+`web/src/shell/AppShell.pullRequestTabVisibility.test.tsx`. For each panel entry
+above, inject a panel render exception, confirm chat and tab/Close controls
+remain usable, clear the fault, and choose **Try again**. Switching sessions
+should also recover. This is separate from provider authentication failures.
+
 - `desktop-rail`, `desktop-composer`, and `mobile-composer`:
   `tests/e2e_ui/gitlab/test_gitlab_panel.py::test_gitlab_panel_summary_and_diff`
   shows `!7` and checks, opens Comments, then opens a readable diff beside an
   empty file's no-text-diff notice and expands unchanged context with the pinned
-  MR revisions. The rail and mobile reconnect variants first show stored titles/status without
-  live checks, open the offline summary, return to the list, then restore live
-  data after Refresh. Record every variant.
+  MR revisions. The rail and mobile reconnect variants open the single MR's
+  stored summary directly, with its title and status but no live checks, then
+  restore live data after Refresh. Record every variant.
 - Associations:
   `tests/e2e_ui/gitlab/test_gitlab_panel.py::test_gitlab_link_select_unlink`
   attaches a second project, changes selection, and removes it.
@@ -66,12 +85,22 @@ responses; they exercise the actual shared UI without contacting GitLab.
 - Live auth, fork context, and removal persistence: follow
   [the manual verification steps](../docs/GITLAB.md#limits-and-verification)
   using a permitted test GitLab project and execution-host credentials.
+- Token auth: follow [token setup](../docs/GITLAB.md#token-authentication-without-a-cli)
+  without `gh` or `glab` installed. Open the panel from the rail or composer and
+  confirm the MR loads. An invalid token must show an access hint, not a CLI
+  install prompt. Client and panel component tests cover this without live credentials.
+- Local review on `desktop-rail`, `desktop-composer`, `mobile-composer`, and
+  `canvas`: follow the linked local-review flow with a readable MR diff. Submit
+  an Agent comment, preview its chip, navigate back, edit or delete it, and send
+  attached comments with the chat draft. Confirm no GitLab comment is published.
 
 ## Gotchas
 
 - The shared panel tab and link actions retain the generic Pull Requests wording.
   The provider heading, MR number prefix, external links, and Canvas label must
   use GitLab metadata.
+- Agent comments belong to the session. Publishing inline reviews to GitLab is
+  unsupported; the GitHub destination is unavailable for an MR.
 - A private instance is discovered from the execution host's `glab auth login`
   config. Nondefault HTTPS ports stay part of that saved host. SSH ports are separate;
   `api_host` routing remains owned by glab.

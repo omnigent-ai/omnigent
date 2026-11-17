@@ -121,6 +121,50 @@ async def test_create_with_harness_override_persists_and_snapshot_reflects(
     assert next(item for item in listed if item["id"] == body["id"])["harness"] == override
 
 
+@pytest.mark.parametrize(
+    "named,override,permission_mode",
+    [
+        (False, "codex-native", None),
+        (False, "claude-native", None),
+        (False, "claude-native", "plan"),
+        (True, "codex-native", None),
+        (True, "claude-native", None),
+    ],
+)
+async def test_spec_permission_args_require_matching_effective_harness(
+    client: httpx.AsyncClient, named: bool, override: str, permission_mode: str | None
+) -> None:
+    executor = {"config": {"harness": "codex-native", "permission_mode": "approve-for-me"}}
+    agent = await create_test_agent(
+        client,
+        executor=executor,
+        sub_agents=[{"name": "worker", "executor": executor}] if named else None,
+    )
+    body: dict[str, Any] = {"agent_id": agent["id"], "harness_override": override}
+    if named:
+        body.update(parent_session_id=agent["_session_id"], sub_agent_name="worker")
+    if permission_mode is not None:
+        body["permission_mode"] = permission_mode
+    created = await client.post("/v1/sessions", json=body)
+    assert created.status_code == 201, created.text
+    expected = None
+    if override == "codex-native":
+        expected = [
+            "--sandbox",
+            "workspace-write",
+            "--ask-for-approval",
+            "on-request",
+            "-c",
+            'approvals_reviewer="auto_review"',
+        ]
+    elif permission_mode is not None:
+        expected = ["--permission-mode", "plan"]
+    snapshot = await client.get(f"/v1/sessions/{created.json()['id']}")
+    assert snapshot.status_code == 200, snapshot.text
+    assert snapshot.json()["harness"] == override
+    assert snapshot.json()["terminal_launch_args"] == expected
+
+
 async def test_create_without_harness_override_reports_spec_default(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -159,6 +203,7 @@ async def test_create_without_harness_override_reports_spec_default(
         raise httpx.ConnectError("Artifact service unavailable")
 
     monkeypatch.setattr(AgentCache, "load", unavailable_bundle)
+    monkeypatch.setattr(AgentCache, "load_spec", unavailable_bundle)
     response = await client.get("/v1/sessions")
     assert response.status_code == 200
     listed_by_id = {item["id"]: item for item in response.json()["data"]}

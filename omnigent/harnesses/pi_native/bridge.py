@@ -56,7 +56,7 @@ def pi_native_env_unset(environ: Mapping[str, str]) -> list[str]:
     return sorted({name.strip() for name in raw.split(",") if name.strip()})
 
 
-_BRIDGE_ROOT = Path.home() / ".omnigent" / "pi-native"
+_BRIDGE_ROOT = native_bridge_common.native_bridge_data_dir() / "pi-native"
 _CONFIG_FILE = "config.json"
 _EXTENSION_FILE = "omnigent_pi_native_extension.js"
 _EXTENSION_PACKAGE = "omnigent.resources.pi_native"
@@ -463,7 +463,10 @@ def refresh_config_auth_headers(bridge_dir: Path, auth_headers: dict[str, str]) 
     if not isinstance(payload, dict):
         return False
     existing = payload.get("authHeaders") or {}
-    merged = {**existing, **auth_headers}
+    # Header names are case-insensitive: a fresh "User-Agent" replaces a stored "user-agent".
+    fresh_names = {name.lower() for name in auth_headers}
+    merged = {key: value for key, value in existing.items() if key.lower() not in fresh_names}
+    merged.update(auth_headers)
     if merged == existing:
         return False
     payload["authHeaders"] = merged

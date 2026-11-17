@@ -46,6 +46,8 @@ _CODECS = [
         ec.encode_scheduled_task_session_mode,
         ec.decode_scheduled_task_session_mode,
     ),
+    (ec.JOURNAL_ENTRY_KIND, ec.encode_journal_entry_kind, ec.decode_journal_entry_kind),
+    (ec.INBOX_ITEM_STATUS, ec.encode_inbox_item_status, ec.decode_inbox_item_status),
 ]
 
 
@@ -128,6 +130,7 @@ def test_shipped_codes_are_stable() -> None:
         "managed_sandbox": 2,
     }
     assert ec.SCHEDULED_TASK_SESSION_MODE == {"new": 1, "continue": 2}
+    assert ec.INBOX_ITEM_STATUS == {"unread": 1, "read": 2, "done": 3, "dismissed": 4}
     assert ec.SCHEDULED_TASK_RUN_STATUS == {
         "scheduled": 1,
         "running": 2,
@@ -136,3 +139,18 @@ def test_shipped_codes_are_stable() -> None:
         "skipped": 5,
         "starting": 6,
     }
+    assert ec.JOURNAL_ENTRY_KIND == {
+        "status": 1,
+        "note": 2,
+        "dispatch": 3,
+        "dispatch_result": 4,
+        "plan": 5,
+        "plan_status": 6,
+    }
+
+
+def test_journal_entry_kinds_match_the_entity_kinds() -> None:
+    """Every journal kind has a code, and every code names a journal kind."""
+    from omnigent.entities.session_journal import JOURNAL_KINDS
+
+    assert set(ec.JOURNAL_ENTRY_KIND) == set(JOURNAL_KINDS)

@@ -41,9 +41,15 @@ function mockResponse(body: unknown, init?: { ok?: boolean; status?: number }): 
 const fetchMock = vi.fn();
 
 /** Wire the two source hooks: serveable state + changed-files paths. */
-function setHooks(opts: { serveable?: boolean | undefined; changedPaths?: string[] | undefined }) {
+function setHooks(opts: {
+  serveable?: boolean | undefined;
+  changedPaths?: string[] | undefined;
+  dataUpdatedAt?: number;
+}) {
   serveableMock.mockReturnValue(opts.serveable);
   changedFilesMock.mockReturnValue({
+    isSuccess: opts.changedPaths !== undefined,
+    dataUpdatedAt: opts.dataUpdatedAt ?? (opts.changedPaths === undefined ? 0 : 1),
     data:
       opts.changedPaths === undefined
         ? undefined
@@ -78,6 +84,30 @@ function renderDiff(
 }
 
 describe("useFileDiff — enable gate", () => {
+  it("refreshes an open diff when the changed-files list succeeds even if its paths are identical", async () => {
+    setHooks({ serveable: true, changedPaths: ["a.ts"] });
+    fetchMock.mockResolvedValue(mockResponse({ path: "a.ts", before: "old", after: "first" }));
+    const { result, rerender } = renderDiff("conv_1", "a.ts");
+    await waitFor(() => expect(result.current.data?.after).toBe("first"));
+    rerender();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    fetchMock.mockResolvedValue(mockResponse({ path: "a.ts", before: "old", after: "second" }));
+    setHooks({ serveable: true, changedPaths: ["a.ts"], dataUpdatedAt: 2 });
+    rerender();
+    await waitFor(() => expect(result.current.data?.after).toBe("second"));
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    changedFilesMock.mockReturnValue({
+      ...changedFilesMock.mock.results.at(-1)!.value,
+      isSuccess: false,
+      isError: true,
+      dataUpdatedAt: 3,
+    });
+    rerender();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
   it("does not fetch when conversationId is missing", () => {
     // No session means there is no diff endpoint to call.
     setHooks({ serveable: true, changedPaths: ["a.ts"] });

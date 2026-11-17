@@ -4,7 +4,8 @@
 
 import { useEffect, useRef } from "react";
 
-import { hasCommandModifier, isFocusInDialogOrMenu, isMacPlatform } from "@/lib/hotkeys";
+import { isFocusInDialogOrMenu, isMacPlatform } from "@/lib/hotkeys";
+import { matchesShortcut } from "@/lib/shortcuts/registry";
 import type { TerminalSplitAxis } from "@/lib/terminalSplitLayout";
 
 /** The split a keydown asks for, or null when it isn't a split chord. */
@@ -12,13 +13,9 @@ export function terminalSplitHotkeyAxis(
   event: globalThis.KeyboardEvent,
   isMac = isMacPlatform(),
 ): TerminalSplitAxis | null {
-  if (!hasCommandModifier(event, isMac) || !event.altKey || event.isComposing) return null;
-  if (typeof event.getModifierState === "function" && event.getModifierState("AltGraph")) {
-    return null;
-  }
-  // Match the physical key: Alt and Shift change the produced character.
-  if (event.code === "Backslash" && event.shiftKey) return "columns";
-  if (event.code === "Minus" && !event.shiftKey) return "rows";
+  if (event.isComposing) return null;
+  if (matchesShortcut(event, "terminal.splitRight", { mac: isMac })) return "columns";
+  if (matchesShortcut(event, "terminal.splitDown", { mac: isMac })) return "rows";
   return null;
 }
 

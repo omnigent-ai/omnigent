@@ -154,9 +154,16 @@ class PingFrame:
 
 @dataclass
 class PongFrame:
-    """Either direction: keepalive response — echoes the ping's ts."""
+    """Either direction: keepalive response — echoes the ping's ts.
+
+    :param ts: The ping's timestamp, echoed back.
+    :param keep_warm: Runner-to-server only. Whether the runner wants its managed
+        sandbox kept warm (it is working, or within its idle timeout of the last
+        work). ``None`` (omitted on the wire) means the runner does not report it.
+    """
 
     ts: int
+    keep_warm: bool | None = None
 
 
 @dataclass
@@ -329,7 +336,10 @@ def encode_frame(frame: Frame) -> str:
     if isinstance(frame, PingFrame):
         return json.dumps({"kind": FrameKind.PING.value, "ts": frame.ts})
     if isinstance(frame, PongFrame):
-        return json.dumps({"kind": FrameKind.PONG.value, "ts": frame.ts})
+        pong: dict[str, object] = {"kind": FrameKind.PONG.value, "ts": frame.ts}
+        if frame.keep_warm is not None:
+            pong["keep_warm"] = frame.keep_warm
+        return json.dumps(pong)
     if isinstance(frame, WSOpenFrame):
         return json.dumps(
             {
@@ -453,7 +463,11 @@ def _decode_known_frame(kind: FrameKind, msg: _JsonObject) -> Frame:
         case FrameKind.PING:
             return PingFrame(ts=_required_int(msg, "ts"))
         case FrameKind.PONG:
-            return PongFrame(ts=_required_int(msg, "ts"))
+            keep_warm = msg.get("keep_warm")
+            return PongFrame(
+                ts=_required_int(msg, "ts"),
+                keep_warm=keep_warm if isinstance(keep_warm, bool) else None,
+            )
         case FrameKind.WS_OPEN:
             return _decode_ws_open(msg)
         case FrameKind.WS_FRAME:
@@ -759,10 +773,14 @@ def is_text_content_type(content_type: str) -> bool:
 def encode_body(body: bytes, content_type: str) -> tuple[str, str]:
     """Return ``(encoded_body, encoding)`` for a body+content-type pair.
 
-    Picks utf-8 inline for text-shaped content, base64 otherwise.
+    Picks utf-8 inline for valid text-shaped content, base64 otherwise.
     """
     if is_text_content_type(content_type):
-        return body.decode("utf-8", errors="replace"), "utf-8"
+        try:
+            return body.decode("utf-8"), "utf-8"
+        except UnicodeDecodeError:
+            # Byte ranges and streaming chunks can split a UTF-8 character.
+            pass
     return base64.b64encode(body).decode("ascii"), "base64"
 
 

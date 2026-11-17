@@ -3,6 +3,10 @@ name: Issue prioritization v2
 on:
   workflow_call:
     inputs:
+      pipeline:
+        description: Stable identity of the calling model workflow
+        required: true
+        type: string
       issue_number:
         description: Issue to classify and prioritize
         required: true
@@ -41,6 +45,9 @@ concurrency:
   group: issue-prioritization-v2-${{ inputs.issue_number }}
   cancel-in-progress: false
 
+env:
+  OMNIGENT_CI_PIPELINE: ${{ inputs.pipeline }}
+
 jobs:
   prioritize:
     runs-on: ubuntu-24.04
@@ -78,6 +85,7 @@ jobs:
       - name: Grade, label, and comment
         if: vars.ISSUE_PRIORITIZATION_V2_ENABLED == 'true'
         env:
+          PYTHONPATH: ${{ github.workspace }}
           DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
           DATABRICKS_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID }}
           DATABRICKS_CLIENT_SECRET: ${{ secrets.DATABRICKS_CLIENT_SECRET }}
@@ -121,6 +129,7 @@ jobs:
               args+=(--post-duplicate-comments)
             fi
           fi
+          uv run --frozen --project .github/triage_v2 python -m dev.ci_usage validate
           uv run --frozen --project .github/triage_v2 issue-priority-event "${args[@]}"
 
       - name: Upload decision artifact

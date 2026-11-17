@@ -37,17 +37,51 @@ on:
         description: Review even if this PR commit already has a review.
         default: false
         type: boolean
+      source_session_id:
+        description: Optional originating Omnigent session for usage attribution.
+        required: false
+        type: string
+      usage_probe:
+        description: Send two bounded attribution probes instead of reviewing a PR.
+        default: false
+        type: boolean
 
 permissions:
   contents: read
   pull-requests: write
 
 env:
+  OMNIGENT_CI_PIPELINE: polly-review
   OMNIGENT_SKIP_WEB_UI: "true"
   UV_INDEX_URL: https://pypi.org/simple
   PIP_INDEX_URL: https://pypi.org/simple
 
 jobs:
+  usage-probe:
+    if: github.event_name == 'workflow_dispatch' && inputs.usage_probe && github.repository == 'omnigent-ai/omnigent'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    env:
+      OMNIGENT_CI_PIPELINE: usage-attribution-probe
+      OMNIGENT_CI_SOURCE_SESSION_ID: ${{ inputs.source_session_id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify gateway protocols
+        env:
+          GATEWAY_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          ANTHROPIC_MODEL: ${{ vars.OMNIGENT_CI_REVIEW_ANTHROPIC_MODEL || vars.OMNIGENT_CI_ANTHROPIC_MODEL }}
+          OPENAI_MODEL: ${{ vars.OMNIGENT_CI_OPENAI_MODEL }}
+        run: |
+          python3 -m dev.ci_usage probe --protocol anthropic --model "$ANTHROPIC_MODEL"
+          python3 -m dev.ci_usage probe --protocol codex/v1 --model "$OPENAI_MODEL"
+          python3 -m dev.ci_usage probe --protocol mlflow/v1 --model "$ANTHROPIC_MODEL"
+
   # Automatic runs use trusted base code and exclude forks. Manual runs require
   # write access or REVIEW_ALLOWLIST membership; forks retain the approval relay.
   # PR changes are fetched only as a diff, never executed here.
@@ -107,7 +141,7 @@ jobs:
     # !cancelled() permits skipped event-specific dependencies; each event
     # still requires its own gate or command validation to succeed.
     if: >-
-      !cancelled() && (
+      !cancelled() && !inputs.usage_probe && (
         (
           github.event_name == 'pull_request_target' &&
           github.event.pull_request.head.repo.full_name == github.repository &&
@@ -265,13 +299,13 @@ jobs:
 
       - name: Install Claude Code CLI
         if: steps.creds.outputs.available == 'true'
-        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@c76912dd5f9cfe9e2e11572eae45ad657243232f
+        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@75d817057138bd2cf5cd5af1cd954fdaca12e03d
         with:
           harness: claude
 
       - name: Install Codex CLI
         if: steps.creds.outputs.available == 'true'
-        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@c76912dd5f9cfe9e2e11572eae45ad657243232f
+        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@75d817057138bd2cf5cd5af1cd954fdaca12e03d
         with:
           harness: codex
 
@@ -317,15 +351,17 @@ jobs:
           # the system python; the output is valid YAML (JSON is a subset).
           python3 -c "
           import pathlib, os, json
+          from omnigent.databricks_ai_gateway import ci_gateway_base_url, ci_request_tags
+          if not ci_request_tags(strict=True).get('pipeline'):
+              raise ValueError('CI pipeline is required')
           gw = os.environ['GATEWAY_BASE_URL']
-          host = gw.removesuffix('/serving-endpoints')
           cfg = {
               'providers': {
                   'databricks-gateway': {
                       'kind': 'gateway',
                       'default': ['anthropic', 'openai'],
                       'anthropic': {
-                          'base_url': gw + '/anthropic',
+                          'base_url': ci_gateway_base_url(gw, 'anthropic'),
                           'api_key_ref': 'env:LLM_API_KEY',
                           # Fable's auto-permission classifier needs a routable Opus fallback.
                           'models': {
@@ -334,7 +370,7 @@ jobs:
                           },
                       },
                       'openai': {
-                          'base_url': host + '/ai-gateway/codex/v1',
+                          'base_url': ci_gateway_base_url(gw, 'codex/v1'),
                           'api_key_ref': 'env:LLM_API_KEY',
                           'wire_api': 'responses',
                           'models': {'default': os.environ['OMNIGENT_OPENAI_MODEL']},
@@ -433,6 +469,13 @@ jobs:
               raise SystemExit(f"::error::Cannot read required database review guidance at {database_guidance_path}: {exc}") from exc
           if not database_guidance.strip():
               raise SystemExit(f"::error::Required database review guidance is empty: {database_guidance_path}")
+          reference_policy_path = pathlib.Path("dev/lint/lint_reference_policy.py").resolve()
+          try:
+              reference_policy = reference_policy_path.read_text(encoding="utf-8")
+          except (OSError, UnicodeError) as exc:
+              raise SystemExit(f"::error::Cannot read required reference policy at {reference_policy_path}: {exc}") from exc
+          if not reference_policy.strip():
+              raise SystemExit(f"::error::Required reference policy is empty: {reference_policy_path}")
 
           # The "missing visual demonstration" nudge targets external contributors
           # only — core team members (OWNER / MEMBER / COLLABORATOR) are assumed to
@@ -647,6 +690,23 @@ jobs:
 
           Before labeling anything **blocking**, double-check: does this issue actually exist in the diff? Verify the problem is real and present in the changed code — not inferred, speculative, or already handled elsewhere. If the issue exists, it is blocking only if it introduces a correctness bug, breaks an explicit contract (including mandatory database best practices), creates a real security risk, or includes changes clearly unrelated to the stated goal; otherwise downgrade to non-blocking.
 
+          **Reference policy** — treat new violations as blocking contract violations.
+          Read `{reference_policy_path}` from the trusted checkout for the
+          prohibited patterns and public-host exceptions. Include this absolute path and
+          the policy requirements in every reviewer task. If the policy cannot be
+          read, report an incomplete review; do not claim a clean review. Check added code,
+          filenames, tests, comments, docs, and generated text. Also flag clearly
+          evidenced non-public deployment details, real workspace addresses or IDs,
+          and organization-specific access instructions that the patterns miss.
+          Existing unchanged references are not new findings; public API integration
+          and generic examples are allowed. Test fixtures and parametrized values
+          are not exempt: use reserved example domains, not plausible deployment
+          addresses. Do not explain prohibited names or repeat matched values in
+          feedback: cite the location and request generic wording. Review the checker,
+          its exemptions, and its tests for bypasses. Only the policy definition may
+          list prohibited patterns; tests must not duplicate prohibited literals or
+          describe deployment details.
+
           **Database best practices** — apply every relevant section of the reference
           document to the changed schema, queries, transactions, and storage code.
           Mandatory requirements are blocking, including the rule against new
@@ -796,6 +856,10 @@ jobs:
         id: polly
         env:
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          OMNIGENT_CI_PIPELINE: polly-review
+          OMNIGENT_CI_PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
+          OMNIGENT_CI_REVIEWED_SHA: ${{ steps.ctx.outputs.head_sha }}
+          OMNIGENT_CI_SOURCE_SESSION_ID: ${{ inputs.source_session_id }}
           OMNIGENT_POLLY_HARNESS: ${{ vars.OMNIGENT_CI_POLLY_HARNESS || 'codex' }}
           OMNIGENT_POLLY_MODEL: ${{ vars.OMNIGENT_CI_POLLY_MODEL || vars.OMNIGENT_CI_OPENAI_MODEL }}
         run: |
@@ -860,13 +924,8 @@ jobs:
           pathlib.Path('/tmp/polly_review.txt').write_text(cleaned)
           "
 
-          # Use a collision-resistant random delimiter so model output
-          # containing "REVIEW_EOF" cannot truncate the output.
-          delim="REVIEW_$(openssl rand -hex 8)"
-          echo "review_text<<${delim}" >> "$GITHUB_OUTPUT"
-          # Cap at 60 KB — GitHub comment body limit is ~65 KB.
-          head -c 61440 /tmp/polly_review.txt >> "$GITHUB_OUTPUT"
-          echo "${delim}" >> "$GITHUB_OUTPUT"
+          # Later steps consume the review file; only readiness crosses step outputs.
+          echo "review_ready=true" >> "$GITHUB_OUTPUT"
 
       # Runs even though "Run Polly review" failed (hence !cancelled()), but
       # only for a capacity/overload failure — a genuine failure gets no note.
@@ -916,7 +975,7 @@ jobs:
 
       - name: Post review comment
         id: publish
-        if: steps.polly.outputs.review_text != ''
+        if: steps.polly.outputs.review_ready == 'true'
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
           REPO: ${{ github.repository }}

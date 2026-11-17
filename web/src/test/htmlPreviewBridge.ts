@@ -1,5 +1,5 @@
 /** Connect a test to a mounted HTML preview's comment bridge. */
-import { waitFor } from "@testing-library/react";
+import { screen, waitFor } from "@testing-library/react";
 import { expect, vi } from "vitest";
 import { BRIDGE_SOURCE } from "@/shell/htmlCommentBridge";
 
@@ -23,4 +23,14 @@ export async function connectHtmlPreviewBridge(iframe: HTMLIFrameElement) {
   const send = (msg: Record<string, unknown>) =>
     port.postMessage({ source: BRIDGE_SOURCE, nonce: init.nonce, ...msg });
   return { port, send };
+}
+
+/** The saved offset the mounted preview was asked to restore, or null for none. */
+export function requestedScrollRestore(): { top: number } | null {
+  const srcDoc = screen.getByTitle<HTMLIFrameElement>("HTML preview").getAttribute("srcdoc");
+  const doc = new DOMParser().parseFromString(srcDoc ?? "", "text/html");
+  const value = doc
+    .querySelector("script[data-omni-nonce]")
+    ?.getAttribute("data-omni-restore-scroll");
+  return value ? (JSON.parse(value) as { top: number }) : null;
 }

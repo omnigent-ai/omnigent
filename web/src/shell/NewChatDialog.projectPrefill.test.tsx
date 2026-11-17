@@ -22,7 +22,10 @@ import {
   useProjects,
 } from "@/hooks/useConversations";
 
-vi.mock("@/hooks/useSidebarData", () => ({ useLoadedConversations: () => useTestConversations() }));
+vi.mock("@/hooks/useSidebarData", () => ({
+  useLoadedConversations: () => useTestConversations(),
+  useOptionalLoadedConversations: () => useTestConversations().data,
+}));
 
 vi.mock("@/hooks/useSkills", () => ({
   useSkills: () => ({ skills: [], skillsStatus: "ready", refetch: vi.fn() }),
@@ -36,6 +39,8 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import type { ReactNode } from "react";
 
 import { authenticatedFetch } from "@/lib/identity";
+import type * as SandboxProfilesModule from "@/lib/sandboxProfilesApi";
+import { fetchSandboxProfiles } from "@/lib/sandboxProfilesApi";
 import type { Host } from "@/hooks/useHosts";
 import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
@@ -58,6 +63,11 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 // workspace, last-used agent). These tests pin those seeding rules.
 const navigateMock = vi.fn();
 
+vi.mock("@/lib/sandboxProfilesApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof SandboxProfilesModule>()),
+  fetchSandboxProfiles: vi.fn(),
+}));
+
 const RECENT_KEY = "omnigent:recent-workspaces";
 const RECENT_WORKSPACE = "/Users/corey/universe/src/foo";
 const REPO = "/Users/corey/projects/alpha";
@@ -65,8 +75,10 @@ const REPO = "/Users/corey/projects/alpha";
 // Mutable so a test can simulate clicking another project's pencil (the
 // screen stays mounted; only the param changes).
 let searchParams = new URLSearchParams("project=Alpha");
+const replaceSearchParamsMock = vi.fn();
 vi.mock("@/lib/routing", () => ({
   useLocation: () => ({ hash: "", state: null }),
+  useReplaceSearchParams: () => replaceSearchParamsMock,
   useNavigate: () => navigateMock,
   useSearchParams: () => [searchParams, vi.fn()],
 }));
@@ -217,8 +229,11 @@ function renderLanding(): { rerender: (ui: ReactNode) => void; unmount: () => vo
   return { rerender, unmount };
 }
 
-/** Same as renderLanding, but with the managed-sandbox host option enabled. */
-function renderSandboxLanding(): { rerender: (ui: ReactNode) => void } {
+/**
+ * Same as renderLanding, but with the managed-sandbox host option enabled.
+ * `sandboxProviders` lists every offered provider; omitted means only the default.
+ */
+function renderSandboxLanding(sandboxProviders?: string[]): { rerender: (ui: ReactNode) => void } {
   const info: ServerInfo = {
     accounts_enabled: false,
     single_user: false,
@@ -227,13 +242,14 @@ function renderSandboxLanding(): { rerender: (ui: ReactNode) => void } {
     databricks_features: false,
     enabled_connections: [],
     managed_sandboxes_enabled: true,
-    sandbox_provider: null,
+    sandbox_provider: "modal",
+    sandbox_providers: sandboxProviders,
     sharing_mode: "on",
     public_sharing_enabled: true,
     server_version: null,
     smart_routing_enabled: false,
     smart_routing_sources: { external: false, oss: false },
-    features: { harness_install: false },
+    features: { harness_install: false, sandbox_profiles: true },
     harness_install_enabled: false,
     installable_harnesses: [],
     dictation_available: false,
@@ -535,9 +551,8 @@ describe("NewChatLandingScreen project prefill", () => {
 
     fireEvent.click(screen.getByTestId("new-chat-landing-workspace-chip"));
     fireEvent.click(screen.getByRole("button", { name: RECENT_WORKSPACE }));
-    expect(screen.getByTestId("new-chat-landing-workspace-chip")).toHaveAttribute(
-      "title",
-      RECENT_WORKSPACE,
+    expect(screen.getByTestId("new-chat-landing-workspace-chip")).toHaveAccessibleName(
+      `Working directory: ${RECENT_WORKSPACE}`,
     );
     await waitFor(() =>
       expect(screen.queryByTestId("new-chat-landing-branch-chip")).not.toBeInTheDocument(),
@@ -617,15 +632,30 @@ describe("NewChatLandingScreen project prefill", () => {
     expect("agent_id" in body).toBe(false);
   });
 
-  it("clears a drafted sandbox repository on an in-place project switch (screen stays mounted)", async () => {
+  it("clears the sandbox repository and profile on an in-place project switch", async () => {
     // Mounted mirror of the unmount/remount sandbox-leak case: clicking
     // another project's pencil only changes `?project=` — the screen never
     // unmounts, so the draft-restore strip can't help. The reset effect must
     // clear the staged repo/branch or project Beta's sandbox silently clones
     // project Alpha's repository.
+    vi.mocked(fetchSandboxProfiles).mockResolvedValue({
+      profiles: [
+        {
+          id: "large",
+          name: "Large workspace",
+          provider: "modal",
+          revision: "revision-1",
+          description: "",
+        },
+      ],
+      managed_providers: ["modal"],
+      next_cursor: null,
+    });
     const { rerender } = renderSandboxLanding();
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
     fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option"));
+    fireEvent.click(await screen.findByRole("button", { name: "Sandbox profile: Choose profile" }));
+    fireEvent.click(screen.getByRole("option", { name: "Large workspace" }));
     fireEvent.click(screen.getByTestId("new-chat-landing-repo-chip"));
     fireEvent.change(screen.getByTestId("new-chat-landing-repo-input"), {
       target: { value: "https://github.com/org/alpha-repo" },
@@ -639,10 +669,15 @@ describe("NewChatLandingScreen project prefill", () => {
     rerender(<NewChatLandingScreen />);
 
     // The sticky host pick re-selects the sandbox, but Alpha's staged repo
-    // is gone.
+    // is gone. The profile picked in Alpha is the last picked, so Beta starts on it.
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-repo-chip").textContent).toContain("Repository"),
     );
+    expect(
+      await screen.findByRole("button", { name: "Sandbox profile: Large workspace" }),
+    ).toBeVisible();
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), { target: { value: "hello" } });
+    await waitFor(() => expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled());
     const body = await submitAndReadBody();
     expect(body.host_type).toBe("managed");
     // No repos carried over → an empty workspaces list; workspace stays pinned
@@ -650,6 +685,8 @@ describe("NewChatLandingScreen project prefill", () => {
     // default-filled path) — not Alpha's repo.
     expect(body.workspaces).toEqual([]);
     expect(body.workspace).toBeNull();
+    expect(body.project_id).toBe("proj_beta");
+    expect(body.sandbox_profile_id).toBe("large");
   });
 
   it("reseeds the SAME project after its stored defaults change (edited then re-opened)", async () => {
@@ -760,10 +797,12 @@ describe("NewChatLandingScreen project prefill", () => {
 
     const workspaceTrigger = screen.getByTestId("new-chat-landing-workspace-chip");
     const worktreeTrigger = screen.getByTestId("new-chat-landing-branch-chip");
-    await waitFor(() => expect(workspaceTrigger).toHaveAttribute("title", LINKED_WORKTREE));
+    await waitFor(() =>
+      expect(workspaceTrigger).toHaveAccessibleName(`Working directory: ${LINKED_WORKTREE}`),
+    );
     expect(workspaceTrigger).toHaveTextContent("gamma");
     expect(worktreeTrigger).toHaveTextContent("feature-x");
-    expect(worktreeTrigger).toHaveAttribute("title", "Existing worktree branch: feature/x");
+    expect(worktreeTrigger).toHaveAccessibleName("Existing worktree branch: feature/x");
     const body = await submitAndReadBody();
     // Bound straight to the worktree dir; the worktree's branch rides along and
     // no base branch is set (it's a bind, not a fork).
@@ -1639,5 +1678,100 @@ describe("NewChatLandingScreen global always-use-worktree default", () => {
     const body = await submitAndReadBody();
     expect(body.workspace).toBe(REPO);
     expect(body.git).toBeUndefined();
+  });
+});
+
+describe("NewChatLandingScreen project repository prefill", () => {
+  const repoUrl = "https://github.com/org/alpha-repo";
+
+  /** Serve one profile for `provider`; the picker fetches on render, so call before rendering. */
+  function serveProfile(provider: string): void {
+    vi.mocked(fetchSandboxProfiles).mockResolvedValue({
+      profiles: [
+        {
+          id: `${provider}-large`,
+          name: `${provider} large`,
+          provider,
+          revision: "revision-1",
+          description: "",
+        },
+      ],
+      managed_providers: [provider],
+      next_cursor: null,
+    });
+  }
+
+  /** Pick the served profile, which enables submit for a sandbox create. */
+  async function pickProfile(provider: string): Promise<void> {
+    fireEvent.click(await screen.findByRole("button", { name: "Sandbox profile: Choose profile" }));
+    fireEvent.click(screen.getByRole("option", { name: `${provider} large` }));
+  }
+
+  it("submits a sandbox project's saved repository and branch as its workspace", async () => {
+    setProjectConfig({
+      host_id: "__sandbox__",
+      sandbox_provider: "modal",
+      repository: { url: repoUrl, branch: "dev" },
+    });
+    serveProfile("modal");
+    renderSandboxLanding();
+
+    await waitFor(() => expect(screen.getByTestId("new-chat-landing-repo-chip")).toBeVisible());
+    await pickProfile("modal");
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), { target: { value: "hello" } });
+    await waitFor(() => expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled());
+    const body = await submitAndReadBody();
+    expect(body.host_type).toBe("managed");
+    expect(body.workspaces).toEqual([`${repoUrl}#dev`]);
+  });
+
+  it("starts on the saved non-default provider when the server offers both", async () => {
+    setProjectConfig({
+      host_id: "__sandbox__",
+      sandbox_provider: "daytona",
+      repository: { url: repoUrl },
+    });
+    serveProfile("daytona");
+    renderSandboxLanding(["modal", "daytona"]);
+
+    await waitFor(() => expect(screen.getByTestId("new-chat-landing-repo-chip")).toBeVisible());
+    await pickProfile("daytona");
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), { target: { value: "hello" } });
+    await waitFor(() => expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled());
+    const body = await submitAndReadBody();
+    expect(body.sandbox_provider).toBe("daytona");
+    expect(body.workspaces).toEqual([repoUrl]);
+  });
+
+  it("ignores a saved repository URL the picker rejects and leaves submit usable", async () => {
+    setProjectConfig({
+      host_id: "__sandbox__",
+      repository: { url: "not a url" },
+    });
+    serveProfile("modal");
+    renderSandboxLanding();
+
+    await waitFor(() => expect(screen.getByTestId("new-chat-landing-repo-chip")).toBeVisible());
+    await pickProfile("modal");
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), { target: { value: "hello" } });
+    await waitFor(() => expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled());
+    const body = await submitAndReadBody();
+    expect(body.workspaces).toEqual([]);
+  });
+
+  it("ignores a legacy string repository and leaves the composer usable", async () => {
+    setProjectConfig({
+      host_id: "__sandbox__",
+      repository: repoUrl,
+    } as unknown as ProjectConfig);
+    serveProfile("modal");
+    renderSandboxLanding();
+
+    await waitFor(() => expect(screen.getByTestId("new-chat-landing-repo-chip")).toBeVisible());
+    await pickProfile("modal");
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), { target: { value: "hello" } });
+    await waitFor(() => expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled());
+    const body = await submitAndReadBody();
+    expect(body.workspaces).toEqual([]);
   });
 });
