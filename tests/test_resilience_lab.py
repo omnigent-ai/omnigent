@@ -231,6 +231,7 @@ def test_runner_readiness_stops_after_health_exhausts_deadline(
         ("passed", False),
         ("failed", False),
         ("setup-failed", False),
+        ("startup-failed", False),
         ("xfail", False),
         ("passed", True),
     ],
@@ -243,11 +244,24 @@ def test_lab_fixture_retains_failure_evidence_without_moving_working_root(
     (root / "working-file").write_text("retained locally")
     evidence = tmp_path / "pytest-base" / "test-case"
     lab = Lab.__new__(Lab)
+    lab._stop_started = False
     lab.root = root
     lab.events = EventLog()
     lab.observer = None
-    lab.start = Mock(return_value=lab)
-    lab.stop = Mock()
+    if outcome == "startup-failed":
+        lab._start = Mock(side_effect=RuntimeError("synthetic startup failure"))
+        lab._port_reservations = Mock()
+        lab._clients = []
+        lab.model = None
+        lab._processes = []
+        lab._kill_stray_host_processes = Mock()
+        lab._proxies = None
+        lab._loop = Mock()
+        lab.start = Mock(wraps=lab.start)
+        lab.stop = Mock(wraps=lab.stop)
+    else:
+        lab.start = Mock(return_value=lab)
+        lab.stop = Mock()
     lab.remove = Mock(wraps=lab.remove)
     lab.describe = Mock(return_value="synthetic lab")
     lab.write_diagnostics = Mock(wraps=lab.write_diagnostics)
@@ -258,22 +272,31 @@ def test_lab_fixture_retains_failure_evidence_without_moving_working_root(
     monkeypatch.setattr(resilience_fixtures, "Lab", constructor)
     monkeypatch.setattr(resilience_fixtures, "require_tmux", lambda: None)
     monkeypatch.setenv(resilience_fixtures.KEEP_ENV, "1" if keep else "0")
-    report = SimpleNamespace(failed=outcome in {"failed", "setup-failed"})
+    report = SimpleNamespace(failed=outcome in {"failed", "setup-failed", "startup-failed"})
     if outcome == "xfail":
         report.wasxfail = "synthetic expected failure"
     request = SimpleNamespace(node=SimpleNamespace(_resilience_call=report))
-    if outcome == "setup-failed":
+    if outcome in {"setup-failed", "startup-failed"}:
         request.node = SimpleNamespace(_resilience_setup=report)
     fixture = resilience_fixtures.lab_factory.__wrapped__(request, evidence)
     start = next(fixture)
-    assert start(root=root) is lab
+    if outcome == "startup-failed":
+        with pytest.raises(RuntimeError, match="synthetic startup failure"):
+            start(root=root)
+    else:
+        assert start(root=root) is lab
     assert constructor.call_args.args[0].root == root
     with pytest.raises(StopIteration):
         next(fixture)
 
     failed = outcome != "passed"
     assert lab.root == root
-    lab.stop.assert_called_once_with()
+    if outcome == "startup-failed":
+        assert lab.stop.call_count == 2
+        assert lab._port_reservations.close.call_count == lab._loop.stop.call_count == 2
+        assert lab._kill_stray_host_processes.call_count == 2
+    else:
+        lab.stop.assert_called_once_with()
     assert lab.remove.call_count == (0 if failed or keep else 1)
     assert (root / "working-file").exists() == (failed or keep)
     assert root.exists() == (failed or keep)
@@ -282,7 +305,11 @@ def test_lab_fixture_retains_failure_evidence_without_moving_working_root(
         lab.write_diagnostics.assert_called_once_with(
             evidence / "resilience-diagnostics" / "lab-0.json"
         )
-        assert [call[0] for call in order.mock_calls] == ["retain", "stop"]
+        assert [call[0] for call in order.mock_calls] == (
+            ["stop", "retain", "stop"] if outcome == "startup-failed" else ["retain", "stop"]
+        )
+        payload = json.loads((evidence / "resilience-diagnostics" / "lab-0.json").read_text())
+        assert payload["captured_before_stop"] is (outcome != "startup-failed")
     else:
         lab.write_diagnostics.assert_not_called()
 
@@ -314,6 +341,7 @@ def test_lab_diagnostic_failure_still_stops_all_labs(
     ) as observer:
         for index in range(2):
             lab = Lab.__new__(Lab)
+            lab._stop_started = False
             lab.root = tmp_path / f"working-{index}"
             lab.events = EventLog()
             lab.observer = observer
@@ -356,17 +384,25 @@ def test_lab_diagnostic_failure_still_stops_all_labs(
             assert "private-diagnostic-error" not in raw
 
 
-@pytest.mark.parametrize("invalid_tail", [False, True], ids=["valid-tail", "invalid-tail"])
+@pytest.mark.parametrize(
+    "invalid_tail,churn",
+    [(False, "none"), (True, "none"), (False, "proxy"), (False, "discovery")],
+    ids=["valid-tail", "invalid-tail", "proxy-churn", "discovery-churn"],
+)
 def test_lab_diagnostics_bound_aggregate_history_and_session_snapshots(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, invalid_tail: bool
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, invalid_tail: bool, churn: str
 ) -> None:
     monkeypatch.setattr(
         lab_module, "time", SimpleNamespace(time=lambda: 123.0, monotonic=lambda: 0.0)
     )
     lab = Lab.__new__(Lab)
+    lab._stop_started = False
     lab.root = tmp_path / "working"
     lab.events = EventLog()
     identities = [f"conv_{index:032x}" for index in range(10)]
+    if churn == "discovery":
+        for index in range(4097):
+            lab.events.emit("lab", "session_created", session_id=f"conv_f{index:031x}")
     for identity in identities:
         lab.events.emit("lab", "session_created", session_id=identity)
     for index in range(3):
@@ -385,6 +421,9 @@ def test_lab_diagnostics_bound_aggregate_history_and_session_snapshots(
                 for wall in range(index * 2500, (index + 1) * 2500)
             ],
         )
+    if churn == "proxy":
+        for index in range(4097):
+            lab.events.emit("proxy:host", "connect", conn=index, tag="runner.tunnel")
     project = Mock(wraps=lab_module._diagnostic_fields)
     monkeypatch.setattr(lab_module, "_diagnostic_fields", project)
     requests = []
@@ -401,7 +440,14 @@ def test_lab_diagnostics_bound_aggregate_history_and_session_snapshots(
         lab.write_diagnostics(destination)
     raw = destination.read_text()
     payload = json.loads(raw)
-    assert [event["session_id"] for event in payload["events"]] == identities
+    if churn == "proxy":
+        assert len(payload["events"]) == 4096
+        assert [event["conn"] for event in payload["events"]] == list(range(1, 4097))
+    elif churn == "discovery":
+        assert len(payload["events"]) == 4093
+        assert [event["session_id"] for event in payload["events"][-10:]] == identities
+    else:
+        assert [event["session_id"] for event in payload["events"]] == identities
     assert [observation["wall"] for observation in payload["observations"]] == (
         [] if invalid_tail else list(range(3404, 7500))
     )
@@ -409,7 +455,8 @@ def test_lab_diagnostics_bound_aggregate_history_and_session_snapshots(
     assert payload["observations_omitted"] == 3404
     assert [snapshot["session_id"] for snapshot in payload["sessions"]] == identities[:8]
     assert requests == [f"/v1/sessions/{identity}" for identity in identities[:8]]
-    assert payload["sessions_omitted"] == 2
+    assert payload["sessions_omitted"] == (4085 if churn == "discovery" else 2)
+    assert payload["discovery_events_omitted"] == (14 if churn == "discovery" else 0)
     assert payload["snapshot_budget_exhausted"] is False
     assert "private-invalid-status" not in raw
 
@@ -424,6 +471,7 @@ def test_lab_diagnostics_project_records_and_upload_only_safe_file(
     launch_id = "b" * 32
     private = "private-content-must-stay-local"
     lab = Lab.__new__(Lab)
+    lab._stop_started = False
     lab.root = root
     lab.config = LabConfig(root=root)
     lab.events = EventLog()
@@ -552,15 +600,18 @@ def test_lab_diagnostics_project_records_and_upload_only_safe_file(
 
 
 @pytest.mark.parametrize(
-    "invalid", ["file-link", "directory-link", "oversize", "malformed", "identity-mismatch"]
+    "invalid",
+    ["file-link", "directory-link", "oversize", "malformed", "nested", "identity-mismatch"],
 )
 def test_lab_diagnostics_reject_outside_or_invalid_native_records(
     tmp_path: Path, invalid: str
 ) -> None:
     lab = Lab.__new__(Lab)
+    lab._stop_started = False
     lab.root = tmp_path / "working"
     lab.config = LabConfig(root=lab.root)
     lab.events = EventLog()
+    lab.events.emit("lab", "process_start", process="runner", pid=123)
     lab.observer = None
     bridge = lab.root / "t" / "omnigent-123" / "claude-native" / ("c" * 32)
     bridge.mkdir(parents=True)
@@ -585,11 +636,15 @@ def test_lab_diagnostics_reject_outside_or_invalid_native_records(
         path.write_text(json.dumps({**value, "payload": "x" * 32768}))
     elif invalid == "malformed":
         path.write_text("private-invalid-json")
+    elif invalid == "nested":
+        path.write_text('{"payload":' + "[" * 16000 + "0" + "]" * 16000 + "}")
     else:
         path.write_text(json.dumps({**value, "launch_id": "a" * 32}))
     destination = tmp_path / "pytest-base" / "resilience-diagnostics" / "lab-0.json"
     lab.write_diagnostics(destination)
-    native = json.loads(destination.read_text())["native_lifecycle"]
+    payload = json.loads(destination.read_text())
+    assert payload["events"][0]["pid"] == 123
+    native = payload["native_lifecycle"]
     assert native["records"] == []
     assert native["rejected"] == native["candidates"]
     assert "private-invalid-json" not in destination.read_text()

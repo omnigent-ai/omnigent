@@ -35,6 +35,7 @@ import sys
 import tempfile
 import time
 import uuid
+from collections import deque
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -45,7 +46,7 @@ import psutil
 import yaml
 
 from tests._helpers.live_server import reserve_port
-from tests.e2e.resilience.lab.events import EventLog
+from tests.e2e.resilience.lab.events import EventLog, LabEvent
 from tests.e2e.resilience.lab.model import MockModel
 from tests.e2e.resilience.lab.processes import (
     ManagedProcess,
@@ -293,6 +294,7 @@ class Lab:
         self._runner: ManagedProcess | None = None
         self._proxies: LabProxies | None = None
         self._clients: list[httpx.Client] = []
+        self._stop_started = False
         self.model: MockModel | None = None
         self.client: httpx.Client | None = None
         self.observer: httpx.Client | None = None
@@ -334,6 +336,7 @@ class Lab:
 
     def stop(self) -> None:
         """Stop every process, proxy and client; keep :attr:`root` for inspection."""
+        self._stop_started = True
         self._port_reservations.close()
         for client in self._clients:
             client.close()
@@ -360,14 +363,24 @@ class Lab:
             time.sleep(1.0)
 
     def write_diagnostics(self, destination: Path) -> None:
-        """Retain a safe failure projection before stopping, never raw lab files."""
+        """Retain a safe failure projection, never raw lab files."""
         events = self.events.events()
+        discovery: deque[LabEvent] = deque(maxlen=_DIAGNOSTIC_LIMIT)
+        discovery_count = 0
+        for event in events:
+            if (event.source, event.kind) in {
+                ("lab", "session_created"),
+                ("observer", "timeline"),
+            }:
+                discovery.append(event)
+                discovery_count += 1
         retained = events[-_DIAGNOSTIC_LIMIT:]
         payload: dict[str, Any] = {
             "schema_version": 1,
             "captured_at": time.time(),
-            "captured_before_stop": True,
+            "captured_before_stop": not self._stop_started,
             "events_omitted": max(0, len(events) - len(retained)),
+            "discovery_events_omitted": discovery_count - len(discovery),
             "events": [],
             "observations": [],
             "observations_omitted": 0,
@@ -377,7 +390,7 @@ class Lab:
         }
         session_ids: set[str] = set()
         observations_remaining = _DIAGNOSTIC_LIMIT
-        for event in reversed(retained):
+        for event in reversed(discovery):
             if event.source == "lab" and event.kind == "session_created":
                 identity = _diagnostic_fields(event.fields).get("session_id")
                 if identity:
@@ -399,7 +412,8 @@ class Lab:
                         safe = _diagnostic_fields(observation)
                         if identity and {"wall", "source", "status"} <= safe.keys():
                             payload["observations"].append({**safe, "session_id": identity})
-            elif (
+        for event in retained:
+            if (
                 event.source in {"lab", "user", "proxy:client", "proxy:host", "proxy:model"}
                 and event.kind in _DIAGNOSTIC_KINDS
             ):
@@ -412,7 +426,6 @@ class Lab:
                         "kind": event.kind,
                     }
                 )
-        payload["events"].reverse()
         payload["observations"].reverse()
         selected_sessions = sorted(session_ids)[:_DIAGNOSTIC_SESSION_LIMIT]
         payload["sessions_omitted"] = len(session_ids) - len(selected_sessions)
@@ -485,7 +498,7 @@ class Lab:
                     and {"event_name", "recorded_at"} <= (safe := _diagnostic_fields(hook)).keys()
                 ]
                 records.append(record)
-            except (OSError, ValueError, TypeError):
+            except (OSError, ValueError, TypeError, RecursionError):
                 continue
         return {
             "records": records,
