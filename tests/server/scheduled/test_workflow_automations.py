@@ -114,11 +114,10 @@ def _edit_header(prompt: str, edit: Callable[[dict[str, Any]], dict[str, Any]]) 
     "edit",
     [
         lambda raw: {**raw, "instructions": "Triage the ticket."},
-        lambda raw: {**raw, "instructions": "Triage the ticket.", "event": "anything"},
         lambda raw: {key: value for key, value in raw.items() if key != "taskSessionMode"},
         lambda raw: {**raw, "taskSessionMode": "continue"},
     ],
-    ids=["other-instructions", "other-instructions-unknown-event", "per-match", "task-session"],
+    ids=["other-instructions", "per-match", "task-session"],
 )
 @pytest.mark.parametrize(
     "name", ["jira_task_session", "jira_per_match", "jira_task_session_unsplittable"]

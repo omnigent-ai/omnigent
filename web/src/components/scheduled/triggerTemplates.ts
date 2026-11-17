@@ -861,13 +861,11 @@ export function updateTriggerWorkerSettings(
 const WORKFLOW_ID_ARGUMENT = /, workflow_id "[0-9a-f]{32}"$/;
 
 /**
- * Start each match's session as a run of the saved workflow the instructions run, or of
- * none, as {@link renderTriggerPrompt} would. A trigger edited as its prompt text keeps
- * its saved creation call, so a changed or cleared workflow must not leave the old one.
+ * Point a trigger prompt's generated creation call at the workflow its instructions run,
+ * as {@link renderTriggerPrompt} would; leave other calls unchanged.
  *
  * @param prompt A trigger prompt without its header line.
  * @param workflowIdSupported Whether `sys_session_create` accepts `workflow_id` here.
- * @returns The prompt with that call updated, or unchanged when no generated call is found.
  */
 export function syncTriggerWorkflowId(prompt: string, workflowIdSupported: boolean): string {
   if (!startsLikeTemplatePrompt(prompt)) return prompt;
