@@ -1329,3 +1329,35 @@ def test_workspace_setting_write_rechecks_the_admin_under_its_lock(db_uri: str) 
         with pytest.raises(OmnigentError, match="revoked"):
             settings.set_workspace_enabled(True, actor="admin", require_admin=True)
     assert settings.read("alice") == (False, True)
+
+
+def test_prompt_write_rechecks_the_admin_under_its_lock(db_uri: str) -> None:
+    """A deleted or demoted admin's in-flight prompt write cannot land."""
+    accounts = SqlAlchemyAccountStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    settings = ProactiveAgentSettingsStore(db_uri)
+    # A second admin, so deleting the first one below is allowed.
+    accounts.create_user_with_password("root", "test-password-hash")
+    permissions.set_admin("root", True)
+    admin = accounts.create_user_with_password("admin", "test-password-hash")
+    permissions.set_admin("admin", True)
+    with account_authority_scope("admin", admin.account_generation):
+        settings.set_prompt_override(
+            "Look for stale pull requests.", actor="admin", require_admin=True
+        )
+    assert settings.read_prompt_override() == "Look for stale pull requests."
+
+    # The route authorized the request while the actor was still an admin.
+    permissions.set_admin("admin", False)
+    with account_authority_scope("admin", admin.account_generation):
+        with pytest.raises(OmnigentError) as demoted:
+            settings.set_prompt_override("Post about anything.", actor="admin", require_admin=True)
+    assert demoted.value.code == ErrorCode.FORBIDDEN
+    assert settings.read_prompt_override() == "Look for stale pull requests."
+
+    permissions.set_admin("admin", True)
+    assert accounts.delete_user("admin") is True
+    with account_authority_scope("admin", admin.account_generation):
+        with pytest.raises(OmnigentError, match="revoked"):
+            settings.set_prompt_override(None, actor="admin", require_admin=True)
+    assert settings.read_prompt_override() == "Look for stale pull requests."

@@ -369,6 +369,9 @@ class WorkflowStore:
             )
             describes = description is not None and not stale
             source = description_source if describes else current.description_source
+            # Another planning chat's journal can't hold the proposal the description came from.
+            if not describes and planning_session_id not in (None, current.planning_session_id):
+                source = None
             workflow_name, text, workflow_steps = normalize_workflow(
                 name=row.name if name is None else name,
                 description=description if describes else current.description,

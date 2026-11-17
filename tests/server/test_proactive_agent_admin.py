@@ -223,6 +223,46 @@ async def test_admin_routes_require_an_admin(
         assert (await client.get("/v1/proactive-agent/prompt", headers=admin)).status_code == 200
 
 
+async def test_admin_routes_authenticate_without_a_permission_store(
+    db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With no permission store everyone who signs in is the admin, but they must sign in."""
+    from omnigent.server.app import create_app
+    from omnigent.server.auth import UnifiedAuthProvider
+    from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+    from omnigent.stores.inbox_item_store.sqlalchemy_store import SqlAlchemyInboxItemStore
+
+    monkeypatch.delenv("OMNIGENT_LOCAL_SINGLE_USER", raising=False)
+    settings = ProactiveAgentSettingsStore(db_uri)
+    app = create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=SqlAlchemyConversationStore(db_uri),
+        artifact_store=LocalArtifactStore(str(tmp_path / "artifacts")),
+        agent_cache=None,  # type: ignore[arg-type]
+        inbox_item_store=SqlAlchemyInboxItemStore(db_uri),
+        proactive_agent=True,
+        proactive_agent_settings_store=settings,
+        auth_provider=UnifiedAuthProvider(source="header", local_single_user=False),
+        permission_store=None,
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        anonymous = [
+            await client.get("/v1/proactive-agent/prompt"),
+            await client.put("/v1/proactive-agent/prompt", json={"prompt": "Do something else"}),
+            await client.post("/v1/proactive-agent/runs", json={"users": ["*"]}),
+        ]
+        assert [resp.status_code for resp in anonymous] == [401, 401, 401]
+        assert settings.read_prompt_override() is None
+        signed_in = {"X-Forwarded-Email": "alice@example.com"}
+        prompt = await client.get("/v1/proactive-agent/prompt", headers=signed_in)
+        assert prompt.status_code == 200
+
+
 @pytest.mark.parametrize("limit", [0, 501])
 def test_list_for_agent_bounds_its_page(db_uri: str, limit: int) -> None:
     from omnigent.stores.scheduled_task_store.sqlalchemy_store import (

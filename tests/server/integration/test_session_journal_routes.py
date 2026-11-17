@@ -413,6 +413,11 @@ async def test_the_runner_appends_and_people_page_the_journal(
         url, params={"order": "asc", "after": written[1]["id"]}, headers=_headers()
     )
     assert [entry["position"] for entry in caught_up.json()["data"]] == [2, 3]
+    # Newest first after an entry, one entry: the one just before it, which places it.
+    preceding = await client.get(
+        url, params={"order": "desc", "after": written[2]["id"], "limit": 1}, headers=_headers()
+    )
+    assert [entry["position"] for entry in preceding.json()["data"]] == [1]
     current = await client.get(
         url, params={"kind": "plan", "order": "desc", "limit": 1}, headers=_headers()
     )
