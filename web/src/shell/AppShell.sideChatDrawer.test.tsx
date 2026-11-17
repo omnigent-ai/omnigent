@@ -10,6 +10,7 @@ import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 import type * as UseSessionModule from "@/hooks/useSession";
 import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as UsePullRequestsModule from "@/hooks/usePullRequests";
+import type * as SessionsApiModule from "@/lib/sessionsApi";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
@@ -66,9 +67,26 @@ vi.mock("@/hooks/useIsMobileViewport", () => ({
 }));
 // The pane itself is covered by its own suite; the stub just names its child.
 vi.mock("@/components/chat/SideChatPane", () => ({
-  SideChatPane: ({ childId }: { childId: string }) => (
-    <div data-testid="side-chat-pane-stub">{childId}</div>
+  SideChatPane: ({
+    childId,
+    onStart,
+  }: {
+    childId: string;
+    onStart?: (text: string) => Promise<void>;
+  }) => (
+    <div data-testid="side-chat-pane-stub">
+      {childId}
+      {onStart && (
+        <button type="button" onClick={() => void onStart("why backoff?").catch(() => {})}>
+          Send first message
+        </button>
+      )}
+    </div>
   ),
+}));
+vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof SessionsApiModule>()),
+  createSideChat: vi.fn(),
 }));
 vi.mock("./Sidebar", () => ({
   Sidebar: () => <div data-testid="sidebar" />,
@@ -99,6 +117,7 @@ import { isMobileViewport } from "./Sidebar";
 import { usePullRequestInfo } from "@/hooks/usePullRequests";
 import { useConversations } from "@/hooks/useConversations";
 import { useSession } from "@/hooks/useSession";
+import { createSideChat } from "@/lib/sessionsApi";
 import type { Session } from "@/lib/types";
 import { useChatStore } from "@/store/chatStore";
 import { writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
@@ -148,7 +167,12 @@ beforeEach(() => {
 });
 
 function NavProbe() {
-  return <Link to="/c/conv_other">Another session</Link>;
+  return (
+    <>
+      <Link to="/c/conv_other">Another session</Link>
+      <Link to="/c/conv_ws">Back to session</Link>
+    </>
+  );
 }
 
 function renderShell(path = "/c/conv_ws") {
@@ -179,6 +203,7 @@ describe("mobile side-chats drawer", () => {
   const initialStoreState = useChatStore.getState();
 
   beforeEach(() => {
+    vi.mocked(createSideChat).mockReset();
     vi.mocked(isMobileViewport).mockReturnValue(true);
     useChatStore.setState({ ...initialStoreState, sessionHarness: "openai-agents" });
     // Two already-open tabs, so a drawer that opens has something to show.
@@ -197,6 +222,34 @@ describe("mobile side-chats drawer", () => {
   /** Publish the one-shot "a side chat is ready" signal for `parentId`. */
   function signal(parentId: string, childId = "conv_side_a") {
     useChatStore.setState({ sideChatToOpen: { childId, parentId } });
+  }
+
+  /** Send the first message from a New side chat tab in the drawer. */
+  async function sendFromNewSideChatTab() {
+    openActionsMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Side chats" }));
+    const drawer = screen.getByTestId("side-chats-panel-drawer");
+    fireEvent.click(within(drawer).getByRole("button", { name: "New side chat" }));
+    await act(async () =>
+      fireEvent.click(within(drawer).getByRole("button", { name: "Send first message" })),
+    );
+    return drawer;
+  }
+
+  /** Hold the next server-side start; `beforeRender` runs once it resolves, before React renders. */
+  function holdSideChatStart() {
+    let finishStart!: (result: { childSessionId: string }) => void;
+    vi.mocked(createSideChat).mockReturnValue(
+      new Promise((resolve) => {
+        finishStart = resolve;
+      }),
+    );
+    return (childSessionId: string, beforeRender?: () => void) =>
+      act(async () => {
+        finishStart({ childSessionId });
+        await Promise.resolve();
+        beforeRender?.();
+      });
   }
 
   it("opens for a side chat belonging to the conversation on screen", () => {
@@ -239,6 +292,133 @@ describe("mobile side-chats drawer", () => {
     fireEvent.click(screen.getByRole("link", { name: "Another session" }));
 
     expect(screen.getByTestId("side-chats-panel-drawer")).toHaveAttribute("data-state", "closed");
+  });
+
+  it("reveals a side chat that finished while the user was away, once they return", () => {
+    renderShell();
+    fireEvent.click(screen.getByRole("link", { name: "Another session" }));
+    act(() => signal("conv_ws"));
+
+    fireEvent.click(screen.getByRole("link", { name: "Back to session" }));
+
+    const drawer = screen.getByTestId("side-chats-panel-drawer");
+    expect(drawer).toHaveAttribute("data-state", "open");
+    expect(within(drawer).getByTestId("side-chat-pane-stub")).toHaveTextContent("conv_side_a");
+    expect(rail()).toHaveAttribute("data-state", "open");
+  });
+
+  it("reveals a new side chat that finished starting while the user was away", async () => {
+    const finishStart = holdSideChatStart();
+    renderShell();
+    const drawer = await sendFromNewSideChatTab();
+
+    fireEvent.click(screen.getByRole("link", { name: "Another session" }));
+    await finishStart("conv_side_new");
+    fireEvent.click(screen.getByRole("link", { name: "Back to session" }));
+
+    expect(drawer).toHaveAttribute("data-state", "open");
+    expect(within(drawer).getByTestId("side-chat-pane-stub")).toHaveTextContent("conv_side_new");
+  });
+
+  it("reveals a new side chat that finishes starting after the user leaves and returns", async () => {
+    const finishStart = holdSideChatStart();
+    renderShell();
+    const drawer = await sendFromNewSideChatTab();
+
+    fireEvent.click(screen.getByRole("link", { name: "Another session" }));
+    fireEvent.click(screen.getByRole("link", { name: "Back to session" }));
+    expect(drawer).toHaveAttribute("data-state", "closed");
+    await finishStart("conv_side_new");
+
+    expect(drawer).toHaveAttribute("data-state", "open");
+    expect(within(drawer).getByTestId("side-chat-pane-stub")).toHaveTextContent("conv_side_new");
+    expect(rail()).toHaveAttribute("data-state", "open");
+  });
+
+  it("reveals a main-composer side chat while another conversation's native fork is pending", async () => {
+    useChatStore.setState({
+      sessionHarness: "codex-native",
+      boundAgentId: "agent_x",
+      send: vi.fn(() => Promise.resolve()),
+    });
+    renderShell();
+    const drawer = await sendFromNewSideChatTab();
+
+    fireEvent.click(screen.getByRole("link", { name: "Another session" }));
+    // That conversation's own /side fork arrives while this pending fork waits.
+    act(() => signal("conv_other", "conv_side_other"));
+
+    expect(drawer).toHaveAttribute("data-state", "open");
+    expect(rail()).toHaveAttribute("data-state", "open");
+  });
+
+  it("stays closed when dismissed while a new side chat is starting", async () => {
+    const finishStart = holdSideChatStart();
+    renderShell();
+    const drawer = await sendFromNewSideChatTab();
+    expect(createSideChat).toHaveBeenCalledTimes(1);
+    expect(createSideChat).toHaveBeenCalledWith("conv_ws", undefined);
+
+    fireEvent.click(within(drawer).getByRole("button", { name: "Close" }));
+    expect(drawer).toHaveAttribute("data-state", "closed");
+    await finishStart("conv_side_new");
+
+    expect(drawer).toHaveAttribute("data-state", "closed");
+    expect(rail()).toHaveAttribute("data-state", "closed");
+    openActionsMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Side chats" }));
+    expect(within(drawer).getByTestId("side-chat-pane-stub")).toHaveTextContent("conv_side_new");
+  });
+
+  it("stays closed when dismissed while a retried side chat is starting", async () => {
+    const finishStart = holdSideChatStart();
+    vi.mocked(createSideChat).mockRejectedValueOnce(new Error("no runner"));
+    renderShell();
+    const drawer = await sendFromNewSideChatTab();
+    await act(async () =>
+      fireEvent.click(within(drawer).getByRole("button", { name: "Send first message" })),
+    );
+    expect(createSideChat).toHaveBeenCalledTimes(2);
+
+    fireEvent.click(within(drawer).getByRole("button", { name: "Close" }));
+    await finishStart("conv_side_new");
+
+    expect(drawer).toHaveAttribute("data-state", "closed");
+    expect(rail()).toHaveAttribute("data-state", "closed");
+  });
+
+  it("reveals a later request for a new side chat whose own signal was displaced", async () => {
+    const finishStart = holdSideChatStart();
+    renderShell();
+    const drawer = await sendFromNewSideChatTab();
+    fireEvent.click(within(drawer).getByRole("button", { name: "Close" }));
+
+    // Another side chat's signal replaces the start's before the panel handles it.
+    await finishStart("conv_side_new", () => signal("conv_ws"));
+    expect(drawer).toHaveAttribute("data-state", "open");
+    fireEvent.click(within(drawer).getByRole("button", { name: "Close" }));
+    act(() => signal("conv_ws", "conv_side_new"));
+
+    expect(drawer).toHaveAttribute("data-state", "open");
+    expect(within(drawer).getByTestId("side-chat-pane-stub")).toHaveTextContent("conv_side_new");
+  });
+
+  it("reveals a main-composer native side chat that arrives while a tab's native fork waits", async () => {
+    const send = vi.fn(() => Promise.resolve());
+    useChatStore.setState({ sessionHarness: "codex-native", boundAgentId: "agent_x", send });
+    renderShell();
+    const drawer = await sendFromNewSideChatTab();
+    expect(send).toHaveBeenCalledWith("/side why backoff?", "agent_x", undefined, {
+      pinnedConversationId: "conv_ws",
+      onError: expect.any(Function),
+    });
+
+    fireEvent.click(within(drawer).getByRole("button", { name: "Close" }));
+    // Native forks carry no launch id, so this could be a /side sent from the main composer.
+    act(() => signal("conv_ws", "conv_side_composer"));
+
+    expect(drawer).toHaveAttribute("data-state", "open");
+    expect(rail()).toHaveAttribute("data-state", "open");
   });
 
   it("replaces an already-open mobile drawer rather than stacking on it", () => {
