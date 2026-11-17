@@ -335,6 +335,7 @@ _TURN_ACTOR_LABEL = "omnigent.turn_actor"
 # via the JSON POST /v1/sessions create — same server-permission posture
 # as _execute_subagent_tool.
 _SESSION_CREATE_TOOLS = frozenset({"sys_session_create"})
+_SESSION_ID_PLACEHOLDER_MAX_CHARS = 64
 
 # Priority 5f.0: Session query tools — peek/list/close/get_info/share. The
 # runner has no in-process ConversationStore, so these read/mutate session
@@ -3818,6 +3819,18 @@ async def _execute_session_create(
         if has_config_path:
             # The bundled create doesn't copy a workflow's plan into the journal.
             return json.dumps({"error": "workflow_id requires agent_id"})
+    session_id_placeholder = args.get("session_id_placeholder")
+    if session_id_placeholder is not None and (
+        not isinstance(session_id_placeholder, str)
+        or not session_id_placeholder.strip()
+        or len(session_id_placeholder) > _SESSION_ID_PLACEHOLDER_MAX_CHARS
+    ):
+        return json.dumps(
+            {
+                "error": "session_id_placeholder must be a nonempty string of at most "
+                f"{_SESSION_ID_PLACEHOLDER_MAX_CHARS} characters"
+            }
+        )
     if has_config_path:
         return await _session_create_from_config_path(
             str(config_path),
@@ -4043,9 +4056,13 @@ async def _execute_session_create(
         if placement in ("same_host", "host") and args.get("message"):
             from omnigent.runner.session_message import execute_message_tool
 
+            # The runner sends this message itself, so it can name the new session's ID.
+            initial_text = args["message"]
+            if session_id_placeholder is not None and isinstance(initial_text, str):
+                initial_text = initial_text.replace(session_id_placeholder, data["id"])
             initial_message = json.loads(
                 await execute_message_tool(
-                    {"session_id": data["id"], "message": args["message"]},
+                    {"session_id": data["id"], "message": initial_text},
                     server_client,
                     conversation_id,
                 )

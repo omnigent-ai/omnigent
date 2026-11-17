@@ -133,8 +133,10 @@ describe("saved trigger prompts", () => {
           ? 'agent_id "worker-agent", placement "same_host", title "Triage \\"orchestrator\\""'
           : 'agent_id "worker-agent", placement "same_host"',
       );
+      // Slack start replies carry the placeholder the runner fills in, kept as written.
+      const placeholder = source === "slack" ? ', session_id_placeholder "CONVERSATION_ID"' : "";
       expect(updated).toContain(
-        'model "model-with-\\"quotes\\"", reasoning_effort "low", permission_mode "approve-for-me", and a message',
+        `model "model-with-\\"quotes\\"", reasoning_effort "low", permission_mode "approve-for-me"${placeholder}, and a message`,
       );
       expect(updated).toContain("Keep this custom instruction.");
       const context = { ...CTX, taskSessionMode };
@@ -1339,6 +1341,30 @@ describe("renderTriggerPrompt", () => {
       expect(combineTriggerPrompt(parts.userPrompt, parts.systemPrompt)).toBe(prompt);
     },
   );
+
+  it("has the runner fill in a Slack worker's link, and keeps that argument on edit", () => {
+    const slackPrompt = (linkBack: boolean) =>
+      renderTriggerPrompt("slack", fields({ event: "posted", scope: "#support", linkBack }), CTX);
+    const prompt = slackPrompt(true);
+    const [manager, worker] = prompt.split("Instructions for each session:\n");
+    expect(manager).toContain('session_id_placeholder "CONVERSATION_ID", and a message under');
+    // The runner rewrites every CONVERSATION_ID in the message, so the worker's own text names none.
+    expect(worker.split("Track progress:")[0]).not.toContain("CONVERSATION_ID");
+    expect(worker).toContain(
+      "If the link still ends with an uppercase placeholder word instead of a session ID",
+    );
+    expect(slackPrompt(false)).not.toContain("session_id_placeholder");
+    expect(renderTriggerPrompt("jira", fields(), CTX)).not.toContain("session_id_placeholder");
+
+    const edited = updateTriggerWorkerSettings(prompt, {
+      ...AGENT_DEFAULT_WORKERS,
+      model: "opus",
+    });
+    expect(edited).toContain(
+      'model "opus", session_id_placeholder "CONVERSATION_ID", and a message under 32000 characters.',
+    );
+    expect(readTriggerWorkerSettings(edited!)).toEqual({ ...AGENT_DEFAULT_WORKERS, model: "opus" });
+  });
 
   it("signs what it posts and stops when it can't reach the service", () => {
     const prompt = renderTriggerPrompt("jira", fields(), CTX);

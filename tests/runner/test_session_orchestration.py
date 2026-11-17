@@ -46,6 +46,7 @@ def test_create_schema_exposes_project_name_and_permission_mode():
     assert schema["parameters"]["properties"]["permission_mode"]["type"] == "string"
     assert schema["parameters"]["properties"]["project_id"]["type"] == "string"
     assert schema["parameters"]["properties"]["workflow_id"]["type"] == "string"
+    assert schema["parameters"]["properties"]["session_id_placeholder"]["type"] == "string"
 
 
 @pytest.mark.asyncio
@@ -875,6 +876,89 @@ async def test_long_first_task_needs_a_server_that_delivers_it(server_info, serv
     ]
     assert json.loads(posts[1].content)["data"]["message"] == message
     assert result["initial_message"] == {"queued": True}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("placement", "placeholder", "filled"),
+    [
+        # The runner sends a same_host message itself, so it can name the new ID.
+        ("same_host", "CONVERSATION_ID", True),
+        # Without the argument, the text is never rewritten.
+        ("same_host", None, False),
+        # A managed message rides in the create body, before the ID exists.
+        ("managed", "CONVERSATION_ID", False),
+    ],
+    ids=["same_host-filled", "same_host-unset", "managed-unchanged"],
+)
+async def test_session_id_placeholder_is_filled_only_where_the_runner_sends_the_message(
+    placement, placeholder, filled
+):
+    session_id = uuid4().hex
+    message = "Track progress: <https://omni.example.com/c/CONVERSATION_ID|Omni Session>"
+    posts = []
+
+    def respond(request):
+        if request.url.path == "/v1/info":
+            return httpx.Response(200, json={})
+        posts.append(request)
+        if request.url.path.endswith("/events"):
+            return httpx.Response(202, json={"queued": True})
+        return httpx.Response(
+            201, json={"id": session_id, "agent_id": "worker", "family": {"id": "manager"}}
+        )
+
+    arguments = {"agent_id": "worker", "placement": placement, "message": message}
+    if placeholder is not None:
+        arguments["session_id_placeholder"] = placeholder
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://server"
+    ) as client:
+        result = json.loads(
+            await execute_tool(
+                tool_name="sys_session_create",
+                arguments=json.dumps(arguments),
+                server_client=client,
+                conversation_id="manager",
+            )
+        )
+
+    if placement == "same_host":
+        sent = json.loads(posts[1].content)["data"]["message"]
+        assert result["initial_message"] == {"queued": True}
+    else:
+        sent = json.loads(posts[0].content)["initial_input"]["data"]["content"][0]["text"]
+    expected = message.replace("CONVERSATION_ID", session_id) if filled else message
+    assert sent == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "placeholder", ["", "  ", 1, "x" * 65], ids=["empty", "blank", "non_text", "too_long"]
+)
+async def test_session_id_placeholder_must_be_a_short_string(placeholder):
+    def unexpected(request):
+        pytest.fail("An invalid placeholder must not reach the server")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(unexpected), base_url="http://server"
+    ) as client:
+        result = json.loads(
+            await execute_tool(
+                tool_name="sys_session_create",
+                arguments=json.dumps(
+                    {
+                        "agent_id": "worker",
+                        "placement": "same_host",
+                        "message": "Hi",
+                        "session_id_placeholder": placeholder,
+                    }
+                ),
+                server_client=client,
+                conversation_id="manager",
+            )
+        )
+    assert "session_id_placeholder must be a nonempty string of at most 64" in result["error"]
 
 
 @pytest.mark.asyncio
