@@ -278,6 +278,7 @@ from omnigent.server.routes._sessions.helpers import (
     _build_new_item,
     _build_policy_engine_from_spec,
     _child_session_summary_from_conversation,
+    _codex_side_chat_resume_supported,
     _codex_subagent_labels_from_body,
     _coerce_cumulative_field,
     _collect_descendant_conversation_ids,
@@ -465,6 +466,7 @@ from omnigent.telemetry.surface import CLIENT_SURFACE_LABEL_KEY, resolve_session
 from omnigent.util.session_lifecycle import (
     CLOSED_LABEL_KEY,
     CLOSED_LABEL_VALUE,
+    is_session_closed,
     labels_with_closed_status,
     title_without_closed_marker,
 )
@@ -6118,6 +6120,7 @@ async def _recover_side_chat_runner_via_source(
         source=source,
     ):
         return None, side_chat
+    original_source_runner_id = source.runner_id
     for _ in range(_SIDE_CHAT_RECOVERY_ATTEMPTS):
         # Checked per attempt: a retry's fresh source row can name another host.
         if (
@@ -6156,6 +6159,16 @@ async def _recover_side_chat_runner_via_source(
         if live_source.runner_id != source.runner_id:
             source = live_source
             continue
+        if native_side_chat and not _codex_side_chat_resume_supported(source, runner_router, None):
+            if (
+                not is_session_closed(side_chat.labels, side_chat.title)
+                and side_chat.runner_id == source.runner_id == original_source_runner_id
+            ):
+                return source_client, side_chat
+            raise OmnigentError(
+                "This runner cannot resume side chats. Update the host and restart the session.",
+                code=ErrorCode.RUNNER_UNAVAILABLE,
+            )
         if not reuse_existing and user_id is not None and runner_router is not None:
             runner_owner = runner_router.runner_owner(source.runner_id)
             if runner_owner is not None and runner_owner != user_id:
@@ -15116,6 +15129,22 @@ async def _get_session_snapshot(
     response.side_chat_settings_supported = await _runner_supports_side_chat_settings(
         conv, conv_store, getattr(request.app.state, "tunnel_registry", None) if request else None
     )
+    from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
+
+    if (
+        _is_codex_native_subagent(conv)
+        and is_side_chat_child(conv.labels)
+        and conv.parent_conversation_id is not None
+    ):
+        parent = await asyncio.to_thread(conv_store.get_conversation, conv.parent_conversation_id)
+        supported = _codex_side_chat_resume_supported(
+            parent,
+            getattr(request.app.state, "runner_router", None) if request else None,
+            getattr(request.app.state, "host_registry", None) if request else None,
+        )
+        response.labels["omnigent.codex_native.side_chat_resume"] = (
+            "true" if supported else "false"
+        )
     response.inference_configured = inference_configured
     response.inference_error = inference_error
     response.usage_included = include_usage

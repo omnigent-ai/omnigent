@@ -35,6 +35,7 @@ from fastapi import FastAPI
 
 from omnigent.entities import Conversation
 from omnigent.entities.conversation import MessageData, NewConversationItem
+from omnigent.host.frames import CAP_CODEX_SIDE_CHAT_RESUME, HostHelloFrame
 from omnigent.runtime import session_stream
 from omnigent.server.routes import sessions as sessions_module
 from omnigent.server.routes.sessions import routes_events as routes_events_module
@@ -2439,6 +2440,7 @@ async def test_subagent_message_503s_when_heal_finds_no_live_ancestor(
 @pytest.mark.parametrize("closed", [False, True])
 async def test_side_chat_recovers_on_parent_runner(
     client: httpx.AsyncClient,
+    app: FastAPI,
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
     event_type: str,
@@ -2459,6 +2461,7 @@ async def test_side_chat_recovers_on_parent_runner(
     store.set_labels(child["id"], labels)
     store.replace_runner_id(child["id"], "runner_old")
     store.replace_runner_id(child["parent_session_id"], "runner_live")
+    register_test_runner(app, "runner_live", capabilities=[CAP_CODEX_SIDE_CHAT_RESUME])
     snapshot = await client.get(f"/v1/sessions/{child['id']}")
     assert snapshot.status_code == 200, snapshot.text
     assert (snapshot.json()["labels"].get(CLOSED_LABEL_KEY) == CLOSED_LABEL_VALUE) == closed
@@ -2762,10 +2765,14 @@ async def test_side_chat_settings_support_follows_parent_runner_handshake(
     supported = runner_state == "current"
     if runner_state != "offline":
         register_test_runner(
-            app, "runner_parent", capabilities=[CAP_SIDE_CHAT_SETTINGS] if supported else []
+            app,
+            "runner_parent",
+            capabilities=[CAP_SIDE_CHAT_SETTINGS, CAP_CODEX_SIDE_CHAT_RESUME] if supported else [],
         )
     register_test_runner(
-        app, "runner_stale", capabilities=[] if supported else [CAP_SIDE_CHAT_SETTINGS]
+        app,
+        "runner_stale",
+        capabilities=[] if supported else [CAP_SIDE_CHAT_SETTINGS, CAP_CODEX_SIDE_CHAT_RESUME],
     )
     parent = await _create_parent_session(client)
     store = SqlAlchemyConversationStore(db_uri)
@@ -2787,9 +2794,25 @@ async def test_side_chat_settings_support_follows_parent_runner_handshake(
     response = await client.get(f"/v1/sessions/{child_id}")
     assert response.status_code == 200, response.text
     assert response.json()["side_chat_settings_supported"] is supported
+    resume_label = "omnigent.codex_native.side_chat_resume"
+    assert response.json()["labels"][resume_label] == str(supported).lower()
+    assert resume_label not in store.get_conversation(child_id).labels
     assert (await client.get(f"/v1/sessions/{parent['id']}")).json()[
         "side_chat_settings_supported"
     ] is False
+    host_id = "98b5b7bc904d461ab181cd077af84445"
+    store.set_host_id(parent["id"], host_id, workspace="/workspace")
+    host = app.state.host_registry.register(
+        host_id,
+        AsyncMock(),
+        HostHelloFrame(version="0.1.0-test", frame_protocol_version=1, name="test-host"),
+        owner=None,
+    )
+    unsupported_host = await client.get(f"/v1/sessions/{child_id}")
+    assert unsupported_host.json()["labels"][resume_label] == str(supported).lower()
+    host.hello.capabilities.append(CAP_CODEX_SIDE_CHAT_RESUME)
+    host_fallback = await client.get(f"/v1/sessions/{child_id}")
+    assert host_fallback.json()["labels"][resume_label] == str(runner_state != "old").lower()
     if supported:
         registry.deregister("runner_parent", retire=False)
         assert (await client.get(f"/v1/sessions/{child_id}")).json()[
@@ -2799,10 +2822,13 @@ async def test_side_chat_settings_support_follows_parent_runner_handshake(
     refused = await client.patch(f"/v1/sessions/{child_id}", json={"reasoning_effort": "low"})
     assert refused.status_code == 503, refused.text
     assert store.get_conversation(child_id).reasoning_effort is None
-    register_test_runner(app, "runner_parent", capabilities=[CAP_SIDE_CHAT_SETTINGS])
+    register_test_runner(
+        app, "runner_parent", capabilities=[CAP_SIDE_CHAT_SETTINGS, CAP_CODEX_SIDE_CHAT_RESUME]
+    )
     recovered = await client.patch(f"/v1/sessions/{child_id}", json={"reasoning_effort": "low"})
     assert recovered.status_code == 200, recovered.text
     assert recovered.json()["side_chat_settings_supported"] is True
+    assert recovered.json()["labels"][resume_label] == "true"
     assert recovered.json()["reasoning_effort"] == "low"
 
 

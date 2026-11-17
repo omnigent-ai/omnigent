@@ -772,6 +772,8 @@ async def _resume_codex_side_chat(
         raise OmnigentError(
             "No runner is available to resume this side chat.", code=ErrorCode.RUNNER_UNAVAILABLE
         )
+    if not is_session_closed(conv.labels, conv.title):
+        return conv
     assert conv.parent_conversation_id is not None
     await _recover_retry_session(
         request=request,

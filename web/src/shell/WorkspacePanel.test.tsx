@@ -1974,6 +1974,7 @@ describe("WorkspacePanel sub-agent tabs", () => {
         "omnigent.closed": "true",
         "omnigent.wrapper": "codex-native-ui-subagent",
         "omnigent.codex_native.agent_nickname": "Side chat",
+        "omnigent.codex_native.side_chat_resume": "true",
       }),
     });
 

@@ -13,6 +13,7 @@ from fastapi import FastAPI
 from omnigent.db.utils import generate_agent_id
 from omnigent.entities import Conversation
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.host.frames import CAP_CODEX_SIDE_CHAT_RESUME
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_OWNER, LEVEL_READ
 from omnigent.server.routes import sessions
 from omnigent.server.routes._sessions import orchestration
@@ -146,6 +147,9 @@ async def test_side_chat_binding_unchanged_when_source_runner_unavailable(
         ("offline", 503, {"error": "no_harness"}, False),
         ("closed", 503, {"error": "codex_side_chat_unavailable"}, False),
         ("closed", 200, {"resumed": False}, False),
+        ("legacy-reappeared", 422, {"detail": [{"type": "union_tag_invalid"}]}, True),
+        ("legacy-closed", 422, {"detail": [{"type": "union_tag_invalid"}]}, False),
+        ("legacy-mismatched", 422, {"detail": [{"type": "union_tag_invalid"}]}, False),
     ],
 )
 async def test_native_side_chat_resume_revalidates_runner_after_parent_initialization(
@@ -163,9 +167,9 @@ async def test_native_side_chat_resume_revalidates_runner_after_parent_initializ
         parent_conversation_id=source.id,
         runner_id=None if state == "unbound" else "runner-first",
     )
-    if state == "mismatched":
+    if state in ("mismatched", "legacy-mismatched"):
         store.replace_runner_id(side.id, "runner-stale")
-    closed = state in ("replaced", "unavailable", "closed", "advanced")
+    closed = state in ("replaced", "unavailable", "closed", "advanced", "legacy-closed")
     store.set_labels(
         side.id,
         {
@@ -197,7 +201,9 @@ async def test_native_side_chat_resume_revalidates_runner_after_parent_initializ
         nonlocal parent_probes
         if session_id == source.id:
             parent_probes += 1
-            if state == "offline" or (state == "reappeared" and parent_probes == 1):
+            if state == "offline" or (
+                state in ("reappeared", "legacy-reappeared") and parent_probes == 1
+            ):
                 return None
         current = store.get_conversation(session_id)
         assert current is not None
@@ -217,7 +223,13 @@ async def test_native_side_chat_resume_revalidates_runner_after_parent_initializ
         "request": SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace())),
         "conv": side,
         "conversation_store": store,
-        "runner_router": None,
+        "runner_router": SimpleNamespace(
+            runner_is_online=lambda _runner_id: True,
+            runner_has_capability=lambda _runner_id, capability: (
+                capability == CAP_CODEX_SIDE_CHAT_RESUME and not state.startswith("legacy-")
+            ),
+            runner_owner=lambda _runner_id: None,
+        ),
         "user_id": None,
         "permission_store": None,
     }
@@ -237,9 +249,15 @@ async def test_native_side_chat_resume_revalidates_runner_after_parent_initializ
             if status == 409 and state != "unavailable"
             else ErrorCode.RUNNER_UNAVAILABLE
         )
-        assert store.get_conversation(side.id).labels.get("omnigent.closed") == "true"
-    if state == "live":
-        ensure_connected.assert_not_awaited()
+        saved = store.get_conversation(side.id)
+        assert (saved.labels.get("omnigent.closed") == "true") == (state != "legacy-mismatched")
+        if state == "legacy-mismatched":
+            assert saved.runner_id == "runner-stale"
+    if state in ("live", "legacy-reappeared", "legacy-closed", "legacy-mismatched"):
+        if state == "legacy-mismatched":
+            ensure_connected.assert_awaited_once()
+        else:
+            ensure_connected.assert_not_awaited()
         initialize.assert_not_awaited()
         first_runner.post.assert_not_awaited()
     elif state == "unavailable":
@@ -481,6 +499,16 @@ async def test_side_chat_recovery_gates_on_source_edit_access_at_the_routes(
         )
         monkeypatch.setattr(
             auth_app.state.runner_router, "host_is_on_another_replica", Mock(return_value=False)
+        )
+        monkeypatch.setattr(
+            auth_app.state.runner_router, "runner_is_online", Mock(return_value=True)
+        )
+        monkeypatch.setattr(
+            auth_app.state.runner_router,
+            "runner_has_capability",
+            Mock(
+                side_effect=lambda _runner_id, capability: capability == CAP_CODEX_SIDE_CHAT_RESUME
+            ),
         )
         monkeypatch.setattr(sessions, "_get_runner_client", AsyncMock(return_value=runner))
         monkeypatch.setattr(routes_events, "_ensure_runner_relay_ready", AsyncMock())

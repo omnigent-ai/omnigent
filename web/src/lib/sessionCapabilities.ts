@@ -133,8 +133,9 @@ export function readOnlyReasonForSessionLabels(
     const nickname =
       activeSession?.labels?.["omnigent.codex_native.agent_nickname"] ??
       activeConv?.labels?.["omnigent.codex_native.agent_nickname"];
-    // Codex side chats recover on their next message even after their native fork closes.
-    if (wrapper !== "codex-native-ui-subagent" || nickname !== "Side chat") {
+    const resumeSupported =
+      (activeSession ?? activeConv)?.labels?.["omnigent.codex_native.side_chat_resume"] === "true";
+    if (wrapper !== "codex-native-ui-subagent" || nickname !== "Side chat" || !resumeSupported) {
       return "This sub-agent session is closed";
     }
   }

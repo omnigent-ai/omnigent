@@ -1661,8 +1661,15 @@ describe("history a side chat copied from its parent", () => {
 });
 
 describe("side chat closed by the server", () => {
-  it("is read-only once the server marks the child closed", () => {
-    mockSession.labels = { "omnigent.closed": "true" };
+  it.each<Record<string, string>>([
+    { "omnigent.closed": "true" },
+    {
+      "omnigent.closed": "true",
+      "omnigent.wrapper": "codex-native-ui-subagent",
+      "omnigent.codex_native.agent_nickname": "Side chat",
+    },
+  ])("is read-only when closed without recovery support (%j)", (labels) => {
+    mockSession.labels = labels;
     renderPane(<SideChatPane childId={childId} />);
 
     expect(
@@ -1677,6 +1684,7 @@ describe("side chat closed by the server", () => {
       "omnigent.closed": "true",
       "omnigent.wrapper": "codex-native-ui-subagent",
       "omnigent.codex_native.agent_nickname": "Side chat",
+      "omnigent.codex_native.side_chat_resume": "true",
     };
     conversationRegistry.acquire(childId).setState({ sessionStatus: "idle" });
     renderPane(<SideChatPane childId={childId} />);
@@ -1696,6 +1704,7 @@ describe("side chat closed by the server", () => {
       "omnigent.closed": "true",
       "omnigent.wrapper": "codex-native-ui-subagent",
       "omnigent.codex_native.agent_nickname": "Side chat",
+      "omnigent.codex_native.side_chat_resume": "true",
     };
     renderPane(<SideChatPane childId={childId} readOnly />);
 

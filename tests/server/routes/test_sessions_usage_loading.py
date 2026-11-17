@@ -240,6 +240,9 @@ async def test_codex_side_chat_restores_own_usage_without_loading_display_usage(
     )
     assert response.status_code == 200, response.text
     body = response.json()
+    resume_label = "omnigent.codex_native.side_chat_resume"
+    assert body["labels"].get(resume_label) == ("false" if side_chat else None)
+    assert resume_label not in usage_app.conversations.get_conversation(usage_app.child_id).labels
     if side_chat:
         baseline = body["native_usage_baseline"]
         assert baseline["cumulative_input_tokens"] == 130
