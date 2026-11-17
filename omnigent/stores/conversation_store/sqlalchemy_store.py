@@ -224,6 +224,10 @@ _SEARCH_SCOPES = frozenset({"all", "title", "content"})
 # database. Bounds the metadata lookup to one indexed IN batch.
 _SEARCH_CANDIDATE_WINDOW = 200
 
+# Windows one search may examine. Bounds the total work when most ranked
+# matches are unreadable; readable matches ranked below it are not returned.
+_SEARCH_MAX_CANDIDATE_WINDOWS = 10
+
 # Escapes LIKE wildcards in a search query. ``/``, as SQLAlchemy's own
 # ``autoescape`` uses, sidesteps MySQL's backslash handling in string literals.
 _LIKE_ESCAPE = "/"
@@ -2690,13 +2694,24 @@ class SqlAlchemyConversationStore(ConversationStore):
                 # The FTS mirror has no workspace column and stores ids as text
                 # in any accepted spelling. Ids are normalized in Python, then
                 # checked against conversation_items by primary key.
+                params: dict[str, str | int | bytes] = {"query": query}
+                conversation_filter = ""
+                if conversation_key is not None:
+                    # Match the stored spellings of this id, so a scoped
+                    # search does not rank other conversations' matches.
+                    conversation_filter = (
+                        "AND f.conversation_id IN (:cid_hex, :cid_dashed, :cid_prefixed) "
+                    )
+                    params["cid_hex"] = conversation_key
+                    params["cid_dashed"] = str(uuid.UUID(conversation_key))
+                    params["cid_prefixed"] = f"conv_{conversation_key}"
                 candidate_sql = (
                     "SELECT f.conversation_id, f.item_id "
                     "FROM conversation_items_fts AS f "
                     "WHERE f.search_text MATCH :query "
+                    f"{conversation_filter}"
                     "ORDER BY f.rank, f.conversation_id, f.item_id"
                 )
-                params: dict[str, str | int | bytes] = {"query": query}
             else:
                 # Non-FTS fallback: LIKE/ILIKE on the data column.
                 # PostgreSQL: cast MEDIUMBLOB/JSONB to text and use ILIKE.
@@ -2740,7 +2755,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             item_keys: list[tuple[str, str]] = []
             seen: set[tuple[str, str]] = set()
             offset = 0
-            while len(item_keys) < limit:
+            for _ in range(_SEARCH_MAX_CANDIDATE_WINDOWS):
+                if len(item_keys) >= limit:
+                    break
                 raw_keys = fetch_candidate_keys(_SEARCH_CANDIDATE_WINDOW, offset)
                 if not raw_keys:
                     break

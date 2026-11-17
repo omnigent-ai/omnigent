@@ -133,7 +133,18 @@ def test_search_prefetches_permissions_from_separate_database(tmp_path: Path) ->
         scoped = store.search(
             "sapphire", conversation_id=denied[0].id, accessible_by="caller@example.com"
         )
+        # One window of two holds only denied matches, so a capped search stops there.
+        with patch(
+            "omnigent.stores.conversation_store.sqlalchemy_store._SEARCH_MAX_CANDIDATE_WINDOWS", 1
+        ):
+            capped = store.search("sapphire", limit=1, accessible_by="caller@example.com")
+            # A scoped search ranks only its own conversation, so the cap is not reached.
+            scoped_allowed = store.search(
+                "sapphire", conversation_id=allowed[0].id, accessible_by="caller@example.com"
+            )
 
+    assert capped == []
+    assert [item.data for item in scoped_allowed] == expected
     assert [item.data for item in one] == expected
     assert [item.data for item in two] == expected * 2
     assert [item.data for item in every] == expected * 3
@@ -224,6 +235,12 @@ def test_search_matches_dashed_and_legacy_fts_ids(tmp_path: Path) -> None:
     assert [item.id for item in store.search("emerald", accessible_by="caller@example.com")] == [
         legacy.id
     ]
+    # A scoped search finds its conversation under either stored spelling.
+    for query, item in (("sapphire", dashed), ("emerald", legacy)):
+        scoped = store.search(
+            query, conversation_id=conversation.id, accessible_by="caller@example.com"
+        )
+        assert [found.id for found in scoped] == [item.id]
 
 
 def test_search_non_fts_branch_filters_before_limit(tmp_path: Path) -> None:
