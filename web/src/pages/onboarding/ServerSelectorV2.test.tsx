@@ -147,6 +147,103 @@ describe("ServerSelectorV2", () => {
     expect(screen.getByLabelText("Server URL")).toBeInTheDocument();
   });
 
+  it("a returning local user starts on the landing, even after a failed connect", () => {
+    render(
+      <ServerSelectorV2
+        setup={makeSetup({ error: "Could not load", recentServers: ["http://localhost:6767/"] })}
+      />,
+    );
+    expect(screen.getByRole("button", { name: "Continue locally" })).toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent("Could not load");
+  });
+
+  it("Continue locally opens a running local install directly", async () => {
+    const setup = makeSetup({
+      installed: true,
+      recentServers: ["https://team.example.com/", "http://127.0.0.1:6767/"],
+    });
+    render(<ServerSelectorV2 setup={setup} />);
+    fireEvent.click(screen.getByRole("button", { name: "Continue locally" }));
+    await waitFor(() =>
+      expect(setup.onConnect).toHaveBeenCalledWith("http://127.0.0.1:6767/", expect.any(Function)),
+    );
+    expect(setup.onStartLocal).not.toHaveBeenCalled();
+  });
+
+  it("Continue locally starts a stopped local install", async () => {
+    const setup = makeSetup({
+      installed: true,
+      recentServers: ["http://127.0.0.1:6767/"],
+      onCheckServer: vi.fn().mockResolvedValue({ status: "unreachable" }),
+    });
+    render(<ServerSelectorV2 setup={setup} />);
+    fireEvent.click(screen.getByRole("button", { name: "Continue locally" }));
+    expect(await screen.findByText(/starting the local server/i)).toBeInTheDocument();
+    await waitFor(() => expect(setup.onStartLocal).toHaveBeenCalledOnce());
+    expect(setup.onConnect).not.toHaveBeenCalled();
+  });
+
+  it("Join your team can't start while the Continue locally probe is pending", async () => {
+    let resolveCheck: (check: { status: "unreachable" }) => void = () => {};
+    const setup = makeSetup({
+      installed: true,
+      recentServers: ["https://team.example.com/", "http://127.0.0.1:6767/"],
+      onConnect: vi.fn(() => new Promise<never>(() => {})),
+      // Defer the landing's probe; the terminal step's re-check finds it down.
+      onCheckServer: vi
+        .fn()
+        .mockImplementationOnce(
+          () =>
+            new Promise((resolve) => {
+              resolveCheck = resolve;
+            }),
+        )
+        .mockResolvedValue({ status: "unreachable" }),
+    });
+    render(<ServerSelectorV2 setup={setup} />);
+    fireEvent.click(screen.getByRole("button", { name: "Continue locally" }));
+    const join = screen.getByRole("button", { name: "Join your team (team.example.com)" });
+    expect(join).toBeDisabled();
+    fireEvent.click(join);
+    await act(async () => resolveCheck({ status: "unreachable" }));
+    // Only the local flow ran: no team connect for it to override.
+    expect(setup.onConnect).not.toHaveBeenCalled();
+    await waitFor(() => expect(setup.onStartLocal).toHaveBeenCalledOnce());
+  });
+
+  it("Continue locally can't start while a team connect is pending", async () => {
+    const setup = makeSetup({
+      installed: true,
+      recentServers: ["https://team.example.com/", "http://127.0.0.1:6767/"],
+      onConnect: vi.fn(() => new Promise<never>(() => {})),
+      onCheckServer: vi.fn().mockResolvedValue({ status: "unreachable" }),
+    });
+    render(<ServerSelectorV2 setup={setup} />);
+    fireEvent.click(screen.getByRole("button", { name: "Join your team (team.example.com)" }));
+    const local = screen.getByRole("button", { name: "Continue locally" });
+    expect(local).toBeDisabled();
+    fireEvent.click(local);
+    await act(async () => {});
+    expect(setup.onCheckServer).not.toHaveBeenCalled();
+    expect(setup.onStartLocal).not.toHaveBeenCalled();
+    expect(screen.getByRole("heading", { name: "Meet Omnigent" })).toBeInTheDocument();
+  });
+
+  it("a failed Continue locally connect shows its error on the landing and allows a retry", async () => {
+    const setup = makeSetup({
+      installed: true,
+      recentServers: ["https://team.example.com/", "http://127.0.0.1:6767/"],
+      onConnect: vi.fn().mockResolvedValue({ error: "Could not open the local server" }),
+    });
+    render(<ServerSelectorV2 setup={setup} />);
+    fireEvent.click(screen.getByRole("button", { name: "Continue locally" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Could not open the local server");
+    const local = screen.getByRole("button", { name: "Continue locally" });
+    expect(local).toBeEnabled();
+    fireEvent.click(local);
+    await waitFor(() => expect(setup.onConnect).toHaveBeenCalledTimes(2));
+  });
+
   it("a local install that's down reads 'Start Omnigent' and boots it", async () => {
     const onConnect = vi.fn().mockResolvedValue({});
     const onStartLocal = vi.fn().mockResolvedValue({ ok: true });
@@ -156,6 +253,7 @@ describe("ServerSelectorV2", () => {
           installed: true,
           onStartLocal,
           // Both loopback spellings of the local install get probed.
+          initialStep: "server",
           recentServers: ["http://localhost:6767/", "http://127.0.0.1:6767/"],
           onConnect,
           onCheckServer: vi.fn().mockResolvedValue({ status: "unreachable" }),
@@ -176,6 +274,7 @@ describe("ServerSelectorV2", () => {
       <ServerSelectorV2
         setup={makeSetup({
           installed: true,
+          initialStep: "server",
           recentServers: ["http://localhost:6767/"],
           onConnect,
           onStartLocal,
@@ -197,6 +296,7 @@ describe("ServerSelectorV2", () => {
       <ServerSelectorV2
         setup={makeSetup({
           installed: false,
+          initialStep: "server",
           recentServers: ["http://localhost:6767/"],
           onInstallCli,
           onStartLocal,
@@ -220,6 +320,7 @@ describe("ServerSelectorV2", () => {
       <ServerSelectorV2
         setup={makeSetup({
           installed: true,
+          initialStep: "server",
           recentServers: ["http://localhost:6767/"],
           onConnect,
           onStartLocal,
@@ -852,6 +953,7 @@ describe("ServerSelectorV2", () => {
       { recentServers: ["https://team.example.com/"] },
       () => fireEvent.click(screen.getByRole("button", { name: "Add server" })),
     ],
+    ["returning, local install", { recentServers: ["http://localhost:6767/"] }, openPresetDropdown],
     [
       "returning, MDM presets",
       { connectedBefore: true, managedServers: ["https://team.example.com/"] },
@@ -956,6 +1058,7 @@ describe("onboarding parity", () => {
     async (result, message) => {
       const setup = makeSetup({
         installed: false,
+        initialStep: "server",
         recentServers: ["http://localhost:6767/"],
         onInstallCli: vi.fn().mockResolvedValue({ ok: false, error: "Installer failed" }),
         onConnect: vi.fn().mockResolvedValue(result),
@@ -1035,6 +1138,7 @@ describe("onboarding parity", () => {
     const setup = makeSetup({
       installed: false,
       installSupported: false,
+      initialStep: "server",
       recentServers: ["http://localhost:6767/"],
     });
     render(<ServerSelectorV2 setup={setup} />);

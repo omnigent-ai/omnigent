@@ -9,6 +9,7 @@ function renderLanding(over: Partial<Parameters<typeof LandingStep>[0]> = {}) {
     managedServers: [] as string[],
     recentServers: [] as string[],
     onGetStarted: vi.fn(),
+    onCreateServer: vi.fn(),
     onJoinServer: vi.fn(),
     onJoinManaged: vi.fn(),
     onJoinUrl: vi.fn(),
@@ -31,6 +32,32 @@ describe("LandingStep", () => {
 
     fireEvent.click(screen.getByRole("button", { name: /join your team/i }));
     expect(props.onJoinServer).toHaveBeenCalledOnce();
+  });
+
+  it("with a local install, offers Continue locally beside a team dropdown without it", () => {
+    const props = renderLanding({
+      recentServers: ["http://127.0.0.1:6767/", "https://team.example.com/"],
+      onContinueLocally: vi.fn(),
+    });
+    expect(screen.queryByRole("button", { name: /get started locally/i })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Continue locally" }));
+    expect(props.onContinueLocally).toHaveBeenCalledOnce();
+
+    openDropdown();
+    expect(screen.getAllByRole("menuitemradio").map((i) => i.textContent)).toEqual([
+      "https://team.example.com/",
+    ]);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Create a new server" }));
+    expect(props.onCreateServer).toHaveBeenCalledOnce();
+
+    fireEvent.click(screen.getByRole("button", { name: "Join your team (team.example.com)" }));
+    expect(props.onJoinUrl).toHaveBeenCalledExactlyOnceWith("https://team.example.com/");
+  });
+
+  it("opens the team dropdown when there's nothing to join yet", () => {
+    renderLanding({ recentServers: ["http://127.0.0.1:6767/"], onContinueLocally: vi.fn() });
+    fireEvent.click(screen.getByRole("button", { name: "Join your team" }));
+    expect(screen.getByLabelText("Server URL")).toBeInTheDocument();
   });
 
   it("makes the first preset's split button the only CTA", () => {
