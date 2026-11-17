@@ -336,7 +336,7 @@ async function disconnectHost(cliCommand, serverUrl) {
 async function ensureServerAuth(cliCommand, serverUrl, { onLogin, loginTimeoutMs, signal } = {}) {
   if (signal?.aborted) return { ok: false, canceled: true };
   if (cli.isLoopbackServer(serverUrl)) return { ok: true };
-  const probe = await cli.probeServerAuth(serverUrl);
+  const probe = await cli.probeServerAuth(serverUrl, signal ? { signal } : undefined);
   // Cancelled during the probe: neither report success nor start a login.
   if (signal?.aborted) return { ok: false, canceled: true };
   const managedOmni = cli.cliCommandParts(cliCommand).prefixArgs[0] === "omni";

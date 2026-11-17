@@ -4735,8 +4735,7 @@ function registerIpc() {
     }
     if (runner !== "local" && runner !== "remote") throw new TypeError("unknown runner");
     if (typeof url !== "string") throw new TypeError("connect-runner requires a URL string");
-    // One attempt per window: Cancel, a newer attempt, or closing the window stops it,
-    // wherever it is, and a stopped attempt never signs in or connects the host.
+    // One attempt per window; Cancel, a newer attempt, or closing the window aborts it.
     runnerConnects.get(event.sender)?.abort();
     const controller = new AbortController();
     runnerConnects.set(event.sender, controller);
@@ -4762,6 +4761,7 @@ function registerIpc() {
     // Resolving can probe the network; don't start anything for a stopped attempt.
     if (signal.aborted || event.sender.isDestroyed()) return canceled;
     const log = (line) => {
+      if (signal.aborted) return;
       try {
         event.sender.send("omnigent:runner-connect-log", { line });
       } catch {

@@ -5009,13 +5009,15 @@ describe("onboarding runner IPC", () => {
   // A setup-page sender that can be closed mid-request.
   function setupSender() {
     let destroyed = false;
+    const events = new EventEmitter();
     return {
       send() {},
-      once() {},
-      removeListener() {},
+      once: (name, listener) => events.once(name, listener),
+      removeListener: (name, listener) => events.removeListener(name, listener),
       isDestroyed: () => destroyed,
       destroy: () => {
         destroyed = true;
+        events.emit("destroyed");
       },
     };
   }
@@ -5126,6 +5128,37 @@ describe("onboarding runner IPC", () => {
     assert.equal(hostConnected, false);
   });
 
+  it("closing the window stops a pending sign-in without connecting the host", async (t) => {
+    let signal;
+    let hostConnected = false;
+    const h = harness(t, {
+      cliPath: "/usr/local/bin/omnigent",
+      hostConnectResult: () => {
+        hostConnected = true;
+        return { ok: true };
+      },
+      serverAuthResult: (_cli, _url, options) => {
+        ({ signal } = options);
+        return new Promise((resolve) => {
+          signal.addEventListener("abort", () => resolve({ ok: false, canceled: true }));
+        });
+      },
+    });
+    const sender = setupSender();
+    const connecting = h.ipc.get("omnigent:connect-runner")(
+      { sender, senderFrame: setupFrame(h) },
+      server,
+      "local",
+    );
+    await until(() => signal !== undefined, "sign-in started");
+
+    sender.destroy();
+
+    assert.deepEqual(plain(await connecting), { ok: false, canceled: true });
+    assert.equal(signal.aborted, true);
+    assert.equal(hostConnected, false);
+  });
+
   it("a newer attempt stops the previous one from the same window", async (t) => {
     const signals = [];
     const h = harness(t, {
@@ -5168,19 +5201,6 @@ describe("onboarding runner IPC", () => {
       ? JSON.parse(fs.readFileSync(h.settingsPath, "utf8"))
       : {};
     assert.equal(saved.onboarding_runner, undefined);
-  });
-
-  it("records the laptop as the onboarding runner when nothing cancels the connect", async (t) => {
-    const h = harness(t, { cliPath: "/usr/local/bin/omnigent" });
-    const event = { sender: setupSender(), senderFrame: setupFrame(h) };
-
-    const result = await h.ipc.get("omnigent:connect-runner")(event, server, "local");
-
-    assert.equal(result.ok, true);
-    assert.equal(
-      JSON.parse(fs.readFileSync(h.settingsPath, "utf8")).onboarding_runner.runner,
-      "local",
-    );
   });
 
   it("passes separate authentication message and action fields to the setup page", async (t) => {

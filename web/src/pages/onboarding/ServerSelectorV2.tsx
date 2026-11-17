@@ -345,8 +345,6 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
       errorAction: result.errorAction,
     };
   };
-  // Checked at run time (Retry re-checks): a picked local install that's up opens
-  // that exact URL; one that's down starts like "Get started locally".
   // Bumped per run and on Cancel, so a run the user cancelled can't go on to open the server.
   const terminalRun = useRef(0);
   const cancelTerminal = () => {
@@ -354,6 +352,8 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
     void setup.onCancelRunnerConnect?.();
     setStep(terminalTarget.back);
   };
+  // Checked at run time (Retry re-checks): a picked local install that's up opens
+  // that exact URL; one that's down starts like "Get started locally".
   const runTerminal = async () => {
     setRemoteRunnerFailed(false);
     const run = ++terminalRun.current;
@@ -551,7 +551,11 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
               onRun={runTerminal}
               onSetupLog={terminalRunner ? setup.onRunnerLog : setup.onSetupLog}
               onBack={() => setStep(terminalTarget.back)}
-              onCancel={terminalTarget.kind === "connect" ? cancelTerminal : undefined}
+              onCancel={
+                terminalTarget.kind === "connect" && terminalTarget.runner !== "remote"
+                  ? cancelTerminal
+                  : undefined
+              }
               onConnectAnyway={connectAnyway}
               runningLabel={terminalCopy.label}
               runningHint={terminalCopy.hint}

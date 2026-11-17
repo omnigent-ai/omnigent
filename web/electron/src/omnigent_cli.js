@@ -1108,10 +1108,10 @@ async function probeHostTunnel(serverUrl, hostId, { timeoutMs = 2000 } = {}) {
  * and let the connect attempt raise its own, clearer error. Never throws.
  *
  * @param {string} serverUrl
- * @param {{ timeoutMs?: number }} [opts]
+ * @param {{ timeoutMs?: number, signal?: AbortSignal }} [opts] aborting `signal` ends the probe early.
  * @returns {Promise<{ authed: boolean, reachable: boolean }>}
  */
-async function probeServerAuth(serverUrl, { timeoutMs = 10000 } = {}) {
+async function probeServerAuth(serverUrl, { timeoutMs = 10000, signal } = {}) {
   if (typeof serverUrl !== "string" || serverUrl === "") {
     return { authed: false, reachable: false };
   }
@@ -1123,7 +1123,9 @@ async function probeServerAuth(serverUrl, { timeoutMs = 10000 } = {}) {
     const resp = await fetch(`${base}/v1/me`, {
       headers,
       redirect: "manual",
-      signal: AbortSignal.timeout(timeoutMs),
+      signal: signal
+        ? AbortSignal.any([AbortSignal.timeout(timeoutMs), signal])
+        : AbortSignal.timeout(timeoutMs),
     });
     return { authed: resp.status === 200, reachable: true };
   } catch {
