@@ -13642,6 +13642,7 @@ def _running_child_server_handler(
     child_busy: bool = False,
     delete_posts: list[int] | None = None,
     events_status: int = 200,
+    event_status: str = "buffered",
 ) -> Any:
     """Build a MockTransport handler for a named-mode in-flight-send test.
 
@@ -13651,7 +13652,9 @@ def _running_child_server_handler(
     accidental untracked create is caught. ``events_status`` forces the child's
     /events response code (e.g. 500 to exercise a post failure), and any DELETE
     of the child is recorded in ``delete_posts`` so a test can assert a still-live
-    turn is never torn down.
+    turn is never torn down. ``event_status`` is the disposition the child's
+    /events answers with: ``buffered`` when the message joins a running turn,
+    ``accepted`` when it starts a new one.
     """
 
     async def _handler(request: httpx.Request) -> httpx.Response:
@@ -13687,7 +13690,10 @@ def _running_child_server_handler(
             return httpx.Response(204)
         if request.method == "POST" and path == f"/v1/sessions/{child_id}/events":
             event_posts.append(json.loads(request.content))
-            return httpx.Response(events_status, json={"ok": events_status < 400})
+            return httpx.Response(
+                events_status,
+                json={"ok": events_status < 400, "status": event_status},
+            )
         return httpx.Response(404, json={"error": str(request.url)})
 
     return _handler
@@ -13930,10 +13936,23 @@ async def test_named_send_registers_fresh_when_tracked_turn_already_ended(
         event_posts=event_posts,
         create_posts=create_posts,
         child_busy=True,
+        event_status="accepted",
     )
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    reaped: list[subagent_work._SubagentWorkEntry] = []
     try:
         output = await _run_named_continuation(parent_id, handler)
         work = subagent_work.get_subagent_work(child_id)
+        assert work is not None
+        # The new turn accepted its prompt and reports nothing, so its launch bound
+        # must fire and wake the parent, instead of being exempted as an old turn.
+        assert work.child_start_reported is False
+        assert work.delivered is False
+        subagent_work._session_inboxes_ref[parent_id] = inbox
+        subagent_work.arm_subagent_child_start_timeout(child_id)
+        reaped = subagent_work.reap_stalled_subagent_launches(
+            now=work.created_at + 7200.0, timeout_s=180.0
+        )
     finally:
         subagent_work.unregister_subagent_work(child_id)
         subagent_work._session_inboxes_ref.pop(parent_id, None)
@@ -13943,12 +13962,14 @@ async def test_named_send_registers_fresh_when_tracked_turn_already_ended(
     # A fresh entry is registered under a NEW dispatch id (not the drained one),
     # in "running", so the new turn's completion has a live entry to deliver to.
     assert len(stamped) == 1
-    assert work is not None
     assert work.work_id == stamped[0]
     assert work.work_id != stale_work_id
-    assert work.status == "running"
-    assert work.delivered is False
     assert len(event_posts) == 1
+    assert [entry.child_session_id for entry in reaped] == [child_id]
+    assert work.status == "failed"
+    notice = inbox.get_nowait()
+    assert notice["status"] == "failed"
+    assert "no turn start" in notice["output"]
 
 
 @pytest.mark.asyncio

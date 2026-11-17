@@ -1670,6 +1670,20 @@ async def _record_subagent_receipt(
         )
 
 
+def _message_joined_running_turn(resp: httpx.Response) -> bool:
+    """
+    Return whether a child message POST was buffered into an already-running turn.
+
+    :param resp: Response to the child's ``/events`` message POST.
+    :returns: ``True`` only for the server's ``buffered`` disposition.
+    """
+    try:
+        body = resp.json()
+    except ValueError:
+        return False
+    return isinstance(body, dict) and body.get("status") == "buffered"
+
+
 async def _post_child_message_event(
     server_client: httpx.AsyncClient,
     session_id: str,
@@ -1797,6 +1811,10 @@ async def _send_to_in_flight_child(
             f"Error: failed to steer in-flight sub-agent {agent!r} title {title!r}: "
             f"{msg_resp.status_code} {msg_resp.text[:200]}"
         )
+    # Only a message buffered into a turn that was already running needs no start
+    # report. Any other response means this post started a new turn, which the
+    # launch bound must cover.
+    joined_running_turn = _message_joined_running_turn(msg_resp)
 
     async with _subagent_work.in_flight_send_lock(child_session_id):
         entry = _subagent_work.get_subagent_work(child_session_id)
@@ -1828,8 +1846,7 @@ async def _send_to_in_flight_child(
                 work_id=work_id,
             )
             fresh.status = "running"
-            # The turn was already in flight, so its start report predates this entry.
-            fresh.child_start_reported = True
+            fresh.child_start_reported = joined_running_turn
             # Best-effort dispatch-id stamp for restart recovery only; the
             # in-memory entry above already makes the completion deliverable, so
             # a stamp failure degrades recovery but never live delivery.

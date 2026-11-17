@@ -6886,6 +6886,9 @@ async def _post_missed_turn_start(
         return
     # Resume replay may end this turn concurrently; its terminal edge must win.
     async with _conversation_item_delivery_scope(session_id):
+        # Resume replay may have published this turn's running while this item waited.
+        if turn_id == forwarder_state.running_reported_turn_id:
+            return
         state = read_bridge_state(bridge_dir)
         if (
             state is None

@@ -1098,8 +1098,15 @@ async def test_recovered_running_waits_for_replay_that_ended_the_turn(tmp_path: 
 
 
 @pytest.mark.asyncio
-async def test_live_item_does_not_republish_running_that_resume_reported(tmp_path: Path) -> None:
-    """A live item does not republish the running edge that resume replay already reported."""
+@pytest.mark.parametrize("overlapping", [False, True])
+async def test_live_item_does_not_republish_running_that_resume_reported(
+    tmp_path: Path, overlapping: bool
+) -> None:
+    """A live item does not republish the running edge that resume replay already reported.
+
+    When the item waits behind the replay's delivery scope, the replay's running
+    edge is what it must see before deciding to publish.
+    """
     write_bridge_state(
         tmp_path,
         CodexNativeBridgeState(
@@ -1112,8 +1119,16 @@ async def test_live_item_does_not_republish_running_that_resume_reported(tmp_pat
     )
     client = _RecordingClient()
     state = fwd._CodexForwarderState()
-    locks_token = fwd._conversation_item_locks.set({})
-    try:
+    live_item = {
+        "method": "item/completed",
+        "params": {
+            "threadId": "thread_1",
+            "turnId": "turn_1",
+            "item": {"type": "agentMessage", "id": "item_1", "text": "Working."},
+        },
+    }
+
+    async def replay() -> None:
         await fwd._post_resume_turn_status(
             client,  # type: ignore[arg-type]
             session_id="conv_x",
@@ -1122,21 +1137,28 @@ async def test_live_item_does_not_republish_running_that_resume_reported(tmp_pat
             turns=[{"id": "turn_1", "status": "inProgress", "items": []}],
             forwarder_state=state,
         )
+
+    async def live() -> None:
         await fwd._post_missed_turn_start(
             client,  # type: ignore[arg-type]
             session_id="conv_x",
             bridge_dir=tmp_path,
             thread_id="thread_1",
-            event={
-                "method": "item/completed",
-                "params": {
-                    "threadId": "thread_1",
-                    "turnId": "turn_1",
-                    "item": {"type": "agentMessage", "id": "item_1", "text": "Working."},
-                },
-            },
+            event=live_item,
             forwarder_state=state,
         )
+
+    locks_token = fwd._conversation_item_locks.set({})
+    try:
+        if not overlapping:
+            await replay()
+            await live()
+        else:
+            async with fwd._conversation_item_delivery_scope("conv_x"):
+                waiting = asyncio.create_task(live())
+                await asyncio.sleep(0)
+                await replay()
+            await asyncio.wait_for(waiting, timeout=5.0)
     finally:
         fwd._conversation_item_locks.reset(locks_token)
 
