@@ -4416,8 +4416,6 @@ def register_core_routes(
         )
         native_agent = _native_coding_agent_for_session(updated)
         claude_native = native_agent is not None and native_agent.harness == "claude-native"
-        if claude_native:
-            negotiation["preserve_unconfirmed_model"] = True
         settings_forward_timeout = (
             _CODEX_SETTINGS_FORWARD_TIMEOUT_S if codex_native else _TUI_INJECT_FORWARD_TIMEOUT_S
         )
@@ -4508,10 +4506,17 @@ def register_core_routes(
                 )
         if live_model_change:
             if not combined_model_forward:
+                model_event: dict[str, object] = {
+                    "type": "model_change",
+                    "model": updated.model_override,
+                    **negotiation,
+                }
+                if claude_native:
+                    model_event["preserve_unconfirmed_model"] = True
                 _model_forward = await _forward_session_change_to_runner(
                     session_id,
                     runner_router,
-                    {"type": "model_change", "model": updated.model_override, **negotiation},
+                    model_event,
                     timeout_s=settings_forward_timeout,
                 )
             # Append a durable [System: model changed to X] note for sessions

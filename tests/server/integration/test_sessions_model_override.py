@@ -834,6 +834,7 @@ async def test_silent_patch_skips_claude_native_forward(
         assert model_forwards_after_user_patch[0][1] == {
             "type": "model_change",
             "model": "claude-opus-4-7",
+            "preserve_unconfirmed_model": True,
         }
 
         # Bind-time PATCH (silent: true): forward suppressed.
