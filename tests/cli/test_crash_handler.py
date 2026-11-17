@@ -675,8 +675,21 @@ def test_issue_url_scrubs_repr_escaped_home(
             "https://example.test/cache//home/example/file",
         ),
         ("/home/example/project", "~/project"),
+        (
+            "https://example.test/cache/file:///home/example/file.py",
+            "https://example.test/cache/file:///home/example/file.py",
+        ),
+        ("/mnt/file:///home/example/file.py", "/mnt/file:///home/example/file.py"),
     ],
-    ids=["mount-prefix", "url-path", "doubled-slash-mount", "doubled-slash-url", "home-itself"],
+    ids=[
+        "mount-prefix",
+        "url-path",
+        "doubled-slash-mount",
+        "doubled-slash-url",
+        "home-itself",
+        "file-url-in-url",
+        "file-url-in-mount",
+    ],
 )
 def test_scrub_keeps_home_text_inside_other_paths(
     monkeypatch: pytest.MonkeyPatch, text: str, expected: str
@@ -690,6 +703,22 @@ def test_scrub_redacts_home_in_file_url(monkeypatch: pytest.MonkeyPatch) -> None
     """A ``file://`` URL to the home directory still exposes it, so it is scrubbed."""
     monkeypatch.setattr(Path, "home", lambda: Path("/home/example"))
     assert ch._scrub("file:///home/example/notes.txt") == "file://~/notes.txt"
+
+
+def test_command_line_keeps_sibling_argument_with_spaces(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An argument naming a sibling directory keeps its quoting, so it is not rewritten."""
+    monkeypatch.setattr(Path, "home", lambda: Path("/home/example"))
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["omnigent", "run", "/home/example backup/config.yaml", "/home/example/app.yaml"],
+    )
+    assert (
+        ch._scrub(ch._command_line())
+        == "omnigent run '/home/example backup/config.yaml' ~/app.yaml"
+    )
 
 
 def test_issue_url_redacts_multiline_bearer_before_truncation(data_dir: Path) -> None:

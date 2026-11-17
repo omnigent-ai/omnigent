@@ -30,6 +30,7 @@ import datetime
 import os
 import platform
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -309,7 +310,7 @@ def _redact(text: str) -> str:
 
 def _command_line() -> str:
     try:
-        return _redact(" ".join(sys.argv))
+        return _redact(shlex.join(sys.argv))
     except Exception:  # noqa: BLE001  pragma: no cover
         return "(unavailable)"
 
@@ -482,9 +483,9 @@ def _scrub(text: str) -> str:
             pattern = (
                 rf"""(?P<quote>['"`]){home_pattern}(?=(?P<suffix>[^\r\n]*?)(?P=quote))"""
                 + "|"
-                # Not inside a longer path or URL (``/mnt/home/user``, ``cache//home/user``);
-                # ``file://`` URLs still point at the home itself.
-                + r"(?:(?<![\w.\-~/])|(?<=file://))"
+                # Not inside a longer path or URL (``/mnt/home/user``, ``cache//home/user``).
+                # A ``file://`` URL to the home directory is the one exception.
+                + r"(?:(?<![\w.\-~/])|(?<=(?<![\w.\-~/])file://))"
                 + home_pattern
                 + r"""(?=$|[/\\\s'"`)\]}>]|[.,;:!?]+(?=$|[\s'"`)\]}>]))"""
             )
