@@ -1,9 +1,13 @@
 # Workspace fast track
 
-The file viewer can read a session's workspace files through the workspace API
-(`omnigent/api/workspace/v1alpha1/workspace.proto`) instead of the REST file
-routes. The session's host answers every call with one implementation
-(`omnigent/host/workspace_service.py`), whichever route carried it.
+The file viewer and the Files tree can read a session's workspace through the
+workspace API (`omnigent/api/workspace/v1alpha1/workspace.proto`) instead of the
+REST file routes: file reads (`ReadFile`) and directory listings
+(`ListDirectory`, including the checks for files mentioned in chat). The
+session's host answers every call with one implementation
+(`omnigent/host/workspace_service.py`), whichever route carried it. Its listings
+match the runner's REST listings; `tests/runner/test_environment_filesystem.py`
+compares them.
 
 ## Routes
 
@@ -116,6 +120,6 @@ source with Rust.
 
 ## Not covered yet
 
-- Files tree listings still use REST.
+- Go to File and content search still use REST.
 - Hosts on other machines with no record and no inferable alias use the server API route.
 - Windows has no direct route.
