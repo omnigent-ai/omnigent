@@ -335,7 +335,6 @@ _TURN_ACTOR_LABEL = "omnigent.turn_actor"
 # via the JSON POST /v1/sessions create — same server-permission posture
 # as _execute_subagent_tool.
 _SESSION_CREATE_TOOLS = frozenset({"sys_session_create"})
-_SESSION_ID_PLACEHOLDER_MAX_CHARS = 64
 
 # Priority 5f.0: Session query tools — peek/list/close/get_info/share. The
 # runner has no in-process ConversationStore, so these read/mutate session
@@ -3819,18 +3818,6 @@ async def _execute_session_create(
         if has_config_path:
             # The bundled create doesn't copy a workflow's plan into the journal.
             return json.dumps({"error": "workflow_id requires agent_id"})
-    session_id_placeholder = args.get("session_id_placeholder")
-    if session_id_placeholder is not None and (
-        not isinstance(session_id_placeholder, str)
-        or not session_id_placeholder.strip()
-        or len(session_id_placeholder) > _SESSION_ID_PLACEHOLDER_MAX_CHARS
-    ):
-        return json.dumps(
-            {
-                "error": "session_id_placeholder must be a nonempty string of at most "
-                f"{_SESSION_ID_PLACEHOLDER_MAX_CHARS} characters"
-            }
-        )
     if has_config_path:
         return await _session_create_from_config_path(
             str(config_path),
@@ -3887,8 +3874,6 @@ async def _execute_session_create(
         info_data: _JsonObject = {}
         # Independent first tasks are delivered after creation, so check the server's
         # limit first rather than leave a session without its task.
-        # The longest first task the server takes; filling in the session ID must stay under it.
-        first_task_max_chars = min(LEGACY_SESSION_MESSAGE_MAX_CHARS, SESSION_MESSAGE_MAX_CHARS)
         long_first_task = (
             placement in ("same_host", "host")
             and isinstance(message, str)
@@ -3905,11 +3890,6 @@ async def _execute_session_create(
             info = await server_client.get("/v1/info", timeout=30.0)
             info.raise_for_status()
             info_data = info.json()
-            advertised_max_chars = info_data.get("session_message_max_chars")
-            if isinstance(advertised_max_chars, int) and not isinstance(
-                advertised_max_chars, bool
-            ):
-                first_task_max_chars = min(advertised_max_chars, SESSION_MESSAGE_MAX_CHARS)
         if long_first_task:
             server_max_chars = info_data.get("session_message_max_chars")
             if not isinstance(server_max_chars, int) or isinstance(server_max_chars, bool):
@@ -4063,16 +4043,9 @@ async def _execute_session_create(
         if placement in ("same_host", "host") and args.get("message"):
             from omnigent.runner.session_message import execute_message_tool
 
-            # The runner sends this message itself, so it can name the new session's ID,
-            # unless that would push the task over the limit; the worker then looks it up.
-            initial_text = args["message"]
-            if session_id_placeholder is not None and isinstance(initial_text, str):
-                filled = initial_text.replace(session_id_placeholder, data["id"])
-                if len(filled) <= first_task_max_chars:
-                    initial_text = filled
             initial_message = json.loads(
                 await execute_message_tool(
-                    {"session_id": data["id"], "message": initial_text},
+                    {"session_id": data["id"], "message": args["message"]},
                     server_client,
                     conversation_id,
                 )
