@@ -422,24 +422,24 @@ describe("chromeCookieStore — import scopes", () => {
     assert.deepEqual(store.cookieScopeCandidates("127.0.0.1"), ["127.0.0.1"]);
   });
 
-  it("keeps an opened site only when the page's tree doesn't cover it", () => {
+  it("keeps an opened site on any host other than the page's", () => {
     assert.equal(
       store.openedSiteScope("idp.example.net", "Workspace.Example.com"),
       "workspace.example.com",
     );
-    assert.equal(store.openedSiteScope("example.com", "files.example.com"), null);
-    assert.equal(store.openedSiteScope("example.com", "example.com"), null);
+    assert.equal(store.openedSiteScope("example.com", "files.example.com"), "files.example.com");
+    assert.equal(store.openedSiteScope("example.com", "Example.com"), null);
     assert.equal(store.openedSiteScope("idp.example.net", undefined), null);
     assert.equal(store.openedSiteScope("idp.example.net", "not a host!"), null);
   });
 
-  it("refuses an opened site inside the page's tree or not a host before reading Chrome", async () => {
+  it("refuses an opened site that is the page's host or not a host before reading Chrome", async () => {
     const touched = [];
     const sentinel = (name) => () => {
       touched.push(name);
       throw new Error(`${name} must not run`);
     };
-    for (const openedHost of ["files.example.com", "not a host!"]) {
+    for (const openedHost of ["example.com", "not a host!"]) {
       // oxlint-disable-next-line no-await-in-loop -- each refusal is checked in turn
       const result = await store.importSiteCookies({
         host: "example.com",
@@ -787,13 +787,38 @@ describe("chromeCookieStore — sqlite3 reader", { skip: !hasSqlite3 }, () => {
         { host: "unrelated.test", cookieCount: 1, openedCookieCount: 2 },
       ]);
 
+      // The opened site's only cookie is a parent-domain one the page's scope
+      // already imports; it adds nothing but is still where the tab goes back.
+      const shared = await store.previewSiteCookies({
+        host: "files.example.com",
+        openedHost: "workspace.example.com",
+        rootDir: root,
+      });
+      assert.equal(shared.openedHost, "workspace.example.com");
+      assert.deepEqual(shared.profiles[0].scopes, [
+        { host: "files.example.com", cookieCount: 2, openedCookieCount: 0 },
+        { host: "example.com", cookieCount: 3, openedCookieCount: 0 },
+      ]);
+
+      // A wider scope can hold all of them, and the page's tree can contain the site.
+      const wider = await store.previewSiteCookies({
+        host: "files.example.com",
+        openedHost: "example.com",
+        rootDir: root,
+      });
+      assert.deepEqual(wider.profiles[0].scopes, [
+        { host: "files.example.com", cookieCount: 2, openedCookieCount: 1 },
+        { host: "example.com", cookieCount: 3, openedCookieCount: 0 },
+      ]);
       const covered = await store.previewSiteCookies({
         host: "example.com",
         openedHost: "files.example.com",
         rootDir: root,
       });
-      assert.equal(covered.openedHost, undefined);
-      assert.deepEqual(covered.profiles[0].scopes, [{ host: "example.com", cookieCount: 3 }]);
+      assert.equal(covered.openedHost, "files.example.com");
+      assert.deepEqual(covered.profiles[0].scopes, [
+        { host: "example.com", cookieCount: 3, openedCookieCount: 0 },
+      ]);
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }

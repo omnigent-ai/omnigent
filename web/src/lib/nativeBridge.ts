@@ -395,7 +395,7 @@ export interface ChromeCookiePreviewResult {
   /** Host whose page asked for the import (main-derived from the real URL). */
   host?: string;
   /** The site this tab opened before a redirect moved it to `host` (main-derived),
-   *  present when Chrome holds cookies for it. */
+   *  present whenever it is another host, even if a scope already holds its cookies. */
   openedHost?: string;
   /** Scopes the user may pick: `host`, then each parent domain Chrome holds
    *  a domain cookie for. */
@@ -414,7 +414,7 @@ export interface ChromeCookieImportResult {
   scope?: string;
   /** The opened site copied alongside `scope`, if any. */
   openedHost?: string;
-  /** Where to send the tab afterwards, set when the opened site was imported. */
+  /** Where to send the tab afterwards, set when the opened site was included. */
   openedUrl?: string;
   profileId?: string;
   profileName?: string;

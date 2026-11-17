@@ -831,16 +831,19 @@ Scope is deliberately narrow:
   `blogspot.com`) that reads every tenant's cookies for the suffix; the dialog
   names the scope before anything is read, and the user has to confirm.
 - When a sign-in redirect moved the tab to another site (an IdP challenge), the
-  dialog also offers the site the tab opened, checked by default. Main tracks
-  that site from the view's own navigations, never from the renderer: an
-  address-bar or agent load, a back/forward step, or a navigation within five
-  seconds of a click or key press in the page sets it when it reaches another
-  host, while redirects and page-driven loads keep it. Only the cookies Chrome
-  sends to that host itself are read (its host-only cookies and the domain
-  cookies that reach it, not its subdomains'). The native prompt names it,
-  `beforeWrite` re-checks it, and afterwards the tab goes back to the opened
-  address instead of reloading the sign-in page, which would only repeat its
-  challenge.
+  dialog also offers the site the tab opened, checked by default. Only a load
+  the pane asks main for (the address bar, an agent, or a link opened from the
+  app) sets that site, once the load commits; the page can't choose it. Server
+  and page redirects keep it, and so do sign-in steps on the same host. Any
+  other way of leaving its host clears it, including a page navigation within
+  five seconds of a click or key press, a back/forward step, or a popup loaded
+  into the tab. Only the cookies Chrome sends to that host itself are read (its
+  host-only cookies and the domain cookies that reach it, not its subdomains'),
+  minus those the picked scope already copies. The site is offered even when
+  that leaves none, because afterwards the tab goes back to the opened address
+  instead of reloading the sign-in page, which would only repeat its challenge.
+  The native prompt names it when it adds cookies, and `beforeWrite` re-checks
+  it.
 - `browser-chrome-cookie-preview` reports only counts and profile names, and
   touches no Keychain, so the confirmation dialog opens without a system prompt.
   The import re-derives the host from the view's own URL main-side and refuses if

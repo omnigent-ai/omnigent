@@ -162,8 +162,8 @@ function cookieInScope(hostKey, scope) {
 }
 
 /**
- * The site a tab opened before it was redirected elsewhere (a sign-in page),
- * when the page's own scope doesn't already cover it; otherwise null.
+ * The site a tab opened before it was redirected elsewhere (a sign-in page), or
+ * null when it isn't a host or is the page's own host.
  *
  * @param {string} pageHost normalized
  * @param {unknown} openedHost
@@ -177,7 +177,7 @@ function openedSiteScope(pageHost, openedHost) {
   } catch {
     return null;
   }
-  return cookieAppliesToScope(normalized, pageHost) ? null : normalized;
+  return normalized === pageHost ? null : normalized;
 }
 
 /** Opened-site rows that `scope` doesn't already import. */
@@ -583,7 +583,7 @@ async function readSafeStoragePassword({ run = execFileAsync } = {}) {
 /**
  * How many of `host`'s cookies each installed Chrome profile holds. No Keychain
  * access, so this is safe to call as soon as the dialog opens. With an
- * `openedHost` outside the page's tree, each scope also counts the cookies
+ * `openedHost` other than the page's host, each scope also counts the cookies
  * Chrome sends to that host which the scope doesn't already include.
  *
  * @param {{ host: string, openedHost?: string, rootDir?: string, run?: Function,
@@ -614,7 +614,6 @@ async function previewSiteCookies({
   const opened = openedSiteScope(normalized, openedHost);
   const profiles = await listChromeProfiles({ rootDir, fsImpl });
   const found = [];
-  let openedHasCookies = false;
   // Profiles can hold different parent-domain cookies, so the picker offers the
   // union; each profile still reports counts only for the scopes it has.
   const offered = new Set();
@@ -647,7 +646,6 @@ async function previewSiteCookies({
         opened,
         nowMs,
       ).length;
-      if (openedCookieCount > 0) openedHasCookies = true;
       return { ...counts, openedCookieCount };
     });
     if (scopeCounts.some((entry) => entry.cookieCount > 0 || entry.openedCookieCount > 0)) {
@@ -665,7 +663,8 @@ async function previewSiteCookies({
   return {
     ok: true,
     host: normalized,
-    ...(openedHasCookies ? { openedHost: opened } : {}),
+    // Offered even when the scope already holds its cookies: the tab still goes back there.
+    ...(opened ? { openedHost: opened } : {}),
     scopes,
     profiles: found,
   };

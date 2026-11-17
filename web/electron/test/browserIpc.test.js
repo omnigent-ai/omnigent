@@ -1224,7 +1224,7 @@ describe("browserIpc — Chrome cookie import", () => {
   });
 
   /** A store whose preview also counts cookies for the site the tab opened. */
-  function stubOpenedSiteStore() {
+  function stubOpenedSiteStore(openedCookieCount = 2) {
     const store = stubStore();
     const preview = store.previewSiteCookies;
     store.previewSiteCookies = async (args) => {
@@ -1235,7 +1235,7 @@ describe("browserIpc — Chrome cookie import", () => {
         openedHost: args.openedHost,
         profiles: result.profiles.map((profile) => ({
           ...profile,
-          scopes: profile.scopes.map((scope) => ({ ...scope, openedCookieCount: 2 })),
+          scopes: profile.scopes.map((scope) => ({ ...scope, openedCookieCount })),
         })),
       };
     };
@@ -1292,6 +1292,32 @@ describe("browserIpc — Chrome cookie import", () => {
     assert.equal(importCall.args.cookiesApi, wc.session.cookies);
   });
 
+  it("goes back to the opened site when the picked scope already holds its cookies", async () => {
+    const store = stubOpenedSiteStore(0);
+    const confirmations = [];
+    const { ipcMain, event } = setupSignInRedirect({
+      chromeCookieStore: store,
+      confirmCookieImport: async (request) => {
+        confirmations.push(request);
+        return true;
+      },
+    });
+    const r = await ipcMain.invoke("omnigent:browser-chrome-cookie-import", event, {
+      conversationId: "conv_1",
+      profileId: "Default",
+      expectedHost: "idp.example.net",
+      openedHost: "workspace.example.com",
+    });
+    assert.equal(r.ok, true);
+    assert.equal(r.openedUrl, "https://workspace.example.com/start");
+    // The prompt names only sites whose cookies are copied.
+    assert.equal(confirmations.length, 1);
+    assert.equal("openedHost" in confirmations[0], false);
+    assert.equal(confirmations[0].cookieCount, 3);
+    const importCall = store.calls.find((call) => call.fn === "import");
+    assert.equal(importCall.args.openedHost, "workspace.example.com");
+  });
+
   it("imports only the page's site unless the opened site is requested", async () => {
     const store = stubOpenedSiteStore();
     const { ipcMain, event } = setupSignInRedirect({ chromeCookieStore: store });
@@ -1325,7 +1351,7 @@ describe("browserIpc — Chrome cookie import", () => {
     assert.match(r.error, /no longer on that site/);
     assert.deepEqual(store.calls, []);
 
-    // Main's own preview found nothing to add for the opened site.
+    // Main's own preview doesn't offer the opened site.
     const empty = stubStore();
     const emptySetup = setupSignInRedirect({ chromeCookieStore: empty, confirmCookieImport });
     const none = await emptySetup.ipcMain.invoke(

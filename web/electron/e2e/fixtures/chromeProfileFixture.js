@@ -55,7 +55,7 @@ function writeChromeProfile(homeDir, cookies) {
     );`,
     ...rows,
   ].join("\n");
-  const result = spawnSync("sqlite3", [cookieDbPath], { input: sql, encoding: "utf8" });
+  const result = spawnSync("/usr/bin/sqlite3", [cookieDbPath], { input: sql, encoding: "utf8" });
   if (result.status !== 0) throw new Error(`sqlite3 failed: ${result.stderr}`);
   return cookieDbPath;
 }

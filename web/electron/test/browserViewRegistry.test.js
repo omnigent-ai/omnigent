@@ -488,19 +488,38 @@ describe("browserViewRegistry — opened site for the Chrome cookie import", () 
   const start = (url, details = {}) => [
     { url, isMainFrame: true, isSameDocument: false, initiator: null, ...details },
   ];
+  const openAndCommit = (tab, url, committedUrl = url) => {
+    tab.registry.openOrNavigate("conv_1", url);
+    tab.emit("did-start-navigation", ...start(url));
+    tab.commit(committedUrl);
+    tab.emit("did-navigate", {}, committedUrl);
+  };
   const signInRedirect = () => {
     const tab = makeEventCapturingRegistry();
-    tab.registry.openOrNavigate("conv_1", "https://workspace.example.com/start");
-    tab.emit("did-start-navigation", ...start("https://workspace.example.com/start"));
-    tab.commit("https://workspace.example.com/login");
+    openAndCommit(
+      tab,
+      "https://workspace.example.com/start",
+      "https://workspace.example.com/login",
+    );
     tab.emit(
       "did-start-navigation",
       ...start("https://idp.example.net/authorize", { initiator: pageFrame }),
     );
     tab.commit("https://idp.example.net/authorize");
+    tab.emit("did-navigate", {}, "https://idp.example.net/authorize");
     return tab;
   };
   const opened = (tab) => tab.registry.get("conv_1").openedSite?.url;
+
+  it("sets the opened site from an explicit open once it commits, through its redirects", () => {
+    const tab = makeEventCapturingRegistry();
+    tab.registry.openOrNavigate("conv_1", "https://workspace.example.com/start");
+    tab.emit("did-start-navigation", ...start("https://workspace.example.com/start"));
+    assert.equal(opened(tab), undefined, "not before the load commits");
+    tab.commit("https://idp.example.net/authorize");
+    tab.emit("did-navigate", {}, "https://idp.example.net/authorize");
+    assert.equal(opened(tab), "https://workspace.example.com/start");
+  });
 
   it("keeps the opened site through page-driven redirects and sign-in steps", () => {
     const tab = signInRedirect();
@@ -520,29 +539,44 @@ describe("browserViewRegistry — opened site for the Chrome cookie import", () 
       "did-start-navigation",
       ...start("https://idp.example.net/verify", { initiator: pageFrame }),
     );
+    tab.emit("did-navigate", {}, "https://idp.example.net/verify");
     assert.equal(opened(tab), "https://workspace.example.com/start");
   });
 
-  it("moves the opened site to another host the user, agent or history opens", () => {
+  it("clears the opened site when the tab leaves its host any other way", () => {
+    const afterInput = (type) => (tab) => {
+      tab.emit("input-event", {}, { type });
+      tab.emit(
+        "did-start-navigation",
+        ...start("https://other.example.org/", { initiator: pageFrame }),
+      );
+    };
     const leave = {
-      "a click in the page": (tab) => {
-        tab.emit("input-event", {}, { type: "mouseDown" });
-        tab.emit(
-          "did-start-navigation",
-          ...start("https://other.example.org/", { initiator: pageFrame }),
-        );
-      },
-      "a back or forward step": (tab) =>
+      "a click in the page": afterInput("mouseDown"),
+      "a key press in the page": afterInput("keyDown"),
+      "a raw key press in the page": afterInput("rawKeyDown"),
+      "a page navigation whose frame is gone": (tab) =>
         tab.emit("did-start-navigation", ...start("https://other.example.org/")),
-      "an older Electron event": (tab) =>
+      "an event without details": (tab) =>
         tab.emit("did-start-navigation", {}, "https://other.example.org/", false, true),
-      "the address bar": (tab) =>
-        tab.registry.openOrNavigate("conv_1", "https://other.example.org/"),
     };
     for (const [name, navigate] of Object.entries(leave)) {
       const tab = signInRedirect();
       navigate(tab);
-      assert.equal(opened(tab), "https://other.example.org/", name);
+      tab.commit("https://other.example.org/");
+      tab.emit("did-navigate", {}, "https://other.example.org/");
+      assert.equal(opened(tab), undefined, name);
+    }
+  });
+
+  it("keeps the earlier opened site when an explicit open never commits", () => {
+    for (const end of ["did-stop-loading", "did-fail-load"]) {
+      const tab = signInRedirect();
+      tab.registry.openOrNavigate("conv_1", "https://files.example.org/report.zip");
+      tab.emit("did-start-navigation", ...start("https://files.example.org/report.zip"));
+      tab.emit(end, {}, -3, "ERR_ABORTED", "https://files.example.org/report.zip", true);
+      tab.emit("did-navigate", {}, "https://idp.example.net/authorize");
+      assert.equal(opened(tab), "https://workspace.example.com/start", end);
     }
   });
 

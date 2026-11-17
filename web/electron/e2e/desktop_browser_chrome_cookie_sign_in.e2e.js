@@ -2,6 +2,7 @@
 
 const { it } = require("node:test");
 const assert = require("node:assert/strict");
+const { execFileSync } = require("node:child_process");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
@@ -14,7 +15,14 @@ const { startSsoSites } = require("./fixtures/ssoSiteFixture");
 const deps = desktopDepsAvailable();
 const FIXTURES = path.join(__dirname, "fixtures");
 const RECORDING = Boolean(process.env.OMNIGENT_DESKTOP_RECORD_DIR);
-const sqliteMissing = !fs.existsSync("/usr/bin/sqlite3") && "missing /usr/bin/sqlite3";
+const sqliteMissing = (() => {
+  try {
+    execFileSync("/usr/bin/sqlite3", ["-json", ":memory:", "SELECT 1"], { stdio: "ignore" });
+    return false;
+  } catch {
+    return "missing /usr/bin/sqlite3 with -json (3.33+)";
+  }
+})();
 
 it(
   "signs in to a workspace with Chrome's cookies imported from its identity provider redirect",
@@ -90,6 +98,12 @@ it(
           `requests ${JSON.stringify(sites.requests)}`,
       );
       assert.equal(landing?.url, sites.workspaceUrl);
+      // The user approved a prompt that named the workspace and counted its cookie.
+      const prompts = await electronApp.evaluate(() => globalThis.cookieImportPrompts);
+      assert.deepEqual(
+        prompts.map(({ host, openedHost, cookieCount }) => ({ host, openedHost, cookieCount })),
+        [{ host: "idp.localhost", openedHost: "workspace.localhost", cookieCount: 2 }],
+      );
     } finally {
       try {
         if (desktop) {

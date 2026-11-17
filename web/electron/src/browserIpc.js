@@ -887,8 +887,8 @@ function registerBrowserIpc({
     return { host: parsed.hostname };
   };
 
-  // The site the user or agent last sent this tab to, which a sign-in redirect
-  // doesn't change. Main-owned, so the renderer can't substitute a site.
+  // The site the user or agent last opened in this tab, which a sign-in redirect
+  // doesn't change. Main-owned, so neither the renderer nor the page can choose it.
   const openedSiteForEntry = (entry) => {
     let parsed;
     try {
@@ -989,14 +989,15 @@ function registerBrowserIpc({
         return { ok: false, error: "That site scope isn't available for this tab." };
       }
       const openedCookieCount = opened ? (offered.openedCookieCount ?? 0) : 0;
-      if (opened && (!preview.openedHost || openedCookieCount === 0)) {
+      if (opened && !preview.openedHost) {
         return { ok: false, error: "That site isn't available for this tab." };
       }
       const openedSite = opened ? { openedHost: preview.openedHost } : {};
       const approved = await confirmCookieImport({
         host: site.host,
         scope: offered.host,
-        ...openedSite,
+        // Named only when it adds cookies; the scope may already hold its session.
+        ...(openedCookieCount > 0 ? openedSite : {}),
         profileName: profile.name,
         cookieCount: offered.cookieCount + openedCookieCount,
         parentWindow: getWindowForEvent(event) ?? null,

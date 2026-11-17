@@ -468,8 +468,7 @@ export function BrowserPane({
     const scope = cookieScopeOptions(preview, cookieProfileId).includes(cookieScope)
       ? cookieScope
       : preview.host;
-    const includeOpened =
-      cookieIncludeOpened && openedSiteCookieCount(preview, cookieProfileId, scope) > 0;
+    const includeOpened = cookieIncludeOpened && Boolean(preview.openedHost);
     setCookieBusy(true);
     try {
       const result = await bridge.browserChromeCookieImport(conversationId, {
@@ -684,6 +683,7 @@ export function BrowserPane({
     cookieProfileId,
     activeCookieScope,
   );
+  const importsOpenedCookies = cookieIncludeOpened && openedCookieCount > 0;
   /** Cookies the selected profile holds for one scope. */
   const countForScope = (scope: string) =>
     selectedCookieProfile?.scopes?.find((entry) => entry.host === scope)?.cookieCount ??
@@ -880,10 +880,12 @@ export function BrowserPane({
             <p className="text-muted-foreground text-xs">
               {countForScope(activeCookieScope)}{" "}
               {countForScope(activeCookieScope) === 1 ? "cookie" : "cookies"} for{" "}
-              {activeCookieScope} and its subdomains. Other sites' cookies stay out of Omnigent
-              entirely.
+              {activeCookieScope} and its subdomains.{" "}
+              {importsOpenedCookies
+                ? `Other sites' cookies, apart from ${cookiePreview?.openedHost}'s, stay out of Omnigent.`
+                : "Other sites' cookies stay out of Omnigent entirely."}
             </p>
-            {openedCookieCount > 0 && (
+            {cookiePreview?.openedHost && (
               <div className="flex items-start gap-2">
                 <Checkbox
                   id={openedSiteCheckboxId}
@@ -891,9 +893,9 @@ export function BrowserPane({
                   onCheckedChange={(checked) => setCookieIncludeOpened(checked === true)}
                 />
                 <label htmlFor={openedSiteCheckboxId} className="cursor-pointer text-sm">
-                  Also import {openedCookieCount} {openedCookieCount === 1 ? "cookie" : "cookies"}{" "}
-                  for {cookiePreview?.openedHost}, the site this tab opened before it was sent to{" "}
-                  {cookiePreview?.host}. The tab goes back there afterwards.
+                  {openedCookieCount > 0
+                    ? `Also import ${openedCookieCount} ${openedCookieCount === 1 ? "cookie" : "cookies"} for ${cookiePreview.openedHost}, the site this tab opened before it was sent to ${cookiePreview.host}. The tab goes back there afterwards.`
+                    : `Go back to ${cookiePreview.openedHost} afterwards, the site this tab opened before it was sent to ${cookiePreview.host}.`}
                 </label>
               </div>
             )}
@@ -911,7 +913,8 @@ export function BrowserPane({
               {/* Agent and user tabs share one jar per conversation: the agent can
                   act as you on this site whether or not it drives this tab. */}
               This conversation's tabs share one cookie jar, including any tab the agent controls,
-              so the agent can act as you on this site while these cookies are loaded.
+              so the agent can act as you on {importsOpenedCookies ? "these sites" : "this site"}{" "}
+              while these cookies are loaded.
             </p>
           </div>
           <DialogFooter>

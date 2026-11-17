@@ -32,8 +32,8 @@ const { agentInputInFlight } = require("./browserInput");
 // Each view is a separate renderer process; the cap bounds memory per window.
 const DEFAULT_CAP = 20;
 
-// Chromium's transient user-activation lifespan: page input this recent makes the
-// next navigation the user's (or agent's), not a page-driven redirect.
+// Chromium's transient user-activation lifespan: a page navigation this soon after
+// input may be the user's, not a sign-in redirect.
 const PAGE_INPUT_NAVIGATION_WINDOW_MS = 5000;
 const PAGE_INPUT_TYPES = new Set(["mouseDown", "keyDown", "rawKeyDown"]);
 
@@ -195,9 +195,10 @@ function createBrowserViewRegistry({
       // Last URL we EXPLICITLY requested (not getURL(), which drifts as the page
       // navigates) — lets openOrNavigate skip reissuing loadURL on a re-mount.
       lastRequestedUrl: "",
-      // { url } of the site the user or agent last sent this tab to; redirects
-      // after that keep it, so the Chrome cookie import can see past a sign-in hop.
+      // { url } of the last explicit open that committed; sign-in redirects keep it,
+      // so the Chrome cookie import can see past them. Pages can't set it.
       openedSite: null,
+      pendingOpenedSite: null,
       lastPageInputAt: 0,
       // Enables navigation guards; renderer IPC always sets it.
       navigationPolicyEnforced: false,
@@ -351,25 +352,38 @@ function createBrowserViewRegistry({
     });
   }
 
-  // Browser-initiated navigations (address bar, history, popup reuse) and ones
-  // right after page input move the opened site when they leave the current host.
+  // Only openOrNavigate's own load sets the opened site, once it commits. Leaving
+  // its host any other way clears it, except a page redirect without recent input.
   function attachOpenedSiteTracker(entry) {
     const wc = entry.view && entry.view.webContents;
     if (!wc || typeof wc.on !== "function") return;
     wc.on("input-event", (_event, input) => {
       if (PAGE_INPUT_TYPES.has(input?.type)) entry.lastPageInputAt = Date.now();
     });
-    // Electron passes a details event (newer) and positional flags (older).
     wc.on("did-start-navigation", (details, positionalUrl, isInPlace, isMainFrame) => {
       if ((details?.isMainFrame ?? isMainFrame) === false) return;
       if (details?.isSameDocument ?? isInPlace) return;
-      const target = details?.url ?? positionalUrl;
-      const driven =
-        !details?.initiator ||
-        Date.now() - entry.lastPageInputAt <= PAGE_INPUT_NAVIGATION_WINDOW_MS;
-      if (driven && hostnameOf(target) !== hostnameOf(wc.getURL?.())) {
-        entry.openedSite = { url: target };
+      const targetHost = hostnameOf(details?.url ?? positionalUrl);
+      const pending = entry.pendingOpenedSite;
+      if (pending && !details?.initiator && targetHost === hostnameOf(pending.url)) return;
+      const pageRedirect =
+        Boolean(details?.initiator) &&
+        Date.now() - entry.lastPageInputAt > PAGE_INPUT_NAVIGATION_WINDOW_MS;
+      if (!pageRedirect && targetHost !== hostnameOf(wc.getURL?.())) {
+        entry.openedSite = null;
+        entry.pendingOpenedSite = null;
       }
+    });
+    wc.on("did-navigate", () => {
+      if (entry.pendingOpenedSite) entry.openedSite = entry.pendingOpenedSite;
+      entry.pendingOpenedSite = null;
+    });
+    // A load that ends without committing (a download, a 204, a blocked redirect) opened nothing.
+    wc.on("did-fail-load", (_event, _code, _description, _url, isMainFrame) => {
+      if (isMainFrame !== false) entry.pendingOpenedSite = null;
+    });
+    wc.on("did-stop-loading", () => {
+      entry.pendingOpenedSite = null;
     });
   }
 
@@ -672,7 +686,7 @@ function createBrowserViewRegistry({
       // drifts with in-page nav — stops a re-mount from refreshing to the initial URL.
       if (created || force || entry.lastRequestedUrl !== url) {
         entry.lastRequestedUrl = url;
-        entry.openedSite = { url };
+        entry.pendingOpenedSite = { url };
         try {
           entry.view.webContents.loadURL(url);
         } catch (e) {

@@ -739,6 +739,16 @@ describe("BrowserPane Chrome cookie import", () => {
       },
     ],
   };
+  const SIGN_IN_IMPORT_RESULT = {
+    ok: true as const,
+    host: SIGN_IN_HOST,
+    openedHost: OPENED_HOST,
+    openedUrl: `https://${OPENED_HOST}/start`,
+    profileId: "Default",
+    imported: 3,
+    skipped: 0,
+    failed: 0,
+  };
   const openedSiteCheckbox = (dialog: HTMLElement) =>
     within(dialog).getByRole("checkbox", {
       name: `Also import 2 cookies for ${OPENED_HOST}, the site this tab opened before it was sent to ${SIGN_IN_HOST}. The tab goes back there afterwards.`,
@@ -747,22 +757,21 @@ describe("BrowserPane Chrome cookie import", () => {
   it("includes the site a sign-in redirect left and goes back there after importing", async () => {
     const bridge = installCookieBridge({
       preview: SIGN_IN_PREVIEW,
-      importResult: {
-        ok: true as const,
-        host: SIGN_IN_HOST,
-        openedHost: OPENED_HOST,
-        openedUrl: `https://${OPENED_HOST}/start`,
-        profileId: "Default",
-        imported: 3,
-        skipped: 0,
-        failed: 0,
-      },
+      importResult: SIGN_IN_IMPORT_RESULT,
     });
     render(<BrowserPane conversationId="conv_opened" />);
 
     fireEvent.click(await screen.findByRole("button", { name: "Import cookies from Chrome" }));
     const dialog = await screen.findByRole("dialog");
     expect(openedSiteCheckbox(dialog)).toBeChecked();
+    expect(
+      within(dialog).getByText(
+        `1 cookie for ${SIGN_IN_HOST} and its subdomains. Other sites' cookies, apart from ${OPENED_HOST}'s, stay out of Omnigent.`,
+      ),
+    ).toBeInTheDocument();
+    expect(
+      within(dialog).getByText(/the agent can act as you on these sites while/),
+    ).toBeInTheDocument();
     fireEvent.click(within(dialog).getByRole("button", { name: "Import cookies" }));
 
     await waitFor(() =>
@@ -792,6 +801,14 @@ describe("BrowserPane Chrome cookie import", () => {
     const dialog = await screen.findByRole("dialog");
     fireEvent.click(openedSiteCheckbox(dialog));
     expect(openedSiteCheckbox(dialog)).not.toBeChecked();
+    expect(
+      within(dialog).getByText(
+        `1 cookie for ${SIGN_IN_HOST} and its subdomains. Other sites' cookies stay out of Omnigent entirely.`,
+      ),
+    ).toBeInTheDocument();
+    expect(
+      within(dialog).getByText(/the agent can act as you on this site while/),
+    ).toBeInTheDocument();
     fireEvent.click(within(dialog).getByRole("button", { name: "Import cookies" }));
 
     await waitFor(() =>
@@ -802,6 +819,54 @@ describe("BrowserPane Chrome cookie import", () => {
       }),
     );
     await waitFor(() => expect(bridge.browserReload).toHaveBeenCalledWith("conv_opened_off"));
+    expect(bridge.browserOpenOrNavigate).not.toHaveBeenCalled();
+  });
+
+  it("goes back to the opened site when the sign-in page's scope already holds its cookies", async () => {
+    const bridge = installCookieBridge({
+      preview: {
+        ...SIGN_IN_PREVIEW,
+        profiles: [
+          {
+            ...SIGN_IN_PREVIEW.profiles[0],
+            scopes: [{ host: SIGN_IN_HOST, cookieCount: 1, openedCookieCount: 0 }],
+          },
+        ],
+      },
+      importResult: SIGN_IN_IMPORT_RESULT,
+    });
+    render(<BrowserPane conversationId="conv_opened_shared" />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Import cookies from Chrome" }));
+    const dialog = await screen.findByRole("dialog");
+    const goBack = within(dialog).getByRole("checkbox", {
+      name: `Go back to ${OPENED_HOST} afterwards, the site this tab opened before it was sent to ${SIGN_IN_HOST}.`,
+    });
+    expect(goBack).toBeChecked();
+    expect(
+      within(dialog).getByText(
+        `1 cookie for ${SIGN_IN_HOST} and its subdomains. Other sites' cookies stay out of Omnigent entirely.`,
+      ),
+    ).toBeInTheDocument();
+    fireEvent.click(within(dialog).getByRole("button", { name: "Import cookies" }));
+
+    await waitFor(() =>
+      expect(bridge.browserChromeCookieImport).toHaveBeenCalledWith("conv_opened_shared", {
+        profileId: "Default",
+        expectedHost: SIGN_IN_HOST,
+        scope: SIGN_IN_HOST,
+        openedHost: OPENED_HOST,
+      }),
+    );
+    await waitFor(() =>
+      expect(bridge.browserOpenOrNavigate).toHaveBeenCalledWith(
+        "conv_opened_shared",
+        `https://${OPENED_HOST}/start`,
+        undefined,
+        { force: true },
+      ),
+    );
+    expect(bridge.browserReload).not.toHaveBeenCalled();
   });
 
   it("offers the page's host and its parent domain, and imports the picked one", async () => {
