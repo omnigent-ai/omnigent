@@ -276,7 +276,7 @@ function KanbanColumn({
       </h2>
       {/* The lane's own scroller; its side padding keeps card rings from clipping. */}
       <ul
-        className="-mx-2 flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto px-2 pt-0.5 pb-2"
+        className="-mx-2 flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto px-2 pt-0.5 pb-2"
         style={{ paddingBottom: overlayClearance }}
       >
         {cards.map((card) => (
