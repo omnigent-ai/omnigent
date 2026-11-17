@@ -56,13 +56,6 @@ is opened or the connect screen is loaded.
 
 ## Managed features
 
-When `databricksInternalFeaturesEnabled` is `true`, macOS apps, including unpackaged
-development, default to V2 onboarding for new and existing profiles. This does not require
-`serverUrls` or a connected server. An explicit selector choice still wins,
-and saved servers still reconnect on launch. Other platforms
-keep the legacy default; `OMNIGENT_SERVER_SELECTOR_V2=1` still
-forces V2.
-
 When `databricksInternalFeaturesEnabled` is `true` **and** the window is
 connected to an eligible HTTPS server, the new-session host picker offers
 **Run on Arca**, which connects the user's Arca instance to the current server

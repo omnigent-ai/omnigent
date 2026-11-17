@@ -13,6 +13,10 @@ import type { SavedWorkflow, WorkflowPagination } from "@/hooks/useSavedWorkflow
 import { cn } from "@/lib/utils";
 import { pickerTriggerClass } from "./pickerStyles";
 
+// Label and placeholder for instructions an automation already saved with its workflow.
+export const WORKFLOW_DETAILS_LABEL = "Additional instructions (optional)";
+export const WORKFLOW_DETAILS_PLACEHOLDER = "Leave empty to run the workflow as saved.";
+
 /**
  * New automation's optional Workflow field: one of the user's saved workflows
  * for each run to follow. Its menu is as wide as the field, so a long
@@ -26,6 +30,7 @@ export function WorkflowField({
   onChange,
   onOpenChange,
   locked = false,
+  runsAsSaved = false,
 }: {
   workflows: readonly SavedWorkflow[];
   pagination?: WorkflowPagination;
@@ -35,8 +40,16 @@ export function WorkflowField({
   onOpenChange?: (open: boolean) => void;
   /** Shows `value` with no menu, so it can't be changed or cleared. */
   locked?: boolean;
+  /** Runs follow `value` with no instructions of their own, so the field says so. */
+  runsAsSaved?: boolean;
 }) {
   const [open, setOpen] = useState(false);
+  const note =
+    runsAsSaved && value ? (
+      <p className="text-sm text-muted-foreground" data-testid="task-workflow-note">
+        Each run follows this workflow as saved.
+      </p>
+    ) : null;
   if (locked && value) {
     return (
       <div className="flex flex-col gap-1.5" data-testid="task-workflow-field">
@@ -52,6 +65,7 @@ export function WorkflowField({
           <WorkflowIcon className="size-3.5 shrink-0" />
           <span className="flex-1 truncate text-left">{value.name}</span>
         </Button>
+        {note}
       </div>
     );
   }
@@ -92,6 +106,7 @@ export function WorkflowField({
           />
         </DropdownMenuContent>
       </DropdownMenu>
+      {note}
     </div>
   );
 }

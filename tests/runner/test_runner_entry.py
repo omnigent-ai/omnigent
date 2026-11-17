@@ -4151,13 +4151,14 @@ async def test_runner_hides_scheduled_task_tools_only_when_server_turns_automati
 
 
 @pytest.mark.asyncio
-async def test_runner_hides_user_inbox_tools_only_when_the_server_turns_them_off(tmp_path):
+async def test_runner_keeps_user_inbox_tools_only_when_the_server_turns_them_on(tmp_path):
     from omnigent.automations_availability import USER_INBOX_HEADER
     from omnigent.tools.manager import ToolManager
     from tests.server.helpers import build_agent_bundle
 
-    bundle = build_agent_bundle("inbox-agent", tool_groups={"user_inbox": True})
-    # "1" is on; no header is an older server, which keeps the tools.
+    # The group is on by default, so a plain agent gets the tools where offered.
+    bundle = build_agent_bundle("inbox-agent")
+    # No header is a server without the Inbox routes, so the tools would only fail.
     gate_headers = [{USER_INBOX_HEADER: "0"}, {USER_INBOX_HEADER: "1"}, {}]
 
     def handler(request):
@@ -4185,7 +4186,7 @@ async def test_runner_hides_user_inbox_tools_only_when_the_server_turns_them_off
         names = {schema["function"]["name"] for schema in ToolManager(spec).get_tool_schemas()}
         return {"sys_user_inbox_post", "sys_user_inbox_list"} <= names
 
-    assert [advertised(result.spec) for result in results] == [False, True, True]
+    assert [advertised(result.spec) for result in results] == [False, True, False]
 
 
 async def test_runner_selection_changes_without_rewriting_cached_bundle(tmp_path):

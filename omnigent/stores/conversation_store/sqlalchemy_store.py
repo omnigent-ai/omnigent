@@ -1577,6 +1577,17 @@ class SqlAlchemyConversationStore(ConversationStore):
                     SqlConversation.id.in_(unique_ids),
                 )
             ).all()
+            current_runs = dict(
+                session.execute(
+                    select(SqlConversationLabel.conversation_id, SqlConversationLabel.value).where(
+                        SqlConversationLabel.workspace_id == current_workspace_id(),
+                        SqlConversationLabel.conversation_id.in_(unique_ids),
+                        SqlConversationLabel.key == SCHEDULED_TASK_RUN_LABEL_KEY,
+                    )
+                )
+                .tuples()
+                .all()
+            )
         if not updated:
             return {}
         with self._session("get_session_activity") as session:
@@ -1615,6 +1626,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 pending_elicitation_count=pending_counts.get(row.id),
                 runner_id=runner_ids.get(row.id),
                 archived=bool(row.archived),
+                current_run_id=current_runs.get(row.id),
             )
         return activity
 

@@ -1580,7 +1580,9 @@ def _load_agent_spec_bundle(
         # Older servers send no header; keep the tools there, as before.
         if resp.headers.get(AUTOMATIONS_HEADER) == "0":
             spec = without_scheduled_task_tools(spec)
-        if resp.headers.get(USER_INBOX_HEADER) == "0":
+        # Servers that predate the Inbox routes send no header either, so the Inbox
+        # tools need the server to turn them on.
+        if resp.headers.get(USER_INBOX_HEADER) != "1":
             spec = without_user_inbox_tools(spec)
         _apply_host_interactive_shells(spec)
     except Exception:

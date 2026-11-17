@@ -292,10 +292,10 @@ def register_agent_routes(
         automations_available = getattr(request.app.state, "automations_available", None)
         if automations_available is not None:
             selection_headers[AUTOMATIONS_HEADER] = "1" if automations_available() else "0"
-        inbox_enabled_for = getattr(request.app.state, "proactive_agent_enabled_for", None)
+        inbox_enabled_for = getattr(request.app.state, "inbox_items_enabled_for", None)
         if inbox_enabled_for is not None:
-            # Evaluate the caller's deployment gate with the root owner's settings;
-            # a failing settings read turns the optional Inbox tools off.
+            # Evaluate the caller's deployment gate for the root owner's Inbox;
+            # a failing check turns the Inbox tools off.
             try:
                 owner = (
                     await asyncio.to_thread(

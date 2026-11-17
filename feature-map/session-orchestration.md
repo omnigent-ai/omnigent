@@ -26,7 +26,9 @@ MCP independent creation.
   another session". `sys_session_list` and `sys_session_get_info` expose
   `created_by_session_id` so managers can identify their workers across restarts;
   `sys_session_list` with `include_archived` also lists archived workers, each
-  marked `archived`.
+  marked `archived`. With `created_by_this_session`, the runner pages the global
+  `sessions` view itself and returns only the caller's workers in one call, up to
+  a scan limit; the `sub_agents` view is then empty.
 - `list-scope`: `sys_session_list`'s global `sessions` view lists only the
   caller's own sessions by default, like the sidebar's My view. Sessions other
   users shared with the caller appear only with `visibility: "shared"` (or
@@ -66,7 +68,14 @@ MCP independent creation.
   `project_name`. Project defaults do not override the worker's agent or placement.
 - `destinations`: Settings → Admin → General → **Nested agent destinations** limits new
   agents to the current host, the current host or a fresh managed sandbox, or
-  any available host. The server enforces the same choice for the composer,
+  any available host. The Admin → General page itself appears whenever the
+  server offers nested agents or Omni Advisor; on an Advisor-only deploy it
+  carries the Advisor workspace switch and no destinations group. Settings →
+  Admin → General → **Omni Advisor** turns the agent off for the whole
+  workspace: every viewer's Settings → General → **Omni Advisor** switch then
+  shows off and locked with a note that an admin turned it off, and the Inbox
+  drops its Omni Advisor tab. Turning it back on restores each viewer's own
+  choice. The server enforces the same choice for the composer,
   uploaded custom agents, direct API calls, MCP, later host launches, and runner reassignment. Failed
   relaunches retain the prior host so restricted sessions can retry. Any available host is the
   behavior-preserving default. For a standalone session in another project, the policy
