@@ -887,6 +887,13 @@ describe("UserBubble command tint", () => {
     expect(screen.getByTestId("message-bubble")).toHaveTextContent("/team fix the bug");
   });
 
+  it("adds no trailing space after a command sent without args", () => {
+    renderScoped(userBubble("/team"), <PublishCommands />);
+    const token = screen.getByText("/team");
+    expect(token).not.toHaveClass("float-left");
+    expect(token.textContent).toBe("/team");
+  });
+
   it("floats the token beside paragraph args but not beside a block", () => {
     const view = renderScoped(userBubble("/team fix it"), <PublishCommands />);
     expect(screen.getByText("/team")).toHaveClass("float-left");

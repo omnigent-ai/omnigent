@@ -1277,7 +1277,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
                       ) : command ? (
                         // Floated so the args' first markdown line flows after the token.
                         <div className="flow-root">
-                          {startsOnOwnLine(command.after) ? (
+                          {command.after.trim() === "" || startsOnOwnLine(command.after) ? (
                             <span className="text-message text-brand-accent">{command.token}</span>
                           ) : (
                             // whitespace-pre keeps the separating space in copied text.
