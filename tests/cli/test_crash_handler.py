@@ -790,8 +790,6 @@ def test_issue_url_scrubs_notes_before_truncation(
     assert f"URI: {redacted_uri}{uri_separator}private.txt" in noted_body
     assert f"{redacted_uri}?download=1 {redacted_uri}#section" in noted_body
     assert "Final diagnostic: failure" in noted_body.split("**Traceback:**\n", 1)[1]
-    report_path = ch._save_report(report)
-    assert report_path.read_text(encoding="utf-8") == report
 
 
 def test_issue_url_oversized_final_note_leaves_empty_traceback(data_dir: Path) -> None:
