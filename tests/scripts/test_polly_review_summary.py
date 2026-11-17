@@ -141,13 +141,26 @@ def test_incomplete_reviews_are_rejected_regardless_of_size(review: str) -> None
 
 
 @pytest.mark.parametrize(
-    ("rationale_lengths", "preceding_paragraph_length"),
-    [(None, 0), ((20000, 45000, 20000), 0), ((3000,) * 30, 59194)],
-    ids=["many-rows", "unequal-rows", "header-boundary"],
+    ("rationale_lengths", "preceding_paragraph_length", "row_indentation"),
+    [
+        (None, 0, ""),
+        ((20000, 45000, 20000), 0, ""),
+        ((3000,) * 30, 59194, ""),
+        (None, 0, "  "),
+        ((70000,), 0, ""),
+    ],
+    ids=[
+        "many-rows",
+        "unequal-rows",
+        "header-boundary",
+        "indented-rows",
+        "oversized-row",
+    ],
 )
 def test_long_review_parts_preserve_all_assessments_and_markdown_context(
     rationale_lengths: tuple[int, ...] | None,
     preceding_paragraph_length: int,
+    row_indentation: str,
 ) -> None:
     rationales = (
         ["Guards the regression without a second setup."] * 1200
@@ -155,8 +168,8 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
         else ["x" * length for length in rationale_lengths]
     )
     rows = "".join(
-        f"| tests/test_parser.py::test_case[{number}] | Empty input é🙂 | Unit | Keep | "
-        f"{rationale} |\n"
+        f"{row_indentation}| tests/test_parser.py::test_case[{number}] | "
+        f"Empty input é🙂 | Unit | Keep | {rationale} |\n"
         for number, rationale in enumerate(rationales)
     )
     review = _REVIEW.replace(
@@ -181,8 +194,23 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
     assert all(comment.count("<details>") == comment.count("</details>") for comment in comments)
     assert sum(comment.count("<!-- polly-reviewed-sha:") for comment in comments) == 1
     assert "<!-- polly-reviewed-sha: " + "a" * 40 + " -->" in comments[0]
-    for row in rows.splitlines():
-        assert sum(comment.count(row) for comment in comments) == 1
+    for row, rationale in zip(rows.splitlines(), rationales, strict=True):
+        if len(rationale.encode("utf-8")) > 60000:
+            expected = _HELPERS["split_table_row"](row.strip().strip("|"))
+            fragments = [
+                _HELPERS["split_table_row"](line.strip().strip("|"))
+                for comment in comments
+                for line in comment.splitlines()
+                if line.lstrip().startswith("|" + expected[0] + "|")
+            ]
+            assert len(fragments) >= 2
+            assert all(len(cells) == 5 and cells[:4] == expected[:4] for cells in fragments)
+            reconstructed = "".join(
+                cells[4].removeprefix(" ").removesuffix(" ") for cells in fragments
+            )
+            assert reconstructed == rationale
+        else:
+            assert sum(comment.count(row) for comment in comments) == 1
     assert len(comments) >= 3
     for part, comment in enumerate(comments[1:], 2):
         assert f"part {part}/{len(comments)}" in comment

@@ -298,7 +298,7 @@ def split_review(review: str, byte_limit: int) -> list[str]:
 
 
 def _markdown_context(text: str) -> tuple[str, str, str]:
-    """Reopen details, fenced code and table headers at a comment boundary."""
+    """Reopen details, fenced code and table context at a comment boundary."""
     details = 0
     fence = ""
     fence_line = ""
@@ -333,6 +333,12 @@ def _markdown_context(text: str) -> tuple[str, str, str]:
         prefix += fence_line + "\n"
         suffix = "\n" + fence + "\n" + suffix
         table_header = ""
+    if table_header and not text.endswith("\n"):
+        cells = split_table_row(previous.strip().strip("|"))
+        if len(cells) == TEST_FIELD_COUNT:
+            prefix += table_header + "|" + "|".join(cells[:-1]) + "| "
+            suffix = " |\n" + suffix
+            table_header = ""
     return prefix, suffix, table_header
 
 
@@ -376,7 +382,7 @@ def review_comments(review: str, *, head_sha: str, run_id: str, run_url: str) ->
             prefix, _, table_header = _markdown_context(before)
             before += chunk
             _, suffix, _ = _markdown_context(before)
-            if chunk.startswith("|"):
+            if chunk.lstrip().startswith("|"):
                 prefix += table_header
             comments.append(wrap(prefix + chunk + suffix, part, len(chunks)))
         overflow = max(len(comment.encode("utf-8")) for comment in comments) - COMMENT_BYTE_LIMIT
