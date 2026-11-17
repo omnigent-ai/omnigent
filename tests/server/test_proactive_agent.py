@@ -15,6 +15,7 @@ import httpx
 import pytest
 import pytest_asyncio
 from fastapi import FastAPI
+from fastapi.routing import APIRoute
 
 from omnigent.db.account_authority import account_authority_scope
 from omnigent.db.utils import builtin_agent_id
@@ -39,6 +40,7 @@ from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.inbox_item_store.sqlalchemy_store import SqlAlchemyInboxItemStore
+from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from omnigent.stores.proactive_agent_settings_store import ProactiveAgentSettingsStore
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
 from tests.server.helpers import FakeSandboxLauncher
@@ -174,6 +176,7 @@ def _app(
     enabled: bool,
     sandbox: bool = True,
     auth_provider: Any = None,
+    permission_store: Any = None,
 ) -> FastAPI:
     artifacts = LocalArtifactStore(str(tmp_path / "artifacts"))
     agents = SqlAlchemyAgentStore(db_uri)
@@ -192,6 +195,7 @@ def _app(
         proactive_agent=lambda: enabled,
         proactive_agent_settings_store=ProactiveAgentSettingsStore(db_uri),
         auth_provider=auth_provider,
+        permission_store=permission_store,
     )
     # The lifespan seeds built-in agents; these tests skip it.
     app.state.seed_builtin_agents = lambda: _ensure_default_agents(agents, artifacts, cache)
@@ -300,6 +304,96 @@ async def test_users_cannot_move_a_task_onto_the_proactive_agent(
     assert store.get(task.id).agent_id == "e" * 32
     assert hidden.status_code == 404
     assert store.get(hidden_id).agent_id == PROACTIVE_AGENT_ID
+
+
+# Bodies that pass validation, so these routes reach their task lookup.
+_PROBE_BODIES: dict[tuple[str, str], dict[str, Any]] = {
+    ("PATCH", "/v1/scheduled-tasks/{scheduled_task_id}"): {"name": "renamed"},
+    ("PUT", "/v1/scheduled-tasks/{scheduled_task_id}/permissions"): {
+        "user_id": "someone@example.com",
+        "level": 1,
+    },
+}
+
+
+_SHARING_USER = "alice@example.com"
+
+
+@pytest_asyncio.fixture()
+async def sharing_client(db_uri: str, tmp_path: Path) -> AsyncIterator[httpx.AsyncClient]:
+    # A permission store takes the automation sharing routes past their 403; it
+    # needs a signed-in user.
+    from omnigent.server.auth import UnifiedAuthProvider
+
+    app = _app(
+        db_uri,
+        tmp_path,
+        enabled=True,
+        auth_provider=UnifiedAuthProvider(source="header", local_single_user=False),
+        permission_store=SqlAlchemyPermissionStore(db_uri),
+    )
+    app.state.seed_builtin_agents()
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
+        headers={"X-Forwarded-Email": _SHARING_USER},
+    ) as c:
+        c.app = app  # type: ignore[attr-defined]
+        yield c
+
+
+async def test_no_scheduled_task_route_reveals_the_proactive_task(
+    sharing_client: httpx.AsyncClient,
+) -> None:
+    # Tasks carry no "hidden" kind: each route must exclude the proactive agent's
+    # task itself, so every route the app registers is checked, including new ones.
+    client = sharing_client
+    app: Any = client.app  # type: ignore[attr-defined]
+    store: Any = app.state.scheduled_task_store
+    await _create_session(client)
+    hidden = store.get(proactive_task_id(_SHARING_USER))
+    assert hidden is not None
+    with account_authority_scope(_SHARING_USER, hidden.account_generation):
+        visible = store.create(
+            uuid.uuid4().hex, "mine", "go", "FREQ=DAILY;BYHOUR=9", _SHARING_USER, "e" * 32, "UTC"
+        )
+    # A failed run with no session, which the automation Inbox lists.
+    for task in (hidden, visible):
+        store.create_run(uuid.uuid4().hex, task.id, "failed", 1, finished_at=2, error="boom")
+    hidden_forms = (hidden.id, str(uuid.UUID(hidden.id)))
+
+    routes = [
+        route
+        for route in app.routes
+        if isinstance(route, APIRoute) and route.path.startswith("/v1/scheduled-tasks")
+    ]
+    # Delete last, so a regression there cannot hide the other routes' results.
+    probes = sorted(
+        ((method, route.path) for route in routes for method in route.methods - {"HEAD"}),
+        key=lambda probe: (probe[0] == "DELETE", probe),
+    )
+    item_probes = [(m, p) for m, p in probes if "{scheduled_task_id}" in p]
+    list_probes = [(m, p) for m, p in probes if "{" not in p and m == "GET"]
+    assert item_probes and list_probes
+
+    for method, path in item_probes:
+        url = path.replace("{scheduled_task_id}", hidden.id).replace(
+            "{target_user_id:path}", "someone@example.com"
+        )
+        resp = await client.request(method, url, json=_PROBE_BODIES.get((method, path)))
+        assert resp.status_code == 404, (method, path, resp.status_code, resp.text)
+
+    for method, path in list_probes:
+        resp = await client.request(method, path)
+        assert resp.status_code == 200, (path, resp.status_code, resp.text)
+        assert not any(form in resp.text for form in hidden_forms), (path, resp.text)
+
+    # The same reads do return the user's own automation and its failure.
+    listed = (await client.get("/v1/scheduled-tasks")).json()["scheduled_tasks"]
+    assert [t["id"] for t in listed] == [visible.id]
+    failures = (await client.get("/v1/scheduled-tasks/inbox")).json()["data"]
+    assert [f["task_id"] for f in failures] == [visible.id]
+    assert store.get(hidden.id).state != "deleted"
 
 
 async def test_provisioning_arms_the_in_process_scheduler(db_uri: str) -> None:
