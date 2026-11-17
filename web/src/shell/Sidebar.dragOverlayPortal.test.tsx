@@ -10,7 +10,7 @@ vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
 // coordinates against the aside's box and drifts away from the cursor whenever
 // the aside sits off (0,0), e.g. while it peeks as a floating card.
 
-import { act, cleanup, fireEvent, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, screen, waitFor } from "@testing-library/react";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import type { Conversation } from "@/hooks/useConversations";
 
@@ -157,12 +157,18 @@ describe("session drag preview portal", () => {
     expect(document.body.querySelector('[class*="max-w-[16rem]"]')).toBeNull();
   });
 
-  it("renders the drag preview under <body>, outside the translated aside", () => {
+  it("renders the drag preview under <body> and keeps row tooltips out of the way", async () => {
+    mockConversations([conv("conv_a"), conv("conv_b")]);
     const { container } = renderSidebar();
+    const target = screen.getByRole("link", { name: "conv_b" });
+    fireEvent.focus(target);
+    await screen.findByRole("tooltip");
 
     const row = screen.getByRole("link", { name: "conv_a" }).closest("li");
     expect(row).not.toBeNull();
     startRowDrag(row!);
+    fireEvent.focus(target);
+    await waitFor(() => expect(screen.queryByRole("tooltip")).toBeNull());
 
     // The preview card is the truncated compact card the overlay draws.
     const card = document.body.querySelector('[class*="max-w-[16rem]"]');

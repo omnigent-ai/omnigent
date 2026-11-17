@@ -6155,6 +6155,7 @@ function ConversationRowImpl({
     listeners: dragListeners,
     setNodeRef: setDragNodeRef,
     isDragging,
+    active: sidebarDrag,
   } = useDraggable({
     id: conversation.id,
     data: {
@@ -6177,6 +6178,8 @@ function ConversationRowImpl({
       isEditing ||
       isProvisionalRow,
   });
+  const { triggerProps: rowHoverTriggerProps, ...rowHoverProps } =
+    useMenuGuardedTooltip(!!sidebarDrag);
   const {
     setNodeRef: setSessionOrderNodeRef,
     isOver: isReorderTarget,
@@ -6532,8 +6535,10 @@ function ConversationRowImpl({
           that same surface so hovering still opens the project flyout. */}
       {selectionMode ? (
         projectFlyoutName ? (
-          <HoverCard openDelay={150} closeDelay={0}>
-            <HoverCardTrigger asChild>{rowLink}</HoverCardTrigger>
+          <HoverCard openDelay={150} closeDelay={0} {...rowHoverProps}>
+            <HoverCardTrigger asChild {...rowHoverTriggerProps}>
+              {rowLink}
+            </HoverCardTrigger>
             <PinnedProjectFlyoutContent
               title={conversation.title ?? conversation.id}
               projectName={projectFlyoutName}
@@ -6547,8 +6552,10 @@ function ConversationRowImpl({
         ) : isMobile ? (
           rowLink
         ) : (
-          <Tooltip>
-            <TooltipTrigger asChild>{rowLink}</TooltipTrigger>
+          <Tooltip {...rowHoverProps}>
+            <TooltipTrigger asChild {...rowHoverTriggerProps}>
+              {rowLink}
+            </TooltipTrigger>
             <SessionTooltipContent
               conversation={conversation}
               hostsById={hostsById}
@@ -6559,10 +6566,12 @@ function ConversationRowImpl({
           </Tooltip>
         )
       ) : projectFlyoutName ? (
-        <HoverCard openDelay={150} closeDelay={0}>
+        <HoverCard openDelay={150} closeDelay={0} {...rowHoverProps}>
           <ContextMenu>
             <ContextMenuTrigger asChild>
-              <HoverCardTrigger asChild>{rowLink}</HoverCardTrigger>
+              <HoverCardTrigger asChild {...rowHoverTriggerProps}>
+                {rowLink}
+              </HoverCardTrigger>
             </ContextMenuTrigger>
             <ContextMenuContent className="min-w-44">
               <ConversationMenuItems
@@ -6594,11 +6603,13 @@ function ConversationRowImpl({
           </ContextMenuContent>
         </ContextMenu>
       ) : (
-        <Tooltip>
+        <Tooltip {...rowHoverProps}>
           <ContextMenu>
             <ContextMenuTrigger asChild>
               <div className="w-full">
-                <TooltipTrigger asChild>{rowLink}</TooltipTrigger>
+                <TooltipTrigger asChild {...rowHoverTriggerProps}>
+                  {rowLink}
+                </TooltipTrigger>
               </div>
             </ContextMenuTrigger>
             <ContextMenuContent className="min-w-44">
