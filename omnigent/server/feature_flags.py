@@ -54,6 +54,7 @@ class Feature(StrEnum):
     WORKSPACE_DIRECT_ACCESS = "workspace_direct_access"
     WORKSPACE_API_SERVER_ACCESS = "workspace_api_server_access"
     PROACTIVE_AGENT = "proactive_agent"
+    USER_INBOX = "user_inbox"
 
 
 @dataclass(frozen=True)
@@ -274,12 +275,21 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
     ),
     FeatureDefinition(
         feature=Feature.PROACTIVE_AGENT,
-        description="Agent-posted Inbox suggestions and the proactive agent that writes them",
+        description="The proactive agent (Omni Advisor), which posts suggestions to the Inbox",
         owner="server",
         review_by_release="0.25.0",
         # Clients probe proactive_agent_available in GET /v1/info; the settings
-        # decide whether it is enabled.
+        # decide whether it is enabled. It needs user_inbox to post.
         frontend_visible=False,
+    ),
+    FeatureDefinition(
+        feature=Feature.USER_INBOX,
+        description="Agents post items to their owner's Inbox",
+        owner="server",
+        review_by_release="0.26.0",
+        # Clients probe inbox_items_available in GET /v1/info.
+        frontend_visible=False,
+        default_enabled=True,
     ),
 )
 

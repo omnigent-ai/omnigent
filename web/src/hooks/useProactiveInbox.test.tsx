@@ -23,16 +23,13 @@ vi.mock("@/lib/proactiveInbox", async (importActual) => ({
   updateSuggestion: vi.fn(),
 }));
 vi.mock("./useViewerId", () => ({ useViewerId: () => "alice" }));
-vi.mock("./useProactiveAgentSettings", () => ({
-  useProactiveAgentSettings: () => ({ settings: enabled ? { enabled: true } : undefined }),
-}));
 vi.mock("@/components/ui/toast", () => ({ showToast: vi.fn() }));
 
 let client: QueryClient;
 let enabled = true;
 const wrapper = ({ children }: { children: ReactNode }) => (
   <QueryClientProvider client={client}>
-    <CapabilitiesProvider info={FALLBACK_SERVER_INFO}>
+    <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, inbox_items_available: enabled }}>
       <RoutingProvider value={basenamedRouting("/")}>{children}</RoutingProvider>
     </CapabilitiesProvider>
   </QueryClientProvider>
@@ -47,6 +44,7 @@ const item: Suggestion = {
   actions: [],
   media: [],
   sourceSessionId: "s",
+  agentId: "agent",
   status: "unread",
   resolution: "none",
   createdAt: 1,

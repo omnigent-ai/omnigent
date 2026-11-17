@@ -365,6 +365,8 @@ export interface ServerInfo {
    * absent on older servers (off).
    */
   scheduled_task_sharing?: boolean;
+  /** Agents can post items to this caller's Inbox (``/v1/inbox/items``). */
+  inbox_items_available?: boolean;
   /**
    * Automations shared with the viewer can be listed (``/v1/scheduled-tasks/shared``);
    * absent on older servers (off), including some that advertise sharing.
@@ -375,8 +377,6 @@ export interface ServerInfo {
    * whether it is on for them is at ``GET /v1/proactive-agent/settings``.
    */
   proactive_agent_available?: boolean;
-  /** The server has Omni Advisor's prompt and Run now routes; older servers omit it. */
-  proactive_agent_admin_available?: boolean;
   /** Scheduled permissions support native harnesses beyond Claude Code. */
   scheduled_task_harness_settings?: boolean;
   /** Automations accept modes that skip approval; older servers may reject them. */
@@ -750,9 +750,9 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           scheduled_task_projects: data.scheduled_task_projects === true,
           scheduled_task_inbox: data.scheduled_task_inbox === true,
           scheduled_task_sharing: data.scheduled_task_sharing === true,
+          inbox_items_available: data.inbox_items_available === true,
           scheduled_task_shared_with_me: data.scheduled_task_shared_with_me === true,
           proactive_agent_available: data.proactive_agent_available === true,
-          proactive_agent_admin_available: data.proactive_agent_admin_available === true,
           scheduled_task_harness_settings: data.scheduled_task_harness_settings === true,
           scheduled_task_approval_skipping_modes:
             data.scheduled_task_approval_skipping_modes === true,

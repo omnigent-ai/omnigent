@@ -1158,13 +1158,17 @@ tool_groups:
   agent_discovery: false  # sys_agent_get / sys_agent_download / sys_agent_list
   journal: false          # sys_journal_read / _write_plan / _write_status / _write_note, sys_workflow_request_input / _save / _load / _list
   projects: false         # sys_project_* / sys_session_update
+  user_inbox: false       # sys_user_inbox_post / sys_user_inbox_list
 ```
 
 Every group defaults to `true`, so omitting the block changes nothing. Values
 must be booleans and group names must match exactly; a typo fails the load
 rather than silently leaving the group registered. The `journal` group also
 requires the server's `workflows` feature flag, which defaults off; enable it
-with `OMNIGENT_FEATURES=workflows` on the server. Disabling `browser` also
+with `OMNIGENT_FEATURES=workflows` on the server. The `user_inbox` group, which
+posts to and reads the session owner's Inbox, requires the server's `user_inbox`
+feature flag, which defaults on; turn it off with `OMNIGENT_FEATURES=-user_inbox`.
+Disabling `browser` also
 drops the embedded-browser guidance from the composed system prompt, and
 disabling `journal` also drops the `/workflow` and `/save-workflow` skills (see
 [Session journal](session-journal.md)). The block is read the same way from a
