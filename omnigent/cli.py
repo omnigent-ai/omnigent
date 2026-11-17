@@ -9523,8 +9523,9 @@ def _confirm_background_host_alive(record: _HostDaemonRecord) -> None:
 
 
 # The daemon logs each failed tunnel attempt as "Host tunnel disconnected:
-# <reason>. Reconnecting in ..." (``omnigent.host.connect``).
-_TUNNEL_DISCONNECT_RE = re.compile(r"Host tunnel disconnected: (.+?)\. Reconnecting in ")
+# <reason>. Reconnecting in ..." (``omnigent.host.connect``); a reason can span lines.
+_TUNNEL_DISCONNECT_PREFIX = "Host tunnel disconnected: "
+_TUNNEL_DISCONNECT_SUFFIX = ". Reconnecting in "
 _SERVER_SIDE_TUNNEL_FAILURE_RE = re.compile(
     r"server rejected WebSocket connection: HTTP 5\d\d|timed out during handshake"
 )
@@ -9562,9 +9563,14 @@ def _server_side_tunnel_failure(log_path: str | None) -> str | None:
         return None
     # Other loggers can push the latest tunnel attempt out of the displayed tail.
     tail = _background_host_log_tail(Path(log_path), max_bytes=64 * 1024)
-    reasons = _TUNNEL_DISCONNECT_RE.findall(tail)
-    if reasons and _SERVER_SIDE_TUNNEL_FAILURE_RE.fullmatch(reasons[-1]):
-        return reasons[-1]
+    start = tail.rfind(_TUNNEL_DISCONNECT_PREFIX)
+    if start < 0:
+        return None
+    reason, found, _ = tail[start + len(_TUNNEL_DISCONNECT_PREFIX) :].partition(
+        _TUNNEL_DISCONNECT_SUFFIX
+    )
+    if found and _SERVER_SIDE_TUNNEL_FAILURE_RE.fullmatch(reason):
+        return reason
     return None
 
 

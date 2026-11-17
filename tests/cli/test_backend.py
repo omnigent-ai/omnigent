@@ -1232,6 +1232,13 @@ def test_registration_timeout_names_server_side_tunnel_failure_and_skips_stale_h
             ],
             id="latest-attempt-401",
         ),
+        pytest.param(
+            [
+                "server rejected WebSocket connection: HTTP 504",
+                "registration failed: Traceback (most recent call last):\n  RuntimeError: boom",
+            ],
+            id="latest-attempt-multiline",
+        ),
     ],
 )
 def test_registration_timeout_keeps_stale_host_hint_when_server_answers(
