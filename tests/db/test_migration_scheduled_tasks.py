@@ -23,6 +23,7 @@ from alembic import command
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import DBAPIError, IntegrityError
 
+from omnigent.db.cockroachdb import _crdb_server_version, _prepare_crdb_schema_transaction
 from omnigent.db.db_models import SqlScheduledTask, SqlScheduledTaskRun, SqlScheduledTaskShare
 from omnigent.db.utils import (
     _build_alembic_config,
@@ -42,6 +43,8 @@ _COMMENT_ANCHOR_REVISION = "f9b3e6c2a401"
 _MCP_SERVICES_MERGE_REVISION = "a7d4c2e9f610"
 _KIND_PREVIOUS = "b4e2d7a91c35"
 _KIND_REVISION = "27d16059fab9"
+_TIMER_KIND_PREVIOUS = "f7c2d8a4b901"
+_TIMER_KIND_REVISION = "128fa36ead42"
 _SHARES_PREVIOUS = "a7d4c2e9f610"
 _SHARES_REVISION = "a8be64286ffc"
 _SCHEMA_PATHS = [
@@ -291,6 +294,13 @@ def test_expected_indexes(db_engine: Engine) -> None:
         "workspace_id",
         "id",
     ]
+    assert scheduled_tasks_idx_cols["ix_scheduled_tasks_kind_session"] == [
+        "kind",
+        "state",
+        "workspace_id",
+        "session_id",
+        "id",
+    ]
     assert "ix_scheduled_tasks_agent_id" not in scheduled_tasks_idx
     # The separate created_at + user_id listing indexes were folded into the
     # single user-scope index above: with the user_id filter pushed into SQL the
@@ -422,7 +432,7 @@ def test_session_mode_check_rejects_bad_code(db_engine: Engine) -> None:
 
 @pytest.mark.parametrize("db_engine", _SCHEMA_PATHS, indirect=True)
 def test_kind_check_rejects_bad_code(db_engine: Engine) -> None:
-    """Migrated and model-built ``kind`` CHECKs both reject codes outside 1-2."""
+    """Migrated and model-built ``kind`` CHECKs both reject codes outside 1-3."""
     tasks = sa.Table("scheduled_tasks", sa.MetaData(), autoload_with=db_engine)
     # MySQL reports CHECK violations as OperationalError (3819).
     with pytest.raises((IntegrityError, sa.exc.OperationalError)), db_engine.begin() as conn:
@@ -434,7 +444,7 @@ def test_kind_check_rejects_bad_code(db_engine: Engine) -> None:
                 rrule="FREQ=DAILY;BYHOUR=9",
                 agent_id=b"g" * 16,
                 timezone="UTC",
-                kind=3,
+                kind=4,
                 created_at=1,
             )
         )
@@ -1160,6 +1170,86 @@ def test_kind_migration_makes_existing_tasks_automations_and_round_trips(
         command.upgrade(config, _KIND_REVISION)
     with engine.begin() as conn:
         assert conn.execute(sa.select(tasks.c.kind)).scalars().all() == [1, 1]
+
+
+def test_timer_kind_migration_round_trips(dispatch_migration_engine: Engine) -> None:
+    engine = dispatch_migration_engine
+    config = _build_alembic_config(engine.url.render_as_string(hide_password=False))
+    command.upgrade(config, _TIMER_KIND_PREVIOUS)
+    tasks = sa.Table("scheduled_tasks", sa.MetaData(), autoload_with=engine)
+    values = {
+        "name": "check-in",
+        "prompt": b"p",
+        "rrule": "FREQ=MINUTELY;INTERVAL=10",
+        "agent_id": b"g" * 16,
+        "timezone": "UTC",
+        "created_at": 1,
+    }
+    # MySQL reports CHECK violations as OperationalError (3819).
+    with pytest.raises((IntegrityError, sa.exc.OperationalError)), engine.begin() as conn:
+        conn.execute(tasks.insert().values(id=b"t" * 16, kind=3, **values))
+    with engine.begin() as conn:
+        config.attributes["connection"] = conn
+        command.upgrade(config, _TIMER_KIND_REVISION)
+    with engine.begin() as conn:
+        conn.execute(tasks.insert().values(id=b"t" * 16, kind=3, **values))
+        # Cancelled timers waiting for cleanup, more than one cleanup batch of them,
+        # and a one-shot timer that fired.
+        conn.execute(
+            tasks.insert(),
+            [{"id": uuid4().bytes, "kind": 3, "state": 3, **values} for _ in range(201)],
+        )
+        conn.execute(tasks.insert().values(id=b"f" * 16, kind=3, state=4, **values))
+        conn.execute(tasks.insert().values(id=b"a" * 16, kind=1, **values))
+
+    def downgrade() -> None:
+        with engine.connect() as conn:
+            if engine.dialect.name == "cockroachdb":
+                _prepare_crdb_schema_transaction(conn, _crdb_server_version(engine))
+            config.attributes["connection"] = conn
+            command.downgrade(config, _TIMER_KIND_PREVIOUS)
+            conn.commit()
+
+    with pytest.raises(RuntimeError, match="Delete active or paused timer"):
+        downgrade()
+    with engine.begin() as conn:
+        conn.execute(tasks.update().where(tasks.c.id == b"t" * 16).values(state=3))
+    updates: list[str] = []
+
+    def inspect_cleanup(conn, _cursor, statement, _parameters, _context, _executemany) -> None:
+        if statement.startswith("UPDATE scheduled_tasks"):
+            updates.append(statement)
+            if engine.dialect.name != "cockroachdb":
+                assert conn.get_execution_options().get("isolation_level") == "AUTOCOMMIT"
+        elif statement.startswith("SELECT scheduled_tasks.workspace_id, scheduled_tasks.id"):
+            assert "LIMIT" in statement
+
+    sa.event.listen(engine, "before_cursor_execute", inspect_cleanup)
+    try:
+        downgrade()
+    finally:
+        sa.event.remove(engine, "before_cursor_execute", inspect_cleanup)
+    assert len(updates) == 2
+    assert "ix_scheduled_tasks_kind_session" not in {
+        index["name"] for index in sa.inspect(engine).get_indexes("scheduled_tasks")
+    }
+    with pytest.raises((IntegrityError, sa.exc.OperationalError)), engine.begin() as conn:
+        conn.execute(tasks.insert().values(id=b"x" * 16, kind=3, **values))
+    with engine.begin() as conn:
+        rows = conn.execute(sa.select(tasks.c.kind, tasks.c.state)).tuples().all()
+    # Finished and deleted timers are left as deleted automations for cleanup to purge.
+    assert sorted(rows) == [(1, 1)] + [(1, 3)] * 203
+    with engine.begin() as conn:
+        config.attributes["connection"] = conn
+        command.upgrade(config, _TIMER_KIND_REVISION)
+
+
+def test_timer_kind_downgrade_requires_live_connection() -> None:
+    config = _build_alembic_config("postgresql://")
+    config.output_buffer = StringIO()
+    with pytest.raises(RuntimeError, match="Downgrade requires a live connection"):
+        command.downgrade(config, f"{_TIMER_KIND_REVISION}:{_TIMER_KIND_PREVIOUS}", sql=True)
+    assert "ALTER TABLE" not in config.output_buffer.getvalue()
 
 
 @pytest.mark.parametrize(

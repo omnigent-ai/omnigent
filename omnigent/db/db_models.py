@@ -1669,7 +1669,7 @@ class SqlScheduledTask(OmnigentBase):
         CheckConstraint("state IN (1, 2, 3, 4)", name="ck_scheduled_tasks_lifecycle_state"),
         CheckConstraint("execution_target IN (1, 2)", name="ck_scheduled_tasks_execution_target"),
         CheckConstraint("session_mode IN (1, 2)", name="ck_scheduled_tasks_session_mode"),
-        CheckConstraint("kind IN (1, 2)", name="ck_scheduled_tasks_kind"),
+        CheckConstraint("kind IN (1, 2, 3)", name="ck_scheduled_tasks_task_kind"),
         Index("ix_scheduled_tasks_due", "state", "next_run_at", "workspace_id", "id"),
         # Covers a user's task listing ordered by creation time.
         Index(
@@ -1681,6 +1681,10 @@ class SqlScheduledTask(OmnigentBase):
         ),
         # Pages one agent's tasks across owners, e.g. every proactive-agent task.
         Index("ix_scheduled_tasks_agent", "workspace_id", "agent_id", "id"),
+        # Counts a session's active timers, and finds timers across workspaces.
+        Index(
+            "ix_scheduled_tasks_kind_session", "kind", "state", "workspace_id", "session_id", "id"
+        ),
     )
 
 
