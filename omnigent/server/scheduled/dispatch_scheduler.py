@@ -694,15 +694,19 @@ class PersistentTaskScheduler:
             or now - task.next_run_at <= TIMER_LAST_FIRING_GRACE_SECONDS
         ):
             return False
+        # The cursor can name an earlier missed firing; nothing comes after now, so a
+        # firing after the grace window's start is the last one, and it isn't late.
+        if await self._next_occurrence(task, now - TIMER_LAST_FIRING_GRACE_SECONDS) is not None:
+            return False
         with workspace_scope(task.workspace_id):
             completed = await asyncio.to_thread(
                 self._store.skip_scheduled_occurrence, task, now=now, next_run_at=None
             )
         _log_event(
             _logger.info,
-            "Dropped the last firing of timer %s, due %s seconds ago",
+            "Dropped timer %s's last firing, found more than %s seconds after its time",
             task.id,
-            now - task.next_run_at,
+            TIMER_LAST_FIRING_GRACE_SECONDS,
             extra=debug_event(
                 "scheduled_run_skipped_expired",
                 task_id=task.id,

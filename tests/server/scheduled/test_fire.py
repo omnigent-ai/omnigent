@@ -3903,6 +3903,25 @@ async def test_a_timer_that_cannot_be_cancelled_still_records_its_failed_firing(
 
 
 @pytest.mark.asyncio
+async def test_a_timer_whose_message_cannot_be_sent_records_a_failed_firing() -> None:
+    conv_store = _ExistingConversationStore(_continued_session())
+    store = FakeScheduledTaskStore(rows={"task_1": _timer()})
+
+    async def _unreachable(conv: Any, task: Any) -> None:
+        raise RuntimeError("runner unreachable")
+
+    await build_on_fire(_deps(store, conversation_store=conv_store), launch_dispatch=_unreachable)(
+        0, "task_1"
+    )
+    await _drain()
+
+    assert [(run["status"], run["error_code"]) for run in store.runs] == [
+        ("failed", "launch_failed")
+    ]
+    assert conv_store.created == []
+
+
+@pytest.mark.asyncio
 async def test_a_continued_session_that_cannot_be_stamped_records_a_failed_run() -> None:
     """Without the label, the journal entries could land on another run, so nothing is sent."""
     conv_store = _ExistingConversationStore(_continued_session())

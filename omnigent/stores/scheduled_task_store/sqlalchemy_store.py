@@ -17,6 +17,7 @@ from sqlalchemy.sql.elements import ColumnElement
 from omnigent.db.account_authority import require_active_account
 from omnigent.db.db_models import (
     DEFAULT_WORKSPACE_ID,
+    SqlConversationMetadata,
     SqlHost,
     SqlPreference,
     SqlScheduledTask,
@@ -311,8 +312,15 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
 
         def write(session: Session) -> ScheduledTask:
             generation = require_active_account(session, user_id)
-            if kind == "timer" and _timers_kept(session, session_id) >= TIMERS_PER_SESSION:
-                raise ScheduledTaskSessionTimerCapError(session_id)
+            if kind == "timer":
+                # Locking the session's row makes creates racing for its last place take turns.
+                session.get(
+                    SqlConversationMetadata,
+                    (current_workspace_id(), session_id),
+                    with_for_update=True,
+                )
+                if _timers_kept(session, session_id) >= TIMERS_PER_SESSION:
+                    raise ScheduledTaskSessionTimerCapError(session_id)
             row = SqlScheduledTask(
                 account_generation=generation,
                 id=scheduled_task_id,

@@ -14,6 +14,7 @@ import pytest
 
 from omnigent.db.db_models import current_workspace_id, workspace_scope
 from omnigent.server.scheduled.dispatch_scheduler import (
+    TIMER_LAST_FIRING_GRACE_SECONDS,
     TRIGGER_POLL_SECONDS,
     PersistentTaskScheduler,
     ScheduledTaskDispatchHooks,
@@ -2842,6 +2843,37 @@ async def test_a_repeating_timer_survives_a_restart_and_fires_once_each_time(
     ended = store.get(task.id)
     assert (ended.state, ended.next_run_at) == ("completed", None)
     assert len(store.list_runs(task.id)[0]) == 2
+
+
+@pytest.mark.parametrize(
+    ("late", "delivered"), [(60, True), (TIMER_LAST_FIRING_GRACE_SECONDS + 60, False)]
+)
+async def test_a_timer_back_after_missed_firings_sends_its_last_only_within_the_grace(
+    store, late: int, delivered: bool
+) -> None:
+    task = _task(
+        store,
+        rrule="FREQ=MINUTELY;INTERVAL=10;COUNT=3",
+        session_mode="continue",
+        session_id=uuid.uuid4().hex,
+        kind="timer",
+    )
+    # Stopped before its second firing, the cursor still names the first.
+    last = task.created_at + 3 * 600
+    clock = FakeClock(last + late)
+    fired = []
+
+    async def fire(snapshot, lease):
+        fired.append(lease.run.scheduled_at)
+        await lease.attach_session(snapshot.session_id)
+        await lease.finish("succeeded")
+
+    scheduler = PersistentTaskScheduler(store, fire, AsyncMock(), now=clock.now)
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    assert len(fired) == (1 if delivered else 0)
+    ended = store.get(task.id)
+    assert (ended.state, ended.next_run_at) == ("completed", None)
 
 
 async def test_without_a_busy_check_a_trigger_keeps_its_saved_schedule(store) -> None:

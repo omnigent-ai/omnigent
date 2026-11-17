@@ -235,6 +235,64 @@ def test_a_session_keeps_a_bounded_number_of_timers(store: SqlAlchemyScheduledTa
     keep("st_timer_again")
 
 
+def test_racing_creates_for_a_sessions_last_timer_place_take_turns(
+    store: SqlAlchemyScheduledTaskStore, db_uri: str
+) -> None:
+    import contextlib
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    import sqlalchemy as sa
+
+    from omnigent.db.db_models import SqlConversationMetadata
+    from omnigent.db.utils import get_or_create_engine
+    from omnigent.stores.scheduled_task_store import (
+        TIMERS_PER_SESSION,
+        ScheduledTaskSessionTimerCapError,
+    )
+
+    session_id = _uid("conv_race")
+    engine = get_or_create_engine(db_uri)
+    with engine.begin() as conn:
+        conn.execute(
+            sa.insert(SqlConversationMetadata).values(
+                workspace_id=current_workspace_id(), id=session_id
+            )
+        )
+    # An owner without an account row, so no account lock orders the two creates.
+    fields = _reminder_fields(
+        name="Timer",
+        rrule="FREQ=MINUTELY;INTERVAL=10",
+        kind="timer",
+        session_id=session_id,
+        user_id=None,
+    )
+    for index in range(TIMERS_PER_SESSION - 1):
+        store.create(scheduled_task_id=_uid(f"st_race_{index}"), **fields)
+    # Unlocked, both creates would count nine here before either one inserts.
+    both_counted = threading.Barrier(2, timeout=2)
+
+    def hold_inserts(_conn, _cursor, statement, *_args) -> None:
+        if statement.startswith("INSERT INTO scheduled_tasks"):
+            with contextlib.suppress(threading.BrokenBarrierError):
+                both_counted.wait()
+
+    def create(seed: str) -> bool:
+        try:
+            store.create(scheduled_task_id=_uid(seed), **fields)
+        except ScheduledTaskSessionTimerCapError:
+            return False
+        return True
+
+    sa.event.listen(engine, "before_cursor_execute", hold_inserts)
+    try:
+        with ThreadPoolExecutor(2) as pool:
+            created = list(pool.map(create, ["st_race_a", "st_race_b"]))
+    finally:
+        sa.event.remove(engine, "before_cursor_execute", hold_inserts)
+    assert sorted(created) == [False, True]
+
+
 @pytest.mark.parametrize(
     "arrival", ["on_time", "one_second_early", "at_the_minute", "late", "late_and_exhausted"]
 )
