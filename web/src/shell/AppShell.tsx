@@ -914,10 +914,11 @@ function AppShellImpl() {
     openSessionRow,
     permissionLevel,
   ]);
-  // Read state is personal, so any open session the user can see can be flagged.
-  const readStateRow = activeConv ?? actionConversation;
-  const readStateId = readStateRow?.id;
-  const readStateUpdatedAt = readStateRow?.updated_at;
+  // Read state is personal, so any open top-level session can be flagged,
+  // including a shared one missing from the loaded sidebar rows.
+  const readStateSnapshot = isKnownTopLevel && activeSessionMatchesRoute ? activeSession : null;
+  const readStateId = activeConv?.id ?? readStateSnapshot?.id;
+  const readStateUpdatedAt = activeConv?.updated_at ?? readStateSnapshot?.createdAt;
   const readStateTarget = useMemo<ReadStateTarget | null>(
     () =>
       readStateId !== undefined && readStateUpdatedAt !== undefined

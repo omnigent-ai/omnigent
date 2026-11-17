@@ -6884,6 +6884,32 @@ describe("mark-unread shortcut", () => {
     fireEvent.keyDown(composer, chord);
     expect(isExplicitlyUnread("conv_shared")).toBe(false);
   });
+
+  it("toggles a directly linked shared session that is not in the loaded sidebar rows", () => {
+    resetReadStateForTests();
+    mockConversations([]);
+    useSessionMock.mockReturnValue({
+      session: sessionSnapshot({ id: "conv_linked", permissionLevel: 1 }),
+      isLoading: false,
+      error: null,
+    });
+    renderShell("/c/conv_linked");
+    fireEvent.keyDown(window, { key: "u", code: "KeyU", ctrlKey: true, altKey: true });
+    expect(isExplicitlyUnread("conv_linked")).toBe(true);
+  });
+
+  it("leaves a sub-agent session's read state alone", () => {
+    resetReadStateForTests();
+    mockConversations([]);
+    useSessionMock.mockReturnValue({
+      session: sessionSnapshot({ id: "conv_child", parentSessionId: "conv_parent" }),
+      isLoading: false,
+      error: null,
+    });
+    renderShell("/c/conv_child");
+    fireEvent.keyDown(window, { key: "u", code: "KeyU", ctrlKey: true, altKey: true });
+    expect(isExplicitlyUnread("conv_child")).toBe(false);
+  });
 });
 
 describe("AppShell desktop Close", () => {
