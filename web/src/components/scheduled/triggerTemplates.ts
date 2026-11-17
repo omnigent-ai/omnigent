@@ -8,7 +8,7 @@ import {
   PagerDutyIcon,
   SlackIcon,
 } from "@/components/icons/IntegrationIcons";
-import { parseSavedWorkflowRun } from "@/lib/savedWorkflowRun";
+import { opensWithSavedWorkflowRun, parseSavedWorkflowRun } from "@/lib/savedWorkflowRun";
 
 export type TriggerSource = "jira" | "slack" | "github" | "linear" | "pagerduty";
 
@@ -678,17 +678,20 @@ function slackWorkerPostingInstructions(linkBack: boolean, sessionLink: string):
   return `${POSTING_INSTRUCTIONS}\n${start}Reply in the same thread when you have a useful result or a blocker. Each later reply carries only what is new since your previous reply in that thread${linkBack ? ", without the session link" : ""}.`;
 }
 
+/** Whether `prompt` begins like a prompt rendered from a trigger template. */
+function startsLikeTemplatePrompt(prompt: string): boolean {
+  return TRIGGER_SOURCES.some((source) =>
+    prompt.startsWith(`This automation watches ${triggerServiceName(source)} `),
+  );
+}
+
 /** Separate saved template instructions without guessing at free-form prompts. */
 export function splitTriggerPrompt(prompt: string): {
   userPrompt: string;
   systemPrompt: string | null;
 } {
   const unsplit = { userPrompt: prompt, systemPrompt: null };
-  if (
-    !TRIGGER_SOURCES.some((source) =>
-      prompt.startsWith(`This automation watches ${triggerServiceName(source)} `),
-    )
-  ) {
+  if (!startsLikeTemplatePrompt(prompt)) {
     return unsplit;
   }
   const headings = triggerPromptHeadings(prompt);
@@ -720,6 +723,24 @@ export function splitTriggerPrompt(prompt: string): {
     combineTriggerPrompt(parts.userPrompt, parts.systemPrompt) === prompt
     ? parts
     : unsplit;
+}
+
+/**
+ * Whether the prompt an automation's runs send could run a saved workflow, read as the
+ * server reads it (omnigent/server/scheduled/workflow_automations.py): a trigger's
+ * instructions when its prompt splits, otherwise every place its instructions could start.
+ */
+export function promptMayRunSavedWorkflow(prompt: string): boolean {
+  const body = stripTriggerHeader(prompt);
+  const parts = splitTriggerPrompt(body);
+  if (parts.systemPrompt !== null || !startsLikeTemplatePrompt(body)) {
+    return parseSavedWorkflowRun(parts.userPrompt) !== null;
+  }
+  // Instructions that repeat a heading, for example, keep the prompt from splitting.
+  return body
+    .split(triggerPromptHeadings(body).instructions)
+    .slice(1)
+    .some((section) => opensWithSavedWorkflowRun(section));
 }
 
 /** Keep existing template prompts byte-for-byte when neither part changed. */

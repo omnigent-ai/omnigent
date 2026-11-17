@@ -36,7 +36,8 @@ _WORKFLOW_RUN_OPENING = (
     r"\(ID [0-9a-f]{32}\)\."
 )
 _SAVED_WORKFLOW_RUN = re.compile(_WORKFLOW_RUN_OPENING + r"(?:\n\n[\s\S]*)?")
-# A run opening instructions whose end the prompt doesn't mark.
+# A run's first line, for instructions whose end the prompt doesn't mark. Keep in sync
+# with SAVED_WORKFLOW_RUN_OPENING in web/src/lib/savedWorkflowRun.ts.
 _SAVED_WORKFLOW_RUN_START = re.compile(_WORKFLOW_RUN_OPENING + r"(?:\n|\Z)")
 # What JavaScript's String.prototype.trim removes.
 _JS_WHITESPACE = "\t\n\v\f\r \xa0" + "".join(
@@ -101,7 +102,8 @@ def _instructions_may_start_with_saved_workflow_run(prompt: str) -> bool:
     saved workflow: one opens after any of its instructions headings.
 
     The form reads such a prompt's instructions from its header, which can disagree with
-    the prompt that runs, so this reads every place the instructions could start.
+    the prompt that runs, so this reads every place the instructions could start, as
+    ``promptMayRunSavedWorkflow`` in triggerTemplates.ts does.
     """
     instructions_heading, _ = _headings(prompt)
     return any(

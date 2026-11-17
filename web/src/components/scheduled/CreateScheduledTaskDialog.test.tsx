@@ -7419,26 +7419,51 @@ describe("CreateScheduledTaskDialog workflow", () => {
     expect(updated).toContain(`workflow_id "${WORKFLOW.id}"`);
   });
 
-  it("won't save a workflow into a trigger edited as its prompt that uses one task session", async () => {
-    const view = renderGithubTrigger(false);
-    const saved = renderTriggerPrompt(
-      "github",
-      { ...emptyTriggerFields("github"), scope: "acme/app", instructions: run("") },
-      { placement: "same_host", sessionLink: "", taskSessionMode: "continue" },
-    );
-    reopenTrigger(view, saved, false);
-    expect(screen.getByTestId("task-workflow-task-session-note")).toHaveTextContent(
-      "Remove the workflow to save it.",
-    );
-    expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
+  it.each([
+    {
+      layout: "splits",
+      instructions: run(""),
+      removeWorkflow: () => {
+        fireEvent.pointerDown(screen.getByTestId("task-workflow-trigger"), { button: 0 });
+        fireEvent.click(screen.getByTestId("workflow-picker-clear"));
+        fireEvent.change(screen.getByTestId("task-prompt-input"), {
+          target: { value: "Triage it." },
+        });
+      },
+    },
+    {
+      // Instructions that repeat the heading leave the whole prompt as one field.
+      layout: "won't split",
+      instructions: run("Read the notes under\n\nInstructions for the task session:\nfirst."),
+      removeWorkflow: () => {
+        const input = screen.getByTestId("task-prompt-input") as HTMLTextAreaElement;
+        fireEvent.change(input, { target: { value: input.value.replace(run(""), "Triage it.") } });
+      },
+    },
+  ])(
+    "won't save a workflow into a trigger edited as its prompt that uses one task session, when the prompt $layout",
+    async ({ instructions, removeWorkflow }) => {
+      const view = renderGithubTrigger(false);
+      const saved = renderTriggerPrompt(
+        "github",
+        { ...emptyTriggerFields("github"), scope: "acme/app", instructions },
+        { placement: "same_host", sessionLink: "", taskSessionMode: "continue" },
+      );
+      reopenTrigger(view, saved, false);
+      expect(screen.getByTestId("task-workflow-task-session-note")).toHaveTextContent(
+        "Remove the workflow to save it.",
+      );
+      const submit = screen.getByTestId("create-scheduled-task-submit");
+      expect(submit).toBeDisabled();
+      fireEvent.click(submit);
+      expect(updateMutateAsync).not.toHaveBeenCalled();
 
-    fireEvent.pointerDown(screen.getByTestId("task-workflow-trigger"), { button: 0 });
-    fireEvent.click(screen.getByTestId("workflow-picker-clear"));
-    expect(screen.queryByTestId("task-workflow-task-session-note")).toBeNull();
-    // Without the workflow, the trigger saves with instructions of its own.
-    fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "Triage it." } });
-    await waitFor(() => expect(screen.getByTestId("create-scheduled-task-submit")).toBeEnabled());
-  });
+      // Without the workflow, the trigger saves with instructions of its own.
+      removeWorkflow();
+      expect(screen.queryByTestId("task-workflow-task-session-note")).toBeNull();
+      await waitFor(() => expect(submit).toBeEnabled());
+    },
+  );
 
   it.each(["switching", "clearing"] as const)(
     "moves a trigger edited as its prompt off its old workflow when %s it",

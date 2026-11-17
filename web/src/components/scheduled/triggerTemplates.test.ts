@@ -11,6 +11,7 @@ import {
   emptyTriggerFields,
   jiraAssignee,
   parseGithubReviewer,
+  promptMayRunSavedWorkflow,
   isTaskSessionTriggerPrompt,
   hasTriggerHeader,
   isTriggerPrompt,
@@ -122,6 +123,20 @@ describe("saved trigger prompts", () => {
     expect(
       renderTriggerPrompt("jira", runsWorkflow, { ...supported, taskSessionMode: "continue" }),
     ).not.toContain("workflow_id");
+  });
+
+  it("reads a prompt's saved workflow as the server does, even when it won't split", () => {
+    const unsplittable = `${WORKFLOW_RUN}\n\nInstructions for each session:\nfirst.`;
+    const render = (instructions: string) =>
+      renderTriggerPrompt("jira", fields({ instructions }), CTX);
+    expect(promptMayRunSavedWorkflow(render(WORKFLOW_RUN))).toBe(true);
+    expect(splitTriggerPrompt(render(unsplittable)).systemPrompt).toBeNull();
+    expect(promptMayRunSavedWorkflow(render(unsplittable))).toBe(true);
+    expect(
+      promptMayRunSavedWorkflow(render(unsplittable.replace(WORKFLOW_RUN, "Triage it."))),
+    ).toBe(false);
+    expect(promptMayRunSavedWorkflow(WORKFLOW_RUN)).toBe(true);
+    expect(promptMayRunSavedWorkflow("Summarize overnight activity")).toBe(false);
   });
 
   it("keeps a prompt's creation call on the workflow its instructions now run", () => {

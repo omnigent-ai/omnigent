@@ -79,6 +79,7 @@ import {
   encodeTriggerPrompt,
   hasTriggerHeader,
   isTriggerPrompt,
+  promptMayRunSavedWorkflow,
   readTriggerWorkerPlacement,
   readTriggerMessageMaxChars,
   readTriggerWorkerSettings,
@@ -1113,11 +1114,11 @@ export function CreateScheduledTaskDialog({
     workflowIdSupported,
   );
   // Each run of a saved workflow gets its own new session, whether the workflow was
-  // picked or its message typed, as the server requires.
+  // picked or its message typed; text is read as the server reads it.
   const runsSavedWorkflow =
     trigger !== null
       ? parseSavedWorkflowRun(promptTriggerFields.instructions) !== null
-      : parseSavedWorkflowMessage(freeTextPrompt) !== null;
+      : promptMayRunSavedWorkflow(freeTextPrompt);
   // A trigger keeps its one polling session; only its matches start new ones.
   const workflowNeedsNewSessions =
     runsSavedWorkflow && trigger === null && !isTriggerPrompt(freeTextPrompt);
