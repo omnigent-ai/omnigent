@@ -84,6 +84,7 @@ import { skillInvocationPrefix } from "@/lib/harnessSetup";
 import { isNativeTerminalSession } from "@/lib/nativeCodingAgents";
 import { sideChatSettingsMutationKey, usesNativeSideChatFork } from "@/lib/sideChat";
 import { parentIdFromLabels } from "@/lib/sessionHost";
+import { readOnlyReasonForSessionLabels } from "@/lib/sessionCapabilities";
 import {
   appendReplyQuote,
   removeReplyQuote,
@@ -176,7 +177,7 @@ export function SideChatPane({
   childId: string;
   selectionParentId?: string;
   onStart?: (text: string) => Promise<void>;
-  /** A dead, restored Codex side chat: show the transcript without a composer. */
+  /** Show the transcript without a composer when the viewer cannot edit. */
   readOnly?: boolean;
   /** Display an existing session with its complete history and scoped composer. */
   fullSession?: boolean;
@@ -185,14 +186,16 @@ export function SideChatPane({
 }) {
   const pending = isPendingSideChat(childId);
   const starting = useChatStore((s) => s.sideChatComposers[childId]?.starting ?? false);
-  // The server seals a side chat whose fork died with its runner.
   const {
     session,
     isLoading: sessionLoading,
     error: sessionError,
   } = useSession(pending ? null : childId);
   const { session: draftSource } = useSession(pending ? (selectionParentId ?? null) : null);
-  const readOnly = restoredReadOnly || session?.labels?.["omnigent.closed"] === "true";
+  const readOnly =
+    restoredReadOnly ||
+    (session?.labels?.["omnigent.closed"] === "true" &&
+      readOnlyReasonForSessionLabels(session, null) !== null);
   useLayoutEffect(() => {
     if (!selectionParentId || readOnly || starting) return;
     const target = { childId, parentId: selectionParentId };
@@ -748,7 +751,7 @@ function SideChatComposer({
     textareaRef.current = tailTextareaRef.current;
     if (quote !== undefined || composer?.quotes?.length) tailTextareaRef.current?.focus();
   }, [quote, composer?.quotes?.length]);
-  // Re-read the labels so a side chat the server just sealed turns read-only.
+  // Refresh lifecycle labels after a send or recovery attempt.
   const refreshLabels = useCallback(
     () => void queryClient.invalidateQueries({ queryKey: ["session", childId] }),
     [queryClient, childId],
