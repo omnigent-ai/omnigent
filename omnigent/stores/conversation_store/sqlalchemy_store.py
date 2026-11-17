@@ -3335,7 +3335,13 @@ class SqlAlchemyConversationStore(ConversationStore):
         # Postgres text column never sees a NUL (tool output can embed one, e.g.
         # reading a binary file), which would abort the whole INSERT.
         recovery_candidates: dict[int, NewConversationItem] = {}
+        interruption_notices: set[int] = set()
         for index, item in enumerate(items):
+            if isinstance(item.data, MessageData) and not item.data.user_authored:
+                from omnigent.inner.executor import is_interruption_marker
+
+                if is_interruption_marker({"role": item.data.role, "content": item.data.content}):
+                    interruption_notices.add(index)
             if (
                 isinstance(item.data, MessageData)
                 and item.data.role == "user"
@@ -3475,6 +3481,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                         and item.data.role == "user"
                         and not item.data.is_meta
                         and recovery is not None
+                        and index not in interruption_notices
                     ):
                         # Real input supersedes recovery and any later echo in this batch.
                         _write_session_recovery(session, conversation_id, None)

@@ -1222,3 +1222,31 @@ def test_turn_completion_fences_recovery_in_the_input_database(
     record_turn(store, conv.id, "runner", "first", finished=True)
     assert store.get_session_recovery(conv.id).response_id == "second"
     assert store.get_session_recovery(conv.id).phase == "active"
+
+
+@pytest.mark.parametrize("user_authored", [False, True])
+def test_interruption_notice_preserves_stop_fence(
+    store: SqlAlchemyConversationStore, user_authored: bool
+) -> None:
+    from omnigent.entities import MessageData, NewConversationItem
+    from omnigent.inner.executor import INTERRUPTION_MARKER_TEXT
+    from omnigent.session_recovery import SessionRecovery
+
+    conv = store.create_conversation(host_id="a" * 32, workspace="/workspace", runner_id="runner")
+    state = SessionRecovery("a" * 32, "runner", 100, phase="stopped", response_id="turn")
+    assert store.replace_session_recovery(conv.id, None, state)
+    store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="cancel",
+                data=MessageData(
+                    role="user",
+                    user_authored=user_authored,
+                    content=[{"type": "input_text", "text": INTERRUPTION_MARKER_TEXT}],
+                ),
+            )
+        ],
+    )
+    assert store.get_session_recovery(conv.id) == (None if user_authored else state)
