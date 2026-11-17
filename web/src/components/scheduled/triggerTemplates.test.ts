@@ -1232,7 +1232,7 @@ describe("renderTriggerPrompt", () => {
       expect(manager).not.toContain("Link-back pending:");
       expect(manager).not.toContain('Reply "Omnigent session:');
       const startReply =
-        ":hourglass_flowing_sand: Omnigent is working on it...\n\nTrack progress: [Omni Session](https://omni.example.com/c/CONVERSATION_ID)\nSent with Omnigent\nCall sys_session_get_info";
+        "<slack-reply>\n:hourglass_flowing_sand: Omnigent is working on it...\n\nTrack progress: <https://omni.example.com/c/CONVERSATION_ID|Omni Session>\nSent with Omnigent\n</slack-reply>\nReply in the same thread";
       if (linkBack) {
         expect(worker).toContain(startReply);
       } else {

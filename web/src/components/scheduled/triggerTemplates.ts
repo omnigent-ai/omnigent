@@ -663,7 +663,7 @@ const POSTING_INSTRUCTIONS = `Anything you post for this, such as a comment, rep
 /** How a Slack worker replies: one start reply with its session link, then only new results. */
 function slackWorkerPostingInstructions(linkBack: boolean, sessionLink: string): string {
   const start = linkBack
-    ? `As soon as you start working on a Slack message, reply once in its thread with exactly these lines:\n:hourglass_flowing_sand: Omnigent is working on it...\n\nTrack progress: [Omni Session](${sessionLink})\n${OMNIGENT_ATTRIBUTION}\nCall sys_session_get_info to obtain your session_id and substitute it for ${SESSION_LINK_ID_PLACEHOLDER}. If your Slack tool doesn't render Markdown links, use Slack's <url|Omni Session> form. `
+    ? `As soon as you start working on a Slack message, call sys_session_get_info to obtain your session_id and substitute it for ${SESSION_LINK_ID_PLACEHOLDER} in the link below; if your Slack tool takes Markdown rather than Slack mrkdwn, write the link as [Omni Session](<url>) instead. Then reply once in the message's thread with exactly the lines between <slack-reply> and </slack-reply>, without those marker lines:\n<slack-reply>\n:hourglass_flowing_sand: Omnigent is working on it...\n\nTrack progress: <${sessionLink}|Omni Session>\n${OMNIGENT_ATTRIBUTION}\n</slack-reply>\n`
     : "Do not send an acknowledgement or a session link. ";
   return `${POSTING_INSTRUCTIONS}\n${start}Reply in the same thread when you have a useful result or a blocker. Each later reply carries only what is new since your previous reply in that thread${linkBack ? ", without the session link" : ""}.`;
 }
