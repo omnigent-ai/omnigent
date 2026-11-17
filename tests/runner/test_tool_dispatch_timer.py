@@ -405,3 +405,20 @@ async def test_cancelling_a_kept_timer_goes_to_the_server(
     assert delete.method == "DELETE"
     assert delete.url.path == f"/v1/sessions/{_SESSION}/timers/{_KEPT_TIMER['timer_id']}"
     assert delete.headers[ORCHESTRATION_SOURCE_HEADER] == _SESSION
+
+
+@pytest.mark.parametrize(("spec_timers", "relayed"), [(None, True), (False, False)])
+def test_native_harnesses_get_the_timer_tools_unless_the_spec_turns_them_off(
+    spec_timers: bool | None, relayed: bool
+) -> None:
+    from omnigent.runner.tool_dispatch import build_native_relay_tool_schemas
+    from omnigent.spec.types import AgentSpec
+
+    spec = (
+        AgentSpec(spec_version=1)
+        if spec_timers is None
+        else AgentSpec(spec_version=1, timers=False)
+    )
+    timer_tools = {"sys_timer_set", "sys_timer_cancel"}
+    names = {schema["name"] for schema in build_native_relay_tool_schemas(spec)}
+    assert names & timer_tools == (timer_tools if relayed else set())

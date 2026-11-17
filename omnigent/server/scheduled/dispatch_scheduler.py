@@ -369,6 +369,10 @@ BusyUntil = Callable[[ScheduledTask, int], Awaitable[int | None]]
 # following the trigger's saved schedule.
 TRIGGER_POLL_SECONDS = 2 * 60
 
+# A repeating timer's last firing found later than this after its time, as after an outage,
+# is dropped, so a timer never wakes its session long after its count ends it.
+TIMER_LAST_FIRING_GRACE_SECONDS = 10 * 60
+
 
 class FireIdentityRevoked(Exception):
     """Raised by a ``fire_identity`` when the owner can no longer be acted for.
@@ -675,6 +679,40 @@ class PersistentTaskScheduler:
             return min(occurrence, now + TRIGGER_POLL_SECONDS)
         return occurrence
 
+    async def _drop_late_last_timer_firing(
+        self, task: ScheduledTask, *, now: int, next_run: int | None
+    ) -> bool:
+        """Complete a repeating timer whose last firing is long overdue, recording no run.
+
+        A claim starts delivery right away, and recovery fails a stale run rather than
+        sending it again, so checking here bounds when a timer can still wake its session.
+        """
+        assert task.next_run_at is not None
+        if (
+            next_run is not None
+            or not is_repeating_timer(task)
+            or now - task.next_run_at <= TIMER_LAST_FIRING_GRACE_SECONDS
+        ):
+            return False
+        with workspace_scope(task.workspace_id):
+            completed = await asyncio.to_thread(
+                self._store.skip_scheduled_occurrence, task, now=now, next_run_at=None
+            )
+        _log_event(
+            _logger.info,
+            "Dropped the last firing of timer %s, due %s seconds ago",
+            task.id,
+            now - task.next_run_at,
+            extra=debug_event(
+                "scheduled_run_skipped_expired",
+                task_id=task.id,
+                task_workspace_id=task.workspace_id,
+                scheduled_at=task.next_run_at,
+                completed=completed,
+            ),
+        )
+        return True
+
     async def _skip_busy_occurrence(
         self, task: ScheduledTask, *, now: int, next_run: int | None
     ) -> bool:
@@ -946,6 +984,8 @@ class PersistentTaskScheduler:
                     next_run = await self._next_occurrence(task, now)
                     if self._stopped:
                         return
+                    if await self._drop_late_last_timer_firing(task, now=now, next_run=next_run):
+                        continue
                     if await self._skip_busy_occurrence(task, now=now, next_run=next_run):
                         continue
                     with workspace_scope(task.workspace_id):

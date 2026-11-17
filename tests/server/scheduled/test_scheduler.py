@@ -36,6 +36,7 @@ class _FakeTask:
     workspace_id: int = 0
     session_mode: str = "new"
     execution_target: str = "connected_host"
+    kind: str = "automation"
 
 
 # ── Fakes ────────────────────────────────────────────────────────────────────
@@ -114,6 +115,7 @@ def _task(
     timezone: str = "UTC",
     state: str = "active",
     workspace_id: int = 0,
+    kind: str = "automation",
 ) -> _FakeTask:
     return _FakeTask(
         id=task_id,
@@ -121,6 +123,7 @@ def _task(
         timezone=timezone,
         state=state,
         workspace_id=workspace_id,
+        kind=kind,
     )
 
 
@@ -197,6 +200,19 @@ async def test_start_skips_paused_tasks() -> None:
     )
     await scheduler.start()
     assert scheduler.job_count == 1
+
+
+async def test_timers_wait_for_the_database_scheduler() -> None:
+    # Kept by a server that later turned automations v2 off, eight days after it was set.
+    timer = _task("timer", "FREQ=MINUTELY;INTERVAL=10;COUNT=1008", kind="timer")
+    scheduler, clock, seam, fired = _make([_task("a"), timer])
+    clock.advance(8 * 24 * 3600)
+    await scheduler.start()
+    scheduler.add(_task("later", "FREQ=MINUTELY;INTERVAL=10", kind="timer"))
+    assert scheduler.job_count == 1
+    assert scheduler.next_run_at("timer") is None
+    assert len(seam.live()) == 1
+    assert fired.calls == []
 
 
 async def test_start_skips_bad_rrule_without_crashing() -> None:

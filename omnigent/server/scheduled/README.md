@@ -240,7 +240,12 @@ later. Unlike a trigger's last poll, which is always sent, its last firing is th
 dropped, completing the timer without a run. A running status whose runner is
 gone, or that has shown no activity for an hour (`TIMER_BUSY_SKIP_MAX_SECONDS`),
 doesn't hold it back, and neither does a pending count left by a runner that is
-gone, so a stale status can't stall the check-ins meant to recover it.
+gone, so a stale status can't stall the check-ins meant to recover it. A last
+firing found more than `TIMER_LAST_FIRING_GRACE_SECONDS` after its time, as after
+an outage, is dropped the same way: a claim starts delivery right away, and
+recovery fails a stale run instead of sending it again, so checking at the claim
+bounds when a timer can still wake its session. The legacy in-process scheduler
+never arms a timer; with it, timers wait for the database scheduler.
 
 If the replica stops before recording, recovery finds no session on the run and
 records `failed`; it never resends. A first run of such a task records its

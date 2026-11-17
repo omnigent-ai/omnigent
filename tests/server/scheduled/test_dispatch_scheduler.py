@@ -2833,6 +2833,16 @@ async def test_a_repeating_timer_survives_a_restart_and_fires_once_each_time(
         task.next_run_at + 1200,
     )
 
+    # Back eight days after it was set, past its last firing: it ends without waking anyone.
+    clock.advance(task.created_at + 8 * 24 * 3600 - clock.now())
+    scheduler = restarted(clock)
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    assert fired == [task.next_run_at, task.next_run_at + 600]
+    ended = store.get(task.id)
+    assert (ended.state, ended.next_run_at) == ("completed", None)
+    assert len(store.list_runs(task.id)[0]) == 2
+
 
 async def test_without_a_busy_check_a_trigger_keeps_its_saved_schedule(store) -> None:
     task = _task(
