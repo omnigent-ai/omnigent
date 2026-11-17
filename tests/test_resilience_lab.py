@@ -1,7 +1,8 @@
-"""Mocked readiness checks for native host startup helpers."""
+"""Mocked readiness and failure-evidence checks for native resilience labs."""
 
 from __future__ import annotations
 
+import json
 from contextlib import ExitStack
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,9 +10,14 @@ from unittest.mock import Mock
 
 import httpx
 import pytest
+import yaml
 
 from tests._helpers.server_runner import ServerRunner
-from tests.e2e.resilience.lab.lab import Lab
+from tests.e2e.resilience import conftest as resilience_fixtures
+from tests.e2e.resilience.lab.events import EventLog
+from tests.e2e.resilience.lab.lab import Lab, LabConfig
+from tests.e2e.resilience.lab.observe import Observation, SessionWatcher
+from tests.e2e.resilience.scenarios import _contract
 
 
 @pytest.mark.parametrize(
@@ -216,3 +222,291 @@ def test_runner_readiness_stops_after_health_exhausts_deadline(
     assert requests[0][1]["read"] == 1.0
     assert clock.now == 1.0
     sleep.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "outcome,keep",
+    [
+        ("passed", False),
+        ("failed", False),
+        ("setup-failed", False),
+        ("xfail", False),
+        ("passed", True),
+    ],
+)
+def test_lab_fixture_retains_failure_evidence_without_moving_working_root(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, outcome: str, keep: bool
+) -> None:
+    root = tmp_path / "caller-root"
+    root.mkdir()
+    (root / "working-file").write_text("retained locally")
+    evidence = tmp_path / "pytest-base" / "test-case"
+    lab = Lab.__new__(Lab)
+    lab.root = root
+    lab.events = EventLog()
+    lab.observer = None
+    lab.start = Mock(return_value=lab)
+    lab.stop = Mock()
+    lab.remove = Mock(wraps=lab.remove)
+    lab.describe = Mock(return_value="synthetic lab")
+    lab.write_diagnostics = Mock(wraps=lab.write_diagnostics)
+    order = Mock()
+    order.attach_mock(lab.write_diagnostics, "retain")
+    order.attach_mock(lab.stop, "stop")
+    constructor = Mock(return_value=lab)
+    monkeypatch.setattr(resilience_fixtures, "Lab", constructor)
+    monkeypatch.setattr(resilience_fixtures, "require_tmux", lambda: None)
+    monkeypatch.setenv(resilience_fixtures.KEEP_ENV, "1" if keep else "0")
+    report = SimpleNamespace(failed=outcome in {"failed", "setup-failed"})
+    if outcome == "xfail":
+        report.wasxfail = "synthetic expected failure"
+    request = SimpleNamespace(node=SimpleNamespace(_resilience_call=report))
+    if outcome == "setup-failed":
+        request.node = SimpleNamespace(_resilience_setup=report)
+    fixture = resilience_fixtures.lab_factory.__wrapped__(request, evidence)
+    start = next(fixture)
+    assert start(root=root) is lab
+    assert constructor.call_args.args[0].root == root
+    with pytest.raises(StopIteration):
+        next(fixture)
+
+    failed = outcome != "passed"
+    assert lab.root == root
+    lab.stop.assert_called_once_with()
+    assert lab.remove.call_count == (0 if failed or keep else 1)
+    assert (root / "working-file").exists() == (failed or keep)
+    assert root.exists() == (failed or keep)
+    assert (evidence / "resilience-diagnostics" / "lab-0.json").exists() == failed
+    if failed:
+        lab.write_diagnostics.assert_called_once_with(
+            evidence / "resilience-diagnostics" / "lab-0.json"
+        )
+        assert [call[0] for call in order.mock_calls] == ["retain", "stop"]
+    else:
+        lab.write_diagnostics.assert_not_called()
+
+
+def test_lab_diagnostic_failure_still_stops_all_labs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    labs = [Mock(), Mock()]
+    for lab in labs:
+        lab.start.return_value = lab
+        lab.write_diagnostics.side_effect = OSError("private-diagnostic-error")
+    monkeypatch.setattr(resilience_fixtures, "Lab", Mock(side_effect=labs))
+    monkeypatch.setattr(resilience_fixtures, "require_tmux", lambda: None)
+    request = SimpleNamespace(node=SimpleNamespace(_resilience_call=SimpleNamespace(failed=True)))
+    fixture = resilience_fixtures.lab_factory.__wrapped__(request, tmp_path)
+    start = next(fixture)
+    start()
+    start()
+    with pytest.raises(StopIteration):
+        next(fixture)
+    for lab in labs:
+        lab.stop.assert_called_once_with()
+        lab.remove.assert_not_called()
+    assert "private-diagnostic-error" not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("snapshot_available", [True, False])
+def test_lab_diagnostics_project_records_and_upload_only_safe_file(
+    tmp_path: Path, snapshot_available: bool
+) -> None:
+    root = tmp_path / "lab-working-root"
+    root.mkdir()
+    session_id = "conv_" + "a" * 32
+    launch_id = "b" * 32
+    private = "private-content-must-stay-local"
+    lab = Lab.__new__(Lab)
+    lab.root = root
+    lab.config = LabConfig(root=root)
+    lab.events = EventLog()
+    lab.events.emit(
+        "lab",
+        "session_created",
+        session_id=session_id,
+        harness="claude",
+        env=private,
+        config=private,
+        keys=private,
+        credentials=private,
+        database=private,
+        raw_model_payload=private,
+    )
+    lab.events.emit("lab", "process_start", process="runner", pid=123, argv=private)
+    lab.events.emit("proxy:host", "connect", conn=4, tag="runner.tunnel", request=private)
+    lab.events.emit(private, private, headers=private)
+    lab.events.emit(
+        "observer",
+        "timeline",
+        session_id=session_id,
+        observations=[
+            {"wall": 10.0, "source": "stream", "status": "idle", "headers": private},
+            {"wall": 11.0, "source": "stream", "status": "running"},
+            {"wall": 12.0, "source": "snapshot", "status": "running", "runner_online": True},
+            {"wall": float("nan"), "source": private, "status": private},
+        ],
+    )
+    bridge = root / "t" / "omnigent-123" / "claude-native" / ("c" * 32)
+    bridge.mkdir(parents=True)
+    lifecycle = {
+        "schema_version": 1,
+        "terminal_instance_id": "d" * 32,
+        "launch_id": launch_id,
+        "launch_session_id": session_id,
+        "events": [
+            {
+                "event_name": "Stop",
+                "recorded_at": 11.5,
+                "claude_session_id": "e" * 32,
+                "bridge_session_id": session_id,
+                "payload": private,
+                "source": private,
+            }
+        ],
+        "headers": private,
+    }
+    (bridge / f"lifecycle-{launch_id}.json").write_text(json.dumps(lifecycle))
+    for path in (
+        root / "config.yaml",
+        root / "chat.db",
+        bridge / "bridge.json",
+        root / "events.jsonl",
+    ):
+        path.write_text(private)
+    (root / "logs").mkdir()
+    (root / "logs" / "runner.log").write_text(private)
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == f"/v1/sessions/{session_id}"
+        assert request.extensions["timeout"]["read"] <= 2
+        if not snapshot_available:
+            raise RuntimeError(private)
+        return httpx.Response(
+            200,
+            json={
+                "status": "running",
+                "runner_online": True,
+                "metadata": private,
+                "labels": {"token": private},
+            },
+        )
+
+    evidence = tmp_path / "pytest-base" / "test-case" / "resilience-diagnostics"
+    destination = evidence / "lab-0.json"
+    with httpx.Client(
+        base_url="http://example.test", transport=httpx.MockTransport(respond)
+    ) as observer:
+        lab.observer = observer
+        lab.write_diagnostics(destination)
+    raw = destination.read_text()
+    payload = json.loads(raw)
+    assert private not in raw
+    assert str(root) not in raw
+    expected_snapshot = {"session_id": session_id, "read_status": "unavailable"}
+    if snapshot_available:
+        expected_snapshot.update(read_status="ok", status="running", runner_online=True)
+    assert payload["sessions"] == [expected_snapshot]
+    assert [item["status"] for item in payload["observations"]] == ["idle", "running", "running"]
+    assert [item["wall"] for item in payload["observations"]] == [10.0, 11.0, 12.0]
+    assert payload["events"][1]["pid"] == 123
+    assert payload["events"][2]["conn"] == 4
+    assert payload["native_lifecycle"]["candidates"] == 1
+    assert payload["native_lifecycle"]["rejected"] == payload["native_lifecycle"]["omitted"] == 0
+    assert payload["native_lifecycle"]["records"][0]["terminal_instance_id"] == "d" * 32
+    assert payload["native_lifecycle"]["records"][0]["events"] == [
+        {
+            "event_name": "Stop",
+            "recorded_at": 11.5,
+            "claude_session_id": "e" * 32,
+            "bridge_session_id": session_id,
+        }
+    ]
+    assert (root / "config.yaml").read_text() == private
+
+    for name in ("config.yaml", "private.json", "runner.log", "lab-0.db"):
+        (evidence / name).write_text(private)
+    action = yaml.safe_load(
+        (Path(__file__).resolve().parents[1] / ".github/actions/e2e-run/action.yml").read_text()
+    )
+    upload = next(
+        step
+        for step in action["runs"]["steps"]
+        if step.get("name") == "Upload server logs on failure"
+    )
+    selectors = [
+        line for line in upload["with"]["path"].splitlines() if "resilience-diagnostics" in line
+    ]
+    selected = {
+        path
+        for selector in selectors
+        for path in (tmp_path / "pytest-base").glob("**/" + selector.split("/**/", 1)[1])
+    }
+    assert selected == {destination}
+
+
+@pytest.mark.parametrize(
+    "invalid", ["file-link", "directory-link", "oversize", "malformed", "identity-mismatch"]
+)
+def test_lab_diagnostics_reject_outside_or_invalid_native_records(
+    tmp_path: Path, invalid: str
+) -> None:
+    lab = Lab.__new__(Lab)
+    lab.root = tmp_path / "working"
+    lab.config = LabConfig(root=lab.root)
+    lab.events = EventLog()
+    lab.observer = None
+    bridge = lab.root / "t" / "omnigent-123" / "claude-native" / ("c" * 32)
+    bridge.mkdir(parents=True)
+    launch_id = "b" * 32
+    path = bridge / f"lifecycle-{launch_id}.json"
+    value = {
+        "schema_version": 1,
+        "terminal_instance_id": "d" * 32,
+        "launch_id": launch_id,
+        "events": [{"event_name": "Stop", "recorded_at": 1.0}],
+    }
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    source = outside / path.name
+    source.write_text(json.dumps(value))
+    if invalid == "file-link":
+        path.symlink_to(source)
+    elif invalid == "directory-link":
+        bridge.rmdir()
+        bridge.symlink_to(outside, target_is_directory=True)
+    elif invalid == "oversize":
+        path.write_text(json.dumps({**value, "payload": "x" * 32768}))
+    elif invalid == "malformed":
+        path.write_text("private-invalid-json")
+    else:
+        path.write_text(json.dumps({**value, "launch_id": "a" * 32}))
+    destination = tmp_path / "pytest-base" / "resilience-diagnostics" / "lab-0.json"
+    lab.write_diagnostics(destination)
+    native = json.loads(destination.read_text())["native_lifecycle"]
+    assert native["records"] == []
+    assert native["rejected"] == native["candidates"]
+    assert "private-invalid-json" not in destination.read_text()
+    assert source.read_text() == json.dumps(value)
+
+
+def test_scenario_retains_uncompressed_observation_history(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    watcher = SessionWatcher("http://example.test", "conv_" + "a" * 32)
+    watcher.observations = [
+        Observation(wall=10.0, source="snapshot", status="running"),
+        Observation(wall=11.0, source="snapshot", status="running"),
+    ]
+    monkeypatch.setattr(SessionWatcher, "start", lambda self: self)
+    monkeypatch.setattr(SessionWatcher, "stop", lambda self: None)
+    monkeypatch.setattr(_contract, "SessionWatcher", lambda *_: watcher)
+    monkeypatch.setattr(_contract, "_start_recorder", lambda *_: None)
+    lab = SimpleNamespace(
+        server_url="http://example.test", root=Path("synthetic-lab"), events=EventLog()
+    )
+    with _contract.observe(lab, SimpleNamespace(session_id=watcher.session_id), Mock()):
+        pass
+    timeline = lab.events.events(source="observer", kind="timeline")
+    assert len(timeline) == 1
+    assert [entry["wall"] for entry in timeline[0].fields["observations"]] == [10.0, 11.0]

@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import shutil
 from collections.abc import Callable, Generator, Iterator
+from pathlib import Path
 
 import pytest
 
@@ -32,11 +33,12 @@ def require_tmux() -> None:
 
 
 @pytest.fixture
-def lab_factory(request: pytest.FixtureRequest) -> Iterator[Callable[..., Lab]]:
+def lab_factory(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[Callable[..., Lab]]:
     """Start labs on demand; stop them after the test and delete passing runs.
 
     A failing run (or any run with ``OMNIGENT_RESILIENCE_KEEP=1``) keeps its
-    root (logs, database, proxy events) and prints it.
+    root (logs, database, proxy events) and prints it. Failed runs also export
+    allowlisted diagnostics beneath pytest's artifact directory.
     """
     labs: list[Lab] = []
 
@@ -54,7 +56,13 @@ def lab_factory(request: pytest.FixtureRequest) -> Iterator[Callable[..., Lab]]:
     )
     keep = failed or os.environ.get(KEEP_ENV) == "1"
     errors: list[Exception] = []
-    for lab in labs:
+    for index, lab in enumerate(labs):
+        if failed:
+            try:
+                lab.write_diagnostics(tmp_path / "resilience-diagnostics" / f"lab-{index}.json")
+            except Exception:
+                # Diagnostic failures must neither expose exception text nor skip cleanup.
+                print("resilience diagnostics unavailable")
         # One lab failing to stop must not leave the others running.
         try:
             lab.stop()
