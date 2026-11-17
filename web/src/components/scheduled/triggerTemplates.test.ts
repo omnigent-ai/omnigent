@@ -1220,26 +1220,37 @@ describe("renderTriggerPrompt", () => {
     expect(sorted).not.toContain("ORDER BY created DESC");
   });
 
-  it.each([true, false])("puts Slack links in the worker result with linkBack=%s", (linkBack) => {
-    const prompt = renderTriggerPrompt(
-      "slack",
-      fields({ event: "posted", scope: "#support", linkBack }),
-      CTX,
-    );
-    const [manager, worker] = prompt.split("Instructions for each session:\n");
-    expect(manager).not.toContain("Link-back pending:");
-    expect(manager).not.toContain('Reply "Omnigent session:');
-    expect(worker).toContain(
-      "Reply in the source thread when you have a useful result or a blocker",
-    );
-    expect(worker).toContain("Do not send an acknowledgement or a separate session-link message");
-    expect(worker).toContain(
-      linkBack ? "Include your own session link at the bottom" : "Do not add a session link",
-    );
-    const parts = splitTriggerPrompt(prompt);
-    expect(parts.userPrompt).toBe(fields().instructions);
-    expect(combineTriggerPrompt(parts.userPrompt, parts.systemPrompt)).toBe(prompt);
-  });
+  it.each([true, false])(
+    "posts the Slack session link once, at start, with linkBack=%s",
+    (linkBack) => {
+      const prompt = renderTriggerPrompt(
+        "slack",
+        fields({ event: "posted", scope: "#support", linkBack }),
+        CTX,
+      );
+      const [manager, worker] = prompt.split("Instructions for each session:\n");
+      expect(manager).not.toContain("Link-back pending:");
+      expect(manager).not.toContain('Reply "Omnigent session:');
+      const startReply =
+        "<slack-reply>\n:hourglass_flowing_sand: Omnigent is working on it...\n\nTrack progress: <https://omni.example.com/c/CONVERSATION_ID|Omni Session>\nSent with Omnigent\n</slack-reply>\nReply in the same thread";
+      if (linkBack) {
+        expect(worker).toContain(startReply);
+      } else {
+        expect(worker).not.toContain("Track progress:");
+        expect(worker).toContain("Do not send an acknowledgement or a session link.");
+      }
+      expect(worker).toContain('ends with a line "Sent with Omnigent"');
+      expect(worker).toContain(
+        "Reply in the same thread when you have a useful result or a blocker",
+      );
+      expect(worker).toContain(
+        `Each later reply carries only what is new since your previous reply in that thread${linkBack ? ", without the session link" : ""}.`,
+      );
+      const parts = splitTriggerPrompt(prompt);
+      expect(parts.userPrompt).toBe(fields().instructions);
+      expect(combineTriggerPrompt(parts.userPrompt, parts.systemPrompt)).toBe(prompt);
+    },
+  );
 
   it("signs what it posts and stops when it can't reach the service", () => {
     const prompt = renderTriggerPrompt("jira", fields(), CTX);
@@ -1409,7 +1420,7 @@ describe("renderTriggerPrompt", () => {
     );
     expect(filtered).toContain("Only messages that are about bug reports count.");
     expect(filtered).toContain('title "Slack <channel> <message ts>"');
-    expect(filtered).toContain("Reply in the source thread when you have a useful result");
+    expect(filtered).toContain("Reply in the same thread when you have a useful result");
 
     const unfiltered = renderTriggerPrompt(
       "slack",
