@@ -23,6 +23,7 @@ from omnigent.harnesses.codex_native import bridge as codex_bridge
 from omnigent.inner.databricks_executor import DatabricksAuthError
 from omnigent.runner import create_runner_app
 from omnigent.runner._entry import _RunnerDatabricksAuth
+from omnigent.runner.routing import routing_host_id
 from omnigent.runner.transports.ws_tunnel.frames import (
     Frame,
     HelloFrame,
@@ -237,6 +238,8 @@ async def native_session(
 ) -> AsyncIterator[_NativeSession]:
     isolate_provider_resolution(monkeypatch, tmp_path / "config")
     session_kind = getattr(request, "param", "claude-native")
+    inherited_host = session_kind.startswith("inherited-")
+    session_kind = session_kind.removeprefix("inherited-")
     custom_agent = session_kind == "custom-claude-native"
     harness = "claude-native" if custom_agent else session_kind
     is_claude = harness == "claude-native"
@@ -267,6 +270,21 @@ async def native_session(
     )
     store.set_host_id(session_id, host_id=host.host_id, workspace=str(tmp_path))
     store.replace_runner_id(session_id, "runner_connected")
+    if inherited_host:
+        child = store.create_conversation(
+            kind="sub_agent",
+            parent_conversation_id=session_id,
+            agent_id=agent["id"],
+            runner_id="runner_connected",
+            labels={} if custom_agent else {"omnigent.wrapper": wrapper},
+            model_override=previous_model,
+            reasoning_effort="high",
+        )
+        assert child.host_id is None
+        assert child.runner_id == "runner_connected"
+        assert child.inference_snapshot is None
+        assert routing_host_id(child, store) == host.host_id
+        session_id = child.id
 
     terminals = TerminalRegistry()
     terminal_name = "claude" if is_claude else "codex"
@@ -510,7 +528,14 @@ async def test_unconfirmed_claude_model_change_keeps_intent_without_claiming_an_
 
 
 @pytest.mark.parametrize(
-    "native_session", ["claude-native", "custom-claude-native"], indirect=True
+    "native_session",
+    [
+        "claude-native",
+        "custom-claude-native",
+        "inherited-claude-native",
+        "inherited-custom-claude-native",
+    ],
+    indirect=True,
 )
 async def test_cancelled_claude_model_change_keeps_intent_after_losing_the_reply(
     client: httpx.AsyncClient,
@@ -608,6 +633,40 @@ async def test_cancelled_claude_model_change_keeps_intent_after_losing_the_reply
             if not task.done():
                 task.cancel()
         await asyncio.gather(dispatch, pending, return_exceptions=True)
+
+
+@pytest.mark.parametrize(
+    "native_session",
+    ["inherited-claude-native", "inherited-custom-claude-native"],
+    indirect=True,
+)
+async def test_claude_model_change_without_a_runner_saves_intent_without_forwarding(
+    client: httpx.AsyncClient,
+    native_session: _NativeSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = native_session
+    assert session.claude is not None
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._get_runner_client", AsyncMock(return_value=None)
+    )
+    monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: None)
+    session.tunnel.frames.clear()
+
+    response = await _pick_model(client, session)
+
+    assert response.status_code == 200, response.text
+    saved = session.store.get_conversation(session.session_id)
+    assert saved.model_override == session.requested_model
+    assert saved.reasoning_effort == "high"
+    assert session.claude.commands == []
+    assert claude_bridge.read_claude_status_model(session.claude.bridge_dir) == (
+        session.previous_model
+    )
+    assert session.runner_replies == []
+    assert session.tunnel.frames == []
+    assert session.errors == []
+    assert session.notices == []
 
 
 @pytest.mark.parametrize("unconfirmed", [False, True], ids=["refused", "unconfirmed"])

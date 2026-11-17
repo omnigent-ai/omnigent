@@ -4516,6 +4516,14 @@ def register_core_routes(
                     runner_router,
                     model_event,
                     timeout_s=settings_forward_timeout,
+                    transport_error_result=(
+                        _RunnerForwardResult(
+                            status_code=503,
+                            body=json.dumps({"error": "claude_native_model_unconfirmed"}),
+                        )
+                        if claude_native
+                        else None
+                    ),
                 )
             # Append a durable [System: model changed to X] note for sessions
             # whose history Omnigent writes. Gate on the wrapper label (NOT

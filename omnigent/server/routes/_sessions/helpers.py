@@ -7847,6 +7847,8 @@ async def _forward_session_change_to_runner_impl(
     runner_router: Any,
     event: dict[str, Any],
     timeout_s: float = 5.0,
+    *,
+    transport_error_result: _RunnerForwardResult | None = None,
 ) -> _RunnerForwardResult | None:
     """
     Best-effort POST a control event to the bound runner.
@@ -7889,10 +7891,11 @@ async def _forward_session_change_to_runner_impl(
     :param timeout_s: Request budget, e.g. ``5.0``. Callers whose event the
         runner answers by driving the TUI pass
         :data:`_TUI_INJECT_FORWARD_TIMEOUT_S`.
+    :param transport_error_result: Optional caller outcome for a failed POST,
+        distinguishing a possibly committed control from no runner client.
     :returns: The runner's HTTP status/body, or ``None`` when no
-        runner client could be resolved or the POST failed at the
-        transport layer (in both cases the AP-side persisted value /
-        operation is the authoritative fallback).
+        runner client could be resolved. A transport failure returns
+        ``transport_error_result``, defaulting to the saved-value fallback.
     """
     from omnigent.runtime import get_runner_client
     from omnigent.server.runtime_compatibility import RuntimeSupportError
@@ -7927,19 +7930,17 @@ async def _forward_session_change_to_runner_impl(
             timeout=timeout_s,
         )
     except (httpx.HTTPError, ConnectionError):
-        # Transport-level miss (runner asleep, tunnel still reconnecting). The
-        # persisted AP-side value stays authoritative and the runner re-reads it,
-        # so this is a recovered condition — WARNING, matching the non-2xx branch
-        # below rather than out-ranking it.
+        # A lost reply may follow a committed control; callers can retain that uncertainty.
         _logger.warning(
-            "Session-change forward did not reach the runner for session=%r type=%r; "
+            "Session-change forward did not reach the runner or lost its reply for "
+            "session=%r type=%r; "
             "the persisted value remains authoritative",
             session_id,
             event.get("type"),
             exc_info=True,
             extra={"session_id": session_id},
         )
-        return None
+        return transport_error_result
     if resp.status_code >= 400:
         _logger.warning(
             "Session-change forward rejected for session=%s type=%r status=%s body=%s",
