@@ -3054,3 +3054,375 @@ async def test_prompt_input_item_id_is_current_or_null(fresh_session, tail, expe
         assert prompts[0]["params"]["prompt"] == [{"type": "text", "text": ""}]
     if fresh_session and tail.get("role") == "user":
         assert "old reply" in prompts[0]["params"]["prompt"][0]["text"]
+
+
+# ---------------------------------------------------------------------------
+# Dynamic model & reasoning-effort discovery and live switching
+# ---------------------------------------------------------------------------
+
+
+def test_supports_live_model_options_is_true() -> None:
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    assert ex.supports_live_model_options() is True
+
+
+def test_config_options_parses_grouped_models_and_thought_level_efforts() -> None:
+    """Grouped ``model`` + ``thought_level`` configOptions populate options and efforts."""
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._note_config_options(
+        [
+            {
+                "id": "model",
+                "category": "model",
+                "currentValue": "gemini-3-pro",
+                "options": [
+                    {
+                        "group": "Gemini",
+                        "options": [
+                            {"value": "gemini-3-pro", "name": "Gemini 3 Pro"},
+                            {"value": "gemini-3-flash", "name": "Gemini 3 Flash"},
+                        ],
+                    }
+                ],
+            },
+            {
+                "id": "thinking",
+                "category": "thought_level",
+                "currentValue": "extra_high",
+                "options": [
+                    {"value": "off", "name": "Off"},
+                    {"value": "low", "name": "Low"},
+                    {"value": "medium", "name": "Medium"},
+                    {"value": "high", "name": "High"},
+                    {"value": "extra_high", "name": "Extra High"},
+                ],
+            },
+        ]
+    )
+
+    assert ex._active_model == "gemini-3-pro"
+    assert ex._active_effort == "xhigh"
+    assert ex._active_effort_wire == "extra_high"
+    assert ex._effort_config_option_id == "thinking"
+
+    payload = ex._build_model_options_payload()
+    assert payload is not None
+    assert payload["active_model"] == "gemini-3-pro"
+    assert payload["active_effort"] == "xhigh"
+    models = payload["models"]
+    assert [m["id"] for m in models] == ["gemini-3-pro", "gemini-3-flash"]
+    assert models[0]["isDefault"] is True
+    assert models[1].get("isDefault") is not True
+    assert [e["reasoningEffort"] for e in models[0]["supportedReasoningEfforts"]] == [
+        "none",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+    ]
+    assert models[0]["defaultReasoningEffort"] == "xhigh"
+
+
+def test_config_options_preserves_literal_none_over_off_alias() -> None:
+    """When an agent offers both ``none`` and ``off``, ``none`` maps to itself."""
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._note_config_options(
+        [
+            {
+                "id": "reasoning_effort",
+                "currentValue": "none",
+                "options": [
+                    {"value": "off", "name": "Off"},
+                    {"value": "none", "name": "None"},
+                    {"value": "high", "name": "High"},
+                ],
+            }
+        ]
+    )
+
+    assert ex._effort_canonical_to_wire["none"] == "none"
+    assert ex._effort_canonical_to_wire["off"] == "off"
+    assert ex._active_effort == "none"
+
+
+def test_build_model_options_payload_synthesizes_default_row_for_effort_only_agent() -> None:
+    """An agent exposing effort choices without a model list yields a synthetic row."""
+    ex = AcpExecutor(AcpAgentConfig(command="x", model="antigravity-default"))
+    ex._note_config_options(
+        [
+            {
+                "id": "thought_level",
+                "category": "thought_level",
+                "currentValue": "medium",
+                "options": [
+                    {"value": "low"},
+                    {"value": "medium"},
+                    {"value": "high"},
+                ],
+            }
+        ]
+    )
+
+    payload = ex._build_model_options_payload()
+    assert payload is not None
+    assert payload["active_effort"] == "medium"
+    assert payload["models"] == [
+        {
+            "id": "antigravity-default",
+            "model": "antigravity-default",
+            "isDefault": True,
+            "supportedReasoningEfforts": [
+                {"reasoningEffort": "low"},
+                {"reasoningEffort": "medium"},
+                {"reasoningEffort": "high"},
+            ],
+            "defaultReasoningEffort": "medium",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_live_model_options_probes_and_resets_pre_turn_session_when_mcp_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pre-turn probe discovers models/efforts then drops sessionId so Turn 1 sends mcpServers."""
+    monkeypatch.delenv("OMNIGENT_ACP_MCP", raising=False)
+    ex = AcpExecutor(AcpAgentConfig(command="x", omnigent_mcp=True))
+    ex._proc = Mock(returncode=None)
+    ex._initialized = True
+    ex._start_process = AsyncMock()  # type: ignore[method-assign]
+    ex._ensure_initialized = AsyncMock()  # type: ignore[method-assign]
+
+    async def fake_rpc(method: str, params: dict, timeout: float = 30.0) -> dict:
+        assert method == "session/new"
+        return {
+            "result": {
+                "sessionId": "probe-sid",
+                "models": {
+                    "currentModelId": "ag-pro",
+                    "availableModels": [
+                        {"modelId": "ag-pro", "name": "AG Pro"},
+                        {"modelId": "ag-flash", "name": "AG Flash"},
+                    ],
+                },
+                "configOptions": [
+                    {
+                        "id": "thinking",
+                        "category": "thought_level",
+                        "currentValue": "medium",
+                        "options": [{"value": "low"}, {"value": "medium"}, {"value": "high"}],
+                    }
+                ],
+            }
+        }
+
+    ex._rpc = fake_rpc  # type: ignore[assignment]
+    payload = await ex.live_model_options()
+
+    assert payload is not None
+    assert [m["id"] for m in payload["models"]] == ["ag-pro", "ag-flash"]
+    assert payload["active_model"] == "ag-pro"
+    assert payload["active_effort"] == "medium"
+    # Pre-turn probe kept discovered options & process alive, but reset session_id
+    # so Turn 1 calls session/new with mcpServers attached.
+    assert ex._session_id is None
+    assert ex._initial_model is None
+    assert ex._initial_effort is None
+    assert ex._catalog_probed is True
+
+
+@pytest.mark.asyncio
+async def test_apply_live_settings_switches_model_and_effort_and_restores_initial_effort() -> None:
+    """apply_live_settings maps canonical efforts to wire values and clears back to initial."""
+    ex = AcpExecutor(AcpAgentConfig(command="x", omnigent_mcp=False))
+    ex._session_id = "sid-live"
+    ex._initial_model = "ag-pro"
+    ex._initial_effort = "medium"
+    ex._note_config_options(
+        [
+            {
+                "id": "model",
+                "category": "model",
+                "currentValue": "ag-pro",
+                "options": [{"value": "ag-pro"}, {"value": "ag-flash"}],
+            },
+            {
+                "id": "thinking",
+                "category": "thought_level",
+                "currentValue": "MEDIUM",
+                "options": [
+                    {"value": "LOW"},
+                    {"value": "MEDIUM"},
+                    {"value": "EXTRA_HIGH"},
+                ],
+            },
+        ]
+    )
+
+    calls: list[tuple[str, dict]] = []
+
+    async def fake_rpc(method: str, params: dict, timeout: float = 30.0) -> dict:
+        calls.append((method, params))
+        cfg_id = params["configId"]
+        val = params["value"]
+        if cfg_id == "model":
+            return {"result": {"configOptions": [{"id": "model", "currentValue": val}]}}
+        return {"result": {"configOptions": [{"id": "thinking", "currentValue": val}]}}
+
+    ex._rpc = fake_rpc  # type: ignore[assignment]
+    res = await ex.apply_live_settings(
+        model="ag-flash",
+        effort="xhigh",
+        apply_model=True,
+        apply_effort=True,
+    )
+    assert res == {"active_model": "ag-flash", "active_effort": "xhigh", "applied": True}
+    assert calls == [
+        (
+            "session/set_config_option",
+            {"sessionId": "sid-live", "configId": "model", "value": "ag-flash"},
+        ),
+        (
+            "session/set_config_option",
+            {"sessionId": "sid-live", "configId": "thinking", "value": "EXTRA_HIGH"},
+        ),
+    ]
+
+    # Resetting effort (effort=None) restores _initial_effort ("medium" -> "MEDIUM").
+    calls.clear()
+    res_reset = await ex.apply_live_settings(effort=None, apply_effort=True)
+    assert res_reset == {"active_model": "ag-flash", "active_effort": "medium", "applied": True}
+    assert calls == [
+        (
+            "session/set_config_option",
+            {"sessionId": "sid-live", "configId": "thinking", "value": "MEDIUM"},
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_apply_live_settings_noop_and_preserves_inflight_queue() -> None:
+    """No session returns applied=False; an in-flight prompt keeps queued chunks untouched."""
+    ex = AcpExecutor(AcpAgentConfig(command="x", omnigent_mcp=False))
+    assert await ex.apply_live_settings(model="m1", apply_model=True) == {
+        "active_model": None,
+        "active_effort": None,
+        "applied": False,
+    }
+
+    ex._session_id = "sid-busy"
+    ex._prompt_in_flight = True
+    ex._note_config_options(
+        [
+            {
+                "id": "thinking",
+                "category": "thought_level",
+                "currentValue": "low",
+                "options": [{"value": "low"}, {"value": "high"}],
+            }
+        ]
+    )
+    queued = {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": "sid-busy",
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "hello"},
+            },
+        },
+    }
+    ex._queue.put_nowait(queued)
+
+    async def accept_rpc(method: str, params: dict, timeout: float = 30.0) -> dict:
+        del method, timeout
+        return {"result": {"configOptions": [{"id": "thinking", "currentValue": params["value"]}]}}
+
+    ex._rpc = AsyncMock(side_effect=accept_rpc)  # type: ignore[assignment]
+
+    res = await ex.apply_live_settings(effort="high", apply_effort=True)
+    assert res["applied"] is True
+    assert res["active_effort"] == "high"
+    # Queued message chunk must remain in _queue for the active run_turn consumer.
+    assert ex._queue.qsize() == 1
+    assert ex._queue.get_nowait() is queued
+
+
+@pytest.mark.asyncio
+async def test_apply_effort_override_preserves_clamped_echoed_effort() -> None:
+    """When the agent echoes its unchanged/clamped effort, do not overwrite with request."""
+    ex = AcpExecutor(AcpAgentConfig(command="x", omnigent_mcp=False))
+    ex._note_config_options(
+        [
+            {
+                "id": "thinking",
+                "category": "thought_level",
+                "currentValue": "medium",
+                "options": [{"value": "medium"}, {"value": "high"}],
+            }
+        ]
+    )
+    ex._rpc = AsyncMock(  # type: ignore[assignment]
+        return_value={"result": {"configOptions": [{"id": "thinking", "currentValue": "medium"}]}}
+    )
+    await ex._apply_effort_override("sid-1", "high")
+    assert ex._active_effort_wire == "medium"
+    assert ex._active_effort == "medium"
+
+
+@pytest.mark.asyncio
+async def test_delayed_initial_effort_captured_until_overridden() -> None:
+    """Delayed initial config_option_update sets _initial_effort only before an override."""
+    ex = AcpExecutor(AcpAgentConfig(command="x", omnigent_mcp=False))
+    # Initial session/new had no currentValue; delayed notification supplies it.
+    ex._note_config_options(
+        [
+            {
+                "id": "thinking",
+                "category": "thought_level",
+                "options": [{"value": "low"}, {"value": "medium"}, {"value": "high"}],
+            }
+        ]
+    )
+    assert ex._initial_effort is None
+
+    ex._note_config_options(
+        [
+            {
+                "id": "thinking",
+                "category": "thought_level",
+                "currentValue": "low",
+                "options": [{"value": "low"}, {"value": "medium"}, {"value": "high"}],
+            }
+        ]
+    )
+    assert ex._initial_effort == "low"
+
+    async def accept_rpc(method: str, params: dict, timeout: float = 30.0) -> dict:
+        del method, timeout
+        return {"result": {"configOptions": [{"id": "thinking", "currentValue": params["value"]}]}}
+
+    ex._rpc = AsyncMock(side_effect=accept_rpc)  # type: ignore[assignment]
+    await ex._apply_effort_override("sid-1", "high")
+    assert ex._initial_effort == "low"
+    assert ex._active_effort == "high"
+
+    # Resetting effort restores the delayed initial effort.
+    await ex._apply_effort_override("sid-1", None)
+    assert ex._active_effort == "low"
+
+
+@pytest.mark.asyncio
+async def test_live_model_options_preserves_existing_session_when_tools_empty() -> None:
+    """Probing model options must not clear a pre-existing session id."""
+    ex = AcpExecutor(AcpAgentConfig(command="x", omnigent_mcp=True))
+    ex._proc = type("P", (), {"returncode": None})()  # type: ignore[assignment]
+    ex._initialized = True
+    ex._session_id = "sid-existing"
+    ex._omnigent_tools = []
+    ex._rpc = AsyncMock()  # type: ignore[assignment]
+
+    await ex.live_model_options()
+    assert ex._session_id == "sid-existing"
+    ex._rpc.assert_not_awaited()

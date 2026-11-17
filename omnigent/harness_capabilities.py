@@ -61,6 +61,9 @@ class EffortFamily(str, Enum):
     # The real codex process is the per-model authority on reasoning levels
     # (Sol reaches ``ultra``); the SDK codex wire caps at ``xhigh``.
     CODEX_NATIVE = "codex-native"
+    # Generic ACP agents advertise supported thought/reasoning levels dynamically
+    # via session configOptions (e.g. category ``thought_level``).
+    ACP = "acp"
 
 
 class ModelFamily(str, Enum):

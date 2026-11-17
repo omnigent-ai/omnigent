@@ -62,7 +62,7 @@ from typing import Any, Protocol, TypeAlias
 from omnigent.debug_logging import debug_event
 from omnigent.inner import _proc
 from omnigent.inner._acp_metadata import _META_INPUT_ITEM_ID
-from omnigent.inner._acp_omnigent_mcp import OmnigentAcpMcp
+from omnigent.inner._acp_omnigent_mcp import OmnigentAcpMcp, _mcp_enabled
 from omnigent.inner.acp_extension import NO_ACP_EXTENSION, AcpExtension
 from omnigent.inner.acp_subagents import SubAgentActivity, SubAgentStart, read_subagent_events
 from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
@@ -72,6 +72,7 @@ from omnigent.inner.executor import (
     ExecutorConfig,
     ExecutorError,
     ExecutorEvent,
+    LiveSettingsRejectedError,
     Message,
     ReasoningChunk,
     SubAgentCompleted,
@@ -159,6 +160,77 @@ _CONFIG_OPTION_MODEL = "model"
 # this shape and never sends ``config_option_update``, so an agent selected this
 # way is unreachable through ``session/set_config_option`` alone.
 _AGENT_METHOD_SET_MODEL = "session/set_model"
+
+_EFFORT_OPTION_CATEGORIES = ("thought_level", "reasoning_effort", "reasoning", "thinking")
+_EFFORT_OPTION_IDS = frozenset(
+    {"thought_level", "reasoning_effort", "reasoning", "thinking_level", "thinking", "effort"}
+)
+_EFFORT_CANONICAL_ALIASES: dict[str, str] = {
+    "none": "none",
+    "off": "none",
+    "disabled": "none",
+    "min": "minimal",
+    "minimal": "minimal",
+    "low": "low",
+    "med": "medium",
+    "medium": "medium",
+    "normal": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "x-high": "xhigh",
+    "x_high": "xhigh",
+    "extra_high": "xhigh",
+    "extra-high": "xhigh",
+    "very_high": "xhigh",
+    "very-high": "xhigh",
+    "max": "max",
+    "maximum": "max",
+    "ultra": "ultra",
+}
+
+
+def _canonicalize_acp_effort(raw_value: str | None) -> str | None:
+    """Normalize an ACP thought/reasoning level value to Omnigent's canonical vocabulary."""
+    if not isinstance(raw_value, str):
+        return None
+    normalized = raw_value.strip().lower().replace(" ", "_")
+    if not normalized:
+        return None
+    return _EFFORT_CANONICAL_ALIASES.get(normalized, normalized)
+
+
+def _flatten_config_option_choices(options_raw: object) -> list[_AcpJsonObject]:
+    """Flatten ACP configOption ``options`` whether ungrouped or grouped."""
+    if not isinstance(options_raw, list):
+        return []
+    flattened: list[_AcpJsonObject] = []
+    for entry in options_raw:
+        if not isinstance(entry, dict):
+            continue
+        nested = entry.get("options")
+        if isinstance(nested, list) and "value" not in entry:
+            for item in nested:
+                if isinstance(item, dict) and isinstance(item.get("value"), str):
+                    flattened.append(item)
+        elif isinstance(entry.get("value"), str):
+            flattened.append(entry)
+    return flattened
+
+
+def _effort_option_priority(opt: _AcpJsonObject) -> int | None:
+    """Return match priority (lower is stronger) if *opt* represents reasoning/thought effort."""
+    category = opt.get("category")
+    opt_id = opt.get("id")
+    cat_norm = category.strip().lower() if isinstance(category, str) else ""
+    id_norm = opt_id.strip().lower() if isinstance(opt_id, str) else ""
+    if cat_norm == "thought_level":
+        return 0
+    if cat_norm in ("reasoning_effort", "reasoning", "thinking"):
+        return 1
+    if id_norm in _EFFORT_OPTION_IDS:
+        return 2
+    return None
+
 
 # ACP tool-call lifecycle statuses (the terminal ones close a tool card).
 _TOOL_STATUS_COMPLETED = "completed"
@@ -270,7 +342,7 @@ class AcpAgentConfig:
     default_model: str | None = None
 
 
-class _AcpModelSwitchError(RuntimeError):
+class _AcpModelSwitchError(LiveSettingsRejectedError, RuntimeError):
     """A rejected model selection, before the ACP prompt is sent."""
 
 
@@ -487,6 +559,19 @@ class AcpExecutor(Executor):
         self._active_model: str | None = None
         self._model_config_option_id: str | None = None
         self._initial_model: str | None = None
+        self._session_models: list[_AcpJsonObject] = []
+        self._config_models: list[_AcpJsonObject] = []
+        self._initial_effort: str | None = None
+        self._effort_overridden: bool = False
+        self._active_effort: str | None = None
+        self._active_effort_wire: str | None = None
+        self._effort_config_option_id: str | None = None
+        self._effort_options: list[dict[str, str]] = []
+        self._effort_canonical_to_wire: dict[str, str] = {}
+        self._effort_wire_to_canonical: dict[str, str] = {}
+        self._catalog_probed: bool = False
+        self._prompt_in_flight: bool = False
+        self._control_lock = asyncio.Lock()
         # Latches off once an agent proves it can't warm-switch, so we don't
         # retry a failing request on every turn.
         self._model_switch_supported: bool = True
@@ -970,14 +1055,19 @@ class AcpExecutor(Executor):
                 "ACP session/new response missing sessionId: " + json.dumps(resp)[:200]
             )
         self._session_id = session_id
-        # Capture the agent's advertised model from session/new's config options, so a
-        # turn's usage can name it. Agents that report the model here (e.g. jcode) would
-        # otherwise leave it unknown until a later config_option_update, leaving the
-        # server unable to attribute per-model token usage for the turn.
+        # Capture the agent's advertised models and config options from session/new,
+        # applying configOptions second so ACP's newer configOptions shape takes
+        # precedence over the deprecated models field when both are present.
         if isinstance(result, dict):
-            self._note_config_options(result.get("configOptions"))
             self._note_session_models(result.get("models"))
+            self._note_config_options(result.get("configOptions"))
+        # Drain notifications queued ahead of/alongside session/new (e.g., an
+        # agent emitting config_option_update right before its session/new reply)
+        # before snapshotting the session's initial model and effort defaults.
+        await self._drain_stale_queue()
         self._initial_model = self._active_model
+        self._initial_effort = self._active_effort
+        self._catalog_probed = True
         return self._session_id
 
     def _note_session_models(self, models: object) -> None:
@@ -996,11 +1086,58 @@ class AcpExecutor(Executor):
             return
         available = models.get("availableModels")
         if isinstance(available, list):
+            parsed: list[_AcpJsonObject] = []
+            seen: set[str] = set()
             for entry in available:
-                if isinstance(entry, dict):
-                    model_id = entry.get("modelId")
-                    if isinstance(model_id, str) and model_id:
-                        self._session_model_ids.add(model_id)
+                if not isinstance(entry, dict):
+                    continue
+                model_id = entry.get("modelId")
+                if not isinstance(model_id, str) or not model_id:
+                    continue
+                self._session_model_ids.add(model_id)
+                if model_id in seen:
+                    continue
+                seen.add(model_id)
+                item: _AcpJsonObject = {"id": model_id, "model": model_id}
+                name = entry.get("name")
+                if isinstance(name, str) and name.strip():
+                    item["displayName"] = name.strip()
+                desc = entry.get("description")
+                if isinstance(desc, str) and desc.strip():
+                    item["description"] = desc.strip()
+                raw_efforts = entry.get("supportedReasoningEfforts") or entry.get(
+                    "reasoningEfforts"
+                )
+                if isinstance(raw_efforts, list):
+                    efforts_list: list[dict[str, str]] = []
+                    seen_efforts: set[str] = set()
+                    for eff in raw_efforts:
+                        raw_val = (
+                            eff.get("reasoningEffort") or eff.get("value") or eff.get("id")
+                            if isinstance(eff, dict)
+                            else eff
+                        )
+                        canon = _canonicalize_acp_effort(
+                            raw_val if isinstance(raw_val, str) else None
+                        )
+                        if canon and canon not in seen_efforts:
+                            seen_efforts.add(canon)
+                            eff_row: dict[str, str] = {"reasoningEffort": canon}
+                            if isinstance(eff, dict):
+                                eff_desc = eff.get("description") or eff.get("name")
+                                if isinstance(eff_desc, str) and eff_desc.strip():
+                                    eff_row["description"] = eff_desc.strip()
+                            efforts_list.append(eff_row)
+                    if efforts_list:
+                        item["supportedReasoningEfforts"] = efforts_list
+                default_eff = entry.get("defaultReasoningEffort")
+                if isinstance(default_eff, str) and default_eff.strip():
+                    item["defaultReasoningEffort"] = (
+                        _canonicalize_acp_effort(default_eff) or default_eff.strip().lower()
+                    )
+                parsed.append(item)
+            if parsed:
+                self._session_models = parsed
         current = models.get("currentModelId")
         if isinstance(current, str) and current:
             self._active_model = current
@@ -1544,6 +1681,20 @@ class AcpExecutor(Executor):
         """Forget state that is only valid for the current ACP session."""
         self._session_id = None
         self._initial_model = None
+        self._initial_effort = None
+        self._effort_overridden = False
+        self._active_effort = None
+        self._active_effort_wire = None
+        self._effort_config_option_id = None
+        self._effort_options = []
+        self._effort_canonical_to_wire = {}
+        self._effort_wire_to_canonical = {}
+        self._session_models = []
+        self._config_models = []
+        self._session_model_ids.clear()
+        self._config_option_ids.clear()
+        self._model_config_option_id = None
+        self._catalog_probed = False
         self._system_prompt_sent = False
         self._tool_names.clear()
         self._tool_inputs.clear()
@@ -1646,21 +1797,23 @@ class AcpExecutor(Executor):
         return events
 
     def _note_config_options(self, options: object) -> str | None:
-        """Record which session config options the agent exposes, and their values.
+        """Record session config options and return any echoed model ``currentValue``."""
+        echoed_model, _ = self._apply_config_options(options)
+        return echoed_model
 
-        ACP agents advertise settable options (``mode``, ``model``, …) via
-        ``config_option_update``. Tracking the ids tells us whether a warm model
-        switch is possible at all; tracking ``model``'s ``currentValue`` is the
-        only trustworthy record of which model is live — an agent's own
-        self-report is unreliable.
+    def _apply_config_options(self, options: object) -> tuple[str | None, bool]:
+        """Record advertised config options and return ``(echoed_model, echoed_effort)``.
 
-        :returns: The echoed ``model`` ``currentValue`` when the payload carried a
-            model option, else ``None`` — lets a caller distinguish "the agent
-            reported its model" from "no model option present".
+        ACP agents advertise settable options (``mode``, ``model``, ``thought_level``, …)
+        via ``session/new`` and ``config_option_update``. Capturing both the model
+        choices and thought/reasoning effort choices lets Omnigent render dynamic
+        pickers and warm-switch both dimensions via ``session/set_config_option``.
         """
         if not isinstance(options, list):
-            return None
+            return (None, False)
         model_option: _AcpJsonObject | None = None
+        effort_option: _AcpJsonObject | None = None
+        effort_priority: int | None = None
         for opt in options:
             if not isinstance(opt, dict):
                 continue
@@ -1674,14 +1827,88 @@ class AcpExecutor(Executor):
                 model_option is None and opt.get("category") == _CONFIG_OPTION_MODEL
             ):
                 model_option = opt
+            prio = _effort_option_priority(opt)
+            if prio is not None and (effort_priority is None or prio < effort_priority):
+                effort_option = opt
+                effort_priority = prio
+
+        echoed_effort = False
+        if effort_option is not None:
+            effort_opt_id = effort_option["id"]
+            self._effort_config_option_id = effort_opt_id
+            choices = _flatten_config_option_choices(effort_option.get("options"))
+            parsed_efforts: list[dict[str, str]] = []
+            c2w: dict[str, str] = {}
+            w2c: dict[str, str] = {}
+            # Check if an explicit "none" value exists so "off"/"disabled" don't
+            # overwrite a literal "none" wire spelling.
+            raw_values = {
+                c["value"].strip().lower()
+                for c in choices
+                if isinstance(c.get("value"), str) and c["value"].strip()
+            }
+            for choice in choices:
+                wire_val = choice["value"].strip()
+                if not wire_val:
+                    continue
+                if wire_val.lower() in ("off", "disabled") and "none" in raw_values:
+                    canon = wire_val.lower()
+                else:
+                    canon = _canonicalize_acp_effort(wire_val) or wire_val.lower()
+                w2c[wire_val] = canon
+                if canon not in c2w:
+                    c2w[canon] = wire_val
+                    row: dict[str, str] = {"reasoningEffort": canon}
+                    desc = choice.get("description") or choice.get("name")
+                    if isinstance(desc, str) and desc.strip():
+                        row["description"] = desc.strip()
+                    parsed_efforts.append(row)
+            if parsed_efforts:
+                self._effort_options = parsed_efforts
+                self._effort_canonical_to_wire = c2w
+                self._effort_wire_to_canonical = w2c
+            current_eff = effort_option.get("currentValue")
+            if isinstance(current_eff, str) and current_eff.strip():
+                echoed_effort = True
+                wire_curr = current_eff.strip()
+                self._active_effort_wire = wire_curr
+                self._active_effort = self._effort_wire_to_canonical.get(
+                    wire_curr,
+                    _canonicalize_acp_effort(wire_curr) or wire_curr.lower(),
+                )
+                # Delayed initial config_option_update can establish the agent's
+                # true default effort as long as no override has run yet.
+                if self._initial_effort is None and not self._effort_overridden:
+                    self._initial_effort = self._active_effort
+
         if model_option is None:
-            return None
+            return (None, echoed_effort)
         self._model_config_option_id = model_option["id"]
+        model_choices = _flatten_config_option_choices(model_option.get("options"))
+        if model_choices:
+            parsed_models: list[_AcpJsonObject] = []
+            seen_models: set[str] = set()
+            for choice in model_choices:
+                val = choice["value"].strip()
+                if not val or val in seen_models:
+                    continue
+                seen_models.add(val)
+                item: _AcpJsonObject = {"id": val, "model": val}
+                name = choice.get("name")
+                if isinstance(name, str) and name.strip():
+                    item["displayName"] = name.strip()
+                desc = choice.get("description")
+                if isinstance(desc, str) and desc.strip():
+                    item["description"] = desc.strip()
+                parsed_models.append(item)
+            if parsed_models:
+                self._config_models = parsed_models
+
         current = model_option.get("currentValue")
         if not isinstance(current, str) or not current:
-            return None
+            return (None, echoed_effort)
         self._active_model = current
-        return current
+        return (current, echoed_effort)
 
     async def _apply_model_override(self, session_id: str, model: str | None) -> None:
         """Warm-switch the agent's model via ACP ``session/set_config_option``.
@@ -1701,7 +1928,7 @@ class AcpExecutor(Executor):
         # A launch override must not replace the default restored by later turns.
         default_model = self._config.default_model
         if default_model is None:
-            default_model = self._config.model
+            default_model = self._config.model or self._initial_model
         elif not default_model:
             default_model = self._initial_model
         model = model or default_model
@@ -1718,11 +1945,11 @@ class AcpExecutor(Executor):
             if available:
                 raise _AcpModelSwitchError(f"ACP agent cannot switch to model {model!r}.")
             return
-        # An agent that returned a model catalog from ``session/new`` selects
-        # models with ``session/set_model`` and never advertises a ``model``
-        # config option, so the config-option path below would bail out and leave
-        # it on its own default. Take the catalog route first when we have one.
-        if self._session_model_ids:
+        # When the agent advertised a ``model`` configOption, prefer
+        # ``session/set_config_option`` (ACP's standard mechanism superseding
+        # deprecated ``models``). Otherwise use ``session/set_model`` when a
+        # ``session/new.models`` catalog was returned.
+        if self._session_model_ids and self._model_config_option_id is None:
             await self._set_model_via_catalog(session_id, model)
             return
         # Before the first config update, the RPC response determines support.
@@ -1782,6 +2009,164 @@ class AcpExecutor(Executor):
         logger.info(
             "acp[%s] model set to %s (transcript kept)", self._config.name, self._active_model
         )
+
+    async def _apply_effort_override(self, session_id: str, effort: str | None) -> None:
+        """Warm-switch the agent's thought/reasoning effort via ``session/set_config_option``."""
+        target = _canonicalize_acp_effort(effort) if effort else self._initial_effort
+        if not target:
+            return
+        config_id = self._effort_config_option_id
+        if not config_id:
+            return
+        wire_value = self._effort_canonical_to_wire.get(target, target)
+        if self._active_effort_wire == wire_value or (
+            self._active_effort == target and not self._effort_canonical_to_wire
+        ):
+            return
+        self._effort_overridden = True
+        response = await self._rpc(
+            _AGENT_METHOD_SET_CONFIG_OPTION,
+            {
+                "sessionId": session_id,
+                "configId": config_id,
+                "value": wire_value,
+            },
+        )
+        if "error" in response:
+            logger.warning(
+                "acp[%s] effort switch to %s (%s) rejected (%s); continuing on current effort",
+                self._config.name,
+                target,
+                wire_value,
+                response["error"].get("message", response["error"]),
+            )
+            return
+        result = response.get("result")
+        echoed_effort = False
+        if isinstance(result, dict) and isinstance(result.get("configOptions"), list):
+            _, echoed_effort = self._apply_config_options(result.get("configOptions"))
+        if not echoed_effort:
+            self._active_effort_wire = wire_value
+            self._active_effort = self._effort_wire_to_canonical.get(wire_value, target)
+        logger.info(
+            "acp[%s] effort set to %s (wire=%s)",
+            self._config.name,
+            self._active_effort,
+            self._active_effort_wire,
+        )
+
+    def _build_model_options_payload(self) -> _AcpJsonObject:
+        """Build the model+effort catalog payload from discovered ACP state."""
+        # Prefer configOptions model catalog when present (ACP spec supersedes deprecated
+        # ``models``), enriching displayName/description/per-model efforts from ``models``.
+        session_by_id = {
+            item["id"]: dict(item)
+            for item in self._session_models
+            if isinstance(item.get("id"), str)
+        }
+        if self._config_models:
+            base_models: list[_AcpJsonObject] = []
+            for item in self._config_models:
+                merged = dict(session_by_id.get(str(item["id"]), {}))
+                merged.update(item)
+                base_models.append(merged)
+        elif self._session_models:
+            base_models = [dict(item) for item in self._session_models]
+        else:
+            base_models = []
+
+        if not base_models and self._effort_options:
+            fallback_id = (
+                self._active_model or self._config.default_model or self._config.model or "default"
+            )
+            base_models = [{"id": fallback_id, "model": fallback_id, "isDefault": True}]
+
+        default_id = self._config.default_model or self._initial_model or self._active_model
+        default_effort = self._initial_effort or self._active_effort
+        models_out: list[_AcpJsonObject] = []
+        for entry in base_models:
+            row = dict(entry)
+            model_id = str(row.get("id", ""))
+            if default_id and model_id == default_id:
+                row["isDefault"] = True
+            if self._effort_options and "supportedReasoningEfforts" not in row:
+                row["supportedReasoningEfforts"] = [dict(e) for e in self._effort_options]
+            if default_effort and "defaultReasoningEffort" not in row:
+                row["defaultReasoningEffort"] = default_effort
+            models_out.append(row)
+
+        payload: _AcpJsonObject = {"models": models_out}
+        if self._active_model:
+            payload["active_model"] = self._active_model
+        if self._active_effort:
+            payload["active_effort"] = self._active_effort
+        return payload
+
+    def reported_model(self) -> str | None:
+        """Return the active ACP model resolved from session setup or config updates."""
+        return self._active_model
+
+    def supports_live_model_options(self) -> bool:
+        """ACP executors can dynamically probe and live-switch session models/effort."""
+        return True
+
+    async def live_model_options(self) -> _AcpJsonObject | None:
+        """Discover models & thought/reasoning effort levels from the ACP agent."""
+        async with self._control_lock:
+            if not self._catalog_probed and not self._config_models and not self._session_models:
+                if self._proc is None or self._proc.returncode is not None:
+                    await self._start_process()
+                await self._ensure_initialized()
+                had_session = self._session_id is not None
+                await self._ensure_session()
+                if not self._prompt_in_flight:
+                    await self._drain_stale_queue()
+                # If Omnigent MCP is enabled and turn 1 hasn't supplied builtin tools
+                # yet, discard this pre-turn session id (keeping the subprocess and
+                # discovered catalog) so turn 1's session/new includes mcpServers.
+                if (
+                    not had_session
+                    and not self._prompt_in_flight
+                    and self._config.omnigent_mcp
+                    and _mcp_enabled()
+                    and not self._omnigent_tools
+                ):
+                    self._session_id = None
+                    self._system_prompt_sent = False
+                    self._initial_model = None
+                    self._initial_effort = None
+            return self._build_model_options_payload()
+
+    async def apply_live_settings(
+        self,
+        *,
+        model: str | None = None,
+        effort: str | None = None,
+        apply_model: bool = False,
+        apply_effort: bool = False,
+    ) -> _AcpJsonObject:
+        """Apply model and/or reasoning effort changes on the live ACP session if active."""
+        async with self._control_lock:
+            session_id = self._session_id
+            if session_id is None:
+                return {
+                    "active_model": self._active_model,
+                    "active_effort": self._active_effort,
+                    "applied": False,
+                }
+            if not self._prompt_in_flight:
+                await self._drain_stale_queue()
+            if apply_model:
+                await self._apply_model_override(session_id, model)
+            if apply_effort:
+                await self._apply_effort_override(session_id, effort)
+            if not self._prompt_in_flight:
+                await self._drain_stale_queue()
+            return {
+                "active_model": self._active_model,
+                "active_effort": self._active_effort,
+                "applied": True,
+            }
 
     async def _set_model_via_catalog(self, session_id: str, model: str) -> None:
         """Warm-switch the model with ``session/set_model``.
@@ -1877,42 +2262,63 @@ class AcpExecutor(Executor):
         # to back the MCP relay. Storing them when the relay is disabled would
         # let stale data accidentally reach the session/prompt path (#4917).
         self._omnigent_tools = (tools or []) if self._config.omnigent_mcp else []
-        try:
-            if self._proc is None or self._proc.returncode is not None:
-                await self._start_process()
-            await self._ensure_initialized()
-            session_id = await self._ensure_session()
-        except Exception as exc:  # noqa: BLE001
-            yield ExecutorError(message=self._startup_error_message(exc), retryable=False)
-            return
-
-        # Apply a ``/model`` pick to the live session before prompting, so the
-        # switch takes effect on this turn with the transcript intact. Drain first:
-        # a report queued behind ``session/new`` names the option id to target.
-        requested_model = config.model if config is not None else None
-        await self._drain_stale_queue()
-        try:
-            await self._apply_model_override(session_id, requested_model)
-        except Exception as exc:  # noqa: BLE001
-            if self._config.available_models:
-                if not isinstance(exc, _AcpModelSwitchError):
-                    # A transport failure leaves the actual selection uncertain.
-                    self._active_model = None
-                yield ExecutorError(
-                    message=f"ACP model selection failed: {describe_exception(exc)}. "
-                    "No prompt was sent; retry or select another configured model.",
-                    retryable=True,
-                    preserve_session=(
-                        isinstance(exc, (_AcpModelSwitchError, TimeoutError))
-                        and self._proc is not None
-                        and self._proc.returncode is None
-                        and self._reader_task is not None
-                        and not self._reader_task.done()
-                    ),
+        startup_error: ExecutorError | None = None
+        session_id: str | None = None
+        async with self._control_lock:
+            try:
+                if self._proc is None or self._proc.returncode is not None:
+                    await self._start_process()
+                await self._ensure_initialized()
+                session_id = await self._ensure_session()
+            except Exception as exc:  # noqa: BLE001
+                startup_error = ExecutorError(
+                    message=self._startup_error_message(exc), retryable=False
                 )
-                return
-            self._model_switch_supported = False
-            logger.warning("acp[%s] model switch failed: %s", self._config.name, exc)
+            else:
+                # Apply a ``/model`` pick to the live session before prompting, so the
+                # switch takes effect on this turn with the transcript intact. Drain first:
+                # a report queued behind ``session/new`` names the option id to target.
+                requested_model = config.model if config is not None else None
+                await self._drain_stale_queue()
+                try:
+                    await self._apply_model_override(session_id, requested_model)
+                except Exception as exc:  # noqa: BLE001
+                    if self._config.available_models:
+                        if not isinstance(exc, _AcpModelSwitchError):
+                            # A transport failure leaves the actual selection uncertain.
+                            self._active_model = None
+                        startup_error = ExecutorError(
+                            message=f"ACP model selection failed: {describe_exception(exc)}. "
+                            "No prompt was sent; retry or select another configured model.",
+                            retryable=True,
+                            preserve_session=(
+                                isinstance(exc, (_AcpModelSwitchError, TimeoutError))
+                                and self._proc is not None
+                                and self._proc.returncode is None
+                                and self._reader_task is not None
+                                and not self._reader_task.done()
+                            ),
+                        )
+                    else:
+                        self._model_switch_supported = False
+                        logger.warning("acp[%s] model switch failed: %s", self._config.name, exc)
+                if startup_error is None:
+                    requested_effort = (
+                        config.extra.get("reasoning_effort")
+                        if config is not None and isinstance(config.extra, dict)
+                        else None
+                    )
+                    try:
+                        await self._apply_effort_override(
+                            session_id,
+                            requested_effort if isinstance(requested_effort, str) else None,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("acp[%s] effort switch failed: %s", self._config.name, exc)
+        if startup_error is not None or session_id is None:
+            if startup_error is not None:
+                yield startup_error
+            return
 
         # A fresh ACP session holds no prior context. Captured before the latch
         # flips so we know whether to replay history into this turn.
@@ -1974,72 +2380,78 @@ class AcpExecutor(Executor):
         self._active_prompt_request_id = req_id
         self._cancel_grace_deadline = None
 
-        await self._send(
-            {
-                "jsonrpc": "2.0",
-                "id": req_id,
-                "method": _AGENT_METHOD_SESSION_PROMPT,
-                "params": {
-                    "sessionId": session_id,
-                    "prompt": prompt_blocks,
-                    "_meta": {_META_INPUT_ITEM_ID: input_item_id},
-                },
-            }
-        )
+        self._prompt_in_flight = True
+        try:
+            await self._send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "method": _AGENT_METHOD_SESSION_PROMPT,
+                    "params": {
+                        "sessionId": session_id,
+                        "prompt": prompt_blocks,
+                        "_meta": {_META_INPUT_ITEM_ID: input_item_id},
+                    },
+                }
+            )
 
-        deadline = loop.time() + _PROMPT_TIMEOUT_SECONDS
-        accumulated_text: list[str] = []
-
-        while True:
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                yield ExecutorError(message="Timeout waiting for ACP response", retryable=True)
-                return
-
-            # Complete only once the future is resolved AND the queue is drained,
-            # so trailing chunks aren't truncated.
-            if fut.done() and self._queue.empty():
-                try:
-                    response = fut.result()
-                except Exception as exc:
-                    logger.exception("ACP process response retrieval failed")
-                    self._reset_session_state()
-                    yield ExecutorError(message=f"ACP process error: {exc}", retryable=True)
-                    return
-                if "error" in response:
-                    error_msg = response["error"].get("message", "Unknown ACP error")
-                    if "Session not found" in error_msg:
-                        self._reset_session_state()
-                    yield ExecutorError(message=error_msg, retryable=True)
-                    return
-                result = response.get("result", {}) if isinstance(response, dict) else {}
-                usage = self._usage_with_active_model(result) if isinstance(result, dict) else None
-                yield TurnComplete(response="".join(accumulated_text), usage=usage)
-                return
-
-            try:
-                notification = await asyncio.wait_for(
-                    self._queue.get(), timeout=min(remaining, 2.0)
-                )
-            except TimeoutError:
-                continue
-
-            method = notification.get("method", "")
-            params = notification.get("params", {})
-
-            if method == _CLIENT_NOTIFICATION_SESSION_UPDATE:
-                update = params.get("update", {})
-                for event in self._handle_session_update(update):
-                    if isinstance(event, TextChunk):
-                        accumulated_text.append(event.text)
-                    yield event
-            elif notification.get("id") is not None and notification.get("method"):
-                # Server-initiated request (session/request_permission / fs/*):
-                # routes through policy + elicitation. Blocks while the human decides.
-                await self._respond_to_agent_request(notification)
-
-            # Inbound message = progress; reset the idle deadline.
             deadline = loop.time() + _PROMPT_TIMEOUT_SECONDS
+            accumulated_text: list[str] = []
+
+            while True:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    yield ExecutorError(message="Timeout waiting for ACP response", retryable=True)
+                    return
+
+                # Complete only once the future is resolved AND the queue is drained,
+                # so trailing chunks aren't truncated.
+                if fut.done() and self._queue.empty():
+                    try:
+                        response = fut.result()
+                    except Exception as exc:
+                        logger.exception("ACP process response retrieval failed")
+                        self._reset_session_state()
+                        yield ExecutorError(message=f"ACP process error: {exc}", retryable=True)
+                        return
+                    if "error" in response:
+                        error_msg = response["error"].get("message", "Unknown ACP error")
+                        if "Session not found" in error_msg:
+                            self._reset_session_state()
+                        yield ExecutorError(message=error_msg, retryable=True)
+                        return
+                    result = response.get("result", {}) if isinstance(response, dict) else {}
+                    usage = (
+                        self._usage_with_active_model(result) if isinstance(result, dict) else None
+                    )
+                    yield TurnComplete(response="".join(accumulated_text), usage=usage)
+                    return
+
+                try:
+                    notification = await asyncio.wait_for(
+                        self._queue.get(), timeout=min(remaining, 2.0)
+                    )
+                except TimeoutError:
+                    continue
+
+                method = notification.get("method", "")
+                params = notification.get("params", {})
+
+                if method == _CLIENT_NOTIFICATION_SESSION_UPDATE:
+                    update = params.get("update", {})
+                    for event in self._handle_session_update(update):
+                        if isinstance(event, TextChunk):
+                            accumulated_text.append(event.text)
+                        yield event
+                elif notification.get("id") is not None and notification.get("method"):
+                    # Server-initiated request (session/request_permission / fs/*):
+                    # routes through policy + elicitation. Blocks while the human decides.
+                    await self._respond_to_agent_request(notification)
+
+                # Inbound message = progress; reset the idle deadline.
+                deadline = loop.time() + _PROMPT_TIMEOUT_SECONDS
+        finally:
+            self._prompt_in_flight = False
 
     async def interrupt_session(self, session_key: str) -> bool:  # noqa: ARG002 — one ACP session per process
         """Abort the running turn via the ACP ``session/cancel`` notification.

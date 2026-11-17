@@ -40,7 +40,11 @@ from omnigent.debug_logging import (
 )
 from omnigent.entities import Conversation
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.harness_aliases import canonicalize_harness, harness_account_key
+from omnigent.harness_aliases import (
+    canonicalize_harness,
+    harness_account_key,
+    resolve_acp_probe_harness,
+)
 from omnigent.host.frames import (
     CAP_CLONE_REPOSITORY,
     CAP_HARNESS_ACCOUNTS,
@@ -1162,10 +1166,11 @@ def create_hosts_router(
             raise _host_absent_error(host)
         _require_harness_setup_support(conn, "pre-launch model listing")
 
+        resolved_harness = resolve_acp_probe_harness(harness)
         result = await _proxy_model_options(
             host_registry=host_registry,
             host_conn=conn,
-            harness=canonicalize_harness(harness) or harness,
+            harness=resolved_harness,
         )
         if result.get("status") != "ok":
             raise HTTPException(

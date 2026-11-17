@@ -6037,6 +6037,25 @@ describe("automation harness settings", () => {
     expect(hostsHook.useHostModelOptions).toHaveBeenLastCalledWith("host_1", harness, model);
   });
 
+  it("probes live host models and per-model efforts for acp:<slug> scheduled tasks", async () => {
+    mockHarness("acp:antigravity");
+    renderDialog();
+    expect(hostsHook.useHostModelOptions).toHaveBeenLastCalledWith(
+      "host_1",
+      "acp:antigravity",
+      true,
+      {
+        poll: false,
+      },
+    );
+    expect(screen.getByTestId("task-model-trigger")).toBeInTheDocument();
+    expect(screen.getByTestId("task-effort-trigger")).toBeInTheDocument();
+    expect(screen.queryByTestId("task-permission-trigger")).not.toBeInTheDocument();
+    await choose("model", "Model B");
+    fireEvent.keyDown(screen.getByTestId("task-effort-trigger"), { key: "Enter" });
+    expect(await screen.findByRole("option", { name: "Low" })).toBeInTheDocument();
+  });
+
   it.each([
     ["Full Access", "full-access"],
     ["Bypass approvals & sandbox", "bypass"],

@@ -8903,6 +8903,135 @@ async def test_model_options_frame_replies_off_the_receive_loop(
     _cleanup_host(host)
 
 
+async def test_handle_model_options_probes_acp_slug_dedups_and_caches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """HostDaemon probes ``acp:<slug>`` via AcpExecutor, dedups in-flight, and caches."""
+    from omnigent.inner import acp_executor
+    from omnigent.onboarding import acp_auth
+
+    entry = acp_auth.AcpAgentEntry(
+        slug="antigravity",
+        name="Antigravity",
+        command="agy acp --dangerously-skip-permissions",
+    )
+    monkeypatch.setattr(
+        acp_auth,
+        "resolve_acp_agent",
+        lambda slug: entry if slug == "antigravity" else None,
+    )
+
+    probe_started = asyncio.Event()
+    release_probe = asyncio.Event()
+    calls: list[str] = []
+    closes: list[str] = []
+
+    class _FakeAcpExecutor:
+        def __init__(self, config: acp_executor.AcpAgentConfig, **_kwargs: object) -> None:
+            self.config = config
+
+        async def live_model_options(self) -> dict[str, object]:
+            calls.append(self.config.command)
+            probe_started.set()
+            await release_probe.wait()
+            return {
+                "models": [
+                    {
+                        "id": "gemini-3-pro",
+                        "displayName": "Gemini 3 Pro",
+                        "isDefault": True,
+                        "supportedReasoningEfforts": [{"reasoningEffort": "high"}],
+                        "defaultReasoningEffort": "high",
+                    }
+                ]
+            }
+
+        async def close(self) -> None:
+            closes.append(self.config.command)
+
+    monkeypatch.setattr(acp_executor, "AcpExecutor", _FakeAcpExecutor)
+    host = _make_host_process()
+
+    t1 = asyncio.create_task(
+        host._handle_model_options(
+            HostModelOptionsFrame(request_id="req_acp_1", harness="acp:antigravity")
+        )
+    )
+    await asyncio.wait_for(probe_started.wait(), timeout=2.0)
+    t2 = asyncio.create_task(
+        host._handle_model_options(
+            HostModelOptionsFrame(request_id="req_acp_2", harness="acp:antigravity")
+        )
+    )
+    await asyncio.sleep(0)
+    release_probe.set()
+    first, second = await asyncio.gather(t1, t2)
+
+    assert first.status == "ok"
+    assert first.routable_models == ["gemini-3-pro"]
+    assert first.models[0]["supportedReasoningEfforts"] == [{"reasoningEffort": "high"}]
+    assert second.status == "ok"
+    assert second.models == first.models
+    assert calls == ["agy acp --dangerously-skip-permissions"]
+    assert closes == ["agy acp --dangerously-skip-permissions"]
+
+    # Subsequent call hits the 300s TTL cache without spawning again.
+    third = await host._handle_model_options(
+        HostModelOptionsFrame(request_id="req_acp_3", harness="acp:antigravity")
+    )
+    assert third.status == "ok"
+    assert third.models == first.models
+    assert calls == ["agy acp --dangerously-skip-permissions"]
+    _cleanup_host(host)
+
+
+async def test_handle_model_options_acp_probe_failure_does_not_poison_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Failed ACP host probe closes executor and does not cache the failure."""
+    from omnigent.inner import acp_executor
+    from omnigent.onboarding import acp_auth
+
+    entry = acp_auth.AcpAgentEntry(slug="antigravity", name="Antigravity", command="agy acp")
+    monkeypatch.setattr(acp_auth, "resolve_acp_agent", lambda _slug: entry)
+
+    attempts = 0
+    closes = 0
+
+    class _FailingAcpExecutor:
+        def __init__(self, config: acp_executor.AcpAgentConfig, **_kwargs: object) -> None:
+            self.config = config
+
+        async def live_model_options(self) -> dict[str, object]:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise TimeoutError("boot timed out")
+            return {"models": [{"id": "recovered-model", "displayName": "Recovered"}]}
+
+        async def close(self) -> None:
+            nonlocal closes
+            closes += 1
+
+    monkeypatch.setattr(acp_executor, "AcpExecutor", _FailingAcpExecutor)
+    host = _make_host_process()
+
+    failed = await host._handle_model_options(
+        HostModelOptionsFrame(request_id="req_fail", harness="acp:antigravity")
+    )
+    assert failed.status == "failed"
+    assert "acp:antigravity" not in host._acp_model_options_cache
+    assert closes == 1
+
+    recovered = await host._handle_model_options(
+        HostModelOptionsFrame(request_id="req_ok", harness="acp:antigravity")
+    )
+    assert recovered.status == "ok"
+    assert recovered.models == [{"id": "recovered-model", "displayName": "Recovered"}]
+    assert closes == 2
+    _cleanup_host(host)
+
+
 async def test_dns_errno_failure_is_not_a_recycle(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,

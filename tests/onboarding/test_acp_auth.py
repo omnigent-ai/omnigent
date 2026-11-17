@@ -160,3 +160,21 @@ def test_shadowed_builtin_acp_rows_matches_row_ids_only() -> None:
 def test_shadowed_builtin_acp_rows_empty_without_config() -> None:
     """No configured agents → no rows suppressed (the common case)."""
     assert shadowed_builtin_acp_rows([]) == frozenset()
+
+
+def test_resolve_acp_harness_entry_honors_path_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Builtin ACP CLI entries use the shared env -> config -> binary lookup."""
+    from omnigent.onboarding.acp_auth import resolve_acp_harness_entry
+
+    monkeypatch.delenv("OMNIGENT_GROK_PATH", raising=False)
+    cfg = {"harness": {"grok": {"command": "/opt/cfg/grok"}}}
+    cfg_entry = resolve_acp_harness_entry("grok", config=cfg)
+    assert cfg_entry is not None
+    assert cfg_entry.command.startswith("/opt/cfg/grok ")
+
+    monkeypatch.setenv("OMNIGENT_GROK_PATH", "/opt/env/grok")
+    env_entry = resolve_acp_harness_entry("grok", config=cfg)
+    assert env_entry is not None
+    assert env_entry.command.startswith("/opt/env/grok ")

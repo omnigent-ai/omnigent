@@ -35,7 +35,7 @@ class _AliveProc:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("harness", ["claude-sdk", "acp"])
+@pytest.mark.parametrize("harness", ["claude-sdk"])
 async def test_get_client_respawns_only_when_model_changes(
     monkeypatch: pytest.MonkeyPatch,
     harness: str,
@@ -103,10 +103,18 @@ async def test_get_client_respawns_only_when_model_changes(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("harness", ["qwen", "acp"])
+@pytest.mark.parametrize(
+    ("harness", "extra_env"),
+    [
+        ("qwen", {}),
+        ("acp", {}),
+        ("acp", {"HARNESS_ACP_MODEL_LIST": "model-a,model-b"}),
+    ],
+)
 async def test_live_acp_model_change_keeps_process(
     monkeypatch: pytest.MonkeyPatch,
     harness: str,
+    extra_env: dict[str, str],
 ) -> None:
     """ACP applies model changes through session config without respawning."""
     pm = HarnessProcessManager()
@@ -128,9 +136,8 @@ async def test_live_acp_model_change_keeps_process(
     monkeypatch.setattr(pm, "_spawn_entry", _fake_spawn)
     key = _model_env_key(harness)
 
-    env = {"HARNESS_ACP_MODEL_LIST": "model-a,model-b"} if harness == "acp" else {}
-    await pm.get_client("conv_acp", harness, env={**env, key: "model-a"})
-    await pm.get_client("conv_acp", harness, env={**env, key: "model-b"})
+    await pm.get_client("conv_acp", harness, env={**extra_env, key: "model-a"})
+    await pm.get_client("conv_acp", harness, env={**extra_env, key: "model-b"})
 
     assert spawns == ["model-a"]
     entry = pm._entries.get("conv_acp")

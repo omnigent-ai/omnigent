@@ -58,6 +58,10 @@ from __future__ import annotations
 import json
 import logging
 import os
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from omnigent.onboarding.acp_auth import AcpAgentEntry
 
 from fastapi import FastAPI
 
@@ -188,6 +192,24 @@ def _build_acp_executor(extension: AcpExtension = NO_ACP_EXTENSION) -> Executor:
     return AcpExecutor(config=config, cwd=cwd, os_env=_resolve_os_env(), extension=extension)
 
 
+def acp_agent_config_from_entry(
+    entry: AcpAgentEntry,
+    *,
+    omnigent_mcp: bool | None = None,
+) -> AcpAgentConfig:
+    """Build an :class:`AcpAgentConfig` from a configured :class:`AcpAgentEntry`."""
+    return AcpAgentConfig(
+        command=entry.command,
+        name=entry.name,
+        model=entry.model,
+        session_id_mode=entry.session_id_mode,
+        send_model_in_session_new=entry.send_model,
+        omnigent_mcp=entry.omnigent_mcp if omnigent_mcp is None else omnigent_mcp,
+        inject_system_prompt=entry.inject_system_prompt,
+        env_passthrough=entry.env_passthrough,
+    )
+
+
 def create_app(extension: AcpExtension = NO_ACP_EXTENSION) -> FastAPI:
     """Build the generic ACP harness's FastAPI app (required entry point).
 
@@ -204,6 +226,8 @@ def create_app(extension: AcpExtension = NO_ACP_EXTENSION) -> FastAPI:
     """
     label = os.environ.get(_ENV_NAME, "").strip() or "ACP agent"
     adapter = ExecutorAdapter(
-        executor_factory=lambda: _build_acp_executor(extension), harness_label=label
+        executor_factory=lambda: _build_acp_executor(extension),
+        harness_label=label,
+        supports_model_options=True,
     )
     return adapter.build()

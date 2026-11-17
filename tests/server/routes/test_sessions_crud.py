@@ -1159,3 +1159,54 @@ async def test_patch_rejects_forged_server_owned_labels(
     conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
     assert conv is not None
     assert label_key not in conv.labels
+
+
+async def test_patch_acp_model_change_rolls_back_on_runner_400_rejection(
+    client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """When a live ACP runner rejects a model switch with 400, rollback model_override."""
+    import json
+
+    from omnigent.server.routes._sessions import helpers, orchestration
+    from omnigent.server.routes.sessions import routes_core
+    from omnigent.spec.types import AgentSpec, ExecutorSpec
+
+    agent_store = SqlAlchemyAgentStore(db_uri)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    agent_id = generate_agent_id()
+    agent_store.create(agent_id, name="acp-reject-agent", bundle_location="test:///bundle")
+    conv = conv_store.create_conversation(agent_id=agent_id)
+    conv_store.replace_runner_id(conv.id, "runner-1")
+    conv_store.update_conversation(
+        conv.id,
+        harness_override="acp",
+        model_override="good-model",
+    )
+
+    acp_spec = AgentSpec(
+        spec_version=1,
+        name="acp-reject-agent",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "acp"}),
+    )
+    rejected = helpers._RunnerForwardResult(
+        status_code=400,
+        body=json.dumps({"error": "session_settings_rejected", "detail": "model rejected by ACP"}),
+    )
+    with (
+        patch.object(orchestration, "_load_agent_spec_for_session", return_value=acp_spec),
+        patch.object(
+            routes_core,
+            "_forward_session_change_to_runner",
+            new=AsyncMock(return_value=rejected),
+        ),
+    ):
+        response = await client.patch(
+            f"/v1/sessions/{conv.id}",
+            json={"model_override": "bad-model"},
+        )
+
+    assert response.status_code == 400, response.text
+    assert "model rejected by ACP" in response.text
+    after = conv_store.get_conversation(conv.id)
+    assert after is not None
+    assert after.model_override == "good-model"

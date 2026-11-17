@@ -1331,6 +1331,7 @@ class ResponseObject(BaseModel):
     conversation: ConversationRef | None = None
     instructions: str | None = None
     reasoning: dict[str, str] | None = None
+    reported_model: str | None = None
     error: ErrorDetail | None = None
     incomplete_details: IncompleteDetails | None = None
 

@@ -268,6 +268,49 @@ def command_binary_on_path(command: str) -> bool:
     return shutil.which(parts[0]) is not None
 
 
+def resolve_acp_cli_executable(harness: str, config: dict[str, object] | None = None) -> str:
+    """Resolve the executable path for a builtin ACP CLI harness."""
+    from omnigent._platform import resolve_cli_binary
+    from omnigent.harness_startup_config import (
+        config_harness_path_override,
+        resolve_harness_path,
+    )
+
+    cli_entry = ACP_CLI_HARNESSES[harness]
+    cfg = load_config() if config is None else config
+    return (
+        resolve_harness_path(harness)
+        or config_harness_path_override(harness, cfg)
+        or resolve_cli_binary(cli_entry.binary)
+        or cli_entry.binary
+    )
+
+
+def resolve_acp_harness_entry(
+    harness: str, config: dict[str, object] | None = None
+) -> AcpAgentEntry | None:
+    """Resolve an ``acp``, ``acp:<slug>``, or builtin ACP CLI id to an :class:`AcpAgentEntry`."""
+    import shlex
+
+    if harness.startswith("acp:"):
+        slug = harness.split(":", 1)[1].strip()
+        return resolve_acp_agent(slug) if config is None else resolve_acp_agent(slug, config)
+    if harness in ACP_CLI_HARNESSES:
+        cli_entry = ACP_CLI_HARNESSES[harness]
+        executable = resolve_acp_cli_executable(harness, config)
+        return AcpAgentEntry(
+            slug=harness,
+            name=cli_entry.label,
+            command=shlex.join([executable, *cli_entry.args]),
+            omnigent_mcp=cli_entry.omnigent_mcp,
+            env_passthrough=cli_entry.env_passthrough,
+        )
+    if harness == "acp":
+        entries = acp_agents() if config is None else acp_agents(config)
+        return entries[0] if entries else None
+    return None
+
+
 @dataclass(frozen=True)
 class AcpConfigSummary:
     """Readiness view of the ``acp:`` block for the setup readout."""

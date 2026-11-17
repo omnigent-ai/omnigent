@@ -1,6 +1,7 @@
 import type { NativeModelOption } from "./types";
+import { isAcpHarnessAgent, isGenericAcpHarness } from "./agentGrouping";
 import { nativeCodingAgentForHarness } from "./nativeCodingAgents";
-import { codexEffortLevelsForModel } from "./codexNativeModels";
+import { codexEffortLevelsForModel, findNativeModelOption } from "./codexNativeModels";
 import { findModelLabelOption } from "./composerModelLabel";
 import { effortLevelsForFamily, supportsEffortControl } from "./sessionCapabilities";
 
@@ -23,6 +24,32 @@ const PI_NATIVE_EFFORT_LEVELS = [
 export type NativeModelPickerKind =
   "claude" | "codex" | "cursor" | "kiro" | "opencode" | "pi" | "devin" | "acp" | "configured";
 
+/**
+ * Effort levels for an ACP session model, falling back to the agent's active
+ * default model (or sole model) when ``currentModel`` has not been overridden.
+ */
+export function acpEffortLevelsForModel(
+  options: readonly NativeModelOption[],
+  currentModel: string | null | undefined,
+): readonly string[] {
+  if (currentModel) {
+    const exactLevels = codexEffortLevelsForModel(options, currentModel);
+    if (exactLevels.length > 0) return exactLevels;
+    if (findNativeModelOption(options, currentModel) !== null) return [];
+  }
+  const fallback =
+    options.find((option) => option.isDefault) ?? (options.length === 1 ? options[0] : undefined);
+  if (!fallback) return [];
+  const efforts = fallback.supportedReasoningEfforts ?? [];
+  return Array.from(
+    new Set(
+      efforts
+        .map((option) => option.reasoningEffort)
+        .filter((effort): effort is string => typeof effort === "string" && effort.length > 0),
+    ),
+  );
+}
+
 /** Preserve inherited effort; clear an explicit choice that the new model cannot use. */
 export function effortAfterModelChange(
   effort: string | null,
@@ -42,7 +69,7 @@ export function selectedModelForPicker(
     const model = reportedModel || requestedModel;
     return model ? (findModelLabelOption(options, model)?.id ?? model) : null;
   }
-  return requestedModel ?? (kind === "configured" ? reportedModel : null);
+  return requestedModel ?? (kind === "configured" || kind === "acp" ? reportedModel : null);
 }
 
 /** Resolve unlabeled native sessions from their harness; children keep their own capabilities. */
@@ -93,6 +120,12 @@ export function effortLevelsForConv(
     case "pi-native-ui":
       return PI_NATIVE_EFFORT_LEVELS;
     default:
+      if (
+        conv?.parentSessionId == null &&
+        (isGenericAcpHarness(conv?.harness) || effortFamily === "acp")
+      ) {
+        return acpEffortLevelsForModel(codexModelOptions, currentModel);
+      }
       // A non-native harness offers its declared family's ladder (claude-sdk →
       // anthropic, codex → openai); with no family the shared default holds.
       return effortFamily ? effortLevelsForFamily(effortFamily) : EFFORT_LEVELS;
@@ -146,9 +179,40 @@ export function modelPickerKindForConv(
       if (conv?.inferenceConfigured) return "configured";
       // Generic ACP sessions carry no wrapper label; the server canonicalizes
       // ``acp:<slug>`` ids to "acp" in the snapshot's harness field.
-      if (conv?.harness === "acp" && modelOptions.length > 1) return "acp";
+      if (isGenericAcpHarness(conv?.harness) && modelOptions.length > 1) return "acp";
       return null;
   }
+}
+
+/**
+ * Resolve the host model-probe harness id for an active chat / side-chat session,
+ * distinguishing generic ACP probes (one-shot unpolled) from native SDK probes.
+ */
+export function resolveHostProbeTarget(params: {
+  pickerKind: NativeModelPickerKind | null;
+  boundAgent: { harness?: string | null; acpHarness?: boolean } | null | undefined;
+  agentId: string | null | undefined;
+  harness: string | null | undefined;
+  acpHarnessIds?: ReadonlySet<string>;
+}): { probeHarness: string | null; isAcp: boolean } {
+  const { pickerKind, boundAgent, agentId, harness, acpHarnessIds } = params;
+  if (pickerKind === "codex" || pickerKind === "claude" || pickerKind === "devin") {
+    return { probeHarness: `${pickerKind}-native`, isAcp: false };
+  }
+  if (pickerKind !== null && pickerKind !== "acp") {
+    return { probeHarness: null, isAcp: false };
+  }
+  if (
+    boundAgent != null &&
+    boundAgent.harness &&
+    isAcpHarnessAgent({ harness: boundAgent.harness, acpHarness: boundAgent.acpHarness })
+  ) {
+    return { probeHarness: boundAgent.harness, isAcp: true };
+  }
+  if (!agentId && isGenericAcpHarness(harness, acpHarnessIds)) {
+    return { probeHarness: harness ?? null, isAcp: harness != null };
+  }
+  return { probeHarness: null, isAcp: false };
 }
 
 export function shouldShowModelPicker(

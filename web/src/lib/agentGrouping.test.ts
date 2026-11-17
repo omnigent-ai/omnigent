@@ -97,6 +97,7 @@ describe("isAcpHarnessAgent", () => {
     expect(isAcpHarnessAgent({ harness: "acp:devin" })).toBe(true);
     expect(isAcpHarnessAgent({ harness: "acp:kilocode" })).toBe(true);
     expect(isAcpHarnessAgent({ harness: "grok" })).toBe(true);
+    expect(isAcpHarnessAgent({ harness: "jcode" })).toBe(true);
     // Bare builtin ACP CLI ids: a seeded `devin` agent carries
     // `harness: "devin"`, not `acp:devin`. This is the older-server fallback
     // path (no `acpHarness` flag), which the legacy id set still covers.

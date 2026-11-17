@@ -558,6 +558,50 @@ it.each([false, true])("hides native settings before a child exists (draft=%s)",
   expect(screen.queryByRole("button", { name: "Side chat model and effort" })).toBeNull();
 });
 
+it("probes host model options for an ACP side chat with empty session models", async () => {
+  const fetch = vi.spyOn(identity, "authenticatedFetch").mockImplementation(async (url) => {
+    if (String(url) === "/v1/sessions/side/agent") {
+      return new Response(
+        JSON.stringify({
+          id: "agent",
+          object: "agent",
+          name: "antigravity",
+          harness: "acp:antigravity",
+        }),
+        { status: 200 },
+      );
+    }
+    return new Response(JSON.stringify({ models }), { status: 200 });
+  });
+  render(
+    <QueryClientProvider client={cache}>
+      <SideChatSettings
+        session={{
+          ...child,
+          hostId: "host",
+          harness: "acp",
+          labels: { "omnigent.side_chat": "1", "omnigent.side_chat.source_id": "parent" },
+          codexModelOptions: [],
+          modelOverride: "model-a",
+          reasoningEffort: "high",
+        }}
+      />
+    </QueryClientProvider>,
+  );
+  const picker = await screen.findByRole("button", { name: "Side chat model and effort" });
+  expect(fetch).toHaveBeenCalledWith("/v1/hosts/host/harnesses/acp%3Aantigravity/model-options");
+  const user = userEvent.setup();
+  await user.click(picker);
+  await user.click(screen.getByTestId("side-chat-model-edit"));
+  await user.click(screen.getByRole("menuitemcheckbox", { name: "Model B" }));
+  await waitFor(() =>
+    expect(sessionsApi.updateSession).toHaveBeenCalledWith("side", {
+      modelOverride: "model-b",
+      reasoningEffort: null,
+    }),
+  );
+});
+
 it.each([false, true])(
   "preserves unspecified effort when selecting a model (draft=%s)",
   async (draft) => {

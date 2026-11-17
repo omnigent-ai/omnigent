@@ -224,6 +224,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _SUBAGENT_FORWARD_RECONNECT_WAIT_S,
     _TERMINAL_RESPONSE_EVENT_TYPES,
     _TURN_ACTOR_LABEL,
+    _acp_dynamic_options_probed,
     _deferred_elicitation_clear_tasks,
     _intentional_runner_stop_locks,
     _intentional_stop_sessions,
@@ -363,6 +364,7 @@ from omnigent.server.routes._sessions.helpers import (
     _repl_terminal_ui_labels,
     _require_declared_subagent,
     _require_external_status_forward,
+    _resolve_acp_probe_harness_impl,
     _resolve_harness,
     _resolve_llm_model,
     _resolve_subagent_spec,
@@ -2035,9 +2037,9 @@ async def _persist_relay_reported_model(
 ) -> None:
     """Persist the concrete model reported by an SDK harness response."""
     usage_obj = resp_obj.get("usage")
-    if not isinstance(usage_obj, dict):
-        return
-    raw_model = usage_obj.get("model")
+    raw_model = usage_obj.get("model") if isinstance(usage_obj, dict) else None
+    if not raw_model:
+        raw_model = resp_obj.get("reported_model")
     model = concrete_reported_model(raw_model)
     if model is None:
         return
@@ -10673,7 +10675,16 @@ async def _relay_runner_stream_once(
                         _turn_in = _resp_usage.get("input_tokens")
                         _turn_out = _resp_usage.get("output_tokens")
                         _turn_cost = _resp_usage.get("cost_usd")
-                        _turn_model: str | None = _resp_usage.get("model") or current_model or None
+                        _turn_model: str | None = (
+                            _resp_usage.get("model")
+                            or (
+                                _response.get("reported_model")
+                                if isinstance(_response, dict)
+                                else None
+                            )
+                            or current_model
+                            or None
+                        )
                         _tel_emit(
                             _TelTurnEndEvent(
                                 installation_id=_get_installation_id(),
@@ -14281,17 +14292,68 @@ async def _fetch_model_options(
         # Generic ACP sessions carry no native wrapper label; their picker
         # serves the deployment's curated provider ``models:`` shortlist
         # resolved from the spec instead of a runner-owned catalog.
-        from omnigent.harness_aliases import canonicalize_harness
+        from omnigent.harness_aliases import is_acp_harness
 
         is_acp = (
             _resolve_harness_impl_is_acp(conv, agent_store, agent=agent)
             if isinstance(harness, _UnresolvedHarness)
-            else canonicalize_harness(harness) == "acp"
+            else is_acp_harness(harness)
         )
         if is_acp:
-            return await _load_acp_model_options(
-                session_id, conv, agent_store, agent=agent, agent_cache=agent_cache
-            )
+            if session_id not in _acp_dynamic_options_probed:
+                curated = await _load_acp_model_options(
+                    session_id, conv, agent_store, agent=agent, agent_cache=agent_cache
+                )
+                if curated:
+                    return curated
+            cached = _model_options_cache.get(session_id)
+            if runner_client is None:
+                if cached:
+                    return cached
+                if conv.host_id is not None and session_id not in _model_options_inflight:
+                    probe_harness = (
+                        _resolve_acp_probe_harness_impl(
+                            conv,
+                            agent_store=agent_store,
+                            agent_cache=agent_cache,
+                            agent=agent,
+                        )
+                        or "acp"
+                    )
+                    task = asyncio.create_task(
+                        _load_model_options_from_host(session_id, conv.host_id, probe_harness)
+                    )
+                    _model_options_inflight[session_id] = task
+
+                    def _clear_acp_host_options_inflight(
+                        _task: asyncio.Task[None],
+                    ) -> None:
+                        _model_options_inflight.pop(session_id, None)
+
+                    task.add_done_callback(_clear_acp_host_options_inflight)
+                return cached or []
+            if (
+                session_id in _acp_dynamic_options_probed
+                and session_id not in _model_options_stale
+            ):
+                return cached or []
+            if session_id not in _model_options_inflight:
+                task = asyncio.create_task(
+                    _load_model_options(
+                        runner_client,
+                        session_id,
+                        f"/v1/sessions/{session_id}/model-options",
+                        empty_is_authoritative=True,
+                        timeout_s=20.0,
+                    )
+                )
+                _model_options_inflight[session_id] = task
+
+                def _clear_acp_options_inflight(_task: asyncio.Task[None]) -> None:
+                    _model_options_inflight.pop(session_id, None)
+
+                task.add_done_callback(_clear_acp_options_inflight)
+            return cached or []
         return []
     cached = _model_options_cache.get(session_id)
     if runner_client is None:
@@ -14395,21 +14457,18 @@ async def _codex_side_chat_fork_lost(
 def _resolve_harness_impl_is_acp(
     conv: Conversation, agent_store: AgentStore | None, agent: Agent | None = None
 ) -> bool:
-    """Return whether *conv* runs a generic ``acp`` harness.
-
-    ``canonicalize_harness`` folds ``acp:<slug>`` ids to ``"acp"``, so any
-    configured or embedded generic ACP agent matches.
+    """Return whether *conv* runs a generic ACP harness (including ``acp:<slug>`` and ACP CLIs).
 
     :param conv: Conversation row the session snapshot was built from.
     :param agent_store: Optional store for the harness lookup; ``None`` lets
         :func:`_resolve_harness` fall back to the runtime global.
     :param agent: The bound agent row when the caller already read it.
-    :returns: ``True`` when the session's resolved harness is ``"acp"``.
+    :returns: ``True`` when the session's resolved harness is an ACP harness.
     """
-    from omnigent.harness_aliases import canonicalize_harness
+    from omnigent.harness_aliases import is_acp_harness
 
     harness = _resolve_harness(conv, agent_store=agent_store, agent=agent)
-    return canonicalize_harness(harness) == "acp"
+    return is_acp_harness(harness)
 
 
 def _validate_acp_spec_models(
