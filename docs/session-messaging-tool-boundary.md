@@ -17,9 +17,9 @@ Creating C from A with `sys_session_create(placement="same_host")` or
 records origin; `parent_session_id` determines the child relationship. C is
 filed in A's project, or in the automation's current project when A is one of
 its runs, so a trigger automation's per-item sessions follow the automation's
-project. A `project_name` argument files C
-in the owner's project with that name instead, created if missing. With
-`sibling_sessions` enabled, C is standalone only when that project is not A's.
+project. A `project_name` argument files C in the owner's project with that
+name instead, created if missing. With `sibling_sessions` enabled, C is
+standalone when its destination project differs from A's.
 Named child dispatch through `sys_session_send(agent=..., args=...)` remains
 available too. The table describes the intended choice, not a new restriction
 on which owned destinations the peer-message tool can address.
