@@ -318,6 +318,9 @@ _PROBE_BODIES: dict[tuple[str, str], dict[str, Any]] = {
 }
 
 
+# Create is not probed: test_users_cannot_schedule_the_proactive_agent covers it.
+_UNPROBED_ROUTES = {("POST", "/v1/scheduled-tasks")}
+
 _SHARING_USER = "alice@example.com"
 _RECIPIENT = "bob@example.com"
 
@@ -383,7 +386,9 @@ async def test_no_scheduled_task_route_reveals_the_proactive_task(
     )
     item_probes = [(m, p) for m, p in probes if "{scheduled_task_id}" in p]
     list_probes = [(m, p) for m, p in probes if "{" not in p and m == "GET"]
-    assert item_probes and list_probes
+    # A route neither group covers must be probed here or excluded on purpose.
+    unprobed = set(probes) - set(item_probes) - set(list_probes)
+    assert unprobed == _UNPROBED_ROUTES, unprobed
 
     # The owner and the recipient each reach the task a different way.
     for user in (_RECIPIENT, _SHARING_USER):
