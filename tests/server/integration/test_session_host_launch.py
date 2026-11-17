@@ -74,7 +74,7 @@ from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
 from tests.budgets import Deadline, budget
 from tests.debug_log_helpers import capture_debug_rows
-from tests.server.helpers import create_test_agent
+from tests.server.helpers import claude_ask_user_question_payload, create_test_agent
 from tests.server.helpers import websocket_scope as _websocket_scope
 
 pytestmark = pytest.mark.asyncio
@@ -5510,29 +5510,8 @@ _QUESTION = "Which database should the worker target?"
 
 
 def _ask_user_question_hook_payload(question: str = _QUESTION) -> dict[str, Any]:
-    """Build a Claude ``PermissionRequest`` body for one AskUserQuestion."""
-    payload: dict[str, Any] = {
-        "session_id": "claude_sess_ask",
-        "transcript_path": "/tmp/transcript.jsonl",
-        "cwd": _WORKSPACE,
-        "permission_mode": "default",
-        "hook_event_name": "PermissionRequest",
-        "tool_name": "AskUserQuestion",
-        "tool_input": {
-            "questions": [
-                {
-                    "question": question,
-                    "header": "Database",
-                    "multiSelect": False,
-                    "options": [
-                        {"label": "postgres", "description": "Primary store"},
-                        {"label": "sqlite", "description": "Local dev"},
-                    ],
-                },
-            ],
-        },
-    }
-    return payload
+    """Build a Claude ``PermissionRequest`` body for one AskUserQuestion in ``_WORKSPACE``."""
+    return claude_ask_user_question_payload(cwd=_WORKSPACE, question=question)
 
 
 async def _park_ask_user_question(
@@ -5711,12 +5690,16 @@ async def _answer_and_serve_launch(
     *,
     route: str = "resolve",
     content: dict[str, Any] | None = None,
+    launch_status: str = "launched",
+    launch_error_code: str | None = None,
 ) -> httpx.Response:
     """Answer the question and serve the relaunch it must start on the host."""
     answer = asyncio.create_task(
         _resolve_answer(client, session_id, elicitation_id, route=route, content=content)
     )
-    launch = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+    launch = asyncio.create_task(
+        _serve_one_launch(comm, launch_status=launch_status, launch_error_code=launch_error_code)
+    )
     try:
         try:
             await asyncio.wait_for(asyncio.shield(launch), budget(10.0))
@@ -6231,3 +6214,40 @@ async def test_a_new_question_under_a_reused_id_is_answered_again(
     texts = _message_texts(runner_posts)
     assert len(texts) == 2, runner_posts
     assert new_question in texts[1] and "postgres" in texts[1], texts[1]
+
+
+async def test_a_refused_relaunch_keeps_the_answer_in_the_failed_turn(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    app: FastAPI,
+) -> None:
+    """A refused relaunch closes the card, as for a chat message; the answer stays saved."""
+    from omnigent.runtime import pending_elicitations, set_runner_client
+
+    comm, session_id, hook_task, elicitation_id = await _park_on_claude_session(client, app)
+    set_runner_client(None)
+    _stage_relaunched_runner(monkeypatch, None)
+    try:
+        response = await _answer_and_serve_launch(
+            client,
+            comm,
+            session_id,
+            elicitation_id,
+            launch_status="failed",
+            launch_error_code="harness_not_configured",
+        )
+    finally:
+        hook_task.cancel()
+        await asyncio.gather(hook_task, return_exceptions=True)
+
+    assert response.status_code < 300, response.text
+    assert pending_elicitations.lookup(elicitation_id, conversation_id=session_id) is None
+    items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
+    texts = [
+        part.get("text", "")
+        for item in items
+        if item["type"] == "message"
+        for part in item.get("content", [])
+        if isinstance(part, dict)
+    ]
+    assert any(_QUESTION in text and "sqlite" in text for text in texts), items
