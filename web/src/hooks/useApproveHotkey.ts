@@ -25,7 +25,6 @@ import { useEffect } from "react";
 import { create } from "zustand";
 
 import { schemaFields } from "@/components/blocks/ElicitationSchemaForm";
-import { ENTER_KEY, ESC_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
 import { useIsEmbedded } from "@/lib/embedded";
 import { getEmbedRoot } from "@/lib/host";
 import {
@@ -36,13 +35,13 @@ import {
   isTextEntry,
 } from "@/lib/hotkeys";
 import type { AnyBlock, ElicitationBlock } from "@/lib/blocks";
-import { matchesShortcut } from "@/lib/shortcuts/registry";
+import { matchesShortcut, shortcutKeys } from "@/lib/shortcuts/registry";
 import { useChatStore } from "@/store/chatStore";
 
 /** Glyphs for the chord this hook matches; shown on the Approve button it would press. */
-export const APPROVE_KEYS = [MOD_KEY, ENTER_KEY] as const;
+export const APPROVE_KEYS = shortcutKeys("approval.accept");
 /** Glyph for the key that declines; shown on the Reject button it would press. */
-export const DECLINE_KEYS = [ESC_KEY] as const;
+export const DECLINE_KEYS = shortcutKeys("approval.decline");
 
 /**
  * Whether Esc belongs to something else: an open dialog or modal, menu, composer
