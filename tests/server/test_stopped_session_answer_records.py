@@ -31,11 +31,39 @@ async def test_the_prune_keeps_running_and_recent_records() -> None:
     try:
         orchestration._prune_stopped_session_answers()
 
-        kept = {key for key in records if orchestration._stopped_session_answers.get(key)}
+        kept = {
+            key for key in records if orchestration._stopped_session_answers.get(key) is not None
+        }
         assert kept == {("session", "old_running"), ("session", "recent")}
     finally:
         for key in records:
             orchestration._stopped_session_answers.pop(key, None)
+
+
+async def test_an_answer_prunes_old_records() -> None:
+    old = time.time() - orchestration._CLAUDE_NATIVE_PERMISSION_HOOK_TIMEOUT_S - 1
+    key = ("session", "old_done")
+    orchestration._stopped_session_answers[key] = _record(old, delivering=False)
+    request = Request({"type": "http", "method": "POST", "path": "/", "headers": []})
+    conv = Conversation(id="other", created_at=0, updated_at=0, root_conversation_id="other")
+
+    async def _post_event(*args: object, **kwargs: object) -> dict[str, bool]:
+        raise AssertionError("an out-of-scope answer must not be delivered")
+
+    try:
+        delivered = await orchestration._deliver_answer_to_stopped_session(
+            request,
+            "other",
+            conv,
+            {"elicitation_id": "elicit_x", "action": "decline"},
+            None,
+            _post_event,
+        )
+
+        assert delivered is None
+        assert orchestration._stopped_session_answers.get(key) is None
+    finally:
+        orchestration._stopped_session_answers.pop(key, None)
 
 
 async def test_a_reused_id_does_not_drop_a_running_delivery() -> None:

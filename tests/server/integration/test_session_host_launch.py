@@ -23,7 +23,7 @@ import logging
 import subprocess
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, Mock
@@ -5648,34 +5648,49 @@ def _stage_live_runner(monkeypatch: pytest.MonkeyPatch, fake_runner: httpx.Async
     monkeypatch.setattr(sessions_module, "_get_runner_client", _live)
 
 
+async def _wait_until(predicate: Callable[[], bool], failure: str) -> None:
+    """Poll *predicate* until it holds; fail with *failure* after the hang guard."""
+    deadline = time.monotonic() + budget(5.0)
+    while not predicate():
+        if time.monotonic() > deadline:
+            raise AssertionError(failure)
+        await asyncio.sleep(0.01)
+
+
+async def _cancel_all(*tasks: asyncio.Task[Any] | None) -> None:
+    """Cancel and await every task that was started."""
+    started = [task for task in tasks if task is not None]
+    for task in started:
+        task.cancel()
+    await asyncio.gather(*started, return_exceptions=True)
+
+
 async def _wait_for_dispatch_in_flight(session_id: str) -> None:
     """Wait until the message path counts a message in flight for the session."""
     from omnigent.server.routes._sessions import orchestration
 
-    deadline = time.monotonic() + budget(5.0)
-    while orchestration._dispatch_in_flight.get(session_id, 0) == 0:
-        if time.monotonic() > deadline:
-            raise AssertionError("the first answer never reached the message path")
-        await asyncio.sleep(0.01)
+    await _wait_until(
+        lambda: orchestration._dispatch_in_flight.get(session_id, 0) > 0,
+        "the first answer never reached the message path",
+    )
 
 
 async def _wait_for_follower(session_id: str, elicitation_id: str) -> None:
     """Wait until a second request waits on the question's running delivery."""
     from omnigent.server.routes._sessions import orchestration
 
-    deadline = time.monotonic() + budget(5.0)
-    while True:
+    def _follower_waits() -> bool:
         record = orchestration._stopped_session_answers.get((session_id, elicitation_id))
-        # The delivery keeps one callback of its own; each waiting request adds one.
-        if (
+        # CPython futures list callbacks: the delivery keeps one; each waiting request adds one.
+        return (
             record is not None
             and record.delivery is not None
             and len(record.delivery._callbacks) > 1
-        ):
-            return
-        if time.monotonic() > deadline:
-            raise AssertionError("the second answer never waited on the first one's delivery")
-        await asyncio.sleep(0.01)
+        )
+
+    await _wait_until(
+        _follower_waits, "the second answer never waited on the first one's delivery"
+    )
 
 
 async def _resolve_answer(
@@ -5813,8 +5828,8 @@ async def test_answer_with_a_live_runner_reaches_the_hook_and_sends_no_message(
         await asyncio.gather(hook_task, return_exceptions=True)
         await fake_runner.aclose()
 
+    # On admission_error the old path's later approval forward still errors, as before.
     if lookup == "live":
-        # On admission_error the old path's later approval forward still errors, as before.
         assert response.status_code == 202, response.text
         assert response.json() == {"queued": False}
     decision = hook_response.json()["hookSpecificOutput"]["decision"]
@@ -5937,13 +5952,7 @@ async def test_two_answers_at_once_deliver_one_message(
         responses = await asyncio.wait_for(asyncio.gather(first, second), budget(10.0))
     finally:
         gate[1].set()
-        for task in (first, second, launch, hook_task):
-            if task is not None:
-                task.cancel()
-        await asyncio.gather(
-            *(t for t in (first, second, launch, hook_task) if t is not None),
-            return_exceptions=True,
-        )
+        await _cancel_all(first, second, launch, hook_task)
         await fake_runner.aclose()
 
     if case == "leader_fails":
@@ -5989,21 +5998,13 @@ async def test_two_answers_in_the_same_moment_deliver_one_message(
     ]
     launch: asyncio.Task[HostLaunchRunnerFrame] | None = None
     try:
-        deadline = time.monotonic() + budget(5.0)
-        while waiting < 2:
-            assert time.monotonic() < deadline, "both answers must reach the runner check"
-            await asyncio.sleep(0.01)
+        await _wait_until(lambda: waiting == 2, "both answers must reach the runner check")
         release.set()
         launch = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
         responses = await asyncio.wait_for(asyncio.gather(*answers), budget(10.0))
     finally:
         release.set()
-        for task in (*answers, launch, hook_task):
-            if task is not None:
-                task.cancel()
-        await asyncio.gather(
-            *(t for t in (*answers, launch, hook_task) if t is not None), return_exceptions=True
-        )
+        await _cancel_all(*answers, launch, hook_task)
         await fake_runner.aclose()
 
     assert all(r.status_code < 300 and r.json().get("queued") is True for r in responses), [
@@ -6042,19 +6043,14 @@ async def test_a_cancelled_answer_can_be_answered_again(
         assert follower.json()["error"]["code"] == "runner_unavailable", follower.text
 
         monkeypatch.setattr(sessions_module, "_HOST_RECONNECT_GRACE_S", 0.05)
-        deadline = time.monotonic() + budget(5.0)
-        while orchestration._dispatch_in_flight.get(session_id, 0) > 0:
-            assert time.monotonic() < deadline, "the cancelled request never left the message path"
-            await asyncio.sleep(0.01)
+        await _wait_until(
+            lambda: orchestration._dispatch_in_flight.get(session_id, 0) == 0,
+            "the cancelled request never left the message path",
+        )
         comm = await _connect_host(app)
         retried = await _answer_and_serve_launch(client, comm, session_id, elicitation_id)
     finally:
-        for task in (first, second, hook_task):
-            if task is not None:
-                task.cancel()
-        await asyncio.gather(
-            *(t for t in (first, second, hook_task) if t is not None), return_exceptions=True
-        )
+        await _cancel_all(first, second, hook_task)
         await fake_runner.aclose()
 
     assert retried.status_code < 300, retried.text
@@ -6100,13 +6096,7 @@ async def test_a_card_close_error_does_not_strand_the_answer(
             _resolve_answer(client, session_id, elicitation_id), budget(10.0)
         )
     finally:
-        for task in (first, second, launch, hook_task):
-            if task is not None:
-                task.cancel()
-        await asyncio.gather(
-            *(t for t in (first, second, launch, hook_task) if t is not None),
-            return_exceptions=True,
-        )
+        await _cancel_all(first, second, launch, hook_task)
         await fake_runner.aclose()
 
     assert leader.status_code >= 500, leader.text
@@ -6226,12 +6216,7 @@ async def test_a_stale_hook_that_asks_again_gets_the_cancel(
         )
         repark_response = await asyncio.wait_for(asyncio.shield(repark), budget(5.0))
     finally:
-        for task in (hook_task, repark):
-            if task is not None:
-                task.cancel()
-        await asyncio.gather(
-            *(t for t in (hook_task, repark) if t is not None), return_exceptions=True
-        )
+        await _cancel_all(hook_task, repark)
         await fake_runner.aclose()
 
     assert response.status_code < 300, response.text
@@ -6271,12 +6256,7 @@ async def test_a_new_question_under_a_reused_id_is_answered_again(
             client, comm, session_id, second_id, content={new_question: "postgres"}
         )
     finally:
-        for task in (hook_task, second_hook):
-            if task is not None:
-                task.cancel()
-        await asyncio.gather(
-            *(t for t in (hook_task, second_hook) if t is not None), return_exceptions=True
-        )
+        await _cancel_all(hook_task, second_hook)
         await fake_runner.aclose()
 
     assert answered.status_code < 300, answered.text
