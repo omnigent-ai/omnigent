@@ -296,7 +296,7 @@ export const TRIGGER_TEMPLATES: Record<TriggerSource, TriggerTemplate> = {
       { id: "author", label: "Author", operators: ["is", "is_not"], placeholder: "@alerts-bot" },
     ],
     instructionsPlaceholder: "Answer the question, or investigate the reported bug.",
-    linkBackLabel: "Include the session link with the result in the thread",
+    linkBackLabel: "Reply in the thread with the session link when work starts",
     itemPlural: "messages",
     toolsExample: "a Slack MCP server",
   },
@@ -659,6 +659,14 @@ function triggerPromptHeadings(prompt: string): TriggerPromptHeadings {
 }
 
 const POSTING_INSTRUCTIONS = `Anything you post for this, such as a comment, reply, message, issue or pull request, ends with a line "${OMNIGENT_ATTRIBUTION}", since it posts with the owner's account.`;
+
+/** How a Slack worker replies: one start reply with its session link, then only new results. */
+function slackWorkerPostingInstructions(linkBack: boolean, sessionLink: string): string {
+  const start = linkBack
+    ? `As soon as you start working on a Slack message, reply once in its thread with exactly these lines:\n:hourglass_flowing_sand: Omnigent is working on it...\n\nTrack progress: [Omni Session](${sessionLink})\n${OMNIGENT_ATTRIBUTION}\nCall sys_session_get_info to obtain your session_id and substitute it for ${SESSION_LINK_ID_PLACEHOLDER}. If your Slack tool doesn't render Markdown links, use Slack's <url|Omni Session> form. `
+    : "Do not send an acknowledgement or a session link. ";
+  return `${POSTING_INSTRUCTIONS}\n${start}Reply in the same thread when you have a useful result or a blocker. Each later reply carries only what is new since your previous reply in that thread${linkBack ? ", without the session link" : ""}.`;
+}
 
 /** Separate saved template instructions without guessing at free-form prompts. */
 export function splitTriggerPrompt(prompt: string): {
@@ -1742,7 +1750,7 @@ export function renderTriggerPrompt(
   const managerPostsLink = fields.linkBack && source !== "slack";
   const workerPostingInstructions =
     source === "slack"
-      ? `${POSTING_INSTRUCTIONS}\nDo not send an acknowledgement or a separate session-link message. Reply in the source thread when you have a useful result or a blocker.${fields.linkBack ? ` Include your own session link at the bottom of that reply: call sys_session_get_info to obtain your session_id and substitute it for ${SESSION_LINK_ID_PLACEHOLDER} in ${ctx.sessionLink}.` : " Do not add a session link."}`
+      ? slackWorkerPostingInstructions(fields.linkBack, ctx.sessionLink)
       : POSTING_INSTRUCTIONS;
   const pendingLines = [
     `"${DELIVERY_PENDING}"`,
