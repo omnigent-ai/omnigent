@@ -3355,6 +3355,21 @@ def register_core_routes(
                                 # changed so it re-reads list membership.
                                 await _send({"type": "access_changed", "ids": [sid]})
                             elif items:
+                                family = items[0].get("family") or {}
+                                representative = family.get("representative_id")
+                                if (
+                                    isinstance(representative, str)
+                                    and representative != sid
+                                    and representative in watched
+                                ):
+                                    # A first sibling also gives its source a family; push
+                                    # both rows so the sidebar groups them at once.
+                                    source_items = await _fetch_watched_items(
+                                        [representative], user_id
+                                    )
+                                    for source_item in source_items:
+                                        last_sent[source_item["id"]] = source_item
+                                    items = [*items, *source_items]
                                 await _send({"type": "changed", "items": items})
                         except WebSocketDisconnect:
                             # Client gone mid-send — propagate to tear the stream down.

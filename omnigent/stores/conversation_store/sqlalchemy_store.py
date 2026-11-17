@@ -2111,6 +2111,57 @@ class SqlAlchemyConversationStore(ConversationStore):
 
             run_write_transaction(self._session_immediate, "copy_sibling_labels", finish_labels)
 
+    def leave_session_family(self, session_id: str) -> None:
+        """
+        Remove a session from its sibling family, freeing its family slot.
+
+        When the session's id keys the family, the remaining members move to a
+        remaining member's id, so the departed session can start a new family later.
+
+        :param session_id: The leaving session, e.g. ``"9f2c..."``; a session
+            without a family is left unchanged.
+        """
+        meta = self._get_meta(session_id)
+        if meta is None or meta.family_id is None:
+            return
+        family_id = meta.family_id
+
+        def write(session: Session) -> None:
+            self._lock_session_family(session, family_id)
+            current = session.get(
+                SqlConversationMetadata, (current_workspace_id(), session_id), with_for_update=True
+            )
+            if current is None or current.family_id != family_id:
+                return
+            remaining = [
+                member
+                for member in self._family_member_ids(session, family_id)
+                if member != session_id
+            ]
+            current.family_id = None
+            if session_id == family_id and remaining:
+                self._lock_session_family(session, remaining[0])
+                session.execute(
+                    update(SqlConversationMetadata)
+                    .where(
+                        SqlConversationMetadata.workspace_id == current_workspace_id(),
+                        SqlConversationMetadata.id.in_(remaining),
+                    )
+                    .values(family_id=remaining[0])
+                )
+            with self._profile_label_session(session) as labels_session:
+                labels_session.execute(
+                    delete(SqlConversationLabel).where(
+                        SqlConversationLabel.workspace_id == current_workspace_id(),
+                        SqlConversationLabel.conversation_id == session_id,
+                        SqlConversationLabel.key.startswith(
+                            FAMILY_PIN_LABEL_PREFIX, autoescape=True
+                        ),
+                    )
+                )
+
+        run_write_transaction(self._session_immediate, "leave_session_family", write)
+
     def set_family_pin(self, session_id: str, value: str, *, user_id: str | None) -> None:
         value = _prepare_label_updates({PINNED_LABEL_KEY: value})[PINNED_LABEL_KEY]
         source = self.get_conversation(session_id)
@@ -4766,6 +4817,14 @@ class SqlAlchemyConversationStore(ConversationStore):
         if ap_result is None:
             return None
         row, labels, reasoning_effort_changed, model_override_changed = ap_result
+        if archived:
+            # An archived session leaves its family and returns standalone if unarchived.
+            self.leave_session_family(conversation_id)
+            labels = {
+                key: value
+                for key, value in labels.items()
+                if not key.startswith(FAMILY_PIN_LABEL_PREFIX)
+            }
         if terminal_launch_args is not None:
             recreated_metadata_kind = encode_conversation_kind(
                 "sub_agent" if row.parent_conversation_id else "default"

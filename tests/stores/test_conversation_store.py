@@ -10384,9 +10384,8 @@ async def test_sibling_family_lifecycle(tmp_path, split_database, user_id, monke
         store.set_conversation_project(first.id, project_id)
     store.set_conversation_project(source.id, project_id)
     assert all(member.project_id == project_id for member in store.get_session_family(second.id))
-    store.update_conversation(source.id, archived=True)
-    store.set_family_pin(first.id, "345", user_id=user_id)
     assert await store.delete_conversation(source.id)
+    store.set_family_pin(first.id, "345", user_id=user_id)
     assert [member.id for member in store.get_session_family(second.id)] == [first.id, second.id]
     assert store.get_conversation(second.id).labels[family_pinned_label_key(user_id)] == "345"
     later = store.create_conversation(
@@ -10445,7 +10444,7 @@ async def test_sibling_family_lifecycle(tmp_path, split_database, user_id, monke
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("cleanup_failed", [False, True])
-async def test_family_limit_counts_archived_members_and_cleans_up_rejected_creation(
+async def test_family_limit_cleans_up_rejected_creation(
     conversation_store, monkeypatch, cleanup_failed, caplog
 ):
     from omnigent.errors import OmnigentError
@@ -10457,7 +10456,6 @@ async def test_family_limit_counts_archived_members_and_cleans_up_rejected_creat
     for _ in range(MAX_SESSION_FAMILY_MEMBERS - 1):
         member = store.create_conversation()
         store.add_new_sibling(source.id, member.id, user_id="alice")
-        store.update_conversation(member.id, archived=True)
     retained = {member.id for member in store.get_session_family(source.id)}
     assert len(retained) == MAX_SESSION_FAMILY_MEMBERS
     rejected = store.create_conversation()
@@ -10476,6 +10474,57 @@ async def test_family_limit_counts_archived_members_and_cleans_up_rejected_creat
     else:
         assert store.get_conversation(rejected.id) is None
     assert {member.id for member in store.get_session_family(source.id)} == retained
+
+
+@pytest.mark.parametrize("split_database", [False, True])
+def test_archiving_a_sibling_leaves_its_family(tmp_path, split_database) -> None:
+    from omnigent.stores.conversation_store import (
+        MAX_SESSION_FAMILY_MEMBERS,
+        family_pinned_label_key,
+    )
+
+    store = SqlAlchemyConversationStore(
+        f"sqlite:///{tmp_path / 'metadata.db'}",
+        f"sqlite:///{tmp_path / 'messages.db'}" if split_database else None,
+    )
+    pin_key = family_pinned_label_key("alice")
+    source = store.create_conversation(conversation_id="1" * 32)
+    members = [store.create_conversation(conversation_id=f"{n}" * 32) for n in (2, 3, 4)]
+    for member in members:
+        store.add_new_sibling(source.id, member.id, user_id="alice")
+    store.set_family_pin(source.id, "123", user_id="alice")
+
+    # A full family frees a slot once a member is archived.
+    for _ in range(MAX_SESSION_FAMILY_MEMBERS - 1 - len(members)):
+        store.add_new_sibling(source.id, store.create_conversation().id, user_id="alice")
+    archived = store.update_conversation(members[0].id, archived=True)
+    assert archived.family_id is None
+    assert pin_key not in archived.labels
+    store.add_new_sibling(source.id, store.create_conversation().id, user_id="alice")
+    assert len(store.get_session_family(source.id)) == MAX_SESSION_FAMILY_MEMBERS
+
+    # Unarchiving returns it standalone, able to start its own family.
+    restored = store.update_conversation(members[0].id, archived=False)
+    assert restored.family_id is None
+    assert pin_key not in restored.labels
+    store.add_new_sibling(members[0].id, store.create_conversation().id, user_id="alice")
+    assert len(store.get_session_family(members[0].id)) == 2
+
+    # Archiving the session whose id keys the family moves the rest to a member's id.
+    store.update_conversation(source.id, archived=True)
+    remaining = store.get_session_family(members[1].id)
+    assert source.id not in {member.id for member in remaining}
+    new_family_ids = {member.family_id for member in remaining}
+    assert len(new_family_ids) == 1
+    assert new_family_ids <= {member.id for member in remaining}
+    assert all(member.labels[pin_key] == "123" for member in remaining)
+    store.update_conversation(source.id, archived=False)
+    follow_up = store.create_conversation()
+    store.add_new_sibling(source.id, follow_up.id, user_id="alice")
+    assert [member.id for member in store.get_session_family(source.id)] == [
+        source.id,
+        follow_up.id,
+    ]
 
 
 @pytest.mark.parametrize(

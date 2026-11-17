@@ -600,6 +600,30 @@ def test_session_added_event_pushes_unwatched_session(
         assert items[s2]["title"] == "brand new"
 
 
+def test_session_added_sibling_pushes_its_source_in_the_same_frame(app: FastAPI, stores) -> None:
+    """A first sibling also gives its watched source a family, so both rows
+    arrive in one frame and the sidebar groups them without waiting a rescan.
+    The production rescan interval keeps the next tick from racing the push."""
+    conversation_store = stores[0]
+    source = _seed_session(stores, owner=ALICE, title="monitor")
+    with TestClient(app).websocket_connect(
+        "/v1/sessions/updates", headers={"X-Forwarded-Email": ALICE}
+    ) as ws:
+        ws.send_text(json.dumps({"type": "watch", "session_ids": [source]}))
+        snapshot = _recv_until(ws, {"snapshot"})
+        assert snapshot["items"][0]["family"] is None  # type: ignore[index]
+        sibling = _seed_session(stores, owner=ALICE, title="Slack match")
+        conversation_store.add_new_sibling(source, sibling, user_id=ALICE)
+        sessions_routes.user_session_stream.publish(
+            ALICE, {"type": "session_added", "session_id": sibling}
+        )
+        changed = _recv_until(ws, {"changed"})
+        items = {item["id"]: item for item in changed["items"]}  # type: ignore[index]
+        assert set(items) == {source, sibling}
+        assert items[source]["family"]["representative_id"] == source
+        assert items[sibling]["family"]["representative_id"] == source
+
+
 def test_session_added_for_inaccessible_session_is_not_pushed(
     app: FastAPI, stores, fast_rescan: None
 ) -> None:

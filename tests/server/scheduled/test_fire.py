@@ -5231,3 +5231,53 @@ async def test_an_idle_session_is_polled_two_quiet_minutes_after_its_last_change
     check = _busy_until_check("idle", due - 5 * 60, updated_at=due - seconds_since_change)
     task = _task(session_mode="continue", session_id="sess_busy_check", next_run_at=due)
     assert await check(task, due) == (None if wait_seconds is None else due + wait_seconds)
+
+
+@pytest.mark.asyncio
+async def test_trigger_run_archives_only_its_idle_launched_siblings(tmp_path, monkeypatch) -> None:
+    from sqlalchemy import update
+
+    from omnigent.db.db_models import SqlConversation
+    from omnigent.stores.conversation_store import SCHEDULED_TASK_LAUNCH_LABEL_KEY
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+
+    store = SqlAlchemyConversationStore(f"sqlite:///{tmp_path / 'chat.db'}")
+    monitor = store.create_conversation(title="Slack trigger")
+    sessions = {
+        name: store.create_conversation(title=name)
+        for name in ("idle", "active", "owner_added", "other_automation")
+    }
+    for session in sessions.values():
+        store.add_new_sibling(monitor.id, session.id, user_id="alice")
+    for name, task_id in (("idle", "task"), ("active", "task"), ("other_automation", "other")):
+        store.set_labels(sessions[name].id, {SCHEDULED_TASK_LAUNCH_LABEL_KEY: task_id})
+    stale = int(time.time()) - fire_mod.LAUNCHED_SESSION_IDLE_ARCHIVE_S - 60
+    with store._conv_engine.begin() as connection:
+        connection.execute(
+            update(SqlConversation)
+            .where(SqlConversation.id != sessions["active"].id)
+            .values(updated_at=stale)
+        )
+    stopped = []
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration._spawn_archive_stop",
+        lambda session_id, *args, **kwargs: stopped.append(session_id),
+    )
+    deps = SimpleNamespace(
+        conversation_store=store,
+        runner_router=None,
+        host_registry=None,
+        host_store=None,
+        sandbox_config=None,
+    )
+
+    await fire_mod.archive_idle_launched_sessions(
+        deps, SimpleNamespace(id="task"), store.get_conversation(monitor.id)
+    )
+
+    assert stopped == [sessions["idle"].id]
+    archived = {name for name, s in sessions.items() if store.get_conversation(s.id).archived}
+    assert archived == {"idle"}
+    assert not store.get_conversation(monitor.id).archived
+    # The archived session left the family, freeing its slot.
+    assert sessions["idle"].id not in {m.id for m in store.get_session_family(monitor.id)}

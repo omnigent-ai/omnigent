@@ -166,6 +166,7 @@ from omnigent.server.session_mcp_selection import (
 from omnigent.stores.conversation_store import (
     CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
     SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY,
+    SCHEDULED_TASK_LAUNCH_LABEL_KEY,
     SCHEDULED_TASK_ORIGIN_LABEL_KEY,
     SCHEDULED_TASK_RUN_LABEL_KEY,
     SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY,
@@ -176,6 +177,9 @@ if TYPE_CHECKING:
     from omnigent.server.managed_hosts import ManagedLaunch, ManagedLaunchTracker
 
 _logger = logging.getLogger(__name__)
+
+# A trigger's sessions are archived once idle this long, freeing their family slots.
+LAUNCHED_SESSION_IDLE_ARCHIVE_S = 3 * 24 * 60 * 60
 
 
 @dataclass
@@ -1114,6 +1118,54 @@ async def _sandbox_never_started(deps: FireDeps, task: ScheduledTask, conv: Conv
     return problem is None
 
 
+async def archive_idle_launched_sessions(
+    deps: FireDeps, task: ScheduledTask, conv: Conversation
+) -> None:
+    """
+    Archive idle sessions an automation started from its continued session.
+
+    They are that session's siblings, so this reads one bounded family. Only
+    members carrying this automation's launch label are archived, never the
+    session itself or nested agents the owner added. Never raises.
+
+    :param deps: The fire's stores and lifecycle handles.
+    :param task: The automation being fired.
+    :param conv: The session it continues, e.g. a Slack trigger's polling session.
+    """
+    if conv.family_id is None:
+        return
+    from omnigent.server.routes._sessions.helpers import _prune_session_read_state
+    from omnigent.server.routes._sessions.orchestration import _spawn_archive_stop
+
+    cutoff = time.time() - LAUNCHED_SESSION_IDLE_ARCHIVE_S
+    try:
+        families = await asyncio.to_thread(
+            deps.conversation_store.get_session_families, [conv.family_id]
+        )
+        for member in families.get(conv.family_id, []):
+            if (
+                member.id == conv.id
+                or member.archived
+                or member.updated_at > cutoff
+                or member.labels.get(SCHEDULED_TASK_LAUNCH_LABEL_KEY) != task.id
+            ):
+                continue
+            await asyncio.to_thread(
+                deps.conversation_store.update_conversation, member.id, archived=True
+            )
+            _prune_session_read_state(member.id)
+            _spawn_archive_stop(
+                member.id,
+                deps.conversation_store,
+                deps.runner_router,
+                deps.host_registry,
+                host_store=deps.host_store,
+                sandbox_config=deps.sandbox_config,
+            )
+    except Exception:
+        _logger.exception("scheduled fire: task %s could not archive idle sessions", task.id)
+
+
 async def _continue_session(
     deps: FireDeps,
     task: ScheduledTask,
@@ -1196,6 +1248,8 @@ async def _continue_session(
         app_state=deps.app_state,
         host_registry=deps.host_registry,
     )
+    if is_trigger_automation(task):
+        await archive_idle_launched_sessions(deps, task, conv)
     progress = _PromptSendProgress()
     progress_token = _PROMPT_SEND_PROGRESS.set(progress)
     # Stamped before the prompt goes in, so the journal entries the session records
