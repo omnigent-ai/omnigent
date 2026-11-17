@@ -583,10 +583,11 @@ for draft persistence and parent-isolation checks. The microphone beside
 side-chat message loads it into that side chat's composer, not the main one.
 
 **Grid cell** (desktop session grids, see [Sessions](sessions.md)): each cell's
-one-row composer shows the session's host status, permission mode (switchable by
-the owner) and harness. Shift+Tab in the cell's composer steps that session's mode
-too; side chats and subagent tabs keep Shift+Tab for focus. Switch hosts and see or
-switch the model from the full-screen view.
+one-row composer shows the session's host, permission mode (switchable by the
+owner) and harness. Shift+Tab in the cell's composer steps that session's mode
+too; side chats and subagent tabs keep Shift+Tab for focus. Switch the host from
+the cell's host menu when you can edit the session. See or switch the model from
+the full-screen view.
 
 ## Driving it with the repro environment
 

@@ -939,9 +939,10 @@ describe("HostBadge in a grid cell", () => {
     );
   });
 
-  it("shows the launch a cell passes in, not the open conversation's", () => {
+  it("prefers the launch a cell passes in over the open session's own launch", () => {
+    // The cell is also the open session, so its store launch would show without the prop.
     useChatStore.setState({
-      conversationId: "conv_open",
+      conversationId: "conv_cell",
       sandboxStatus: { stage: "provisioning", error: null },
     });
     useSessionMock.mockReturnValue({ session: { hostId: null } });
