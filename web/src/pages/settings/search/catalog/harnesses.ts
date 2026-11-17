@@ -3,6 +3,7 @@ import {
   INVENTORY_HARNESS_IDS,
   INVENTORY_HARNESSES,
 } from "@/hooks/useHarnessInventory";
+import { HARNESS_CREDENTIAL_COPY } from "@/lib/harnessSetup";
 import { NATIVE_CODING_AGENTS } from "@/lib/nativeCodingAgents";
 
 import { type SettingsEntry, settingsEntry, settingsEntryFamily } from "./types";
@@ -78,12 +79,18 @@ export const FIX_DIALOG_PARTS = {
   retry: "Try again",
   credentialChoice: "Credential",
   useCredentialForm: "Use an API key or gateway URL instead",
+  openSignIn: "Open sign-in page",
   copySignInLink: "Copy sign-in link",
   copyCode: "Copy one-time code",
   copyLoginCommand: "Copy login command",
   copyOmniSetup: "Copy omni setup",
   copyTmuxInstall: "Copy brew install tmux",
 } as const;
+
+/** The credential choice's two cards, named by their labels. */
+const FIX_DIALOG_PART_CHOICES = {
+  credentialChoice: Object.values(HARNESS_CREDENTIAL_COPY).map((copy) => copy.label),
+};
 
 /** The controls that open the fix dialog: a card's Set up, a page's fix, and the Credential card's action. */
 export type FixOpener = "setUp" | "fixAction" | "credentialAction";
@@ -126,6 +133,7 @@ export const HARNESS_CARD_ENTRIES = settingsEntryFamily({
         ...FIX_DIALOG_PARTS,
       },
       nameAlternatives: FIX_DIALOG_ALTERNATIVES,
+      partChoices: FIX_DIALOG_PART_CHOICES,
       // A card opens its page only when the harness is ready or can be fixed from here; its
       // gear shows once it has settings to open; Set up only for a harness that can be installed.
       presence: {
@@ -228,6 +236,7 @@ export const HARNESS_DETAIL_ENTRIES = settingsEntryFamily({
       description: `${name} on a machine: its MCP servers, skills and plugins, and its setup.`,
       keywords: ["harness", "agent", "setup"],
       parts: { back: "Back to Harnesses", fixAction: "Set up", ...FIX_DIALOG_PARTS },
+      partChoices: FIX_DIALOG_PART_CHOICES,
       nameAlternatives: {
         fixAction: {
           install: "Install",
@@ -244,7 +253,7 @@ export const HARNESS_DETAIL_ENTRIES = settingsEntryFamily({
     return settingsEntry({
       ...page,
       parts: { ...page.parts, tab: `${name} view` },
-      partChoices: { tab: [...INVENTORY_KINDS, "Settings"] },
+      partChoices: { ...page.partChoices, tab: [...INVENTORY_KINDS, "Settings"] },
       // While the inventory loads, a tab shows its plain name; once loaded, its count.
       choiceTemplates: {
         tab: Object.fromEntries(
@@ -279,6 +288,7 @@ export const HARNESS_CREDENTIAL_ENTRIES = settingsEntryFamily({
         switchConfirm: "Sign out and switch",
         accountHint: "Account to sign in with",
       },
+      partChoices: FIX_DIALOG_PART_CHOICES,
       nameAlternatives: {
         credentialAction: { switch: "Switch account", signInAgain: "Sign in again" },
         ...FIX_DIALOG_ALTERNATIVES,
