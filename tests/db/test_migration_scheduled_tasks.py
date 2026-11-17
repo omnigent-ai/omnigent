@@ -1185,12 +1185,23 @@ def test_timer_kind_migration_round_trips(dispatch_migration_engine: Engine) -> 
         "timezone": "UTC",
         "created_at": 1,
     }
+
+    def migrate(*, down: bool = False) -> None:
+        # The migration commits on CockroachDB, so it runs on a plain connection, as at startup.
+        with engine.connect() as conn:
+            if engine.dialect.name == "cockroachdb":
+                _prepare_crdb_schema_transaction(conn, _crdb_server_version(engine))
+            config.attributes["connection"] = conn
+            if down:
+                command.downgrade(config, _TIMER_KIND_PREVIOUS)
+            else:
+                command.upgrade(config, _TIMER_KIND_REVISION)
+            conn.commit()
+
     # MySQL reports CHECK violations as OperationalError (3819).
     with pytest.raises((IntegrityError, sa.exc.OperationalError)), engine.begin() as conn:
         conn.execute(tasks.insert().values(id=b"t" * 16, kind=3, **values))
-    with engine.begin() as conn:
-        config.attributes["connection"] = conn
-        command.upgrade(config, _TIMER_KIND_REVISION)
+    migrate()
     with engine.begin() as conn:
         conn.execute(tasks.insert().values(id=b"t" * 16, kind=3, **values))
         # Cancelled timers waiting for cleanup, more than one cleanup batch of them,
@@ -1201,17 +1212,8 @@ def test_timer_kind_migration_round_trips(dispatch_migration_engine: Engine) -> 
         )
         conn.execute(tasks.insert().values(id=b"f" * 16, kind=3, state=4, **values))
         conn.execute(tasks.insert().values(id=b"a" * 16, kind=1, **values))
-
-    def downgrade() -> None:
-        with engine.connect() as conn:
-            if engine.dialect.name == "cockroachdb":
-                _prepare_crdb_schema_transaction(conn, _crdb_server_version(engine))
-            config.attributes["connection"] = conn
-            command.downgrade(config, _TIMER_KIND_PREVIOUS)
-            conn.commit()
-
     with pytest.raises(RuntimeError, match="Delete active or paused timer"):
-        downgrade()
+        migrate(down=True)
     with engine.begin() as conn:
         conn.execute(tasks.update().where(tasks.c.id == b"t" * 16).values(state=3))
     updates: list[str] = []
@@ -1226,7 +1228,7 @@ def test_timer_kind_migration_round_trips(dispatch_migration_engine: Engine) -> 
 
     sa.event.listen(engine, "before_cursor_execute", inspect_cleanup)
     try:
-        downgrade()
+        migrate(down=True)
     finally:
         sa.event.remove(engine, "before_cursor_execute", inspect_cleanup)
     assert len(updates) == 2
@@ -1239,9 +1241,7 @@ def test_timer_kind_migration_round_trips(dispatch_migration_engine: Engine) -> 
         rows = conn.execute(sa.select(tasks.c.kind, tasks.c.state)).tuples().all()
     # Finished and deleted timers are left as deleted automations for cleanup to purge.
     assert sorted(rows) == [(1, 1)] + [(1, 3)] * 203
-    with engine.begin() as conn:
-        config.attributes["connection"] = conn
-        command.upgrade(config, _TIMER_KIND_REVISION)
+    migrate()
 
 
 def test_timer_kind_downgrade_requires_live_connection() -> None:
