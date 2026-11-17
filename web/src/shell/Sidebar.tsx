@@ -3473,16 +3473,14 @@ function ConversationList({
 
   const nestDestinations = useMemo(
     () =>
-      dedupeConversationsById([
-        ...allConversations,
-        ...[...folderConversations.values()].flatMap((folder) => folder.conversations),
-      ]).filter(
-        (row) =>
-          row.family?.representative_id === row.id &&
-          !row.archived &&
-          !row.provisional &&
-          isOwnedByViewer(row, viewerId),
-      ),
+      [
+        ...sessionFamilyGroups(
+          dedupeConversationsById([
+            ...allConversations,
+            ...[...folderConversations.values()].flatMap((folder) => folder.conversations),
+          ]).filter((row) => !row.archived && !row.provisional && isOwnedByViewer(row, viewerId)),
+        ).values(),
+      ].map(([representative]) => representative),
     [allConversations, folderConversations, viewerId],
   );
   const revealNest = useStableCallback((sourceId: string | null) => {
@@ -5139,7 +5137,8 @@ export function ConversationMenuItems({
   const pinSaving = useContext(PinSavingContext);
   const moveToNest = useMoveToNest();
   const revealNest = useContext(RevealNestContext);
-  const nestingEnabled = info !== "loading" && info.sibling_sessions === true;
+  const nestingEnabled =
+    info !== "loading" && info.sibling_sessions === true && info.session_nest_moves === true;
   const canMoveProject = !isIndentedSibling(conversation);
   const moveSession = useContext(SessionReorderContext);
   const grids = useGridSessions();
@@ -6143,6 +6142,7 @@ function ConversationRowImpl({
   const canMoveNest =
     serverInfo !== "loading" &&
     serverInfo.sibling_sessions === true &&
+    serverInfo.session_nest_moves === true &&
     isOwner &&
     !conversation.parent_session_id;
   // Drag-and-drop: a row is grabbable when the viewer owns it (re-filing is
@@ -7584,12 +7584,14 @@ function SessionMovePickerMenu({
   const [search, setSearch] = useState("");
   const trimmed = search.trim();
   const matchesSearch = (name: string) => name.toLowerCase().includes(trimmed.toLowerCase());
+  const nestLabel = (row: Conversation) =>
+    row.id === row.family?.representative_id
+      ? conversationDisplayLabel(row)
+      : (row.family?.representative_title ?? conversationDisplayLabel(row));
   const filtered = canMoveProject ? projects.filter((project) => matchesSearch(project.name)) : [];
   const filteredNests = nestingEnabled
     ? nests.filter(
-        (row) =>
-          row.family?.id !== conversation.family?.id &&
-          matchesSearch(conversationDisplayLabel(row)),
+        (row) => row.family?.id !== conversation.family?.id && matchesSearch(nestLabel(row)),
       )
     : [];
   const canCreate =
@@ -7635,12 +7637,12 @@ function SessionMovePickerMenu({
           <C.Item
             key={nest.id}
             className="px-2 py-1"
-            textValue={conversationDisplayLabel(nest)}
+            textValue={nestLabel(nest)}
             disabled={nestSaving}
             onSelect={() => onNestSelect(nest.id)}
           >
             <GitBranchIcon className="size-3.5 shrink-0 text-muted-foreground" />
-            <span className="flex-1 truncate text-left">{conversationDisplayLabel(nest)}</span>
+            <span className="flex-1 truncate text-left">{nestLabel(nest)}</span>
           </C.Item>
         ))}
         {filtered.length === 0 && filteredNests.length === 0 && !canCreate && (

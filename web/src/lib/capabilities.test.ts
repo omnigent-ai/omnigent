@@ -287,6 +287,7 @@ describe("resolveServerInfo session_search_scope", () => {
 });
 
 describe.each([
+  "session_nest_moves",
   "scheduled_task_projects",
   "scheduled_task_harness_settings",
   "scheduled_task_approval_skipping_modes",

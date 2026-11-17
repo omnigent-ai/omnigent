@@ -112,6 +112,7 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
         "workspace_api_server_access": False,
     }
     assert data["sibling_sessions"] is True
+    assert data["session_nest_moves"] is True
     # Compatibility field for frontend builds predating the nested map.
     assert data["harness_install_enabled"] is False
     # installable_harnesses is the allowlist the SPA offers setup for; blank
@@ -168,6 +169,8 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
     assert data["picker"] == {"restrict_to_agent_names": [], "default_agent_name": None}
 
     # Older servers omit capabilities they do not support.
+    del data["session_nest_moves"]
+    assert ServerInfoResponse.model_validate(data).session_nest_moves is False
     del data["agent_detail"]
     assert ServerInfoResponse.model_validate(data).agent_detail is False
     del data["agent_config_edit"]

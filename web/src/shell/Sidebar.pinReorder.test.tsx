@@ -124,6 +124,7 @@ describe("moving sessions between nests by drag", () => {
       info: {
         ...FALLBACK_SERVER_INFO,
         sibling_sessions: true,
+        session_nest_moves: true,
         features: { sidebar_grouping_ui: true },
       },
     });
@@ -188,8 +189,14 @@ describe("moving sessions between nests by drag", () => {
     });
   });
 
-  it("does not offer membership moves when nested agents are disabled", async () => {
-    renderSidebar({ features: { sidebar_grouping_ui: true } });
+  it.each([
+    { sibling_sessions: false, session_nest_moves: true },
+    { sibling_sessions: true, session_nest_moves: false },
+    { sibling_sessions: true },
+  ])("does not offer membership moves without server support: %j", async (capabilities) => {
+    renderSidebar({
+      info: { ...FALLBACK_SERVER_INFO, ...capabilities, features: { sidebar_grouping_ui: true } },
+    });
     await dropOnto("conv_c", "conv_d", { expectTarget: false });
     expect(mocks.moveToNest).not.toHaveBeenCalled();
     expect(screen.queryByTestId("sidebar-remove-from-nest")).toBeNull();
