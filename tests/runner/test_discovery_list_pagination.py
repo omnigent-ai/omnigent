@@ -90,7 +90,10 @@ async def _agent_list_with_empty_server(
 
 
 async def _session_list_with_rows(
-    *, sessions: list[dict[str, object]], children: list[dict[str, object]]
+    *,
+    sessions: list[dict[str, object]],
+    children: list[dict[str, object]],
+    sessions_status: int = 200,
 ) -> str:
     async def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/v1/sessions/conv_caller/child_sessions":
@@ -98,7 +101,7 @@ async def _session_list_with_rows(
         if request.url.path == "/v1/sessions/conv_caller":
             return httpx.Response(200, json={"id": "conv_caller", "parent_session_id": None})
         if request.url.path == "/v1/sessions":
-            return httpx.Response(200, json={"data": sessions})
+            return httpx.Response(sessions_status, json={"data": sessions})
         raise AssertionError(f"unexpected path {request.url.path}")
 
     async with httpx.AsyncClient(
@@ -1116,6 +1119,60 @@ async def test_sys_session_list_reports_oversized_fixed_sub_agents() -> None:
         "kind": "fixed_section",
         "sections": ["sub_agents"],
     }
+
+
+@pytest.mark.asyncio
+async def test_sys_session_list_reports_failed_read_beside_oversized_sub_agents() -> None:
+    """A failed read stays visible when the child view leaves no room for its diagnostic."""
+    title = "x" * (tool_dispatch._DISCOVERY_LIST_OUTPUT_MAX_CHARS - 400)
+    child = {
+        "id": "conv_child",
+        "title": f"researcher:{title}",
+        "tool": "researcher",
+        "session_name": title,
+    }
+    raw = await _session_list_with_rows(sessions=[], children=[child], sessions_status=503)
+
+    result = json.loads(raw)
+    assert len(raw) <= 100_000
+    assert result["error"].endswith("Could not read sessions (the server returned HTTP 503).")
+    assert result["page"] == {"has_more": {"sessions": True}}
+    assert result["oversized"] == {"kind": "fixed_section", "sections": ["sub_agents"]}
+
+
+@pytest.mark.asyncio
+async def test_sys_agent_list_shortens_failure_before_dropping_healthy_rows(
+    tmp_path: Path,
+) -> None:
+    """A failed source's long diagnostic is shortened before a healthy source loses rows."""
+    description = "x" * (tool_dispatch._DISCOVERY_LIST_OUTPUT_MAX_CHARS // 3 - 400)
+    builtins = [{**row, "description": description} for row in _agent_rows(large=False)]
+    session_afters: list[str | None] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/agents":
+            return _server_page(request, builtins)
+        if request.url.path == "/v1/sessions":
+            session_afters.append(request.url.params.get("after"))
+            error = {"code": "busy", "message": "y" * 2_000}
+            return httpx.Response(503, json={"error": error})
+        if request.url.path == "/v1/sessions/conv_caller":
+            return httpx.Response(404)
+        raise AssertionError(f"unexpected path {request.url.path}")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server"
+    ) as client:
+        first = await _call_agent(client, tmp_path, {"limit": 3})
+        second = await _call_agent(
+            client, tmp_path, {"limit": 3, "cursor": first["page"]["next_cursor"]}
+        )
+
+    assert [row["agent_id"] for row in first["builtins"]] == ["ag_00", "ag_01", "ag_02"]
+    assert first["error"].startswith("Could not read session_agents. page.next_cursor retries")
+    assert first["page"]["has_more"]["session_agents"] is True
+    assert [row["agent_id"] for row in second["builtins"]] == ["ag_03", "ag_04", "ag_05"]
+    assert session_afters == [None, None]
 
 
 @pytest.mark.asyncio

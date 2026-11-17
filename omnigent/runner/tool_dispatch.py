@@ -882,6 +882,7 @@ def _bounded_discovery_result(
     """
     paged = page_sections or tuple(sections)
     failed = [name for name in paged if source_pages[name].failed]
+    detailed = "; ".join(f"{name} ({source_pages[name].failure})" for name in failed)
     errors: list[str | None] = [None]
     if failed:
         # Otherwise a persistently failing read looks like endless empty pages.
@@ -893,13 +894,12 @@ def _bounded_discovery_result(
                 "page because the server no longer accepts its cursor; rows already listed "
                 "may repeat"
             )
-        detailed = "; ".join(f"{name} ({source_pages[name].failure})" for name in failed)
-        # Shorten the diagnostic, then drop it, before giving up rows or the retry cursor.
+        # A page may drop the failure details to keep its rows, but never the failure itself.
         errors = [
             f"Could not read {reads}. {retry}; if the read keeps failing, "
             "report this error instead of retrying."
             for reads in (detailed, ", ".join(failed))
-        ] + [None]
+        ]
     complete = json.dumps(sections)
     if (
         limit is None
@@ -956,15 +956,15 @@ def _bounded_discovery_result(
             result["error"] = error
         return json.dumps(result)
 
-    for error in errors:
-        # Cursor size depends on the last returned row, so serialized page size is
-        # not monotonic in the row limit. Check the bounded public range directly.
-        for candidate_limit in range(requested_limit, 0, -1):
+    # Cursor size depends on the last returned row, so serialized page size is
+    # not monotonic in the row limit. Check the bounded public range directly.
+    for candidate_limit in range(requested_limit, 0, -1):
+        for error in errors:
             candidate = _candidate(candidate_limit, error)
             if candidate is not None and len(candidate) <= _DISCOVERY_LIST_OUTPUT_MAX_CHARS:
                 return candidate
 
-    empty_page = _candidate(0, None)
+    empty_page = _candidate(0, errors[-1])
     if empty_page is None:
         return json.dumps(
             {
@@ -982,12 +982,15 @@ def _bounded_discovery_result(
     else:
         kind = "paginated_row"
         oversized_sections = [name for name in paged if sections[name]]
+    error = (
+        f"Discovery result exceeds the {_DISCOVERY_LIST_OUTPUT_MAX_CHARS}-character "
+        "output limit even at the smallest page."
+    )
+    if failed:
+        error = f"{error} Could not read {detailed}."
     return json.dumps(
         {
-            "error": (
-                f"Discovery result exceeds the {_DISCOVERY_LIST_OUTPUT_MAX_CHARS}-character "
-                "output limit even at the smallest page."
-            ),
+            "error": error,
             "page": {
                 "has_more": {
                     name: source_pages[name].has_more or source_pages[name].failed
