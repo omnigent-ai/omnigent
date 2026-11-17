@@ -98,7 +98,8 @@ export const UNOWNED_CONTROLS: Readonly<Record<string, { count: number; reason: 
   },
   "src/pages/settings/HarnessCatalog.tsx › CatalogRow › button": {
     count: 1,
-    reason: "Harness catalog row's control, not yet catalog-owned.",
+    reason:
+      "Skill or plugin row's open button; its region's owner is a prop, which the guard can't read.",
   },
   "src/pages/settings/HarnessCatalog.tsx › HarnessCatalog › SettingsDataRegion": {
     count: 2,
@@ -106,7 +107,8 @@ export const UNOWNED_CONTROLS: Readonly<Record<string, { count: number; reason: 
   },
   "src/pages/settings/HarnessCatalog.tsx › McpRow › summary": {
     count: 1,
-    reason: "Per-harness MCP server switch; its name is per server, not yet declared.",
+    reason:
+      "MCP server row's open trigger, named by the server's own data, as its list's rows are.",
   },
   "src/pages/settings/HarnessCatalog.tsx › PluginPage › SettingsDataRegion": {
     count: 1,
