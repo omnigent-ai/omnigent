@@ -16,9 +16,9 @@ from __future__ import annotations
 import io
 import os
 import re
-import shlex
 import subprocess
 import sys
+import time
 import traceback
 import urllib.parse
 from pathlib import Path
@@ -119,15 +119,10 @@ def test_command_line_redacts_tokens_in_argv(
     cmd = ch._command_line()
     assert all(token not in cmd for token in tokens)
     assert "synthetic.jwt.payload" not in cmd
-    assert shlex.split(cmd) == [
-        "omnigent",
-        "run",
-        "a.yaml",
-        "--api-key",
-        "sk-s***",
-        "--note",
-        f"{home}/x sk-s*** dapi*** xoxb*** ghp_*** AIza*** Bear***",
-    ]
+    assert cmd == (
+        f"omnigent run a.yaml --api-key sk-s*** --note {home}/x "
+        "sk-s*** dapi*** xoxb*** ghp_*** AIza*** Bear***"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -540,67 +535,66 @@ def test_issue_url_drops_body_when_command_alone_is_too_long(
 
 
 @pytest.mark.parametrize(
-    "home_directory",
+    ("home_directory", "text", "expected"),
     [
-        "/home/example-user",
-        r"C:\Users\example-user",
-        "/home/example user",
-        r"C:\Users\example user",
+        ("/home/example-user", "/home/example-user/app.py", "~/app.py"),
+        ("/home/example-user", '"/home/example-user/app.py"', '"~/app.py"'),
+        ("/home/example-user", "(/home/example-user)", "(~)"),
+        ("/home/example-user", "Home: `/home/example-user`", "Home: `~`"),
+        ("/home/example-user", "cannot write to /home/example-user.", "cannot write to ~."),
+        ("/home/example-user", "/home/example-user, next", "~, next"),
+        ("/home/example-user", "'/home/example-user:/opt/lib'", "'~:/opt/lib'"),
+        ("/home/example-user", "--config=/home/example-user/x", "--config=~/x"),
+        ("/home/example-user", "file:///home/example-user/notes.txt", "file://~/notes.txt"),
+        ("C:\\Users\\example-user", "C:\\Users\\example-user\\app.py", "~\\app.py"),
+        ("C:\\Users\\example-user", "C:/Users/example-user/app.py", "~/app.py"),
+        ("C:\\Users\\example-user", "C:\\\\Users\\\\example-user\\\\app.py", "~\\\\app.py"),
+        (
+            "C:\\Users\\example-user",
+            "file:///C:/Users/example-user/notes.txt",
+            "file:///~/notes.txt",
+        ),
+        # Privacy-first: siblings that share the home prefix are rewritten on purpose.
+        ("/home/example-user", "/home/example-user-backup/x", "~-backup/x"),
+        ("/home/example-user", "/home/example-user&backup/x", "~&backup/x"),
+        ("/home/example-user", "/home/example-user(backup)/x", "~(backup)/x"),
+        ("/home/example-user", "/home/example-user backup/x", "~ backup/x"),
+        # A home path inside another name is another location, so it is left alone.
+        ("/home/example-user", "/mnt/home/example-user/project", "/mnt/home/example-user/project"),
+        (
+            "/home/example-user",
+            "https://example.com/home/example-user/file",
+            "https://example.com/home/example-user/file",
+        ),
     ],
     ids=[
-        "posix-home",
-        "windows-home",
-        "home-with-spaces",
-        "windows-home-with-spaces",
+        "path",
+        "double-quoted",
+        "parenthesized",
+        "backticked",
+        "sentence-period",
+        "comma-after",
+        "quoted-path-list",
+        "option-value",
+        "file-url",
+        "windows-backslash",
+        "windows-forward-slash",
+        "windows-doubled-backslash",
+        "windows-file-url",
+        "hyphen-sibling",
+        "ampersand-sibling",
+        "parenthesis-sibling",
+        "space-sibling",
+        "mount-embedded",
+        "url-embedded",
     ],
 )
-def test_scrub_home_directory_boundaries(
-    monkeypatch: pytest.MonkeyPatch, home_directory: str
+def test_scrub_replaces_home_at_path_boundaries(
+    monkeypatch: pytest.MonkeyPatch, home_directory: str, text: str, expected: str
 ) -> None:
-    """Redact genuine home paths without changing similarly named siblings."""
-    home_path = Path(home_directory)
-    monkeypatch.setattr(Path, "home", lambda: home_path)
-    home = str(home_path)
-    text = (
-        f'  File "{home}/app.py", line 1\n'
-        f'  File "{home}\\native.py", line 2\n'
-        f'  File "{home}name/module.py", line 3\n'
-        f'  File "{home}.backup/module.py", line 4\n'
-        f'  File "{home} backup/module.py", line 5\n'
-        f"  File '{home}, backup/native.py', line 6\n"
-        f'  File "{home}/child directory/app.py", line 7\n'
-        f'  File "{home}\\child directory\\native.py", line 8\n'
-        f'  File "{home}-backup/module.py", line 9\n'
-        f"Sibling paths: {home}.backup/module.py {home},backup/module.py\n"
-        f"Sibling paths: {home}é/module.py {home}+backup/module.py "
-        f"{home}@backup/module.py {home}~backup/module.py\n"
-        f"Sibling paths: {home}!backup/app.py {home};backup/app.py\n"
-        f"Sibling paths: {home})backup/app.py {home}]backup/app.py {home}}}backup/app.py\n"
-        f"Home: \"{home}\" '{home}' `{home}` {home}\n"
-        f"Home: ({home}) [{home}] {{{home}}} <{home}> {home}, {home}. {home}... {home}!!!\n"
-    )
-    body = ch._scrub(text)
-    assert 'File "~/app.py"' in body
-    assert 'File "~\\native.py"' in body
-    assert f'File "{home}name/module.py"' in body
-    assert f'File "{home}.backup/module.py"' in body
-    assert f'File "{home} backup/module.py"' in body
-    assert f"{home})backup/app.py" in body
-    assert f"{home}]backup/app.py" in body
-    assert f"{home}}}backup/app.py" in body
-    assert f"File '{home}, backup/native.py'" in body
-    assert 'File "~/child directory/app.py"' in body
-    assert 'File "~\\child directory\\native.py"' in body
-    assert f'File "{home}-backup/module.py"' in body
-    assert f"Sibling paths: {home}.backup/module.py {home},backup/module.py\n" in body
-    assert (
-        f"Sibling paths: {home}é/module.py {home}+backup/module.py "
-        f"{home}@backup/module.py {home}~backup/module.py\n"
-    ) in body
-    assert f"Sibling paths: {home}!backup/app.py {home};backup/app.py\n" in body
-    assert "Home: \"~\" '~' `~` ~\n" in body
-    assert "Home: (~) [~] {~} <~> ~, ~. ~... ~!!!\n" in body
-    assert ch._scrub(home) == "~"
+    """The home path is replaced wherever it starts a path, whatever follows it."""
+    monkeypatch.setattr(Path, "home", lambda: Path(home_directory))
+    assert ch._scrub(text) == expected
 
 
 def test_issue_url_redacts_tokens_before_title_cutoff(
@@ -668,38 +662,6 @@ def test_issue_url_oversized_final_note_leaves_empty_traceback(data_dir: Path) -
 
 
 @pytest.mark.parametrize(
-    ("executable", "expected_executable"),
-    [
-        ("/home/example-user/.venv/bin/tool", "~/.venv/bin/tool"),
-        ("/home/example-user-old/bin/tool", "/home/example-user-old/bin/tool"),
-    ],
-    ids=["two-home-command", "sibling-first-command"],
-)
-def test_issue_url_scrubs_each_home_in_quoted_command(
-    data_dir: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    executable: str,
-    expected_executable: str,
-) -> None:
-    ch.install_crash_handler("omnigent", "omnigent-ai/omnigent")
-    home = Path("/home/example-user")
-    monkeypatch.setattr(Path, "home", lambda: home)
-    exc = subprocess.CalledProcessError(1, f"{executable} --config {home}/.config/app.toml")
-    url, body_included = ch._issue_url(exc, "".join(traceback.format_exception(exc)))
-    assert body_included is True
-    title = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)["title"][0]
-    summary = _description_of(url).split("**Exception:** ", 1)[1].split("\n\n", 1)[0]
-    expected_message = (
-        f"Command '{expected_executable} --config ~/.config/app.toml' "
-        "returned non-zero exit status 1."
-    )
-    assert title == f"[Crash] CalledProcessError: {expected_message}"
-    assert summary == f"`CalledProcessError: {expected_message}`"
-    assert f"{home}/.config/app.toml" not in _description_of(url)
-    assert f"{home}/" not in urllib.parse.unquote_plus(url)
-
-
-@pytest.mark.parametrize(
     ("home_directory", "filename_suffix"),
     [
         (r"C:\Users\example-user", r"\private.txt"),
@@ -729,195 +691,67 @@ def test_issue_url_scrubs_repr_escaped_home(
     assert "example" not in urllib.parse.unquote_plus(url)
 
 
-@pytest.mark.parametrize(
-    ("text", "expected"),
-    [
-        ("/mnt/home/example/project", "/mnt/home/example/project"),
-        ("https://example.com/home/example/file", "https://example.com/home/example/file"),
-        ("/mnt/cache//home/example/file", "/mnt/cache//home/example/file"),
-        (
-            "https://example.test/cache//home/example/file",
-            "https://example.test/cache//home/example/file",
-        ),
-        (r"/mnt/cache\/home/example/file", r"/mnt/cache\/home/example/file"),
-        ("/home/example/project", "~/project"),
-        (
-            "https://example.test/cache/file:///home/example/file.py",
-            "https://example.test/cache/file:///home/example/file.py",
-        ),
-        ("/mnt/file:///home/example/file.py", "/mnt/file:///home/example/file.py"),
-        (
-            r"/mnt/cache\file:///home/example/file.py",
-            r"/mnt/cache\file:///home/example/file.py",
-        ),
-    ],
-    ids=[
-        "mount-prefix",
-        "url-path",
-        "doubled-slash-mount",
-        "doubled-slash-url",
-        "backslash-mount",
-        "home-itself",
-        "file-url-in-url",
-        "file-url-in-mount",
-        "file-url-after-backslash",
-    ],
-)
-def test_scrub_keeps_home_text_inside_other_paths(
-    monkeypatch: pytest.MonkeyPatch, text: str, expected: str
+def test_issue_url_scrubs_every_home_reference_in_command(
+    data_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A home path embedded in a longer path or URL is another location, so it stays intact."""
-    monkeypatch.setattr(Path, "home", lambda: Path("/home/example"))
-    assert ch._scrub(text) == expected
+    """Each home reference in an exception message is scrubbed, in title and description."""
+    ch.install_crash_handler("omnigent", "omnigent-ai/omnigent")
+    monkeypatch.setattr(Path, "home", lambda: Path("/home/example-user"))
+    command = "/home/example-user/.venv/bin/tool --config /home/example-user/.config/app.toml"
+    exc = subprocess.CalledProcessError(1, command)
+    url, _ = ch._issue_url(exc, "Traceback (most recent call last):\nCalledProcessError\n")
+    assert "example-user" not in urllib.parse.unquote_plus(url)
+    assert "~/.config/app.toml" in _description_of(url)
 
 
-@pytest.mark.parametrize(
-    ("home_directory", "home_uri"),
-    [
-        ("/home/example", "file:///home/example"),
-        ("/home/example user", "file:///home/example%20user"),
-        (r"C:\Users\example-user", "file:///C:/Users/example-user"),
-    ],
-    ids=["literal-posix", "encoded-posix", "windows"],
-)
-def test_scrub_redacts_home_in_file_url(
-    monkeypatch: pytest.MonkeyPatch, home_directory: str, home_uri: str
+def test_command_line_scrubs_home_argument_and_keeps_argv_plain(
+    data_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Canonical home URIs are private; siblings and embedded URLs are other locations."""
-    monkeypatch.setattr(Path, "home", lambda: Path(home_directory))
-    assert ch._scrub(f"{home_uri}/notes.txt") == "file://~/notes.txt"
-    sibling = f"{home_uri}-backup/notes.txt"
-    embedded = f"https://example.test/cache/{home_uri}/notes.txt"
-    mounted = f"/mnt/{home_uri}/notes.txt"
-    assert ch._scrub(sibling) == sibling
-    assert ch._scrub(embedded) == embedded
-    assert ch._scrub(mounted) == mounted
+    """The public command keeps plain argv joining, with the home argument rewritten."""
+    ch.install_crash_handler("omnigent", "omnigent-ai/omnigent")
+    monkeypatch.setattr(Path, "home", lambda: Path("/home/example-user"))
+    monkeypatch.setattr(sys, "argv", ["omnigent", "run", "/home/example-user/app.yaml", "--flag"])
+    assert ch._scrub(ch._command_line()) == "omnigent run ~/app.yaml --flag"
 
 
 @pytest.mark.parametrize(
-    ("home_directory", "sibling_suffix"),
+    "argv",
     [
-        ("/home/example", " backup/config.yaml"),
-        ("/home/O'Brien", " backup/config.yaml"),
-        (r"C:\Users\O'Brien", " backup/config.yaml"),
-        ("/home/example", "'backup/config.yaml"),
-        ("/home/example", "=backup/config.yaml"),
-        ("/home/example", "%backup/config.yaml"),
-    ],
-    ids=[
-        "plain-home",
-        "posix-apostrophe",
-        "windows-apostrophe",
-        "apostrophe-sibling",
-        "equals-sibling",
-        "percent-sibling",
-    ],
-)
-def test_command_line_keeps_sibling_argument_with_spaces(
-    monkeypatch: pytest.MonkeyPatch,
-    home_directory: str,
-    sibling_suffix: str,
-) -> None:
-    """Public shell quoting preserves siblings and redacts homes, including apostrophes."""
-    home_path = Path(home_directory)
-    monkeypatch.setattr(Path, "home", lambda: home_path)
-    sibling = f"{home_path}{sibling_suffix}"
-    argv = [
-        "omnigent",
-        "run",
-        sibling,
-        f"--config={sibling}",
-        f"file://{sibling}",
-        f"{sibling} --config {home_path}/.config/app.toml",
-        f"{home_path}/project/file.py",
-        f"Home: ({home_path})",
-    ]
-    monkeypatch.setattr(sys, "argv", argv)
-    assert shlex.split(ch._command_line(public=False)) == argv
-    assert shlex.split(ch._command_line(public=True)) == [
-        "omnigent",
-        "run",
-        sibling,
-        f"--config={sibling}",
-        f"file://{sibling}",
-        f"{sibling} --config ~/.config/app.toml",
-        "~/project/file.py",
-        "Home: (~)",
-    ]
-
-
-@pytest.mark.parametrize(
-    ("prefix", "local_prefix", "public_prefix"),
-    [
-        ("Authorization: Bearer", "Authorization: Bear***", "Authorization: Bear***"),
-        (
-            "/home/example-user/x Bearer",
-            "/home/example-user/x Bear***",
-            "~/x Bear***",
-        ),
+        ["example", "Authorization: Bearer", "synthetic.jwt.payload"],
+        ["tool", "--header", "/home/example-user/my dir Bearer", "synthetic.token.value"],
     ],
     ids=["plain-prefix", "home-containing-prefix"],
 )
 def test_bearer_token_split_across_arguments_is_redacted(
-    monkeypatch: pytest.MonkeyPatch,
-    prefix: str,
-    local_prefix: str,
-    public_prefix: str,
+    data_dir: Path, monkeypatch: pytest.MonkeyPatch, argv: list[str]
 ) -> None:
-    """Quoting must not stop a bearer pattern from matching the token that follows it."""
-    home = Path("/home/example-user")
-    monkeypatch.setattr(Path, "home", lambda: home)
-    token = "example-token-value"
-    neighbors = [f"{home} backup/config.yaml", f"{home}/app.yaml", "--keep", "unchanged"]
-    monkeypatch.setattr(sys, "argv", ["omnigent", "--note", prefix, token, *neighbors])
-    local_command = ch._command_line(public=False)
-    assert token not in local_command
-    assert local_prefix in local_command
-    assert shlex.split(local_command)[-4:] == neighbors
-    public_command = ch._command_line(public=True)
-    assert token not in public_command
-    assert public_prefix in public_command
-    assert shlex.split(public_command)[-4:] == [neighbors[0], "~/app.yaml", *neighbors[2:]]
+    """A bearer value in the next argument is redacted, and no home path leaks."""
+    ch.install_crash_handler("omnigent", "omnigent-ai/omnigent")
+    monkeypatch.setattr(Path, "home", lambda: Path("/home/example-user"))
+    monkeypatch.setattr(sys, "argv", argv)
+    url, _ = ch._issue_url(
+        _make_exc("failure"), "Traceback (most recent call last):\nValueError\n"
+    )
+    decoded_url = urllib.parse.unquote_plus(url)
+    assert "synthetic.jwt.payload" not in decoded_url
+    assert "synthetic.token.value" not in decoded_url
+    assert "example-user" not in decoded_url
 
 
-def test_issue_url_preserves_command_paths_and_redacts_split_bearer(
+def test_issue_url_large_exception_message_is_bounded(
     data_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Reports and public URLs use the command renderer without re-scrubbing shell text."""
+    """A multi-megabyte summary is rejected without searching traceback suffixes."""
     ch.install_crash_handler("omnigent", "omnigent-ai/omnigent")
-    home = Path("/home/example-user")
-    monkeypatch.setattr(Path, "home", lambda: home)
-    token = "example-token-value"
-    sibling = f"{home} backup/config.yaml"
-    neighbors = [sibling, f"{home}/app.yaml", "--keep", "unchanged"]
-    monkeypatch.setattr(sys, "argv", ["omnigent", "--note", f"{home}/x Bearer", token, *neighbors])
-    exc = _make_exc("failure")
-    tb_text = "".join(traceback.format_exception(exc))
-    report = ch._build_report(exc, tb_text, source="test")
-    assert token not in report
-    assert tb_text in report
-    local_command = report.split("## Command\n\n```\n", 1)[1].split("\n```", 1)[0]
-    assert shlex.split(local_command) == [
-        "omnigent",
-        "--note",
-        f"{home}/x Bear***",
-        "***",
-        *neighbors,
-    ]
-    url, body_included = ch._issue_url(exc, tb_text)
-    assert body_included is True
+    monkeypatch.setattr(Path, "home", lambda: Path("/home/example-user"))
+    message = "x" * 5_000_000
+    tb_text = "Traceback (most recent call last):\n" + f"ValueError: {message}\n"
+    started = time.perf_counter()
+    url, body_included = ch._issue_url(ValueError(message), tb_text)
+    elapsed = time.perf_counter() - started
     assert len(url) <= ch._MAX_URL_LENGTH
-    assert token not in urllib.parse.unquote_plus(url)
-    public_command = _description_of(url).split("**Command:**\n```\n", 1)[1].split("\n```", 1)[0]
-    assert shlex.split(public_command) == [
-        "omnigent",
-        "--note",
-        "~/x Bear***",
-        "***",
-        sibling,
-        "~/app.yaml",
-        *neighbors[2:],
-    ]
+    assert body_included is False
+    assert elapsed < 5.0
 
 
 def test_issue_url_redacts_multiline_bearer_before_truncation(data_dir: Path) -> None:

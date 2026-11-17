@@ -30,7 +30,6 @@ import datetime
 import os
 import platform
 import re
-import shlex
 import shutil
 import subprocess
 import sys
@@ -38,7 +37,7 @@ import threading
 import traceback
 import urllib.parse
 import webbrowser
-from pathlib import Path, PureWindowsPath
+from pathlib import Path
 from types import TracebackType
 from typing import BinaryIO, TextIO, TypedDict
 
@@ -308,50 +307,9 @@ def _redact(text: str) -> str:
     return text
 
 
-def _quote_path_argument(arg: str, *, public: bool = False) -> str:
-    """Scrub public paths before shell quoting can obscure argument boundaries."""
-    with contextlib.suppress(Exception):
-        home = str(Path.home())
-        if home and home != os.sep and home in arg:
-            needs_quoting = shlex.quote(arg) != arg
-            if public:
-                prefix, separator, value = arg.partition("=")
-                if arg.startswith((home, "file://")) or not separator:
-                    prefix, value = "", arg
-                else:
-                    prefix += separator
-                if value.startswith("file://"):
-                    prefix += "file://"
-                    value = value[len("file://") :]
-                suffix = value[len(home) :] if value.startswith(home) else ""
-                if suffix and not suffix.startswith(("/", "\\")):
-                    # Preserve a sibling's home-like prefix, then scrub later references.
-                    arg = _scrub(prefix) + home + _scrub(suffix)
-                else:
-                    arg = _scrub(arg)
-            return shlex.quote(arg) if needs_quoting else arg
-    return _scrub(arg) if public else arg
-
-
-def _command_line(*, public: bool = False) -> str:
+def _command_line() -> str:
     try:
-        args = list(sys.argv)
-        # Match before shell quoting, preserving argument boundaries when
-        # redacting credentials that span arguments.
-        for pat in _TOKEN_PATTERNS:
-            matches = list(pat.finditer(" ".join(args)))
-            offset = 0
-            for index, arg in enumerate(args):
-                end = offset + len(arg)
-                for match in reversed(matches):
-                    start = max(offset, match.start() + 4)
-                    stop = min(end, match.end())
-                    if start < stop:
-                        args[index] = (
-                            args[index][: start - offset] + "***" + args[index][stop - offset :]
-                        )
-                offset = end + 1
-        return " ".join(_quote_path_argument(arg, public=public) for arg in args)
+        return _redact(" ".join(sys.argv))
     except Exception:  # noqa: BLE001  pragma: no cover
         return "(unavailable)"
 
@@ -487,71 +445,45 @@ def _issue_body(exc: BaseException, tb_text: str, *, truncated: bool = False) ->
     """
     exc_type = type(exc).__qualname__
     msg = str(exc).strip() or "(no message)"
-    summary = _scrub(f"{exc_type}: {msg}")
     note = (
         "_Traceback truncated to fit this link; the full report was saved locally._\n"
         if truncated
         else ""
     )
-    # Scrubbing the rendered command would discard its argument boundaries.
-    return (
+    return _scrub(
         "This crash was auto-reported by Omnigent's crash handler.\n\n"
-        f"**Exception:** `{summary}`\n\n"
+        f"**Exception:** `{exc_type}: {msg}`\n\n"
         "**Command:**\n"
-        f"```\n{_command_line(public=True)}\n```\n\n"
+        f"```\n{_command_line()}\n```\n\n"
         "**Traceback:**\n"
-        f"{note}```\n{_scrub(tb_text)}```\n"
+        f"{note}```\n{tb_text}```\n"
     )
 
 
 def _scrub(text: str) -> str:
-    """Redact tokens and the home directory from text bound for a public issue."""
+    """Replace the home directory with ``~`` in text bound for a public issue.
+
+    Privacy-first: the home path is replaced wherever it starts a path, whatever
+    follows it, so a sibling sharing the prefix (``/home/user-backup``) is rewritten
+    too. A home path embedded in another name (``/mnt/home/user``) is left alone.
+    """
     text = _redact(text)
     with contextlib.suppress(Exception):
         home = str(Path.home())
         if home and home != os.sep:
-            windows_home = PureWindowsPath(home)
-            home_uri = (windows_home if windows_home.is_absolute() else Path(home)).as_uri()
-            escaped_home = home.replace("\\", "\\\\")
-            home_variants = sorted(
-                {
-                    home,
-                    home.replace("'", "'\"'\"'"),
-                    escaped_home,
-                    escaped_home.replace("'", "\\'"),
-                    escaped_home.replace('"', '\\"'),
-                },
-                key=len,
-                reverse=True,
-            )
-            home_pattern = "(?:" + "|".join(map(re.escape, home_variants)) + ")"
-            pattern = (
-                # Canonical file URIs encode names and use forward slashes on Windows.
-                rf"""(?P<uri>(?<![\w.\-~/\\]){re.escape(home_uri)})(?=/|[?#\s'"`]|$)"""
-                + "|"
-                # Inspect spaced siblings without consuming later paths in the same quote.
-                + rf"""(?P<quote>['"`]){home_pattern}(?=(?P<suffix>[^\r\n]*?)(?P=quote))"""
-                + "|"
-                # Not inside a longer path or URL (``/mnt/home/user``, ``cache//home/user``).
-                # A ``file://`` URL to the home directory is the one exception.
-                + r"(?:(?<![\w.\-~/\\])|(?<=(?<![\w.\-~/\\])file://))"
-                + home_pattern
-                # Not followed by a name character, directly or after punctuation (``home)x``).
-                + r"""(?![\w+@~\-]|[.,;:!?)\]}>]+[\w+@~\-])"""
-            )
-
-            def redact_home(match: re.Match[str]) -> str:
-                if match.group("uri") is not None:
-                    return "file://~"
-                quote = match.group("quote")
-                if quote is None:
-                    return "~"
-                suffix = match.group("suffix")
-                if suffix and not suffix.startswith(("/", "\\")):
-                    return match.group(0)
-                return f"{quote}~"
-
-            text = re.sub(pattern, redact_home, text)
+            forms = {
+                home,
+                home.replace("\\", "/"),
+                home.replace("\\", "\\\\"),
+                urllib.parse.quote(home),
+            }
+            variants = {
+                escaped
+                for form in forms
+                for escaped in (form, form.replace("'", "\\'"), form.replace('"', '\\"'))
+            }
+            alternation = "|".join(map(re.escape, sorted(variants, key=len, reverse=True)))
+            text = re.sub(rf"(?<![\w.\-~])(?:{alternation})", "~", text)
     return text
 
 
@@ -580,8 +512,8 @@ def _issue_url(exc: BaseException, tb_text: str) -> tuple[str, bool]:
     """
     # Scrub before cutting the tail, so a credential split across lines is caught whole.
     tb_text = _scrub(tb_text)
-    first_line = (_scrub(str(exc)).strip().splitlines() or [""])[0]
-    title = _scrub(f"[Crash] {type(exc).__qualname__}: {first_line[:140]}")
+    first_line = (str(exc).strip().splitlines() or [""])[0]
+    title = f"[Crash] {type(exc).__qualname__}: {_scrub(first_line)[:140]}"
     repo = _CONFIG["repo"]
     version = _CONFIG.get("version", "unknown")
     os_str = platform.platform(terse=True)
@@ -599,6 +531,10 @@ def _issue_url(exc: BaseException, tb_text: str) -> tuple[str, bool]:
     full_url = url_with_body(_issue_body(exc, tb_text))
     if len(full_url) <= _MAX_URL_LENGTH:
         return full_url, True
+
+    # A summary too long for the link alone makes the suffix search pointless.
+    if len(url_with_body(_issue_body(exc, "", truncated=True))) > _MAX_URL_LENGTH:
+        return base + urllib.parse.urlencode(params), False
 
     # URL length grows with the kept tail, so binary-search the longest tail that fits.
     low, high = 0, len(tb_text)
