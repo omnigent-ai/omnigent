@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
@@ -157,3 +158,50 @@ async def test_forget_drops_the_cached_bridge_id(
     await _get(runner)
 
     assert bridge_ids.calls == [SESSION, SESSION]
+
+
+async def test_rebind_follows_the_new_bridge_transcript(
+    tmp_path: Path, transcripts: dict[str, Path]
+) -> None:
+    inherited = tmp_path / "inherited.jsonl"
+    inherited.write_text(json.dumps(GOAL_SET) + "\n")
+    own = tmp_path / "own.jsonl"
+    own.write_text("")
+    transcripts.update(bridge_inherited=inherited, bridge_own=own)
+    bridge_ids = _BridgeIds("bridge_inherited")
+    runner = ClaudeGoalRunner(bridge_id_for_session=bridge_ids)
+    body = await _get(runner)
+    assert isinstance(body, dict) and body["goal"] is not None
+
+    runner.rebind(SESSION, "bridge_own")
+
+    assert await _get(runner) == {"goal": None, "available": True}
+    own.write_text(json.dumps(GOAL_SET) + "\n")
+    body = await _get(runner)
+    assert isinstance(body, dict) and body["goal"] is not None
+    assert bridge_ids.calls == [SESSION]
+
+
+async def test_a_lookup_answered_after_a_rebind_is_discarded(
+    tmp_path: Path, transcripts: dict[str, Path]
+) -> None:
+    inherited = tmp_path / "inherited.jsonl"
+    inherited.write_text(json.dumps(GOAL_SET) + "\n")
+    own = tmp_path / "own.jsonl"
+    own.write_text("")
+    transcripts.update(bridge_inherited=inherited, bridge_own=own)
+    looking_up, answer = asyncio.Event(), asyncio.Event()
+
+    async def slow_lookup(conv_id: str) -> str:
+        looking_up.set()
+        await answer.wait()
+        return "bridge_inherited"
+
+    runner = ClaudeGoalRunner(bridge_id_for_session=slow_lookup)
+    pending = asyncio.create_task(_get(runner))
+    await looking_up.wait()
+    runner.rebind(SESSION, "bridge_own")
+    answer.set()
+
+    assert await pending == UNAVAILABLE
+    assert await _get(runner) == {"goal": None, "available": True}

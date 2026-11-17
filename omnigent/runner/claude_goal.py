@@ -40,11 +40,26 @@ class ClaudeGoalRunner:
         self._bridge_ids: dict[str, str] = {}
         self._readers: dict[str, ClaudeGoalStateReader] = {}
         self._readers_lock = threading.Lock()
+        # Bumped whenever a session's bridge changes, so an in-flight lookup
+        # cannot cache the bridge id it replaced.
+        self._generations: dict[str, int] = {}
 
     def forget(self, conv_id: str) -> None:
         """Drop the cached bridge id and transcript reader for a released session."""
+        self._generations[conv_id] = self._generations.get(conv_id, 0) + 1
         self._bridge_ids.pop(conv_id, None)
-        self._readers.pop(conv_id, None)
+        with self._readers_lock:
+            self._readers.pop(conv_id, None)
+
+    def rebind(self, conv_id: str, bridge_id: str) -> None:
+        """
+        Follow a session's new Claude bridge from the next read on.
+
+        :param conv_id: Session id, e.g. ``"conv_abc123"``.
+        :param bridge_id: The bridge id its new pane runs under, e.g. ``"bridge_abc"``.
+        """
+        self.forget(conv_id)
+        self._bridge_ids[conv_id] = bridge_id
 
     def _read(self, conv_id: str, bridge_id: str) -> tuple[bool, ClaudeGoal | None]:
         """Return ``(available, goal)``; unavailable until a transcript is readable."""
@@ -86,6 +101,7 @@ class ClaudeGoalRunner:
             return None
         if session_harness_name(conv_id) not in (None, "claude-native"):
             return _unavailable()
+        generation = self._generations.get(conv_id, 0)
         bridge_id = self._bridge_ids.get(conv_id)
         if bridge_id is None:
             try:
@@ -93,10 +109,13 @@ class ClaudeGoalRunner:
             except (httpx.HTTPError, RuntimeError, ValueError):
                 _logger.debug("claude goal bridge lookup failed for session=%s", conv_id)
                 return _unavailable()
+            if self._generations.get(conv_id, 0) != generation:
+                return _unavailable()
             if bridge_id != conv_id:
                 self._bridge_ids[conv_id] = bridge_id
         available, goal = await asyncio.to_thread(self._read, conv_id, bridge_id)
-        if not available:
+        # A rebind during the lookup or read makes this answer describe the old transcript.
+        if not available or self._generations.get(conv_id, 0) != generation:
             return _unavailable()
         wire = goal.to_wire() if goal is not None else None
         return JSONResponse(status_code=200, content={"goal": wire, "available": True})

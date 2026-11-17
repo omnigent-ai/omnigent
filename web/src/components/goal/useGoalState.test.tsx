@@ -3,7 +3,7 @@ import type * as GoalApiModule from "@/lib/goalApi";
 import { useEffect } from "react";
 import { act, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { getGoal, type Goal } from "@/lib/goalApi";
+import { getGoal, type Goal, type GoalBackend } from "@/lib/goalApi";
 import * as identity from "@/lib/identity";
 import { useGoalState } from "./useGoalState";
 
@@ -120,6 +120,16 @@ describe("useGoalState", () => {
       await act(async () => window.dispatchEvent(new Event("focus")));
       expect(result.current.goal).toEqual(changedGoal);
       expect(result.current.goalRevision).toBeGreaterThan(confirmedRevision);
+      const expectCheckUpdatePublished = async (checkUpdate: Partial<Goal>) => {
+        const revisionBeforeCheck = result.current.goalRevision;
+        const checkedGoal = { ...changedGoal, ...checkUpdate };
+        mockGetGoal.mockResolvedValue({ goal: checkedGoal });
+        await act(async () => window.dispatchEvent(new Event("focus")));
+        expect(result.current.goal).toEqual(checkedGoal);
+        expect(result.current.goalRevision).toBeGreaterThan(revisionBeforeCheck);
+      };
+      await expectCheckUpdatePublished({ statusDetail: "Two tests still fail" });
+      await expectCheckUpdatePublished({ iterations: 2 });
       const changedRevision = result.current.goalRevision;
 
       await act(() => result.current.refreshGoal());
@@ -664,17 +674,37 @@ describe("useGoalState", () => {
       )
       .mockResolvedValueOnce({ goal: null })
       .mockResolvedValueOnce({ goal: null });
-    const { result, rerender } = renderHook(({ id }) => useGoalState(id, true), {
-      initialProps: { id: "first" },
-    });
+    const { result, rerender } = renderHook(
+      ({ id, backend }) => useGoalState(id, true, true, backend),
+      { initialProps: { id: "first", backend: "codex" as GoalBackend } },
+    );
     const updatePreviousGoal = result.current.setGoal;
-    rerender({ id: "second" });
+    rerender({ id: "second", backend: "codex" });
     await act(async () => {});
-    rerender({ id: "first" });
+    rerender({ id: "first", backend: "codex" });
     await act(async () => {});
     await act(async () => resolveRead({ goal: GOAL }));
     act(() => updatePreviousGoal(GOAL));
 
+    expect(result.current.goal).toBeNull();
+
+    let resolveCodexRead!: (response: { goal: Goal | null }) => void;
+    mockGetGoal
+      .mockReturnValueOnce(
+        new Promise((resolve) => {
+          resolveCodexRead = resolve;
+        }),
+      )
+      .mockResolvedValueOnce({ goal: null });
+    const codexRefresh = result.current.refreshGoal().catch(() => undefined);
+    rerender({ id: "first", backend: "claude" });
+    await act(async () => {});
+    await act(async () => {
+      resolveCodexRead({ goal: GOAL });
+      await codexRefresh;
+    });
+
+    expect(mockGetGoal).toHaveBeenLastCalledWith("first", { strict: false, backend: "claude" });
     expect(result.current.goal).toBeNull();
   });
 

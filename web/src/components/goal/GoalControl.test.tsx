@@ -112,6 +112,7 @@ describe("GoalControl", () => {
     const pill = screen.getByTestId("composer-goal-mode");
     expect(pill).toHaveAttribute("data-state", "working");
     expect(pill).toHaveAccessibleName(`Goal active: ${GOAL.objective}`);
+    expect(screen.queryByTestId("composer-goal-mode-label")).toBeNull();
   });
 
   it("renders a done icon once the goal completes", () => {
@@ -122,6 +123,7 @@ describe("GoalControl", () => {
     );
 
     expect(screen.getByTestId("composer-goal-mode")).toHaveAttribute("data-state", "done");
+    expect(screen.queryByTestId("composer-goal-mode-label")).toBeNull();
   });
 
   it.each([
@@ -139,16 +141,6 @@ describe("GoalControl", () => {
     expect(pill).toHaveAttribute("data-state", state);
     expect(within(pill).getByTestId("composer-goal-mode-label")).toHaveTextContent(label);
     expect(pill).toHaveAccessibleName(`Goal ${label.toLowerCase()}: ${GOAL.objective}`);
-  });
-
-  it.each(["active", "complete"])("keeps the %s pill icon-only", (status) => {
-    render(
-      <TooltipProvider>
-        <GoalStatusPill goal={{ ...GOAL, status }} />
-      </TooltipProvider>,
-    );
-
-    expect(screen.queryByTestId("composer-goal-mode-label")).toBeNull();
   });
 
   it("shows the latest goal check in the tooltip", async () => {

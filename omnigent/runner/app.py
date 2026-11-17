@@ -2798,6 +2798,7 @@ def create_runner_app(
         cached = _session_init_envelopes.get(session_id)
         if cached is not None:
             cached[1].snapshot.labels[BRIDGE_ID_LABEL_KEY] = bridge_id
+        claude_goal_runner.rebind(session_id, bridge_id)
         # The next turn respawns the harness with the new bridge dir.
         if process_manager is not None:
             await process_manager.release(session_id)

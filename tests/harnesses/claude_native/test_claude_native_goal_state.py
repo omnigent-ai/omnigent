@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from omnigent.harnesses.claude_native import goal_state
 from omnigent.harnesses.claude_native.goal_state import (
     ClaudeGoal,
     ClaudeGoalStateReader,
@@ -173,6 +175,39 @@ def test_reader_starts_over_when_the_transcript_is_replaced_or_truncated(
     replacement.replace(transcript)
     goal = reader.read()
     assert goal is not None and goal.status == "active"
+
+
+def test_overlapping_reads_do_not_skip_later_records(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    transcript = tmp_path / "session.jsonl"
+    _write(transcript, SET)
+    reader = ClaudeGoalStateReader(transcript)
+    folding, release = threading.Event(), threading.Event()
+
+    def fold_after_release(goal: ClaudeGoal | None, entry: dict[str, Any]) -> ClaudeGoal | None:
+        if not folding.is_set():
+            folding.set()
+            release.wait(timeout=5)
+        return apply_goal_entry(goal, entry)
+
+    monkeypatch.setattr(goal_state, "apply_goal_entry", fold_after_release)
+    first = threading.Thread(target=reader.read)
+    second = threading.Thread(target=reader.read)
+    first.start()
+    assert folding.wait(timeout=5)
+    second.start()
+    second.join(timeout=0.2)
+    # The second read waits for the first rather than folding the same bytes.
+    assert second.is_alive()
+    release.set()
+    first.join(timeout=5)
+    second.join(timeout=5)
+
+    _write(transcript, CLEAR, *[{"type": "assistant", "text": "x" * 200}] * 3)
+
+    assert reader.read() is None
+    assert ClaudeGoalStateReader(transcript).read() is None
 
 
 def test_reader_raises_when_the_transcript_is_missing(tmp_path: Path) -> None:
