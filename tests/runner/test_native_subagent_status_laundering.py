@@ -655,6 +655,16 @@ def _drive_steer_lifecycle(
             _STEER_ACCEPTED_AT,
             id="new-request-after-unidentified-settlement-is-attributable",
         ),
+        pytest.param(
+            ["register", "accept_steer", "run_prev"],
+            _STEER_ACCEPTED_AT,
+            id="stale-running-after-current-acceptance",
+        ),
+        pytest.param(
+            ["register", "accept_steer", "settle_prev"],
+            _STEER_ACCEPTED_AT,
+            id="stale-settlement-after-current-acceptance",
+        ),
     ],
 )
 @pytest.mark.asyncio

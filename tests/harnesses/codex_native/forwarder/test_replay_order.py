@@ -1204,7 +1204,7 @@ def _live_item(item_id: str) -> dict:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("mode", ["rejected", "raised"])
+@pytest.mark.parametrize("mode", ["rejected", "raised", "cancelled"])
 async def test_failed_running_publish_is_retried_by_the_next_live_item(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, mode: str
 ) -> None:
@@ -1228,46 +1228,13 @@ async def test_failed_running_publish_is_retried_by_the_next_live_item(
     state = fwd._CodexForwarderState()
     locks_token = fwd._conversation_item_locks.set({})
     try:
-        for item_id in ("item_1", "item_2"):
-            # The supervisor logs a raised publish and keeps delivering later items.
-            with contextlib.suppress(RuntimeError):
-                await fwd._post_missed_turn_start(
-                    client,  # type: ignore[arg-type]
-                    session_id="conv_x",
-                    bridge_dir=tmp_path,
-                    thread_id="thread_1",
-                    event=_live_item(item_id),
-                    forwarder_state=state,
-                )
-    finally:
-        fwd._conversation_item_locks.reset(locks_token)
-
-    assert outcomes == [mode, "accepted"]
-    assert _running_statuses(client) == ["running"]
-    assert state.running_reported_turn_id == "turn_1"
-
-
-@pytest.mark.asyncio
-async def test_cancelled_running_publish_is_retried_by_the_next_live_item(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """A cancelled running publish leaves the turn unmarked, so the next item publishes it."""
-    write_bridge_state(
-        tmp_path,
-        CodexNativeBridgeState(
-            session_id="conv_x",
-            socket_path=str(tmp_path / "app-server.sock"),
-            thread_id="thread_1",
-            codex_home=str(tmp_path / "codex-home"),
-            active_turn_id="turn_1",
-        ),
-    )
-    outcomes = _fail_first_running_publish(monkeypatch, "cancelled")
-    client = _RecordingClient()
-    state = fwd._CodexForwarderState()
-    locks_token = fwd._conversation_item_locks.set({})
-    try:
-        with pytest.raises(asyncio.CancelledError):
+        if mode == "cancelled":
+            failure = pytest.raises(asyncio.CancelledError)
+        elif mode == "raised":
+            failure = pytest.raises(RuntimeError, match="credential resolution failed")
+        else:
+            failure = contextlib.nullcontext()
+        with failure:
             await fwd._post_missed_turn_start(
                 client,  # type: ignore[arg-type]
                 session_id="conv_x",
@@ -1276,6 +1243,8 @@ async def test_cancelled_running_publish_is_retried_by_the_next_live_item(
                 event=_live_item("item_1"),
                 forwarder_state=state,
             )
+        assert outcomes == [mode]
+        assert _running_statuses(client) == []
         assert state.running_reported_turn_id is None
         await fwd._post_missed_turn_start(
             client,  # type: ignore[arg-type]
@@ -1288,8 +1257,9 @@ async def test_cancelled_running_publish_is_retried_by_the_next_live_item(
     finally:
         fwd._conversation_item_locks.reset(locks_token)
 
-    assert outcomes == ["cancelled", "accepted"]
+    assert outcomes == [mode, "accepted"]
     assert _running_statuses(client) == ["running"]
+    assert state.running_reported_turn_id == "turn_1"
 
 
 @pytest.mark.asyncio
