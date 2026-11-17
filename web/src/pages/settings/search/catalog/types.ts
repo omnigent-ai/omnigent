@@ -111,6 +111,10 @@ export function settingsRevealedByProblems(entries: readonly SettingsEntry[]): s
   for (const entry of entries) {
     const revealer = settingsRevealer(entry);
     if (!revealer) continue;
+    if (revealer.id === entry.id) {
+      problems.push(`${entry.id} is revealed by itself`);
+      continue;
+    }
     const target = byId.get(revealer.id);
     if (!target) {
       problems.push(`${entry.id} is revealed by ${revealer.id}, which isn't an entry`);
@@ -237,6 +241,12 @@ type ChoiceTemplateKey<Entry> = Entry extends { choiceTemplates: infer Templates
 type Opener<Entry, Self> =
   | typeof SETTINGS_MAIN_CONTROL
   | Exclude<DeclaredPart<Entry>, Self | PresenceKey<Entry> | ReachedKey<Entry>>;
+/** A part shown only inside an overlay, which can't be the origin of a captured dialog. */
+type OverlayPresenceKey<Entry> = Entry extends { presence: infer Presence }
+  ? {
+      [Key in keyof Presence]: Presence[Key] extends { overlay: string } ? Key : never;
+    }[keyof Presence]
+  : never;
 /** A part whose overlay is captured: it may show only in some states, as its dialog outlives it. */
 type CapturedOpener<Entry, Self> = Entry extends { overlays: infer Overlays }
   ? Exclude<
@@ -244,7 +254,7 @@ type CapturedOpener<Entry, Self> = Entry extends { overlays: infer Overlays }
         [Key in keyof Overlays]: Overlays[Key] extends { captured: true } ? Key : never;
       }[keyof Overlays] &
         DeclaredPart<Entry>,
-      Self | ReachedKey<Entry>
+      Self | ReachedKey<Entry> | OverlayPresenceKey<Entry>
     >
   : never;
 
@@ -402,6 +412,9 @@ export function settingsEntryProblems(entry: SettingsEntry): string[] {
     ...Object.keys(entry.reachedBy ?? {}),
   ]);
   const problems: string[] = [];
+  if (entry.id.trim() === "" || entry.id.includes(":")) {
+    problems.push(`${entry.id} isn't a usable id: it must be non-blank and contain no ":"`);
+  }
   // A captured dialog may open from a part that shows only in some states: it keeps its origin.
   // That opener is still a part shown on the page, not one inside an overlay or reached another way.
   const capturedOpener = (opener: string) => {
@@ -412,19 +425,20 @@ export function settingsEntryProblems(entry: SettingsEntry): string[] {
       (presence === undefined || !("overlay" in presence))
     );
   };
-  const checkOpener = (part: string, opener: string) => {
+  // Only an overlay may open from a captured origin; a redirect needs an opener that always shows.
+  const checkOpener = (part: string, opener: string, allowCaptured: boolean) => {
     if (opener === SETTINGS_MAIN_CONTROL) return;
     if (opener === part) problems.push(`${entry.id}:${part} is its own opener`);
     else if (!parts.has(opener))
       problems.push(`${entry.id}:${part}'s opener "${opener}" isn't a part`);
-    else if (conditional.has(opener) && !capturedOpener(opener)) {
+    else if (conditional.has(opener) && !(allowCaptured && capturedOpener(opener))) {
       problems.push(`${entry.id}:${part}'s opener "${opener}" doesn't always show`);
     }
   };
   for (const [part, presence] of Object.entries(entry.presence ?? {})) {
     if (!parts.has(part))
       problems.push(`${entry.id} gives a presence to "${part}", which isn't a part`);
-    if ("overlay" in presence) checkOpener(part, presence.overlay);
+    if ("overlay" in presence) checkOpener(part, presence.overlay, true);
     if ("states" in presence && presence.states.length === 0) {
       problems.push(`${entry.id}:${part} shows in no state`);
     }
@@ -474,6 +488,9 @@ export function settingsEntryProblems(entry: SettingsEntry): string[] {
       rowNameProblems(`${entry.id}:${region}:${action}`, overlay);
     }
   }
+  if (entry.choices?.some((choice) => !meaningful(choice))) {
+    problems.push(`${entry.id} lists a blank choice`);
+  }
   for (const [part, choices] of Object.entries(entry.partChoices ?? {})) {
     if (!parts.has(part))
       problems.push(`${entry.id} gives choices to "${part}", which isn't a part`);
@@ -518,7 +535,7 @@ export function settingsEntryProblems(entry: SettingsEntry): string[] {
     if (presence && "overlay" in presence) {
       problems.push(`${entry.id}:${part} is in an overlay, so its overlay's opener reveals it`);
     }
-    checkOpener(part, opener);
+    checkOpener(part, opener, false);
   }
   return problems;
 }

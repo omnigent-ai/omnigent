@@ -22,6 +22,8 @@ const base = {
 } as const;
 
 describe("conditional parts", () => {
+  const entry = (extra: Partial<SettingsEntry>): SettingsEntry => ({ ...base, ...extra });
+
   it("are checked as the catalog declares them", () => {
     settingsEntry({
       ...base,
@@ -37,10 +39,15 @@ describe("conditional parts", () => {
     settingsEntry({ ...base, presence: { done: { overlay: "note" }, note: { states: ["x"] } } });
     // @ts-expect-error A redirect points at a declared part or the main control.
     settingsEntry({ ...base, reachedBy: { note: "missing" } });
+    settingsEntry({
+      ...base,
+      // @ts-expect-error A captured dialog's origin is a part on the page, not one inside an overlay.
+      presence: { done: { overlay: "fix" }, fix: { overlay: "note" } },
+      overlays: { fix: { captured: true } },
+    });
   });
 
   it("report the same mistakes in entries built without settingsEntry", () => {
-    const entry = (extra: Partial<SettingsEntry>): SettingsEntry => ({ ...base, ...extra });
     expect(settingsEntryProblems(entry({ presence: { other: { states: ["open"] } } }))).toEqual([
       'fixture-row gives a presence to "other", which isn\'t a part',
     ]);
@@ -63,6 +70,36 @@ describe("conditional parts", () => {
     expect(settingsEntryProblems(entry({ presence: { note: { states: [] } } }))).toEqual([
       "fixture-row:note shows in no state",
     ]);
+  });
+
+  it("reject an id that is blank or contains a colon, which the hash reveal can't name", () => {
+    expect(settingsEntryProblems(entry({ id: "a:b" }))).toEqual([
+      'a:b isn\'t a usable id: it must be non-blank and contain no ":"',
+    ]);
+    expect(settingsEntryProblems(entry({ id: " " }))).toHaveLength(1);
+  });
+
+  it("reject a captured dialog's origin as a redirect target", () => {
+    const presence = { fix: { states: ["editing"] } } as const;
+    const overlays = { fix: { captured: true } } as const;
+    expect(
+      settingsEntryProblems({
+        ...base,
+        presence,
+        overlays,
+        reachedBy: { note: "fix" },
+      } as SettingsEntry),
+    ).toEqual(["fixture-row:note's opener \"fix\" doesn't always show"]);
+  });
+
+  it("reject a captured origin that is itself inside an overlay", () => {
+    expect(
+      settingsEntryProblems({
+        ...base,
+        presence: { done: { overlay: "fix" }, fix: { overlay: "note" } },
+        overlays: { fix: { captured: true } },
+      } as SettingsEntry),
+    ).toEqual(["fixture-row:done's opener \"fix\" doesn't always show"]);
   });
 
   it("let a captured dialog keep an opener that shows only in some states", () => {
@@ -108,6 +145,12 @@ describe("the entry's name parts", () => {
         nameAlternatives: { other: { busy: "x" } },
       } as SettingsEntry),
     ).toEqual(['fixture-row gives other names to "other", which isn\'t a part']);
+  });
+
+  it("reject a blank choice of the main control", () => {
+    expect(settingsEntryProblems({ ...base, choices: ["System", " "] } as SettingsEntry)).toEqual([
+      "fixture-row lists a blank choice",
+    ]);
   });
 
   it("reject blank labels, choices and content areas", () => {
@@ -190,6 +233,9 @@ describe("a structured revealedBy", () => {
   });
 
   it("rejects a missing entry, another section, an undeclared part, and an unknown choice", () => {
+    expect(
+      settingsRevealedByProblems([{ ...child, revealedBy: "fixture-child" } as SettingsEntry]),
+    ).toEqual(["fixture-child is revealed by itself"]);
     expect(settingsRevealedByProblems([child])).toEqual([
       "fixture-child is revealed by fixture-tabs, which isn't an entry",
     ]);
@@ -256,7 +302,8 @@ describe("an entry family", () => {
 
   it("narrows to a subset that shares its members' entries", () => {
     const subset = family.subset("fixture-subset", ["gamma"]);
-    expect(subset.entries).toEqual([family.entry("gamma")]);
+    expect(subset.entries).toHaveLength(1);
+    expect(subset.entries[0]).toBe(family.entry("gamma"));
     expect(isSettingsEntryFamily(subset)).toBe(true);
     expect(() => family.subset("fixture-subset", ["delta" as never])).toThrow(
       "fixture-subset names delta, which fixture doesn't have",
