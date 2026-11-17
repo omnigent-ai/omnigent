@@ -14,8 +14,8 @@ class SysTriggerStateTool(Tool):
     def description(cls) -> str:
         return (
             "Read this Slack trigger automation's state: each configured channel's ID (when "
-            "known) and the time to read from, the author and topic conditions you must apply "
-            "yourself, and the read rules. Takes no arguments."
+            "known) and the time to read from, the saved workspace URL and author IDs, and the "
+            "author and topic conditions you must apply yourself. Takes no arguments."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -50,6 +50,7 @@ class SysTriggerDispatchTool(Tool):
         )
 
     def get_schema(self) -> dict[str, Any]:
+        optional_string = {"type": ["string", "null"]}
         message_schema: dict[str, Any] = {
             "type": "object",
             "properties": {
@@ -57,12 +58,11 @@ class SysTriggerDispatchTool(Tool):
                     "type": "string",
                     "description": "Slack message ts, e.g. 1700000000.000100.",
                 },
-                "thread_ts": {"type": "string"},
-                "user": {"type": "string"},
-                "bot_id": {"type": "string"},
-                "subtype": {"type": "string"},
-                "text": {"type": "string"},
-                "permalink": {"type": "string"},
+                "text": optional_string,
+                "thread_ts": optional_string,
+                "user": optional_string,
+                "bot_id": optional_string,
+                "subtype": optional_string,
             },
             "required": ["ts", "text"],
             "additionalProperties": False,
@@ -103,8 +103,8 @@ class SysTriggerDispatchTool(Tool):
                         "workspace_url": {
                             "type": "string",
                             "description": (
-                                "The Slack workspace URL from auth.test, for building permalinks; "
-                                "saved so later runs can skip auth.test."
+                                "The Slack workspace URL from auth.test or sys_trigger_state, "
+                                "for building permalinks; saved so later runs skip auth.test."
                             ),
                         },
                         "author_ids": {

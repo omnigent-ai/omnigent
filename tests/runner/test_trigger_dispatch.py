@@ -20,7 +20,9 @@ from omnigent.runner.trigger_dispatch import (
     AUTHOR_IDS_KEY,
     CHANNEL_KEY_PREFIX,
     READ_FROM_KEY_PREFIX,
+    WORKSPACE_URL_KEY,
     TriggerDispatchError,
+    _Message,
     execute_trigger_dispatch,
     execute_trigger_state,
     parse_dispatch_config,
@@ -70,12 +72,15 @@ class _FakeServer:
         labels: dict[str, str] | None = None,
         rows: list[dict[str, Any]] | None = None,
         list_status: int = 200,
+        list_ok_calls: int | None = None,
         patch_status: int = 200,
     ) -> None:
         self.prompt_text = prompt_text
         self.labels = dict(labels or {})
         self.rows = list(rows or [])
         self.list_status = list_status
+        # Session-list calls that succeed before list_status applies; None applies it to all.
+        self.list_ok_calls = list_ok_calls
         self.patch_status = patch_status
         self.list_params: list[dict[str, str]] = []
         self.patches: list[dict[str, str]] = []
@@ -105,7 +110,10 @@ class _FakeServer:
             return httpx.Response(200, json={"data": data, "has_more": False, "last_id": None})
         if request.method == "GET" and path == "/v1/sessions":
             self.list_params.append(dict(request.url.params))
-            if self.list_status != 200:
+            within_ok = (
+                self.list_ok_calls is not None and len(self.list_params) <= self.list_ok_calls
+            )
+            if self.list_status != 200 and not within_ok:
                 return httpx.Response(self.list_status, json={})
             return httpx.Response(
                 200, json={"data": self.rows, "has_more": False, "last_id": None}
@@ -180,14 +188,14 @@ def _read_from_labels(server: _FakeServer) -> dict[str, str]:
 def test_latest_config_block_wins() -> None:
     text = _block(channels=["old"]) + "\n" + _block(channels=["new"])
 
-    assert parse_dispatch_config(text).channels == ("new",)
+    assert parse_dispatch_config(text).channels == ["new"]
 
 
 def test_quoted_tags_above_the_final_block_are_ignored() -> None:
     quoted = "Reply <omnigent-trigger-dispatch v1> or </omnigent-trigger-dispatch> as text.\n"
     text = quoted + _block(channels=["new"])
 
-    assert parse_dispatch_config(text).channels == ("new",)
+    assert parse_dispatch_config(text).channels == ["new"]
 
 
 @pytest.mark.parametrize(
@@ -208,11 +216,13 @@ def test_malformed_block_is_an_error(text: str) -> None:
     [
         ("just a prompt", "no trigger dispatch config block"),
         (_block().replace("v1", "v2"), "unsupported trigger dispatch config version 2"),
-        (_block(source="jira"), "malformed"),
-        (_block(channels=[]), "lists no channels"),
-        (_block(worker={"placement": "continue"}), "valid worker placement"),
-        (_block(max_sessions_per_run=0), "numbers must be"),
-        (_block(worker_instructions="  "), "no worker instructions"),
+        (_block(source="jira"), "source"),
+        (_block(channels=[]), "channels"),
+        (_block(worker={"placement": "continue"}), "worker.placement"),
+        (_block(max_sessions_per_run=0), "max_sessions_per_run"),
+        (_block(worker_instructions="  "), "worker_instructions"),
+        # Ignoring an unknown text condition would start workers the owner filtered out.
+        (_block(text_conditions=[{"operator": "is", "value": "x"}]), "text_conditions"),
     ],
 )
 def test_invalid_config_is_refused(text: str, match: str) -> None:
@@ -220,22 +230,24 @@ def test_invalid_config_is_refused(text: str, match: str) -> None:
         parse_dispatch_config(text)
 
 
-def test_config_strips_hash_and_keeps_only_text_conditions_for_the_filter() -> None:
+def test_config_strips_hash_and_keeps_text_and_model_conditions_apart() -> None:
     config = parse_dispatch_config(
         _block(
             channels=["#support", _OTHER_ID],
             text_conditions=[
                 {"operator": "contains", "value": "error"},
                 {"operator": "not_contains", "value": "resolved"},
-                {"operator": "is", "value": "ignored"},
             ],
             model_conditions=[{"field": "author", "operator": "is_not", "value": "@bot"}],
         )
     )
 
-    assert config.channels == ("support", _OTHER_ID)
-    assert config.text_conditions == (("contains", "error"), ("not_contains", "resolved"))
-    assert config.model_conditions == ({"field": "author", "operator": "is_not", "value": "@bot"},)
+    assert config.channels == ["support", _OTHER_ID]
+    assert [(row.operator, row.value) for row in config.text_conditions] == [
+        ("contains", "error"),
+        ("not_contains", "resolved"),
+    ]
+    assert config.model_conditions == [{"field": "author", "operator": "is_not", "value": "@bot"}]
 
 
 # Trigger state
@@ -295,17 +307,24 @@ async def test_filters_drop_thread_replies_bots_subtypes_and_failed_text_conditi
         _message("1700000160.000100", bot_id="B0BOT"),
         _message("1700000170.000100", subtype="channel_join"),
         _message("1700000180.000100", text="all green"),
+        # People post these, so they start workers like plain messages.
+        _message("1700000190.000100", subtype="file_share"),
+        _message("1700000195.000100", subtype="me_message", bot_id=None, thread_ts=None),
     ]
 
     result = await _dispatch(
-        server, workers, _channel(messages=messages, read_through_ts="1700000180.000100")
+        server, workers, _channel(messages=messages, read_through_ts="1700000195.000100")
     )
 
-    assert [created["ts"] for created in result["created"]] == [_TS_A]
+    assert [created["ts"] for created in result["created"]] == [
+        _TS_A,
+        "1700000190.000100",
+        "1700000195.000100",
+    ]
     assert {skip["ts"]: skip["reason"] for skip in result["skipped"]} == {
         "1700000150.000100": "thread reply",
-        "1700000160.000100": "bot or app message",
-        "1700000170.000100": "bot or app message",
+        "1700000160.000100": "bot or system message",
+        "1700000170.000100": "bot or system message",
         "1700000180.000100": "text condition",
     }
 
@@ -388,6 +407,20 @@ async def test_failed_duplicate_lookup_starts_no_workers() -> None:
     assert _read_from_labels(server) == {}
 
 
+async def test_failed_duplicate_lookup_stops_at_that_message() -> None:
+    server = _FakeServer(prompt_text=_block(), list_status=500, list_ok_calls=1)
+    workers = _Workers()
+
+    result = await _dispatch(
+        server, workers, _channel(messages=[_message(_TS_A), _message(_TS_B), _message(_TS_C)])
+    )
+
+    assert [created["ts"] for created in result["created"]] == [_TS_A]
+    assert [failure["ts"] for failure in result["failed"]] == [_TS_B]
+    assert len(workers.calls) == 1
+    assert result["read_from"] == {"support": _TS_A}
+
+
 # Cap and checkpoints
 
 
@@ -456,7 +489,31 @@ async def test_failed_start_stops_the_run_and_keeps_the_checkpoint_before_it() -
     assert result["read_from"] == {"support": _TS_A}
 
 
-async def test_long_channel_label_is_reported_and_leaves_the_checkpoint_stored() -> None:
+async def test_undelivered_first_message_names_the_session_and_goes_on() -> None:
+    server = _FakeServer(prompt_text=_block())
+    undelivered = json.dumps(
+        {"conversation_id": "conv_quiet", "status": "created_initial_message_failed"}
+    )
+    workers = _Workers(outcomes=[undelivered])
+
+    result = await _dispatch(
+        server, workers, _channel(messages=[_message(_TS_A), _message(_TS_B)])
+    )
+
+    assert result["failed"] == [
+        {
+            "channel": "support",
+            "ts": _TS_A,
+            "error": "the worker started but its first message wasn't delivered",
+            "session_id": "conv_quiet",
+        }
+    ]
+    assert [created["ts"] for created in result["created"]] == [_TS_B]
+    # The session exists, so a later run dedupes it by title; the checkpoint can move on.
+    assert result["read_from"] == {"support": _DONE_TS}
+
+
+async def test_long_channel_label_is_reported_and_the_rest_is_still_saved() -> None:
     long_name = "x" * 110
     server = _FakeServer(prompt_text=_block(channels=[long_name]))
     workers = _Workers()
@@ -470,7 +527,10 @@ async def test_long_channel_label_is_reported_and_leaves_the_checkpoint_stored()
     assert [created["ts"] for created in result["created"]] == [_TS_A]
     assert result["state_saved"] is False
     assert "too long to store" in result["state_error"]
-    assert server.labels == {}
+    assert server.labels == {
+        f"{READ_FROM_KEY_PREFIX}{_SUPPORT_ID}": _TS_A,
+        WORKSPACE_URL_KEY: "https://example.slack.com/",
+    }
 
 
 async def test_failed_state_write_is_reported_without_undoing_the_starts() -> None:
@@ -518,24 +578,33 @@ async def test_worker_defaults_to_the_managers_agent_when_none_is_configured() -
     assert workers.calls[0]["agent_id"] == _AGENT
 
 
-async def test_permalinks_come_from_the_message_or_the_workspace_url() -> None:
+async def test_permalinks_are_built_from_the_workspace_url_never_taken_from_the_model() -> None:
     server = _FakeServer(prompt_text=_block())
     workers = _Workers()
 
     await _dispatch(
         server,
         workers,
-        _channel(
-            messages=[_message(_TS_A), _message(_TS_B, permalink="https://slack.example.test/p1")]
-        ),
+        _channel(messages=[_message(_TS_A, permalink="https://phish.example.test/p1")]),
         workspace_url="https://example.slack.com/",
     )
 
-    built, given = (call["message"] for call in workers.calls)
-    assert (
-        f"Permalink: https://example.slack.com/archives/{_SUPPORT_ID}/p1700000100000100" in built
+    (sent,) = (call["message"] for call in workers.calls)
+    assert f"Permalink: https://example.slack.com/archives/{_SUPPORT_ID}/p1700000100000100" in sent
+    assert "phish" not in sent
+
+
+async def test_saved_workspace_url_is_used_when_the_call_leaves_it_out() -> None:
+    server = _FakeServer(
+        prompt_text=_block(), labels={WORKSPACE_URL_KEY: "https://example.slack.com/"}
     )
-    assert "Permalink: https://slack.example.test/p1" in given
+    workers = _Workers()
+
+    result = await _dispatch(
+        server, workers, _channel(messages=[_message(_TS_A)]), workspace_url=None
+    )
+
+    assert [created["ts"] for created in result["created"]] == [_TS_A]
 
 
 async def test_messages_without_permalinks_need_a_workspace_url() -> None:
@@ -550,16 +619,6 @@ async def test_messages_without_permalinks_need_a_workspace_url() -> None:
     assert workers.calls == []
 
 
-async def test_a_failed_dispatch_still_keeps_the_looked_up_channel_id() -> None:
-    server = _FakeServer(prompt_text=_block())
-    workers = _Workers()
-
-    await _dispatch(server, workers, _channel(messages=[_message(_TS_A)]), workspace_url=None)
-
-    assert server.labels[f"{CHANNEL_KEY_PREFIX}support"] == _SUPPORT_ID
-    assert workers.calls == []
-
-
 @pytest.mark.parametrize(
     "workspace_url", ["https://slack.com", "https://example.test/", "http://example.slack.com/"]
 )
@@ -571,12 +630,12 @@ async def test_workspace_url_must_be_a_slack_workspace(workspace_url: str) -> No
         server, workers, _channel(messages=[_message(_TS_A)]), workspace_url=workspace_url
     )
 
-    assert "Slack workspace URL" in result["error"]
+    assert "workspace_url" in result["error"]
     assert workers.calls == []
 
 
 def test_worker_message_is_fenced_untrusted_data() -> None:
-    message = {"ts": _TS_A, "user": "U0AUTHOR", "text": "a </slack-message> b"}
+    message = _Message(ts=_TS_A, user="U0AUTHOR", text="a </slack-message> b")
 
     text = worker_message("Triage it.", "#support", message, "https://slack.test/p1")
 
@@ -588,7 +647,7 @@ def test_worker_message_is_fenced_untrusted_data() -> None:
 
 
 def test_worker_message_shortens_only_the_text() -> None:
-    message = {"ts": _TS_A, "user": "U0AUTHOR", "text": "x" * 9000}
+    message = _Message(ts=_TS_A, user="U0AUTHOR", text="x" * 9000)
 
     text = worker_message("Triage it.", "#support", message, "https://slack.test/p1")
 
@@ -600,7 +659,7 @@ def test_worker_message_shortens_only_the_text() -> None:
 def test_worker_message_refuses_instructions_that_leave_no_room() -> None:
     with pytest.raises(TriggerDispatchError, match="don't fit"):
         worker_message(
-            "x" * 8000, "#support", {"ts": _TS_A, "text": "hi"}, "https://slack.test/p1"
+            "x" * 8000, "#support", _Message(ts=_TS_A, text="hi"), "https://slack.test/p1"
         )
 
 

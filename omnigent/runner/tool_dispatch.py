@@ -335,7 +335,7 @@ _TURN_ACTOR_LABEL = "omnigent.turn_actor"
 _SESSION_CREATE_TOOLS = frozenset({"sys_session_create"})
 
 # Slack trigger dispatch: runner-local tools that read the manager's config block and start
-# workers through the same ``_execute_session_create`` path. Gated by the trigger feature flag.
+# workers through the same ``_execute_session_create`` path.
 _TRIGGER_DISPATCH_TOOLS = frozenset({SysTriggerStateTool.name(), SysTriggerDispatchTool.name()})
 
 # Priority 5f.0: Session query tools — peek/list/close/get_info/share. The
