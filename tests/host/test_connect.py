@@ -3207,30 +3207,36 @@ async def test_hello_advertises_the_workspace_socket_only_while_it_runs(
         assert hello.workspace_token_key is None
 
 
-@pytest.mark.parametrize(
-    ("features", "enabled"),
-    [("workspace_direct_access", True), ("", False), ("not_a_feature", False)],
-)
-async def test_workspace_direct_access_follows_omnigent_features(
-    monkeypatch: pytest.MonkeyPatch, features: str, enabled: bool
-) -> None:
-    """The host opens its socket only when enabled, and an invalid list never stops the host."""
-    from omnigent.host.connect import _workspace_direct_access_enabled
-
-    monkeypatch.setenv("OMNIGENT_FEATURES", features)
-
-    assert _workspace_direct_access_enabled() is enabled
-
-
 async def test_workspace_socket_without_its_extra_leaves_the_host_running(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Enabling direct access without `omnigent[workspace-api]` turns it off, not the host."""
-    monkeypatch.setenv("OMNIGENT_FEATURES", "workspace_direct_access")
+    """Without `omnigent[workspace-api]` the host runs with no workspace socket."""
     # None in sys.modules makes the import fail as if connectrpc weren't installed.
     monkeypatch.setitem(sys.modules, "omnigent.host.workspace_service", None)
 
     assert await _make_host_process()._start_workspace_socket() is None
+
+
+async def test_installed_workspace_extra_starts_the_socket_without_a_host_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An installed `omnigent[workspace-api]` opens the socket; no host flag gates it."""
+    monkeypatch.delenv("OMNIGENT_FEATURES", raising=False)
+    socket = object()
+    started_for: list[str] = []
+
+    async def _start(_reader: object, *, host_id: str) -> object:
+        started_for.append(host_id)
+        return socket
+
+    monkeypatch.setitem(
+        sys.modules,
+        "omnigent.host.workspace_service",
+        SimpleNamespace(start_workspace_socket=_start),
+    )
+
+    assert await _make_host_process()._start_workspace_socket() is socket
+    assert started_for == ["host_test_connect"]
 
 
 async def test_slow_capability_discovery_blocks_registration_and_frame_dispatch(

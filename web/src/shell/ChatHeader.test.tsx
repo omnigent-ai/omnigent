@@ -60,6 +60,9 @@ const mobileMenu = {
   onOpenSubagents: () => {},
   githubPanelOpen: false,
   onOpenGithub: () => {},
+  tasksPanelOpen: false,
+  showTasks: false,
+  onOpenTasks: () => {},
   contentSearchPanelOpen: false,
   showContentSearch: false,
   onOpenContentSearch: () => {},
@@ -299,6 +302,19 @@ describe("ChatHeader — workspace pane alignment", () => {
     expect(
       session.container.querySelector("header")!.classList.contains("session-header-glass"),
     ).toBe(!mobile);
+  });
+
+  it("lets a page's content take clicks under the header, away from its controls", () => {
+    // A page scrolls under the header without a backdrop, e.g. its Back link.
+    const page = renderHeader({ sidebarOpen: true });
+    expect(page.container.querySelector("header")).toHaveClass(
+      "pointer-events-none",
+      "*:pointer-events-auto",
+    );
+    page.unmount();
+
+    const session = renderHeader({ sidebarOpen: true, conversationId: "conv-1" });
+    expect(session.container.querySelector("header")).not.toHaveClass("pointer-events-none");
   });
 });
 
@@ -1118,6 +1134,29 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
     });
     fireEvent.click(screen.getByRole("menuitem", { name: "Files" }));
     expect(onOpenFiles).toHaveBeenCalled();
+  });
+
+  it("opens the Tasks drawer from the kebab, with no count of workers", () => {
+    const onOpenTasks = vi.fn();
+    isMobileMock.mockReturnValue(true);
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: conversation.id,
+      conversationTitle: conversation.title,
+      actionConversation: conversation,
+      hasRailContent: true,
+      showFilesPanel: true,
+      mobileMenu: { ...mobileMenu, showTasks: true, subagentsWorking: 2, onOpenTasks },
+    });
+
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Conversation actions" }), {
+      button: 0,
+    });
+    const item = screen.getByTestId("mobile-tasks-action");
+    // Busy sub-agents count on the Agents item; the Tasks item is just its label.
+    expect(item.textContent?.trim()).toBe("Tasks");
+    fireEvent.click(item);
+    expect(onOpenTasks).toHaveBeenCalled();
   });
 
   it("opens the content-search drawer from the kebab when the feature is available", () => {

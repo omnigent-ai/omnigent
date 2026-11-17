@@ -78,6 +78,7 @@ const { registerServerAwayWatch, AWAY_BANNER_DELAY_MS } = require("./away_banner
 const { createReturnBanner } = require("./return_banner");
 const { createReconnectOverlay } = require("./reconnect_overlay");
 const { createBrowserViewRegistry } = require("./browserViewRegistry");
+const { registerBrowserTabsIpc } = require("./browserTabs");
 const { createBrowserViewBoundsController } = require("./browserViewBounds");
 const { goBack, goForward, registerBrowserIpc } = require("./browserIpc");
 const { arcaTarget, createArcaIdentityStore, isArcaAgentContext } = require("./arcaIdentity");
@@ -132,6 +133,9 @@ const {
   sanitizeDesktopCommandState,
 } = require("./desktopCommands");
 const omnigentCli = require("./omnigent_cli");
+const { workspaceSocketRequest } = require("./workspaceSocket");
+const { createWorkspaceSshForwards } = require("./workspaceSshForwards");
+const { createSshHostStore } = require("./sshHosts");
 
 const serverManager = require("./server_manager");
 const { diagnostics } = require("./diagnostics");
@@ -354,6 +358,9 @@ function databricksInternalFeaturesEnabled() {
  * while one is in flight re-focuses the console and shares its outcome.
  */
 const arcaIdentities = createArcaIdentityStore();
+// Hosts this desktop connected over SSH, and the connections that reach their workspace sockets.
+const sshHosts = createSshHostStore(() => path.join(app.getPath("userData"), "ssh-hosts.json"));
+const workspaceSshForwards = createWorkspaceSshForwards();
 
 function startArcaHostConnect(serverUrl, deps) {
   const finish = arcaIdentities.begin(serverUrl);
@@ -3145,7 +3152,11 @@ function newWindow() {
   const current = win?.webContents.getURL();
   // Cloning an ephemeral (multi-server) window keeps the clone
   // ephemeral, so Change Server… from it still won't touch saved settings.
-  createWindow(current, { ephemeral: win ? windows.get(win)?.ephemeral === true : false });
+  // The clone's server is its source's, not its /c/<id> URL (browserTabs.js keys tabs by it).
+  createWindow(current, {
+    ephemeral: win ? windows.get(win)?.ephemeral === true : false,
+    serverUrl: (win && windows.get(win)?.serverUrl) || undefined,
+  });
 }
 
 /**
@@ -5378,6 +5389,19 @@ function registerIpc() {
     };
   });
 
+  // SPA → a workspace API call on a session host's local socket. The socket and
+  // call shape are checked in workspaceSocket.js; the host checks the token.
+  ipcMain.handle("omnigent:workspace-socket-request", (event, request) => {
+    if (!isPinnedOriginSender(event)) {
+      throw new Error("workspace-socket-request is only available to a connected server page");
+    }
+    const serverUrl = senderServerUrl(event);
+    return workspaceSocketRequest(request, {
+      sshDestination: (hostId) => (serverUrl ? sshHosts.destination(serverUrl, hostId) : null),
+      forwards: workspaceSshForwards,
+    });
+  });
+
   // SPA → connect a machine over SSH as a host. Requires the window's pinned origin
   // and revalidates the destination before the shell-owned console asks consent.
   ipcMain.handle("omnigent:ssh-connect", async (event, destination) => {
@@ -5408,7 +5432,20 @@ function registerIpc() {
         error: `${target} can't reach a server on this computer (${new URL(serverUrl).host}). Connect this window to a server ${target} can reach, or, if ${target} runs this server itself, run "omnigent host" there.`,
       };
     }
-    return sshConnectFlow.run(BrowserWindow.fromWebContents(event.sender), serverUrl, target);
+    const result = await sshConnectFlow.run(
+      BrowserWindow.fromWebContents(event.sender),
+      serverUrl,
+      target,
+    );
+    // Lets the file viewer read this host's workspace over SSH.
+    if (result?.ok && result.identity) {
+      try {
+        sshHosts.record(serverUrl, result.identity.hostId, target);
+      } catch (error) {
+        console.warn("[omnigent] couldn't record the SSH host:", error);
+      }
+    }
+    return result;
   });
 
   // SPA → connect the user's Arca instance to the window's server as a host,
@@ -5551,11 +5588,37 @@ function registerIpc() {
 
   // Embedded browser pane — the `omnigent:browser-*` surface lives in
   // browserIpc.js; the trust gate + per-window registry lookup are injected.
+  // Every window's view of each session's browser tabs, and the
+  // routing of a tab's calls to the one window with its page
+  // (browserTabs.js).
+  const windowShowsServer = (win) => {
+    const origin = windows.get(win)?.origin;
+    return !!origin && originOf(win.webContents.getURL()) === origin;
+  };
+  const browserTabs = registerBrowserTabsIpc({
+    ipcMain,
+    isPinnedOriginSender,
+    windows: () => windows,
+    windowForEvent: (event) => BrowserWindow.fromWebContents(event.sender),
+    // A window that navigated to a foreign page keeps its pinned origin.
+    showsServer: windowShowsServer,
+    // Tabs belong to a server, so two servers on one origin share none.
+    serverOf: (state) =>
+      (state.serverUrl && normalizeSavedServerUrl(state.serverUrl).replace(/\/+$/, "")) ||
+      state.origin,
+  });
   registerBrowserIpc({
     ipcMain,
     isPinnedOriginSender,
     getRegistryForEvent: browserRegistryForSender,
     getWindowForEvent: (event) => BrowserWindow.fromWebContents(event.sender),
+    showsServerForEvent: (event) => {
+      const win = BrowserWindow.fromWebContents(event.sender);
+      return !!win && windowShowsServer(win);
+    },
+    routeViewForEvent: browserTabs.route, // a tab's one page, in its window
+    whileOpeningView: browserTabs.whileOpening,
+    refuseCloseForEvent: browserTabs.refuseClose,
     getAgentContextForEvent: (event, opts) => {
       const win = BrowserWindow.fromWebContents(event.sender);
       const sourceHostId = typeof opts?.sourceHostId === "string" ? opts.sourceHostId : null;
@@ -6189,7 +6252,10 @@ if (!gotLock) {
     });
   });
 
-  app.on("will-quit", () => globalShortcut.unregisterAll());
+  app.on("will-quit", () => {
+    globalShortcut.unregisterAll();
+    workspaceSshForwards.closeAll();
+  });
   app.on("window-all-closed", () => {
     // macOS apps typically stay alive until Cmd-Q.
     if (process.platform !== "darwin") app.quit();
@@ -6224,6 +6290,8 @@ if (!gotLock) {
   app.on("quit", clearQuitForceExitTimer);
   app.on("before-quit", (event) => {
     quitConfirmation.quitStarted();
+    // Forced exits below skip will-quit, so SSH connections are torn down here first.
+    workspaceSshForwards.closeAll();
     if (quitCleanupDone) return;
     // A second quit (e.g. Cmd-Q again during the SIGKILL grace window) must not
     // re-enter shutdown() concurrently — just keep deferring until the first

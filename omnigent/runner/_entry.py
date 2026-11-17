@@ -34,7 +34,8 @@ from omnigent._platform import IS_WINDOWS, normalize_interactive_shells
 from omnigent.debug_logging import debug_event, runner_primary_session_id
 from omnigent.inner import _proc
 from omnigent.runner.busy_check import RunnerBusyCheck
-from omnigent.runner.identity import RUNNER_AUTH_REJECTED_EXIT_CODE
+from omnigent.runner.identity import RUNNER_AUTH_REJECTED_EXIT_CODE, RUNNER_SLICE_KEY_ENV_VAR
+from omnigent.runner.session_requests import remember_session_host
 from omnigent.runner.transports.ws_tunnel.serve import (
     RUNNER_TUNNEL_NO_CREDENTIAL_PREFIX,
     RUNNER_TUNNEL_REJECTION_PREFIX,
@@ -385,7 +386,7 @@ class _RunnerDatabricksAuth(ThreadedAuth):
         # none recorded. Set once here; it persists across the retry yield.
         if self._server_url:
             from omnigent.cli_auth import databricks_request_headers
-            from omnigent.runner.session_requests import REQUEST_HOST_EXTENSION
+            from omnigent.session_host import REQUEST_HOST_EXTENSION
 
             request.headers.update(
                 databricks_request_headers(
@@ -1481,7 +1482,12 @@ def _load_agent_spec_bundle(
     spec_cache_root: Path, resp: httpx.Response, agent_id: str, session_id: str
 ) -> ResolvedSpec:
     """Hash, load and publish a validated bundle while its cache lock is held."""
-    from omnigent.automations_availability import AUTOMATIONS_HEADER, without_scheduled_task_tools
+    from omnigent.automations_availability import (
+        AUTOMATIONS_HEADER,
+        USER_INBOX_HEADER,
+        without_scheduled_task_tools,
+        without_user_inbox_tools,
+    )
     from omnigent.mcp_selection import MCP_SELECTION_HEADER, selected_mcp_spec
     from omnigent.runner.native import ResolvedSpec
     from omnigent.spec import load
@@ -1517,6 +1523,8 @@ def _load_agent_spec_bundle(
     # Older servers send no header; keep the tools there, as before.
     if resp.headers.get(AUTOMATIONS_HEADER) == "0":
         spec = without_scheduled_task_tools(spec)
+    if resp.headers.get(USER_INBOX_HEADER) == "0":
+        spec = without_user_inbox_tools(spec)
     _apply_host_interactive_shells(spec)
     return ResolvedSpec(spec=spec, workdir=dest)
 
@@ -1673,6 +1681,8 @@ def create_app(
         )
 
     server_client = _server_client_factory()
+    # The runner already knows the host of its own session.
+    remember_session_host(runner_primary_session_id(), os.environ.get(RUNNER_SLICE_KEY_ENV_VAR))
 
     mcp_manager = RunnerMcpManager(
         stdio_cwd=runner_workspace,

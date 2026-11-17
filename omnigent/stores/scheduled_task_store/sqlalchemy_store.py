@@ -339,10 +339,16 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 return None
             return _to_entity(row)
 
-    def list(self, *, owner_user_id: str | None = None) -> list[ScheduledTask]:
+    def list(
+        self,
+        *,
+        owner_user_id: str | None = None,
+        exclude_agent_ids: frozenset[str] = frozenset(),
+    ) -> list[ScheduledTask]:
         """List non-deleted scheduled tasks ordered by ``created_at ASC, id ASC``.
 
         When *owner_user_id* is given, only tasks owned by that user are returned.
+        Tasks bound to *exclude_agent_ids* are left out.
         """
         with self._session("list_tasks") as session:
             stmt = (
@@ -353,8 +359,31 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             )
             if owner_user_id is not None:
                 stmt = stmt.where(SqlScheduledTask.user_id == owner_user_id)
+            if exclude_agent_ids:
+                stmt = stmt.where(SqlScheduledTask.agent_id.not_in(sorted(exclude_agent_ids)))
             rows = session.execute(stmt).scalars().all()
             return [_to_entity(r) for r in rows]
+
+    def list_for_agent(
+        self, agent_id: str, *, after: str | None = None, limit: int = 100
+    ) -> tuple[builtins.list[ScheduledTask], str | None]:
+        """See base class. Seeks ``ix_scheduled_tasks_agent``."""
+        if not 1 <= limit <= 500:
+            raise ValueError("limit must be between 1 and 500")
+        stmt = select(SqlScheduledTask).where(
+            SqlScheduledTask.workspace_id == current_workspace_id(),
+            SqlScheduledTask.agent_id == agent_id,
+        )
+        if after is not None:
+            stmt = stmt.where(SqlScheduledTask.id > after)
+        stmt = stmt.order_by(asc(SqlScheduledTask.id)).limit(limit + 1)
+        with self._session("list_tasks_for_agent") as session:
+            rows = session.execute(stmt).scalars().all()
+        page = rows[:limit]
+        cursor = page[-1].id if len(rows) > limit else None
+        deleted = encode_scheduled_task_state("deleted")
+        # Deleted tasks are dropped after paging so each query examines at most limit + 1 rows.
+        return [_to_entity(row) for row in page if row.state != deleted], cursor
 
     def list_active(self) -> builtins.list[ScheduledTask]:
         """List active scheduled tasks ordered by ``created_at ASC, id ASC``."""
@@ -436,6 +465,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         last_run_at: int | None = None,
         last_run_conversation_id: str | None = _UNSET,
         expected_schedule: ScheduledTask | None = None,
+        guard: Callable[[ScheduledTask], None] | None = None,
     ) -> ScheduledTask | None:
         """Update mutable fields.
 
@@ -450,7 +480,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         managed-sandbox execution). Passing ``rrule`` updates the recurring
         trigger and ``agent_id`` rebinds the task to a different agent
         (switching the harness future firings run); ``None`` leaves either
-        unchanged.
+        unchanged. ``guard`` runs on the locked row before any write; see the base class.
         """
         updated_at = now_epoch()
         checks_owner = state is not None and state != "deleted"
@@ -476,6 +506,8 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             )
             if row is None or row.state == encode_scheduled_task_state("deleted"):
                 return None
+            if guard is not None:
+                guard(_to_entity(row))
             if expected_schedule is not None:
                 current = _to_entity(row)
                 if any(
@@ -861,6 +893,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         check_generation: bool = False,
         after: tuple[int, str] | None = None,
         limit: int = 50,
+        exclude_agent_ids: frozenset[str] = frozenset(),
     ) -> tuple[builtins.list[AutomationFailure], tuple[int, str] | None]:
         """Bound discovery by the owner/task index, then read one indexed run/task."""
         if not 1 <= limit <= 100:
@@ -877,6 +910,8 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 SqlScheduledTask.workspace_id == current_workspace_id(),
                 SqlScheduledTask.user_id == owner_user_id,
             )
+            if exclude_agent_ids:
+                stmt = stmt.where(SqlScheduledTask.agent_id.not_in(sorted(exclude_agent_ids)))
             if after is not None:
                 stmt = stmt.where(
                     self._cursor_after(
@@ -932,6 +967,12 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                         )
                     )
             return failures, cursor
+
+    def get_run(self, run_id: str) -> ScheduledTaskRun | None:
+        """Read a run's durable outcome without scanning its task's history."""
+        with self._session("select_task_run") as session:
+            row = session.get(SqlScheduledTaskRun, (current_workspace_id(), run_id))
+            return _run_to_entity(row) if row is not None else None
 
     def list_runs(
         self,

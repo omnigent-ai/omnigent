@@ -135,6 +135,7 @@ from omnigent.server.host_registry import (
     HostRegistry,
     RunnerExitReports,
 )
+from omnigent.server.journal_markers import record_todo_markers
 from omnigent.server.managed_hosts import (
     MANAGED_SANDBOX_LABEL_NAMESPACE,
     ManagedHostLaunch,
@@ -3235,6 +3236,9 @@ async def _handle_external_session_todos(
     )
     if not persisted:
         return
+    await record_todo_markers(
+        conversation_store, session_id, persisted.previous, validated, update_id=persisted.id
+    )
     event = SessionTodosEvent(
         type="session.todos",
         conversation_id=session_id,
@@ -5054,8 +5058,18 @@ def _publish_child_status_to_parent(session_id: str, status: str) -> None:
     if store is None:
         return
 
+    handoffs = session_live_state.handoff_count(session_id)
+
     def _fan_out() -> None:
         conv = store.get_conversation(session_id)
+        if store is not session_live_state.conversation_store():
+            return
+        session_live_state.record_child_status(
+            session_id,
+            conv.parent_conversation_id if conv else None,
+            _session_status_cache.get(session_id),
+            handoffs=handoffs,
+        )
         if conv is None or conv.parent_conversation_id is None:
             return
         parent_id = conv.parent_conversation_id
@@ -5230,6 +5244,10 @@ def _publish_status(
         return
     previous_status = _session_status_cache.get(session_id)
     _session_status_cache[session_id] = status
+    if status not in ("running", "waiting"):
+        session_live_state.record_child_status(
+            session_id, None, status, handoffs=session_live_state.handoff_count(session_id)
+        )
     _set_blocked_on(session_id, blocked_on)
     # Only a ``waiting`` edge names background agents; any other edge ends that wait.
     if status != "waiting":
@@ -5267,7 +5285,9 @@ def _publish_status(
             error="runner disappeared before the turn reached a terminal state",
         )
     elif status == "idle":
-        session_live_state.persist_scheduled_run_completion(session_id, "succeeded")
+        session_live_state.persist_scheduled_run_completion(
+            session_id, "succeeded", turn_completed=turn_completed
+        )
     elif status == "failed":
         # Canonical server-side broken-turn signal: every server-originated
         # failed turn (runner disconnect mid-turn, setup/dispatch failure,
@@ -8527,6 +8547,8 @@ async def _dispatch_skill_slash_command_to_runner(
         conversation_store,
     )
 
+    from omnigent.tools.browser_agent_tools import browser_agent_tools_turn_flag
+
     runner_body: dict[str, Any] = {
         "type": "message",
         "role": "user",
@@ -8538,6 +8560,7 @@ async def _dispatch_skill_slash_command_to_runner(
         # Live-renderer hint: the runner drops ``browser_*`` schemas for
         # the turn when no renderer is subscribed to the session stream.
         "browser_renderer_available": session_stream.has_subscribers(session_id),
+        **browser_agent_tools_turn_flag(conv.labels),
         # The forwarded message carries ``meta_content`` — i.e. the
         # META item (persisted_items[1]), not the user-visible item.
         # Hand the runner that id so a cold-cache reload drops the
@@ -11233,7 +11256,9 @@ def _reject_reserved_cost_control_label_seed(labels: dict[str, str]) -> None:
         )
 
 
-def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
+def _reject_server_reserved_label_seed(
+    labels: dict[str, str] | None, *, at_creation: bool = False
+) -> None:
     """
     Reject a client-supplied label map that touches server-internal keys.
 
@@ -11242,6 +11267,9 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
     critical metadata (e.g. the policy-evaluation actor identity).
 
     :param labels: The client-supplied label mapping, or ``None``.
+    :param at_creation: Whether a session is being created, when a continuation
+        (a native ``/clear`` replacement) may carry its predecessor's browser-tool
+        label.
     :raises OmnigentError: 400 when any reserved key is present.
     """
     if not labels:
@@ -11263,7 +11291,12 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
     from omnigent.stores.conversation_store import (
         CREATED_BY_SESSION_LABEL_KEY,
         FAMILY_PIN_LABEL_PREFIX,
+        SCHEDULED_TASK_ACTIVITY_LABEL_KEY,
+        SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY,
+        SCHEDULED_TASK_LAUNCH_LABEL_KEY,
         SCHEDULED_TASK_ORIGIN_LABEL_KEY,
+        SCHEDULED_TASK_PENDING_RUN_LABEL_PREFIX,
+        SCHEDULED_TASK_RUN_LABEL_KEY,
         SCHEDULED_TASK_SOURCE_LABEL_KEY,
         SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY,
         SIDE_CHAT_SOURCE_LABEL_KEY,
@@ -11271,11 +11304,20 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
 
     if any(key.startswith(FAMILY_PIN_LABEL_PREFIX) for key in labels):
         raise OmnigentError("Family pins are server-owned", code=ErrorCode.INVALID_INPUT)
+    if any(key.startswith(SCHEDULED_TASK_PENDING_RUN_LABEL_PREFIX) for key in labels):
+        raise OmnigentError(
+            "Scheduled run labels are server-internal", code=ErrorCode.INVALID_INPUT
+        )
     for key in (
         SCHEDULED_TASK_ORIGIN_LABEL_KEY,
+        SCHEDULED_TASK_RUN_LABEL_KEY,
+        SCHEDULED_TASK_ACTIVITY_LABEL_KEY,
+        SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY,
         # Deleting a session also deletes the automation this label names.
         SCHEDULED_TASK_SOURCE_LABEL_KEY,
         SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY,
+        # Launches from a session carrying it are shared with that automation's grantees.
+        SCHEDULED_TASK_LAUNCH_LABEL_KEY,
         CREATED_BY_SESSION_LABEL_KEY,
     ):
         if key in labels:
@@ -11299,6 +11341,18 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
     if _TURN_ACTOR_LABEL in labels:
         raise OmnigentError(
             f"label {_TURN_ACTOR_LABEL!r} is server-internal and cannot be set by clients",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    # The browser-tool mode is fixed at creation: from the app's header, or the
+    # label a continuation copies from its source.
+    from omnigent.tools.browser_agent_tools import BROWSER_AGENT_TOOLS_CREATION_LABEL_KEYS
+
+    if not at_creation and (
+        reserved := sorted(BROWSER_AGENT_TOOLS_CREATION_LABEL_KEYS & labels.keys())
+    ):
+        raise OmnigentError(
+            f"label {reserved[0]!r} is set only when a session is created"
+            " and cannot be set by clients",
             code=ErrorCode.INVALID_INPUT,
         )
     # The archive timestamp is stamped by the server on the archive transition

@@ -27,6 +27,7 @@ from omnigent.spec.types import (
 )
 from omnigent.tools import ToolManager
 from omnigent.tools.base import Tool, ToolContext
+from omnigent.tools.browser_agent_tools import ADVANCED_BROWSER_TOOL_NAMES
 from omnigent.tools.client_specified import ClientSideTool, ClientSideToolSpec
 from omnigent.tools.manager import _UCFunctionSchemaTool
 from omnigent.tools.mcp import clear_discovery_cache
@@ -94,6 +95,17 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         "sys_scheduled_task_update",
         "sys_scheduled_task_delete",
         "sys_reminder_set",
+        # The session journal's tools are always auto-registered so every
+        # agent can keep a plan, step statuses and notes, and ask about a
+        # task; runner-dispatched.
+        "sys_journal_read",
+        "sys_journal_write_note",
+        "sys_journal_write_plan",
+        "sys_journal_write_status",
+        "sys_workflow_request_input",
+        "sys_workflow_save",
+        "sys_workflow_load",
+        "sys_workflow_list",
         # Embedded-browser tools are always auto-registered (framework-
         # owned) so any agent can drive the desktop app's browser without
         # the spec opting in. Schema-only; runner-dispatched.
@@ -103,6 +115,7 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         "browser_type",
         "browser_screenshot",
     }
+    | ADVANCED_BROWSER_TOOL_NAMES
 )
 
 

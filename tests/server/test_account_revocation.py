@@ -262,10 +262,10 @@ async def test_connected_host_cannot_launch_after_reset_until_it_reconnects(setu
     from asgiref.testing import ApplicationCommunicator
 
     from omnigent.errors import OmnigentError
+    from tests.server.helpers import wait_for_tunnel_registration
     from tests.server.integration.test_host_tunnel_route import (
         _make_hello,
         _managed_scope,
-        _wait_registered,
         _websocket_scope,
     )
 
@@ -300,7 +300,7 @@ async def test_connected_host_cannot_launch_after_reset_until_it_reconnects(setu
         response = await connection.receive_output(timeout=5)
         assert response["type"] == "websocket.accept", response
         await connection.send_input({"type": "websocket.receive", "text": _make_hello()})
-        await asyncio.wait_for(_wait_registered(registry, host_id), timeout=5)
+        await wait_for_tunnel_registration(connection, registry, host_id)
 
     async def disconnect(connection: ApplicationCommunicator) -> None:
         await connection.send_input({"type": "websocket.disconnect", "code": 1000})
@@ -554,9 +554,9 @@ async def test_accounts_host_handshake_revalidates_each_connection(setup_app):
 
     from asgiref.testing import ApplicationCommunicator
 
+    from tests.server.helpers import wait_for_tunnel_registration
     from tests.server.integration.test_host_tunnel_route import (
         _make_hello,
-        _wait_registered,
         _websocket_scope,
     )
 
@@ -583,7 +583,7 @@ async def test_accounts_host_handshake_revalidates_each_connection(setup_app):
         assert response["type"] == "websocket.accept", response
         await connection.send_input({"type": "websocket.receive", "text": _make_hello()})
         registry = admin.app.state.host_registry
-        await asyncio.wait_for(_wait_registered(registry, host_id), timeout=5)
+        await wait_for_tunnel_registration(connection, registry, host_id)
         assert registry.get(host_id).account_generation == generation
         assert checked == [generation]
     finally:
@@ -1430,6 +1430,19 @@ async def test_existing_session_transfers_between_hosts(setup_app, workflow):
                     await comm.wait(timeout=10)
 
 
+def _replace_alice(admin: TestClient) -> TestClient:
+    """Delete alice and register a different account under the same name."""
+    assert admin.delete("/auth/users/alice").status_code == 204
+    invite = admin.post("/auth/invite", json={}).json()["token"]
+    replacement = TestClient(admin.app)
+    registered = replacement.post(
+        "/auth/register",
+        json={"invite": invite, "username": "alice", "password": "replacement-password-1234"},
+    )
+    assert registered.status_code == 200, registered.text
+    return replacement
+
+
 @pytest.mark.parametrize("operation", ["reset", "share_lookup", "share_ensure", "share_grant"])
 def test_target_write_cannot_cross_registration(setup_app, monkeypatch, operation):
     admin, _, stores, _ = setup_app
@@ -1466,20 +1479,7 @@ def test_target_write_cannot_cross_registration(setup_app, monkeypatch, operatio
             )
         try:
             assert reached.wait(15)
-            assert admin.delete("/auth/users/alice").status_code == 204
-            invite = admin.post("/auth/invite", json={}).json()["token"]
-            replacement = TestClient(admin.app)
-            assert (
-                replacement.post(
-                    "/auth/register",
-                    json={
-                        "invite": invite,
-                        "username": "alice",
-                        "password": "replacement-password-1234",
-                    },
-                ).status_code
-                == 200
-            )
+            replacement = _replace_alice(admin)
         finally:
             resume.set()
         response = pending.result(timeout=15)
@@ -1493,6 +1493,109 @@ def test_target_write_cannot_cross_registration(setup_app, monkeypatch, operatio
         == 200
     )
     assert stores["permission_store"].get("alice", session_id) is None
+
+
+def _create_schedule(admin: TestClient) -> str:
+    created = admin.post(
+        "/v1/scheduled-tasks",
+        json={
+            "name": "shared schedule",
+            "prompt": "hello",
+            "rrule": "FREQ=DAILY;BYHOUR=9",
+            "agent_id": create_session(admin).json()["agent_id"],
+            "timezone": "UTC",
+        },
+    )
+    assert created.status_code == 200, created.text
+    return created.json()["id"]
+
+
+def _replace_alice_during(admin, reached, resume, method, url, **kwargs):
+    """Send the request as *admin*, and replace alice once it sets *reached*."""
+    requester = TestClient(admin.app)
+    requester.cookies.update(admin.cookies)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(requester.request, method, url, **kwargs)
+        try:
+            assert reached.wait(15)
+            _replace_alice(admin)
+        finally:
+            resume.set()
+        return pending.result(timeout=15)
+
+
+@pytest.mark.parametrize("setup_app", [True], indirect=True)
+@pytest.mark.parametrize("method", ["ensure_user", "grant_for_scheduled_task"])
+def test_automation_share_cannot_cross_registration(setup_app, monkeypatch, method):
+    admin, _, stores, _ = setup_app
+    task_id = _create_schedule(admin)
+    permissions = stores["permission_store"]
+    original = getattr(permissions, method)
+    reached, resume = Event(), Event()
+
+    def paused(user_id, *args, **kwargs):
+        if user_id == "alice":
+            reached.set()
+            assert resume.wait(15)
+        return original(user_id, *args, **kwargs)
+
+    monkeypatch.setattr(permissions, method, paused)
+    response = _replace_alice_during(
+        admin,
+        reached,
+        resume,
+        "PUT",
+        f"/v1/scheduled-tasks/{task_id}/permissions",
+        json={"user_id": "alice", "level": 1},
+    )
+    # The grant was meant for the deleted account, not the new one.
+    assert response.status_code == 409, response.text
+    assert permissions.list_for_scheduled_task(task_id) == ([], None)
+
+
+@pytest.mark.parametrize("setup_app", [True], indirect=True)
+@pytest.mark.parametrize("replaced_after", ["resolve_scheduled_task_access", "grant_delete"])
+def test_a_failed_automation_revoke_restores_no_grant_to_a_replaced_account(
+    setup_app, monkeypatch, replaced_after
+):
+    admin, _, stores, _ = setup_app
+    task_id = _create_schedule(admin)
+    shared = admin.put(
+        f"/v1/scheduled-tasks/{task_id}/permissions", json={"user_id": "alice", "level": 1}
+    )
+    assert shared.status_code == 200, shared.text
+    permissions = stores["permission_store"]
+    reached, resume = Event(), Event()
+
+    def pause_once():
+        if not reached.is_set():
+            reached.set()
+            assert resume.wait(15)
+
+    lookup = permissions.resolve_scheduled_task_access
+    delete_grant = permissions.revoke_for_scheduled_task
+
+    def lookup_then_pause(*args, **kwargs):
+        held = lookup(*args, **kwargs)
+        if replaced_after == "resolve_scheduled_task_access":
+            pause_once()
+        return held
+
+    def delete_then_fail(user_id, scheduled_task_id):
+        delete_grant(user_id, scheduled_task_id)
+        if replaced_after == "grant_delete":
+            pause_once()
+        # Committed, but the route sees an error and puts the grant back.
+        raise RuntimeError("connection lost after commit")
+
+    monkeypatch.setattr(permissions, "resolve_scheduled_task_access", lookup_then_pause)
+    monkeypatch.setattr(permissions, "revoke_for_scheduled_task", delete_then_fail)
+    response = _replace_alice_during(
+        admin, reached, resume, "DELETE", f"/v1/scheduled-tasks/{task_id}/permissions/alice"
+    )
+    assert response.status_code == 500, response.text
+    # The grant being restored was the deleted account's, not the new one's.
+    assert permissions.list_for_scheduled_task(task_id) == ([], None)
 
 
 @pytest.mark.parametrize("startup_phase", ["unavailable", "loading"])

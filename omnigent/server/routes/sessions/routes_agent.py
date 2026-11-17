@@ -16,7 +16,7 @@ from fastapi import (
 )
 from fastapi.responses import Response
 
-from omnigent.automations_availability import AUTOMATIONS_HEADER
+from omnigent.automations_availability import AUTOMATIONS_HEADER, USER_INBOX_HEADER
 from omnigent.errors import SESSION_AGENT_MISSING_MESSAGE, ErrorCode, OmnigentError
 from omnigent.host.identity import MANAGED_HOST_TOKEN_HEADER
 from omnigent.mcp_selection import MCP_SELECTION_HEADER, MCP_SELECTION_PREFIX, selected_mcp_spec
@@ -36,9 +36,11 @@ from omnigent.server.auth import (
     LEVEL_EDIT,
     LEVEL_OWNER,
     LEVEL_READ,
+    RESERVED_USER_LOCAL,
     AuthProvider,
 )
 from omnigent.server.bundles import bundle_location, redacted_agent_bundle, validate_agent_bundle
+from omnigent.server.feature_flags import Feature, FeatureFlags
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import (
@@ -288,6 +290,29 @@ def register_agent_routes(
         automations_available = getattr(request.app.state, "automations_available", None)
         if automations_available is not None:
             selection_headers[AUTOMATIONS_HEADER] = "1" if automations_available() else "0"
+        inbox_enabled_for = getattr(request.app.state, "proactive_agent_enabled_for", None)
+        if inbox_enabled_for is not None:
+            # Evaluate the caller's deployment gate with the root owner's settings;
+            # a failing settings read turns the optional Inbox tools off.
+            try:
+                owner = (
+                    await asyncio.to_thread(
+                        conversation_store.get_session_owner,
+                        conv.root_conversation_id,
+                        owner_only=True,
+                    )
+                    if permission_store is not None
+                    else RESERVED_USER_LOCAL
+                )
+                inbox_on = owner is not None and await asyncio.to_thread(inbox_enabled_for, owner)
+            except Exception:
+                _logger.warning(
+                    "Inbox settings check failed for session %s; offering no Inbox tools",
+                    session_id,
+                    exc_info=True,
+                )
+                inbox_on = False
+            selection_headers[USER_INBOX_HEADER] = "1" if inbox_on else "0"
         return Response(
             content=bundle_bytes,
             media_type="application/gzip",
@@ -589,6 +614,17 @@ def register_agent_routes(
 
         if method == "tools/call":
             from omnigent.server.mcp_identity import mcp_policy_actor
+            from omnigent.tools.builtins.journal import JOURNAL_TOOLS
+
+            tool_name = params.get("name")
+            if (
+                isinstance(tool_name, str)
+                and tool_name in {tool.name() for tool in JOURNAL_TOOLS}
+                and not getattr(request.app.state, "feature_flags", FeatureFlags()).enabled(
+                    Feature.WORKFLOWS
+                )
+            ):
+                return _mcp_error_response(rpc_id, -32601, "Workflows are disabled on this server")
 
             conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             actor = mcp_policy_actor(request, conv, user_id) if conv else _build_actor(user_id)

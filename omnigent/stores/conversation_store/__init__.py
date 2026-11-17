@@ -6,7 +6,7 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, TypedDict
+from typing import TYPE_CHECKING, Any, Literal, TypedDict
 
 from omnigent.entities import (
     Agent,
@@ -16,7 +16,10 @@ from omnigent.entities import (
     PagedList,
 )
 from omnigent.session_import import IMPORT_PROVENANCE_LABEL_KEYS
-from omnigent.stores.conversation_store.activity_error import LATEST_ACTIVITY_ERROR_LABEL_KEY
+from omnigent.stores.conversation_store.activity_error import (
+    LATEST_ACTIVITY_ERROR_LABEL_KEY,
+    LATEST_ACTIVITY_ERROR_RESPONSE_LABEL_KEY,
+)
 from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY
 
 # Pending inputs share the item store, but are not harness transcript history yet.
@@ -182,9 +185,23 @@ ARCHIVED_AT_LABEL_KEY = "omnigent.archived_at"
 # Server-owned origin, retained when a schedule's run history is deleted.
 SCHEDULED_TASK_ORIGIN_LABEL_KEY = "omnigent.scheduled_task_origin"
 SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY = "omnigent.scheduled_task_worktree_source_sha256"
+# Server-owned: the automation run this session serves, set before each run's
+# prompt is sent. Journal entries the session records are attributed to it.
+SCHEDULED_TASK_RUN_LABEL_KEY = "omnigent.scheduled_task_run"
+SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY = "omnigent.scheduled_task_initial_run"
+SCHEDULED_TASK_PENDING_RUN_LABEL_PREFIX = "omnigent.pending_scheduled_run."
+# The run whose agent has appended real activity; copied history never sets it.
+SCHEDULED_TASK_ACTIVITY_LABEL_KEY = "omnigent.scheduled_task_activity"
+
 # Server-owned: marks the copy an automation starts each run from (its source
 # session). The value is the task id; runs never inherit it.
 SCHEDULED_TASK_SOURCE_LABEL_KEY = "omnigent.scheduled_task_source"
+# Server-owned: the automation whose run's session tree launched this independent or
+# sibling session, directly or through other launches. Forks drop it.
+SCHEDULED_TASK_LAUNCH_LABEL_KEY = "omnigent.scheduled_task_launch"
+
+# Compare-and-swap rounds swap_label tries before giving up on a contended label.
+_LABEL_SWAP_ATTEMPTS = 5
 
 # Creation provenance only; this does not confer parentage or permissions.
 CREATED_BY_SESSION_LABEL_KEY = "omnigent.created_by_session_id"
@@ -249,9 +266,14 @@ _SANDBOX_REPO_LABEL_KEY = "omnigent.sandbox.repo"
 _SANDBOX_REQUESTED_HOST_ID_LABEL_KEY = "omnigent.sandbox.requested_host_id"
 _FORK_ONLY_DROPPED_LABEL_KEYS = IMPORT_PROVENANCE_LABEL_KEYS | {
     CREATED_BY_SESSION_LABEL_KEY,
+    SCHEDULED_TASK_RUN_LABEL_KEY,
+    SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY,
+    SCHEDULED_TASK_ACTIVITY_LABEL_KEY,
     ARCHIVED_AT_LABEL_KEY,
     # A fork of an automation's copy isn't what the automation runs from.
     SCHEDULED_TASK_SOURCE_LABEL_KEY,
+    # Nor is a fork of a session a run launched; the automation doesn't share it.
+    SCHEDULED_TASK_LAUNCH_LABEL_KEY,
     # Closing seals only that child (a stopped side chat, a closed sub-agent);
     # forking it is how the user continues it as a session of its own.
     CLOSED_LABEL_KEY,
@@ -261,6 +283,7 @@ _FORK_ONLY_DROPPED_LABEL_KEYS = IMPORT_PROVENANCE_LABEL_KEYS | {
     _SANDBOX_REQUESTED_HOST_ID_LABEL_KEY,
     # A truncated fork's newest item differs; its next append recomputes it.
     LATEST_ACTIVITY_ERROR_LABEL_KEY,
+    LATEST_ACTIVITY_ERROR_RESPONSE_LABEL_KEY,
 }
 
 
@@ -276,6 +299,14 @@ class CreatedSession:
 
     conversation: Conversation
     agent: Agent
+
+
+@dataclass(frozen=True)
+class SessionTodosUpdate:
+    """An accepted native task snapshot and the state it atomically replaced."""
+
+    id: str
+    previous: list[dict[str, Any]]
 
 
 @dataclass(frozen=True)
@@ -1383,6 +1414,85 @@ class ConversationStore(ABC):
         """
         ...
 
+    def replace_label_if(
+        self,
+        conversation_id: str,
+        key: str,
+        *,
+        expected: str | None,
+        value: str | None,
+    ) -> bool:
+        """
+        Change one label only while it still holds *expected*.
+
+        Lets a writer undo its own label without clobbering a later writer's.
+        This default reads then writes, which is enough for stores without
+        concurrent writers; SQL stores override it with one conditional write.
+
+        :param conversation_id: The conversation to update.
+        :param key: The label key, e.g. ``"omnigent.scheduled_task_run"``.
+        :param expected: The value the label must still hold, or ``None`` for
+            a label that must still be absent.
+        :param value: The new value, or ``None`` to delete the label.
+        :returns: Whether the label held *expected* and was changed.
+        :raises ValueError: If *expected* and *value* are both ``None``.
+        """
+        if expected is None and value is None:
+            raise ValueError("replace_label_if needs an expected value or a new value")
+        conversation = self.get_conversation(conversation_id)
+        if conversation is None or conversation.labels.get(key) != expected:
+            return False
+        if value is None:
+            self.delete_label(conversation_id, key)
+        else:
+            self.set_labels(conversation_id, {key: value})
+        return True
+
+    def swap_label(self, conversation_id: str, key: str, value: str) -> str | None:
+        """
+        Set one label and return the value it replaced.
+
+        Built on :meth:`replace_label_if`, so the returned value is the one the
+        write actually replaced even while other writers change the label.
+
+        :param conversation_id: The conversation to update.
+        :param key: The label key, e.g. ``"omnigent.scheduled_task_run"``.
+        :param value: The new value.
+        :returns: The label's previous value, or ``None`` if it had none.
+        :raises RuntimeError: If other writers kept changing the label.
+        """
+        for _ in range(_LABEL_SWAP_ATTEMPTS):
+            conversation = self.get_conversation(conversation_id)
+            previous = conversation.labels.get(key) if conversation is not None else None
+            if self.replace_label_if(conversation_id, key, expected=previous, value=value):
+                return previous
+        raise RuntimeError(f"label {key!r} on {conversation_id!r} kept changing")
+
+    def update_scheduled_run_label(
+        self,
+        conversation_id: str,
+        run_id: str,
+        *,
+        action: Literal["begin", "commit", "rollback"],
+    ) -> None:
+        """Begin or settle a continued run's tentative session attribution.
+
+        A rollback removes this attempt from the pending chain even if another
+        attempt replaced it. A commit retains it as a valid predecessor once
+        sending may have begun. Each operation must be atomic across replicas.
+        """
+        raise NotImplementedError
+
+    def clear_scheduled_run_label(
+        self, conversation_id: str, run_id: str, *, pending_run_finished: bool = False
+    ) -> bool:
+        """End a human's inherited attribution without clearing a newer dispatch.
+
+        A pending dispatch is retained unless its run is terminal or its stamp
+        has exceeded the scheduler's stale-run window.
+        """
+        raise NotImplementedError
+
     @abstractmethod
     def list_projects(
         self,
@@ -1462,8 +1572,8 @@ class ConversationStore(ABC):
         self,
         conversation_id: str,
         todos: list[dict[str, Any]],
-    ) -> bool:
-        """Persist the native Plan snapshot; empty clears, missing metadata returns false."""
+    ) -> SessionTodosUpdate | None:
+        """Persist the Plan snapshot and return its update; missing metadata returns None."""
         raise NotImplementedError
 
     def add_new_sibling(self, source_id: str, session_id: str, *, user_id: str | None) -> None:
@@ -2319,6 +2429,7 @@ class ConversationStore(ABC):
         up_to_response_id: str | None = None,
         before_item_id: str | None = None,
         copy_items: bool = True,
+        copy_journal: bool = True,
         continue_source: bool = False,
         project_id: str | None = None,
         file_id_map: Mapping[str, str] | None = None,
@@ -2438,6 +2549,9 @@ class ConversationStore(ABC):
         :param copy_items: ``False`` copies no items at all, whatever the
             source holds when the fork commits, e.g. for ``/clear``. A
             truncation; exclusive with both cutoffs.
+        :param copy_journal: ``False`` leaves the source's journal behind, so
+            the fork starts with none, e.g. an automation run's copy of its
+            source session, which plans its own work.
         :param continue_source: Also copy the source's host, workspace and
             branch (in the same write that creates the fork), its routing
             switches and its workspace-file sharing, for a same-owner
