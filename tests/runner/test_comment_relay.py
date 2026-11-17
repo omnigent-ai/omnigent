@@ -1794,7 +1794,9 @@ async def test_agent_switch_replaces_relay_in_same_bridge_dir(
 
 
 @pytest.mark.asyncio
-async def test_agent_switch_moves_relay_to_new_bridge_dir(tmp_path: Path) -> None:
+async def test_agent_switch_moves_relay_to_new_bridge_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A switch that changes the bridge id relays into the new directory.
 
     Switching between native harness families reassigns the session's
@@ -1802,6 +1804,15 @@ async def test_agent_switch_moves_relay_to_new_bridge_dir(tmp_path: Path) -> Non
     advertisement (otherwise the new harness sees no relay tools at all),
     and the old directory's advertisement must be withdrawn.
     """
+    started_relays: list[bridge.ClaudeNativeToolRelay] = []
+    start_tool_relay = bridge.start_tool_relay
+
+    def start(**kwargs: Any) -> bridge.ClaudeNativeToolRelay:
+        relay = start_tool_relay(**kwargs)
+        started_relays.append(relay)
+        return relay
+
+    monkeypatch.setattr(bridge, "start_tool_relay", start)
     agent_a, agent_b = "ag_bridge_a", "ag_bridge_b"
     bridge_a = f"bridge_{uuid.uuid4().hex[:10]}"
     bridge_b = f"bridge_{uuid.uuid4().hex[:10]}"
@@ -1824,6 +1835,11 @@ async def test_agent_switch_moves_relay_to_new_bridge_dir(tmp_path: Path) -> Non
             await _launch_bridged(c, session_id)
             assert (dir_a / _TOOL_RELAY_FILE).exists(), "no relay written for the first bridge"
             old_relay = json.loads((dir_a / _TOOL_RELAY_FILE).read_text())
+            assert len(started_relays) == 1
+            original_relay = started_relays[0]
+            original_socket = original_relay._httpd.socket
+            assert not original_relay._closed.is_set()
+            assert original_socket.fileno() != -1
 
             server_client.agent_id = agent_b
             server_client.bridge_id = bridge_b
@@ -1839,14 +1855,44 @@ async def test_agent_switch_moves_relay_to_new_bridge_dir(tmp_path: Path) -> Non
             assert not (dir_a / _TOOL_RELAY_FILE).exists(), (
                 "the previous bridge directory kept a stale relay advertisement"
             )
+            assert len(started_relays) == 2
+            assert original_relay._closed.is_set()
+            assert original_socket.fileno() == -1
+            new_relay = json.loads((dir_b / _TOOL_RELAY_FILE).read_text())
+            assert new_relay["token"] != old_relay["token"]
+            mcp_post = AsyncMock(
+                return_value=httpx.Response(
+                    200,
+                    json={"result": {"content": [{"type": "text", "text": '{"items": []}'}]}},
+                    request=httpx.Request("POST", f"http://server/v1/sessions/{session_id}/mcp"),
+                )
+            )
+            monkeypatch.setattr(server_client, "post", mcp_post)
             async with httpx.AsyncClient(trust_env=False) as relay_client:
-                with pytest.raises(httpx.ConnectError):
-                    await relay_client.post(
-                        f"{old_relay['url']}/tool",
-                        headers={"Authorization": f"Bearer {old_relay['token']}"},
-                        json={"name": "list_comments", "arguments": {}},
-                        timeout=2.0,
-                    )
+                refused = await relay_client.post(
+                    f"{new_relay['url']}/tool",
+                    headers={"Authorization": f"Bearer {old_relay['token']}"},
+                    json={"name": "list_comments", "arguments": {}},
+                    timeout=2.0,
+                )
+                assert refused.status_code == 401
+                mcp_post.assert_not_awaited()
+                response = await relay_client.post(
+                    f"{new_relay['url']}/tool",
+                    headers={"Authorization": f"Bearer {new_relay['token']}"},
+                    json={"name": "list_comments", "arguments": {"status": "pending"}},
+                    timeout=2.0,
+                )
+                assert response.status_code == 200
+                result = response.json()
+                assert not result.get("isError")
+                assert json.loads(result["content"][0]["text"]) == {"items": []}
+                mcp_post.assert_awaited_once()
+                assert mcp_post.call_args.args == (f"/v1/sessions/{session_id}/mcp",)
+                mcp_call = mcp_post.call_args.kwargs["json"]
+                assert mcp_call["method"] == "tools/call"
+                assert mcp_call["params"]["name"] == "list_comments"
+                assert mcp_call["params"]["arguments"] == {"status": "pending"}
     finally:
         with contextlib.suppress(httpx.HTTPError):
             async with httpx.AsyncClient(

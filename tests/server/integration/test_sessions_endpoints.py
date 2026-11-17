@@ -11340,6 +11340,7 @@ async def test_codex_side_chat_message_drives_parent_thread_without_child_init(
     )
     assert child_response.status_code == 202, child_response.text
     child_id = child_response.json()["child_session_id"]
+    SqlAlchemyConversationStore(db_uri).replace_runner_id(parent["id"], "native-runner")
     SqlAlchemyConversationStore(db_uri).replace_runner_id(child_id, "native-runner")
     forwarded: list[tuple[str, dict[str, Any]]] = []
 

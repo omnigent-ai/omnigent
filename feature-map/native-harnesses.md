@@ -153,7 +153,8 @@ implements them separately, so a fix for one harness does not reach the others.
     next session-list refresh instead.
 - `side-chat`: Codex forks an ephemeral native thread through `/side`; follow-ups,
   including those sent while it works, stay in that thread, and closing it
-  leaves the parent usable.
+  leaves the parent usable. Sending another message or choosing Resume reopens
+  a closed side chat, restoring saved context when its native thread is gone.
 - `codex-async-questions`: each Codex `request_user_input_async` question shows
   a card in Chat and Inbox that leaves the composer usable, like the Codex TUI's
   queued-question picker. A card closes when the question is answered from the
