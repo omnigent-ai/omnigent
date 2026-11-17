@@ -466,26 +466,37 @@ def _scrub(text: str) -> str:
     with contextlib.suppress(Exception):
         home = str(Path.home())
         if home and home != os.sep:
-            home_variants = sorted({home, home.replace("\\", "\\\\")}, key=len, reverse=True)
+            # ``repr()`` doubles backslashes and escapes apostrophes in exception text.
+            forms = {home, home.replace("\\", "\\\\")}
+            home_variants = sorted(
+                forms | {form.replace("'", "\\'") for form in forms}, key=len, reverse=True
+            )
             home_pattern = "(?:" + "|".join(map(re.escape, home_variants)) + ")"
-            # Spaces inside a quoted path may belong to a sibling directory.
-            pattern = (
-                rf"""(?P<quote>['"`]){home_pattern}(?P<suffix>[^\r\n]*?)(?P=quote)"""
-                + "|"
-                + home_pattern
-                + r"""(?=$|[/\\\s'"`)\]}>]|[.,;:!?]+(?=$|[\s'"`)\]}>]))"""
+            plain_home = re.compile(
+                home_pattern + r"""(?=$|[/\\\s'"`)\]}>]|[.,;:!?]+(?=$|[\s'"`)\]}>]))"""
             )
 
-            def redact_home(match: re.Match[str]) -> str:
+            def redact_quoted(match: re.Match[str]) -> str:
+                # Spaces in a quoted path may belong to a sibling directory; the span is the
+                # home only when a separator follows. Later references in it are scrubbed too.
                 quote = match.group("quote")
-                if quote is None:
-                    return "~"
                 suffix = match.group("suffix")
+                rest = plain_home.sub("~", suffix)
                 if suffix and not suffix.startswith(("/", "\\")):
-                    return match.group(0)
-                return f"{quote}~{suffix}{quote}"
+                    head = match.group("home")
+                else:
+                    head = "~"
+                return f"{quote}{head}{rest}{quote}"
 
-            text = re.sub(pattern, redact_home, text)
+            def redact_home(match: re.Match[str]) -> str:
+                if match.group("quote") is None:
+                    return "~"
+                return redact_quoted(match)
+
+            quoted_home = (
+                rf"""(?P<quote>['"`])(?P<home>{home_pattern})(?P<suffix>[^\r\n]*?)(?P=quote)"""
+            )
+            text = re.sub(f"{quoted_home}|{plain_home.pattern}", redact_home, text)
     return text
 
 

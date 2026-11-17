@@ -16,6 +16,7 @@ from __future__ import annotations
 import io
 import os
 import re
+import subprocess
 import sys
 import traceback
 import urllib.parse
@@ -585,6 +586,51 @@ def test_issue_url_scrubs_repr_escaped_windows_home(
     url, body_included = ch._issue_url(exc, "Traceback (most recent call last):\nOSError\n")
     assert body_included is True
     assert "example-user" not in urllib.parse.unquote_plus(url)
+    assert "~" in _description_of(url)
+
+
+def test_issue_url_scrubs_every_home_reference_in_quoted_command(
+    data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A quoted command with two home references loses both, in title and description."""
+    ch.install_crash_handler("omnigent", "omnigent-ai/omnigent")
+    monkeypatch.setattr(Path, "home", lambda: Path("/home/example-user"))
+    command = "/home/example-user/.venv/bin/tool --config /home/example-user/.config/app.toml"
+    exc = subprocess.CalledProcessError(1, command)
+    url, _ = ch._issue_url(exc, "Traceback (most recent call last):\nCalledProcessError\n")
+    decoded_url = urllib.parse.unquote_plus(url)
+    assert "/home/example-user/" not in decoded_url
+    assert "~/.config/app.toml" in _description_of(url)
+
+
+def test_issue_url_keeps_sibling_quoted_command_but_scrubs_later_home(
+    data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A quoted command starting with a sibling directory keeps it and still scrubs the home."""
+    ch.install_crash_handler("omnigent", "omnigent-ai/omnigent")
+    monkeypatch.setattr(Path, "home", lambda: Path("/home/example-user"))
+    command = "/home/example-user-old/bin/tool --config /home/example-user/.config/app.toml"
+    exc = subprocess.CalledProcessError(1, command)
+    url, _ = ch._issue_url(exc, "Traceback (most recent call last):\nCalledProcessError\n")
+    decoded_url = urllib.parse.unquote_plus(url)
+    assert "/home/example-user-old/bin/tool" in decoded_url
+    assert "/home/example-user/.config" not in decoded_url
+    assert "~/.config/app.toml" in _description_of(url)
+
+
+def test_issue_url_scrubs_apostrophe_home_in_repr_escaped_filename(
+    data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Python escapes an apostrophe in a home path inside ``repr()``; it is still scrubbed."""
+    ch.install_crash_handler("omnigent", "omnigent-ai/omnigent")
+    home_path = Path("/home/example'user")
+    monkeypatch.setattr(Path, "home", lambda: home_path)
+    exc = FileNotFoundError(2, "missing", str(home_path) + '/private"file.txt')
+    url, body_included = ch._issue_url(exc, "Traceback (most recent call last):\nOSError\n")
+    assert body_included is True
+    decoded_url = urllib.parse.unquote_plus(url)
+    assert "example'user" not in decoded_url
+    assert "example\\'user" not in decoded_url
     assert "~" in _description_of(url)
 
 
