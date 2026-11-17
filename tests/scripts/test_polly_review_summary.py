@@ -140,11 +140,21 @@ def test_incomplete_reviews_are_rejected_regardless_of_size(review: str) -> None
         )
 
 
-def test_long_review_parts_preserve_all_assessments_and_markdown_context() -> None:
+@pytest.mark.parametrize(
+    "rationale_lengths", [None, (20000, 45000, 20000)], ids=["many-rows", "unequal-rows"]
+)
+def test_long_review_parts_preserve_all_assessments_and_markdown_context(
+    rationale_lengths: tuple[int, ...] | None,
+) -> None:
+    rationales = (
+        ["Guards the regression without a second setup."] * 1200
+        if rationale_lengths is None
+        else ["x" * length for length in rationale_lengths]
+    )
     rows = "".join(
         f"| tests/test_parser.py::test_case[{number}] | Empty input é🙂 | Unit | Keep | "
-        "Guards the regression without a second setup. |\n"
-        for number in range(1200)
+        f"{rationale} |\n"
+        for number, rationale in enumerate(rationales)
     )
     review = _REVIEW.replace(
         "| tests/test_parser.py::test_empty | Empty input | Unit | Keep |"
@@ -160,13 +170,13 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context() -> No
     )
 
     assert "".join(chunks) == composed
-    assert len(comments) >= 3
     assert all(len(comment.encode("utf-8")) <= 60000 for comment in comments)
     assert all(comment.count("<details>") == comment.count("</details>") for comment in comments)
     assert sum(comment.count("<!-- polly-reviewed-sha:") for comment in comments) == 1
     assert "<!-- polly-reviewed-sha: " + "a" * 40 + " -->" in comments[0]
     for row in rows.splitlines():
         assert sum(comment.count(row) for comment in comments) == 1
+    assert len(comments) >= 3
     for part, comment in enumerate(comments[1:], 2):
         assert f"part {part}/{len(comments)}" in comment
         assert (
@@ -204,24 +214,43 @@ def test_multipart_publication_is_retryable_and_completes_only_after_primary(
     tmp_path: Path, failed_call: int | None
 ) -> None:
     review = tmp_path / "polly_review.txt"
-    review.write_text(_REVIEW + ("A preserved finding é🙂.\n" * 4500), encoding="utf-8")
+    finding = "A preserved finding é🙂.\n"
+    quoted_markers = (
+        "```text\n\t<!-- polly-review-bot -->\n"
+        "<!-- polly-reviewed-sha: " + "a" * 40 + " -->\n```\n"
+    )
+    review.write_text(_REVIEW + finding * 2300 + quoted_markers + finding * 2200, encoding="utf-8")
     receipt = tmp_path / "polly-completed-sha.txt"
     receipt.write_text("stale receipt\n")
     env = _fake_gh(
         tmp_path,
+        "import subprocess\n"
         "directory = pathlib.Path(sys.argv[0]).parent\n"
-        "assert not (directory / 'polly-completed-sha.txt').exists()\n"
         "arguments = sys.argv[1:]\n"
+        "published = directory / 'published.json'\n"
+        "bodies = json.loads(published.read_text()) if published.exists() else []\n"
+        "if arguments[0] == 'api':\n"
+        "    if arguments[1] == 'repos/test/repo/pulls/1':\n"
+        "        print('a' * 40)\n"
+        "    else:\n"
+        "        assert arguments[1:3] == ['repos/test/repo/issues/1/comments', '--paginate']\n"
+        "        comments = [dict(user=dict(type='Bot'), html_url=f'https://example.test/{i}', "
+        "body=body) for i, body in enumerate(bodies)]\n"
+        "        subprocess.run(['jq', '-r', arguments[arguments.index('--jq') + 1]], "
+        "input=json.dumps(comments), text=True, check=True)\n"
+        "    sys.exit(0)\n"
         "assert arguments[:5] == ['pr', 'comment', '1', '--repo', 'test/repo']\n"
         "assert arguments[5] == '--body-file'\n"
         "body = pathlib.Path(arguments[6]).read_text()\n"
+        "if body.startswith('<!-- polly-skipped-sha:'):\n"
+        "    (directory / 'skip.md').write_text(body)\n"
+        "    sys.exit(0)\n"
+        "assert not (directory / 'polly-completed-sha.txt').exists()\n"
         "record = directory / 'calls.json'\n"
         "calls = json.loads(record.read_text()) if record.exists() else []\n"
         "calls.append(body)\n"
         "record.write_text(json.dumps(calls))\n"
         f"if len(calls) - 1 == {failed_call!r}: sys.exit(42)\n"
-        "published = directory / 'published.json'\n"
-        "bodies = json.loads(published.read_text()) if published.exists() else []\n"
         "published.write_text(json.dumps(bodies + [body]))\n",
     )
     env.update(
@@ -232,6 +261,23 @@ def test_multipart_publication_is_retryable_and_completes_only_after_primary(
         PR_NUMBER="1",
         REPO="test/repo",
     )
+    workflow = yaml.safe_load((_ROOT / ".github/workflows/polly-review.yml").read_text())
+    dedupe = next(step for step in workflow["jobs"]["review"]["steps"] if step.get("id") == "dupe")
+
+    def already_reviewed() -> bool:
+        output = tmp_path / "dedupe_output"
+        output.write_text("")
+        result = subprocess.run(
+            ["bash", "-e", "-o", "pipefail", "-c", dedupe["run"].replace("/tmp/", f"{tmp_path}/")],
+            env={**env, "GITHUB_OUTPUT": str(output), "COMMENT_BODY": "", "FORCE_REVIEW": "false"},
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        return "duplicate=true" in output.read_text()
+
+    primary_header = "<!-- polly-review-bot -->\n<!-- polly-reviewed-sha: " + "a" * 40 + " -->\n"
     command = [sys.executable, str(_SCRIPT), "publish", str(review), str(receipt)]
     result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=10)
     calls = json.loads((tmp_path / "calls.json").read_text())
@@ -242,18 +288,19 @@ def test_multipart_publication_is_retryable_and_completes_only_after_primary(
         published = tmp_path / "published.json"
         if published.exists():
             assert all(
-                "<!-- polly-reviewed-sha:" not in body
-                for body in json.loads(published.read_text())
+                not body.startswith(primary_header) for body in json.loads(published.read_text())
             )
-        # A later ordinary attempt can publish every part; partial comments have no dedupe marker.
+        assert not already_reviewed()
         result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=10)
         calls = json.loads((tmp_path / "calls.json").read_text())[failed_call + 1 :]
     assert result.returncode == 0, result.stdout + result.stderr
     assert receipt.read_text() == "a" * 40 + "\n"
     assert len(calls) == 3
     assert all(f"part {part}/3" in body for part, body in zip([2, 3, 1], calls, strict=True))
-    assert all("<!-- polly-reviewed-sha:" not in body for body in calls[:-1])
-    assert "<!-- polly-reviewed-sha: " + "a" * 40 + " -->" in calls[-1]
+    assert all(not body.startswith(primary_header) for body in calls[:-1])
+    assert calls[-1].startswith(primary_header)
+    assert quoted_markers in calls[0]
+    assert already_reviewed()
 
 
 def test_pipes_inside_code_spans_do_not_split_test_rows() -> None:

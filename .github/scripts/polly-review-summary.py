@@ -277,7 +277,7 @@ def split_review(review: str, byte_limit: int) -> list[str]:
             boundary -= 1
         prefix = encoded[:boundary].decode("utf-8")
         line_end = prefix.rfind("\n") + 1
-        end = line_end if line_end > len(prefix) // 2 else len(prefix)
+        end = line_end or len(prefix)
         parts.append(review[:end])
         review = review[end:]
     parts.append(review)
