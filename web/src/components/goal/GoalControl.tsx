@@ -137,7 +137,7 @@ export function GoalStatusPill({ goal, onOpen }: { goal: Goal; onOpen?: () => vo
         </button>
       </TooltipTrigger>
       <TooltipContent side="top" align="end" className="flex-col items-start gap-0.5">
-        <div className="font-medium">{`Goal ${goalStatusLabel(goal.status).toLowerCase()}`}</div>
+        <div className="font-medium">{label}</div>
         <div className="line-clamp-3 wrap-anywhere">{goal.objective}</div>
         {goal.statusDetail && (
           <div className="line-clamp-3 wrap-anywhere text-muted-foreground">

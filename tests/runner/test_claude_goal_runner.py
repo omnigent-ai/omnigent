@@ -176,9 +176,9 @@ async def test_rebind_follows_the_new_bridge_transcript(
     runner.rebind(SESSION, "bridge_own")
 
     assert await _get(runner) == {"goal": None, "available": True}
-    own.write_text(json.dumps(GOAL_SET) + "\n")
+    own.write_text(json.dumps(GOAL_SET).replace("All tests pass", "Docs build") + "\n")
     body = await _get(runner)
-    assert isinstance(body, dict) and body["goal"] is not None
+    assert isinstance(body, dict) and body["goal"]["condition"] == "Docs build"
     assert bridge_ids.calls == [SESSION]
 
 

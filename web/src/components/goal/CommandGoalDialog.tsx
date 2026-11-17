@@ -34,9 +34,8 @@ export interface CommandGoalDialogProps {
  */
 export function formatCommandGoalUsage(goal: Goal): string {
   const parts: string[] = [];
-  if (goal.iterations != null && goal.iterations > 0) {
-    parts.push(`${goal.iterations.toLocaleString()} ${goal.iterations === 1 ? "check" : "checks"}`);
-  }
+  const checks = goal.iterations ?? 0;
+  if (checks > 0) parts.push(`${checks.toLocaleString()} ${checks === 1 ? "check" : "checks"}`);
   if (goal.tokensUsed > 0) parts.push(`${goal.tokensUsed.toLocaleString()} tokens`);
   const minutes = Math.floor(goal.timeUsedSeconds / 60);
   if (minutes > 0) parts.push(`${minutes.toLocaleString()} min`);
