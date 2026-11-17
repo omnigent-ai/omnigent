@@ -13,7 +13,7 @@
 // unexpected wire shape all resolve to `undefined`, and the caller falls back
 // to the generic body. This module never takes down the notification path.
 
-import { hostFetch } from "./host";
+import { authenticatedFetch } from "./identity";
 
 /**
  * How many trailing items to scan for the last assistant message. A turn
@@ -76,21 +76,33 @@ export function extractErrorText(item: unknown): string | undefined {
 }
 
 /**
- * Preview of a session's latest output for the Inbox: the newest assistant
- * text or error headline, whichever comes last, condensed via
- * {@link previewText}.
+ * A session's latest output for the Inbox: the newest assistant text or error
+ * headline, whichever comes last, condensed via {@link previewText}, plus a
+ * key naming that item so a caller can tell a new reply from the one it
+ * already showed even when both land in the same `updated_at` second.
  *
  * :param items: Raw session items, oldest-to-newest.
  * :param maxChars: Preview character budget (default 160).
- * :returns: The preview, or `undefined` when no item carries output text.
+ * :returns: The preview, its item key (the item id, else the text), and the
+ *     untrimmed `fullText` when the preview cut any of it; `undefined` when no
+ *     item carries output text.
  */
-export function latestOutputPreview(
+export function latestOutput(
   items: readonly unknown[],
   maxChars: number = DEFAULT_MAX_CHARS,
-): string | undefined {
+): { key: string; preview: string; fullText?: string } | undefined {
   for (let i = items.length - 1; i >= 0; i--) {
     const text = extractAssistantText(items[i]) ?? extractErrorText(items[i]);
-    if (text !== undefined) return previewText(text, maxChars);
+    if (text === undefined) continue;
+    const id = (items[i] as Record<string, unknown>).id;
+    const preview = previewText(text, maxChars);
+    // Uncapped, the preview is every non-empty line; anything shorter was cut.
+    const truncated = preview !== previewText(text, Infinity, Infinity);
+    return {
+      key: typeof id === "string" ? id : text,
+      preview,
+      ...(truncated ? { fullText: text } : {}),
+    };
   }
   return undefined;
 }
@@ -144,9 +156,10 @@ export async function fetchLastAssistantText(
 ): Promise<string | undefined> {
   try {
     const params = new URLSearchParams({ limit: String(SCAN_ITEMS), order: "desc" });
-    // `hostFetch` applies the deployment base path (e.g. `/proxy/6767`) in
-    // standalone and routes through the embed host transport when embedded.
-    const res = await hostFetch(`/v1/sessions/${encodeURIComponent(sessionId)}/items?${params}`);
+    // Session-scoped, so it carries the session's host key (see `authenticatedFetch`).
+    const res = await authenticatedFetch(
+      `/v1/sessions/${encodeURIComponent(sessionId)}/items?${params}`,
+    );
     if (!res.ok) return undefined;
     const json = (await res.json()) as { data?: unknown };
     const items = Array.isArray(json.data) ? json.data : [];

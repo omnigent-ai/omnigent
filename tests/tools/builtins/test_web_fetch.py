@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import shutil
 import sys
 
@@ -346,6 +347,7 @@ def test_researcher_drops_every_framework_tool_group() -> None:
     from omnigent.tools.manager import ToolManager
 
     researcher = WebFetchTool(parent_spec=_make_parent_spec()).researcher_spec
+    assert not any(dataclasses.asdict(researcher.tool_groups).values())
     names = {
         s["function"]["name"]
         for s in ToolManager(researcher, os_env_schema_only=True).get_tool_schemas()
@@ -355,6 +357,11 @@ def test_researcher_drops_every_framework_tool_group() -> None:
         n for n in names if n.startswith(("browser_", "sys_scheduled_task_", "sys_agent_"))
     }
     assert not names & {"list_comments", "update_comment", "sys_add_policy", "sys_policy_registry"}
+    assert not names & {
+        "sys_project_list",
+        "sys_session_update",
+        "sys_project_update",
+    }
     assert "sys_os_shell" in names
     composed = build_instructions_nullable(researcher, None, [])
     assert composed is not None

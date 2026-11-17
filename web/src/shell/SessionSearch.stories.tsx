@@ -6,7 +6,17 @@ import { StoryQueryRouter } from "@/storybook/StoryProviders";
 import { CommandPalette } from "./CommandPalette";
 
 const sessions = [
-  { id: "parser", title: "Fix the parser" },
+  {
+    id: "parser",
+    title: "Fix the parser",
+    project_id: "project",
+    family: {
+      id: "family",
+      representative_id: "deploy",
+      representative_title: "Deploy API",
+      pinned: false,
+    },
+  },
   { id: "deploy", title: "Deploy API" },
   { id: "docs", title: "Update documentation" },
 ];
@@ -88,6 +98,7 @@ const meta = {
             ],
             pageParams: [undefined],
           };
+          client.setQueryData(["projects"], [{ id: "project", name: "Release preparation" }]);
           client.setQueryData(["conversations", "", false], data);
           client.setQueryData(["conversations", "", true], data);
         }}

@@ -1,7 +1,10 @@
 import { useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useMemo } from "react";
-import { authenticatedFetch } from "@/lib/identity";
-import type { NativeModelOption } from "@/lib/types";
+import { useSavedSandboxSessionCatalog } from "@/hooks/useSandboxSessionCatalog";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { getOmnigentServerIdentity } from "@/lib/host";
+import { authenticatedFetch, getCurrentUserId } from "@/lib/identity";
+import type { NativeModelOption, SandboxStatus } from "@/lib/types";
 
 export interface SandboxModelOptions {
   models: NativeModelOption[];
@@ -25,7 +28,14 @@ export function sandboxModelOptionsKey(
   agentId: string | null,
   user: string | null,
 ) {
-  return ["sandbox-model-options", user, provider, harness, agentId] as const;
+  return [
+    "sandbox-model-options",
+    user,
+    provider,
+    harness,
+    agentId,
+    getOmnigentServerIdentity(),
+  ] as const;
 }
 
 async function fetchSandboxModelOptions(
@@ -91,6 +101,43 @@ export function useSandboxModelOptions(
     enabled: active,
     refetchInterval: active ? SELECTED_PREVIEW_POLL_MS : false,
   });
+}
+
+/** Preview a launching sandbox's provider catalog until the session is bound to a host. */
+export function useSandboxLaunchModelOptions(
+  launch: SandboxStatus | null,
+  hostId: string | null,
+  harness: string | null,
+  agentId: string | null,
+  enabled: boolean,
+): NativeModelOption[] | undefined {
+  // The host is bound by `connecting`, before the session snapshot shows it.
+  const provider =
+    launch !== null && launch.stage !== "failed" && launch.stage !== "connecting" && hostId === null
+      ? (launch.provider ?? null)
+      : null;
+  const info = useServerInfo();
+  // A bound inference profile already gives the session its saved catalog.
+  const offered =
+    provider !== null &&
+    info !== "loading" &&
+    info.sandbox_provider_capabilities?.[provider]?.default_models === true;
+  const { data } = useSandboxModelOptions(
+    provider,
+    harness,
+    agentId,
+    getCurrentUserId(),
+    enabled && offered,
+  );
+  // Match the new-session picker: the agent's last session catalog wins over the gateway list.
+  const saved = useSavedSandboxSessionCatalog(
+    enabled && offered ? provider : null,
+    harness,
+    agentId,
+  );
+  if (!enabled || !offered || data?.status === "unconfigured" || data?.status === "unsupported")
+    return undefined;
+  return saved ?? (data?.status === "ready" ? data.models : undefined);
 }
 
 export interface SandboxPreviewEntry {

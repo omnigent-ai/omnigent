@@ -103,3 +103,16 @@ def test_caption_rules_reach_the_agent_without_treating_hidden_labels_as_visible
     assert "Quote only text the viewer can see" in lanes
     assert "quote only visibly rendered text" in instructions
     assert "hidden accessibility labels and backend logs are not screen evidence" in instructions
+
+
+def test_caption_absence_claims_stay_scoped_to_the_checked_element() -> None:
+    lanes = _normalized(_DEV / "recording-lanes.md")
+    instructions = _loaded_repro_instructions()
+    assert "A driver check covers only the element it targets" in lanes
+    assert "a spinner on its sidebar row, and a sub-agent count badge" in lanes
+    assert "An absence check on the chat pane's indicator supports" in lanes
+    assert "Check every such place before claiming that none shows the state" in lanes
+    assert "An absence check covers only the element it targets" in instructions
+    assert "name the checked element" in instructions
+    assert "after checking only the chat pane" in instructions
+    assert "unless every place showing that state was checked" in instructions

@@ -28,9 +28,12 @@ cleared per test below.
 from __future__ import annotations
 
 import asyncio
+import gc
+import inspect
 import json
 import logging
-from collections.abc import Iterator
+import warnings
+from collections.abc import Coroutine, Iterator
 from typing import Any
 
 import pytest
@@ -39,14 +42,63 @@ from omnigent.entities.conversation import (
     ConversationItem,
     FunctionCallData,
     FunctionCallOutputData,
+    NewConversationItem,
 )
 from omnigent.server._elicitation_registry import (
     _harness_parked_elicitations,
     _ParkedHarnessElicitation,
 )
 from omnigent.server.routes import sessions as sessions_route
+from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 
 SESSION = "conv_test"
+
+
+def test_deferred_clear_does_not_leak_without_a_running_loop() -> None:
+    """Rejected scheduling must not leave an unawaited cleanup coroutine."""
+    before = set(sessions_route._deferred_elicitation_clear_tasks)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", RuntimeWarning)
+        with pytest.raises(RuntimeError, match="no running event loop"):
+            sessions_route._schedule_deferred_elicitation_clear(SESSION, "e_unavailable", None)
+        gc.collect()
+
+    assert not [warning for warning in caught if "was never awaited" in str(warning.message)]
+    assert sessions_route._deferred_elicitation_clear_tasks == before
+
+
+@pytest.mark.parametrize(
+    "failure", [RuntimeError("scheduler unavailable"), asyncio.CancelledError()]
+)
+async def test_deferred_clear_closes_coroutine_when_task_factory_rejects(
+    failure: BaseException,
+) -> None:
+    """Keep the original scheduling failure and release its unowned coroutine."""
+    loop = asyncio.get_running_loop()
+    original_factory = loop.get_task_factory()
+    rejected: list[Coroutine[Any, Any, None]] = []
+    before = set(sessions_route._deferred_elicitation_clear_tasks)
+
+    def reject_task(
+        _loop: asyncio.AbstractEventLoop,
+        coroutine: Coroutine[Any, Any, None],
+        **_kwargs: Any,
+    ) -> asyncio.Task[None]:
+        rejected.append(coroutine)
+        raise failure
+
+    loop.set_task_factory(reject_task)
+    try:
+        with pytest.raises(type(failure)) as raised:
+            sessions_route._schedule_deferred_elicitation_clear(SESSION, "e_rejected", None)
+        assert raised.value is failure
+        assert len(rejected) == 1
+        assert inspect.getcoroutinestate(rejected[0]) == inspect.CORO_CLOSED
+        assert sessions_route._deferred_elicitation_clear_tasks == before
+    finally:
+        loop.set_task_factory(original_factory)
+        for coroutine in rejected:
+            coroutine.close()
 
 
 @pytest.fixture(autouse=True)
@@ -264,3 +316,106 @@ def test_drive_output_without_known_call_id_is_noop() -> None:
     )
 
     assert not a.resolved_elsewhere.is_set()
+
+
+def _store_with_mirrored_call(
+    db_uri: str, call_id: str, name: str, tool_input: dict[str, Any]
+) -> tuple[SqlAlchemyConversationStore, str]:
+    """Persist a mirrored ``function_call`` as another replica would have."""
+    store = SqlAlchemyConversationStore(db_uri)
+    session_id = store.create_conversation(kind="default").id
+    call = _function_call_item(call_id, name, tool_input)
+    store.append(
+        session_id,
+        [NewConversationItem(type="function_call", response_id="resp_test", data=call.data)],
+    )
+    return store, session_id
+
+
+async def test_store_fallback_resolves_prompt_whose_call_another_replica_mirrored(
+    db_uri: str,
+) -> None:
+    """
+    A result arriving on a replica that never cached its call (the session
+    moved replicas between the call and its result) still resolves the
+    prompt parked here, from the call persisted in the store.
+    """
+    store, session_id = _store_with_mirrored_call(
+        db_uri, "toolu_q", "AskUserQuestion", {"questions": [{"question": "Pick?"}]}
+    )
+    asked = _park(
+        "e_q", "AskUserQuestion", {"questions": [{"question": "Pick?"}]}, session_id=session_id
+    )
+    other = _park(
+        "e_other",
+        "AskUserQuestion",
+        {"questions": [{"question": "Other?"}]},
+        session_id=session_id,
+    )
+    output = _function_call_output_item("toolu_q")
+
+    # The per-process cache path recovers nothing on this replica.
+    sessions_route._drive_terminal_resolved_elicitation(session_id, output)
+    assert not asked.resolved_elsewhere.is_set()
+
+    await sessions_route._drive_terminal_resolved_elicitation_from_store(session_id, output, store)
+
+    assert asked.resolved_elsewhere.is_set()
+    assert not other.resolved_elsewhere.is_set()
+
+
+def _record_list_items(store: SqlAlchemyConversationStore) -> list[str]:
+    """Record the session id of every ``list_items`` call on ``store``."""
+    reads: list[str] = []
+    original = store.list_items
+
+    def recording_list_items(*args: Any, **kwargs: Any) -> Any:
+        reads.append(args[0])
+        return original(*args, **kwargs)
+
+    store.list_items = recording_list_items  # type: ignore[method-assign]
+    return reads
+
+
+async def test_store_fallback_skips_store_without_a_parked_prompt(db_uri: str) -> None:
+    """With nothing parked for the session, a cache miss reads nothing."""
+    store, session_id = _store_with_mirrored_call(db_uri, "toolu_q", "Bash", {"command": "ls"})
+    _park("e_elsewhere", "Bash", {"command": "ls"}, session_id="conv_other")
+    reads = _record_list_items(store)
+
+    await sessions_route._drive_terminal_resolved_elicitation_from_store(
+        session_id, _function_call_output_item("toolu_q"), store
+    )
+
+    assert reads == []
+
+
+async def test_store_fallback_skips_store_on_a_cache_hit(db_uri: str) -> None:
+    """A result whose call this replica cached resolves through the cache alone."""
+    store, session_id = _store_with_mirrored_call(db_uri, "toolu_q", "Bash", {"command": "ls"})
+    parked = _park("e_q", "Bash", {"command": "ls"}, session_id=session_id)
+    # Another prompt stays parked, so only the cache hit keeps the store unread.
+    _park("e_other", "Bash", {"command": "pwd"}, session_id=session_id)
+    reads = _record_list_items(store)
+    sessions_route._drive_terminal_resolved_elicitation(
+        session_id, _function_call_item("toolu_q", "Bash", {"command": "ls"})
+    )
+    output = _function_call_output_item("toolu_q")
+
+    sessions_route._drive_terminal_resolved_elicitation(session_id, output)
+    await sessions_route._drive_terminal_resolved_elicitation_from_store(session_id, output, store)
+
+    assert parked.resolved_elsewhere.is_set()
+    assert reads == []
+
+
+async def test_store_fallback_ignores_unknown_call_id(db_uri: str) -> None:
+    """A result whose call is not in the store resolves nothing."""
+    store, session_id = _store_with_mirrored_call(db_uri, "toolu_q", "Bash", {"command": "ls"})
+    parked = _park("e_q", "Bash", {"command": "ls"}, session_id=session_id)
+
+    await sessions_route._drive_terminal_resolved_elicitation_from_store(
+        session_id, _function_call_output_item("toolu_unknown"), store
+    )
+
+    assert not parked.resolved_elsewhere.is_set()

@@ -44,6 +44,8 @@ browser ───────────────►  Worker (src/index.js)
 - **D1** is the database. The server reaches it through the
   `sqlalchemy-cloudflare-d1` dialect, which speaks D1's HTTP API — so
   `DATABASE_URL` is `cloudflare_d1://<account>:<api-token>@<database-id>`.
+  The image sets `OMNIGENT_FEATURES=-automations_v2` to keep the legacy timers,
+  since D1 cannot provide the transactions required by persistent scheduling.
 - **R2** is the artifact store. Cloudflare container disk is **ephemeral**, so
   artifacts (agent bundles, user files) go to R2 over its **S3 API** via
   Omnigent's native `S3ArtifactStore`, selected with

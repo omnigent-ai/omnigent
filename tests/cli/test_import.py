@@ -2,19 +2,32 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
+from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 import httpx
+import pytest
 import respx
 from click.testing import CliRunner
 
 from omnigent.cli import _CLICK_SUBCOMMANDS, cli
-from omnigent.session_import.models import SessionImportNotFoundError
+from omnigent.harnesses.opencode_native.app_server import OpenCodeCliNotFoundError
+from omnigent.harnesses.opencode_native.client import OpenCodeSession
+from tests._helpers.codex_rollout import CodexRollout, codex_message
 
 _BASE = "http://localhost:6767"
+
+
+@pytest.fixture(autouse=True)
+def _isolate_harness_homes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The CLI reads harness history under $HOME; ambient overrides must not redirect it."""
+    for name in ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "QWEN_HOME", "PI_CODING_AGENT_DIR"):
+        monkeypatch.delenv(name, raising=False)
 
 
 def _write_claude_transcript(
@@ -76,6 +89,7 @@ def test_import_command_loads_local_session_and_posts_normalized_items(tmp_path:
         "external_session_id": session_id,
         "workspace": "/repo",
         "title": None,
+        "archived": False,
         "force": False,
         "items": [
             {
@@ -88,6 +102,108 @@ def test_import_command_loads_local_session_and_posts_normalized_items(tmp_path:
             }
         ],
     }
+
+
+@respx.mock
+def test_import_command_marks_a_codex_archived_thread_as_archived(tmp_path: Path) -> None:
+    """A thread Codex archived (its rollout under archived_sessions/) posts ``archived: true``."""
+    session_id = "019e96aa-0be2-7343-8d3b-6f914d60936b"
+    rollout = CodexRollout(session_id, cwd="/repo")
+    rollout.append("response_item", codex_message("user", "inspect TODO.md"))
+    rollout.write(
+        tmp_path
+        / ".codex"
+        / "archived_sessions"
+        / f"rollout-2026-10-02T09-00-00-{session_id}.jsonl"
+    )
+    route = respx.post(f"{_BASE}/v1/imports").mock(
+        return_value=httpx.Response(
+            201,
+            json={"session_id": "conv_imported", "status": "imported", "item_count": 1},
+        )
+    )
+
+    with patch("omnigent.cli._resolve_attach_server", return_value=_BASE):
+        result = CliRunner().invoke(
+            cli,
+            ["import", "--harness", "codex", "--session", session_id],
+            env={"HOME": str(tmp_path)},
+        )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(route.calls.last.request.content)["archived"] is True
+
+
+_FRONT_DOOR_REJECTION = (
+    "Server received a request which exceeds maximum allowed content length. "
+    "RequestSize(bytes): 33967957, Limit(bytes): 33554432"
+)
+
+
+@pytest.mark.parametrize(
+    ("rejection", "compacted", "retried"),
+    [
+        (
+            httpx.Response(
+                400, json={"error_code": "BAD_REQUEST", "message": _FRONT_DOOR_REJECTION}
+            ),
+            True,
+            True,
+        ),
+        (httpx.Response(413, text="Request Entity Too Large"), True, True),
+        (httpx.Response(400, json={"error": {"message": "invalid transcript"}}), True, False),
+        (httpx.Response(413, text="Request Entity Too Large"), False, False),
+    ],
+    ids=["front-door-cap", "http-413", "other-error", "too-large-without-compaction"],
+)
+@respx.mock
+def test_import_command_retries_from_the_last_compaction_when_rejected_as_too_large(
+    tmp_path: Path, rejection: httpx.Response, compacted: bool, retried: bool
+) -> None:
+    """A body a deployment refuses as too large is resent from the last compaction onward.
+
+    Other errors, and a session with no compaction to trim to, fail as before.
+    """
+    session_id = "019e96aa-0be2-7343-8d3b-6f914d60936b"
+    rollout = CodexRollout(session_id, cwd="/repo")
+    rollout.turn(1, "before compaction", "answer 1")
+    if compacted:
+        rollout.append(
+            "compacted",
+            {"message": "summary", "replacement_history": [codex_message("user", "summary")]},
+        )
+    rollout.turn(2, "after compaction", "answer 2")
+    rollout.write(
+        tmp_path / ".codex" / "sessions" / "2026" / "10" / "02" / f"rollout-x-{session_id}.jsonl"
+    )
+    route = respx.post(f"{_BASE}/v1/imports").mock(
+        side_effect=[
+            rejection,
+            httpx.Response(
+                201, json={"session_id": "conv_imported", "status": "imported", "item_count": 3}
+            ),
+        ]
+    )
+
+    with patch("omnigent.cli._resolve_attach_server", return_value=_BASE):
+        result = CliRunner().invoke(
+            cli,
+            ["import", "--harness", "codex", "--session", session_id],
+            env={"HOME": str(tmp_path)},
+        )
+
+    assert len(route.calls) == (2 if retried else 1)
+    first = json.loads(route.calls[0].request.content)["items"]
+    assert len(first) == (5 if compacted else 4)
+    if not retried:
+        assert result.exit_code == 1, result.output
+        assert f"Import failed ({rejection.status_code})" in result.output
+        return
+    assert result.exit_code == 0, result.output
+    assert "only its history from the last compaction onward" in result.output
+    resent = json.loads(route.calls[1].request.content)
+    assert [item["type"] for item in resent["items"]] == ["compaction", "message", "message"]
+    assert resent["external_session_id"] == session_id
 
 
 @respx.mock
@@ -225,27 +341,33 @@ def test_import_command_accepts_qwen_session(tmp_path: Path) -> None:
 
 
 @respx.mock
-def test_import_command_accepts_opencode_export() -> None:
-    """The CLI accepts OpenCode and uploads its public export representation."""
+def test_import_command_accepts_opencode_session() -> None:
+    """The CLI accepts OpenCode and uploads the session read from its v2 server."""
     route = respx.post(f"{_BASE}/v1/imports").mock(
         return_value=httpx.Response(
             201,
             json={"session_id": "conv_opencode", "status": "imported", "item_count": 1},
         )
     )
-    export = {
-        "info": {"id": "ses_cli", "directory": "/repo"},
-        "messages": [
-            {
-                "info": {"id": "msg_user", "role": "user"},
-                "parts": [{"type": "text", "text": "hello"}],
-            }
-        ],
-    }
+    session = OpenCodeSession(id="ses_cli", directory="/repo", raw={"id": "ses_cli"})
+    messages: list[dict[str, Any]] = [
+        {"id": "msg_user", "type": "user", "text": "hello", "time": {"created": 1}}
+    ]
+
+    class _Client:
+        async def get_session(self, session_id: str) -> OpenCodeSession | None:
+            return session if session_id == session.id else None
+
+        async def list_messages(self, session_id: str) -> list[dict[str, Any]]:
+            return messages
+
+    @contextlib.asynccontextmanager
+    async def _import_client() -> AsyncIterator[_Client]:
+        yield _Client()
 
     with (
         patch("omnigent.cli._resolve_attach_server", return_value=_BASE),
-        patch("omnigent.session_import.local._run_opencode_json", return_value=export),
+        patch("omnigent.session_import.local._opencode_import_client", _import_client),
     ):
         result = CliRunner().invoke(
             cli,
@@ -262,9 +384,12 @@ def test_import_command_accepts_opencode_export() -> None:
 
 def test_import_command_reports_opencode_discovery_failure() -> None:
     """Batch discovery surfaces a missing or broken OpenCode CLI cleanly."""
-    with patch(
-        "omnigent.session_import.local._run_opencode_json",
-        side_effect=SessionImportNotFoundError("opencode CLI not found on PATH"),
+    with (
+        patch("omnigent.session_import.local._opencode_user_store_exists", return_value=True),
+        patch(
+            "omnigent.session_import.local.find_opencode_cli",
+            side_effect=OpenCodeCliNotFoundError("opencode CLI not found on PATH"),
+        ),
     ):
         result = CliRunner().invoke(
             cli,

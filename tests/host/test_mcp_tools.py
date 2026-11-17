@@ -416,3 +416,12 @@ async def test_http_network_settings_invalidate_probe_cache(monkeypatch):
         "http://first.example:8080",
         "http://second.example:8080",
     ]
+
+
+@pytest.mark.parametrize("name,plugin", [("renamed", None), ("docs", "other")])
+async def test_source_id_also_requires_matching_name_and_plugin(monkeypatch, name, plugin):
+    entry = _entry({"url": "https://example.test/mcp"})
+    entry.summary["source_id"] = "a" * 64
+    monkeypatch.setattr(mcp_tools, "configured_mcp_servers", lambda: [entry])
+    with pytest.raises(LookupError):
+        await HostMcpTools().probe("claude", name, plugin, "a" * 64)

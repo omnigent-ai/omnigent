@@ -74,6 +74,7 @@ describe("Select item interaction", () => {
   it("uses the hand cursor for options", () => {
     renderSelect({});
     fireEvent.click(screen.getByRole("combobox"));
+    expect(screen.getByRole("listbox")).toHaveClass("menu-surface");
     expect(screen.getByRole("option", { name: "High" })).toHaveClass("cursor-pointer");
   });
 });

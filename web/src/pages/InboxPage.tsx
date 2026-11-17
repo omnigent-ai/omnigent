@@ -26,7 +26,8 @@
  *
  * It also lists sessions with unseen agent output — the same read-state
  * behind the sidebar's unread dot — previewing the latest reply. Opening
- * the session or "Mark as read" clears a row.
+ * the session or "Mark as read" clears a row. The card can also reply; a send
+ * leaves the whole-second read baseline alone and lets the running turn hide it.
  *
  * Every kind renders as the same card: a one-line row (kind tile, label,
  * session title — preview, time, unread dot) that expands in place. All
@@ -41,30 +42,53 @@
  * what clears an approval.
  */
 
+import type { AutomationFailure } from "@/lib/scheduledTasksApi";
+import { describeRunFailure } from "@/lib/scheduleText";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isFeatureEnabled } from "@/lib/capabilities";
 import type { Query } from "@tanstack/react-query";
 import type { Session } from "@/lib/types";
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useId, useRef, useState, type ReactNode } from "react";
 import { useQueries, useQueryClient } from "@tanstack/react-query";
 import {
   AlertTriangleIcon,
   ArrowRightIcon,
+  ArrowUpIcon,
   CheckIcon,
   CircleAlertIcon,
   CircleCheckIcon,
   HandIcon,
   InboxIcon,
+  LightbulbIcon,
   Loader2Icon,
   SquarePenIcon,
+  ChevronDownIcon,
   type LucideIcon,
 } from "lucide-react";
 import { ApprovalCard, type SubmitApprovalFn } from "@/components/blocks/ApprovalCard";
+import { SuggestionMedia } from "@/components/inbox/SuggestionMedia";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { useProactiveInbox } from "@/hooks/useProactiveInbox";
+import { useProactiveAgentSettings } from "@/hooks/useProactiveAgentSettings";
+import { FilePathAwareMessageResponse } from "@/components/blocks/ChatMarkdown";
 import { ElicitationMessage } from "@/components/blocks/ElicitationMessage";
 import { PageScroll } from "@/components/PageScroll";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Button } from "@/components/ui/button";
+import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Textarea } from "@/components/ui/textarea";
+import { showToast } from "@/components/ui/toast";
+import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useSidebarData } from "@/hooks/useSidebarData";
 import {
+  clearUnreadOverride,
   isConversationUnseen,
   markConversationRead,
   useUnseenTick,
@@ -84,13 +108,50 @@ import {
   writeInboxFilter,
   type InboxFilter,
 } from "@/lib/inboxFilterPreferences";
-import { latestOutputPreview } from "@/lib/lastAssistantText";
+import { clearAskUserQuestionDraft } from "@/lib/askUserQuestionDrafts";
+import {
+  isComposerAltNewlineKey,
+  isComposerSendKey,
+  readSubmitWithModEnter,
+} from "@/lib/composerSendShortcutPreferences";
+import { insertComposerText } from "@/lib/composerText";
+import { isImeCompositionKeyEvent } from "@/lib/ime";
+import { latestOutput } from "@/lib/lastAssistantText";
+import { isEditorLevel } from "@/lib/permissionsApi";
+import { randomUUID } from "@/lib/randomUUID";
+import { describeSendFailure } from "@/lib/sendFailure";
+import {
+  acknowledgeLocalElicitationResolution,
+  affectedSessionIds,
+  beginLocalElicitationResolution,
+  cancelLocalElicitationResolution,
+} from "@/lib/localElicitationResolutions";
+import { newSessionLocation } from "@/lib/newSessionHandoff";
+import {
+  DISMISS_REASONS,
+  OPEN_SUGGESTION_STATUSES,
+  PROACTIVE_AGENT_DISPLAY_NAME,
+  suggestionKindLabel,
+  suggestionLinkTarget,
+  suggestionPreview,
+  unreadCountText,
+  type Suggestion,
+  type SuggestionUpdate,
+} from "@/lib/proactiveInbox";
 import { relativeTime } from "@/lib/relativeTime";
-import { Link } from "@/lib/routing";
+import { Link, useNavigate } from "@/lib/routing";
 import { useOmnigentAnalytics } from "@/lib/analytics";
-import { approve, fetchSessionItemsPage, getSession } from "@/lib/sessionsApi";
+import {
+  ApiError,
+  HOST_OFFLINE_CODE,
+  approve,
+  fetchSessionItemsPage,
+  getSession,
+  postEvent,
+} from "@/lib/sessionsApi";
 import { userColor, userInitials } from "@/lib/userBadge";
 import { cn } from "@/lib/utils";
+import { FileViewerContext } from "@/shell/FileViewerContext";
 import { conversationDisplayLabel, getConversationAgentType } from "@/shell/sidebarNav";
 
 /** Optimistic verdicts keyed by elicitation id, mirroring the chat store's flip. */
@@ -104,10 +165,29 @@ type RespondedMap = Record<
   }
 >;
 
+/**
+ * Per-session reply state; absent means idle. `retryStableId` names the failed
+ * attempt for an untouched retry; `outputKey` and `rowStatus` are the row's
+ * latest output and status at send time.
+ */
+type ReplyStatus =
+  | { state: "sending" }
+  | { state: "failed"; message: string; retryStableId: string }
+  | { state: "sent"; outputKey: string | null; rowStatus: string | undefined };
+
+// An answer saved in the reply's own `updated_at` second leaves the row
+// unchanged, so the preview is refetched once after that second has passed.
+const SAME_SECOND_RECHECK_MS = 2000;
+
+// The server's hold message promises a resend the Inbox doesn't do.
+const HOST_OFFLINE_REPLY_MESSAGE =
+  "The host for this session is offline, so the reply wasn’t sent. Try again once it reconnects.";
+
 const INBOX_TABS: { value: InboxFilter; label: string }[] = [
   { value: "all", label: "All" },
   { value: "unread", label: "Unread" },
   { value: "awaiting", label: "Awaiting response" },
+  { value: "advisor", label: PROACTIVE_AGENT_DISPLAY_NAME },
 ];
 
 const EMPTY_STATES: Record<InboxFilter, { title: string; body: string }> = {
@@ -123,17 +203,24 @@ const EMPTY_STATES: Record<InboxFilter, { title: string; body: string }> = {
     title: "No approvals waiting",
     body: "When an agent needs your input, it will show up here.",
   },
+  advisor: {
+    title: `No suggestions from ${PROACTIVE_AGENT_DISPLAY_NAME}`,
+    body: "Follow-ups, related information, and reminders about your recent work will show up here.",
+  },
 };
 
 // Enough trailing items to step past a tool call or two after the final reply.
 const PREVIEW_SCAN_ITEMS = 12;
+const UNREAD_ONLY = ["unread"] as const;
 const PREVIEW_MAX_CHARS = 280;
 
 /** One inbox card, tagged by kind, with the epoch-seconds time it sorts and groups by. */
 type InboxEntry =
   | { kind: "approval"; key: string; at: number; item: InboxItem }
   | { kind: "comment"; key: string; at: number; item: CommentInboxItem }
-  | { kind: "unread"; key: string; at: number; item: UnreadInboxItem };
+  | { kind: "unread"; key: string; at: number; item: UnreadInboxItem }
+  | { kind: "automation"; key: string; at: number; item: AutomationFailure }
+  | { kind: "suggestion"; key: string; at: number; item: Suggestion };
 
 const TILE_TONES = {
   yellow: "bg-status-yellow/12 text-status-yellow",
@@ -143,19 +230,61 @@ const TILE_TONES = {
 
 // Compact action buttons inside an expanded card.
 const OUTLINE_ACTION =
-  "rounded-md border-button-border bg-transparent text-ui text-muted-foreground hover:text-foreground";
+  "mobile-touch-target mobile-app:h-auto mobile-app:whitespace-normal rounded-md border-button-border bg-transparent text-ui text-muted-foreground hover:text-foreground";
 const PRIMARY_ACTION =
-  "rounded-md bg-foreground text-ui text-card hover:bg-foreground/80 [&_svg]:text-card";
+  "mobile-touch-target mobile-app:h-auto mobile-app:whitespace-normal rounded-md bg-foreground text-ui text-card hover:bg-foreground/80 [&_svg]:text-card";
 
 export function InboxPage() {
   const queryClient = useQueryClient();
   const { trackClick } = useOmnigentAnalytics();
+  useEffect(() => {
+    void queryClient.invalidateQueries({ queryKey: ["automation-inbox"] });
+  }, [queryClient]);
   const {
     inbox: conversationsQuery,
-    inboxRows: allRows,
+    // Server counts, not the answer overlay: a card answered here stays listed,
+    // with its delivery state, until the server drops the prompt.
+    serverInboxRows: allRows,
     comments: commentInbox,
+    automationInbox,
+    identityReady,
   } = useSidebarData();
-  const [filter, setFilter] = useState<InboxFilter>(readInboxFilter);
+  const navigate = useNavigate();
+  const taskDetailsEnabled = isFeatureEnabled(useServerInfo(), "automations_v2");
+  const [storedFilter, setFilter] = useState<InboxFilter>(readInboxFilter);
+  const {
+    available: advisorAvailable,
+    settings: advisorSettings,
+    query: advisorSettingsQuery,
+  } = useProactiveAgentSettings();
+  // The Omni Advisor tab exists only while the agent is on for the viewer. While
+  // the settings are still loading it shows only where it was already selected,
+  // so a viewer who turned the agent off never sees it appear and vanish.
+  const advisorTab =
+    advisorAvailable &&
+    (advisorSettings?.enabled === true ||
+      (advisorSettings === undefined && storedFilter === "advisor"));
+  // Suggestions load only once the settings say the agent is on, so until they
+  // arrive the page is still assembling, and a failed first read is a failure
+  // to show. A failed refetch keeps the settings it had, and the cards with them.
+  const advisorSettingsPending = advisorAvailable && advisorSettingsQuery.isPending;
+  const advisorSettingsFailed =
+    advisorAvailable && advisorSettingsQuery.isError && advisorSettings === undefined;
+  const filter: InboxFilter = storedFilter === "advisor" && !advisorTab ? "all" : storedFilter;
+  const advisorOnly = filter === "advisor";
+  // The Unread tab pages through unread suggestions only, so an older unread
+  // one is reachable behind newer read ones.
+  const proactiveInbox = useProactiveInbox(
+    identityReady,
+    filter === "unread" ? UNREAD_ONLY : OPEN_SUGGESTION_STATUSES,
+  );
+  // Suggestions expanded while unread, kept on screen until collapsed even
+  // though marking them read takes them out of the Unread list.
+  const [pinnedSuggestions, setPinnedSuggestions] = useState<Record<string, Suggestion>>({});
+  // Pins outlive the list they came from, so drop them once the agent is off.
+  useEffect(() => {
+    if (!proactiveInbox.enabled) setPinnedSuggestions({});
+  }, [proactiveInbox.enabled]);
   const [responded, setResponded] = useState<RespondedMap>({});
   const pendingSubmissions = useRef(new Map<string, RespondedMap[string]>());
   // Manual expand/collapse toggles keyed by entry key. Anything not in
@@ -163,6 +292,14 @@ export function InboxPage() {
   // approval. Keying by id (not index) keeps a user's explicit toggles
   // stable when new items shift positions.
   const [expandedOverrides, setExpandedOverrides] = useState<Record<string, boolean>>({});
+  // Keyed by session id at page level: a collapsed card unmounts its body,
+  // and the draft must survive the toggle.
+  const [replyDrafts, setReplyDrafts] = useState<Record<string, string>>({});
+  const [replyStatuses, setReplyStatuses] = useState<Record<string, ReplyStatus>>({});
+  const [submitWithModEnter] = useState(readSubmitWithModEnter);
+  const isMobileViewport = useIsMobileViewport();
+  const isCoarsePointer = useIsCoarsePointer();
+  const preventsKeyboardSubmit = isMobileViewport || isCoarsePointer;
 
   const { hasNextPage, isFetchingNextPage, fetchNextPage } = conversationsQuery;
   const rows = allRows.filter((c) => (c.pending_elicitations_count ?? 0) > 0);
@@ -201,8 +338,10 @@ export function InboxPage() {
   // sidebar) drops the row immediately instead of on the next list poll.
   useUnseenTick();
   const unreadItems = collectUnreadInboxItems(allRows, isConversationUnseen);
-  const showApprovals = filter !== "unread";
-  const showUnread = filter !== "awaiting";
+  const showApprovals = filter === "all" || filter === "awaiting";
+  // Unread sessions, file comments, and automation results.
+  const showUnread = filter === "all" || filter === "unread";
+  const showSuggestions = filter !== "awaiting";
 
   // Latest-output preview per unread session. `updated_at` in the key
   // refetches after a new turn; a failed fetch just leaves the row bare.
@@ -211,33 +350,105 @@ export function InboxPage() {
       queryKey: ["inbox-unread-preview", row.id, row.updated_at],
       queryFn: async () => {
         const page = await fetchSessionItemsPage(row.id, { limit: PREVIEW_SCAN_ITEMS });
-        return latestOutputPreview(page.items, PREVIEW_MAX_CHARS) ?? null;
+        return latestOutput(page.items, PREVIEW_MAX_CHARS) ?? null;
       },
       enabled: showUnread,
       staleTime: Infinity,
       retry: 1,
     })),
   });
-  const previewBySession = new Map(
-    unreadItems.map(({ row }, i) => [row.id, previewQueries[i]?.data ?? undefined]),
-  );
+  const previewBySession = new Map(unreadItems.map(({ row }, i) => [row.id, previewQueries[i]]));
+
+  // Settle once the row hides, changes status, or loads new output; then
+  // refetch, since the answer may share a cached second.
+  const settledReplyIds = Object.entries(replyStatuses)
+    .filter(([sessionId, status]) => {
+      if (status.state !== "sent") return false;
+      const index = unreadItems.findIndex(({ row }) => row.id === sessionId);
+      if (index === -1) return true;
+      const query = previewQueries[index];
+      return (
+        unreadItems[index]!.row.status !== status.rowStatus ||
+        (query?.isPending === false &&
+          !query.isError &&
+          (query.data?.key ?? null) !== status.outputKey)
+      );
+    })
+    .map(([sessionId]) => sessionId);
+  const settledReplyKey = settledReplyIds.join("\n");
+  useEffect(() => {
+    if (!settledReplyKey) return;
+    const settled = settledReplyKey.split("\n");
+    for (const sessionId of settled) {
+      void queryClient.invalidateQueries({ queryKey: ["inbox-unread-preview", sessionId] });
+    }
+    setReplyStatuses((prev) =>
+      Object.fromEntries(
+        Object.entries(prev).filter(([sessionId]) => !settled.includes(sessionId)),
+      ),
+    );
+  }, [settledReplyKey, queryClient]);
 
   const visibleApprovals = showApprovals ? items : [];
   const visibleComments = showUnread ? commentInbox.items : [];
   const visibleUnread = showUnread ? unreadItems : [];
-  const visibleCount = visibleApprovals.length + visibleComments.length + visibleUnread.length;
-  const totalCount = items.length + commentInbox.items.length + unreadItems.length;
+  const visibleAutomations = showUnread ? automationInbox.items : [];
+  const listedSuggestionIds = new Set(proactiveInbox.items.map((item) => item.id));
+  // Only the Unread list drops a suggestion once it is read; elsewhere a
+  // dismissal or action hides the card at once.
+  const pinned =
+    filter === "unread"
+      ? Object.values(pinnedSuggestions).filter((item) => !listedSuggestionIds.has(item.id))
+      : [];
+  const visibleSuggestions =
+    showSuggestions && proactiveInbox.enabled ? [...proactiveInbox.items, ...pinned] : [];
+  const visibleCount =
+    visibleApprovals.length +
+    visibleComments.length +
+    visibleUnread.length +
+    visibleAutomations.length +
+    visibleSuggestions.length;
+  const totalCount =
+    items.length +
+    commentInbox.items.length +
+    unreadItems.length +
+    automationInbox.items.length +
+    proactiveInbox.items.length;
   const summary = [
     items.length > 0 && (items.length === 1 ? "1 approval" : `${items.length} approvals`),
     commentInbox.items.length > 0 &&
       (commentInbox.items.length === 1 ? "1 comment" : `${commentInbox.items.length} comments`),
     unreadItems.length > 0 && `${unreadItems.length} unread`,
+    automationInbox.items.length > 0 &&
+      (automationInbox.items.length === 1
+        ? "1 failed automation"
+        : `${automationInbox.items.length} failed automations`),
+    // Count what is listed, like the other entries; the unread total is the
+    // server's and can reach past the loaded pages.
+    proactiveInbox.items.length > 0 &&
+      `${proactiveInbox.items.length === 1 ? "1 suggestion" : `${proactiveInbox.items.length} suggestions`}${
+        proactiveInbox.unreadCount > 0
+          ? ` (${unreadCountText(proactiveInbox.unreadCount, proactiveInbox.unreadCountCapped)} unread)`
+          : ""
+      }`,
   ]
     .filter(Boolean)
     .join(" · ");
   const emptyState = EMPTY_STATES[filter];
 
   const groups = groupInboxEntries<InboxEntry>([
+    ...visibleSuggestions.map((item) => ({
+      kind: "suggestion" as const,
+      key: `suggestion:${item.id}`,
+      at: item.createdAt,
+      item,
+    })),
+    ...visibleAutomations.map((item) => ({
+      kind: "automation" as const,
+      key: `automation:${item.runId}`,
+      at: item.finishedAt ?? item.scheduledAt,
+      item,
+    })),
     ...visibleApprovals.map((item) => ({
       kind: "approval" as const,
       key: `approval:${item.elicitation.elicitationId}`,
@@ -294,13 +505,19 @@ export function InboxPage() {
   // would be a lie. Failed snapshots also block the empty state (their
   // approvals exist, we just couldn't fetch them) and get a banner.
   const assembling =
-    conversationsQuery.isLoading ||
-    isFetchingNextPage ||
-    snapshotQueries.some((q) => q.isLoading) ||
-    commentInbox.isLoading;
+    (!advisorOnly &&
+      (conversationsQuery.isLoading ||
+        isFetchingNextPage ||
+        snapshotQueries.some((q) => q.isLoading) ||
+        commentInbox.isLoading)) ||
+    (showUnread && automationInbox.isLoading) ||
+    (showSuggestions && (advisorSettingsPending || proactiveInbox.isLoading));
   const failedSnapshots = snapshotQueries.filter((q) => q.isError);
-  const failedSessionCount =
-    failedSnapshots.length + commentInbox.failedCount + Number(Boolean(conversationsQuery.isError));
+  const failedSessionCount = advisorOnly
+    ? 0
+    : failedSnapshots.length +
+      commentInbox.failedCount +
+      Number(Boolean(conversationsQuery.isError));
 
   // Mirrors `chatStore.submitApproval`: optimistic flip → resolve POST →
   // rollback on error. Success invalidates the session list so the row's
@@ -318,6 +535,15 @@ export function InboxPage() {
       };
       pendingSubmissions.current.set(elicitationId, verdict);
       setResponded((prev) => ({ ...prev, [elicitationId]: verdict }));
+      const holdToken = beginLocalElicitationResolution(
+        elicitationId,
+        affectedSessionIds(
+          [item.row.id, item.resolveSessionId],
+          (knownSessionId) =>
+            queryClient.getQueryData<Session>(["session", knownSessionId])?.parentSessionId,
+        ),
+        { nativeDelivery: Boolean(item.elicitation.nativeDelivery) },
+      );
       void approve(item.resolveSessionId, elicitationId, {
         action,
         ...(content === undefined ? {} : { content }),
@@ -326,6 +552,8 @@ export function InboxPage() {
         () => {
           if (pendingSubmissions.current.get(elicitationId) !== verdict) return;
           pendingSubmissions.current.delete(elicitationId);
+          acknowledgeLocalElicitationResolution(elicitationId, holdToken);
+          clearAskUserQuestionDraft(elicitationId);
           void queryClient.invalidateQueries({ queryKey: ["conversations"] });
           if (item.elicitation.nativeDelivery) {
             const queryKey = ["inbox-elicitations", item.row.id];
@@ -337,6 +565,7 @@ export function InboxPage() {
         () => {
           if (pendingSubmissions.current.get(elicitationId) !== verdict) return;
           pendingSubmissions.current.delete(elicitationId);
+          cancelLocalElicitationResolution(elicitationId, holdToken);
           // Roll back to pending so the buttons reappear and the user
           // can retry — same recovery the chat store uses.
           setResponded((prev) => {
@@ -355,6 +584,136 @@ export function InboxPage() {
       trackClick(`inbox.${entry.kind}.toggle_expanded`, "button");
       setExpandedOverrides((prev) => ({ ...prev, [entry.key]: !expanded }));
     };
+    if (entry.kind === "suggestion") {
+      const { item } = entry;
+      const unpin = () => setPinnedSuggestions(({ [item.id]: _pinned, ...rest }) => rest);
+      // Keep expanded read suggestions visible on Unread until the server
+      // accepts their resolution.
+      const resolve = (change: SuggestionUpdate) =>
+        void proactiveInbox.update(item.id, change).then((accepted) => {
+          if (accepted) unpin();
+        });
+      const onToggleSuggestion = () => {
+        if (!expanded && item.status === "unread") {
+          setPinnedSuggestions((prev) => ({ ...prev, [item.id]: { ...item, status: "read" } }));
+          proactiveInbox.update(item.id, { status: "read" });
+        }
+        if (expanded) unpin();
+        onToggle();
+      };
+      const takeAction = (index: number) => {
+        const action = item.actions[index];
+        if (!action) return;
+        resolve({ resolution: "action_taken", resolutionAction: index });
+        // The user reviews and sends the prompt from the composer.
+        navigate(newSessionLocation(action.prompt, []));
+      };
+      return (
+        <InboxCard
+          key={entry.key}
+          testId="inbox-suggestion"
+          dataKind={item.kind}
+          tile={<KindTile icon={LightbulbIcon} tone="gray" />}
+          kindLabel={`${PROACTIVE_AGENT_DISPLAY_NAME} · ${suggestionKindLabel(item.kind)}`}
+          title={item.title}
+          preview={suggestionPreview(item.bodyMd)}
+          at={entry.at}
+          unread={item.status === "unread"}
+          expanded={expanded}
+          onToggle={onToggleSuggestion}
+        >
+          <p className="text-ui font-medium">{item.title}</p>
+          {/* No session is open here, so file paths stay plain text. */}
+          <FileViewerContext.Provider value={null}>
+            <FilePathAwareMessageResponse>{item.bodyMd}</FilePathAwareMessageResponse>
+          </FileViewerContext.Provider>
+          <SuggestionMedia media={item.media} />
+          <SuggestionLinks item={item} />
+          <InboxActions>
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button
+                  variant="outline"
+                  size="xs"
+                  className={OUTLINE_ACTION}
+                  componentId="inbox.suggestion.dismiss"
+                >
+                  Dismiss <ChevronDownIcon className="size-3.5" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="min-w-52">
+                {DISMISS_REASONS.map((reason) => (
+                  <DropdownMenuItem
+                    key={reason.resolution}
+                    onSelect={() => {
+                      trackClick(`inbox.suggestion.dismiss.${reason.resolution}`, "button");
+                      resolve({ resolution: reason.resolution });
+                    }}
+                  >
+                    {reason.label}
+                  </DropdownMenuItem>
+                ))}
+              </DropdownMenuContent>
+            </DropdownMenu>
+            {item.actions.map((action, index) => (
+              <Button
+                // Agent actions are a fixed list per item; the label can repeat.
+                // oxlint-disable-next-line react/no-array-index-key
+                key={index}
+                size="xs"
+                className={index === 0 ? PRIMARY_ACTION : OUTLINE_ACTION}
+                variant={index === 0 ? undefined : "outline"}
+                onClick={() => takeAction(index)}
+                componentId="inbox.suggestion.action"
+              >
+                {action.label}
+              </Button>
+            ))}
+          </InboxActions>
+        </InboxCard>
+      );
+    }
+    if (entry.kind === "automation") {
+      const { item } = entry;
+      const failure = describeRunFailure(item.errorCode, "failed");
+      const reason = failure.stage ? `${failure.stage} · ${failure.reason}` : failure.reason;
+      return (
+        <InboxCard
+          key={entry.key}
+          testId="inbox-automation-item"
+          tile={<KindTile icon={AlertTriangleIcon} tone="red" />}
+          kindLabel="Automation failed"
+          title={item.taskName}
+          preview={reason}
+          at={entry.at}
+          unread
+          expanded={expanded}
+          onToggle={onToggle}
+        >
+          <p className="text-ui font-medium">{item.taskName}</p>
+          <p className="mt-2 text-ui text-muted-foreground">{reason}</p>
+          <InboxActions>
+            <Button asChild size="xs" className={PRIMARY_ACTION}>
+              <Link
+                to={taskDetailsEnabled ? `/tasks/${item.taskId}` : "/tasks"}
+                componentId="inbox.automation.open"
+              >
+                Open automation <ArrowRightIcon className="size-3.5" />
+              </Link>
+            </Button>
+            <Button
+              variant="outline"
+              size="xs"
+              className={OUTLINE_ACTION}
+              onClick={() => automationInbox.markRead(item.runId)}
+              componentId="inbox.automation.mark_read"
+            >
+              <CheckIcon className="size-3.5" /> Mark as read
+            </Button>
+          </InboxActions>
+        </InboxCard>
+      );
+    }
     const title = conversationDisplayLabel(entry.item.row);
 
     if (entry.kind === "approval") {
@@ -406,6 +765,7 @@ export function InboxPage() {
             response={verdict ?? null}
             askUserQuestion={item.elicitation.askUserQuestion}
             exitPlanMode={item.elicitation.exitPlanMode}
+            fileEdit={item.elicitation.fileEdit}
             codexCommand={item.elicitation.codexCommand}
             allowAllEdits={item.elicitation.allowAllEdits}
             allowAutoMode={item.elicitation.allowAutoMode}
@@ -482,10 +842,14 @@ export function InboxPage() {
               {/* Deep-link into the file browser with this comment selected —
                   opening it there marks it seen, which clears this item. */}
               <Link
-                to={`/c/${entry.item.row.id}?file=${encodeURIComponent(comment.path)}&comment=${encodeURIComponent(comment.id)}`}
+                to={
+                  comment.anchor_metadata
+                    ? `/c/${entry.item.row.id}`
+                    : `/c/${entry.item.row.id}?file=${encodeURIComponent(comment.path)}&comment=${encodeURIComponent(comment.id)}`
+                }
                 componentId="inbox.comment.open_file"
               >
-                Open file
+                {comment.anchor_metadata ? "Open session" : "Open file"}
                 <ArrowRightIcon className="size-3.5" />
               </Link>
             </Button>
@@ -497,11 +861,95 @@ export function InboxPage() {
     const { item } = entry;
     const sessionId = item.row.id;
     const isError = item.kind === "error";
-    const preview = previewBySession.get(sessionId);
+    const previewQuery = previewBySession.get(sessionId);
+    const output = previewQuery?.data ?? undefined;
+    const preview = output?.preview;
     const markRead = () => {
-      // Drop the toggle so a later reply re-surfaces the row collapsed.
+      // Drop the toggle so a later reply re-surfaces the row collapsed, and
+      // the reply state so it can't come back stale with the row.
       setExpandedOverrides(({ [entry.key]: _cleared, ...rest }) => rest);
+      setReplyDrafts(({ [sessionId]: _draft, ...rest }) => rest);
+      setReplyStatuses(({ [sessionId]: _status, ...rest }) => rest);
       markConversationRead(sessionId, item.row.updated_at);
+    };
+    // The server refuses user messages below edit access.
+    const canReply = isEditorLevel(item.row.permission_level);
+    const replyDraft = replyDrafts[sessionId] ?? "";
+    const replyStatus = replyStatuses[sessionId];
+    const replySending = replyStatus?.state === "sending";
+    const replyAwaitingAnswer =
+      replyStatus?.state === "sent" && !settledReplyIds.includes(sessionId);
+    // A send records the current output to tell the agent's answer from it, so
+    // only a loaded preview will do; a failed fetch leaves no baseline.
+    const previewReady = previewQuery?.isSuccess === true;
+    const showReplyField = canReply && !replyAwaitingAnswer;
+    const sendIsPrimary = showReplyField && replyDraft.trim() !== "";
+    const sendReply = () => {
+      if (!replyDraft.trim() || replySending || !previewReady) return;
+      // One telemetry point for both the button and the keyboard shortcut.
+      trackClick("inbox.unread.reply", "button");
+      // Like the composer: an untouched retry reuses the failed id; editing drops it.
+      const retriesFailedSend = replyStatus?.state === "failed";
+      const stableId = retriesFailedSend
+        ? replyStatus.retryStableId
+        : randomUUID().replace(/-/g, "");
+      const outputKey = output?.key ?? null;
+      const rowStatus = item.row.status;
+      setReplyStatuses((prev) => ({ ...prev, [sessionId]: { state: "sending" } }));
+      void postEvent(
+        sessionId,
+        {
+          type: "message",
+          data: {
+            role: "user",
+            content: [{ type: "input_text", text: replyDraft }],
+            stable_id: stableId,
+          },
+        },
+        // Otherwise an offline host gets a failed turn recorded while the
+        // POST still answers `queued`, and the reply would read as sent.
+        { holdWhenHostOffline: true },
+      ).then(
+        (result) => {
+          if (result.denied) {
+            setReplyStatuses((prev) => ({
+              ...prev,
+              [sessionId]: {
+                state: "failed",
+                message: "A policy blocked this reply.",
+                retryStableId: stableId,
+              },
+            }));
+            return;
+          }
+          setReplyDrafts(({ [sessionId]: _sent, ...rest }) => rest);
+          // A retry may or may not start a turn (the server dedupes one that
+          // already ran), so it gets no note that might never settle.
+          setReplyStatuses(({ [sessionId]: _previous, ...rest }) =>
+            retriesFailedSend
+              ? rest
+              : { ...rest, [sessionId]: { state: "sent", outputKey, rowStatus } },
+          );
+          // Replying is reading: undo only an explicit "Mark as unread".
+          clearUnreadOverride(sessionId);
+          void queryClient.invalidateQueries({ queryKey: ["conversations"] });
+          setTimeout(() => {
+            void queryClient.invalidateQueries({ queryKey: ["inbox-unread-preview", sessionId] });
+          }, SAME_SECOND_RECHECK_MS);
+          showToast(`Reply sent to ${title}`);
+        },
+        (error: unknown) => {
+          // Keep the draft so the user can retry or open the session instead.
+          const message =
+            error instanceof ApiError && error.code === HOST_OFFLINE_CODE
+              ? HOST_OFFLINE_REPLY_MESSAGE
+              : describeSendFailure(error).message;
+          setReplyStatuses((prev) => ({
+            ...prev,
+            [sessionId]: { state: "failed", message, retryStableId: stableId },
+          }));
+        },
+      );
     };
     return (
       <InboxCard
@@ -524,29 +972,90 @@ export function InboxPage() {
       >
         <div>
           <SessionLine title={title} />
-          {preview && (
-            <p className="mt-2 text-ui font-medium break-words whitespace-pre-wrap">{preview}</p>
-          )}
+          {preview && <LatestOutputPreview preview={preview} fullText={output?.fullText} />}
         </div>
+        {replyAwaitingAnswer && (
+          <p role="status" className="flex items-center gap-1.5 text-sm text-muted-foreground">
+            <CheckIcon aria-hidden className="size-3.5 shrink-0" />
+            Reply sent. The agent’s answer will show up here.
+          </p>
+        )}
+        {showReplyField && (
+          <InboxReplyField
+            label={`Reply to ${title}`}
+            value={replyDraft}
+            onChange={(value) => {
+              setReplyDrafts((prev) => ({ ...prev, [sessionId]: value }));
+              setReplyStatuses(({ [sessionId]: _stale, ...rest }) => rest);
+            }}
+            onSubmit={sendReply}
+            sending={replySending}
+            error={replyStatus?.state === "failed" ? replyStatus.message : undefined}
+            submitWithModEnter={submitWithModEnter}
+            preventsKeyboardSubmit={preventsKeyboardSubmit}
+          />
+        )}
+        {showReplyField && previewQuery?.isError && (
+          <p className="text-sm text-muted-foreground">
+            Couldn’t load the latest reply, so replying here is paused. Open the session to reply.
+          </p>
+        )}
         <InboxActions>
           <Button
             variant="outline"
             size="xs"
             className={OUTLINE_ACTION}
+            disabled={replySending}
             onClick={markRead}
             componentId="inbox.unread.mark_read"
           >
             <CheckIcon className="size-3.5" />
             Mark as read
           </Button>
-          <Button asChild size="xs" className={PRIMARY_ACTION}>
-            {/* Opening is reading. Mark it here: a freshly mounted chat keeps an
-                explicit "Mark as unread" override, so it wouldn't clear this row. */}
-            <Link to={`/c/${sessionId}`} onClick={markRead} componentId="inbox.unread.open_session">
+          {/* One live primary action: Send once there's a draft, else Open session. */}
+          <Button
+            asChild
+            variant={sendIsPrimary ? "outline" : "default"}
+            size="xs"
+            className={cn(
+              sendIsPrimary ? OUTLINE_ACTION : PRIMARY_ACTION,
+              "aria-disabled:pointer-events-none aria-disabled:opacity-50",
+            )}
+          >
+            {/* Opening is reading; mark it here because chat keeps an explicit
+                unread override. Locked while a reply sends. */}
+            <Link
+              to={`/c/${sessionId}`}
+              aria-disabled={replySending}
+              onClick={(event) => {
+                if (replySending) {
+                  event.preventDefault();
+                  return;
+                }
+                markRead();
+              }}
+              componentId="inbox.unread.open_session"
+            >
               Open session
               <ArrowRightIcon className="size-3.5" />
             </Link>
           </Button>
+          {showReplyField && (
+            <Button
+              variant={sendIsPrimary ? "default" : "outline"}
+              size="xs"
+              className={sendIsPrimary ? PRIMARY_ACTION : OUTLINE_ACTION}
+              disabled={!replyDraft.trim() || replySending || !previewReady}
+              onClick={sendReply}
+            >
+              {replySending ? (
+                <Loader2Icon className="size-3.5 animate-spin" />
+              ) : (
+                <ArrowUpIcon className="size-3.5" />
+              )}
+              Send
+            </Button>
+          )}
         </InboxActions>
       </InboxCard>
     );
@@ -577,12 +1086,22 @@ export function InboxPage() {
         componentId="inbox.filter"
         className="mb-4"
       >
-        <TabsList variant="pill" aria-label="Inbox filter" className="gap-1">
-          {INBOX_TABS.map(({ value, label }) => (
-            <TabsTrigger key={value} value={value} className="h-7 flex-none px-3">
-              {label}
-            </TabsTrigger>
-          ))}
+        <TabsList
+          variant="pill"
+          aria-label="Inbox filter"
+          className="gap-1 mobile-app:max-w-full mobile-app:flex-wrap mobile-app:justify-start"
+        >
+          {INBOX_TABS.filter(({ value }) => value !== "advisor" || advisorTab).map(
+            ({ value, label }) => (
+              <TabsTrigger
+                key={value}
+                value={value}
+                className="h-7 mobile-touch-target mobile-app:h-auto flex-none mobile-app:whitespace-normal px-3"
+              >
+                {label}
+              </TabsTrigger>
+            ),
+          )}
         </TabsList>
       </Tabs>
 
@@ -611,6 +1130,48 @@ export function InboxPage() {
         </div>
       )}
 
+      {showSuggestions && advisorSettingsFailed && (
+        <div role="alert" className="mb-4 flex items-center gap-2 text-ui text-destructive">
+          Couldn’t load {PROACTIVE_AGENT_DISPLAY_NAME} settings, so its suggestions are not shown.
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => void advisorSettingsQuery.refetch()}
+            componentId="inbox.retry_advisor_settings"
+          >
+            Retry settings
+          </Button>
+        </div>
+      )}
+
+      {showSuggestions && proactiveInbox.isError && (
+        <div role="alert" className="mb-4 flex items-center gap-2 text-ui text-destructive">
+          Couldn’t load suggestions.
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => void proactiveInbox.refetch()}
+            componentId="inbox.retry_suggestions"
+          >
+            Retry suggestions
+          </Button>
+        </div>
+      )}
+
+      {showUnread && automationInbox.isError && (
+        <div role="alert" className="mb-4 flex items-center gap-2 text-ui text-destructive">
+          Couldn’t load automation failures.
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => void automationInbox.refetch()}
+            componentId="inbox.retry_automations"
+          >
+            Retry automations
+          </Button>
+        </div>
+      )}
+
       {assembling && visibleCount === 0 && (
         <div className="flex items-center gap-2 py-12 text-ui text-muted-foreground">
           <Loader2Icon className="size-4 animate-spin" />
@@ -618,15 +1179,23 @@ export function InboxPage() {
         </div>
       )}
 
-      {!assembling && failedSessionCount === 0 && visibleCount === 0 && (
-        <div className="flex flex-col items-center gap-2 py-16 text-center">
-          <InboxIcon className="size-8 text-muted-foreground/50" />
-          <p className="text-ui font-medium">
-            {hasNextPage ? "Nothing waiting in these sessions" : emptyState.title}
-          </p>
-          <p className="text-sm text-muted-foreground">{emptyState.body}</p>
-        </div>
-      )}
+      {!assembling &&
+        failedSessionCount === 0 &&
+        !(showUnread && automationInbox.isError) &&
+        !(showSuggestions && (advisorSettingsFailed || proactiveInbox.isError)) &&
+        visibleCount === 0 && (
+          <div className="flex flex-col items-center gap-2 py-16 text-center">
+            <InboxIcon className="size-8 text-muted-foreground/50" />
+            <p className="text-ui font-medium">
+              {(!advisorOnly && hasNextPage) ||
+              (showUnread && automationInbox.hasNextPage) ||
+              (showSuggestions && proactiveInbox.hasNextPage)
+                ? "Nothing waiting in the loaded items"
+                : emptyState.title}
+            </p>
+            <p className="text-sm text-muted-foreground">{emptyState.body}</p>
+          </div>
+        )}
 
       <div className="flex flex-col gap-4">
         {groups.map((group) => (
@@ -642,7 +1211,7 @@ export function InboxPage() {
           </div>
         )}
       </div>
-      {hasNextPage && (
+      {!advisorOnly && hasNextPage && (
         <Button
           variant="outline"
           disabled={conversationsQuery.isFetching}
@@ -651,6 +1220,28 @@ export function InboxPage() {
           className="mt-4"
         >
           {isFetchingNextPage ? "Loading…" : "Load more sessions"}
+        </Button>
+      )}
+      {showSuggestions && proactiveInbox.hasNextPage && (
+        <Button
+          variant="outline"
+          disabled={proactiveInbox.isFetchingNextPage}
+          onClick={() => void proactiveInbox.fetchNextPage()}
+          componentId="inbox.load_more_suggestions"
+          className="mt-4"
+        >
+          {proactiveInbox.isFetchingNextPage ? "Loading…" : "Load more suggestions"}
+        </Button>
+      )}
+      {showUnread && automationInbox.hasNextPage && (
+        <Button
+          variant="outline"
+          disabled={automationInbox.isFetching}
+          onClick={() => void automationInbox.fetchNextPage()}
+          componentId="inbox.load_more_automations"
+          className="mt-4"
+        >
+          {automationInbox.isFetchingNextPage ? "Loading…" : "Check more automations"}
         </Button>
       )}
     </PageScroll>
@@ -764,6 +1355,168 @@ function SessionLine({ title, detail }: { title: string; detail?: string }) {
   );
 }
 
+/** What a suggestion is based on: sessions open here, other links in a new tab. */
+function SuggestionLinks({ item }: { item: Suggestion }) {
+  const headingId = useId();
+  const seen = new Set<string>();
+  const links = item.links.flatMap((link) => {
+    const target = suggestionLinkTarget(link);
+    const key = target && (target.kind === "session" ? target.path : target.href);
+    if (!target || !key || seen.has(key)) return [];
+    seen.add(key);
+    return [{ key, link, target }];
+  });
+  if (links.length === 0) return null;
+  return (
+    <section aria-labelledby={headingId} className="flex flex-col gap-1 text-sm">
+      <h3 id={headingId} className="text-xs font-medium text-muted-foreground">
+        Source
+      </h3>
+      <ul className="flex flex-col gap-1">
+        {links.map(({ key, link, target }) => (
+          <li key={key} className="truncate">
+            {target.kind === "session" ? (
+              <Link
+                to={target.path}
+                componentId="inbox.suggestion.open_session"
+                className="underline underline-offset-2"
+              >
+                {link.label ?? "Open session"}
+              </Link>
+            ) : (
+              <a
+                href={target.href}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="underline underline-offset-2"
+              >
+                {link.label ?? link.ref}
+              </a>
+            )}
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
+}
+
 function InboxActions({ children }: { children: ReactNode }) {
-  return <div className="flex items-center justify-end gap-1 pt-0.5">{children}</div>;
+  return (
+    <div className="flex items-center justify-end gap-1 pt-0.5 mobile-app:flex-col mobile-app:items-stretch">
+      {children}
+    </div>
+  );
+}
+
+/**
+ * The expanded unread card's latest-output preview. When the preview cut the
+ * reply, hovering or focusing it shows the whole reply, rendered like the chat.
+ */
+function LatestOutputPreview({ preview, fullText }: { preview: string; fullText?: string }) {
+  const className = "mt-2 text-ui font-medium break-words whitespace-pre-wrap";
+  if (fullText === undefined) return <p className={className}>{preview}</p>;
+  return (
+    // The close delay lets the pointer cross into the card to scroll it.
+    <HoverCard openDelay={300} closeDelay={150}>
+      <HoverCardTrigger asChild>
+        <p
+          tabIndex={0}
+          className={cn(
+            className,
+            "cursor-default rounded-sm outline-none focus-visible:ring-3 focus-visible:ring-ring/50",
+          )}
+        >
+          {preview}
+        </p>
+      </HoverCardTrigger>
+      <HoverCardContent
+        side="bottom"
+        align="start"
+        className="max-h-[min(60vh,32rem)] w-[min(40rem,calc(100vw-2rem))] overflow-y-auto p-3"
+      >
+        {/* No session is open here, so file paths stay plain text instead of
+            resolving against whichever session the file viewer last showed. */}
+        <FileViewerContext.Provider value={null}>
+          <FilePathAwareMessageResponse>{fullText}</FilePathAwareMessageResponse>
+        </FileViewerContext.Provider>
+      </HoverCardContent>
+    </HoverCard>
+  );
+}
+
+/** The expanded unread card's reply box; its Send button lives in the action row. */
+function InboxReplyField({
+  label,
+  value,
+  onChange,
+  onSubmit,
+  sending,
+  error,
+  submitWithModEnter,
+  preventsKeyboardSubmit,
+}: {
+  label: string;
+  value: string;
+  onChange: (value: string) => void;
+  onSubmit: () => void;
+  sending: boolean;
+  error?: string;
+  submitWithModEnter: boolean;
+  preventsKeyboardSubmit: boolean;
+}) {
+  const errorId = useId();
+  // Safari confirms an IME candidate with an Enter that isn't flagged as
+  // composing, so track composition like the chat composer does.
+  const isComposingRef = useRef(false);
+  return (
+    <div className="flex flex-col gap-1.5">
+      <Textarea
+        aria-label={label}
+        aria-invalid={error !== undefined}
+        aria-describedby={error === undefined ? undefined : errorId}
+        placeholder="Reply…"
+        value={value}
+        // Read-only rather than disabled, so focus stays put for a retry.
+        readOnly={sending}
+        aria-busy={sending}
+        // `setRangeText` (Alt+Enter's fallback) ignores `readonly`, and an edit
+        // would drop the sending state, so the box takes no input while it sends.
+        onChange={(event) => {
+          if (!sending) onChange(event.target.value);
+        }}
+        onKeyDown={(event) => {
+          if (sending) {
+            if (event.key === "Enter") event.preventDefault();
+            return;
+          }
+          if (isImeCompositionKeyEvent(event, isComposingRef.current)) return;
+          const keyEvent = { ...event, isComposing: event.nativeEvent.isComposing };
+          // Alt+Enter is a newline in the composer too; browsers insert nothing for it.
+          if (isComposerAltNewlineKey(keyEvent)) {
+            event.preventDefault();
+            insertComposerText(event.currentTarget, "\n");
+            return;
+          }
+          // Same send chord as the chat composer, including the Mod+Enter preference.
+          if (!isComposerSendKey(keyEvent, submitWithModEnter, preventsKeyboardSubmit)) {
+            return;
+          }
+          event.preventDefault();
+          onSubmit();
+        }}
+        onCompositionStart={() => {
+          isComposingRef.current = true;
+        }}
+        onCompositionEnd={() => {
+          isComposingRef.current = false;
+        }}
+        className="max-h-48 min-h-14 resize-none"
+      />
+      {error && (
+        <p id={errorId} role="alert" className="text-sm text-destructive">
+          {error}
+        </p>
+      )}
+    </div>
+  );
 }

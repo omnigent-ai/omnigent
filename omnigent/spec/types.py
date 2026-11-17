@@ -77,7 +77,9 @@ class RetryPolicy:
         their own jitter at L0.
     :param timeout_per_request_s: Per-HTTP-request timeout. ``None``
         lets the SDK use its default. Used at L0 only — bounds an
-        individual attempt's wall-clock.
+        individual attempt according to the SDK's timeout semantics.
+        For Claude CLI, this bounds the wait for response headers;
+        streaming responses have separate idle timeouts.
     :param retryable_status_codes: HTTP status codes the in-process
         LLM path's ``classify_llm_error`` treats as retryable.
         Used only by the in-process LLM path and the tool-retry
@@ -317,17 +319,16 @@ class _ClaudeCliRetryAdapter:
         """
         Env vars to merge into ``ClaudeAgentOptions.env``.
 
-        The Claude CLI's retry budget isn't publicly documented as
-        env-tunable; we set Anthropic SDK conventions
-        speculatively.
+        Claude CLI caps retries at 15 outside its retry-watchdog mode.
+        Its request timeout is in milliseconds and ends at response headers.
 
         :returns: Dict mapping env var names to string values.
         """
         env: dict[str, str] = {
-            "ANTHROPIC_MAX_RETRIES": str(self.policy.max_retries),
+            "CLAUDE_CODE_MAX_RETRIES": str(self.policy.max_retries),
         }
         if self.policy.timeout_per_request_s is not None:
-            env["ANTHROPIC_REQUEST_TIMEOUT_SECONDS"] = str(int(self.policy.timeout_per_request_s))
+            env["API_TIMEOUT_MS"] = str(max(1, round(self.policy.timeout_per_request_s * 1000)))
         return env
 
 
@@ -537,8 +538,9 @@ class ExecutorSpec:  # type: ignore[explicit-any]  # config: dict[str, Any] fiel
         codex/cursor/kimi bypass flags, opt-out for codex/cursor and
         opt-in for kimi) and ``"permission_mode"`` (exact-match string;
         ``bypassPermissions`` maps to the claude-native /
-        antigravity-native skip flags) into the session's
-        ``terminal_launch_args``.
+        antigravity-native skip flags; a codex-native mode such as
+        ``approve-for-me`` maps to that mode's launch args) into the
+        session's ``terminal_launch_args``.
 
         🚨 **TECH DEBT — REMOVE WHEN OMNIGENT COMPAT ENDS.**
         This field exists *solely* to carry harness / profile /
@@ -878,17 +880,25 @@ class ToolGroupsConfig:
     """
     Which framework-owned tool groups an agent advertises.
 
-    Every group defaults to ``True``: the groups register on every agent
-    unless the spec opts out under a top-level ``tool_groups:`` block (a
-    mapping of group name to boolean). Trimming a group the agent cannot
+    Every group except ``user_inbox`` defaults to ``True``: those groups
+    register on every agent unless the spec opts out under a top-level
+    ``tool_groups:`` block (a mapping of group name to boolean).
+    ``user_inbox`` is opt-in, so only agents built to post Inbox suggestions
+    can write to their owner's Inbox. Trimming a group the agent cannot
     use keeps the advertised tool payload under a strict provider's byte
     limit and stops a small model from picking an irrelevant tool.
 
     :param browser: The ``browser_*`` embedded-browser tools (5).
-    :param scheduled_tasks: The ``sys_scheduled_task_*`` tools (4).
+    :param scheduled_tasks: The ``sys_scheduled_task_*`` tools (4) and ``sys_reminder_set``.
     :param comments: ``list_comments`` and ``update_comment``.
     :param policies: ``sys_add_policy`` and ``sys_policy_registry``.
     :param agent_discovery: The read-only ``sys_agent_*`` tools (3).
+    :param journal: The ``sys_journal_*`` tools (4): the session's plan, step
+        statuses and notes.
+    :param projects: ``sys_project_list``, ``sys_project_update`` and
+        ``sys_session_update``.
+    :param user_inbox: ``sys_user_inbox_post`` and ``sys_user_inbox_list``,
+        which write to and read the owner's Inbox. Off by default.
     """
 
     browser: bool = True
@@ -896,6 +906,9 @@ class ToolGroupsConfig:
     comments: bool = True
     policies: bool = True
     agent_discovery: bool = True
+    journal: bool = True
+    projects: bool = True
+    user_inbox: bool = False
 
 
 @dataclass
@@ -1653,3 +1666,14 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
     tool_groups: ToolGroupsConfig = field(default_factory=ToolGroupsConfig)
     agent_session_sharing: SharePolicy = SharePolicy.NONE
     source_rel_dir: str | None = field(default=None, compare=False)
+
+    @property
+    def loads_user_settings(self) -> bool:
+        """Whether a claude-sdk run loads the user's Claude settings and user-scope MCP servers.
+
+        ``skills_filter: "none"`` runs the CLI with ``setting_sources=[]``, so only
+        managed (enterprise) servers load; every other filter keeps the user source.
+
+        :returns: ``False`` only for ``skills_filter == "none"``.
+        """
+        return self.skills_filter != "none"

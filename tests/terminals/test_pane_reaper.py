@@ -28,6 +28,7 @@ from omnigent.terminals.pane_reaper import (
     NativePaneReaper,
     PaneRef,
     resolve_native_pane_idle_timeout_s,
+    resolve_sub_agent_pane_idle_timeout_s,
 )
 from omnigent.terminals.registry import TerminalRegistry
 from tests.runner.helpers import NullServerClient, make_test_terminal_instance
@@ -153,25 +154,54 @@ async def test_scan_recheck_spares_pane_that_became_busy() -> None:
 # ── Env resolver ────────────────────────────────────────────────────────────
 
 
-def test_resolve_default_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("default_timeout_s", [_DEFAULT_IDLE_TIMEOUT_S, 86400, 0])
+def test_resolve_default_when_unset(
+    monkeypatch: pytest.MonkeyPatch, default_timeout_s: float
+) -> None:
     monkeypatch.delenv(_IDLE_TIMEOUT_ENV, raising=False)
-    assert resolve_native_pane_idle_timeout_s() == float(_DEFAULT_IDLE_TIMEOUT_S)
+    assert resolve_native_pane_idle_timeout_s(default_timeout_s) == default_timeout_s
 
 
-def test_resolve_reads_env(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("default_timeout_s", [_DEFAULT_IDLE_TIMEOUT_S, 86400, 0])
+def test_resolve_reads_env(monkeypatch: pytest.MonkeyPatch, default_timeout_s: float) -> None:
     monkeypatch.setenv(_IDLE_TIMEOUT_ENV, "120")
-    assert resolve_native_pane_idle_timeout_s() == 120.0
+    assert resolve_native_pane_idle_timeout_s(default_timeout_s) == 120.0
 
 
-def test_resolve_zero_disables(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("default_timeout_s", [_DEFAULT_IDLE_TIMEOUT_S, 86400, 0])
+def test_resolve_zero_disables(monkeypatch: pytest.MonkeyPatch, default_timeout_s: float) -> None:
     monkeypatch.setenv(_IDLE_TIMEOUT_ENV, "0")
-    assert resolve_native_pane_idle_timeout_s() == 0.0
+    assert resolve_native_pane_idle_timeout_s(default_timeout_s) == 0.0
 
 
 @pytest.mark.parametrize("bad", ["abc", "-5", ""])
-def test_resolve_invalid_falls_back(monkeypatch: pytest.MonkeyPatch, bad: str) -> None:
+@pytest.mark.parametrize("default_timeout_s", [_DEFAULT_IDLE_TIMEOUT_S, 86400, 0])
+def test_resolve_invalid_falls_back(
+    monkeypatch: pytest.MonkeyPatch, bad: str, default_timeout_s: float
+) -> None:
     monkeypatch.setenv(_IDLE_TIMEOUT_ENV, bad)
-    assert resolve_native_pane_idle_timeout_s() == float(_DEFAULT_IDLE_TIMEOUT_S)
+    assert resolve_native_pane_idle_timeout_s(default_timeout_s) == default_timeout_s
+
+
+@pytest.mark.parametrize(
+    ("env", "session_timeout_s", "expected"),
+    [
+        (None, 86400.0, _DEFAULT_IDLE_TIMEOUT_S),
+        (None, 600.0, 600.0),
+        (None, 0.0, 0.0),
+        ("120", 86400.0, 120.0),
+        ("7200", 7200.0, 7200.0),
+        ("0", 0.0, 0.0),
+    ],
+)
+def test_resolve_sub_agent_window_caps_session_window_at_native_default(
+    monkeypatch: pytest.MonkeyPatch, env: str | None, session_timeout_s: float, expected: float
+) -> None:
+    if env is None:
+        monkeypatch.delenv(_IDLE_TIMEOUT_ENV, raising=False)
+    else:
+        monkeypatch.setenv(_IDLE_TIMEOUT_ENV, env)
+    assert resolve_sub_agent_pane_idle_timeout_s(session_timeout_s) == expected
 
 
 # ── Loop smoke (start/shutdown + disable) ───────────────────────────────────
@@ -194,7 +224,7 @@ async def test_loop_reaps_idle_pane() -> None:
 
 async def test_loop_disabled_when_timeout_non_positive() -> None:
     f = _Fakes()
-    f.panes = [_pane("conv_a")]
+    f.panes = [_pane("conv_a"), _pane("conv_child")._replace(sub_agent=True)]
     r = _make(f, timeout=0.0, interval=0.01)  # 0 disables
     await r.start()
     try:
@@ -202,6 +232,7 @@ async def test_loop_disabled_when_timeout_non_positive() -> None:
     finally:
         await r.shutdown()
     assert f.reaped == []
+    assert f.busy_calls == 0
 
 
 def test_every_native_harness_but_kimi_is_offered_to_the_reaper() -> None:
@@ -213,25 +244,30 @@ def test_every_native_harness_but_kimi_is_offered_to_the_reaper() -> None:
     assert pane_names >= NATIVE_PANE_TERMINAL_NAMES
 
 
-async def test_runner_busy_check_spares_a_pane_parked_on_an_approval(
+@pytest.mark.parametrize("live_work", ["approval_wait", "background_agent"])
+async def test_runner_busy_check_spares_a_pane_with_live_work(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    live_work: str,
 ) -> None:
     """
-    The runner's busy check treats a fresh approval-wait marker as busy.
+    The runner's busy check treats an approval wait or a background agent as busy.
 
-    A pane parked on a permission prompt has no active turn, no ``running``
-    status, no attached client and no output, so every other signal reads idle
-    and the reaper would kill the prompt under a still-answerable card.
+    A pane parked on a permission prompt, or whose settled turn left a background
+    agent working, has no active turn, no ``running`` status, no attached client
+    and no output, so every other signal reads idle and the reaper would kill it.
     """
     # Bound by name when the app is built, so stub before building: no tmux here.
     monkeypatch.setattr(native_cost_popup, "_tmux_last_client_input_at", lambda *_args: None)
     monkeypatch.setattr(native_cost_popup, "_tmux_window_activity_at", lambda *_args: None)
     monkeypatch.setattr(claude_native_bridge, "_APPROVAL_WAIT_ROOT", tmp_path / "approval-waits")
     registry = TerminalRegistry()
+    resources = SessionResourceRegistry(terminal_registry=registry)
+    agent_sessions: set[str] = set()
+    monkeypatch.setattr(resources, "session_has_background_agents", agent_sessions.__contains__)
     app = create_runner_app(
         terminal_registry=registry,
-        resource_registry=SessionResourceRegistry(terminal_registry=registry),
+        resource_registry=resources,
         server_client=NullServerClient(),  # type: ignore[arg-type]
     )
     reaper = app.state.native_pane_reaper
@@ -242,11 +278,14 @@ async def test_runner_busy_check_spares_a_pane_parked_on_an_approval(
 
     assert not await reaper._is_busy(pane)
 
-    marker = claude_native_bridge.approval_wait_marker_path("conv_parked")
-    marker.parent.mkdir(parents=True)
-    claude_native_bridge.touch_approval_wait_marker(marker)
+    if live_work == "approval_wait":
+        marker = claude_native_bridge.approval_wait_marker_path("conv_parked")
+        marker.parent.mkdir(parents=True)
+        claude_native_bridge.touch_approval_wait_marker(marker)
+    else:
+        agent_sessions.add("conv_parked")
     assert await reaper._is_busy(pane)
-    # Another session's parked prompt does not spare this pane.
+    # Another session's live work does not spare this pane.
     other = PaneRef("conv_other", pane.terminal_id, "claude", pane.socket_path)
     assert not await reaper._is_busy(other)
 

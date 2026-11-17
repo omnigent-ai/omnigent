@@ -215,9 +215,10 @@ def test_stop_session_stops_hosted_side_chats(
         row = page.locator(f'li[data-sidebar-session-id="{parent_id}"]')
         if entrypoint == "mobile":
             page.set_viewport_size({"width": 390, "height": 844})
-            if not row.is_visible():
-                page.get_by_role("button", name="Open sidebar", exact=True).click()
+            page.get_by_role("button", name="Open sidebar", exact=True).click()
         if entrypoint == "mobile":
+            # Wait for the drawer transition before sampling raw touch coordinates.
+            row.click(trial=True)
             box = row.bounding_box()
             assert box is not None
             cdp = page.context.new_cdp_session(page)

@@ -3,15 +3,26 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import os
+import select
+import signal
 import subprocess
 import sys
 import time
+import tty
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 
-from omnigent.terminals.program_status import ProgramStatus, ProgramStatusParser, parse_report
+from omnigent.terminals.program_status import (
+    _REPLY,
+    _UNSENT_INPUT_LIMIT,
+    ProgramStatus,
+    ProgramStatusParser,
+    parse_report,
+)
 
 
 @pytest.mark.parametrize("ending", [b"\x07", b"\x1b\\"])
@@ -185,6 +196,205 @@ def test_relay_process_failure_cleanup(tmp_path: Path, failure: str) -> None:
                 assert process.returncode == (127 if failure == "missing" else 126), output
                 assert b"cannot exec" in output
             assert not state_file.exists()
+    finally:
+        os.close(master)
+        os.close(slave)
+
+
+@contextlib.contextmanager
+def _start_relay(
+    state_file: Path, command: list[str], stdin: int
+) -> Iterator[subprocess.Popen[bytes]]:
+    with subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "from omnigent.terminals.program_status import main; main()",
+            "--state-file",
+            str(state_file),
+            "--app",
+            "claude-code",
+            "--",
+            *command,
+        ],
+        stdin=stdin,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    ) as process:
+        try:
+            yield process
+        finally:
+            # A failed assertion must not leave Popen's exit waiting on a stuck relay.
+            if process.poll() is None:
+                process.kill()
+
+
+def _wait_for_file(path: Path, process: subprocess.Popen[bytes]) -> None:
+    deadline = time.monotonic() + 5
+    while not path.exists() and time.monotonic() < deadline:
+        assert process.poll() is None
+        time.sleep(0.01)
+    assert path.exists(), "child never became ready"
+
+
+def _write_until_stalled(master: int, data: bytes) -> int:
+    """Write until the relay stops draining its input for 0.5 s; return the bytes written."""
+    written = 0
+    stalled_since = time.monotonic()
+    fill_deadline = stalled_since + 10
+    while written < len(data) and time.monotonic() - stalled_since < 0.5:
+        assert time.monotonic() < fill_deadline, "relay kept accepting input"
+        try:
+            written += os.write(master, data[written : written + 4096])
+            stalled_since = time.monotonic()
+        except BlockingIOError:
+            time.sleep(0.05)
+    return written
+
+
+@pytest.mark.parametrize("child_on_stop", ["ignores", "exits"])
+def test_stop_signal_releases_relay_blocked_on_unread_input(
+    tmp_path: Path, child_on_stop: str
+) -> None:
+    """A raw-mode child that stops reading input cannot keep the relay and its PTY alive."""
+    state_file = tmp_path / "status.json"
+    ready = tmp_path / "ready"
+    ignore = ""
+    if child_on_stop == "ignores":
+        ignore = "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+    command = [
+        sys.executable,
+        "-c",
+        "import os,signal,time,tty; from pathlib import Path; "
+        f"{ignore}tty.setraw(0); "
+        f"ready = Path({str(ready)!r}); pending = ready.with_suffix('.tmp'); "
+        "pending.write_text(str(os.getpid())); pending.replace(ready); "
+        "time.sleep(30)",
+    ]
+    master, slave = os.openpty()
+    tty.setraw(slave)
+    os.set_blocking(master, False)
+    try:
+        with _start_relay(state_file, command, slave) as process:
+            _wait_for_file(ready, process)
+            child = int(ready.read_text())
+            flood = b"x" * (1 << 20)
+            assert _write_until_stalled(master, flood) < len(flood), "input never backed up"
+            process.send_signal(signal.SIGTERM)
+            try:
+                output, _ = process.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                with contextlib.suppress(ProcessLookupError):
+                    os.kill(child, signal.SIGKILL)
+                pytest.fail("relay stayed blocked after SIGTERM")
+            assert b"Traceback" not in output, output
+            # The relay mirrors the reaped child's status: SIGKILL after the grace period.
+            expected = signal.SIGKILL if child_on_stop == "ignores" else signal.SIGTERM
+            assert process.returncode == -expected, output
+            with pytest.raises(ProcessLookupError):
+                os.kill(child, 0)
+            assert not state_file.exists()
+    finally:
+        os.close(master)
+        os.close(slave)
+
+
+def test_backed_up_input_reaches_the_child_intact(tmp_path: Path) -> None:
+    """Input and a query reply queued while the child is not reading arrive once, in order."""
+    ready = tmp_path / "ready"
+    resume = tmp_path / "resume"
+    received = tmp_path / "received"
+    payload = bytes(range(256)) * 1024
+    child_script = (
+        "import os, time, tty\n"
+        "from pathlib import Path\n"
+        "tty.setraw(0)\n"
+        f"Path({str(ready)!r}).touch()\n"
+        f"while not Path({str(resume)!r}).exists():\n"
+        "    time.sleep(0.01)\n"
+        "os.write(1, b'\\x1b]7501;?\\x1b\\\\')\n"
+        "data = b''\n"
+        f"while len(data) < {len(payload) + len(_REPLY)}:\n"
+        "    data += os.read(0, 65536)\n"
+        f"Path({str(received)!r}).write_bytes(data)\n"
+    )
+    master, slave = os.openpty()
+    tty.setraw(slave)
+    os.set_blocking(master, False)
+    try:
+        with _start_relay(
+            tmp_path / "status.json", [sys.executable, "-c", child_script], slave
+        ) as process:
+            _wait_for_file(ready, process)
+            written = _write_until_stalled(master, payload)
+            assert written < len(payload), "input never backed up"
+            # The child queries while the relay still holds unsent input, then reads it all.
+            resume.touch()
+            deadline = time.monotonic() + 10
+            while written < len(payload):
+                assert time.monotonic() < deadline, "relay stopped forwarding input"
+                try:
+                    written += os.write(master, payload[written:])
+                except BlockingIOError:
+                    time.sleep(0.01)
+            output, _ = process.communicate(timeout=10)
+            assert process.returncode == 0, output
+        data = received.read_bytes()
+        assert data.count(_REPLY) == 1
+        assert data.replace(_REPLY, b"") == payload
+    finally:
+        os.close(master)
+        os.close(slave)
+
+
+def test_query_replies_stop_queueing_at_the_limit_and_resume(tmp_path: Path) -> None:
+    """Replies to a child that is not reading stop queueing at the limit, then resume."""
+    resume = tmp_path / "resume"
+    backlog = tmp_path / "backlog"
+    after = tmp_path / "after"
+    queries = 2 * _UNSENT_INPUT_LIMIT // len(_REPLY)
+    child_script = (
+        "import os, select, time, tty\n"
+        "from pathlib import Path\n"
+        "tty.setraw(0)\n"
+        f"flood = b'\\x1b]7501;?\\x1b\\\\' * {queries} + b'flooded'\n"
+        "while flood:\n"
+        "    flood = flood[os.write(1, flood) :]\n"
+        f"while not Path({str(resume)!r}).exists():\n"
+        "    time.sleep(0.01)\n"
+        "data = b''\n"
+        "while select.select([0], [], [], 1)[0]:\n"
+        "    data += os.read(0, 65536)\n"
+        f"Path({str(backlog)!r}).write_bytes(data)\n"
+        "os.write(1, b'\\x1b]7501;?\\x1b\\\\')\n"
+        "data = b''\n"
+        f"while len(data) < {len(_REPLY)}:\n"
+        f"    data += os.read(0, {len(_REPLY)} - len(data))\n"
+        f"Path({str(after)!r}).write_bytes(data)\n"
+    )
+    master, slave = os.openpty()
+    tty.setraw(slave)
+    try:
+        with _start_relay(
+            tmp_path / "status.json", [sys.executable, "-c", child_script], slave
+        ) as process:
+            assert process.stdout is not None
+            # The relay forwards this marker only after handling every earlier query.
+            output = b""
+            deadline = time.monotonic() + 10
+            while b"flooded" not in output:
+                assert time.monotonic() < deadline, output
+                if select.select([process.stdout], [], [], 0.1)[0]:
+                    output += os.read(process.stdout.fileno(), 65536)
+            resume.touch()
+            rest, _ = process.communicate(timeout=15)
+            assert process.returncode == 0, output + rest
+        drained = backlog.read_bytes()
+        replies = len(drained) // len(_REPLY)
+        assert drained == _REPLY * replies
+        assert _UNSENT_INPUT_LIMIT // len(_REPLY) <= replies < queries
+        assert after.read_bytes() == _REPLY
     finally:
         os.close(master)
         os.close(slave)

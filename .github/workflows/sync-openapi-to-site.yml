@@ -32,7 +32,7 @@ permissions:
 jobs:
   sync:
     name: Open sync PR on omnigent-site
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Skip cleanly on forks / installs where the App isn't configured,
     # rather than failing the token step with a confusing error.
     if: ${{ vars.OMNIGENT_BOT_APP_ID != '' }}

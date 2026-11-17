@@ -10,7 +10,7 @@
 import { useEffect, useRef, useState } from "react";
 import { RotateCw } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import type { ConnectProgress } from "@/pages/onboarding/ServerSelectorV2";
+import type { ConnectProgress, SetupResult } from "@/pages/onboarding/ServerSelectorV2";
 import { ConnectStatus } from "@/pages/onboarding/primitives";
 
 type Phase = "installing" | "running" | "ready" | "failed";
@@ -32,11 +32,11 @@ export function SetupTerminalStep({
   onCancelConnect,
 }: {
   /** Install the CLI first (when missing). Absent → skip straight to onRun. */
-  onInstallCli?: () => Promise<{ ok: boolean; error?: string }>;
+  onInstallCli?: () => Promise<SetupResult>;
   /** Subscribe to the installer's output lines; returns an unsubscribe. */
   onInstallLog?: (cb: (line: string) => void) => () => void;
   /** The main action after install: start the local server or connect. */
-  onRun: () => Promise<{ ok: boolean; error?: string }>;
+  onRun: () => Promise<SetupResult>;
   /** Subscribe to the run action's log lines (server boot); returns unsubscribe. */
   onSetupLog?: (cb: (line: string) => void) => () => void;
   onBack: () => void;
@@ -52,6 +52,7 @@ export function SetupTerminalStep({
 }) {
   const [phase, setPhase] = useState<Phase>(onInstallCli ? "installing" : "running");
   const [error, setError] = useState<string | undefined>();
+  const [errorAction, setErrorAction] = useState<string | undefined>();
   const [lines, setLines] = useState<string[]>([]);
   // Bump to re-run the sequence on retry.
   const [attempt, setAttempt] = useState(0);
@@ -98,6 +99,7 @@ export function SetupTerminalStep({
   useEffect(() => {
     let canceled = false;
     setError(undefined);
+    setErrorAction(undefined);
     setLines([]);
     (async () => {
       const install = onInstallCliRef.current;
@@ -115,7 +117,8 @@ export function SetupTerminalStep({
         if (canceled || !alive.current) return;
         if (!res.ok) {
           setPhase("failed");
-          setError(res.error ?? "Couldn't install the Omnigent CLI.");
+          setError(res.errorMessage ?? res.error ?? "Couldn't install the Omnigent CLI.");
+          setErrorAction(res.errorAction);
           return;
         }
         setLines([]);
@@ -126,7 +129,8 @@ export function SetupTerminalStep({
       if (result.ok) setPhase("ready");
       else {
         setPhase("failed");
-        setError(result.error);
+        setError(result.errorMessage ?? result.error);
+        setErrorAction(result.errorAction);
       }
     })();
     return () => {
@@ -196,12 +200,28 @@ export function SetupTerminalStep({
         )}
         {phase === "ready" && (
           <div className="text-[rgb(34,197,94)]">
-            <span className="select-none">✓</span> Server ready
+            <span className="select-none" aria-hidden="true">
+              ✓
+            </span>{" "}
+            Server ready
           </div>
         )}
         {phase === "failed" && (
-          <div className="text-destructive">
-            <span className="select-none">✕</span> {error ?? "Could not set up Omnigent."}
+          <div role="alert" className="space-y-1">
+            <div className="text-destructive">
+              <span className="select-none" aria-hidden="true">
+                ✕
+              </span>{" "}
+              {error ?? "Could not set up Omnigent."}
+            </div>
+            {errorAction && (
+              <div className="text-cyan-700 dark:text-cyan-300">
+                <span className="select-none" aria-hidden="true">
+                  →
+                </span>{" "}
+                {errorAction}
+              </div>
+            )}
           </div>
         )}
       </div>

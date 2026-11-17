@@ -204,22 +204,41 @@ describe("markSaved echo dedupe", () => {
 });
 
 // ---------------------------------------------------------------------------
-// reconcileServerContent — pre-write conflict check
+// beginServerCheck — pre-write conflict check
 // ---------------------------------------------------------------------------
 
-describe("reconcileServerContent", () => {
-  it("returns false when the fetched content matches the last-known server state", () => {
-    const { result } = renderSync({ content: "v1" });
-    let conflict = true;
+describe("beginServerCheck", () => {
+  function renderWithSetter(content: string) {
+    const setContentFn = vi.fn();
+    const setContentRef = { current: setContentFn };
+    const utils = renderHook(
+      (props: { content: string; path: string; isSettled: boolean }) =>
+        useMarkdownEditorSync({ ...props, onDirtyChange: undefined, setContentRef }),
+      { initialProps: { content, path: "/file.md", isSettled: true } },
+    );
+    const refresh = (next: string) =>
+      utils.rerender({ content: next, path: "/file.md", isSettled: true });
+    return { ...utils, setContentFn, refresh };
+  }
+
+  function check(
+    result: { current: ReturnType<typeof useMarkdownEditorSync> },
+    serverContent: string | null,
+  ) {
+    let outcome = "";
     act(() => {
-      conflict = result.current.reconcileServerContent("v1");
+      outcome = result.current.beginServerCheck()(serverContent);
     });
-    // Server is unchanged → no conflict → the caller may write.
-    expect(conflict).toBe(false);
+    return outcome;
+  }
+
+  it("lets the write proceed when the server still has the last-known content", () => {
+    const { result } = renderSync({ content: "v1" });
+    expect(check(result, "v1")).toBe("write");
     expect(result.current.hasExternalUpdate).toBe(false);
   });
 
-  it("returns false when the fetched content matches our own last save", () => {
+  it("lets the write proceed when the server has our own last save", () => {
     const { result } = renderSync({ content: "v1" });
     act(() => {
       result.current.setDirty(true);
@@ -227,45 +246,103 @@ describe("reconcileServerContent", () => {
     act(() => {
       result.current.markSaved("v2");
     });
-    let conflict = true;
-    // The server reflects exactly what we last wrote — not an external edit.
-    act(() => {
-      conflict = result.current.reconcileServerContent("v2");
-    });
-    expect(conflict).toBe(false);
+    expect(check(result, "v2")).toBe("write");
     expect(result.current.hasExternalUpdate).toBe(false);
   });
 
-  it("raises a conflict (returns true) when dirty and the server changed externally", () => {
+  it("lets the write proceed when the GET failed", () => {
     const { result } = renderSync({ content: "v1" });
     act(() => {
       result.current.setDirty(true);
     });
-    let conflict = false;
+    expect(check(result, null)).toBe("write");
+  });
+
+  it("raises a conflict when dirty and the server changed externally", () => {
+    const { result } = renderSync({ content: "v1" });
+    act(() => {
+      result.current.setDirty(true);
+    });
     // Agent wrote "agent" while the user has unsaved edits → must block the
     // clobbering write and surface Keep mine / Load latest.
-    act(() => {
-      conflict = result.current.reconcileServerContent("agent");
-    });
-    expect(conflict).toBe(true);
+    expect(check(result, "agent")).toBe("conflict");
     expect(result.current.hasExternalUpdate).toBe(true);
   });
 
-  it("adopts new content without conflict when the editor is clean", () => {
-    const setContentFn = vi.fn();
-    const setContentRef = { current: setContentFn };
-    const { result } = renderHook(
-      (props: { content: string; path: string; isSettled: boolean }) =>
-        useMarkdownEditorSync({ ...props, onDirtyChange: undefined, setContentRef }),
-      { initialProps: { content: "v1", path: "/file.md", isSettled: true } },
-    );
-    let conflict = true;
+  it("blocks the write when a refresh raised the conflict during the check", () => {
+    const { result, refresh } = renderWithSetter("v1");
     act(() => {
-      conflict = result.current.reconcileServerContent("v2");
+      result.current.setDirty(true);
     });
-    // Clean editor → nothing to conflict with → adopt the content in place.
-    expect(conflict).toBe(false);
-    expect(setContentFn).toHaveBeenCalledWith("v2");
+    const finish = result.current.beginServerCheck();
+    // A refresh lands the other writer's text while the save's GET is in flight.
+    refresh("theirs");
+    expect(result.current.hasExternalUpdate).toBe(true);
+    let outcome = "";
+    act(() => {
+      outcome = finish("theirs");
+    });
+    expect(outcome).toBe("conflict");
+
+    // Keep mine resolves it; the next check lets the user's save through.
+    act(() => {
+      result.current.dismissExternalUpdate();
+    });
+    expect(check(result, "theirs")).toBe("write");
+  });
+
+  it("keeps a refresh's newer update when an older check response arrives", () => {
+    const { result, refresh, setContentFn } = renderWithSetter("v1");
+    act(() => {
+      result.current.setDirty(true);
+    });
+    const finish = result.current.beginServerCheck();
+    // The check read "older"; before it answered, a refresh landed "newer".
+    refresh("newer");
+    let outcome = "";
+    act(() => {
+      outcome = finish("older");
+    });
+    expect(outcome).toBe("conflict");
+
+    // An unchanged refresh changes nothing; Load latest applies the newer text.
+    refresh("newer");
+    act(() => {
+      result.current.discardAndApplyExternal();
+    });
+    expect(setContentFn).toHaveBeenLastCalledWith("newer");
+  });
+
+  it("reports stale when a refresh applied newer content during the check", () => {
+    const { result, refresh, setContentFn } = renderWithSetter("v1");
+    act(() => {
+      result.current.setDirty(true);
+    });
+    const finish = result.current.beginServerCheck();
+    // Undone to clean, a refresh applies "newer" in place, then the user types.
+    act(() => {
+      result.current.setDirty(false);
+    });
+    refresh("newer");
+    expect(setContentFn).toHaveBeenLastCalledWith("newer");
+    act(() => {
+      result.current.setDirty(true);
+    });
+    let outcome = "";
+    act(() => {
+      outcome = finish("older");
+    });
+    // The older response is neither stashed nor written over the newer text.
+    expect(outcome).toBe("stale");
+    expect(result.current.hasExternalUpdate).toBe(false);
+    expect(check(result, "newer")).toBe("write");
+  });
+
+  it("leaves a clean editor to the refresh instead of applying the check's response", () => {
+    const { result, setContentFn } = renderWithSetter("v1");
+    // The response may be older than what a refresh shows next; nothing conflicts.
+    expect(check(result, "v2")).toBe("write");
+    expect(setContentFn).not.toHaveBeenCalled();
   });
 
   it("lets a 'Keep mine' overwrite through after acknowledging the conflict", () => {
@@ -273,10 +350,7 @@ describe("reconcileServerContent", () => {
     act(() => {
       result.current.setDirty(true);
     });
-    act(() => {
-      result.current.reconcileServerContent("agent");
-    });
-    expect(result.current.hasExternalUpdate).toBe(true);
+    expect(check(result, "agent")).toBe("conflict");
 
     // User clicks Keep mine.
     act(() => {
@@ -286,11 +360,7 @@ describe("reconcileServerContent", () => {
     // The next pre-write check sees the same (now acknowledged) server
     // content → no conflict → the overwrite proceeds. Proves the external
     // content was recorded as the known baseline.
-    let conflict = true;
-    act(() => {
-      conflict = result.current.reconcileServerContent("agent");
-    });
-    expect(conflict).toBe(false);
+    expect(check(result, "agent")).toBe("write");
   });
 });
 

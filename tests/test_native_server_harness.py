@@ -155,7 +155,9 @@ async def test_interrupt_swallows_abort_error() -> None:
 async def test_enqueue_injects_prompt() -> None:
     transport = _FakeTransport()
     assert await _harness(transport).enqueue_session_message("k", "steer") is True
-    assert transport.prompts == [("ses_1", NativePrompt(text="steer"))]
+    assert transport.prompts == [
+        ("ses_1", NativePrompt(text="steer", metadata={"delivery": "queue"}))
+    ]
 
 
 async def test_enqueue_empty_content_returns_false() -> None:

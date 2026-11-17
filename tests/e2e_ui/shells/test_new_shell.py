@@ -30,9 +30,13 @@ Five behaviors are covered:
 
 4. **Terminal view startup vs. stopped states.** A starting terminal-first
    session renders a passive "Starting up…" status with no actionable
-   control; a stopped one — PTY removed mid-session, or a genuine stop
-   followed by a hard reload inside the cold-boot window — renders the
-   stopped copy with an enabled Resume action and no startup status.
+   control. A stopped one offers Resume after automatic recovery fails,
+   or when its host cannot be reached.
+
+5. **A program's terminal queries are answered once.** tmux answers a query
+   such as the cursor position itself; the browser terminal must not answer
+   the copy control mode forwards, or the extra reply reaches the program as
+   typed input.
 
 All use the function-scoped ``terminal_session`` fixture (registers the
 ``zsh``-declaring agent and a runner-bound session), so each test gets an
@@ -50,8 +54,9 @@ from collections.abc import Callable
 from pathlib import Path
 
 import httpx
-from playwright.sync_api import Page, expect
+from playwright.sync_api import Page, Route, expect
 
+from tests._helpers.polling import poll_until
 from tests.e2e_ui.conftest import _server_state, open_right_rail
 
 
@@ -113,6 +118,50 @@ def test_new_shell_launches_and_opens(page: Page, terminal_session: tuple[str, s
     close_tab.click()
     page.get_by_role("button", name="Close shell").click()
     expect(terminal_view).to_have_count(0)
+
+
+def test_new_shell_attaches_while_create_in_flight(
+    page: Page, terminal_session: tuple[str, str]
+) -> None:
+    """A new shell's attach opens before its create returns, then carries output.
+
+    The create POST is held in the browser, so the attach (flagged
+    ``await_launch``) reaches the runner before the launch does; releasing
+    the POST must end with that same connection delivering the shell's output.
+    """
+    base_url, session_id = terminal_session
+    held: list[Route] = []
+    page.route(
+        re.compile(r"/v1/sessions/[^/]+/resources/terminals$"),
+        lambda route: held.append(route) if route.request.method == "POST" else route.continue_(),
+    )
+    page.goto(f"{base_url}/c/{session_id}")
+    expect(page.get_by_placeholder("Send a message…")).to_be_visible()
+
+    with page.expect_websocket(
+        lambda ws: "/resources/terminals/terminal_zsh_u-" in ws.url, timeout=30_000
+    ) as attach:
+        _open_new_shell(page)
+    assert "await_launch=true" in attach.value.url
+    frames: list[object] = []
+    attach.value.on("framereceived", lambda payload: frames.append(payload))
+    # Route handlers only run while Playwright waits, so wait through it.
+    deadline = time.monotonic() + 10
+    while not held and time.monotonic() < deadline:
+        page.wait_for_timeout(50)
+    assert len(held) == 1, "create POST never sent"
+    assert frames == [], "terminal output arrived before the shell was created"
+
+    held[0].continue_()
+    rail = page.get_by_role("complementary", name="Workspace")
+    expect(rail.get_by_test_id("terminal-view").last).to_have_attribute(
+        "data-state", "connected", timeout=20_000
+    )
+    # The early connection carries the shell's output once it exists.
+    deadline = time.monotonic() + 20
+    while not frames and time.monotonic() < deadline:
+        page.wait_for_timeout(50)
+    assert frames, "the early attach never received terminal output"
 
 
 def test_new_shell_accepts_typed_command(page: Page, terminal_session: tuple[str, str]) -> None:
@@ -341,14 +390,7 @@ def test_starting_terminal_view_shows_loading_without_resume(
 
 
 def test_stopped_terminal_view_keeps_resume(page: Page, terminal_session: tuple[str, str]) -> None:
-    """A genuinely stopped terminal-first session keeps its Resume action.
-
-    Mirror of the startup-gap test above — same offline modeling (empty PTY
-    inventory, runner down, live channels silenced) — but the session row
-    is OLDER than the 45s cold-boot grace, so nothing can read it as a
-    starting session: the stopped-session UI and its Resume action must
-    render, with no startup status.
-    """
+    """Failed automatic recovery leaves a stopped session's Resume action."""
     base_url, session_id = terminal_session
 
     # Outside the grace window (created an hour ago), runner down.
@@ -377,6 +419,18 @@ def test_stopped_terminal_view_keeps_resume(page: Page, terminal_session: tuple[
     # for why each is needed).
     page.route(f"**/v1/sessions/{session_id}/stream*", lambda route: route.abort())
     page.route_web_socket(re.compile(r"/v1/sessions/updates"), lambda ws: None)
+
+    retry_payloads = []
+
+    def _fail_retry(route):
+        payload = route.request.post_data_json
+        if payload.get("type") != "retry_session":
+            route.continue_()
+            return
+        retry_payloads.append(payload)
+        route.fulfill(status=503, json={"detail": "Terminal reconnect failed"})
+
+    page.route(f"**/v1/sessions/{session_id}/events", _fail_retry)
 
     # Every liveness carrier agrees: runner offline, created long past the
     # cold-boot grace.
@@ -415,11 +469,13 @@ def test_stopped_terminal_view_keeps_resume(page: Page, terminal_session: tuple[
 
     terminal_view = page.locator('[data-testid="main-terminal-view"][data-visible="true"]')
     expect(terminal_view).to_be_visible()
-    # The stopped-session UI renders — no startup status, and the Resume
-    # action is present and enabled.
+    expect(terminal_view.get_by_role("alert")).to_have_text(
+        "Couldn't reconnect the terminal automatically."
+    )
     expect(terminal_view).to_contain_text("The harness is not running.")
     expect(terminal_view.get_by_role("button", name="Resume session")).to_be_enabled()
     expect(terminal_view.get_by_role("status")).to_have_count(0)
+    assert retry_payloads == [{"type": "retry_session", "data": {}}]
 
 
 def test_failed_terminal_view_surfaces_runner_failure_cause(
@@ -470,6 +526,18 @@ def test_failed_terminal_view_surfaces_runner_failure_cause(
     page.route(f"**/v1/sessions/{session_id}/stream*", lambda route: route.abort())
     page.route_web_socket(re.compile(r"/v1/sessions/updates"), lambda ws: None)
 
+    retry_payloads = []
+
+    def _fail_retry(route):
+        payload = route.request.post_data_json
+        if payload.get("type") != "retry_session":
+            route.continue_()
+            return
+        retry_payloads.append(payload)
+        route.fulfill(status=503, json={"detail": "Terminal reconnect failed"})
+
+    page.route(f"**/v1/sessions/{session_id}/events", _fail_retry)
+
     def _patch_conversation_rows(route):
         resp = route.fetch()
         body = resp.json()
@@ -509,8 +577,12 @@ def test_failed_terminal_view_surfaces_runner_failure_cause(
 
     terminal_view = page.locator('[data-testid="main-terminal-view"][data-visible="true"]')
     expect(terminal_view).to_be_visible()
-    # Baseline: the failed session renders the generic stopped terminal state.
+    expect(terminal_view.get_by_role("alert")).to_have_text(
+        "Couldn't reconnect the terminal automatically."
+    )
     expect(terminal_view).to_contain_text("The harness is not running.")
+    expect(terminal_view.get_by_role("button", name="Resume session")).to_be_enabled()
+    assert retry_payloads == [{"type": "retry_session", "data": {}}]
 
     # The persisted failure cause must be visible, mirroring the Chat error pill.
     expect(terminal_view).to_contain_text("host authentication failed")
@@ -578,6 +650,50 @@ def test_shell_wheel_scroll_reaches_mouse_tracking_program(
         f"(log: {log.read_bytes()[:200]!r})"
         if log.exists()
         else "wheel log never created"
+    )
+
+
+_CURSOR_POSITION_REPORT = re.compile(rb"\x1b\[\d+;\d+R")
+
+
+def _cursor_position_reports(log: Path) -> int:
+    """Count the cursor position reports a shell program has read so far."""
+    return len(_CURSOR_POSITION_REPORT.findall(log.read_bytes())) if log.exists() else 0
+
+
+def test_shell_program_gets_one_reply_to_a_cursor_position_query(
+    page: Page, terminal_session: tuple[str, str], tmp_path: Path
+) -> None:
+    """A program's cursor position query gets exactly one answer.
+
+    PowerShell asks for the cursor position on every prompt. tmux answers, but
+    control mode also forwards the raw query to the browser's xterm, and a
+    second answer from there reaches the program as typed input: ``28;1R`` at
+    the prompt. Like the wheel test, a program writes the query from a raw tty
+    and records its stdin to an absolute ``tmp_path`` file. Which queries the
+    browser still answers is covered by ``TerminalQueryReplies.test.ts``.
+    """
+    base_url, session_id = terminal_session
+    log = tmp_path / "replies.log"
+
+    page.goto(f"{base_url}/c/{session_id}")
+    _open_new_shell(page)
+
+    terminal_view = page.get_by_test_id("terminal-view").last
+    expect(terminal_view).to_be_visible(timeout=60_000)
+    expect(terminal_view).to_have_attribute("data-state", "connected", timeout=20_000)
+
+    textarea = terminal_view.locator("textarea.xterm-helper-textarea")
+    textarea.focus()
+    page.keyboard.type(f"stty raw -echo; printf '\\e[6n'; cat > '{log}'")
+    page.keyboard.press("Enter")
+
+    poll_until(lambda: _cursor_position_reports(log) >= 1, timeout_s=15)
+    # A duplicate from the browser trails tmux's reply by a WebSocket round trip.
+    page.wait_for_timeout(1_500)  # custom-lint: disable=sleep-then-assert -- duplicate window
+    reports = _cursor_position_reports(log)
+    assert reports == 1, (
+        f"expected one cursor position report, got {reports} (log: {log.read_bytes()[:200]!r})"
     )
 
 

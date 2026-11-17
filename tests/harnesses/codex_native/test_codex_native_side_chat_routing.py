@@ -2,7 +2,7 @@
 
 Covers the two pure-ish seams that carry a user's follow-up turn into the side
 chat's Codex thread: the server redirect (`_forward_codex_side_chat_turn`) and
-the runner's message-text extraction (`_side_chat_text_from_content`).
+the runner's message-text extraction (`side_chat_text_from_content`).
 """
 
 from __future__ import annotations
@@ -16,7 +16,9 @@ _JsonObject = dict[str, Any]
 
 
 def test_side_chat_text_from_content_joins_text_blocks() -> None:
-    from omnigent.runner.app import _side_chat_text_from_content
+    from omnigent.harnesses.codex_native.side_chat import (
+        side_chat_text_from_content as _side_chat_text_from_content,
+    )
 
     assert _side_chat_text_from_content([{"type": "input_text", "text": "and why?"}]) == "and why?"
     assert (
@@ -29,7 +31,8 @@ def test_side_chat_text_from_content_joins_text_blocks() -> None:
         )
         == "a\nb"
     )
-    assert _side_chat_text_from_content("nope") == ""  # not a list
+    assert _side_chat_text_from_content("typed  ") == "typed"  # plain text is typed text
+    assert _side_chat_text_from_content(None) == ""
     assert _side_chat_text_from_content([]) == ""
 
 
@@ -60,6 +63,8 @@ async def test_forward_side_chat_turn_redirects_to_parent_with_thread_id() -> No
     conv = SimpleNamespace(
         parent_conversation_id="conv_parent",
         kind="sub_agent",
+        model_override=None,
+        reasoning_effort=None,
         labels={_CODEX_NATIVE_SUBAGENT_THREAD_ID_LABEL_KEY: "thread_side"},
     )
     body = SimpleNamespace(data={"content": [{"type": "input_text", "text": "and why?"}]})
@@ -73,6 +78,8 @@ async def test_forward_side_chat_turn_redirects_to_parent_with_thread_id() -> No
     assert "conv_parent" in url and url.endswith("/events")  # forwarded to the PARENT
     assert payload["codex_side_thread_id"] == "thread_side"  # tagged with the child thread
     assert payload["content"] == [{"type": "input_text", "text": "and why?"}]
+    assert "model_override" not in payload
+    assert "reasoning_effort" not in payload
 
 
 @pytest.mark.asyncio
@@ -128,6 +135,8 @@ async def test_forward_side_chat_turn_translates_runner_errors(
     conv = SimpleNamespace(
         parent_conversation_id="conv_parent",
         kind="sub_agent",
+        model_override=None,
+        reasoning_effort=None,
         labels={_CODEX_NATIVE_SUBAGENT_THREAD_ID_LABEL_KEY: "thread_side"},
     )
     body = SimpleNamespace(data={"content": [{"type": "input_text", "text": "hi"}]})

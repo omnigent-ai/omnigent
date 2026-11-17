@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from omnigent.entities.comment import Comment, CommentsFingerprint
+from omnigent.entities.comment import Comment, CommentsFingerprint, PullRequestCommentAnchor
 from omnigent.stores.comment_store import CommentStore
 from omnigent.tools.base import ToolContext
 from omnigent.tools.builtins.list_comments import ListCommentsTool
@@ -104,6 +104,12 @@ class _InMemoryCommentStore(CommentStore):
             if c.conversation_id == conversation_id and (path is None or c.path == path)
         ]
         return sorted(results, key=lambda c: c.created_at)
+
+    def list_page(
+        self, conversation_id: str, *, limit: int = 100, after_id: str | None = None
+    ) -> tuple[list[Comment], str | None]:
+        """The legacy tool does not use paginated reads."""
+        raise NotImplementedError
 
     def update_comment(
         self,
@@ -355,6 +361,15 @@ def test_returns_all_comments_for_session(
     """
     c1 = store.add("conv-123", "app.py", "Fix typo", 0, 10)
     c2 = store.add("conv-123", "util.py", "Rename variable", 50, 60)
+    pr_comment = store.add("conv-123", "app.py", "PR feedback", 0, 0)
+    pr_comment.anchor_metadata = PullRequestCommentAnchor(
+        pr_url="https://github.com/acme/app/pull/1",
+        side="LEFT",
+        line=9,
+        start_line=7,
+        head_sha="a" * 40,
+        base_sha="b" * 40,
+    )
     # Comment from a different session — must not appear.
     store.add("conv-OTHER", "app.py", "Other session comment", 0, 5)
 

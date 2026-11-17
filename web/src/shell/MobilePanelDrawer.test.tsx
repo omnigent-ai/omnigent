@@ -1,9 +1,19 @@
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
-import { MobilePanelDrawer } from "./MobilePanelDrawer";
+import { useState } from "react";
+import { createPortal } from "react-dom";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { MobilePanelDrawer, useMobilePanelHeaderTarget } from "./MobilePanelDrawer";
+
+const drawerError = new Error("Drawer component failed");
+
+function suppressDrawerError(event: ErrorEvent) {
+  if (event.error === drawerError) event.preventDefault();
+}
 
 afterEach(() => {
   cleanup();
+  window.removeEventListener("error", suppressDrawerError);
+  vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
 
@@ -30,15 +40,16 @@ function stubIOSKeyboard(): (keyboardHeight: number) => void {
 }
 
 function renderDrawer(props: Partial<Parameters<typeof MobilePanelDrawer>[0]> = {}) {
+  const { children = <div data-testid="drawer-body" />, ...drawerProps } = props;
   return render(
     <MobilePanelDrawer
       open
       title="Shells"
       onClose={() => {}}
       testId="shells-panel-drawer"
-      {...props}
+      {...drawerProps}
     >
-      <div data-testid="drawer-body" />
+      {children}
     </MobilePanelDrawer>,
   );
 }
@@ -132,5 +143,114 @@ describe("MobilePanelDrawer", () => {
     expect(drawer.style.paddingBottom).toBe("");
     setKeyboardHeight(300);
     expect(drawer.style.paddingBottom).toBe("");
+  });
+
+  it("preserves a kept-mounted child's draft and DOM when closed and reopened", () => {
+    function Draft() {
+      const [text, setText] = useState("");
+      return (
+        <textarea
+          aria-label="Side chat draft"
+          value={text}
+          onChange={(event) => setText(event.target.value)}
+        />
+      );
+    }
+    const { rerender } = renderDrawer({ keepMounted: true, children: <Draft /> });
+    const draft = screen.getByRole("textbox", { name: "Side chat draft" });
+    fireEvent.change(draft, { target: { value: "Unsent side chat" } });
+
+    rerender(
+      <MobilePanelDrawer open={false} title="Shells" onClose={() => {}} keepMounted>
+        <Draft />
+      </MobilePanelDrawer>,
+    );
+    expect(draft).toBeInTheDocument();
+    expect(draft).toHaveValue("Unsent side chat");
+
+    rerender(
+      <MobilePanelDrawer open title="Shells" onClose={() => {}} keepMounted>
+        <Draft />
+      </MobilePanelDrawer>,
+    );
+    expect(screen.getByRole("textbox", { name: "Side chat draft" })).toBe(draft);
+    expect(draft).toHaveValue("Unsent side chat");
+  });
+
+  describe("render failures", () => {
+    beforeEach(() => {
+      window.addEventListener("error", suppressDrawerError);
+      vi.spyOn(console, "error").mockImplementation(() => {});
+    });
+
+    it.each([false, true])(
+      "keeps the title and Close usable and recovers when the drawer reopens (keepMounted=%s)",
+      (keepMounted) => {
+        let broken = true;
+        function Panel() {
+          if (broken) throw drawerError;
+          return <p>Drawer recovered</p>;
+        }
+        function Drawer() {
+          const [open, setOpen] = useState(true);
+          return (
+            <>
+              <button type="button" onClick={() => setOpen(true)}>
+                Open drawer
+              </button>
+              <MobilePanelDrawer
+                open={open}
+                title="Shells"
+                onClose={() => setOpen(false)}
+                testId="drawer"
+                keepMounted={keepMounted}
+              >
+                <Panel />
+              </MobilePanelDrawer>
+            </>
+          );
+        }
+        render(<Drawer />);
+        expect(screen.getByRole("alert")).toHaveTextContent("Unable to display Shells.");
+        expect(screen.getByRole("heading", { name: "Shells" })).toBeInTheDocument();
+
+        fireEvent.click(screen.getByRole("button", { name: "Close" }));
+        expect(screen.getByTestId("drawer")).toHaveAttribute("data-state", "closed");
+        expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+
+        broken = false;
+        fireEvent.click(screen.getByRole("button", { name: "Open drawer" }));
+        expect(screen.getByText("Drawer recovered")).toBeInTheDocument();
+      },
+    );
+
+    it("contains failures portaled into the header and restores them on retry", () => {
+      let broken = true;
+      function HeaderAction() {
+        if (broken) throw drawerError;
+        return <button type="button">Panel action</button>;
+      }
+      function Panel() {
+        const header = useMobilePanelHeaderTarget();
+        return (
+          <>
+            {header?.actions && createPortal(<HeaderAction />, header.actions)}
+            <p>Drawer content</p>
+          </>
+        );
+      }
+      const onClose = vi.fn();
+      renderDrawer({ children: <Panel />, onClose });
+      expect(screen.getByRole("alert")).toHaveTextContent("Unable to display Shells.");
+      expect(screen.getByRole("heading", { name: "Shells" })).toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: "Close" }));
+      expect(onClose).toHaveBeenCalledOnce();
+
+      broken = false;
+      fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+      expect(screen.getByText("Drawer content")).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Panel action" })).toBeInTheDocument();
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    });
   });
 });

@@ -24,8 +24,9 @@ Platform notes that shape this launcher:
   after 15 idle minutes BY DEFAULT — fatal for a session host that may
   sit between turns — so :meth:`DaytonaSandboxLauncher.provision`
   disables auto-stop. Sandboxes then live until the session is deleted
-  or stopped out-of-band. Stopped and archived sandboxes wake in place;
-  the dead-sandbox relaunch path replaces one that was deleted.
+  or they are stopped, out-of-band or through
+  :meth:`DaytonaSandboxLauncher.stop`. Stopped and archived sandboxes wake
+  in place; the dead-sandbox relaunch path replaces one that was deleted.
 - **Workload env rides sandbox creation.** Daytona has no named-secret
   store to attach at create time; harness credentials are injected as
   literal ``env_vars``, resolved BY NAME from the server process
@@ -136,6 +137,27 @@ def _ensure_sdk() -> None:
         ) from exc
 
 
+def _unusable_state_error(
+    handle: DaytonaSandbox, sandbox_id: str, transition: str
+) -> click.ClickException:
+    """Explain why a sandbox's state blocks it from being ``transition`` (e.g. ``"stopped"``)."""
+    import daytona
+
+    if handle.state == daytona.SandboxState.DESTROYING:
+        return click.ClickException(
+            f"Daytona sandbox '{sandbox_id}' is being deleted; retry later."
+        )
+    if handle.state == daytona.SandboxState.DESTROYED:
+        return SandboxGoneError(f"Daytona sandbox '{sandbox_id}' no longer exists")
+    state = getattr(handle.state, "value", handle.state)
+    reason = getattr(handle, "error_reason", None)
+    reason_suffix = f": {reason}" if reason else ""
+    return click.ClickException(
+        f"Daytona sandbox '{sandbox_id}' is in state {state!r}{reason_suffix}; "
+        f"it cannot be safely {transition}."
+    )
+
+
 def _drive_foreground_pty(pty: PtyHandle, sandbox_id: str, command: str) -> int:
     """
     Drive a freshly-created PTY session through one foreground command.
@@ -186,8 +208,9 @@ class DaytonaSandboxLauncher(SandboxLauncher):
     commands (the Daytona toolbox runs them through a shell, with the
     two output streams merged into one result), ``sandbox.fs`` for
     file shipping, PTY sessions for the foreground attach, and
-    ``Daytona.create`` / ``delete`` for lifecycle. Handles are cached
-    per sandbox id to avoid a server round-trip on every primitive.
+    ``Daytona.create`` / ``delete`` plus ``Sandbox.start`` / ``stop`` for
+    lifecycle. Handles are cached per sandbox id to avoid a server
+    round-trip on every primitive.
     """
 
     provider: ClassVar[str] = "daytona"
@@ -424,19 +447,42 @@ class DaytonaSandboxLauncher(SandboxLauncher):
             click.echo(f"  → starting sandbox (state: {handle.state.value})")
             handle.start(timeout=_RESUME_TIMEOUT_S)
             return
-        if handle.state == daytona.SandboxState.DESTROYING:
-            raise click.ClickException(
-                f"Daytona sandbox '{sandbox_id}' is being deleted; retry later."
-            )
-        if handle.state == daytona.SandboxState.DESTROYED:
-            raise SandboxGoneError(f"Daytona sandbox '{sandbox_id}' no longer exists")
-        state = getattr(handle.state, "value", handle.state)
-        reason = getattr(handle, "error_reason", None)
-        reason_suffix = f": {reason}" if reason else ""
-        raise click.ClickException(
-            f"Daytona sandbox '{sandbox_id}' is in state {state!r}{reason_suffix}; "
-            "it cannot be safely resumed in place."
-        )
+        raise _unusable_state_error(handle, sandbox_id, "resumed in place")
+
+    def _stop_existing(self, handle: DaytonaSandbox, sandbox_id: str) -> None:
+        """Bring a persisted sandbox to a stopped state without deleting it."""
+        import daytona
+
+        if handle.state in {
+            daytona.SandboxState.STOPPED,
+            daytona.SandboxState.ARCHIVED,
+        }:
+            return
+        if handle.state == daytona.SandboxState.STOPPING:
+            click.echo("  → waiting for sandbox to stop")
+            # The SDK wait also returns once the sandbox is destroyed.
+            handle.wait_for_sandbox_stop(timeout=_RESUME_TIMEOUT_S)
+            self._stop_existing(handle, sandbox_id)
+            return
+        if handle.state == daytona.SandboxState.ARCHIVING:
+            click.echo("  → waiting for sandbox to archive")
+            self._wait_for_archive(handle, sandbox_id)
+            self._stop_existing(handle, sandbox_id)
+            return
+        if handle.state in {
+            daytona.SandboxState.STARTING,
+            daytona.SandboxState.RESTORING,
+        }:
+            # Daytona rejects a stop while a start is in flight.
+            click.echo(f"  → waiting for sandbox (state: {handle.state.value})")
+            handle.wait_for_sandbox_start(timeout=_RESUME_TIMEOUT_S)
+            self._stop_existing(handle, sandbox_id)
+            return
+        if handle.state == daytona.SandboxState.STARTED:
+            handle.stop(timeout=_RESUME_TIMEOUT_S)
+            self._stop_existing(handle, sandbox_id)
+            return
+        raise _unusable_state_error(handle, sandbox_id, "stopped")
 
     def attach(self, sandbox_id: str) -> None:
         """
@@ -486,6 +532,24 @@ class DaytonaSandboxLauncher(SandboxLauncher):
         except daytona.DaytonaError as exc:
             raise click.ClickException(
                 f"Could not resume Daytona sandbox '{sandbox_id}': {exc}"
+            ) from exc
+
+    def stop(self, sandbox_id: str) -> None:
+        """Stop a sandbox's compute and keep its filesystem for a later :meth:`resume`."""
+        _ensure_sdk()
+        import daytona
+
+        try:
+            handle = self._daytona().get(sandbox_id)
+            self._sandboxes[sandbox_id] = handle
+            click.echo(f"▸ Stopping Daytona sandbox '{sandbox_id}'")
+            self._stop_existing(handle, sandbox_id)
+        except daytona.DaytonaNotFoundError as exc:
+            self._sandboxes.pop(sandbox_id, None)
+            raise SandboxGoneError(f"Daytona sandbox '{sandbox_id}' no longer exists") from exc
+        except daytona.DaytonaError as exc:
+            raise click.ClickException(
+                f"Could not stop Daytona sandbox '{sandbox_id}': {exc}"
             ) from exc
 
     def keep_alive(self, sandbox_id: str) -> None:

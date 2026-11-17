@@ -25,6 +25,7 @@ from omnigent.server.routes._sessions import common
 from omnigent.server.routes.sessions import routes_events
 from omnigent.server.schemas import BackgroundTaskInfo, ErrorDetail
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+from omnigent.stores.conversation_store import SCHEDULED_TASK_RUN_LABEL_KEY
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
 from tests.debug_log_helpers import capture_debug_rows
@@ -77,8 +78,10 @@ async def status_route(
         common._session_active_response_cache[conv.id] = "resp_active"
         common._session_background_task_count_cache[conv.id] = 2
         common._session_background_tasks_cache[conv.id] = [_BACKGROUND_TASK]
+        run_id = uuid4().hex
+        store.set_labels(conv.id, {SCHEDULED_TASK_RUN_LABEL_KEY: run_id})
         scheduled.create_run(
-            run_id=uuid4().hex,
+            run_id=run_id,
             scheduled_task_id=task_id,
             status="running",
             scheduled_at=1000,
@@ -195,6 +198,21 @@ async def test_subagent_idle_publishes_status_without_completion(
 ) -> None:
     route = status_route
     sid = route.child_id if is_child else route.parent_id
+    # The run's agent has replied, so going idle ends its run.
+    reply = route.store.append(
+        sid,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_active",
+                data=MessageData(
+                    role="assistant",
+                    agent="claude-native",
+                    content=[{"type": "output_text", "text": "Done."}],
+                ),
+            )
+        ],
+    )
     response = await route.client.post(
         f"/v1/sessions/{sid}/events",
         json={"type": "subagent.status", "data": {"idle": True, **optional}},
@@ -209,7 +227,8 @@ async def test_subagent_idle_publishes_status_without_completion(
     assert common._session_background_tasks_cache.get(sid) == tasks
     conv = route.store.get_conversation(sid)
     assert conv is not None and conv.live_status == "idle"
-    assert route.store.list_items(sid).data == []
+    # The idle status writes no completion item of its own.
+    assert [item.id for item in route.store.list_items(sid).data] == [reply[0].id]
     runs, _ = route.scheduled.list_runs(route.task_id)
     run = next(run for run in runs if run.conversation_id == sid)
     assert run.status == "succeeded"
@@ -752,3 +771,30 @@ async def test_native_child_completes_once_per_confirmed_turn(
         assert all(item.data.event_type == "session.subagent.returned" for item in notices)
         assert all(item.data.resource_id == route.child_id for item in notices)
         assert all(item.data.resource["status"] == "completed" for item in notices)
+
+
+async def test_bare_external_failure_preserves_intake_presence_before_enrichment(
+    status_route: _StatusRoute,
+) -> None:
+    route = status_route
+    with capture_debug_rows("server") as rows:
+        response = await route.client.post(
+            f"/v1/sessions/{route.child_id}/events",
+            json={
+                "type": "external_session_status",
+                "data": {"status": "failed", "response_id": "synthetic:signals"},
+            },
+        )
+    assert response.status_code == 202, response.text
+    [failure] = [row for row in rows if row["event_name"] == "session_turn_failed"]
+    attributes = failure["attributes"]
+    assert attributes["failure_wire_error"] == "missing"
+    assert attributes["failure_wire_output"] == "missing"
+    assert attributes["failure_wire_context"] == "missing"
+    assert attributes["failure_connection_source"] == "bound_runner_at_intake"
+    assert attributes["failure_connection_state"] == "no_runner_binding"
+    assert attributes["detail_source"] == "missing"
+    assert attributes["response_id"] == "synthetic:signals"
+    assert attributes["active_response_id_at_failure"] == "resp_active"
+    assert route.store.get_conversation(route.child_id) is not None
+    assert common._session_status_cache[route.child_id] == "failed"

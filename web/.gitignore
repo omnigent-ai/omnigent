@@ -24,3 +24,6 @@ coverage
 *.njsproj
 *.sln
 *.sw?
+
+# Build lock the UI E2E fixture takes while building the web app
+.build.lock

@@ -74,6 +74,21 @@ describe("useRegistrySignIn", () => {
     expect(result.current.authorizing).toBeNull();
   });
 
+  it("cancels the sign-in in flight so its completion selects nothing", async () => {
+    const popup = pendingPopup();
+    const refresh = vi.fn().mockResolvedValue([{ ...tracker, connected: true }]);
+    const { result } = renderHook(() => useRegistrySignIn(refresh));
+    let pending!: Promise<boolean>;
+    act(() => {
+      pending = result.current.signIn(tracker);
+    });
+    act(() => result.current.cancel());
+    expect(popup.signals[0]!.aborted).toBe(true);
+    expect(result.current.authorizing).toBeNull();
+    await expect(pending).resolves.toBe(false);
+    expect(result.current.error).toBeNull();
+  });
+
   it("aborts the sign-in when the owner unmounts", () => {
     const popup = pendingPopup();
     const { result, unmount } = renderHook(() => useRegistrySignIn(vi.fn()));

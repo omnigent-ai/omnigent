@@ -45,26 +45,26 @@ import { Button } from "@/components/ui/button";
 import { RunningDot } from "@/components/RunningDot";
 import { shortModelName } from "@/components/CostRoutingControl";
 import { MAX_TREE_DEPTH, useChildSessions, type ChildSessionInfo } from "@/hooks/useChildSessions";
+import { useAgentCosts, type AgentCost, type AgentCosts } from "@/hooks/useAgentCosts";
 import { useSession } from "@/hooks/useSession";
 import { sessionNavigationSearch } from "@/lib/sessionNavigation";
 import type { SessionItem } from "@/lib/types";
 import { cn } from "@/lib/utils";
+import { useOpenSubagentInPanel } from "./subagentPanelOpener";
 
 const SubagentsGraphView = lazy(() =>
   import("./SubagentsGraphView").then((m) => ({ default: m.SubagentsGraphView })),
 );
 import {
-  ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER,
-  CODEX_NATIVE_SUBAGENT_WRAPPER,
+  nativeCodingAgentForSubagentWrapper,
   nativeCodingAgentForWrapper,
   WRAPPER_LABEL_KEY,
 } from "@/lib/nativeCodingAgents";
+import { AgentCostTag } from "./AgentCostTag";
 import { childPrimaryLabel } from "./subagentLabel";
 import { childStatus, type AgentActivity, type AgentStatus } from "./subagentStatus";
 import { AddAgentDialog } from "./AddAgentDialog";
 
-const CODEX_NATIVE_SUBAGENT_ROLE_LABEL = "omnigent.codex_native.agent_role";
-const ANTIGRAVITY_NATIVE_SUBAGENT_ROLE_LABEL = "omnigent.antigravity_native.agent_role";
 // Pi children are scaffold (no wrapper label); the spawn title's agent-type head (``tool``) is the signal.
 const PI_AGENT_NAME = "pi";
 type AgentRowIcon = ComponentType<SVGProps<SVGSVGElement>>;
@@ -84,6 +84,8 @@ type ViewMode = "list" | "graph";
 
 export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanelProps) {
   const { children, isLoading, error } = useChildSessions(rootSessionId);
+  // Loaded only with the session overview feature on.
+  const costs = useAgentCosts(rootSessionId).data ?? undefined;
   const [addOpen, setAddOpen] = useState(false);
   const [viewMode, setViewMode] = useState<ViewMode>("list");
   const [collapsedRows, setCollapsedRows] = useState<Record<string, boolean>>({});
@@ -125,7 +127,11 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
             </div>
           }
         >
-          <SubagentsGraphView conversationId={conversationId} rootSessionId={rootSessionId} />
+          <SubagentsGraphView
+            conversationId={conversationId}
+            rootSessionId={rootSessionId}
+            costs={costs}
+          />
         </Suspense>
       </div>
     );
@@ -144,7 +150,11 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
         Add agent
       </button>
       <ul className="relative flex min-h-0 flex-1 flex-col gap-px overflow-y-auto px-2 pb-2 pt-2">
-        <MainRow rootSessionId={rootSessionId} isActive={conversationId === rootSessionId} />
+        <MainRow
+          rootSessionId={rootSessionId}
+          isActive={conversationId === rootSessionId}
+          cost={costs?.get(rootSessionId)}
+        />
         {children.map((child, index) => (
           <SubagentRow
             key={child.id}
@@ -154,6 +164,7 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
             conversationId={conversationId}
             collapsedRows={collapsedRows}
             onToggleCollapsed={toggleCollapsedRow}
+            costs={costs}
           />
         ))}
       </ul>
@@ -253,11 +264,9 @@ export function iconForAgentType(tool: string | null): AgentRowIcon {
  * carries enough metadata. The shared harness-selector icon component uses
  * this identity to render the same color variant in the Agents panel.
  *
- * Only full native sessions get the harness glyph. *Sub-agent* wrapper
- * children (``…-subagent``) deliberately fall through to the role icons
- * (and the generic bot fallback) — a native session's sub-agents are all the
- * same brand, so repeating the logo down the tree says nothing, while
- * role icons distinguish what each one is doing.
+ * Both full native sessions and their native sub-agent children
+ * (``…-subagent`` wrappers) get the harness glyph, so every coding agent
+ * reads by the harness it runs on.
  *
  * @param child - One child-session summary from the poll or stream.
  * @returns The agent identity used by the harness selector, or ``null``.
@@ -266,7 +275,8 @@ function harnessAgentForChild(
   child: ChildSessionInfo,
 ): { name: string; harness: string | null } | null {
   const wrapper = child.labels?.[WRAPPER_LABEL_KEY];
-  const nativeAgent = nativeCodingAgentForWrapper(wrapper);
+  const nativeAgent =
+    nativeCodingAgentForWrapper(wrapper) ?? nativeCodingAgentForSubagentWrapper(wrapper);
   if (nativeAgent) {
     return { name: nativeAgent.agentName, harness: nativeAgent.harness };
   }
@@ -275,24 +285,6 @@ function harnessAgentForChild(
     return { name: "pi-native-ui", harness: "pi-native" };
   }
   return null;
-}
-
-/**
- * Resolve the semantic role that chooses a sub-agent's category icon.
- *
- * Native runtimes may give an instance a friendly nickname (for example,
- * Codex's "Archimedes") while carrying its functional role separately. The
- * nickname remains the row label; the role drives iconography.
- */
-function iconRoleForChild(child: ChildSessionInfo): string | null {
-  const wrapper = child.labels?.[WRAPPER_LABEL_KEY];
-  if (wrapper === CODEX_NATIVE_SUBAGENT_WRAPPER) {
-    return child.labels?.[CODEX_NATIVE_SUBAGENT_ROLE_LABEL] ?? child.tool;
-  }
-  if (wrapper === ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER) {
-    return child.labels?.[ANTIGRAVITY_NATIVE_SUBAGENT_ROLE_LABEL] ?? child.tool;
-  }
-  return child.tool;
 }
 
 const STATUS_AVATAR_CLASS: Record<AgentActivity, string> = {
@@ -395,7 +387,15 @@ function mainMessagePreview(items: SessionItem[] | undefined): string | null {
   return null;
 }
 
-function MainRow({ rootSessionId, isActive }: { rootSessionId: string; isActive: boolean }) {
+function MainRow({
+  rootSessionId,
+  isActive,
+  cost,
+}: {
+  rootSessionId: string;
+  isActive: boolean;
+  cost: AgentCost | undefined;
+}) {
   const { session } = useSession(rootSessionId);
   const search = sessionNavigationSearch(useLocation().search);
   // Same wrapper-label probe used by the sidebar (Sidebar.tsx) and
@@ -449,6 +449,7 @@ function MainRow({ rootSessionId, isActive }: { rootSessionId: string; isActive:
                 />
               </span>
               <span className="min-w-0 truncate text-base font-semibold">{label}</span>
+              <AgentCostTag cost={cost} className="ml-auto" />
             </div>
             {preview && (
               <p
@@ -489,6 +490,7 @@ function SubagentRow({
   conversationId,
   collapsedRows,
   onToggleCollapsed,
+  costs,
 }: {
   child: ChildSessionInfo;
   /** Levels below the root, 1 = direct child of "main". */
@@ -499,14 +501,16 @@ function SubagentRow({
   conversationId: string;
   collapsedRows: Record<string, boolean>;
   onToggleCollapsed: (id: string) => void;
+  costs: AgentCosts | undefined;
 }) {
   const collapsed = collapsedRows[child.id] ?? false;
   const status = childStatus(child);
   const search = sessionNavigationSearch(useLocation().search);
   const harnessAgent = harnessAgentForChild(child);
-  const RoleIcon = iconForAgentType(iconRoleForChild(child));
+  const RoleIcon = iconForAgentType(child.tool);
   const primary = childPrimaryLabel(child);
   const isActive = conversationId === child.id;
+  const openInPanel = useOpenSubagentInPanel();
   // De-emphasize settled rows (done/idle) so working/failed agents dominate
   // — but never the row the user is currently viewing.
   const dim = !isActive && SETTLED_STATE[status.activity];
@@ -570,6 +574,9 @@ function SubagentRow({
           to={{ pathname: `/c/${child.id}`, search }}
           data-testid="subagent-row"
           data-child-session-id={child.id}
+          onClick={(event) => {
+            openInPanel(child.id, event);
+          }}
           data-depth={depth}
           // Left gutter (depth-stepped) + connector glyph nests this row
           // under its parent, signaling where it sits in the tree.
@@ -628,6 +635,7 @@ function SubagentRow({
                     {shortModelName(child.routed_model)}
                   </span>
                 ) : null}
+                <AgentCostTag cost={costs?.get(child.id)} />
               </div>
               {child.last_message_preview && (
                 <p className="mt-0.5 truncate text-sm text-muted-foreground">
@@ -648,6 +656,7 @@ function SubagentRow({
             conversationId={conversationId}
             collapsedRows={collapsedRows}
             onToggleCollapsed={onToggleCollapsed}
+            costs={costs}
           />
         ))}
     </>

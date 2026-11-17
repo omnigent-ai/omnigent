@@ -52,6 +52,12 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from omnigent.errors import ErrorCode, HarnessTransportClosedError, OmnigentError
+from omnigent.inner.executor import (
+    LiveMcpHarnessNotRunning,
+    LiveMcpReconnectRefused,
+    LiveMcpServerStatus,
+    LiveMcpServerUnknown,
+)
 from omnigent.native import _native_forwarder_health as native_forwarder_health
 from omnigent.policies.types import FAIL_CLOSED_PHASES
 from omnigent.runtime.tool_output import cap_tool_output
@@ -842,6 +848,48 @@ class TurnContext:
                 policy_future.cancel()
 
 
+# Long enough for a harness's reason, short enough for one row of the /mcp panel.
+_LIVE_MCP_DETAIL_MAX_CHARS = 300
+
+
+def _live_mcp_body(statuses: list[LiveMcpServerStatus] | None) -> dict[str, Any]:
+    """The wire body for a harness's MCP connections; ``None`` means none are running."""
+    return {
+        "running": statuses is not None,
+        "servers": [
+            {
+                key: value
+                for key, value in (
+                    ("name", entry.name),
+                    ("status", entry.status),
+                    ("error", entry.error),
+                    ("scope", entry.scope),
+                )
+                if value is not None
+            }
+            for entry in statuses or []
+        ],
+    }
+
+
+async def _live_mcp_server_name(request: Request) -> str | None:
+    """The non-empty ``name`` string in a JSON request body, else ``None``."""
+    try:
+        body = await request.json()
+    except ValueError:
+        return None
+    name = body.get("name") if isinstance(body, dict) else None
+    return name if isinstance(name, str) and name.strip() else None
+
+
+def _live_mcp_detail(exc: BaseException) -> str:
+    return str(exc).strip()[:_LIVE_MCP_DETAIL_MAX_CHARS]
+
+
+def _live_mcp_failure(status_code: int, error: str) -> JSONResponse:
+    return JSONResponse({"error": error}, status_code=status_code)
+
+
 class HarnessApp:
     """
     Base class for harness wraps. Subclasses implement
@@ -917,6 +965,28 @@ class HarnessApp:
 
         The base implementation is a no-op.
         """
+
+    def supports_live_mcp_control(self) -> bool:
+        """Whether this harness reports and reconnects its own MCP connections."""
+        return False
+
+    async def live_mcp_statuses(self) -> list[LiveMcpServerStatus] | None:
+        """The harness's MCP connections, or ``None`` while it has none running.
+
+        Only called when :meth:`supports_live_mcp_control` is true.
+        """
+        raise NotImplementedError
+
+    async def reconnect_live_mcp_server(self, name: str) -> None:
+        """Reconnect one of the harness's MCP servers.
+
+        Only called when :meth:`supports_live_mcp_control` is true.
+
+        :raises LiveMcpHarnessNotRunning: The harness has no MCP connections running.
+        :raises LiveMcpServerUnknown: The harness reports no server named *name*.
+        :raises LiveMcpReconnectRefused: The harness tried and gave its reason.
+        """
+        raise NotImplementedError
 
     async def run_turn(self, request: CreateResponseRequest, ctx: TurnContext) -> None:
         """
@@ -1144,7 +1214,84 @@ class HarnessApp:
             # heterogeneous return type.
             response_model=None,
         )
+        router.add_api_route(
+            "/sessions/{conversation_id}/mcp-status",
+            self._get_live_mcp_status,
+            methods=["GET"],
+            response_model=None,
+        )
+        router.add_api_route(
+            "/sessions/{conversation_id}/mcp-reconnect",
+            self._post_live_mcp_reconnect,
+            methods=["POST"],
+            response_model=None,
+        )
         return router
+
+    def _live_mcp_request_error(self, request: Request, conversation_id: str) -> Response | None:
+        """Authorize a live-MCP request; refuse one this harness cannot answer."""
+        denied = self._check_auth(request)
+        if denied is not None:
+            return denied
+        self._check_conversation_id(request, conversation_id)
+        if not self.supports_live_mcp_control():
+            return JSONResponse(
+                {"error": "unsupported", "detail": "This harness does not report MCP status."},
+                status_code=status.HTTP_404_NOT_FOUND,
+            )
+        return None
+
+    async def _get_live_mcp_status(self, conversation_id: str, request: Request) -> Response:
+        """Handle ``GET /v1/sessions/{conversation_id}/mcp-status``."""
+        refused = self._live_mcp_request_error(request, conversation_id)
+        if refused is not None:
+            return refused
+        try:
+            statuses = await self.live_mcp_statuses()
+        except TimeoutError:
+            return _live_mcp_failure(status.HTTP_504_GATEWAY_TIMEOUT, "mcp_status_timeout")
+        except Exception:
+            _logger.warning("Reading live MCP status failed", exc_info=True)
+            return _live_mcp_failure(status.HTTP_502_BAD_GATEWAY, "mcp_status_failed")
+        return JSONResponse(_live_mcp_body(statuses))
+
+    async def _post_live_mcp_reconnect(self, conversation_id: str, request: Request) -> Response:
+        """Handle ``POST /v1/sessions/{conversation_id}/mcp-reconnect`` with ``{"name": ...}``.
+
+        Answers with the connections as they stand after the reconnect.
+        """
+        refused = self._live_mcp_request_error(request, conversation_id)
+        if refused is not None:
+            return refused
+        server_name = await _live_mcp_server_name(request)
+        if server_name is None:
+            return _live_mcp_failure(status.HTTP_400_BAD_REQUEST, "invalid_request")
+        reconnect_error: str | None = None
+        try:
+            await self.reconnect_live_mcp_server(server_name)
+        except LiveMcpHarnessNotRunning:
+            return _live_mcp_failure(status.HTTP_409_CONFLICT, "harness_not_running")
+        except LiveMcpServerUnknown:
+            return _live_mcp_failure(status.HTTP_404_NOT_FOUND, "mcp_server_unknown")
+        except TimeoutError:
+            return _live_mcp_failure(status.HTTP_504_GATEWAY_TIMEOUT, "mcp_reconnect_timeout")
+        except LiveMcpReconnectRefused as exc:
+            _logger.info("The harness refused to reconnect MCP server %r: %s", server_name, exc)
+            reconnect_error = _live_mcp_detail(exc) or "Reconnect failed."
+        except Exception:
+            # Other failures can carry internal detail, so only the log gets it.
+            _logger.warning("Reconnecting MCP server %r failed", server_name, exc_info=True)
+            return _live_mcp_failure(status.HTTP_502_BAD_GATEWAY, "mcp_reconnect_failed")
+        body: dict[str, Any]
+        try:
+            body = _live_mcp_body(await self.live_mcp_statuses())
+        except Exception:
+            _logger.warning("Reading live MCP status after reconnect failed", exc_info=True)
+            # The harness is still running; only its status could not be read.
+            body = {"running": True, "servers": [], "status_unavailable": True}
+        if reconnect_error is not None:
+            body["reconnect_error"] = reconnect_error
+        return JSONResponse(body)
 
     def _check_conversation_id(self, request: Request, conversation_id: str) -> None:
         """
@@ -1454,29 +1601,33 @@ class HarnessApp:
             HTTP response.
         """
         sequence = 0
-        for initial_event in self._initial_envelope_events(ctx, model=model, start_seq=sequence):
-            yield _format_sse_event(initial_event)
-            sequence += 1
-
-        run_task = asyncio.create_task(
-            self._guarded_run_turn(request, ctx),
-            name=f"harness-run-turn:{ctx.response_id}",
-        )
-        heartbeat_task = asyncio.create_task(
-            self._heartbeat_loop(ctx),
-            name=f"harness-heartbeat:{ctx.response_id}",
-        )
-        # Track the sequence_number of the last non-heartbeat
-        # event emitted on this stream so we can stamp the
-        # heartbeat's ``last_event_seq`` field at yield time.
-        # Per the contract (§Heartbeats), heartbeats carry the
-        # *previous* user-visible event's sequence number so
-        # consumers can detect dropped events. ``None`` until
-        # the first non-heartbeat event lands; the initial
-        # response.created / response.in_progress envelope
-        # events count, so this populates immediately.
-        last_event_seq: int | None = sequence - 1 if sequence > 0 else None
+        run_task: asyncio.Task[None] | None = None
+        heartbeat_task: asyncio.Task[None] | None = None
         try:
+            for initial_event in self._initial_envelope_events(
+                ctx, model=model, start_seq=sequence
+            ):
+                yield _format_sse_event(initial_event)
+                sequence += 1
+
+            run_task = asyncio.create_task(
+                self._guarded_run_turn(request, ctx),
+                name=f"harness-run-turn:{ctx.response_id}",
+            )
+            heartbeat_task = asyncio.create_task(
+                self._heartbeat_loop(ctx),
+                name=f"harness-heartbeat:{ctx.response_id}",
+            )
+            # Track the sequence_number of the last non-heartbeat
+            # event emitted on this stream so we can stamp the
+            # heartbeat's ``last_event_seq`` field at yield time.
+            # Per the contract (§Heartbeats), heartbeats carry the
+            # *previous* user-visible event's sequence number so
+            # consumers can detect dropped events. ``None`` until
+            # the first non-heartbeat event lands; the initial
+            # response.created / response.in_progress envelope
+            # events count, so this populates immediately.
+            last_event_seq: int | None = sequence - 1 if sequence > 0 else None
             while True:
                 event = await ctx._event_queue.get()
                 if event is None:
@@ -1510,7 +1661,8 @@ class HarnessApp:
             yield _format_sse_event(terminal)
         finally:
             await self._teardown_turn(ctx, run_task, heartbeat_task)
-            _freeze_gc_if_armed(run_task, ctx)
+            if run_task is not None:
+                _freeze_gc_if_armed(run_task, ctx)
 
     def _initial_envelope_events(
         self, ctx: TurnContext, model: str, start_seq: int
@@ -1559,8 +1711,8 @@ class HarnessApp:
     async def _teardown_turn(
         self,
         ctx: TurnContext,
-        run_task: asyncio.Task[None],
-        heartbeat_task: asyncio.Task[None],
+        run_task: asyncio.Task[None] | None,
+        heartbeat_task: asyncio.Task[None] | None,
     ) -> None:
         """
         Cancel the heartbeat + (defensively) the run task, then
@@ -1572,16 +1724,15 @@ class HarnessApp:
 
         :param ctx: The per-turn context (used for the response_id
             registry key).
-        :param run_task: The completed (or to-be-cancelled)
-            run_turn task.
-        :param heartbeat_task: The heartbeat emitter task; always
-            still running at this point (it loops forever) and
-            needs explicit cancellation.
+        :param run_task: The completed (or to-be-cancelled) run_turn task,
+            or ``None`` if the stream closed during its initial envelope.
+        :param heartbeat_task: The heartbeat emitter task, if started.
         """
-        heartbeat_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await heartbeat_task
-        if not run_task.done():
+        if heartbeat_task is not None:
+            heartbeat_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await heartbeat_task
+        if run_task is not None and not run_task.done():
             # Defensive: run_turn might still be parked on a
             # Future the cleanup didn't release. Cancel here as a
             # last resort so the task doesn't leak.

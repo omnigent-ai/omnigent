@@ -56,7 +56,7 @@ def test_timeout(dialog_request: dict, expected: float | None) -> None:
         ({"method": "input"}, [], "Input", True),
         (
             {"method": "editor", "prefill": "one\ntwo"},
-            [{"label": "Keep as-is", "preview": "one\ntwo"}],
+            [],
             "Editor",
             True,
         ),
@@ -77,6 +77,11 @@ def test_question_schema(
             "multiSelect": False,
             "isOther": is_other,
             **({"header": header} if header else {}),
+            **(
+                {"textInput": {"default": "one\ntwo"}}
+                if dialog_request["method"] == "editor"
+                else {}
+            ),
         }
     ]
 
@@ -111,7 +116,10 @@ def test_confirm_answer(action: str | None, confirmed: bool) -> None:
         ("select", "accept", {"0": ["", "Unlisted"]}, {"cancelled": True}),
         ("select", "decline", None, {"cancelled": True}),
         ("input", "accept", {"0": "hello world"}, {"value": "hello world"}),
-        ("editor", "accept", {"0": "Keep as-is"}, {"value": "one\ntwo"}),
+        ("editor", "accept", {"0": "Keep as-is"}, {"value": "Keep as-is"}),
+        ("editor", "accept", {"0": ""}, {"value": ""}),
+        ("editor", "accept", {"0": "  one\ntwo\n"}, {"value": "  one\ntwo\n"}),
+        ("editor", "decline", None, {"cancelled": True}),
     ],
 )
 def test_text_answer(method: str, action: str, content: dict | None, expected: dict) -> None:

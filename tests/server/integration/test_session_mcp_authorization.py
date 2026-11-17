@@ -360,3 +360,32 @@ async def test_bundle_replacement_requires_owner(
     assert await _download_bundle(client, session_id) == (
         mcp_edit if level == LEVEL_OWNER else expected
     )
+
+
+@pytest.mark.parametrize("level", _LEVELS)
+async def test_live_mcp_reads_need_read_and_reconnects_need_edit(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    level: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Readers may see live MCP status; reconnecting a running harness needs edit access."""
+    from omnigent.server.routes import session_mcp_servers
+
+    forwarded: list[str] = []
+
+    async def runner_request(_router: object, _session_id: str, method: str, path: str, **_: Any):
+        forwarded.append(method)
+        return httpx.Response(200, json={"running": True, "servers": []})
+
+    monkeypatch.setattr(session_mcp_servers, "_live_mcp_runner_request", runner_request)
+    session_id, headers = await _create_session(client, db_uri, _bundle(), level)
+    url = f"/v1/sessions/{session_id}/live-mcp-servers"
+
+    status = await client.get(url, headers=headers)
+    assert status.status_code == 200, status.text
+    reconnect = await client.post(f"{url}/reconnect", headers=headers, json={"name": "service"})
+    assert reconnect.status_code == (403 if level == LEVEL_READ else 200), reconnect.text
+    assert forwarded == (["GET"] if level == LEVEL_READ else ["GET", "POST"])
+    outsider = await client.get(url, headers={"X-Forwarded-Email": "outsider@example.com"})
+    assert outsider.status_code in (403, 404), outsider.text

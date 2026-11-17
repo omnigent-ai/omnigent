@@ -57,6 +57,20 @@ def is_native_harness(harness: str | None) -> bool:
     return (canonicalize_harness(harness) or harness) in NATIVE_HARNESSES
 
 
+def harness_account_key(harness: str | None) -> str | None:
+    """Return the account-metadata family shared by a harness and its aliases."""
+    canonical = canonicalize_harness(harness)
+    if canonical in {"claude", "claude-sdk", "claude-native"}:
+        return "claude"
+    if canonical in {"codex", "codex-native"}:
+        return "codex"
+    if canonical in {"pi", "pi-native"}:
+        return "pi"
+    if canonical in {"opencode", "opencode-native"}:
+        return "opencode"
+    return None
+
+
 def native_terminal_name(harness: str | None) -> str | None:
     """Return the tmux terminal short-name a native harness runs its CLI in.
 

@@ -28,8 +28,10 @@ Lifecycle contract:
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+
+from omnigent.runtime.tool_call_deadline import pause_tool_call_deadline
 
 # Default wait budget for a UI verdict, in seconds. Held at one day
 # (86400s) — matching the deciding policy's default ``ask_timeout``: an ASK
@@ -65,10 +67,13 @@ class Verdict:
     :param content: The resolver's ``content`` map, or ``None`` when the
         verdict carried none (a bare approve/reject card, a decline, or a
         timeout).
+    :param timed_out: ``True`` when nobody answered before the wait expired,
+        as opposed to a decline.
     """
 
     approved: bool
     content: ElicitContent | None = None
+    timed_out: bool = False
 
 
 # Module-global registry: elicitation_id → asyncio.Future[Verdict].
@@ -99,13 +104,18 @@ _server_reconnect_waiters: set[asyncio.Future[int]] = set()
 # ``omnigent/runner/app.py``.
 _session_pending: dict[str, int] = {}
 
+# Waits that outlived the tool call that asked: they park no turn, so
+# ``_session_pending`` leaves them out, across reconnect re-registrations too.
+_detached: set[str] = set()
+
 
 def has_pending(conversation_id: str) -> bool:
     """
     Whether *conversation_id* currently has an outstanding ASK verdict.
 
     ``True`` between :func:`wait_for_user_approval` parking and its exit
-    (verdict, decline, timeout, or cancellation). Lets callers treat a
+    (verdict, decline, timeout, or cancellation), unless the wait was
+    :func:`detach`-ed from its tool call. Lets callers treat a
     session as "awaiting human approval" without threading the
     elicitation id around.
 
@@ -113,6 +123,29 @@ def has_pending(conversation_id: str) -> bool:
     :returns: ``True`` when at least one approval is parked for the session.
     """
     return _session_pending.get(conversation_id, 0) > 0
+
+
+def _release_session_pending(conversation_id: str) -> None:
+    remaining = _session_pending.get(conversation_id, 0) - 1
+    if remaining > 0:
+        _session_pending[conversation_id] = remaining
+    else:
+        _session_pending.pop(conversation_id, None)
+
+
+def detach(elicitation_id: str, conversation_id: str) -> None:
+    """
+    Stop counting a parked wait in :func:`has_pending` once its tool call returned.
+
+    The wait keeps its Future, so a later verdict still resolves it.
+
+    :param elicitation_id: The parked wait's correlation id, e.g. ``"elicit_abc123"``.
+    :param conversation_id: The session the wait was counted for.
+    """
+    if elicitation_id not in _pending or elicitation_id in _detached:
+        return
+    _detached.add(elicitation_id)
+    _release_session_pending(conversation_id)
 
 
 def has_any_pending() -> bool:
@@ -250,6 +283,8 @@ async def wait_for_user_verdict(
     publish_event: Callable[[str, dict[str, object]], None],
     timeout_seconds: float | None = None,
     retry_on_server_reconnect: bool = False,
+    keep_pending_on_reconnect: bool = False,
+    on_registered: Callable[[], Awaitable[None]] | None = None,
 ) -> Verdict:
     """
     Park on a registered Future until the user delivers a verdict.
@@ -284,6 +319,9 @@ async def wait_for_user_verdict(
     :param retry_on_server_reconnect: Wake with :class:`ServerReconnected`
         after a tunnel reconnect so the caller can recreate server-owned
         approval state.
+    :param keep_pending_on_reconnect: Retain a question that the caller re-registers
+        with the same ID; a delayed resolution would clear its replacement.
+    :param on_registered: Publish a question only after its answer can be delivered.
     :returns: The user's :class:`Verdict`. Declines and timeouts
         carry ``approved=False`` and no content.
     """
@@ -295,34 +333,41 @@ async def wait_for_user_verdict(
     # Mark the session as awaiting approval for the lifetime of this park
     # so ``has_pending`` reports it. Decremented in ``finally`` on every
     # exit path (verdict, timeout, cancellation) so the flag never leaks.
-    _session_pending[conversation_id] = _session_pending.get(conversation_id, 0) + 1
+    counted = elicitation_id not in _detached
+    if counted:
+        _session_pending[conversation_id] = _session_pending.get(conversation_id, 0) + 1
     answered = False
+    reconnecting = False
     try:
-        verdict = await asyncio.wait_for(fut, timeout=effective_timeout)
+        with pause_tool_call_deadline(effective_timeout):
+            if on_registered is not None:
+                await on_registered()
+            verdict = await asyncio.wait_for(fut, timeout=effective_timeout)
         answered = True
     except TimeoutError:
-        verdict = Verdict(approved=False)
+        verdict = Verdict(approved=False, timed_out=True)
+    except ServerReconnected:
+        reconnecting = True
+        raise
     finally:
         cleanup(elicitation_id)
-        _remaining = _session_pending.get(conversation_id, 0) - 1
-        if _remaining > 0:
-            _session_pending[conversation_id] = _remaining
-        else:
-            _session_pending.pop(conversation_id, None)
-        # Signal the Omnigent server's pending-elicitations index that
-        # this prompt is done. Idempotent on the happy path (the
-        # AP-side dispatch already cleared the entry); on timeout
-        # / cancellation this event is the ONLY signal the server
-        # gets, so it must fire on every exit path.
-        resolved: dict[str, object] = {
-            "type": "response.elicitation_resolved",
-            "elicitation_id": elicitation_id,
-        }
-        if not answered:
-            # Nobody decided anything: let the card say the prompt expired
-            # rather than render the neutral "Resolved elsewhere" pill.
-            resolved["reason"] = "unanswered"
-        publish_event(conversation_id, resolved)
+        if not fut.done():
+            fut.cancel()
+        elif not fut.cancelled():
+            fut.exception()
+        # A detach during this park already released its count.
+        if counted and elicitation_id not in _detached:
+            _release_session_pending(conversation_id)
+        # Timeout and cancellation still clear the prompt; re-registration is not an answer.
+        if not (reconnecting and keep_pending_on_reconnect):
+            _detached.discard(elicitation_id)
+            resolved: dict[str, object] = {
+                "type": "response.elicitation_resolved",
+                "elicitation_id": elicitation_id,
+            }
+            if not answered:
+                resolved["reason"] = "unanswered"
+            publish_event(conversation_id, resolved)
     return verdict
 
 
@@ -363,6 +408,7 @@ def reset_for_tests() -> None:
     _pending.clear()
     _retry_on_server_reconnect.clear()
     _session_pending.clear()
+    _detached.clear()
     for waiter in tuple(_server_reconnect_waiters):
         waiter.cancel()
     _server_reconnect_waiters.clear()

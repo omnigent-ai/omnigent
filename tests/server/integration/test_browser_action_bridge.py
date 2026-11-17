@@ -250,6 +250,14 @@ async def test_claim_unknown_action_returns_not_claimed(client: httpx.AsyncClien
 # ── result-route guards ──────────────────────────────────────────
 
 
+@pytest.fixture
+def _keep_action_claimable(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Guard tests need an accepted claim, independent of CI scheduling latency.
+    # The unclaimed-renderer test below owns the claim deadline contract.
+    monkeypatch.setattr(sessions_routes, "_BROWSER_ACTION_CLAIM_GRACE_S", None)
+
+
+@pytest.mark.usefixtures("_keep_action_claimable")
 async def test_result_without_token_rejected(client: httpx.AsyncClient) -> None:
     """A result with no claim_token is rejected (403); Future stays parked."""
     agent = await create_test_agent(client, "test-browser-no-token")
@@ -259,7 +267,9 @@ async def test_result_without_token_rejected(client: httpx.AsyncClient) -> None:
     try:
         # Claim first so a token EXISTS — proving it's the *missing body*
         # token, not the absence of any claim, that triggers the 403.
-        await client.post(f"/v1/sessions/{session_id}/browser/action_claim/{action_id}")
+        claim = await client.post(f"/v1/sessions/{session_id}/browser/action_claim/{action_id}")
+        assert claim.status_code == 200, claim.text
+        assert claim.json()["claimed"] is True
         resp = await client.post(
             f"/v1/sessions/{session_id}/browser/action_result/{action_id}",
             json={"result": {"ok": True}},
@@ -274,6 +284,7 @@ async def test_result_without_token_rejected(client: httpx.AsyncClient) -> None:
         await asyncio.gather(request_task, return_exceptions=True)
 
 
+@pytest.mark.usefixtures("_keep_action_claimable")
 async def test_result_wrong_token_rejected(client: httpx.AsyncClient) -> None:
     """A result with a mismatched claim_token is rejected (403)."""
     agent = await create_test_agent(client, "test-browser-wrong-token")
@@ -281,7 +292,9 @@ async def test_result_wrong_token_rejected(client: httpx.AsyncClient) -> None:
     request_task, action_id = await _park_action_request(client, session_id)
 
     try:
-        await client.post(f"/v1/sessions/{session_id}/browser/action_claim/{action_id}")
+        claim = await client.post(f"/v1/sessions/{session_id}/browser/action_claim/{action_id}")
+        assert claim.status_code == 200, claim.text
+        assert claim.json()["claimed"] is True
         resp = await client.post(
             f"/v1/sessions/{session_id}/browser/action_result/{action_id}",
             json={"result": {"ok": True}, "claim_token": "not_the_real_token"},
@@ -296,6 +309,7 @@ async def test_result_wrong_token_rejected(client: httpx.AsyncClient) -> None:
         await asyncio.gather(request_task, return_exceptions=True)
 
 
+@pytest.mark.usefixtures("_keep_action_claimable")
 async def test_result_wrong_session_rejected(client: httpx.AsyncClient) -> None:
     """
     A result delivered under a DIFFERENT session is rejected even with a

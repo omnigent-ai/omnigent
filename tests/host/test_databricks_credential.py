@@ -6,6 +6,10 @@ import configparser
 import json
 import os
 import stat
+import subprocess
+import sys
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import httpx
@@ -13,6 +17,7 @@ import pytest
 
 from omnigent.host import databricks_credential as dc
 from omnigent.host.identity import HOST_TOKEN_ENV_VAR
+from tests._helpers.polling import poll_until
 
 
 class _Resp:
@@ -34,6 +39,25 @@ def _isolate(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv(HOST_TOKEN_ENV_VAR, "host-tok")
     monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(tmp_path / ".databrickscfg"))
     monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+
+
+@pytest.fixture
+def _credential_env(tmp_path: Path) -> dict[str, str]:
+    source = Path(__file__).resolve().parents[2]
+    credential_home = tmp_path / "home"
+    credential_home.mkdir()
+    return {
+        "HOME": str(credential_home),
+        "PYTHONPATH": os.pathsep.join(
+            str(source / entry) for entry in (".", "sdks/python-client", "sdks/ui")
+        ),
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "IS_SANDBOX": "1",
+        HOST_TOKEN_ENV_VAR: "host-tok",
+        "DATABRICKS_CONFIG_FILE": str(tmp_path / ".databrickscfg"),
+        "OMNIGENT_CONFIG_HOME": str(tmp_path / "config"),
+        "OMNIGENT_DATA_DIR": str(tmp_path / "data"),
+    }
 
 
 def _patch_get(monkeypatch: pytest.MonkeyPatch, resp_or_exc) -> dict:
@@ -86,19 +110,192 @@ def test_bearer_is_never_persisted_to_disk(
     assert "dbx-tok" not in (tmp_path / dc._SIDECAR_NAME).read_text()
 
 
+@pytest.mark.parametrize("failure", [None, "write", "replace"])
+@pytest.mark.parametrize("existing", [False, True], ids=["initial", "reconfigure"])
 def test_sidecar_records_broker_coords_privately(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    failure: str | None,
+    existing: bool,
 ) -> None:
-    _connected(monkeypatch)
-    assert dc.configure_host_databricks("https://omni.example", "host-1") is True
+    seen = _connected(monkeypatch)
     sidecar = tmp_path / dc._SIDECAR_NAME
-    assert json.loads(sidecar.read_text()) == {
+    original = {
         "server": "https://omni.example",
         "host_id": "host-1",
         "host_token": "host-tok",
         "workspace_host": "https://ws.example",
     }
-    assert stat.S_IMODE(os.stat(sidecar).st_mode) == 0o600
+    if existing:
+        assert dc.configure_host_databricks("https://omni.example", "host-1") is True
+        assert json.loads(sidecar.read_text()) == original
+        assert stat.S_IMODE(os.stat(sidecar).st_mode) == 0o600
+    capsys.readouterr()
+    reads: list[tuple[int, str, str | None]] = []
+    dump = json.dump
+
+    def read_helper() -> None:
+        seen.clear()
+        status = dc.main(["token", "--workspace", "https://ws.example"])
+        reads.append(
+            (
+                status,
+                capsys.readouterr().out,
+                seen.get("headers", {}).get("X-Omnigent-Host-Token"),
+            )
+        )
+
+    def interrupted_dump(payload, handle) -> None:
+        assert stat.S_IMODE(os.fstat(handle.fileno()).st_mode) == 0o600
+        read_helper()
+        handle.write('{"server":')
+        handle.flush()
+        read_helper()
+        if failure == "write":
+            raise OSError("sidecar write interrupted")
+        handle.seek(0)
+        handle.truncate()
+        dump(payload, handle)
+
+    def fail_replace(*_args) -> None:
+        raise OSError("sidecar replacement interrupted")
+
+    monkeypatch.setattr(dc.json, "dump", interrupted_dump)
+    if failure == "replace":
+        monkeypatch.setattr(dc.os, "replace", fail_replace)
+    monkeypatch.setenv(HOST_TOKEN_ENV_VAR, "replacement-host-tok")
+    assert dc.configure_host_databricks("https://omni.example", "host-1") is (failure is None)
+    capsys.readouterr()
+    read_helper()
+
+    before = (0, "dbx-tok\n", "host-tok") if existing else (0, "", None)
+    expected_token = ("host-tok" if existing else None) if failure else "replacement-host-tok"
+    assert reads == [
+        before,
+        before,
+        (0, "dbx-tok\n" if expected_token else "", expected_token),
+    ]
+    if expected_token:
+        assert json.loads(sidecar.read_text()) == {**original, "host_token": expected_token}
+        assert stat.S_IMODE(os.stat(sidecar).st_mode) == 0o600
+    else:
+        assert not sidecar.exists()
+    expected_files = [".databrickscfg"] + ([dc._SIDECAR_NAME] if expected_token else [])
+    assert sorted(path.name for path in tmp_path.iterdir()) == expected_files
+
+
+def test_cli_reads_complete_sidecar_during_host_reconfiguration(
+    tmp_path: Path, _credential_env: dict[str, str]
+) -> None:
+    """A separate CLI reader sees old coordinates until the writer publishes new ones."""
+    workspace = "https://workspace.example.test"
+    received: list[tuple[str, str | None]] = []
+
+    class BrokerHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            identity = self.headers.get("X-Omnigent-Host-Token")
+            received.append((self.path, identity))
+            body = json.dumps(
+                {"connected": True, "token": f"bearer-{identity}", "workspace_host": workspace}
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, _format: str, *_args: object) -> None:
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), BrokerHandler)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    writer = None
+    sidecar = tmp_path / dc._SIDECAR_NAME
+    writing = tmp_path / "writing"
+    writer_code = """
+import os
+import sys
+from pathlib import Path
+from omnigent.host import databricks_credential as dc
+from omnigent.host.identity import HOST_TOKEN_ENV_VAR
+
+server, marker = sys.argv[1:]
+assert dc.configure_host_databricks(server, "host")
+original_dump = dc.json.dump
+def paused_dump(payload, handle):
+    handle.write('{"server":')
+    handle.flush()
+    Path(marker).touch()
+    assert sys.stdin.readline() == "publish\\n"
+    handle.seek(0)
+    handle.truncate()
+    original_dump(payload, handle)
+dc.json.dump = paused_dump
+os.environ[HOST_TOKEN_ENV_VAR] = "new-host-tok"
+assert dc.configure_host_databricks(server, "host")
+"""
+
+    def read_token() -> str:
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "omnigent.host.databricks_credential",
+                "token",
+                "--coords",
+                str(sidecar),
+                "--workspace",
+                workspace,
+            ],
+            env=_credential_env,
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert result.returncode == 0, result.stderr
+        return result.stdout.strip()
+
+    try:
+        writer = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                writer_code,
+                f"http://127.0.0.1:{server.server_port}",
+                str(writing),
+            ],
+            env=_credential_env,
+            cwd=tmp_path,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        poll_until(
+            lambda: writing.exists() or writer.poll() is not None, timeout_s=10, interval_s=0.02
+        )
+        assert writer.poll() is None, writer.communicate(timeout=1)
+        assert read_token() == "bearer-host-tok"
+        _, stderr = writer.communicate("publish\n", timeout=10)
+        assert writer.returncode == 0, stderr
+        assert read_token() == "bearer-new-host-tok"
+        assert stat.S_IMODE(sidecar.stat().st_mode) == 0o600
+        assert "bearer-" not in sidecar.read_text()
+        assert not list(tmp_path.glob(f".{dc._SIDECAR_NAME}.*"))
+        assert received == [
+            ("/v1/hosts/host/credentials/databricks", identity)
+            for identity in ("host-tok", "new-host-tok", "host-tok", "new-host-tok")
+        ]
+    finally:
+        if writer is not None and writer.poll() is None:
+            writer.kill()
+            writer.communicate(timeout=5)
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=2)
+        assert not server_thread.is_alive()
 
 
 def test_preserves_existing_profiles(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -357,3 +554,183 @@ def test_api_key_auth_precludes_broker(monkeypatch: pytest.MonkeyPatch) -> None:
     # A spec-level DatabricksAuth is authoritative and is not a key, so the broker
     # still runs even when a global key exists.
     assert dc.api_key_auth_precludes_broker(dbx_spec) is False
+
+
+def _scripted_get(monkeypatch: pytest.MonkeyPatch, steps: list) -> list[int]:
+    """Serve *steps* in order (exceptions raised, responses returned); return call count."""
+    calls: list[int] = []
+
+    def fake_get(url: str, headers: dict, timeout: float):
+        calls.append(1)
+        step = steps.pop(0)
+        if isinstance(step, Exception):
+            raise step
+        return step
+
+    monkeypatch.setattr(dc.httpx, "get", fake_get)
+    return calls
+
+
+_BEARER_OK = _Resp(
+    200, {"connected": True, "token": "dbx-tok", "workspace_host": "https://ws.example/"}
+)
+
+
+def test_main_retries_transient_broker_failures(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A connection blip or 503 must not empty the bearer and fail the turn."""
+    _connected(monkeypatch)
+    assert dc.configure_host_databricks("https://omni.example", "h") is True
+    capsys.readouterr()  # discard configure-time log output
+    monkeypatch.setattr(dc, "_RETRY_BACKOFF_S", (0.0, 0.0))
+    calls = _scripted_get(monkeypatch, [httpx.ConnectError("reset"), _Resp(503, None), _BEARER_OK])
+    assert dc.main(["token"]) == 0
+    assert capsys.readouterr().out.strip() == "dbx-tok"
+    assert len(calls) == 3
+
+
+def test_main_gives_up_after_retries_are_exhausted(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _connected(monkeypatch)
+    assert dc.configure_host_databricks("https://omni.example", "h") is True
+    capsys.readouterr()
+    monkeypatch.setattr(dc, "_RETRY_BACKOFF_S", (0.0, 0.0))
+    calls = _scripted_get(
+        monkeypatch, [httpx.ConnectError("down"), httpx.ReadTimeout("slow"), _Resp(500, None)]
+    )
+    assert dc.main(["token"]) == 0
+    assert capsys.readouterr().out == ""
+    assert len(calls) == 3
+
+
+def test_main_retries_stay_within_one_timeout_budget(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A slow broker gets no extra attempts past the single-attempt timeout."""
+    _connected(monkeypatch)
+    assert dc.configure_host_databricks("https://omni.example", "h") is True
+    capsys.readouterr()
+    clock = [0.0]
+    monkeypatch.setattr(dc.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(dc.time, "sleep", lambda s: clock.__setitem__(0, clock[0] + s))
+    timeouts: list[float] = []
+
+    def slow_get(url: str, headers: dict, timeout: float):
+        timeouts.append(timeout)
+        clock[0] += timeout
+        raise httpx.ReadTimeout("slow")
+
+    monkeypatch.setattr(dc.httpx, "get", slow_get)
+    assert dc.main(["token"]) == 0
+    assert capsys.readouterr().out == ""
+    assert timeouts == [dc._TIMEOUT_S]
+
+
+def test_main_treats_a_non_transport_http_error_as_final(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _connected(monkeypatch)
+    assert dc.configure_host_databricks("https://omni.example", "h") is True
+    capsys.readouterr()
+    monkeypatch.setattr(dc, "_RETRY_BACKOFF_S", (0.0, 0.0))
+    calls = _scripted_get(monkeypatch, [httpx.TooManyRedirects("loop")])
+    assert dc.main(["token"]) == 0
+    assert capsys.readouterr().out == ""
+    assert len(calls) == 1
+
+
+def test_main_does_not_retry_a_rejected_launch_token(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A 401/403 is permanent, so it is answered once rather than retried."""
+    _connected(monkeypatch)
+    assert dc.configure_host_databricks("https://omni.example", "h") is True
+    capsys.readouterr()
+    monkeypatch.setattr(dc, "_RETRY_BACKOFF_S", (0.0, 0.0))
+    calls = _scripted_get(monkeypatch, [_Resp(401, None)])
+    assert dc.main(["token"]) == 0
+    assert capsys.readouterr().out == ""
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("initial_status", "expected_requests", "expected_output"),
+    [(503, 2, "synthetic-bearer\n"), (401, 1, "")],
+    ids=["transient-outage", "rejected-credential"],
+)
+def test_token_cli_retries_outage_but_preserves_rejection(
+    tmp_path: Path,
+    _credential_env: dict[str, str],
+    initial_status: int,
+    expected_requests: int,
+    expected_output: str,
+) -> None:
+    """Cross real CLI/TCP boundaries with production retry policy and synthetic credentials."""
+    workspace = "https://workspace.example.test"
+    received: list[tuple[str, str | None]] = []
+
+    class BrokerHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            received.append((self.path, self.headers.get("X-Omnigent-Host-Token")))
+            status = initial_status if len(received) == 1 else 200
+            payload = (
+                {"connected": True, "token": "synthetic-bearer", "workspace_host": workspace}
+                if status == 200
+                else {"error": "synthetic broker failure"}
+            )
+            body = json.dumps(payload).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, _format: str, *_args: object) -> None:
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), BrokerHandler)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    try:
+        sidecar = tmp_path / dc._SIDECAR_NAME
+        sidecar.write_text(
+            json.dumps(
+                {
+                    "server": f"http://127.0.0.1:{server.server_port}",
+                    "host_id": "synthetic-host",
+                    "host_token": "synthetic-launch-token",
+                    "workspace_host": workspace,
+                }
+            )
+        )
+        sidecar.chmod(0o600)
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "omnigent.host.databricks_credential",
+                "token",
+                "--coords",
+                str(sidecar),
+                "--workspace",
+                workspace,
+            ],
+            cwd=tmp_path,
+            env=_credential_env,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        assert result.returncode == 0, result.stderr
+        assert (
+            received
+            == [("/v1/hosts/synthetic-host/credentials/databricks", "synthetic-launch-token")]
+            * expected_requests
+        )
+        assert result.stdout == expected_output
+    finally:
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=5)

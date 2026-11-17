@@ -167,10 +167,12 @@ async def test_snapshot_can_skip_usage_without_exposing_parent_only_cost(
     load_usage.assert_not_called()
 
 
-async def test_pi_launch_restores_only_own_tokens_without_loading_display_usage(
+@pytest.mark.parametrize("complete", [True, False, None])
+async def test_pi_launch_restores_only_own_usage_without_loading_display_usage(
     usage_app: _UsageApp,
     usage_client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    complete: bool | None,
 ) -> None:
     """Real HTTP snapshot and runner decoding exclude the parent's children."""
     monkeypatch.setattr(orchestration, "_resolve_harness", lambda *_args, **_kwargs: "pi-native")
@@ -181,20 +183,35 @@ async def test_pi_launch_restores_only_own_tokens_without_loading_display_usage(
     )
     usage_app.conversations.set_session_usage(
         usage_app.parent_id,
-        {"input_tokens": 100, "output_tokens": 20, "cache_read_input_tokens": 30},
+        {
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "cache_read_input_tokens": 30,
+            "total_cost_usd": 0.25,
+            "native_cost_complete": complete,
+        },
     )
     usage_app.conversations.set_session_usage(
         usage_app.child_id,
-        {"input_tokens": 9000, "output_tokens": 8000, "cache_read_input_tokens": 7000},
+        {
+            "input_tokens": 9000,
+            "output_tokens": 8000,
+            "cache_read_input_tokens": 7000,
+            "total_cost_usd": 99.5,
+        },
     )
     launch = await _pi_native_launch_config(
         session_id=usage_app.parent_id, server_client=usage_client
     )
-    assert launch.native_usage_baseline == {
+    expected = {
         "cumulative_input_tokens": 130,
         "cumulative_output_tokens": 20,
         "cumulative_cache_read_input_tokens": 30,
     }
+
+    if complete is True:
+        expected["cumulative_cost_usd"] = 0.25
+    assert launch.native_usage_baseline == expected
 
 
 async def test_real_codex_launch_config_does_not_load_usage(

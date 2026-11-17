@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from dataclasses import dataclass
 from typing import Any
 
@@ -584,9 +585,19 @@ async def test_call_tool_minus_32000_returns_json_error_not_raises() -> None:
         }
     )
     transport = _StubTransport([rpc_error])
-    manager = _make_manager(transport)
 
-    output = await manager.call_tool(_make_spec("github"), "github__push", {})
+    def unexpected_reattach() -> httpx.AsyncClient:
+        raise AssertionError("Application errors must not open a reattachment connection")
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap-server") as client:
+        manager = ProxyMcpManager(
+            "conv_test",
+            client,
+            execution_registry=McpExecutionRegistry(),
+            reattach_client_factory=unexpected_reattach,
+        )
+        output = await manager.call_tool(_make_spec("github"), "github__push", {})
+    assert len(transport.calls) == 1
 
     parsed = json.loads(output)
     assert parsed == {"error": "Policy DENIED: push to main blocked"}, (
@@ -655,6 +666,104 @@ async def test_call_tool_network_error_raises() -> None:
     assert "conv_test" in error_msg, "Session id must appear in the error message"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("request_id", ["00000000-0000-4000-8000-000000000001", "private-header"])
+async def test_call_tool_http_failure_keeps_operation_evidence_without_replaying(
+    caplog: pytest.LogCaptureFixture, request_id: str
+) -> None:
+    response = httpx.Response(
+        504,
+        text="private-response-body",
+        headers={"x-request-id": request_id, "authorization": "private-credential"},
+    )
+    transport = _StubTransport([response])
+    manager = _make_manager(transport)
+
+    with caplog.at_level(logging.WARNING), pytest.raises(RuntimeError, match="504"):
+        await manager.call_tool(None, "sys_os_shell", {"command": "private-shell-command"})
+
+    assert len(transport.calls) == 1
+    [record] = [
+        r for r in caplog.records if getattr(r, "event_name", None) == "mcp_proxy_call_failed"
+    ]
+    attrs = record.attributes
+    assert attrs["operation_id"] == transport.calls[0].body["params"][MCP_OPERATION_ID_PARAM]
+    assert attrs["jsonrpc_request_id"] == 1
+    assert attrs["failure_phase"] == "http_status"
+    assert attrs["http_status"] == 504
+    assert attrs["exception_type"] == "HTTPStatusError"
+    assert attrs["proxy_route"] == "session"
+    assert attrs["phase_elapsed_ms"] >= 0
+    assert attrs.get("upstream_request_id") == (
+        request_id if request_id != "private-header" else None
+    )
+    assert "private-" not in record.getMessage() + json.dumps(attrs)
+
+
+@pytest.mark.asyncio
+async def test_call_tool_failed_diagnostics_preserves_original_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.runner import proxy_mcp_manager
+
+    def broken_sink(*args: Any, **kwargs: Any) -> None:
+        raise ValueError("logging unavailable")
+
+    monkeypatch.setattr(proxy_mcp_manager._logger, "warning", broken_sink)
+    transport = _StubTransport([httpx.Response(504)])
+    manager = _make_manager(transport)
+
+    with pytest.raises(RuntimeError, match="504") as failure:
+        await manager.call_tool(None, "sys_os_shell", {})
+
+    assert isinstance(failure.value.__cause__, httpx.HTTPStatusError)
+    assert len(transport.calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retained", [True, False])
+async def test_call_tool_server_reattach_failure_keeps_operation_evidence(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, retained: bool
+) -> None:
+    from omnigent.runner import proxy_mcp_manager
+
+    monkeypatch.setattr(proxy_mcp_manager, "_SERVER_RECONNECT_WAIT_S", 0.0)
+    request_id = "00000000-0000-4000-8000-000000000001"
+    response = _json_resp({"error": {"code": RUNNER_MCP_EXECUTION_DETACHED_CODE}})
+    response.headers["x-request-id"] = request_id
+    transport = _StubTransport([response])
+    registry = McpExecutionRegistry() if retained else None
+    pending_approvals.reset_for_tests()
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://ap-server") as client:
+            manager = ProxyMcpManager(
+                session_id="conv_test", ap_client=client, execution_registry=registry
+            )
+            expected = "no replacement" if retained else "without a reserved"
+            with caplog.at_level(logging.WARNING), pytest.raises(RuntimeError, match=expected):
+                await manager.call_tool(None, "sys_os_write", {"content": "private-file-content"})
+    finally:
+        pending_approvals.reset_for_tests()
+
+    assert len(transport.calls) == 1
+    [record] = [
+        r for r in caplog.records if getattr(r, "event_name", None) == "mcp_proxy_call_failed"
+    ]
+    attrs = record.attributes
+    assert attrs["operation_id"] == transport.calls[0].body["params"][MCP_OPERATION_ID_PARAM]
+    assert attrs["failure_phase"] == "server_reattach"
+    assert attrs["exception_type"] == ("TimeoutError" if retained else "none")
+    assert attrs["reattach_trigger"] == "detached_response"
+    assert attrs["http_status"] == 200
+    assert attrs["upstream_request_id"] == request_id
+    assert attrs["operation_retained"] is retained
+    assert attrs["server_generation"] == attrs["observed_server_generation"] == 0
+    assert attrs["phase_elapsed_ms"] >= 0
+    assert "private-" not in record.getMessage() + json.dumps(attrs)
+    if registry is not None:
+        assert not registry.has_operation("conv_test", attrs["operation_id"])
+
+
 # ── dispatch timeout nesting ────────────────────────────────────────────────
 
 
@@ -713,3 +822,147 @@ async def test_call_tool_uses_configured_read_timeout() -> None:
         "otherwise call_tool may regress to httpx's shorter default."
     )
     assert timeout["connect"] == 10.0, "Connect timeout stays short to fail fast on a dead server"
+
+
+@pytest.mark.asyncio
+async def test_reattach_uses_new_connection_without_disrupting_shared_requests() -> None:
+    """A retained tool survives a replica change while an old HTTP socket stays live."""
+    from contextlib import suppress
+
+    from omnigent.cli_auth import open_server_client
+
+    registry = McpExecutionRegistry()
+    pending_approvals.reset_for_tests()
+    moved = False
+    started = asyncio.Event()
+    detached = asyncio.Event()
+    reattached = asyncio.Event()
+    release_tool = asyncio.Event()
+    unrelated_started = asyncio.Event()
+    release_unrelated = asyncio.Event()
+    calls: list[tuple[str, dict[str, Any]]] = []
+    executions = 0
+    work: list[asyncio.Task[McpExecutionResult]] = []
+    handlers: set[asyncio.Task[None]] = set()
+
+    async def retained_tool() -> McpExecutionResult:
+        nonlocal executions
+        executions += 1
+        started.set()
+        await release_tool.wait()
+        return McpExecutionResult(status_code=200, content={"result": {"output": "done"}})
+
+    async def serve(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        replica = "B" if moved else "A"
+        task = asyncio.current_task()
+        assert task is not None
+        handlers.add(task)
+        try:
+            while True:
+                head = await reader.readuntil(b"\r\n\r\n")
+                request_line, *lines = head.decode().split("\r\n")
+                headers = dict(line.lower().split(": ", 1) for line in lines if line)
+                body = await reader.readexactly(int(headers.get("content-length", "0")))
+                assert headers["x-routing-fixture"] == "preserved"
+                assert headers["authorization"] == "bearer local-fixture"
+                if request_line.startswith("GET /unrelated "):
+                    unrelated_started.set()
+                    await release_unrelated.wait()
+                    response: dict[str, Any] = {"unrelated": "done"}
+                else:
+                    payload = json.loads(body)
+                    calls.append((replica, payload))
+                    operation_id = payload["params"][MCP_OPERATION_ID_PARAM]
+                    if replica == "A" and len(calls) > 1:
+                        response = {"error": {"code": -32000, "message": "No runner bound"}}
+                    else:
+                        execution = asyncio.create_task(
+                            registry.execute(
+                                session_id="conv_test",
+                                operation_id=operation_id,
+                                step="initial",
+                                params={"name": "fixture__gated", "arguments": {}},
+                                run=retained_tool,
+                            )
+                        )
+                        work.append(execution)
+                        await started.wait()
+                        if replica == "A":
+                            response = {
+                                "error": {
+                                    "code": RUNNER_MCP_EXECUTION_DETACHED_CODE,
+                                    "message": "Runner MCP execution detached.",
+                                }
+                            }
+                            detached.set()
+                        else:
+                            reattached.set()
+                            await execution
+                            response = {"result": {"content": [{"type": "text", "text": "done"}]}}
+                encoded = json.dumps(response).encode()
+                writer.write(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
+                    + str(len(encoded)).encode()
+                    + b"\r\n\r\n"
+                    + encoded
+                )
+                await writer.drain()
+        except (asyncio.IncompleteReadError, ConnectionError):
+            pass
+        finally:
+            writer.close()
+            await writer.wait_closed()
+            handlers.discard(task)
+
+    server = await asyncio.start_server(serve, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+
+    def client_factory() -> httpx.AsyncClient:
+        return open_server_client(
+            f"http://127.0.0.1:{port}",
+            bearer_token="local-fixture",
+            headers={"X-Routing-Fixture": "preserved"},
+        )
+
+    tool_task: asyncio.Task[str] | None = None
+    unrelated: asyncio.Task[httpx.Response] | None = None
+    try:
+        async with client_factory() as client:
+            manager = ProxyMcpManager(
+                "conv_test",
+                client,
+                execution_registry=registry,
+                reattach_client_factory=client_factory,
+            )
+            unrelated = asyncio.create_task(client.get("/unrelated"))
+            await asyncio.wait_for(unrelated_started.wait(), 2)
+            tool_task = asyncio.create_task(manager.call_tool(None, "fixture__gated", {}))
+            await asyncio.wait_for(detached.wait(), 2)
+            moved = True
+            pending_approvals.notify_server_reconnect()
+            await asyncio.wait_for(reattached.wait(), 2)
+            assert not tool_task.done()
+            assert not unrelated.done()
+            assert executions == 1
+            release_unrelated.set()
+            assert (await asyncio.wait_for(unrelated, 2)).json() == {"unrelated": "done"}
+            release_tool.set()
+            assert await asyncio.wait_for(tool_task, 2) == "done"
+            assert [replica for replica, _ in calls] == ["A", "B"]
+            assert calls[0][1]["params"] == calls[1][1]["params"]
+            assert [payload["id"] for _, payload in calls] == [1, 2]
+            assert executions == 1
+    finally:
+        release_tool.set()
+        release_unrelated.set()
+        for pending in [tool_task, unrelated, *work]:
+            if pending is not None:
+                pending.cancel()
+                with suppress(asyncio.CancelledError):
+                    await pending
+        server.close()
+        await server.wait_closed()
+        for handler in list(handlers):
+            handler.cancel()
+        await asyncio.gather(*handlers, return_exceptions=True)
+        pending_approvals.reset_for_tests()

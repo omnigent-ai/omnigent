@@ -289,11 +289,6 @@ def _spawn_host_daemon(
     # "Failed to auto-create opencode terminal" signature lands) is
     # discoverable under <data_dir>/logs/runner/.
     env["OMNIGENT_DATA_DIR"] = str(data_dir)
-    # The daemon gates opencode-native launches on an available provider
-    # credential (opencode_auth_summary().has_provider). Terminal auto-create
-    # never calls the LLM, so a placeholder env key is enough to un-gate the
-    # launch without granting anything.
-    env.setdefault("OPENAI_API_KEY", "sk-e2e-placeholder")
     # Put the functional opencode first: readiness gating and the runner's
     # `opencode serve` launch must not hit a broken wrapper shim.
     if _OPENCODE_BIN_DIR:

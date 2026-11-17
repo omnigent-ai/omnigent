@@ -14,8 +14,6 @@ FIRE_AND_FORGET_METHODS: frozenset[str] = frozenset(
 POLICY_NAME = "pi_native_extension_ui"
 PHASE = "pi_extension_ui"
 
-_KEEP_AS_IS_LABEL = "Keep as-is"
-
 
 def is_dialog_method(method: object) -> bool:
     """Return whether *method* is a Pi dialog that needs a client response."""
@@ -108,12 +106,7 @@ def _ask_user_question(req: dict[str, Any], method: object) -> dict[str, Any]:
     if option_labels:
         options = [{"label": label} for label in option_labels]
     elif method == "editor":
-        prefill = req.get("prefill")
-        prefill_text = prefill if isinstance(prefill, str) else ""
-        option: dict[str, Any] = {"label": _KEEP_AS_IS_LABEL}
-        if prefill_text:
-            option["preview"] = prefill_text
-        options = [option]
+        options = []
         header = "Editor"
     else:
         # A placeholder radio could be submitted without the user typing.
@@ -130,6 +123,9 @@ def _ask_user_question(req: dict[str, Any], method: object) -> dict[str, Any]:
     }
     if header:
         question["header"] = header
+    if method == "editor":
+        prefill = req.get("prefill")
+        question["textInput"] = {"default": prefill if isinstance(prefill, str) else ""}
     return {"questions": [question]}
 
 
@@ -141,7 +137,7 @@ def _select_labels(req: dict[str, Any]) -> list[str]:
 
 
 def _accepted_text(req: dict[str, Any], result: ElicitationResult) -> str | None:
-    """First selected / typed label from the form, remapping editor Keep as-is."""
+    """Read the form answer, preserving an editor's exact text."""
     content = result.content
     if not isinstance(content, dict):
         return None
@@ -150,14 +146,12 @@ def _accepted_text(req: dict[str, Any], result: ElicitationResult) -> str | None
         title = _nonempty_str(req.get("title"))
         if title:
             answer = content.get(title)
+    if req.get("method") == "editor" and isinstance(answer, str):
+        return answer
     labels = _answer_labels(answer)
     if not labels:
         return None
-    text = labels[0]
-    if req.get("method") == "editor" and text == _KEEP_AS_IS_LABEL:
-        prefill = req.get("prefill")
-        return prefill if isinstance(prefill, str) else ""
-    return text
+    return labels[0]
 
 
 def _answer_labels(answer: object) -> list[str]:

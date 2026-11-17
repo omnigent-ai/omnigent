@@ -39,6 +39,8 @@ def test_tab_completes_compact_until_explicit_submit(
         route.fulfill(status=202, json={"queued": False})
 
     page.route(f"**/v1/sessions/{session_id}/events", accept_message)
+    # Queue busy follow-ups instead of steering them (Always steer defaults on).
+    page.add_init_script("localStorage.setItem('omnigent:always-steer', 'false')")
     page.goto(f"{base_url}/c/{session_id}?view=chat")
     composer = page.get_by_label("Message the agent")
     expect(composer).to_be_visible(timeout=30_000)

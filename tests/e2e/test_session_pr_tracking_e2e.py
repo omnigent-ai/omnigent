@@ -92,7 +92,7 @@ async def test_native_session_tracks_prs_across_repositories(
         session_id="conv_owned",
     )
     hook = hook_settings(bridge_dir, sys.executable, f"omnigent.harnesses.{harness}.hook")
-    command = shlex.split(str(hook["command"]))
+    command = ["/bin/sh", "-c", str(hook["command"])]
     try:
         shell_command = (
             "gh auth switch --user example-user; gh repo set-default example/one && "

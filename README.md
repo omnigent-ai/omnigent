@@ -4,7 +4,7 @@
 
 ### The open-source meta-harness for all your AI agents.
 
-Omnigent is an open-source **meta-harness** that gives you a common orchestration layer over Claude Code, Codex, Cursor, OpenCode, Hermes, Pi, and the agents you write yourself: swap or combine harnesses without rewriting, enforce policies and sandboxing, and collaborate in real time from any device — terminal, browser, phone, or the native desktop app.
+Omnigent is an open-source **meta-harness** that gives you a common orchestration layer over Claude Code, Codex, Cursor, OpenCode, Goose, Antigravity, GitHub Copilot, Devin, Kiro, Qwen Code, Kimi Code, Grok Build, Jcode, Hermes, Pi, OpenAI Agents / Open Responses, and the agents you write yourself: swap or combine harnesses without rewriting, enforce policies and sandboxing, and collaborate in real time from any device — terminal, browser, phone, or the native desktop app.
 
 [![PyPI version](https://img.shields.io/pypi/v/omnigent.svg)](https://pypi.org/project/omnigent/)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://github.com/omnigent-ai/omnigent/blob/main/LICENSE)
@@ -30,8 +30,9 @@ Omnigent lets you:
   your phone. Messages, sub-agents, terminals, and files stay in sync.
 
 - **🤖 Supervise multiple agents.** Mix Claude Code, Codex, Cursor, OpenCode,
-  Hermes, Pi, and custom agents (defined in YAML) together in the same
-  session. Ask one agent to review another's work, or split a task across
+  Goose, Antigravity, GitHub Copilot, Devin, Kiro, Qwen Code, Kimi Code, Grok
+  Build, Jcode, Hermes, Pi, OpenAI Agents / Open Responses, and custom agents
+  (defined in YAML) together in the same session. Ask one agent to review another's work, or split a task across
   agents that are each good at different things.
 
 - **🔌 Use any model.** A first-party API key, a Claude/ChatGPT subscription,
@@ -293,10 +294,37 @@ omnigent codex                       # Codex
 omnigent cursor                      # Cursor
 omnigent agy                         # Antigravity
 omnigent opencode                    # OpenCode
+omnigent goose                       # Goose
+omnigent kiro                        # Kiro
+omnigent qwen                        # Qwen Code
+omnigent kimi                        # Kimi Code
+omnigent devin                       # Devin
 omnigent hermes                      # Hermes Agent (Nous Research)
 omnigent pi                          # Pi
 omnigent copilot                     # GitHub Copilot (SDK harness, via `omnigent run`)
 ```
+
+<details>
+<summary>Forward variables from your shell to one session</summary>
+
+Sessions run under the host daemon, which may have started from a different
+shell, so your terminal's variables don't reach the agent by default. To
+forward specific ones to the session you're launching, list their names:
+
+```bash
+OMNIGENT_SESSION_ENV_PASSTHROUGH=TERMINAL_PANE_SOCKET,TOOL_TOKEN omnigent claude
+```
+
+The values go only to the runner this command launches, through an owner-only
+file the local daemon deletes at launch. They aren't sent to the server or
+stored. They become part of that runner's environment, so the agent and any
+stdio MCP server that declares `env` inherit them too. A session whose runner is
+already running keeps its original values, and a runner the server relaunches
+later (for example, after an idle timeout) starts without them. Names starting
+with `OMNIGENT` and `RUNNER_SERVER_URL` are rejected. Forwarding isn't
+available on Windows yet.
+
+</details>
 
 `omnigent agy` requires agy 1.1.13 or newer. When `GEMINI_API_KEY` is set,
 direct Gemini API authentication takes precedence over agy's saved OAuth login.
@@ -322,16 +350,19 @@ See the [native agy gateway guide](docs/native-agy-gateways.md) for compatibilit
 requirements, model and authentication behavior, troubleshooting, and smoke
 steps. These settings configure native agy; the Antigravity Python SDK retains
 its separate key/Vertex setup.
+`omnigent opencode` requires OpenCode 2.0.x (`npm i -g @opencode/cli@2.0.32`).
+Its free models need no sign-in; run `opencode auth login` to add your own
+providers. See the [OpenCode harness guide](docs/opencode-native.md).
 
 Using OpenClaw? See the [OpenClaw integration guide](docs/openclaw.md) to import
 its coding agents or drive a live OpenClaw Gateway session over ACP.
 
 <details>
-<summary>Grok Build and Devin</summary>
+<summary>Grok Build and Jcode</summary>
 
 Two more coding agents are built in but have no `omnigent <name>` launcher of
-their own, because each ships a CLI that holds its own login. Install the vendor
-CLI, log in with it, then name the harness:
+their own, because each ships a CLI that owns its own login or provider
+config. Install the vendor CLI, set it up, then name the harness:
 
 ```bash
 # Grok Build (xAI)
@@ -339,24 +370,27 @@ curl -fsSL https://x.ai/cli/install.sh | bash
 grok login --device-auth              # xAI OAuth
 omnigent run --harness grok           # 'grok-build' also works
 
-# Devin (Cognition)
-curl -fsSL https://cli.devin.ai/install.sh | bash
-devin auth login
-omnigent run --harness devin
+# Jcode (https://jcode.sh)
+curl -fsSL https://jcode.sh/install | bash
+# configure a provider in ~/.jcode/config.toml
+omnigent run --harness jcode
 ```
 
 Both speak the [Agent Client Protocol](https://agentclientprotocol.com) over
 stdio, and Omnigent stores no credential for either — each CLI reads back the
-login it wrote to disk. That also means `--model` is refused rather than
-silently dropped: both run their account-default model. To pin one, configure an
-`acp:` agent whose command passes the vendor's own model flag.
+login or config it wrote to disk. That also means `--model` is refused rather
+than silently dropped: each runs its own default model. To pin one, configure
+an `acp:` agent whose command passes the vendor's own model flag. The exception
+is Jcode bound to an OpenAI-compatible Chat Completions provider in Omnigent's
+inference config: Omnigent then writes a session-private Jcode config and
+forwards the agent's `model`. Jcode's ACP server ignores session-scoped MCP
+servers, so Omnigent's MCP tools are not offered to it.
 
-Use the vendor login rather than an API key. A builtin ACP row has no
-`env_passthrough` of its own, and `XAI_API_KEY` is not in the host-to-runner
-credential allowlist, so exporting it in your shell does not reach the agent.
-If you need the key route, pass it explicitly with
-`OMNIGENT_RUNNER_ENV_PASSTHROUGH=XAI_API_KEY`, or configure an `acp:` agent that
-declares the passthrough.
+Use the vendor login or explicitly forward an API key. The builtin Grok row
+declares `XAI_API_KEY` for runner-to-Grok forwarding. Host-to-runner forwarding
+still requires `OMNIGENT_RUNNER_ENV_PASSTHROUGH=XAI_API_KEY`; exporting the key
+in your host shell alone does not reach a host-managed runner. Custom `acp:`
+agents can declare their own passthrough variables.
 
 </details>
 
@@ -417,6 +451,12 @@ To suppress the automatic browser tab, use `omni host --no-open` or set
 --background` and `omni start`. Sign-in may still open a browser; use
 `--non-interactive` in scripts to fail if sign-in is required.
 
+To open it in the Omnigent desktop app instead, use `--open-in-desktop` or set
+`OMNIGENT_HOST_OPEN_IN_DESKTOP=1`; it falls back to the browser if the app is
+not installed, too old to accept the request, or does not respond within five
+seconds. URLs with base paths or query/fragment selectors stay in the browser
+to preserve their destination.
+
 A session can also start itself: the **Automations** page runs an agent on a
 recurring schedule. See the [automations guide](https://github.com/omnigent-ai/omnigent/blob/main/docs/AUTOMATIONS.md)
 for the schedule format, the REST API, and the current limits.
@@ -455,6 +495,15 @@ session_title_instructions: |
 
 Server operators can set the same key in the YAML passed to
 `omnigent server --config`.
+
+Each user can also add personal requirements under Settings → General →
+**Title instructions** in the web UI, up to 4,000 characters. The server stores
+them per user and adds them after the server's `session_title_instructions`
+when titling that user's sessions; where the two conflict, the personal ones
+win. Leave the field blank to use only the server setting or the default
+prompt. Runners older than this server accept at most 4,000 characters, so for
+them the server shortens longer guidance: it drops the language rule first,
+then the server's instructions, and keeps the personal ones.
 
 Claude Code sessions generate titles with the `haiku` model alias. If that
 model answers the message instead of returning a title, set
@@ -653,8 +702,12 @@ prompt: You are a helpful data analyst.
 
 executor:
   harness: claude-sdk          # or: claude-native, codex, codex-native, cursor,
-                               # cursor-native, hermes, hermes-native, opencode,
-                               # pi, pi-native, openai-agents
+                               # cursor-native, opencode-native, goose,
+                               # goose-native, kiro-native, antigravity,
+                               # antigravity-native, copilot, devin-native,
+                               # qwen, qwen-native, kimi, kimi-native, hermes,
+                               # hermes-native, pi, pi-native, grok, jcode,
+                               # openai-agents, open-responses, acp:<slug>
 
 tools:
   # A local Python function (schema auto-generated from the signature)

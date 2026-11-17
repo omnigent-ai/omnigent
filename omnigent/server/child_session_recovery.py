@@ -14,6 +14,7 @@ from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.entities import Conversation
 from omnigent.harness_plugins import native_agents
 from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
+from omnigent.runner.launch_failure import RUNNER_PROCESS_CRASH
 from omnigent.server.runner_session_init import RunnerSessionInitializer, is_session_agent_removed
 from omnigent.stores.conversation_store import ConversationNotFoundError, ConversationStore
 from omnigent.util.session_lifecycle import is_session_closed
@@ -103,7 +104,8 @@ def _interrupted(conv: Conversation) -> bool:
     return status in {"running", "waiting"} or (
         status == "failed"
         and error is not None
-        and error.get("code") in {"runner_disconnected", "runner_failed_to_start"}
+        and error.get("code")
+        in {"runner_disconnected", "runner_failed_to_start", RUNNER_PROCESS_CRASH}
     )
 
 

@@ -95,6 +95,11 @@ vi.mock("./useMonacoCommentLayer", () => ({ useMonacoCommentLayer: () => null })
 vi.mock("next-themes", () => ({ useTheme: () => ({ resolvedTheme: "light" }) }));
 vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: vi.fn().mockReturnValue(true) }));
 vi.mock("@/hooks/useWriteFileContent", () => ({ useWriteFileContent: vi.fn() }));
+// The pre-write conflict check GETs the live file before every save.
+vi.mock("@/hooks/useFileContent", async (importOriginal) => ({
+  ...(await importOriginal<typeof FileContentModule>()),
+  fetchFileContent: vi.fn(),
+}));
 vi.mock("@/hooks/RunnerHealthProvider", () => ({
   useSessionRunnerOnline: vi.fn(),
   useSessionHostOnline: vi.fn(),
@@ -106,6 +111,8 @@ import { MonacoCodeEditor } from "./MonacoCodeEditor";
 import * as writeHook from "@/hooks/useWriteFileContent";
 import * as runnerHook from "@/hooks/RunnerHealthProvider";
 import * as syncHook from "./useMarkdownEditorSync";
+import { fetchFileContent } from "@/hooks/useFileContent";
+import type * as FileContentModule from "@/hooks/useFileContent";
 
 const PATH = "src/a.ts";
 const INITIAL = "const x = 1;\n";
@@ -116,7 +123,7 @@ const EDITED = "const x = 2;\n";
 let setDirty: ReturnType<typeof vi.fn>;
 let markSaved: ReturnType<typeof vi.fn>;
 let dismissExternalUpdate: ReturnType<typeof vi.fn>;
-let reconcileServerContent: ReturnType<typeof vi.fn>;
+let beginServerCheck: ReturnType<typeof vi.fn>;
 
 let resolveWrite: () => void;
 let writePromise: Promise<void>;
@@ -163,7 +170,15 @@ beforeEach(() => {
   setDirty = vi.fn();
   markSaved = vi.fn();
   dismissExternalUpdate = vi.fn();
-  reconcileServerContent = vi.fn().mockReturnValue(false);
+  beginServerCheck = vi.fn(() => () => "write");
+  vi.mocked(fetchFileContent).mockResolvedValue({
+    object: "session.environment.filesystem.file_content",
+    path: PATH,
+    content_type: null,
+    encoding: "utf-8",
+    content: INITIAL,
+    bytes: INITIAL.length,
+  });
   vi.mocked(syncHook.useMarkdownEditorSync).mockReturnValue({
     editorKey: 1,
     isDirty: false,
@@ -172,7 +187,7 @@ beforeEach(() => {
     discardAndApplyExternal: vi.fn(),
     dismissExternalUpdate,
     markSaved,
-    reconcileServerContent,
+    beginServerCheck,
   } as unknown as ReturnType<typeof syncHook.useMarkdownEditorSync>);
 
   writePromise = new Promise<void>((r) => {

@@ -188,6 +188,8 @@ def test_draft_survives_streaming_reply_and_queue_flush(
     storage on a queued-message re-render.
     """
     base_url, session_id = seeded_session
+    # Queue busy follow-ups instead of steering them (Always steer defaults on).
+    page.add_init_script("localStorage.setItem('omnigent:always-steer', 'false')")
     page.goto(f"{base_url}/c/{session_id}")
 
     _send(page, _TURN_A_MSG)

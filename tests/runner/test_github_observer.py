@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import functools
+
 import pytest
 
 from omnigent.runner.git_providers import ShellPrOp, ShellSegment
@@ -15,7 +17,7 @@ def _segment(*tokens: str, env: tuple[str, ...] = ()) -> ShellSegment:
     return ShellSegment(raw_tokens=(*env, *tokens), invocation_tokens=tokens)
 
 
-def test_pr_and_api_ops_stay_in_order_before_deferred_push() -> None:
+def test_pr_and_api_ops_stay_in_order_before_deferred_lookups() -> None:
     target = PullRequestRef.from_url(A)
     segments = [
         _segment("gh", "auth", "status"),
@@ -28,13 +30,37 @@ def test_pr_and_api_ops_stay_in_order_before_deferred_push() -> None:
 
     ops = PULL_REQUESTS.shell_pr_operations(segments)
 
-    assert ops[:-1] == [
+    assert ops[:-2] == [
         ShellPrOp(tracks=False, creates=False, target=target, content_only=False),
         ShellPrOp(tracks=True, creates=True, target=None, content_only=False),
         ShellPrOp(tracks=True, creates=False, target=target, content_only=False),
         ShellPrOp(tracks=False, creates=False, target=target, content_only=True),
     ]
-    assert ops[-1].resolve_result is not None
+    assert ops[-2].creates and ops[-2].resolve_result is not None
+    assert not ops[-1].creates and ops[-1].resolve_result is not None
+
+
+@pytest.mark.parametrize(
+    "segments,mixed",
+    [
+        ([_segment("gh", "api", "repos/example/one", "--jq", ".permissions.push")], True),
+        ([_segment("gh", "pr", "diff", "42")], True),
+        ([_segment("gh", "pr", "edit", "42", "--body", "test")], False),
+        ([], False),
+    ],
+)
+def test_create_defers_a_created_lookup(segments: list[ShellSegment], mixed: bool) -> None:
+    ops = PULL_REQUESTS.shell_pr_operations([*segments, _segment("gh", "pr", "create")])
+
+    [lookup] = [op for op in ops if op.creates and op.resolve_result is not None]
+    assert isinstance(lookup.resolve_result, functools.partial)
+    assert lookup.resolve_result.keywords["mixed"] == mixed
+
+
+def test_reads_without_a_create_defer_no_created_lookup() -> None:
+    ops = PULL_REQUESTS.shell_pr_operations([_segment("gh", "pr", "diff", "42")])
+
+    assert all(op.resolve_result is None for op in ops)
 
 
 @pytest.mark.parametrize(

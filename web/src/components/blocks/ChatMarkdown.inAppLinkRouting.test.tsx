@@ -1,5 +1,4 @@
-// Desktop chat links: an opted-in plain click routes to the embedded browser;
-// everything else keeps the shell's external default.
+// Desktop chat links open independent in-app tabs when opted in.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, render, screen } from "@testing-library/react";
@@ -12,6 +11,10 @@ import { FilePathAwareMessageResponse } from "./ChatMarkdown";
 vi.mock("@/lib/nativeBridge", async (importOriginal) => ({
   ...(await importOriginal<typeof NativeBridge>()),
   isNativeShell: () => true,
+}));
+
+vi.mock("@/lib/fetchSessionHostId", () => ({
+  fetchSessionHostId: vi.fn().mockResolvedValue("local-host"),
 }));
 
 const LINK = "https://example.com/page";
@@ -53,14 +56,27 @@ function clickLink(href = LINK, init: MouseEventInit = {}): MouseEvent {
   return event;
 }
 
-it("routes an opted-in plain click into the conversation's browser view", () => {
-  expect(clickLink().defaultPrevented).toBe(true);
-  expect(openOrNavigate).toHaveBeenCalledWith("conv-1", LINK, undefined, { agent: true });
+it.each([
+  ["plain click", {}],
+  ["cmd-click", { metaKey: true }],
+  ["ctrl-click", { ctrlKey: true }],
+])("routes an opted-in %s into a new in-app browser tab", async (_label, init) => {
+  expect(clickLink(LINK, init).defaultPrevented).toBe(true);
+  await vi.waitFor(() =>
+    expect(openOrNavigate).toHaveBeenCalledWith(
+      expect.stringMatching(/^browser-tab:conv-1:[^:]+$/),
+      LINK,
+      undefined,
+      { agent: true, sourceHostId: "local-host", sessionHostProtocol: 1 },
+    ),
+  );
 });
 
 it.each([
-  ["cmd-click", LINK, { metaKey: true }],
-  ["ctrl-click", LINK, { ctrlKey: true }],
+  ["shift-click", LINK, { shiftKey: true }],
+  ["shift-cmd-click", LINK, { shiftKey: true, metaKey: true }],
+  ["shift-ctrl-click", LINK, { shiftKey: true, ctrlKey: true }],
+  ["alt-click", LINK, { altKey: true }],
   ["middle-click", LINK, { button: 1 }],
   ["a mailto: link", "mailto:a@example.com", {}],
 ])("keeps %s on the external path", (_label, href, init) => {
@@ -68,8 +84,11 @@ it.each([
   expect(openOrNavigate).not.toHaveBeenCalled();
 });
 
-it("keeps the external default when the preference is off", () => {
-  writeOpenLinksInApp(false);
-  expect(clickLink().defaultPrevented).toBe(false);
-  expect(openOrNavigate).not.toHaveBeenCalled();
-});
+it.each([{}, { metaKey: true }, { ctrlKey: true }])(
+  "keeps the external default when the preference is off (%j)",
+  (init) => {
+    writeOpenLinksInApp(false);
+    expect(clickLink(LINK, init).defaultPrevented).toBe(false);
+    expect(openOrNavigate).not.toHaveBeenCalled();
+  },
+);

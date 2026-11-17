@@ -253,3 +253,36 @@ Final section.`;
     });
   });
 });
+
+describe("MarkdownTableOfContents Escape", () => {
+  it("marks itself as closing on Escape when it has a close action", async () => {
+    // Page-wide Escape shortcuts (declining an approval) leave keys inside it alone.
+    function Toc({ onClose }: { onClose?: () => void }) {
+      const ref = useRef<HTMLDivElement>(null);
+      useEffect(() => {
+        if (ref.current) {
+          ref.current.innerHTML = '<h1 id="alpha">Alpha</h1><h2 id="beta">Beta</h2>';
+        }
+      }, []);
+      return (
+        <div>
+          <div ref={ref} />
+          <MarkdownTableOfContents
+            content={"# Alpha\n## Beta"}
+            containerRef={ref}
+            onClose={onClose}
+          />
+        </div>
+      );
+    }
+    const closable = render(<Toc onClose={vi.fn()} />);
+    await waitFor(() =>
+      expect(closable.container.querySelector("nav")).toHaveAttribute("data-escape-owner"),
+    );
+    closable.unmount();
+
+    const inline = render(<Toc />);
+    await waitFor(() => expect(inline.container.querySelector("nav")).toBeInTheDocument());
+    expect(inline.container.querySelector("nav")).not.toHaveAttribute("data-escape-owner");
+  });
+});

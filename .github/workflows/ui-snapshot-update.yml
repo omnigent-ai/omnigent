@@ -94,7 +94,7 @@ jobs:
           standalone: true
 
       - name: Install uv
-        uses: omnigent-ai/omnigent/.github/actions/setup-uv@25521b2eb074b11ebe51fe5e3eaeb494e20101eb # self-contained setup
+        uses: omnigent-ai/omnigent/.github/actions/setup-uv@c144e4b1a1c2f9ed45aa6596b90c3672b3faf1c8 # self-contained setup
         with:
           enable-cache: true
 
@@ -155,7 +155,7 @@ jobs:
 
   # 2) Commit + push on a clean runner. Runs NO PR code -- only checks out the
   #    branch, drops in the rendered PNG, and pushes -- so it is safe to hold the
-  #    App token here. `git`/`gh` are preinstalled on ubuntu-latest.
+  #    App token here. `git`/`gh` are preinstalled on the runner.
   commit:
     name: Commit + push visual baselines
     needs: render
@@ -166,7 +166,7 @@ jobs:
     permissions:
       contents: write      # push the regenerated baseline (GITHUB_TOKEN fallback)
       pull-requests: write # comment the result + drop the trigger label
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - name: Checkout PR branch

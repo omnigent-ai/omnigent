@@ -94,6 +94,7 @@ class MainActivity : AppCompatActivity() {
     }
     private var ignoreNextAuthTabCancellation = false
     private val databricksAuthExecutor = Executors.newSingleThreadExecutor()
+    private val workspaceSessionProbe = WorkspaceSessionProbe()
     private val databricksAuthLauncher =
         AuthTabIntent.registerActivityResultLauncher(this, ::handleDatabricksAuthResult)
     private var workspaceCoordinator: DatabricksWorkspaceCoordinator? = null
@@ -1093,10 +1094,38 @@ class MainActivity : AppCompatActivity() {
         val session = workspaceSession ?: return
         val profile = workspaceProfile ?: return
         val page = lastWorkspacePageUri ?: session.pageUri
-        profile.hasSessionCookie(page).whenComplete { present, rawError ->
+        profile.sessionCookieValue(page).whenComplete { dbauth, rawError ->
             runOnUiThread {
                 if (workspaceSession !== session || isFinishing || isDestroyed) return@runOnUiThread
-                if (rawError != null || present != true) handleWorkspaceSessionInvalid(null)
+                if (rawError != null || dbauth.isNullOrEmpty()) {
+                    handleWorkspaceSessionInvalid(null)
+                    return@runOnUiThread
+                }
+                verifyWorkspaceSession(session, page, dbauth)
+            }
+        }
+    }
+
+    /**
+     * A cookie can outlive its server-side session, and the SPA keeps streaming
+     * with a dead one, so ask the workspace whether it still accepts the session.
+     * Only a rejection acts (through the same recovery as a failed load); a
+     * network failure leaves the session alone.
+     */
+    private fun verifyWorkspaceSession(
+        session: DatabricksWebSession,
+        page: URI,
+        dbauth: String,
+    ) {
+        databricksAuthExecutor.execute {
+            val check = workspaceSessionProbe.check(page, dbauth)
+            runOnUiThread {
+                if (workspaceSession !== session || isFinishing || isDestroyed) {
+                    return@runOnUiThread
+                }
+                if (check is WorkspaceSessionCheck.Rejected) {
+                    handleWorkspaceSessionInvalid(check.status)
+                }
             }
         }
     }

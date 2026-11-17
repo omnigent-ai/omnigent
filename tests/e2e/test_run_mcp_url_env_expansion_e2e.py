@@ -30,6 +30,7 @@ import httpx
 import pytest
 import yaml
 
+from omnigent.testing.process_reaper import reap_leaked_omnigent_processes
 from tests._helpers.live_server import find_free_port
 from tests.e2e.conftest import configure_mock_llm, get_mock_requests, reset_mock_llm
 
@@ -48,7 +49,6 @@ _REGION = "eu-west-1"
 # One launch covers daemon spawn, local-server boot, bundle upload, runner
 # bring-up and a single mocked tool round-trip (~30s observed).
 _RUN_TIMEOUT_S = 240
-_STOP_TIMEOUT_S = 120
 
 _SESSION_LINE_RE = re.compile(r"Omnigent session: (?P<base>https?://[^/\s]+)/c/(?P<sid>[0-9a-f]+)")
 _PROXY_VARS = frozenset({"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"})
@@ -154,6 +154,7 @@ def _run_env(home: Path, mock_llm_server_url: str, *, mcp_base_url: str | None) 
         {
             "HOME": str(home),
             "OMNIGENT_CONFIG_HOME": str(config_home),
+            "OMNIGENT_DATA_DIR": str(config_home),
             "OMNIGENT_SKIP_ONBOARD": "1",
             "OPENAI_API_KEY": "mock-key",
             "OPENAI_BASE_URL": f"{mock_llm_server_url}/v1",
@@ -172,18 +173,12 @@ def _run_env(home: Path, mock_llm_server_url: str, *, mcp_base_url: str | None) 
 
 @contextlib.contextmanager
 def _local_omnigent(env: dict[str, str], cwd: Path) -> Iterator[None]:
-    """Stop the local server and daemon ``omnigent run`` spawned, even when the test fails."""
+    """Reap this test's detached runtime even when the turn fails."""
     try:
         yield
     finally:
-        subprocess.run(
-            [sys.executable, "-m", "omnigent", "stop"],
-            capture_output=True,
-            env=env,
-            cwd=cwd,
-            timeout=_STOP_TIMEOUT_S,
-            check=False,
-        )
+        _, survivors = reap_leaked_omnigent_processes(env["OMNIGENT_DATA_DIR"])
+        assert not survivors, f"MCP fixture runtime survived cleanup: {survivors}"
 
 
 def _omnigent_run(
