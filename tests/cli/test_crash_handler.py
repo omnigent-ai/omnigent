@@ -537,8 +537,27 @@ def test_issue_url_scrubs_home_directory_and_tokens(
             '"/home/example-user-backup/module.py"',
             True,
         ),
+        ("File /home/example-useré/module.py\n", "/home/example-useré/module.py", True),
+        (
+            "File /home/example-user+backup/module.py\n",
+            "/home/example-user+backup/module.py",
+            True,
+        ),
+        (
+            "File /home/example-user@backup/module.py\n",
+            "/home/example-user@backup/module.py",
+            True,
+        ),
     ],
-    ids=["parenthesized", "bracketed", "braced", "hyphenated-sibling"],
+    ids=[
+        "parenthesized",
+        "bracketed",
+        "braced",
+        "hyphenated-sibling",
+        "unicode-sibling",
+        "plus-sibling",
+        "at-sibling",
+    ],
 )
 def test_issue_url_scrubs_punctuation_bounded_home_path(
     data_dir: Path,

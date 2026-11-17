@@ -467,7 +467,7 @@ def _scrub(text: str) -> str:
         home = str(Path.home())
         if home and home != os.sep:
             # Only a whole path component: ``/home/al`` must not rewrite ``/home/alice``.
-            text = re.sub(re.escape(home) + r"(?![A-Za-z0-9_.\-])", "~", text)
+            text = re.sub(re.escape(home) + r"(?![\w.+@~\-])", "~", text)
     return text
 
 
