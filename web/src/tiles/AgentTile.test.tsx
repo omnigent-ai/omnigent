@@ -1,4 +1,5 @@
 import { fireEvent, render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
@@ -88,9 +89,11 @@ describe("AgentTile", () => {
     expect(onActivate).toHaveBeenCalledWith("conv_1");
   });
 
-  it("does not activate from its header controls", () => {
+  it("opens single agent view from its menu without activating", async () => {
+    const user = userEvent.setup();
     const { onActivate, onOpenSingle } = renderTile();
-    fireEvent.click(screen.getByRole("button", { name: /single agent view/i }));
+    await user.click(screen.getByRole("button", { name: "More for Fix authentication" }));
+    await user.click(screen.getByRole("menuitem", { name: "Open in single agent view" }));
     expect(onOpenSingle).toHaveBeenCalledWith("conv_1");
     expect(onActivate).not.toHaveBeenCalled();
   });
