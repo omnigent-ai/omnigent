@@ -741,7 +741,7 @@ describe("BrowserPane Chrome cookie import", () => {
   };
   const openedSiteCheckbox = (dialog: HTMLElement) =>
     within(dialog).getByRole("checkbox", {
-      name: new RegExp(`Also import 2 cookies for ${OPENED_HOST}`),
+      name: `Also import 2 cookies for ${OPENED_HOST}, the site this tab opened before it was sent to ${SIGN_IN_HOST}. The tab goes back there afterwards.`,
     });
 
   it("includes the site a sign-in redirect left and goes back there after importing", async () => {
