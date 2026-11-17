@@ -26,6 +26,7 @@ from omnigent.harnesses.claude_native.main import (
     ClaudeNativeUcodeConfig,
     claude_native_model_options,
 )
+from omnigent.runner.background_titles.service import BACKGROUND_TITLE_INSTRUCTIONS
 from tests._helpers.host import isolated_host
 from tests._helpers.native_session import create_native_session
 from tests._helpers.polling import poll_until
@@ -1089,25 +1090,85 @@ def _open_live_claude_model_menu(page: Page, entry: str = "gear") -> None:
     expect(page.get_by_test_id("composer-agent-config-menu")).to_be_visible()
 
 
-def _assert_mock_claude_turn(mock_url: str, marker: str, model: str) -> None:
-    """Require exactly one streaming request for the current turn, with the exact model."""
+def _claude_text_blocks(content: object) -> list[str]:
+    if isinstance(content, str):
+        return [content]
+    if isinstance(content, list):
+        return [
+            block["text"]
+            for block in content
+            if isinstance(block, dict)
+            and block.get("type") == "text"
+            and isinstance(block.get("text"), str)
+        ]
+    return []
+
+
+def _assert_mock_claude_turn(
+    mock_url: str, marker: str, model: str, *, native_session: str, user_text: str
+) -> None:
+    """Correlate one conversation request, accounting for explicit title calls."""
     turn_requests = []
+    observed = []
     for request in get_mock_message_requests(mock_url):
         body = request["body"]
         users = [message for message in body.get("messages", []) if message.get("role") == "user"]
-        if body.get("stream") and users and marker in json.dumps(users[-1].get("content")):
+        if not (body.get("stream") and users and marker in json.dumps(users[-1].get("content"))):
+            continue
+        text_blocks = _claude_text_blocks(users[-1].get("content"))
+        system_blocks = _claude_text_blocks(body.get("system"))
+        metadata = body.get("metadata")
+        try:
+            identity = (
+                json.loads(metadata.get("user_id", "{}")) if isinstance(metadata, dict) else {}
+            )
+        except (TypeError, ValueError):
+            identity = {}
+        request_session = identity.get("session_id") if isinstance(identity, dict) else None
+        exact_blocks = text_blocks.count(user_text)
+        details = {
+            "model": body.get("model"),
+            "native_session": request_session,
+            "exact_user_blocks": exact_blocks,
+        }
+        if exact_blocks:
+            assert exact_blocks == 1 and request_session == native_session, details
+            details["purpose"] = "conversation"
             turn_requests.append(request)
-    assert len(turn_requests) == 1, {
-        "marker": marker,
-        "matching_requests": len(turn_requests),
-        "models": [request["body"].get("model") for request in turn_requests],
-    }
+        elif not body.get("tools") and (
+            request_session == native_session
+            and len(text_blocks) == 1
+            and text_blocks[0].startswith(
+                f"<session>\n{user_text}\n</session>\n\n"
+                "Write the title in the predominant language of the session"
+            )
+            and any(
+                text.startswith(
+                    "You are naming a coding session so the user can pick it out "
+                    "of a long list of sessions."
+                )
+                for text in system_blocks
+            )
+        ):
+            details["purpose"] = "native title"
+        elif (
+            not body.get("tools")
+            and isinstance(request_session, str)
+            and request_session != native_session
+            and text_blocks == [f"<user_message>\n{user_text}\n</user_message>"]
+            and BACKGROUND_TITLE_INSTRUCTIONS in system_blocks
+        ):
+            details["purpose"] = "background title"
+        else:
+            raise AssertionError({"unclassified_request": details, "marker": marker})
+        observed.append(details)
+    assert len(turn_requests) == 1, {"marker": marker, "requests": observed}
     assert turn_requests[0]["body"]["model"] == _native_claude_wire_model(model)
 
 
 def _assert_native_claude_turn(
     base_url: str, session_id: str, marker: str, reply: str, model: str
-) -> None:
+) -> tuple[str, str]:
     """Correlate one committed turn with Claude's transcript and fresh raw statusLine."""
     items = _ordered_message_items(base_url, session_id)
     for role, token in (("user", marker), ("assistant", reply)):
@@ -1196,6 +1257,11 @@ def _assert_native_claude_turn(
             f"No fresh native context for prompt {user['promptId']!r}, "
             f"session {native_session!r}, model {wire_model!r}: {observed!r}"
         ) from exc
+    user_blocks = _claude_text_blocks(user["message"].get("content"))
+    assert len(user_blocks) == 1 and user_blocks[0], (
+        "The native user record must have one complete text block to correlate"
+    )
+    return native_session, user_blocks[0]
 
 
 @pytest.mark.nightly
@@ -1249,7 +1315,7 @@ def test_claude_native_picker_repeated_pins_reach_the_real_terminal(
         }
         model = _PINNED_CLAUDE_MODELS[alias]
         poll_until(
-            lambda expected=model: (
+            lambda expected=_native_claude_wire_model(model): (
                 _live_claude_snapshot(base_url, session_id).get("llm_model") == expected
             ),
             timeout_s=30,
@@ -1272,8 +1338,12 @@ def test_claude_native_picker_repeated_pins_reach_the_real_terminal(
         expect(page.locator(_USER, has_text=marker)).to_have_count(1)
         expect(page.locator(_ASSISTANT, has_text=reply)).to_have_count(1)
         _wait_for_transcript_message(page, base_url, session_id, reply, role="assistant")
-        _assert_native_claude_turn(base_url, session_id, marker, reply, model)
-        _assert_mock_claude_turn(mock_llm_server_url, marker, model)
+        native_session, user_text = _assert_native_claude_turn(
+            base_url, session_id, marker, reply, model
+        )
+        _assert_mock_claude_turn(
+            mock_llm_server_url, marker, model, native_session=native_session, user_text=user_text
+        )
         expect(page.get_by_test_id("error-headline")).to_have_count(0)
 
     _open_terminal_view(page)
@@ -1313,10 +1383,16 @@ def test_claude_native_refusal_preserves_a_newer_same_model_selection(
             expect(page.locator(_USER, has_text=marker)).to_have_count(1)
             expect(page.locator(_ASSISTANT, has_text=reply)).to_have_count(1)
             _wait_for_transcript_message(page, live_server, session_id, reply, role="assistant")
-            _assert_native_claude_turn(
+            native_session, user_text = _assert_native_claude_turn(
                 live_server, session_id, marker, reply, _PINNED_CLAUDE_MODELS["sonnet"]
             )
-            _assert_mock_claude_turn(mock_llm_server_url, marker, _PINNED_CLAUDE_MODELS["sonnet"])
+            _assert_mock_claude_turn(
+                mock_llm_server_url,
+                marker,
+                _PINNED_CLAUDE_MODELS["sonnet"],
+                native_session=native_session,
+                user_text=user_text,
+            )
             expect(page.locator(_WORKING)).to_have_count(0)
             client.patch(
                 f"/v1/sessions/{session_id}",
