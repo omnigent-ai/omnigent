@@ -148,9 +148,18 @@ class ProactiveAgentSettingsStore:
             return None
         return prompt if isinstance(prompt, str) and prompt.strip() else None
 
-    def set_prompt_override(self, prompt: str | None) -> None:
-        """Replace the agent's built-in prompt for the workspace; ``None`` restores it.
+    def set_prompt_override(
+        self, prompt: str | None, *, actor: str | None, require_admin: bool = False
+    ) -> None:
+        """Replace the agent's built-in prompt for the workspace on *actor*'s behalf.
 
+        ``None`` restores the built-in prompt. The actor is checked again under
+        its account lock in the write's transaction, as for
+        :meth:`set_workspace_enabled`, so a request in flight when the actor was
+        deleted or demoted cannot land.
+
+        :raises OmnigentError: When the actor's account was revoked, or with
+            *require_admin*, is no longer an admin.
         :raises ValueError: If *prompt* is longer than
             :data:`MAX_PROMPT_OVERRIDE_BYTES` bytes of UTF-8, or its JSON text is
             longer than readers accept.
@@ -164,6 +173,14 @@ class ProactiveAgentSettingsStore:
             raise ValueError("the prompt has too many characters that need escaping")
 
         def write(session: Session) -> None:
+            require_active_account(session, actor)
+            if require_admin and actor is not None:
+                row = lock_account(session, actor)
+                if row is not None and not row.is_admin:
+                    raise OmnigentError(
+                        "Admin privileges required to change the proactive agent's prompt",
+                        code=ErrorCode.FORBIDDEN,
+                    )
             if prompt is None:
                 session.execute(
                     delete(SqlPreference).where(
