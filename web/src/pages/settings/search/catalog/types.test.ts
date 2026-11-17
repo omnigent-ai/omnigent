@@ -74,9 +74,11 @@ describe("conditional parts", () => {
 
   it("reject an id that is blank or contains a colon, which the hash reveal can't name", () => {
     expect(settingsEntryProblems(entry({ id: "a:b" }))).toEqual([
-      'a:b isn\'t a usable id: it must be non-blank and contain no ":"',
+      '"a:b" isn\'t a usable id: it must be non-blank and contain no ":"',
     ]);
-    expect(settingsEntryProblems(entry({ id: " " }))).toHaveLength(1);
+    expect(settingsEntryProblems(entry({ id: " " }))).toEqual([
+      '" " isn\'t a usable id: it must be non-blank and contain no ":"',
+    ]);
   });
 
   it("reject a captured dialog's origin as a redirect target", () => {

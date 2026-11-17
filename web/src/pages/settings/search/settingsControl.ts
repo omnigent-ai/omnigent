@@ -1,6 +1,7 @@
 // How a Settings control takes its name from its catalog entry, and how a URL names the row
 // (and part) to reveal.
 
+import { ownValue } from "@/lib/toolValue";
 import { settingsSectionPath } from "@/shell/settingsNav";
 
 import { SETTINGS_MAIN_CONTROL, type SettingsEntry } from "./catalog/types";
@@ -29,7 +30,7 @@ function declared<Value>(
   record: Readonly<Record<string, Value>> | undefined,
   key: string,
 ): Value | undefined {
-  return record !== undefined && Object.hasOwn(record, key) ? record[key] : undefined;
+  return record === undefined ? undefined : ownValue(record, key);
 }
 
 export interface SettingsControlProps {

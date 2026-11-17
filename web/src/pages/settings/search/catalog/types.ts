@@ -413,7 +413,7 @@ export function settingsEntryProblems(entry: SettingsEntry): string[] {
   ]);
   const problems: string[] = [];
   if (entry.id.trim() === "" || entry.id.includes(":")) {
-    problems.push(`${entry.id} isn't a usable id: it must be non-blank and contain no ":"`);
+    problems.push(`"${entry.id}" isn't a usable id: it must be non-blank and contain no ":"`);
   }
   // A captured dialog may open from a part that shows only in some states: it keeps its origin.
   // That opener is still a part shown on the page, not one inside an overlay or reached another way.
