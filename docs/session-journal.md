@@ -263,8 +263,10 @@ workflow" above, shows **Ran N workflows** under its tasks. The list holds every
 workflow run below it, flat, each right after the run that started it. Each
 session its session started before its next run adds the workflow run that
 session began with, and so on below: each of those sessions adds only the
-sessions it started before its own next run. The list starts open while any of
-them is working or waiting, and **Show more** loads it past the first 20. Only
+sessions it started before its own next run. Session start times are in whole
+seconds, so a session started in the same second as its starter's next run
+counts toward that next run. The list starts open while any of them is working
+or waiting, including runs past the first 20, which **Show more** loads. Only
 runs of your own workflows link to their workflow or offer actions. A run there that another of them started, and a run on the
 called workflow's own page, says **Started by** and links to the session that
 started it. A session's Tasks tab shows the same list for its current run when

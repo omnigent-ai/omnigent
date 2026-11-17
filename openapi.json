@@ -16471,6 +16471,12 @@
             "title": "Descendant Runs",
             "type": "array"
           },
+          "descendant_runs_active": {
+            "default": false,
+            "description": "Whether any run below this one, on any page, is working or waiting for input.",
+            "title": "Descendant Runs Active",
+            "type": "boolean"
+          },
           "descendant_runs_cursor": {
             "anyOf": [
               {

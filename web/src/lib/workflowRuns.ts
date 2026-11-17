@@ -47,6 +47,8 @@ export interface WorkflowRun {
   descendantRunCount?: number;
   /** Continues `descendantRuns`; `null` when they are all here. */
   descendantRunsCursor?: string | null;
+  /** Whether any run below this one, on any page, is working or waiting for input. */
+  descendantRunsActive?: boolean;
 }
 
 /** The session that started a workflow run. */
