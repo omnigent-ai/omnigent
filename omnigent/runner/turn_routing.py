@@ -1222,9 +1222,8 @@ async def _replay(
                                 + refusal_detail
                             ),
                             "remediation": (
-                                "Resolve the model-switch refusal, then relaunch this session "
-                                "to retry the saved message. "
-                                "Do not resend it while it remains pending."
+                                "Open Terminal to check the current model and resolve the "
+                                "refusal. The saved message will not retry automatically."
                             ),
                         },
                     },
