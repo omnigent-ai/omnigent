@@ -184,6 +184,7 @@ import {
   writeCodeFontSizePx,
   writeCodeFontWeight,
 } from "@/lib/codeFontPreferences";
+import { DEFAULT_CODE_BLOCK_WORD_WRAP, writeCodeBlockWordWrap } from "@/lib/codeWrapPreferences";
 import {
   readTerminalThemeMode,
   TERMINAL_THEME_DEFAULT,
@@ -1162,6 +1163,7 @@ function AppearanceSection() {
     writeCodeFontSizePx(CODE_FONT_SIZE_DEFAULT);
     writeCodeFontFamily(CODE_FONT_FAMILY_DEFAULT);
     writeCodeFontWeight(CODE_FONT_WEIGHT_DEFAULT);
+    writeCodeBlockWordWrap(DEFAULT_CODE_BLOCK_WORD_WRAP);
 
     // Remove the persisted keys so this device has no appearance overrides at
     // all. Some write helpers already remove the key for the default value;
