@@ -895,11 +895,14 @@ async def _run_fire_for_task(
     try:
         start_fire_stage("session_create")
         effective = await _own_task_agent(deps, effective)
+        mcp_selection = await _run_mcp_selection(
+            deps, task, effective.host_id or recorder.managed_host_id
+        )
         conv = await _create_session(
             deps,
             effective,
             labels={
-                **_session_labels(task, _task_mcp_selection(deps, task), recorder.managed_host_id),
+                **_session_labels(task, mcp_selection, recorder.managed_host_id),
                 SCHEDULED_TASK_RUN_LABEL_KEY: recorder.run_id,
                 SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY: recorder.run_id,
             },
@@ -1911,9 +1914,22 @@ def _sandbox_workspaces(task: ScheduledTask) -> list[str]:
     return []
 
 
-def _task_mcp_selection(deps: FireDeps, task: ScheduledTask) -> SessionMcpSelection:
-    """The selection *task*'s runs use: its sandbox provider's, or the registry's."""
-    return mcp_selection_for(task_sandbox(deps.sandbox_config, task.execution_target))
+async def _run_mcp_selection(
+    deps: FireDeps, task: ScheduledTask, host_id: str | None
+) -> SessionMcpSelection:
+    """The selection of the sandbox a managed run's session lands in, or the registry's.
+
+    A run that joins, wakes or relaunches an existing sandbox host stays on that
+    host's recorded provider, which need not be today's default; only a host that
+    does not exist yet is provisioned on the default.
+    """
+    sandbox = task_sandbox(deps.sandbox_config, task.execution_target)
+    if sandbox is None or host_id is None or deps.host_store is None:
+        return mcp_selection_for(sandbox)
+    host = await asyncio.to_thread(deps.host_store.get_host, host_id)
+    if host is not None and host.sandbox_provider is not None:
+        sandbox = deps.sandbox_config.recorded(host.sandbox_provider)
+    return mcp_selection_for(sandbox)
 
 
 def _session_labels(

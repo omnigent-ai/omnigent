@@ -524,12 +524,25 @@ class _FakeSandboxConfig:
     """Minimal stand-in for ManagedSandboxDeployment in fire tests."""
 
     def __init__(
-        self, *, managed_launch_supported: bool = True, mcp_selection: Any | None = None
+        self,
+        *,
+        managed_launch_supported: bool = True,
+        mcp_selection: Any | None = None,
+        others: Mapping[str, Any] | None = None,
     ) -> None:
         self.managed_launch_supported = managed_launch_supported
-        # The provider a managed run launches on, and how it records MCP services.
+        # The provider a fresh managed run launches on, and how it records MCP services.
         self.default = SimpleNamespace(provider="box", mcp_selection=mcp_selection)
-        self.configs = (self.default,)
+        self.configs = (
+            self.default,
+            *(
+                SimpleNamespace(provider=name, mcp_selection=selection)
+                for name, selection in (others or {}).items()
+            ),
+        )
+
+    def recorded(self, provider: str | None) -> Any:
+        return next((c for c in self.configs if c.provider == provider), self.default)
 
 
 class FakeHostStore:
@@ -3623,6 +3636,58 @@ async def test_only_a_sandbox_session_whose_launch_failed_unbound_is_replaced(
     assert continued.session_id == (None if released else "conv_prev")
 
 
+class _KeyedSelection:
+    """A provider that records the whole selection in one label of its own."""
+
+    def __init__(self, key: str) -> None:
+        self.key = key
+
+    def validate(self, *args: Any, **kwargs: Any) -> tuple[str, ...]:
+        raise AssertionError("firing does not revalidate")
+
+    def session_labels(self, services: Sequence[str]) -> dict[str, str]:
+        return {self.key: json.dumps(list(services))} if services else {}
+
+    def selected_services(self, labels: Mapping[str, str]) -> tuple[str, ...]:
+        return tuple(json.loads(labels.get(self.key, "[]")))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["joins", "relaunches"])
+async def test_a_run_on_the_tasks_existing_sandbox_keeps_its_providers_mcp_labels(
+    monkeypatch: pytest.MonkeyPatch, path: str
+) -> None:
+    """The task's sandbox stays on the provider it was launched on, not today's default."""
+    from omnigent.server.routes import sessions
+
+    joins = path == "joins"
+    task = _sandbox_continue_task(
+        last_run_conversation_id="conv_prev" if joins else None, mcp_services=("slack",)
+    )
+    own = continued_sandbox_host_id(task.id, task.workspace_id)
+    conv_store = _ExistingConversationStore(
+        _continued_session(host_id=own, workspace="/sandbox/ws", labels={})
+    )
+    monkeypatch.setattr(sessions, "_run_managed_launch", AsyncMock())
+    store = FakeScheduledTaskStore(rows={"task_1": task})
+    hosts = FakeHostStore({own: _FakeHost(own, "local", sandbox_provider="older")})
+    # The default moved to "box" after the task's sandbox was launched on "older".
+    deployment = _FakeSandboxConfig(
+        mcp_selection=_KeyedSelection("box.mcp"),
+        others={"older": _KeyedSelection("older.mcp")},
+    )
+
+    await _fire_once(
+        _deps(store, conversation_store=conv_store, host_store=hosts, sandbox_config=deployment)
+    )
+
+    [created] = conv_store.created
+    if joins:
+        assert created["host_id"] == own
+    assert created["labels"]["older.mcp"] == '["slack"]'
+    assert "box.mcp" not in created["labels"]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("repository", [None, "https://github.com/example/runtime"])
 async def test_a_new_session_joins_the_tasks_sandbox_in_an_earlier_sessions_workspace(
@@ -4691,17 +4756,22 @@ class _ListLabelSelection:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("task_services", "written"),
-    [(("github",), '["github"]'), ((), None)],
-    ids=["task-selection-replaces", "no-task-selection-keeps-the-copy"],
+    ("source_labels", "task_services", "written"),
+    [
+        ({"deployment.mcp_services": '["slack"]'}, ("github",), '["github"]'),
+        ({"deployment.mcp_services": '["slack"]'}, (), None),
+        # A registry selection the task's provider can't read is replaced too.
+        ({"omnigent.mcp_service.slack": "1"}, ("github",), '["github"]'),
+    ],
+    ids=["task-selection-replaces", "no-task-selection-keeps-the-copy", "replaces-a-registry-one"],
 )
-async def test_a_copied_run_keeps_a_one_label_selection_unless_the_task_has_one(
-    task_services: tuple[str, ...], written: str | None
+async def test_a_copied_run_keeps_its_source_selection_unless_the_task_has_one(
+    source_labels: dict[str, str], task_services: tuple[str, ...], written: str | None
 ) -> None:
     selection = _ListLabelSelection()
     conv_store = FakeConversationStore()
     conv_store.get_conversation = lambda conversation_id: _FakeConversation(  # type: ignore[method-assign]
-        id=conversation_id, agent_id="ag_1", labels={selection.key: '["slack"]'}
+        id=conversation_id, agent_id="ag_1", labels=source_labels
     )
     store = FakeScheduledTaskStore(
         rows={
@@ -4726,46 +4796,9 @@ async def test_a_copied_run_keeps_a_one_label_selection_unless_the_task_has_one(
     await _drain()
 
     (fork,) = conv_store.forked
-    # The copy's own label survives unless the task writes its selection over it.
-    assert (selection.key in fork["dropped_label_keys"]) == (written is not None)
+    # The copy's own selection survives unless the task writes its selection over it.
+    assert (set(source_labels) <= fork["dropped_label_keys"]) == (written is not None)
     assert fork["extra_labels"].get(selection.key) == written
-
-
-@pytest.mark.asyncio
-async def test_a_copied_run_drops_a_registry_selection_its_provider_cannot_read() -> None:
-    # The source picked a registry service on a connected host; the task runs in a
-    # sandbox whose provider records services its own way.
-    selection = _ListLabelSelection()
-    conv_store = FakeConversationStore()
-    conv_store.get_conversation = lambda conversation_id: _FakeConversation(  # type: ignore[method-assign]
-        id=conversation_id, agent_id="ag_1", labels={"omnigent.mcp_service.slack": "1"}
-    )
-    store = FakeScheduledTaskStore(
-        rows={
-            "task_1": _task(
-                source_session_id="conv_source",
-                mcp_services=("github",),
-                execution_target="managed_sandbox",
-            )
-        }
-    )
-
-    async def _launch(conv: Any, task: Any) -> None:
-        pass
-
-    deps = _deps(
-        store,
-        conversation_store=conv_store,
-        permission_store=FakePermissionStore(),
-        sandbox_config=_FakeSandboxConfig(mcp_selection=selection),
-    )
-    await build_on_fire(deps, launch_dispatch=_launch)(0, "task_1")
-    await _drain()
-
-    (fork,) = conv_store.forked
-    # The task's services replace the source's, not add to them.
-    assert "omnigent.mcp_service.slack" in fork["dropped_label_keys"]
-    assert fork["extra_labels"][selection.key] == '["github"]'
 
 
 @pytest.mark.asyncio

@@ -1769,24 +1769,18 @@ async def test_managed_worker_starts_with_the_source_mcp_services(
 
     from omnigent.server.managed_hosts import parse_sandbox_config
     from omnigent.server.routes.sessions import routes_core
-    from omnigent.stores.host_store import HostStore
 
     source, _, _ = peers
     store = SqlAlchemyConversationStore(db_uri)
     if source_services:
         store.set_labels(source["id"], {"deployment.mcp_services": json.dumps(source_services)})
-    # The source and the worker both run in the provider's sandboxes, which record
-    # MCP services their own way.
+    # The worker runs in a new sandbox of a provider that records MCP services its own way.
     deployment = parse_sandbox_config(
         {"server_url": "https://managed-test.example.com", "providers": [{"provider": "modal"}]}
     )
     auth_app.state.sandbox_config = replace(
         deployment, configs=(replace(deployment.default, mcp_selection=_ListLabelSelection()),)
     )
-    HostStore(db_uri).reserve_sandbox_host(
-        host_id="5a" * 16, name="source-sandbox", user_id="alice", provider="modal"
-    )
-    store.set_host_id(source["id"], "5a" * 16, workspace="/workspace")
     launched = asyncio.Event()
     release = asyncio.Event()
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -333,3 +334,31 @@ def test_a_sessions_services_are_read_whichever_selection_wrote_them() -> None:
     assert session_mcp_label_keys(deployment, registry_labels) == {"omnigent.mcp_service.github"}
     # Without a provider of its own, only the registry's labels are read.
     assert session_mcp_services(None, provider_labels) == ()
+
+
+class _ListSelection:
+    """A provider that records the whole selection in one label of its own."""
+
+    def __init__(self, key: str) -> None:
+        self.key = key
+
+    def validate(self, request, services, *, spec, user_id):
+        return tuple(services)
+
+    def session_labels(self, services):
+        return {self.key: json.dumps(list(services))} if services else {}
+
+    def selected_services(self, labels):
+        return tuple(json.loads(labels.get(self.key, "[]")))
+
+
+def test_services_from_several_providers_selections_are_read_once_each() -> None:
+    deployment = ManagedSandboxDeployment(
+        configs=(
+            _provider("box", _ListSelection("box.mcp")),
+            _provider("cube", _ListSelection("cube.mcp")),
+        )
+    )
+    labels = {"box.mcp": '["slack", "github"]', "cube.mcp": '["github", "jira"]'}
+    assert session_mcp_services(deployment, labels) == ("slack", "github", "jira")
+    assert session_mcp_label_keys(deployment, labels) == {"box.mcp", "cube.mcp"}
