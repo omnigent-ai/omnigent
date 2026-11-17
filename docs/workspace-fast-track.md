@@ -64,12 +64,14 @@ source with Rust.
      links use (`web/src/hooks/useHostSshTarget.ts`). Main first asks the user
      in a native dialog, and records the alias only after a token-checked
      `ListDirectory` call over it succeeds (`web/electron/src/sshTargets.js`).
-     Each server's questions are asked one at a time. After "Not now", that
-     server's aliases aren't asked about again until the app restarts. An
-     allowed alias that fails isn't tried again for five minutes. If the host
-     refuses the probe's token, main answers the call with a 401 itself, so the
-     page renews its token, and the call never reaches the alias. A second
-     refusal in a row counts as a failure.
+     A server has one question open at a time. Its other suggestions read
+     through the server meanwhile, without the page backing off, and are asked
+     on a later read. After "Not now", that server's aliases aren't asked about
+     again until the app restarts. An allowed alias that fails isn't tried
+     again for five minutes. If the host refuses the probe's token, main
+     answers the call with a 401 itself, so the page renews its token, and the
+     call never reaches the alias. A second refusal within five minutes counts
+     as a failure.
 4. The host checks the token, then reads the file from the token's workspace.
 
 ## Security

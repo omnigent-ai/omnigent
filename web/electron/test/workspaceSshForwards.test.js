@@ -424,34 +424,38 @@ describe("an SSH alias the page suggests", { skip: !unix && "needs Unix sockets"
     assert.equal(ssh.sessions.length, 0, "no connection is opened");
   });
 
-  it("shares one question and one probe among concurrent reads, and asks the next question after it", async () => {
-    const answers = [];
+  it("shares one question and one probe among concurrent reads, and holds other hosts' for later", async () => {
+    let allow;
     userAnswer = () =>
       new Promise((resolve) => {
-        answers.push(resolve);
+        allow = resolve;
       });
 
-    const reads = [suggest(), suggest(), suggest({ hostId: "host-2", socketPath: GONE })];
-    await settle();
-    assert.deepEqual(asked, [["host-1", "my-box"]], "the second question waits for the first");
-    answers[0](true);
-    await settle();
-    answers[1](true);
+    const reads = [suggest(), suggest()];
+    const held = await suggest({ hostId: "host-2", socketPath: GONE });
+    assert.equal(held.status, 503, "the page reads through the server, and doesn't back off");
+    allow(true);
 
     assert.deepEqual(
       (await Promise.all(reads)).map((response) => response.status),
-      [200, 200, 200],
+      [200, 200],
     );
+    assert.deepEqual(paths, [PROBE, METHOD, METHOD]);
+    userAnswer = async () => true;
+    assert.equal((await suggest({ hostId: "host-2", socketPath: GONE })).status, 200);
     assert.deepEqual(asked, [
       ["host-1", "my-box"],
       ["host-2", "my-box"],
     ]);
-    assert.equal(paths.filter((requestPath) => requestPath === PROBE).length, 2);
   });
 
   it("answers a refused token itself, without sending the call, and probes again with the next", async () => {
     const refusedRead = await suggest({ headers: { authorization: "Bearer other" } });
     assert.equal(refusedRead.status, 401, "the page sees the refusal and renews its token");
+    const [session] = ssh.sessions;
+    assert.deepEqual(recorded, []);
+    assert.equal(session.cancelled.length, 1, "the refused forward is cancelled");
+    assert.equal(session.closed, false, "the connection may serve other hosts");
 
     assert.equal((await suggest()).status, 200);
     assert.deepEqual(paths, [PROBE, PROBE, METHOD], "the refused call never reaches the alias");

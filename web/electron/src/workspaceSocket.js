@@ -30,11 +30,12 @@ const REMOTE_SOCKET_PATH =
 // A unary call the host answers only for a valid token, so a 200 proves the right host.
 const PROBE_PATH = "/omnigent.api.workspace.v1alpha1.WorkspaceService/ListDirectory";
 const PROBE_BODY = Buffer.from('{"pageSize":1}');
-// The host's answer to a refused token. Main gives it to the page instead of sending the
-// call to an unproven host, and the page renews its token.
-const REFUSED_BODY = Buffer.from(
-  '{"code":"unauthenticated","message":"the host refused the token"}',
-);
+// Main's own answers for calls it doesn't send to an unproven host. After a refused token
+// the page renews it; while another question is open it reads through the server for now.
+const NOT_SENT = {
+  refused: { status: 401, code: "unauthenticated", message: "the host refused the token" },
+  busy: { status: 503, code: "unavailable", message: "another SSH question is open" },
+};
 
 /**
  * Whether `socketPath` is a workspace socket an Omnigent host made for this user.
@@ -76,7 +77,7 @@ function isWorkspaceSocket(socketPath) {
  * @param {{hostId?: string, sshTarget?: string, socketPath: string, path: string, headers: Record<string, string>, body: Uint8Array}} request
  * @param {{
  *   sshDestination?: (hostId: string) => string | null,
- *   verifySshTarget?: (hostId: string, alias: string, proves: () => Promise<boolean | "refused">) => Promise<boolean | "refused">,
+ *   verifySshTarget?: (hostId: string, alias: string, proves: () => Promise<boolean | "refused">) => Promise<boolean | "refused" | "busy">,
  *   forwards?: ReturnType<typeof import("./workspaceSshForwards").createWorkspaceSshForwards>,
  * }} [routes]
  * @returns {Promise<{status: number, headers: Record<string, string>, body: Uint8Array}>}
@@ -130,14 +131,15 @@ function workspaceSocketRequest(request, routes = {}) {
   const forward = recorded
     ? forwards.localSocket(destination, socketPath)
     : routes.verifySshTarget(hostId, destination, proves).then((verdict) => {
-        if (verdict === "refused") return null;
+        if (Object.hasOwn(NOT_SENT, verdict)) return verdict;
         if (!verdict) throw new Error("SSH alias not allowed or not verified for this host");
         return forwards.localSocket(destination, socketPath);
       });
   return forward.then((reached) => {
-    if (!reached) {
-      const refusal = new Uint8Array(REFUSED_BODY);
-      return { status: 401, headers: { "content-type": "application/json" }, body: refusal };
+    if (typeof reached === "string") {
+      const { status, code, message } = NOT_SENT[reached];
+      const error = new Uint8Array(Buffer.from(JSON.stringify({ code, message })));
+      return { status, headers: { "content-type": "application/json" }, body: error };
     }
     const { socketPath: local, dropConnection, dropForward } = reached;
     return send(local, methodPath, forwarded, body).catch((error) => {
