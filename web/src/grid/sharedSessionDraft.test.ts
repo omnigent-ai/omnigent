@@ -181,6 +181,56 @@ describe("a grid cell's shared draft", () => {
     ]);
   });
 
+  it("keeps a tag found in a quote's preamble until its token is deleted from it", () => {
+    const replyDraft: StoredReplyDraft = {
+      version: 1,
+      quotes: [{ before: "Read @src/app.ts first", text: "Quoted" }],
+      text: "",
+    };
+    seedDraft({
+      text: serializeReplyDraft(replyDraft),
+      replyDraft,
+      files: [],
+      mentions: {
+        files: [{ path: "src/app.ts", isDir: false, token: "@src/app.ts" }],
+        sessions: [],
+      },
+    });
+    renderHook(() => useSharedSessionDraft(sessionId));
+    const [quote] = cellComposer()!.quotes!;
+
+    editCell({ quotes: [{ ...quote!, before: "Read @src/app.ts carefully" }] });
+    expect(getSessionDraft(sessionId)?.mentions?.files).toHaveLength(1);
+
+    editCell({ quotes: [{ ...quote!, before: "Read the file first" }] });
+    expect(getSessionDraft(sessionId)?.mentions).toBeUndefined();
+
+    editCell({ quotes: [{ ...quote!, before: "Read @src/app.ts first" }] });
+    expect(getSessionDraft(sessionId)?.mentions).toBeUndefined();
+  });
+
+  it("does not keep a tag whose token appears only in a quote's source text", () => {
+    const replyDraft: StoredReplyDraft = {
+      version: 1,
+      quotes: [{ before: "Intro", text: "See @src/app.ts" }],
+      text: "Reply",
+    };
+    seedDraft({
+      text: serializeReplyDraft(replyDraft),
+      replyDraft,
+      files: [],
+      mentions: {
+        files: [{ path: "src/app.ts", isDir: false, token: "@src/app.ts" }],
+        sessions: [],
+      },
+    });
+    renderHook(() => useSharedSessionDraft(sessionId));
+
+    editCell({ text: "Reply again" });
+
+    expect(getSessionDraft(sessionId)?.mentions).toBeUndefined();
+  });
+
   it("empties the session draft and its tags when the cell's composer is cleared", () => {
     seedDraft({
       text: "Read @src/app.ts",

@@ -105,9 +105,14 @@ import {
   presentTaggedMentions,
   recallFileMentions,
   recallSessionMentions,
+  type TaggedMentions,
 } from "@/lib/composerMentions";
 import { clearLocalReviewContexts } from "@/lib/localReviewContext";
-import { getSessionDraft, setSessionMentions, useSessionReviewComments } from "@/lib/sessionDrafts";
+import {
+  setSessionMentions,
+  useSessionMentions,
+  useSessionReviewComments,
+} from "@/lib/sessionDrafts";
 import { interrupt } from "@/lib/sessionsApi";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
 
@@ -125,25 +130,39 @@ function isPendingSideChat(id: string): boolean {
 }
 
 /**
- * A grid cell's edited message: its session tags come back as tokens, as in the
- * full-screen composer, and the tags the cell held before are dropped.
+ * A grid cell's message text with its session and file tags recalled as tokens, as
+ * the full-screen composer does. Used by edit-and-resend, failed-send restore and the
+ * delivered-draft check, so the three paths agree.
  */
-function loadRecalledGridText(childId: string, text: string): void {
-  const composerKey = gridCellComposerKey(childId);
+function recallGridDraft(text: string): { text: string; mentions: TaggedMentions | undefined } {
   const sessions = recallSessionMentions(text);
   const files = recallFileMentions(
     sessions.main,
     sessions.sessions.map((session) => session.token!),
   );
+  const tagged = files.files.length > 0 || sessions.sessions.length > 0;
+  return {
+    text: files.text,
+    mentions: tagged ? { files: files.files, sessions: sessions.sessions } : undefined,
+  };
+}
+
+/**
+ * A grid cell's edited message: its session tags come back as tokens, as in the
+ * full-screen composer, and the tags the cell held before are dropped.
+ */
+function loadRecalledGridText(childId: string, text: string): void {
+  const composerKey = gridCellComposerKey(childId);
+  const recalled = recallGridDraft(text);
   // Text first: the shared draft keeps only tags whose token the new text has.
   useChatStore.getState().updateSideChatComposer(composerKey, (current) => ({
     ...current,
-    text: files.text,
+    text: recalled.text,
     files: [],
     quotes: [],
     autoFocus: true,
   }));
-  setSessionMentions(childId, { files: files.files, sessions: sessions.sessions });
+  setSessionMentions(childId, recalled.mentions);
 }
 
 const TEXT_INPUT_TYPES = new Set(["text", "search", "email", "url", "password", "number", "tel"]);
@@ -236,6 +255,8 @@ export function SideChatPane({
   const pending = isPendingSideChat(childId);
   // A grid cell edits its own composer entry, apart from a sub-agent tab of the same id.
   const composerKey = gridComposer ? gridCellComposerKey(childId) : childId;
+  // Review comments are part of a grid cell's draft, so replacing the draft asks first.
+  const draftReviewComments = useSessionReviewComments(gridComposer ? childId : null);
   const starting = useChatStore((s) => s.sideChatComposers[composerKey]?.starting ?? false);
   const {
     session,
@@ -285,7 +306,10 @@ export function SideChatPane({
     canAccept: () => !readOnly && !starting,
     hasDraft: () => {
       const draft = useChatStore.getState().sideChatComposers[composerKey];
-      return Boolean(draft && (draft.text.trim() || draft.files.length || draft.quotes?.length));
+      return Boolean(
+        (draft && (draft.text.trim() || draft.files.length || draft.quotes?.length)) ||
+        draftReviewComments.length > 0,
+      );
     },
     loadText: (text) => {
       if (gridComposer) {
@@ -654,6 +678,7 @@ function SideChatComposer({
   // A grid cell's tags and review comments come from its session's shared draft.
   const gridCell = gridComposer !== undefined;
   const reviewComments = useSessionReviewComments(gridCell ? childId : null);
+  const sessionMentions = useSessionMentions(gridCell ? childId : null);
   const updateComposer = useChatStore((s) => s.updateSideChatComposer);
   const clearComposer = useChatStore((s) => s.clearSideChatComposer);
   const enqueueMessage = useChatStore((s) => s.enqueueMessage);
@@ -697,10 +722,10 @@ function SideChatComposer({
     if (!failed) return;
     const { accepted, errors } = validateAttachments(failed.files, attachmentPolicy);
     errors.forEach((message) => toast.error(message));
-    // A grid cell restores its session tags as tokens, as the full-screen composer does.
-    const recalled = gridCell ? recallSessionMentions(failed.text) : null;
-    updateComposer(composerKey, () => ({ text: recalled?.main ?? failed.text, files: accepted }));
-    if (recalled) setSessionMentions(childId, { files: [], sessions: recalled.sessions });
+    // A grid cell restores its tags as tokens, as its edit-and-resend does.
+    const recalled = gridCell ? recallGridDraft(failed.text) : null;
+    updateComposer(composerKey, () => ({ text: recalled?.text ?? failed.text, files: accepted }));
+    if (recalled) setSessionMentions(childId, recalled.mentions);
     // Track the displayed draft for delivery; filtered files require a fresh send ID.
     const entry = conversationRegistry.peek(childId)!;
     const restored = entry.getState().restoredSendDraft;
@@ -727,10 +752,8 @@ function SideChatComposer({
       useChatStore.getState().sideChatComposers[composerKey] ?? EMPTY_SIDE_CHAT_COMPOSER;
     entry!.setState({ restoredSendDraft: null });
     if (current.quotes?.length) return;
-    // A grid cell shows the restored text with its session tags as tokens.
-    const shown = gridCell
-      ? { ...restored, text: recallSessionMentions(restored.text).main }
-      : restored;
+    // A grid cell shows the restored text with its tags as tokens, as it restored it.
+    const shown = gridCell ? { ...restored, text: recallGridDraft(restored.text).text } : restored;
     if (
       restoredSendDraftUnchanged(shown, restored.stableId, current.text, current.files, undefined)
     )
@@ -881,10 +904,10 @@ function SideChatComposer({
     (!pending && files.length > 0) ||
     reviewComments.length > 0;
   // The tags and review comments a send carries. A grid cell's come from its session draft.
-  const sharedTags = presentTaggedMentions(
-    gridCell ? getSessionDraft(childId)?.mentions : undefined,
-    [text, ...quotes.map((replyQuote) => replyQuote.before)],
-  );
+  const sharedTags = presentTaggedMentions(sessionMentions, [
+    text,
+    ...quotes.map((replyQuote) => replyQuote.before),
+  ]);
   const sendContext: ComposerSendContext = {
     mentions: composerInlineMentions(
       sharedTags?.files ?? [],

@@ -1576,14 +1576,21 @@ describe("grid cell composer shares its session's draft", () => {
   const gridCell = () =>
     renderPane(<SideChatPane childId={childId} fullSession gridComposer={{}} />);
 
+  /** A cell mounted over its session draft alone, so the bridge does the seeding. */
+  function bridgedCell(sharedDraft: Parameters<typeof setSessionDraft>[1]) {
+    setSessionDraft(childId, sharedDraft);
+    const bridge = renderHook(() => useSharedSessionDraft(childId));
+    gridCell();
+    return bridge;
+  }
+
   it("sends a tagged file and session as their markers, with the session hint", () => {
     const text = "Compare @src/app.ts with @Fix CI";
-    seedCell(text, {
+    const bridge = bridgedCell({
       text,
       files: [],
       mentions: { files: [fileTag], sessions: [sessionTag] },
     });
-    gridCell();
 
     fireEvent.click(screen.getByTestId("side-chat-send"));
 
@@ -1593,6 +1600,11 @@ describe("grid cell composer shares its session's draft", () => {
       undefined,
       { pinnedConversationId: childId },
     );
+    // The bridge mirrors the cleared composer, so the shared draft empties too.
+    expect(getSessionDraft(childId)).toBeUndefined();
+    bridge.unmount();
+    // Remounting the cell starts empty: nothing from the sent draft comes back.
+    renderHook(() => useSharedSessionDraft(childId));
     expect(useChatStore.getState().sideChatComposers[gridCellComposerKey(childId)]).toBeUndefined();
   });
 
@@ -1639,8 +1651,11 @@ describe("grid cell composer shares its session's draft", () => {
   });
 
   it("sends a cell's review comments with its instructions, then clears them", () => {
-    seedCell("Address this", { text: "Address this", files: [], reviewComments: [reviewComment] });
-    gridCell();
+    const bridge = bridgedCell({
+      text: "Address this",
+      files: [],
+      reviewComments: [reviewComment],
+    });
 
     expect(
       screen.getByRole("button", { name: "Open local review comment src/app.ts:4 (new)" }),
@@ -1650,7 +1665,53 @@ describe("grid cell composer shares its session's draft", () => {
     const message = send.mock.calls[0]![0];
     expect(message).toMatch(/^Address this\n\n```local-review-comment\n\{/);
     expect(message).toContain('"body": "Rename this"');
-    expect(getSessionDraft(childId)?.reviewComments ?? []).toEqual([]);
+    expect(getSessionDraft(childId)).toBeUndefined();
+    bridge.unmount();
+    renderHook(() => useSharedSessionDraft(childId));
+    expect(useChatStore.getState().sideChatComposers[gridCellComposerKey(childId)]).toBeUndefined();
+  });
+
+  /** Fails a grid send of `sent` and mounts the cell, which restores it. */
+  function failedGridSend(sent: string) {
+    const entry = conversationRegistry.acquire(childId);
+    entry.setState({
+      sessionStatus: "idle",
+      abortController: new AbortController(),
+      failedSendDraft: { conversationId: childId, text: sent, files: [], stableId: "retry-stable" },
+    });
+    renderHook(() => useSharedSessionDraft(childId));
+    gridCell();
+    return entry;
+  }
+
+  it("clears a restored grid draft once its send is delivered, if the user left it as restored", async () => {
+    const sent = `Compare [Session: "Fix CI" id=sess_fix subagent=no]\n\n${SESSION_MENTION_HINT}`;
+    const entry = failedGridSend(sent);
+    expect(screen.getByTestId("side-chat-input")).toHaveValue("Compare @Fix CI");
+
+    act(() =>
+      entry.setState({
+        restoredSendDraft: { ...entry.getState().restoredSendDraft!, delivered: true },
+      }),
+    );
+
+    await waitFor(() => expect(screen.getByTestId("side-chat-input")).toHaveValue(""));
+  });
+
+  it("keeps a restored grid draft the user edited after the failed send", () => {
+    const sent = `Compare [Session: "Fix CI" id=sess_fix subagent=no]\n\n${SESSION_MENTION_HINT}`;
+    const entry = failedGridSend(sent);
+    fireEvent.change(screen.getByTestId("side-chat-input"), {
+      target: { value: "Compare @Fix CI, then more" },
+    });
+
+    act(() =>
+      entry.setState({
+        restoredSendDraft: { ...entry.getState().restoredSendDraft!, delivered: true },
+      }),
+    );
+
+    expect(screen.getByTestId("side-chat-input")).toHaveValue("Compare @Fix CI, then more");
   });
 
   it("sends a review comment on its own with the instruction to address it", () => {

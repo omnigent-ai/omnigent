@@ -35,12 +35,9 @@ function saveComposerToSessionDraft(
 }
 
 function setComposerEntry(key: string, composer: SideChatComposerDraft | undefined): void {
-  useChatStore.setState((state) => {
-    const others = Object.fromEntries(
-      Object.entries(state.sideChatComposers).filter(([id]) => id !== key),
-    );
-    return { sideChatComposers: composer ? { ...others, [key]: composer } : others };
-  });
+  const store = useChatStore.getState();
+  if (composer) store.updateSideChatComposer(key, () => composer);
+  else store.clearSideChatComposer(key);
 }
 
 /** Whether the composer already shows the session draft's text and attachments. */

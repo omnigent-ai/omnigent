@@ -216,6 +216,15 @@ export function useSessionReviewComments(conversationId: string | null): Comment
   );
 }
 
+/** The session draft's tags, re-rendering the caller when they change. */
+export function useSessionMentions(conversationId: string | null): TaggedMentions | undefined {
+  return useSyncExternalStore(
+    subscribe,
+    () => (conversationId ? sessionDrafts.get(conversationId)?.mentions : undefined),
+    () => undefined,
+  );
+}
+
 export function useHasSessionDraft(conversationId: string): boolean {
   return useSyncExternalStore(
     subscribe,
