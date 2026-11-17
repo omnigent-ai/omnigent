@@ -13130,8 +13130,10 @@ async def test_external_codex_subagent_start_mints_child_session(
     )
 
 
+@pytest.mark.parametrize("parent_item_id", ["parent-before", ""])
 async def test_external_codex_subagent_start_is_idempotent_and_upserts_labels(
     client: httpx.AsyncClient,
+    parent_item_id: str,
 ) -> None:
     """
     Re-registering the same Codex child thread returns the existing child
@@ -13178,11 +13180,19 @@ async def test_external_codex_subagent_start_is_idempotent_and_upserts_labels(
                 "parent_thread_id": "thread_parent",
                 "agent_nickname": "Euclid",
                 "agent_role": "explorer",
+                "parent_item_id": parent_item_id,
             },
         },
     )
     assert second.status_code == 202, second.text
     child_id_second = second.json()["child_session_id"]
+    replay = await client.post(
+        f"/v1/sessions/{parent['id']}/events",
+        json={"type": "external_codex_subagent_start", "data": {"thread_id": "thread_child_beta"}},
+    )
+    assert replay.status_code == 202, replay.text
+    child = (await client.get(f"/v1/sessions/{child_id_second}")).json()
+    assert child["labels"]["omnigent.codex_native.side_chat_parent_item_id"] == parent_item_id
 
     # Must return the same child id — no duplicate row minted.
     assert child_id_first == child_id_second, (

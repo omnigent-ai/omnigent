@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+from collections.abc import AsyncIterator
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -32,6 +33,17 @@ from omnigent.harnesses.codex_native.bridge import (
 )
 
 _JsonObject = dict[str, Any]
+
+
+@pytest.fixture
+async def side_chat_api_client() -> AsyncIterator[httpx.AsyncClient]:
+    async with httpx.AsyncClient(
+        base_url="http://test",
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, json={"data": [], "child_session_id": "conv_side"})
+        ),
+    ) as client:
+        yield client
 
 
 class _FakeCodexClient:
@@ -325,7 +337,8 @@ async def test_interrupt_side_turn_propagates_unrelated_errors(error: Exception)
 
 
 @pytest.mark.asyncio
-async def test_open_side_chat_forks_then_submits_first_turn() -> None:
+@pytest.mark.parametrize("parent_item_id", ["parent-before", ""])
+async def test_open_side_chat_forks_then_submits_first_turn(parent_item_id: str) -> None:
     client = _FakeCodexClient(
         {
             "thread/fork": {"result": {"thread": {"id": "thread_side"}}},
@@ -333,9 +346,30 @@ async def test_open_side_chat_forks_then_submits_first_turn() -> None:
         }
     )
 
-    child = await side_chat.open_side_chat_on_client(
-        client, parent_thread_id="thread_parent", question="what does this repo do?"
-    )
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            assert client.calls == [], "Capture the boundary before the native fork"
+            assert request.url.path == "/v1/sessions/conv_parent/items"
+            assert dict(request.url.params) == {"limit": "1", "order": "desc"}
+            return httpx.Response(
+                200, json={"data": [{"id": parent_item_id}] if parent_item_id else []}
+            )
+        assert [method for method, _ in client.calls] == ["thread/fork"]
+        event = json.loads(request.content)
+        assert event["data"]["parent_item_id"] == parent_item_id
+        assert event["data"]["agent_nickname"] == "Side chat"
+        return httpx.Response(202, json={"child_session_id": "conv_side"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://test"
+    ) as ap_client:
+        child = await side_chat.open_side_chat_on_client(
+            client,
+            ap_client=ap_client,
+            parent_session_id="conv_parent",
+            parent_thread_id="thread_parent",
+            question="what does this repo do?",
+        )
 
     assert child == "thread_side"
     # order: fork first, then the first turn on the CHILD (not the main thread)
@@ -344,13 +378,50 @@ async def test_open_side_chat_forks_then_submits_first_turn() -> None:
 
 
 @pytest.mark.asyncio
-async def test_open_side_chat_aborts_when_fork_fails() -> None:
-    client = _FakeCodexClient({"thread/fork": {"result": {}}})  # no thread id
-    child = await side_chat.open_side_chat_on_client(
-        client, parent_thread_id="thread_parent", question="q"
+@pytest.mark.parametrize(
+    "failure", ["fork", "history", "invalid-page", "invalid-item", "registration"]
+)
+async def test_open_side_chat_aborts_when_context_or_fork_fails(failure: str) -> None:
+    client = _FakeCodexClient(
+        {"thread/fork": {"result": {} if failure == "fork" else {"thread": {"id": "thread_side"}}}}
     )
-    assert child is None
-    assert [m for m, _ in client.calls] == ["thread/fork"]  # no turn submitted
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            if failure == "history":
+                return httpx.Response(503)
+            items = (
+                None if failure == "invalid-page" else ([{}] if failure == "invalid-item" else [])
+            )
+            return httpx.Response(200, json={"data": items})
+        return httpx.Response(422)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://test"
+    ) as ap_client:
+        if failure == "fork":
+            assert (
+                await side_chat.open_side_chat_on_client(
+                    client,
+                    ap_client=ap_client,
+                    parent_session_id="conv_parent",
+                    parent_thread_id="thread_parent",
+                    question="q",
+                )
+                is None
+            )
+        else:
+            with pytest.raises((httpx.HTTPStatusError, RuntimeError)):
+                await side_chat.open_side_chat_on_client(
+                    client,
+                    ap_client=ap_client,
+                    parent_session_id="conv_parent",
+                    parent_thread_id="thread_parent",
+                    question="q",
+                )
+    assert [m for m, _ in client.calls] == (
+        ["thread/fork"] if failure in {"fork", "registration"} else []
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -590,6 +661,7 @@ def test_peek_side_chat_requests_discards_corrupt_payloads(tmp_path: Path) -> No
 async def test_drive_side_chat_requests_forks_on_the_forwarder_client(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    side_chat_api_client: httpx.AsyncClient,
     filesystem_operation: str,
     cancel_during_discard: bool,
 ) -> None:
@@ -633,7 +705,7 @@ async def test_drive_side_chat_requests_forks_on_the_forwarder_client(
     drain = asyncio.create_task(
         fwd._drive_side_chat_requests(
             client,
-            ap_client=AsyncMock(),
+            ap_client=side_chat_api_client,
             bridge_dir=tmp_path,
             target=SimpleNamespace(thread_id="thread_parent", session_id="conv_parent"),
         )
@@ -661,7 +733,10 @@ async def test_drive_side_chat_requests_forks_on_the_forwarder_client(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("current_thread_id", [None, "thread_replacement"])
 async def test_drive_side_chat_requests_uses_the_parent_after_scanning(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, current_thread_id: str | None
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    current_thread_id: str | None,
+    side_chat_api_client: httpx.AsyncClient,
 ) -> None:
     client = _FakeCodexClient(
         {
@@ -685,7 +760,7 @@ async def test_drive_side_chat_requests_uses_the_parent_after_scanning(
     monkeypatch.setattr(fwd, "_sleep", _stop)
     with pytest.raises(asyncio.CancelledError):
         await fwd._drive_side_chat_requests(
-            client, ap_client=AsyncMock(), bridge_dir=tmp_path, target=target
+            client, ap_client=side_chat_api_client, bridge_dir=tmp_path, target=target
         )
 
     if current_thread_id is None:
@@ -698,7 +773,7 @@ async def test_drive_side_chat_requests_uses_the_parent_after_scanning(
 
 @pytest.mark.asyncio
 async def test_drive_side_chat_requests_forks_with_the_parents_switched_settings(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, side_chat_api_client: httpx.AsyncClient
 ) -> None:
     # The app-server's launch -c model would otherwise pair the old model with the new effort.
     _write_parent_settings(tmp_path, "gpt-6-sol", "max")
@@ -718,7 +793,7 @@ async def test_drive_side_chat_requests_forks_with_the_parents_switched_settings
     with pytest.raises(asyncio.CancelledError):
         await fwd._drive_side_chat_requests(
             client,
-            ap_client=AsyncMock(),
+            ap_client=side_chat_api_client,
             bridge_dir=tmp_path,
             target=SimpleNamespace(thread_id="thread_parent", session_id="conv_parent"),
         )
@@ -759,7 +834,7 @@ async def test_drive_side_chat_requests_keeps_the_request_until_the_parent_threa
 
 @pytest.mark.asyncio
 async def test_drive_side_chat_requests_surfaces_a_notice_and_discards_on_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, side_chat_api_client: httpx.AsyncClient
 ) -> None:
     # A fork that fails must not vanish silently: surface a visible notice, then
     # discard the request so the same failure isn't retried forever.
@@ -779,7 +854,7 @@ async def test_drive_side_chat_requests_surfaces_a_notice_and_discards_on_failur
     with pytest.raises(asyncio.CancelledError):
         await fwd._drive_side_chat_requests(
             client,
-            ap_client=AsyncMock(),
+            ap_client=side_chat_api_client,
             bridge_dir=tmp_path,
             target=SimpleNamespace(thread_id="thread_parent", session_id="conv_parent"),
         )
@@ -818,9 +893,19 @@ async def test_side_effort_reset_without_live_model_does_not_submit() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("lost", [False, True], ids=["live", "runner-restarted"])
+@pytest.mark.parametrize(
+    ("lost", "reference_boundary"),
+    [
+        (False, "parent-before"),
+        (True, "parent-before"),
+        (True, ""),
+        (True, None),
+        (True, "missing"),
+    ],
+    ids=["live", "runner-restarted", "empty-parent", "legacy", "missing-boundary"],
+)
 async def test_resume_side_chat_keeps_its_thread_and_saved_context(
-    tmp_path: Path, lost: bool
+    tmp_path: Path, lost: bool, reference_boundary: str | None
 ) -> None:
     thread_id = "019e96aa-0be2-7343-8d3b-6f914d60936b"
     child = {
@@ -840,6 +925,8 @@ async def test_resume_side_chat_keeps_its_thread_and_saved_context(
             "omnigent.closed": "true",
         },
     }
+    if reference_boundary is not None:
+        child["labels"][side_chat.PARENT_REFERENCE_ITEM_LABEL] = reference_boundary
     _write_parent_settings(tmp_path, "gpt-6-sol", "medium")
     write_bridge_state(
         tmp_path,
@@ -872,7 +959,7 @@ async def test_resume_side_chat_keeps_its_thread_and_saved_context(
             return httpx.Response(
                 200,
                 json={
-                    "data": [message("parent-before", 10), message("parent-after", 30)],
+                    "data": [message("parent-before", 20), message("parent-after", 20)],
                     "has_more": False,
                 },
             )
@@ -920,6 +1007,12 @@ async def test_resume_side_chat_keeps_its_thread_and_saved_context(
             tmp_path, codex_client=codex_client, ap_client=ap_client, forwarder_state=state
         )
         try:
+            if reference_boundary == "missing":
+                with pytest.raises(RuntimeError, match="reference boundary is unavailable"):
+                    await side_chat.resume_side_chat(tmp_path, "conv_side")
+                assert state.session_for_child_thread(thread_id) is None
+                assert len([method for method, _ in calls if method == "thread/resume"]) == 1
+                return
             await side_chat.resume_side_chat(tmp_path, "conv_side")
             await side_chat.resume_side_chat(tmp_path, "conv_side")
         finally:
@@ -941,12 +1034,14 @@ async def test_resume_side_chat_keeps_its_thread_and_saved_context(
         assert records[0]["payload"]["cwd"] == str(tmp_path)
         payloads = [record["payload"] for record in records if record["type"] == "response_item"]
         texts = [block["text"] for payload in payloads for block in payload.get("content", [])]
-        assert texts == [
-            "parent-before",
-            side_chat.SIDE_REFERENCE_ONLY_INSTRUCTIONS,
-            "side-first",
-            "side-second",
-        ]
+        assert texts[-2:] == ["side-first", "side-second"]
+        assert "parent-after" not in texts
+        if reference_boundary:
+            assert texts[:2] == ["parent-before", side_chat.SIDE_REFERENCE_ONLY_INSTRUCTIONS]
+        else:
+            assert len(texts) == 3
+            assert texts[0].startswith(side_chat.SIDE_REFERENCE_ONLY_INSTRUCTIONS)
+            assert ("unavailable" in texts[0]) == (reference_boundary is None)
         usage = [
             record["payload"]
             for record in records

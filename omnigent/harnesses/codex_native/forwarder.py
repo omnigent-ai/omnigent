@@ -3053,6 +3053,8 @@ async def _drive_side_chat_requests(
                     try:
                         child_thread_id = await side_chat.open_side_chat_on_client(
                             codex_client,
+                            ap_client=ap_client,
+                            parent_session_id=target.session_id,
                             parent_thread_id=parent_thread_id,
                             question=request.question,
                             bridge_dir=bridge_dir,
@@ -7586,6 +7588,8 @@ async def _register_child_session(
     nickname = item.get("agent_nickname")
     if isinstance(nickname, str) and nickname:
         data["agent_nickname"] = nickname
+    if isinstance(item.get("parent_item_id"), str):
+        data["parent_item_id"] = item["parent_item_id"]
     response = await _post_session_event(
         client,
         parent_session_id,
