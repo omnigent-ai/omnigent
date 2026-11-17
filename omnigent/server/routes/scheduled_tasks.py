@@ -33,20 +33,17 @@ from omnigent.db.account_authority import account_generation, current_account_us
 from omnigent.entities import Agent, Conversation, ScheduledTask, ScheduledTaskRun
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.inner._subprocess_lifecycle import await_cleanup_task
-from omnigent.runner.identity import (
-    ORCHESTRATION_SOURCE_HEADER,
-    RUNNER_TUNNEL_TOKEN_HEADER,
-)
 from omnigent.runtime import pending_elicitations
-from omnigent.server.auth import (
-    LEVEL_OWNER,
-    RESERVED_USER_LOCAL,
-    AuthProvider,
-    bind_host_is_loopback,
-)
+from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.bundles import agent_for_user
 from omnigent.server.feature_flags import DeploymentGate, deployment_gate_enabled
 from omnigent.server.managed_hosts import parse_repo_workspace
+from omnigent.server.proactive_agent import (
+    PROACTIVE_AGENT_IDS,
+    is_proactive_task,
+    reject_proactive_agent_id,
+)
+from omnigent.server.routes._agent_origin import require_agent_origin
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._host_launch import resolve_host_owner
 from omnigent.server.routes._session_create_validation import (
@@ -60,7 +57,6 @@ from omnigent.server.routes._sessions.helpers import (
     _session_status_from_cache,
 )
 from omnigent.server.routes._sessions.orchestration import _list_status_with_starting
-from omnigent.server.routes.runner_tunnel import _expected_runner_id_from_headers
 from omnigent.server.routes.scheduled_task_permissions import (
     agent_shared_target_guard,
     owns_scheduled_task,
@@ -82,7 +78,6 @@ from omnigent.server.scheduled.run_reconciler import force_fail_stale_runs
 from omnigent.server.scheduled.run_sharing import delete_task_grants
 from omnigent.server.scheduled.telemetry import log_task_created
 from omnigent.server.session_mcp_selection import MAX_SESSION_MCP_SERVICES, session_mcp_selection
-from omnigent.server.session_orchestration import require_owned_session
 from omnigent.server.workflows import require_workflows
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
 from omnigent.stores.artifact_store import ArtifactStore
@@ -94,6 +89,11 @@ from omnigent.stores.scheduled_task_store import (
     ScheduledTaskStore,
     encode_mcp_services,
 )
+from omnigent.tools.browser_agent_tools import (
+    BROWSER_AGENT_TOOLS_CREATION_LABEL_KEYS,
+    browser_agent_tools_creation_labels,
+)
+from omnigent.util.uuid import normalize_uuid
 
 _logger = logging.getLogger(__name__)
 
@@ -403,6 +403,9 @@ def _validate_timezone_or_400(timezone: str) -> None:
         ) from exc
 
 
+_AGENT_AUTOMATION_ACTION = "Agent automation changes"
+
+
 def _inbox_cursor_task_id(task_id: str) -> str:
     """An Inbox cursor's task ID: bare hex if a UUID, else as the store allocated it.
 
@@ -414,70 +417,6 @@ def _inbox_cursor_task_id(task_id: str) -> str:
         return uuid.UUID(task_id).hex
     except ValueError:
         return task_id
-
-
-def require_scheduled_task_agent_origin(
-    request: Request,
-    *,
-    owner: str,
-    auth_provider: AuthProvider | None,
-    conversation_store: ConversationStore,
-    permission_store: PermissionStore | None,
-) -> None:
-    """Bind a runner-marked mutation to the owner's source session and runner."""
-    if auth_provider is None or owner == RESERVED_USER_LOCAL:
-        return
-    if ORCHESTRATION_SOURCE_HEADER not in request.headers:
-        # UI/API saves and older runners do not opt into source verification.
-        return
-    source_id = (request.headers.get(ORCHESTRATION_SOURCE_HEADER) or "").strip()
-    if not source_id or permission_store is None:
-        raise OmnigentError(
-            "Agent automation changes require a source session",
-            code=ErrorCode.FORBIDDEN,
-        )
-    try:
-        source = require_owned_session(
-            source_id,
-            owner,
-            conversation_store,
-            permission_store,
-        )
-    except OmnigentError as exc:
-        raise OmnigentError(
-            "Agent automation changes require an owned source session",
-            code=ErrorCode.FORBIDDEN,
-        ) from exc
-    is_loopback = request.client is not None and bind_host_is_loopback(request.client.host)
-    allowed_tokens = request.app.state.runner_tunnel_tokens
-    try:
-        try:
-            expected_runner_id = _expected_runner_id_from_headers(
-                request.headers, allowed_tunnel_tokens=allowed_tokens
-            )
-        except ValueError:
-            if not is_loopback:
-                raise
-            expected_runner_id = _expected_runner_id_from_headers(request.headers)
-        if expected_runner_id is None and allowed_tokens is None and not is_loopback:
-            raise ValueError("runner tunnel token is required")
-    except ValueError as exc:
-        raise OmnigentError(
-            "Agent automation changes require an authorized runner token",
-            code=ErrorCode.FORBIDDEN,
-        ) from exc
-    if (
-        not source.runner_id
-        or (expected_runner_id is not None and expected_runner_id != source.runner_id)
-        or (
-            RUNNER_TUNNEL_TOKEN_HEADER not in request.headers
-            and source.runner_id.startswith("runner_token_")
-        )
-    ):
-        raise OmnigentError(
-            "Agent automation changes require the source session's bound runner",
-            code=ErrorCode.FORBIDDEN,
-        )
 
 
 def create_scheduled_tasks_router(
@@ -658,9 +597,12 @@ def create_scheduled_tasks_router(
         enumerable across users.
         """
         task = store.get(scheduled_task_id)
-        if task is None or not owns_scheduled_task(task, owner):
+        # Proactive tasks are framework-owned and never shown to their owner.
+        if task is None or is_proactive_task(task) or not owns_scheduled_task(task, owner):
             raise OmnigentError("Scheduled task not found", code=ErrorCode.NOT_FOUND)
         return task
+
+    _reject_proactive_agent = reject_proactive_agent_id
 
     async def _validated_mcp_services(
         request: Request, services: list[str], agent: Agent, owner: str
@@ -760,6 +702,12 @@ def create_scheduled_tasks_router(
             )
         if conv.agent_id is None:
             raise OmnigentError("The session has no agent to copy", code=ErrorCode.INVALID_INPUT)
+        # Its copy would carry the hidden proactive agent into a user automation.
+        if normalize_uuid(conv.agent_id) in PROACTIVE_AGENT_IDS:
+            raise OmnigentError(
+                "An automation can't start from a proactive agent's session",
+                code=ErrorCode.INVALID_INPUT,
+            )
         from omnigent.server.scheduled.source_session import last_finished_response_id
 
         # Runs start from the history through the last finished reply, so there must be one.
@@ -829,6 +777,7 @@ def create_scheduled_tasks_router(
         owner: str,
         project_id: str | None,
         carry: bool,
+        browser_labels: dict[str, str],
     ) -> Conversation:
         """Copy *source*, through its last finished reply, for the task's runs to start from."""
         # Its threads can commit after the request is cancelled; the copy is deleted once they do.
@@ -841,6 +790,7 @@ def create_scheduled_tasks_router(
                 owner=owner,
                 project_id=project_id,
                 carry=carry,
+                browser_labels=browser_labels,
             )
         )
         try:
@@ -867,6 +817,7 @@ def create_scheduled_tasks_router(
         owner: str,
         project_id: str | None,
         carry: bool,
+        browser_labels: dict[str, str],
     ) -> Conversation:
         """Copy *source* and grant its owner the copy, deleting the copy if either fails."""
         from omnigent.server.scheduled.source_session import (
@@ -891,7 +842,10 @@ def create_scheduled_tasks_router(
                 created_by=owner,
                 project_id=project_id,
                 carry_history_into_native=carry,
-                labels={SCHEDULED_TASK_SOURCE_LABEL_KEY: task_id},
+                # The copy, and so every run copied from it, takes its browser
+                # tools from the creating request, not from the source.
+                labels={SCHEDULED_TASK_SOURCE_LABEL_KEY: task_id, **browser_labels},
+                dropped_label_keys=BROWSER_AGENT_TOOLS_CREATION_LABEL_KEYS,
                 up_to_response_id=up_to,
             )
         except SourceCopyIncompleteError as exc:
@@ -993,13 +947,15 @@ def create_scheduled_tasks_router(
     ) -> dict[str, Any]:
         """Create a scheduled task and arm it on the live scheduler."""
         owner = _owner(request)
-        require_scheduled_task_agent_origin(
+        require_agent_origin(
             request,
+            action=_AGENT_AUTOMATION_ACTION,
             owner=owner,
             auth_provider=auth_provider,
             conversation_store=conversation_store,
             permission_store=permission_store,
         )
+        _reject_proactive_agent(body.agent_id)
         await _validate_rrule_or_400(
             body.rrule,
             body.session_mode,
@@ -1087,6 +1043,7 @@ def create_scheduled_tasks_router(
                         owner=owner,
                         project_id=project_id,
                         carry=carry,
+                        browser_labels=browser_agent_tools_creation_labels(request.headers),
                     )
                 # Synchronous, so a cancel can't land after the save and release the saved ID.
                 task = store.create(
@@ -1187,7 +1144,7 @@ def create_scheduled_tasks_router(
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
         tasks = [
             t
-            for t in store.list(owner_user_id=owner_id)
+            for t in store.list(owner_user_id=owner_id, exclude_agent_ids=PROACTIVE_AGENT_IDS)
             if owns_scheduled_task(t, owner_id) and (kind == "all" or t.kind == "automation")
         ]
         task_ids = [t.id for t in tasks]
@@ -1234,6 +1191,7 @@ def create_scheduled_tasks_router(
             check_generation=current_account_user() is not None,
             after=cursor,
             limit=limit,
+            exclude_agent_ids=PROACTIVE_AGENT_IDS,
         )
         return AutomationFailurePage(
             data=failures,
@@ -1478,8 +1436,9 @@ def create_scheduled_tasks_router(
     ) -> dict[str, Any]:
         """Update mutable fields of a task and re-sync the scheduler."""
         owner = _owner(request)
-        require_scheduled_task_agent_origin(
+        require_agent_origin(
             request,
+            action=_AGENT_AUTOMATION_ACTION,
             owner=owner,
             auth_provider=auth_provider,
             conversation_store=conversation_store,
@@ -1487,6 +1446,7 @@ def create_scheduled_tasks_router(
         )
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
         stored = _require_owned(scheduled_task_id, owner_id)
+        _reject_proactive_agent(body.agent_id)
         existing = without_legacy_sandbox_workspace(stored)
         legacy_workspace = existing.workspace != stored.workspace
         if body.timezone is not None:

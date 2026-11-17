@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import random
 import uuid
 from collections import Counter
 from collections.abc import AsyncIterator
@@ -97,6 +98,12 @@ def _runner(session_id: str, user: str = ALICE) -> dict[str, str]:
         ORCHESTRATION_SOURCE_HEADER: session_id,
         RUNNER_TUNNEL_TOKEN_HEADER: _RUNNER_TOKEN,
     }
+
+
+def _oversized_description() -> str:
+    """CJK noise within the 2,000-character limit whose stored form is over 2,000 bytes."""
+    noise = random.Random(0)
+    return "".join(chr(noise.randrange(0x4E00, 0x9FFF)) for _ in range(2000))
 
 
 def _write(kind: str, content: dict[str, object], key: str, **fields: object) -> dict[str, object]:
@@ -568,12 +575,25 @@ async def test_reading_needs_read_access_and_writing_needs_edit(
                 "k",
             ),
             400,
-            "exactly two fields, name and steps",
+            "a plan's content has name and steps, and optionally description",
         ),
         (
             _write("plan", {"steps": [{"id": "a", "name": "A"}]}, "k"),
             400,
-            "exactly two fields, name and steps",
+            "a plan's content has name and steps, and optionally description",
+        ),
+        (
+            _write(
+                "plan",
+                {
+                    "name": "A",
+                    "steps": [{"id": "a", "name": "A"}],
+                    "description": _oversized_description(),
+                },
+                "k",
+            ),
+            400,
+            "stored bytes; the limit is 2000",
         ),
         (_write("dispatch", {"dispatch_id": "x"}, "k"), 422, "kind"),
         (
@@ -591,6 +611,23 @@ async def test_invalid_entries_are_refused_without_writing(
     resp = await client.post(url, json=body, headers=_runner(session_id))
     assert resp.status_code == status, resp.text
     assert reason in resp.text
+    assert (await client.get(url, headers=_headers())).json()["data"] == []
+
+
+async def test_a_proposed_description_that_isnt_unicode_is_refused_without_writing(
+    client: httpx.AsyncClient, db_uri: str
+) -> None:
+    session_id = _session(db_uri)
+    url = f"/v1/sessions/{session_id}/journal"
+    plan = {"name": "A", "steps": [{"id": "a", "name": "A"}], "description": "\ud800"}
+    # ASCII JSON can carry an escaped lone surrogate that no UTF-8 text holds.
+    resp = await client.post(
+        url,
+        content=json.dumps(_write("plan", plan, "k")).encode("ascii"),
+        headers={**_runner(session_id), "content-type": "application/json"},
+    )
+    assert resp.status_code == 400, resp.text
+    assert "description must be valid Unicode text" in resp.text
     assert (await client.get(url, headers=_headers())).json()["data"] == []
 
 
@@ -704,8 +741,11 @@ async def test_the_agents_tools_write_and_read_through_the_runner(
             {"id": "nightly", "name": "Get the nightly build green", "depends_on": []},
             {"id": "ship", "name": "Ship", "depends_on": ["nightly"]},
         ],
+        # A workflow planning chat's proposal also carries the description Save plan stores.
+        "description": "Gets the nightly build green, then ships it.",
     }
     assert (await run("sys_journal_write_plan", replan))["version"] == 2
+    assert published[-1][1]["entry"]["content"]["description"] == replan["description"]
     early = await run("sys_journal_write_status", {"status": "started", "step": "ship"})
     assert early["error"].startswith("step_not_ready: ship waits on nightly, not done yet")
     await run(

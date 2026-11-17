@@ -698,14 +698,15 @@ describe("GoalDialog", () => {
       try {
         queueGoalMutations(action, oldRequest.promise);
         queueGoalMutations("save", nextRequest.promise);
-        const { rerender } = render(<ManagedDialog />);
+        // A background poll on a slow runner would add reads this test counts.
+        const { rerender } = render(<ManagedDialog pollingEnabled={false} />);
         await waitFor(() => expect(screen.getByTestId("goal-save")).toBeEnabled());
         fireEvent.click(screen.getByTestId(button));
         if (boundary === "reopen") {
-          rerender(<ManagedDialog open={false} />);
-          rerender(<ManagedDialog />);
+          rerender(<ManagedDialog pollingEnabled={false} open={false} />);
+          rerender(<ManagedDialog pollingEnabled={false} />);
         } else {
-          rerender(<ManagedDialog key="replacement" />);
+          rerender(<ManagedDialog key="replacement" pollingEnabled={false} />);
         }
         await waitFor(() => expect(screen.queryByText("Loading goal")).not.toBeInTheDocument());
 

@@ -28,6 +28,7 @@ from omnigent.stores.conversation_store import (
 )
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+from omnigent.tools.builtins.session_message import SESSION_MESSAGE_MAX_CHARS
 from tests.debug_log_helpers import capture_debug_rows
 from tests.server.integration.test_managed_startup_inputs import auth_app as auth_app
 from tests.server.integration.test_managed_startup_inputs import (
@@ -113,6 +114,16 @@ async def test_private_sender_can_message_shared_receiver(
     store = SqlAlchemyConversationStore(db_uri)
     assert store.get_conversation(target["id"]).parent_conversation_id is None
     assert store.get_conversation(source["id"]).parent_conversation_id is None
+
+
+async def test_message_long_enough_for_automation_instructions_is_delivered(auth_client, peers):
+    source, target, _ = peers
+    # A message at the limit, as an automation sends with long instructions and a large item.
+    message = "Long task " + "a" * (SESSION_MESSAGE_MAX_CHARS - len("Long task "))
+    result = await _send(auth_client, source, target, message)
+    assert result.get("queued") is True, result
+    items = await auth_client.get(f"/v1/sessions/{target['id']}/items")
+    assert f"[Message from session {source['id']}]\\n{message}" in items.text
 
 
 @pytest.mark.parametrize("runner_features", [None, "peer_session_messaging"])
@@ -236,7 +247,7 @@ async def test_refusal_before_delivery(condition, auth_client, auth_app, peers, 
             "data": {
                 "message": {
                     "blank": " ",
-                    "oversize": "a" * 8001,
+                    "oversize": "a" * (SESSION_MESSAGE_MAX_CHARS + 1),
                 }.get(condition, "DO_NOT_DELIVER")
             },
         },
@@ -1684,6 +1695,8 @@ async def test_managed_creation_uses_default_provider_and_saves_private_first_ta
         await release.wait()
 
     monkeypatch.setattr(routes_core, "_run_managed_launch", launch)
+    # A full-size first task, as an automation sends with long instructions.
+    first_task = "First task\n" + "x" * (SESSION_MESSAGE_MAX_CHARS - len("First task\n"))
     try:
         with capture_debug_rows("server") as rows:
             result = json.loads(
@@ -1693,7 +1706,7 @@ async def test_managed_creation_uses_default_provider_and_saves_private_first_ta
                         {
                             "agent_id": source["agent_id"],
                             "placement": "managed",
-                            "message": "First task",
+                            "message": first_task,
                         }
                     ),
                     server_client=auth_client,
@@ -1715,10 +1728,10 @@ async def test_managed_creation_uses_default_provider_and_saves_private_first_ta
         assert (
             store.get_conversation(session_id).labels[CREATED_BY_SESSION_LABEL_KEY] == source["id"]
         )
-        assert "First task" in str(store.list_pending_inputs(session_id))
-        assert f"[Message from session {source['id']}]" in str(
-            store.list_pending_inputs(session_id)
-        )
+        pending = store.list_pending_inputs(session_id)
+        assert [item.data.content[0]["text"] for item in pending] == [
+            f"[Message from session {source['id']}]\n{first_task}"
+        ]
         grants, _ = SqlAlchemyPermissionStore(db_uri).list_for_session(session_id)
         assert [g.user_id for g in grants] == ["alice"]
     finally:

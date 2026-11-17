@@ -70,8 +70,10 @@ import uuid
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
+from datetime import datetime
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Literal, Protocol
+from zoneinfo import ZoneInfo
 
 from fastapi import HTTPException
 from sqlalchemy.exc import IntegrityError
@@ -96,6 +98,7 @@ from omnigent.server.managed_hosts import (
     parse_repo_workspace,
     read_managed_repo_workspaces,
 )
+from omnigent.server.proactive_agent import fire_skip_reason, is_proactive_task
 from omnigent.server.routes._session_create_validation import (
     validate_existing_host_workspace,
     validate_session_agent,
@@ -130,6 +133,7 @@ from omnigent.server.scheduled.schedule import (
     continued_sandbox_host_id,
     is_trigger_automation,
     strip_trigger_header,
+    task_timezone,
 )
 from omnigent.server.scheduled.source_session import (
     SourceCopyIncompleteError,
@@ -446,7 +450,16 @@ class _NewRunRecorder:
 def _scheduled_session_title(task: ScheduledTask) -> str:
     if is_trigger_automation(task):
         return f"[automation job] {task.name}"
-    return task.name
+    if task.session_mode == "continue":
+        return task.name
+    # Every run of a new-session task would otherwise share the task's name,
+    # leaving the sidebar with a column of identical titles.
+    return f"{task.name} ({format_run_time(time.time(), task_timezone(task))})"
+
+
+def format_run_time(epoch_seconds: float, timezone: ZoneInfo) -> str:
+    """Render a fire time like ``2026-11-13 09:05`` in the task's timezone."""
+    return f"{datetime.fromtimestamp(epoch_seconds, timezone):%Y-%m-%d %H:%M}"
 
 
 # Follows the prompt in every message a fire sends. No one watches a run, so a
@@ -757,6 +770,12 @@ async def _run_fire_for_task(
     if await _owner_is_deleted(deps, task):
         await _disable_for_deleted_owner(deps, task, recorder)
         return
+    if is_proactive_task(task):
+        skip = await asyncio.to_thread(fire_skip_reason, deps.app_state, deps.agent_store, task)
+        if skip is not None:
+            _logger.info("scheduled fire: proactive task %s skipped: %s", task.id, skip)
+            await recorder.finish("skipped", error=skip, error_code="proactive_agent_off")
+            return
     managed = task.execution_target == "managed_sandbox"
     if not managed and task.execution_target != "connected_host":
         _logger.info(

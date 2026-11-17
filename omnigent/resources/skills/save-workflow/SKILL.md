@@ -32,8 +32,9 @@ do not wait for a person.
 A request to create or save a workflow authorizes saving it, not executing its
 steps. Respect an explicit request to draft, review or try it before saving.
 In a workflow page's planning chat, follow its instructions: publish the
-proposal in the journal and let **Save plan** apply it to the existing
-workflow; do not create another workflow or run its steps.
+proposal in the journal, with a description (see Description) on every plan,
+and let **Save plan** apply both to the existing workflow; do not create
+another workflow or run its steps.
 
 ## Research the procedure while authoring
 

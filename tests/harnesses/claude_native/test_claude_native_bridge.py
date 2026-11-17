@@ -4673,8 +4673,10 @@ def test_augment_claude_args_disables_auto_mode_setup_offer(
         ((), None),
         (("--permission-mode", "default"), "default"),
         (("--permission-mode", "auto"), "auto"),
+        (("--permission-mode", "plan"), "plan"),
+        (("--permission-mode", "dontAsk"), "dontAsk"),
     ],
-    ids=["none", "default", "auto"],
+    ids=["none", "default", "auto", "plan", "dont-ask"],
 )
 def test_augment_claude_args_allows_reading_session_attachments(
     launch_args: tuple[str, ...],
@@ -4703,7 +4705,11 @@ def test_augment_claude_args_allows_reading_session_attachments(
 
     permissions = settings.get("permissions", {})
     assert permissions.get("defaultMode") == default_mode
-    assert permissions.get("allow") == [f"Read(/{attachment.parent.as_posix()}/**)"]
+    assert permissions.get("allow") == [
+        f"Read(/{attachment.parent.as_posix()}/**)",
+        "mcp__omnigent__sys_scheduled_task_create",
+        "mcp__omnigent__sys_scheduled_task_update",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -4726,7 +4732,13 @@ def test_augment_claude_args_omits_attachment_rule_for_pattern_cache_path(
         )
     )
 
-    assert settings.get("permissions") == expected_permissions
+    assert settings.get("permissions") == {
+        **(expected_permissions or {}),
+        "allow": [
+            "mcp__omnigent__sys_scheduled_task_create",
+            "mcp__omnigent__sys_scheduled_task_update",
+        ],
+    }
 
 
 @pytest.mark.parametrize(

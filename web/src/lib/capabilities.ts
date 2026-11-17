@@ -288,6 +288,11 @@ export interface ServerInfo {
   scheduled_task_trigger_headers?: boolean;
   /** Server default for new trigger templates, from 10 to 240 minutes. */
   automation_trigger_poll_minutes?: number;
+  /**
+   * Longest session message the server delivers, e.g. 32000. Older servers
+   * omit it and deliver at most 8,000 characters.
+   */
+  session_message_max_chars?: number;
   /** Sandbox automations accept a repository URL as their workspace. */
   scheduled_task_sandbox_workspaces?: boolean;
   /**
@@ -360,6 +365,11 @@ export interface ServerInfo {
    * absent on older servers (off).
    */
   scheduled_task_sharing?: boolean;
+  /**
+   * The deployment offers the proactive agent (Omni Advisor) to this caller;
+   * whether it is on for them is at ``GET /v1/proactive-agent/settings``.
+   */
+  proactive_agent_available?: boolean;
   /** Scheduled permissions support native harnesses beyond Claude Code. */
   scheduled_task_harness_settings?: boolean;
   /** Automations accept modes that skip approval; older servers may reject them. */
@@ -560,6 +570,14 @@ export function sandboxProfilesEnabled(info: ServerInfo | "loading"): boolean {
   );
 }
 
+/** Whether the Admin > General page has a setting to show: nested agents or Omni Advisor. */
+export function adminGeneralSettingsAvailable(info: ServerInfo | "loading"): boolean {
+  return (
+    info !== "loading" &&
+    (info.sibling_sessions === true || info.proactive_agent_available === true)
+  );
+}
+
 export function customAgentsSettingsEnabled(info: ServerInfo | "loading"): boolean {
   return info !== "loading" && info.agent_install === true;
 }
@@ -690,6 +708,12 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           scheduled_task_source_sessions: data.scheduled_task_source_sessions === true,
           scheduled_task_subhour: data.scheduled_task_subhour === true,
           scheduled_task_trigger_headers: data.scheduled_task_trigger_headers === true,
+          session_message_max_chars:
+            typeof data.session_message_max_chars === "number" &&
+            Number.isInteger(data.session_message_max_chars) &&
+            data.session_message_max_chars > 0
+              ? data.session_message_max_chars
+              : undefined,
           automation_trigger_poll_minutes:
             typeof data.automation_trigger_poll_minutes === "number" &&
             Number.isInteger(data.automation_trigger_poll_minutes) &&
@@ -719,6 +743,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           scheduled_task_projects: data.scheduled_task_projects === true,
           scheduled_task_inbox: data.scheduled_task_inbox === true,
           scheduled_task_sharing: data.scheduled_task_sharing === true,
+          proactive_agent_available: data.proactive_agent_available === true,
           scheduled_task_harness_settings: data.scheduled_task_harness_settings === true,
           scheduled_task_approval_skipping_modes:
             data.scheduled_task_approval_skipping_modes === true,

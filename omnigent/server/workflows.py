@@ -119,6 +119,7 @@ def _object(workflow: Workflow) -> WorkflowObject:
         **_summary(workflow).model_dump(),
         steps=[WorkflowStep(**step) for step in workflow.steps],
         planning_session_id=workflow.planning_session_id,
+        description_source=workflow.description_source,
     )
 
 
@@ -319,6 +320,15 @@ def create_workflows_router(
                 )
                 if session is None or session.archived:
                     raise OmnigentError("Planning session not found", code=ErrorCode.NOT_FOUND)
+        description_source = body.description_source
+        if description_source is not None:
+            try:
+                uuid_to_bytes(description_source)
+            except InvalidUuidError as exc:
+                raise OmnigentError(
+                    "description_source must be a journal entry ID", code=ErrorCode.INVALID_INPUT
+                ) from exc
+            description_source = normalize_uuid(description_source)
         try:
             workflow = await asyncio.to_thread(
                 store.update,
@@ -326,6 +336,8 @@ def create_workflows_router(
                 user_id=user_id,
                 name=body.name,
                 description=body.description,
+                expected_description=body.expected_description,
+                description_source=description_source,
                 steps=_steps(body.steps),
                 planning_session_id=planning_session_id,
             )

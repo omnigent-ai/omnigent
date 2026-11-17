@@ -1,5 +1,7 @@
 import { useState } from "react";
 import { PageScroll } from "@/components/PageScroll";
+import { ProactiveAgentAdminControls } from "@/components/ProactiveAgentAdminControls";
+import { ProactiveAgentSettingControl } from "@/components/ProactiveAgentSettingControl";
 import { SettingsGroup } from "@/components/SettingsGroup";
 import {
   Select,
@@ -9,9 +11,11 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { useIsAdmin } from "@/hooks/useIsAdmin";
+import { useProactiveAgentSettings } from "@/hooks/useProactiveAgentSettings";
 import { useSharing, useSetSharing } from "@/hooks/useSharing";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isSingleUserMode, type SiblingSessionDestinations } from "@/lib/capabilities";
+import { PROACTIVE_AGENT_DISPLAY_NAME } from "@/lib/proactiveInbox";
 
 const AGENT_DESTINATIONS: {
   id: SiblingSessionDestinations;
@@ -41,6 +45,7 @@ export function AdminGeneralPage() {
   const isAdmin = useIsAdmin();
   const canManage = isSingleUserMode(info) || isAdmin;
   const nestedAgentsEnabled = info !== "loading" && info.sibling_sessions === true;
+  const { available: advisorAvailable, settings: advisorSettings } = useProactiveAgentSettings();
   const {
     data: sharing,
     error: sharingError,
@@ -65,7 +70,7 @@ export function AdminGeneralPage() {
     );
   }
 
-  if (!nestedAgentsEnabled) return null;
+  if (!nestedAgentsEnabled && !advisorAvailable) return null;
   return (
     <PageScroll maxWidthClassName="max-w-4xl" contentClassName="px-4 md:px-8" extraBottom="2.5rem">
       <h1 className="settings-page-title text-2xl font-medium">Admin settings</h1>
@@ -77,7 +82,18 @@ export function AdminGeneralPage() {
       ) : (
         <>
           {isLoading && <p className="text-ui text-muted-foreground">Loading...</p>}
-          {sharing && (
+          {advisorAvailable && advisorSettings?.can_manage_workspace !== false && (
+            <SettingsGroup
+              title={PROACTIVE_AGENT_DISPLAY_NAME}
+              testId="settings-group-admin-proactive-agent"
+            >
+              <ProactiveAgentSettingControl scope="workspace" />
+              <div className="mt-4 border-t border-border pt-4">
+                <ProactiveAgentAdminControls />
+              </div>
+            </SettingsGroup>
+          )}
+          {nestedAgentsEnabled && sharing && (
             <SettingsGroup
               title="Nested agent destinations"
               testId="settings-group-agent-destinations"

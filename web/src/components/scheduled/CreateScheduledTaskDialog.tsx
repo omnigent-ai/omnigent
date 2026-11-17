@@ -58,7 +58,11 @@ import {
   type TriggerMcpService,
 } from "@/components/scheduled/TriggerTemplateFields";
 import { ModelEffortFields } from "@/components/scheduled/ModelEffortFields";
-import { WorkflowField } from "@/components/scheduled/WorkflowField";
+import {
+  WORKFLOW_DETAILS_LABEL,
+  WORKFLOW_DETAILS_PLACEHOLDER,
+  WorkflowField,
+} from "@/components/scheduled/WorkflowField";
 import { type SavedWorkflow, useSavedWorkflows } from "@/hooks/useSavedWorkflows";
 import { skillInvocationPrefix } from "@/lib/harnessSetup";
 import { parseSavedWorkflowMessage, savedWorkflowMessage } from "@/lib/workflow";
@@ -75,6 +79,7 @@ import {
   hasTriggerHeader,
   isTriggerPrompt,
   readTriggerWorkerPlacement,
+  readTriggerMessageMaxChars,
   readTriggerWorkerSettings,
   renderTriggerConfigPrompt,
   splitTriggerPrompt,
@@ -82,6 +87,7 @@ import {
   stripTriggerHeader,
   TRIGGER_TEMPLATES,
   triggerFieldsComplete,
+  triggerMessageBudget,
   triggerPromptSource,
   triggerMcpService,
   triggerServiceName,
@@ -333,8 +339,11 @@ export function CreateScheduledTaskDialog({
 
   const [name, setName] = useState("");
   const [prompt, setPrompt] = useState("");
-  // A saved workflow for each run to follow; the instructions then hold the run's details.
+  // A saved workflow for each run to follow as saved, so the form hides the instructions.
   const [workflowChoice, setWorkflowChoice] = useState<SavedWorkflow | null>(null);
+  // The workflow an automation already saved instructions with; they stay editable while it's
+  // chosen, and saving them empty ends that.
+  const [detailsWorkflowId, setDetailsWorkflowId] = useState<string | null>(null);
   const savedWorkflows = useSavedWorkflows({ enabled: open });
   // The rendered template text around the instructions of an older trigger. Never shown.
   const [systemPrompt, setSystemPrompt] = useState<string | null>(null);
@@ -642,6 +651,7 @@ export function CreateScheduledTaskDialog({
               (savedRun && { id: savedRun.id, name: savedRun.name, description: "" }))
           : null,
       );
+      setDetailsWorkflowId(savedRun?.details ? savedRun.id : null);
       setPrompt(editingTriggerConfig ? "" : (savedRun?.details ?? parts.userPrompt));
       setSystemPrompt(parts.systemPrompt);
       setTimezone(editingTask?.timezone ?? localTimezone());
@@ -830,7 +840,8 @@ export function CreateScheduledTaskDialog({
     const updated = updateTriggerWorkerSettings(effectivePrompt, settings);
     if (updated === null) return;
     const parts = splitTriggerPrompt(updated);
-    setPrompt(withoutWorkflow(parts.userPrompt));
+    // A chosen workflow leaves the hidden draft out of the prompt, so keep the draft as typed.
+    if (showsInstructions) setPrompt(withoutWorkflow(parts.userPrompt));
     setSystemPrompt(parts.systemPrompt);
   }
 
@@ -1031,6 +1042,20 @@ export function CreateScheduledTaskDialog({
   // first ONLINE host so unconfigured agents show "needs setup" right away.
   const badgeHost =
     selectedHost ?? hostOptions.find((h) => h.status === "online") ?? hostOptions[0];
+  // Trigger messages fit what both the server and the pinned polling host deliver.
+  const savedMessageMaxChars =
+    editingTemplateTrigger && originalTargetSelected
+      ? readTriggerMessageMaxChars(editingTask.prompt)
+      : null;
+  const loadedMessageBudget = triggerMessageBudget(
+    // Until server info loads, a saved trigger keeps its limit; Save waits for it.
+    curationPending ? (savedMessageMaxChars ?? undefined) : info.session_message_max_chars,
+    sandboxMode ? "managed_sandbox" : selectedHost,
+    savedMessageMaxChars,
+  );
+  const messageBudget = curationPending
+    ? { ...loadedMessageBudget, upgradeHint: null }
+    : loadedMessageBudget;
 
   // A workspace is only valid with a host — mirror the server's pairing rule so
   // the user gets inline feedback instead of a 400. In sandbox mode there is no
@@ -1056,8 +1081,18 @@ export function CreateScheduledTaskDialog({
     validateSchedule(schedule, { allowPastEnd, sessionMode, subhourSupported, executionTarget }) !==
       null;
   const workflowPrefix = skillInvocationPrefix(harnessSettings.harness);
+  // With a workflow, text typed before choosing it stays hidden and out of each run.
+  const keepsWorkflowDetails = workflowChoice !== null && workflowChoice.id === detailsWorkflowId;
+  const showsInstructions = workflowChoice === null || keepsWorkflowDetails;
   const withWorkflow = (text: string) =>
-    workflowChoice ? savedWorkflowMessage(workflowPrefix, workflowChoice, text, false) : text;
+    workflowChoice
+      ? savedWorkflowMessage(
+          workflowPrefix,
+          workflowChoice,
+          keepsWorkflowDetails ? text : "",
+          false,
+        )
+      : text;
   // The saved list's copy, once loaded, has the workflow's current name.
   const workflowShown =
     workflowChoice &&
@@ -1074,6 +1109,7 @@ export function CreateScheduledTaskDialog({
         onChange={setWorkflowChoice}
         onOpenChange={handleSelectOpenChange}
         locked={lockedWorkflow !== null}
+        runsAsSaved={!showsInstructions}
       />
     ) : null;
   const promptTriggerFields = {
@@ -1085,11 +1121,13 @@ export function CreateScheduledTaskDialog({
     pollingIntervalMinutes:
       schedule.preset === "custom" && schedule.customFreq === "minutely" ? schedule.interval : 60,
     taskSessionTitle: name,
+    messageMaxChars: messageBudget.messageMaxChars,
   };
   // An edit keeps the saved workers; a new trigger's workers run where the manager
   // runs (beside it on a connected host, or each in its own sandbox).
   const renderedTriggerConfig: TriggerConfig | null =
-    trigger !== null && triggerFieldsComplete(promptTriggerFields, trigger)
+    trigger !== null &&
+    triggerFieldsComplete(promptTriggerFields, trigger, messageBudget.instructionsMaxChars)
       ? {
           source: trigger,
           ...promptTriggerFields,
@@ -1904,40 +1942,56 @@ export function CreateScheduledTaskDialog({
                         taskSessionMode={triggerTaskSessionMode}
                         workflowField={workflowField}
                         instructionsAreDetails={workflowChoice !== null}
+                        hideInstructions={!showsInstructions}
                         mcpService={triggerMcpNote}
+                        instructionsMaxChars={messageBudget.instructionsMaxChars}
+                        instructionsUpgradeHint={messageBudget.upgradeHint}
                       />
                     ) : (
                       <div ref={promptFieldsRef} className="flex flex-col gap-1.5">
-                        {workflowField && <div className="mb-3.5">{workflowField}</div>}
-                        <Textarea
-                          id="task-prompt"
-                          aria-label={
-                            startsFromSession || workflowChoice
-                              ? "Additional instructions"
-                              : "Instructions"
-                          }
-                          value={prompt}
-                          rows={5}
-                          placeholder={
-                            workflowChoice
-                              ? "Optional. Instructions to customize the workflow."
-                              : startsFromSession
-                                ? "Optional. For example: Use this week's data."
-                                : "What should the agent do each run?"
-                          }
-                          data-testid="task-prompt-input"
-                          componentId="tasks.scheduled.prompt"
-                          className="min-h-40 resize-y rounded-xl text-ui focus-visible:ring-0"
-                          onChange={(e) => setPrompt(e.target.value)}
-                        />
-                        {systemPrompt !== null &&
-                          splitTriggerPrompt(effectivePrompt).systemPrompt === null && (
-                            <p role="status" className="text-sm text-warning">
-                              {prompt.trim() === ""
-                                ? "Instructions can't be empty."
-                                : "These edits change the template structure. After saving, the full text will appear as one prompt."}
-                            </p>
-                          )}
+                        {workflowField && (
+                          <div className={showsInstructions ? "mb-3.5" : undefined}>
+                            {workflowField}
+                          </div>
+                        )}
+                        {showsInstructions && (
+                          <>
+                            {workflowChoice && (
+                              <Label htmlFor="task-prompt">{WORKFLOW_DETAILS_LABEL}</Label>
+                            )}
+                            <Textarea
+                              id="task-prompt"
+                              aria-label={
+                                workflowChoice
+                                  ? undefined
+                                  : startsFromSession
+                                    ? "Additional instructions"
+                                    : "Instructions"
+                              }
+                              value={prompt}
+                              rows={5}
+                              placeholder={
+                                workflowChoice
+                                  ? WORKFLOW_DETAILS_PLACEHOLDER
+                                  : startsFromSession
+                                    ? "Optional. For example: Use this week's data."
+                                    : "What should the agent do each run?"
+                              }
+                              data-testid="task-prompt-input"
+                              componentId="tasks.scheduled.prompt"
+                              className="min-h-40 resize-y rounded-xl text-ui focus-visible:ring-0"
+                              onChange={(e) => setPrompt(e.target.value)}
+                            />
+                            {systemPrompt !== null &&
+                              splitTriggerPrompt(effectivePrompt).systemPrompt === null && (
+                                <p role="status" className="text-sm text-warning">
+                                  {prompt.trim() === ""
+                                    ? "Instructions can't be empty."
+                                    : "These edits change the template structure. After saving, the full text will appear as one prompt."}
+                                </p>
+                              )}
+                          </>
+                        )}
                       </div>
                     )}
                   </div>
