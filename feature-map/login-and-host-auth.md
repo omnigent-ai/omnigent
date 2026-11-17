@@ -75,7 +75,11 @@ be able to write resources without a separate Omnigent account.
   server has no runner to set up, chooses **Just join** (the default: opens the
   server, installs nothing) or **Install CLI first** (installs the CLI, signs
   in, connects this laptop as a host, then opens the server). States: a failed
-  install or host connect (Retry, Back, or Continue anyway without a host), no
+  install or host connect (Retry, Back, or Continue anyway without a host),
+  **Cancel** while installing or waiting on the sign-in (returns to the choice;
+  a cancelled sign-in stops and never connects the laptop; the installer and a
+  host connect already underway keep going), no Cancel while starting the local
+  server or connecting a remote environment, no
   in-app install on Windows/Linux (manual instructions), and no choice for
   returning users, an installed CLI, the local install, or a server that brings
   its own host CLI.

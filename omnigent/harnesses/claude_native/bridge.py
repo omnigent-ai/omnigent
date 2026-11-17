@@ -511,11 +511,13 @@ _SCROLLED_DRAFT_SURFACE = "a draft taller than the terminal"
 _ESCAPE_DISMISS_HINT = re.compile(r"\b(?:\w+/)*Esc(?:/\w+)*\s+to\s+\w", re.IGNORECASE)
 # Headlines of startup dialogs whose "Esc to cancel" quits Claude Code rather
 # than closing the dialog (2.1.299: the settings error exits 1, the folder-trust
-# question exits 0). Only the person may answer them.
+# question exits 0; 2.1.326: the --add-dir trust question exits 1). Only the
+# person may answer them.
 _ESCAPE_QUITS_DIALOG_HEADLINES = (
     "Settings Error",
     "Accessing workspace",
     "Do you trust the files in this folder",
+    "Adding a new directory",
 )
 # Titles of the confirmation dialog Claude Code pops when a switch invalidates
 # the prompt cache — one component, titled for what is being switched. It only
@@ -2083,7 +2085,12 @@ def _account_home_dir() -> Path:
         return Path.home()
 
 
-def ensure_claude_workspace_trusted(workspace: Path, env: Mapping[str, str] | None = None) -> None:
+def ensure_claude_workspace_trusted(
+    workspace: Path,
+    env: Mapping[str, str] | None = None,
+    *,
+    added_dirs: Sequence[Path] = (),
+) -> None:
     """
     Pre-accept Claude Code's first-run trust, onboarding, and mode prompts.
 
@@ -2092,15 +2099,16 @@ def ensure_claude_workspace_trusted(workspace: Path, env: Mapping[str, str] | No
     top-level ``hasCompletedOnboarding`` key in its global config
     (:func:`claude_global_config_path`, usually ``~/.claude.json``), a
     per-directory "Do you trust the files in this folder?" dialog gated
-    by ``projects["<abs cwd>"].hasTrustDialogAccepted``, and a "Make auto
-    mode your default permission mode?" question gated by
-    ``hasSeenAutoDefaultNudge``. None fires a
+    by ``projects["<abs cwd>"].hasTrustDialogAccepted``, an "Adding a new
+    directory" question (2.1.326+) for each ``--add-dir`` gated by the same
+    key, and a "Make auto mode your default permission mode?" question gated
+    by ``hasSeenAutoDefaultNudge``. None fires a
     ``PermissionRequest`` hook, so on a host-spawned (web-UI-driven)
     session there is nobody at the terminal to answer them: Claude hangs
     and the web UI shows nothing. This is acute with
     per-session git worktrees, which hand Claude a brand-new —
-    therefore untrusted — directory on every session, and for sessions
-    rooted at the home directory, whose interactively accepted trust
+    therefore untrusted — directory on every session, and for the home
+    directory and added directories, whose interactively accepted trust
     Claude keeps for that session only.
 
     Seed the gating keys idempotently so the launch never blocks. Only
@@ -2125,6 +2133,8 @@ def ensure_claude_workspace_trusted(workspace: Path, env: Mapping[str, str] | No
     :param env: Environment the Claude terminal is launched with, used to
         find the config file Claude will load. ``None`` uses this process's
         environment.
+    :param added_dirs: Omnigent-owned directories passed to ``--add-dir``
+        to trust as well, e.g. the portable-skill overlay.
     :returns: None.
     :raises ValueError: If the existing global config is not a regular
         file or is a broken or looping symlink, or it (or its ``projects`` map /
@@ -2167,18 +2177,20 @@ def ensure_claude_workspace_trusted(workspace: Path, env: Mapping[str, str] | No
 
     # Per-directory trust gate. Claude keys its ``projects`` map by the
     # resolved absolute path, so match that exactly.
-    project_key = str(workspace.resolve())
     projects = data.setdefault("projects", {})
     if not isinstance(projects, dict):
         raise ValueError(f"{config_path} 'projects' is not a JSON object; refusing to overwrite.")
-    project = projects.setdefault(project_key, {})
-    if not isinstance(project, dict):
-        raise ValueError(
-            f"{config_path} projects[{project_key!r}] is not a JSON object; refusing to overwrite."
-        )
-    if project.get("hasTrustDialogAccepted") is not True:
-        project["hasTrustDialogAccepted"] = True
-        changed = True
+    for directory in (workspace, *added_dirs):
+        project_key = str(directory.resolve())
+        project = projects.setdefault(project_key, {})
+        if not isinstance(project, dict):
+            raise ValueError(
+                f"{config_path} projects[{project_key!r}] is not a JSON object; "
+                "refusing to overwrite."
+            )
+        if project.get("hasTrustDialogAccepted") is not True:
+            project["hasTrustDialogAccepted"] = True
+            changed = True
 
     if not changed:
         return
