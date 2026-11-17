@@ -73,9 +73,8 @@ export function composerHighlightSplit(
   nativeShell: string | null,
   classifyValue: string = value,
 ): ComposerHighlightSplit | null {
-  if (nativeShell && splitNativeShellCommand(classifyValue, nativeShell)) {
-    // classifyValue only drops characters and never a `!`, so the token is value's first `!`.
-    const at = value.indexOf("!");
+  const at = value.indexOf("!");
+  if (at >= 0 && nativeShell && splitNativeShellCommand(classifyValue, nativeShell)) {
     return { kind: "shell", before: value.slice(0, at), token: "!", after: value.slice(at + 1) };
   }
   const command = splitKnownSlashCommand(value, commands);

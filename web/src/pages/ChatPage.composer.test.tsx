@@ -5830,6 +5830,9 @@ describe("Composer native shell mode", () => {
       expect(overlay.textContent).toBe(textarea().value);
       expect(within(overlay).getByText(token)).toHaveClass("text-brand-accent");
       expect(within(overlay).getByTestId("composer-mention-token")).toBeInTheDocument();
+      if (mode === "data-shell-command") {
+        expect(screen.getByTestId("composer-shell-mode-indicator")).toBeVisible();
+      }
     },
   );
 });

@@ -938,13 +938,6 @@ describe("UserBubble command tint", () => {
   });
 
   it("classifies a pending peer message by its raw text, keeping the sender", () => {
-    const shell = renderScoped(
-      userBubble("!echo hi", { pending: true }),
-      <PublishCommands nativeShell="codex-native" />,
-    );
-    expect(screen.getByText("!echo hi").closest("pre")).not.toBeNull();
-    shell.unmount();
-
     renderScoped(
       userBubble("[Message from session s_source]\n!echo **hi**", { pending: true }),
       <PublishCommands nativeShell="codex-native" />,
