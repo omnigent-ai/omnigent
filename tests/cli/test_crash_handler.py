@@ -664,6 +664,23 @@ def test_issue_url_scrubs_repr_escaped_home(
     assert "example" not in urllib.parse.unquote_plus(url)
 
 
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("/mnt/home/example/project", "/mnt/home/example/project"),
+        ("https://example.com/home/example/file", "https://example.com/home/example/file"),
+        ("/home/example/project", "~/project"),
+    ],
+    ids=["mount-prefix", "url-path", "home-itself"],
+)
+def test_scrub_keeps_home_text_inside_other_paths(
+    monkeypatch: pytest.MonkeyPatch, text: str, expected: str
+) -> None:
+    """A home path embedded in a longer path or URL is another location, so it stays intact."""
+    monkeypatch.setattr(Path, "home", lambda: Path("/home/example"))
+    assert ch._scrub(text) == expected
+
+
 def test_issue_url_redacts_multiline_bearer_before_truncation(data_dir: Path) -> None:
     """A credential split across lines is redacted before the head is cut away."""
     ch.install_crash_handler("omnigent", "omnigent-ai/omnigent")

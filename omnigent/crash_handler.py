@@ -482,6 +482,8 @@ def _scrub(text: str) -> str:
             pattern = (
                 rf"""(?P<quote>['"`]){home_pattern}(?=(?P<suffix>[^\r\n]*?)(?P=quote))"""
                 + "|"
+                # Not preceded by a name or URL character: ``/mnt/home/user`` is another path.
+                + r"(?<![\w.\-~])"
                 + home_pattern
                 + r"""(?=$|[/\\\s'"`)\]}>]|[.,;:!?]+(?=$|[\s'"`)\]}>]))"""
             )
