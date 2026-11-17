@@ -120,3 +120,40 @@ async def saved_profile(
     if snapshot is not None:
         await asyncio.to_thread(catalog.validate_snapshot, snapshot, user_id=user_id)
     return snapshot
+
+
+async def default_profile_for_unrecorded_host(
+    catalog: Any,
+    session_id: str,
+    host_id: str,
+    provider: str,
+    *,
+    user_id: str | None,
+) -> dict[str, Any] | None:
+    """Give a scheduled reset session the default profile when its host's profile is unknown.
+
+    A host's profile is recorded only on the sessions bound to it. Once a continue
+    task's sessions are deleted, a provider that cannot report a sandbox's profile
+    leaves the host with no record, and the relaunch would wait for a selection no
+    one can make. Automations always launch on the default, so it is what the host
+    was built with unless an admin changed the default since.
+
+    :returns: The default, now accepted for *session_id*, or ``None`` when the
+        session or host already has a profile or the provider has no default.
+    """
+    if catalog is None:
+        return None
+    if await asyncio.to_thread(catalog.get_session_snapshot, session_id) is not None:
+        return None
+    if (
+        await asyncio.to_thread(
+            catalog.get_host_snapshot, host_id, reference_session_id=session_id
+        )
+        is not None
+    ):
+        return None
+    default = await asyncio.to_thread(catalog.default_selection, provider, user_id=user_id)
+    if default is None:
+        return None
+    await asyncio.to_thread(catalog.bind_session, session_id, default)
+    return default

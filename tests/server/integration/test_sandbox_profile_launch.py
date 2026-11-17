@@ -239,24 +239,11 @@ async def test_default_profile_is_authorized_like_an_explicit_selection(env):
     assert env.recording.allocations == []
 
 
-@pytest.mark.parametrize(
-    ("env", "reset"),
-    [
-        ("provider", "repo-change"),
-        ("controller", "repo-change"),
-        ("controller", "deleted-session"),
-        ("provider", "revoked"),
-        ("controller", "revoked"),
-    ],
-    indirect=["env"],
-)
-async def test_scheduled_sandbox_preserves_its_default_profile_after_reset(env, reset, db_uri):
-    _with_default_profile(env, "build")
+async def _first_continue_fire(env: _Env, db_uri: str) -> tuple[FireDeps, Any, str, str]:
+    """Fire a new continue automation once; return its deps, task, session, and host."""
     response = await env.client.post("/v1/sessions", json={"agent_id": env.agent_id})
     assert response.status_code == 201, response.text
     session_id = response.json()["id"]
-    conversation = env.conversations.get_conversation(session_id)
-    assert conversation is not None
     schedules = SqlAlchemyScheduledTaskStore(db_uri)
     deps = FireDeps(
         scheduled_task_store=schedules,
@@ -282,13 +269,37 @@ async def test_scheduled_sandbox_preserves_its_default_profile_after_reset(env, 
     )
     env.conversations.set_labels(session_id, _session_labels(task))
     host_id = continued_sandbox_host_id(task.id, task.workspace_id)
+    launch = await _fire_session(env, deps, task, session_id, host_id)
+    assert launch.error is None, launch.error
+    return deps, task, session_id, host_id
+
+
+async def _fire_session(env: _Env, deps: FireDeps, task: Any, session_id: str, host_id: str):
+    conversation = env.conversations.get_conversation(session_id)
+    assert conversation is not None
     launching = _make_managed_sandbox_start(deps)(
         conversation, task, host_id, _STAGED_LAUNCH_ERRORS
     )
     launch = env.app.state.managed_launches.get(session_id)
     assert launch is not None
     await asyncio.wait_for(launching, timeout=10)
-    assert launch.error is None, launch.error
+    return launch
+
+
+@pytest.mark.parametrize(
+    ("env", "reset"),
+    [
+        ("provider", "repo-change"),
+        ("controller", "repo-change"),
+        ("controller", "deleted-session"),
+        ("provider", "revoked"),
+        ("controller", "revoked"),
+    ],
+    indirect=["env"],
+)
+async def test_scheduled_sandbox_preserves_its_default_profile_after_reset(env, reset, db_uri):
+    _with_default_profile(env, "build")
+    deps, task, session_id, host_id = await _first_continue_fire(env, db_uri)
     snapshot = env.catalog.get_session_snapshot(session_id)
     assert snapshot is not None and snapshot["id"] == "build"
     assert env.recording.allocations == [_PROVIDER_CONFIG]
@@ -314,12 +325,7 @@ async def test_scheduled_sandbox_preserves_its_default_profile_after_reset(env, 
     replacement_id = response.json()["id"]
     replacement = env.conversations.get_conversation(replacement_id)
     assert replacement is not None and replacement.host_id is None
-    launching = _make_managed_sandbox_start(deps)(
-        replacement, task, host_id, _STAGED_LAUNCH_ERRORS
-    )
-    launch = env.app.state.managed_launches.get(replacement_id)
-    assert launch is not None
-    await asyncio.wait_for(launching, timeout=10)
+    launch = await _fire_session(env, deps, task, replacement_id, host_id)
     if reset == "revoked":
         assert launch.error is not None
         assert "access denied" in launch.error.lower()
@@ -331,6 +337,29 @@ async def test_scheduled_sandbox_preserves_its_default_profile_after_reset(env, 
         assert env.catalog.get_session_snapshot(replacement_id) == snapshot
         assert env.conversations.get_conversation(replacement_id).host_id == host_id
         assert env.recording.allocations == [_PROVIDER_CONFIG, _PROVIDER_CONFIG]
+
+
+async def test_scheduled_reset_after_its_sessions_are_deleted_takes_the_default(env, db_uri):
+    # The default provider cannot report a sandbox's profile, so the host's only
+    # record is the session the owner deletes.
+    _with_default_profile(env, "build")
+    deps, task, session_id, host_id = await _first_continue_fire(env, db_uri)
+    snapshot = env.catalog.get_session_snapshot(session_id)
+    assert snapshot is not None and snapshot["id"] == "build"
+    await env.conversations.delete_conversation(session_id)
+    assert env.catalog.get_host_snapshot(host_id) is None
+
+    response = await env.client.post("/v1/sessions", json={"agent_id": env.agent_id})
+    assert response.status_code == 201, response.text
+    replacement_id = response.json()["id"]
+    task = dataclasses.replace(task, last_run_conversation_id=session_id)
+    launch = await _fire_session(env, deps, task, replacement_id, host_id)
+
+    assert launch.error is None, launch.error
+    assert env.catalog.get_session_snapshot(replacement_id) == snapshot
+    assert env.conversations.get_conversation(replacement_id).host_id == host_id
+    assert env.catalog.get_host_snapshot(host_id) == snapshot
+    assert env.recording.allocations == [_PROVIDER_CONFIG, _PROVIDER_CONFIG]
 
 
 @pytest.mark.parametrize("mode", ["profile", "ordinary", "flag-off", "legacy-managed"])
