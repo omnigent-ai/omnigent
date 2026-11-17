@@ -3805,9 +3805,10 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   },
 
   setEffort: async (effort, sessionId) => {
-    const conversationId = sessionId ?? get().conversationId;
-    const previous =
-      (sessionId === undefined ? get() : setterForState(sessionId))?.sessionReasoningEffort ?? null;
+    const target = sessionId === undefined ? get() : setterForState(sessionId);
+    if (target === null) return;
+    const conversationId = sessionId ?? target.conversationId;
+    const previous = target.sessionReasoningEffort;
     (sessionId === undefined ? setActive : setterFor(sessionId))({
       sessionReasoningEffort: effort,
     });
@@ -3848,9 +3849,10 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
 
   setModel: async (model, opts) => {
     const sessionId = opts?.sessionId;
-    const conversationId = sessionId ?? get().conversationId;
-    const previous =
-      (sessionId === undefined ? get() : setterForState(sessionId))?.sessionModelOverride ?? null;
+    const target = sessionId === undefined ? get() : setterForState(sessionId);
+    if (target === null) return;
+    const conversationId = sessionId ?? target.conversationId;
+    const previous = target.sessionModelOverride;
     (sessionId === undefined ? setActive : setterFor(sessionId))({ sessionModelOverride: model });
     if (conversationId) {
       const expectConfirmation = opts?.expectConfirmation === true && model !== null;
@@ -3901,10 +3903,10 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   },
 
   setCostControlMode: async (mode, sessionId) => {
-    const conversationId = sessionId ?? get().conversationId;
-    if (!conversationId) return;
     const target = sessionId === undefined ? get() : setterForState(sessionId);
-    const previous = target?.costControlModeOverride ?? null;
+    const conversationId = sessionId ?? target?.conversationId;
+    if (!target || !conversationId) return;
+    const previous = target.costControlModeOverride;
     // Routing and a pinned model are mutually exclusive: the server's routing
     // guard skips whenever model_override is set, so turning routing ON must
     // also clear this session's pinned model (in the SAME PATCH) — otherwise
@@ -3912,7 +3914,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // would never run. Mirrors the new-chat dialog's mutual exclusion. Only
     // clear when a model is actually pinned, so toggling routing on a
     // model-less (e.g. SDK) session doesn't emit a spurious model-cleared change.
-    const previousModel = target?.sessionModelOverride ?? null;
+    const previousModel = target.sessionModelOverride;
     const clearModel = mode === "on" && previousModel != null;
     // Pin the target: these are this conversation's switches, and the PATCH can
     // outlive a switch away. Resolving the target afterwards would leave a

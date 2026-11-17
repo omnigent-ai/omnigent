@@ -13488,32 +13488,54 @@ describe("chatStore — session configuration scope", () => {
     const activeId = "conv_settings_active";
     for (const id of [cellId, activeId]) {
       seedSession(id, []);
-      withSnapshot(id, { labels: { "omnigent.wrapper": "claude-code-native-ui" } });
+      sessionLabels.set(id, { "omnigent.wrapper": "claude-code-native-ui" });
     }
+    // Echo a model pick like the real server ("default" clears it), so turning
+    // routing on must clear the pinned model.
+    fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const response = defaultFetchHandler(input, init);
+      const patch: Record<string, unknown> =
+        init?.method === "PATCH" ? JSON.parse(String(init.body)) : {};
+      if (!("model_override" in patch)) return response;
+      const model = patch.model_override === "default" ? null : patch.model_override;
+      return mockResponse({ ...(await response.json()), model_override: model });
+    });
     await useChatStore.getState().switchTo(cellId);
     await useChatStore.getState().switchTo(activeId);
-    useChatStore.setState({ sessionModelOverride: "opus", sessionReasoningEffort: "low" });
+    useChatStore.setState({ sessionModelOverride: null, sessionReasoningEffort: "low" });
     const cell = () => conversationRegistry.peek(cellId)!.getState();
     fetchMock.mockClear();
 
     await useChatStore.getState().setModel("sonnet", { sessionId: cellId });
+    expect(cell().sessionModelOverride).toBe("sonnet");
     await useChatStore.getState().setEffort("high", cellId);
     await useChatStore.getState().setCostControlMode("on", cellId);
 
     expect(patchCallsFor(cellId)).toEqual([
       { model_override: "sonnet" },
       { reasoning_effort: "high" },
-      { cost_control_mode_override: "on" },
+      { cost_control_mode_override: "on", model_override: "default" },
     ]);
     expect(patchCallsFor(activeId)).toEqual([]);
-    expect(cell().sessionReasoningEffort).toBe("high");
-    expect(cell().costControlModeOverride).toBe("on");
+    expect(cell()).toMatchObject({
+      sessionModelOverride: null,
+      sessionReasoningEffort: "high",
+      costControlModeOverride: "on",
+    });
     expect(useChatStore.getState()).toMatchObject({
       conversationId: activeId,
-      sessionModelOverride: "opus",
+      sessionModelOverride: null,
       sessionReasoningEffort: "low",
       costControlModeOverride: null,
     });
+  });
+
+  it("leaves a session that isn't loaded alone", async () => {
+    const store = useChatStore.getState();
+    await store.setModel("sonnet", { sessionId: "conv_not_loaded" });
+    await store.setEffort("high", "conv_not_loaded");
+    await store.setCostControlMode("on", "conv_not_loaded");
+    expect(patchCallsFor("conv_not_loaded")).toEqual([]);
   });
 
   it("hydrates server-side model and effort without PATCHing", async () => {

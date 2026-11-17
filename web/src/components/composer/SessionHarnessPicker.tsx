@@ -15,7 +15,7 @@ import { MODEL_PICKER_KEYS } from "@/hooks/useModelPickerHotkey";
 import { codexEffortLevelsForModel, findNativeModelOption } from "@/lib/codexNativeModels";
 import { modelConfigurationSourceRows } from "@/lib/modelConfigurationSource";
 import { useChatStore, type ConversationState } from "@/store/chatStore";
-import { useConversationEntryState } from "@/hooks/useConversationEntryState";
+import { useConversationEntryValue } from "@/hooks/useConversationEntryState";
 import { nativeCodingAgentForHarness } from "@/lib/nativeCodingAgents";
 import { nativeModelLabel } from "@/components/HarnessConfigControls";
 import {
@@ -46,9 +46,10 @@ function useSessionField<T>(
   sessionId: string | undefined,
   select: (state: ConversationState) => T,
 ): T {
-  const active = useChatStore((state) => select(state));
-  const entry = useConversationEntryState(sessionId ?? null);
-  return sessionId === undefined ? active : select(entry);
+  // Each half reads only its own source, so neither re-renders for the other's updates.
+  const active = useChatStore((state) => (sessionId === undefined ? select(state) : null));
+  const entry = useConversationEntryValue(sessionId ?? null, select);
+  return sessionId === undefined ? (active as T) : entry;
 }
 
 /** The conversation a picker targets: *sessionId*, else whichever is active now. */
@@ -476,7 +477,8 @@ export function SessionHarnessPicker({
   const { preview, dismissPreview } = useComposerConfigCycleHotkeys(
     cycleModelSection?.choices,
     cycleEffortSection?.choices.filter(({ key }) => key !== "__fast__"),
-    !disabled && !busy && pendingModelChange === null,
+    // The window-wide hotkeys belong to the main composer's picker.
+    sessionId === undefined && !disabled && !busy && pendingModelChange === null,
     busy || pendingModelChange !== null,
     staged ? { apply: applyCycle, cancel: cancelCycle } : undefined,
   );
