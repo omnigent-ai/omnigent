@@ -12,8 +12,8 @@ describe("session families", () => {
     expect(orderSessionFamilies([standalone, c, a, b]).map((row) => row.id)).toEqual([
       "x",
       "a",
-      "b",
       "c",
+      "b",
     ]);
     expect([a, b, c].map(isIndentedSibling)).toEqual([false, true, true]);
     const promoted = [member("c", 3, "b"), member("b", 2, "b")];

@@ -21,3 +21,7 @@ export const SIDEBAR_GRID_MEMBER_HIGHLIGHT =
   "bg-[var(--sidebar-active)]/50 hover:bg-[var(--sidebar-active)]/50 dark:hover:bg-[var(--sidebar-active)]/50";
 // The focused grid pane's row adds an inset ring on top.
 export const SIDEBAR_GRID_SELECTED_RING = "ring-1 ring-inset ring-brand-accent/50";
+// Nested rows join into one line under the parent icon, inset 4px from the parent
+// row and the last nested row.
+export const SIDEBAR_FAMILY_LINE =
+  "pointer-events-none absolute -top-px bottom-0 -left-[7.5px] w-px bg-muted-foreground/40 [li:not([data-sibling-session]+li)>&]:top-[3px] [li:not(:has(+li[data-sibling-session]))>&]:bottom-1";

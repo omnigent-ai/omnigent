@@ -27,6 +27,8 @@ export function sessionFamilyGroups(rows: readonly Conversation[]): Map<string, 
         Number(b.id === familyId) - Number(a.id === familyId) ||
         a.id.localeCompare(b.id),
     );
+    // The head row stays first; nested sessions list newest first beneath it.
+    members.push(...members.splice(1).reverse());
   }
   return families;
 }

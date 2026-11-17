@@ -1523,6 +1523,14 @@ describe("Sidebar session list", () => {
     expect(screen.getByTestId("new-chat-button")).not.toHaveClass("bg-[var(--sidebar-active)]");
   });
 
+  it("leaves New session inactive on a nested-agent composer", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar(true, "/?sibling=conv_one");
+
+    expect(screen.getByTestId("new-chat-button")).not.toHaveClass("bg-[var(--sidebar-active)]");
+    expect(screen.getByTestId("new-chat-button")).not.toHaveAttribute("aria-current");
+  });
+
   it("marks Automations active (not New session) on /tasks/:taskId (detail route)", () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
     renderSidebar(true, "/tasks/task_abc123", undefined, AUTOMATIONS_INFO);
@@ -2227,7 +2235,7 @@ describe("Sidebar sections", () => {
       expect(placeholder.closest("a")).toHaveAttribute("href", `/?sibling=${source.id}`);
       expect(await screen.findByText("conv_peer")).toBeInTheDocument();
       const rowNode = placeholder.closest("li");
-      expect(rowNode).toHaveClass("ml-9");
+      expect(rowNode).toHaveClass("ml-6");
       if (scope.endsWith("backfill")) {
         const fetch = vi.spyOn(identity, "authenticatedFetch").mockResolvedValue(
           new Response(
@@ -2463,20 +2471,41 @@ describe("Sidebar sections", () => {
       if (inProject) fireEvent.click(screen.getByRole("button", { name: /^Customer X/ }));
       expect(screen.getByText("conv_0")).toBeInTheDocument();
       expect(screen.getByRole("button", { name: "Collapse session family" })).toBeInTheDocument();
-      for (let index = 1; index < 5; index++) {
+      // Nested sessions list newest first, so the oldest one is past the first page.
+      for (let index = 2; index <= 5; index++) {
         expect(screen.getByText(`conv_${index}`).closest("li")).toHaveAttribute(
           "data-sibling-session",
           "true",
         );
       }
-      expect(screen.queryByText("conv_5")).toBeNull();
+      expect(screen.queryByText("conv_1")).toBeNull();
       fireEvent.click(screen.getByRole("button", { name: inProject ? /Show more/ : "Load more" }));
-      expect(screen.getByText("conv_5").closest("li")).toHaveAttribute(
+      expect(screen.getByText("conv_1").closest("li")).toHaveAttribute(
         "data-sibling-session",
         "true",
       );
     },
   );
+
+  it("toggles the family when its parent row is clicked", () => {
+    const family = { id: "family", representative_id: "conv_parent", pinned: false };
+    mockConversations([
+      conv("conv_parent", "Claude Code", { updated_at: 2, family }),
+      conv("conv_nested", "Claude Code", { updated_at: 1, family }),
+    ]);
+    renderSidebar();
+    const parent = screen.getByRole("link", { name: /conv_parent/ });
+
+    fireEvent.click(parent);
+    expect(screen.queryByText("conv_nested")).toBeNull();
+    expect(screen.getByRole("button", { name: "Expand session family" })).toBeInTheDocument();
+
+    fireEvent.click(parent, { metaKey: true });
+    expect(screen.queryByText("conv_nested")).toBeNull();
+
+    fireEvent.click(parent);
+    expect(screen.getByText("conv_nested")).toBeInTheDocument();
+  });
 });
 
 // The sidebar splits sessions across two tabs: "My sessions" (owned, with the

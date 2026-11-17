@@ -71,6 +71,8 @@ import {
   GitPullRequestIcon,
   InboxIcon,
   ListChecksIcon,
+  ListChevronsDownUpIcon,
+  ListChevronsUpDownIcon,
   ListFilterIcon,
   LaptopIcon,
   LayoutDashboardIcon,
@@ -366,6 +368,7 @@ import {
   SIDEBAR_GRID_MEMBER_HIGHLIGHT,
   SIDEBAR_GRID_SELECTED_RING,
   SIDEBAR_OPEN_MENU_HIGHLIGHT,
+  SIDEBAR_FAMILY_LINE,
 } from "./sidebarStyles";
 import { MAIN_CANVAS_ID } from "@/canvas/canvasLayout";
 import { CANVAS_QUERY_PARAM, canvasLocation, isCanvasPathname } from "@/canvas/canvasNavigation";
@@ -640,14 +643,15 @@ function useActiveNavItem(): {
     !isWorkflowsPage &&
     !isUsagePage &&
     !isExtensionRoute;
-  const requestedProject = isNewSessionRoute
-    ? new URLSearchParams(location.search).get("project")
-    : null;
+  const searchParams = new URLSearchParams(location.search);
+  const requestedProject = isNewSessionRoute ? searchParams.get("project") : null;
   const newSessionProjectName = requestedProject || null;
   // Exclude non-composer routes: they also have no `:conversationId`, so they
   // would otherwise light up the "New session" button. A project-prefilled
-  // new session belongs to that project row instead of the global nav item.
-  const isNewChatPage = isNewSessionRoute && newSessionProjectName == null;
+  // new session belongs to that project row, and a nested-agent composer to
+  // its ghost row, instead of the global nav item.
+  const isNewChatPage =
+    isNewSessionRoute && newSessionProjectName == null && !searchParams.get("sibling");
   return {
     isNewChatPage,
     isInboxPage,
@@ -6191,9 +6195,18 @@ function ConversationRowImpl({
           aria-label={familyExpanded ? "Collapse session family" : "Expand session family"}
           aria-expanded={familyExpanded}
           onClick={onToggleFamily}
-          className="absolute top-1/2 left-2 z-10 -translate-y-1/2 rounded p-0.5 text-muted-foreground hover:text-foreground"
+          className={cn(
+            "absolute top-1/2 left-2 z-10 -translate-y-1/2 rounded p-0.5",
+            !selectionMode && isActive
+              ? "text-[var(--sidebar-active-foreground)]"
+              : "text-muted-foreground hover:text-foreground",
+          )}
         >
-          <ChevronRightIcon className={cn("size-3", familyExpanded && "rotate-90")} />
+          {familyExpanded ? (
+            <ListChevronsDownUpIcon aria-hidden className="size-3.5" />
+          ) : (
+            <ListChevronsUpDownIcon aria-hidden className="size-3.5" />
+          )}
         </button>
       )}
       <Link
@@ -6226,7 +6239,8 @@ function ConversationRowImpl({
           "w-full",
           // Touch reaches the row menu by long press.
           "mobile-touch-target",
-          familyExpanded !== undefined && "pl-7",
+          // Aligns the parent title with its nested rows' titles (ml-6 + px-2).
+          familyExpanded !== undefined && "pl-8",
           // Mobile drops the pin + kebab (see the trailing controls below), so it
           // reserves only what the badge needs — the same width desktop uses at
           // rest, before hover reveals the controls.
@@ -6257,6 +6271,14 @@ function ConversationRowImpl({
             e.stopPropagation();
             onToggleSelected(conversation.id, e.shiftKey);
             return;
+          }
+          // Opening a family's parent also expands or collapses its nested sessions.
+          if (
+            familyExpanded !== undefined &&
+            e.button === 0 &&
+            !(e.metaKey || e.ctrlKey || e.shiftKey || e.altKey)
+          ) {
+            onToggleFamily?.();
           }
           activateRow(conversation.id, e);
           onClick(e);
@@ -6308,14 +6330,9 @@ function ConversationRowImpl({
         ref={rowRef}
         data-sidebar-session-id={conversation.family ? conversation.id : undefined}
         data-sibling-session={familyIndented ? "true" : undefined}
-        className={cn("group relative", familyIndented && "ml-9")}
+        className={cn("group relative", familyIndented && "ml-6")}
       >
-        {familyIndented && (
-          <span
-            aria-hidden="true"
-            className="pointer-events-none absolute -left-3 top-0 h-5 w-2 rounded-bl-md border-b border-l border-muted-foreground/40"
-          />
-        )}
+        {familyIndented && <span aria-hidden="true" className={SIDEBAR_FAMILY_LINE} />}
         {rowLink}
         {shortcutSlot !== undefined && (
           <SessionShortcutHint slot={shortcutSlot} overlayTop={overlayTop} />
@@ -6341,15 +6358,10 @@ function ConversationRowImpl({
           dragListeners?.onTouchStart?.(event);
         }
       }}
-      className={cn("group relative", familyIndented && "ml-9", isDragging && "opacity-40")}
+      className={cn("group relative", familyIndented && "ml-6", isDragging && "opacity-40")}
       data-sibling-session={familyIndented || undefined}
     >
-      {familyIndented && (
-        <span
-          aria-hidden="true"
-          className="pointer-events-none absolute -left-3 top-0 h-5 w-2 rounded-bl-md border-b border-l border-muted-foreground/40"
-        />
-      )}
+      {familyIndented && <span aria-hidden="true" className={SIDEBAR_FAMILY_LINE} />}
       {insertion && (
         <span
           data-testid={pinInsertion ? "pin-order-insertion" : "session-order-insertion"}
