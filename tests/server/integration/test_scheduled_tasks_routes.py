@@ -2498,6 +2498,11 @@ async def test_list_runs_includes_conversation_read_state_fields(
     conv_store.set_session_usage(conv.id, {"total_cost_usd": 2.5})
     conv_store.set_session_live_status(conv.id, "running")
     conv_store.set_labels(conv.id, {SCHEDULED_TASK_RUN_LABEL_KEY: continued_id})
+    shared_elicitation_id = uuid.uuid4().hex
+    pending_elicitations.record_publish(
+        conv.id,
+        {"type": "response.elicitation_request", "elicitation_id": shared_elicitation_id},
+    )
     resp = await auth_client.get(f"/v1/scheduled-tasks/{task_id}/runs", headers=_headers())
     assert resp.status_code == 200
     shared = {row["id"]: row for row in resp.json()["runs"] if row["conversation_id"] == conv.id}
@@ -2505,6 +2510,9 @@ async def test_list_runs_includes_conversation_read_state_fields(
     assert all(row["session_cost_usd"] == 2.5 for row in shared.values())
     assert shared[continued_id]["conversation_status"] == "running"
     assert shared[succeeded_id]["conversation_status"] is None
+    assert shared[continued_id]["conversation_pending_approvals"] == 1
+    assert shared[succeeded_id]["conversation_pending_approvals"] == 0
+    pending_elicitations.resolve(conv.id, shared_elicitation_id)
 
 
 @pytest.mark.usefixtures("clean_session_read_state")
