@@ -466,11 +466,13 @@ def _scrub(text: str) -> str:
     with contextlib.suppress(Exception):
         home = str(Path.home())
         if home and home != os.sep:
+            home_variants = sorted({home, home.replace("\\", "\\\\")}, key=len, reverse=True)
+            home_pattern = "(?:" + "|".join(map(re.escape, home_variants)) + ")"
             # Spaces inside a quoted path may belong to a sibling directory.
             pattern = (
-                rf"""(?P<quote>['"`]){re.escape(home)}(?P<suffix>[^\r\n]*?)(?P=quote)"""
+                rf"""(?P<quote>['"`]){home_pattern}(?P<suffix>[^\r\n]*?)(?P=quote)"""
                 + "|"
-                + re.escape(home)
+                + home_pattern
                 + r"""(?=$|[/\\\s'"`)\]}>]|[.,;:!?]+(?=$|[\s'"`)\]}>]))"""
             )
 

@@ -525,6 +525,7 @@ def test_issue_url_scrubs_home_directory_and_tokens(
         f"Sibling paths: {home}.backup/module.py {home},backup/module.py\n"
         f"Sibling paths: {home}é/module.py {home}+backup/module.py "
         f"{home}@backup/module.py {home}~backup/module.py\n"
+        f"Sibling paths: {home}!backup/app.py {home};backup/app.py\n"
         f"Home: \"{home}\" '{home}' `{home}` {home}\n"
         f"Home: ({home}) [{home}] {{{home}}} <{home}> {home}, {home}. {home}... {home}!!!\n"
     )
@@ -547,6 +548,7 @@ def test_issue_url_scrubs_home_directory_and_tokens(
         f"Sibling paths: {home}é/module.py {home}+backup/module.py "
         f"{home}@backup/module.py {home}~backup/module.py\n"
     ) in body
+    assert f"Sibling paths: {home}!backup/app.py {home};backup/app.py\n" in body
     assert "Home: \"~\" '~' `~` ~\n" in body
     assert "Home: (~) [~] {~} <~> ~, ~. ~... ~!!!\n" in body
     assert ch._scrub(home) == "~"
@@ -570,6 +572,20 @@ def test_issue_url_scrubs_home_directory_and_tokens(
     assert "truncated" in noted_body
     assert "Home: (~)" in noted_body
     assert "Home: ~... ~!!!" in noted_body
+
+
+def test_issue_url_scrubs_repr_escaped_windows_home(
+    data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Backslashes doubled by ``repr()`` in an exception message are still scrubbed."""
+    ch.install_crash_handler("omnigent", "omnigent-ai/omnigent")
+    home_path = Path(r"C:\Users\example-user")
+    monkeypatch.setattr(Path, "home", lambda: home_path)
+    exc = FileNotFoundError(2, "No such file or directory", r"C:\Users\example-user\private.txt")
+    url, body_included = ch._issue_url(exc, "Traceback (most recent call last):\nOSError\n")
+    assert body_included is True
+    assert "example-user" not in urllib.parse.unquote_plus(url)
+    assert "~" in _description_of(url)
 
 
 def test_issue_url_redacts_multiline_bearer_before_truncation(data_dir: Path) -> None:
