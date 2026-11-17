@@ -347,7 +347,7 @@ import {
   resolveThisMachineHostId,
   SANDBOX_REPO_LABEL_KEY,
 } from "./NewChatDialog";
-import { useDesktopHostId } from "./RevealInFileManager";
+import { useDesktopHostId } from "@/lib/desktopHostId";
 import { ForkSessionDialog } from "./ForkSessionDialog";
 import { CreateAutomationFromSessionDialog } from "@/components/scheduled/CreateAutomationFromSessionDialog";
 import {
@@ -4658,7 +4658,16 @@ function ConversationSection({
     const representative = familyRepresentative(row);
     return representative !== undefined && representative.id !== row.id;
   };
+  const familyExpandedState = (row: Conversation) =>
+    row.family &&
+    familyRepresentative(row)?.id === row.id &&
+    families.get(row.family.id)!.length > 1
+      ? !collapsedFamilies.has(row.family.id)
+      : undefined;
   const visibleFamilyRows = orderSessionFamilies(rows, collapsedFamilies);
+  // Project rows already sit in an indent; other lists need a gutter for family chevrons.
+  const reserveFamilyGutter =
+    !indentRows && visibleFamilyRows.some((row) => familyExpandedState(row) !== undefined);
   const reorderRows = visibleFamilyRows.filter((row) => !isNestedFamilyRow(row));
 
   const groupingEmptyState = isFeatureEnabled(useContext(ServerInfoContext), "sidebar_grouping_ui");
@@ -4769,19 +4778,20 @@ function ConversationSection({
             )
           ) : (
             // Indent project chats a step under the project-folder name above.
-            <ul ref={listRef} className={cn("flex flex-col gap-px", indentRows && "pl-6")}>
+            <ul
+              ref={listRef}
+              className={cn(
+                "flex flex-col gap-px",
+                indentRows && "pl-6",
+                reserveFamilyGutter && "pl-4",
+              )}
+            >
               {visibleFamilyRows.map((conv) => (
                 <ConversationRow
                   key={nestedSessionSidebarKey(conv.id)}
                   conversation={conv}
                   familyIndented={isNestedFamilyRow(conv)}
-                  familyExpanded={
-                    conv.family &&
-                    familyRepresentative(conv)?.id === conv.id &&
-                    families.get(conv.family.id)!.length > 1
-                      ? !collapsedFamilies.has(conv.family.id)
-                      : undefined
-                  }
+                  familyExpanded={familyExpandedState(conv)}
                   onToggleFamily={() => onToggleFamily(conv.family!.id)}
                   isActive={conv.id === activeConversationId || !!conv.nested_draft_source_id}
                   inActiveGrid={gridMembers.has(conv.id)}
@@ -6251,7 +6261,7 @@ function ConversationRowImpl({
           aria-label={familyExpanded ? "Collapse session family" : "Expand session family"}
           aria-expanded={familyExpanded}
           onClick={onToggleFamily}
-          className="absolute top-1/2 left-2 z-10 -translate-y-1/2 rounded p-0.5 text-muted-foreground hover:text-foreground"
+          className="absolute top-1/2 right-full z-10 -translate-y-1/2 rounded p-0.5 text-muted-foreground hover:text-foreground"
         >
           <ChevronRightIcon className={cn("size-3", familyExpanded && "rotate-90")} />
         </button>
@@ -6284,7 +6294,6 @@ function ConversationRowImpl({
           "w-full",
           // Touch reaches the row menu by long press.
           "mobile-touch-target",
-          familyExpanded !== undefined && "pl-7",
           // Mobile drops the pin + kebab (see the trailing controls below), so it
           // reserves only what the badge needs — the same width desktop uses at
           // rest, before hover reveals the controls.
@@ -6366,7 +6375,7 @@ function ConversationRowImpl({
         ref={rowRef}
         data-sidebar-session-id={conversation.family ? conversation.id : undefined}
         data-sibling-session={familyIndented ? "true" : undefined}
-        className={cn("group relative", familyIndented && "ml-9")}
+        className={cn("group relative", familyIndented && "ml-6")}
       >
         {familyIndented && (
           <span
@@ -6399,7 +6408,7 @@ function ConversationRowImpl({
           dragListeners?.onTouchStart?.(event);
         }
       }}
-      className={cn("group relative", familyIndented && "ml-9", isDragging && "opacity-40")}
+      className={cn("group relative", familyIndented && "ml-6", isDragging && "opacity-40")}
       data-sibling-session={familyIndented || undefined}
     >
       {familyIndented && (

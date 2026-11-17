@@ -45,8 +45,6 @@ export function AdminGeneralPage() {
   const isAdmin = useIsAdmin();
   const canManage = isSingleUserMode(info) || isAdmin;
   const nestedAgentsEnabled = info !== "loading" && info.sibling_sessions === true;
-  // Older servers offer the workspace switch but not the prompt and Run now routes.
-  const advisorAdminAvailable = info !== "loading" && info.proactive_agent_admin_available === true;
   const { available: advisorAvailable, settings: advisorSettings } = useProactiveAgentSettings();
   const {
     data: sharing,
@@ -90,11 +88,9 @@ export function AdminGeneralPage() {
               testId="settings-group-admin-proactive-agent"
             >
               <ProactiveAgentSettingControl scope="workspace" />
-              {advisorAdminAvailable && (
-                <div className="mt-4 border-t border-border pt-4">
-                  <ProactiveAgentAdminControls />
-                </div>
-              )}
+              <div className="mt-4 border-t border-border pt-4">
+                <ProactiveAgentAdminControls />
+              </div>
             </SettingsGroup>
           )}
           {nestedAgentsEnabled && sharing && (

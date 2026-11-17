@@ -32,6 +32,7 @@ def test_unset_or_empty_uses_feature_defaults(environ: dict[str, str]) -> None:
             Feature.SESSION_ORCHESTRATION,
             Feature.SIBLING_SESSIONS,
             Feature.SIDEBAR_GROUPING_UI,
+            Feature.USER_INBOX,
         }
     )
     assert flags.frontend_dict() == {
@@ -75,6 +76,7 @@ def test_resolves_comma_separated_enabled_set() -> None:
         "sibling_sessions",
         "sidebar_grouping_ui",
         "usage_page",
+        "user_inbox",
     )
 
 
@@ -97,6 +99,7 @@ def test_resolves_comma_separated_enabled_set() -> None:
         "session_orchestration",
         "sibling_sessions",
         "sidebar_grouping_ui",
+        "user_inbox",
     ],
 )
 def test_explicit_disable_wins_and_preserves_other_features(override: str, feature: str) -> None:
@@ -114,6 +117,7 @@ def test_explicit_disable_wins_and_preserves_other_features(override: str, featu
         "sibling_sessions",
         "sidebar_grouping_ui",
         "usage_page",
+        "user_inbox",
     } - {feature}
 
 
@@ -131,6 +135,7 @@ def test_default_off_features_can_also_be_explicitly_disabled(feature: str) -> N
         "session_orchestration",
         "sibling_sessions",
         "sidebar_grouping_ui",
+        "user_inbox",
     )
 
 
@@ -172,6 +177,7 @@ def test_canvas_is_a_frontend_visible_feature() -> None:
         "session_orchestration",
         "sibling_sessions",
         "sidebar_grouping_ui",
+        "user_inbox",
     )
 
 

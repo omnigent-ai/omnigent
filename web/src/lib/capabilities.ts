@@ -277,6 +277,12 @@ export interface ServerInfo {
    */
   session_create_permission_modes?: boolean;
   /**
+   * True when a session create (and so ``sys_session_create``) accepts
+   * ``workflow_id``. Runners refuse the field on older servers, so trigger
+   * templates start workers as workflow runs only here. Fails to ``false``.
+   */
+  session_create_workflow_id?: boolean;
+  /**
    * True when a scheduled task can start every run from a copy of an existing
    * session (``source_session_id``). Gates the session menu's "Create
    * automation…" item. Fails to ``false``.
@@ -365,6 +371,8 @@ export interface ServerInfo {
    * absent on older servers (off).
    */
   scheduled_task_sharing?: boolean;
+  /** Agents can post items to this caller's Inbox (``/v1/inbox/items``). */
+  inbox_items_available?: boolean;
   /**
    * Automations shared with the viewer can be listed (``/v1/scheduled-tasks/shared``);
    * absent on older servers (off), including some that advertise sharing.
@@ -375,8 +383,6 @@ export interface ServerInfo {
    * whether it is on for them is at ``GET /v1/proactive-agent/settings``.
    */
   proactive_agent_available?: boolean;
-  /** The server has Omni Advisor's prompt and Run now routes; older servers omit it. */
-  proactive_agent_admin_available?: boolean;
   /** Scheduled permissions support native harnesses beyond Claude Code. */
   scheduled_task_harness_settings?: boolean;
   /** Automations accept modes that skip approval; older servers may reject them. */
@@ -522,6 +528,7 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   session_search_scope: false,
   scheduled_task_session_modes: false,
   session_create_permission_modes: false,
+  session_create_workflow_id: false,
   scheduled_task_mcp_services: false,
   scheduled_task_source_sessions: false,
   scheduled_task_subhour: false,
@@ -711,6 +718,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           session_search_scope: data.session_search_scope === true,
           scheduled_task_session_modes: data.scheduled_task_session_modes === true,
           session_create_permission_modes: data.session_create_permission_modes === true,
+          session_create_workflow_id: data.session_create_workflow_id === true,
           scheduled_task_mcp_services: data.scheduled_task_mcp_services === true,
           scheduled_task_source_sessions: data.scheduled_task_source_sessions === true,
           scheduled_task_subhour: data.scheduled_task_subhour === true,
@@ -750,9 +758,9 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           scheduled_task_projects: data.scheduled_task_projects === true,
           scheduled_task_inbox: data.scheduled_task_inbox === true,
           scheduled_task_sharing: data.scheduled_task_sharing === true,
+          inbox_items_available: data.inbox_items_available === true,
           scheduled_task_shared_with_me: data.scheduled_task_shared_with_me === true,
           proactive_agent_available: data.proactive_agent_available === true,
-          proactive_agent_admin_available: data.proactive_agent_admin_available === true,
           scheduled_task_harness_settings: data.scheduled_task_harness_settings === true,
           scheduled_task_approval_skipping_modes:
             data.scheduled_task_approval_skipping_modes === true,

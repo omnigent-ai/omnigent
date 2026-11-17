@@ -74,6 +74,7 @@ from omnigent.stores.conversation_store import (
     SCHEDULED_TASK_SOURCE_LABEL_KEY,
     SessionActivity,
 )
+from omnigent.stores.permission_store import PermissionStore
 from tests.server.helpers import build_agent_bundle
 
 # The trigger form's saved state; see encodeTriggerPrompt in web/.../triggerTemplates.ts.
@@ -496,6 +497,11 @@ class FakePermissionStore:
 
     def list_for_session(self, conversation_id: str, **_: Any) -> tuple[list[Any], None]:
         return [SessionPermission(*g) for g in self.grants if g[1] == conversation_id], None
+
+    # Its session reads are already direct, as the store defaults assume.
+    get_direct = PermissionStore.get_direct
+    list_direct_for_session = PermissionStore.list_direct_for_session
+    public_grantees = PermissionStore.public_grantees
 
     def delete_for_scheduled_task(self, scheduled_task_id: str) -> int:
         self.deleted_task_grants.append(scheduled_task_id)
@@ -1646,6 +1652,7 @@ async def test_sent_prompt_tells_the_agent_no_one_is_watching(
         sessions_routes, "_dispatch_session_event_to_runner", _dispatch_session_event_to_runner
     )
     task = _task(prompt=f"{header}Merge the open Dependabot PRs.\n")
+    monkeypatch.setattr(fire_mod.time, "time", lambda: 1_794_895_414.9)
 
     await fire_mod._send_prompt(
         _deps(FakeScheduledTaskStore(rows={"task_1": task})),
@@ -1658,7 +1665,8 @@ async def test_sent_prompt_tells_the_agent_no_one_is_watching(
         [
             {
                 "type": "input_text",
-                "text": f"Merge the open Dependabot PRs.\n\n{fire_mod.UNATTENDED_RUN_NOTE}",
+                "text": "Merge the open Dependabot PRs.\n\n"
+                + fire_mod.unattended_run_note(1_794_895_414),
             }
         ]
     ]
@@ -2416,9 +2424,13 @@ async def test_managed_fire_saves_prompt_then_launches_fresh_sandbox(
     assert [label[REQUESTED_HOST_ID_LABEL_KEY] for label in labels] == launched_host_ids
     for saved in startup.enqueued:
         assert saved["user_id"] == RESERVED_USER_LOCAL
-        assert saved["event"].data["content"] == [
-            {"type": "input_text", "text": f"do the thing\n\n{fire_mod.UNATTENDED_RUN_NOTE}"}
-        ]
+        [content] = saved["event"].data["content"]
+        assert content["type"] == "input_text"
+        run_time = re.search(r"\(Unix time (\d+)\)", content["text"])
+        assert run_time is not None
+        assert content["text"] == "do the thing\n\n" + fire_mod.unattended_run_note(
+            int(run_time.group(1))
+        )
         assert saved["headers"].get("x-omnigent-background-session-titles") == "on"
     for call in managed_launch.await_args_list:
         assert call.kwargs["sandbox_config"] is config
@@ -4536,6 +4548,15 @@ def test_session_approval_skipping_mode(
     conv = SimpleNamespace(labels=labels, terminal_launch_args=launch_args)
 
     assert fire_mod.session_approval_skipping_mode(conv) == expected
+
+
+def test_unattended_run_note_opens_with_the_run_time_in_utc() -> None:
+    note = fire_mod.unattended_run_note(1_794_895_414.9)
+
+    assert note == fire_mod.UNATTENDED_RUN_NOTE.replace(
+        "<omnigent-automation-context>\n",
+        "<omnigent-automation-context>\nRun time: 2026-11-17T06:03:34Z (Unix time 1794895414).\n",
+    )
 
 
 def test_new_session_run_titles_carry_the_fire_time_in_the_task_timezone(

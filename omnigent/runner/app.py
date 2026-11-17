@@ -614,6 +614,9 @@ _TERMINAL_EXIT_RELEASE_GRACE_S = 2.0
 # on the way; releasing the harness before it lands severs the stream carrying
 # it, so the wait is longer. The pane is already gone, so nothing else waits.
 _EXPECTED_CLOSE_RELEASE_GRACE_S = 15.0
+# How long an interrupted in-process turn may take to relay its own terminal,
+# which carries its usage, before the cancel floor; within the server's 5s stop deadline.
+_INTERRUPTED_TURN_SETTLE_GRACE_S = 1.0
 # Display names for the terminals whose exits the runner describes to people.
 _TERMINAL_DISPLAY_NAMES = {"claude": "Claude Code"}
 
@@ -4627,6 +4630,31 @@ def create_runner_app(
         _interrupted_sessions.discard(conv_id)
         return True
 
+    def _has_live_turn(conv_id: str) -> bool:
+        """Whether a turn slot holds unfinished work; a done Task is a leftover, not a turn."""
+        if conv_id not in _active_turns:
+            return False
+        target = _active_turns[conv_id]
+        return not (isinstance(target, asyncio.Task) and target.done())
+
+    def _settle_stop_without_turn(conv_id: str) -> None:
+        """Publish ``idle`` after a stop that found no turn, so a stale server ``running`` clears.
+
+        Skipped while work remains (a turn, an in-flight response or a buffered message), after a
+        failed setup, and for sessions this runner never initialized.
+        """
+        if conv_id in _active_turns or _session_message_buffers.get(conv_id):
+            return
+        if process_manager is not None and process_manager.has_active_turn(conv_id):
+            return
+        if _native_pane_status.get(conv_id) == "failed":
+            return
+        known = conv_id in _session_start_cache or (
+            process_manager is not None and process_manager.has_session(conv_id)
+        )
+        if known:
+            _publish_turn_status(conv_id, "idle")
+
     def _on_proxy_stream_end(
         conv_id: str,
         *,
@@ -4862,7 +4890,7 @@ def create_runner_app(
                 extra={"session_id": conv_id},
             )
 
-    async def _cancel_inprocess_turn(conv_id: str) -> None:
+    async def _cancel_inprocess_turn(conv_id: str, *, settle_grace_s: float = 0.0) -> None:
         # Distinguish "no live turn" (absent) from a stream-mode turn (present as
         # the None sentinel — driven by the AP request's consumption of
         # proxy_stream, so the runner owns no cancellable Task). Both a live Task
@@ -4885,6 +4913,8 @@ def create_runner_app(
         # and direct interrupt/stop callers rely on the forwarded interrupt
         # ending proxy_stream.
         if isinstance(target, asyncio.Task):
+            if settle_grace_s > 0:
+                await asyncio.wait({target}, timeout=settle_grace_s)
             await _cancel_active_turn(conv_id, expected_task=target)
 
     async def _resync_turn_state(
@@ -8136,7 +8166,12 @@ def create_runner_app(
             _interrupt_resp = await _native_interrupt_runner.interrupt(_harness, conversation_id)
             if _interrupt_resp is not None:
                 return _interrupt_resp
-            await _cancel_inprocess_turn(conversation_id)
+            _had_live_turn = _has_live_turn(conversation_id)
+            await _cancel_inprocess_turn(
+                conversation_id, settle_grace_s=_INTERRUPTED_TURN_SETTLE_GRACE_S
+            )
+            if not _had_live_turn:
+                _settle_stop_without_turn(conversation_id)
             return Response(status_code=204)
 
         if body_type == "external_session_status":
@@ -8321,7 +8356,12 @@ def create_runner_app(
                     else:
                         _interrupted_sessions.discard(conversation_id)
                 return _stop_resp
-            await _cancel_inprocess_turn(conversation_id)
+            _had_live_turn = _has_live_turn(conversation_id)
+            await _cancel_inprocess_turn(
+                conversation_id, settle_grace_s=_INTERRUPTED_TURN_SETTLE_GRACE_S
+            )
+            if not _had_live_turn:
+                _settle_stop_without_turn(conversation_id)
             return Response(status_code=204)
 
         if body_type == "effort_change":

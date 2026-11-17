@@ -50,6 +50,7 @@ function item(overrides: Partial<Suggestion> = {}): Suggestion {
     actions: [],
     media: [],
     sourceSessionId: "s",
+    agentId: "agent",
     status: "unread",
     resolution: "none",
     createdAt: 1,

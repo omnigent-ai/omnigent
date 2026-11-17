@@ -23,7 +23,8 @@ firing:
    with the automation's grantees (:mod:`~omnigent.server.scheduled.run_sharing`).
 #. **Launches the runner and dispatches the prompt** so the agent actually runs
    (a seeded prompt with no launched runner would just sit as history). The
-   message ends with :data:`UNATTENDED_RUN_NOTE`, since no one watches the run.
+   message ends with :data:`UNATTENDED_RUN_NOTE`, since no one watches the run;
+   the note opens with the run time.
 #. **Records the run** — stamps ``last_run_at`` + ``last_run_conversation_id`` on
    the task row and writes a ``scheduled_task_runs`` history row.
 
@@ -70,7 +71,7 @@ import uuid
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 from zoneinfo import ZoneInfo
@@ -466,7 +467,7 @@ def format_run_time(epoch_seconds: float, timezone: ZoneInfo) -> str:
 # question or a permission request stalls it instead of reaching a person. Only
 # the sent message carries it: the task keeps the prompt its owner wrote, so the
 # automation pages never show it. The chat hides it by exact text, so a change
-# here also goes in AUTOMATION_CONTEXT_NOTE in web/src/lib/systemMessage.ts.
+# here or to its run-time line also goes in web/src/lib/systemMessage.ts.
 UNATTENDED_RUN_NOTE = (
     "<omnigent-automation-context>\n"
     "Note: an Omnigent automation sent this message, and no one is watching this run. "
@@ -490,9 +491,26 @@ UNATTENDED_RUN_NOTE = (
 )
 
 
+_AUTOMATION_CONTEXT_OPEN = "<omnigent-automation-context>\n"
+
+
+def unattended_run_note(sent_at: float) -> str:
+    """:data:`UNATTENDED_RUN_NOTE`, opening with the time the fire sent it.
+
+    The run time saves the agent a clock lookup; the chat hides this line with the note.
+    """
+    seconds = int(sent_at)
+    run_time = f"{datetime.fromtimestamp(seconds, UTC):%Y-%m-%dT%H:%M:%SZ}"
+    return UNATTENDED_RUN_NOTE.replace(
+        _AUTOMATION_CONTEXT_OPEN,
+        f"{_AUTOMATION_CONTEXT_OPEN}Run time: {run_time} (Unix time {seconds}).\n",
+        1,
+    )
+
+
 def _prompt_event(prompt: str) -> SessionEventInput:
     """Build the user-message event that carries a task's prompt to the runner."""
-    text = f"{strip_trigger_header(prompt).rstrip()}\n\n{UNATTENDED_RUN_NOTE}"
+    text = f"{strip_trigger_header(prompt).rstrip()}\n\n{unattended_run_note(time.time())}"
     return SessionEventInput(
         type="message",
         data={"role": "user", "content": [{"type": "input_text", "text": text}]},

@@ -6257,6 +6257,11 @@
       "ProactiveAgentSettings": {
         "description": "The caller's view of the settings.",
         "properties": {
+          "agent_id": {
+            "description": "The proactive agent's id, which its Inbox items carry.",
+            "title": "Agent Id",
+            "type": "string"
+          },
           "can_manage_workspace": {
             "description": "Whether the caller may change the workspace setting.",
             "title": "Can Manage Workspace",
@@ -6282,7 +6287,8 @@
           "workspace_enabled",
           "user_enabled",
           "enabled",
-          "can_manage_workspace"
+          "can_manage_workspace",
+          "agent_id"
         ],
         "title": "ProactiveAgentSettings",
         "type": "object"
@@ -7857,6 +7863,11 @@
             "title": "Harness Install Enabled",
             "type": "boolean"
           },
+          "inbox_items_available": {
+            "default": false,
+            "title": "Inbox Items Available",
+            "type": "boolean"
+          },
           "installable_harnesses": {
             "items": {
               "type": "string"
@@ -7893,11 +7904,6 @@
             "default": {
               "restrict_to_agent_names": []
             }
-          },
-          "proactive_agent_admin_available": {
-            "default": false,
-            "title": "Proactive Agent Admin Available",
-            "type": "boolean"
           },
           "proactive_agent_available": {
             "default": false,
@@ -21071,7 +21077,7 @@
             }
           },
           {
-            "description": "The grantee to remove, e.g. `\"alice@example.com\"`.",
+            "description": "The grantee to remove, e.g. `\"alice@example.com\"`, in any spelling `PermissionStore.validate_grants` resolves.",
             "in": "path",
             "name": "target_user_id",
             "required": true,

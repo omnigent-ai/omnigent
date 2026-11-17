@@ -12003,6 +12003,81 @@ async def test_interrupt_cleanup_is_scoped_to_turn_generation(replacement: str) 
         app.state.active_turns.pop(conv, None)
 
 
+async def _stop_session_without_a_turn(
+    stop_type: str, setup: str
+) -> tuple[httpx.Response, list[str]]:
+    """POST *stop_type* to a session with no turn after *setup*; return response and statuses."""
+    conv = f"conv_stop_{stop_type}_{setup}"
+    child = f"{conv}_child"
+    pm = _RecoveryFakeProcessManager(_RecoveryScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    if setup not in {"unknown_session", "cache_only_session"}:
+        await pm.get_client(conv, _TEST_HARNESS_NAME)
+    if setup == "finished_task_slot":
+        finished = asyncio.create_task(asyncio.sleep(0))
+        await finished
+        app.state.active_turns[conv] = finished
+    elif setup == "subagent_running":
+        subagent_work.register_subagent_work(
+            parent_session_id=conv, child_session_id=child, agent="worker", title="task"
+        )
+    elif setup == "in_flight_response":
+        pm.mark_in_flight(conv, "resp_live")
+    elif setup == "buffered_message":
+        app.state.session_message_buffers[conv] = [{"type": "message"}]
+    elif setup == "failed_setup":
+        app.state.native_pane_status[conv] = "failed"
+    try:
+        async with _recovery_runner_client(app) as http:
+            if setup == "cache_only_session":
+                initialized = await http.post(
+                    "/v1/sessions", json={"session_id": conv, "agent_id": "ag_stop"}
+                )
+                assert initialized.status_code == 201, initialized.text
+                assert pm.has_session(conv)
+                await pm.release(conv)
+                assert not pm.has_session(conv)
+                retained = await http.get(f"/v1/sessions/{conv}")
+                assert retained.status_code == 200, retained.text
+                assert retained.json()["created_at"] == initialized.json()["created_at"]
+            response = await http.post(f"/v1/sessions/{conv}/events", json={"type": stop_type})
+            if setup == "cache_only_session":
+                assert not pm.has_session(conv)
+    finally:
+        subagent_work.unregister_subagent_work(child)
+    events = _drain_recovery_status_events(app.state.session_event_queues, conv)
+    return response, [event["status"] for event in events]
+
+
+@pytest.mark.parametrize("stop_type", ["interrupt", "stop_session"])
+@pytest.mark.parametrize(
+    "setup", ["no_turn_slot", "finished_task_slot", "subagent_running", "cache_only_session"]
+)
+@pytest.mark.asyncio
+async def test_stop_without_a_turn_settles_idle(stop_type: str, setup: str) -> None:
+    """Stop with no turn publishes ``idle``, like stopping a live turn does."""
+    response, statuses = await _stop_session_without_a_turn(stop_type, setup)
+    assert response.status_code == 204, response.text
+    assert statuses == ["idle"]
+
+
+@pytest.mark.parametrize("stop_type", ["interrupt", "stop_session"])
+@pytest.mark.parametrize(
+    "setup", ["in_flight_response", "buffered_message", "failed_setup", "unknown_session"]
+)
+@pytest.mark.asyncio
+async def test_stop_without_a_turn_leaves_remaining_work_to_report(
+    stop_type: str, setup: str
+) -> None:
+    """Stop publishes nothing while work remains, after failed setup, or for unknown sessions."""
+    response, statuses = await _stop_session_without_a_turn(stop_type, setup)
+    assert response.status_code == 204, response.text
+    assert statuses == []
+
+
 @pytest.mark.asyncio
 async def test_resync_ownership_gate_ignores_superseded_delivery_failure() -> None:
     """BLOCKING-2: a delayed verdict-delivery failure must not cancel a newer turn."""

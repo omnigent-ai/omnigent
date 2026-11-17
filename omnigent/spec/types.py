@@ -880,13 +880,11 @@ class ToolGroupsConfig:
     """
     Which framework-owned tool groups an agent advertises.
 
-    Every group except ``user_inbox`` defaults to ``True``: those groups
-    register on every agent unless the spec opts out under a top-level
-    ``tool_groups:`` block (a mapping of group name to boolean).
-    ``user_inbox`` is opt-in, so only agents built to post Inbox suggestions
-    can write to their owner's Inbox. Trimming a group the agent cannot
-    use keeps the advertised tool payload under a strict provider's byte
-    limit and stops a small model from picking an irrelevant tool.
+    Every group defaults to ``True``: groups register on every agent unless
+    the spec opts out under a top-level ``tool_groups:`` block (a mapping of
+    group name to boolean). Trimming a group the agent cannot use keeps the
+    advertised tool payload under a strict provider's byte limit and stops a
+    small model from picking an irrelevant tool.
 
     :param browser: The ``browser_*`` embedded-browser tools (5).
     :param scheduled_tasks: The ``sys_scheduled_task_*`` tools (4) and ``sys_reminder_set``.
@@ -898,7 +896,8 @@ class ToolGroupsConfig:
     :param projects: ``sys_project_list``, ``sys_project_update`` and
         ``sys_session_update``.
     :param user_inbox: ``sys_user_inbox_post`` and ``sys_user_inbox_list``,
-        which write to and read the owner's Inbox. Off by default.
+        which write to and read the owner's Inbox. The runner also drops them
+        unless the server offers the Inbox to the session's owner.
     """
 
     browser: bool = True
@@ -908,7 +907,7 @@ class ToolGroupsConfig:
     agent_discovery: bool = True
     journal: bool = True
     projects: bool = True
-    user_inbox: bool = False
+    user_inbox: bool = True
 
 
 @dataclass

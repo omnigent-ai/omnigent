@@ -158,6 +158,21 @@ def _is_host_tool(tool_name: str) -> bool:
     return _strip_mcp_tool_prefix(tool_name).startswith(_HOST_TOOL_PREFIX)
 
 
+def _keep_turn_usage(event: ExecutorEvent, ctx: TurnContext) -> None:
+    """
+    Keep the usage that an interrupted turn's event reports, for its terminal event.
+
+    An interrupted executor can still end its turn with the usage of the model
+    calls it made, such as the Claude CLI's final result. The server counts the
+    usage on ``response.cancelled`` too, so the session's cost includes them.
+
+    :param event: An event of the interrupted turn.
+    :param ctx: The turn's context, whose ``provider_usage`` the terminal event reads.
+    """
+    if isinstance(event, (TurnComplete, TurnCancelled, ExecutorError)) and event.usage is not None:
+        ctx.provider_usage = event.usage
+
+
 class InnerExecutorError(RuntimeError):
     """
     An executor-reported failure with a code or explicit delivery evidence.
@@ -421,8 +436,9 @@ class ExecutorAdapter(HarnessApp):
                         # the finally's _safe_interrupt fallback still fires.
                         await executor.interrupt_session(self._session_key)
                         _turn_outcome = "cancelled"
+                        _keep_turn_usage(event, ctx)
                         clean_exit = (
-                            await self._settle_interrupted_turn(event, turn_events)
+                            await self._settle_interrupted_turn(event, turn_events, ctx)
                             if executor.resumes_after_interrupt()
                             else True
                         )
@@ -490,6 +506,7 @@ class ExecutorAdapter(HarnessApp):
                         clean_exit = True
                         return
                     if isinstance(event, TurnCancelled):
+                        _keep_turn_usage(event, ctx)
                         log_input_event(
                             _logger,
                             "native_input_execution_finished",
@@ -657,16 +674,18 @@ class ExecutorAdapter(HarnessApp):
         cleanup.add_done_callback(self._bg_tasks.discard)
 
     async def _settle_interrupted_turn(
-        self, event: ExecutorEvent, turn_events: AsyncIterator[ExecutorEvent]
+        self, event: ExecutorEvent, turn_events: AsyncIterator[ExecutorEvent], ctx: TurnContext
     ) -> bool:
         """Discard an interrupted turn's events, from *event* on, until its harness ends it.
 
+        Keeps the usage that the turn reports as it ends, as its model calls were spent.
         Returns ``False`` when the turn does not end in time or reports a session-ending
         error, so the caller drops the executor instead of resuming its native session.
         """
         try:
             async with asyncio.timeout(_INTERRUPT_SETTLE_TIMEOUT_S):
                 while True:
+                    _keep_turn_usage(event, ctx)
                     if isinstance(event, ExecutorError) and not event.preserve_session:
                         _logger.warning(
                             "interrupted turn of inner session %s ended with an error: %s",
