@@ -1,7 +1,7 @@
 # Codex forwarding tests
 
-Existing scenarios from `test_codex_native_forwarder.py`, grouped by behavior. Test names,
-assertions and parameter cases are retained. Counts below are test definitions;
+Existing scenarios from `test_codex_native_forwarder.py`, grouped by behavior.
+Assertions and parameter cases are retained. Counts below are test definitions;
 parameterization produces additional collected cases.
 
 | Module | Behavior | Test definitions |
@@ -15,7 +15,7 @@ parameterization produces additional collected cases.
 | [test_health.py](test_health.py) | Health | 4 |
 | [test_instructions.py](test_instructions.py) | Instructions | 20 |
 | [test_mcp_startup.py](test_mcp_startup.py) | Mcp startup | 14 |
-| [test_replay_order.py](test_replay_order.py) | Replay order | 15 |
+| [test_replay_order.py](test_replay_order.py) | Replay order | 14 |
 | [test_settings.py](test_settings.py) | Settings | 20 |
 | [test_side_chat.py](test_side_chat.py) | Side chat | 1 |
 | [test_subagents.py](test_subagents.py) | Subagents | 16 |

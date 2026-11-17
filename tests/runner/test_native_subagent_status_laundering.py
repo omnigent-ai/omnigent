@@ -490,10 +490,8 @@ async def test_native_prompt_delivery_acknowledges_the_launch() -> None:
         subagent_work.unregister_subagent_work(child_id)
 
 
-# Start-bound lifecycle for a steered Codex child. Evidence belongs to the child's turn:
-# a settled turn clears it, a registration consumes it once, and draining or replacing a
-# dispatch entry never touches it. Each case interleaves the events of a previous turn
-# (``*_prev``) with the steered turn that the parent's send starts.
+# Exercise previous/current-turn acceptance, start and settlement interleavings
+# across dispatch replacement and draining.
 
 _START_BUDGET_S = 180.0
 _PREVIOUS_ACCEPTED_AT = 1000.0
