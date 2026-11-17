@@ -986,10 +986,13 @@ def test_daemon_host_online_false_when_no_host_id(
     assert cli._daemon_host_online(record) is False
 
 
-def _server_record(target: str = "http://127.0.0.1:59999") -> cli._HostDaemonRecord:
+def _server_record(
+    target: str = "http://127.0.0.1:59999", log_path: str | None = None
+) -> cli._HostDaemonRecord:
     """Build a server-mode daemon record pointing at *target*.
 
     :param target: Configured server URL the daemon must register with.
+    :param log_path: The daemon's log file, or ``None`` for no log.
     :returns: A record with a host id, suitable for the registration wait.
     """
     return cli._HostDaemonRecord(
@@ -997,7 +1000,7 @@ def _server_record(target: str = "http://127.0.0.1:59999") -> cli._HostDaemonRec
         target=target,
         mode="server",
         server_url=target,
-        log_path=None,
+        log_path=log_path,
         started_at=1_000_000,
         host_id="host_abc",
     )
@@ -1159,23 +1162,98 @@ def test_registration_timeout_keeps_hint_when_server_answered_then_dropped(
     assert suppresses_recovery_hint(excinfo.value) is False
 
 
-def test_registration_timeout_keeps_stale_host_hint_when_server_answers(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A reachable server that never reports the host online keeps the hint.
+def _write_tunnel_log(path: Path, reasons: list[str], other_lines: int = 0) -> str:
+    """Write a host log with one failed tunnel attempt per reason.
 
-    Here a stale host process really can be the cause (e.g. a rejected
-    tunnel), so the generic timeout still names the server but the
-    recovery hint stays.
+    :param path: Log file to write.
+    :param reasons: Disconnect reasons in attempt order, e.g.
+        ``["timed out during handshake"]``.
+    :param other_lines: Unrelated log lines written after the attempts.
+    :returns: *path* as a string, for a daemon record's ``log_path``.
+    """
+    connecting = "INFO  host.connect _connect_and_serve | Connecting to ws://127.0.0.1:59999"
+    lines = []
+    for reason in reasons:
+        lines.append(connecting)
+        lines.append(
+            f"WARN  host.connect run | Host tunnel disconnected: {reason}. Reconnecting in 3.0s"
+        )
+    lines.extend(
+        f"INFO  host.maintenance _run_once | host global maintenance stage completed: {index}"
+        for index in range(other_lines)
+    )
+    # The daemon is mid-attempt when the registration grace runs out.
+    lines.append(connecting)
+    path.write_text("\n".join(lines) + "\n")
+    return str(path)
+
+
+@pytest.mark.parametrize(
+    ("reason", "other_lines"),
+    [
+        pytest.param("server rejected WebSocket connection: HTTP 504", 0, id="http-504"),
+        pytest.param("timed out during handshake", 0, id="handshake-timeout"),
+        pytest.param("timed out during handshake", 100, id="beyond-displayed-tail"),
+    ],
+)
+def test_registration_timeout_names_server_side_tunnel_failure_and_skips_stale_host_hint(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, reason: str, other_lines: int
+) -> None:
+    """A tunnel upgrade failed by the server side is named, without the hint.
+
+    The server answers HTTP, but a 5xx upgrade response or an unanswered
+    handshake comes from the server or a gateway in front of it, so the
+    stale-host recovery hint (`omnigent stop`) would mislead.
     """
     from omnigent.cli_diagnostics import suppresses_recovery_hint
 
+    log_path = _write_tunnel_log(tmp_path / "host.log", [reason], other_lines)
     _patch_registration_wait(
         monkeypatch, cli._HostHttpResult(status_code=200, body={"status": "offline"})
     )
 
     with pytest.raises(click.ClickException) as excinfo:
-        cli._confirm_background_host_registered(_server_record())
+        cli._confirm_background_host_registered(_server_record(log_path=log_path))
+
+    message = str(excinfo.value)
+    assert "could not open its tunnel to the server at http://127.0.0.1:59999" in message
+    assert f"WebSocket upgrade failed ({reason})" in message
+    assert suppresses_recovery_hint(excinfo.value) is True
+
+
+@pytest.mark.parametrize(
+    "tunnel_reasons",
+    [
+        pytest.param(None, id="no-log"),
+        pytest.param(
+            [
+                "server rejected WebSocket connection: HTTP 504",
+                "server rejected WebSocket connection: HTTP 401",
+            ],
+            id="latest-attempt-401",
+        ),
+    ],
+)
+def test_registration_timeout_keeps_stale_host_hint_when_server_answers(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, tunnel_reasons: list[str] | None
+) -> None:
+    """A reachable server that never reports the host online keeps the hint.
+
+    Here a stale host process really can be the cause (e.g. a rejected
+    tunnel), so the generic timeout still names the server but the
+    recovery hint stays, even after an earlier server-side tunnel failure.
+    """
+    from omnigent.cli_diagnostics import suppresses_recovery_hint
+
+    log_path = None
+    if tunnel_reasons is not None:
+        log_path = _write_tunnel_log(tmp_path / "host.log", tunnel_reasons)
+    _patch_registration_wait(
+        monkeypatch, cli._HostHttpResult(status_code=200, body={"status": "offline"})
+    )
+
+    with pytest.raises(click.ClickException) as excinfo:
+        cli._confirm_background_host_registered(_server_record(log_path=log_path))
 
     message = str(excinfo.value)
     assert "did not register with the server at http://127.0.0.1:59999" in message

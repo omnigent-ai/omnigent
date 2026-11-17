@@ -8990,6 +8990,39 @@ async def test_sustained_recycle_failures_fall_back_to_backoff(
     assert prompt == [0, 1, 2], f"prompt cadence must stop after the streak cap: {prompt}"
 
 
+@pytest.mark.parametrize(
+    "failure",
+    [
+        pytest.param(_invalid_status(504), id="http-504"),
+        pytest.param(TimeoutError("timed out during handshake"), id="handshake-timeout"),
+    ],
+)
+async def test_server_side_upgrade_failure_log_is_recognized_by_cli(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    tmp_path: Path,
+    failure: BaseException,
+) -> None:
+    """The reconnect warning keeps the wording `host --background` diagnoses.
+
+    The CLI reads the daemon log to tell a server-side tunnel failure from a
+    stale-host rejection, so the reconnect line must stay parseable.
+    """
+    from omnigent import cli
+
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_CAP_S", 0.0)
+    spy = _ConnectSpy([failure, asyncio.CancelledError()])
+    _patch_connect(monkeypatch, spy)
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.host.connect"):
+        await _host().run()
+
+    log_path = tmp_path / "host.log"
+    log_path.write_text("\n".join(record.message for record in caplog.records) + "\n")
+    assert cli._server_side_tunnel_failure(str(log_path)) == str(failure)
+
+
 @pytest.mark.parametrize("console_error", [None, BrokenPipeError, ValueError, OSError])
 async def test_silent_connect_streak_escalates_and_slows_reconnects(
     monkeypatch: pytest.MonkeyPatch,
