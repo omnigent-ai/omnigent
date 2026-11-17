@@ -718,7 +718,7 @@ function HarnessDetail({
     ),
   });
   const header = (
-    <SettingsItem entry={detail}>
+    <>
       <BackButton label="Harnesses" to="/settings/harnesses" />
       <div className="flex items-start justify-between gap-4">
         <div className="flex min-w-0 items-center gap-3">
@@ -738,7 +738,7 @@ function HarnessDetail({
         </div>
       </div>
       {host && canSetup && <MachineField host={host} />}
-    </SettingsItem>
+    </>
   );
   const credentialCard = (
     <SettingsItem entry={credentialEntry}>
@@ -807,18 +807,20 @@ function HarnessDetail({
   const inventoryPage = harnessInventoryPage(entry.harness);
   if (host && inventoryPage && (status.ready || canFix)) {
     return (
-      <HarnessCatalog
-        header={header}
-        settings={settings}
-        host={host}
-        family={inventoryPage.family}
-        detail={inventoryPage.detail}
-        defaultTab={status.ready ? "mcps" : "settings"}
-      />
+      <SettingsItem entry={detail}>
+        <HarnessCatalog
+          header={header}
+          settings={settings}
+          host={host}
+          family={inventoryPage.family}
+          detail={inventoryPage.detail}
+          defaultTab={status.ready ? "mcps" : "settings"}
+        />
+      </SettingsItem>
     );
   }
   return (
-    <>
+    <SettingsItem entry={detail}>
       {header}
       <div className="mt-6 flex flex-col gap-6">
         {!host ? (
@@ -859,7 +861,7 @@ function HarnessDetail({
           </p>
         )}
       </div>
-    </>
+    </SettingsItem>
   );
 }
 

@@ -558,23 +558,25 @@ describe("Harness page catalog rows", () => {
     hosts = [ONLINE];
     renderHarnesses("claude-native");
 
-    expect(
-      document.querySelector('[data-settings-item="harness-claude-native-detail"]'),
-    ).toContainElement(screen.getByRole("heading", { name: "Claude Code" }));
-    expect(screen.getByRole("tablist", { name: "Claude Code view" })).toHaveAttribute(
-      "data-settings-control",
-      "harness-claude-native-detail:tab",
-    );
+    const detailRow = document.querySelector('[data-settings-item="harness-claude-native-detail"]');
+    expect(detailRow).toContainElement(screen.getByRole("heading", { name: "Claude Code" }));
+    const tabList = screen.getByRole("tablist", { name: "Claude Code view" });
+    expect(detailRow).toContainElement(tabList);
+    expect(tabList).toHaveAttribute("data-settings-control", "harness-claude-native-detail:tab");
   });
 
   it("names the setup warning's fix and the credential card's action by their key", () => {
     hosts = [{ ...ONLINE, configured_harnesses: { "codex-native": "binary-missing" } }];
     renderHarnesses("codex-native");
 
-    expect(screen.getByRole("button", { name: "Install" })).toHaveAttribute(
+    const install = screen.getByRole("button", { name: "Install" });
+    expect(install).toHaveAttribute(
       "data-settings-control",
       "harness-codex-native-detail:fixAction",
     );
+    expect(
+      document.querySelector('[data-settings-item="harness-codex-native-detail"]'),
+    ).toContainElement(install);
     expect(
       document.querySelector('[data-settings-item="harness-codex-native-credential"]'),
     ).toBeTruthy();
