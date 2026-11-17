@@ -198,7 +198,10 @@ export function parseFileReference(raw: string, source: FileReferenceSource): Fi
     if (!strong && (/\s/.test(path) || !(anchored && segments.filter(Boolean).length >= 3))) {
       return null;
     }
-    if (!hasDirectory && !looksLikeFileName(fileName)) return null;
+    // A bare word with a dot (`19.x`, `e.g`, `example.com`) needs a known extension.
+    if (!hasDirectory && !EXTENSIONLESS_FILE_NAMES.has(fileName) && !hasKnownExtension(fileName)) {
+      return null;
+    }
   }
 
   const candidates: string[] = [];
@@ -223,12 +226,16 @@ export function worthSearching(reference: FileReference): boolean {
     return false;
   }
   if (reference.hasDirectory || reference.citation.hasPosition) return true;
-  const extension = reference.candidates[0]?.match(/\.([A-Za-z0-9]+)$/)?.[1]?.toLowerCase();
-  return !!extension && SEARCHABLE_EXTENSIONS.has(extension);
+  return hasKnownExtension(reference.candidates[0] ?? "");
+}
+
+function hasKnownExtension(name: string): boolean {
+  const extension = name.match(/\.([A-Za-z0-9]+)$/)?.[1]?.toLowerCase();
+  return !!extension && KNOWN_FILE_EXTENSIONS.has(extension);
 }
 
 // Extensions common enough in agent replies that a bare `name.ext` is a file.
-const SEARCHABLE_EXTENSIONS = new Set(
+const KNOWN_FILE_EXTENSIONS = new Set(
   (
     "ts tsx js jsx mjs cjs py pyi rs go java kt kts scala swift m mm c cc cpp h hpp cs rb php " +
     "sh bash zsh fish ps1 sql proto graphql gql css scss less html vue svelte astro " +

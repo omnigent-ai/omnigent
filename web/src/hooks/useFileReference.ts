@@ -11,6 +11,7 @@
 //      path written relative to the repository root or a subfolder, used only
 //      when exactly one file matches.
 
+import { useEffect, useState } from "react";
 import { useQueries, useQuery } from "@tanstack/react-query";
 import type { FileReference } from "@/lib/fileReferences";
 import { worthSearching } from "@/lib/fileReferences";
@@ -118,6 +119,10 @@ export function useFileReference(
   const { root, home } = useWorkspacePaths();
   const serveable = useWorkspaceServeable(conversationId);
 
+  // A miss counts only from a listing fetched after this reference first
+  // rendered: an earlier mention (the user asking for `report.md`) may have
+  // cached the directory before the agent wrote the file.
+  const [renderedAt] = useState(() => Date.now());
   const candidates = reference?.candidates ?? [];
   const resolutions = candidates.map((candidate) =>
     resolveReferenceCandidate(candidate, root, home),
@@ -155,7 +160,8 @@ export function useFileReference(
         break;
       }
       const query = listings[index];
-      const state = candidateState(query.isSuccess ? query.data : null, resolution.path);
+      let state = candidateState(query.isSuccess ? query.data : null, resolution.path);
+      if (state === "missing" && missIsOutdated(query, renderedAt)) state = "pending";
       if (state === "pending") {
         undecided = true;
         break;
@@ -196,9 +202,33 @@ export function useFileReference(
       );
       if (matches.length === 1) searchMatch = matches[0].path;
       // A cut-short search that found nothing hasn't proven absence.
-      else if (!matches.length && result.truncated) searchPending = true;
+      else if (!matches.length && (result.truncated || missIsOutdated(search, renderedAt))) {
+        searchPending = true;
+      }
     }
   }
+
+  // Re-check an outdated miss; a hit stays cached.
+  const outdated = listings
+    .map((query, index) => {
+      const path = resolvedPaths[index];
+      if (!checking || path === null || !query.isSuccess || query.isFetching) return false;
+      return candidateState(query.data, path) === "missing" && missIsOutdated(query, renderedAt);
+    })
+    .join();
+  const searchOutdated =
+    searchable &&
+    search.isSuccess &&
+    !search.isFetching &&
+    !searchMatch &&
+    missIsOutdated(search, renderedAt);
+  useEffect(() => {
+    outdated.split(",").forEach((flag, index) => {
+      if (flag === "true") void listings[index]?.refetch();
+    });
+    if (searchOutdated) void search.refetch();
+  }, [outdated, searchOutdated, listings, search]);
+
   const citation =
     (winner >= 0 ? reference?.candidateCitations?.[winner] : undefined) ?? reference?.citation;
   const position: FilePosition | null =
@@ -245,6 +275,11 @@ export function useFileReference(
   // haven't verified anything.
   if (!checking) return { ...base, status: "pending", open: null };
   return { ...base, status: "missing", open: null };
+}
+
+/** True when a query's answer predates `renderedAt`, so its "not there" may be out of date. */
+function missIsOutdated(query: { dataUpdatedAt: number }, renderedAt: number): boolean {
+  return query.dataUpdatedAt < renderedAt;
 }
 
 /** Relative candidates a search result's path may end with (absolute and `~` ones never match). */

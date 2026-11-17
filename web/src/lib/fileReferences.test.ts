@@ -100,6 +100,7 @@ describe("findProseFileReferences", () => {
     "run /merge or /health",
     "see https://example.com/docs/a.md",
     "v1.2 and 3.14",
+    "before the 19.x job, e.g. on example.com",
   ])("finds nothing in %s", (text) => {
     expect(found(text)).toEqual([]);
   });

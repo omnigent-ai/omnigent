@@ -992,3 +992,37 @@ describe("file references beyond backticks and links", () => {
     expect(openFile).toHaveBeenCalledWith("/home/u/other/notes.md");
   });
 });
+
+describe("a file written after an earlier mention", () => {
+  it("re-checks a directory listed before the link rendered", async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const tree = (messages: string[]) => (
+      <QueryClientProvider client={client}>
+        <FileViewerContext.Provider value={FILE_VIEWER_WITH_SESSION}>
+          {messages.map((message) => (
+            <FilePathAwareMessageResponse key={message}>{message}</FilePathAwareMessageResponse>
+          ))}
+        </FileViewerContext.Provider>
+      </QueryClientProvider>
+    );
+    // The user's request lists the root before the agent has written the file.
+    fetchMock.mockResolvedValue(dirListing([]));
+    const { rerender } = render(tree(["Create report.md and link it."]));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+
+    fetchMock.mockResolvedValue(
+      jsonResponse({
+        object: "list",
+        data: [{ name: "report.md", path: "report.md", type: "file", bytes: 5 }],
+        has_more: false,
+      }),
+    );
+    rerender(
+      tree(["Create report.md and link it.", `Done: [report.md](file://${WORKSPACE}/report.md)`]),
+    );
+
+    fireEvent.click(await screen.findByRole("button", { name: "report.md" }));
+    expect(openFile).toHaveBeenCalledWith("report.md");
+    expect(toastMock).not.toHaveBeenCalled();
+  });
+});
