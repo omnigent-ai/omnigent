@@ -190,7 +190,8 @@ export function runSavedWorkflowPrompt(
 /**
  * Read back a {@link savedWorkflowMessage}, directly or inside a trigger prompt.
  * Keep in sync with omnigent/server/scheduled/workflow_automations.py, which reads
- * prompts the same way to keep these automations off a reused session.
+ * the prompt below a trigger header the same way to keep these automations off a
+ * reused session.
  *
  * @returns The workflow's ID and name and the run's details, or `null` for any other text.
  */

@@ -956,9 +956,7 @@ function canonicalConfig(config: TriggerConfig): SavedTriggerConfig {
 
 /**
  * Detects edits made outside the form: a hash of the config and the body it
- * rendered. Change detection only (cyrb53), not a security boundary. The server
- * checks it the same way; keep this and canonicalConfig in sync with
- * omnigent/server/scheduled/workflow_automations.py.
+ * rendered. Change detection only (cyrb53), not a security boundary.
  */
 function triggerFingerprint(config: TriggerConfig, body: string): string {
   const text = `${JSON.stringify(canonicalConfig(config))}\n${body}`;

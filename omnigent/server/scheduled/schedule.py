@@ -111,17 +111,12 @@ _TRIGGER_PROMPT_OPENINGS = tuple(
 )
 # The trigger form saves its state as the prompt's first line; the model never sees it.
 # Keep in sync with TRIGGER_HEADER_PATTERN in web/src/components/scheduled/triggerTemplates.ts.
-_TRIGGER_HEADER = re.compile(r"<!-- omnigent-trigger v([0-9]+) ([^\n]*) -->\n")
-
-
-def match_trigger_header(prompt: str) -> re.Match[str] | None:
-    """The trigger form's header line opening ``prompt``: its version, then its saved JSON."""
-    return _TRIGGER_HEADER.match(prompt)
+_TRIGGER_HEADER = re.compile(r"<!-- omnigent-trigger v\d+ [^\n]* -->\n")
 
 
 def strip_trigger_header(prompt: str) -> str:
     """Return ``prompt`` without the trigger form's header line, if it has one."""
-    match = match_trigger_header(prompt)
+    match = _TRIGGER_HEADER.match(prompt)
     return prompt[match.end() :] if match else prompt
 
 
