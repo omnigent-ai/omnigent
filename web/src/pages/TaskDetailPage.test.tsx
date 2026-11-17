@@ -1774,6 +1774,11 @@ describe("runs of a saved workflow", () => {
       expect(within(old!).queryByTestId("plan-continue")).toBeNull();
       expect(within(old!).queryByTestId("run-status-label")).toBeNull();
       expect(within(current!).getByRole("button", { name: "Stop" })).toBeInTheDocument();
+      // Both runs share the session, and each row keeps its own run's words.
+      expect(within(old!).getByTestId("run-status-text")).toHaveTextContent(
+        completed ? "Done: Found it" : "Started: Working",
+      );
+      expect(within(current!).getByTestId("run-status-text")).toHaveTextContent("Done: Found it");
       fireEvent.focus(within(old!).getAllByTestId("tasks-progress-segment")[0]!);
       expect(await screen.findByTestId("tasks-progress-card")).toHaveTextContent("Explore");
       expect(screen.queryByTestId("tasks-progress-menu")).toBeNull();
