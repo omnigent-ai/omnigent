@@ -521,7 +521,10 @@ def test_issue_url_scrubs_home_directory_and_tokens(
         f"  File '{home}, backup/native.py', line 6\n"
         f'  File "{home}/child directory/app.py", line 7\n'
         f'  File "{home}\\child directory\\native.py", line 8\n'
+        f'  File "{home}-backup/module.py", line 9\n'
         f"Sibling paths: {home}.backup/module.py {home},backup/module.py\n"
+        f"Sibling paths: {home}é/module.py {home}+backup/module.py "
+        f"{home}@backup/module.py {home}~backup/module.py\n"
         f"Home: \"{home}\" '{home}' `{home}` {home}\n"
         f"Home: ({home}) [{home}] {{{home}}} <{home}> {home}, {home}. {home}... {home}!!!\n"
     )
@@ -538,7 +541,12 @@ def test_issue_url_scrubs_home_directory_and_tokens(
     assert f"File '{home}, backup/native.py'" in body
     assert 'File "~/child directory/app.py"' in body
     assert 'File "~\\child directory\\native.py"' in body
+    assert f'File "{home}-backup/module.py"' in body
     assert f"Sibling paths: {home}.backup/module.py {home},backup/module.py\n" in body
+    assert (
+        f"Sibling paths: {home}é/module.py {home}+backup/module.py "
+        f"{home}@backup/module.py {home}~backup/module.py\n"
+    ) in body
     assert "Home: \"~\" '~' `~` ~\n" in body
     assert "Home: (~) [~] {~} <~> ~, ~. ~... ~!!!\n" in body
     assert ch._scrub(home) == "~"
