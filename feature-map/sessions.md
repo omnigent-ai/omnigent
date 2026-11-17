@@ -31,6 +31,17 @@ the header menu), and each place is a separate entry point.
   by their edges, Focus shows the active agent beside a live strip, and Cards
   show status only. Settings → General → Tiles can hide the button or open the
   app in Tiles.
+- `session-tiles-organize`: star a tile to pin it first; filter by status or
+  project, search with `/`, and park tiles in the Stack (quiet agents stack after
+  a day; agents waiting on you never do). Each tile has its own color.
+- `session-tiles-workspace`: **Files** opens the Workspace panel for the active
+  tile and follows it when you switch; an agent with no runner says it isn't
+  running.
+- `session-tiles-details`: clicking a tile's title shows what the agent is doing,
+  where, its usage and latest reply, and renames it inline.
+- `session-tiles-arrange`: full screen (button, title double-click or F; Esc
+  leaves), text size per tile, drag or arrow-key reorder, `[` / `]` to switch
+  agents, and pop-out to a browser window.
 - `pin`: standalone sessions and family representatives move to Pinned and back;
   pinning a representative moves its whole family.
 - `pin-undo`: unpinning shows an Undo toast that re-pins the session into its

@@ -60,15 +60,42 @@ Tiles beyond the budget render as status cards until activated, and a tile that
 stops being live releases its stream immediately rather than waiting for
 registry eviction.
 
+## Second PR: Farm features
+
+- **Favorites, filters, search.** A star pins the session (the sidebar's pinned
+  label, so favorites match Pinned everywhere) and sorts it first. Status radios
+  with counts, a project menu (`?project=`), and search (`/` to focus, Esc to
+  clear) narrow the tiles.
+- **Stack.** Park a tile to take it off the grid; agents quiet for a day stack
+  automatically, and agents waiting on you never do. The Stack drawer lists them
+  with Unstack. Per device.
+- **Tile colors and title.** A color stripe opens twelve hues or Auto (a stable
+  hue per session) for the header tint and border; the title is larger.
+- **Workspace drawer.** The session Workspace panel (Files, Changes, Terminal)
+  for the active tile only, so one session loads workspace data at a time. It
+  follows tile switches, asks before discarding unsaved edits, and opens file
+  links from the active tile's chat. It shares Grid's implementation through
+  `useSessionWorkspace`, `SessionWorkspacePanel` and
+  `useResizableWorkspacePanel`. An agent with no runner (imported or dormant)
+  shows "Agent isn't running" instead of requesting files.
+- **Agent details.** Clicking a tile's title opens cards: Now, Where, Usage,
+  Agent (with inline rename, as in the header) and Latest reply. Usage and the
+  reply are fetched only while the details are open.
+- **Arranging.** Full screen (button, title double-click or F; Esc returns),
+  per-tile text size (85–130%, applied as zoom on the body), drag to reorder by
+  the handle or its arrow keys (tiles never moved keep their natural place), and
+  `[` / `]` to switch the active agent. Pop-out opens the agent in its own
+  browser window; the desktop shell sends `window.open` to the system browser,
+  so it is hidden there.
+
 ## Follow-ups
 
-1. **Farm features.** Favorites (on pinned sessions), status and project
-   filters, search, a Stack for parked or quiet agents, per-project history and
-   Wake, the Workspace panel following the active tile, an expandable details
-   panel, full screen, pop-out, per-tile text size, tile color, and drag to
-   reorder.
+1. **Open in browser (desktop).** A shell button that opens the current view in
+   the default browser, and a desktop pop-out window.
 2. **Metrics.** An Activity Monitor–style view: a sortable per-agent process
    table (CPU, memory, tokens) with a detail inspector. Needs host-reported
    process metrics.
-3. **Terminal-first tiles.** A Chat/Terminal switch for native terminal
+3. **History, Wake and Scan.** Past agents per project, waking a dormant agent,
+   and finding Claude Code or Codex sessions on disk to import.
+4. **Terminal-first tiles.** A Chat/Terminal switch for native terminal
    sessions, as in Grid.

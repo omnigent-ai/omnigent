@@ -148,3 +148,36 @@ def test_settings_can_hide_tiles_from_the_sidebar(
     page.get_by_test_id("tiles-show-in-sidebar-toggle").click()
     page.goto(f"{base_url}/")
     expect(page.get_by_test_id("tiles-toggle-nav")).to_be_visible(timeout=30_000)
+
+
+def test_search_stack_and_files_drawer(
+    page: Page,
+    tiles_server: tuple[str, str, str],
+) -> None:
+    """Search narrows the tiles, the Stack parks one, and Files follows the active agent."""
+    base_url, session_a, session_b = tiles_server
+    page.goto(f"{base_url}/tiles?active={session_a}")
+    expect(_tile(page, session_b)).to_be_visible(timeout=30_000)
+
+    search = page.get_by_role("searchbox", name="Search agents")
+    search.fill("quick question")
+    expect(_tile(page, session_a)).to_have_count(0)
+    expect(_tile(page, session_b)).to_be_visible()
+    search.press("Escape")
+    expect(_tile(page, session_a)).to_be_visible()
+
+    _tile(page, session_b).get_by_role("button", name=re.compile("to the Stack$")).click()
+    expect(_tile(page, session_b)).to_have_count(0)
+    stack_toggle = page.get_by_test_id("tiles-stack-toggle")
+    expect(stack_toggle).to_have_text("Stack · 1")
+    stack_toggle.click()
+    row = page.locator(f'[data-testid="tiles-stack-row"][data-session-id="{session_b}"]')
+    row.get_by_role("button", name="Unstack").click()
+    expect(_tile(page, session_b)).to_be_visible()
+    expect(stack_toggle).to_have_text("Stack · 0")
+
+    # Imported examples have no runner, so the drawer says so instead of failing.
+    files_toggle = page.get_by_test_id("tiles-workspace-toggle")
+    if files_toggle.get_attribute("aria-pressed") != "true":
+        files_toggle.click()
+    expect(page.get_by_test_id("tiles-workspace-not-running")).to_be_visible()
