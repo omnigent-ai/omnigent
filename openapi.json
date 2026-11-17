@@ -12860,7 +12860,7 @@
                 "type": "null"
               }
             ],
-            "description": "Pi's own cumulative token baseline, excluding descendants. Available even when display usage aggregation is skipped; `None` for other harnesses or older servers."
+            "description": "Own cumulative token baseline for Pi and Codex side chats, excluding descendants. Available even when display usage aggregation is skipped; `None` for other harnesses or older servers."
           },
           "parent_session_id": {
             "anyOf": [
