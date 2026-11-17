@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import type { SettingsEntry } from "@/pages/settings/search/catalog/types";
 
 import {
+  auditOpenedPortals,
   auditSettingsDom,
   auditSettingsDomFindings,
   domAuditProblems,
@@ -483,6 +484,351 @@ describe("a part named around a runtime value", () => {
   });
 });
 
+describe("an overlay of runtime choices", () => {
+  /** A row whose Default app part opens a list of the apps the shell finds, plus None. */
+  const APPS: SettingsEntry = {
+    id: "fixture.apps",
+    section: "general",
+    label: "Apps",
+    description: "Which app opens.",
+    choices: ["Automatic", "Off"],
+    parts: { app: "Default app" },
+    overlays: { "": {}, app: { runtimeChoices: { fixed: ["None"] } } },
+  };
+  const entries = new Map([SYNC, ACCENT, APPS].map((entry) => [entry.id, entry]));
+  const APPS_ROW = `
+    <div data-settings-item="fixture.apps">
+      <span id="settings-fixture.apps-label">Apps</span>
+      <button role="combobox" aria-labelledby="settings-fixture.apps-label" data-settings-control="fixture.apps"></button>
+      <button aria-label="About Default app">?</button>
+      <button role="combobox" aria-label="Default app" data-settings-control="fixture.apps:app"></button>
+    </div>`;
+  const option = (name: string, marker?: string) =>
+    `<div role="option"${marker === undefined ? "" : ` data-settings-runtime-choice="${marker}"`}>${name}</div>`;
+  const overlay = (owner: string, body: string) =>
+    `<div data-settings-overlay-owner="${owner}">${body}</div>`;
+  function auditApps(html: string, portal: string): string[] {
+    document.body.innerHTML = `<main>${html}</main><aside>${portal}</aside>`;
+    const roots = [document.querySelector("main")!, document.querySelector("aside")!];
+    return auditSettingsDom({ roots, entries, expected: [] });
+  }
+
+  it("names marked options from runtime data, and the rest by its fixed list", () => {
+    const list = `${option("Omnigent Canary (this app)", "fixture.apps:app")}${option("Omnigent (not running)", "fixture.apps:app")}${option("None")}`;
+    expect(auditApps(APPS_ROW, overlay("fixture.apps:app", list))).toEqual([]);
+  });
+
+  it("fails an unmarked name it doesn't list, and a marked option with no name", () => {
+    expect(
+      auditApps(
+        APPS_ROW,
+        overlay("fixture.apps:app", `${option("Omnigent")}${option(" ", "fixture.apps:app")}`),
+      ),
+    ).toEqual([
+      'div[role=option] "Omnigent": is an option of fixture.apps:app that isn\'t marked as a runtime choice or listed as fixed',
+      'div[role=option] "": is a runtime choice with no name',
+    ]);
+  });
+
+  it("keeps the options of a part's own select to that part's choices", () => {
+    const KEEP: SettingsEntry = {
+      id: "fixture.keep",
+      section: "general",
+      label: "Keep",
+      description: "How long to keep things.",
+      parts: { days: "Keep for" },
+      partChoices: { days: ["7 days", "Never"] },
+      overlays: { days: {} },
+    };
+    const keepRow = `<div data-settings-item="fixture.keep"><span>Keep</span><button role="combobox" aria-label="Keep for" data-settings-control="fixture.keep:days"></button></div>`;
+    document.body.innerHTML = `<main>${keepRow}</main><aside>${overlay("fixture.keep:days", `${option("7 days")}${option("Monthly")}`)}</aside>`;
+    expect(
+      auditSettingsDom({
+        roots: [document.querySelector("main")!, document.querySelector("aside")!],
+        entries: new Map([[KEEP.id, KEEP]]),
+        expected: [],
+      }),
+    ).toEqual([
+      'div[role=option] "Monthly": is a choice of fixture.keep:days that its part doesn\'t list',
+    ]);
+  });
+
+  it("keeps a finite select's choices to its entry, beside the runtime list", () => {
+    expect(auditApps(APPS_ROW, overlay("fixture.apps", option("Omnigent")))).toEqual([
+      'div[role=option] "Omnigent": is a choice of fixture.apps that its entry doesn\'t list',
+    ]);
+  });
+
+  it("fails a marker anywhere but its own part's overlay", () => {
+    const marked = option("Omnigent", "fixture.apps:app");
+    expect(
+      auditApps(
+        `${APPS_ROW}${OWNED_ROW}${marked}`,
+        [
+          // The row's other select, another row's overlay, and inside another overlay.
+          overlay("fixture.apps", marked),
+          overlay("fixture.sync:reset", marked),
+          overlay("fixture.apps:app", overlay("fixture.sync:reset", marked)),
+          // The marker names the overlay, but that overlay doesn't declare runtime choices.
+          overlay("fixture.sync:reset", option("Fast", "fixture.sync:reset")),
+          overlay(
+            "fixture.apps:app",
+            `<button data-settings-runtime-choice="fixture.apps:app">Omnigent</button>`,
+          ),
+        ].join(""),
+      ),
+    ).toEqual([
+      'div[role=option] "Omnigent": is a runtime choice of fixture.apps:app outside any overlay',
+      'div[role=option] "Omnigent": is a runtime choice of fixture.apps:app, but sits in an overlay of fixture.apps',
+      'div[role=option] "Omnigent": is a runtime choice of fixture.apps:app, but sits in an overlay of fixture.sync:reset',
+      'div[role=option] "Omnigent": is a runtime choice of fixture.apps:app, but sits in an overlay of fixture.sync:reset',
+      "div[role=option] \"Fast\": is a runtime choice, but fixture.sync:reset's overlay doesn't declare runtime choices",
+      'button "Omnigent": carries a runtime-choice marker, but isn\'t an option',
+    ]);
+  });
+
+  it("holds every option and marker to the contract, however else it's owned", () => {
+    // An unmarked option owned as the part itself, and a native option marked for another row.
+    const ownedOption = `<div role="option" aria-label="Default app" data-settings-control="fixture.apps:app">Default app</div>`;
+    const nativeSelect = `<select aria-labelledby="settings-fixture.apps-label" data-settings-control="fixture.apps"><option data-settings-runtime-choice="fixture.sync:wrong">Omnigent</option></select>`;
+    expect(
+      auditApps(
+        APPS_ROW.replace("</div>", `${nativeSelect}</div>`),
+        overlay("fixture.apps:app", ownedOption),
+      ),
+    ).toEqual([
+      'option "Omnigent": is a runtime choice of fixture.sync:wrong outside any overlay',
+      'div[role=option] "Default app": is an option of fixture.apps:app that isn\'t marked as a runtime choice or listed as fixed',
+    ]);
+  });
+
+  describe("a part's help button", () => {
+    const noOwner = 'button "About Default app": has no owner in the Settings catalog';
+    const withoutPart = APPS_ROW.replace(
+      '<button role="combobox" aria-label="Default app" data-settings-control="fixture.apps:app"></button>',
+      "",
+    );
+
+    it("is owned beside that part's control in the same row", () => {
+      expect(auditApps(APPS_ROW, "")).toEqual([]);
+    });
+
+    it("isn't owned when the part doesn't render there", () => {
+      // The part absent, rendered only in a portal, or in a row nested inside this one.
+      expect(auditApps(withoutPart, "")).toEqual([noOwner]);
+      expect(
+        auditApps(
+          withoutPart,
+          overlay(
+            "fixture.apps",
+            '<button role="combobox" aria-label="Default app" data-settings-control="fixture.apps:app"></button>',
+          ),
+        ),
+      ).toContain(noOwner);
+      expect(
+        auditApps(
+          withoutPart.replace(
+            "</div>",
+            '<div data-settings-item="fixture.accent"><button role="combobox" aria-label="Default app" data-settings-control="fixture.apps:app"></button></div></div>',
+          ),
+          "",
+        ),
+      ).toContain(noOwner);
+    });
+
+    it("isn't owned by a part that only labels something that can't be focused", () => {
+      const labelOnly = withoutPart.replace(
+        "</div>",
+        '<span aria-label="Default app" data-settings-control="fixture.apps:app">Default app</span></div>',
+      );
+      expect(auditApps(labelOnly, "")).toEqual([noOwner]);
+    });
+
+    it("isn't owned for another row's part", () => {
+      expect(
+        auditApps(`${APPS_ROW.replace("About Default app", "About Reset sync")}${OWNED_ROW}`, ""),
+      ).toEqual(['button "About Reset sync": has no owner in the Settings catalog']);
+    });
+  });
+});
+
+describe("a row's plumbing and sub-labels", () => {
+  /** A row like Color theme: a main select under a "Theme palette" sub-label, and a slider. */
+  const THEME: SettingsEntry = {
+    id: "fixture.theme",
+    section: "appearance",
+    label: "Color theme",
+    description: "Colors.",
+    parts: { contrast: "Theme contrast", chooseFile: "Choose file" },
+    partLabels: { "": "Theme palette", contrast: "Contrast" },
+  };
+  const entries = new Map([SYNC, THEME].map((entry) => [entry.id, entry]));
+  const MAIN = `<button role="combobox" aria-labelledby="settings-fixture.theme-label" data-settings-control="fixture.theme"></button>`;
+  const CONTRAST = `<input type="range" aria-label="Theme contrast" data-settings-control="fixture.theme:contrast">`;
+  const row = (body: string) =>
+    `<div data-settings-item="fixture.theme"><span id="settings-fixture.theme-label">Color theme</span>${body}</div>`;
+  const run = (html: string) => {
+    document.body.innerHTML = `<main>${html}</main>`;
+    return auditSettingsDom({ roots: [document.querySelector("main")!], entries });
+  };
+  const help = (label: string) => `<button aria-label="About ${label}">?</button>`;
+
+  describe("a sub-label's help button", () => {
+    it("is owned beside the control it labels, the main control included", () => {
+      expect(run(row(`${help("Theme palette")}${MAIN}${help("Contrast")}${CONTRAST}`))).toEqual([]);
+    });
+
+    it("isn't owned when that control is absent, not interactive, or in another row", () => {
+      const unowned = (label: string) =>
+        `button "About ${label}": has no owner in the Settings catalog`;
+      expect(run(row(`${help("Theme palette")}${help("Contrast")}`))).toEqual([
+        unowned("Theme palette"),
+        unowned("Contrast"),
+      ]);
+      expect(
+        run(
+          row(
+            `${help("Contrast")}<span aria-label="Theme contrast" data-settings-control="fixture.theme:contrast"></span>`,
+          ),
+        ),
+      ).toEqual([unowned("Contrast")]);
+      expect(
+        run(`${row(help("Contrast"))}<div data-settings-item="fixture.sync">${CONTRAST}</div>`),
+      ).toContain(unowned("Contrast"));
+    });
+  });
+
+  describe("a hidden file input", () => {
+    const input = (attributes: string) =>
+      `<input type="file" ${attributes} data-settings-file-input="fixture.theme:chooseFile">`;
+
+    it("is plumbing for the part it's bound to, while hidden and out of the tab order", () => {
+      expect(run(row(input('hidden tabindex="-1"')))).toEqual([]);
+    });
+
+    it("fails exposed, focusable, of another kind, in another row, or bound to no part", () => {
+      expect(run(row(input('tabindex="-1"')))).toEqual([
+        'input "": is a file input bound to a part, but isn\'t hidden',
+      ]);
+      expect(run(row(input("hidden")))).toEqual([
+        'input "": is a hidden file input that can take focus',
+      ]);
+      expect(
+        run(row(`<div hidden data-settings-file-input="fixture.theme:chooseFile"></div>`)),
+      ).toEqual(['div "": carries a file-input marker, but isn\'t a file input']);
+      expect(
+        run(
+          `${row("")}<div data-settings-item="fixture.sync">${input('hidden tabindex="-1"')}</div>`,
+        ),
+      ).toEqual(['input "": is bound to fixture.theme:chooseFile but sits in fixture.sync']);
+      expect(
+        run(
+          row(
+            `<input type="file" hidden tabindex="-1" data-settings-file-input="fixture.theme:upload">`,
+          ),
+        ),
+      ).toEqual(['input "": is bound to "upload", which isn\'t a part of fixture.theme']);
+    });
+
+    it("leaves an unmarked hidden input as it was: unowned", () => {
+      expect(run(row('<input type="file" hidden tabindex="-1">'))).toEqual([
+        'input "": has no owner in the Settings catalog',
+      ]);
+    });
+  });
+});
+
+describe("auditOpenedPortals", () => {
+  /** A row whose Reset opens a dialog holding its confirm button, as Settings data does. */
+  const DATA: SettingsEntry = {
+    id: "fixture.data",
+    section: "appearance",
+    label: "Settings data",
+    description: "Data.",
+    parts: { reset: "Reset to defaults", confirm: "Reset", retry: "Try again" },
+    presence: { confirm: { overlay: "reset" }, retry: { states: ["failed"] } },
+    overlays: { reset: { dialogActions: ["Cancel"] } },
+  };
+  const entries = new Map([DATA].map((entry) => [entry.id, entry]));
+  // The page, with an unowned control the scenario's own audit already counted.
+  const PAGE = `<div data-settings-item="fixture.data"><span>Settings data</span>
+      <button aria-label="Reset to defaults" data-settings-control="fixture.data:reset"></button>
+    </div>
+    <input aria-label="An unowned field">`;
+  const CONFIRM = `<button aria-label="Reset" data-settings-control="fixture.data:confirm"></button>`;
+  const CANCEL = `<button data-settings-dialog-action="Cancel">Cancel</button>`;
+  const dialog = (body: string, owner = "fixture.data:reset") =>
+    `<div${owner ? ` data-settings-overlay-owner="${owner}"` : ""}><h2>Reset appearance?</h2>${body}</div>`;
+  function open(portal: string) {
+    document.body.innerHTML = `<main>${PAGE}</main>`;
+    const opened = document.createElement("aside");
+    opened.innerHTML = portal;
+    document.body.append(opened);
+    const input = { roots: [document.body], entries, expected: [DATA], opened: [opened] };
+    return {
+      messages: auditOpenedPortals(input).map((finding) => finding.message),
+      parts: renderedSettingsParts([document.body], entries),
+    };
+  }
+
+  it("passes an open overlay holding its parts, and doesn't recount the page", () => {
+    const { messages, parts } = open(dialog(`${CONFIRM}${CANCEL}`));
+    expect(messages).toEqual([]);
+    // What an action shows counts toward coverage.
+    expect(parts.has("fixture.data:confirm")).toBe(true);
+  });
+
+  it("keeps a problem outside what opened, and drops only the page's unowned controls", () => {
+    // The dialog is valid, but its opener on the page was renamed while it was open.
+    document.body.innerHTML = `<main>${PAGE.replace('aria-label="Reset to defaults"', 'aria-label="Reset everything"')}</main>`;
+    const opened = document.createElement("aside");
+    opened.innerHTML = dialog(`${CONFIRM}${CANCEL}`);
+    document.body.append(opened);
+    const findings = auditOpenedPortals({
+      roots: [document.body],
+      entries,
+      expected: [DATA],
+      opened: [opened],
+    });
+    expect(findings.map((finding) => finding.message)).toEqual([
+      'button "Reset everything": is named "Reset everything", but fixture.data names it "Reset to defaults"',
+    ]);
+  });
+
+  it("fails a required part gone while the dialog still shows its title", () => {
+    expect(open(dialog(CANCEL)).messages).toEqual(['fixture.data: part "confirm" doesn\'t render']);
+  });
+
+  it("fails a part under another opener's overlay, or in a portal without its owner", () => {
+    expect(open(dialog(`${CONFIRM}${CANCEL}`, "fixture.data")).messages).toContain(
+      'fixture.data: part "confirm" renders, though none of the states it shows in is driven',
+    );
+    expect(open(dialog(`${CONFIRM}${CANCEL}`, "")).messages).toEqual([
+      'button "Reset": belongs to fixture.data but sits in no row',
+      'button "Cancel": dialog action "Cancel" isn\'t declared',
+      'fixture.data: part "confirm" renders, though none of the states it shows in is driven',
+    ]);
+  });
+
+  it("counts an unowned control nested in what opened, and a part in a state not driven", () => {
+    const nested = `<div><div><input aria-label="Extra field"></div></div>`;
+    const retry = `<button aria-label="Try again" data-settings-control="fixture.data:retry"></button>`;
+    expect(open(dialog(`${CONFIRM}${CANCEL}${nested}${retry}`)).messages).toEqual([
+      'input "Extra field": has no owner in the Settings catalog',
+      'fixture.data: part "retry" renders, though none of the states it shows in is driven',
+    ]);
+  });
+
+  it("leaves an overlay part out of coverage when no action opens it", () => {
+    document.body.innerHTML = `<main>${PAGE}</main>`;
+    const parts = renderedSettingsParts([document.body], entries);
+    expect(settingsCoverageProblems([DATA], new Set([DATA.id]), parts)).toEqual([
+      'fixture.data: no scenario renders its part "confirm"',
+      'fixture.data: no scenario renders its part "retry"',
+    ]);
+  });
+});
+
 describe("a select's hidden form value", () => {
   it("passes beside its own trigger, and fails anywhere else", () => {
     const hidden =
@@ -492,5 +838,616 @@ describe("a select's hidden form value", () => {
     const row = (body: string) => OWNED_ROW.replace(/<\/div>$/, `${body}</div>`);
     expect(audit(row(`${trigger}${hidden}`))).toEqual([]);
     expect(audit(row(hidden))).toEqual(['select "": has no owner in the Settings catalog']);
+  });
+});
+
+describe("a data region's rows", () => {
+  const region = (rows: string, value = "fixture.sync:items") =>
+    `<div data-settings-region="${value}">${rows}</div>`;
+  const row = (body: string) => OWNED_ROW.replace(/<\/div>$/, `${body}</div>`);
+  const DELETE = '<button data-settings-row-action="delete">Delete</button>';
+  const TOKEN = (name: string) => `<input aria-label="${name}" data-settings-row-field="token">`;
+
+  describe("named by their row's data", () => {
+    const servers = (rows: string) => row(region(rows, "fixture.sync:servers"));
+    const serverRow = (body: string) => `<div data-settings-region-row>${body}</div>`;
+    const open = (name: string, tag = "button") =>
+      `<${tag} data-settings-row-action="open"${tag === "a" ? ' href="#x"' : ""}>${name}</${tag}>`;
+    const reasons = (html: string) => audit(html).map((problem) => problem.replace(/^[^:]*: /, ""));
+
+    it("take any name from their row, once in each region row", () => {
+      expect(
+        audit(
+          servers(
+            serverRow(open("docs · mcp.example.com · Connected")) + serverRow(open("notes", "a")),
+          ),
+        ),
+      ).toEqual([]);
+    });
+
+    it("fail without a name, as something else, outside a region row, or twice in one", () => {
+      expect(reasons(servers(serverRow(open(""))))).toEqual([
+        'row action "open" has no name from its row\'s data',
+      ]);
+      expect(
+        reasons(
+          servers(
+            serverRow('<div role="switch" tabindex="0" data-settings-row-action="open">On</div>'),
+          ),
+        ),
+      ).toEqual(['row action "open" isn\'t a button, link or disclosure']);
+      expect(reasons(servers(open("docs")))).toEqual([
+        'row action "open" isn\'t in a row of fixture.sync:servers',
+      ]);
+      expect(reasons(servers(serverRow(open("docs") + open("notes"))))).toEqual([
+        'row action "open" shows 2 times in one row of fixture.sync:servers',
+        'row action "open" shows 2 times in one row of fixture.sync:servers',
+      ]);
+      // A row of another region doesn't count as this one's.
+      const borrowed = servers(region(serverRow(open("docs")), "fixture.sync:items"));
+      expect(reasons(borrowed)).toEqual([
+        'row action "open" isn\'t declared for fixture.sync:items',
+      ]);
+    });
+
+    it("counts an action once per row of its own region, not a nested region's", () => {
+      const nested = region(
+        '<button data-settings-row-action="open">Open details</button>',
+        "fixture.sync:serverDetails",
+      );
+      expect(audit(servers(serverRow(open("docs") + nested)))).toEqual([]);
+    });
+
+    describe("a disclosure in a tool row", () => {
+      const tools = (rows: string) => region(rows, "fixture.sync:tools");
+      const toolRow = (body: string) => `<li data-settings-region-row>${body}</li>`;
+      const expand = (name: string, before = "") =>
+        `<details>${before}<summary data-settings-row-action="expand">${name}</summary><p>What it does.</p></details>`;
+      const server = (name: string, rows: string) =>
+        serverRow(open(name) + tools(`<ul>${rows}</ul>`));
+
+      it("opens by its first summary, in each tool row of each server, by the tool's name", () => {
+        // A tool name may repeat across servers; a tool without a description is plain text.
+        expect(
+          audit(
+            servers(
+              server("docs", toolRow(expand("lookup_docs")) + toolRow("<span>list_pages</span>")) +
+                server("notes", toolRow(expand("lookup_docs"))),
+            ),
+          ),
+        ).toEqual([]);
+      });
+
+      it("takes the first summary after another element, but no later one", () => {
+        expect(
+          audit(servers(server("docs", toolRow(expand("lookup_docs", "<p>Intro</p>"))))),
+        ).toEqual([]);
+        // A later summary isn't a control, so a marker on it is refused; marked on both, the
+        // row also has the action twice, and marked only there, the real control is unowned.
+        const both = `<details><summary data-settings-row-action="expand">lookup_docs</summary><summary data-settings-row-action="expand">Again</summary></details>`;
+        expect(reasons(servers(server("docs", toolRow(both))))).toEqual([
+          "carries a row marker, but isn't a control",
+          'row action "expand" shows 2 times in one row of fixture.sync:tools',
+        ]);
+        const later = `<details><summary>lookup_docs</summary><summary data-settings-row-action="expand">Again</summary></details>`;
+        expect(reasons(servers(server("docs", toolRow(later))))).toEqual([
+          "carries a row marker, but isn't a control",
+          "has no owner in the Settings catalog",
+        ]);
+        const span = '<span data-settings-row-action="expand">lookup_docs</span>';
+        expect(reasons(servers(server("docs", toolRow(span))))).toEqual([
+          "carries a row marker, but isn't a control",
+        ]);
+      });
+
+      it("fails without a name, twice in one row, or outside its own region's row", () => {
+        expect(reasons(servers(server("docs", toolRow(expand("")))))).toEqual([
+          'row action "expand" has no name from its row\'s data',
+        ]);
+        expect(
+          reasons(servers(server("docs", toolRow(expand("lookup_docs") + expand("list_pages"))))),
+        ).toEqual([
+          'row action "expand" shows 2 times in one row of fixture.sync:tools',
+          'row action "expand" shows 2 times in one row of fixture.sync:tools',
+        ]);
+        // In its server's row but no tool row of its own, it can't borrow the server's.
+        expect(reasons(servers(serverRow(open("docs") + tools(expand("lookup_docs")))))).toEqual([
+          'row action "expand" isn\'t in a row of fixture.sync:tools',
+        ]);
+      });
+    });
+
+    it("keeps region rows inside their region, and one row out of another", () => {
+      expect(reasons(row(serverRow("")))).toEqual(["is a region row outside any data region"]);
+      expect(reasons(servers(serverRow(serverRow(open("docs")))))).toEqual([
+        "is a region row inside another row of its region",
+      ]);
+    });
+  });
+
+  it("takes declared actions by their exact names, and fields named around a value", () => {
+    expect(audit(row(region(`${DELETE}${TOKEN("Token for Tracker")}`)))).toEqual([]);
+  });
+
+  it("fails a declared action with another name, and a field without its affix or value", () => {
+    expect(
+      audit(
+        row(
+          region(
+            `<button data-settings-row-action="delete">Delete now</button>${TOKEN("Key for Tracker")}${TOKEN("Token for  ")}`,
+          ),
+        ),
+      ),
+    ).toEqual([
+      'button "Delete now": row action "delete" is named "Delete now", but fixture.sync:items names it "Delete"',
+      'input "Key for Tracker": row field "token" is named "Key for Tracker", not fixture.sync:items\'s "Token for …"',
+      'input "Token for": row field "token" is named "Token for", not fixture.sync:items\'s "Token for …"',
+    ]);
+  });
+
+  it("fails a field marker on a control that takes no value", () => {
+    const marked = (tag: string) =>
+      `<${tag} data-settings-row-field="token">Token for New action</${tag}>`;
+    expect(
+      audit(
+        row(
+          region(
+            `${marked("button")}<a href="#token" data-settings-row-field="token">Token for New action</a>`,
+          ),
+        ),
+      ),
+    ).toEqual([
+      'button "Token for New action": row field "token" marks a control that takes no value',
+      'a "Token for New action": row field "token" marks a control that takes no value',
+    ]);
+  });
+
+  it("fails a row control in another entry's row nested inside the region", () => {
+    const nested = `<div data-settings-item="fixture.accent"><span>Accent</span>${DELETE}</div>`;
+    expect(audit(row(region(nested)))).toContain(
+      'button "Delete": is in fixture.accent\'s row inside a region of fixture.sync',
+    );
+  });
+
+  describe("in the dialog a row action opens", () => {
+    const dialog = (body: string, value = "fixture.sync:items:delete") =>
+      `<div role="dialog" data-settings-row-overlay="${value}">${body}</div>`;
+    const CONFIRM = `<input aria-label="Why delete Tracker" data-settings-row-field="reason"><button data-settings-row-action="cancel">Cancel</button><button data-settings-row-action="confirm">Delete</button><button data-slot="dialog-close">Close</button>`;
+
+    it("take the dialog's declared actions and fields, opened from a row that shows its action", () => {
+      expect(audit(row(region(DELETE)), [], dialog(CONFIRM))).toEqual([]);
+    });
+
+    it("fail the region's own controls, a wrong name, and anything unmarked", () => {
+      expect(
+        audit(
+          row(region(DELETE)),
+          [],
+          dialog(
+            `${DELETE}${TOKEN("Token for Tracker")}<button data-settings-row-action="confirm">Delete now</button><button>Other</button>`,
+          ),
+        ),
+      ).toEqual([
+        'button "Delete": row action "delete" isn\'t declared for fixture.sync:items:delete',
+        'input "Token for Tracker": row field "token" isn\'t declared for fixture.sync:items:delete',
+        'button "Delete now": row action "confirm" is named "Delete now", but fixture.sync:items:delete names it "Delete"',
+        'button "Other": has no owner in the Settings catalog',
+      ]);
+    });
+
+    it("fail a dialog no region declares, or one no row on the page opens", () => {
+      const cancel = '<button data-settings-row-action="cancel">Cancel</button>';
+      expect(audit(row(region(DELETE)), [], dialog(cancel, "fixture.sync:servers:open"))).toEqual([
+        'row dialog "fixture.sync:servers:open": is in a row\'s dialog "fixture.sync:servers:open" that no region declares',
+        'button "Cancel": is in a row\'s dialog "fixture.sync:servers:open" that no region declares',
+      ]);
+      expect(audit(row(region("")), [], dialog(cancel))).toEqual([
+        'row dialog "fixture.sync:items:delete": no row of fixture.sync:items shows the action that opens it',
+      ]);
+      // The action outside its region, or its region outside the entry's row, opens nothing.
+      expect(audit(`${row("")}${region(DELETE)}`, [], dialog(cancel))).toContain(
+        'row dialog "fixture.sync:items:delete": no row of fixture.sync:items shows the action that opens it',
+      );
+    });
+  });
+
+  it("lets a row field's own label have a help button, and nothing else named like one", () => {
+    const fieldRow = (field: string, help: string) =>
+      row(
+        region(
+          `<div data-settings-region-row><button aria-label="About ${help}">?</button><input aria-label="${field}" data-settings-row-field="token"></div>`,
+        ),
+      );
+    expect(audit(fieldRow("Token for Tracker", "Tracker"))).toEqual([]);
+    expect(audit(fieldRow("Token for Tracker", "Notes"))).toEqual([
+      'button "About Notes": has no owner in the Settings catalog',
+    ]);
+  });
+
+  it("lets a region sit in an overlay its own row opens, and only its own", () => {
+    const inOverlay = (owner: string) =>
+      `<div role="dialog" data-settings-overlay-owner="${owner}">${region(DELETE)}</div>`;
+    expect(audit(row(""), [], inOverlay("fixture.sync:reset"))).toEqual([]);
+    expect(audit(row(""), [], inOverlay("fixture.accent"))).toContain(
+      'button "Delete": is in a region of fixture.sync that sits in fixture.accent',
+    );
+  });
+
+  it("fails a region in another row, of an unknown entry or region, or no region at all", () => {
+    const accentRow = (body: string) =>
+      `<div data-settings-item="fixture.accent"><span>Accent</span>${body}</div>`;
+    expect(audit(accentRow(region(DELETE)))).toEqual([
+      'button "Delete": is in a region of fixture.sync that sits in fixture.accent',
+    ]);
+    expect(audit(row(region(DELETE, "fixture.missing:items")))).toEqual([
+      'button "Delete": is in a data region of an entry that isn\'t in the catalog (fixture.missing:items)',
+    ]);
+    expect(audit(row(region(DELETE, "fixture.sync:other")))).toEqual([
+      'button "Delete": is in "other", which isn\'t a declared region of fixture.sync',
+    ]);
+    expect(audit(row(DELETE))).toEqual([
+      'button "Delete": is a row control outside any data region',
+    ]);
+  });
+});
+
+describe("a dialog's parts in its states", () => {
+  const FORM: SettingsEntry = {
+    id: "fixture.password",
+    section: "account",
+    label: "Password",
+    description: "Your password.",
+    parts: { change: "Change password", current: "Current password", done: "Done" },
+    presence: {
+      current: { overlay: "change", states: ["editing"] },
+      done: { overlay: "change", states: ["changed"] },
+    },
+    nameAlternatives: { change: { busy: "Changing…" } },
+  };
+  const entries = new Map([[FORM.id, FORM]]);
+  const ROW = `<div data-settings-item="fixture.password"><span>Password</span>
+    <button aria-label="Change password" data-settings-control="fixture.password:change"></button></div>`;
+  const CURRENT =
+    '<input aria-label="Current password" data-settings-control="fixture.password:current">';
+  const DONE = '<button aria-label="Done" data-settings-control="fixture.password:done"></button>';
+  const dialog = (body: string, owner = "fixture.password:change") =>
+    `<div data-settings-overlay-owner="${owner}">${body}</div>`;
+  function run(portal: string, states: string[]) {
+    document.body.innerHTML = `<main>${ROW}</main><aside>${portal}</aside>`;
+    return auditSettingsDom({
+      roots: [document.querySelector("main")!, document.querySelector("aside")!],
+      entries,
+      expected: [FORM],
+      drivenStates: new Map([[FORM.id, new Set(states)]]),
+    });
+  }
+
+  it("needs a part while its overlay is open and its state is driven, and not otherwise", () => {
+    expect(run(dialog(CURRENT), ["editing"])).toEqual([]);
+    expect(run(dialog(DONE), ["changed"])).toEqual([]);
+    // Closed, nothing is needed.
+    expect(run("", ["editing"])).toEqual([]);
+  });
+
+  it("fails a part in a state not driven, missing while needed, or outside its overlay", () => {
+    expect(run(dialog(`${CURRENT}${DONE}`), ["editing"])).toEqual([
+      'fixture.password: part "done" renders, though none of the states it shows in is driven',
+    ]);
+    expect(run(dialog(""), ["editing"])).toEqual([
+      'fixture.password: part "current" doesn\'t render',
+    ]);
+    expect(run(`${dialog("")}${CURRENT}`, ["editing"])).toContain(
+      'fixture.password: part "current" doesn\'t render',
+    );
+    expect(
+      run(dialog(`<div data-settings-overlay-owner="fixture.password">${CURRENT}</div>`), [
+        "editing",
+      ]),
+    ).toContain('fixture.password: part "current" doesn\'t render');
+  });
+
+  it("names a part by a declared alternative, and no other", () => {
+    const busy = ROW.replace('aria-label="Change password"', 'aria-label="Changing…"');
+    document.body.innerHTML = `<main>${busy}</main>`;
+    expect(auditSettingsDom({ roots: [document.querySelector("main")!], entries })).toEqual([]);
+    document.body.innerHTML = `<main>${ROW.replace('aria-label="Change password"', 'aria-label="Saving…"')}</main>`;
+    expect(auditSettingsDom({ roots: [document.querySelector("main")!], entries })).toEqual([
+      'button "Saving…": is named "Saving…", but fixture.password names it "Change password"',
+    ]);
+  });
+});
+
+describe("a tab list's tabs and panels", () => {
+  const PAGES: SettingsEntry = {
+    id: "fixture.pages",
+    section: "general",
+    label: "Pages",
+    description: "A page's views.",
+    parts: { tab: "Pages", other: "Other pages" },
+    partChoices: { tab: ["Settings", "Servers"] },
+    choiceTemplates: { tab: { Servers: { before: "Servers · ", count: true } } },
+  };
+  const entries = new Map([PAGES, SYNC].map((entry) => [entry.id, entry]));
+  const tab = (name: string, id: string, controls: string, selected = false) =>
+    `<button role="tab" id="${id}" aria-controls="${controls}" aria-selected="${selected}">${name}</button>`;
+  const list = (tabs: string, part = "tab") =>
+    `<div role="tablist" tabindex="0" aria-label="${PAGES.parts![part]}" data-settings-control="fixture.pages:${part}">${tabs}</div>`;
+  const panel = (id: string, labelledBy: string, body = "") =>
+    `<div role="tabpanel" tabindex="0" id="${id}" aria-labelledby="${labelledBy}">${body}</div>`;
+  const row = (body: string) =>
+    `<div data-settings-item="fixture.pages"><span>Pages</span><div data-slot="tabs">${body}</div></div>`;
+  const VALID =
+    list(
+      tab("Settings", "t-settings", "p-settings", true) +
+        tab("Servers · 2", "t-servers", "p-servers"),
+    ) +
+    panel("p-settings", "t-settings", "Settings view") +
+    // An inactive panel renders hidden and empty.
+    `<div role="tabpanel" tabindex="0" hidden id="p-servers" aria-labelledby="t-servers"></div>`;
+  function run(html: string): string[] {
+    document.body.innerHTML = `<main>${html}</main>`;
+    return auditSettingsDom({ roots: [document.querySelector("main")!], entries });
+  }
+
+  it("accepts an owned tab list, static and counted tabs, and their panels, active or not", () => {
+    expect(run(row(VALID))).toEqual([]);
+  });
+
+  it("takes a counted choice only around a whole number", () => {
+    const named = (name: string) => run(row(list(tab(name, "t", "p", true)) + panel("p", "t")));
+    for (const name of ["Servers · 0", "Servers · 12"]) expect(named(name)).toEqual([]);
+    for (const name of ["Servers · 1.5", "Servers · -1", "Servers · 01", "Servers · two"]) {
+      expect(named(name)).toEqual([
+        `button[role=tab] "${name}": is a tab of fixture.pages:tab named "${name}", which its entry doesn't list`,
+        `div[role=tabpanel] "${name}": is the panel of a tab that is a tab of fixture.pages:tab named "${name}", which its entry doesn't list`,
+      ]);
+    }
+    // The other part declares no choices, so even a static one isn't its.
+    expect(run(row(list(tab("Settings", "t", "p", true), "other") + panel("p", "t")))).toEqual([
+      'button[role=tab] "Settings": is a tab of fixture.pages:other named "Settings", which its entry doesn\'t list',
+      'div[role=tabpanel] "Settings": is the panel of a tab that is a tab of fixture.pages:other named "Settings", which its entry doesn\'t list',
+    ]);
+  });
+
+  it("leaves an unowned tab list's tabs and panels unowned, and rejects a tab outside any list", () => {
+    const unowned = `<div data-slot="tabs"><div role="tablist" tabindex="0">${tab("A", "t", "p", true)}</div>${panel("p", "t")}</div>`;
+    expect(run(unowned)).toEqual([
+      'div[role=tablist] "": has no owner in the Settings catalog',
+      'button[role=tab] "A": has no owner in the Settings catalog',
+      'div[role=tabpanel] "A": has no owner in the Settings catalog',
+    ]);
+    expect(run(row(tab("Settings", "t", "p")))).toEqual([
+      'button[role=tab] "Settings": is a tab outside any tab list',
+    ]);
+  });
+
+  it("covers a panel only through one reciprocal owned tab in its group and row", () => {
+    const owned = list(tab("Settings", "t", "p", true));
+    const cases: [string, string][] = [
+      [
+        owned + `<div role="tabpanel" tabindex="0" id="p"></div>`,
+        "is a tab panel not labelled by exactly one tab",
+      ],
+      [owned + panel("p", "t other"), "is a tab panel not labelled by exactly one tab"],
+      [
+        owned + `<div role="tabpanel" tabindex="0" aria-labelledby="t"></div>`,
+        "is a tab panel without an id for its tab to name",
+      ],
+      [
+        owned + panel("p", "t") + `<span id="p"></span>`,
+        'is a tab panel whose id "p" isn\'t unique',
+      ],
+      [owned + panel("p", "missing"), 'is labelled by "missing", which isn\'t exactly one element'],
+      [
+        owned + `<span id="label">Settings</span>` + panel("p", "label"),
+        "is a tab panel labelled by something that isn't a tab",
+      ],
+      [
+        list(tab("Settings", "t", "elsewhere", true)) + panel("p", "t"),
+        "is a tab panel its tab doesn't name with aria-controls",
+      ],
+    ];
+    for (const [body, reason] of cases) {
+      const problems = run(row(body)).filter((problem) => problem.startsWith("div[role=tabpanel]"));
+      expect(problems.map((problem) => problem.replace(/^[^:]*: /, ""))).toEqual([reason]);
+    }
+    // Another group's panel, and a panel borrowed by a nested row, aren't the tab's.
+    const otherGroup = row(owned).replace(
+      "</div></div>",
+      `</div><div data-slot="tabs">${panel("p", "t")}</div></div>`,
+    );
+    expect(run(otherGroup).filter((problem) => problem.includes("tabpanel"))).toEqual([
+      'div[role=tabpanel] "Settings": is a tab panel of another tab group',
+    ]);
+    const nestedRow = row(
+      owned + `<div data-settings-item="fixture.sync"><span>Sync</span>${panel("p", "t")}</div>`,
+    );
+    expect(run(nestedRow).filter((problem) => problem.includes("tabpanel"))).toEqual([
+      'div[role=tabpanel] "Settings": is a tab panel outside its tab\'s row',
+    ]);
+  });
+
+  it("rejects a tab that sits in another row inside its list", () => {
+    const nested = list(
+      `<div data-settings-item="fixture.sync"><span>Sync</span>${tab("Settings", "t", "p", true)}</div>`,
+    );
+    expect(run(row(nested)).filter((problem) => problem.startsWith("button[role=tab]"))).toEqual([
+      'button[role=tab] "Settings": is a tab of fixture.pages:tab in another row',
+    ]);
+  });
+
+  it("checks a tab's and a panel's structure before any owner marker on them", () => {
+    expect(
+      run(
+        row(
+          `<button role="tab" aria-label="Pages view" data-settings-control="fixture.pages:tab">Pages view</button>`,
+        ),
+      ),
+    ).toEqual([
+      'button[role=tab] "Pages view": is a tab with an owner of its own; a tab is a choice of its owned tab list',
+    ]);
+    expect(
+      run(
+        row(
+          list(tab("Settings", "t", "p", true)) +
+            `<div role="tabpanel" tabindex="0" id="p" aria-labelledby="t" data-settings-control="fixture.pages:tab">View</div>`,
+        ),
+      ),
+    ).toEqual([
+      'div[role=tabpanel] "Settings": is a tab panel with an owner of its own; its tab covers it',
+    ]);
+  });
+
+  it("checks a file-input or runtime-choice marker on a tab or panel before its structure", () => {
+    const owned = (marker: string) =>
+      list(
+        `<button role="tab" id="t" aria-controls="p" aria-selected="true" ${marker}>Settings</button>`,
+      ) + panel("p", "t");
+    const panelMarked = (marker: string) =>
+      list(tab("Settings", "t", "p", true)) +
+      `<div role="tabpanel" tabindex="0" id="p" aria-labelledby="t" ${marker}></div>`;
+    const file = 'data-settings-file-input="fixture.pages:tab"';
+    const choice = 'data-settings-runtime-choice="fixture.sync:reset"';
+    const reasons = (html: string) =>
+      run(row(html)).map((problem) => problem.replace(/^[^:]*: /, ""));
+    expect(reasons(owned(file))).toEqual([expect.stringContaining("isn't a file input")]);
+    expect(reasons(owned(choice))).toEqual([expect.stringContaining("isn't an option")]);
+    expect(reasons(panelMarked(file))).toEqual([expect.stringContaining("isn't a file input")]);
+    expect(reasons(panelMarked(choice))).toEqual([expect.stringContaining("isn't an option")]);
+    // A panel that takes no focus is reported once, by the ownership pass, not again by the sweep.
+    expect(
+      reasons(
+        list(tab("Settings", "t", "p", true)) +
+          `<div role="tabpanel" id="p" aria-labelledby="t" ${file}></div>`,
+      ),
+    ).toEqual([expect.stringContaining("isn't a file input")]);
+  });
+
+  it("checks tab lists and panels that take no focus, but leaves unowned ones as they were", () => {
+    const owned = list(tab("Settings", "t", "p", true));
+    for (const tabindex of ["", ' tabindex="-1"']) {
+      expect(
+        run(row(owned + `<div role="tabpanel"${tabindex} id="p" aria-labelledby="missing"></div>`)),
+      ).toEqual([
+        'div[role=tabpanel] "": is labelled by "missing", which isn\'t exactly one element',
+      ]);
+    }
+    const misnamed = `<div role="tablist" aria-label="Wrong" data-settings-control="fixture.pages:tab">${tab("Settings", "t", "p", true)}</div>`;
+    expect(run(row(misnamed + panel("p", "t")))).toEqual([
+      'div[role=tablist] "Wrong": is named "Wrong", but fixture.pages names it "Pages"',
+    ]);
+    // An unowned list and panel that take no focus aren't controls, as before; the tab still is.
+    expect(
+      run(
+        `<div data-slot="tabs"><div role="tablist">${tab("A", "t", "p", true)}</div><div role="tabpanel" id="p" aria-labelledby="t"></div></div>`,
+      ),
+    ).toEqual(['button[role=tab] "A": has no owner in the Settings catalog']);
+  });
+
+  it("still audits the controls inside a covered panel", () => {
+    expect(
+      run(row(list(tab("Settings", "t", "p", true)) + panel("p", "t", `<button>Extra</button>`))),
+    ).toEqual(['button "Extra": has no owner in the Settings catalog']);
+  });
+});
+
+describe("a content area", () => {
+  const row = (body: string) => OWNED_ROW.replace(/<\/div>$/, `${body}</div>`);
+  const area = (body: string, value = "fixture.sync:doc") =>
+    `<div data-settings-content="${value}">${body}</div>`;
+  const LINK = '<a href="https://example.com/guide" rel="noreferrer" target="_blank">Guide</a>';
+  const reasons = (html: string) => audit(html).map((problem) => problem.replace(/^[^:]*: /, ""));
+
+  it("holds links out in its entry's row, and nothing else needs an owner there", () => {
+    expect(audit(row(area(`<p>Read the ${LINK}.</p>`)))).toEqual([]);
+  });
+
+  it("holds only plain links out: not a relative link, a button, a marked link or a task box", () => {
+    const only = "is in a content area of fixture.sync, which holds only links out";
+    for (const body of [
+      '<a href="#section">Section</a>',
+      "<button>Copy</button>",
+      '<a href="https://example.com" data-settings-control="fixture.sync">Guide</a>',
+      '<input type="checkbox" disabled checked>',
+      // A link out that says it's something else.
+      '<a href="https://example.com" role="button">Run</a>',
+    ]) {
+      expect(reasons(row(area(body)))).toEqual([only]);
+    }
+  });
+
+  it("holds only links even where an overlay's option would be valid", () => {
+    const APPS: SettingsEntry = {
+      id: "fixture.apps",
+      section: "general",
+      label: "Apps",
+      description: "Which app opens.",
+      parts: { pick: "Pick" },
+      overlays: { pick: { runtimeChoices: { fixed: ["None"] } } },
+      contentAreas: ["doc"],
+    };
+    const inOverlay = (body: string) =>
+      `<div data-settings-item="fixture.apps">Apps<button aria-label="Pick" data-settings-control="fixture.apps:pick">Pick</button>` +
+      `<div data-settings-overlay-owner="fixture.apps:pick"><div data-settings-content="fixture.apps:doc">${body}</div></div></div>`;
+    const run = (body: string) => {
+      document.body.innerHTML = `<main>${inOverlay(body)}</main>`;
+      return auditSettingsDom({
+        roots: [document.querySelector("main")!],
+        entries: new Map([[APPS.id, APPS]]),
+      });
+    };
+    const only = "is in a content area of fixture.apps, which holds only links out";
+    expect(
+      run(
+        '<a href="https://example.test/guide" role="option" data-settings-runtime-choice="fixture.apps:pick">Guide</a>',
+      ),
+    ).toEqual([`a[role=option] "Guide": ${only}`]);
+    expect(run('<button role="option">None</button>')).toEqual([
+      `button[role=option] "None": ${only}`,
+    ]);
+  });
+
+  it("is a declared area in its own row, claimed once and not nested", () => {
+    // The area and the link in it are each reported.
+    expect(audit(row(area(LINK, "fixture.sync:other")))).toEqual([
+      'content area "fixture.sync:other": is in "fixture.sync:other", which isn\'t a declared content area',
+      'a "Guide": is in "fixture.sync:other", which isn\'t a declared content area',
+    ]);
+    const accent = `<div data-settings-item="fixture.accent"><span>Accent</span>${area(LINK)}</div>`;
+    expect(audit(accent)).toEqual([
+      'content area "fixture.sync:doc": is in a content area of fixture.sync outside its row',
+      'a "Guide": is in a content area of fixture.sync outside its row',
+    ]);
+    // With only text, it's still a declared area in its own row.
+    expect(audit(row(area("<p>Just words.</p>", "fixture.sync:other")))).toEqual([
+      'content area "fixture.sync:other": is in "fixture.sync:other", which isn\'t a declared content area',
+    ]);
+    const nestedRow = row(
+      area(`<div data-settings-item="fixture.accent"><span>Accent</span>${LINK}</div>`),
+    );
+    expect(reasons(nestedRow)).toContain("is in another row inside a content area of fixture.sync");
+    expect(audit(row(area(LINK) + area(LINK)))).toEqual([
+      'content area "fixture.sync:doc": is claimed 2 times in one row',
+    ]);
+    // Nested, it's inside another and a second claim in the row.
+    expect(audit(row(area(area(LINK))))).toEqual([
+      'content area "fixture.sync:doc": is claimed 2 times in one row',
+      'content area "fixture.sync:doc": is inside another',
+    ]);
+  });
+});
+
+describe("a modal's focus guards", () => {
+  it("aren't controls, though they take focus; another focusable span still is", () => {
+    const guard =
+      '<span data-radix-focus-guard="" tabindex="0" aria-hidden="true" style="outline: none; opacity: 0; position: fixed; pointer-events: none;"></span>';
+    expect(audit(`${OWNED_ROW}${guard}${guard}`, [SYNC])).toEqual([]);
+    expect(audit(`${OWNED_ROW}<span tabindex="0">Focus me</span>`, [SYNC])).toEqual([
+      'span "": has no owner in the Settings catalog',
+    ]);
+    // Without the guard's own marks, it's no guard.
+    expect(
+      audit(`${OWNED_ROW}<span data-radix-focus-guard="" tabindex="0"></span>`, [SYNC]),
+    ).toEqual(['span "": has no owner in the Settings catalog']);
   });
 });
