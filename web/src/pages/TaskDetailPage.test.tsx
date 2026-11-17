@@ -1524,6 +1524,7 @@ it.each(["continue", "new"] as const)(
     setTask(
       task({
         prompt: "This automation watches Jira and starts one Omnigent session",
+        rrule: "FREQ=MINUTELY;INTERVAL=10",
         sessionMode,
         nextRunAt: "2026-03-10T14:00:00Z",
       }),
@@ -1538,14 +1539,15 @@ it.each(["continue", "new"] as const)(
         {pageTree()}
       </CapabilitiesProvider>,
     );
+    const schedule = screen.getByTestId("task-detail-schedule");
     if (sessionMode === "continue") {
-      expect(screen.getByTestId("task-detail-schedule")).toHaveTextContent(
-        "Runs when new items match",
-      );
-      expect(screen.getByTestId("task-detail-schedule")).not.toHaveTextContent("Next run");
+      expect(schedule).toHaveTextContent("Runs when new items match");
+      expect(schedule).not.toHaveTextContent("Every 10 minutes");
+      expect(schedule).not.toHaveTextContent("Next run");
       expect(screen.queryByTestId("task-detail-run-now")).not.toBeInTheDocument();
     } else {
-      expect(screen.getByTestId("task-detail-schedule")).toHaveTextContent("Next run");
+      expect(schedule).toHaveTextContent("Every 10 minutes");
+      expect(schedule).toHaveTextContent("Next run");
       expect(screen.getByTestId("task-detail-run-now")).toBeInTheDocument();
     }
   },

@@ -93,9 +93,9 @@ async def test_settings_are_hidden_where_the_deployment_does_not_offer_the_agent
             "/v1/proactive-agent/settings/me", json={"enabled": True}, headers=_ALICE
         )
         assert put.status_code == 404
-        assert (await client.get("/v1/info", headers=_ALICE)).json()[
-            "proactive_agent_available"
-        ] is False
+        info = (await client.get("/v1/info", headers=_ALICE)).json()
+        assert info["proactive_agent_available"] is False
+        assert info["proactive_agent_admin_available"] is False
 
 
 async def test_both_settings_start_on(db_uri: str, tmp_path: Path) -> None:
@@ -107,9 +107,10 @@ async def test_both_settings_start_on(db_uri: str, tmp_path: Path) -> None:
             "can_manage_workspace": False,
         }
         assert (await _settings(client, _ADMIN))["can_manage_workspace"] is True
-        assert (await client.get("/v1/info", headers=_ALICE)).json()[
-            "proactive_agent_available"
-        ] is True
+        info = (await client.get("/v1/info", headers=_ALICE)).json()
+        assert info["proactive_agent_available"] is True
+        # The web client shows the prompt and Run now controls only where this is set.
+        assert info["proactive_agent_admin_available"] is True
 
 
 async def test_a_user_can_turn_it_off_for_themselves_only(db_uri: str, tmp_path: Path) -> None:
