@@ -313,8 +313,10 @@ import {
   dateBucket,
   writeLegacyPinnedConversationIds,
   isOwnedByViewer,
-  sessionBelongsToProject,
+  isSharedAutomationRun,
+  sessionInSidebarFolder,
   sessionsListAcceptsDrop,
+  withAutomationFolder,
 } from "./sidebarNav";
 import { SidebarServerPicker } from "./SidebarServerPicker";
 import { isRowFullyVisible } from "./sidebarRowVisibility";
@@ -1680,6 +1682,8 @@ type ProjectHeaderDrag = ReturnType<typeof useSortable>;
 function ProjectFolder({
   name,
   projectId,
+  placeholder = false,
+  includeSharedRuns,
   icon,
   windowConversations,
   archived,
@@ -1722,6 +1726,13 @@ function ProjectFolder({
   name: string;
   /** First-class project id, or null for a label-only folder. */
   projectId: string | null;
+  /**
+   * The default automation folder shown for shared runs before the viewer has
+   * that project: nothing is filed, dropped, reordered or edited through it.
+   */
+  placeholder?: boolean;
+  /** Whether other users' automation runs join the default automation folder. */
+  includeSharedRuns: boolean;
   /** Chosen emoji icon (unicode grapheme), or null/absent for the default
       folder glyph. */
   icon?: string | null;
@@ -1766,7 +1777,7 @@ function ProjectFolder({
 }) {
   const { registerFolder, sortBy, customOrder, applyLocalResolutions } = useSidebarData();
   const viewerId = useViewerId();
-  const query = useProjectSessions(name, expanded, sortBy, archived);
+  const query = useProjectSessions(name, expanded && !placeholder, sortBy, archived);
   const watchedRows = useMemo(
     () => query.data?.pages.flatMap((page) => page.data) ?? [],
     [query.data],
@@ -1792,7 +1803,7 @@ function ProjectFolder({
         [...byId.values()].filter(
           (c) =>
             (c.archived === true) === archived &&
-            sessionBelongsToProject(c, { id: projectId, name }, viewerId) &&
+            sessionInSidebarFolder(c, { id: projectId, name }, viewerId, includeSharedRuns) &&
             (archived || !isSessionPinned(c, pinnedSet)),
         ),
         activeOverride,
@@ -1814,6 +1825,7 @@ function ProjectFolder({
     projectId,
     name,
     viewerId,
+    includeSharedRuns,
   ]);
   // Each expansion, archive switch or re-sort restarts the page count and auto-load
   // budget; when paginated, the open session is never left hidden.
@@ -1883,6 +1895,7 @@ function ProjectFolder({
   const { setNodeRef, isOver } = useDroppable({
     id: `project:${name}`,
     data: { type: "project", name },
+    disabled: placeholder,
   });
 
   const { actions: menuActions, dialogs: menuDialogs } = useProjectFolderMenu(
@@ -1952,7 +1965,7 @@ function ProjectFolder({
         />
       )}
       <ConversationSection
-        headerDrag={headerDrag}
+        headerDrag={placeholder ? undefined : headerDrag}
         title={name}
         icon={
           icon ? (
@@ -1998,6 +2011,8 @@ function ProjectFolder({
         emptyMessage={
           loadingFirstPage ? undefined : archived ? (
             "No archived sessions"
+          ) : placeholder ? (
+            "No sessions"
           ) : (
             <span className="block">
               No sessions. Start a{" "}
@@ -2017,21 +2032,28 @@ function ProjectFolder({
         }
         indentRows
         headerAction={
-          <ProjectFolderActions
-            projectName={name}
-            onNavigate={onRowClick}
-            actions={orderedMenuActions}
-          />
-        }
-        headerContextMenu={
-          <ContextMenuContent className="min-w-40" onCloseAutoFocus={menuActions.onCloseAutoFocus}>
-            <ProjectFolderMenuItems
-              components={contextBundle}
+          placeholder ? undefined : (
+            <ProjectFolderActions
               projectName={name}
               onNavigate={onRowClick}
               actions={orderedMenuActions}
             />
-          </ContextMenuContent>
+          )
+        }
+        headerContextMenu={
+          placeholder ? undefined : (
+            <ContextMenuContent
+              className="min-w-40"
+              onCloseAutoFocus={menuActions.onCloseAutoFocus}
+            >
+              <ProjectFolderMenuItems
+                components={contextBundle}
+                projectName={name}
+                onNavigate={onRowClick}
+                actions={orderedMenuActions}
+              />
+            </ContextMenuContent>
+          )
         }
         footer={footer}
       />
@@ -2214,7 +2236,14 @@ function ConversationList({
   // persisted per-device preference. With the release flag off the sidebar
   // keeps its default layout and ignores any stored choice.
   const groupingUi = isFeatureEnabled(serverInfo, "sidebar_grouping_ui");
-  const { view, updateView: saveView, sortBy, customOrder, loadedRows } = useSidebarData();
+  const {
+    view,
+    updateView: saveView,
+    sortBy,
+    customOrder,
+    loadedRows,
+    sharedActive,
+  } = useSidebarData();
   const updateView = useStableCallback((patch: Partial<SidebarViewPreferences>) => {
     // Regrouping swaps which sections (and selection scopes) exist, so leave
     // selection the way a Display switch does.
@@ -2473,6 +2502,16 @@ function ConversationList({
     if (custom) saveView({ ordering: "custom", custom });
   });
   const reorderable = groupingUi && !selectionMode;
+  // Other users' automation runs join the default automation folder. My sessions
+  // takes them from the shared rows already loaded, so none show when those aren't.
+  const includeSharedRuns = activeTab !== "mine" || sharedActive;
+  const mineSharedRuns = useMemo(
+    () =>
+      activeTab === "mine" && includeSharedRuns
+        ? loadedRows.filter((c) => isSharedAutomationRun(c, viewerId))
+        : EMPTY_CONVERSATIONS,
+    [activeTab, includeSharedRuns, loadedRows, viewerId],
+  );
 
   // Build sections: Pinned and Archived are peeled off; the rest splits into
   // the viewer's own sessions (Chats) and ones shared with them. Archived
@@ -2517,25 +2556,46 @@ function ConversationList({
 
     // Folders use live members on All / My and archives on Archived. Filing is
     // owner-only, so Shared and grouped views omit folders; pins precede them.
-    const folderCandidates = activeTab === "archived" ? tabScoped : notArchived;
+    // My sessions' own rows hold no shared runs, so they come from the loaded rows.
+    const folderCandidates =
+      activeTab === "archived"
+        ? tabScoped
+        : dedupeConversationsById([...notArchived, ...mineSharedRuns]);
+    const sharedRunsToFile =
+      includeSharedRuns &&
+      folderCandidates.some((c) => isSharedAutomationRun(c, viewerId) && !pinnedIdSet.has(c.id));
+    const folders =
+      grouped || activeTab === "shared"
+        ? []
+        : withAutomationFolder(
+            projects,
+            sharedRunsToFile,
+            projectOrder.data?.sort_mode === "manual",
+          );
     const filedIds = new Set<string>();
     const projectGroups: {
       id: string | null;
       name: string;
       icon?: string | null;
+      /** Shown for shared automation runs; the viewer has no such project yet. */
+      placeholder: boolean;
       conversations: Conversation[];
-    }[] = (grouped || activeTab === "shared" ? [] : projects).map(({ id, name, icon }) => {
+    }[] = folders.map((folder) => {
+      const { id, name } = folder;
       // Dual-read membership: a session belongs to this folder if it has
       // the first-class id OR the legacy omni_project label of this name,
       // and (filing being owner-only) the viewer owns it.
       const inProject = folderCandidates.filter(
-        (c) => sessionBelongsToProject(c, { id, name }, viewerId) && !pinnedIdSet.has(c.id),
+        (c) =>
+          sessionInSidebarFolder(c, { id, name }, viewerId, includeSharedRuns) &&
+          !pinnedIdSet.has(c.id),
       );
       inProject.forEach((c) => filedIds.add(c.id));
       return {
         id,
         name,
-        icon,
+        icon: "placeholder" in folder ? null : folder.icon,
+        placeholder: "placeholder" in folder,
         conversations: orderSessionFamilies(
           sortConversations(inProject, activeOverride, frozenKeys, sortBy, customOrder),
         ),
@@ -2639,7 +2699,10 @@ function ConversationList({
     frozenKeys,
     frozenStatus,
     projects,
+    projectOrder.data?.sort_mode,
     activeTab,
+    includeSharedRuns,
+    mineSharedRuns,
     viewerId,
     groupingUi,
     grouped,
@@ -3560,55 +3623,62 @@ function ConversationList({
                         items={projects.map((p) => projectDragId(p.name))}
                         strategy={verticalListSortingStrategy}
                       >
-                        {sections.projectGroups.map((group, index) => (
-                          <ProjectFolder
-                            key={group.name}
-                            ordering={{
-                              disabled:
-                                !projectOrder.data ||
-                                saveOrder.isPending ||
-                                selectionMode ||
-                                editingIds.size > 0,
-                              first: index === 0,
-                              last: index === projects.length - 1,
-                              move: (destination) => moveProject(group.name, destination),
-                              insertion:
-                                overProject === group.name &&
-                                draggedProject !== group.name &&
-                                draggedProject !== null
-                                  ? projects.findIndex((p) => p.name === draggedProject) < index
-                                    ? "after"
-                                    : "before"
-                                  : undefined,
-                            }}
-                            scrollRoot={scrollContainerRef}
-                            pageSize={projectFolderCollapse ? projectFolderPageSize : undefined}
-                            name={group.name}
-                            projectId={group.id}
-                            icon={group.icon}
-                            windowConversations={group.conversations}
-                            archived={activeTab === "archived"}
-                            activeConversationId={displayedActiveId}
-                            expanded={expandedProjects.includes(group.name)}
-                            active={newSessionProjectName === group.name}
-                            onToggleCollapsed={() => toggleProjectExpanded(group.name)}
-                            collapsedFamilies={collapsedFamilies}
-                            onToggleFamily={toggleFamily}
-                            pinnedConversationIds={pinnedConversationIds}
-                            sessionShortcutSlots={sessionShortcutSlots}
-                            activeOverride={activeOverride}
-                            frozenSortKeys={frozenKeys}
-                            onRowClick={onRowClick}
-                            onTogglePinned={onTogglePinned}
-                            selectionMode={projectsSelecting}
-                            selectedIds={selectedIds}
-                            onToggleSelected={onToggleSelected}
-                            onProjectAssigned={expandProject}
-                            onProjectRenamed={renameExpandedProject}
-                            onConversationsLoaded={handleFolderConversationsLoaded}
-                            reorderable={reorderable}
-                          />
-                        ))}
+                        {sections.projectGroups.map((group) => {
+                          // Its place among the viewer's projects; a placeholder has none.
+                          const index = projects.findIndex((p) => p.name === group.name);
+                          return (
+                            <ProjectFolder
+                              key={group.name}
+                              placeholder={group.placeholder}
+                              includeSharedRuns={includeSharedRuns}
+                              ordering={{
+                                disabled:
+                                  group.placeholder ||
+                                  !projectOrder.data ||
+                                  saveOrder.isPending ||
+                                  selectionMode ||
+                                  editingIds.size > 0,
+                                first: index === 0,
+                                last: index === projects.length - 1,
+                                move: (destination) => moveProject(group.name, destination),
+                                insertion:
+                                  overProject === group.name &&
+                                  draggedProject !== group.name &&
+                                  draggedProject !== null
+                                    ? projects.findIndex((p) => p.name === draggedProject) < index
+                                      ? "after"
+                                      : "before"
+                                    : undefined,
+                              }}
+                              scrollRoot={scrollContainerRef}
+                              pageSize={projectFolderCollapse ? projectFolderPageSize : undefined}
+                              name={group.name}
+                              projectId={group.id}
+                              icon={group.icon}
+                              windowConversations={group.conversations}
+                              archived={activeTab === "archived"}
+                              activeConversationId={displayedActiveId}
+                              expanded={expandedProjects.includes(group.name)}
+                              active={newSessionProjectName === group.name}
+                              onToggleCollapsed={() => toggleProjectExpanded(group.name)}
+                              collapsedFamilies={collapsedFamilies}
+                              onToggleFamily={toggleFamily}
+                              pinnedConversationIds={pinnedConversationIds}
+                              sessionShortcutSlots={sessionShortcutSlots}
+                              activeOverride={activeOverride}
+                              frozenSortKeys={frozenKeys}
+                              onRowClick={onRowClick}
+                              onTogglePinned={onTogglePinned}
+                              selectionMode={projectsSelecting}
+                              selectedIds={selectedIds}
+                              onToggleSelected={onToggleSelected}
+                              onProjectAssigned={expandProject}
+                              onProjectRenamed={renameExpandedProject}
+                              onConversationsLoaded={handleFolderConversationsLoaded}
+                              reorderable={reorderable}
+                            />
+                          );
+                        })}
                       </SortableContext>
                       {sections.projectGroups.length === 0 &&
                         !effectiveCollapsedSections.includes("Projects") && (
@@ -5267,16 +5337,25 @@ function SessionErrorHint() {
   );
 }
 
+// Who a row's people icon says the session is shared with: others (the viewer owns
+// it) or the viewer (an automation run shared with them).
+type SessionSharing = "with_others" | "with_you";
+
+const SESSION_SHARING_LABEL: Record<SessionSharing, string> = {
+  with_others: "Shared with others",
+  with_you: "Shared with you",
+};
+
 // Explains the row's people icon, which can't hold a tooltip of its own: it
 // sits over the row link and fades out on hover.
-function SessionSharedHint() {
+function SessionSharedHint({ sharing }: { sharing: SessionSharing }) {
   return (
     <p
       data-testid="session-shared-hint"
       className="mt-1 flex items-center gap-1.5 text-sm text-muted-foreground"
     >
       <UsersIcon aria-hidden className="size-3.5 shrink-0" />
-      <span>Shared with others</span>
+      <span>{SESSION_SHARING_LABEL[sharing]}</span>
     </p>
   );
 }
@@ -5522,7 +5601,7 @@ function LegacySessionTooltipContent({
   conversation: Conversation;
   hostsById: ReadonlyMap<string, Host>;
   hasError: boolean;
-  shared: boolean;
+  shared: SessionSharing | null;
 }) {
   return (
     <TooltipContent
@@ -5557,7 +5636,7 @@ function LegacySessionTooltipContent({
           <span className="truncate">{conversation.git_branch}</span>
         </p>
       )}
-      {shared && <SessionSharedHint />}
+      {shared !== null && <SessionSharedHint sharing={shared} />}
       {hasError && <SessionErrorHint />}
     </TooltipContent>
   );
@@ -5572,7 +5651,7 @@ function SessionTooltipContent({
   conversation: Conversation;
   hostsById: ReadonlyMap<string, Host>;
   hasError: boolean;
-  shared: boolean;
+  shared: SessionSharing | null;
 }) {
   const serverInfo = useContext(ServerInfoContext);
   if (!isFeatureEnabled(serverInfo, "sidebar_grouping_ui")) {
@@ -5608,7 +5687,7 @@ function SessionTooltipContent({
         </span>
       </p>
       <SessionTooltipDetails conversation={conversation} />
-      {shared && <SessionSharedHint />}
+      {shared !== null && <SessionSharedHint sharing={shared} />}
       {hasError && <SessionErrorHint />}
     </TooltipContent>
   );
@@ -5861,7 +5940,14 @@ function ConversationRowImpl({
   // present; otherwise only an inactive row needs the draft marker.
   const showDraftIndicator = hasDraft && !isActive;
   // The server reports `shared_with_others` only to the owner; absent means not shared.
-  const showSharedIndicator = isOwner && conversation.shared_with_others === true;
+  // A shared automation run sits among the viewer's own, so it says it's shared too.
+  const sharing: SessionSharing | null =
+    isOwner && conversation.shared_with_others === true
+      ? "with_others"
+      : isSharedAutomationRun(conversation, viewerId)
+        ? "with_you"
+        : null;
+  const showSharedIndicator = sharing !== null;
   const hasSessionIndicator = sessionState !== null || showDraftIndicator;
   // The "Show → Updated" timestamp takes the indicator slot only when it's free.
   const show = useContext(SidebarShowContext);
@@ -6346,7 +6432,7 @@ function ConversationRowImpl({
               projectIcon={projectFlyoutIcon}
               gitBranch={gitBranch}
               hasError={sessionState?.kind === "error"}
-              shared={showSharedIndicator}
+              shared={sharing}
             />
           </HoverCard>
         ) : isMobile ? (
@@ -6358,7 +6444,7 @@ function ConversationRowImpl({
               conversation={conversation}
               hostsById={hostsById}
               hasError={sessionState?.kind === "error"}
-              shared={showSharedIndicator}
+              shared={sharing}
             />
           </Tooltip>
         )
@@ -6382,7 +6468,7 @@ function ConversationRowImpl({
             projectIcon={projectFlyoutIcon}
             gitBranch={gitBranch}
             hasError={sessionState?.kind === "error"}
-            shared={showSharedIndicator}
+            shared={sharing}
           />
         </HoverCard>
       ) : isMobile ? (
@@ -6416,7 +6502,7 @@ function ConversationRowImpl({
             conversation={conversation}
             hostsById={hostsById}
             hasError={sessionState?.kind === "error"}
-            shared={showSharedIndicator}
+            shared={sharing}
           />
         </Tooltip>
       )}
@@ -6470,11 +6556,11 @@ function ConversationRowImpl({
           <SessionUpdatedLabel updatedAt={conversation.updated_at} />
         </span>
       ) : null}
-      {!selectionMode && showSharedIndicator && (
+      {!selectionMode && sharing !== null && (
         <span
           role="img"
           // The row's hover surface carries the visible explanation.
-          aria-label="Shared with others"
+          aria-label={SESSION_SHARING_LABEL[sharing]}
           // Shares the state slot's classes so it fades on every trigger the
           // badge does (hover, focus, open menu, shortcut hint).
           className={cn(
@@ -6978,7 +7064,7 @@ function PinnedProjectFlyoutContent({
   projectIcon: string | null;
   gitBranch: string | null;
   hasError: boolean;
-  shared: boolean;
+  shared: SessionSharing | null;
 }) {
   return (
     <HoverCardContent
@@ -7005,7 +7091,7 @@ function PinnedProjectFlyoutContent({
           <span className="truncate">{gitBranch}</span>
         </p>
       )}
-      {shared && <SessionSharedHint />}
+      {shared !== null && <SessionSharedHint sharing={shared} />}
       {hasError && <SessionErrorHint />}
     </HoverCardContent>
   );

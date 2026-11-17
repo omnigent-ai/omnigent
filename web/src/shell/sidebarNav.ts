@@ -3,6 +3,12 @@ import type { Conversation, SessionSortBy } from "@/hooks/useConversations";
 import { nativeCodingAgentForWrapper, WRAPPER_LABEL_KEY } from "@/lib/nativeCodingAgents";
 import { getOptimisticTitle } from "@/lib/optimisticTitles";
 import { PROJECT_LABEL_KEY, PINNED_LABEL_KEY } from "@/lib/sessionListCache";
+import {
+  DEFAULT_AUTOMATION_PROJECT,
+  SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY,
+  SCHEDULED_TASK_LAUNCH_LABEL_KEY,
+  SCHEDULED_TASK_ORIGIN_LABEL_KEY,
+} from "@/lib/automationSessions";
 import type { SidebarCustomOrder } from "@/lib/sidebarViewPreferences";
 import { isIndentedSibling, isSessionPinned, orderSessionFamilies } from "@/lib/sessionFamilies";
 
@@ -188,6 +194,76 @@ export function sessionBelongsToProject(
     ((project.id !== null && conversation.project_id === project.id) ||
       conversation.labels?.[PROJECT_LABEL_KEY] === project.name)
   );
+}
+
+/**
+ * Whether *conversation* is another user's automation run shared with the
+ * viewer: the session a run created (a fork drops its initial-run label), or one
+ * launched from a run's session tree.
+ */
+export function isSharedAutomationRun(
+  conversation: Conversation,
+  viewerId: string | null,
+): boolean {
+  if (isOwnedByViewer(conversation, viewerId)) return false;
+  const labels = conversation.labels ?? {};
+  return Boolean(
+    (labels[SCHEDULED_TASK_ORIGIN_LABEL_KEY] && labels[SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY]) ||
+    labels[SCHEDULED_TASK_LAUNCH_LABEL_KEY],
+  );
+}
+
+/**
+ * Sidebar folder membership: {@link sessionBelongsToProject}, and with
+ * `includeSharedRuns` other users' automation runs shared with the viewer go
+ * in the default automation folder, wherever their owner filed them.
+ */
+export function sessionInSidebarFolder(
+  conversation: Conversation,
+  project: { id: string | null; name: string },
+  viewerId: string | null,
+  includeSharedRuns: boolean,
+): boolean {
+  return (
+    sessionBelongsToProject(conversation, project, viewerId) ||
+    (includeSharedRuns &&
+      project.name === DEFAULT_AUTOMATION_PROJECT &&
+      isSharedAutomationRun(conversation, viewerId))
+  );
+}
+
+/** A folder the sidebar shows for shared automation runs before the viewer has that project. */
+export interface PlaceholderProjectFolder {
+  id: null;
+  name: string;
+  placeholder: true;
+}
+
+/**
+ * The viewer's project folders, plus a placeholder default automation folder
+ * when `needed` and they have no project of that name. It takes the place a new
+ * project would: by name, as the server sorts, or last under a manual order.
+ * Creating the real project later replaces it in that spot.
+ */
+export function withAutomationFolder<Project extends { name: string }>(
+  projects: Project[],
+  needed: boolean,
+  manualOrder: boolean,
+): (Project | PlaceholderProjectFolder)[] {
+  if (!needed || projects.some((project) => project.name === DEFAULT_AUTOMATION_PROJECT)) {
+    return projects;
+  }
+  const folder: PlaceholderProjectFolder = {
+    id: null,
+    name: DEFAULT_AUTOMATION_PROJECT,
+    placeholder: true,
+  };
+  const index = manualOrder
+    ? -1
+    : projects.findIndex((project) => project.name > DEFAULT_AUTOMATION_PROJECT);
+  return index < 0
+    ? [...projects, folder]
+    : [...projects.slice(0, index), folder, ...projects.slice(index)];
 }
 
 export function conversationDisplayLabel(conversation: Conversation): string {

@@ -74,6 +74,7 @@ from omnigent.stores.conversation_store import (
     SCHEDULED_TASK_SOURCE_LABEL_KEY,
     SessionActivity,
 )
+from omnigent.stores.permission_store import PermissionStore
 from tests.server.helpers import build_agent_bundle
 
 # The trigger form's saved state; see encodeTriggerPrompt in web/.../triggerTemplates.ts.
@@ -496,6 +497,11 @@ class FakePermissionStore:
 
     def list_for_session(self, conversation_id: str, **_: Any) -> tuple[list[Any], None]:
         return [SessionPermission(*g) for g in self.grants if g[1] == conversation_id], None
+
+    # Its session reads are already direct, as the store defaults assume.
+    get_direct = PermissionStore.get_direct
+    list_direct_for_session = PermissionStore.list_direct_for_session
+    public_grantees = PermissionStore.public_grantees
 
     def delete_for_scheduled_task(self, scheduled_task_id: str) -> int:
         self.deleted_task_grants.append(scheduled_task_id)

@@ -26,7 +26,8 @@ def task() -> ScheduledTask:
 @pytest.mark.parametrize(
     "source,template,expected_source,expected_template",
     [
-        (None, None, "api", "unknown"),
+        (None, None, "api", "none"),
+        ("ui", None, "ui", "unknown"),
         ("ui", "custom", "ui", "custom"),
         ("ui", "jira", "ui", "jira"),
         ("ui", "slack", "ui", "slack"),
@@ -36,7 +37,8 @@ def task() -> ScheduledTask:
         ("ui", "follow-up-monitor", "ui", "follow-up-monitor"),
         ("ui", "pr-sweep", "ui", "pr-sweep"),
         ("ui", "news-digest", "ui", "news-digest"),
-        ("agent", None, "agent", "unknown"),
+        ("agent", None, "agent", "none"),
+        ("agent", "private prompt", "agent", "unknown"),
         ("private source", "private prompt", "api", "unknown"),
     ],
 )
@@ -53,6 +55,17 @@ def test_creation_telemetry_bounds_dimensions(
     assert event.attributes["template_id"] == expected_template
     assert "private" not in str(event.attributes)
     assert task.prompt not in str(event.attributes)
+
+
+@pytest.mark.parametrize("kind", ["automation", "reminder"])
+def test_creation_telemetry_records_kind(task, caplog, kind):
+    caplog.set_level(logging.INFO)
+    task.kind = kind
+    telemetry.log_task_created(task, owner="alice@example.com", source="agent", template=None)
+    [event] = [
+        r for r in caplog.records if getattr(r, "event_name", None) == "scheduled_task_created"
+    ]
+    assert event.attributes["kind"] == kind
 
 
 def test_creation_telemetry_tolerates_logging_failure(task, monkeypatch):
