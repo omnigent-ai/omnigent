@@ -46,7 +46,7 @@ const GOAL_STATUS_LABELS: Record<string, string> = {
  * @returns A label such as ``"Budget limited"``, or the raw status when unknown.
  */
 export function goalStatusLabel(status: Goal["status"]): string {
-  return GOAL_STATUS_LABELS[status] ?? status;
+  return Object.hasOwn(GOAL_STATUS_LABELS, status) ? GOAL_STATUS_LABELS[status] : status;
 }
 
 export function canPauseGoal(goal: Goal | null): boolean {

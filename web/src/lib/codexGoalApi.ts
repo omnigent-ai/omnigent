@@ -131,7 +131,17 @@ async function readJsonOrThrow<T>(res: Response): Promise<T> {
   return (await res.json()) as T;
 }
 
-async function requestCodexGoal<T>(url: string, init: RequestInit = {}): Promise<T> {
+/**
+ * Fetch goal JSON, bounding the whole request so a stalled runner reads as a timeout.
+ *
+ * @param timeoutCode - ``ApiError`` code for a timeout, e.g. ``"claude_goal_request_timeout"``.
+ * @throws ApiError for a non-ok response or a timeout (status 504).
+ */
+export async function requestGoalJson<T>(
+  url: string,
+  init: RequestInit = {},
+  timeoutCode = "codex_goal_request_timeout",
+): Promise<T> {
   const isRead = (init.method ?? "GET").toUpperCase() === "GET";
   const controller = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -144,7 +154,7 @@ async function requestCodexGoal<T>(url: string, init: RequestInit = {}): Promise
               ? "Goal read timed out. Try again."
               : "Goal request timed out. The outcome is uncertain. Refresh the goal before retrying.",
             504,
-            "codex_goal_request_timeout",
+            timeoutCode,
           ),
         );
         controller.abort();
@@ -236,7 +246,7 @@ export async function getCodexGoal(
   options: CodexGoalReadOptions = {},
 ): Promise<CodexGoalReadResponse> {
   const strict = options.strict !== false;
-  const wire = await requestCodexGoal<CodexGoalReadResponseWire>(
+  const wire = await requestGoalJson<CodexGoalReadResponseWire>(
     `/v1/sessions/${encodeURIComponent(sessionId)}/codex_goal`,
     {
       headers: strict ? { [CODEX_GOAL_READ_HEADER]: CODEX_GOAL_READ_STRICT } : undefined,
@@ -292,7 +302,7 @@ export async function setCodexGoal(
   if (goal.status !== undefined) {
     body.status = goal.status;
   }
-  const wire = await requestCodexGoal<CodexGoalResponseWire>(
+  const wire = await requestGoalJson<CodexGoalResponseWire>(
     `/v1/sessions/${encodeURIComponent(sessionId)}/codex_goal`,
     {
       method: "PUT",
@@ -315,7 +325,7 @@ export async function updateCodexGoalStatus(
   sessionId: string,
   status: CodexGoalStatusUpdate,
 ): Promise<CodexGoalResponse> {
-  const wire = await requestCodexGoal<CodexGoalResponseWire>(
+  const wire = await requestGoalJson<CodexGoalResponseWire>(
     `/v1/sessions/${encodeURIComponent(sessionId)}/codex_goal/status`,
     {
       method: "PATCH",
@@ -333,7 +343,7 @@ export async function updateCodexGoalStatus(
  * @returns Whether Codex removed an existing goal.
  */
 export async function clearCodexGoal(sessionId: string): Promise<{ cleared: boolean }> {
-  const wire = await requestCodexGoal<{ cleared: boolean }>(
+  const wire = await requestGoalJson<{ cleared: boolean }>(
     `/v1/sessions/${encodeURIComponent(sessionId)}/codex_goal`,
     { method: "DELETE" },
   );

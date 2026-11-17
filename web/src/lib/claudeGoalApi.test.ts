@@ -65,17 +65,55 @@ describe("getClaudeGoal", () => {
       { available: true, goal: null },
     ],
     [{ available: false, goal: null }, { available: false }],
-    [{ available: true, goal: { status: "active" } }, { available: false }],
-    [{}, { available: false }],
   ])("reads %j as %j", async (body, expected) => {
     mockAuthenticatedFetch.mockResolvedValueOnce(mockJsonResponse(body));
 
     await expect(getClaudeGoal("conv")).resolves.toEqual(expected);
   });
 
-  it("raises an ApiError for a failed request", async () => {
-    mockAuthenticatedFetch.mockResolvedValueOnce(mockJsonResponse({}, 400));
+  it.each([
+    { available: true, goal: { status: "active" } },
+    { available: false, goal: { condition: "All tests pass", status: "active" } },
+    { goal: null },
+    {},
+  ])("rejects the malformed body %j", async (body) => {
+    mockAuthenticatedFetch.mockResolvedValueOnce(mockJsonResponse(body));
 
-    await expect(getClaudeGoal("conv")).rejects.toBeInstanceOf(ApiError);
+    await expect(getClaudeGoal("conv")).rejects.toMatchObject({
+      status: 502,
+      code: "claude_goal_failed",
+    });
+  });
+
+  it("keeps the server's error message and code", async () => {
+    mockAuthenticatedFetch.mockResolvedValueOnce(
+      mockJsonResponse(
+        { error: { code: "invalid_request", message: "Not a Claude session" } },
+        400,
+      ),
+    );
+
+    const error = await getClaudeGoal("conv").catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(ApiError);
+    expect(error).toMatchObject({
+      status: 400,
+      code: "invalid_request",
+      message: "Not a Claude session",
+    });
+  });
+
+  it("reports a stalled read as a timeout", async () => {
+    vi.useFakeTimers();
+    try {
+      mockAuthenticatedFetch.mockReturnValueOnce(new Promise<Response>(() => {}));
+      const read = getClaudeGoal("conv").catch((caught: unknown) => caught);
+
+      await vi.advanceTimersByTimeAsync(60_000);
+
+      expect(await read).toMatchObject({ status: 504, code: "claude_goal_request_timeout" });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

@@ -1,8 +1,6 @@
+import { requestGoalJson } from "./codexGoalApi";
 import type { Goal, GoalReadResponse } from "./goalApi";
-import { authenticatedFetch } from "./identity";
 import { ApiError } from "./sessionsApi";
-
-const CLAUDE_GOAL_REQUEST_TIMEOUT_MS = 30_000;
 
 /** Wire goal from `GET /v1/sessions/{id}/claude_goal`, derived from Claude's transcript. */
 interface ClaudeGoalWire {
@@ -18,6 +16,11 @@ interface ClaudeGoalWire {
   /** Unix seconds. */
   set_at?: number | null;
   updated_at?: number | null;
+}
+
+interface ClaudeGoalReadWire {
+  goal: ClaudeGoalWire | null;
+  available: boolean;
 }
 
 function optionalNumber(value: unknown): number | null {
@@ -47,29 +50,34 @@ function isClaudeGoalWire(value: unknown): value is ClaudeGoalWire {
   return typeof goal.condition === "string" && typeof goal.status === "string";
 }
 
+function isClaudeGoalReadWire(value: unknown): value is ClaudeGoalReadWire {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const body = value as Partial<ClaudeGoalReadWire>;
+  if (typeof body.available !== "boolean") return false;
+  if (body.goal === null) return true;
+  return body.available && isClaudeGoalWire(body.goal);
+}
+
 /**
  * Read the `/goal` of a Claude-native session.
  *
  * @param sessionId - Session id, e.g. `"conv_abc123"`.
  * @returns The goal, or `{ available: false }` while the runner cannot read it.
+ * @throws ApiError for a failed, timed-out (504), or malformed (502) read.
  */
 export async function getClaudeGoal(sessionId: string): Promise<GoalReadResponse> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), CLAUDE_GOAL_REQUEST_TIMEOUT_MS);
-  try {
-    const res = await authenticatedFetch(
-      `/v1/sessions/${encodeURIComponent(sessionId)}/claude_goal`,
-      { signal: controller.signal },
+  const body = await requestGoalJson<unknown>(
+    `/v1/sessions/${encodeURIComponent(sessionId)}/claude_goal`,
+    {},
+    "claude_goal_request_timeout",
+  );
+  if (!isClaudeGoalReadWire(body)) {
+    throw new ApiError(
+      "Could not read Claude goal: server returned a malformed response.",
+      502,
+      "claude_goal_failed",
     );
-    if (!res.ok) {
-      throw new ApiError(`Could not read Claude goal (${res.status})`, res.status, null);
-    }
-    const body = (await res.json()) as { goal?: unknown; available?: unknown };
-    if (body.available !== true) return { available: false };
-    if (body.goal === null) return { goal: null, available: true };
-    if (!isClaudeGoalWire(body.goal)) return { available: false };
-    return { goal: claudeGoalFromWire(body.goal), available: true };
-  } finally {
-    clearTimeout(timer);
   }
+  if (!body.available) return { available: false };
+  return { goal: body.goal === null ? null : claudeGoalFromWire(body.goal), available: true };
 }

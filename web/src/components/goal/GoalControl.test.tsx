@@ -138,7 +138,7 @@ describe("GoalControl", () => {
     const pill = screen.getByTestId("composer-goal-mode");
     expect(pill).toHaveAttribute("data-state", state);
     expect(within(pill).getByTestId("composer-goal-mode-label")).toHaveTextContent(label);
-    expect(pill).toHaveAccessibleName(`Goal ${status}: ${GOAL.objective}`);
+    expect(pill).toHaveAccessibleName(`Goal ${label.toLowerCase()}: ${GOAL.objective}`);
   });
 
   it.each(["active", "complete"])("keeps the %s pill icon-only", (status) => {

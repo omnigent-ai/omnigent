@@ -6,7 +6,7 @@ import type { Goal } from "@/lib/goalApi";
 import { cn } from "@/lib/utils";
 import { CommandGoalDialog } from "./CommandGoalDialog";
 import { GoalDialog } from "./GoalDialog";
-import { formatGoalStatus, goalStatusLabel, goalStatusTone } from "./goalUtils";
+import { goalStatusLabel, goalStatusTone } from "./goalUtils";
 
 interface GoalControlBaseProps {
   conversationId: string | null;
@@ -111,7 +111,7 @@ const PILL_ICONS = {
 export function GoalStatusPill({ goal, onOpen }: { goal: Goal; onOpen?: () => void }) {
   const tone = goalStatusTone(goal.status);
   const Icon = PILL_ICONS[tone];
-  const label = `Goal ${formatGoalStatus(goal.status)}`;
+  const label = `Goal ${goalStatusLabel(goal.status).toLowerCase()}`;
   const needsAttention = tone === "paused" || tone === "failed";
   return (
     <Tooltip>

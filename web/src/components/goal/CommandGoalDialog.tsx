@@ -12,7 +12,7 @@ import {
 import { Textarea } from "@/components/ui/textarea";
 import type { Goal } from "@/lib/goalApi";
 import { cn } from "@/lib/utils";
-import { formatGoalUsage, goalStatusLabel, goalStatusTone } from "./goalUtils";
+import { goalStatusLabel, goalStatusTone } from "./goalUtils";
 
 export interface CommandGoalDialogProps {
   open: boolean;
@@ -27,7 +27,7 @@ export interface CommandGoalDialogProps {
 }
 
 /**
- * Summarize a command-driven goal's usage, e.g. ``"3 checks · 1,200 tokens"``.
+ * Summarize a command-driven goal's usage, e.g. ``"3 checks · 1,200 tokens · 2 min"``.
  *
  * @param goal - Goal reported by the agent.
  * @returns Usage text, or an empty string before the first check.
@@ -37,7 +37,9 @@ export function formatCommandGoalUsage(goal: Goal): string {
   if (goal.iterations != null && goal.iterations > 0) {
     parts.push(`${goal.iterations.toLocaleString()} ${goal.iterations === 1 ? "check" : "checks"}`);
   }
-  if (goal.tokensUsed > 0 || goal.timeUsedSeconds >= 60) parts.push(formatGoalUsage(goal));
+  if (goal.tokensUsed > 0) parts.push(`${goal.tokensUsed.toLocaleString()} tokens`);
+  const minutes = Math.floor(goal.timeUsedSeconds / 60);
+  if (minutes > 0) parts.push(`${minutes.toLocaleString()} min`);
   return parts.join(" · ");
 }
 

@@ -99,7 +99,7 @@ describe("CommandGoalDialog", () => {
     const current = screen.getByTestId("goal-current");
     expect(current).toHaveAttribute("data-state", "done");
     expect(current).toHaveTextContent("Complete");
-    expect(current).toHaveTextContent("3 checks · 1,200 tokens / 2 min");
+    expect(current).toHaveTextContent("3 checks · 1,200 tokens · 2 min");
     expect(screen.getByTestId("goal-status-detail")).toHaveTextContent(
       "The test run shows 12 passed",
     );
@@ -129,5 +129,6 @@ describe("CommandGoalDialog", () => {
     const fresh = { ...CLAUDE_GOAL, iterations: null, tokensUsed: 0, timeUsedSeconds: 0 };
     expect(formatCommandGoalUsage(fresh)).toBe("");
     expect(formatCommandGoalUsage({ ...fresh, iterations: 1 })).toBe("1 check");
+    expect(formatCommandGoalUsage({ ...fresh, timeUsedSeconds: 125 })).toBe("2 min");
   });
 });

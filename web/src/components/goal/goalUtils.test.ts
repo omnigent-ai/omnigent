@@ -53,6 +53,7 @@ describe("goal utils", () => {
     ["complete", "done", "Complete"],
     ["failed", "failed", "Failed"],
     ["somethingNew", "working", "somethingNew"],
+    ["constructor", "working", "constructor"],
   ])("classifies %s as %s", (status, tone, label) => {
     expect(goalStatusTone(status)).toBe(tone);
     expect(goalStatusLabel(status)).toBe(label);

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 from collections.abc import Awaitable, Callable
 
 import httpx
@@ -38,6 +39,7 @@ class ClaudeGoalRunner:
         self._bridge_id_for_session = bridge_id_for_session
         self._bridge_ids: dict[str, str] = {}
         self._readers: dict[str, ClaudeGoalStateReader] = {}
+        self._readers_lock = threading.Lock()
 
     def forget(self, conv_id: str) -> None:
         """Drop the cached bridge id and transcript reader for a released session."""
@@ -54,9 +56,10 @@ class ClaudeGoalRunner:
         transcript_path = read_transcript_path(bridge_dir_for_bridge_id(bridge_id))
         if transcript_path is None:
             return False, None
-        reader = self._readers.get(conv_id)
-        if reader is None or reader.transcript_path != transcript_path:
-            reader = self._readers[conv_id] = ClaudeGoalStateReader(transcript_path)
+        with self._readers_lock:
+            reader = self._readers.get(conv_id)
+            if reader is None or reader.transcript_path != transcript_path:
+                reader = self._readers[conv_id] = ClaudeGoalStateReader(transcript_path)
         try:
             return True, reader.read()
         except OSError:

@@ -4967,7 +4967,10 @@ function ComposerImpl(
                   showClaudeNativeGoalControl
                 }
                 onGoal={() => setGoalDialogOpen(true)}
-                goalDisabled={!composerSessionId || (!showGoalControl && isReadOnly)}
+                goalDisabled={
+                  !composerSessionId ||
+                  (!showGoalControl && !showClaudeNativeGoalControl && isReadOnly)
+                }
                 goalActive={goal !== null}
                 goalDescription={goal ? "View or update your goal" : "Set a goal for this session"}
                 showPlan={showCodexPlanMode}

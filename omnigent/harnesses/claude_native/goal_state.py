@@ -12,6 +12,8 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import re
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -20,6 +22,10 @@ ClaudeGoalStatus = Literal["active", "paused", "complete", "failed"]
 
 _PAUSED_NOTICE_PREFIX = "Goal paused"
 _STILL_ACTIVE_NOTICE_PREFIX = "Goal still active"
+# User records Claude Code writes without starting a model turn: slash-command
+# echoes and output, `!` shell input and output, and interrupt markers.
+_NON_PROMPT_PREFIXES = ("<command-name>", "<command-message>", "<local-command", "<bash-")
+_INTERRUPT_RECORD_RE = re.compile(r"^\[Request interrupted by user(?: for tool use)?\]$")
 # Lines that can change goal state; everything else is skipped before parsing JSON.
 _RELEVANT_MARKERS = (b'"goal_status"', b'"informational"', b'"type":"user"', b'"type": "user"')
 
@@ -68,21 +74,34 @@ def _optional_int(raw: object) -> int | None:
     return raw if isinstance(raw, int) and not isinstance(raw, bool) else None
 
 
+def _is_typed_prompt(text: str) -> bool:
+    stripped = text.strip()
+    return (
+        bool(stripped)
+        and not stripped.startswith(_NON_PROMPT_PREFIXES)
+        and _INTERRUPT_RECORD_RE.match(stripped) is None
+    )
+
+
 def _is_user_prompt(entry: dict[str, Any]) -> bool:
     """Whether *entry* is a prompt the user sent (not a tool result or framework text)."""
-    if entry.get("type") != "user" or entry.get("isMeta"):
+    if entry.get("type") != "user" or entry.get("isMeta") or entry.get("isCompactSummary"):
         return False
     message = entry.get("message")
     content = message.get("content") if isinstance(message, dict) else None
     if isinstance(content, str):
-        return bool(content.strip())
-    if isinstance(content, list):
-        return any(
-            isinstance(block, dict) and block.get("type") == "text" for block in content
-        ) and not any(
-            isinstance(block, dict) and block.get("type") == "tool_result" for block in content
-        )
-    return False
+        return _is_typed_prompt(content)
+    if not isinstance(content, list) or any(
+        isinstance(block, dict) and block.get("type") == "tool_result" for block in content
+    ):
+        return False
+    return any(
+        isinstance(block, dict)
+        and block.get("type") == "text"
+        and isinstance(block.get("text"), str)
+        and _is_typed_prompt(block["text"])
+        for block in content
+    )
 
 
 def apply_goal_entry(goal: ClaudeGoal | None, entry: dict[str, Any]) -> ClaudeGoal | None:
@@ -156,15 +175,16 @@ class ClaudeGoalStateReader:
         self._identity: tuple[int, int] | None = None
         self._scanned_to = 0
         self._goal: ClaudeGoal | None = None
+        self._lock = threading.Lock()
 
     def read(self) -> ClaudeGoal | None:
         """
         Return the transcript's current goal.
 
-        :returns: The goal, or ``None`` when none is set or the file is unreadable.
+        :returns: The goal, or ``None`` when none is set.
         :raises OSError: When the transcript cannot be opened.
         """
-        with open(self.transcript_path, "rb") as handle:
+        with self._lock, open(self.transcript_path, "rb") as handle:
             status = os.fstat(handle.fileno())
             identity = (status.st_dev, status.st_ino)
             if identity != self._identity or status.st_size < self._scanned_to:
