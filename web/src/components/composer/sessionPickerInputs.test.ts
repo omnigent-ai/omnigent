@@ -1,4 +1,4 @@
-import { cleanup, renderHook } from "@testing-library/react";
+import { act, cleanup, renderHook } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
 import type * as AgentLabels from "@/lib/agentLabels";
 import type { NativeModelOption, Session } from "@/lib/types";
@@ -57,15 +57,15 @@ it("reads a background session's options and model, not the active conversation'
 
 it("uses the launch preview only while the active conversation has no catalog", () => {
   const PREVIEW = [codexModel("gpt-preview", "medium")];
-  const launchPreviewOptions = { launchPreviewOptions: PREVIEW };
   useChatStore.setState({ conversationId: "active", codexModelOptions: [] });
+  // One mounted consumer, so the catalog's arrival is seen as a live switch.
+  const { result } = renderHook(() =>
+    useSessionPickerInputs(undefined, null, { launchPreviewOptions: PREVIEW }),
+  );
+  expect(result.current.codexModelOptions).toBe(PREVIEW);
+  expect(result.current.modelsFromLaunchPreview).toBe(true);
 
-  const preview = renderHook(() => useSessionPickerInputs(undefined, null, launchPreviewOptions));
-  expect(preview.result.current.codexModelOptions).toBe(PREVIEW);
-  expect(preview.result.current.modelsFromLaunchPreview).toBe(true);
-
-  useChatStore.setState({ codexModelOptions: ACTIVE_OPTIONS });
-  const stored = renderHook(() => useSessionPickerInputs(undefined, null, launchPreviewOptions));
-  expect(stored.result.current.codexModelOptions).toBe(ACTIVE_OPTIONS);
-  expect(stored.result.current.modelsFromLaunchPreview).toBe(false);
+  act(() => useChatStore.setState({ codexModelOptions: ACTIVE_OPTIONS }));
+  expect(result.current.codexModelOptions).toBe(ACTIVE_OPTIONS);
+  expect(result.current.modelsFromLaunchPreview).toBe(false);
 });
