@@ -21071,7 +21071,7 @@
             }
           },
           {
-            "description": "The grantee to remove, e.g. `\"alice@example.com\"`.",
+            "description": "The grantee to remove, e.g. `\"alice@example.com\"`, in any spelling `PermissionStore.validate_grants` resolves.",
             "in": "path",
             "name": "target_user_id",
             "required": true,

@@ -16,7 +16,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from omnigent.entities import ScheduledTask
+from omnigent.entities import ScheduledTask, SessionPermission
 from omnigent.server.auth import (
     LEVEL_EDIT,
     LEVEL_MANAGE,
@@ -28,6 +28,7 @@ from omnigent.server.auth import (
 from omnigent.server.scheduled import run_sharing
 from omnigent.server.scheduled.run_sharing import (
     launching_automation,
+    revoke_from_task_session,
     share_launched_session,
     share_new_run_session,
     sync_continued_session,
@@ -99,6 +100,54 @@ def _levels(permissions: SqlAlchemyPermissionStore, session_id: str) -> dict[str
     return {grant.user_id: grant.level for grant in grants}
 
 
+class _EffectiveAccessStore(SqlAlchemyPermissionStore):
+    """Reads effective access, as a directory-backed store may, and records revokes.
+
+    An ``admins`` group manages every session and Alice reaches every session through
+    a group; neither is a grant on it. General access is a grant to ``users``.
+    """
+
+    EFFECTIVE = {"admins": LEVEL_MANAGE, GRANTEES[0]: LEVEL_READ}
+
+    def __init__(self, storage_location: str) -> None:
+        super().__init__(storage_location)
+        self.revoked: list[str] = []
+
+    def get(self, user_id: str, conversation_id: str) -> SessionPermission | None:
+        held = super().get(user_id, conversation_id)
+        if held is None and user_id in self.EFFECTIVE:
+            return SessionPermission(user_id, conversation_id, self.EFFECTIVE[user_id])
+        return held
+
+    def list_for_session(
+        self, conversation_id: str, *, limit: int = 100, after_user_id: str | None = None
+    ) -> tuple[list[SessionPermission], str | None]:
+        page, cursor = super().list_for_session(
+            conversation_id, limit=limit, after_user_id=after_user_id
+        )
+        if after_user_id is None:
+            page += [
+                SessionPermission(user_id, conversation_id, level)
+                for user_id, level in self.EFFECTIVE.items()
+            ]
+        return page, cursor
+
+    def get_direct(self, user_id: str, conversation_id: str) -> SessionPermission | None:
+        return super().get(user_id, conversation_id)
+
+    def list_direct_for_session(
+        self, conversation_id: str, *, limit: int, after_user_id: str | None = None
+    ) -> tuple[list[SessionPermission], str | None]:
+        return super().list_for_session(conversation_id, limit=limit, after_user_id=after_user_id)
+
+    def public_grantees(self) -> frozenset[str]:
+        return frozenset({"users"})
+
+    def revoke(self, user_id: str, conversation_id: str) -> bool:
+        self.revoked.append(user_id)
+        return super().revoke(user_id, conversation_id)
+
+
 @pytest.mark.parametrize(
     "mode,target,workspace,shared",
     [
@@ -160,39 +209,42 @@ async def test_a_launch_without_a_workspace_is_shared_only_as_a_new_sandbox(
     assert len(announced) == (len(GRANTEES) if shared else 0)
 
 
-@pytest.mark.parametrize("fault", ["not_on_root", "root_grant_unreadable"])
+@pytest.mark.parametrize("fault", ["not_on_root", "root_grant_unreadable", "group_access_to_root"])
 async def test_a_launch_is_shared_only_with_grantees_who_can_see_its_root(
-    permissions, task, announced, monkeypatch, fault
+    db_uri, permissions, task, announced, monkeypatch, fault
 ) -> None:
     alice, bob = GRANTEES
+    # Alice sees the root through a group, which is no grant on it.
+    store = _EffectiveAccessStore(db_uri) if fault == "group_access_to_root" else permissions
     run_session = _session(
-        permissions, **{bob: LEVEL_READ, **({} if fault == "not_on_root" else {alice: LEVEL_READ})}
+        store,
+        **{bob: LEVEL_READ, **({alice: LEVEL_READ} if fault == "root_grant_unreadable" else {})},
     )
     if fault == "root_grant_unreadable":
-        get = permissions.get
+        get_direct = permissions.get_direct
 
         def fail_alices_root_grant(user_id: str, session_id: str) -> Any:
             if (user_id, session_id) == (alice, run_session.id):
                 raise RuntimeError("grant read failed")
-            return get(user_id, session_id)
+            return get_direct(user_id, session_id)
 
-        monkeypatch.setattr(permissions, "get", fail_alices_root_grant)
-    launched = _session(permissions)
+        monkeypatch.setattr(permissions, "get_direct", fail_alices_root_grant)
+    launched = _session(store)
     written: list[str] = []
-    grant_if_absent = permissions.grant_if_absent
+    grant_if_absent = store.grant_if_absent
 
     def record_write(user_id: str, conversation_id: str, level: int) -> bool:
         written.append(user_id)
         return grant_if_absent(user_id, conversation_id, level)
 
-    monkeypatch.setattr(permissions, "grant_if_absent", record_write)
+    monkeypatch.setattr(store, "grant_if_absent", record_write)
 
     await share_launched_session(
         task,
         launched,
         launched_from_root=run_session.id,
         managed=False,
-        permission_store=permissions,
+        permission_store=store,
         app_state=None,
         host_registry=None,
     )
@@ -347,16 +399,16 @@ async def test_a_share_made_after_the_grantee_was_found_without_one_is_not_lower
     permissions, task, announced, monkeypatch, level
 ) -> None:
     session = _session(permissions, **{RESERVED_USER_LOCAL: LEVEL_OWNER})
-    get = permissions.get
+    get_direct = permissions.get_direct
 
     def share_by_hand_once_looked_up(user_id: str, session_id: str) -> Any:
-        held = get(user_id, session_id)
+        held = get_direct(user_id, session_id)
         if user_id == "alice@example.com":
             # The owner shares with Alice by hand after the sync found she had no share.
             permissions.grant(user_id, session_id, level)
         return held
 
-    monkeypatch.setattr(permissions, "get", share_by_hand_once_looked_up)
+    monkeypatch.setattr(permissions, "get_direct", share_by_hand_once_looked_up)
     await _sync(permissions, task, session)
 
     assert _levels(permissions, session.id) == {
@@ -365,6 +417,28 @@ async def test_a_share_made_after_the_grantee_was_found_without_one_is_not_lower
         "bob@example.com": LEVEL_READ,
     }
     assert announced == [("bob@example.com", session.id)]
+
+
+async def test_a_sync_works_from_the_grants_set_on_the_session(
+    db_uri, permissions, task, announced
+) -> None:
+    store = _EffectiveAccessStore(db_uri)
+    session = _session(
+        store,
+        **{RESERVED_USER_LOCAL: LEVEL_OWNER, "carol@example.com": LEVEL_READ, "users": LEVEL_READ},
+    )
+
+    await _sync(store, task, session)
+
+    # Admin rights aren't revoked, and the store's General access grantee is kept.
+    assert store.revoked == ["carol@example.com"]
+    # Alice, who sees the session through a group, gets a grant of her own.
+    assert _levels(permissions, session.id) == {
+        RESERVED_USER_LOCAL: LEVEL_OWNER,
+        "users": LEVEL_READ,
+        **dict.fromkeys(GRANTEES, LEVEL_READ),
+    }
+    assert announced == [(grantee, session.id) for grantee in GRANTEES]
 
 
 async def test_a_sync_keeps_a_grant_the_database_matches_to_a_grantee(
@@ -559,14 +633,14 @@ async def test_a_failed_grant_read_revokes_nothing_unchecked(
 
         monkeypatch.setattr(permissions, "list_for_scheduled_task", fail_the_first_read)
     else:
-        list_session_page = permissions.list_for_session
+        list_session_page = permissions.list_direct_for_session
 
         def fail_after_the_first_page(session_id: str, **kwargs: Any) -> Any:
             if kwargs.get("after_user_id") is not None:
                 raise RuntimeError("second page failed")
             return list_session_page(session_id, **kwargs)
 
-        monkeypatch.setattr(permissions, "list_for_session", fail_after_the_first_page)
+        monkeypatch.setattr(permissions, "list_direct_for_session", fail_after_the_first_page)
     session = _session(
         permissions,
         **{
@@ -617,3 +691,24 @@ async def test_a_grant_change_syncs_only_a_continued_session_its_owner_owns(
         "owned_without_grants": owner,
     }.get(case, owner | hand_made)
     assert _levels(permissions, session.id) == expected
+
+
+async def test_removing_a_grantee_revokes_only_a_grant_set_on_the_session(
+    db_uri, permissions, task
+) -> None:
+    store = _EffectiveAccessStore(db_uri)
+    session = _session(
+        store,
+        **{RESERVED_USER_LOCAL: LEVEL_OWNER, "bob@example.com": LEVEL_READ, "users": LEVEL_READ},
+    )
+    continued = replace(task, session_mode="continue", session_id=session.id)
+
+    for user_id in ("admins", "users", "bob@example.com"):
+        await revoke_from_task_session(continued, user_id, permission_store=store)
+
+    # Admin rights are no grant to revoke, and General access isn't one grantee's.
+    assert store.revoked == ["bob@example.com"]
+    assert _levels(permissions, session.id) == {
+        RESERVED_USER_LOCAL: LEVEL_OWNER,
+        "users": LEVEL_READ,
+    }
