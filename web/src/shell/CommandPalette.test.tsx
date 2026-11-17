@@ -5,6 +5,7 @@ import type { Conversation } from "@/hooks/useConversations";
 import type { ComponentProps, ReactNode } from "react";
 
 import { ALT_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
+import { isExplicitlyUnread, resetReadStateForTests } from "@/hooks/useUnseenConversations";
 import { CommandPalette } from "./CommandPalette";
 
 const navigate = vi.fn();
@@ -347,6 +348,31 @@ describe("CommandPalette — sessions", () => {
 
     renderPalette({ rightSidebarShortcutEnabled: false });
     expect(chordsFor("Toggle workspace sidebar")).toEqual([]);
+  });
+
+  it("marks the open session unread, then offers to mark it read again", () => {
+    const chordsFor = (label: string) =>
+      Array.from(
+        screen
+          .getByText(label)
+          .closest("[cmdk-item]")!
+          .querySelectorAll<HTMLElement>('[data-slot="kbd"]'),
+      ).map((key) => key.textContent);
+    renderPalette();
+    expect(screen.queryByText("Mark current session as unread")).toBeNull();
+    cleanup();
+
+    resetReadStateForTests();
+    const openSession = { id: "open", updatedAt: 5_000 };
+    const props = renderPalette({ openSession });
+    expect(chordsFor("Mark current session as unread")).toEqual([MOD_KEY, ALT_KEY, "U"]);
+    fireEvent.click(screen.getByText("Mark current session as unread"));
+    expect(props.onOpenChange).toHaveBeenCalledWith(false);
+    expect(isExplicitlyUnread("open")).toBe(true);
+    expect(screen.getByText("Mark current session as read")).toBeTruthy();
+
+    fireEvent.click(screen.getByText("Mark current session as read"));
+    expect(isExplicitlyUnread("open")).toBe(false);
   });
 
   it("lists sessions by display label with their agent type", () => {

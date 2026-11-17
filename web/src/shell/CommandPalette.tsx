@@ -13,6 +13,8 @@ import {
   FolderIcon,
   InboxIcon,
   type LucideIcon,
+  MailIcon,
+  MailOpenIcon,
   PanelLeftIcon,
   PanelRightIcon,
   SettingsIcon,
@@ -29,6 +31,8 @@ import {
 } from "@/hooks/useConversations";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { rememberOpenSessionRow } from "@/hooks/useOpenSessionRow";
+import { type ReadStateTarget, toggleOpenSessionUnread } from "@/hooks/useToggleUnreadHotkey";
+import { isExplicitlyUnread, useReadStateSnapshot } from "@/hooks/useUnseenConversations";
 import { PROJECT_LABEL_KEY } from "@/lib/sessionListCache";
 import { BOOT_PROBE_TIMEOUT_MS } from "@/lib/bootCapabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
@@ -40,6 +44,7 @@ import {
   rightSidebarToggleShortcutKeys,
   settingsShortcutKeys,
   sidebarToggleShortcutKeys,
+  TOGGLE_UNREAD_KEYS,
 } from "@/components/KeyboardShortcut";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
@@ -63,6 +68,8 @@ export interface CommandPaletteProps {
   onToggleRightSidebar: () => void;
   /** False on grid routes, where ⌘⌥] belongs to the grid's own workspace. */
   rightSidebarShortcutEnabled?: boolean;
+  /** The open session, which adds an action to mark it unread or read. */
+  openSession?: ReadStateTarget | null;
 }
 
 interface ActionCommand {
@@ -186,6 +193,7 @@ export function CommandPalette({
   onToggleLeftSidebar,
   onToggleRightSidebar,
   rightSidebarShortcutEnabled = true,
+  openSession = null,
 }: CommandPaletteProps) {
   const navigate = useNavigate();
   const isMobile = useIsMobileViewport();
@@ -209,6 +217,9 @@ export function CommandPalette({
   }, [query]);
 
   const close = (): void => onOpenChange(false);
+  const openSessionUnread = useReadStateSnapshot(
+    () => openSession !== null && isExplicitlyUnread(openSession.id),
+  );
 
   const actions = useMemo<ActionCommand[]>(
     () => [
@@ -258,8 +269,29 @@ export function CommandPalette({
         run: onToggleRightSidebar,
         shortcut: rightSidebarShortcutEnabled ? rightSidebarToggleShortcutKeys() : undefined,
       },
+      ...(openSession
+        ? [
+            {
+              id: "toggle-session-unread",
+              label: openSessionUnread
+                ? "Mark current session as read"
+                : "Mark current session as unread",
+              icon: openSessionUnread ? MailOpenIcon : MailIcon,
+              keywords: ["unread", "read", "flag", "revisit", "later"],
+              run: () => toggleOpenSessionUnread(openSession),
+              shortcut: TOGGLE_UNREAD_KEYS,
+            },
+          ]
+        : []),
     ],
-    [navigate, onToggleLeftSidebar, onToggleRightSidebar, rightSidebarShortcutEnabled],
+    [
+      navigate,
+      onToggleLeftSidebar,
+      onToggleRightSidebar,
+      rightSidebarShortcutEnabled,
+      openSession,
+      openSessionUnread,
+    ],
   );
 
   const filteredActions = useMemo(() => {

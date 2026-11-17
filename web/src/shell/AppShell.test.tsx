@@ -46,6 +46,7 @@ import { maybeOpenLinkInApp } from "@/lib/openLinkInApp";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import { writeWorkspacePanelDefault } from "@/lib/workspacePanelPreferences";
 import { writePinnedWorkspaceTabs } from "@/lib/workspaceTabPreferences";
+import { isExplicitlyUnread, resetReadStateForTests } from "@/hooks/useUnseenConversations";
 
 const runnerHealthState = vi.hoisted(() => ({
   runnerOnline: undefined as boolean | undefined,
@@ -6860,6 +6861,28 @@ describe("new-session browser shortcut", () => {
     fireEvent.keyDown(composer, { key: "O", code: "KeyO", ctrlKey: true, shiftKey: true });
     expect(screen.getByText("New session route")).toBeInTheDocument();
     setEmbedRoot(null);
+  });
+});
+
+describe("mark-unread shortcut", () => {
+  it("toggles a shared open session's unread flag from the composer", () => {
+    resetReadStateForTests();
+    mockConversations([{ id: "conv_shared", permission_level: 1 }]);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      shellTree(
+        client,
+        "/c/conv_shared",
+        <Route path="c/:conversationId" element={<textarea aria-label="Message" />} />,
+      ),
+    );
+    const composer = screen.getByRole("textbox", { name: "Message" });
+    composer.focus();
+    const chord = { key: "u", code: "KeyU", ctrlKey: true, altKey: true };
+    fireEvent.keyDown(composer, chord);
+    expect(isExplicitlyUnread("conv_shared")).toBe(true);
+    fireEvent.keyDown(composer, chord);
+    expect(isExplicitlyUnread("conv_shared")).toBe(false);
   });
 });
 

@@ -342,6 +342,19 @@ export function markConversationRead(conversationId: string, updatedAt: number):
 }
 
 /**
+ * Flips the explicit unread flag of the session being viewed, where opening it
+ * already counted as reading it. Returns whether the session is now unread.
+ */
+export function toggleConversationUnread(conversationId: string, updatedAt: number): boolean {
+  if (explicitlyUnread.has(conversationId)) {
+    markConversationRead(conversationId, updatedAt);
+    return false;
+  }
+  markConversationUnread(conversationId, updatedAt);
+  return true;
+}
+
+/**
  * Subscribes the caller to read-state mirror writes and returns the current
  * write version, so a component re-renders (and recomputes
  * `isConversationUnseen`) the instant the user marks a row read/unread — not

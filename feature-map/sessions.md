@@ -100,6 +100,8 @@ the header menu), and each place is a separate entry point.
   including for the session being viewed. Its dot appears once the turn is
   idle; approval and error indicators can take precedence. A row showing the
   unread dot offers Mark as read instead. Bulk selection also offers these actions.
+  Cmd+Option+U (Ctrl+Alt+U elsewhere) or the command palette toggles the open
+  session between unread and read (see Unread shortcut below).
   Behind `automations_v2`, an automation's detail page shows the same unread state
   on each run that started a session: a run that succeeds while the page is open
   is marked unread, and opening its session from the run row clears it there and
@@ -416,6 +418,15 @@ rename again. With the sidebar closed, or the row hidden in a collapsed project
 or section, the header title becomes the input instead. Enter or blur
 saves; Escape cancels. The shortcut leaves terminals, code editors, and open
 menus or dialogs alone. It is listed in Keyboard shortcuts and Settings.
+
+**Unread shortcut:** in any open session you can see, press Cmd+Option+U on
+macOS or Ctrl+Alt+U elsewhere, including while writing a draft, to mark it
+unread; press it again to mark it read. A toast confirms which. The session's
+sidebar row shows the unread dot once its turn is idle, and leaving the session
+keeps it. The command palette's **Mark current session as unread** (or **as
+read**) action does the same. Like rename, the shortcut leaves terminals, code
+editors, and open menus or dialogs alone, and it is listed in Keyboard shortcuts
+and Settings.
 
 **Message actions:** fork through a specific assistant message, excluding later
 turns. The header's Fork action copies the whole session instead. In either

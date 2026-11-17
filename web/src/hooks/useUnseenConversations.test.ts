@@ -305,6 +305,27 @@ describe("markConversationRead", () => {
   });
 });
 
+describe("toggleConversationUnread", () => {
+  it("flags the viewed session unread, then marks it read again", async () => {
+    const mod = await loadFresh();
+    mod.seedReadState([{ id: "conv-1", updated_at: 5_000 }]);
+    vi.useFakeTimers({ now: 6_000_000 });
+    // Viewing it counted as reading it.
+    mod.markConversationSeen("conv-1");
+    authFetch.mockClear();
+
+    expect(mod.toggleConversationUnread("conv-1", 5_000)).toBe(true);
+    expect(mod.isExplicitlyUnread("conv-1")).toBe(true);
+    expect(mod.isConversationUnseen("conv-1", 5_000, "idle")).toBe(true);
+    expect(lastPutBody()).toEqual({ last_seen: 4_999, unread: true });
+
+    expect(mod.toggleConversationUnread("conv-1", 5_000)).toBe(false);
+    expect(mod.isExplicitlyUnread("conv-1")).toBe(false);
+    expect(mod.isConversationUnseen("conv-1", 5_000, "idle")).toBe(false);
+    expect(lastPutBody()).toEqual({ last_seen: 6_000, unread: false });
+  });
+});
+
 describe("clearUnreadOverride", () => {
   it("removes the override, PUTs the cleared state, and re-enables mark-seen", async () => {
     const mod = await loadFresh();

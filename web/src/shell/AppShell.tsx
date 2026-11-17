@@ -44,6 +44,7 @@ import { useIsEmbedded } from "@/lib/embedded";
 import { AgentInfoContent, agentHasInfo } from "@/components/AgentInfo";
 import { useIdleNotifications } from "@/hooks/useIdleNotifications";
 import { useSeedReadState } from "@/hooks/useUnseenConversations";
+import { type ReadStateTarget, useToggleUnreadHotkey } from "@/hooks/useToggleUnreadHotkey";
 import { useIOSViewportLock } from "@/hooks/useIOSViewportLock";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { readFilesPanelPreferences, writeFilesPanelPreferences } from "@/lib/filesPanelPreferences";
@@ -913,6 +914,18 @@ function AppShellImpl() {
     openSessionRow,
     permissionLevel,
   ]);
+  // Read state is personal, so any open session the user can see can be flagged.
+  const readStateRow = activeConv ?? actionConversation;
+  const readStateId = readStateRow?.id;
+  const readStateUpdatedAt = readStateRow?.updated_at;
+  const readStateTarget = useMemo<ReadStateTarget | null>(
+    () =>
+      readStateId !== undefined && readStateUpdatedAt !== undefined
+        ? { id: readStateId, updatedAt: readStateUpdatedAt }
+        : null,
+    [readStateId, readStateUpdatedAt],
+  );
+  useToggleUnreadHotkey(readStateTarget);
   // Header action gating, hoisted so the desktop buttons and the mobile
   // three-dot menu render the exact same set (they can't drift apart).
   // Stop session is not a header action — it lives in the sidebar row's
@@ -3495,6 +3508,7 @@ function AppShellImpl() {
             allConversations={allConversations}
             serverConversationId={serverConversationId}
             updateOverlayHeight={updateOverlayHeight}
+            openSession={readStateTarget}
           />
         </ForkDialogContextProvider>
       </TerminalFirstContextProvider>

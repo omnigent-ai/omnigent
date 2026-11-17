@@ -4,6 +4,7 @@ import { KeyboardShortcutsDialog } from "@/components/KeyboardShortcutsDialog";
 import { ImportReviewGate } from "@/components/onboarding/HostImportReview";
 import { Toaster } from "@/components/ui/sonner";
 import type { Conversation } from "@/hooks/useConversations";
+import type { ReadStateTarget } from "@/hooks/useToggleUnreadHotkey";
 import { isFeatureEnabled, type ServerInfo } from "@/lib/capabilities";
 import { isElectronShell } from "@/lib/nativeBridge";
 import { updateOverlayToastOffset } from "@/lib/updateOverlayInset";
@@ -27,6 +28,8 @@ export interface AppShellOverlaysProps {
   allConversations: Conversation[] | undefined;
   serverConversationId: string | undefined;
   updateOverlayHeight: number;
+  /** The open session the command palette's read-state action applies to. */
+  openSession: ReadStateTarget | null;
 }
 
 /**
@@ -46,6 +49,7 @@ export function AppShellOverlays({
   allConversations,
   serverConversationId,
   updateOverlayHeight,
+  openSession,
 }: AppShellOverlaysProps) {
   return (
     <>
@@ -74,6 +78,7 @@ export function AppShellOverlays({
         onToggleLeftSidebar={toggleLeftSidebar}
         onToggleRightSidebar={toggleRightPanel}
         rightSidebarShortcutEnabled={!gridRoute}
+        openSession={openSession}
       />
       <RecentSessionsSwitcher
         conversations={allConversations}
