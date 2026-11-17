@@ -46,6 +46,7 @@ _CODECS = [
         ec.encode_scheduled_task_session_mode,
         ec.decode_scheduled_task_session_mode,
     ),
+    (ec.SCHEDULED_TASK_KIND, ec.encode_scheduled_task_kind, ec.decode_scheduled_task_kind),
     (ec.JOURNAL_ENTRY_KIND, ec.encode_journal_entry_kind, ec.decode_journal_entry_kind),
     (ec.INBOX_ITEM_STATUS, ec.encode_inbox_item_status, ec.decode_inbox_item_status),
 ]
