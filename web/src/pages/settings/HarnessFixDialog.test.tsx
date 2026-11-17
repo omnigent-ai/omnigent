@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { showToast } from "@/components/ui/toast";
 import { copyText } from "@/lib/clipboard";
+import { HARNESS_CREDENTIAL_COPY } from "@/lib/harnessSetup";
 import { authenticatedFetch } from "@/lib/identity";
 import { HarnessFixDialog, type HarnessFixDialogProps } from "./HarnessFixDialog";
 import { harnessFixOwner } from "./search/catalog/harnesses";
@@ -175,7 +176,14 @@ describe("HarnessFixDialog", () => {
     const user = userEvent.setup();
 
     expect(screen.getByRole("heading", { name: "Reconfigure Codex" })).toBeVisible();
-    expect(screen.getByRole("radio", { name: /Isaac/ })).toHaveAttribute("aria-checked", "true");
+    const [firstCredential] = Object.values(HARNESS_CREDENTIAL_COPY);
+    expect(screen.getByRole("radio", { name: firstCredential.label })).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    expect(screen.getByRole("radio", { name: firstCredential.label })).toHaveAccessibleDescription(
+      firstCredential.description,
+    );
     await user.click(screen.getByRole("button", { name: "Authenticate" }));
 
     expect(
