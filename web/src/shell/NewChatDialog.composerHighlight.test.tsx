@@ -207,6 +207,15 @@ describe("landing composer highlight", () => {
     );
   });
 
+  it("decides shell mode on the sanitized text but mirrors the raw draft", () => {
+    renderLanding("claude-native");
+    type("\x05!echo ok");
+    expect(screen.getByTestId("composer-shell-mode-indicator")).toBeVisible();
+    const overlay = screen.getByTestId("composer-highlight-overlay");
+    expect(overlay.textContent).toBe("\x05!echo ok");
+    expect(within(overlay).getByText("!")).toHaveClass("text-brand-accent");
+  });
+
   it("does not offer shell mode on a harness without native `!` input", () => {
     renderLanding("claude-sdk");
     type("!git status");

@@ -67,6 +67,9 @@ describe("composerHighlightSplit native shell", () => {
     ["codex-native", "!ls -la", { before: "", token: "!", after: "ls -la" }],
     ["codex-native", " !ls", { before: " ", token: "!", after: "ls" }],
     ["codex-native", "! git status", { before: "", token: "!", after: " git status" }],
+    // Python's strip() counts \x1c as whitespace but not \ufeff.
+    ["codex-native", "\x1c!echo ok", { before: "\x1c", token: "!", after: "echo ok" }],
+    ["codex-native", "!\ufeff", { before: "", token: "!", after: "\ufeff" }],
     ["claude-native", "!ls -la", { before: "", token: "!", after: "ls -la" }],
     // The TUI enters bash mode on the first `!`; the second is the command.
     ["claude-native", "!!ls", { before: "", token: "!", after: "!ls" }],
@@ -82,6 +85,8 @@ describe("composerHighlightSplit native shell", () => {
     ["codex-native", "a blank command", "!   \n"],
     ["claude-native", "a blank command", "!   \n"],
     ["codex-native", "a mid-text `!`", "run !ls"],
+    ["codex-native", "a `!` after a BOM", "\ufeff!echo ok"],
+    ["codex-native", "a whitespace-only command", "!\x1c"],
   ])("%s keeps %s as model input", (harness, _label, value) => {
     expect(splitNativeShellCommand(value, harness)).toBeNull();
   });

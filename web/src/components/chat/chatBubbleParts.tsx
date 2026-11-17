@@ -1069,14 +1069,19 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   const published = usePublishedComposerCommands(sessionId);
   const text =
     bubble.shellCommand !== undefined ? `!${bubble.shellCommand}` : extractUserText(bubble.content);
+  // The backend classifies the raw block, before sender and context wrappers
+  // are stripped for display.
+  const rawText =
+    bubble.content.length === 1 && bubble.content[0]?.type === "input_text"
+      ? bubble.content[0].text
+      : null;
   // An optimistic `!cmd` has no shellCommand until the terminal mirror lands.
   const isShellCommand =
     bubble.shellCommand !== undefined ||
     (bubble.pending === true &&
       published?.nativeShell != null &&
-      bubble.content.length === 1 &&
-      bubble.content[0]?.type === "input_text" &&
-      splitNativeShellCommand(text, published.nativeShell) !== null);
+      rawText !== null &&
+      splitNativeShellCommand(rawText, published.nativeShell) !== null);
   const origin = isShellCommand ? null : userMessageOrigin(bubble.content);
   const collapsesOrigin = usePeerSessionMessageDisplay() === "collapse" && origin !== null;
   const [originExpanded, setOriginExpanded] = useState(false);

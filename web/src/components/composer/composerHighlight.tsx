@@ -32,6 +32,13 @@ export function splitKnownSlashCommand(
   return { before, token, after: value.slice(before.length + token.length) };
 }
 
+// Python's `str.isspace` set, which the backend's strip()s use. JS `\s` lacks
+// \x1c-\x1f and \x85 and adds \ufeff, so it disagrees on those drafts.
+const PYTHON_WHITESPACE_CLASS =
+  "\\t\\n\\v\\f\\r\\x1c-\\x20\\x85\\xa0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000";
+const LEADING_PYTHON_WHITESPACE = new RegExp(`^[${PYTHON_WHITESPACE_CLASS}]*`);
+const PYTHON_WHITESPACE_ONLY = new RegExp(`^[${PYTHON_WHITESPACE_CLASS}]*$`);
+
 /**
  * Split a `!command` draft at its `!`, or null when *harness* would treat it
  * as model input. codex-native mirrors `shell_command_from_content`
@@ -48,10 +55,10 @@ export function splitNativeShellCommand(
     if (!value.startsWith("!") || value.slice(1).trim() === "") return null;
     return { before: "", token: "!", after: value.slice(1) };
   }
-  const before = value.match(/^\s*/)?.[0] ?? "";
+  const before = value.match(LEADING_PYTHON_WHITESPACE)?.[0] ?? "";
   const rest = value.slice(before.length);
   if (!rest.startsWith("!") || rest.startsWith("!!")) return null;
-  if (rest.slice(1).trim() === "") return null;
+  if (PYTHON_WHITESPACE_ONLY.test(rest.slice(1))) return null;
   return { before, token: "!", after: rest.slice(1) };
 }
 
@@ -64,9 +71,13 @@ export function composerHighlightSplit(
   value: string,
   commands: Iterable<string>,
   nativeShell: string | null,
+  classifyValue: string = value,
 ): ComposerHighlightSplit | null {
-  const shell = nativeShell ? splitNativeShellCommand(value, nativeShell) : null;
-  if (shell) return { kind: "shell", ...shell };
+  if (nativeShell && splitNativeShellCommand(classifyValue, nativeShell)) {
+    // classifyValue only drops characters and never a `!`, so the token is value's first `!`.
+    const at = value.indexOf("!");
+    return { kind: "shell", before: value.slice(0, at), token: "!", after: value.slice(at + 1) };
+  }
   const command = splitKnownSlashCommand(value, commands);
   return command ? { kind: "command", ...command } : null;
 }
@@ -93,6 +104,8 @@ export interface UseComposerHighlightOptions {
   /** False while quotes or attachments ride along (they change what is sent). */
   enabled: boolean;
   nativeShell: string | null;
+  /** The text as sent, when sending drops characters from `value`; decides shell mode. */
+  classifyValue?: string;
   /** Inline @mention tokens the mirror paints as pills; empty where none apply. */
   mentionTokens: readonly string[];
   /** The textarea the mirror is pinned to. */
@@ -126,12 +139,15 @@ export function useComposerHighlight({
   commandNames,
   enabled,
   nativeShell,
+  classifyValue,
   mentionTokens,
   textareaRef,
 }: UseComposerHighlightOptions): ComposerHighlight {
   const mirrorRef = useRef<HTMLDivElement>(null);
   const hintId = useId();
-  const split = enabled ? composerHighlightSplit(value, commandNames, nativeShell) : null;
+  const split = enabled
+    ? composerHighlightSplit(value, commandNames, nativeShell, classifyValue)
+    : null;
   const shell = split?.kind === "shell";
   const mirrorActive = split !== null || findMentionTokens(value, mentionTokens).length > 0;
   useComposerMirrorAlignment(mirrorRef, textareaRef, mirrorActive);

@@ -894,23 +894,22 @@ describe("UserBubble command tint", () => {
     expect(token.textContent).toBe("/team");
   });
 
-  it("floats the token beside paragraph args but not beside a block", () => {
-    const view = renderScoped(userBubble("/team fix it"), <PublishCommands />);
+  it("floats the token beside paragraph args", () => {
+    renderScoped(userBubble("/team fix it"), <PublishCommands />);
     expect(screen.getByText("/team")).toHaveClass("float-left");
-    view.unmount();
-
-    renderScoped(userBubble("/team - first\n- second"), <PublishCommands />);
-    expect(screen.getByText("/team")).not.toHaveClass("float-left");
-    expect(within(screen.getByTestId("message-bubble")).getAllByRole("listitem")).toHaveLength(2);
   });
 
-  it.each(["---", "$$\nx^2\n$$", "<details>more</details>"])(
-    "does not float the token beside a %j block",
-    (block) => {
-      renderScoped(userBubble(`/team ${block}`), <PublishCommands />);
-      expect(screen.getByText("/team")).not.toHaveClass("float-left");
-    },
-  );
+  it.each([
+    ["- first\n- second", 2],
+    ["---", 0],
+    ["$$\nx^2\n$$", 0],
+    ["<details>more</details>", 0],
+  ])("does not float the token beside a %j block", (block, listItems) => {
+    renderScoped(userBubble(`/team ${block}`), <PublishCommands />);
+    expect(screen.getByText("/team")).not.toHaveClass("float-left");
+    const bubble = within(screen.getByTestId("message-bubble"));
+    expect(bubble.queryAllByRole("listitem")).toHaveLength(listItems);
+  });
 
   it("keeps an indented code block on the line after the token", async () => {
     renderScoped(userBubble("/team\n    const x = 1"), <PublishCommands />);
@@ -936,6 +935,26 @@ describe("UserBubble command tint", () => {
 
     renderScoped(bubble, <PublishCommands />);
     expect(screen.queryByText("!echo **hi**")).toBeNull();
+  });
+
+  it("classifies a pending peer message by its raw text, keeping the sender", () => {
+    const shell = renderScoped(
+      userBubble("!echo hi", { pending: true }),
+      <PublishCommands nativeShell="codex-native" />,
+    );
+    expect(screen.getByText("!echo hi").closest("pre")).not.toBeNull();
+    shell.unmount();
+
+    renderScoped(
+      userBubble("[Message from session s_source]\n!echo **hi**", { pending: true }),
+      <PublishCommands nativeShell="codex-native" />,
+    );
+    expect(screen.getByTestId("collapsed-session-message")).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("expand-session-message"));
+    const bubble = screen.getByTestId("message-bubble");
+    expect(within(bubble).getByTestId("message-origin")).toBeInTheDocument();
+    expect(bubble.querySelector("pre")).toBeNull();
+    expect(within(bubble).getByText("hi")).toHaveAttribute("data-streamdown", "strong");
   });
 
   it.each([

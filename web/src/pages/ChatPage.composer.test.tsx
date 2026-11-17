@@ -5786,45 +5786,52 @@ describe("Composer native shell mode", () => {
     expect(screen.queryByTestId("composer-highlight-overlay")).toBeNull();
   });
 
-  it("paints the `!` and an inline mention pill in the one mirror", () => {
-    useChatStore.setState({ sessionHarness: "codex-native" });
-    render(<Composer {...composerProps({ isNativeWrapper: true, permissionLevel: null })} />);
-    fireEvent.change(textarea(), { target: { value: "!ls" } });
-    expect(screen.getByTestId("composer-shell-mode-indicator")).toBeVisible();
+  it.each([
+    {
+      label: "the `!`",
+      draft: "!ls",
+      token: "!",
+      mode: "data-shell-command",
+      props: () => {
+        useChatStore.setState({ sessionHarness: "codex-native" });
+        return composerProps({ isNativeWrapper: true, permissionLevel: null });
+      },
+    },
+    {
+      label: "a known command",
+      draft: "/team fix",
+      token: "/team",
+      mode: "data-slash-command",
+      props: () => {
+        setComposerState({
+          conversationId: "conv_shell",
+          skills: [{ name: "team", description: "Run a team" }],
+          blocks: [],
+        });
+        return composerProps();
+      },
+    },
+  ])(
+    "paints $label and an inline mention pill in the one mirror",
+    ({ draft, token, mode, props }) => {
+      render(<Composer {...props()} />);
+      fireEvent.change(textarea(), { target: { value: draft } });
+      expect(textarea()).toHaveAttribute(mode, "true");
 
-    // The attachment lands as an inline token after the text, so `!` still leads.
-    act(() =>
-      useChatStore.setState({
-        pendingComposerAttachments: [{ path: "src/example.ts", isDir: false }],
-      }),
-    );
-    expect(screen.getByTestId("composer-shell-mode-indicator")).toBeVisible();
-    expect(screen.getAllByTestId("composer-highlight-overlay")).toHaveLength(1);
-    const overlay = screen.getByTestId("composer-highlight-overlay");
-    expect(overlay.textContent).toBe(textarea().value);
-    expect(within(overlay).getByText("!")).toHaveClass("text-brand-accent");
-    expect(within(overlay).getByTestId("composer-mention-token")).toBeInTheDocument();
-  });
-
-  it("paints a known command and an inline mention pill together", () => {
-    setComposerState({
-      conversationId: "conv_shell",
-      skills: [{ name: "team", description: "Run a team" }],
-      blocks: [],
-    });
-    render(<Composer {...composerProps()} />);
-    fireEvent.change(textarea(), { target: { value: "/team fix" } });
-    act(() =>
-      useChatStore.setState({
-        pendingComposerAttachments: [{ path: "src/example.ts", isDir: false }],
-      }),
-    );
-    expect(screen.getAllByTestId("composer-highlight-overlay")).toHaveLength(1);
-    const overlay = screen.getByTestId("composer-highlight-overlay");
-    expect(within(overlay).getByText("/team")).toHaveClass("text-brand-accent");
-    expect(within(overlay).getByTestId("composer-mention-token")).toBeInTheDocument();
-    expect(textarea()).toHaveAttribute("data-slash-command", "true");
-  });
+      // The attachment lands as an inline token after the text, so the token still leads.
+      act(() =>
+        useChatStore.setState({
+          pendingComposerAttachments: [{ path: "src/example.ts", isDir: false }],
+        }),
+      );
+      expect(textarea()).toHaveAttribute(mode, "true");
+      expect(screen.getAllByTestId("composer-highlight-overlay")).toHaveLength(1);
+      const overlay = screen.getByTestId("composer-highlight-overlay");
+      expect(overlay.textContent).toBe(textarea().value);
+      expect(within(overlay).getByText(token)).toHaveClass("text-brand-accent");
+      expect(within(overlay).getByTestId("composer-mention-token")).toBeInTheDocument();
+    },
+  );
 });
 
 describe("Composer placeholder", () => {

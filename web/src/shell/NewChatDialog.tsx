@@ -5597,6 +5597,7 @@ function NewChatLandingContent({
     commandNames: skillCommandNames,
     enabled: files.length === 0,
     nativeShell: supportsNativeShellInput(skillsHarness) ? skillsHarness : null,
+    classifyValue: sanitizeInitialPrompt(message),
     mentionTokens,
     textareaRef,
   });
