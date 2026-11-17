@@ -8,12 +8,14 @@ faked. No live Codex is needed.
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 
 from omnigent.harnesses.codex_native import app_server as codex_app_server
@@ -23,6 +25,8 @@ from omnigent.harnesses.codex_native.app_server import CodexAppServerResponseErr
 from omnigent.harnesses.codex_native.bridge import (
     CodexNativeBridgeState,
     codex_home_for_bridge_dir,
+    read_child_usage_baselines,
+    record_child_usage_baseline,
     write_bridge_state,
     write_unmirrored_codex_settings,
 )
@@ -811,3 +815,235 @@ async def test_side_effort_reset_without_live_model_does_not_submit() -> None:
     with pytest.raises(ValueError, match="capabilities unavailable"):
         await side_chat.submit_side_turn(client, "thread_side", "hello", reset_effort=True)
     assert client.calls == [("thread/read", {"threadId": "thread_side", "includeTurns": False})]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lost", [False, True], ids=["live", "runner-restarted"])
+async def test_resume_side_chat_keeps_its_thread_and_saved_context(
+    tmp_path: Path, lost: bool
+) -> None:
+    thread_id = "019e96aa-0be2-7343-8d3b-6f914d60936b"
+    child = {
+        "id": "conv_side",
+        "kind": "sub_agent",
+        "parent_session_id": "conv_parent",
+        "created_at": 20,
+        "native_usage_baseline": {
+            "cumulative_input_tokens": 130,
+            "cumulative_output_tokens": 20,
+            "cumulative_cache_read_input_tokens": 30,
+        },
+        "labels": {
+            "omnigent.wrapper": "codex-native-ui-subagent",
+            "omnigent.codex_native.subagent_thread_id": thread_id,
+            "omnigent.codex_native.agent_nickname": "Side chat",
+            "omnigent.closed": "true",
+        },
+    }
+    _write_parent_settings(tmp_path, "gpt-6-sol", "medium")
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_parent",
+            socket_path="ws://127.0.0.1:1234",
+            thread_id="thread_parent",
+            codex_home=str(codex_home_for_bridge_dir(tmp_path)),
+            cwd=str(tmp_path),
+        ),
+    )
+    history_requests: list[str] = []
+
+    def message(text: str, created_at: int) -> _JsonObject:
+        return {
+            "id": text,
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": text}],
+            "created_at": created_at,
+        }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions/conv_side":
+            return httpx.Response(200, json=child)
+        if request.url.path == "/v1/sessions/conv_parent":
+            return httpx.Response(200, json={"workspace": None})
+        history_requests.append(str(request.url))
+        if request.url.path == "/v1/sessions/conv_parent/items":
+            return httpx.Response(
+                200,
+                json={
+                    "data": [message("parent-before", 10), message("parent-after", 30)],
+                    "has_more": False,
+                },
+            )
+        assert request.url.path == "/v1/sessions/conv_side/items"
+        if request.url.params.get("after") == "page-one":
+            return httpx.Response(
+                200, json={"data": [message("side-second", 22)], "has_more": False}
+            )
+        return httpx.Response(
+            200,
+            json={"data": [message("side-first", 21)], "has_more": True, "last_id": "page-one"},
+        )
+
+    record_child_usage_baseline(tmp_path, thread_id, (400, 200, 100))
+    state = fwd._CodexForwarderState(
+        parent_session_id="conv_parent", child_usage_baseline_dir=tmp_path
+    )
+    calls: list[tuple[str, _JsonObject]] = []
+
+    async def request(method: str, params: _JsonObject) -> _JsonObject:
+        assert state.session_for_child_thread(thread_id) == "conv_side"
+        calls.append((method, params))
+        if method == "config/read":
+            return {"result": {"config": {"model_provider": "provider_override"}}}
+        if lost and len(calls) == 1:
+            raise CodexAppServerResponseError(
+                {"code": -32600, "message": f"no rollout found for thread id {thread_id}"}
+            )
+        if method == "thread/resume" and "path" in params:
+            assert state.child_usage_baselines[thread_id] == (0, 0, 0)
+            assert read_child_usage_baselines(tmp_path)[thread_id] == (0, 0, 0)
+        return {"result": {"thread": {"id": thread_id}}}
+
+    codex_client = SimpleNamespace(request=request)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://test"
+    ) as ap_client:
+        side_chat.register_side_chat_forwarder(
+            tmp_path, codex_client=codex_client, ap_client=ap_client, forwarder_state=state
+        )
+        try:
+            await side_chat.resume_side_chat(tmp_path, "conv_side")
+            await side_chat.resume_side_chat(tmp_path, "conv_side")
+        finally:
+            side_chat.unregister_side_chat_forwarder(tmp_path, codex_client)
+
+    resume_calls = [params for method, params in calls if method == "thread/resume"]
+    assert len(resume_calls) == (2 if lost else 1)
+    assert state.session_for_child_thread(thread_id) == "conv_side"
+    assert not state.needs_child_thread_backfill(thread_id)
+    expected_baseline = (0, 0, 0) if lost else (400, 200, 100)
+    assert state.child_usage_baselines[thread_id] == expected_baseline
+    assert read_child_usage_baselines(tmp_path)[thread_id] == expected_baseline
+    if lost:
+        params = resume_calls[-1]
+        assert params["threadId"] == thread_id
+        assert params["excludeTurns"] is True
+        records = [json.loads(line) for line in Path(params["path"]).read_text().splitlines()]
+        assert records[0]["payload"]["model_provider"] == "provider_override"
+        assert records[0]["payload"]["cwd"] == str(tmp_path)
+        payloads = [record["payload"] for record in records if record["type"] == "response_item"]
+        texts = [block["text"] for payload in payloads for block in payload.get("content", [])]
+        assert texts == [
+            "parent-before",
+            side_chat.SIDE_REFERENCE_ONLY_INSTRUCTIONS,
+            "side-first",
+            "side-second",
+        ]
+        usage = [
+            record["payload"]
+            for record in records
+            if record["type"] == "event_msg" and record["payload"]["type"] == "token_count"
+        ]
+        assert len(usage) == 1
+        assert usage[0]["type"] == "token_count"
+        assert usage[0]["info"]["total_token_usage"] == {
+            "input_tokens": 130,
+            "cached_input_tokens": 30,
+            "output_tokens": 20,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 150,
+        }
+        assert all(value == 0 for value in usage[0]["info"]["last_token_usage"].values())
+    else:
+        assert history_requests == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "foreign_parent", [False, True], ids=["ordinary-subagent", "foreign-parent"]
+)
+async def test_resume_side_chat_rejects_sessions_outside_its_parent(
+    tmp_path: Path, foreign_parent: bool
+) -> None:
+    child = {
+        "kind": "sub_agent",
+        "parent_session_id": "other-parent" if foreign_parent else "conv_parent",
+        "labels": {
+            "omnigent.wrapper": "codex-native-ui-subagent",
+            "omnigent.codex_native.subagent_thread_id": "thread_side",
+        },
+    }
+    if foreign_parent:
+        child["labels"]["omnigent.codex_native.agent_nickname"] = "Side chat"
+    codex_client = _FakeCodexClient({})
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, json=child)),
+        base_url="http://test",
+    ) as ap_client:
+        side_chat.register_side_chat_forwarder(
+            tmp_path,
+            codex_client=codex_client,
+            ap_client=ap_client,
+            forwarder_state=fwd._CodexForwarderState(parent_session_id="conv_parent"),
+        )
+        try:
+            with pytest.raises(ValueError, match="not a side chat"):
+                await side_chat.resume_side_chat(tmp_path, "conv_side")
+        finally:
+            side_chat.unregister_side_chat_forwarder(tmp_path, codex_client)
+    assert codex_client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_resume_side_chat_failure_remains_retryable(tmp_path: Path) -> None:
+    child = {
+        "kind": "sub_agent",
+        "parent_session_id": "conv_parent",
+        "labels": {
+            "omnigent.wrapper": "codex-native-ui-subagent",
+            "omnigent.codex_native.subagent_thread_id": "thread_side",
+            "omnigent.codex_native.agent_nickname": "Side chat",
+        },
+    }
+    request = AsyncMock(
+        side_effect=[
+            CodexAppServerResponseError(
+                {"code": -32600, "message": "already has an active writer"}
+            ),
+            {"result": {}},
+        ]
+    )
+    codex_client = SimpleNamespace(request=request)
+    state = fwd._CodexForwarderState(parent_session_id="conv_parent")
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, json=child)),
+        base_url="http://test",
+    ) as ap_client:
+        side_chat.register_side_chat_forwarder(
+            tmp_path, codex_client=codex_client, ap_client=ap_client, forwarder_state=state
+        )
+        try:
+            with pytest.raises(CodexAppServerResponseError, match="active writer"):
+                await side_chat.resume_side_chat(tmp_path, "conv_side")
+            assert state.session_for_child_thread("thread_side") is None
+            await side_chat.resume_side_chat(tmp_path, "conv_side")
+        finally:
+            side_chat.unregister_side_chat_forwarder(tmp_path, codex_client)
+    assert request.await_count == 2
+
+
+def test_old_side_chat_forwarder_cannot_unregister_its_replacement(tmp_path: Path) -> None:
+    old = _FakeCodexClient({})
+    replacement = _FakeCodexClient({})
+    for client in (old, replacement):
+        side_chat.register_side_chat_forwarder(
+            tmp_path,
+            codex_client=client,
+            ap_client=AsyncMock(),
+            forwarder_state=fwd._CodexForwarderState(),
+        )
+    side_chat.unregister_side_chat_forwarder(tmp_path, old)
+    assert side_chat._side_chat_forwarders[tmp_path].codex_client is replacement
+    side_chat.unregister_side_chat_forwarder(tmp_path, replacement)

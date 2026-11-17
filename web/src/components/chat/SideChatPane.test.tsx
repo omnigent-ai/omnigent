@@ -1660,7 +1660,7 @@ describe("history a side chat copied from its parent", () => {
   });
 });
 
-describe("side chat sealed by the server", () => {
+describe("side chat closed by the server", () => {
   it("is read-only once the server marks the child closed", () => {
     mockSession.labels = { "omnigent.closed": "true" };
     renderPane(<SideChatPane childId={childId} />);
@@ -1670,6 +1670,36 @@ describe("side chat sealed by the server", () => {
     ).toBeInTheDocument();
     expect(screen.queryByTestId("side-chat-input")).toBeNull();
     expect(sessionsApi.stopSession).not.toHaveBeenCalled();
+  });
+
+  it("sends another message to a closed Codex side chat", async () => {
+    mockSession.labels = {
+      "omnigent.closed": "true",
+      "omnigent.wrapper": "codex-native-ui-subagent",
+      "omnigent.codex_native.agent_nickname": "Side chat",
+    };
+    conversationRegistry.acquire(childId).setState({ sessionStatus: "idle" });
+    renderPane(<SideChatPane childId={childId} />);
+
+    fireEvent.change(screen.getByTestId("side-chat-input"), { target: { value: "Continue" } });
+    fireEvent.keyDown(screen.getByTestId("side-chat-input"), { key: "Enter" });
+
+    await waitFor(() =>
+      expect(send).toHaveBeenCalledWith("Continue", "agent_side", undefined, {
+        pinnedConversationId: childId,
+      }),
+    );
+  });
+
+  it("preserves read-only access for a closed Codex side chat", () => {
+    mockSession.labels = {
+      "omnigent.closed": "true",
+      "omnigent.wrapper": "codex-native-ui-subagent",
+      "omnigent.codex_native.agent_nickname": "Side chat",
+    };
+    renderPane(<SideChatPane childId={childId} readOnly />);
+
+    expect(screen.queryByTestId("side-chat-input")).toBeNull();
   });
 
   it("re-reads the child's labels after the opening /side send settles", async () => {

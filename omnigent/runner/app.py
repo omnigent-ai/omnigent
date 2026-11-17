@@ -7805,6 +7805,44 @@ def create_runner_app(
             body.get("model_override") if isinstance(body, dict) else None,
             extra={"session_id": conversation_id},
         )
+        if body_type == "codex_side_chat_resume":
+            from websockets.exceptions import WebSocketException
+
+            from omnigent.harnesses.codex_native import side_chat
+
+            child_session_id = body.get("codex_side_session_id")
+            if not isinstance(child_session_id, str) or not child_session_id.strip():
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": "invalid_request",
+                        "detail": "Missing side-chat session id.",
+                    },
+                )
+            try:
+                bridge_dir = await _codex_native_bridge_dir_for_session(conversation_id)
+                await side_chat.resume_side_chat(bridge_dir, child_session_id)
+            except ValueError as exc:
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "invalid_request", "detail": str(exc)},
+                )
+            except (RuntimeError, OSError, httpx.HTTPError, TimeoutError, WebSocketException):
+                _logger.warning(
+                    "Codex side-chat resume failed: conv=%s child=%s",
+                    conversation_id,
+                    child_session_id,
+                    exc_info=True,
+                    extra={"session_id": conversation_id},
+                )
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "error": "codex_side_chat_unavailable",
+                        "detail": "The Codex side chat could not be resumed; try again.",
+                    },
+                )
+            return JSONResponse(status_code=200, content={"resumed": True})
         _side_thread_id = body.get("codex_side_thread_id") if isinstance(body, dict) else None
         if _side_thread_id:
             # Side-chat controls use the parent's bridge but target the child's

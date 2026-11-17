@@ -214,6 +214,44 @@ async def test_pi_launch_restores_only_own_usage_without_loading_display_usage(
     assert launch.native_usage_baseline == expected
 
 
+@pytest.mark.parametrize("side_chat", [True, False], ids=["side-chat", "worker"])
+async def test_codex_side_chat_restores_own_usage_without_loading_display_usage(
+    usage_app: _UsageApp,
+    usage_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    side_chat: bool,
+) -> None:
+    load_usage = Mock(side_effect=AssertionError("side-chat recovery must not aggregate usage"))
+    monkeypatch.setattr(orchestration, "load_session_usage", load_usage)
+    usage_app.conversations.set_labels(
+        usage_app.child_id,
+        {
+            "omnigent.wrapper": "codex-native-ui-subagent",
+            "omnigent.codex_native.agent_nickname": "Side chat" if side_chat else "Worker",
+        },
+    )
+    usage_app.conversations.set_session_usage(
+        usage_app.child_id,
+        {"input_tokens": 100, "output_tokens": 20, "cache_read_input_tokens": 30},
+    )
+    response = await usage_client.get(
+        f"/v1/sessions/{usage_app.child_id}",
+        params={**_USAGE_SNAPSHOT_PARAMS, "include_usage": "false"},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    if side_chat:
+        baseline = body["native_usage_baseline"]
+        assert baseline["cumulative_input_tokens"] == 130
+        assert baseline["cumulative_output_tokens"] == 20
+        assert baseline["cumulative_cache_read_input_tokens"] == 30
+    else:
+        assert body["native_usage_baseline"] is None
+    assert body["usage_included"] is False
+    assert body["usage_by_model"] is None
+    load_usage.assert_not_called()
+
+
 async def test_real_codex_launch_config_does_not_load_usage(
     usage_app: _UsageApp,
     usage_client: httpx.AsyncClient,

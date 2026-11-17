@@ -463,8 +463,6 @@ from omnigent.telemetry.events import TurnEndEvent as _TelTurnEndEvent
 from omnigent.telemetry.installation_id import get_installation_id as _get_installation_id
 from omnigent.telemetry.surface import CLIENT_SURFACE_LABEL_KEY, resolve_session_surface
 from omnigent.util.session_lifecycle import (
-    CLOSED_LABEL_KEY,
-    CLOSED_LABEL_VALUE,
     labels_with_closed_status,
     title_without_closed_marker,
 )
@@ -1646,7 +1644,6 @@ def _build_session_response(
     viewer_id: str | None = None,
     agent_store: AgentStore | None = None,
     agent_cache: AgentCache | None = None,
-    side_chat_sealed: bool = False,
     agent: Agent | None = None,
     background_agents: list[BackgroundTaskInfo] | None = None,
     harness: str | _UnresolvedHarness | None = _UNRESOLVED_HARNESS,
@@ -1741,8 +1738,12 @@ def _build_session_response(
         harness = _resolve_harness(
             conv, agent_store=agent_store, agent_cache=agent_cache, agent=agent
         )
+    from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
+
     native_usage_baseline = None
-    if harness == "pi-native":
+    if harness == "pi-native" or (
+        _is_codex_native_subagent(conv) and is_side_chat_child(conv.labels)
+    ):
         own_usage = conv.session_usage or {}
         cached = int(own_usage.get("cache_read_input_tokens", 0) or 0)
         native_usage_baseline = NativeUsageBaseline(
@@ -1763,12 +1764,6 @@ def _build_session_response(
         or native_coding_agent_for_harness(harness) is not None
     ):
         labels = {**labels, _CLAUDE_NATIVE_UI_LABEL_KEY: _CLAUDE_NATIVE_UI_LABEL_VALUE}
-    # A codex /side child whose ephemeral fork's runner is gone (parent resumed
-    # onto a new runner) can never be sent to again. Surface it as closed so the
-    # composer reads-only itself instead of letting the user fire a turn at a
-    # vanished thread. Computed per-response (not persisted) — self-heals.
-    if side_chat_sealed:
-        labels = {**labels, CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE}
     return SessionResponse(
         id=conv.id,
         agent_id=conv.agent_id,
@@ -6041,6 +6036,11 @@ async def ensure_runner_connected(
 
 def _side_chat_source_id(conv: Conversation) -> str | None:
     """Return the source session whose runner a side chat shares, if any."""
+    from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
+
+    if _is_codex_native_subagent(conv) and is_side_chat_child(conv.labels):
+        source_id = conv.parent_conversation_id
+        return source_id if source_id != conv.id else None
     if conv.kind != "default" or conv.host_id is not None:
         return None
     labels = conv.labels or {}
@@ -14385,58 +14385,6 @@ async def _fetch_model_options(
     return cached or []
 
 
-async def _codex_side_chat_fork_sealed(conv: Conversation, conv_store: ConversationStore) -> bool:
-    """
-    Whether a codex ``/side`` child's ephemeral fork is no longer reachable.
-
-    The fork lives only in the runner process that created it. A side-chat child
-    keeps its birth ``runner_id`` while the parent's changes on resume/relaunch,
-    so a divergence means the fork's owning runner is gone and a follow-up turn
-    would hit a vanished thread. Gated to ``/side`` children (the "Side chat"
-    nickname) so ordinary codex sub-agents are unaffected; a plain reload with
-    the same live runner does not diverge, so a still-live side chat stays
-    sendable.
-    """
-    from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
-
-    if (
-        not _is_codex_native_subagent(conv)
-        or conv.parent_conversation_id is None
-        or not conv.runner_id
-        or not is_side_chat_child(conv.labels)
-    ):
-        return False
-    parent = await asyncio.to_thread(conv_store.get_conversation, conv.parent_conversation_id)
-    return parent is not None and bool(parent.runner_id) and parent.runner_id != conv.runner_id
-
-
-async def _codex_side_chat_fork_lost(
-    conv: Conversation,
-    conv_store: ConversationStore,
-    runner_router: RunnerRouter | None,
-    host_registry: HostRegistry | None,
-) -> bool:
-    """Whether a side chat's ephemeral fork is provably gone with its runner."""
-    if await _codex_side_chat_fork_sealed(conv, conv_store):
-        return True
-    from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
-    from omnigent.runner.routing import routing_host_id
-
-    if not _is_codex_native_subagent(conv) or not conv.runner_id or host_registry is None:
-        return False
-    if not is_side_chat_child(conv.labels) or (
-        runner_router is not None and runner_router.runner_is_online(conv.runner_id)
-    ):
-        return False
-    host_id = await asyncio.to_thread(routing_host_id, conv, conv_store)
-    host_conn = host_registry.get(host_id) if host_id is not None else None
-    if host_conn is None:
-        return False
-    # The host owns the process: "unknown" means it is not running there either.
-    status = await _query_host_runner_status(host_conn, host_registry, conv.runner_id)
-    return status in {"dead", "unknown"}
-
-
 def _resolve_harness_impl_is_acp(
     conv: Conversation, agent_store: AgentStore | None, agent: Agent | None = None
 ) -> bool:
@@ -15101,7 +15049,6 @@ async def _get_session_snapshot(
         items,
         status,
         permission_level,
-        side_chat_sealed=await _codex_side_chat_fork_sealed(conv, conv_store),
         background_agents=background_agents,
         background_task_count=_session_background_task_count_cache.get(session_id),
         background_tasks=_session_background_tasks_cache.get(session_id),

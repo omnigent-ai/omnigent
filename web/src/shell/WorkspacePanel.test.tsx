@@ -1963,6 +1963,24 @@ describe("WorkspacePanel sub-agent tabs", () => {
     expect(screen.getByTestId("subagent-tab-read-only")).toHaveTextContent(reason);
   });
 
+  it("allows a closed Codex side chat to resume in a sub-agent tab", () => {
+    writeSessionWorkspaceState("conv_ws", {
+      openSubagentTabs: [SUBAGENT_TAB],
+      selectedSideChatId: SUBAGENT_TAB,
+    });
+    renderWorkspace({
+      rightRailTab: "sidechat",
+      queryClient: clientWithSubagent("Side chat", {
+        "omnigent.closed": "true",
+        "omnigent.wrapper": "codex-native-ui-subagent",
+        "omnigent.codex_native.agent_nickname": "Side chat",
+      }),
+    });
+
+    expect(screen.getByTestId("side-chat-pane-stub")).toHaveAttribute("data-read-only", "false");
+    expect(screen.queryByTestId("subagent-tab-read-only")).toBeNull();
+  });
+
   it("selects a session's open side-chat tab instead of adding a sub-agent tab for it", () => {
     writeSessionWorkspaceState("conv_ws", {
       openSideChats: ["conv_child"],

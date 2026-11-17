@@ -267,7 +267,6 @@ from omnigent.server.routes._sessions.orchestration import (
     _best_effort_stop,
     _cancel_runner_relays,
     _child_session_summaries_from_conversations,
-    _codex_side_chat_fork_lost,
     _codex_side_chat_thread_id,
     _dispatch_session_event_to_runner,
     _enrich_terminal_status_with_subagent_output,
@@ -358,6 +357,7 @@ from omnigent.util.session_lifecycle import (
     CLOSED_LABEL_KEY,
     CLOSED_LABEL_VALUE,
     is_session_closed,
+    title_without_closed_marker,
 )
 
 # custom-lint: disable-next=workspace-scoped-cache -- lock; collision only serializes
@@ -731,6 +731,94 @@ def _refuse_offline_host_send(
     if client_holds:
         raise OmnigentError(_host_offline_hold_message(), code=ErrorCode.HOST_OFFLINE)
     raise OmnigentError(_host_offline_message(), code=ErrorCode.RUNNER_UNAVAILABLE)
+
+
+async def _resume_codex_side_chat(
+    *,
+    request: Request,
+    conv: Conversation,
+    conversation_store: ConversationStore,
+    runner_router: RunnerRouter | None,
+    user_id: str | None,
+    permission_store: PermissionStore | None,
+) -> Conversation:
+    """Restore a native side thread on its parent's authorized live runner."""
+    from omnigent.harnesses.claude_native.bridge import url_component
+
+    runner_client, conv = await _recover_side_chat_runner_via_source(
+        conv,
+        app_state=request.app.state,
+        conversation_store=conversation_store,
+        runner_router=runner_router,
+        user_id=user_id,
+        permission_store=permission_store,
+        raise_host_refusal=True,
+    )
+    if runner_client is None:
+        raise OmnigentError(
+            "No runner is available to resume this side chat.", code=ErrorCode.RUNNER_UNAVAILABLE
+        )
+    assert conv.parent_conversation_id is not None
+    await _recover_retry_session(
+        request=request,
+        session_id=conv.parent_conversation_id,
+        conversation_store=conversation_store,
+        runner_router=runner_router,
+        user_id=user_id,
+        permission_store=permission_store,
+    )
+    # Parent initialization can advance its runner generation.
+    runner_client, conv = await _recover_side_chat_runner_via_source(
+        conv,
+        app_state=request.app.state,
+        conversation_store=conversation_store,
+        runner_router=runner_router,
+        user_id=user_id,
+        permission_store=permission_store,
+        raise_host_refusal=True,
+    )
+    if runner_client is None:
+        raise OmnigentError(
+            "The side chat's runner changed while reconnecting. Try again.",
+            code=ErrorCode.RUNNER_UNAVAILABLE,
+        )
+    assert conv.parent_conversation_id is not None
+    try:
+        response = await runner_client.post(
+            f"/v1/sessions/{url_component(conv.parent_conversation_id)}/events",
+            json={"type": "codex_side_chat_resume", "codex_side_session_id": conv.id},
+        )
+    except (httpx.HTTPError, ConnectionError, TimeoutError) as exc:
+        raise OmnigentError(
+            "The side chat could not reconnect to its runner. Try again.",
+            code=ErrorCode.RUNNER_UNAVAILABLE,
+        ) from exc
+    if response.status_code >= 400:
+        from omnigent.server.routes._sessions.orchestration import _codex_side_chat_runner_error
+
+        raise _codex_side_chat_runner_error(response)
+    try:
+        resumed = response.status_code == 200 and response.json().get("resumed") is True
+    except (ValueError, AttributeError):
+        resumed = False
+    if not resumed:
+        raise OmnigentError(
+            "This runner cannot resume side chats. Update the host and restart the session.",
+            code=ErrorCode.RUNNER_UNAVAILABLE,
+        )
+    if is_session_closed(conv.labels, conv.title):
+        if conv.title != title_without_closed_marker(conv.title):
+            await asyncio.to_thread(
+                conversation_store.update_conversation,
+                conv.id,
+                title=title_without_closed_marker(conv.title),
+            )
+        await asyncio.to_thread(conversation_store.delete_label, conv.id, CLOSED_LABEL_KEY)
+        refreshed = await asyncio.to_thread(conversation_store.get_conversation, conv.id)
+        if refreshed is None:
+            raise _session_not_found()
+        conv = refreshed
+    return conv
 
 
 async def _recover_retry_session(
@@ -1642,22 +1730,23 @@ def register_events_routes(
                     code=ErrorCode.INVALID_INPUT,
                 )
         if (
-            body.type == _RETRY_SESSION_TYPE
-            or (body.type == "message" and body.data.get("role") == "user")
-        ) and await _codex_side_chat_fork_lost(
-            conv,
-            conversation_store,
-            runner_router,
-            getattr(request.app.state, "host_registry", None),
+            (
+                body.type == _RETRY_SESSION_TYPE
+                or (body.type == "message" and body.data.get("role", "user") == "user")
+            )
+            and _codex_side_chat_thread_id(conv) is not None
+            and is_side_chat_child(conv.labels)
         ):
-            # The ephemeral fork died with its runner; keep the transcript read-only.
-            await asyncio.to_thread(
-                conversation_store.set_labels, conv.id, {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE}
+            conv = await _resume_codex_side_chat(
+                request=cast("Request", request),
+                conv=conv,
+                conversation_store=conversation_store,
+                runner_router=runner_router,
+                user_id=user_id,
+                permission_store=permission_store,
             )
-            raise OmnigentError(
-                "This side chat ended when its runner restarted and can't be continued.",
-                code=ErrorCode.CONFLICT,
-            )
+            if body.type == _RETRY_SESSION_TYPE:
+                return {"queued": False, "recovered": True, "recovery": "native_side_chat_ready"}
         if body.type == _RETRY_SESSION_TYPE:
             startup = getattr(request.app.state, "startup_inputs", None)
             result = await _retry_session_single_flight(

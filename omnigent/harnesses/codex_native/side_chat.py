@@ -1,10 +1,10 @@
 """Codex ``/side`` ephemeral side-chat support for the native Codex harness.
 
-A side chat is an ephemeral fork of the active Codex thread. It inherits the
-parent's history as *reference only*, never persists to disk (``ephemeral``),
-and is driven out-of-band over the app-server via ``turn/start`` on the child
-thread id. Because the fork is a separate thread, the driven Codex TUI keeps
-showing the main conversation the whole time: the side chat surfaces only as an
+A new side chat is an ephemeral fork of the active Codex thread. It inherits the
+parent's history as *reference only* and is driven out-of-band over the
+app-server via ``turn/start`` on the child thread id. After a restart, its saved
+Omnigent transcript restores it as a persisted Codex thread. The driven Codex
+TUI keeps showing the main conversation: the side chat surfaces only as an
 Omnigent sub-agent (rail) child, never in the left sidebar.
 
 Why a fork and not the claude-native ``/btw`` overlay: Codex ``/side`` is a
@@ -25,9 +25,10 @@ inputs do):
 
 Storage / cache notes (verified against the Codex source + the installed 0.147.0
 app-server schema): ``ephemeral=true`` means no rollout / no state-db row (parity
-with native ``/side``, not resumable after a runner restart), and an ephemeral
+with native ``/side``), and an ephemeral
 root fork reuses the parent's session id for cache routing inside Codex, so we
-deliberately do NOT pin a ``prompt_cache_key``.
+deliberately do NOT pin a ``prompt_cache_key``. After a restart, the saved
+Omnigent transcript can rebuild the side thread with its original reference context.
 """
 
 from __future__ import annotations
@@ -36,6 +37,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import uuid
 from collections.abc import Mapping
 from pathlib import Path
@@ -76,6 +78,215 @@ _SIDE_REQUEST_DIRNAME = "side_chat_requests"
 
 _logger = logging.getLogger(__name__)
 _JsonObject = dict[str, Any]
+
+
+class _SideChatForwarder(NamedTuple):
+    codex_client: CodexAppServerClient
+    ap_client: httpx.AsyncClient
+    state: _CodexForwarderState
+    lock: asyncio.Lock
+
+
+_side_chat_forwarders: dict[Path, _SideChatForwarder] = {}
+
+
+def register_side_chat_forwarder(
+    bridge_dir: Path,
+    *,
+    codex_client: CodexAppServerClient,
+    ap_client: httpx.AsyncClient,
+    forwarder_state: _CodexForwarderState,
+) -> None:
+    """Expose the long-lived connection that must own resumed child notifications."""
+    _side_chat_forwarders[bridge_dir] = _SideChatForwarder(
+        codex_client, ap_client, forwarder_state, asyncio.Lock()
+    )
+
+
+def unregister_side_chat_forwarder(bridge_dir: Path, codex_client: CodexAppServerClient) -> None:
+    """Leave a replacement forwarder registered when its predecessor exits."""
+    current = _side_chat_forwarders.get(bridge_dir)
+    if current is not None and current.codex_client is codex_client:
+        _side_chat_forwarders.pop(bridge_dir)
+
+
+async def resume_side_chat(bridge_dir: Path, child_session_id: str) -> None:
+    """Restore a saved side chat on its parent's existing forwarder connection."""
+    from omnigent.harnesses.claude_native.bridge import url_component
+    from omnigent.harnesses.codex_native.app_server import (
+        is_missing_rollout_error,
+        is_unreadable_thread_error,
+    )
+    from omnigent.harnesses.codex_native.bridge import record_child_usage_baseline
+
+    active = _side_chat_forwarders.get(bridge_dir)
+    if active is None:
+        raise RuntimeError("The parent Codex forwarder is not ready. Try again.")
+    async with active.lock:
+        response = await active.ap_client.get(
+            f"/v1/sessions/{url_component(child_session_id)}", params={"include_usage": "false"}
+        )
+        response.raise_for_status()
+        child = response.json()
+        labels = child.get("labels", {})
+        thread_id = labels.get("omnigent.codex_native.subagent_thread_id")
+        if (
+            child.get("kind") != "sub_agent"
+            or child.get("parent_session_id") != active.state.parent_session_id
+            or labels.get("omnigent.wrapper") != "codex-native-ui-subagent"
+            or not is_side_chat_child(labels)
+            or not isinstance(thread_id, str)
+            or not thread_id
+        ):
+            raise ValueError("This session is not a side chat of the active Codex parent.")
+        existing = active.state.session_for_child_thread(thread_id)
+        if existing is not None:
+            if existing != child_session_id:
+                raise ValueError("The Codex thread belongs to another side chat.")
+            return
+        # Map before resume can emit thread/started, so it cannot rotate the parent.
+        active.state.note_child_thread(thread_id, child_session_id)
+        try:
+            params: _JsonObject = {"threadId": thread_id, "excludeTurns": True}
+            try:
+                await active.codex_client.request("thread/resume", params)
+            except RuntimeError as exc:
+                if not (is_missing_rollout_error(exc) or is_unreadable_thread_error(exc)):
+                    raise
+                path = await _rebuild_side_chat_rollout(bridge_dir, active, child, thread_id)
+                active.state.child_usage_baselines[thread_id] = (0, 0, 0)
+                await asyncio.to_thread(
+                    record_child_usage_baseline, bridge_dir, thread_id, (0, 0, 0)
+                )
+                await active.codex_client.request(
+                    "thread/resume",
+                    {
+                        **params,
+                        "path": str(path),
+                        "developerInstructions": SIDE_REFERENCE_ONLY_INSTRUCTIONS,
+                    },
+                )
+            active.state.note_child_thread_subscribed(thread_id)
+        except BaseException:
+            active.state.subagents_by_thread.pop(thread_id, None)
+            raise
+
+
+async def _rebuild_side_chat_rollout(
+    bridge_dir: Path, active: _SideChatForwarder, child: _JsonObject, thread_id: str
+) -> Path:
+    """Carry the parent's original reference context and the child's saved turns."""
+    import click
+
+    from omnigent.harnesses.claude_native.bridge import url_component
+    from omnigent.harnesses.codex_native.app_server import _codex_effective_model_provider
+    from omnigent.harnesses.codex_native.bridge import codex_home_for_bridge_dir, read_bridge_state
+    from omnigent.harnesses.codex_native.main import (
+        _codex_items_with_attachment_references,
+        _codex_rollout_records_from_session_items,
+        _ensure_local_codex_resume_rollout,
+        _fetch_all_session_items_for_codex_resume,
+    )
+    from omnigent.inner.native_attachments import resolve_session_item_file_references
+
+    parent_id = child["parent_session_id"]
+    parent_response = await active.ap_client.get(
+        f"/v1/sessions/{url_component(parent_id)}", params={"include_usage": "false"}
+    )
+    parent_response.raise_for_status()
+    parent = parent_response.json()
+    bridge_state = read_bridge_state(bridge_dir)
+    workspace = Path(
+        parent.get("workspace")
+        or (bridge_state.cwd if bridge_state is not None else None)
+        or os.environ.get("OMNIGENT_RUNNER_WORKSPACE")
+        or Path.cwd()
+    ).resolve()
+    codex_home = codex_home_for_bridge_dir(bridge_dir)
+    model_provider = await _codex_effective_model_provider(active.codex_client, workspace)
+    if model_provider is None:
+        raise RuntimeError("The parent Codex provider is not available. Try again.")
+    try:
+        parent_items = await _fetch_all_session_items_for_codex_resume(active.ap_client, parent_id)
+        # shortcut: timestamps approximate the fork boundary until an exact item cutoff is stored.
+        parent_items = [item for item in parent_items if item["created_at"] <= child["created_at"]]
+        parent_items = await resolve_session_item_file_references(
+            active.ap_client, session_id=parent_id, items=parent_items
+        )
+        parent_items = _codex_items_with_attachment_references(parent_items, bridge_dir=bridge_dir)
+        path = await _ensure_local_codex_resume_rollout(
+            active.ap_client,
+            session_id=child["id"],
+            external_session_id=thread_id,
+            codex_home=codex_home,
+            workspace=workspace,
+            model_provider=model_provider,
+            codex_path=None,
+            terminal_launch_args=parent.get("terminal_launch_args"),
+        )
+    except click.ClickException as exc:
+        raise RuntimeError("Could not restore this side chat's saved history. Try again.") from exc
+    parent_records = _codex_rollout_records_from_session_items(
+        parent_items,
+        session_id=parent_id,
+        external_session_id=thread_id,
+        cwd=workspace,
+        model_provider=model_provider,
+        cli_version="0.0.0",
+        terminal_launch_args=parent.get("terminal_launch_args"),
+    )
+    records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    boundary = {
+        "timestamp": records[0]["timestamp"],
+        "type": "response_item",
+        "payload": {
+            "type": "message",
+            "role": "developer",
+            "content": [{"type": "input_text", "text": SIDE_REFERENCE_ONLY_INSTRUCTIONS}],
+        },
+    }
+    if any(record.get("payload") == boundary["payload"] for record in records):
+        return path
+    restored = [records[0], *parent_records[1:], boundary, *records[1:]]
+    baseline = child.get("native_usage_baseline")
+    if isinstance(baseline, dict):
+        # Codex restores cumulative totals from this event before counting the next turn.
+        empty_usage = {
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 0,
+        }
+        input_tokens = baseline["cumulative_input_tokens"]
+        output_tokens = baseline["cumulative_output_tokens"]
+        restored.append(
+            {
+                "timestamp": records[-1]["timestamp"],
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            **empty_usage,
+                            "input_tokens": input_tokens,
+                            "cached_input_tokens": baseline["cumulative_cache_read_input_tokens"],
+                            "output_tokens": output_tokens,
+                            "total_tokens": input_tokens + output_tokens,
+                        },
+                        "last_token_usage": empty_usage,
+                        "model_context_window": None,
+                    },
+                    "rate_limits": None,
+                },
+            }
+        )
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(
+        "".join(json.dumps(record) + "\n" for record in restored), encoding="utf-8"
+    )
+    temporary.replace(path)
+    return path
 
 
 def side_chat_question_from_text(text: str) -> str | None:
