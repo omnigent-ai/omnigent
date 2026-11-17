@@ -2837,3 +2837,47 @@ it.each([false, true])(
     }
   },
 );
+
+describe("side-chat composer highlight", () => {
+  it("tints a known side-chat command but not an unknown one", () => {
+    conversationRegistry.acquire(childId).setState({ sessionHarness: "claude-sdk" });
+    skillsFixture.current = {
+      skills: [{ name: "team", description: "Run a team" }],
+      skillsStatus: "ready",
+    };
+    renderPane(<SideChatPane childId={childId} />);
+    const input = screen.getByTestId("side-chat-input");
+
+    fireEvent.change(input, { target: { value: "/team fix it" } });
+    const overlay = screen.getByTestId("composer-highlight-overlay");
+    expect(overlay).toHaveTextContent("/team fix it");
+    expect(within(overlay).getByText("/team")).toHaveClass("text-brand-accent");
+
+    fireEvent.change(input, { target: { value: "/typo fix it" } });
+    expect(screen.queryByTestId("composer-highlight-overlay")).toBeNull();
+  });
+
+  it("marks a codex-native owner's `!` draft as a shell command and sends it unchanged", () => {
+    conversationRegistry.acquire(childId).setState({ sessionStatus: "idle" });
+    renderPane(<SideChatPane childId={childId} />);
+    const input = screen.getByTestId("side-chat-input");
+    fireEvent.change(input, { target: { value: "!git status" } });
+    expect(input).toHaveAccessibleDescription("Shell command");
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(send.mock.calls[0]?.[0]).toBe("!git status");
+  });
+
+  it("does not offer shell mode to a codex-native non-owner", () => {
+    mockSession.snapshot = { permissionLevel: 2 };
+    renderPane(<SideChatPane childId={childId} />);
+    fireEvent.change(screen.getByTestId("side-chat-input"), { target: { value: "!git status" } });
+    expect(screen.queryByTestId("composer-shell-mode-indicator")).toBeNull();
+  });
+
+  it("does not offer shell mode on a pending tab, whose text seeds the fork", () => {
+    renderPane(<SideChatPane childId="pending:side" onStart={vi.fn()} />);
+    fireEvent.change(screen.getByTestId("side-chat-input"), { target: { value: "!ls" } });
+    expect(screen.queryByTestId("composer-shell-mode-indicator")).toBeNull();
+    expect(screen.queryByTestId("composer-highlight-overlay")).toBeNull();
+  });
+});

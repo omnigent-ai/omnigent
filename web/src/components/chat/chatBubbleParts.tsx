@@ -67,6 +67,11 @@ import { BrandLogo } from "@/components/BrandLogo";
 import { RunningDot } from "@/components/RunningDot";
 import { formatMessageTimestamp } from "@/lib/relativeTime";
 import { cn } from "@/lib/utils";
+import {
+  splitKnownSlashCommand,
+  splitNativeShellCommand,
+  usePublishedComposerCommands,
+} from "@/components/composer/composerHighlight";
 import { readableSentText, replaceSentMentions } from "@/lib/composerMentions";
 import { mentionPillMarkdown } from "@/lib/mentionPills";
 import { splitSessionMessageOrigin, type SessionMessageOrigin } from "@/lib/sessionMessageOrigin";
@@ -146,6 +151,16 @@ export function extractUserText(content: MessageContentBlock[]): string {
 /** A user message's text for rendering: mention markers become inline pills. */
 function userMarkdownText(content: MessageContentBlock[]): string {
   return replaceSentMentions(userMessageBody(content), mentionPillMarkdown).trimEnd();
+}
+
+// A floated token would sit beside a list, heading, quote, fence, table, rule,
+// HTML or math block, or indented code block instead of flowing into a paragraph.
+const MARKDOWN_BLOCK_OPENER =
+  /^(?: {4}|\t| {0,3}(?:[-*+] |\d+[.)] |#{1,6}(?:\s|$)|>|```|~~~|\||<|\$\$|(?:(?:-[^\S\n]*){3,}|(?:\*[^\S\n]*){3,}|(?:_[^\S\n]*){3,})(?:\n|$)))/;
+
+// Whether a command's args start on a fresh line rather than after the token.
+function startsOnOwnLine(after: string): boolean {
+  return /^[^\S\n]*\n/.test(after) || MARKDOWN_BLOCK_OPENER.test(after.replace(/^[^\S\n]/, ""));
 }
 
 /** "From @<sender>" above a message another session sent with ``sys_session_message``. */
@@ -1051,8 +1066,17 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   //   for a block carrying neither.
   // - input_file: always render as a chip (non-image files can't be
   //   previewed inline).
-  const isShellCommand = bubble.shellCommand !== undefined;
-  const text = isShellCommand ? `!${bubble.shellCommand}` : extractUserText(bubble.content);
+  const published = usePublishedComposerCommands(sessionId);
+  const text =
+    bubble.shellCommand !== undefined ? `!${bubble.shellCommand}` : extractUserText(bubble.content);
+  // An optimistic `!cmd` has no shellCommand until the terminal mirror lands.
+  const isShellCommand =
+    bubble.shellCommand !== undefined ||
+    (bubble.pending === true &&
+      published?.nativeShell != null &&
+      bubble.content.length === 1 &&
+      bubble.content[0]?.type === "input_text" &&
+      splitNativeShellCommand(text, published.nativeShell) !== null);
   const origin = isShellCommand ? null : userMessageOrigin(bubble.content);
   const collapsesOrigin = usePeerSessionMessageDisplay() === "collapse" && origin !== null;
   const [originExpanded, setOriginExpanded] = useState(false);
@@ -1080,6 +1104,10 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   const visibleText = isCollapsed
     ? omitIncompleteLocalReviewComment(sliceByCodePoint(renderedText, COLLAPSE_THRESHOLD))
     : renderedText;
+  const command =
+    !isShellCommand && published
+      ? splitKnownSlashCommand(visibleText, published.commandNames)
+      : null;
   // Runtime-injected `[System: ...]` notifications ride in on role=user. When
   // the content is a pure system marker, swap in a muted centered indicator.
   // Another session's message is never one: it keeps its sender attribution.
@@ -1246,6 +1274,30 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
                         <pre className="whitespace-pre-wrap break-words font-mono text-sm">
                           <code>{visibleText}</code>
                         </pre>
+                      ) : command ? (
+                        // Floated so the args' first markdown line flows after the token.
+                        <div className="flow-root">
+                          {startsOnOwnLine(command.after) ? (
+                            <span className="text-message text-brand-accent">{command.token}</span>
+                          ) : (
+                            // whitespace-pre keeps the separating space in copied text.
+                            <span className="text-message float-left whitespace-pre text-brand-accent">
+                              {`${command.token} `}
+                            </span>
+                          )}
+                          {command.after.trim() !== "" && (
+                            <FilePathAwareMessageResponse
+                              className="text-message"
+                              breaks
+                              mode="static"
+                              remarkRehypeOptions={USER_MESSAGE_REMARK_REHYPE_OPTIONS}
+                              renderLocalReviewComment={renderLocalReviewComment}
+                            >
+                              {/* Keep the next line's indentation (an indented code block). */}
+                              {command.after.replace(/^[^\S\n]*\n?/, "")}
+                            </FilePathAwareMessageResponse>
+                          )}
+                        </div>
                       ) : (
                         <FilePathAwareMessageResponse
                           className="text-message"

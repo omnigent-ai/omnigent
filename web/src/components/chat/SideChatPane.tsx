@@ -86,7 +86,12 @@ import type { Session } from "@/lib/types";
 import { useSkills } from "@/hooks/useSkills";
 import { useSlashCompletion } from "@/hooks/useSlashCompletion";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
-import { skillInvocationPrefix } from "@/lib/harnessSetup";
+import { skillInvocationPrefix, supportsNativeShellInput } from "@/lib/harnessSetup";
+import { isOwnerLevel } from "@/lib/permissionsApi";
+import {
+  useComposerHighlight,
+  usePublishComposerCommands,
+} from "@/components/composer/composerHighlight";
 import { isNativeTerminalSession } from "@/lib/nativeCodingAgents";
 import { isPermissionModeCycleKey } from "@/lib/permissionModeCycle";
 import {
@@ -1112,6 +1117,24 @@ function SideChatComposer({
     onTabComplete: completeMenuSelection,
     clearText: () => setText(""),
   });
+  const menuCommandNames = useMemo(() => Object.keys(menuCommands), [menuCommands]);
+  // A pending tab's text seeds the fork rather than reaching the harness.
+  const nativeShell =
+    !pending &&
+    supportsNativeShellInput(harness) &&
+    (harness !== "codex-native" || isOwnerLevel(session?.permissionLevel ?? null))
+      ? (harness ?? null)
+      : null;
+  const highlight = useComposerHighlight({
+    value: text,
+    commandNames: menuCommandNames,
+    enabled: quotes.length === 0 && files.length === 0,
+    nativeShell,
+    // The side chat has no @-mention picker.
+    mentionTokens: [],
+    textareaRef: tailTextareaRef,
+  });
+  usePublishComposerCommands(childId, menuCommandNames, nativeShell);
   // Like the main composer, a draft turns Interrupt into Send; a grid cell queues its draft.
   const showInterrupt = !pending && busy && ((fullSession && !gridCell) || !canSend);
 
@@ -1312,6 +1335,7 @@ function SideChatComposer({
         hasContent={!pending && files.length > 0}
         data-side-chat="true"
         keyboard={{ submitWithModEnter: false, preventsKeyboardSubmit: false }}
+        className={highlight.cardClassName}
         input={{
           ref: tailTextareaRef,
           value: text,
@@ -1333,7 +1357,8 @@ function SideChatComposer({
           "data-testid": "side-chat-input",
           onKeyDown: handleKeyDown,
           onPaste,
-          className: quotes.length ? "max-h-none overflow-y-hidden" : undefined,
+          ...highlight.input,
+          className: cn(quotes.length && "max-h-none overflow-y-hidden", highlight.input.className),
         }}
         slots={{
           beforeInput: slashCompletion.open ? (
@@ -1371,6 +1396,8 @@ function SideChatComposer({
                 }}
               />
             ),
+          inputBackdrop: highlight.backdrop,
+          inputHint: highlight.hint,
           attachments:
             (!pending && files.length > 0) || reviewComments.length > 0 ? (
               <>

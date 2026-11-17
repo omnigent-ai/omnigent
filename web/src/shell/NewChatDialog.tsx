@@ -71,12 +71,7 @@ import {
   ComposerFeedbackRow,
   ComposerSendButton,
 } from "@/components/composer/ChatComposer";
-import {
-  ComposerMirror,
-  MIRRORED_TEXTAREA_CLASS,
-  renderMentionTokens,
-  useComposerMirrorAlignment,
-} from "@/components/composer/MentionTokenOverlay";
+import { useComposerHighlight } from "@/components/composer/composerHighlight";
 import {
   SandboxProfilePicker,
   useSandboxProfileCatalog,
@@ -177,6 +172,7 @@ import {
   isNativeOpenCodeHarness,
   MIN_TMUX_VERSION,
   skillInvocationPrefix,
+  supportsNativeShellInput,
 } from "@/lib/harnessSetup";
 
 // Re-exported for tests that import the readiness helpers from this module.
@@ -405,7 +401,6 @@ import {
 import {
   composerInlineMentions,
   expandMentionTokens,
-  findMentionTokens,
   presentMentions,
   type TaggedMentions,
   withSessionMentionHint,
@@ -5555,7 +5550,6 @@ function NewChatLandingContent({
     debouncedQuery: useDebouncedValue(mention?.query ?? "", MENTION_SEARCH_DEBOUNCE_MS),
     currentSessionId: null,
   });
-  const mirrorRef = useRef<HTMLDivElement>(null);
   // Closed-but-loading window: don't let Enter send the half-typed "@dir/".
   // ``isPlaceholderData`` covers the drill-down window where react-query is
   // still serving the previous directory's rows (``isLoading`` stays false).
@@ -5597,8 +5591,15 @@ function NewChatLandingContent({
   };
   // The draft snapshot is built above the hook; add the tags it owns.
   draftRef.current.mentions = { files: mentionedItems, sessions: mentionedSessions };
-  const mentionTokensShown = findMentionTokens(message, mentionTokens).length > 0;
-  useComposerMirrorAlignment(mirrorRef, textareaRef, mentionTokensShown);
+  const skillCommandNames = useMemo(() => Object.keys(skillCommands), [skillCommands]);
+  const highlight = useComposerHighlight({
+    value: message,
+    commandNames: skillCommandNames,
+    enabled: files.length === 0,
+    nativeShell: supportsNativeShellInput(skillsHarness) ? skillsHarness : null,
+    mentionTokens,
+    textareaRef,
+  });
 
   const workspaceTarget = JSON.stringify([projectParam, selectedHostId, sandboxSelected]);
   const [workspaceReadyTarget, setWorkspaceReadyTarget] = useState<string | null>(null);
@@ -7522,15 +7523,12 @@ function NewChatLandingContent({
                 attachmentError !== null
               }
               keyboard={{ submitWithModEnter, preventsKeyboardSubmit }}
-              className={cn(isDragActive && "ring-2 ring-ring ring-inset")}
+              className={cn(isDragActive && "ring-2 ring-ring ring-inset", highlight.cardClassName)}
               data-testid="new-chat-landing-composer"
               input={{
                 ref: textareaRef,
                 value: message,
-                className: mentionTokensShown ? MIRRORED_TEXTAREA_CLASS : undefined,
-                onScroll: (e) => {
-                  if (mirrorRef.current) mirrorRef.current.scrollTop = e.currentTarget.scrollTop;
-                },
+                ...highlight.input,
                 onSelect: (e) => slashCompletion.onSelectionChange(e.currentTarget),
                 onChange: (e) => {
                   slashCompletion.onSelectionChange(e.target);
@@ -7588,11 +7586,7 @@ function NewChatLandingContent({
                 "data-testid": "new-chat-landing-input",
               }}
               slots={{
-                inputBackdrop: mentionTokensShown && (
-                  <ComposerMirror ref={mirrorRef}>
-                    {renderMentionTokens(message, mentionTokens)}
-                  </ComposerMirror>
-                ),
+                inputBackdrop: highlight.backdrop,
                 beforeInput: (
                   <>
                     {/* Skill suggestions — floats above the composer box. */}
@@ -7629,6 +7623,7 @@ function NewChatLandingContent({
                 ),
                 inputHint: (
                   <>
+                    {highlight.hint}
                     {/* Gated on an empty draft so it reads as the placeholder.
                   pointer-events-none lets clicks fall through to focus the
                   textarea; the pills themselves opt back in. */}

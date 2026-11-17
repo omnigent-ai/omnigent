@@ -5695,6 +5695,10 @@ describe("Composer slash-command highlight overlay", () => {
     "/cross-review have Claude Code implement GH issue #<number>, then have Codex review";
 
   it("tints only the token for a command with args (args stay default)", () => {
+    setComposerState({
+      conversationId: "conv_test",
+      skills: [{ name: "cross-review", description: "Cross-review a change." }],
+    });
     render(<Composer {...composerProps()} />);
     fireEvent.change(textarea(), { target: { value: COMMAND_PROMPT } });
     expect(textarea().value).toBe(COMMAND_PROMPT);
@@ -5731,6 +5735,95 @@ describe("Composer slash-command highlight overlay", () => {
     render(<Composer {...composerProps()} />);
     fireEvent.change(textarea(), { target: { value: "just a normal message" } });
     expect(screen.queryByTestId("composer-highlight-overlay")).toBeNull();
+  });
+
+  it("leaves an unknown command-shaped token untinted", () => {
+    render(<Composer {...composerProps()} />);
+    fireEvent.change(textarea(), { target: { value: COMMAND_PROMPT } });
+    expect(screen.queryByTestId("composer-highlight-overlay")).toBeNull();
+    expect(textarea()).not.toHaveAttribute("data-slash-command");
+    expect(textarea()).not.toHaveClass("text-transparent");
+  });
+});
+
+describe("Composer native shell mode", () => {
+  beforeEach(() => {
+    clearSessionDrafts();
+    const { sessionHarness } = useChatStore.getState();
+    onTestFinished(() => useChatStore.setState({ sessionHarness }));
+    setComposerState({ conversationId: "conv_shell", skills: [], blocks: [] });
+  });
+  afterEach(() => cleanup());
+
+  it.each([
+    { harness: "claude-native", permissionLevel: 2 },
+    { harness: "codex-native", permissionLevel: null },
+  ])("marks a `!` draft as a shell command on $harness and sends it unchanged", (row) => {
+    useChatStore.setState({ sessionHarness: row.harness });
+    const props = composerProps({ isNativeWrapper: true, permissionLevel: row.permissionLevel });
+    render(<Composer {...props} />);
+    fireEvent.change(textarea(), { target: { value: "!git log -1 --oneline" } });
+
+    const overlay = screen.getByTestId("composer-highlight-overlay");
+    expect(overlay).toHaveTextContent("!git log -1 --oneline");
+    expect(within(overlay).getByText("!")).toHaveClass("text-brand-accent");
+    expect(textarea()).toHaveAttribute("data-shell-command", "true");
+    expect(textarea()).toHaveAccessibleDescription("Shell command");
+    expect(screen.getByTestId("composer-shell-mode-indicator")).toBeVisible();
+
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(props.onSend).toHaveBeenCalledExactlyOnceWith("!git log -1 --oneline", undefined);
+  });
+
+  it.each([
+    { label: "an unsupported harness", harness: "pi", permissionLevel: null },
+    { label: "a codex-native non-owner", harness: "codex-native", permissionLevel: 2 },
+  ])("shows no shell mode for $label", ({ harness, permissionLevel }) => {
+    useChatStore.setState({ sessionHarness: harness });
+    render(<Composer {...composerProps({ isNativeWrapper: true, permissionLevel })} />);
+    fireEvent.change(textarea(), { target: { value: "!git status" } });
+    expect(screen.queryByTestId("composer-shell-mode-indicator")).toBeNull();
+    expect(screen.queryByTestId("composer-highlight-overlay")).toBeNull();
+  });
+
+  it("paints the `!` and an inline mention pill in the one mirror", () => {
+    useChatStore.setState({ sessionHarness: "codex-native" });
+    render(<Composer {...composerProps({ isNativeWrapper: true, permissionLevel: null })} />);
+    fireEvent.change(textarea(), { target: { value: "!ls" } });
+    expect(screen.getByTestId("composer-shell-mode-indicator")).toBeVisible();
+
+    // The attachment lands as an inline token after the text, so `!` still leads.
+    act(() =>
+      useChatStore.setState({
+        pendingComposerAttachments: [{ path: "src/example.ts", isDir: false }],
+      }),
+    );
+    expect(screen.getByTestId("composer-shell-mode-indicator")).toBeVisible();
+    expect(screen.getAllByTestId("composer-highlight-overlay")).toHaveLength(1);
+    const overlay = screen.getByTestId("composer-highlight-overlay");
+    expect(overlay.textContent).toBe(textarea().value);
+    expect(within(overlay).getByText("!")).toHaveClass("text-brand-accent");
+    expect(within(overlay).getByTestId("composer-mention-token")).toBeInTheDocument();
+  });
+
+  it("paints a known command and an inline mention pill together", () => {
+    setComposerState({
+      conversationId: "conv_shell",
+      skills: [{ name: "team", description: "Run a team" }],
+      blocks: [],
+    });
+    render(<Composer {...composerProps()} />);
+    fireEvent.change(textarea(), { target: { value: "/team fix" } });
+    act(() =>
+      useChatStore.setState({
+        pendingComposerAttachments: [{ path: "src/example.ts", isDir: false }],
+      }),
+    );
+    expect(screen.getAllByTestId("composer-highlight-overlay")).toHaveLength(1);
+    const overlay = screen.getByTestId("composer-highlight-overlay");
+    expect(within(overlay).getByText("/team")).toHaveClass("text-brand-accent");
+    expect(within(overlay).getByTestId("composer-mention-token")).toBeInTheDocument();
+    expect(textarea()).toHaveAttribute("data-slash-command", "true");
   });
 });
 

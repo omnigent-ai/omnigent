@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { MessageContentBlock } from "@/lib/blocks";
@@ -10,6 +10,9 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { EditSentMessageContext, type SentMessage } from "@/components/chat/editSentMessage";
 import type * as IdentityModule from "@/lib/identity";
 import { BubbleView, buildPendingBubbles } from "./ChatPage";
+import type { ReactNode } from "react";
+import { ConversationScopeContext } from "@/components/chat/conversationScope";
+import { usePublishComposerCommands } from "@/components/composer/composerHighlight";
 
 // Unmocked, the viewer id is null in jsdom; Edit tests pin who is signed in.
 const viewer = vi.hoisted(() => ({ id: null as string | null }));
@@ -839,5 +842,110 @@ describe("UserBubble still-sending note", () => {
       </FileViewerContext.Provider>,
     );
     expect(screen.queryByTestId("message-still-sending")).toBeNull();
+  });
+});
+
+const SCOPED_FILE_VIEWER = { ...FILE_VIEWER_NOOP, conversationId: "conv_cmd" };
+
+describe("UserBubble command tint", () => {
+  function PublishCommands({ nativeShell = null }: { nativeShell?: string | null }) {
+    usePublishComposerCommands("conv_cmd", PUBLISHED_COMMANDS, nativeShell);
+    return null;
+  }
+  const PUBLISHED_COMMANDS = ["/team"];
+  let queryClient: QueryClient;
+
+  beforeEach(() => {
+    queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    // Bubbles may ask for session info; keep it pending instead of hitting the network.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => new Promise<Response>(() => {})),
+    );
+  });
+  afterEach(() => {
+    queryClient.clear();
+    vi.unstubAllGlobals();
+  });
+
+  function renderScoped(bubble: Bubble, publish: ReactNode) {
+    return render(
+      <QueryClientProvider client={queryClient}>
+        <ConversationScopeContext.Provider value="conv_cmd">
+          {publish}
+          <FileViewerContext.Provider value={SCOPED_FILE_VIEWER}>
+            <BubbleView bubble={bubble} />
+          </FileViewerContext.Provider>
+        </ConversationScopeContext.Provider>
+      </QueryClientProvider>,
+    );
+  }
+
+  it("tints a known command the composer published, keeping the args", () => {
+    renderScoped(userBubble("/team fix **the** bug"), <PublishCommands />);
+    expect(screen.getByText("/team")).toHaveClass("text-brand-accent");
+    expect(screen.getByTestId("message-bubble")).toHaveTextContent("/team fix the bug");
+  });
+
+  it("floats the token beside paragraph args but not beside a block", () => {
+    const view = renderScoped(userBubble("/team fix it"), <PublishCommands />);
+    expect(screen.getByText("/team")).toHaveClass("float-left");
+    view.unmount();
+
+    renderScoped(userBubble("/team - first\n- second"), <PublishCommands />);
+    expect(screen.getByText("/team")).not.toHaveClass("float-left");
+    expect(within(screen.getByTestId("message-bubble")).getAllByRole("listitem")).toHaveLength(2);
+  });
+
+  it.each(["---", "$$\nx^2\n$$", "<details>more</details>"])(
+    "does not float the token beside a %j block",
+    (block) => {
+      renderScoped(userBubble(`/team ${block}`), <PublishCommands />);
+      expect(screen.getByText("/team")).not.toHaveClass("float-left");
+    },
+  );
+
+  it("keeps an indented code block on the line after the token", async () => {
+    renderScoped(userBubble("/team\n    const x = 1"), <PublishCommands />);
+    expect(screen.getByText("/team")).not.toHaveClass("float-left");
+    const code = await screen.findByText(/const x = 1/, { selector: "pre, pre *" });
+    expect(code.closest("pre")).not.toBeNull();
+  });
+
+  it.each([
+    ["an unknown command", "/typo fix it", "/typo", <PublishCommands key="p" />],
+    ["no published commands", "/team fix it", "/team", null],
+  ])("leaves %s untinted", (_label, text, token, publish) => {
+    renderScoped(userBubble(text), publish);
+    expect(screen.queryByText(token)).toBeNull();
+    expect(screen.getByTestId("message-bubble")).toHaveTextContent(text);
+  });
+
+  it("renders a pending `!cmd` literally only when the session runs native shell input", () => {
+    const bubble = userBubble("!echo **hi**", { pending: true });
+    const view = renderScoped(bubble, <PublishCommands nativeShell="codex-native" />);
+    expect(screen.getByText("!echo **hi**").tagName).toBe("CODE");
+    view.unmount();
+
+    renderScoped(bubble, <PublishCommands />);
+    expect(screen.queryByText("!echo **hi**")).toBeNull();
+  });
+
+  it.each([
+    ["a committed bubble", userBubble("!echo **hi**")],
+    [
+      "a multi-block bubble",
+      userBubble("", {
+        pending: true,
+        content: [
+          { type: "input_text", text: "!echo " },
+          { type: "input_text", text: "**hi**" },
+        ],
+      }),
+    ],
+  ])("renders `!cmd` as markdown for %s", (_label, bubble) => {
+    renderScoped(bubble, <PublishCommands nativeShell="codex-native" />);
+    expect(screen.queryByText("!echo **hi**")).toBeNull();
+    expect(screen.getByTestId("message-bubble")).toHaveTextContent("!echo hi");
   });
 });

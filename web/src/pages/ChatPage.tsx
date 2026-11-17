@@ -46,11 +46,9 @@ import {
   ComposerSendButton,
 } from "@/components/composer/ChatComposer";
 import {
-  ComposerMirror,
-  MIRRORED_TEXTAREA_CLASS,
-  renderMentionTokens,
-  useComposerMirrorAlignment,
-} from "@/components/composer/MentionTokenOverlay";
+  useComposerHighlight,
+  usePublishComposerCommands,
+} from "@/components/composer/composerHighlight";
 import { ComposerAddMenu } from "@/components/composer/ComposerAddMenu";
 import { BackgroundTaskIndicator } from "@/components/composer/BackgroundTaskIndicator";
 import { SubagentTaskIndicator } from "@/components/composer/SubagentTaskIndicator";
@@ -124,7 +122,7 @@ import {
 } from "@/lib/sideChat";
 import { shouldQueueSend } from "@/lib/messageQueue";
 import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
-import { skillInvocationPrefix } from "@/lib/harnessSetup";
+import { skillInvocationPrefix, supportsNativeShellInput } from "@/lib/harnessSetup";
 import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import {
   composerInlineMentions,
@@ -365,27 +363,6 @@ const HOST_MCP_SIGN_IN_POLL_MS = 5_000;
 
 /** Only an http(s) page is ever opened from a host's sign-in report. */
 const HOST_SIGN_IN_URL_RE = /^https?:\/\//i;
-
-// Leading whitespace + the command token, so the composer overlay can tint
-// just the `/command` or `$skill` and leave args in the default color.
-const SLASH_COMMAND_SPLIT_RE = /^(\s*)([/$][A-Za-z0-9][\w:-]*)(?=\s|$)/;
-
-/**
- * Split a command or skill draft for the composer highlight overlay. The token
- * is a known `commands` entry's full name (it may contain spaces or punctuation),
- * else the first `/command`-shaped word. Null for prose and paths like `/etc/hosts`.
- */
-export function splitSlashCommand(
-  value: string,
-  commands: Iterable<string> = [],
-): { before: string; token: string; after: string } | null {
-  const token =
-    matchSlashCommandInvocation(value, commands)?.command ??
-    SLASH_COMMAND_SPLIT_RE.exec(value)?.[2];
-  if (token === undefined) return null;
-  const before = /^\s*/.exec(value)?.[0] ?? "";
-  return { before, token, after: value.slice(before.length + token.length) };
-}
 
 // Iterate code points (not UTF-16 units) so emoji aren't cut mid-surrogate;
 // prefer the last word boundary within 10 chars of the limit so we don't
@@ -2516,9 +2493,6 @@ function ComposerImpl(
   // Declared after textareaRef so dictation can place the caret after the
   // text it inserts (and insert at the caret rather than the draft's end).
   const dictation = useDictationInsert(value, setValue, textareaRef);
-  // Highlight overlay mirroring the textarea; scroll-synced so the tinted
-  // `/skill` token stays aligned once the draft grows past the visible rows.
-  const backdropRef = useRef<HTMLDivElement>(null);
   const isStreaming = status === "streaming";
 
   // Read-only when either the user lacks a write grant OR the session
@@ -3124,15 +3098,13 @@ function ComposerImpl(
     [commandSkills, showEffort, showModel, showBtw, showSide, skillPrefix],
   );
 
-  // Suggest names until a space starts the arguments; exclude file paths.
-  const trimmedValue = value.trimStart();
-  const hasCommandPrefix = trimmedValue.startsWith("/") || trimmedValue.startsWith(skillPrefix);
-  // Tint only the command or skill token, leaving arguments in the default color.
-  const composerIsCommand =
-    draft.quotes.length === 0 &&
-    files.length === 0 &&
-    hasCommandPrefix &&
-    splitSlashCommand(value, slashCommandNames) !== null;
+  // The server runs codex `!` input only for the owner.
+  const nativeShell =
+    supportsNativeShellInput(sessionHarness) &&
+    (sessionHarness !== "codex-native" || isOwnerLevel(permissionLevel))
+      ? sessionHarness
+      : null;
+  usePublishComposerCommands(conversationId, slashCommandNames, nativeShell);
 
   const toggleCodexPlanMode = async () => {
     if (planModeBusy) return;
@@ -3251,11 +3223,16 @@ function ComposerImpl(
     [draft.text, ...draft.quotes.map((quote) => quote.before)],
   );
   const hasMentions = liveMentions.length > 0;
-  // One mirror paints both the slash-command tint and inline mention pills.
-  const mentionTokensShown =
-    draft.quotes.length === 0 && findMentionTokens(draft.text, mentionTokens).length > 0;
-  const mirrorActive = composerIsCommand || mentionTokensShown;
-  useComposerMirrorAlignment(backdropRef, tailTextareaRef, mirrorActive);
+  // One mirror paints the command or `!` tint and inline mention pills. Quotes
+  // and files are sent ahead of the text, so it no longer starts with the token.
+  const highlight = useComposerHighlight({
+    value,
+    commandNames: slashCommandNames,
+    enabled: draft.quotes.length === 0 && files.length === 0,
+    nativeShell,
+    mentionTokens: draft.quotes.length === 0 ? mentionTokens : [],
+    textareaRef: tailTextareaRef,
+  });
   const hasDraft =
     fullText.trim().length > 0 || files.length > 0 || hasMentions || localReviewComments.length > 0;
   const showInterruptButton =
@@ -4518,6 +4495,7 @@ function ComposerImpl(
           "mx-auto",
           COMPOSER_COLUMN_WIDTH,
           isDragActive && "ring-2 ring-ring ring-inset",
+          highlight.cardClassName,
         )}
         data-suggestions-open={slashCompletion.open || mentionOpen ? "true" : undefined}
         input={{
@@ -4536,11 +4514,9 @@ function ComposerImpl(
             dismissMention();
           },
           onPaste,
-          onScroll: (e) => {
-            // Keep the overlay's scroll position locked to the textarea's.
-            if (backdropRef.current) backdropRef.current.scrollTop = e.currentTarget.scrollTop;
-          },
+          onScroll: highlight.input.onScroll,
           "aria-label": "Message the agent",
+          "aria-describedby": highlight.input["aria-describedby"],
           "aria-keyshortcuts": nextFromSelected === null ? undefined : "Shift+Tab",
           placeholder: composerLockedByBtw
             ? "Side chat open — press Esc to close"
@@ -4559,13 +4535,12 @@ function ComposerImpl(
                         : readyPlaceholder,
           rows: 1,
           disabled: inputDisabled,
-          "data-slash-command": composerIsCommand ? "true" : undefined,
+          "data-slash-command": highlight.input["data-slash-command"],
+          "data-shell-command": highlight.input["data-shell-command"],
           "data-has-draft": hasDraft ? "true" : undefined,
           className: cn(
             draft.quotes.length > 0 && "max-h-none overflow-y-hidden",
-            // Hand glyph painting to the overlay while a command is drafted;
-            // the caret stays visible via caret-foreground.
-            mirrorActive && MIRRORED_TEXTAREA_CLASS,
+            highlight.input.className,
           ),
         }}
         slots={{
@@ -4706,23 +4681,8 @@ function ComposerImpl(
             matches the textarea exactly. Only mounted while the draft is a command. */}
             </>
           ),
-          inputBackdrop: mirrorActive && (
-            <ComposerMirror ref={backdropRef}>
-              {(() => {
-                const split = composerIsCommand
-                  ? splitSlashCommand(value, slashCommandNames)
-                  : null;
-                if (!split) return renderMentionTokens(value, mentionTokens);
-                return (
-                  <>
-                    {split.before}
-                    <span className="text-brand-accent">{split.token}</span>
-                    {renderMentionTokens(split.after, mentionTokens)}
-                  </>
-                );
-              })()}
-            </ComposerMirror>
-          ),
+          inputBackdrop: highlight.backdrop,
+          inputHint: highlight.hint,
           attachments: (
             <>
               {/* Pending attachments — image thumbnails (click to view) + file rows. */}
