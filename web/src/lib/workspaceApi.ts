@@ -46,14 +46,21 @@ const TRANSIENT_CODES = new Set([Code.Unavailable]);
 const grants = new Map<string, GrantEntry>();
 const failedUntil = new Map<string, number>();
 
-function routesFor(sessionId: string): Route[] {
+/** A failed direct route is retried as soon as a read brings an SSH alias it didn't have. */
+function routeKey(route: Route, sessionId: string, sshTarget?: string | null): string {
+  return route === "direct" ? `direct:${sessionId}:${sshTarget ?? ""}` : `${route}:${sessionId}`;
+}
+
+function routesFor(sessionId: string, sshTarget?: string | null): Route[] {
   const info = getCachedServerInfo() ?? "loading";
   const routes: Route[] = [];
   if (workspaceSocketBridge() && isFeatureEnabled(info, "workspace_direct_access")) {
     routes.push("direct");
   }
   if (isFeatureEnabled(info, "workspace_api_server_access")) routes.push("server");
-  return routes.filter((route) => (failedUntil.get(`${route}:${sessionId}`) ?? 0) <= Date.now());
+  return routes.filter(
+    (route) => (failedUntil.get(routeKey(route, sessionId, sshTarget)) ?? 0) <= Date.now(),
+  );
 }
 
 function sessionPath(sessionId: string): string {
@@ -117,6 +124,7 @@ function directClient(
     headers: Record<string, string>;
     body: Uint8Array;
   }>,
+  sshTarget?: string | null,
 ): WorkspaceClient {
   return createClient(
     WorkspaceService,
@@ -131,6 +139,7 @@ function directClient(
         const response = await abortable(
           send({
             hostId: grant.hostId,
+            ...(sshTarget ? { sshTarget } : {}),
             socketPath: grant.socketPath,
             path: new URL(String(input)).pathname,
             headers,
@@ -164,13 +173,15 @@ async function readFileOn(
   sessionId: string,
   path: string,
   signal?: AbortSignal,
+  sshTarget?: string | null,
 ): Promise<FileContentResponse> {
   if (route === "server") return readFile(serverClient(sessionId), path, signal);
   const send = workspaceSocketBridge();
   if (!send) throw new Error("The desktop shell can't reach local sockets");
   const pending = directGrant(sessionId);
   try {
-    return await readFile(directClient(await abortable(pending, signal), send), path, signal);
+    const grant = await abortable(pending, signal);
+    return await readFile(directClient(grant, send, sshTarget), path, signal);
   } catch (error) {
     // Drop only the grant this read used; a parallel read may have renewed it.
     if (!signal?.aborted && grants.get(sessionId)?.pending === pending) grants.delete(sessionId);
@@ -226,6 +237,8 @@ async function readFile(
  *
  * :param sessionId: The session whose workspace to read.
  * :param path: Workspace-relative path, e.g. ``"src/main.py"``.
+ * :param sshTarget: An SSH alias the desktop may try for a host on another
+ *     machine it has no destination for, e.g. from the host's provider.
  * :returns: The REST route's payload, or null when the caller should read
  *     through REST: no route is enabled or working, or the API answered with
  *     an error, which REST reports in the shape callers expect.
@@ -234,12 +247,13 @@ export async function readFileViaWorkspaceApi(
   sessionId: string,
   path: string,
   signal?: AbortSignal,
+  sshTarget?: string | null,
 ): Promise<FileContentResponse | null> {
   // Each route's attempt must finish before the next is tried.
   /* oxlint-disable no-await-in-loop */
-  for (const route of routesFor(sessionId)) {
+  for (const route of routesFor(sessionId, sshTarget)) {
     try {
-      return await readFileOn(route, sessionId, path, signal);
+      return await readFileOn(route, sessionId, path, signal, sshTarget);
     } catch (error) {
       signal?.throwIfAborted();
       const code = error instanceof ConnectError ? error.code : null;
@@ -247,7 +261,7 @@ export async function readFileViaWorkspaceApi(
       if (code !== null && TRANSIENT_CODES.has(code)) continue;
       // A restarted host refuses the old token; the next read gets a new one.
       if (route === "direct" && code === Code.Unauthenticated) continue;
-      failedUntil.set(`${route}:${sessionId}`, Date.now() + ROUTE_RETRY_MS);
+      failedUntil.set(routeKey(route, sessionId, sshTarget), Date.now() + ROUTE_RETRY_MS);
     }
   }
   /* oxlint-enable no-await-in-loop */

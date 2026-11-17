@@ -136,6 +136,7 @@ const omnigentCli = require("./omnigent_cli");
 const { workspaceSocketRequest } = require("./workspaceSocket");
 const { createWorkspaceSshForwards } = require("./workspaceSshForwards");
 const { createSshHostStore } = require("./sshHosts");
+const { createSshTargetChecks } = require("./sshTargets");
 
 const serverManager = require("./server_manager");
 const { diagnostics } = require("./diagnostics");
@@ -361,6 +362,27 @@ const arcaIdentities = createArcaIdentityStore();
 // Hosts this desktop connected over SSH, and the connections that reach their workspace sockets.
 const sshHosts = createSshHostStore(() => path.join(app.getPath("userData"), "ssh-hosts.json"));
 const workspaceSshForwards = createWorkspaceSshForwards();
+const sshTargetChecks = createSshTargetChecks({ record: sshHosts.record });
+
+/**
+ * Ask, in a dialog the page can't draw over, before SSH runs with a destination
+ * the page suggested. Null when there is no window to ask in.
+ */
+async function approveSshTarget(win, serverUrl, alias) {
+  if (!win || win.isDestroyed()) return null;
+  const { response } = await dialog.showMessageBox(win, {
+    type: "question",
+    buttons: ["Not now", "Allow"],
+    defaultId: 0,
+    cancelId: 0,
+    message: `Read this session's files over SSH from "${alias}"?`,
+    detail:
+      `${new URL(serverUrl).host} says this session's host runs on the SSH destination "${alias}". ` +
+      "Omnigent would connect with your SSH config and keys, check that the host is there, and read files from it directly instead of through the server.\n\n" +
+      `Allow only if you recognize "${alias}".`,
+  });
+  return response === 1;
+}
 
 function startArcaHostConnect(serverUrl, deps) {
   const finish = arcaIdentities.begin(serverUrl);
@@ -5398,6 +5420,14 @@ function registerIpc() {
     const serverUrl = senderServerUrl(event);
     return workspaceSocketRequest(request, {
       sshDestination: (hostId) => (serverUrl ? sshHosts.destination(serverUrl, hostId) : null),
+      verifySshTarget: serverUrl
+        ? (hostId, alias, proves) =>
+            sshTargetChecks.verify(serverUrl, hostId, alias, {
+              approve: () =>
+                approveSshTarget(BrowserWindow.fromWebContents(event.sender), serverUrl, alias),
+              proves,
+            })
+        : undefined,
       forwards: workspaceSshForwards,
     });
   });

@@ -71,14 +71,20 @@ function joinPath(base: string, path: string): string {
   return `${base.replace(/[\\/]+$/, "")}/${path}`;
 }
 
+/** The viewed session's host: the viewer's own, else the one the session inherits. */
+export function useSessionHostId(conversationId: string | null | undefined): string | null {
+  const ctx = useContext(FileViewerContext);
+  const inheritedHostId = useSyncExternalStore(subscribeSessionHostChanges, () =>
+    conversationId ? getSessionHost(conversationId) : null,
+  );
+  return ctx?.sessionHostId || inheritedHostId;
+}
+
 /** Resolve a file against the session's host and currently browsed folder. */
 export function useHostFileTarget(path: string | null): RevealTarget | null {
   const ctx = useContext(FileViewerContext);
   const base = useContext(RevealBaseContext);
-  const inheritedHostId = useSyncExternalStore(subscribeSessionHostChanges, () =>
-    ctx?.conversationId ? getSessionHost(ctx.conversationId) : null,
-  );
-  const hostId = ctx?.sessionHostId || inheritedHostId;
+  const hostId = useSessionHostId(ctx?.conversationId);
   const root = ctx?.workspaceRoot;
   if (path === null || !root || !hostId) return null;
   return { hostId, path: joinPath(joinPath(root, base), path) };
