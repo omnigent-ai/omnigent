@@ -4,6 +4,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 
 import type { SettingsEntry } from "@/pages/settings/search/catalog/types";
+import { provenOverlayOrigin } from "@/test/settingsPageSteps";
 
 import {
   auditOpenedPortals,
@@ -1449,5 +1450,137 @@ describe("a modal's focus guards", () => {
     expect(
       audit(`${OWNED_ROW}<span data-radix-focus-guard="" tabindex="0"></span>`, [SYNC]),
     ).toEqual(['span "": has no owner in the Settings catalog']);
+  });
+});
+
+describe("a captured overlay", () => {
+  // A fix dialog its own Set up opens, which goes away once the fix installs; and a member's twin.
+  const fix = (id: string, captured: boolean): SettingsEntry => ({
+    id,
+    section: "general",
+    label: "Fix",
+    description: "A harness fix.",
+    parts: { setUp: "Set up", retry: "Try again" },
+    presence: { setUp: { states: ["can be set up"] }, retry: { overlay: "setUp" } },
+    overlays: { setUp: captured ? { captured: true } : {} },
+  });
+  const FIX = fix("fixture.fix-alpha", true);
+  const TWIN = fix("fixture.fix-beta", true);
+  const PLAIN = fix("fixture.fix-plain", false);
+  const entries = new Map([FIX, TWIN, PLAIN].map((entry) => [entry.id, entry]));
+  const row = (id: string, opener: boolean) => `
+    <div data-settings-item="${id}">
+      <span>Fix</span>
+      ${opener ? `<button aria-label="Set up" data-settings-control="${id}:setUp">+</button>` : ""}
+    </div>`;
+  const dialog = (
+    owner: string,
+    body = `<button aria-label="Try again" data-settings-control="${owner.split(":")[0]}:retry">Try again</button>`,
+  ) => `<div role="dialog" data-settings-overlay-owner="${owner}">${body}</div>`;
+  const auditFix = (
+    entry: SettingsEntry,
+    { opener = false, portal = dialog(`${entry.id}:setUp`), origins = [] as string[] } = {},
+  ) => {
+    document.body.innerHTML = `<main>${row(entry.id, opener)}</main><aside>${portal}</aside>`;
+    return auditSettingsDom({
+      roots: [document.querySelector("main")!, document.querySelector("aside")!],
+      entries,
+      expected: [entry],
+      origins,
+      drivenStates: opener ? new Map([[entry.id, new Set(["can be set up"])]]) : new Map(),
+    });
+  };
+
+  it("stands in for its opener once that's gone, only with an origin proved for it", () => {
+    expect(auditFix(FIX, { origins: ["fixture.fix-alpha:setUp"] })).toEqual([]);
+    const unproved =
+      'overlay "fixture.fix-alpha:setUp": no origin was proved for this captured overlay';
+    // Being captured proves nothing; nor does another member's origin.
+    expect(auditFix(FIX)).toEqual([unproved]);
+    expect(auditFix(FIX, { origins: ["fixture.fix-beta:setUp"] })).toEqual([unproved]);
+    // A live opener is no proof either: the overlay answers to the origin proved for it.
+    expect(auditFix(FIX, { opener: true })).toEqual([unproved]);
+    expect(auditFix(FIX, { opener: true, origins: ["fixture.fix-beta:setUp"] })).toEqual([
+      unproved,
+    ]);
+    expect(auditFix(FIX, { opener: true, origins: ["fixture.fix-alpha:setUp"] })).toEqual([]);
+    // An ordinary overlay keeps needing its opener, whatever origin is offered.
+    expect(auditFix(PLAIN, { origins: ["fixture.fix-plain:setUp"] })).toEqual([
+      'overlay "fixture.fix-plain:setUp": fixture.fix-plain\'s row has no control that opens it',
+    ]);
+  });
+
+  it("still holds its parts, its place and its owner to the catalog", () => {
+    const origins = ["fixture.fix-alpha:setUp"];
+    expect(auditFix(FIX, { origins, portal: dialog("fixture.fix-alpha:setUp", "") })).toEqual([
+      'fixture.fix-alpha: part "retry" doesn\'t render',
+    ]);
+    expect(
+      auditFix(FIX, {
+        origins,
+        portal: `<div data-settings-overlay-owner="fixture.fix-beta:setUp">${dialog("fixture.fix-alpha:setUp")}</div>`,
+      }),
+    ).toContain(
+      'overlay "fixture.fix-alpha:setUp": a captured overlay opens on the page, not inside another',
+    );
+    // Content without an owner is no overlay of its, and its controls are unowned.
+    expect(
+      auditFix(FIX, {
+        origins,
+        portal: '<div role="dialog"><button aria-label="Try again">Try again</button></div>',
+      }),
+    ).toEqual(['button "Try again": has no owner in the Settings catalog']);
+  });
+
+  it("is proved only from its opener, owned in its own row, before it opens", () => {
+    document.body.innerHTML = `<main>${row("fixture.fix-alpha", true)}</main>`;
+    expect(provenOverlayOrigin("fixture.fix-alpha:setUp")).toBe("fixture.fix-alpha:setUp");
+    document.body.innerHTML = `<main>${row("fixture.fix-alpha", false)}</main>`;
+    expect(() => provenOverlayOrigin("fixture.fix-alpha:setUp")).toThrow(/isn't rendered/);
+    // An opener's attributes copied into the dialog aren't the opener.
+    document.body.innerHTML = `<main>${row("fixture.fix-alpha", false)}</main><aside><div data-settings-overlay-owner="fixture.fix-alpha:setUp"><button data-settings-control="fixture.fix-alpha:setUp">Set up</button></div></aside>`;
+    expect(() => provenOverlayOrigin("fixture.fix-alpha:setUp")).toThrow(/isn't rendered/);
+    // Nor is its marker inside another row nested in its own, or on something that's no control.
+    document.body.innerHTML = `<main><div data-settings-item="fixture.fix-alpha"><span>Fix</span><div data-settings-item="fixture.fix-beta"><span>Fix</span><button aria-label="Set up" data-settings-control="fixture.fix-alpha:setUp">+</button></div></div></main>`;
+    expect(() => provenOverlayOrigin("fixture.fix-alpha:setUp")).toThrow(/isn't rendered/);
+    document.body.innerHTML = `<main><div data-settings-item="fixture.fix-alpha"><span>Fix</span><span aria-label="Set up" data-settings-control="fixture.fix-alpha:setUp">+</span></div></main>`;
+    expect(() => provenOverlayOrigin("fixture.fix-alpha:setUp")).toThrow(/isn't rendered/);
+    // Nor is a control an overlay holds, even an overlay rendered inside its own row.
+    document.body.innerHTML = `<main><div data-settings-item="fixture.fix-alpha"><span>Fix</span><div data-settings-overlay-owner="fixture.fix-alpha:setUp"><button aria-label="Set up" data-settings-control="fixture.fix-alpha:setUp">+</button></div></div></main>`;
+    expect(() => provenOverlayOrigin("fixture.fix-alpha:setUp")).toThrow(/isn't rendered/);
+  });
+
+  it("is audited against the origin proved before it opened, even after its opener goes", () => {
+    document.body.innerHTML = `<main>${row("fixture.fix-alpha", true)}${row("fixture.fix-beta", true)}</main>`;
+    const origin = provenOverlayOrigin("fixture.fix-alpha:setUp");
+    // Another member's dialog, though its own opener is live, isn't the one proved.
+    document.body.insertAdjacentHTML(
+      "beforeend",
+      `<aside>${dialog("fixture.fix-beta:setUp")}</aside>`,
+    );
+    const roots = [document.querySelector("main")!, document.querySelector("aside")!];
+    const driven = new Map([
+      ["fixture.fix-alpha", new Set(["can be set up"])],
+      ["fixture.fix-beta", new Set(["can be set up"])],
+    ]);
+    expect(
+      auditSettingsDom({
+        roots,
+        entries,
+        expected: [FIX, TWIN],
+        origins: [origin],
+        drivenStates: driven,
+      }),
+    ).toEqual(['overlay "fixture.fix-beta:setUp": no origin was proved for this captured overlay']);
+    // Its own dialog, once its opener has gone, still passes on that origin.
+    document.body.innerHTML = `<main>${row("fixture.fix-alpha", false)}</main><aside>${dialog("fixture.fix-alpha:setUp")}</aside>`;
+    expect(
+      auditSettingsDom({
+        roots: [document.querySelector("main")!, document.querySelector("aside")!],
+        entries,
+        expected: [FIX],
+        origins: [origin],
+      }),
+    ).toEqual([]);
   });
 });
