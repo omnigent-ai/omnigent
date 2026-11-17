@@ -135,6 +135,8 @@ import {
 import { useResizableInlinePanel } from "@/hooks/useResizableInlinePanel";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { ChatHeader } from "./ChatHeader";
+import { ProjectHomeTitle, ProjectNewSessionButton } from "@/projectHome/ProjectHomeHeader";
+import { projectNameFromHomePath } from "@/projectHome/projectHomeNavigation";
 import { MobileHeaderControlsProvider } from "./MobileHeaderControlsSlot";
 import { CREATED_BY_SESSION_LABEL_KEY } from "./CreatedBySession";
 import {
@@ -849,6 +851,10 @@ function AppShellImpl() {
     isChildSession && activeSession?.parentSessionId
       ? `/c/${activeSession.parentSessionId}`
       : undefined;
+  const projectHomeName =
+    extensionId === undefined && isFeatureEnabled(serverInfo, "project_kanban")
+      ? projectNameFromHomePath(location.pathname)
+      : null;
   // Positive "this is a top-level session" signal for the top-level-only
   // actions (Share/Clone). Gating those on ``!isChildSession`` flickered:
   // while the snapshot loads ``activeSession`` is null, so ``isChildSession``
@@ -3170,6 +3176,16 @@ function AppShellImpl() {
                     projectName={headerProjectName}
                     projectIcon={headerProjectIcon}
                     titleLinkTo={headerTitleLinkTo}
+                    pageTitle={
+                      projectHomeName !== null ? (
+                        <ProjectHomeTitle projectName={projectHomeName} />
+                      ) : undefined
+                    }
+                    pageActions={
+                      projectHomeName !== null ? (
+                        <ProjectNewSessionButton projectName={projectHomeName} />
+                      ) : undefined
+                    }
                     boundAgent={boundAgent}
                     wrapperLabel={wrapperLabel}
                     canShare={canShare}

@@ -7201,7 +7201,7 @@ function ProjectFolderMenuItems({
   );
 }
 
-interface ProjectFolderMenuActions {
+export interface ProjectFolderMenuActions {
   ordering?: {
     disabled: boolean;
     first: boolean;
@@ -7216,12 +7216,13 @@ interface ProjectFolderMenuActions {
   onCloseAutoFocus: (event: Event) => void;
 }
 
-/** Owns the dialogs and mutations shared by both project-folder menus. */
-function useProjectFolderMenu(
+/** Owns the dialogs and mutations shared by the project-folder menus and the project home. */
+export function useProjectFolderMenu(
   projectName: string,
   projectId: string | null,
   icon?: string | null,
   onRenamed?: (oldName: string, newName: string) => void,
+  onDeleted?: () => void,
 ): { actions: ProjectFolderMenuActions; dialogs: ReactNode } {
   const [menuOpen, setMenuOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
@@ -7547,6 +7548,7 @@ function useProjectFolderMenu(
                       }
                       setDeleteOpen(false);
                       setMenuOpen(false);
+                      onDeleted?.();
                     },
                   },
                 );

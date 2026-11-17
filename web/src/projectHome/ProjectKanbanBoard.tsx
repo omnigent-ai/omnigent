@@ -123,7 +123,14 @@ function columnOf(row: Conversation): StatusBucket {
   return statusBucket(row, isUnseen(row), hasSessionDraft(row.id));
 }
 
-export function ProjectKanbanBoard({ projectName }: { projectName: string }) {
+export function ProjectKanbanBoard({
+  projectName,
+  overlayClearance,
+}: {
+  projectName: string;
+  /** Room below each lane's last card, so it can scroll clear of an overlay such as the composer. */
+  overlayClearance?: string;
+}) {
   const viewerId = useViewerId();
   const { data: projects } = useProjects();
   const projectId = projects?.find((project) => project.name === projectName)?.id ?? null;
@@ -197,12 +204,12 @@ export function ProjectKanbanBoard({ projectName }: { projectName: string }) {
             }
           }}
         >
-          <div className="flex flex-1 flex-col">
+          <div className="flex min-h-0 flex-1 flex-col">
             <div
               role="region"
               aria-label={`${projectName} kanban board`}
               data-testid="project-kanban-board"
-              className="flex flex-1 justify-center-safe gap-3 overflow-x-auto px-4 pt-1 pb-4 md:px-6"
+              className="flex min-h-0 flex-1 justify-center-safe gap-3 overflow-x-auto overflow-y-hidden px-4 pt-1 pb-4"
             >
               {KANBAN_COLUMNS.map((column) => (
                 <KanbanColumn
@@ -211,6 +218,7 @@ export function ProjectKanbanBoard({ projectName }: { projectName: string }) {
                   cards={columns.get(column)!}
                   dropAllowed={dragged !== null && kanbanDropAction(dragged, column) !== null}
                   suppressClick={() => Date.now() - dragEndedAt.current < DRAG_CLICK_SUPPRESS_MS}
+                  overlayClearance={overlayClearance}
                 />
               ))}
             </div>
@@ -241,12 +249,14 @@ function KanbanColumn({
   cards,
   dropAllowed,
   suppressClick,
+  overlayClearance,
 }: {
   column: StatusBucket;
   cards: KanbanCard[];
   /** Whether the card being dragged can drop here. */
   dropAllowed: boolean;
   suppressClick: () => boolean;
+  overlayClearance?: string;
 }) {
   const { setNodeRef, isOver } = useDroppable({ id: `column:${column}`, data: { column } });
   return (
@@ -255,16 +265,20 @@ function KanbanColumn({
       aria-label={column}
       data-testid={`kanban-column-${column}`}
       className={cn(
-        "flex max-w-[calc(440px+1rem)] min-w-52 flex-1 basis-0 flex-col rounded-xl bg-muted/50 p-2 transition-colors",
+        "flex max-w-[calc(440px+1rem)] min-w-52 flex-1 basis-0 flex-col rounded-xl bg-muted/50 px-2 pt-2 transition-colors",
         dropAllowed && "outline-1 outline-muted-foreground/50 outline-dashed",
         dropAllowed && isOver && "bg-primary/10 outline-primary",
       )}
     >
-      <h2 className="flex items-center justify-between px-1.5 pb-2 text-sm font-medium text-muted-foreground">
+      <h2 className="flex shrink-0 items-center justify-between px-1.5 pt-1.5 pb-3 text-sm font-medium text-muted-foreground">
         <Badge className={cn("border-transparent", COLUMN_TAG_CLASS[column])}>{column}</Badge>
         <span className="tabular-nums">{cards.length}</span>
       </h2>
-      <ul className="flex flex-col gap-2">
+      {/* The lane's own scroller; its side padding keeps card rings from clipping. */}
+      <ul
+        className="-mx-2 flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto px-2 pt-0.5 pb-2"
+        style={{ paddingBottom: overlayClearance }}
+      >
         {cards.map((card) => (
           <li key={card.conversation.id}>
             <DraggableKanbanCard card={card} suppressClick={suppressClick} />

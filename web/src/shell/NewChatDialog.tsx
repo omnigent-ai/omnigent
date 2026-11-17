@@ -2312,8 +2312,14 @@ function NewChatWorkspaceControls({
   );
 }
 
-/** `projectName` scopes the composer to a project, as `?project=` does, on the project home. */
-export function NewChatLandingScreen({ projectName }: { projectName?: string } = {}) {
+/**
+ * `projectName` scopes the composer to a project, as `?project=` does, for the
+ * project home's floating composer; `onSessionStarted` hides it after a start.
+ */
+export function NewChatLandingScreen({
+  projectName,
+  onSessionStarted,
+}: { projectName?: string; onSessionStarted?: () => void } = {}) {
   const [params] = useSearchParams();
   const navigate = useNavigate();
   const siblingSourceId = params.get("sibling");
@@ -2357,6 +2363,7 @@ export function NewChatLandingScreen({ projectName }: { projectName?: string } =
       siblingSourceId={siblingSourceId}
       siblingSource={source.data}
       projectHomeName={projectName}
+      onSessionStarted={onSessionStarted}
     />
   );
 }
@@ -2365,10 +2372,12 @@ function NewChatLandingContent({
   siblingSourceId,
   siblingSource,
   projectHomeName,
+  onSessionStarted,
 }: {
   siblingSourceId: string | null;
   siblingSource?: Awaited<ReturnType<typeof getSessionSlim>>;
   projectHomeName?: string;
+  onSessionStarted?: () => void;
 }) {
   const [draftState] = useState(() => {
     const state = landingDrafts.get(siblingSourceId) ?? { draft: null, revision: 0 };
@@ -6129,20 +6138,6 @@ function NewChatLandingContent({
     }
   }
 
-  // The project home stays on screen after a start, so the spent draft gives way
-  // to an empty composer and a fresh worktree branch for the next session.
-  function clearComposerForNextSession() {
-    submittedRef.current = false;
-    submittedDraftRevisionRef.current = null;
-    submittedLinkedPromptRef.current = null;
-    setMessage("");
-    restoreFiles([]);
-    clearTaggedMentionsRef.current();
-    setBranchName("");
-    setAutoSeededBranch("");
-    worktreeSeededForRef.current = null;
-  }
-
   async function handleCreate() {
     // Captured before any await: a newer prompt link can replace the kept record
     // while an earlier submit is still waiting on a pre-create check.
@@ -6874,7 +6869,7 @@ function NewChatLandingContent({
           navigate(sessionLocation(data.id));
         }
       }
-      if (onProjectHome && onScreenRef.current) clearComposerForNextSession();
+      if (onProjectHome && onScreenRef.current) onSessionStarted?.();
     } catch {
       if (siblingSource && createdSessionId) {
         const stillViewing = localConv
@@ -7411,32 +7406,14 @@ function NewChatLandingContent({
     </NewChatWorkspaceControls>
   );
 
-  const projectIcon = selectedProject ? (
-    <ProjectLandingIcon
-      projectId={configProjectId}
-      projectName={selectedProject}
-      config={storedProjectConfig}
-      // Gate editing until the config resolves: the PATCH replaces the
-      // whole blob, so a write before the name→id and config have loaded
-      // would wipe the project's other defaults. A label-only folder
-      // (`configProjectId === null`) has no first-class config to lose.
-      configReady={
-        !projectListLoading && (configProjectId === null || storedProjectConfig !== undefined)
-      }
-      inline={onProjectHome}
-    />
-  ) : null;
-
   return (
     // Desktop keeps the centered composition; mobile docks the composer. The
-    // project home stacks it above the project's board instead.
+    // project home floats just the composer over its board.
     <div
       ref={setLandingSurface}
       className={cn(
         "relative flex",
-        onProjectHome
-          ? "shrink-0"
-          : "min-h-0 flex-1 items-stretch justify-center md:items-center md:pb-24",
+        !onProjectHome && "min-h-0 flex-1 items-stretch justify-center md:items-center md:pb-24",
       )}
       data-testid="new-chat-landing"
     >
@@ -7446,22 +7423,13 @@ function NewChatLandingContent({
           viewport edges on phones. */}
       <div
         className={cn(
-          "flex min-h-0 w-full flex-col px-4 md:select-none",
-          onProjectHome
-            ? "items-start pt-6 pb-4 md:px-6"
-            : "max-w-[800px] items-center pt-8 pb-[max(16px,env(safe-area-inset-bottom))] md:pb-16",
+          "flex min-h-0 w-full flex-col md:select-none",
+          !onProjectHome &&
+            "max-w-[800px] items-center px-4 pt-8 pb-[max(16px,env(safe-area-inset-bottom))] md:pb-16",
         )}
       >
         {onProjectHome ? (
-          <div className="mb-3 flex w-full min-w-0 flex-col items-start gap-1">
-            <div className="flex w-full min-w-0 items-center gap-1.5">
-              {projectIcon}
-              <h1 className="min-w-0 truncate text-[28px] font-normal tracking-[-0.05em] text-foreground md:text-[2.15em]">
-                {selectedProject || projectHomeName}
-              </h1>
-            </div>
-            {isMobileViewport && workspaceControls}
-          </div>
+          isMobileViewport && workspaceControls
         ) : (
           /* On phones the heading yields its height first, so a long draft cannot
             push Send below the keyboard. */
@@ -7472,12 +7440,24 @@ function NewChatLandingContent({
                   <PlusIcon className="size-6 text-brand-accent" />
                 </span>
               </div>
-            ) : projectIcon ? (
+            ) : selectedProject ? (
               // Landing inside a project: swap Otto's eyes for the project's
               // icon — the default pink folder, or a chosen emoji — and name the
               // project. Sized to Otto's h-16 box so the centered composer doesn't
               // shift when toggling between the two landings.
-              projectIcon
+              <ProjectLandingIcon
+                projectId={configProjectId}
+                projectName={selectedProject}
+                config={storedProjectConfig}
+                // Gate editing until the config resolves: the PATCH replaces the
+                // whole blob, so a write before the name→id and config have loaded
+                // would wipe the project's other defaults. A label-only folder
+                // (`configProjectId === null`) has no first-class config to lose.
+                configReady={
+                  !projectListLoading &&
+                  (configProjectId === null || storedProjectConfig !== undefined)
+                }
+              />
             ) : (
               <BrandLogo variant="eyes" className="h-14 w-auto shrink-0" />
             )}
