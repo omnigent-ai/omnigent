@@ -7049,6 +7049,37 @@ describe("chatStore — delivered-but-unacked send", () => {
     expect(errorCards()).toEqual([]);
   });
 
+  it("returns a queued message whose POST stays unanswered to the queue for a retry", async () => {
+    vi.useFakeTimers();
+    onTestFinished(() => {
+      vi.useRealTimers();
+    });
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+      boundAgentId: "agent_xyz",
+    });
+    const post = holdEventPosts();
+    useChatStore.getState().enqueueMessage("check the rollback plan", undefined);
+    useChatStore.getState().maybeFlushQueuedHead();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(useChatStore.getState().queuedMessages).toEqual([]);
+    const [, init] = fetchMock.mock.calls.find(([input]) => String(input).endsWith("/events"))!;
+    const stableId = JSON.parse(String(init?.body)).data.stable_id;
+
+    await vi.advanceTimersByTimeAsync(SEND_UNANSWERED_GIVE_UP_MS);
+
+    expect(useChatStore.getState().queuedMessages).toEqual([
+      expect.objectContaining({ text: "check the rollback plan", stableId, requiresRetry: true }),
+    ]);
+    expect(errorCards()).toEqual([expect.objectContaining({ message: SEND_UNANSWERED_MESSAGE })]);
+    expect(useChatStore.getState().failedSendDraft).toBeNull();
+    useChatStore.getState().maybeFlushQueuedHead();
+    await vi.advanceTimersByTimeAsync(SEND_UNANSWERED_GIVE_UP_MS);
+    expect(post.count()).toBe(1);
+    expect(post.aborted()).toBe(false);
+  });
+
   it.each([
     ["a receipt under its stable id", false, () => commitMirror("stable_taken", "deploy")],
     [
