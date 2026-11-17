@@ -273,7 +273,15 @@ def test_family_chevron_keeps_top_level_rows_in_one_column(
     assert chevron_box["x"] >= nav_box["x"]
     chevron.click()
     expect(member).to_have_count(0)
-    expect(lead.get_by_role("button", name="Expand session family")).to_be_visible()
+    expand = lead.get_by_role("button", name="Expand session family")
+    expect(expand).to_be_visible()
+    assert content_left(lead, "Lead") == column
+    assert content_left(plain_after, "Plain after") == column
+
+    expand.click()
+    expect(member.get_by_role("link")).to_be_visible()
+    assert content_left(lead, "Lead") == column
+    assert content_left(member, "Member") >= column + 16
 
 
 @pytest.fixture
