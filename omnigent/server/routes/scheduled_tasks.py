@@ -6,11 +6,12 @@ update, and delete tasks; the live :class:`ScheduledTaskScheduler` is kept in
 sync on every mutation so a change takes effect without a restart.
 
 Ownership mirrors hosts: tasks are scoped to the calling user (``"local"`` when
-auth is disabled). The RRULE is validated on create/update with
-:func:`validate_rrule` — an invalid rule (bad syntax, never-fires, fires-once, or
-below the minimum-interval floor) is a 400. With the database scheduler and the
-``one_time_automations`` release feature, an explicit ``COUNT=1`` is accepted as a
-one-time schedule such as a reminder.
+auth is disabled). People an automation is shared with can also read it, its runs
+and their steps; every change stays with its owner. The RRULE is validated on
+create/update with :func:`validate_rrule` — an invalid rule (bad syntax,
+never-fires, fires-once, or below the minimum-interval floor) is a 400. With the
+database scheduler and the ``one_time_automations`` release feature, an explicit
+``COUNT=1`` is accepted as a one-time schedule such as a reminder.
 """
 
 from __future__ import annotations
@@ -58,10 +59,15 @@ from omnigent.server.routes._sessions.helpers import (
 )
 from omnigent.server.routes._sessions.orchestration import _list_status_with_starting
 from omnigent.server.routes.scheduled_task_permissions import (
+    ScheduledTaskViewerRole,
     agent_shared_target_guard,
+    display_names_or_ids,
     owns_scheduled_task,
     register_scheduled_task_permissions_routes,
+    request_from_agent,
     require_agent_keeps_shared_target,
+    scheduled_task_sharing_supported,
+    scheduled_task_viewer_role,
     without_legacy_sandbox_workspace,
 )
 from omnigent.server.scheduled.harness_settings import (
@@ -82,6 +88,7 @@ from omnigent.server.workflows import require_workflows
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import SCHEDULED_TASK_RUN_LABEL_KEY
+from omnigent.stores.permission_store import MAX_SHARED_SCHEDULED_TASKS_PAGE_SIZE
 from omnigent.stores.project_store import ProjectStore
 from omnigent.stores.scheduled_task_store import (
     AutomationFailure,
@@ -261,6 +268,8 @@ def _to_response(
     *,
     last_run_status: str | None = None,
     next_run_at: str | None = None,
+    viewer_role: ScheduledTaskViewerRole = "owner",
+    owner_display_name: str | None = None,
 ) -> dict[str, Any]:
     """Serialize a :class:`ScheduledTask` to a JSON-safe dict.
 
@@ -273,6 +282,9 @@ def _to_response(
         ``None`` when the task is paused / not armed. Deliberately server-sourced
         — the client must never recompute next-run (it can't match the server
         anchor for INTERVAL>1 rules).
+    :param viewer_role: ``"owner"``, or ``"viewer"`` for someone it is shared with,
+        who may only read it.
+    :param owner_display_name: The owner's name for a viewer; ``None`` for the owner.
     """
     return {
         "id": task.id,
@@ -305,6 +317,8 @@ def _to_response(
         "last_run_conversation_id": task.last_run_conversation_id,
         "next_run_at": next_run_at,
         "updated_at": task.updated_at,
+        "viewer_role": viewer_role,
+        "owner_display_name": owner_display_name,
     }
 
 
@@ -322,6 +336,7 @@ def _run_to_response(
     viewer_unread: bool | None = None,
     session_cost_usd: float | None = None,
     conversation_pending_approvals: int = 0,
+    include_error_detail: bool = True,
 ) -> dict[str, Any]:
     """Serialize a :class:`ScheduledTaskRun` to a JSON-safe dict.
 
@@ -329,6 +344,7 @@ def _run_to_response(
     ``error`` is sent as ``error_detail``, capped at
     :data:`_RUN_ERROR_DETAIL_MAX_CHARS`, so the run list can say why a run failed,
     e.g. the sandbox provider's recovery steps for a sandbox that never connected.
+    Each session field defaults to its value for a run with no session.
 
     :param conversation_updated_at: The conversation's ``updated_at`` epoch
         seconds, or ``None`` for runs without a conversation. Embedded so the
@@ -347,6 +363,8 @@ def _run_to_response(
     :param session_cost_usd: Current cumulative session cost, or ``None`` when
         unreported. Runs continuing the same session share this total.
     :param conversation_pending_approvals: Current session approval/question count.
+    :param include_error_detail: ``False`` leaves ``error_detail`` null, for a caller
+        who sees only the run's outcome.
     """
     return {
         "id": run.id,
@@ -357,7 +375,9 @@ def _run_to_response(
         "fired_at": run.fired_at,
         "finished_at": run.finished_at,
         "error_code": run.error_code,
-        "error_detail": run.error[:_RUN_ERROR_DETAIL_MAX_CHARS] if run.error else None,
+        "error_detail": (
+            run.error[:_RUN_ERROR_DETAIL_MAX_CHARS] if include_error_detail and run.error else None
+        ),
         "conversation_updated_at": conversation_updated_at,
         "conversation_status": conversation_status,
         "viewer_last_seen": viewer_last_seen,
@@ -603,6 +623,35 @@ def create_scheduled_tasks_router(
         return task
 
     _reject_proactive_agent = reject_proactive_agent_id
+
+    async def _require_readable(
+        request: Request, scheduled_task_id: str
+    ) -> tuple[ScheduledTask, ScheduledTaskViewerRole]:
+        """Load a task its owner or a recipient may read, or raise ``_require_owned``'s 404.
+
+        Only read routes use this; every change stays owner-only.
+        """
+        owner = _owner(request)
+        caller_id = None if owner == RESERVED_USER_LOCAL else owner
+        task = await asyncio.to_thread(store.get, scheduled_task_id)
+        # Proactive tasks stay hidden here too, as in ``_require_owned``.
+        role = (
+            await asyncio.to_thread(
+                scheduled_task_viewer_role, request, task, caller_id, permission_store
+            )
+            if task is not None and not is_proactive_task(task)
+            else None
+        )
+        if task is None or role is None:
+            raise OmnigentError("Scheduled task not found", code=ErrorCode.NOT_FOUND)
+        return task, role
+
+    async def _owner_display_names(tasks: list[ScheduledTask]) -> dict[str, str]:
+        """Display names for the owners of tasks shown to a recipient, in one batch."""
+        owners = sorted({task.user_id for task in tasks if task.user_id is not None})
+        if not owners or permission_store is None:
+            return {}
+        return await asyncio.to_thread(display_names_or_ids, permission_store, owners)
 
     async def _validated_mcp_services(
         request: Request, services: list[str], agent: Agent, owner: str
@@ -1198,22 +1247,104 @@ def create_scheduled_tasks_router(
             next_cursor=f"{next_cursor[0]}:{next_cursor[1]}" if next_cursor else None,
         )
 
+    @router.get("/scheduled-tasks/shared")
+    async def list_shared_scheduled_tasks(
+        request: Request,
+        limit: int = Query(default=50, ge=1, le=MAX_SHARED_SCHEDULED_TASKS_PAGE_SIZE),
+        after: str | None = Query(
+            default=None, max_length=64, description="Cursor: a previous page's next_cursor"
+        ),
+    ) -> dict[str, Any]:
+        """List one page of the automations other users shared with the caller.
+
+        A grant to the caller or to any of their groups counts, and each automation is
+        listed once, ordered by ID. Deleted automations, reminders and the caller's own
+        automations are left out, so a page can be short, or empty while
+        ``next_cursor`` is set. Each item has the list's shape with ``viewer_role``
+        ``"viewer"`` and the owner's ``owner_display_name``. Empty on a server that
+        cannot share automations and for the local user. Unlike the owner's list, this
+        doesn't fail stale running runs, so it reads one run per automation.
+
+        :param limit: Max automations to return (1–100, default 50).
+        :param after: Cursor, a previous page's ``next_cursor``.
+        :returns: ``{"scheduled_tasks": [...], "next_cursor": str|null}``.
+        :raises OmnigentError: 403 for an agent's request; 422 for a malformed cursor.
+        """
+        if request_from_agent(request):
+            raise OmnigentError(
+                "Agents cannot list the automations shared with you",
+                code=ErrorCode.FORBIDDEN,
+            )
+        owner = _owner(request)
+        if owner == RESERVED_USER_LOCAL or not scheduled_task_sharing_supported(
+            request.app.state, permission_store
+        ):
+            return {"scheduled_tasks": [], "next_cursor": None}
+        assert permission_store is not None
+        try:
+            cursor = uuid.UUID(after).hex if after is not None else None
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=422, detail="Invalid shared automations cursor"
+            ) from exc
+        principals = await asyncio.to_thread(permission_store.caller_principals, owner)
+        task_ids, next_cursor = await asyncio.to_thread(
+            permission_store.list_scheduled_tasks_shared_with,
+            principals,
+            limit=limit,
+            after_scheduled_task_id=cursor,
+        )
+        loaded = await asyncio.to_thread(store.get_many, task_ids)
+        tasks = [
+            task
+            for task_id in task_ids
+            if (task := loaded.get(task_id)) is not None
+            and task.state != "deleted"
+            and task.kind == "automation"
+            and task.user_id != owner
+            and not is_proactive_task(task)
+        ]
+        ids = [task.id for task in tasks]
+        # Reads one run per automation; a stale running run fails when its history is read.
+        latest_status = await asyncio.to_thread(store.list_latest_run_status_for_tasks, ids)
+        names = await _owner_display_names(tasks)
+        return {
+            "scheduled_tasks": [
+                _to_response(
+                    task,
+                    last_run_status=latest_status.get(task.id),
+                    next_run_at=_next_run_at(task, request),
+                    viewer_role="viewer",
+                    owner_display_name=names.get(task.user_id or "", task.user_id),
+                )
+                for task in tasks
+            ],
+            "next_cursor": next_cursor,
+        }
+
     @router.get("/scheduled-tasks/{scheduled_task_id}")
     async def get_scheduled_task(
         request: Request,
         scheduled_task_id: str,
     ) -> dict[str, Any]:
-        """Fetch one of the caller's scheduled tasks."""
-        owner = _owner(request)
-        owner_id = None if owner == RESERVED_USER_LOCAL else owner
-        task = _require_owned(scheduled_task_id, owner_id)
+        """Fetch a scheduled task the caller owns or that is shared with them.
+
+        Anyone else gets 404. ``viewer_role`` says which, and a recipient also gets the
+        owner's ``owner_display_name``.
+        """
+        task, role = await _require_readable(request, scheduled_task_id)
         running = store.list_running_runs_for_tasks([task.id])
         force_fail_stale_runs(store, running)
         latest_status = store.list_latest_run_status_for_tasks([task.id])
+        owner_name = None
+        if role == "viewer":
+            owner_name = (await _owner_display_names([task])).get(task.user_id or "", task.user_id)
         return _to_response(
             task,
             last_run_status=latest_status.get(task.id),
             next_run_at=_next_run_at(task, request),
+            viewer_role=role,
+            owner_display_name=owner_name,
         )
 
     @router.get("/scheduled-tasks/{scheduled_task_id}/runs")
@@ -1223,12 +1354,18 @@ def create_scheduled_tasks_router(
         limit: int = Query(default=100, ge=1, le=1000),
         after: str | None = Query(default=None),
     ) -> dict[str, Any]:
-        """List the run history for one of the caller's scheduled tasks.
+        """List the run history of a scheduled task the caller owns or that is shared with them.
 
-        Owner-scoped: a task owned by someone else (or absent) 404s via
-        ``_require_owned``, so runs aren't enumerable across users. Runs come
+        Anyone else gets 404, as for ``GET /scheduled-tasks/{id}``, so runs aren't
+        enumerable across users. Runs come
         back most-recent-first (``scheduled_at DESC``); an empty history is an
         empty list.
+
+        Someone it is shared with gets every run's times, status, ``error_code`` and
+        ``conversation_id``, but none of its session's data: ``error_detail``, the
+        ``conversation_*`` and ``viewer_*`` fields and ``session_cost_usd`` are null and
+        ``conversation_pending_approvals`` is 0, since they may not be able to open
+        that session.
 
         Cursor-paginated so history is never silently truncated: pass ``limit``
         (1-1000, default 100) and ``after`` (a prior page's ``next_cursor``).
@@ -1244,14 +1381,17 @@ def create_scheduled_tasks_router(
         conversation I/O); a young in-flight run is untouched, and the
         conditional ``update_run`` never clobbers an already-terminal row.
         """
-        owner = _owner(request)
-        owner_id = None if owner == RESERVED_USER_LOCAL else owner
-        _require_owned(scheduled_task_id, owner_id)
-        # Read state is keyed by the caller's raw identity, as the session
-        # read-state routes key it; ``owner_id`` folds "local" into None.
-        viewer_id = require_user(request, auth_provider)
+        _, role = await _require_readable(request, scheduled_task_id)
         runs, next_cursor = store.list_runs(scheduled_task_id, limit=limit, after_id=after)
         runs = force_fail_stale_runs(store, runs)
+        if role == "viewer":
+            return {
+                "runs": [_run_to_response(r, include_error_detail=False) for r in runs],
+                "next_cursor": next_cursor,
+            }
+        # Read state is keyed by the caller's raw identity, as the session
+        # read-state routes key it.
+        viewer_id = require_user(request, auth_provider)
         # Batch-fetch conversation metadata for runs that produced a session so
         # the frontend can compute unread dots without per-row session GETs.
         # Runs without a conversation_id (skipped/failed) contribute null fields.
@@ -1314,16 +1454,19 @@ def create_scheduled_tasks_router(
     ) -> dict[str, Any]:
         """The plan steps of one page of a scheduled task's runs, for their timelines.
 
-        Pages like ``GET /scheduled-tasks/{id}/runs``, most recent first. Each
+        Pages and authorizes like ``GET /scheduled-tasks/{id}/runs``, most recent first. Each
         run that wrote a plan lists its latest plan within that invocation and
         each step's newest status entry. The first plan's ID still guards actions.
         The response is ``{"runs": [{"run_id", "plan_id", "plan_graph_revision",
         "workflow_id", "plan_name", "is_current", "steps", "statuses"}], "next_cursor"}``.
+        Plans are session content, so someone it is shared with always gets
+        ``{"runs": [], "next_cursor": null}``.
         """
         from omnigent.server.session_journal import entry_to_response, open_store
 
-        owner = _owner(request)
-        _require_owned(scheduled_task_id, None if owner == RESERVED_USER_LOCAL else owner)
+        _, role = await _require_readable(request, scheduled_task_id)
+        if role == "viewer":
+            return {"runs": [], "next_cursor": None}
         runs, next_cursor = store.list_runs(scheduled_task_id, limit=limit, after_id=after)
         journal = open_store(conversation_store)
         served = [run for run in runs if run.conversation_id is not None]
