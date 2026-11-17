@@ -200,7 +200,8 @@ to the publisher. No new test-selection gate is introduced.
      findings, including non-blocking notes. Fixes needed changes and records
      evidenced invalid/not-needed dispositions. After every push, dispatches
      both workflows (the bot equivalent of `/review` and `/ocr`) and waits for
-     current-head completion proof. There is no fixed round cap. A bundled live
+     current-head completion proof. Without a workflow budget it stops after three
+     rounds and reassesses the approach. A bundled live
      checker rejects missing reviews, stale receipts, and missing dispositions;
      a concrete blocker or execution deadline produces an incomplete checkpoint.
    - Writes a **paste-to-an-agent live-validation prompt** into the PR body so a
