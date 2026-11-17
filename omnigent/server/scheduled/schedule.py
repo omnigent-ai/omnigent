@@ -41,6 +41,8 @@ def next_scheduled_time(task: ScheduledTask, after: int) -> int | None:
             datetime.fromtimestamp(after, UTC),
             timezone,
             anchor=datetime.fromtimestamp(task.created_at, UTC),
+            # A timer repeats from when it was set, like one the runner keeps.
+            phase_from_anchor=task.kind == "timer",
         )
     except RRuleSearchError:
         raise
@@ -125,6 +127,16 @@ def fits_reminder(task: ScheduledTask) -> bool:
         and task.session_id is not None
         and is_one_time_rule(task.rrule)
     )
+
+
+def fits_timer(task: ScheduledTask) -> bool:
+    """Whether a task can be a timer: a message, once or on repeat, into a known session."""
+    return task.session_mode == "continue" and task.session_id is not None
+
+
+def is_repeating_timer(task: ScheduledTask) -> bool:
+    """Whether a task is a ``sys_timer_set`` timer that fires more than once."""
+    return task.kind == "timer" and not is_one_time_rule(task.rrule)
 
 
 def is_trigger_automation(task: ScheduledTask) -> bool:

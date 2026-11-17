@@ -192,6 +192,128 @@ def test_an_edit_that_stops_a_reminder_fitting_makes_it_an_automation(
     assert restored.kind == "automation"
 
 
+@pytest.mark.parametrize("rrule", [_REMINDER_RULE, "FREQ=MINUTELY;INTERVAL=10"])
+def test_a_timer_continues_its_session_once_or_on_repeat(
+    store: SqlAlchemyScheduledTaskStore, rrule: str
+) -> None:
+    fields = _reminder_fields(name="Timer: check-in", rrule=rrule, kind="timer")
+    task_id = store.create(scheduled_task_id=_uid("st_timer"), **fields).id
+    assert store.get(task_id).kind == "timer"
+    assert store.update(task_id, name="renamed").kind == "timer"
+    # Leaving its session makes it an ordinary automation, as for a reminder.
+    assert store.update(task_id, session_id=None).kind == "automation"
+    with pytest.raises(ValueError, match="a timer needs"):
+        store.create(
+            scheduled_task_id=_uid("st_bad_timer"),
+            **_reminder_fields(kind="timer", session_mode="new", session_id=None),
+        )
+
+
+def test_a_session_keeps_a_bounded_number_of_timers(
+    store: SqlAlchemyScheduledTaskStore, db_uri: str
+) -> None:
+    import sqlalchemy as sa
+
+    from omnigent.db.utils import get_or_create_engine
+    from omnigent.stores.scheduled_task_store import (
+        TIMERS_PER_SESSION,
+        ScheduledTaskSessionTimerCapError,
+    )
+
+    session_id = _uid("conv_timers")
+
+    def keep(seed: str, **overrides: Any) -> str:
+        fields = _reminder_fields(
+            name="Timer", rrule="FREQ=MINUTELY;INTERVAL=10", kind="timer", session_id=session_id
+        )
+        return store.create(scheduled_task_id=_uid(seed), **{**fields, **overrides}).id
+
+    kept = [keep(f"st_timer_{index}") for index in range(TIMERS_PER_SESSION)]
+    with pytest.raises(ScheduledTaskSessionTimerCapError):
+        keep("st_timer_over")
+    assert store.get(_uid("st_timer_over")) is None
+    # Another session's timers and this session's automations don't count.
+    keep("st_timer_elsewhere", session_id=_uid("conv_other"))
+    keep("st_automation", kind="automation")
+    # A cancelled timer makes room for another.
+    store.delete(kept[0])
+    engine = get_or_create_engine(db_uri)
+    plans: list[str] = []
+
+    def explain_count(conn, cursor, statement, parameters, _context, _executemany) -> None:
+        if conn.dialect.name == "sqlite" and statement.startswith("SELECT count(*)"):
+            steps = cursor.connection.execute(f"EXPLAIN QUERY PLAN {statement}", parameters)
+            plans.append(" ".join(str(step) for step in steps.fetchall()))
+
+    sa.event.listen(engine, "before_cursor_execute", explain_count)
+    try:
+        keep("st_timer_again")
+    finally:
+        sa.event.remove(engine, "before_cursor_execute", explain_count)
+    if engine.dialect.name == "sqlite":
+        # The count seeks the session's active timers, however long its timer history.
+        [plan] = plans
+        assert "ix_scheduled_tasks_kind_session (kind=? AND state=? AND workspace_id=?" in plan
+
+
+def test_racing_creates_for_a_sessions_last_timer_place_take_turns(
+    store: SqlAlchemyScheduledTaskStore, db_uri: str
+) -> None:
+    import contextlib
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    import sqlalchemy as sa
+
+    from omnigent.db.db_models import SqlConversationMetadata
+    from omnigent.db.utils import get_or_create_engine
+    from omnigent.stores.scheduled_task_store import (
+        TIMERS_PER_SESSION,
+        ScheduledTaskSessionTimerCapError,
+    )
+
+    session_id = _uid("conv_race")
+    engine = get_or_create_engine(db_uri)
+    with engine.begin() as conn:
+        conn.execute(
+            sa.insert(SqlConversationMetadata).values(
+                workspace_id=current_workspace_id(), id=session_id
+            )
+        )
+    # An owner without an account row, so no account lock orders the two creates.
+    fields = _reminder_fields(
+        name="Timer",
+        rrule="FREQ=MINUTELY;INTERVAL=10",
+        kind="timer",
+        session_id=session_id,
+        user_id=None,
+    )
+    for index in range(TIMERS_PER_SESSION - 1):
+        store.create(scheduled_task_id=_uid(f"st_race_{index}"), **fields)
+    # Unlocked, both creates would count nine here before either one inserts.
+    both_counted = threading.Barrier(2, timeout=2)
+
+    def hold_inserts(_conn, _cursor, statement, *_args) -> None:
+        if statement.startswith("INSERT INTO scheduled_tasks"):
+            with contextlib.suppress(threading.BrokenBarrierError):
+                both_counted.wait()
+
+    def create(seed: str) -> bool:
+        try:
+            store.create(scheduled_task_id=_uid(seed), **fields)
+        except ScheduledTaskSessionTimerCapError:
+            return False
+        return True
+
+    sa.event.listen(engine, "before_cursor_execute", hold_inserts)
+    try:
+        with ThreadPoolExecutor(2) as pool:
+            created = list(pool.map(create, ["st_race_a", "st_race_b"]))
+    finally:
+        sa.event.remove(engine, "before_cursor_execute", hold_inserts)
+    assert sorted(created) == [False, True]
+
+
 @pytest.mark.parametrize(
     "arrival", ["on_time", "one_second_early", "at_the_minute", "late", "late_and_exhausted"]
 )
@@ -2729,6 +2851,25 @@ def test_inbox_failures_latest_run_and_session_dedup(store, state, latest_status
         conversation_id=conversation_id,
     )
     assert store.list_inbox_failures(owner_user_id=task.user_id) == ([], None)
+
+
+def test_inbox_failures_leave_timers_out(store):
+    timer = _session_task(
+        store,
+        "inbox-timer",
+        session_mode="continue",
+        session_id=_uid("conv"),
+        kind="timer",
+    )
+    store.create_run(
+        run_id=_uid("timer-failure"),
+        scheduled_task_id=timer.id,
+        status="failed",
+        scheduled_at=100,
+        finished_at=101,
+        error_code="owner_identity_unavailable",
+    )
+    assert store.list_inbox_failures(owner_user_id=timer.user_id) == ([], None)
 
 
 def test_inbox_failures_pages_examined_tasks_and_scopes_owner_workspace_generation(store):

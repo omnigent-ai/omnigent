@@ -46,6 +46,7 @@ class Feature(StrEnum):
     AUTOMATIONS = "automations"
     AUTOMATIONS_V2 = "automations_v2"
     ONE_TIME_AUTOMATIONS = "one_time_automations"
+    DURABLE_TIMERS = "durable_timers"
     SPLITTABLE_TERMINAL_VIEW_UI = "splittable_terminal_view_ui"
     SIDEBAR_WINDOWED_ROWS = "sidebar_windowed_rows"
     WORKFLOWS = "workflows"
@@ -142,6 +143,17 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         ),
         owner="server",
         review_by_release="0.24.0",
+        frontend_visible=False,
+    ),
+    FeatureDefinition(
+        feature=Feature.DURABLE_TIMERS,
+        description=(
+            "Keep sys_timer_set timers of ten minutes or more as scheduled tasks, so they "
+            "fire after the runner stops. Every server sharing the database must already "
+            "know timer tasks"
+        ),
+        owner="server",
+        review_by_release="0.26.0",
         frontend_visible=False,
     ),
     FeatureDefinition(

@@ -251,6 +251,10 @@ class ScheduledTaskScheduler:
 
     def _register(self, task: ScheduledTask) -> None:
         """Validate the task's rrule and arm its timer, replacing any existing."""
+        if task.kind == "timer":
+            # Only the database scheduler keeps a timer's interval, lifetime and busy skips;
+            # here one waits until that scheduler is back on.
+            return
         trigger = validate_rrule(
             task.rrule, session_mode=task.session_mode, execution_target=task.execution_target
         )

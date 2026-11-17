@@ -48,6 +48,7 @@ from omnigent.server.routes._host_worktree import (
     WORKTREE_ROOT_LABEL_KEY,
     worktree_root_fingerprint,
 )
+from omnigent.server.routes._sessions.helpers import SessionLiveness
 from omnigent.server.scheduled import fire as fire_mod
 from omnigent.server.scheduled.fire import (
     BUSY_QUIET_SECONDS,
@@ -3745,6 +3746,182 @@ async def test_a_legacy_fire_names_its_run_on_the_session_before_sending(continu
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("kind", "prompt", "rrule", "hidden"),
+    [
+        (
+            "reminder",
+            "[Reminder set for 2026-11-12 23:00 UTC]\nCheck whether CI passed.",
+            "FREQ=YEARLY;BYMONTH=11;BYMONTHDAY=12;BYHOUR=23;BYMINUTE=0;BYSECOND=0;COUNT=1",
+            False,
+        ),
+        (
+            "timer",
+            "[System: timer timer_0123 fired]\nnote: 'workflow check-in'",
+            "FREQ=MINUTELY;INTERVAL=10",
+            True,
+        ),
+    ],
+)
+async def test_a_reminder_or_timer_continues_its_sessions_current_run(
+    monkeypatch: pytest.MonkeyPatch, kind: str, prompt: str, rrule: str, hidden: bool
+) -> None:
+    """A reminder or timer names no run on its session and doesn't say no one is watching.
+
+    Naming one would make the journal start a new run, resetting the session's plan
+    progress, and refuse a watched workflow's questions as unattended. A timer's
+    firing is hidden, like one the runner keeps.
+    """
+    import omnigent.server.routes.sessions as sessions_routes
+    from omnigent.stores.conversation_store import SCHEDULED_TASK_RUN_LABEL_KEY
+
+    task = _continuing_task(kind=kind, prompt=prompt, rrule=rrule)
+    conv_store = _ExistingConversationStore(_continued_session())
+    store = FakeScheduledTaskStore(rows={"task_1": task})
+    sent: list[Any] = []
+
+    async def _runner_start(*args: Any) -> None:
+        return None
+
+    async def _runner_send(conv_id: str, conv: Any, event: Any, *args: Any, **kwargs: Any) -> Any:
+        sent.append(event)
+        return SimpleNamespace(accepted=True)
+
+    monkeypatch.setattr(sessions_routes, "_ensure_runner_session_initialized", _runner_start)
+    monkeypatch.setattr(sessions_routes, "_dispatch_session_event_to_runner", _runner_send)
+    deps = _deps(store, conversation_store=conv_store)
+
+    async def _launch(conv: Any, task: Any) -> None:
+        await fire_mod._send_prompt(deps, conv, object(), task)
+
+    await build_on_fire(deps, launch_dispatch=_launch)(0, "task_1")
+    await _drain()
+
+    assert SCHEDULED_TASK_RUN_LABEL_KEY not in conv_store.label_writes.get("conv_prev", {})
+    assert [event.data for event in sent] == [
+        {
+            "role": "user",
+            "content": [{"type": "input_text", "text": prompt}],
+            **({"is_meta": True} if hidden else {}),
+        }
+    ]
+    assert [(run["status"], run["conversation_id"]) for run in store.runs] == [
+        ("succeeded", "conv_prev")
+    ]
+
+
+def _timer(**overrides: Any) -> ScheduledTask:
+    return _continuing_task(
+        kind="timer",
+        rrule="FREQ=MINUTELY;INTERVAL=10",
+        prompt="[System: timer timer_0123 fired]",
+        **overrides,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_timer_wakes_a_session_whose_mode_skips_approval() -> None:
+    """Like a timer the runner keeps, it fires into the mode its session already runs."""
+    session = _continued_session(
+        labels={"omnigent.claude_native.permission_mode": "bypassPermissions"}
+    )
+    conv_store = _ExistingConversationStore(session)
+    store = FakeScheduledTaskStore(rows={"task_1": _timer()})
+
+    launched = await _fire_once(_deps(store, conversation_store=conv_store))
+
+    assert [conv.id for conv in launched] == ["conv_prev"]
+    assert [run["status"] for run in store.runs] == ["succeeded"]
+
+
+@pytest.mark.asyncio
+async def test_a_timer_cancelled_after_its_firing_was_claimed_sends_nothing() -> None:
+    """An agent that cancelled its timer must not still get the firing it just stopped."""
+    from dataclasses import replace
+
+    store = FakeScheduledTaskStore(rows={"task_1": _timer()})
+
+    class _CancelledMidFire(_ExistingConversationStore):
+        def get_conversation(self, conversation_id: str) -> _FakeConversation | None:
+            # The cancel lands while the firing checks the session.
+            store._rows["task_1"] = replace(store._rows["task_1"], state="deleted")
+            return super().get_conversation(conversation_id)
+
+    conv_store = _CancelledMidFire(_continued_session())
+
+    launched = await _fire_once(_deps(store, conversation_store=conv_store))
+
+    assert launched == []
+    assert [(run["status"], run["error_code"]) for run in store.runs] == [
+        ("skipped", "task_deleted")
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("existing", "error_code"),
+    [
+        (None, "continued_session_missing"),
+        (_continued_session(archived=True), "continued_session_archived"),
+    ],
+    ids=["deleted", "archived"],
+)
+async def test_a_timer_whose_session_cannot_take_it_is_cancelled(
+    existing: _FakeConversation | None, error_code: str
+) -> None:
+    """A repeating timer never starts a new session, and stops once its session is gone."""
+    conv_store = _ExistingConversationStore(*([existing] if existing else []))
+    store = FakeScheduledTaskStore(rows={"task_1": _timer()})
+
+    launched = await _fire_once(_deps(store, conversation_store=conv_store))
+
+    assert launched == []
+    assert conv_store.created == []
+    assert store.released == []
+    assert [(run["status"], run["error_code"]) for run in store.runs] == [("failed", error_code)]
+    assert "the timer was cancelled" in store.runs[0]["error"]
+    assert {"id": "task_1", "state": "deleted"} in store.updates
+
+
+@pytest.mark.asyncio
+async def test_a_timer_that_cannot_be_cancelled_still_records_its_failed_firing() -> None:
+    store = FakeScheduledTaskStore(rows={"task_1": _timer()})
+    update = store.update
+
+    def _fail_cancel(scheduled_task_id: str, **kwargs: Any) -> ScheduledTask | None:
+        if kwargs.get("state") == "deleted":
+            raise RuntimeError("database unavailable")
+        return update(scheduled_task_id, **kwargs)
+
+    store.update = _fail_cancel  # type: ignore[method-assign]
+
+    await _fire_once(_deps(store, conversation_store=_ExistingConversationStore()))
+
+    assert [(run["status"], run["error_code"]) for run in store.runs] == [
+        ("failed", "continued_session_missing")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_timer_whose_message_cannot_be_sent_records_a_failed_firing() -> None:
+    conv_store = _ExistingConversationStore(_continued_session())
+    store = FakeScheduledTaskStore(rows={"task_1": _timer()})
+
+    async def _unreachable(conv: Any, task: Any) -> None:
+        raise RuntimeError("runner unreachable")
+
+    await build_on_fire(_deps(store, conversation_store=conv_store), launch_dispatch=_unreachable)(
+        0, "task_1"
+    )
+    await _drain()
+
+    assert [(run["status"], run["error_code"]) for run in store.runs] == [
+        ("failed", "launch_failed")
+    ]
+    assert conv_store.created == []
+
+
+@pytest.mark.asyncio
 async def test_a_continued_session_that_cannot_be_stamped_records_a_failed_run() -> None:
     """Without the label, the journal entries could land on another run, so nothing is sent."""
     conv_store = _ExistingConversationStore(_continued_session())
@@ -4989,6 +5166,7 @@ def _busy_until_check(
     fired_at: int | None = None,
     status: str = "succeeded",
     pending: int | None = None,
+    liveness: SessionLiveness | None = None,
 ):
     """The busy check over one session's persisted status and the task's latest run."""
     session_id = "sess_busy_check"
@@ -5011,7 +5189,14 @@ def _busy_until_check(
     )
     sched_store = Mock(list_runs=Mock(return_value=(runs, None)))
     conversation_store = Mock(get_session_activity=Mock(return_value=activity))
-    return build_busy_until(_deps(sched_store, conversation_store=conversation_store))
+    app_state = (
+        None
+        if liveness is None
+        else SimpleNamespace(session_liveness_lookup=lambda ids: {session_id: liveness})
+    )
+    return build_busy_until(
+        _deps(sched_store, conversation_store=conversation_store, app_state=app_state)
+    )
 
 
 @pytest.mark.parametrize(
@@ -5130,3 +5315,66 @@ async def test_an_idle_session_is_polled_two_quiet_minutes_after_its_last_change
     check = _busy_until_check("idle", due - 5 * 60, updated_at=due - seconds_since_change)
     task = _task(session_mode="continue", session_id="sess_busy_check", next_run_at=due)
     assert await check(task, due) == (None if wait_seconds is None else due + wait_seconds)
+
+
+_RUNNER_UP = SessionLiveness(runner_online=True, host_online=True)
+_RUNNER_GONE = SessionLiveness(runner_online=False, host_online=True)
+_HOST_OFFLINE = SessionLiveness(runner_online=False, host_online=False)
+
+
+@pytest.mark.parametrize(
+    ("live_status", "pending", "status", "quiet_seconds", "liveness", "skips"),
+    [
+        pytest.param("running", None, "succeeded", 10, _RUNNER_UP, True, id="turn-in-progress"),
+        # A status that never left running can't hold the check-ins back for good.
+        pytest.param("running", None, "succeeded", 3600, None, False, id="running-but-silent"),
+        pytest.param("running", None, "succeeded", 10, _RUNNER_GONE, False, id="runner-gone"),
+        pytest.param("idle", 1, "succeeded", 10, _RUNNER_UP, True, id="waiting-on-a-person"),
+        pytest.param("idle", 1, "succeeded", 3 * 3600, None, True, id="waiting-for-hours"),
+        # A runner that is gone can't still be waiting on its question.
+        pytest.param("idle", 1, "succeeded", 10, _RUNNER_GONE, False, id="count-left-behind"),
+        # A firing that can't reach the host waits for it instead of failing.
+        pytest.param("idle", 0, "succeeded", 10, _HOST_OFFLINE, True, id="host-offline"),
+        pytest.param("idle", 0, "starting", 10, None, True, id="last-firing-on-its-way"),
+        pytest.param("idle", 0, "succeeded", 10, _RUNNER_UP, False, id="idle"),
+    ],
+)
+async def test_a_busy_session_skips_its_repeating_timers_firing(
+    live_status, pending, status, quiet_seconds, liveness, skips
+) -> None:
+    due = 1_800_003_600
+    # Unlike a trigger's poll, a timer doesn't wait for a quiet session.
+    check = _busy_until_check(
+        live_status,
+        due - 600,
+        updated_at=due - quiet_seconds,
+        status=status,
+        pending=pending,
+        liveness=liveness,
+    )
+    timer = _task(
+        kind="timer",
+        rrule="FREQ=MINUTELY;INTERVAL=10",
+        session_mode="continue",
+        session_id="sess_busy_check",
+        next_run_at=due,
+    )
+    # Skipped to its next firing, ten minutes on.
+    assert await check(timer, due) == (due + 600 if skips else None)
+
+
+@pytest.mark.asyncio
+async def test_a_busy_session_still_skips_its_timers_last_firing() -> None:
+    due = 1_800_003_600
+    check = _busy_until_check("running", due - 600, updated_at=due - 10, liveness=_RUNNER_UP)
+    # Its sixth and last firing, an hour after it was set.
+    timer = _task(
+        kind="timer",
+        rrule="FREQ=MINUTELY;INTERVAL=10;COUNT=6",
+        session_mode="continue",
+        session_id="sess_busy_check",
+        next_run_at=due,
+    )
+    # No firing is left to skip to, so any later time says the session is busy.
+    until = await check(timer, due)
+    assert until is not None and until > due

@@ -9,7 +9,7 @@ Two tools:
   previously scheduled timer by ``timer_id``.
 
 Both tools are gated on the agent spec's top-level ``timers:`` flag
-(see :attr:`AgentSpec.timers`, defaulting to ``False``).
+(see :attr:`AgentSpec.timers`, defaulting to ``True``).
 
 These classes own the LLM-facing schema and argument validation.
 The firing itself runs in the runner: ``execute_tool`` intercepts
@@ -18,6 +18,11 @@ The firing itself runs in the runner: ``execute_tool`` intercepts
 ``_execute_timer_cancel``, which run the sleep-and-wake loop and own
 the per-session timer registry. The shared :func:`validate_timer_set_args`
 helper keeps both surfaces rejecting the same inputs.
+
+A timer of at least :data:`DURABLE_TIMER_MIN_SECONDS` (in whole minutes when it
+repeats) is kept by the server instead, when it supports that, as a scheduled
+task that sends the same message into the session. It outlives the runner, an
+idle shutdown and a server restart.
 
 The tools are **synchronous** (``is_async() == False``): the LLM
 gets the ``timer_id`` back immediately so it can later cancel by ID.
@@ -37,11 +42,26 @@ from __future__ import annotations
 import json
 import logging
 import math
+import re
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from omnigent.tools.base import Tool, ToolContext
+from omnigent.tools.builtins.scheduled_tasks import reminder_rrule
 
 _logger = logging.getLogger(__name__)
+
+# The shortest timer the server keeps. It also bounds a repeating one's interval,
+# which must be whole minutes: the scheduler fires continued sessions at most
+# every ten minutes.
+DURABLE_TIMER_MIN_SECONDS = 600
+# A repeating timer the server keeps ends this long after it is set, so one left
+# running after its work ended stops on its own.
+DURABLE_TIMER_MAX_LIFETIME = timedelta(days=7)
+# Leaves room for a kept repeating timer to fire at least twice before it ends.
+DURABLE_TIMER_MAX_INTERVAL = DURABLE_TIMER_MAX_LIFETIME / 2
+_TIMER_ID_PREFIX = "timer_"
+_DURABLE_TIMER_TASK_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
 
 # Maximum ``seconds`` value the LLM can pass to ``sys_timer_set``.
 # A pragmatic cap (~12 days) that's long enough for any realistic
@@ -96,6 +116,87 @@ def validate_timer_set_args(
     return seconds, repeat, note
 
 
+def durable_timer_problem(seconds: float, repeat: bool) -> str | None:
+    """
+    Why the server can't keep a timer with these validated arguments.
+
+    :param seconds: The delay, or a repeating timer's interval, e.g. ``600``.
+    :param repeat: Whether the timer repeats.
+    :returns: ``None`` from :data:`DURABLE_TIMER_MIN_SECONDS` up, and for a
+        repeating timer in whole minutes up to :data:`DURABLE_TIMER_MAX_INTERVAL`;
+        otherwise the reason, e.g. ``"The server keeps only timers of at least 600
+        seconds"``.
+    """
+    if seconds < DURABLE_TIMER_MIN_SECONDS:
+        return f"The server keeps only timers of at least {DURABLE_TIMER_MIN_SECONDS} seconds"
+    if not repeat:
+        return None
+    if not (seconds.is_integer() and int(seconds) % 60 == 0):
+        return "The server keeps a repeating timer only in whole minutes"
+    if seconds > DURABLE_TIMER_MAX_INTERVAL.total_seconds():
+        hours = int(DURABLE_TIMER_MAX_INTERVAL.total_seconds()) // 3600
+        return (
+            f"The server keeps a repeating timer only up to every {hours} hours, so it fires "
+            f"at least twice in the {DURABLE_TIMER_MAX_LIFETIME.days} days it lasts"
+        )
+    return None
+
+
+def is_durable_timer(seconds: float, repeat: bool) -> bool:
+    """Whether the server can keep a timer with these validated arguments; see
+    :func:`durable_timer_problem`."""
+    return durable_timer_problem(seconds, repeat) is None
+
+
+def durable_timer_rule(seconds: float, repeat: bool, now: datetime) -> tuple[str, datetime | None]:
+    """
+    The schedule that keeps a durable timer, and a one-shot timer's fire time.
+
+    :param seconds: A delay or interval :func:`is_durable_timer` accepts, e.g. ``600``.
+    :param repeat: Whether the timer repeats.
+    :param now: When the timer is set, timezone-aware.
+    :returns: ``("FREQ=MINUTELY;INTERVAL=10;COUNT=1008", None)`` for a timer
+        repeating every ten minutes, counted from its creation, whose last firing
+        falls within :data:`DURABLE_TIMER_MAX_LIFETIME`, or a one-time rule and its
+        UTC fire time: the whole minute at or after ``now + seconds``.
+    """
+    if repeat:
+        minutes = int(seconds) // 60
+        firings = int(DURABLE_TIMER_MAX_LIFETIME.total_seconds()) // (minutes * 60)
+        return f"FREQ=MINUTELY;INTERVAL={minutes};COUNT={firings}", None
+    when = (now + timedelta(seconds=seconds)).astimezone(UTC)
+    if when.second or when.microsecond:
+        when = when.replace(second=0, microsecond=0) + timedelta(minutes=1)
+    return reminder_rrule(when), when
+
+
+def timer_fired_text(timer_id: str, note: str | None) -> str:
+    """
+    The hidden message a timer's firing sends into its session.
+
+    :param timer_id: e.g. ``"timer_0123…cdef"``.
+    :param note: The note the timer was set with, echoed back, or ``None``.
+    :returns: e.g. ``"[System: timer timer_0123…cdef fired]\\nnote: 'check CI'"``.
+    """
+    text = f"[System: timer {timer_id} fired]"
+    if note:
+        text += f"\nnote: {note!r}"
+    return text
+
+
+def durable_timer_id(scheduled_task_id: str) -> str:
+    """The ``timer_id`` of the scheduled task that keeps a durable timer."""
+    return f"{_TIMER_ID_PREFIX}{scheduled_task_id}"
+
+
+def durable_timer_task_id(timer_id: str) -> str | None:
+    """The scheduled task a durable ``timer_id`` names, or ``None`` if it can't name one."""
+    task_id = timer_id.removeprefix(_TIMER_ID_PREFIX)
+    if task_id == timer_id or not _DURABLE_TIMER_TASK_ID.fullmatch(task_id):
+        return None
+    return task_id
+
+
 class SysTimerSetTool(Tool):
     """
     Schedule a timer that fires a notification after a delay.
@@ -125,7 +226,16 @@ class SysTimerSetTool(Tool):
             "conversation; you can include an optional note that's "
             "echoed back in the firing. Set repeat=true for a "
             "recurring timer (cancel via sys_timer_cancel). The "
-            "tool returns immediately with the timer_id."
+            "tool returns immediately with the timer_id. A timer of "
+            f"at least {DURABLE_TIMER_MIN_SECONDS} seconds (when it repeats, whole "
+            "minutes at most "
+            f"{int(DURABLE_TIMER_MAX_INTERVAL.total_seconds()) // 3600} hours apart) "
+            "is kept by the server when it can be, so it "
+            "still fires after this runner stops or the server restarts; "
+            "the result says durable: true. A durable repeating timer "
+            "skips a firing while this session is busy or waiting on someone, and "
+            f"ends {DURABLE_TIMER_MAX_LIFETIME.days} days after it is set. "
+            "Other timers end with the runner."
         )
 
     def get_schema(self) -> dict[str, Any]:

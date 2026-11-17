@@ -214,6 +214,39 @@ status is read from session activity, which needs no caller access check, so the
 poll does not act as the owner. A failed check sends the prompt. Other continued
 tasks, legacy timers and a scheduler with a custom `on_fire` hook (it has no busy
 check) follow the saved schedule and never skip, and neither does Run now.
+
+A continued run names itself on the session (`omnigent.scheduled_task_run`)
+before sending, so the journal starts a new run of the plan and the session counts
+as unattended. A reminder or a timer belongs to the session's current work instead:
+its message goes in as written, without the unattended-run note, and names no run,
+so a workflow keeps its progress and can still ask its user questions.
+
+A timer (`kind: "timer"`) is a `sys_timer_set` timer the server keeps for its
+session, created through `POST /v1/sessions/{id}/timers` by that session's own
+runner. Its message is hidden (`is_meta`), like an in-memory timer's firing. It
+fires in the permission mode its session already runs, even one that skips
+approval. It never starts a session: when its session is gone or can no longer
+take it, the firing fails and the timer is cancelled. A cancel that lands after a
+firing was claimed still stops it until delivery starts: the firing reads the timer
+again before it wakes the runner and records `skipped` (`task_deleted`). A firing
+already being delivered still arrives, as with an in-memory timer that just fired.
+A timer counts its interval from
+when it was set, not from midnight, so it first fires a whole interval later, and
+a repeating timer's `COUNT` ends it seven days after it was set. It goes through
+the same busy check as a trigger, but while its session is running, waiting on an
+approval or question, or still taking the previous firing, or while its host is
+offline, it skips to its next occurrence instead of checking again two minutes
+later. Unlike a trigger's last poll, which is always sent, its last firing is then
+dropped, completing the timer without a run. A running status whose runner is
+gone, or that has shown no activity for an hour (`TIMER_BUSY_SKIP_MAX_SECONDS`),
+doesn't hold it back, and neither does a pending count left by a runner that is
+gone, so a stale status can't stall the check-ins meant to recover it. A last
+firing found more than `TIMER_LAST_FIRING_GRACE_SECONDS` after its time, as after
+an outage, is dropped the same way: a claim starts delivery right away, and
+recovery fails a stale run instead of sending it again, so checking at the claim
+bounds when a timer can still wake its session. The legacy in-process scheduler
+never arms a timer; with it, timers wait for the database scheduler.
+
 If the replica stops before recording, recovery finds no session on the run and
 records `failed`; it never resends. A first run of such a task records its
 session on the task once the session exists and its owner is granted, so a run

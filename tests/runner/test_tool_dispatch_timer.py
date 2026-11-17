@@ -193,3 +193,241 @@ async def test_timer_delivery_logs_http_error_status(caplog: pytest.LogCaptureFi
         and result["timer_id"] in record.getMessage()
         for record in caplog.records
     )
+
+
+# ── Timers the server keeps ───────────────────────────────────
+
+_SESSION = "conv_parent"
+_KEPT_TIMER = {
+    "timer_id": "timer_" + "a" * 32,
+    "scheduled_task_id": "a" * 32,
+    "next_run_at": "2026-11-16T12:10:00+00:00",
+}
+
+
+def _timer_server(
+    *,
+    keeps: bool,
+    create: httpx.Response | httpx.HTTPError | None = None,
+    delete: httpx.Response | None = None,
+) -> tuple[Any, list[httpx.Request]]:
+    """A server that may keep timers, recording each request it gets."""
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        if request.url.path == "/v1/info":
+            return httpx.Response(200, json={"scheduled_task_timers": keeps})
+        if request.url.path.startswith(f"/v1/sessions/{_SESSION}/timers"):
+            if request.method == "DELETE":
+                return delete or httpx.Response(200, json={"status": "cancelled"})
+            if isinstance(create, httpx.HTTPError):
+                raise create
+            return create or httpx.Response(200, json=_KEPT_TIMER)
+        return httpx.Response(202, json={"queued": True})
+
+    return handler, calls
+
+
+def _runner_timers() -> dict[str, Any]:
+    from omnigent.runner import app as runner_app
+
+    return runner_app._session_timers.get(_SESSION, {})
+
+
+async def _set_timer(server_client: httpx.AsyncClient, **args: Any) -> dict[str, Any]:
+    output = await execute_tool(
+        tool_name="sys_timer_set",
+        arguments=json.dumps(args),
+        conversation_id=_SESSION,
+        server_client=server_client,
+    )
+    return json.loads(output)
+
+
+@pytest.mark.asyncio
+async def test_a_long_timer_is_kept_by_the_server_when_it_can() -> None:
+    """A ten-minute check-in outlives the runner: the server keeps it, not a runner loop."""
+    from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
+
+    handler, calls = _timer_server(keeps=True)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server"
+    ) as server_client:
+        result = await _set_timer(
+            server_client, seconds=600, repeat=True, note="workflow check-in"
+        )
+
+    assert result == {
+        "timer_id": _KEPT_TIMER["timer_id"],
+        "status": "scheduled",
+        "seconds": 600.0,
+        "repeat": True,
+        "note": "workflow check-in",
+        "durable": True,
+        "next_run_at": _KEPT_TIMER["next_run_at"],
+    }
+    [create] = [call for call in calls if call.method == "POST"]
+    assert create.url.path == f"/v1/sessions/{_SESSION}/timers"
+    assert json.loads(create.content) == {
+        "seconds": 600.0,
+        "repeat": True,
+        "note": "workflow check-in",
+    }
+    assert create.headers[ORCHESTRATION_SOURCE_HEADER] == _SESSION
+    assert _runner_timers() == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("keeps", "create", "reason"),
+    [
+        (False, None, "this Omnigent server doesn't keep timers"),
+        (
+            True,
+            httpx.Response(
+                400,
+                json={"error": {"code": "invalid_input", "message": "A side chat can't keep it"}},
+            ),
+            "A side chat can't keep it",
+        ),
+    ],
+    ids=["unsupported", "refused"],
+)
+async def test_a_timer_the_server_does_not_keep_lives_in_the_runner(
+    keeps: bool, create: httpx.Response | None, reason: str
+) -> None:
+    handler, calls = _timer_server(keeps=keeps, create=create)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server"
+    ) as server_client:
+        result = await _set_timer(server_client, seconds=900, note="check CI")
+        try:
+            assert result["durable"] is False
+            assert result["not_durable_because"] == reason
+            assert result["timer_id"] in _runner_timers()
+        finally:
+            cancelled = await execute_tool(
+                tool_name="sys_timer_cancel",
+                arguments=json.dumps({"timer_id": result["timer_id"]}),
+                conversation_id=_SESSION,
+                server_client=server_client,
+            )
+    assert json.loads(cancelled)["status"] == "cancelled"
+    # The runner held it, so cancelling never reached the server.
+    assert [call.method for call in calls if "/timers" in call.url.path] == (
+        ["POST"] if keeps else []
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("args", "reason"),
+    [
+        ({"seconds": 300, "repeat": True}, "at least 600 seconds"),
+        ({"seconds": 630, "repeat": True}, "in whole minutes"),
+        # Four days apart, its second firing would come after the timer ends.
+        ({"seconds": 345600, "repeat": True}, "up to every 84 hours"),
+    ],
+)
+async def test_a_timer_the_server_cannot_keep_never_asks_it(
+    args: dict[str, Any], reason: str
+) -> None:
+    handler, calls = _timer_server(keeps=True)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server"
+    ) as server_client:
+        result = await _set_timer(server_client, **args)
+        try:
+            assert result["durable"] is False
+            assert reason in result["not_durable_because"]
+        finally:
+            await execute_tool(
+                tool_name="sys_timer_cancel",
+                arguments=json.dumps({"timer_id": result["timer_id"]}),
+                conversation_id=_SESSION,
+                server_client=server_client,
+            )
+    assert calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "create",
+    [
+        httpx.Response(504, text="gateway timeout"),
+        httpx.ReadTimeout("the server didn't answer"),
+        # A success that doesn't say which timer it kept.
+        httpx.Response(200, json={"scheduled_task_id": "0123"}),
+        httpx.Response(200, text="<html>proxy page</html>"),
+    ],
+    ids=["gateway-timeout", "no-answer", "no-timer-id", "not-json"],
+)
+async def test_a_timer_create_that_may_have_landed_is_not_doubled_in_the_runner(
+    create: httpx.Response | httpx.HTTPError,
+) -> None:
+    handler, _ = _timer_server(keeps=True, create=create)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server"
+    ) as server_client:
+        result = await _set_timer(server_client, seconds=600)
+    assert "may have kept this timer" in result["error"]
+    assert _runner_timers() == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("reply", "status"),
+    [
+        (httpx.Response(200, json={"status": "cancelled"}), "cancelled"),
+        (httpx.Response(200, json={"status": "not_found"}), "not_found"),
+        # A gate in front of the route, or an older server without it, says nothing of the timer.
+        (httpx.Response(404, json={"detail": "not found"}), None),
+        (httpx.Response(405, text="method not allowed"), None),
+        (httpx.Response(403, json={"error": {"message": "forbidden"}}), None),
+        (httpx.Response(503, text="unavailable"), None),
+    ],
+    ids=["cancelled", "not-found", "gate-404", "older-server-405", "refused-403", "down-503"],
+)
+async def test_cancelling_a_kept_timer_goes_to_the_server(
+    reply: httpx.Response, status: str | None
+) -> None:
+    from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
+
+    handler, calls = _timer_server(keeps=True, delete=reply)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server"
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_timer_cancel",
+            arguments=json.dumps({"timer_id": _KEPT_TIMER["timer_id"]}),
+            conversation_id=_SESSION,
+            server_client=server_client,
+        )
+    result = json.loads(output)
+    if status is None:
+        # Only the timer route's own answer says the timer is gone.
+        assert "may still be set" in result["error"]
+    else:
+        assert result == {"timer_id": _KEPT_TIMER["timer_id"], "status": status}
+    [delete] = calls
+    assert delete.method == "DELETE"
+    assert delete.url.path == f"/v1/sessions/{_SESSION}/timers/{_KEPT_TIMER['timer_id']}"
+    assert delete.headers[ORCHESTRATION_SOURCE_HEADER] == _SESSION
+
+
+@pytest.mark.parametrize(("spec_timers", "relayed"), [(None, True), (False, False)])
+def test_native_harnesses_get_the_timer_tools_unless_the_spec_turns_them_off(
+    spec_timers: bool | None, relayed: bool
+) -> None:
+    from omnigent.runner.tool_dispatch import build_native_relay_tool_schemas
+    from omnigent.spec.types import AgentSpec
+
+    spec = (
+        AgentSpec(spec_version=1)
+        if spec_timers is None
+        else AgentSpec(spec_version=1, timers=False)
+    )
+    timer_tools = {"sys_timer_set", "sys_timer_cancel"}
+    names = {schema["name"] for schema in build_native_relay_tool_schemas(spec)}
+    assert names & timer_tools == (timer_tools if relayed else set())

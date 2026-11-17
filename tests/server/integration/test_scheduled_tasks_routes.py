@@ -103,6 +103,7 @@ def _build_app(
     automations_feature: bool = True,
     session_mcp_selection: object | None = None,
     workflows: bool = False,
+    timers: bool = False,
 ) -> FastAPI:
     from omnigent.server.auth import UnifiedAuthProvider
     from omnigent.stores.host_store import HostStore
@@ -130,6 +131,7 @@ def _build_app(
                     + ("" if automations_feature else ",-automations")
                     + (",one_time_automations" if one_time else "")
                     + (",workflows" if workflows else "")
+                    + (",durable_timers" if timers else "")
                 )
             }
         ),
@@ -5584,3 +5586,256 @@ async def test_no_marker_for_a_session_its_automations_owner_does_not_own(
     listed = await auth_client.get(f"/v1/sessions/{session_id}/permissions", headers=_headers())
     assert listed.status_code == 200, listed.text
     assert listed.json()["managed_by_automation"] is None
+
+
+# ── Session timers ───────────────────────────────────────────────────────────
+
+_TIMER_TOKEN = "session-timer-token"
+
+
+def _timer_app(
+    db_uri: str,
+    tmp_path: Path,
+    *,
+    timers: bool = True,
+    automations: Callable[[], bool] | None = None,
+) -> FastAPI:
+    app = _build_app(db_uri, tmp_path, persistent=True, timers=timers, automations=automations)
+    _make_user(db_uri)
+    _register_host(app, _HOST_ID, "alice@example.com")
+    return app
+
+
+def _runner_session(db_uri: str, **fields: object) -> str:
+    """An owned session bound to the runner that holds the test's tunnel token."""
+    session_id = _owned_session(db_uri, **fields)
+    SqlAlchemyConversationStore(db_uri).set_runner_id(
+        session_id, token_bound_runner_id(_TIMER_TOKEN)
+    )
+    return session_id
+
+
+def _runner_headers(session_id: str) -> dict[str, str]:
+    return {
+        **_headers(),
+        ORCHESTRATION_SOURCE_HEADER: session_id,
+        RUNNER_TUNNEL_TOKEN_HEADER: _TIMER_TOKEN,
+    }
+
+
+@asynccontextmanager
+async def _off_host_client(app: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
+    """A client calling from another machine, as a session's runner on its host does."""
+    transport = httpx.ASGITransport(app=app, client=("192.0.2.10", 12345))
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        yield client
+
+
+async def test_a_sessions_own_runner_keeps_and_cancels_its_timer(
+    runtime_init: None, db_uri: str, tmp_path: Path
+) -> None:
+    app = _timer_app(db_uri, tmp_path)
+    session_id = _runner_session(db_uri)
+    async with _off_host_client(app) as client:
+        info = (await client.get("/v1/info", headers=_headers())).json()
+        assert info["scheduled_task_timers"] is True
+        created = await client.post(
+            f"/v1/sessions/{session_id}/timers",
+            json={"seconds": 600, "repeat": True, "note": "workflow check-in"},
+            headers=_runner_headers(session_id),
+        )
+        assert created.status_code == 200, created.text
+        timer = created.json()
+        task_id = timer["scheduled_task_id"]
+        assert timer["timer_id"] == f"timer_{task_id}"
+        stored = (await client.get(f"/v1/scheduled-tasks/{task_id}", headers=_headers())).json()
+        assert {key: stored[key] for key in ("kind", "rrule", "session_id", "prompt")} == {
+            "kind": "timer",
+            # A week of firings, counted from when it was set.
+            "rrule": "FREQ=MINUTELY;INTERVAL=10;COUNT=1008",
+            "session_id": session_id,
+            "prompt": f"[System: timer {timer['timer_id']} fired]\nnote: 'workflow check-in'",
+        }
+        assert stored["next_run_at"] == timer["next_run_at"] is not None
+        kept = SqlAlchemyScheduledTaskStore(db_uri).get(task_id)
+        assert kept is not None and kept.next_run_at == kept.created_at + 600
+        # The Automations page leaves it out; the list agents read includes it.
+        automations = await client.get("/v1/scheduled-tasks", headers=_headers())
+        assert automations.json()["scheduled_tasks"] == []
+        everything = await client.get(
+            "/v1/scheduled-tasks", params={"kind": "all"}, headers=_headers()
+        )
+        assert [(t["id"], t["kind"]) for t in everything.json()["scheduled_tasks"]] == [
+            (task_id, "timer")
+        ]
+        # Only the session's agent changes it, with its timer tools.
+        renamed = await client.patch(
+            f"/v1/scheduled-tasks/{task_id}", json={"name": "renamed"}, headers=_headers()
+        )
+        assert renamed.status_code == 400, renamed.text
+        ran = await client.post(f"/v1/scheduled-tasks/{task_id}/run", headers=_headers())
+        assert ran.status_code == 400, ran.text
+
+        url = f"/v1/sessions/{session_id}/timers/{timer['timer_id']}"
+        cancelled = await client.delete(url, headers=_runner_headers(session_id))
+        assert cancelled.json() == {"timer_id": timer["timer_id"], "status": "cancelled"}
+        again = await client.delete(url, headers=_runner_headers(session_id))
+        assert (again.status_code, again.json()["status"]) == (200, "not_found")
+
+
+async def test_a_one_shot_timer_fires_on_the_minute_after_its_delay(
+    runtime_init: None, db_uri: str, tmp_path: Path
+) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    app = _timer_app(db_uri, tmp_path)
+    session_id = _runner_session(db_uri)
+    async with _off_host_client(app) as client:
+        before = datetime.now(UTC)
+        created = await client.post(
+            f"/v1/sessions/{session_id}/timers",
+            json={"seconds": 900, "note": "check CI"},
+            headers=_runner_headers(session_id),
+        )
+        after = datetime.now(UTC)
+    assert created.status_code == 200, created.text
+    fires = datetime.fromisoformat(created.json()["next_run_at"])
+    assert (fires.second, fires.microsecond) == (0, 0)
+    assert before + timedelta(seconds=900) <= fires < after + timedelta(seconds=960)
+    stored = SqlAlchemyScheduledTaskStore(db_uri).get(created.json()["scheduled_task_id"])
+    assert stored is not None
+    assert (stored.kind, stored.rrule.endswith(";COUNT=1")) == ("timer", True)
+
+
+@pytest.mark.parametrize(
+    ("case", "status", "message"),
+    [
+        ("feature-off", 404, "does not keep timers"),
+        ("no-source-session", 403, "require a source session"),
+        ("another-sessions-runner", 403, "set by its own agent"),
+        ("side-chat", 400, "side chat"),
+        ("too-short", 400, "at least 600 seconds"),
+        ("off-minute-repeat", 400, "whole minutes"),
+    ],
+)
+async def test_only_a_sessions_own_runner_keeps_a_timer_the_server_can_keep(
+    runtime_init: None, db_uri: str, tmp_path: Path, case: str, status: int, message: str
+) -> None:
+    app = _timer_app(db_uri, tmp_path, timers=case != "feature-off")
+    fields = {"side_chat_parent_id": _owned_session(db_uri)} if case == "side-chat" else {}
+    session_id = _runner_session(db_uri, **fields)
+    caller = _runner_session(db_uri) if case == "another-sessions-runner" else session_id
+    seconds = {"too-short": 300, "off-minute-repeat": 630}.get(case, 600)
+    async with _off_host_client(app) as client:
+        refused = await client.post(
+            f"/v1/sessions/{session_id}/timers",
+            json={"seconds": seconds, "repeat": True},
+            headers=_headers() if case == "no-source-session" else _runner_headers(caller),
+        )
+        assert refused.status_code == status, refused.text
+        assert message in refused.json()["error"]["message"]
+        if case == "feature-off":
+            info = (await client.get("/v1/info", headers=_headers())).json()
+            assert info["scheduled_task_timers"] is False
+    assert [task.kind for task in SqlAlchemyScheduledTaskStore(db_uri).list()] == []
+
+
+async def test_only_the_session_that_set_a_timer_cancels_it(
+    runtime_init: None, db_uri: str, tmp_path: Path
+) -> None:
+    gate = {"automations": True}
+    app = _timer_app(db_uri, tmp_path, automations=lambda: gate["automations"])
+    session_id = _runner_session(db_uri)
+    other = _runner_session(db_uri)
+    url = f"/v1/sessions/{session_id}/timers"
+    async with _off_host_client(app) as client:
+        created = await client.post(
+            url, json={"seconds": 600, "repeat": True}, headers=_runner_headers(session_id)
+        )
+        assert created.status_code == 200, created.text
+        timer_id = created.json()["timer_id"]
+        # With no source session, from another session's runner, and under that session.
+        refused = [
+            await client.delete(f"{url}/{timer_id}", headers=_headers()),
+            await client.delete(f"{url}/{timer_id}", headers=_runner_headers(other)),
+            await client.delete(
+                f"/v1/sessions/{other}/timers/{timer_id}", headers=_runner_headers(other)
+            ),
+        ]
+        # Behind a closed automations gate, the route isn't reached at all.
+        gate["automations"] = False
+        gated = await client.delete(f"{url}/{timer_id}", headers=_runner_headers(session_id))
+    assert [response.status_code for response in refused] == [403, 403, 200]
+    assert refused[2].json()["status"] == "not_found"
+    assert gated.status_code == 404
+    [timer] = SqlAlchemyScheduledTaskStore(db_uri).list()
+    assert (timer.kind, timer.state) == ("timer", "active")
+
+
+async def test_a_session_keeps_at_most_ten_timers(
+    runtime_init: None, db_uri: str, tmp_path: Path
+) -> None:
+    app = _timer_app(db_uri, tmp_path)
+    session_id = _runner_session(db_uri)
+    url = f"/v1/sessions/{session_id}/timers"
+    async with _off_host_client(app) as client:
+        kept = [
+            await client.post(
+                url, json={"seconds": 600, "repeat": True}, headers=_runner_headers(session_id)
+            )
+            for _ in range(10)
+        ]
+        assert all(result.status_code == 200 for result in kept), [r.text for r in kept]
+        refused = await client.post(
+            url, json={"seconds": 600, "repeat": True}, headers=_runner_headers(session_id)
+        )
+        assert refused.status_code == 400
+        assert "already keeps 10 timers" in refused.json()["error"]["message"]
+        # Cancelling one makes room for another; the store test covers racing creates.
+        cancelled = await client.delete(
+            f"{url}/{kept[0].json()['timer_id']}", headers=_runner_headers(session_id)
+        )
+        assert cancelled.json()["status"] == "cancelled", cancelled.text
+        again = await client.post(
+            url, json={"seconds": 600, "repeat": True}, headers=_runner_headers(session_id)
+        )
+        assert again.status_code == 200, again.text
+
+
+@pytest.mark.parametrize(("delivered", "outcome"), [(False, "cancelled"), (True, "not_found")])
+async def test_cancelling_a_one_shot_timer_stops_a_firing_still_on_its_way(
+    runtime_init: None, db_uri: str, tmp_path: Path, delivered: bool, outcome: str
+) -> None:
+    app = _timer_app(db_uri, tmp_path)
+    session_id = _runner_session(db_uri)
+    async with _off_host_client(app) as client:
+        created = await client.post(
+            f"/v1/sessions/{session_id}/timers",
+            json={"seconds": 600},
+            headers=_runner_headers(session_id),
+        )
+        assert created.status_code == 200, created.text
+        timer = created.json()
+        # Claiming its only occurrence completes a one-shot timer.
+        tasks = SqlAlchemyScheduledTaskStore(db_uri)
+        tasks.configure_dispatch(True)
+        task = tasks.get(timer["scheduled_task_id"])
+        assert task is not None and task.next_run_at is not None
+        run = tasks.claim_scheduled_run(
+            task, now=task.next_run_at, next_run_at=None, host_id=task.host_id, lease_seconds=120
+        )
+        assert run is not None
+        assert tasks.get(task.id).state == "completed"
+        if delivered:
+            tasks.transition_starting_run(
+                run,
+                now=lambda: task.next_run_at + 1,
+                status="succeeded",
+                conversation_id=session_id,
+            )
+        cancelled = await client.delete(
+            f"/v1/sessions/{session_id}/timers/{timer['timer_id']}",
+            headers=_runner_headers(session_id),
+        )
+    assert cancelled.status_code == 200, cancelled.text
+    assert cancelled.json()["status"] == outcome

@@ -14,6 +14,7 @@ import pytest
 
 from omnigent.db.db_models import current_workspace_id, workspace_scope
 from omnigent.server.scheduled.dispatch_scheduler import (
+    TIMER_LAST_FIRING_GRACE_SECONDS,
     TRIGGER_POLL_SECONDS,
     PersistentTaskScheduler,
     ScheduledTaskDispatchHooks,
@@ -1405,13 +1406,13 @@ async def test_schedule_search_failure_preserves_next_run_at_and_retries(
             raise RRuleSearchError("RRULE validation exceeds the supported time limit")
         return original_validate(rule, **kwargs)
 
-    def calculate(rule, after, tz, *, anchor=None):
+    def calculate(rule, after, tz, *, anchor=None, phase_from_anchor=False):
         # Distinguish the task without replacing schedule error handling.
         if failing and failure != "validation" and rule == "FREQ=HOURLY":
             if failure == "unexpected":
                 raise OverflowError("invalid persisted timestamp")
             raise RRuleSearchError("RRULE search exceeds the supported time limit")
-        return original(rule, after, tz, anchor=anchor)
+        return original(rule, after, tz, anchor=anchor, phase_from_anchor=phase_from_anchor)
 
     store.update(healthy.id, rrule="FREQ=HOURLY;INTERVAL=1")
     monkeypatch.setattr(schedule, "get_next_fire_time", calculate)
@@ -2727,6 +2728,157 @@ async def test_other_continued_sessions_keep_their_schedule_and_send_while_busy(
     [run] = store.list_runs(task.id)[0]
     assert run.scheduled_at == task.next_run_at
     assert store.get(task.id).next_run_at == task.next_run_at + 600
+
+
+async def test_a_busy_session_skips_a_repeating_timers_firing_without_a_run(store) -> None:
+    task = _task(
+        store,
+        rrule="FREQ=MINUTELY;INTERVAL=10",
+        session_mode="continue",
+        session_id=uuid.uuid4().hex,
+        kind="timer",
+    )
+    clock = FakeClock(task.next_run_at)
+    fire = AsyncMock()
+    # The session is mid-turn, so this firing waits for the timer's next one.
+    busy = AsyncMock(return_value=task.next_run_at + 600)
+    scheduler = PersistentTaskScheduler(
+        store, fire, AsyncMock(return_value=None), now=clock.now, busy_until=busy
+    )
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    busy.assert_awaited_once_with(task, task.next_run_at)
+    fire.assert_not_awaited()
+    assert store.list_runs(task.id)[0] == []
+    assert store.get(task.id).next_run_at == task.next_run_at + 600
+
+    busy.return_value = None
+    clock.advance(600)
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    fire.assert_awaited_once()
+    [run] = store.list_runs(task.id)[0]
+    assert run.scheduled_at == task.next_run_at + 600
+
+
+async def test_a_busy_session_drops_a_repeating_timers_last_firing_without_a_run(store) -> None:
+    task = _task(
+        store,
+        rrule="FREQ=MINUTELY;INTERVAL=10;COUNT=2",
+        session_mode="continue",
+        session_id=uuid.uuid4().hex,
+        kind="timer",
+    )
+    last = task.next_run_at + 600
+    clock = FakeClock(task.next_run_at)
+    fire = AsyncMock()
+    busy = AsyncMock(return_value=last)
+    scheduler = PersistentTaskScheduler(
+        store, fire, AsyncMock(return_value=None), now=clock.now, busy_until=busy
+    )
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    assert store.get(task.id).next_run_at == last
+
+    # Still busy at its last firing, which has no later one to wait for.
+    busy.return_value = last + 1
+    clock.advance(600)
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    fire.assert_not_awaited()
+    assert store.list_runs(task.id)[0] == []
+    finished = store.get(task.id)
+    assert (finished.state, finished.next_run_at) == ("completed", None)
+
+
+async def test_a_repeating_timer_survives_a_restart_and_fires_once_each_time(
+    db_uri, store
+) -> None:
+    task = _task(
+        store,
+        rrule="FREQ=MINUTELY;INTERVAL=10;COUNT=1008",
+        session_mode="continue",
+        session_id=uuid.uuid4().hex,
+        kind="timer",
+    )
+    # It first fires a whole interval after it was set.
+    assert task.next_run_at == task.created_at + 600
+    fired = []
+
+    async def fire(snapshot, lease):
+        fired.append(lease.run.scheduled_at)
+        await lease.attach_session(snapshot.session_id)
+        await lease.finish("succeeded")
+
+    def restarted(clock: FakeClock) -> PersistentTaskScheduler:
+        # A new process: a fresh store and scheduler over the same database.
+        fresh = SqlAlchemyScheduledTaskStore(db_uri)
+        fresh.configure_dispatch(True)
+        return PersistentTaskScheduler(fresh, fire, AsyncMock(), now=clock.now)
+
+    clock = FakeClock(task.next_run_at)
+    for _ in range(2):
+        # The same minute after another restart fires nothing again.
+        scheduler = restarted(clock)
+        await scheduler.poll_once()
+        await _drain(scheduler)
+    clock.advance(600)
+    scheduler = restarted(clock)
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    assert fired == [task.next_run_at, task.next_run_at + 600]
+    saved = store.get(task.id)
+    assert (saved.state, saved.kind, saved.next_run_at) == (
+        "active",
+        "timer",
+        task.next_run_at + 1200,
+    )
+
+    # Back eight days after it was set, past its last firing: it ends without waking anyone.
+    clock.advance(task.created_at + 8 * 24 * 3600 - clock.now())
+    scheduler = restarted(clock)
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    assert fired == [task.next_run_at, task.next_run_at + 600]
+    ended = store.get(task.id)
+    assert (ended.state, ended.next_run_at) == ("completed", None)
+    assert len(store.list_runs(task.id)[0]) == 2
+
+
+@pytest.mark.parametrize(
+    ("late", "delivered"),
+    [
+        (TIMER_LAST_FIRING_GRACE_SECONDS - 1, True),
+        (TIMER_LAST_FIRING_GRACE_SECONDS, True),
+        (TIMER_LAST_FIRING_GRACE_SECONDS + 1, False),
+    ],
+)
+async def test_a_timer_back_after_missed_firings_sends_its_last_only_within_the_grace(
+    store, late: int, delivered: bool
+) -> None:
+    task = _task(
+        store,
+        rrule="FREQ=MINUTELY;INTERVAL=10;COUNT=3",
+        session_mode="continue",
+        session_id=uuid.uuid4().hex,
+        kind="timer",
+    )
+    # Stopped before its second firing, the cursor still names the first.
+    last = task.created_at + 3 * 600
+    clock = FakeClock(last + late)
+    fired = []
+
+    async def fire(snapshot, lease):
+        fired.append(lease.run.scheduled_at)
+        await lease.attach_session(snapshot.session_id)
+        await lease.finish("succeeded")
+
+    scheduler = PersistentTaskScheduler(store, fire, AsyncMock(), now=clock.now)
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    assert len(fired) == (1 if delivered else 0)
+    ended = store.get(task.id)
+    assert (ended.state, ended.next_run_at) == ("completed", None)
 
 
 async def test_without_a_busy_check_a_trigger_keeps_its_saved_schedule(store) -> None:

@@ -17,14 +17,19 @@ gated on ``timers``.
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 
 import pytest
 
 from omnigent.spec import AgentSpec
 from omnigent.tools.base import ToolContext
 from omnigent.tools.builtins.timer import (
+    DURABLE_TIMER_MAX_INTERVAL,
+    DURABLE_TIMER_MAX_LIFETIME,
     SysTimerCancelTool,
     SysTimerSetTool,
+    durable_timer_problem,
+    durable_timer_rule,
     validate_timer_set_args,
 )
 from omnigent.tools.manager import ToolManager
@@ -289,22 +294,18 @@ def test_cancel_malformed_json_returns_parse_error() -> None:
 # ─── ToolManager registration gating ─────────────────────────
 
 
-def test_timers_false_does_not_register() -> None:
+def test_timers_are_registered_unless_the_spec_turns_them_off() -> None:
     """
-    With ``timers=False`` (the default) the manager does NOT
-    register either timer tool.
+    Every agent has both timer tools unless its spec sets ``timers: false``.
 
-    The default-off behavior matches the inner stack
-    (``AgentDef.timers`` defaults to False there too) — agents
-    that don't declare ``timers: true`` get the same minimal tool
-    surface they did pre-step-10. A regression that flipped the
-    default to True would surprise existing agents.
+    A workflow keeps a check-in timer, so the tools are on for every agent, the
+    same as in the inner stack, where ``AgentDef.timers`` defaults to True too.
     """
-    spec = AgentSpec(spec_version=1)  # timers defaults to False
-    manager = ToolManager(spec=spec)
-    names = manager.get_tool_names()
-    assert SysTimerSetTool.name() not in names
-    assert SysTimerCancelTool.name() not in names
+    default = ToolManager(spec=AgentSpec(spec_version=1)).get_tool_names()
+    assert {SysTimerSetTool.name(), SysTimerCancelTool.name()} <= set(default)
+    turned_off = ToolManager(spec=AgentSpec(spec_version=1, timers=False)).get_tool_names()
+    assert SysTimerSetTool.name() not in turned_off
+    assert SysTimerCancelTool.name() not in turned_off
 
 
 def test_timers_true_registers_both_tools_and_schemas() -> None:
@@ -349,3 +350,25 @@ def test_timers_independent_of_async_enabled() -> None:
     assert "sys_call_async" not in names
     assert "sys_read_inbox" not in names
     assert "sys_cancel_async" not in names
+
+
+@pytest.mark.parametrize(
+    ("seconds", "firings"), [(600, 1008), (DURABLE_TIMER_MAX_INTERVAL.total_seconds(), 2)]
+)
+def test_a_kept_repeating_timer_fires_last_within_its_lifetime(
+    seconds: float, firings: int
+) -> None:
+    assert durable_timer_problem(seconds, True) is None
+    rule, fire_at = durable_timer_rule(seconds, True, datetime.now(UTC))
+    assert (rule, fire_at) == (
+        f"FREQ=MINUTELY;INTERVAL={int(seconds) // 60};COUNT={firings}",
+        None,
+    )
+    assert firings * seconds <= DURABLE_TIMER_MAX_LIFETIME.total_seconds()
+
+
+@pytest.mark.parametrize("seconds", [DURABLE_TIMER_MAX_INTERVAL.total_seconds() + 60, 604_800])
+def test_a_repeating_timer_too_far_apart_to_fire_twice_is_not_kept(seconds: float) -> None:
+    assert "up to every 84 hours" in (durable_timer_problem(seconds, True) or "")
+    # Firing once, a one-shot timer with the same delay is still kept.
+    assert durable_timer_problem(seconds, False) is None

@@ -79,11 +79,12 @@ class ScheduledTaskDispatchStore(Protocol):
         ...
 
     def skip_scheduled_occurrence(
-        self, task: ScheduledTask, *, now: int, next_run_at: int
+        self, task: ScheduledTask, *, now: int, next_run_at: int | None
     ) -> bool:
         """Advance an unchanged task past its due occurrence without recording a run.
 
-        Returns False, changing nothing, if the task changed since it was listed.
+        ``next_run_at=None`` skips its last occurrence, completing the task. Returns
+        False, changing nothing, if the task changed since it was listed.
         """
         ...
 

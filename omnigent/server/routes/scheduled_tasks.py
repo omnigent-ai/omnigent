@@ -84,14 +84,24 @@ from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import SCHEDULED_TASK_RUN_LABEL_KEY
 from omnigent.stores.project_store import ProjectStore
 from omnigent.stores.scheduled_task_store import (
+    TIMERS_PER_SESSION,
     AutomationFailure,
     ScheduledTaskFirstRunMismatchError,
+    ScheduledTaskSessionTimerCapError,
     ScheduledTaskStore,
     encode_mcp_services,
 )
 from omnigent.tools.browser_agent_tools import (
     BROWSER_AGENT_TOOLS_CREATION_LABEL_KEYS,
     browser_agent_tools_creation_labels,
+)
+from omnigent.tools.builtins.timer import (
+    durable_timer_id,
+    durable_timer_problem,
+    durable_timer_rule,
+    durable_timer_task_id,
+    timer_fired_text,
+    validate_timer_set_args,
 )
 from omnigent.util.uuid import normalize_uuid
 
@@ -404,6 +414,40 @@ def _validate_timezone_or_400(timezone: str) -> None:
 
 
 _AGENT_AUTOMATION_ACTION = "Agent automation changes"
+_TIMER_ACTION = "Session timers"
+_TIMER_NAME_CHARS = 60
+# A note is echoed in every firing, so keep it a label, not a transcript.
+_TIMER_NOTE_MAX_CHARS = 1000
+
+
+class SetSessionTimerRequest(BaseModel):
+    """Body for ``POST /v1/sessions/{session_id}/timers``: a ``sys_timer_set`` call."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    seconds: float
+    repeat: bool = False
+    note: str | None = Field(default=None, max_length=_TIMER_NOTE_MAX_CHARS)
+
+
+def _timer_name(note: str | None, seconds: float, repeat: bool) -> str:
+    """The name a kept timer is stored under, e.g. ``"Timer: workflow check-in"``."""
+    label = " ".join((note or "").split()) or (
+        f"every {int(seconds) // 60} min" if repeat else "once"
+    )
+    if len(label) > _TIMER_NAME_CHARS:
+        label = label[: _TIMER_NAME_CHARS - 3] + "..."
+    return f"Timer: {label}"
+
+
+def _refuse_timer(task: ScheduledTask) -> None:
+    """Refuse to edit or run a timer here: its session's agent owns it through its timer tools."""
+    if task.kind == "timer":
+        raise OmnigentError(
+            "This is a session's timer; its agent sets it with sys_timer_set and cancels it "
+            "with sys_timer_cancel",
+            code=ErrorCode.INVALID_INPUT,
+        )
 
 
 def _inbox_cursor_task_id(task_id: str) -> str:
@@ -1126,8 +1170,9 @@ def create_scheduled_tasks_router(
     ) -> dict[str, list[dict[str, Any]]]:
         """List the caller's scheduled tasks.
 
-        Lists automations unless *kind* is ``all``, so the reminders agents set for
-        their own sessions stay off the Automations page. There is no reminders-only
+        Lists automations unless *kind* is ``all``, so the reminders and timers agents
+        set for their own sessions stay off the Automations page; ``all`` includes them,
+        so an agent can find one to cancel. There is no reminders-only
         view: this list reads every task the owner has, and a selective filter needs
         an indexed, paginated query first.
 
@@ -1401,6 +1446,7 @@ def create_scheduled_tasks_router(
         owner = _owner(request)
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
         task = _require_owned(scheduled_task_id, owner_id)
+        _refuse_timer(task)
         if getattr(request.app.state, "scheduled_task_dispatch_enabled", False):
             scheduler = _scheduler(request)
             if scheduler is None:
@@ -1447,6 +1493,7 @@ def create_scheduled_tasks_router(
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
         stored = _require_owned(scheduled_task_id, owner_id)
         _reject_proactive_agent(body.agent_id)
+        _refuse_timer(stored)
         existing = without_legacy_sandbox_workspace(stored)
         legacy_workspace = existing.workspace != stored.workspace
         if body.timezone is not None:
@@ -1718,4 +1765,157 @@ def create_scheduled_tasks_router(
         conversation_store=conversation_store,
         permission_store=permission_store,
     )
+
+    def _own_runner_session(request: Request, owner: str, session_id: str) -> str:
+        """The path's session, when the call comes from that session's own runner."""
+        source_id = require_agent_origin(
+            request,
+            action=_TIMER_ACTION,
+            owner=owner,
+            auth_provider=auth_provider,
+            conversation_store=conversation_store,
+            permission_store=permission_store,
+            required=True,
+        )
+        if source_id is None or source_id != (normalize_uuid(session_id) or session_id):
+            raise OmnigentError(
+                "A session's timers are set by its own agent", code=ErrorCode.FORBIDDEN
+            )
+        return source_id
+
+    @router.post("/sessions/{session_id}/timers")
+    async def set_session_timer(
+        request: Request, session_id: str, body: SetSessionTimerRequest
+    ) -> dict[str, Any]:
+        """Keep a ``sys_timer_set`` timer for the calling session, firing into it.
+
+        Only the session's own runner sets its timers. Like a timer the runner keeps
+        in memory, it needs no approval: each firing sends the session a fixed notice
+        with the agent's note, in the permission mode the session already runs.
+        """
+        if not getattr(request.app.state, "durable_timers_enabled", False):
+            raise OmnigentError("This server does not keep timers", code=ErrorCode.NOT_FOUND)
+        owner = _owner(request)
+        source_id = _own_runner_session(request, owner, session_id)
+        validated = validate_timer_set_args(body.model_dump())
+        if isinstance(validated, str):
+            raise OmnigentError(validated, code=ErrorCode.INVALID_INPUT)
+        seconds, repeat, note = validated
+        not_kept = durable_timer_problem(seconds, repeat)
+        if not_kept is not None:
+            raise OmnigentError(not_kept, code=ErrorCode.INVALID_INPUT)
+        conv = await asyncio.to_thread(conversation_store.get_conversation, source_id)
+        if conv is None:
+            raise OmnigentError("Session not found", code=ErrorCode.NOT_FOUND)
+        if conv.side_chat_parent_id is not None:
+            # A side chat runs on its source's runner, which a timer can't wake once it stops.
+            raise OmnigentError(
+                "A side chat can't keep a timer; keep it in the session it belongs to",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if conv.agent_id is None or conv.host_id is None:
+            raise OmnigentError(
+                "Only a session on a connected host can keep a timer",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        owner_id = None if owner == RESERVED_USER_LOCAL else owner
+        rrule, fire_at = durable_timer_rule(seconds, repeat, datetime.now(UTC))
+        await _validate_rrule_or_400(rrule, "continue", "connected_host", allow_single_fire=True)
+        name = _timer_name(note, seconds, repeat)
+        async with _allocated_task_id(owner_id, name) as task_id:
+            timer_id = durable_timer_id(task_id)
+            shape = ScheduledTask(
+                id=task_id,
+                name=name,
+                prompt=timer_fired_text(timer_id, note),
+                rrule=rrule,
+                user_id=owner_id,
+                agent_id=conv.agent_id,
+                timezone="UTC",
+                created_at=0,
+                session_mode="continue",
+                session_id=conv.id,
+                host_id=conv.host_id,
+                kind="timer",
+            )
+            from omnigent.server.scheduled.fire import continued_session_problem
+
+            problem = await continued_session_problem(
+                shape,
+                conv,
+                host_store=getattr(request.app.state, "host_store", None),
+                permission_store=permission_store,
+            )
+            if problem is not None:
+                raise OmnigentError(
+                    f"cannot keep a timer in this session: {problem[0]}",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            try:
+                task = store.create(
+                    scheduled_task_id=task_id,
+                    name=name,
+                    prompt=shape.prompt,
+                    rrule=rrule,
+                    user_id=owner_id,
+                    agent_id=conv.agent_id,
+                    timezone="UTC",
+                    session_mode="continue",
+                    session_id=conv.id,
+                    host_id=conv.host_id,
+                    first_run_at=int(fire_at.timestamp()) if fire_at is not None else None,
+                    kind="timer",
+                )
+            except ScheduledTaskFirstRunMismatchError as exc:
+                raise OmnigentError(
+                    "The timer would not first fire when asked, so it was not kept; set it again",
+                    code=ErrorCode.INVALID_INPUT,
+                ) from exc
+            except ScheduledTaskSessionTimerCapError as exc:
+                raise OmnigentError(
+                    f"This session already keeps {TIMERS_PER_SESSION} timers; cancel one with "
+                    "sys_timer_cancel first",
+                    code=ErrorCode.INVALID_INPUT,
+                ) from exc
+        return {
+            "timer_id": timer_id,
+            "scheduled_task_id": task.id,
+            "seconds": seconds,
+            "repeat": repeat,
+            "note": note,
+            "next_run_at": _next_run_at(task, request),
+        }
+
+    @router.delete("/sessions/{session_id}/timers/{timer_id}")
+    async def cancel_session_timer(
+        request: Request, session_id: str, timer_id: str
+    ) -> dict[str, Any]:
+        """Cancel one of the calling session's kept timers; only its own runner calls this.
+
+        Answers ``status`` ``"cancelled"`` or ``"not_found"`` with a 200, so a 404 from
+        a gate in front of this route never reads as a timer that is gone.
+        """
+        owner = _owner(request)
+        source_id = _own_runner_session(request, owner, session_id)
+        owner_id = None if owner == RESERVED_USER_LOCAL else owner
+        task_id = durable_timer_task_id(timer_id)
+        task = await asyncio.to_thread(store.get, task_id) if task_id is not None else None
+        if (
+            task is None
+            or task.kind != "timer"
+            or task.session_id != source_id
+            or not owns_scheduled_task(task, owner_id)
+            or task.state == "deleted"
+            # A one-shot timer that fired has nothing left to cancel, as in memory.
+            or (task.state == "completed" and not await _firing_in_flight(task.id))
+        ):
+            return {"timer_id": timer_id, "status": "not_found"}
+        await asyncio.to_thread(store.delete, task.id)
+        return {"timer_id": timer_id, "status": "cancelled"}
+
+    async def _firing_in_flight(task_id: str) -> bool:
+        """Whether a firing is claimed but not yet sent, which a cancel still stops."""
+        runs, _ = await asyncio.to_thread(store.list_runs, task_id, limit=1)
+        return bool(runs) and runs[0].status in ("scheduled", "starting")
+
     return router

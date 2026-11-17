@@ -26,6 +26,9 @@ tool_groups:
   projects: false
   journal: false
 
+# Timers default to on; a scheduled pass ends with its run and has nothing to wait for.
+timers: false
+
 async: false
 
 # A shell for tools such as `gh` and `git`. The policies below deny the file

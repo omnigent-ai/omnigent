@@ -21,6 +21,7 @@ from omnigent.server.scheduled.config import DEFAULT_SCHEDULER_CONFIG, Scheduled
 from omnigent.server.scheduled.rrule import RRuleSearchError, RRuleValidationError, validate_rrule
 from omnigent.server.scheduled.schedule import (
     host_ownership_key,
+    is_repeating_timer,
     is_trigger_automation,
     manual_trigger_key,
     next_scheduled_time,
@@ -359,13 +360,18 @@ FireIdentity = Callable[[ScheduledTask], AbstractAsyncContextManager[object]]
 DispatchEnabled = Callable[[], bool]
 # Read before each wait between polls.
 PollInterval = Callable[[], float]
-# Given the current time, when a trigger automation's busy session should next be checked,
-# skipping this poll unrecorded; ``None`` polls now. Asked only for trigger automations.
+# Given the current time, when a busy session should next be checked, skipping this poll
+# unrecorded; ``None`` polls now. Asked only for trigger automations and repeating timers,
+# and for a timer's last firing too, which any later time drops.
 BusyUntil = Callable[[ScheduledTask, int], Awaitable[int | None]]
 
 # With a busy check, the server tries to poll a trigger automation this often instead of
 # following the trigger's saved schedule.
 TRIGGER_POLL_SECONDS = 2 * 60
+
+# A repeating timer's last firing found later than this after its time, as after an outage,
+# is dropped, so a timer never wakes its session long after its count ends it.
+TIMER_LAST_FIRING_GRACE_SECONDS = 10 * 60
 
 
 class FireIdentityRevoked(Exception):
@@ -673,14 +679,59 @@ class PersistentTaskScheduler:
             return min(occurrence, now + TRIGGER_POLL_SECONDS)
         return occurrence
 
-    async def _skip_busy_occurrence(self, task: ScheduledTask, *, now: int, next_run: int) -> bool:
-        """Move a busy trigger automation's due poll to its next check, recording no run.
+    async def _drop_late_last_timer_firing(
+        self, task: ScheduledTask, *, now: int, next_run: int | None
+    ) -> bool:
+        """Complete a repeating timer whose last firing is long overdue, recording no run.
 
-        The next check is no later than *next_run*, the schedule's next occurrence. Returns
-        True when this occurrence must not be claimed. A failed busy check returns False, so
-        the occurrence is sent as it would be without skipping.
+        A claim starts delivery right away, and recovery fails a stale run rather than
+        sending it again, so checking here bounds when a timer can still wake its session.
         """
-        if self._busy_until is None or not is_trigger_automation(task):
+        assert task.next_run_at is not None
+        if (
+            next_run is not None
+            or not is_repeating_timer(task)
+            or now - task.next_run_at <= TIMER_LAST_FIRING_GRACE_SECONDS
+        ):
+            return False
+        # The cursor can name an earlier missed firing; nothing comes after now, so a
+        # firing at or after the grace window's start is the last one, and it isn't late.
+        cutoff = now - TIMER_LAST_FIRING_GRACE_SECONDS
+        if await self._next_occurrence(task, cutoff - 1) is not None:
+            return False
+        with workspace_scope(task.workspace_id):
+            completed = await asyncio.to_thread(
+                self._store.skip_scheduled_occurrence, task, now=now, next_run_at=None
+            )
+        _log_event(
+            _logger.info,
+            "Dropped timer %s's last firing, found more than %s seconds after its time",
+            task.id,
+            TIMER_LAST_FIRING_GRACE_SECONDS,
+            extra=debug_event(
+                "scheduled_run_skipped_expired",
+                task_id=task.id,
+                task_workspace_id=task.workspace_id,
+                scheduled_at=task.next_run_at,
+                completed=completed,
+            ),
+        )
+        return True
+
+    async def _skip_busy_occurrence(
+        self, task: ScheduledTask, *, now: int, next_run: int | None
+    ) -> bool:
+        """Move a busy trigger automation's or repeating timer's due run, recording no run.
+
+        The next check is no later than *next_run*, the schedule's next occurrence. A skip
+        only defers a trigger's poll, so its last occurrence is always sent; a repeating
+        timer's last firing is dropped instead, completing the timer. Returns True when
+        this occurrence must not be claimed. A failed busy check returns False, so the
+        occurrence is sent as it would be without skipping.
+        """
+        if self._busy_until is None or not (
+            is_repeating_timer(task) or (is_trigger_automation(task) and next_run is not None)
+        ):
             return False
         assert task.next_run_at is not None
         try:
@@ -693,7 +744,7 @@ class PersistentTaskScheduler:
             return False
         if until is None or until <= now:
             return False
-        until = min(until, next_run)
+        until = None if next_run is None else min(until, next_run)
         with workspace_scope(task.workspace_id):
             advanced = await asyncio.to_thread(
                 self._store.skip_scheduled_occurrence, task, now=now, next_run_at=until
@@ -938,11 +989,9 @@ class PersistentTaskScheduler:
                     next_run = await self._next_occurrence(task, now)
                     if self._stopped:
                         return
-                    # A skip only defers a poll, so the last occurrence of a schedule that ends
-                    # is always sent.
-                    if next_run is not None and await self._skip_busy_occurrence(
-                        task, now=now, next_run=next_run
-                    ):
+                    if await self._drop_late_last_timer_firing(task, now=now, next_run=next_run):
+                        continue
+                    if await self._skip_busy_occurrence(task, now=now, next_run=next_run):
                         continue
                     with workspace_scope(task.workspace_id):
                         run = await asyncio.to_thread(

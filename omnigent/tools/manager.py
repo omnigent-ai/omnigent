@@ -182,9 +182,7 @@ class ToolManager:
         # registration only cares about the gate — no
         # construction-time wiring.
         self._register_async_inbox_tools()
-        # Step 10: register sys_timer_set / sys_timer_cancel when
-        # the spec opts in via ``timers: true``. Defaults off
-        # (matches the inner stack's ``AgentDef.timers`` default).
+        # Step 10: register timer tools unless the spec opts out.
         # Firings ride the same ``async_work_complete`` drain path
         # as ``sys_call_async``, but with ``kind="timer"`` so they
         # don't block end-of-turn auto-collect.
@@ -295,12 +293,12 @@ class ToolManager:
 
     def _register_timer_tools(self) -> None:
         """
-        Register the timer builtins when the agent spec opts in.
+        Register the timer builtins unless the agent spec opts out.
 
-        Gated on :attr:`AgentSpec.timers` (defaults to ``False`` to
-        match ``omnigent/inner/datamodel.py::AgentDef.timers``).
-        Agents that want timer scheduling declare ``timers: true``
-        at the top level of their YAML.
+        Gated on :attr:`AgentSpec.timers` (defaults to ``True``, like
+        ``omnigent/inner/datamodel.py::AgentDef.timers``). Agents that
+        want no timers declare ``timers: false`` at the top level of
+        their YAML.
 
         Registers (in order):
 

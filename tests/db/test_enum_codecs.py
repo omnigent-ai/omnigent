@@ -46,6 +46,7 @@ _CODECS = [
         ec.encode_scheduled_task_session_mode,
         ec.decode_scheduled_task_session_mode,
     ),
+    (ec.SCHEDULED_TASK_KIND, ec.encode_scheduled_task_kind, ec.decode_scheduled_task_kind),
     (ec.JOURNAL_ENTRY_KIND, ec.encode_journal_entry_kind, ec.decode_journal_entry_kind),
     (ec.INBOX_ITEM_STATUS, ec.encode_inbox_item_status, ec.decode_inbox_item_status),
 ]
@@ -130,6 +131,7 @@ def test_shipped_codes_are_stable() -> None:
         "managed_sandbox": 2,
     }
     assert ec.SCHEDULED_TASK_SESSION_MODE == {"new": 1, "continue": 2}
+    assert ec.SCHEDULED_TASK_KIND == {"automation": 1, "reminder": 2, "timer": 3}
     assert ec.INBOX_ITEM_STATUS == {"unread": 1, "read": 2, "done": 3, "dismissed": 4}
     assert ec.SCHEDULED_TASK_RUN_STATUS == {
         "scheduled": 1,

@@ -440,9 +440,46 @@ For a goal you can measure, such as "cut p95 latency by 20%":
   replan so the goal no longer waits on it; the failed try stays in the plan.
 - Record each measurement in the status text or a note.
 
+## Check-ins
+
+Keep one check-in timer running while the run has work left. If your turn
+ends early, a wait outlasts your turn or your runner restarts, a check-in
+wakes you to pick the plan back up. In a native harness such as Claude Code
+or Codex, the timer tools come from the `omnigent` MCP server: in Claude
+Code, `sys_timer_set` is `mcp__omnigent__sys_timer_set`.
+
+1. When you write the run's first `started`, and again whenever you pick
+   the run back up after Continue, Run, Retry or the user's answer, call
+   `sys_timer_set` with `seconds: 600`, `repeat: true` and
+   `note: "workflow check-in"`. Record the returned `timer_id` in a note
+   with `sys_journal_write_note`. If a note already names a check-in timer,
+   cancel that one first with `sys_timer_cancel` and that `timer_id`, so
+   only one runs.
+2. `durable: true` in the result means the server keeps the timer, so it
+   fires even after your runner stops, skips a check-in while your session
+   is busy or waiting on the user, and ends on its own after seven days;
+   set it again then if the run is still going. With `durable: false` it
+   lasts only as long as your runner, and `not_durable_because` says why;
+   keep it anyway.
+3. A check-in arrives as a `[System: timer … fired]` message with that
+   note. Read your journal with `sys_journal_read`, check on the work you're
+   waiting for, write a status for anything that moved and continue the
+   ready steps. If everything left waits on another session or slow
+   external work, end your turn without a reply.
+4. When everything left waits only on the user, cancel the timer with
+   `sys_timer_cancel`: their answer or Continue wakes you, and you set it
+   again then. Cancel it too when the workflow concludes, with every step
+   done or failed, or the rest unable to start because of a failed step,
+   before your final reply, and on Stop. A message from the user doesn't
+   cancel it.
+
+If `sys_timer_set` isn't available, keep checking with a background timer of
+your own tools, as for a session you start.
+
 ## Finish
 
-Before your final reply, write a status for every step you worked on. In the
+Before your final reply, write a status for every step you worked on, and
+cancel the check-in timer if the workflow concluded (see "Check-ins"). In the
 reply, lead with anything the user needs to decide, then summarize what was
 done and what is left. If another session started this workflow and your plan
 is finished, report back to it now (see "When another workflow started

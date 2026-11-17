@@ -140,6 +140,7 @@ def get_next_fire_time(
     tz: ZoneInfo,
     *,
     anchor: datetime | None = None,
+    phase_from_anchor: bool = False,
 ) -> datetime | None:
     """Compute the next fire strictly after ``after``, evaluated in ``tz``.
 
@@ -154,11 +155,17 @@ def get_next_fire_time(
     :param anchor: Creation time for persisted schedules. COUNT includes only
         occurrences strictly after this instant; interval phase uses its local date.
         Omit to retain the legacy timer's query-day anchor and COUNT behavior.
+    :param phase_from_anchor: Count intervals from *anchor* itself rather than from
+        midnight of its day, so ``FREQ=MINUTELY;INTERVAL=10`` first fires ten minutes
+        after it, as a timer set then would.
     :returns: The next fire as a tz-aware datetime, or ``None`` if the rule has
         no further occurrences.
     :raises RRuleValidationError: If ``rule_str`` is malformed.
     """
-    dtstart = _anchor_dtstart(anchor if anchor is not None else after, tz)
+    if phase_from_anchor and anchor is not None:
+        dtstart = anchor.astimezone(tz).replace(microsecond=0)
+    else:
+        dtstart = _anchor_dtstart(anchor if anchor is not None else after, tz)
     rule = _parse(
         rule_str,
         dtstart,

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import dataclasses
 import json
 import logging
@@ -137,6 +138,9 @@ from omnigent.tools.builtins.sys_terminal import (
     SysTerminalSendTool,
 )
 from omnigent.tools.builtins.timer import (
+    durable_timer_problem,
+    durable_timer_task_id,
+    timer_fired_text,
     # Shared with the in-process sys_timer_set tool so the runner's firing
     # loop validates the same argument shape and delay ceiling the LLM-facing
     # schema advertises.
@@ -545,6 +549,9 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     | _JOURNAL_TOOLS
     | _USER_INBOX_TOOLS
     | _TERMINAL_TOOLS
+    # A native harness's own background timers end with its process; these can
+    # outlive the runner. The relay advertises them only when the spec registers them.
+    | _TIMER_TOOLS
     # ``browser_*`` must ride the native relay: the Omnigent desktop app
     # runs native (claude/codex/pi) sessions, which ignore ``request.tools``
     # and see ONLY this relay surface — without this union member the
@@ -4774,6 +4781,27 @@ async def _execute_timer_set(
     if server_client is None or conversation_id is None:
         return json.dumps({"error": "timer requires server_client and conversation_id"})
 
+    not_kept = durable_timer_problem(seconds, repeat)
+    if not_kept is None:
+        kept = await _keep_timer_on_server(
+            server_client, conversation_id, seconds=seconds, repeat=repeat, note=note
+        )
+        if isinstance(kept, _TimerKept):
+            return json.dumps(
+                {
+                    "timer_id": kept.timer_id,
+                    "status": "scheduled",
+                    "seconds": seconds,
+                    "repeat": repeat,
+                    "note": note,
+                    "durable": True,
+                    "next_run_at": kept.next_run_at,
+                }
+            )
+        if kept.error is not None:
+            return json.dumps({"error": kept.error})
+        not_kept = kept.reason
+
     timer_id = f"timer_{uuid.uuid4().hex}"
     task = asyncio.create_task(
         _timer_loop(
@@ -4794,7 +4822,87 @@ async def _execute_timer_set(
             "seconds": seconds,
             "repeat": repeat,
             "note": note,
+            # This runner keeps it, so it ends if the runner stops.
+            "durable": False,
+            **({"not_durable_because": not_kept} if not_kept else {}),
         }
+    )
+
+
+@dataclass(frozen=True)
+class _TimerKept:
+    """A timer the server keeps."""
+
+    timer_id: str
+    next_run_at: str | None
+
+
+@dataclass(frozen=True)
+class _TimerNotKept:
+    """Why the server isn't keeping a timer: keep it here, or report an error."""
+
+    reason: str | None = None
+    # Set when the server may have kept it anyway, so keeping a copy here could fire twice.
+    error: str | None = None
+
+
+async def _keep_timer_on_server(
+    server_client: httpx.AsyncClient,
+    conversation_id: str,
+    *,
+    seconds: float,
+    repeat: bool,
+    note: str | None,
+) -> _TimerKept | _TimerNotKept:
+    """
+    Ask the server to keep a timer as a scheduled task that fires into this session.
+
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :param conversation_id: The session the timer fires into, e.g. ``"conv_abc123"``.
+    :param seconds: The delay, or a repeating timer's interval.
+    :param repeat: Whether the timer repeats.
+    :param note: Echoed in each firing, or ``None``.
+    :returns: The kept timer, or why it wasn't kept.
+    """
+    try:
+        info = await server_client.get("/v1/info", timeout=30.0)
+        supported = info.status_code < 400 and info.json().get("scheduled_task_timers") is True
+    except Exception:  # noqa: BLE001
+        supported = False
+    if not supported:
+        return _TimerNotKept(reason="this Omnigent server doesn't keep timers")
+    may_exist = (
+        "sys_timer_set: the server may have kept this timer even though the request failed "
+        "({problem}). If it fires, its message names its timer_id, which sys_timer_cancel "
+        "takes; set it again only if it doesn't."
+    )
+    try:
+        resp = await server_client.post(
+            f"{_session_url(conversation_id)}/timers",
+            json={"seconds": seconds, "repeat": repeat, "note": note},
+            headers={ORCHESTRATION_SOURCE_HEADER: conversation_id},
+            timeout=30.0,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _TimerNotKept(error=may_exist.format(problem=exc))
+    if resp.status_code >= 500:
+        # A gateway can answer 502 or 504 after the server saved the timer.
+        return _TimerNotKept(error=may_exist.format(problem=f"HTTP {resp.status_code}"))
+    try:
+        body = _string_object_dict(resp.json()) or {}
+    except ValueError:
+        body = {}
+    if resp.status_code >= 400:
+        # Refused before anything was saved, e.g. in a side chat: keep it here instead.
+        error = body.get("error")
+        detail = error.get("message") if isinstance(error, dict) else body.get("detail")
+        return _TimerNotKept(reason=str(detail or f"HTTP {resp.status_code}")[:500])
+    timer_id = body.get("timer_id")
+    if not isinstance(timer_id, str) or not timer_id:
+        return _TimerNotKept(error=may_exist.format(problem="its reply had no timer_id"))
+    next_run_at = body.get("next_run_at")
+    return _TimerKept(
+        timer_id=timer_id, next_run_at=next_run_at if isinstance(next_run_at, str) else None
     )
 
 
@@ -4822,9 +4930,7 @@ async def _timer_loop(
     try:
         while True:
             await asyncio.sleep(seconds)
-            text = f"[System: timer {timer_id} fired]"
-            if note:
-                text += f"\nnote: {note!r}"
+            text = timer_fired_text(timer_id, note)
             try:
                 resp = await server_client.post(
                     f"{_session_url(conversation_id)}/events",
@@ -4861,12 +4967,17 @@ async def _execute_timer_cancel(
     args: _JsonObject,
     *,
     conversation_id: str | None = None,
+    server_client: httpx.AsyncClient | None = None,
 ) -> str:
     """
     Cancel a previously scheduled timer by ``timer_id``.
 
+    A timer this runner doesn't hold may be one the server keeps, so that is
+    cancelled through the server.
+
     :param args: Parsed arguments with ``timer_id`` (string).
     :param conversation_id: Session the timer belongs to.
+    :param server_client: HTTP client pointed at the Omnigent server, or ``None``.
     :returns: JSON with ``status`` ``"cancelled"`` or ``"not_found"``.
     """
     from omnigent.runner import app as _app
@@ -4877,6 +4988,33 @@ async def _execute_timer_cancel(
     if conversation_id is None:
         return json.dumps({"error": "timer_cancel requires conversation_id"})
     cancelled = _app.cancel_timer(conversation_id, timer_id)
+    if not cancelled and server_client is not None and durable_timer_task_id(timer_id):
+        try:
+            resp = await server_client.delete(
+                f"{_session_url(conversation_id)}/timers/{timer_id}",
+                headers={ORCHESTRATION_SOURCE_HEADER: conversation_id},
+                timeout=30.0,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return json.dumps(
+                {"error": f"sys_timer_cancel failed, so the timer may still be set: {exc}"}
+            )
+        answer: _JsonObject = {}
+        if resp.status_code < 300:
+            with contextlib.suppress(ValueError):
+                answer = _string_object_dict(resp.json()) or {}
+        status = answer.get("status")
+        # Only the timer route says whether the server holds the timer; any other reply,
+        # such as a gate's 404 or an older server's, leaves it possibly still set.
+        if status not in ("cancelled", "not_found"):
+            return json.dumps(
+                {
+                    "error": f"sys_timer_cancel: the server returned {resp.status_code} "
+                    "without confirming, so the timer may still be set",
+                    "details": resp.text[:1000],
+                }
+            )
+        return json.dumps({"timer_id": timer_id, "status": status})
     return json.dumps({"timer_id": timer_id, "status": "cancelled" if cancelled else "not_found"})
 
 
@@ -8040,6 +8178,7 @@ async def execute_tool(
                 output = await _execute_timer_cancel(
                     args,
                     conversation_id=conversation_id,
+                    server_client=server_client,
                 )
         elif tool_name in _TASK_LIFECYCLE_TOOLS:
             output = await _execute_task_lifecycle_tool(

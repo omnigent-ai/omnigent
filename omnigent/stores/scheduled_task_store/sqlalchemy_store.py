@@ -17,6 +17,7 @@ from sqlalchemy.sql.elements import ColumnElement
 from omnigent.db.account_authority import require_active_account
 from omnigent.db.db_models import (
     DEFAULT_WORKSPACE_ID,
+    SqlConversationMetadata,
     SqlHost,
     SqlPreference,
     SqlScheduledTask,
@@ -53,6 +54,7 @@ from omnigent.server.scheduled.run_reconciler import (
 from omnigent.server.scheduled.schedule import (
     continued_sandbox_host_id,
     fits_reminder,
+    fits_timer,
     is_trigger_automation,
     next_scheduled_time,
     occurrence_host_id,
@@ -60,9 +62,11 @@ from omnigent.server.scheduled.schedule import (
 )
 from omnigent.stores.host_store import delete_unused_host_in_session
 from omnigent.stores.scheduled_task_store import (
+    TIMERS_PER_SESSION,
     AdoptOutcome,
     AutomationFailure,
     ScheduledTaskFirstRunMismatchError,
+    ScheduledTaskSessionTimerCapError,
     ScheduledTaskStore,
     decode_mcp_services,
     encode_mcp_services,
@@ -202,6 +206,23 @@ def _run_to_entity(row: SqlScheduledTaskRun) -> ScheduledTaskRun:
     )
 
 
+def _timers_kept(session: Session, session_id: str | None) -> int:
+    """Count a session's active timers over ``ix_scheduled_tasks_kind_session``."""
+    # Counting stops at the cap, so a session's timer history never grows the query.
+    kept = (
+        select(SqlScheduledTask.id)
+        .where(
+            SqlScheduledTask.kind == encode_scheduled_task_kind("timer"),
+            SqlScheduledTask.state == encode_scheduled_task_state("active"),
+            SqlScheduledTask.workspace_id == current_workspace_id(),
+            SqlScheduledTask.session_id == session_id,
+        )
+        .limit(TIMERS_PER_SESSION)
+        .subquery()
+    )
+    return session.execute(select(func.count()).select_from(kept)).scalar_one()
+
+
 class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
     """
     SQLAlchemy-backed implementation of :class:`ScheduledTaskStore`.
@@ -271,25 +292,35 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
     ) -> ScheduledTask:
         """Insert a new scheduled task with a required recurring ``rrule``."""
         encoded_kind = encode_scheduled_task_kind(kind)
-        if kind == "reminder" and not fits_reminder(
-            ScheduledTask(
-                id=scheduled_task_id,
-                name=name,
-                prompt=prompt,
-                rrule=rrule,
-                user_id=user_id,
-                agent_id=agent_id,
-                timezone=timezone,
-                created_at=0,
-                session_mode=session_mode,
-                session_id=session_id,
-            )
-        ):
+        shape = ScheduledTask(
+            id=scheduled_task_id,
+            name=name,
+            prompt=prompt,
+            rrule=rrule,
+            user_id=user_id,
+            agent_id=agent_id,
+            timezone=timezone,
+            created_at=0,
+            session_mode=session_mode,
+            session_id=session_id,
+        )
+        if kind == "reminder" and not fits_reminder(shape):
             raise ValueError("a reminder needs a one-time rule that continues a given session")
+        if kind == "timer" and not fits_timer(shape):
+            raise ValueError("a timer needs to continue a given session")
         created_at = now_epoch()
 
         def write(session: Session) -> ScheduledTask:
             generation = require_active_account(session, user_id)
+            if kind == "timer":
+                # Locking the session's row makes creates racing for its last place take turns.
+                session.get(
+                    SqlConversationMetadata,
+                    (current_workspace_id(), session_id),
+                    with_for_update=True,
+                )
+                if _timers_kept(session, session_id) >= TIMERS_PER_SESSION:
+                    raise ScheduledTaskSessionTimerCapError(session_id)
             row = SqlScheduledTask(
                 account_generation=generation,
                 id=scheduled_task_id,
@@ -605,10 +636,13 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             ):
                 row.last_run_conversation_id = last_run_conversation_id
                 changed = True
-            if row.kind == encode_scheduled_task_kind("reminder") and not fits_reminder(
-                _to_entity(row)
+            if (
+                row.kind == encode_scheduled_task_kind("reminder")
+                and not fits_reminder(_to_entity(row))
+            ) or (
+                row.kind == encode_scheduled_task_kind("timer") and not fits_timer(_to_entity(row))
             ):
-                # An edit that makes it recur or leave its session makes it an automation.
+                # A reminder or timer that no longer fits its kind becomes an automation.
                 row.kind = encode_scheduled_task_kind("automation")
                 changed = True
             # Becoming or ceasing to be a trigger changes who picks the next poll.
@@ -906,6 +940,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 SqlScheduledTask.state,
                 SqlScheduledTask.account_generation,
                 SqlScheduledTask.user_id,
+                SqlScheduledTask.kind,
             ).where(
                 SqlScheduledTask.workspace_id == current_workspace_id(),
                 SqlScheduledTask.user_id == owner_user_id,
@@ -932,6 +967,8 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                     task.user_id != owner_user_id
                     or task.state == encode_scheduled_task_state("deleted")
                     or (check_generation and task.account_generation != generation)
+                    # A session's agent manages its timers; the Inbox has no use for them.
+                    or task.kind == encode_scheduled_task_kind("timer")
                 ):
                     continue
                 run = session.execute(
@@ -1503,15 +1540,16 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         return run_write_transaction(self._session_immediate, "claim_occurrence", write)
 
     def skip_scheduled_occurrence(
-        self, task: ScheduledTask, *, now: int, next_run_at: int
+        self, task: ScheduledTask, *, now: int, next_run_at: int | None
     ) -> bool:
         """Lock/recheck the task snapshot, then advance past its due occurrence with no run.
 
         The snapshot check matches :meth:`claim_scheduled_run`, so a concurrent edit,
-        claim or skip makes this one a no-op.
+        claim or skip makes this one a no-op. Skipping the last occurrence
+        (``next_run_at=None``) completes the task.
         """
         self.check_dispatch_support()
-        if next_run_at <= now:
+        if next_run_at is not None and next_run_at <= now:
             raise ValueError("Cannot skip a scheduled run: next_run_at must be later than now.")
         if (
             task.workspace_id != current_workspace_id()
@@ -1526,6 +1564,9 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             if row is None or _to_entity(row) != task:
                 return False
             row.next_run_at = next_run_at
+            if next_run_at is None:
+                row.state = encode_scheduled_task_state("completed")
+                row.updated_at = now
             return True
 
         return run_write_transaction(self._session_immediate, "skip_occurrence", write)

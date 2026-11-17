@@ -131,7 +131,9 @@ from omnigent.server.scheduled.run_sharing import (
 )
 from omnigent.server.scheduled.schedule import (
     continued_sandbox_host_id,
+    is_repeating_timer,
     is_trigger_automation,
+    next_scheduled_time,
     strip_trigger_header,
     task_timezone,
 )
@@ -499,6 +501,25 @@ def _prompt_event(prompt: str) -> SessionEventInput:
     )
 
 
+# Kinds an agent sets to message its own session later. A firing belongs to the
+# session's current work, not to a new run, so nothing says no one is watching.
+SESSION_MESSAGE_KINDS = frozenset({"reminder", "timer"})
+
+
+def _task_prompt_event(task: ScheduledTask) -> SessionEventInput:
+    """The message a firing sends: a reminder's or timer's text as set, else prompt and note."""
+    if task.kind not in SESSION_MESSAGE_KINDS:
+        return _prompt_event(run_prompt_text(task))
+    data: dict[str, Any] = {
+        "role": "user",
+        "content": [{"type": "input_text", "text": task.prompt}],
+    }
+    if task.kind == "timer":
+        # Hidden, like an in-memory timer's firing: it wakes the agent without a chat line.
+        data["is_meta"] = True
+    return SessionEventInput(type="message", data=data)
+
+
 def build_on_fire(
     deps: FireDeps,
     *,
@@ -538,6 +559,9 @@ BUSY_RECHECK_SECONDS = 2 * 60
 # While its session looks busy, a trigger automation still gets a prompt this often, so a
 # stale "running" status cannot stall it.
 BUSY_SKIP_MAX_SECONDS = 10 * 60
+# A session that has shown as running with no activity for this long no longer holds back
+# its repeating timers, so a stale status can't stall the check-ins meant to recover it.
+TIMER_BUSY_SKIP_MAX_SECONDS = 60 * 60
 
 
 def build_busy_until(deps: FireDeps) -> Callable[[ScheduledTask, int], Awaitable[int | None]]:
@@ -550,6 +574,12 @@ def build_busy_until(deps: FireDeps) -> Callable[[ScheduledTask, int], Awaitable
     or waiting on an approval or question), has an approval or question pending, or the
     previous poll is still being delivered. It never waits past
     :data:`BUSY_SKIP_MAX_SECONDS` after the latest poll went out.
+
+    A repeating timer skips to its next occurrence instead while its session is busy, or
+    while the session's host is offline, so a firing that can't arrive records no failed
+    run. A running status with no runner, or with no activity for
+    :data:`TIMER_BUSY_SKIP_MAX_SECONDS`, doesn't hold it back, and neither does a pending
+    approval count left by a runner that is gone.
     """
 
     async def busy_until(task: ScheduledTask, now: int) -> int | None:
@@ -574,12 +604,6 @@ def build_busy_until(deps: FireDeps) -> Callable[[ScheduledTask, int], Awaitable
         waiting = session.runner_id is not None and bool(session.pending_elicitation_count)
         # The previous poll may still be on its way in, e.g. while a sandbox starts.
         delivering = latest is not None and latest.status in ("scheduled", "starting")
-        if running or waiting or delivering:
-            until = now + BUSY_RECHECK_SECONDS
-        else:
-            until = session.updated_at + BUSY_QUIET_SECONDS
-        if until <= now:
-            return None
         # The latest poll went out at the task's last firing or when its newest run started,
         # whichever is later; either can be later than the poll was due.
         sent_times = [task.last_run_at]
@@ -588,12 +612,41 @@ def build_busy_until(deps: FireDeps) -> Callable[[ScheduledTask, int], Awaitable
                 latest.fired_at if latest.fired_at is not None else latest.scheduled_at
             )
         sent_at = max((t for t in sent_times if t is not None), default=None)
-        if sent_at is None:
+        if is_repeating_timer(task):
+            live = await _session_liveness(deps, session_id)
+            runner_up = live is None or live.runner_online
+            host_offline = live is not None and live.host_online is False
+            # A runner that is gone left the status and the count it last reported.
+            busy = runner_up and (
+                waiting or (running and now - session.updated_at < TIMER_BUSY_SKIP_MAX_SECONDS)
+            )
+            if busy or delivering or host_offline:
+                # Its next firing comes on schedule; with none left, the last is dropped.
+                following = await asyncio.to_thread(next_scheduled_time, task, now)
+                return now + 1 if following is None else following
+            return None
+        if running or waiting or delivering:
+            until = now + BUSY_RECHECK_SECONDS
+        else:
+            until = session.updated_at + BUSY_QUIET_SECONDS
+        if until <= now or sent_at is None:
             return None
         backstop = sent_at + BUSY_SKIP_MAX_SECONDS
         return min(until, backstop) if backstop > now else None
 
     return busy_until
+
+
+async def _session_liveness(deps: FireDeps, session_id: str) -> Any | None:
+    """The session's runner and host liveness, or ``None`` when the server can't tell."""
+    lookup = getattr(deps.app_state, "session_liveness_lookup", None)
+    if lookup is None:
+        return None
+    try:
+        return (await asyncio.to_thread(lookup, [session_id])).get(session_id)
+    except Exception:
+        _logger.warning("Could not read the liveness of session %s", session_id, exc_info=True)
+        return None
 
 
 def build_run_now(
@@ -790,9 +843,9 @@ async def _run_fire_for_task(
         )
         return
 
-    if task.continues_session and not is_one_time_rule(task.rrule):
-        # A one-time task, such as a reminder, belongs to its session: with the
-        # session gone it fails instead of running in a new one without its context.
+    if task.continues_session and not is_one_time_rule(task.rrule) and task.kind != "timer":
+        # A one-time task, such as a reminder, and a timer belong to their session: with
+        # the session gone they fail instead of running in a new one without its context.
         task = await _release_replaceable_session(deps, task)
     if task.continues_session:
         await _continue_session(
@@ -1118,10 +1171,18 @@ async def _continue_session(
         await recorder.finish(
             "failed", error=f"{reason}; {_recovery_hint(task)}", error_code=error_code
         )
+        if task.kind == "timer":
+            # Its session can't take it now, so later firings would fail the same way.
+            await asyncio.to_thread(deps.scheduled_task_store.update, task.id, state="deleted")
         return
     assert conv is not None
     agent = await asyncio.to_thread(deps.agent_store.get, task.agent_id)
-    inherited = await _inherited_permission_problem(deps, task, agent, continued=True)
+    # A timer wakes its session in the mode it already runs, as an in-memory timer does.
+    inherited = (
+        None
+        if task.kind == "timer"
+        else await _inherited_permission_problem(deps, task, agent, continued=True)
+    )
     if inherited is not None:
         reason, error_code = inherited
         await recorder.finish(
@@ -1172,6 +1233,11 @@ async def _continue_session(
         app_state=deps.app_state,
         host_registry=deps.host_registry,
     )
+    if task.kind in SESSION_MESSAGE_KINDS:
+        # Naming the run on the session would start a new journal run, resetting its
+        # plan's progress, and mark an attended session unattended.
+        await _send_session_message(deps, conv, task, dispatch, recorder)
+        return
     progress = _PromptSendProgress()
     progress_token = _PROMPT_SEND_PROGRESS.set(progress)
     # Stamped before the prompt goes in, so the journal entries the session records
@@ -1212,6 +1278,42 @@ async def _continue_session(
         _PROMPT_SEND_PROGRESS.reset(progress_token)
     await recorder.finish("succeeded", conversation_id=session_id)
     _logger.info("scheduled fire: task %s continued session %s", task.id, session_id)
+
+
+async def _send_session_message(
+    deps: FireDeps,
+    conv: Conversation,
+    task: ScheduledTask,
+    dispatch: LaunchDispatch,
+    recorder: _FireRecorder,
+) -> None:
+    """Send a reminder's or timer's message into its session as part of its current work."""
+    # Cancelled since this firing was claimed: an agent that cancelled it isn't told it fired.
+    current = await asyncio.to_thread(deps.scheduled_task_store.get, task.id)
+    if current is None or current.state == "deleted":
+        await recorder.finish(
+            "skipped",
+            conversation_id=conv.id,
+            error="cancelled before it was sent",
+            error_code="task_deleted",
+        )
+        return
+    try:
+        start_fire_stage("runner_start", session_id=conv.id)
+        await dispatch(conv, task)
+    except Exception:
+        _logger.exception(
+            "scheduled fire: could not send task %s's message into session %s", task.id, conv.id
+        )
+        await recorder.finish(
+            "failed",
+            conversation_id=conv.id,
+            error="runner launch/dispatch failed",
+            error_code="launch_failed",
+        )
+        return
+    await recorder.finish("succeeded", conversation_id=conv.id)
+    _logger.info("scheduled fire: task %s messaged session %s", task.id, conv.id)
 
 
 async def _settle_run_label(
@@ -1256,6 +1358,8 @@ _ONE_TIME_HINT = "it has no later run; set a new reminder or create a new automa
 
 def _recovery_hint(task: ScheduledTask) -> str:
     """What the owner can do about a continued run that failed."""
+    if task.kind == "timer":
+        return "the timer was cancelled"
     return _ONE_TIME_HINT if is_one_time_rule(task.rrule) else _NEW_SESSION_HINT
 
 
@@ -1345,7 +1449,12 @@ async def continued_session_problem(
     if conv.agent_id != task.agent_id:
         return "the session runs a different agent", "continued_session_incompatible"
     session_mode = session_approval_skipping_mode(conv)
-    if session_mode is not None and task.permission_mode not in APPROVAL_SKIPPING_PERMISSION_MODES:
+    if (
+        session_mode is not None
+        # A timer wakes its session in the mode it already runs, as an in-memory timer does.
+        and task.kind != "timer"
+        and task.permission_mode not in APPROVAL_SKIPPING_PERMISSION_MODES
+    ):
         return (
             f"the session is in permission mode {session_mode!r}, which skips approval, but the "
             "automation does not select such a mode; switch the session to a mode that asks for "
@@ -2651,7 +2760,7 @@ async def _send_prompt(
         result = await _dispatch_session_event_to_runner(
             conv.id,
             conv,
-            _prompt_event(run_prompt_text(task)),
+            _task_prompt_event(task),
             deps.conversation_store,
             runner_client,
             agent_name=None,
@@ -2690,7 +2799,7 @@ def _make_managed_sandbox_dispatch(deps: FireDeps) -> LaunchDispatch:
         # No browser preference applies to a fire; keep the server default.
         await deps.startup_inputs.enqueue(
             conv.id,
-            _prompt_event(run_prompt_text(task)),
+            _task_prompt_event(task),
             user_id=task.user_id or RESERVED_USER_LOCAL,
             headers=Headers({BACKGROUND_SESSION_TITLES_HEADER: "on"}),
         )
