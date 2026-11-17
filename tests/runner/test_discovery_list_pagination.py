@@ -524,23 +524,10 @@ async def test_sys_session_list_continues_server_catalog_with_cursor() -> None:
 @pytest.mark.parametrize(
     ("failure", "reason"),
     [
-        (
-            httpx.Response(
-                400,
-                json={
-                    "error": {
-                        "code": "stale_cursor",
-                        "message": "pagination cursor 'conv_49' no longer exists; "
-                        "restart the enumeration without it",
-                    }
-                },
-            ),
-            "HTTP 400: pagination cursor 'conv_49' no longer exists",
-        ),
         (httpx.Response(503), "HTTP 503"),
         (httpx.ReadTimeout("timed out"), "the request failed: ReadTimeout"),
     ],
-    ids=["stale-cursor", "server-unavailable", "timeout"],
+    ids=["server-unavailable", "timeout"],
 )
 async def test_sys_session_list_continuation_reports_failed_server_read(
     failure: httpx.Response | httpx.TransportError, reason: str
@@ -579,6 +566,54 @@ async def test_sys_session_list_continuation_reports_failed_server_read(
         f"conv_{index:02d}" for index in range(50, 60)
     ]
     assert "error" not in retried
+
+
+@pytest.mark.asyncio
+async def test_sys_session_list_restarts_after_stale_cursor() -> None:
+    """A cursor whose session was deleted restarts the listing instead of failing every retry."""
+    rows = _session_rows(large=False, count=60)
+    received_afters: list[str | None] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions/conv_caller/child_sessions":
+            return httpx.Response(200, json={"data": []})
+        if request.url.path == "/v1/sessions/conv_caller":
+            return httpx.Response(200, json={"id": "conv_caller", "parent_session_id": None})
+        if request.url.path == "/v1/sessions":
+            after = request.url.params.get("after")
+            received_afters.append(after)
+            if after is not None and all(row["id"] != after for row in rows):
+                error = {
+                    "code": "stale_cursor",
+                    "message": f"pagination cursor {after!r} no longer exists; "
+                    "restart the enumeration without it",
+                }
+                return httpx.Response(400, json={"error": error})
+            return _server_page(request, rows)
+        raise AssertionError(f"unexpected path {request.url.path}")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server"
+    ) as client:
+        first = await _call_session(client, {})
+        del rows[49]
+        stale = await _call_session(client, {"cursor": first["page"]["next_cursor"]})
+        restarted = await _call_session(client, {"cursor": stale["page"]["next_cursor"]})
+        rest = await _call_session(client, {"cursor": restarted["page"]["next_cursor"]})
+
+    assert stale["sessions"] == []
+    assert stale["page"]["has_more"] == {"sessions": True}
+    assert "HTTP 400: pagination cursor 'conv_49' no longer exists" in stale["error"]
+    assert "restarting sessions from the first page" in stale["error"]
+    assert [row["session_id"] for row in restarted["sessions"]] == [
+        f"conv_{index:02d}" for index in [*range(49), 50]
+    ]
+    assert "error" not in restarted
+    assert [row["session_id"] for row in rest["sessions"]] == [
+        f"conv_{index:02d}" for index in range(51, 60)
+    ]
+    assert rest["page"]["has_more"] == {"sessions": False}
+    assert received_afters == [None, "conv_49", None, "conv_50"]
 
 
 @pytest.mark.asyncio

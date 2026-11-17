@@ -53,6 +53,7 @@ if TYPE_CHECKING:
 import httpx
 
 from omnigent.debug_logging import runner_primary_session_id
+from omnigent.errors import ErrorCode
 from omnigent.harness_aliases import (
     canonicalize_harness,
     is_native_harness,
@@ -829,6 +830,8 @@ class _DiscoveryPage:
     has_more: bool
     next_after: str | None = None
     failure: str | None = None
+    # The server no longer resolves the incoming cursor, so this source must restart.
+    stale_cursor: bool = False
 
     @property
     def failed(self) -> bool:
@@ -881,6 +884,7 @@ def _bounded_discovery_result(
     failures = [
         f"{name} ({source_pages[name].failure})" for name in paged if source_pages[name].failed
     ]
+    restarted = [name for name in paged if source_pages[name].stale_cursor]
     complete = json.dumps(sections)
     if (
         limit is None
@@ -904,9 +908,11 @@ def _bounded_discovery_result(
             page[name] = page_rows
             source_page = source_pages[name]
             if source_page.failed:
-                # A failed read proves neither progress nor exhaustion. Keep
-                # the incoming position so the continuation retries it.
+                # A failed read proves neither progress nor exhaustion. Retry its
+                # position, or the first page when the server rejects that position.
                 has_more[name] = True
+                if source_page.stale_cursor:
+                    next_state[name] = (_DISCOVERY_START, None)
                 continue
             has_more[name] = len(rows) > candidate_limit or source_page.has_more
             if not has_more[name]:
@@ -933,9 +939,16 @@ def _bounded_discovery_result(
         result: dict[str, object] = {**page, "page": metadata}
         if failures:
             # Otherwise a persistently failing read looks like endless empty pages.
+            retry = "page.next_cursor retries the same position"
+            if restarted:
+                retry = (
+                    f"page.next_cursor retries, restarting {', '.join(restarted)} from the first "
+                    "page because the server no longer accepts its cursor; rows already listed "
+                    "may repeat"
+                )
             result["error"] = (
-                f"Could not read {'; '.join(failures)}. page.next_cursor retries the same "
-                "position; if the read keeps failing, report this error instead of retrying."
+                f"Could not read {'; '.join(failures)}. {retry}; if the read keeps failing, "
+                "report this error instead of retrying."
             )
         return json.dumps(result)
 
@@ -6151,6 +6164,17 @@ async def _session_get_info_via_rest(
     )
 
 
+def _omnigent_error_code(resp: httpx.Response) -> str | None:
+    """Return the ``error.code`` of an Omnigent error response, or ``None``."""
+    try:
+        body = resp.json()
+    except ValueError:
+        return None
+    error = body.get("error") if isinstance(body, dict) else None
+    code = error.get("code") if isinstance(error, dict) else None
+    return code if isinstance(code, str) else None
+
+
 def _omnigent_error_message(resp: httpx.Response) -> str | None:
     """
     Extract the human-readable message from an Omnigent error response.
@@ -6549,7 +6573,10 @@ async def _fetch_discovery_page(
         )
         detail = f": {message}" if message else ""
         return _DiscoveryPage(
-            [], False, failure=f"the server returned HTTP {resp.status_code}{detail}"
+            [],
+            False,
+            failure=f"the server returned HTTP {resp.status_code}{detail}",
+            stale_cursor=_omnigent_error_code(resp) == ErrorCode.STALE_CURSOR,
         )
     try:
         body = resp.json()
