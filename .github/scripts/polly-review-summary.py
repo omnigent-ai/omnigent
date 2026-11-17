@@ -278,6 +278,19 @@ def split_review(review: str, byte_limit: int) -> list[str]:
         prefix = encoded[:boundary].decode("utf-8")
         line_end = prefix.rfind("\n") + 1
         end = line_end or len(prefix)
+        if line_end:
+            header_start = prefix.rfind("\n", 0, end - 1) + 1
+            next_line = review[end:].split("\n", 1)[0]
+            if (
+                header_start
+                and prefix[header_start:end].lstrip().startswith("|")
+                and next_line.lstrip().startswith("|")
+                and all(
+                    re.fullmatch(r"\s*:?-+:?\s*", cell)
+                    for cell in split_table_row(next_line.strip().strip("|"))
+                )
+            ):
+                end = header_start
         parts.append(review[:end])
         review = review[end:]
     parts.append(review)
@@ -344,9 +357,10 @@ def review_comments(review: str, *, head_sha: str, run_id: str, run_url: str) ->
                 "Continuations are posted before part 1; publication is complete only when "
                 "part 1 appears.\n\n"
             )
+        separator = "\n\n---\n" if count > 1 else "\n---\n"
         return (
             f"<!-- polly-review-bot -->\n{marker}\n<!-- polly-review-run:{run_id} -->\n"
-            f"{title}\n\n{note}{content}\n---\n"
+            f"{title}\n\n{note}{content}{separator}"
             f"<sub>Automated review by Polly · [workflow run]({run_url})</sub>\n"
         )
 

@@ -141,10 +141,13 @@ def test_incomplete_reviews_are_rejected_regardless_of_size(review: str) -> None
 
 
 @pytest.mark.parametrize(
-    "rationale_lengths", [None, (20000, 45000, 20000)], ids=["many-rows", "unequal-rows"]
+    ("rationale_lengths", "preceding_paragraph_length"),
+    [(None, 0), ((20000, 45000, 20000), 0), ((3000,) * 30, 59194)],
+    ids=["many-rows", "unequal-rows", "header-boundary"],
 )
 def test_long_review_parts_preserve_all_assessments_and_markdown_context(
     rationale_lengths: tuple[int, ...] | None,
+    preceding_paragraph_length: int,
 ) -> None:
     rationales = (
         ["Guards the regression without a second setup."] * 1200
@@ -161,6 +164,10 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
         " Guards the regression. |\n",
         rows,
     )
+    if preceding_paragraph_length:
+        review = review.replace(
+            "### Tests\n", "### Tests\n" + "x" * preceding_paragraph_length + "\n\n"
+        )
     composed = _HELPERS["compose_review"](
         review, {"markdown": "Computed counts", "test_files": ["tests/test_parser.py"]}
     )
@@ -186,6 +193,7 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
         assert "<!-- polly-reviewed-sha:" not in comment
     assert "## Blocking issues\nNone." in comments[0]
     assert "### Scope\nAll changes support the parser fix." in comments[-1]
+    assert all("\n\n---\n<sub>Automated review by Polly" in comment for comment in comments)
 
 
 def test_unicode_and_wrapper_bytes_are_included_in_comment_limit() -> None:
