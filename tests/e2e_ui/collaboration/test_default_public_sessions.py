@@ -78,9 +78,9 @@ def test_admin_default_public_all_makes_new_sessions_public(
         page.goto(f"{server.public_url}/settings/sharing")
         toggle = page.get_by_role("switch", name=_TOGGLE)
         expect(toggle).not_to_be_checked(timeout=60_000)
-        expect(page.get_by_role("group", name=_GROUP)).not_to_be_visible()
+        expect(page.get_by_role("radiogroup", name=_GROUP)).not_to_be_visible()
         toggle.click()
-        group = page.get_by_role("group", name=_GROUP)
+        group = page.get_by_role("radiogroup", name=_GROUP)
         expect(group.get_by_role("radio", name="Managed hosts only")).to_be_checked()
 
         page.reload()

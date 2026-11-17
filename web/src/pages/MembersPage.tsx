@@ -364,6 +364,7 @@ export function MembersPage() {
           )}
           <DialogFooter>
             <Button
+              data-settings-dialog-action="Cancel"
               variant="ghost"
               onClick={() => setShowCreateInvite(false)}
               disabled={pendingAction}
@@ -397,15 +398,11 @@ export function MembersPage() {
               only once.
             </DialogDescription>
           </DialogHeader>
-          {inviteResult !== null && (
-            <CopyableValue
-              value={rebaseUrl(inviteResult.register_url)}
-              fieldMarkers={{ ...settingsControlProps(MEMBERS_INVITE_ENTRY, "inviteUrl") }}
-              copyMarkers={{ ...settingsControlProps(MEMBERS_INVITE_ENTRY, "copyInviteUrl") }}
-            />
-          )}
+          {inviteResult !== null && <InviteUrlField value={rebaseUrl(inviteResult.register_url)} />}
           <DialogFooter>
-            <Button onClick={() => setInviteResult(null)}>Done</Button>
+            <Button data-settings-dialog-action="Done" onClick={() => setInviteResult(null)}>
+              Done
+            </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
@@ -425,14 +422,7 @@ export function MembersPage() {
             </DialogDescription>
           </DialogHeader>
           {resetResult !== null && (
-            <CopyableValue
-              value={resetResult.new_password}
-              fieldMarkers={{
-                "data-settings-row-field": "password",
-                "aria-label": `New password for ${resetResult.id}`,
-              }}
-              copyMarkers={{ "data-settings-row-action": "copy" }}
-            />
+            <NewPasswordField userId={resetResult.id} value={resetResult.new_password} />
           )}
           <DialogFooter>
             <Button data-settings-row-action="done" onClick={() => setResetResult(null)}>
@@ -494,50 +484,63 @@ export function MembersPage() {
   );
 }
 
-/**
- * A read-only field paired with a one-click copy button.
- *
- * Used for both invite URLs and reset-issued passwords; both are
- * single-use sensitive values that need a frictionless copy path
- * since the user typically pastes them into Slack within seconds.
- */
-/** Attributes a shared copy field takes from the dialog and row that show it. */
-type FieldMarkers = Record<string, string | undefined>;
-
-function CopyableValue({
-  value,
-  fieldMarkers,
-  copyMarkers,
-}: {
-  value: string;
-  fieldMarkers?: FieldMarkers;
-  copyMarkers?: FieldMarkers;
-}) {
+function useCopyValue(value: string) {
   const [copied, setCopied] = useState(false);
-  const onCopy = async () => {
+  const copy = async () => {
     try {
       await navigator.clipboard.writeText(value);
       setCopied(true);
       window.setTimeout(() => setCopied(false), 1500);
     } catch {
-      // No clipboard permission — the input is still selectable.
+      // No clipboard permission — the field is still selectable.
     }
   };
+  return { copied, copy };
+}
+
+/** The invite's single-use URL, read-only and selected on focus, with its copy button. */
+function InviteUrlField({ value }: { value: string }) {
+  const { copied, copy } = useCopyValue(value);
   return (
     <div className="flex items-center gap-2">
       <Input
-        {...fieldMarkers}
+        {...settingsControlProps(MEMBERS_INVITE_ENTRY, "inviteUrl")}
         value={value}
         readOnly
         className="font-mono text-sm"
         onFocus={(e) => e.currentTarget.select()}
       />
       <Button
-        {...copyMarkers}
+        {...settingsControlProps(MEMBERS_INVITE_ENTRY, "copyInviteUrl")}
         variant="outline"
         size="sm"
-        onClick={() => void onCopy()}
-        aria-label="Copy"
+        onClick={() => void copy()}
+      >
+        <CopyIcon /> {copied ? "Copied" : "Copy"}
+      </Button>
+    </div>
+  );
+}
+
+/** A reset's new password for `userId`, read-only and selected on focus, with its copy button. */
+function NewPasswordField({ userId, value }: { userId: string; value: string }) {
+  const { copied, copy } = useCopyValue(value);
+  return (
+    <div className="flex items-center gap-2">
+      <Input
+        data-settings-row-field="password"
+        aria-label={`New password for ${userId}`}
+        value={value}
+        readOnly
+        className="font-mono text-sm"
+        onFocus={(e) => e.currentTarget.select()}
+      />
+      <Button
+        data-settings-row-action="copy"
+        aria-label="Copy password"
+        variant="outline"
+        size="sm"
+        onClick={() => void copy()}
       >
         <CopyIcon /> {copied ? "Copied" : "Copy"}
       </Button>

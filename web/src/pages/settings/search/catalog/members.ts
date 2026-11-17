@@ -12,7 +12,7 @@ export const MEMBERS_INVITE_ENTRY = settingsEntry({
     grantAdmin: "Grant admin privileges",
     create: "Create invite",
     inviteUrl: "Invite URL",
-    copyInviteUrl: "Copy",
+    copyInviteUrl: "Copy invite URL",
   },
   // The invite form, then the link it made, which is shown only once.
   presence: {
@@ -38,7 +38,7 @@ export const MEMBERS_LIST_ENTRY = settingsEntry({
       rowActions: { resetPassword: "Reset", remove: "Remove" },
       rowOverlays: {
         resetPassword: {
-          rowActions: { copy: "Copy", done: "Done" },
+          rowActions: { copy: "Copy password", done: "Done" },
           rowFields: { password: { before: "New password for " } },
         },
         remove: { rowActions: { cancel: "Cancel", remove: "Remove" } },

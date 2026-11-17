@@ -12,6 +12,10 @@ import { useIsAdmin } from "@/hooks/useIsAdmin";
 import { useSharing, useSetSharing } from "@/hooks/useSharing";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isSingleUserMode, type SiblingSessionDestinations } from "@/lib/capabilities";
+import { NESTED_AGENT_DESTINATIONS_ENTRY } from "@/pages/settings/search/catalog/admin";
+import { settingsControlProps } from "@/pages/settings/search/settingsControl";
+import { settingsOverlayProps } from "@/pages/settings/search/settingsOwnership";
+import { SettingsEntryLabel, SettingsItem } from "@/pages/settings/search/SettingsItem";
 
 const AGENT_DESTINATIONS: {
   id: SiblingSessionDestinations;
@@ -78,11 +82,11 @@ export function AdminGeneralPage() {
         <>
           {isLoading && <p className="text-ui text-muted-foreground">Loading...</p>}
           {sharing && (
-            <SettingsGroup
-              title="Nested agent destinations"
-              testId="settings-group-agent-destinations"
-            >
-              <div className="flex flex-col gap-3 md:flex-row-reverse md:items-start md:gap-6">
+            <SettingsGroup title="Nested agents" testId="settings-group-agent-destinations">
+              <SettingsItem
+                entry={NESTED_AGENT_DESTINATIONS_ENTRY}
+                className="flex flex-col gap-3 md:flex-row-reverse md:items-start md:gap-6"
+              >
                 <Select
                   value={destinations}
                   onValueChange={(value) => chooseDestinations(value as SiblingSessionDestinations)}
@@ -91,13 +95,13 @@ export function AdminGeneralPage() {
                   valueHasNoPii
                 >
                   <SelectTrigger
+                    {...settingsControlProps(NESTED_AGENT_DESTINATIONS_ENTRY)}
                     className="w-full shrink-0 md:w-64"
-                    aria-label="Nested agent destinations"
-                    aria-describedby="agent-destinations-description"
                   >
                     <SelectValue>{destination?.label ?? destinations}</SelectValue>
                   </SelectTrigger>
                   <SelectContent
+                    {...settingsOverlayProps(NESTED_AGENT_DESTINATIONS_ENTRY)}
                     position="popper"
                     align="end"
                     className="w-[30rem] max-w-[calc(100vw-2rem)]"
@@ -117,13 +121,13 @@ export function AdminGeneralPage() {
                     ))}
                   </SelectContent>
                 </Select>
-                <p
-                  id="agent-destinations-description"
-                  className="min-w-0 flex-1 text-sm leading-normal text-muted-foreground md:pt-1"
-                >
-                  {destination?.description}
-                </p>
-              </div>
+                <div className="min-w-0 flex-1 md:pt-1">
+                  <SettingsEntryLabel
+                    entry={NESTED_AGENT_DESTINATIONS_ENTRY}
+                    description={destination?.description}
+                  />
+                </div>
+              </SettingsItem>
             </SettingsGroup>
           )}
           {(destinationError || sharingError) && (
