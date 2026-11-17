@@ -64,8 +64,10 @@ source with Rust.
      links use (`web/src/hooks/useHostSshTarget.ts`). Main first asks the user
      in a native dialog, and records the alias only after a token-checked
      `ListDirectory` call over it succeeds (`web/electron/src/sshTargets.js`).
-     "Not now" isn't asked again until the app restarts. An allowed alias that
-     fails isn't tried again for five minutes.
+     Questions are asked one at a time. After "Not now", that server's aliases
+     aren't asked about again until the app restarts. An allowed alias that
+     fails isn't tried again for five minutes. A token the host refuses is
+     passed back to the page, which renews it.
 4. The host checks the token, then reads the file from the token's workspace.
 
 ## Security
@@ -81,7 +83,9 @@ source with Rust.
   host name. Main runs no SSH for it, so no config, proxy or `Match exec`
   either, until the user allows it in a native dialog. The user's consent is
   the only check on which destination is tried. Main records it only after the
-  host accepts that session's token over it. One question is open at a time.
+  host accepts that session's token over it. After "Not now", the server gets
+  no more questions until the app restarts, so it can't keep asking with new
+  names.
 - **No password or host-key prompts.** SSH runs with `BatchMode=yes` and the
   user's own SSH config, so a password or an unknown host key fails, and the
   read goes through the server. An SSH agent's confirmation dialog, or a

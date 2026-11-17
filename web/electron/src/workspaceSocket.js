@@ -71,7 +71,7 @@ function isWorkspaceSocket(socketPath) {
  * @param {{hostId?: string, sshTarget?: string, socketPath: string, path: string, headers: Record<string, string>, body: Uint8Array}} request
  * @param {{
  *   sshDestination?: (hostId: string) => string | null,
- *   verifySshTarget?: (hostId: string, alias: string, proves: () => Promise<boolean>) => Promise<boolean>,
+ *   verifySshTarget?: (hostId: string, alias: string, proves: () => Promise<boolean | "refused">) => Promise<boolean | "refused">,
  *   forwards?: ReturnType<typeof import("./workspaceSshForwards").createWorkspaceSshForwards>,
  * }} [routes]
  * @returns {Promise<{status: number, headers: Record<string, string>, body: Uint8Array}>}
@@ -111,19 +111,22 @@ function workspaceSocketRequest(request, routes = {}) {
       "content-length": String(PROBE_BODY.byteLength),
       ...(forwarded.authorization ? { authorization: forwarded.authorization } : {}),
     };
-    let ok = false;
+    let proof = false;
     try {
-      ok = (await send(local, PROBE_PATH, probe, PROBE_BODY)).status === 200;
+      const { status } = await send(local, PROBE_PATH, probe, PROBE_BODY);
+      if (status === 200) proof = true;
+      else if (status === 401) proof = "refused";
     } finally {
       // The connection may serve other hosts; it closes once idle, or now if it is gone.
-      if (!ok) dropForward();
+      if (!proof) dropForward();
     }
-    return ok;
+    return proof;
   };
   const forward = recorded
     ? forwards.localSocket(destination, socketPath)
-    : routes.verifySshTarget(hostId, destination, proves).then((ok) => {
-        if (!ok) throw new Error("SSH alias not allowed or not verified for this host");
+    : routes.verifySshTarget(hostId, destination, proves).then((verdict) => {
+        // "refused": the host refused the token, so it answers the call, and the page renews it.
+        if (!verdict) throw new Error("SSH alias not allowed or not verified for this host");
         return forwards.localSocket(destination, socketPath);
       });
   return forward.then(({ socketPath: local, dropConnection, dropForward }) =>
