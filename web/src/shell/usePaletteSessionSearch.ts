@@ -8,6 +8,7 @@ import {
   type ConversationsPage,
   type ProjectSummary,
   useProjects,
+  isAbortTimeout,
   useConversations,
   useSessionSearch,
 } from "@/hooks/useConversations";
@@ -213,9 +214,10 @@ export function usePaletteSessionSearch({
   );
   const visibleSessions = sessionsOnly ? sessions.slice(0, SESSION_SEARCH_RESULT_LIMIT) : sessions;
   const searchGroups = [titleSearch, contentSearch];
-  const loadError = searching
-    ? searchGroups.some((group) => group.isError)
-    : isError || isFetchNextPageError;
+  const loadError =
+    (sessionsOnly || query === debouncedQuery) &&
+    (searching ? searchGroups.some((group) => group.isError) : isError || isFetchNextPageError);
+  const searchTimedOut = searchGroups.some((group) => isAbortTimeout(group.error));
   const loadMoreError = searching
     ? searchGroups.some((group) => group.isFetchNextPageError)
     : isFetchNextPageError;
@@ -259,6 +261,7 @@ export function usePaletteSessionSearch({
     isFetching,
     loadError,
     loadMoreError,
+    searchTimedOut,
     searchFetching,
     retrying,
     retryLoad,
