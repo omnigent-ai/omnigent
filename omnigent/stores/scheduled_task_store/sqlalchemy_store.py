@@ -61,9 +61,11 @@ from omnigent.server.scheduled.schedule import (
 )
 from omnigent.stores.host_store import delete_unused_host_in_session
 from omnigent.stores.scheduled_task_store import (
+    TIMERS_PER_SESSION,
     AdoptOutcome,
     AutomationFailure,
     ScheduledTaskFirstRunMismatchError,
+    ScheduledTaskSessionTimerCapError,
     ScheduledTaskStore,
     decode_mcp_services,
     encode_mcp_services,
@@ -203,6 +205,23 @@ def _run_to_entity(row: SqlScheduledTaskRun) -> ScheduledTaskRun:
     )
 
 
+def _timers_kept(session: Session, session_id: str | None) -> int:
+    """Count a session's active timers over ``ix_scheduled_tasks_kind_session``."""
+    # Counting stops at the cap, so a session's timer history never grows the query.
+    kept = (
+        select(SqlScheduledTask.id)
+        .where(
+            SqlScheduledTask.kind == encode_scheduled_task_kind("timer"),
+            SqlScheduledTask.state == encode_scheduled_task_state("active"),
+            SqlScheduledTask.workspace_id == current_workspace_id(),
+            SqlScheduledTask.session_id == session_id,
+        )
+        .limit(TIMERS_PER_SESSION)
+        .subquery()
+    )
+    return session.execute(select(func.count()).select_from(kept)).scalar_one()
+
+
 class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
     """
     SQLAlchemy-backed implementation of :class:`ScheduledTaskStore`.
@@ -292,6 +311,8 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
 
         def write(session: Session) -> ScheduledTask:
             generation = require_active_account(session, user_id)
+            if kind == "timer" and _timers_kept(session, session_id) >= TIMERS_PER_SESSION:
+                raise ScheduledTaskSessionTimerCapError(session_id)
             row = SqlScheduledTask(
                 account_generation=generation,
                 id=scheduled_task_id,
@@ -1511,15 +1532,16 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         return run_write_transaction(self._session_immediate, "claim_occurrence", write)
 
     def skip_scheduled_occurrence(
-        self, task: ScheduledTask, *, now: int, next_run_at: int
+        self, task: ScheduledTask, *, now: int, next_run_at: int | None
     ) -> bool:
         """Lock/recheck the task snapshot, then advance past its due occurrence with no run.
 
         The snapshot check matches :meth:`claim_scheduled_run`, so a concurrent edit,
-        claim or skip makes this one a no-op.
+        claim or skip makes this one a no-op. Skipping the last occurrence
+        (``next_run_at=None``) completes the task.
         """
         self.check_dispatch_support()
-        if next_run_at <= now:
+        if next_run_at is not None and next_run_at <= now:
             raise ValueError("Cannot skip a scheduled run: next_run_at must be later than now.")
         if (
             task.workspace_id != current_workspace_id()
@@ -1534,6 +1556,9 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             if row is None or _to_entity(row) != task:
                 return False
             row.next_run_at = next_run_at
+            if next_run_at is None:
+                row.state = encode_scheduled_task_state("completed")
+                row.updated_at = now
             return True
 
         return run_write_transaction(self._session_immediate, "skip_occurrence", write)

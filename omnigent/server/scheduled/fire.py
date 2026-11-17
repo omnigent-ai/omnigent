@@ -621,8 +621,9 @@ def build_busy_until(deps: FireDeps) -> Callable[[ScheduledTask, int], Awaitable
                 waiting or (running and now - session.updated_at < TIMER_BUSY_SKIP_MAX_SECONDS)
             )
             if busy or delivering or host_offline:
-                # Its next firing comes on schedule.
-                return await asyncio.to_thread(next_scheduled_time, task, now)
+                # Its next firing comes on schedule; with none left, the last is dropped.
+                following = await asyncio.to_thread(next_scheduled_time, task, now)
+                return now + 1 if following is None else following
             return None
         if running or waiting or delivering:
             until = now + BUSY_RECHECK_SECONDS

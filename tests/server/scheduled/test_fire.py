@@ -5342,3 +5342,20 @@ async def test_a_busy_session_skips_its_repeating_timers_firing(
     )
     # Skipped to its next firing, ten minutes on.
     assert await check(timer, due) == (due + 600 if skips else None)
+
+
+@pytest.mark.asyncio
+async def test_a_busy_session_still_skips_its_timers_last_firing() -> None:
+    due = 1_800_003_600
+    check = _busy_until_check("running", due - 600, updated_at=due - 10, liveness=_RUNNER_UP)
+    # Its sixth and last firing, an hour after it was set.
+    timer = _task(
+        kind="timer",
+        rrule="FREQ=MINUTELY;INTERVAL=10;COUNT=6",
+        session_mode="continue",
+        session_id="sess_busy_check",
+        next_run_at=due,
+    )
+    # No firing is left to skip to, so any later time says the session is busy.
+    until = await check(timer, due)
+    assert until is not None and until > due

@@ -2760,6 +2760,36 @@ async def test_a_busy_session_skips_a_repeating_timers_firing_without_a_run(stor
     assert run.scheduled_at == task.next_run_at + 600
 
 
+async def test_a_busy_session_drops_a_repeating_timers_last_firing_without_a_run(store) -> None:
+    task = _task(
+        store,
+        rrule="FREQ=MINUTELY;INTERVAL=10;COUNT=2",
+        session_mode="continue",
+        session_id=uuid.uuid4().hex,
+        kind="timer",
+    )
+    last = task.next_run_at + 600
+    clock = FakeClock(task.next_run_at)
+    fire = AsyncMock()
+    busy = AsyncMock(return_value=last)
+    scheduler = PersistentTaskScheduler(
+        store, fire, AsyncMock(return_value=None), now=clock.now, busy_until=busy
+    )
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    assert store.get(task.id).next_run_at == last
+
+    # Still busy at its last firing, which has no later one to wait for.
+    busy.return_value = last + 1
+    clock.advance(600)
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    fire.assert_not_awaited()
+    assert store.list_runs(task.id)[0] == []
+    finished = store.get(task.id)
+    assert (finished.state, finished.next_run_at) == ("completed", None)
+
+
 async def test_a_repeating_timer_survives_a_restart_and_fires_once_each_time(
     db_uri, store
 ) -> None:

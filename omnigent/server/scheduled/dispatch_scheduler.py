@@ -361,7 +361,8 @@ DispatchEnabled = Callable[[], bool]
 # Read before each wait between polls.
 PollInterval = Callable[[], float]
 # Given the current time, when a busy session should next be checked, skipping this poll
-# unrecorded; ``None`` polls now. Asked only for trigger automations and repeating timers.
+# unrecorded; ``None`` polls now. Asked only for trigger automations and repeating timers,
+# and for a timer's last firing too, which any later time drops.
 BusyUntil = Callable[[ScheduledTask, int], Awaitable[int | None]]
 
 # With a busy check, the server tries to poll a trigger automation this often instead of
@@ -674,15 +675,19 @@ class PersistentTaskScheduler:
             return min(occurrence, now + TRIGGER_POLL_SECONDS)
         return occurrence
 
-    async def _skip_busy_occurrence(self, task: ScheduledTask, *, now: int, next_run: int) -> bool:
+    async def _skip_busy_occurrence(
+        self, task: ScheduledTask, *, now: int, next_run: int | None
+    ) -> bool:
         """Move a busy trigger automation's or repeating timer's due run, recording no run.
 
-        The next check is no later than *next_run*, the schedule's next occurrence. Returns
-        True when this occurrence must not be claimed. A failed busy check returns False, so
-        the occurrence is sent as it would be without skipping.
+        The next check is no later than *next_run*, the schedule's next occurrence. A skip
+        only defers a trigger's poll, so its last occurrence is always sent; a repeating
+        timer's last firing is dropped instead, completing the timer. Returns True when
+        this occurrence must not be claimed. A failed busy check returns False, so the
+        occurrence is sent as it would be without skipping.
         """
         if self._busy_until is None or not (
-            is_trigger_automation(task) or is_repeating_timer(task)
+            is_repeating_timer(task) or (is_trigger_automation(task) and next_run is not None)
         ):
             return False
         assert task.next_run_at is not None
@@ -696,7 +701,7 @@ class PersistentTaskScheduler:
             return False
         if until is None or until <= now:
             return False
-        until = min(until, next_run)
+        until = None if next_run is None else min(until, next_run)
         with workspace_scope(task.workspace_id):
             advanced = await asyncio.to_thread(
                 self._store.skip_scheduled_occurrence, task, now=now, next_run_at=until
@@ -941,11 +946,7 @@ class PersistentTaskScheduler:
                     next_run = await self._next_occurrence(task, now)
                     if self._stopped:
                         return
-                    # A skip only defers a poll, so the last occurrence of a schedule that ends
-                    # is always sent.
-                    if next_run is not None and await self._skip_busy_occurrence(
-                        task, now=now, next_run=next_run
-                    ):
+                    if await self._skip_busy_occurrence(task, now=now, next_run=next_run):
                         continue
                     with workspace_scope(task.workspace_id):
                         run = await asyncio.to_thread(

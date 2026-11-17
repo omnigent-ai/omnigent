@@ -137,9 +137,8 @@ from omnigent.tools.builtins.sys_terminal import (
     SysTerminalSendTool,
 )
 from omnigent.tools.builtins.timer import (
-    DURABLE_TIMER_MIN_SECONDS,
+    durable_timer_problem,
     durable_timer_task_id,
-    is_durable_timer,
     timer_fired_text,
     # Shared with the in-process sys_timer_set tool so the runner's firing
     # loop validates the same argument shape and delay ceiling the LLM-facing
@@ -4781,12 +4780,7 @@ async def _execute_timer_set(
     if server_client is None or conversation_id is None:
         return json.dumps({"error": "timer requires server_client and conversation_id"})
 
-    not_kept: str | None = (
-        None
-        if is_durable_timer(seconds, repeat)
-        else f"only timers of {DURABLE_TIMER_MIN_SECONDS} seconds or more, in whole minutes "
-        "when they repeat, can be kept by the server"
-    )
+    not_kept = durable_timer_problem(seconds, repeat)
     if not_kept is None:
         kept = await _keep_timer_on_server(
             server_client, conversation_id, seconds=seconds, repeat=repeat, note=note

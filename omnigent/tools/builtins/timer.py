@@ -58,6 +58,8 @@ DURABLE_TIMER_MIN_SECONDS = 600
 # A repeating timer the server keeps ends this long after it is set, so one left
 # running after its work ended stops on its own.
 DURABLE_TIMER_MAX_LIFETIME = timedelta(days=7)
+# Leaves room for a kept repeating timer to fire at least twice before it ends.
+DURABLE_TIMER_MAX_INTERVAL = DURABLE_TIMER_MAX_LIFETIME / 2
 _TIMER_ID_PREFIX = "timer_"
 _DURABLE_TIMER_TASK_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
 
@@ -114,18 +116,36 @@ def validate_timer_set_args(
     return seconds, repeat, note
 
 
-def is_durable_timer(seconds: float, repeat: bool) -> bool:
+def durable_timer_problem(seconds: float, repeat: bool) -> str | None:
     """
-    Whether the server can keep a timer with these validated arguments.
+    Why the server can't keep a timer with these validated arguments.
 
     :param seconds: The delay, or a repeating timer's interval, e.g. ``600``.
     :param repeat: Whether the timer repeats.
-    :returns: ``True`` from :data:`DURABLE_TIMER_MIN_SECONDS` up, in whole
-        minutes when it repeats.
+    :returns: ``None`` from :data:`DURABLE_TIMER_MIN_SECONDS` up, and for a
+        repeating timer in whole minutes up to :data:`DURABLE_TIMER_MAX_INTERVAL`;
+        otherwise the reason, e.g. ``"The server keeps only timers of at least 600
+        seconds"``.
     """
     if seconds < DURABLE_TIMER_MIN_SECONDS:
-        return False
-    return not repeat or (seconds.is_integer() and int(seconds) % 60 == 0)
+        return f"The server keeps only timers of at least {DURABLE_TIMER_MIN_SECONDS} seconds"
+    if not repeat:
+        return None
+    if not (seconds.is_integer() and int(seconds) % 60 == 0):
+        return "The server keeps a repeating timer only in whole minutes"
+    if seconds > DURABLE_TIMER_MAX_INTERVAL.total_seconds():
+        hours = int(DURABLE_TIMER_MAX_INTERVAL.total_seconds()) // 3600
+        return (
+            f"The server keeps a repeating timer only up to every {hours} hours, so it fires "
+            f"at least twice in the {DURABLE_TIMER_MAX_LIFETIME.days} days it lasts"
+        )
+    return None
+
+
+def is_durable_timer(seconds: float, repeat: bool) -> bool:
+    """Whether the server can keep a timer with these validated arguments; see
+    :func:`durable_timer_problem`."""
+    return durable_timer_problem(seconds, repeat) is None
 
 
 def durable_timer_rule(seconds: float, repeat: bool, now: datetime) -> tuple[str, datetime | None]:
@@ -136,13 +156,13 @@ def durable_timer_rule(seconds: float, repeat: bool, now: datetime) -> tuple[str
     :param repeat: Whether the timer repeats.
     :param now: When the timer is set, timezone-aware.
     :returns: ``("FREQ=MINUTELY;INTERVAL=10;COUNT=1008", None)`` for a timer
-        repeating every ten minutes, counted from its creation, for
-        :data:`DURABLE_TIMER_MAX_LIFETIME` (at least twice), or a one-time rule and
-        its UTC fire time: the whole minute at or after ``now + seconds``.
+        repeating every ten minutes, counted from its creation, whose last firing
+        falls within :data:`DURABLE_TIMER_MAX_LIFETIME`, or a one-time rule and its
+        UTC fire time: the whole minute at or after ``now + seconds``.
     """
     if repeat:
         minutes = int(seconds) // 60
-        firings = max(2, int(DURABLE_TIMER_MAX_LIFETIME.total_seconds()) // (minutes * 60))
+        firings = int(DURABLE_TIMER_MAX_LIFETIME.total_seconds()) // (minutes * 60)
         return f"FREQ=MINUTELY;INTERVAL={minutes};COUNT={firings}", None
     when = (now + timedelta(seconds=seconds)).astimezone(UTC)
     if when.second or when.microsecond:
@@ -207,13 +227,15 @@ class SysTimerSetTool(Tool):
             "echoed back in the firing. Set repeat=true for a "
             "recurring timer (cancel via sys_timer_cancel). The "
             "tool returns immediately with the timer_id. A timer of "
-            f"at least {DURABLE_TIMER_MIN_SECONDS} seconds (whole minutes "
-            "when it repeats) is kept by the server when it can be, so it "
+            f"at least {DURABLE_TIMER_MIN_SECONDS} seconds (when it repeats, whole "
+            "minutes at most "
+            f"{int(DURABLE_TIMER_MAX_INTERVAL.total_seconds()) // 3600} hours apart) "
+            "is kept by the server when it can be, so it "
             "still fires after this runner stops or the server restarts; "
-            "the result says durable: true. A durable repeating timer skips "
-            "a firing while this session is busy or waiting on someone, and "
+            "the result says durable: true. A durable repeating timer "
+            "skips a firing while this session is busy or waiting on someone, and "
             f"ends {DURABLE_TIMER_MAX_LIFETIME.days} days after it is set. "
-            "Shorter timers end with the runner."
+            "Other timers end with the runner."
         )
 
     def get_schema(self) -> dict[str, Any]:

@@ -79,6 +79,14 @@ class ScheduledTaskFirstRunMismatchError(ValueError):
         super().__init__(f"first run would be at {actual}, not {expected}")
 
 
+# Bounds what one session's agent can keep firing into it.
+TIMERS_PER_SESSION = 10
+
+
+class ScheduledTaskSessionTimerCapError(Exception):
+    """Raised when a new timer's session already keeps :data:`TIMERS_PER_SESSION` timers."""
+
+
 class ScheduledTaskStore(ABC):
     """
     Abstract base for scheduled-task persistence.
@@ -204,9 +212,15 @@ class ScheduledTaskStore(ABC):
         :param kind: ``"automation"`` (default), ``"reminder"`` for a one-time
             (``COUNT=1``) task that continues ``session_id``, or ``"timer"`` for a
             ``sys_timer_set`` timer that continues ``session_id`` once or on repeat.
+            A session keeps :data:`TIMERS_PER_SESSION` active timers. The count and
+            the insert share one write transaction, which serializes them on SQLite;
+            on databases with concurrent writers, creates racing for the last place
+            can each commit, so the cap is a bound, not an exact limit.
         :returns: The newly created :class:`ScheduledTask`.
         :raises ScheduledTaskFirstRunMismatchError: If ``first_run_at`` is set and
             the first run differs; nothing is saved.
+        :raises ScheduledTaskSessionTimerCapError: If a timer's session already keeps
+            :data:`TIMERS_PER_SESSION` active timers; nothing is saved.
         :raises ValueError: If ``state`` or ``kind`` is not a recognized value, or a
             reminder's or timer's rule, session mode or session doesn't fit one.
         """

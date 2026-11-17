@@ -209,6 +209,32 @@ def test_a_timer_continues_its_session_once_or_on_repeat(
         )
 
 
+def test_a_session_keeps_a_bounded_number_of_timers(store: SqlAlchemyScheduledTaskStore) -> None:
+    from omnigent.stores.scheduled_task_store import (
+        TIMERS_PER_SESSION,
+        ScheduledTaskSessionTimerCapError,
+    )
+
+    session_id = _uid("conv_timers")
+
+    def keep(seed: str, **overrides: Any) -> str:
+        fields = _reminder_fields(
+            name="Timer", rrule="FREQ=MINUTELY;INTERVAL=10", kind="timer", session_id=session_id
+        )
+        return store.create(scheduled_task_id=_uid(seed), **{**fields, **overrides}).id
+
+    kept = [keep(f"st_timer_{index}") for index in range(TIMERS_PER_SESSION)]
+    with pytest.raises(ScheduledTaskSessionTimerCapError):
+        keep("st_timer_over")
+    assert store.get(_uid("st_timer_over")) is None
+    # Another session's timers and this session's automations don't count.
+    keep("st_timer_elsewhere", session_id=_uid("conv_other"))
+    keep("st_automation", kind="automation")
+    # A cancelled timer makes room for another.
+    store.delete(kept[0])
+    keep("st_timer_again")
+
+
 @pytest.mark.parametrize(
     "arrival", ["on_time", "one_second_early", "at_the_minute", "late", "late_and_exhausted"]
 )

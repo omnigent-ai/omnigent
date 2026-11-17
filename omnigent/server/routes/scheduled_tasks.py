@@ -19,7 +19,6 @@ import asyncio
 import contextlib
 import logging
 import uuid
-import weakref
 from collections.abc import AsyncIterator, Callable
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -85,8 +84,10 @@ from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import SCHEDULED_TASK_RUN_LABEL_KEY
 from omnigent.stores.project_store import ProjectStore
 from omnigent.stores.scheduled_task_store import (
+    TIMERS_PER_SESSION,
     AutomationFailure,
     ScheduledTaskFirstRunMismatchError,
+    ScheduledTaskSessionTimerCapError,
     ScheduledTaskStore,
     encode_mcp_services,
 )
@@ -95,11 +96,10 @@ from omnigent.tools.browser_agent_tools import (
     browser_agent_tools_creation_labels,
 )
 from omnigent.tools.builtins.timer import (
-    DURABLE_TIMER_MIN_SECONDS,
     durable_timer_id,
+    durable_timer_problem,
     durable_timer_rule,
     durable_timer_task_id,
-    is_durable_timer,
     timer_fired_text,
     validate_timer_set_args,
 )
@@ -416,22 +416,8 @@ def _validate_timezone_or_400(timezone: str) -> None:
 _AGENT_AUTOMATION_ACTION = "Agent automation changes"
 _TIMER_ACTION = "Session timers"
 _TIMER_NAME_CHARS = 60
-# Bounds what one session's agent can keep firing into it.
-_MAX_TIMERS_PER_SESSION = 10
 # A note is echoed in every firing, so keep it a label, not a transcript.
 _TIMER_NOTE_MAX_CHARS = 1000
-
-# custom-lint: disable-next=workspace-scoped-cache -- lock; collision only serializes
-_timer_set_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
-
-
-def _timer_set_lock(session_id: str) -> asyncio.Lock:
-    """Return the lock serializing one session's timer count check and create."""
-    lock = _timer_set_locks.get(session_id)
-    if lock is None:
-        lock = asyncio.Lock()
-        _timer_set_locks[session_id] = lock
-    return lock
 
 
 class SetSessionTimerRequest(BaseModel):
@@ -1815,12 +1801,9 @@ def create_scheduled_tasks_router(
         if isinstance(validated, str):
             raise OmnigentError(validated, code=ErrorCode.INVALID_INPUT)
         seconds, repeat, note = validated
-        if not is_durable_timer(seconds, repeat):
-            raise OmnigentError(
-                f"A kept timer needs at least {DURABLE_TIMER_MIN_SECONDS} seconds, in whole "
-                "minutes when it repeats",
-                code=ErrorCode.INVALID_INPUT,
-            )
+        not_kept = durable_timer_problem(seconds, repeat)
+        if not_kept is not None:
+            raise OmnigentError(not_kept, code=ErrorCode.INVALID_INPUT)
         conv = await asyncio.to_thread(conversation_store.get_conversation, source_id)
         if conv is None:
             raise OmnigentError("Session not found", code=ErrorCode.NOT_FOUND)
@@ -1839,19 +1822,7 @@ def create_scheduled_tasks_router(
         rrule, fire_at = durable_timer_rule(seconds, repeat, datetime.now(UTC))
         await _validate_rrule_or_400(rrule, "continue", "connected_host", allow_single_fire=True)
         name = _timer_name(note, seconds, repeat)
-        # Held through the create, so concurrent sets can't each pass the cap.
-        async with _timer_set_lock(conv.id), _allocated_task_id(owner_id, name) as task_id:
-            kept = [
-                task
-                for task in await asyncio.to_thread(store.list, owner_user_id=owner_id)
-                if task.kind == "timer" and task.session_id == conv.id and task.state == "active"
-            ]
-            if len(kept) >= _MAX_TIMERS_PER_SESSION:
-                raise OmnigentError(
-                    f"This session already keeps {_MAX_TIMERS_PER_SESSION} timers; cancel one "
-                    "with sys_timer_cancel first",
-                    code=ErrorCode.INVALID_INPUT,
-                )
+        async with _allocated_task_id(owner_id, name) as task_id:
             timer_id = durable_timer_id(task_id)
             shape = ScheduledTask(
                 id=task_id,
@@ -1898,6 +1869,12 @@ def create_scheduled_tasks_router(
             except ScheduledTaskFirstRunMismatchError as exc:
                 raise OmnigentError(
                     "The timer would not first fire when asked, so it was not kept; set it again",
+                    code=ErrorCode.INVALID_INPUT,
+                ) from exc
+            except ScheduledTaskSessionTimerCapError as exc:
+                raise OmnigentError(
+                    f"This session already keeps {TIMERS_PER_SESSION} timers; cancel one with "
+                    "sys_timer_cancel first",
                     code=ErrorCode.INVALID_INPUT,
                 ) from exc
         return {

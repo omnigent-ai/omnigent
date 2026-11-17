@@ -206,7 +206,10 @@ _KEPT_TIMER = {
 
 
 def _timer_server(
-    *, keeps: bool, create: httpx.Response | None = None, delete_status: int = 200
+    *,
+    keeps: bool,
+    create: httpx.Response | httpx.HTTPError | None = None,
+    delete_status: int = 200,
 ) -> tuple[Any, list[httpx.Request]]:
     """A server that may keep timers, recording each request it gets."""
     calls: list[httpx.Request] = []
@@ -218,6 +221,8 @@ def _timer_server(
         if request.url.path.startswith(f"/v1/sessions/{_SESSION}/timers"):
             if request.method == "DELETE":
                 return httpx.Response(delete_status, json={"status": "cancelled"})
+            if isinstance(create, httpx.HTTPError):
+                raise create
             return create or httpx.Response(200, json=_KEPT_TIMER)
         return httpx.Response(202, json={"queued": True})
 
@@ -317,9 +322,17 @@ async def test_a_timer_the_server_does_not_keep_lives_in_the_runner(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "args", [{"seconds": 300, "repeat": True}, {"seconds": 630, "repeat": True}]
+    ("args", "reason"),
+    [
+        ({"seconds": 300, "repeat": True}, "at least 600 seconds"),
+        ({"seconds": 630, "repeat": True}, "in whole minutes"),
+        # Four days apart, its second firing would come after the timer ends.
+        ({"seconds": 345600, "repeat": True}, "up to every 84 hours"),
+    ],
 )
-async def test_a_short_or_off_minute_timer_never_asks_the_server(args: dict[str, Any]) -> None:
+async def test_a_timer_the_server_cannot_keep_never_asks_it(
+    args: dict[str, Any], reason: str
+) -> None:
     handler, calls = _timer_server(keeps=True)
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(handler), base_url="http://server"
@@ -327,7 +340,7 @@ async def test_a_short_or_off_minute_timer_never_asks_the_server(args: dict[str,
         result = await _set_timer(server_client, **args)
         try:
             assert result["durable"] is False
-            assert "in whole minutes" in result["not_durable_because"]
+            assert reason in result["not_durable_because"]
         finally:
             await execute_tool(
                 tool_name="sys_timer_cancel",
@@ -339,8 +352,21 @@ async def test_a_short_or_off_minute_timer_never_asks_the_server(args: dict[str,
 
 
 @pytest.mark.asyncio
-async def test_a_timer_create_that_may_have_landed_is_not_doubled_in_the_runner() -> None:
-    handler, _ = _timer_server(keeps=True, create=httpx.Response(504, text="gateway timeout"))
+@pytest.mark.parametrize(
+    "create",
+    [
+        httpx.Response(504, text="gateway timeout"),
+        httpx.ReadTimeout("the server didn't answer"),
+        # A success that doesn't say which timer it kept.
+        httpx.Response(200, json={"scheduled_task_id": "0123"}),
+        httpx.Response(200, text="<html>proxy page</html>"),
+    ],
+    ids=["gateway-timeout", "no-answer", "no-timer-id", "not-json"],
+)
+async def test_a_timer_create_that_may_have_landed_is_not_doubled_in_the_runner(
+    create: httpx.Response | httpx.HTTPError,
+) -> None:
+    handler, _ = _timer_server(keeps=True, create=create)
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(handler), base_url="http://server"
     ) as server_client:
