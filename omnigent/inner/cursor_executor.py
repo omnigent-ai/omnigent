@@ -618,9 +618,16 @@ class _CursorPolicyGate:
     home: Path
     server: asyncio.AbstractServer
     home_identity: tuple[int, int]
+    # Connections still being answered, e.g. waiting on a user's approval.
+    handlers: set[asyncio.Task[None]] = field(default_factory=set)
 
     async def close(self) -> None:
         self.server.close()
+        # A handler can wait a day for an approval; cancel it so closing returns.
+        pending = list(self.handlers)
+        for handler in pending:
+            handler.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
         await self.server.wait_closed()
         try:
             current = self.home.lstat()
@@ -911,6 +918,20 @@ class CursorExecutor(Executor):
             "agent_message": "Cursor policy gate unavailable",
         }
         try:
+            await self._answer_policy_request(reader, writer, response)
+        finally:
+            # Also on cancellation, so the hook sees the stream end and denies.
+            writer.close()
+            with contextlib.suppress(ConnectionError, OSError):
+                await writer.wait_closed()
+
+    async def _answer_policy_request(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        response: dict[str, str],
+    ) -> None:
+        try:
             if not self._trusted_policy_peer(writer):
                 raise PermissionError("Cursor policy request from sandboxed process")
             raw = await asyncio.wait_for(reader.readline(), timeout=30)
@@ -935,14 +956,9 @@ class CursorExecutor(Executor):
             logger.warning("Cursor pre-tool policy gate rejected client: %s", exc)
         except Exception:  # a broken policy channel must block the tool
             logger.exception("Cursor pre-tool policy gate failed")
-        try:
+        with contextlib.suppress(ConnectionError, OSError):
             writer.write((json.dumps(response) + "\n").encode("utf-8"))
             await writer.drain()
-        except (ConnectionError, OSError):
-            pass
-        finally:
-            writer.close()
-            await writer.wait_closed()
 
     async def _start_policy_gate(self, cwd: str) -> _CursorPolicyGate:
         if not _policy_gate_supported():
@@ -973,8 +989,19 @@ class CursorExecutor(Executor):
             hook_script.chmod(0o500)
 
             socket_path = private_home / "policy.sock"
+            handlers: set[asyncio.Task[None]] = set()
+
+            async def serve(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+                task = asyncio.current_task()
+                assert task is not None
+                handlers.add(task)
+                try:
+                    await self._handle_policy_gate_connection(reader, writer)
+                finally:
+                    handlers.discard(task)
+
             server = await asyncio.start_unix_server(
-                self._handle_policy_gate_connection,
+                serve,
                 path=str(socket_path),
                 limit=_POLICY_REQUEST_MAX_BYTES + 1,
             )
@@ -1007,6 +1034,7 @@ class CursorExecutor(Executor):
                 home=private_home,
                 server=server,
                 home_identity=(private_stat.st_dev, private_stat.st_ino),
+                handlers=handlers,
             )
         except BaseException:
             if server is not None:

@@ -146,6 +146,33 @@ async def test_hook_waits_for_interactive_approval(
         await gate.close()
 
 
+@requires_policy_gate
+@pytest.mark.asyncio
+async def test_closing_the_gate_abandons_a_pending_approval(
+    home_and_workspace: tuple[Path, Path],
+) -> None:
+    """Teardown returns while an approval is unanswered, and the waiting tool is denied."""
+    _, workspace = home_and_workspace
+    executor = CursorExecutor(cwd=str(workspace), api_key="test-key", permission_mode="ask")
+    parked = asyncio.Event()
+
+    async def allow(_phase: str, _data: dict[str, object]) -> object:
+        return _verdict("POLICY_ACTION_ALLOW")
+
+    async def never_answers(_name: str, _data: dict[str, object]) -> bool:
+        parked.set()
+        await asyncio.Event().wait()
+        return True
+
+    executor._policy_evaluator = allow
+    executor._elicitation_handler = never_answers
+    gate = await executor._start_policy_gate(str(workspace))
+    hook = asyncio.create_task(_ask_hook(gate.home))
+    await asyncio.wait_for(parked.wait(), timeout=10)
+    await asyncio.wait_for(gate.close(), timeout=5)
+    assert (await asyncio.wait_for(hook, timeout=10))["permission"] == "deny"
+
+
 @pytest.mark.skipif(sys.platform != "darwin", reason="exercises the macOS sandbox")
 @pytest.mark.asyncio
 async def test_sandboxed_process_cannot_use_the_gate_on_macos(
