@@ -25,6 +25,9 @@ from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 _SHELL_REQUEST = json.dumps({"tool_name": "Shell", "tool_input": {"command": "printf hello"}})
 _SHELL_CALL = ("PHASE_TOOL_CALL", {"name": "Shell", "arguments": {"command": "printf hello"}})
 
+_PLATFORM_SANDBOX = "darwin_seatbelt" if sys.platform == "darwin" else "linux_bwrap"
+_STDLIB = Path(os.__file__).resolve().parent
+
 requires_policy_gate = pytest.mark.skipif(
     sys.platform not in ("linux", "darwin"),
     reason="Cursor isolates the filesystem only on Linux and macOS",
@@ -319,6 +322,18 @@ async def test_missing_api_key_fails_before_creating_the_policy_home(
     [
         ("sys_os_shell", OSEnvSandboxSpec(type="none"), "active sandbox"),
         ("sys_terminal_launch", None, "terminal tools"),
+        # The home directory granted as a writable "file".
+        (
+            "sys_os_shell",
+            OSEnvSandboxSpec(type=_PLATFORM_SANDBOX, write_files=["~"]),
+            "policy home",
+        ),
+        # The standard library the hook imports from.
+        (
+            "sys_os_shell",
+            OSEnvSandboxSpec(type=_PLATFORM_SANDBOX, write_paths=[str(_STDLIB)]),
+            "policy hook's Python",
+        ),
     ],
 )
 async def test_bridged_tools_that_could_reach_the_policy_home_are_rejected(

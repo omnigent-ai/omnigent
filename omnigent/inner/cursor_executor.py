@@ -52,6 +52,7 @@ import shutil
 import socket
 import stat
 import struct
+import subprocess
 import sys
 import tempfile
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
@@ -156,6 +157,20 @@ def _policy_gate_supported() -> bool:
     does not, so the hook stays in the workspace as before.
     """
     return sys.platform in ("linux", "darwin")
+
+
+def _policy_hook_runtime_paths() -> list[Path]:
+    """The interpreter that runs the policy hook and every directory it imports from."""
+    interpreter = Path(sys.executable).resolve(strict=True)
+    listed = subprocess.run(
+        [str(interpreter), "-I", "-c", "import json, sys; print(json.dumps(sys.path))"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=True,
+        env={"PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8"},
+    )
+    return [interpreter, *(Path(entry).resolve() for entry in json.loads(listed.stdout) if entry)]
 
 
 def _darwin_peer_is_unsandboxed(peer_socket: socket.socket) -> bool:
@@ -1081,9 +1096,15 @@ class CursorExecutor(Executor):
         sandbox = resolve_sandbox(self._os_env_spec, os_env_cwd)
         if not sandbox.active:
             raise RuntimeError("Cursor SDK OS tools require an active sandbox")
+        # A directory can be granted through ``write_files`` as well.
+        grants = [*sandbox.write_roots, *sandbox.write_files]
         home_root = Path.home().resolve(strict=True)
-        if any(home_root.is_relative_to(root) for root in sandbox.write_roots):
+        if any(home_root.is_relative_to(grant) for grant in grants):
             raise RuntimeError("Cursor SDK OS tools cannot write the policy home")
+        # The hook is only as trustworthy as the interpreter and modules it loads.
+        for path in _policy_hook_runtime_paths():
+            if any(path.is_relative_to(grant) or grant.is_relative_to(path) for grant in grants):
+                raise RuntimeError("Cursor SDK OS tools cannot write the policy hook's Python")
 
     async def _ensure_isolated_session(
         self,
