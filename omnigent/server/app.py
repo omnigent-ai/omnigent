@@ -316,6 +316,9 @@ class ServerInfoResponse(BaseModel):
     # Whether the deployment offers the proactive agent to this caller; each
     # user's own on/off state is at ``GET /v1/proactive-agent/settings``.
     proactive_agent_available: bool = False
+    # Whether this server has the agent's admin routes (prompt override, Run
+    # now); servers that predate them omit it, so clients hide those controls.
+    proactive_agent_admin_available: bool = False
     dictation_available: bool
     # Scheduled tasks accept the optional random-worktree base ref.
     scheduled_task_worktrees: bool = True
@@ -4122,6 +4125,8 @@ def create_app(
                 "sibling_other_project_standalone": True,
                 "automations_enabled": automations_enabled,
                 "proactive_agent_available": app.state.proactive_agent_available(),
+                # Mounted with the settings routes, under the same offer.
+                "proactive_agent_admin_available": app.state.proactive_agent_available(),
                 "automation_trigger_poll_minutes": trigger_poll_minutes,
                 "branding": branding_snapshot.config(),
                 "picker": picker_curation.config(),

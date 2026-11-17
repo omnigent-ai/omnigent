@@ -9,11 +9,16 @@ const mocks = vi.hoisted(() => ({
   singleUser: false,
   nestedAgents: true,
   advisorAvailable: false,
+  advisorAdmin: true,
   advisor: undefined as { can_manage_workspace: boolean } | undefined,
 }));
 vi.mock("@/hooks/useIsAdmin", () => ({ useIsAdmin: () => mocks.isAdmin }));
 vi.mock("@/lib/CapabilitiesContext", () => ({
-  useServerInfo: () => ({ single_user: mocks.singleUser, sibling_sessions: mocks.nestedAgents }),
+  useServerInfo: () => ({
+    single_user: mocks.singleUser,
+    sibling_sessions: mocks.nestedAgents,
+    proactive_agent_admin_available: mocks.advisorAdmin,
+  }),
 }));
 vi.mock("@/hooks/useSharing", () => ({ useSharing: vi.fn(), useSetSharing: vi.fn() }));
 vi.mock("@/hooks/useProactiveAgentSettings", () => ({
@@ -46,6 +51,7 @@ beforeEach(() => {
   mocks.singleUser = false;
   mocks.nestedAgents = true;
   mocks.advisorAvailable = false;
+  mocks.advisorAdmin = true;
   mocks.advisor = undefined;
   vi.mocked(useSharing).mockReturnValue({
     data: {
@@ -70,6 +76,15 @@ describe("AdminGeneralPage", () => {
     expect(screen.getByTestId("advisor-control-workspace")).toBeInTheDocument();
     expect(screen.getByTestId("advisor-admin-controls")).toBeInTheDocument();
     expect(screen.queryByRole("combobox", { name: "Nested agent destinations" })).toBeNull();
+  });
+
+  it("keeps only the workspace switch on a server without the prompt and Run now routes", () => {
+    mocks.nestedAgents = false;
+    mocks.advisorAdmin = false;
+    mocks.advisor = { can_manage_workspace: true };
+    renderPage();
+    expect(screen.getByTestId("advisor-control-workspace")).toBeInTheDocument();
+    expect(screen.queryByTestId("advisor-admin-controls")).toBeNull();
   });
 
   it("hides the Omni Advisor switch from callers who cannot manage it", () => {
