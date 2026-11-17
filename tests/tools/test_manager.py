@@ -1758,6 +1758,10 @@ _TOOL_GROUP_MEMBERS: dict[str, frozenset[str]] = {
 
 def test_automation_worker_start_needs_spawn_and_the_automations_group() -> None:
     """The automation worker start is a spawn write, so it follows both gates."""
+    automations_on = ToolGroupsConfig(scheduled_tasks=True)
+    assert "sys_automation_start_worker" in _tool_names(
+        AgentSpec(spec_version=1, spawn=True, tool_groups=automations_on)
+    )
     automations_off = ToolGroupsConfig(scheduled_tasks=False)
     assert "sys_automation_start_worker" not in _tool_names(AgentSpec(spec_version=1))
     assert "sys_automation_start_worker" not in _tool_names(

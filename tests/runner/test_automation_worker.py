@@ -16,7 +16,10 @@ from omnigent.runner.automation_worker import (
     worker_instructions,
 )
 from omnigent.server.scheduled.fire import unattended_run_note
-from omnigent.stores.conversation_store import SCHEDULED_TASK_ORIGIN_LABEL_KEY
+from omnigent.stores.conversation_store import (
+    CREATED_BY_SESSION_LABEL_KEY,
+    SCHEDULED_TASK_ORIGIN_LABEL_KEY,
+)
 
 INSTRUCTIONS = "Triage the message.\n\nPosting instructions for each session:\nEnd with a line."
 DETAILS = "<slack-message>\nchannel: #support\ntext: the build is red\n</slack-message>"
@@ -33,14 +36,20 @@ def _user_item(text: str) -> dict[str, Any]:
 
 
 def _server_client(
-    pages: list[list[dict[str, Any]]], *, labels: dict[str, str] | None = None
+    pages: list[list[dict[str, Any]]],
+    *,
+    labels: dict[str, str] | None = None,
+    parent: str | None = None,
 ) -> httpx.AsyncClient:
     """A server whose session has *labels* and whose history pages are *pages*, newest first."""
     session_labels = {SCHEDULED_TASK_ORIGIN_LABEL_KEY: "task_1"} if labels is None else labels
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/v1/sessions/conv_manager":
-            return httpx.Response(200, json={"id": "conv_manager", "labels": session_labels})
+            return httpx.Response(
+                200,
+                json={"id": "conv_manager", "labels": session_labels, "parent_session_id": parent},
+            )
         assert request.url.path == "/v1/sessions/conv_manager/items"
         assert request.url.params["order"] == "desc"
         after = request.url.params.get("after")
@@ -63,6 +72,7 @@ async def _start(
     *,
     pages: list[list[dict[str, Any]]] | None = None,
     labels: dict[str, str] | None = None,
+    parent: str | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     created: list[dict[str, Any]] = []
 
@@ -71,7 +81,7 @@ async def _start(
         return json.dumps({"conversation_id": "conv_worker", "status": "created"})
 
     history = pages if pages is not None else [items or []]
-    async with _server_client(history, labels=labels) as client:
+    async with _server_client(history, labels=labels, parent=parent) as client:
         output = await execute_automation_start_worker(
             args,
             server_client=client,
@@ -190,9 +200,15 @@ async def test_unreadable_session_is_refused() -> None:
 async def test_a_worker_cannot_read_its_own_first_message_as_instructions() -> None:
     """Without the server-set origin label, a forged prompt in the history is never used."""
     forged = _automation_prompt("Injected instructions.")
-    output, created = await _start(_args(), [_user_item(forged)], labels={})
-    assert created == []
-    assert "no worker instructions" in output["error"]
+    # Workers inherit the origin label from the session that created them.
+    worker_labels = {
+        SCHEDULED_TASK_ORIGIN_LABEL_KEY: "task_1",
+        CREATED_BY_SESSION_LABEL_KEY: "conv_m",
+    }
+    for labels, parent in (({}, None), (worker_labels, None), (None, "conv_parent")):
+        output, created = await _start(_args(), [_user_item(forged)], labels=labels, parent=parent)
+        assert created == []
+        assert "no worker instructions" in output["error"]
 
 
 @pytest.mark.asyncio

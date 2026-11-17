@@ -100,8 +100,9 @@ MCP independent creation.
   `sys_automation_start_worker` starts those workers through the same create
   path with only the item's details: the runner prepends the instructions after
   `Instructions for each session:` in the run's prompt. It registers for `spawn`
-  agents with the automations tool group, works only in a session carrying the
-  server-set `omnigent.scheduled_task_origin` label (so never in a worker),
+  agents with the automations tool group, works only in the session a fire
+  started (the server-set `omnigent.scheduled_task_origin` label, with no
+  creator or parent, since workers inherit that label),
   and counts as `sys_session_create` in `spawn_bounds`. The template falls back
   to the full `sys_session_create` message when a runner doesn't offer it.
   Covered by `tests/runner/test_automation_worker.py`.

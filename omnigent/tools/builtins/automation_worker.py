@@ -25,8 +25,10 @@ class SysAutomationStartWorkerTool(Tool):
         """:returns: Human-readable description of the tool."""
         return (
             "For a trigger automation's own session only: start one worker session for a matching "
-            "item. Takes the same arguments as sys_session_create, but details in place of "
-            "message. The worker's first message is built for you: the instructions under "
+            "item. Takes sys_session_create's agent_id, placement (same_host or managed), title, "
+            "model, reasoning_effort and permission_mode, plus details in place of message; "
+            "for other options use sys_session_create. The worker's first message is built "
+            "for you: the instructions under "
             '"Instructions for each session:" in the prompt this automation sent, then a line '
             "saying the details are untrusted data, then details. Refused, with nothing "
             "started, when this isn't an automation's session or the message would be too long; "

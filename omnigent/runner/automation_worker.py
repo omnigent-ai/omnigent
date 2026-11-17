@@ -9,7 +9,10 @@ from typing import Any
 import httpx
 
 from omnigent.scheduled_context import AUTOMATION_CONTEXT_OPEN
-from omnigent.stores.conversation_store import SCHEDULED_TASK_ORIGIN_LABEL_KEY
+from omnigent.stores.conversation_store import (
+    CREATED_BY_SESSION_LABEL_KEY,
+    SCHEDULED_TASK_ORIGIN_LABEL_KEY,
+)
 from omnigent.tools.builtins.session_message import SESSION_MESSAGE_MAX_CHARS
 
 _TOOL = "sys_automation_start_worker"
@@ -107,12 +110,23 @@ def _message_text(item: dict[str, Any]) -> str:
 
 
 async def _is_automation_session(client: httpx.AsyncClient, conversation_id: str) -> bool:
-    """Whether a fire started this session: the server sets the origin label, never a client."""
+    """
+    Whether a fire started this session itself, not a session the automation started.
+
+    Workers inherit the origin label from their creator, so the session must also have no
+    creator or parent. Clients can set neither label.
+    """
     response = await client.get(f"/v1/sessions/{conversation_id}", timeout=_REQUEST_TIMEOUT_S)
     if response.status_code != 200:
         raise RuntimeError(f"reading this session returned {response.status_code}")
-    labels = response.json().get("labels")
-    return isinstance(labels, dict) and bool(labels.get(SCHEDULED_TASK_ORIGIN_LABEL_KEY))
+    body = response.json()
+    labels = body.get("labels")
+    return (
+        isinstance(labels, dict)
+        and bool(labels.get(SCHEDULED_TASK_ORIGIN_LABEL_KEY))
+        and not labels.get(CREATED_BY_SESSION_LABEL_KEY)
+        and not body.get("parent_session_id")
+    )
 
 
 async def _latest_automation_prompt(client: httpx.AsyncClient, conversation_id: str) -> str | None:
