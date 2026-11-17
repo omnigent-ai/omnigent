@@ -923,6 +923,51 @@ describe("Composer Claude goal control", () => {
     vi.restoreAllMocks();
   });
 
+  it("shows a paused Claude Code goal and clears it with /goal clear", async () => {
+    const pausedGoal = {
+      objective: "All tests pass",
+      status: "paused",
+      statusDetail: "Goal paused · goal checks kept finding it unmet this turn",
+      iterations: null,
+      tokenBudget: null,
+      tokensUsed: 0,
+      timeUsedSeconds: 0,
+      createdAt: 1,
+      updatedAt: 2,
+    };
+    const previousState = useChatStore.getState();
+    onTestFinished(() => useChatStore.setState(previousState, true));
+    const mockGetGoal = vi.mocked(getGoal).mockResolvedValue({ goal: pausedGoal });
+    onTestFinished(() => {
+      mockGetGoal.mockReset();
+    });
+    const onSend = vi.fn();
+    setComposerState({
+      conversationId: "conv_claude",
+      sessionHarness: "claude-native",
+      skills: [],
+    });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({ onSend, showClaudeNativeGoalControl: true, runnerOnline: true })}
+      />,
+    );
+
+    const pill = await screen.findByTestId("composer-goal-mode");
+    expect(mockGetGoal).toHaveBeenCalledWith("conv_claude", { strict: false, backend: "claude" });
+    expect(pill).toHaveAttribute("data-state", "paused");
+    expect(pill).toHaveTextContent("Paused");
+
+    fireEvent.click(pill);
+    const current = await screen.findByTestId("goal-current");
+    expect(current).toHaveTextContent("All tests pass");
+    expect(current).toHaveTextContent("Send a message to continue.");
+    expect(screen.getByTestId("goal-start")).toHaveTextContent("Replace goal");
+    fireEvent.click(screen.getByTestId("goal-clear"));
+
+    expect(onSend).toHaveBeenCalledWith("/goal clear");
+  });
+
   it("sends the completion condition as a Claude /goal command", async () => {
     const onSend = vi.fn();
     useChatStore.setState({ conversationId: "conv_polly" });
@@ -945,6 +990,7 @@ describe("Composer goal slash command", () => {
     ["codex-native", { showGoalControl: true }],
     ["codex", { showPollyCodexGoalControl: true }],
     ["claude-sdk", { showClaudeGoalControl: true }],
+    ["claude-native", { showClaudeNativeGoalControl: true }],
   ] as const;
 
   beforeEach(() => {

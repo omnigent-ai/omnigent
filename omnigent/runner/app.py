@@ -107,6 +107,7 @@ from omnigent.runner.background_titles import (
 )
 from omnigent.runner.background_titles.service import BACKGROUND_TITLE_MAX_PROMPT_CHARS
 from omnigent.runner.background_work_reports import BackgroundWorkReporter
+from omnigent.runner.claude_goal import ClaudeGoalRunner
 from omnigent.runner.codex.goal import CodexGoalRunner
 from omnigent.runner.journal_tools import (
     answer_arrives_as_message,
@@ -4165,6 +4166,7 @@ def create_runner_app(
         _session_init_envelopes.pop(session_id, None)
         _session_reasoning_effort.pop(session_id, None)
         _session_spec_locks.pop(session_id, None)
+        claude_goal_runner.forget(session_id)
         _session_fs_registries.pop(session_id, None)
         _session_agent_ids.pop(session_id, None)
         _session_tool_schemas.pop(session_id, None)
@@ -4430,6 +4432,11 @@ def create_runner_app(
             and read_bridge_startup_error(bridge_dir) is None
         )
 
+    claude_goal_runner = ClaudeGoalRunner(
+        bridge_id_for_session=lambda conv_id: _claude_native_bridge_id_for_session(
+            server_client=server_client, session_id=conv_id
+        )
+    )
     codex_goal_runner = CodexGoalRunner(
         bridge_state_for_session=_codex_native_bridge_state_for_session,
         client_safe_error_detail=_client_safe_error_detail,
@@ -8460,6 +8467,13 @@ def create_runner_app(
         )
         if codex_goal_response is not None:
             return codex_goal_response
+        claude_goal_response = await claude_goal_runner.handle_event(
+            conversation_id,
+            body_type,
+            session_harness_name=_session_harness_name,
+        )
+        if claude_goal_response is not None:
+            return claude_goal_response
 
         if body_type == "compact":
             if _session_harness_name(conversation_id) == "claude-native":

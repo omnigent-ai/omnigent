@@ -6,6 +6,8 @@ import {
   formatGoalStatus,
   formatGoalUsage,
   goalModeDraftForGoal,
+  goalStatusLabel,
+  goalStatusTone,
   isGoalUserMode,
 } from "./goalUtils";
 
@@ -40,5 +42,19 @@ describe("goal utils", () => {
     expect(goalModeDraftForGoal(null)).toBe("active");
     expect(goalModeDraftForGoal({ ...GOAL, status: "paused" })).toBe("paused");
     expect(goalModeDraftForGoal({ ...GOAL, status: "blocked" })).toBe("keep");
+  });
+
+  it.each([
+    ["active", "working", "Active"],
+    ["paused", "paused", "Paused"],
+    ["blocked", "paused", "Blocked"],
+    ["usageLimited", "paused", "Usage limited"],
+    ["budgetLimited", "paused", "Budget limited"],
+    ["complete", "done", "Complete"],
+    ["failed", "failed", "Failed"],
+    ["somethingNew", "working", "somethingNew"],
+  ])("classifies %s as %s", (status, tone, label) => {
+    expect(goalStatusTone(status)).toBe(tone);
+    expect(goalStatusLabel(status)).toBe(label);
   });
 });

@@ -3415,6 +3415,18 @@ def register_core_routes(
         runner_exit_reports=runner_exit_reports,
     )
 
+    # ── Claude-native goal reads ─────────────────────────────────
+
+    from omnigent.server.routes.claude.sessions import register_claude_session_routes
+
+    register_claude_session_routes(
+        router,
+        conversation_store=conversation_store,
+        runner_router=runner_router,
+        auth_provider=auth_provider,
+        permission_store=permission_store,
+    )
+
     # ── PATCH /sessions/{session_id} ────────────────────────────
 
     @router.post(

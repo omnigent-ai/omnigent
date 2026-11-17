@@ -120,6 +120,8 @@ def test_codex_goal_mode_processes_first_message_with_untrusted_hooks(
     expect(page.get_by_test_id("composer-goal-mode")).to_have_attribute(
         "aria-label", f"Goal paused: {objective}"
     )
+    expect(page.get_by_test_id("composer-goal-mode")).to_have_attribute("data-state", "paused")
+    expect(page.get_by_test_id("composer-goal-mode-label")).to_have_text("Paused")
     expect(page.get_by_test_id("goal-resume")).to_be_visible()
 
     with page.expect_response(_goal_response(session.session_id, "PATCH", "/status")):
@@ -128,6 +130,7 @@ def test_codex_goal_mode_processes_first_message_with_untrusted_hooks(
     expect(page.get_by_test_id("composer-goal-mode")).to_have_attribute(
         "aria-label", f"Goal active: {objective}"
     )
+    expect(page.get_by_test_id("composer-goal-mode-label")).to_have_count(0)
     expect(page.get_by_test_id("goal-pause")).to_be_visible()
 
     page.keyboard.press("Escape")

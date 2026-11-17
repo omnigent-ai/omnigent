@@ -2981,6 +2981,50 @@ class ClearCodexGoalResponse(BaseModel):
     cleared: bool
 
 
+class ClaudeGoalObject(BaseModel):
+    """
+    The ``/goal`` a Claude-native session is pursuing or just finished.
+
+    :param condition: Completion condition, e.g. ``"All tests pass"``.
+    :param status: ``"active"``, ``"paused"``, ``"complete"`` or ``"failed"``.
+    :param detail: Latest goal check reason or pause notice, e.g.
+        ``"Goal paused · the request was rate limited · send a message to retry"``.
+    :param iterations: Goal checks Claude reported, e.g. ``3``.
+    :param tokens: Tokens Claude reported spending on the goal, e.g. ``1200``.
+    :param duration_ms: Time Claude reported spending on the goal, e.g. ``95000``.
+    :param set_at: Unix time the goal was set, e.g. ``1779922393.2``.
+    :param updated_at: Unix time of the latest goal record, e.g. ``1779922400.0``.
+    """
+
+    condition: str
+    status: Literal["active", "paused", "complete", "failed"]
+    detail: str | None = None
+    iterations: int | None = None
+    tokens: int | None = None
+    duration_ms: int | None = None
+    set_at: float | None = None
+    updated_at: float | None = None
+
+
+class ClaudeGoalReadResponse(BaseModel):
+    """
+    Response body for ``GET /v1/sessions/{id}/claude_goal``.
+
+    :param goal: Current goal, or ``None`` when the session has none.
+    :param available: Whether the session's runner read the transcript. An
+        unavailable read must not replace the caller's snapshot.
+    """
+
+    goal: ClaudeGoalObject | None
+    available: Annotated[bool, Strict()]
+
+    @model_validator(mode="after")
+    def _validate_unavailable_goal(self) -> Self:
+        if not self.available and self.goal is not None:
+            raise ValueError("An unavailable goal read cannot contain a goal")
+        return self
+
+
 def _check_managed_sandbox_target(host_id: str | None, workspaces: list[str]) -> None:
     """
     Validate the new sandbox a managed fork or host move asks for.

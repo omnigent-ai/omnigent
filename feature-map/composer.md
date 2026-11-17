@@ -189,6 +189,16 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   unavailable session can also appear to have no goal. See the
   [Goal API compatibility notes](../omnigent/server/codex-API.md) for version
   requirements.
+  In Claude Code native sessions, **+ → Goal** and bare `/goal` open a dialog
+  that sends `/goal <condition>` to Claude Code. The indicator reads goal state
+  from the session's Claude transcript and refreshes after goal commands and
+  while the runner is online. When a goal exists, the dialog shows its status,
+  check count, token and time usage, and the latest check reason, plus **Clear
+  goal**, which sends `/goal clear`. A paused Claude Code goal shows "Send a
+  message to continue." An unreadable transcript or offline runner keeps the
+  last goal shown, as in Codex. In every session with a goal indicator, paused, blocked,
+  limited, and failed goals show a visible text label beside the icon. Active
+  and complete goals stay icon-only, with the status in the tooltip.
 - `slash-rewind`: in claude-sdk and Claude Code native sessions, `/rewind` opens
   a searchable list of the session's prompts, newest first. Choosing one
   continues the conversation in a new session holding only the history before
@@ -364,8 +374,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 
 ## How to get to it (user POV)
 
-- In a Codex native chat or a Polly session with a Goal control, send `/goal`,
-  choose `/goal` from the slash menu, or open **+ → Goal**.
+- In a Codex native chat, a Claude Code native chat, or a Polly session with a
+  Goal control, send `/goal`, choose `/goal` from the slash menu, or open
+  **+ → Goal**.
 
 **In-session composer** (open any session):
 
@@ -850,6 +861,12 @@ Other connection providers alone do not enable the managed MCP picker.
   If goal setup times out or loses its reply, the goal may already have been
   saved even though the objective message was not delivered. Inspect Goal
   before resending: another `/goal <objective>` sets that objective again.
+  `tests/e2e_ui/chat/test_native_claude_goal.py` drives a real Claude Code CLI
+  with a scripted model and goal evaluator through an active, complete, and
+  paused goal, then clears it. Manually, in a Claude Code native Chat, open
+  **+ → Goal**, start a goal, and confirm the pill appears. Hover the pill for
+  the condition, then open it to see the status and usage. Choose **Clear goal**
+  and confirm the pill disappears.
 - **`session-mcp-status`, in-session composer:** component coverage lives in
   `web/src/pages/ChatPage.composer.test.tsx`. Manually open a started session,
   select `/mcp`, and expect the effective MCP names and descriptions under

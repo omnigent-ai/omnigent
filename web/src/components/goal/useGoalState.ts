@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { getGoal, type Goal } from "@/lib/goalApi";
+import { getGoal, type Goal, type GoalBackend } from "@/lib/goalApi";
 
 const GOAL_POLL_INTERVAL_MS = 5_000;
 const GOAL_POLL_MAX_DELAY_MS = 60_000;
@@ -18,7 +18,9 @@ function goalsEqual(previous: Goal | null, next: Goal | null): boolean {
       previous.tokensUsed === next.tokensUsed &&
       previous.timeUsedSeconds === next.timeUsedSeconds &&
       previous.createdAt === next.createdAt &&
-      previous.updatedAt === next.updatedAt)
+      previous.updatedAt === next.updatedAt &&
+      previous.statusDetail === next.statusDetail &&
+      previous.iterations === next.iterations)
   );
 }
 
@@ -32,6 +34,7 @@ interface UseGoalStateResult {
 
 interface GoalOwner {
   conversationId: string;
+  backend: GoalBackend;
 }
 
 interface GoalBinding extends GoalOwner {
@@ -44,6 +47,7 @@ export function useGoalState(
   conversationId: string | null,
   enabled: boolean,
   pollingEnabled = true,
+  backend: GoalBackend = "codex",
 ): UseGoalStateResult {
   const [snapshot, setSnapshot] = useState<{
     binding: GoalBinding;
@@ -56,8 +60,8 @@ export function useGoalState(
   const activeBinding = useRef<GoalBinding | null>(null);
   const activityPoller = useRef<{ binding: GoalBinding; refresh: () => void } | null>(null);
   const owner = useMemo(
-    () => (enabled && conversationId ? { conversationId } : null),
-    [conversationId, enabled],
+    () => (enabled && conversationId ? { conversationId, backend } : null),
+    [conversationId, enabled, backend],
   );
   // Keep accepted state for this session while fencing the previous connection's callbacks.
   const binding = useMemo(
@@ -94,7 +98,10 @@ export function useGoalState(
       const isCurrent = () =>
         activeBinding.current === binding && version > lastSuccessfulVersion.current;
       try {
-        const response = await getGoal(binding.conversationId, { strict });
+        const response = await getGoal(
+          binding.conversationId,
+          binding.backend === "codex" ? { strict } : { strict, backend: binding.backend },
+        );
         if (response.available === false) return false;
         if (isCurrent()) {
           lastSuccessfulVersion.current = version;

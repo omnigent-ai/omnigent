@@ -1516,6 +1516,137 @@
         "title": "ChildSessionSummary",
         "type": "object"
       },
+      "ClaudeGoalObject": {
+        "description": "The `/goal` a Claude-native session is pursuing or just finished.",
+        "properties": {
+          "condition": {
+            "description": "Completion condition, e.g. `\"All tests pass\"`.",
+            "title": "Condition",
+            "type": "string"
+          },
+          "detail": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Latest goal check reason or pause notice, e.g. `\"Goal paused \u00b7 the request was rate limited \u00b7 send a message to retry\"`.",
+            "title": "Detail"
+          },
+          "duration_ms": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Time Claude reported spending on the goal, e.g. `95000`.",
+            "title": "Duration Ms"
+          },
+          "iterations": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Goal checks Claude reported, e.g. `3`.",
+            "title": "Iterations"
+          },
+          "set_at": {
+            "anyOf": [
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Unix time the goal was set, e.g. `1779922393.2`.",
+            "title": "Set At"
+          },
+          "status": {
+            "description": "`\"active\"`, `\"paused\"`, `\"complete\"` or `\"failed\"`.",
+            "enum": [
+              "active",
+              "paused",
+              "complete",
+              "failed"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "tokens": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Tokens Claude reported spending on the goal, e.g. `1200`.",
+            "title": "Tokens"
+          },
+          "updated_at": {
+            "anyOf": [
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Unix time of the latest goal record, e.g. `1779922400.0`.",
+            "title": "Updated At"
+          }
+        },
+        "required": [
+          "condition",
+          "status"
+        ],
+        "title": "ClaudeGoalObject",
+        "type": "object"
+      },
+      "ClaudeGoalReadResponse": {
+        "description": "Response body for `GET /v1/sessions/{id}/claude_goal`.",
+        "properties": {
+          "available": {
+            "description": "Whether the session's runner read the transcript. An unavailable read must not replace the caller's snapshot.",
+            "title": "Available",
+            "type": "boolean"
+          },
+          "goal": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ClaudeGoalObject"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Current goal, or `None` when the session has none."
+          }
+        },
+        "required": [
+          "goal",
+          "available"
+        ],
+        "title": "ClaudeGoalReadResponse",
+        "type": "object"
+      },
       "ClearCodexGoalResponse": {
         "description": "Response body for `DELETE /v1/sessions/{id}/codex_goal`.",
         "properties": {
@@ -22237,6 +22368,50 @@
           }
         },
         "summary": "List Child Sessions",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/claude_goal": {
+      "get": {
+        "description": "Read the `/goal` of a Claude-native session from its runner.\n\nClaude Code sets and clears goals through its own `/goal` command,\nso this route only reads them.\n\n**Returns:** The current goal and whether the runner could read it.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 for a missing session or 400 for a session that is not Claude-native.",
+        "operationId": "get_claude_goal_v1_sessions__session_id__claude_goal_get",
+        "parameters": [
+          {
+            "description": "Session id, e.g. `\"conv_abc123\"`.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClaudeGoalReadResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Claude Goal",
         "tags": [
           "sessions"
         ]

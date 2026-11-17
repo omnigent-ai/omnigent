@@ -1416,6 +1416,7 @@ export function ChatPage() {
       showGoalControl={shouldShowGoalControl(capabilitySource)}
       showClaudeGoalControl={shouldShowPollyClaudeGoalControl(activeSession)}
       showPollyCodexGoalControl={shouldShowPollyCodexGoalControl(activeSession)}
+      showClaudeNativeGoalControl={shouldShowClaudeNativeGoalControl(capabilitySource)}
       costRoutingEligible={costRoutingEligible}
       subagentRoutingEligible={subagentRoutingEligible}
       subAgentLabel={subAgentLabel}
@@ -1587,6 +1588,8 @@ interface MainAgentSurfaceProps {
   showClaudeGoalControl?: boolean;
   /** Show Polly's Codex command-backed Goal control. */
   showPollyCodexGoalControl?: boolean;
+  /** Show the Claude Code goal control, which reads goal state from the transcript. */
+  showClaudeNativeGoalControl?: boolean;
   /** Session passes `isCostRoutingSession` (polly orchestrator, not a child). */
   costRoutingEligible: boolean;
   /** Session passes `isSubagentRoutingSession` (top-level, native Claude/Codex or non-native). */
@@ -1750,6 +1753,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   showGoalControl = false,
   showClaudeGoalControl = false,
   showPollyCodexGoalControl = false,
+  showClaudeNativeGoalControl = false,
   costRoutingEligible,
   subagentRoutingEligible,
   subAgentLabel,
@@ -2088,6 +2092,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
             }
             showClaudeGoalControl={showClaudeGoalControl}
             showPollyCodexGoalControl={showPollyCodexGoalControl}
+            showClaudeNativeGoalControl={showClaudeNativeGoalControl}
             isTerminalFirst={isTerminalFirst}
             isNativeWrapper={isNativeWrapper}
             unreachable={
@@ -2238,6 +2243,8 @@ interface ComposerProps {
   showClaudeGoalControl?: boolean;
   /** Show Polly's Codex command-backed Goal control. */
   showPollyCodexGoalControl?: boolean;
+  /** Show the Claude Code goal control, which reads goal state from the transcript. */
+  showClaudeNativeGoalControl?: boolean;
   /**
    * Terminal-first session. Presentation only: tightens the composer's
    * bottom padding to `pb-1.5` (the status line beneath already cushions
@@ -2598,6 +2605,7 @@ function ComposerImpl(
     runnerStarting = false,
     showClaudeGoalControl = false,
     showPollyCodexGoalControl = false,
+    showClaudeNativeGoalControl = false,
     isNativeWrapper = false,
     unreachable = false,
     sendReconnectsArca = false,
@@ -2984,7 +2992,12 @@ function ComposerImpl(
     setGoal: setGoalState,
     refreshGoal,
     refreshGoalAfterActivity,
-  } = useGoalState(composerSessionId, showGoalControl, runnerOnline === true);
+  } = useGoalState(
+    composerSessionId,
+    showGoalControl || showClaudeNativeGoalControl,
+    runnerOnline === true,
+    showClaudeNativeGoalControl ? "claude" : "codex",
+  );
   useEffect(() => {
     if (isWorking) refreshGoalAfterActivity();
   }, [isWorking, refreshGoalAfterActivity]);
@@ -3251,7 +3264,10 @@ function ComposerImpl(
   }, [isReadOnly, composerSessionId]);
   const showGoal =
     composerSessionId !== null &&
-    (showGoalControl || showClaudeGoalControl || showPollyCodexGoalControl);
+    (showGoalControl ||
+      showClaudeGoalControl ||
+      showPollyCodexGoalControl ||
+      showClaudeNativeGoalControl);
   // The built-ins this session offers; a gated-off one leaves a same-named
   // custom command to run as a skill.
   const offeredBuiltinCommands = useMemo(
@@ -4944,7 +4960,12 @@ function ComposerImpl(
                   disabled || isReadOnly || hasPendingElicitation || composerLockedByBtw
                 }
                 onAttach={() => fileInputRef.current?.click()}
-                showGoal={showGoalControl || showClaudeGoalControl || showPollyCodexGoalControl}
+                showGoal={
+                  showGoalControl ||
+                  showClaudeGoalControl ||
+                  showPollyCodexGoalControl ||
+                  showClaudeNativeGoalControl
+                }
                 onGoal={() => setGoalDialogOpen(true)}
                 goalDisabled={!composerSessionId || (!showGoalControl && isReadOnly)}
                 goalActive={goal !== null}
@@ -5144,13 +5165,25 @@ function ComposerImpl(
           refreshGoal={refreshGoal}
         />
       ) : (
-        (showClaudeGoalControl || showPollyCodexGoalControl) && (
+        (showClaudeGoalControl || showPollyCodexGoalControl || showClaudeNativeGoalControl) && (
           <CommandGoalDialog
             open={goalDialogOpen}
             onOpenChange={setGoalDialogOpen}
             readOnly={isReadOnly}
-            onStartGoal={(condition) => onSend(`/goal ${condition}`)}
-            backendLabel={showClaudeGoalControl ? "Claude" : "Codex"}
+            onStartGoal={(condition) => {
+              onSend(`/goal ${condition}`);
+              if (showClaudeNativeGoalControl) refreshGoalAfterActivity();
+            }}
+            backendLabel={showClaudeGoalControl || showClaudeNativeGoalControl ? "Claude" : "Codex"}
+            goal={showClaudeNativeGoalControl ? goal : undefined}
+            onClearGoal={
+              showClaudeNativeGoalControl
+                ? () => {
+                    onSend("/goal clear");
+                    refreshGoalAfterActivity();
+                  }
+                : undefined
+            }
           />
         )
       )}
@@ -5526,6 +5559,19 @@ export function shouldShowGoalControl(
   conv: { labels?: Record<string, string | null> | null } | null | undefined,
 ): boolean {
   return isCodexNativeSession(conv);
+}
+
+/**
+ * True when the session runs Claude Code natively, whose goal state the runner
+ * reads from the Claude transcript.
+ *
+ * @param conv - Session or sidebar row carrying labels; missing labels fail closed.
+ * @returns True only for Claude-native wrapper sessions.
+ */
+export function shouldShowClaudeNativeGoalControl(
+  conv: { labels?: Record<string, string | null> | null } | null | undefined,
+): boolean {
+  return isClaudeNativeSession(conv);
 }
 
 /** True for top-level Polly sessions running on the Claude SDK harness. */

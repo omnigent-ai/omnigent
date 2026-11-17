@@ -124,6 +124,46 @@ describe("GoalControl", () => {
     expect(screen.getByTestId("composer-goal-mode")).toHaveAttribute("data-state", "done");
   });
 
+  it.each([
+    ["paused", "paused", "Paused"],
+    ["usageLimited", "paused", "Usage limited"],
+    ["failed", "failed", "Failed"],
+  ])("names a stopped %s goal on the pill", (status, state, label) => {
+    render(
+      <TooltipProvider>
+        <GoalStatusPill goal={{ ...GOAL, status }} />
+      </TooltipProvider>,
+    );
+
+    const pill = screen.getByTestId("composer-goal-mode");
+    expect(pill).toHaveAttribute("data-state", state);
+    expect(within(pill).getByTestId("composer-goal-mode-label")).toHaveTextContent(label);
+    expect(pill).toHaveAccessibleName(`Goal ${status}: ${GOAL.objective}`);
+  });
+
+  it.each(["active", "complete"])("keeps the %s pill icon-only", (status) => {
+    render(
+      <TooltipProvider>
+        <GoalStatusPill goal={{ ...GOAL, status }} />
+      </TooltipProvider>,
+    );
+
+    expect(screen.queryByTestId("composer-goal-mode-label")).toBeNull();
+  });
+
+  it("shows the latest goal check in the tooltip", async () => {
+    render(
+      <TooltipProvider>
+        <GoalStatusPill goal={{ ...GOAL, statusDetail: "Two tests still fail" }} />
+      </TooltipProvider>,
+    );
+
+    fireEvent.focus(screen.getByTestId("composer-goal-mode"));
+    await screen.findByRole("tooltip");
+    const bubble = document.querySelector('[data-slot="tooltip-content"]') as HTMLElement;
+    expect(within(bubble).getAllByText("Two tests still fail")[0]).toBeInTheDocument();
+  });
+
   it("opens the goal dialog on click", () => {
     const onOpen = vi.fn();
     render(

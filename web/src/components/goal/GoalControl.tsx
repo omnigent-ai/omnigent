@@ -1,12 +1,12 @@
 import { useEffect, useState } from "react";
-import { GoalIcon, TargetIcon } from "lucide-react";
+import { CircleXIcon, GoalIcon, PauseCircleIcon, TargetIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import type { Goal } from "@/lib/goalApi";
 import { cn } from "@/lib/utils";
 import { CommandGoalDialog } from "./CommandGoalDialog";
 import { GoalDialog } from "./GoalDialog";
-import { formatGoalStatus } from "./goalUtils";
+import { formatGoalStatus, goalStatusLabel, goalStatusTone } from "./goalUtils";
 
 interface GoalControlBaseProps {
   conversationId: string | null;
@@ -95,28 +95,55 @@ export function GoalControl(props: GoalControlProps) {
   );
 }
 
-/** Icon-only workspace-bar indicator for the current goal; details on hover, dialog on click. */
+const PILL_ICONS = {
+  working: TargetIcon,
+  paused: PauseCircleIcon,
+  done: GoalIcon,
+  failed: CircleXIcon,
+} as const;
+
+/**
+ * Workspace-bar indicator for the current goal; details on hover, dialog on click.
+ *
+ * Running and finished goals show only an icon. A goal that stopped short of
+ * its condition also names its state, so a paused goal is visible at a glance.
+ */
 export function GoalStatusPill({ goal, onOpen }: { goal: Goal; onOpen?: () => void }) {
-  const done = goal.status === "complete";
-  const Icon = done ? GoalIcon : TargetIcon;
+  const tone = goalStatusTone(goal.status);
+  const Icon = PILL_ICONS[tone];
   const label = `Goal ${formatGoalStatus(goal.status)}`;
+  const needsAttention = tone === "paused" || tone === "failed";
   return (
     <Tooltip>
       <TooltipTrigger asChild>
         <button
           type="button"
           data-testid="composer-goal-mode"
-          data-state={done ? "done" : "working"}
+          data-state={tone}
           onClick={onOpen}
           aria-label={`${label}: ${goal.objective}`}
-          className="flex shrink-0 items-center rounded-full bg-transparent px-1 text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50 md:px-2"
+          className={cn(
+            "flex shrink-0 items-center gap-1 rounded-full bg-transparent px-1 text-xs text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50 md:px-2",
+            tone === "paused" && "text-warning hover:text-warning",
+            tone === "failed" && "text-destructive hover:text-destructive",
+          )}
         >
           <Icon className="size-3.5" strokeWidth={1.5} aria-hidden="true" />
+          {needsAttention && (
+            <span aria-hidden="true" data-testid="composer-goal-mode-label">
+              {goalStatusLabel(goal.status)}
+            </span>
+          )}
         </button>
       </TooltipTrigger>
       <TooltipContent side="top" align="end" className="flex-col items-start gap-0.5">
-        <div className="font-medium">{label}</div>
+        <div className="font-medium">{`Goal ${goalStatusLabel(goal.status).toLowerCase()}`}</div>
         <div className="line-clamp-3 wrap-anywhere">{goal.objective}</div>
+        {goal.statusDetail && (
+          <div className="line-clamp-3 wrap-anywhere text-muted-foreground">
+            {goal.statusDetail}
+          </div>
+        )}
       </TooltipContent>
     </Tooltip>
   );

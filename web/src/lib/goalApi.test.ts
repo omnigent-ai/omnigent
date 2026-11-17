@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { getClaudeGoal } from "./claudeGoalApi";
 import { clearCodexGoal, getCodexGoal, setCodexGoal, updateCodexGoalStatus } from "./codexGoalApi";
 import { clearGoal, getGoal, setGoal, updateGoalStatus } from "./goalApi";
 
@@ -9,6 +10,9 @@ vi.mock("./codexGoalApi", () => ({
   updateCodexGoalStatus: vi.fn(),
 }));
 
+vi.mock("./claudeGoalApi", () => ({ getClaudeGoal: vi.fn() }));
+
+const mockGetClaudeGoal = vi.mocked(getClaudeGoal);
 const mockClearCodexGoal = vi.mocked(clearCodexGoal);
 const mockGetCodexGoal = vi.mocked(getCodexGoal);
 const mockSetCodexGoal = vi.mocked(setCodexGoal);
@@ -67,5 +71,16 @@ describe("goal API facade", () => {
     await expect(getGoal("conv", { strict: false })).resolves.toEqual({ available: false });
 
     expect(mockGetCodexGoal).toHaveBeenCalledWith("conv", { strict: false });
+  });
+
+  it("reads Claude goals from the Claude backend", async () => {
+    mockGetClaudeGoal.mockResolvedValueOnce({ available: false });
+
+    await expect(getGoal("conv", { strict: false, backend: "claude" })).resolves.toEqual({
+      available: false,
+    });
+
+    expect(mockGetClaudeGoal).toHaveBeenCalledWith("conv");
+    expect(mockGetCodexGoal).not.toHaveBeenCalled();
   });
 });

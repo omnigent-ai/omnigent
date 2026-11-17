@@ -10,6 +10,9 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Textarea } from "@/components/ui/textarea";
+import type { Goal } from "@/lib/goalApi";
+import { cn } from "@/lib/utils";
+import { formatGoalUsage, goalStatusLabel, goalStatusTone } from "./goalUtils";
 
 export interface CommandGoalDialogProps {
   open: boolean;
@@ -17,15 +20,78 @@ export interface CommandGoalDialogProps {
   readOnly: boolean;
   onStartGoal: (condition: string) => void;
   backendLabel?: string;
+  /** Goal the agent reports for this session; omitted when the backend cannot report one. */
+  goal?: Goal | null;
+  /** Clear the current goal; the Clear button is hidden when omitted. */
+  onClearGoal?: () => void;
 }
 
-/** Start a vendor goal by sending its native slash command as the next turn. */
+/**
+ * Summarize a command-driven goal's usage, e.g. ``"3 checks · 1,200 tokens"``.
+ *
+ * @param goal - Goal reported by the agent.
+ * @returns Usage text, or an empty string before the first check.
+ */
+export function formatCommandGoalUsage(goal: Goal): string {
+  const parts: string[] = [];
+  if (goal.iterations != null && goal.iterations > 0) {
+    parts.push(`${goal.iterations.toLocaleString()} ${goal.iterations === 1 ? "check" : "checks"}`);
+  }
+  if (goal.tokensUsed > 0 || goal.timeUsedSeconds >= 60) parts.push(formatGoalUsage(goal));
+  return parts.join(" · ");
+}
+
+function CommandGoalSummary({ goal }: { goal: Goal }) {
+  const tone = goalStatusTone(goal.status);
+  const usage = formatCommandGoalUsage(goal);
+  return (
+    <div
+      data-testid="goal-current"
+      data-state={tone}
+      className="space-y-1 rounded-lg border border-border bg-muted/30 p-3"
+    >
+      <div className="flex items-center justify-between gap-3 text-sm">
+        <span
+          className={cn(
+            "font-medium text-foreground",
+            tone === "paused" && "text-warning",
+            tone === "failed" && "text-destructive",
+          )}
+        >
+          {goalStatusLabel(goal.status)}
+        </span>
+        {usage && <span className="shrink-0 text-muted-foreground">{usage}</span>}
+      </div>
+      <p className="text-ui leading-5 wrap-anywhere whitespace-pre-wrap">{goal.objective}</p>
+      {goal.statusDetail && (
+        <p
+          data-testid="goal-status-detail"
+          className="text-ui leading-5 text-muted-foreground wrap-anywhere whitespace-pre-wrap"
+        >
+          {goal.statusDetail}
+        </p>
+      )}
+      {tone === "paused" && (
+        <p className="text-ui leading-5 text-muted-foreground">Send a message to continue.</p>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Start a vendor goal by sending its native slash command as the next turn.
+ *
+ * When the backend reports goal state, the dialog also shows the current goal
+ * and lets the user clear or replace it.
+ */
 export function CommandGoalDialog({
   open,
   onOpenChange,
   readOnly,
   onStartGoal,
   backendLabel = "The agent",
+  goal,
+  onClearGoal,
 }: CommandGoalDialogProps) {
   const [condition, setCondition] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -65,6 +131,11 @@ export function CommandGoalDialog({
 
           {/* Leave room for the field's focus ring inside the scrollable region. */}
           <div className="-m-1 min-h-0 space-y-1.5 overflow-y-auto p-1">
+            {goal && (
+              <div className="pb-2">
+                <CommandGoalSummary goal={goal} />
+              </div>
+            )}
             <label className="text-sm font-medium text-muted-foreground" htmlFor="goal-condition">
               Completion condition
             </label>
@@ -85,8 +156,22 @@ export function CommandGoalDialog({
           </div>
 
           <DialogFooter>
+            {goal && onClearGoal && (
+              <Button
+                type="button"
+                variant="outline"
+                disabled={readOnly}
+                data-testid="goal-clear"
+                onClick={() => {
+                  onClearGoal();
+                  onOpenChange(false);
+                }}
+              >
+                Clear goal
+              </Button>
+            )}
             <Button type="submit" disabled={readOnly} data-testid="goal-start">
-              Start goal
+              {goal ? "Replace goal" : "Start goal"}
             </Button>
           </DialogFooter>
         </form>

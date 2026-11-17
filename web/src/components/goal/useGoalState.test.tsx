@@ -64,6 +64,18 @@ describe("useGoalState", () => {
     expect(result.current.goal).toEqual(GOAL);
   });
 
+  it("reads goals from the requested backend", async () => {
+    vi.useFakeTimers();
+    mockGetGoal.mockResolvedValue({ goal: GOAL });
+    const { result } = renderHook(() => useGoalState("conv", true, true, "claude"));
+    await act(async () => {});
+    expect(mockGetGoal).toHaveBeenNthCalledWith(1, "conv", { strict: false, backend: "claude" });
+
+    await act(() => result.current.refreshGoal());
+
+    expect(mockGetGoal).toHaveBeenNthCalledWith(2, "conv", { strict: true, backend: "claude" });
+  });
+
   it.each([GOAL, null])(
     "deduplicates equal background snapshots without losing confirmation or ordering (%j)",
     async (goal) => {
