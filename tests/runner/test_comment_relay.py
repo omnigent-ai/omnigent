@@ -460,14 +460,15 @@ async def test_terminal_launch_with_bridge_inject_advertises_comment_tools(
     # (sys_session_list / sys_session_get_history / sys_session_get_info),
     # read-only agent tools (sys_agent_list / sys_agent_get /
     # sys_agent_download), policy tools (sys_add_policy /
-    # sys_policy_registry), and OS tools (sys_os_*) — claude-native
-    # ignores the harness tool schemas, so this relay is the only
-    # surface that reaches Claude Code. All are routed through the AP
-    # server's /mcp endpoint for policy enforcement. The opt-in spawn
-    # writes (sys_session_send/close/create) are absent here because
-    # this fixture's session has no resolvable spec — the fallback
-    # can't evaluate the (tools.agents | spawn) gate; specs that opt
-    # in get them via the ToolManager-derived branch.
+    # sys_policy_registry) — claude-native ignores the harness tool
+    # schemas, so this relay is the only surface that reaches Claude Code.
+    # All are routed through the AP server's /mcp endpoint for policy
+    # enforcement. The opt-in spawn writes (sys_session_send/close/create)
+    # are absent here because this fixture's session has no resolvable
+    # spec — the fallback can't evaluate the (tools.agents | spawn) gate;
+    # specs that opt in get them via the ToolManager-derived branch. The
+    # OS tools (sys_os_*) are absent too: native harnesses use their own
+    # shell and file tools.
     # No more, no less: a missing entry means the schema loop dropped a class;
     # an extra entry means an unintended tool leaked into the relay.
     assert set(tools_by_name) == {
@@ -488,22 +489,16 @@ async def test_terminal_launch_with_bridge_inject_advertises_comment_tools(
         "sys_agent_download",
         "sys_add_policy",
         "sys_policy_registry",
-        "sys_os_read",
-        "sys_os_write",
-        "sys_os_edit",
-        "sys_os_shell",
     }
     # Parameters must be the real schemas from the tool classes — proving
     # get_schema() flowed through rather than an empty placeholder. "status"
     # is a real list_comments filter; "comment_id" is required by update_comment;
-    # "conversation_id" is the sys_session_get_history arg the runner dispatch matches;
-    # "path" is a required param for sys_os_read.
+    # "conversation_id" is the sys_session_get_history arg the runner dispatch matches.
     assert "status" in tools_by_name["list_comments"]["parameters"]["properties"]
     assert "comment_id" in tools_by_name["update_comment"]["parameters"]["properties"]
     assert (
         "conversation_id" in tools_by_name["sys_session_get_history"]["parameters"]["properties"]
     )
-    assert "path" in tools_by_name["sys_os_read"]["parameters"]["properties"]
     assert tools_by_name["sys_session_message"]["parameters"]["required"] == [
         "session_id",
         "message",
@@ -1597,6 +1592,56 @@ async def test_native_relay_discovers_session_mcp_tools_through_gateway(
                 await _launch_bridged(client, session_id)
                 assert "github__get_me" not in _relay_tool_names(relay_file)
                 assert len(requests) == discovery_count
+            finally:
+                await client.delete(f"/v1/sessions/{session_id}")
+    finally:
+        shutil.rmtree(bridge_dir, ignore_errors=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "harness_name",
+    [
+        "claude-native",
+        "codex-native",
+        "cursor-native",
+        "antigravity-native",
+        "qwen-native",
+        "kiro-native",
+    ],
+)
+async def test_native_relay_offers_no_os_tools(tmp_path: Path, harness_name: str) -> None:
+    """
+    The relay never advertises ``sys_os_*`` to a native harness.
+
+    Every native harness has its own shell and file tools, so relayed copies
+    would only add a second route to the workspace. The relay's ``/tool``
+    endpoint runs only advertised names, so withholding them also stops a
+    same-uid caller holding the relay token from reaching ``sys_os_shell``.
+    """
+    spec = AgentSpec(
+        spec_version=1,
+        executor=ExecutorSpec(type="omnigent", config={"harness": harness_name}),
+    )
+    app = _switch_app(
+        tmp_path,
+        _SwitchableServerClient("agent"),
+        {"agent": ResolvedSpec(spec=spec, workdir=tmp_path)},
+    )
+    session_id = f"conv_{uuid.uuid4().hex[:12]}"
+    bridge_dir = prepare_bridge_dir(session_id, workspace=tmp_path)
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://runner"
+        ) as client:
+            try:
+                await _launch_bridged(client, session_id)
+                tools = {
+                    t["name"]
+                    for t in json.loads((bridge_dir / _TOOL_RELAY_FILE).read_text())["tools"]
+                }
+                assert "list_comments" in tools
+                assert not {name for name in tools if name.startswith("sys_os_")}
             finally:
                 await client.delete(f"/v1/sessions/{session_id}")
     finally:

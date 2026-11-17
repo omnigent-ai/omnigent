@@ -376,6 +376,9 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
     )
     tool_names = {tool["name"] for tool in config["tools"]}
     assert {"list_comments", "sys_session_list"} <= tool_names
+    # Pi uses its own shell and file tools, so the extension gets no relayed
+    # sys_os_* that would be a second route to the workspace.
+    assert not {name for name in tool_names if name.startswith("sys_os_")}
     # The fresh terminal is surfaced on the live stream for the Terminal toggle.
     assert any(evt.get("type") == "session.resource.created" for evt in published)
     task = runner_app_mod._AUTO_FORWARDER_TASKS.pop("47f049b9d13df4db397c7f46859b825f")
