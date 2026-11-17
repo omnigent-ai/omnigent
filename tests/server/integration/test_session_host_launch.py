@@ -5773,31 +5773,51 @@ async def test_answer_on_a_stopped_claude_session_relaunches_and_delivers_it(
     assert "updatedInput" not in decision, decision
 
 
+@pytest.mark.parametrize("lookup", ["live", "admission_error"])
 async def test_answer_with_a_live_runner_reaches_the_hook_and_sends_no_message(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
     app: FastAPI,
+    lookup: str,
 ) -> None:
-    """With the runner reachable, the answer goes to the waiting hook as before."""
-    from omnigent.server.routes import sessions as sessions_module
+    """With the runner reachable, the answer goes to the waiting hook as before.
+
+    ``admission_error``: the runner is reachable, but execution admission fails for it.
+    """
+    from omnigent.errors import ErrorCode
+    from omnigent.runner.routing import RoutedRunner
+    from omnigent.server.runtime_compatibility import RuntimeSupportError
 
     comm, session_id, hook_task, elicitation_id = await _park_on_claude_session(client, app)
     runner_posts: list[tuple[str, dict[str, Any]]] = []
     fake_runner = _recording_runner(runner_posts)
+    if lookup == "live":
+        _stage_live_runner(monkeypatch, fake_runner)
+    else:
 
-    async def _live_runner(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
-        del args, kwargs
-        return fake_runner
+        def _admission_fails(conversation_id: str, **kwargs: Any) -> RoutedRunner:
+            del conversation_id, kwargs
+            raise RuntimeSupportError("Cannot load /example/agent.yaml", code=ErrorCode.CONFLICT)
 
-    monkeypatch.setattr(sessions_module, "_get_runner_client", _live_runner)
+        def _control_route(conversation_id: str, **kwargs: Any) -> RoutedRunner:
+            del conversation_id, kwargs
+            return RoutedRunner(runner_id="runner_live", client=fake_runner)
+
+        router = app.state.runner_router
+        monkeypatch.setattr(router, "client_for_session_resources", _admission_fails)
+        monkeypatch.setattr(router, "client_for_session_control", _control_route)
     try:
         response = await _resolve_answer(client, session_id, elicitation_id)
         hook_response = await asyncio.wait_for(hook_task, budget(5.0))
     finally:
+        hook_task.cancel()
+        await asyncio.gather(hook_task, return_exceptions=True)
         await fake_runner.aclose()
 
-    assert response.status_code == 202, response.text
-    assert response.json() == {"queued": False}
+    if lookup == "live":
+        # With admission failing, the old path's later approval forward still errors, as before.
+        assert response.status_code == 202, response.text
+        assert response.json() == {"queued": False}
     decision = hook_response.json()["hookSpecificOutput"]["decision"]
     assert decision["behavior"] == "allow", decision
     assert decision["updatedInput"]["answers"] == {_QUESTION: "sqlite"}

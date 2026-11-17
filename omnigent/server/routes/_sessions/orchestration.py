@@ -2955,7 +2955,9 @@ async def _deliver_answer_to_stopped_session(
     ):
         return None
     if record is None:
-        runner = await _get_runner_client(session_id, runner_router, conversation=conv)
+        runner = await _get_runner_client(
+            session_id, runner_router, conversation=conv, for_control=True
+        )
         record = _stopped_session_answers.get(key)
         if record is not None:
             # Another request started this question's recovery during the lookup.
