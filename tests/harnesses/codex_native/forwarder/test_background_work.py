@@ -466,6 +466,8 @@ async def test_goal_limit_does_not_repeat_a_failure_the_turn_already_reported(
         ("present", False, "agentMessage"),
         ("omitted", False, "agentMessage"),
         ("null", False, "plan"),
+        ("present", False, "item"),
+        ("omitted", False, "item"),
     ],
 )
 async def test_turn_completion_after_a_goal_limit_keeps_the_failure(
@@ -478,9 +480,11 @@ async def test_turn_completion_after_a_goal_limit_keeps_the_failure(
     must be absorbed like a turn that already reported a failure. A stop that
     names no turn belongs to the turn running when it lands, or, when the
     forwarder missed that turn's start, to the next turn it sees. A delta that
-    reveals the missed turn does not report it running over the failure.
+    reveals the missed turn does not report it running over the failure, and
+    neither does the turn's first live item, which goes through the pre-handler.
     """
-    if start_seen:
+    if start_seen or delta == "item":
+        # Prompt acceptance records the active turn even when its start was missed.
         _seed_active_turn(tmp_path, "turn_1")
     elif delta is not None:
         # The thread is known but its turn's start was missed.
@@ -500,7 +504,25 @@ async def test_turn_completion_after_a_goal_limit_keeps_the_failure(
         limit["params"]["turnId"] = None
 
     await _deliver_to_parent(client, tmp_path, state, limit)
-    if delta is not None:
+    if delta == "item":
+        live_item = {
+            "method": "item/completed",
+            "params": {
+                "threadId": "thread_123",
+                "turnId": "turn_1",
+                "item": {"type": "agentMessage", "id": "item_1", "text": "still working"},
+            },
+        }
+        await fwd._post_missed_turn_start(
+            client,  # type: ignore[arg-type]
+            session_id="conv_x",
+            bridge_dir=tmp_path,
+            thread_id="thread_123",
+            event=live_item,
+            forwarder_state=state,
+        )
+        await _deliver_to_parent(client, tmp_path, state, live_item)
+    if delta is not None and delta != "item":
         coalescer = fwd._OutputTextDeltaCoalescer(client, "conv_x")  # type: ignore[arg-type]
         await fwd._handle_event(
             client,  # type: ignore[arg-type]

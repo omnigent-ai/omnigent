@@ -1095,3 +1095,54 @@ async def test_recovered_running_waits_for_replay_that_ended_the_turn(tmp_path: 
     ]
     assert statuses == ["idle"]
     assert read_bridge_state(tmp_path).active_turn_id is None  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
+async def test_live_item_does_not_republish_running_that_resume_reported(tmp_path: Path) -> None:
+    """A live item does not republish the running edge that resume replay already reported."""
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_x",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id="thread_1",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id="turn_1",
+        ),
+    )
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState()
+    locks_token = fwd._conversation_item_locks.set({})
+    try:
+        await fwd._post_resume_turn_status(
+            client,  # type: ignore[arg-type]
+            session_id="conv_x",
+            bridge_dir=tmp_path,
+            thread_id="thread_1",
+            turns=[{"id": "turn_1", "status": "inProgress", "items": []}],
+            forwarder_state=state,
+        )
+        await fwd._post_missed_turn_start(
+            client,  # type: ignore[arg-type]
+            session_id="conv_x",
+            bridge_dir=tmp_path,
+            thread_id="thread_1",
+            event={
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread_1",
+                    "turnId": "turn_1",
+                    "item": {"type": "agentMessage", "id": "item_1", "text": "Working."},
+                },
+            },
+            forwarder_state=state,
+        )
+    finally:
+        fwd._conversation_item_locks.reset(locks_token)
+
+    statuses = [
+        body["data"]["status"]
+        for _, body in client.posts
+        if body["type"] == "external_session_status"
+    ]
+    assert statuses == ["running"]

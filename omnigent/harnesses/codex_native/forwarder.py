@@ -3794,6 +3794,9 @@ async def _post_resume_turn_status(
     if edge is not None and edge.status == "failed" and forwarder_state is not None:
         # As for a live failed turn: a later goal failure must not replace its detail.
         forwarder_state.turn_failure_surfaced = True
+    if edge is not None and edge.status == "running" and forwarder_state is not None:
+        # The recovered first-item edge must not publish this turn's running again.
+        forwarder_state.running_reported_turn_id = edge.turn_id
 
 
 def _resume_turn_status_edge_for_latest_turn(
@@ -6891,6 +6894,9 @@ async def _post_missed_turn_start(
         ):
             return
         forwarder_state.running_reported_turn_id = turn_id
+        # A failure already posted for the turn, such as a stopped goal's, stays its status.
+        if _turn_failure_already_posted(forwarder_state, turn_id):
+            return
         await _post_turn_status_edge(
             client,
             session_id,
