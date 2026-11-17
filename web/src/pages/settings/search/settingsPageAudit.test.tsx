@@ -45,7 +45,10 @@ import {
   HARNESS_PLUGIN_ENTRIES,
   HARNESS_SKILL_ENTRIES,
   HARNESSES_GRID_ENTRY,
+  isInventoryPageHarness,
+  isSkillPageHarness,
   MCP_SERVER_LIST_ENTRIES,
+  NATIVE_HARNESS_IDS,
   type NativeHarnessId,
 } from "./catalog/harnesses";
 
@@ -246,8 +249,9 @@ const ROUTES: readonly SettingsRoute[] = [
     },
   },
   { url: "/v1/hosts/host_1/plugins", body: { plugins: [] } },
-  ...harnessDetailRoutes("claude-native", "claude"),
-  ...harnessDetailRoutes("codex-native", "codex"),
+  ...NATIVE_HARNESS_IDS.flatMap((harness) =>
+    harnessDetailRoutes(harness, harness.replace(/-native$/, "")),
+  ),
   {
     url: "/v1/sessions?order=desc&sort_by=updated_at&limit=100&visibility=archived&include_archived=true",
     body: ARCHIVED_PAGE,
@@ -448,7 +452,45 @@ function integrationScenario({
   };
 }
 
-// Appearance's selects, each opened and audited with its own choices.
+/** A harness's plugin and skill pages' rows, where it has those pages. */
+const nestedPageIds = (harness: NativeHarnessId) => [
+  ...(isInventoryPageHarness(harness) ? [HARNESS_PLUGIN_ENTRIES.entry(harness).id] : []),
+  ...(isSkillPageHarness(harness) ? [HARNESS_SKILL_ENTRIES.entry(harness).id] : []),
+];
+/** A harness page's rows: its own, its credential card's, its MCP list's and its nested pages'. */
+const pageRowIds = (harness: NativeHarnessId) => [
+  HARNESS_DETAIL_ENTRIES.entry(harness).id,
+  HARNESS_CREDENTIAL_ENTRIES.entry(harness).id,
+  ...(isInventoryPageHarness(harness) ? [MCP_SERVER_LIST_ENTRIES.entry(harness).id] : []),
+  ...nestedPageIds(harness),
+];
+const ON_OTHER_PAGE = "It's on another harness's page.";
+const NESTED_PAGE_CLOSED = "Its page opens only from its row, and none is open.";
+const ON_GRID = "It's on the Harnesses grid.";
+/** On `harness`'s own page: the grid and the other harnesses' pages are elsewhere. */
+const onHarnessPage = (harness: NativeHarnessId): Record<string, string> => ({
+  ...Object.fromEntries(
+    [HARNESSES_GRID_ENTRY, ...HARNESS_CARD_ENTRIES.entries].map((entry) => [entry.id, ON_GRID]),
+  ),
+  ...Object.fromEntries(
+    ALL_HARNESSES.filter((other) => other !== harness)
+      .flatMap(pageRowIds)
+      .map((id) => [id, ON_OTHER_PAGE]),
+  ),
+  ...Object.fromEntries(nestedPageIds(harness).map((id) => [id, NESTED_PAGE_CLOSED])),
+});
+
+/** A harness's own page, on a host that has it configured and ready. */
+function harnessPageScenario(harness: NativeHarnessId): SettingsAuditScenario {
+  return {
+    section: "harnesses",
+    scenario: `web › ${HARNESS_CARD_ENTRIES.entry(harness).label} page`,
+    path: `/settings/harnesses/${harness}?host=host_1`,
+    routes: [hostsRoute([harnessHost({ configured_harnesses: { [harness]: true } })])],
+    ready: [{ row: HARNESS_DETAIL_ENTRIES.entry(harness).id }],
+    hides: onHarnessPage(harness),
+  };
+}
 
 const SCENARIOS: readonly SettingsAuditScenario[] = [
   {
@@ -507,6 +549,9 @@ const SCENARIOS: readonly SettingsAuditScenario[] = [
     ready: ["Connect an online host"],
     hides: HARNESS_PAGE_HIDES,
   },
+  ...NATIVE_HARNESS_IDS.filter((harness) => !isInventoryPageHarness(harness)).map(
+    harnessPageScenario,
+  ),
   { section: "custom-agents", scenario: "web", ready: ["my-reviewer"] },
   {
     section: "custom-agents",
@@ -666,6 +711,23 @@ const SCENARIOS: readonly SettingsAuditScenario[] = [
     states: {},
   }),
   { section: "mcp", scenario: "web", ready: ["Tracker"] },
+  {
+    section: "mcp",
+    scenario: "web › services not connected",
+    routes: [
+      {
+        url: "/v1/mcp-registry/services",
+        body: {
+          data: [
+            service("tracker", "Tracker", "oauth", false),
+            service("notes", "Notes", "bearer", false),
+          ],
+          next_cursor: null,
+        },
+      },
+    ],
+    ready: ["Tracker", "Notes"],
+  },
   {
     section: "mcp",
     scenario: "web › connected services",
@@ -1068,10 +1130,10 @@ const LEFT_OUT_SECTIONS: Partial<Record<SettingsSectionId, string>> = {
   updates: "Its rows need the desktop shell's update bridge.",
 };
 /**
- * The fix dialog's parts, and the rows' openers of it, aren't checked for coverage: this audit
- * doesn't open the dialog yet.
+ * The fix dialog's parts, and the buttons that open it on the harness rows, aren't checked for
+ * coverage: this audit doesn't open the dialog yet.
  */
-const FIX_DIALOG_OPENERS = ["setUp", "fixAction"];
+const FIX_DIALOG_OPENERS = ["setUp", "fixAction", "credentialAction"];
 const FIX_DIALOG_LEFT_OUT = new Set([...Object.keys(FIX_DIALOG_PARTS), ...FIX_DIALOG_OPENERS]);
 /** An entry as coverage sees it: harness rows without the parts of the fix dialog they open. */
 function auditedParts(entry: SettingsEntry): SettingsEntry {
@@ -1097,14 +1159,12 @@ const LEFT_OUT_ENTRIES: Readonly<Record<string, string>> = {
     ["open-links-in-app", "global-shortcut"].map((id) => [id, "Only the desktop shell shows it."]),
   ),
   "admin-view": ADMIN_VIEW_NOT_LOADED,
+  // A page with tabs keeps its tab list above its rows, and its MCP list and Credential card in
+  // tabs, so none of its rows is audited yet.
   ...Object.fromEntries(
-    [
-      ...HARNESS_DETAIL_ENTRIES.entries,
-      ...HARNESS_CREDENTIAL_ENTRIES.entries,
-      ...HARNESS_PLUGIN_ENTRIES.entries,
-      ...HARNESS_SKILL_ENTRIES.entries,
-      ...MCP_SERVER_LIST_ENTRIES.entries,
-    ].map((entry) => [entry.id, "Harness pages and their dialogs aren't audited yet."]),
+    NATIVE_HARNESS_IDS.filter(isInventoryPageHarness)
+      .flatMap(pageRowIds)
+      .map((id) => [id, "Its tab list sits above its rows, so its page isn't audited yet."]),
   ),
 };
 
@@ -1119,7 +1179,7 @@ describe("every Settings section, rendered by the real page", () => {
     expect(own.problems).toEqual([]);
   }, 120_000);
 
-  it("answers to the catalog on the Harnesses grid", async () => {
+  it("answers to the catalog on the Harnesses grid and on the pages without tabs", async () => {
     const own = { ...ALL_AUDITS, problems: [] as string[] };
     await auditScenarios(
       SCENARIOS.filter((scenario) => scenario.section === "harnesses"),
