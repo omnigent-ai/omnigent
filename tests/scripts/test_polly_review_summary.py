@@ -199,12 +199,12 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
 def test_unicode_and_wrapper_bytes_are_included_in_comment_limit() -> None:
     review = "## Review\n```text\n" + "é🙂" * 24000 + "\n```\nFinal finding."
     chunks = _HELPERS["split_review"](review, 58000)
-    comments = _HELPERS["review_comments"](
-        review,
-        head_sha="b" * 40,
-        run_id="10-1",
-        run_url="https://example.test/" + "r" * 1000,
-    )
+    review_metadata = {
+        "head_sha": "b" * 40,
+        "run_id": "10-1",
+        "run_url": "https://example.test/" + "r" * 1000,
+    }
+    comments = _HELPERS["review_comments"](review, **review_metadata)
 
     assert "".join(chunks) == review
     assert all(len(chunk.encode("utf-8")) <= 58000 for chunk in chunks)
@@ -213,6 +213,18 @@ def test_unicode_and_wrapper_bytes_are_included_in_comment_limit() -> None:
     assert sum(comment.count("é") for comment in comments) == 24000
     assert sum(comment.count("🙂") for comment in comments) == 24000
     assert "Final finding." in comments[-1]
+
+    wrapper_bytes = len(_HELPERS["review_comments"]("", **review_metadata)[0].encode("utf-8"))
+    boundary_review = "x" * (60000 - wrapper_bytes)
+    exact_comments = _HELPERS["review_comments"](boundary_review, **review_metadata)
+    assert len(exact_comments) == 1
+    assert len(exact_comments[0].encode("utf-8")) == 60000
+
+    overflow_review = boundary_review + "x"
+    assert len(overflow_review.encode("utf-8")) + wrapper_bytes == 60001
+    overflow_comments = _HELPERS["review_comments"](overflow_review, **review_metadata)
+    assert len(overflow_comments) > 1
+    assert all(len(comment.encode("utf-8")) <= 60000 for comment in overflow_comments)
 
 
 @pytest.mark.parametrize(
