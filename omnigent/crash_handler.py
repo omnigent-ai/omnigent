@@ -38,7 +38,7 @@ import threading
 import traceback
 import urllib.parse
 import webbrowser
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from types import TracebackType
 from typing import BinaryIO, TextIO, TypedDict
 
@@ -510,6 +510,8 @@ def _scrub(text: str) -> str:
     with contextlib.suppress(Exception):
         home = str(Path.home())
         if home and home != os.sep:
+            windows_home = PureWindowsPath(home)
+            home_uri = (windows_home if windows_home.is_absolute() else Path(home)).as_uri()
             escaped_home = home.replace("\\", "\\\\")
             home_variants = sorted(
                 {
@@ -523,9 +525,12 @@ def _scrub(text: str) -> str:
                 reverse=True,
             )
             home_pattern = "(?:" + "|".join(map(re.escape, home_variants)) + ")"
-            # Inspect spaced siblings without consuming later paths in the same quote.
             pattern = (
-                rf"""(?P<quote>['"`]){home_pattern}(?=(?P<suffix>[^\r\n]*?)(?P=quote))"""
+                # Canonical file URIs encode names and use forward slashes on Windows.
+                rf"""(?P<uri>(?<![\w.\-~/\\]){re.escape(home_uri)})(?=/|[?#\s'"`]|$)"""
+                + "|"
+                # Inspect spaced siblings without consuming later paths in the same quote.
+                + rf"""(?P<quote>['"`]){home_pattern}(?=(?P<suffix>[^\r\n]*?)(?P=quote))"""
                 + "|"
                 # Not inside a longer path or URL (``/mnt/home/user``, ``cache//home/user``).
                 # A ``file://`` URL to the home directory is the one exception.
@@ -536,6 +541,8 @@ def _scrub(text: str) -> str:
             )
 
             def redact_home(match: re.Match[str]) -> str:
+                if match.group("uri") is not None:
+                    return "file://~"
                 quote = match.group("quote")
                 if quote is None:
                     return "~"
