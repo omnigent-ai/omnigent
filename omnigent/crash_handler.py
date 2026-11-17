@@ -466,7 +466,24 @@ def _scrub(text: str) -> str:
     with contextlib.suppress(Exception):
         home = str(Path.home())
         if home and home != os.sep:
-            text = re.sub(re.escape(home) + r"(?=$|[/\\\s'\"`])", "~", text)
+            # Spaces inside a quoted path may belong to a sibling directory.
+            pattern = (
+                rf"""(?P<quote>['"`]){re.escape(home)}(?P<suffix>[^\r\n]*?)(?P=quote)"""
+                + "|"
+                + re.escape(home)
+                + r"""(?=$|[/\\\s'"`)\]}>]|[.,;:!?](?=$|[\s'"`)\]}>]))"""
+            )
+
+            def redact_home(match: re.Match[str]) -> str:
+                quote = match.group("quote")
+                if quote is None:
+                    return "~"
+                suffix = match.group("suffix")
+                if suffix and not suffix.startswith(("/", "\\")):
+                    return match.group(0)
+                return f"{quote}~{suffix}{quote}"
+
+            text = re.sub(pattern, redact_home, text)
     return text
 
 
@@ -485,9 +502,10 @@ def _issue_url(exc: BaseException, tb_text: str) -> tuple[str, bool]:
     Returns ``(url, body_included)``. The template, title, version, and
     OS are always prefilled. The Description holds the exception and the
     traceback; when the full traceback would exceed :data:`_MAX_URL_LENGTH`
-    its leading frames are cut, so the exception line and innermost frames
-    survive. The Description is omitted when the exception summary and
-    command without a traceback do not fit (``body_included is False``).
+    only a fitting suffix is retained. Long final exception lines or notes
+    may leave no frames or an empty traceback block. The Description is
+    omitted when the exception summary and command without a traceback do
+    not fit (``body_included is False``).
 
     Field IDs (``version``, ``os``, ``description``) come from
     ``.github/ISSUE_TEMPLATE/bug_report.yml``; keep in sync if it changes.
