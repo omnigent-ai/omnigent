@@ -18,13 +18,14 @@ older build keep working on the migrated schema, but an older build does not
 start on it: startup refuses a schema revision the build does not know.
 
 Rollback: turn ``durable_timers`` off and delete the remaining active or paused
-timers, which ``GET /v1/scheduled-tasks?kind=all`` lists. Then stop the servers,
-downgrade with a build that includes this migration (``OMNIGENT_DB_URL=<uri>
-alembic -c omnigent/db/alembic.ini downgrade f7c2d8a4b901``), and start the older
-build. The downgrade refuses while an active or paused timer remains. It turns
-finished and deleted timers into deleted automations, which cleanup purges, in
-batches that each commit, so a downgrade interrupted during that conversion can
-be run again.
+timers, which ``GET /v1/scheduled-tasks?kind=all`` lists. The application can
+then roll back to the build that added this revision, which reads timer rows but
+keeps no timers. To remove the schema as well, stop the servers, downgrade with
+that build (``OMNIGENT_DB_URL=<uri> alembic -c omnigent/db/alembic.ini downgrade
+f7c2d8a4b901``), and start the older build. The downgrade refuses while an active
+or paused timer remains. It turns finished and deleted timers into deleted
+automations, which cleanup purges, in batches that each commit, so a downgrade
+interrupted during that conversion can be run again.
 """
 
 from __future__ import annotations
