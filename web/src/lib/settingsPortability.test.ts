@@ -129,22 +129,22 @@ it.each([
 });
 
 describe.each([
-  ["composer shortcut", COMPOSER_SEND_SHORTCUT_STORAGE_KEY],
-  ["final-answer fold", FOLD_ASSISTANT_NARRATION_STORAGE_KEY],
-  ["code block word wrap", CODE_BLOCK_WORD_WRAP_STORAGE_KEY],
-])("%s portability", (_label, storageKey) => {
+  ["composer shortcut", COMPOSER_SEND_SHORTCUT_STORAGE_KEY, "true"],
+  ["final-answer fold", FOLD_ASSISTANT_NARRATION_STORAGE_KEY, "true"],
+  ["code block word wrap", CODE_BLOCK_WORD_WRAP_STORAGE_KEY, "false"],
+])("%s portability", (_label, storageKey, storedValue) => {
   it("exports, imports, and clears the device-local preference", () => {
-    localStorage.setItem(storageKey, "true");
-    expect(collectSettings()?.settings[storageKey]).toBe("true");
+    localStorage.setItem(storageKey, storedValue);
+    expect(collectSettings()?.settings[storageKey]).toBe(storedValue);
 
     applyImportedSettings({ version: 1, settings: {} });
     expect(localStorage.getItem(storageKey)).toBeNull();
 
     applyImportedSettings({
       version: 1,
-      settings: { [storageKey]: "true" },
+      settings: { [storageKey]: storedValue },
     });
-    expect(localStorage.getItem(storageKey)).toBe("true");
+    expect(localStorage.getItem(storageKey)).toBe(storedValue);
   });
 });
 

@@ -184,7 +184,11 @@ import {
   writeCodeFontSizePx,
   writeCodeFontWeight,
 } from "@/lib/codeFontPreferences";
-import { DEFAULT_CODE_BLOCK_WORD_WRAP, writeCodeBlockWordWrap } from "@/lib/codeWrapPreferences";
+import {
+  CODE_BLOCK_WORD_WRAP_STORAGE_KEY,
+  DEFAULT_CODE_BLOCK_WORD_WRAP,
+  writeCodeBlockWordWrap,
+} from "@/lib/codeWrapPreferences";
 import {
   readTerminalThemeMode,
   TERMINAL_THEME_DEFAULT,
@@ -1177,6 +1181,7 @@ function AppearanceSection() {
           "omnigent:code-font-size",
           "omnigent:code-font-family",
           "omnigent:code-font-weight",
+          CODE_BLOCK_WORD_WRAP_STORAGE_KEY,
           "omnigent:terminal-theme",
           "omnigent:ui-theme-palette",
           "omnigent:custom-theme",
