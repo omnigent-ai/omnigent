@@ -13483,6 +13483,39 @@ describe("chatStore — session configuration scope", () => {
     },
   );
 
+  it("changes a background session's model, effort and routing, leaving the active one", async () => {
+    const cellId = "conv_settings_cell";
+    const activeId = "conv_settings_active";
+    for (const id of [cellId, activeId]) {
+      seedSession(id, []);
+      withSnapshot(id, { labels: { "omnigent.wrapper": "claude-code-native-ui" } });
+    }
+    await useChatStore.getState().switchTo(cellId);
+    await useChatStore.getState().switchTo(activeId);
+    useChatStore.setState({ sessionModelOverride: "opus", sessionReasoningEffort: "low" });
+    const cell = () => conversationRegistry.peek(cellId)!.getState();
+    fetchMock.mockClear();
+
+    await useChatStore.getState().setModel("sonnet", { sessionId: cellId });
+    await useChatStore.getState().setEffort("high", cellId);
+    await useChatStore.getState().setCostControlMode("on", cellId);
+
+    expect(patchCallsFor(cellId)).toEqual([
+      { model_override: "sonnet" },
+      { reasoning_effort: "high" },
+      { cost_control_mode_override: "on" },
+    ]);
+    expect(patchCallsFor(activeId)).toEqual([]);
+    expect(cell().sessionReasoningEffort).toBe("high");
+    expect(cell().costControlModeOverride).toBe("on");
+    expect(useChatStore.getState()).toMatchObject({
+      conversationId: activeId,
+      sessionModelOverride: "opus",
+      sessionReasoningEffort: "low",
+      costControlModeOverride: null,
+    });
+  });
+
   it("hydrates server-side model and effort without PATCHing", async () => {
     seedSession("conv_existing", []);
     withSnapshot("conv_existing", {

@@ -14,7 +14,8 @@ import { useSessionModelLabel } from "@/hooks/useSessionModelLabel";
 import { MODEL_PICKER_KEYS } from "@/hooks/useModelPickerHotkey";
 import { codexEffortLevelsForModel, findNativeModelOption } from "@/lib/codexNativeModels";
 import { modelConfigurationSourceRows } from "@/lib/modelConfigurationSource";
-import { useChatStore } from "@/store/chatStore";
+import { useChatStore, type ConversationState } from "@/store/chatStore";
+import { useConversationEntryState } from "@/hooks/useConversationEntryState";
 import { nativeCodingAgentForHarness } from "@/lib/nativeCodingAgents";
 import { nativeModelLabel } from "@/components/HarnessConfigControls";
 import {
@@ -38,6 +39,25 @@ import {
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 
 /**
+ * A field of *sessionId*'s conversation, or of the active conversation when
+ * omitted (the main composer's case, read straight from the root store).
+ */
+function useSessionField<T>(
+  sessionId: string | undefined,
+  select: (state: ConversationState) => T,
+): T {
+  const active = useChatStore((state) => select(state));
+  const entry = useConversationEntryState(sessionId ?? null);
+  return sessionId === undefined ? active : select(entry);
+}
+
+/** The conversation a picker targets: *sessionId*, else whichever is active now. */
+function useTargetConversationId(sessionId: string | undefined): string | null {
+  const active = useChatStore((state) => state.conversationId);
+  return sessionId ?? active;
+}
+
+/**
  * Whether the session surfaces any run-config the gear modal can edit. Shared
  * render guard for the config gear and click-to-open gate for the model/effort
  * label half of the composer's split pill, so both halves stay in lockstep.
@@ -53,6 +73,7 @@ function hasSessionConfig({
 }
 
 export function SessionHarnessPicker({
+  sessionId,
   appearance = "composer",
   busy,
   busyRef,
@@ -100,6 +121,8 @@ export function SessionHarnessPicker({
   openNonce?: number;
   /** Whether the Ctrl+Shift+M hotkey opens this picker (mirrors its enabled state). */
   modelPickerShortcutEnabled?: boolean;
+  /** Read and change this session instead of the active conversation. */
+  sessionId?: string;
 }) {
   const isMobile = useIsMobileViewport();
   const [menuOpen, setMenuOpen] = useState(false);
@@ -122,13 +145,20 @@ export function SessionHarnessPicker({
     [],
   );
   const appliedOpenNonce = useRef(0);
-  const conversationId = useChatStore((state) => state.conversationId);
-  const sessionHarness = useChatStore((state) => state.sessionHarness);
-  const subAgentName = useChatStore((state) => state.subAgentName);
-  const pendingModelChange = useChatStore((state) => state.pendingModelChange);
-  const sessionModelSeeded = useChatStore((state) => state.sessionModelSeeded);
-  const selectedEffort = useSessionEffort();
-  const costControlModeOverride = useChatStore((state) => state.costControlModeOverride);
+  const conversationId = useTargetConversationId(sessionId);
+  // The live target: a fixed session, or the conversation active at the time of the call.
+  const currentConversationId = () => sessionId ?? useChatStore.getState().conversationId;
+  // Store calls for the active conversation keep their exact arguments; a fixed session adds its id.
+  const target: [] | [string] = sessionId === undefined ? [] : [sessionId];
+  const sessionHarness = useSessionField(sessionId, (state) => state.sessionHarness);
+  const subAgentName = useSessionField(sessionId, (state) => state.subAgentName);
+  const pendingModelChange = useSessionField(sessionId, (state) => state.pendingModelChange);
+  const sessionModelSeeded = useSessionField(sessionId, (state) => state.sessionModelSeeded);
+  const selectedEffort = useSessionEffort(sessionId);
+  const costControlModeOverride = useSessionField(
+    sessionId,
+    (state) => state.costControlModeOverride,
+  );
   const routingOn = costRoutingEligible && costControlModeOverride === "on";
   const {
     effectiveModel,
@@ -138,6 +168,7 @@ export function SessionHarnessPicker({
     modelOptions,
     pickerSelectedModel,
   } = useResolvedComposerModel(
+    sessionId,
     modelPickerKind,
     codexModelOptions,
     modelLabelOptions,
@@ -156,6 +187,7 @@ export function SessionHarnessPicker({
     harness: nativeAgent?.harness ?? sessionHarness,
   };
   const summary = useSessionConfigSummary({
+    sessionId,
     harnessLabel,
     showModels,
     showEffort,
@@ -211,12 +243,13 @@ export function SessionHarnessPicker({
   };
   const changeModel = async (modelId: string | null, nextEffort?: string) => {
     const store = useChatStore.getState();
-    const sourceSessionId = store.conversationId;
+    const sourceSessionId = currentConversationId();
     await store.setModel(modelId, {
       expectConfirmation:
         (modelPickerKind === "claude" || modelPickerKind === "codex") && !modelsFromLaunchPreview,
+      ...(sessionId === undefined ? {} : { sessionId }),
     });
-    if (useChatStore.getState().conversationId !== sourceSessionId) return;
+    if (currentConversationId() !== sourceSessionId) return;
     if (
       selectedEffort !== null &&
       (isFusionModelUid(modelId) ||
@@ -227,13 +260,9 @@ export function SessionHarnessPicker({
             codexEffortLevelsForModel(codexModelOptions, modelId),
           ) === null))
     )
-      await store.setEffort(null);
-    if (
-      costRoutingEligible &&
-      routingOn &&
-      useChatStore.getState().conversationId === sourceSessionId
-    )
-      await store.setCostControlMode("off");
+      await store.setEffort(null, ...target);
+    if (costRoutingEligible && routingOn && currentConversationId() === sourceSessionId)
+      await store.setCostControlMode("off", ...target);
   };
   const selectModel = (modelId: string | null) => {
     cancelCycle();
@@ -241,7 +270,7 @@ export function SessionHarnessPicker({
   };
   const selectEffort = (effort: string) => {
     cancelCycle();
-    void apply(() => useChatStore.getState().setEffort(effort));
+    void apply(() => useChatStore.getState().setEffort(effort, ...target));
   };
   // Devin Fusion: the composed `fusion-…` id is the model; the lead effort is
   // baked in, so it carries no separate reasoning effort.
@@ -412,7 +441,7 @@ export function SessionHarnessPicker({
         : undefined;
   const applyCycle = () => {
     const draft = cycleDraftRef.current;
-    if (!draft || disabled || draft.sessionId !== useChatStore.getState().conversationId) {
+    if (!draft || disabled || draft.sessionId !== currentConversationId()) {
       dismissPreview();
       return;
     }
@@ -440,8 +469,8 @@ export function SessionHarnessPicker({
     cancelCycle();
     void apply(async () => {
       if (modelChanged) await changeModel(draft.model!.id, effort);
-      if (draft.sessionId !== useChatStore.getState().conversationId) return;
-      if (effortChanged) await useChatStore.getState().setEffort(effort);
+      if (draft.sessionId !== currentConversationId()) return;
+      if (effortChanged) await useChatStore.getState().setEffort(effort, ...target);
     }, modelChanged && modelPickWakesSession);
   };
   const { preview, dismissPreview } = useComposerConfigCycleHotkeys(
@@ -470,7 +499,7 @@ export function SessionHarnessPicker({
             onSelect={() => {
               cancelCycle();
               void apply(() =>
-                useChatStore.getState().setCostControlMode(routingOn ? "off" : "on"),
+                useChatStore.getState().setCostControlMode(routingOn ? "off" : "on", ...target),
               );
             }}
             data-active={routingOn ? "true" : undefined}
@@ -576,6 +605,7 @@ export function SessionHarnessPicker({
  * values. The Permissions row lives in the modal itself, not this summary.
  */
 function useSessionConfigSummary({
+  sessionId,
   harnessLabel,
   showModels,
   showEffort,
@@ -584,6 +614,7 @@ function useSessionConfigSummary({
   modelLabel,
   costRoutingEligible,
 }: {
+  sessionId: string | undefined;
   harnessLabel: string | null;
   showModels: boolean;
   showEffort: boolean;
@@ -592,8 +623,8 @@ function useSessionConfigSummary({
   modelLabel: string | null;
   costRoutingEligible: boolean;
 }): { label: string; value: string }[] {
-  const selectedEffort = useSessionEffort();
-  const costControlModeOverride = useChatStore((s) => s.costControlModeOverride);
+  const selectedEffort = useSessionEffort(sessionId);
+  const costControlModeOverride = useSessionField(sessionId, (s) => s.costControlModeOverride);
   const routingOn = costRoutingEligible && costControlModeOverride === "on";
 
   const rows: { label: string; value: string }[] = [];
@@ -625,8 +656,8 @@ function useSessionConfigSummary({
  * `sessionReasoningEffort` is conversation-scoped, so two live conversations at
  * different efforts each read their own.
  */
-function useSessionEffort(): string | null {
-  return useChatStore((s) => s.sessionReasoningEffort);
+function useSessionEffort(sessionId: string | undefined): string | null {
+  return useSessionField(sessionId, (s) => s.sessionReasoningEffort);
 }
 
 /**
@@ -639,18 +670,19 @@ function useSessionEffort(): string | null {
  * @param codexModelOptions Server-provided model options (codex/cursor/…).
  */
 function useResolvedComposerModel(
+  targetSessionId: string | undefined,
   modelPickerKind: NativeModelPickerKind | null,
   codexModelOptions: readonly NativeModelOption[],
   modelLabelOptions: readonly NativeModelOption[],
   hostId: string | null | undefined,
 ) {
-  const sessionId = useChatStore((s) => s.conversationId);
-  const agentId = useChatStore((s) => s.boundAgentId);
-  const harness = useChatStore((s) => s.sessionHarness);
-  const sessionModelOverride = useChatStore((s) => s.sessionModelOverride);
-  const sessionModelSeeded = useChatStore((s) => s.sessionModelSeeded);
-  const llmModel = useChatStore((s) => s.llmModel);
-  const nativeVendorOwnsModel = useChatStore((s) => s.nativeVendorOwnsModel);
+  const sessionId = useTargetConversationId(targetSessionId);
+  const agentId = useSessionField(targetSessionId, (s) => s.boundAgentId);
+  const harness = useSessionField(targetSessionId, (s) => s.sessionHarness);
+  const sessionModelOverride = useSessionField(targetSessionId, (s) => s.sessionModelOverride);
+  const sessionModelSeeded = useSessionField(targetSessionId, (s) => s.sessionModelSeeded);
+  const llmModel = useSessionField(targetSessionId, (s) => s.llmModel);
+  const nativeVendorOwnsModel = useSessionField(targetSessionId, (s) => s.nativeVendorOwnsModel);
 
   // Native model pickers populate from the snapshot's runner-backed
   // ``model_options`` field. Claude's rows are the aliases pinned to the
