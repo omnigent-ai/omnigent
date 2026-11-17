@@ -71,7 +71,8 @@ be able to write resources without a separate Omnigent account.
   managed server).
 - `desktop-join-install-cli`: in desktop onboarding (the V2 server selector,
   the macOS default), a new user without the `omnigent` CLI who joins a server
-  from the **Join your team** list chooses **Just join** (the default: opens the
+  from the **Join your team** list, or from the managed-server landing when the
+  server has no runner to set up, chooses **Just join** (the default: opens the
   server, installs nothing) or **Install CLI first** (installs the CLI, signs
   in, connects this laptop as a host, then opens the server). States: a failed
   install or host connect (Retry, Back, or Continue anyway without a host), no
