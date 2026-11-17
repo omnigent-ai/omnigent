@@ -605,7 +605,7 @@ describe("Slack DM triggers", () => {
     expect(prompt).toContain("Watch: new Slack messages in #eng-support, C0123ABCD\n");
   });
 
-  it("saves a channel trigger's Slack lookups in its reply and reads each channel once", () => {
+  it("saves a channel trigger's Slack lookups in its reply and bounds history reads", () => {
     const prompt = renderTriggerPrompt(
       "slack",
       slack({ scope: "eng-support", scopeOperator: "is" }),
@@ -618,7 +618,10 @@ describe("Slack DM triggers", () => {
     );
     expect(prompt).toContain('Above it, write a "Slack IDs:" line followed by one-line JSON');
     expect(prompt).toContain("users.conversations");
-    expect(prompt).toContain("call conversations.history with the channel ID");
+    expect(prompt).toContain(
+      "use your Slack tools to read the top-level messages posted in #eng-support",
+    );
+    expect(prompt).toContain("If you read a channel with conversations.history, call it once");
     expect(prompt).toContain('pass "Output one JSON object per line for every message');
     expect(prompt).toContain("archives/<channel ID>/p<ts without its dot>");
   });
