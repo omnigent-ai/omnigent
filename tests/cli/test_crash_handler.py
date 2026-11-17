@@ -483,6 +483,23 @@ def test_issue_url_scrubs_home_directory_and_tokens(
     assert "sk-abcdefghijklmnop" not in decoded_url
 
 
+def test_issue_url_redacts_multiline_bearer_before_truncation(data_dir: Path) -> None:
+    """A credential split across lines is redacted before the head is cut away."""
+    ch.install_crash_handler("omnigent", "omnigent-ai/omnigent")
+    oversized_line = "x" * 9000 + " Authorization: Bearer\n"
+    tb_text = (
+        "Traceback (most recent call last):\n"
+        + oversized_line
+        + "synthetic.jwt.payload\n"
+        + "ValueError: failure\n"
+    )
+    url, body_included = ch._issue_url(_make_exc("failure"), tb_text)
+    assert len(url) <= ch._MAX_URL_LENGTH
+    assert body_included is True
+    assert "synthetic.jwt.payload" not in urllib.parse.unquote_plus(url)
+    assert "ValueError: failure" in _description_of(url)
+
+
 def test_issue_url_keeps_short_body_intact(data_dir: Path) -> None:
     """A normal-sized traceback is kept in full, with no truncation note."""
     ch.install_crash_handler("omnigent", "omnigent-ai/omnigent")

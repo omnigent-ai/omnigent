@@ -492,6 +492,8 @@ def _issue_url(exc: BaseException, tb_text: str) -> tuple[str, bool]:
     Field IDs (``version``, ``os``, ``description``) come from
     ``.github/ISSUE_TEMPLATE/bug_report.yml``; keep in sync if it changes.
     """
+    # Scrub before cutting the tail, so a credential split across lines is caught whole.
+    tb_text = _scrub(tb_text)
     first_line = (str(exc).strip().splitlines() or [""])[0]
     title = _scrub(f"[Crash] {type(exc).__qualname__}: {first_line[:140]}")
     repo = _CONFIG["repo"]
