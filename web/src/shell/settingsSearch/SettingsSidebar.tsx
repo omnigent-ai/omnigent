@@ -1,24 +1,29 @@
-// The search field above Settings' section nav. A typed query's results take the nav's place,
-// and clearing the query brings the nav back. The query lasts while Settings stays open.
+// The sidebar Settings shows: Back, the search field, then the section nav, which a typed query's
+// results replace. The query lasts while Settings stays open, across sections.
 
-import { type ReactNode, useState } from "react";
+import { useState } from "react";
+
+import { SettingsSidebarBody } from "@/shell/settingsNav";
 
 import { SettingsSearch } from "./SettingsSearch";
 
 export function SettingsSidebar({
-  nav,
+  onNavClick,
+  harnessesOffered,
   onNavigate,
 }: {
-  /** The section nav, shown while the query is empty. */
-  nav: ReactNode;
+  onNavClick: (e: React.MouseEvent<HTMLAnchorElement>) => void;
+  harnessesOffered?: boolean;
   /** After a search result opens its row, such as to close the phone's Settings menu. */
   onNavigate: () => void;
 }) {
   const [query, setQuery] = useState("");
   return (
-    <>
-      <SettingsSearch query={query} onQueryChange={setQuery} onNavigate={onNavigate} />
-      {query.trim() === "" ? nav : null}
-    </>
+    <SettingsSidebarBody
+      onNavClick={onNavClick}
+      harnessesOffered={harnessesOffered}
+      searching={query.trim() !== ""}
+      search={<SettingsSearch query={query} onQueryChange={setQuery} onNavigate={onNavigate} />}
+    />
   );
 }
