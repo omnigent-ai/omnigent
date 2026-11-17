@@ -1147,20 +1147,6 @@ export function CreateScheduledTaskDialog({
   // A trigger edited as its prompt can't be rendered again, so it keeps its task session.
   const workflowKeepsTaskSession =
     trigger === null && runsSavedWorkflow && isTaskSessionTriggerPrompt(freeTextPrompt);
-  // What saving changes about an edited automation's session because of its workflow.
-  let workflowSessionNote: string | null = null;
-  if (workflowNeedsNewSessions && editingTask?.sessionMode === "continue") {
-    workflowSessionNote =
-      "A workflow runs in a new session each time, so saving switches this automation to a new session for each run.";
-  } else if (
-    isEdit &&
-    trigger !== null &&
-    runsSavedWorkflow &&
-    pickedTriggerTaskSessionMode === "continue"
-  ) {
-    workflowSessionNote =
-      "A workflow runs in a new session for each match, so saving stops sending matches to one task session.";
-  }
   // Agent, host, execution-target and repository changes clear the binding.
   // Host directory edits stay locked: a symlink may resolve to the same directory.
   const reusesExistingSession =
@@ -2065,15 +2051,6 @@ export function CreateScheduledTaskDialog({
                       every match to one task session. Remove the workflow to save it.
                     </p>
                   )}
-                  {workflowSessionNote !== null && (
-                    <p
-                      role="status"
-                      className="text-sm text-muted-foreground sm:col-span-6"
-                      data-testid="task-workflow-session-note"
-                    >
-                      {workflowSessionNote}
-                    </p>
-                  )}
                   {hiddenTriggerScheduleNeedsReplacement && (
                     <div
                       className="flex items-center justify-between gap-3 rounded-lg bg-muted/50 px-3 py-2 text-ui"
@@ -2245,8 +2222,57 @@ export function CreateScheduledTaskDialog({
                           data-testid="task-top-level-controls"
                         >
                           {trigger !== null && editingTask === null && (
-                            <div className="py-px" data-testid="task-trigger-session-mode-field">
-                              <div className="flex min-h-9 items-center justify-between gap-4">
+                            <div
+                              className="flex min-h-9 items-center justify-between gap-4 py-px"
+                              data-testid="task-trigger-session-mode-field"
+                            >
+                              <span className="text-ui text-muted-foreground">
+                                Session continuity
+                              </span>
+                              <DropdownMenu>
+                                <DropdownMenuTrigger asChild>
+                                  <ComposerHarnessTrigger
+                                    label="Session continuity"
+                                    model={
+                                      triggerTaskSessionMode === "new"
+                                        ? "New session for each match"
+                                        : "One task session for all matches"
+                                    }
+                                    icon={<RefreshCwIcon className="size-4 shrink-0" />}
+                                    className={AUTOMATION_ADVANCED_CONTROL_TRIGGER_CLASS_NAME}
+                                    data-testid="task-trigger-session-mode"
+                                  />
+                                </DropdownMenuTrigger>
+                                <DropdownMenuContent align="end" className="min-w-64">
+                                  <DropdownMenuRadioGroup
+                                    value={triggerTaskSessionMode}
+                                    onValueChange={(value) =>
+                                      setTriggerTaskSessionMode(value as TriggerTaskSessionMode)
+                                    }
+                                  >
+                                    <DropdownMenuRadioItem value="new">
+                                      New session for each match
+                                    </DropdownMenuRadioItem>
+                                    <DropdownMenuRadioItem
+                                      value="continue"
+                                      disabled={runsSavedWorkflow}
+                                    >
+                                      One task session for all matches
+                                    </DropdownMenuRadioItem>
+                                  </DropdownMenuRadioGroup>
+                                </DropdownMenuContent>
+                              </DropdownMenu>
+                            </div>
+                          )}
+                          {/* A trigger keeps one session: the mode switch stays hidden, but an edit can restart it. */}
+                          {sessionModesSupported &&
+                            (trigger === null || isEdit) &&
+                            !startsFromSession &&
+                            (!editingTemplateTrigger || editingTask?.sessionId) && (
+                              <div
+                                className="flex min-h-9 items-center justify-between gap-4 py-px"
+                                data-testid="task-session-mode-field"
+                              >
                                 <span className="text-ui text-muted-foreground">
                                   Session continuity
                                 </span>
@@ -2255,117 +2281,54 @@ export function CreateScheduledTaskDialog({
                                     <ComposerHarnessTrigger
                                       label="Session continuity"
                                       model={
-                                        triggerTaskSessionMode === "new"
-                                          ? "New session for each match"
-                                          : "One task session for all matches"
+                                        sessionMode === "new"
+                                          ? "New session each run"
+                                          : "Continue one session"
                                       }
                                       icon={<RefreshCwIcon className="size-4 shrink-0" />}
                                       className={AUTOMATION_ADVANCED_CONTROL_TRIGGER_CLASS_NAME}
-                                      data-testid="task-trigger-session-mode"
+                                      data-testid="task-session-mode-trigger"
                                     />
                                   </DropdownMenuTrigger>
                                   <DropdownMenuContent align="end" className="min-w-64">
-                                    <DropdownMenuRadioGroup
-                                      value={triggerTaskSessionMode}
-                                      onValueChange={(value) =>
-                                        setTriggerTaskSessionMode(value as TriggerTaskSessionMode)
-                                      }
-                                    >
-                                      <DropdownMenuRadioItem value="new">
-                                        New session for each match
-                                      </DropdownMenuRadioItem>
-                                      <DropdownMenuRadioItem
-                                        value="continue"
-                                        disabled={runsSavedWorkflow}
+                                    {!editingTemplateTrigger && (
+                                      <DropdownMenuRadioGroup
+                                        value={sessionMode}
+                                        onValueChange={(value) =>
+                                          setSessionMode(value as ScheduledTaskSessionMode)
+                                        }
                                       >
-                                        One task session for all matches
-                                      </DropdownMenuRadioItem>
-                                    </DropdownMenuRadioGroup>
+                                        <DropdownMenuRadioItem value="new">
+                                          New session each run
+                                        </DropdownMenuRadioItem>
+                                        <DropdownMenuRadioItem
+                                          value="continue"
+                                          disabled={workflowNeedsNewSessions}
+                                        >
+                                          Continue one session
+                                        </DropdownMenuRadioItem>
+                                      </DropdownMenuRadioGroup>
+                                    )}
+                                    {isEdit &&
+                                      sessionMode === "continue" &&
+                                      editingTask?.sessionId && (
+                                        <>
+                                          {!editingTemplateTrigger && <DropdownMenuSeparator />}
+                                          <DropdownMenuCheckboxItem
+                                            checked={startNewSession || triggerSourceSwitched}
+                                            disabled={triggerSourceSwitched}
+                                            onCheckedChange={(checked) =>
+                                              setStartNewSession(checked === true)
+                                            }
+                                            onSelect={(event) => event.preventDefault()}
+                                            data-testid="task-start-new-session"
+                                          >
+                                            Start a new session on the next run
+                                          </DropdownMenuCheckboxItem>
+                                        </>
+                                      )}
                                   </DropdownMenuContent>
                                 </DropdownMenu>
-                              </div>
-                              {runsSavedWorkflow && (
-                                <p
-                                  className="pb-2 text-sm text-muted-foreground"
-                                  data-testid="task-trigger-session-mode-workflow-note"
-                                >
-                                  A workflow runs in a new session for each match.
-                                </p>
-                              )}
-                            </div>
-                          )}
-                          {/* A trigger keeps one session: the mode switch stays hidden, but an edit can restart it. */}
-                          {sessionModesSupported &&
-                            (trigger === null || isEdit) &&
-                            !startsFromSession &&
-                            (!editingTemplateTrigger || editingTask?.sessionId) && (
-                              <div className="py-px" data-testid="task-session-mode-field">
-                                <div className="flex min-h-9 items-center justify-between gap-4">
-                                  <span className="text-ui text-muted-foreground">
-                                    Session continuity
-                                  </span>
-                                  <DropdownMenu>
-                                    <DropdownMenuTrigger asChild>
-                                      <ComposerHarnessTrigger
-                                        label="Session continuity"
-                                        model={
-                                          sessionMode === "new"
-                                            ? "New session each run"
-                                            : "Continue one session"
-                                        }
-                                        icon={<RefreshCwIcon className="size-4 shrink-0" />}
-                                        className={AUTOMATION_ADVANCED_CONTROL_TRIGGER_CLASS_NAME}
-                                        data-testid="task-session-mode-trigger"
-                                      />
-                                    </DropdownMenuTrigger>
-                                    <DropdownMenuContent align="end" className="min-w-64">
-                                      {!editingTemplateTrigger && (
-                                        <DropdownMenuRadioGroup
-                                          value={sessionMode}
-                                          onValueChange={(value) =>
-                                            setSessionMode(value as ScheduledTaskSessionMode)
-                                          }
-                                        >
-                                          <DropdownMenuRadioItem value="new">
-                                            New session each run
-                                          </DropdownMenuRadioItem>
-                                          <DropdownMenuRadioItem
-                                            value="continue"
-                                            disabled={workflowNeedsNewSessions}
-                                          >
-                                            Continue one session
-                                          </DropdownMenuRadioItem>
-                                        </DropdownMenuRadioGroup>
-                                      )}
-                                      {isEdit &&
-                                        sessionMode === "continue" &&
-                                        editingTask?.sessionId && (
-                                          <>
-                                            {!editingTemplateTrigger && <DropdownMenuSeparator />}
-                                            <DropdownMenuCheckboxItem
-                                              checked={startNewSession || triggerSourceSwitched}
-                                              disabled={triggerSourceSwitched}
-                                              onCheckedChange={(checked) =>
-                                                setStartNewSession(checked === true)
-                                              }
-                                              onSelect={(event) => event.preventDefault()}
-                                              data-testid="task-start-new-session"
-                                            >
-                                              Start a new session on the next run
-                                            </DropdownMenuCheckboxItem>
-                                          </>
-                                        )}
-                                    </DropdownMenuContent>
-                                  </DropdownMenu>
-                                </div>
-                                {workflowNeedsNewSessions && (
-                                  <p
-                                    className="pb-2 text-sm text-muted-foreground"
-                                    data-testid="task-session-mode-workflow-note"
-                                  >
-                                    A workflow runs in a new session each time.
-                                  </p>
-                                )}
                               </div>
                             )}
                           {mcpPickerShown && (

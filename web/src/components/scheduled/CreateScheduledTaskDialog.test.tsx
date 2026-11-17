@@ -7069,9 +7069,6 @@ describe("CreateScheduledTaskDialog workflow", () => {
     );
     // Each run of the workflow starts a new session, whatever was picked before.
     expect(sessionMode).toHaveTextContent("New session each run");
-    expect(screen.getByTestId("task-session-mode-workflow-note")).toHaveTextContent(
-      "A workflow runs in a new session each time.",
-    );
     openSessionModeMenu();
     const continueOption = screen.getByRole("menuitemradio", { name: "Continue one session" });
     expect(continueOption).toHaveAttribute("aria-disabled", "true");
@@ -7083,7 +7080,6 @@ describe("CreateScheduledTaskDialog workflow", () => {
     fireEvent.click(screen.getByTestId("workflow-picker-clear"));
     expect(screen.getByTestId("task-prompt-input")).toHaveValue("Summarize the day.");
     expect(sessionMode).toHaveTextContent("Continue one session");
-    expect(screen.queryByTestId("task-session-mode-workflow-note")).toBeNull();
     chooseWorkflow();
     const submit = screen.getByTestId("create-scheduled-task-submit");
     await waitFor(() => expect(submit).toBeEnabled());
@@ -7114,7 +7110,6 @@ describe("CreateScheduledTaskDialog workflow", () => {
     expect(screen.getByTestId("task-session-mode-trigger")).toHaveTextContent(
       "New session each run",
     );
-    expect(screen.getByTestId("task-session-mode-workflow-note")).toBeInTheDocument();
     openSessionModeMenu();
     expect(screen.getByRole("menuitemradio", { name: "Continue one session" })).toHaveAttribute(
       "aria-disabled",
@@ -7334,9 +7329,6 @@ describe("CreateScheduledTaskDialog workflow", () => {
         />,
         { info: { scheduled_task_session_modes: true, ...features } },
       );
-      expect(screen.getByTestId("task-workflow-session-note")).toHaveTextContent(
-        "saving switches this automation to a new session for each run",
-      );
       expect(screen.getByTestId("task-session-mode-trigger")).toHaveTextContent(
         "New session each run",
       );
@@ -7360,9 +7352,6 @@ describe("CreateScheduledTaskDialog workflow", () => {
     chooseWorkflow();
 
     expect(sessionMode).toHaveTextContent("New session for each match");
-    expect(screen.getByTestId("task-trigger-session-mode-workflow-note")).toHaveTextContent(
-      "A workflow runs in a new session for each match.",
-    );
     openSessionModeMenu("task-trigger-session-mode");
     expect(
       screen.getByRole("menuitemradio", { name: "One task session for all matches" }),
@@ -7372,7 +7361,6 @@ describe("CreateScheduledTaskDialog workflow", () => {
     fireEvent.pointerDown(screen.getByTestId("task-workflow-trigger"), { button: 0 });
     fireEvent.click(screen.getByTestId("workflow-picker-clear"));
     expect(sessionMode).toHaveTextContent("One task session for all matches");
-    expect(screen.queryByTestId("task-trigger-session-mode-workflow-note")).toBeNull();
     chooseWorkflow();
     expect(sessionMode).toHaveTextContent("New session for each match");
     fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
@@ -7432,9 +7420,6 @@ describe("CreateScheduledTaskDialog workflow", () => {
     );
     const view = renderGithubTrigger(true, { session_create_workflow_id: true });
     reopenTrigger(view, saved, true);
-    expect(screen.getByTestId("task-workflow-session-note")).toHaveTextContent(
-      "saving stops sending matches to one task session",
-    );
     fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
 
     await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));

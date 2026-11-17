@@ -1345,6 +1345,7 @@ def create_runner_app(
     *,
     process_manager: HarnessProcessManager | None = None,
     spec_resolver: SpecResolver | None = None,
+    spec_workdir_cleanup: Callable[[str], Awaitable[None]] | None = None,
     server_client: httpx.AsyncClient,
     mcp_reattach_client_factory: Callable[[], httpx.AsyncClient] | None = None,
     terminal_registry: TerminalRegistry | None = None,
@@ -1364,6 +1365,9 @@ def create_runner_app(
         For in-process: wraps the server's agent cache.
         For out-of-process: wraps HTTP fetch to GET /v1/agents/{id}/contents.
         ``None`` → runner falls back to body-supplied hints (test path).
+    :param spec_workdir_cleanup: Async callback ``(session_id) -> None`` that
+        removes a session's extracted bundle directories. Called on session
+        delete, after the session's resources have been released.
     :param server_client: httpx.AsyncClient pointed at the AP
         server's public API. Used by the runner for
         elicitation/approval forwarding.
@@ -4157,6 +4161,8 @@ def create_runner_app(
 
         _session_spec_cache.pop(session_id, None)
         _session_root_spec_cache.pop(session_id, None)
+        if spec_workdir_cleanup is not None:
+            await spec_workdir_cleanup(session_id)
         _session_harness_overrides.pop(session_id, None)
         _session_skills_cache.pop(session_id, None)
         _session_cursor_model_names.pop(session_id, None)
@@ -6681,12 +6687,20 @@ def create_runner_app(
             validate_copy_on_write_harness,
         )
 
-        stream_spec = _unwrap_resolved_spec(_session_spec_cache.get(conv_id))
+        stream_spec_entry = _session_spec_cache.get(conv_id) or _session_root_spec_cache.get(
+            conv_id
+        )
+        stream_spec = _unwrap_resolved_spec(stream_spec_entry)
         if stream_spec is None and _ds_agent_id and spec_resolver is not None:
+            generation = _session_cache_generation(conv_id)
             try:
-                stream_spec = _unwrap_resolved_spec(await spec_resolver(_ds_agent_id, conv_id))
+                resolved = await spec_resolver(_ds_agent_id, conv_id)
             except (OmnigentError, httpx.HTTPError, RuntimeError):
-                stream_spec = None
+                resolved = None
+            stream_spec = _unwrap_resolved_spec(resolved)
+            # Keep the extraction for later turns; each resolution holds a bundle directory.
+            if resolved is not None and _session_cache_generation_is_current(conv_id, generation):
+                _session_root_spec_cache[conv_id] = resolved
         if has_copy_on_write(
             getattr(stream_spec, "os_env", None)
         ) or resource_registry.uses_copy_on_write(conv_id):
@@ -7420,6 +7434,7 @@ def create_runner_app(
                                         _agent_id_for_dispatch = cast(
                                             str | None, body.get("agent_id")
                                         )
+                                        _caller_user_id = body.get("caller_user_id")
                                         _dispatch_mcp = ProxyMcpManager(
                                             conv_id,
                                             server_client,
@@ -7458,6 +7473,11 @@ def create_runner_app(
                                                         conv_id
                                                     ),
                                                     wake_on_async_result=_wake_on_async_result,
+                                                    caller_user_id=(
+                                                        _caller_user_id
+                                                        if isinstance(_caller_user_id, str)
+                                                        else None
+                                                    ),
                                                 )
                                             )
                                         )

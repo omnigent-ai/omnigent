@@ -3145,13 +3145,12 @@ async def test_codex_command_approval_hook_accept_round_trip(
     assert resp.json() == {"decision": "accept"}
 
 
-async def test_codex_command_approval_hook_accepts_execpolicy_amendment(
+async def test_codex_command_approval_hook_remembers_offered_rule(
     client: httpx.AsyncClient,
 ) -> None:
     """
-    Codex command approval requests that offer an execpolicy
-    amendment can be accepted with that exact amendment, returning
-    Codex's structured ``acceptWithExecpolicyAmendment`` decision.
+    A remember choice bound to the displayed request fingerprint
+    returns Codex's offered ``acceptWithExecpolicyAmendment`` decision.
     """
     agent = await create_test_agent(client, "test-codex-execpolicy-approval")
     session_id = await _create_session(client, agent["id"])
@@ -3199,7 +3198,10 @@ async def test_codex_command_approval_hook_accepts_execpolicy_amendment(
         session_id,
         event["elicitation_id"],
         "accept",
-        content={"execpolicy_amendment": amendment},
+        content={
+            "remember": True,
+            "request_fingerprint": params["approval_request_fingerprint"],
+        },
     )
     assert verdict.status_code == 202, verdict.text
 
@@ -3214,12 +3216,12 @@ async def test_codex_command_approval_hook_accepts_execpolicy_amendment(
     }
 
 
-async def test_codex_command_approval_hook_rejects_malformed_execpolicy_amendment(
+async def test_codex_command_approval_hook_rejects_client_supplied_execpolicy_amendment(
     client: httpx.AsyncClient,
 ) -> None:
     """
-    Malformed remember approvals fail instead of degrading to a plain
-    command accept.
+    A verdict that supplies its own execpolicy amendment fails instead
+    of degrading to a plain command accept.
     """
     agent = await create_test_agent(client, "test-codex-execpolicy-invalid")
     session_id = await _create_session(client, agent["id"])
@@ -3271,7 +3273,7 @@ async def test_codex_command_approval_hook_rejects_malformed_execpolicy_amendmen
     resp = await hook_task
     assert resp.status_code == 400, resp.text
     assert resp.json()["error"]["code"] == "invalid_input"
-    assert "execpolicy amendment" in resp.json()["error"]["message"]
+    assert "cannot supply its own execpolicy amendment" in resp.json()["error"]["message"]
 
 
 async def test_codex_permissions_approval_hook_grants_requested_profile(
