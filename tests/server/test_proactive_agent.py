@@ -83,6 +83,7 @@ def test_bundle_opts_into_the_inbox_tools_only() -> None:
     # A new framework group defaults to on, so the bundle must turn it off explicitly.
     assert groups.pop("user_inbox") is True
     assert not any(groups.values()), groups
+    assert spec.timers is False
 
 
 def test_seeded_outside_the_seeded_agents_allowlist(
