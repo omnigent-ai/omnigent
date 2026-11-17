@@ -170,7 +170,7 @@ function AgentTileComponent({
       style={active || waiting ? undefined : { borderColor: color.border }}
     >
       <header
-        className="flex h-10 shrink-0 items-center gap-2 border-b pr-2 pl-2"
+        className="@container flex h-10 shrink-0 items-center gap-2 border-b pr-2 pl-2"
         style={{ backgroundColor: color.tint }}
       >
         {reorder && (
@@ -207,10 +207,10 @@ function AgentTileComponent({
           data-testid="agent-tile-title"
           aria-expanded={detailsOpen}
           aria-controls={detailsOpen ? detailsId : undefined}
-          title={detailsOpen ? "Hide details" : "Show details"}
+          title={`${title} · ${detailsOpen ? "Hide details" : "Show details"}`}
           onClick={() => setDetailsOpen((open) => !open)}
           onDoubleClick={() => onToggleFullScreen?.(conversation.id)}
-          className="flex min-w-0 cursor-pointer items-center gap-1 rounded-sm text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          className="mr-auto flex min-w-0 cursor-pointer items-center gap-1 rounded-sm text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
         >
           <strong className="min-w-0 truncate text-sm font-semibold tracking-tight text-foreground">
             {title}
@@ -225,7 +225,7 @@ function AgentTileComponent({
         </button>
         <span
           data-testid="agent-tile-subline"
-          className="min-w-0 flex-1 truncate text-xs text-muted-foreground"
+          className="hidden min-w-0 flex-1 truncate text-xs text-muted-foreground @[34rem]:block"
           title={subline}
         >
           {subline}
@@ -241,17 +241,6 @@ function AgentTileComponent({
             onClick={() => onToggleStar(conversation)}
           >
             <StarIcon className={cn("size-3.5", starred && "fill-amber-400 text-amber-500")} />
-          </Button>
-        )}
-        {onPark && (
-          <Button
-            variant="ghost"
-            size="icon-xs"
-            aria-label={`Move ${title} to the Stack`}
-            title="Move to the Stack"
-            onClick={() => onPark(conversation.id)}
-          >
-            <LayersIcon className="size-3.5" />
           </Button>
         )}
         {onToggleFullScreen && (
@@ -270,75 +259,70 @@ function AgentTileComponent({
             )}
           </Button>
         )}
-        {variant !== "card" && (
-          <DropdownMenu>
-            <DropdownMenuTrigger asChild>
-              <Button variant="ghost" size="icon-xs" aria-label={`More for ${title}`} title="More">
-                <EllipsisIcon className="size-3.5" />
-              </Button>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent align="end" className="min-w-44">
-              {onPopOut && (
-                <>
-                  <DropdownMenuItem onSelect={() => onPopOut(conversation.id)}>
-                    <AppWindowIcon className="size-4" />
-                    Pop out to a window
-                  </DropdownMenuItem>
-                  <DropdownMenuSeparator />
-                </>
-              )}
-              <DropdownMenuLabel className="text-xs text-muted-foreground">
-                Text size · {Math.round(textSize * 100)}%
-              </DropdownMenuLabel>
-              {/* Size steps keep the menu open, so several can be applied in a row. */}
-              <DropdownMenuItem
-                disabled={textSize === TILE_TEXT_SIZES[0]}
-                onSelect={(event) => {
-                  event.preventDefault();
-                  setTileTextSize(conversation.id, stepTextSize(textSize, -1));
-                }}
-              >
-                Smaller text
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <Button variant="ghost" size="icon-xs" aria-label={`More for ${title}`} title="More">
+              <EllipsisIcon className="size-3.5" />
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end" className="min-w-48">
+            <DropdownMenuItem onSelect={() => onOpenSingle(conversation.id)}>
+              <ExternalLinkIcon className="size-4" />
+              Open in single agent view
+            </DropdownMenuItem>
+            {onPopOut && (
+              <DropdownMenuItem onSelect={() => onPopOut(conversation.id)}>
+                <AppWindowIcon className="size-4" />
+                Pop out to a window
               </DropdownMenuItem>
-              <DropdownMenuItem
-                disabled={textSize === TILE_TEXT_SIZES[TILE_TEXT_SIZES.length - 1]}
-                onSelect={(event) => {
-                  event.preventDefault();
-                  setTileTextSize(conversation.id, stepTextSize(textSize, 1));
-                }}
-              >
-                Larger text
+            )}
+            {onPark && (
+              <DropdownMenuItem onSelect={() => onPark(conversation.id)}>
+                <LayersIcon className="size-4" />
+                Move to the Stack
               </DropdownMenuItem>
-              <DropdownMenuItem
-                disabled={textSize === DEFAULT_TILE_TEXT_SIZE}
-                onSelect={() => setTileTextSize(conversation.id, DEFAULT_TILE_TEXT_SIZE)}
-              >
-                Reset text size
-              </DropdownMenuItem>
-            </DropdownMenuContent>
-          </DropdownMenu>
-        )}
-        <Button
-          variant="ghost"
-          size="icon-xs"
-          aria-label={`Open ${title} in single agent view`}
-          title="Open in single agent view"
-          onClick={() => onOpenSingle(conversation.id)}
-        >
-          <ExternalLinkIcon className="size-3.5" />
-        </Button>
+            )}
+            <DropdownMenuSeparator />
+            <DropdownMenuLabel className="text-xs text-muted-foreground">
+              Text size · {Math.round(textSize * 100)}%
+            </DropdownMenuLabel>
+            {/* Size steps keep the menu open, so several can be applied in a row. */}
+            <DropdownMenuItem
+              disabled={textSize === TILE_TEXT_SIZES[0]}
+              onSelect={(event) => {
+                event.preventDefault();
+                setTileTextSize(conversation.id, stepTextSize(textSize, -1));
+              }}
+            >
+              Smaller text
+            </DropdownMenuItem>
+            <DropdownMenuItem
+              disabled={textSize === TILE_TEXT_SIZES[TILE_TEXT_SIZES.length - 1]}
+              onSelect={(event) => {
+                event.preventDefault();
+                setTileTextSize(conversation.id, stepTextSize(textSize, 1));
+              }}
+            >
+              Larger text
+            </DropdownMenuItem>
+            <DropdownMenuItem
+              disabled={textSize === DEFAULT_TILE_TEXT_SIZE}
+              onSelect={() => setTileTextSize(conversation.id, DEFAULT_TILE_TEXT_SIZE)}
+            >
+              Reset text size
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
       </header>
 
-      {detailsOpen && (
+      {detailsOpen ? (
         <TileDetails
           id={detailsId}
           conversation={conversation}
           title={title}
           accent={color.solid}
         />
-      )}
-
-      {showConversation ? (
+      ) : showConversation ? (
         <div className="relative min-h-0 flex-1 overflow-hidden" style={bodyZoom}>
           <RenderErrorBoundary name="tile-chat" resetKey={conversation.id}>
             <SideChatPane childId={conversation.id} fullSession readOnly={!active} />
@@ -381,7 +365,7 @@ function AgentTileComponent({
         </div>
       )}
 
-      {!active && variant !== "card" && live && (
+      {!detailsOpen && !active && variant !== "card" && live && (
         <footer
           className={cn(
             "shrink-0 border-t px-3 py-1.5 text-center text-xs",

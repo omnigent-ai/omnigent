@@ -105,7 +105,7 @@ export function TileFilterBar({
           type="search"
           aria-label="Search agents"
           placeholder="Search agents  /"
-          className="h-7 pr-7 pl-7 text-xs"
+          className="h-7 pr-7 pl-7 text-xs [&::-webkit-search-cancel-button]:appearance-none"
           value={query}
           onChange={(event) => onQueryChange(event.target.value)}
           onKeyDown={(event) => {

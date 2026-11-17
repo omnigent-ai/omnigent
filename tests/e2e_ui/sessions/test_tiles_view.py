@@ -96,7 +96,7 @@ def test_nav_toggle_opens_tiles_and_carries_the_active_agent(
     expect(_tile(page, session_a)).to_have_attribute("data-active", "true")
 
     # Click the tile itself, not a control, to make it the active agent.
-    _tile(page, session_b).get_by_test_id("agent-tile-subline").click()
+    _tile(page, session_b).get_by_test_id("tile-details").click(position={"x": 4, "y": 4})
     expect(_tile(page, session_b)).to_have_attribute("data-active", "true")
 
     # Full screen shows only that agent; Escape returns to the grid.
@@ -166,7 +166,8 @@ def test_search_stack_and_files_drawer(
     search.press("Escape")
     expect(_tile(page, session_a)).to_be_visible()
 
-    _tile(page, session_b).get_by_role("button", name=re.compile("to the Stack$")).click()
+    _tile(page, session_b).get_by_role("button", name=re.compile("^More for ")).click()
+    page.get_by_role("menuitem", name="Move to the Stack").click()
     expect(_tile(page, session_b)).to_have_count(0)
     stack_toggle = page.get_by_test_id("tiles-stack-toggle")
     expect(stack_toggle).to_have_text("Stack · 1")

@@ -127,7 +127,7 @@ export function TileDetails({ id, conversation, title, accent }: TileDetailsProp
     <div
       id={id}
       data-testid="tile-details"
-      className="grid max-h-[50%] shrink-0 grid-cols-2 gap-2 overflow-y-auto border-b bg-muted/30 p-2"
+      className="grid min-h-0 flex-1 auto-rows-min grid-cols-2 content-start gap-2 overflow-y-auto bg-muted/30 p-2"
     >
       <DetailCard title="Now" accent={accent}>
         <span className="font-medium text-sm">
