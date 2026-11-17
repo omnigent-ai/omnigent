@@ -28,6 +28,7 @@ from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.session_orchestration import require_private_bound_source
 from omnigent.stores.conversation_store import ConversationStore
 from omnigent.stores.memory_store import (
+    ACTOR_TYPE_USER,
     DEFAULT_PAGE_SIZE,
     DEFAULT_SEARCH_LIMIT,
     MAX_CONTENT_BYTES,
@@ -36,6 +37,7 @@ from omnigent.stores.memory_store import (
     MAX_PATH_LENGTH,
     MAX_SEARCH_LIMIT,
     MEMORY_SEARCH_UNSUPPORTED,
+    MemoryActor,
     MemoryEntry,
     MemoryStore,
 )
@@ -99,7 +101,7 @@ class MemoryDeleteResponse(BaseModel):
 
 
 def _entry_response(entry: MemoryEntry) -> MemoryEntryResponse:
-    """Drop the actor id: it is always the caller."""
+    """Drop the actor: it is always the caller."""
     return MemoryEntryResponse(
         path=entry.path,
         content=entry.content,
@@ -109,14 +111,14 @@ def _entry_response(entry: MemoryEntry) -> MemoryEntryResponse:
     )
 
 
-def actor_id_for_user(user_id: str | None) -> str:
+def actor_for_user(user_id: str | None) -> MemoryActor:
     """
     Memory actor for an authenticated user.
 
     :param user_id: Authenticated user id, or ``None`` when auth is disabled.
-    :returns: ``"user:<id>"``; ``"user:local"`` in single-user mode.
+    :returns: The user actor; ``local`` in single-user mode.
     """
-    return f"user:{RESERVED_USER_LOCAL if user_id is None else user_id}"
+    return MemoryActor(ACTOR_TYPE_USER, RESERVED_USER_LOCAL if user_id is None else user_id)
 
 
 class _MemoryRoute(APIRoute):
@@ -156,7 +158,7 @@ def create_memory_router(
     """
     router = APIRouter(route_class=_MemoryRoute)
 
-    def resolve_actor(request: Request) -> str:
+    def resolve_actor(request: Request) -> MemoryActor:
         user_id = require_user(request, auth_provider)
         source_id = (request.headers.get(ORCHESTRATION_SOURCE_HEADER) or "").strip()
         if source_id and user_id is not None:
@@ -169,7 +171,7 @@ def create_memory_router(
                     code=ErrorCode.FORBIDDEN,
                 )
             require_private_bound_source(request, user_id, conversation_store, permission_store)
-        return actor_id_for_user(user_id)
+        return actor_for_user(user_id)
 
     @router.put("/memory/entry", response_model=MemoryEntryResponse)
     async def write_entry(request: Request, body: MemoryWriteRequest) -> MemoryEntryResponse:

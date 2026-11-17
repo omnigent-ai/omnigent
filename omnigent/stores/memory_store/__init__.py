@@ -6,7 +6,7 @@ stores) implement it, so a tool behaves the same on every backend.
 
 The contract is deliberately the common subset of what backends can do:
 
-* entries are keyed by ``(workspace, actor_id, path)``; the workspace comes from
+* entries are keyed by ``(workspace, actor, path)``; the workspace comes from
   the ambient :func:`omnigent.db.db_models.current_workspace_id` scope;
 * a path cannot be renamed;
 * listing is paginated, in an order the backend chooses;
@@ -15,8 +15,8 @@ The contract is deliberately the common subset of what backends can do:
   ranked, without pagination;
 * there are no versions or etags; a write replaces the entry at its path.
 
-``actor_id`` is whose memory it is. Callers derive it from the authenticated
-user. It is never accepted from an agent or a request body.
+The :class:`MemoryActor` is whose memory it is. Callers derive it from the
+authenticated user. It is never accepted from an agent or a request body.
 """
 
 from __future__ import annotations
@@ -27,8 +27,12 @@ from dataclasses import dataclass
 
 from omnigent.errors import ErrorCode, OmnigentError
 
-# A user id of up to 128 characters plus an owner-kind prefix such as ``user:``.
-MAX_ACTOR_ID_LENGTH = 160
+# An owner's id within its type: for a user, up to the 128 characters other
+# tables store for a user id.
+MAX_ACTOR_ID_LENGTH = 128
+ACTOR_TYPE_USER = "user"
+# Kinds of memory owner. A backend must keep owners of different types apart.
+ACTOR_TYPES: frozenset[str] = frozenset({ACTOR_TYPE_USER})
 MAX_PATH_LENGTH = 512
 MAX_DESCRIPTION_LENGTH = 512
 # UTF-8 bytes before compression. Leaves headroom for zstd framing under the
@@ -43,11 +47,24 @@ MEMORY_SEARCH_UNSUPPORTED = "Memory search is not available on this memory backe
 
 
 @dataclass(frozen=True)
+class MemoryActor:
+    """
+    Whose memory it is.
+
+    :param type: Kind of owner, one of :data:`ACTOR_TYPES`, e.g. ``"user"``.
+    :param id: The owner's id within its type, e.g. ``"alice"``.
+    """
+
+    type: str
+    id: str
+
+
+@dataclass(frozen=True)
 class MemoryEntry:
     """
     One stored memory.
 
-    :param actor_id: Owner of the memory, e.g. ``"user:alice"``.
+    :param actor: Owner of the memory, e.g. ``MemoryActor("user", "alice")``.
     :param path: Absolute, case-sensitive path, e.g. ``"/projects/api/gotchas"``.
     :param content: Markdown or plain text body.
     :param description: One-line summary returned with listings and search hits, or
@@ -56,7 +73,7 @@ class MemoryEntry:
     :param updated_at: Unix epoch seconds of the last write.
     """
 
-    actor_id: str
+    actor: MemoryActor
     path: str
     content: str
     description: str | None
@@ -91,23 +108,27 @@ class MemoryPage:
     next_page_token: str | None = None
 
 
-def validate_actor_id(actor_id: str) -> str:
+def validate_actor(actor: MemoryActor) -> MemoryActor:
     """
-    Reject an empty or oversized actor id.
+    Reject a missing, unknown-type, empty or oversized actor.
 
-    :param actor_id: Candidate actor id.
-    :returns: *actor_id* unchanged.
+    :param actor: Candidate owner.
+    :returns: *actor* unchanged.
     :raises OmnigentError: ``INVALID_INPUT`` when unusable. Backends call this
         on every operation so a missing actor fails closed instead of falling
         back to a shared default.
     """
-    if not isinstance(actor_id, str) or not actor_id.strip():
-        raise OmnigentError("actor_id is required", code=ErrorCode.INVALID_INPUT)
-    if len(actor_id) > MAX_ACTOR_ID_LENGTH:
+    if not isinstance(actor, MemoryActor):
+        raise OmnigentError("actor is required", code=ErrorCode.INVALID_INPUT)
+    if actor.type not in ACTOR_TYPES:
+        raise OmnigentError(f"Unknown actor type {actor.type!r}", code=ErrorCode.INVALID_INPUT)
+    if not isinstance(actor.id, str) or not actor.id.strip():
+        raise OmnigentError("actor id is required", code=ErrorCode.INVALID_INPUT)
+    if len(actor.id) > MAX_ACTOR_ID_LENGTH:
         raise OmnigentError(
-            f"actor_id exceeds {MAX_ACTOR_ID_LENGTH} characters", code=ErrorCode.INVALID_INPUT
+            f"actor id exceeds {MAX_ACTOR_ID_LENGTH} characters", code=ErrorCode.INVALID_INPUT
         )
-    return actor_id
+    return actor
 
 
 def validate_path(path: str) -> str:
@@ -213,8 +234,8 @@ class MemoryStore(ABC):
     """
     Abstract memory backend.
 
-    Every method takes the ``actor_id`` explicitly and must call
-    :func:`validate_actor_id` first; the workspace comes from the ambient scope.
+    Every method takes the ``actor`` explicitly and must call
+    :func:`validate_actor` first; the workspace comes from the ambient scope.
 
     :cvar supports_search: Whether :meth:`search` is implemented. The server
         offers ``memory_search`` only for a backend that sets it.
@@ -224,12 +245,12 @@ class MemoryStore(ABC):
 
     @abstractmethod
     def write(
-        self, actor_id: str, path: str, content: str, description: str | None = None
+        self, actor: MemoryActor, path: str, content: str, description: str | None = None
     ) -> MemoryEntry:
         """
         Create the entry at *path*, or replace it.
 
-        :param actor_id: Owner of the memory.
+        :param actor: Owner of the memory.
         :param path: Absolute path, see :func:`validate_path`.
         :param content: Entry body.
         :param description: Optional one-line summary, returned with listings and
@@ -238,11 +259,11 @@ class MemoryStore(ABC):
         """
 
     @abstractmethod
-    def get(self, actor_id: str, path: str) -> MemoryEntry | None:
+    def get(self, actor: MemoryActor, path: str) -> MemoryEntry | None:
         """
         Read one entry.
 
-        :param actor_id: Owner of the memory.
+        :param actor: Owner of the memory.
         :param path: Absolute path.
         :returns: The entry, or ``None`` when absent.
         """
@@ -250,7 +271,7 @@ class MemoryStore(ABC):
     @abstractmethod
     def list(
         self,
-        actor_id: str,
+        actor: MemoryActor,
         path_prefix: str | None = None,
         page_token: str | None = None,
         page_size: int = DEFAULT_PAGE_SIZE,
@@ -261,7 +282,7 @@ class MemoryStore(ABC):
         Paging from the first page to the last returns every entry once, in a
         stable order the backend chooses.
 
-        :param actor_id: Owner of the memory.
+        :param actor: Owner of the memory.
         :param path_prefix: Only paths at or under this prefix.
         :param page_token: ``next_page_token`` of the previous page; opaque.
         :param page_size: Page size, at most :data:`MAX_PAGE_SIZE`.
@@ -271,7 +292,7 @@ class MemoryStore(ABC):
 
     def search(
         self,
-        actor_id: str,
+        actor: MemoryActor,
         query: str,
         path_prefix: str | None = None,
         limit: int = DEFAULT_SEARCH_LIMIT,
@@ -281,22 +302,22 @@ class MemoryStore(ABC):
 
         Backends that set :attr:`supports_search` override this.
 
-        :param actor_id: Owner of the memory.
+        :param actor: Owner of the memory.
         :param query: Free-text query.
         :param path_prefix: Only paths at or under this prefix.
         :param limit: Result count, at most :data:`MAX_SEARCH_LIMIT`.
         :returns: Hits, best first, without pagination.
         :raises OmnigentError: ``NOT_FOUND`` on a backend without search.
         """
-        del actor_id, query, path_prefix, limit
+        del actor, query, path_prefix, limit
         raise OmnigentError(MEMORY_SEARCH_UNSUPPORTED, code=ErrorCode.NOT_FOUND)
 
     @abstractmethod
-    def delete(self, actor_id: str, path: str) -> bool:
+    def delete(self, actor: MemoryActor, path: str) -> bool:
         """
         Delete one entry.
 
-        :param actor_id: Owner of the memory.
+        :param actor: Owner of the memory.
         :param path: Absolute path.
         :returns: ``True`` when an entry was deleted.
         """

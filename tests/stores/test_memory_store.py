@@ -128,7 +128,8 @@ class TestSqlAlchemyMemoryStore(MemoryStoreConformance):
         # One indexed search per query: no full partition scan and no sort step.
         bounded = re.compile(
             r"SEARCH (TABLE )?memories USING (PRIMARY KEY|INDEX \w+) "
-            r"\(workspace_id=\? AND actor_id=\? AND path(=\?|>\?( AND path<\?)?)\)"
+            r"\(workspace_id=\? AND actor_type=\? AND actor_id=\? "
+            r"AND path(=\?|>\?( AND path<\?)?)\)"
         )
         assert len(plans) == 4
         assert all(len(plan) == 1 and bounded.fullmatch(plan[0]) for plan in plans), plans

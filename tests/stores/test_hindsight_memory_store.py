@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
+
 import pytest
 
 from omnigent.db.db_models import workspace_scope
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.stores.memory_store import MemoryStore
+from omnigent.stores.memory_store import MemoryActor, MemoryStore
 from omnigent.stores.memory_store.hindsight_store import (
     HindsightMemoryStore,
     bank_id_for,
@@ -46,7 +48,14 @@ class TestHindsightMemoryStore(SearchableMemoryStoreConformance):
         assert bank_id_for(1, ALICE) != bank_id_for(2, ALICE)
         assert bank_id_for(0, ALICE) != bank_id_for(0, BOB)
         # Ids that sanitize to the same readable text still get distinct banks.
-        assert bank_id_for(0, "user:a b") != bank_id_for(0, "user:a_b")
+        assert bank_id_for(0, MemoryActor("user", "a b")) != bank_id_for(
+            0, MemoryActor("user", "a_b")
+        )
+
+    def test_bank_ids_are_named_from_the_type_and_id(self) -> None:
+        """A bank is named from ``"<type>:<id>"``, plus a hash of the workspace and owner."""
+        digest = hashlib.sha256(b"0\0user:alice").hexdigest()[:10]
+        assert bank_id_for(0, ALICE) == f"omnigent-w0-user_alice-{digest}"
 
     def test_a_bank_is_created_once_and_a_creation_failure_is_tolerated(self) -> None:
         fake = FakeHindsight(fail_create_bank=True)

@@ -115,11 +115,13 @@ async def test_owner_writes_reads_lists_and_deletes(auth_client: httpx.AsyncClie
 
 
 async def test_the_longest_user_id_can_use_memory(auth_client: httpx.AsyncClient):
-    # 128 characters, the longest user id other tables store; the owner adds "user:".
+    # 128 characters, the longest user id other tables store and the actor id's limit.
     longest = {"X-Forwarded-Email": "u" * 121 + "@ex.com"}
     assert len(longest["X-Forwarded-Email"]) == 128
+    too_long = {"X-Forwarded-Email": "u" * 122 + "@ex.com"}
 
     assert (await _write(auth_client, longest, "/a", "x")).status_code == 200
+    assert (await _write(auth_client, too_long, "/a", "x")).status_code == 400
     listed = await auth_client.get("/v1/memory/entries", headers=longest)
     assert [e["path"] for e in listed.json()["entries"]] == ["/a"]
     assert (await auth_client.get("/v1/memory/entries", headers=ALICE)).json()["entries"] == []
@@ -140,7 +142,7 @@ async def test_users_cannot_see_each_others_memory(auth_client: httpx.AsyncClien
 async def test_the_actor_cannot_be_supplied_by_the_request(auth_client: httpx.AsyncClient):
     response = await auth_client.put(
         "/v1/memory/entry",
-        json={"path": "/a", "content": "x", "actor_id": "user:alice"},
+        json={"path": "/a", "content": "x", "actor_type": "user", "actor_id": "alice"},
         headers=BOB,
     )
 

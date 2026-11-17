@@ -35,12 +35,13 @@ from omnigent.stores.memory_store import (
     DEFAULT_SEARCH_LIMIT,
     MAX_PAGE_SIZE,
     MAX_SEARCH_LIMIT,
+    MemoryActor,
     MemoryEntry,
     MemoryHit,
     MemoryPage,
     MemoryStore,
     path_in_prefix,
-    validate_actor_id,
+    validate_actor,
     validate_content,
     validate_limit,
     validate_path,
@@ -83,19 +84,21 @@ def _offset_from_page_token(page_token: str | None) -> int:
     return int(page_token)
 
 
-def bank_id_for(workspace_id: int, actor_id: str) -> str:
+def bank_id_for(workspace_id: int, actor: MemoryActor) -> str:
     """
     Bank holding one actor's memory in one workspace.
 
-    A hash of the exact ``(workspace, actor)`` pair keeps two actors whose ids
-    sanitize alike (``"user:a b"``, ``"user:a_b"``) in different banks.
+    The bank is named from ``"<type>:<id>"``. A hash of the exact workspace and
+    owner keeps two owners whose ids sanitize alike (``"a b"``, ``"a_b"``) in
+    different banks.
 
     :param workspace_id: Tenant scope.
-    :param actor_id: Memory owner.
+    :param actor: Memory owner.
     :returns: A bank id, e.g. ``"omnigent-w0-user_alice-1f3c9a07b2"``.
     """
-    digest = hashlib.sha256(f"{workspace_id}\0{actor_id}".encode()).hexdigest()[:10]
-    readable = _BANK_UNSAFE.sub("_", actor_id)[:48]
+    owner = f"{actor.type}:{actor.id}"
+    digest = hashlib.sha256(f"{workspace_id}\0{owner}".encode()).hexdigest()[:10]
+    readable = _BANK_UNSAFE.sub("_", owner)[:48]
     return f"omnigent-w{workspace_id}-{readable}-{digest}"
 
 
@@ -238,7 +241,7 @@ class HindsightMemoryStore(MemoryStore):
             raise
 
     def _entry(
-        self, actor_id: str, path: str, document: Any, *, with_content: bool
+        self, actor: MemoryActor, path: str, document: Any, *, with_content: bool
     ) -> MemoryEntry:
         """Build an entry from a Hindsight document or document-list item."""
         now = now_epoch()
@@ -248,7 +251,7 @@ class HindsightMemoryStore(MemoryStore):
         )
         created = _epoch(_field(document, "created_at"), now)
         return MemoryEntry(
-            actor_id=actor_id,
+            actor=actor,
             path=path,
             content=(_field(document, "original_text") or "") if with_content else "",
             description=description,
@@ -259,12 +262,12 @@ class HindsightMemoryStore(MemoryStore):
     # ── MemoryStore ───────────────────────────────────────────────
 
     def write(
-        self, actor_id: str, path: str, content: str, description: str | None = None
+        self, actor: MemoryActor, path: str, content: str, description: str | None = None
     ) -> MemoryEntry:
-        validate_actor_id(actor_id)
+        validate_actor(actor)
         validate_path(path)
         validate_content(content, description)
-        bank = bank_id_for(current_workspace_id(), actor_id)
+        bank = bank_id_for(current_workspace_id(), actor)
         self._ensure_bank(bank)
         self._call(
             self._client.aretain(
@@ -281,30 +284,28 @@ class HindsightMemoryStore(MemoryStore):
         document = self._call(self._fetch(bank, path), "write")
         if document is None:
             now = now_epoch()
-            return MemoryEntry(actor_id, path, content, description, now, now)
-        return self._entry(actor_id, path, document, with_content=True)
+            return MemoryEntry(actor, path, content, description, now, now)
+        return self._entry(actor, path, document, with_content=True)
 
-    def get(self, actor_id: str, path: str) -> MemoryEntry | None:
-        validate_actor_id(actor_id)
+    def get(self, actor: MemoryActor, path: str) -> MemoryEntry | None:
+        validate_actor(actor)
         validate_path(path)
-        bank = bank_id_for(current_workspace_id(), actor_id)
+        bank = bank_id_for(current_workspace_id(), actor)
         document = self._call(self._fetch(bank, path), "get")
-        return (
-            None if document is None else self._entry(actor_id, path, document, with_content=True)
-        )
+        return None if document is None else self._entry(actor, path, document, with_content=True)
 
     def list(
         self,
-        actor_id: str,
+        actor: MemoryActor,
         path_prefix: str | None = None,
         page_token: str | None = None,
         page_size: int = DEFAULT_PAGE_SIZE,
     ) -> MemoryPage:
-        validate_actor_id(actor_id)
+        validate_actor(actor)
         prefix = validate_path_prefix(path_prefix)
         validate_limit(page_size, MAX_PAGE_SIZE)
         offset = _offset_from_page_token(page_token)
-        bank = bank_id_for(current_workspace_id(), actor_id)
+        bank = bank_id_for(current_workspace_id(), actor)
 
         async def fetch() -> tuple[list[Any], Any]:
             try:
@@ -331,7 +332,7 @@ class HindsightMemoryStore(MemoryStore):
             entry
             for entry in (
                 self._entry(
-                    actor_id, _path_from_document_id(_field(item, "id")), item, with_content=False
+                    actor, _path_from_document_id(_field(item, "id")), item, with_content=False
                 )
                 for item in items
             )
@@ -341,17 +342,17 @@ class HindsightMemoryStore(MemoryStore):
 
     def search(
         self,
-        actor_id: str,
+        actor: MemoryActor,
         query: str,
         path_prefix: str | None = None,
         limit: int = DEFAULT_SEARCH_LIMIT,
     ) -> builtins.list[MemoryHit]:
-        validate_actor_id(actor_id)
+        validate_actor(actor)
         prefix = validate_path_prefix(path_prefix)
         validate_limit(limit, MAX_SEARCH_LIMIT)
         if not isinstance(query, str) or not query.strip():
             raise OmnigentError("query is required", code=ErrorCode.INVALID_INPUT)
-        bank = bank_id_for(current_workspace_id(), actor_id)
+        bank = bank_id_for(current_workspace_id(), actor)
 
         async def recall() -> list[tuple[str, Any]]:
             try:
@@ -384,16 +385,16 @@ class HindsightMemoryStore(MemoryStore):
         total = len(found)
         return [
             MemoryHit(
-                entry=self._entry(actor_id, path, document, with_content=True),
+                entry=self._entry(actor, path, document, with_content=True),
                 score=float(total - rank),
             )
             for rank, (path, document) in enumerate(found)
         ]
 
-    def delete(self, actor_id: str, path: str) -> bool:
-        validate_actor_id(actor_id)
+    def delete(self, actor: MemoryActor, path: str) -> bool:
+        validate_actor(actor)
         validate_path(path)
-        bank = bank_id_for(current_workspace_id(), actor_id)
+        bank = bank_id_for(current_workspace_id(), actor)
 
         async def remove() -> bool:
             try:

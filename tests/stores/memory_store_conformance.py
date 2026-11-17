@@ -16,14 +16,28 @@ import pytest
 from omnigent.db.db_models import workspace_scope
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.stores.memory_store import (
+    MAX_ACTOR_ID_LENGTH,
     MAX_CONTENT_BYTES,
     MAX_PAGE_SIZE,
     MAX_SEARCH_LIMIT,
+    MemoryActor,
     MemoryStore,
 )
 
-ALICE = "user:alice"
-BOB = "user:bob"
+ALICE = MemoryActor("user", "alice")
+BOB = MemoryActor("user", "bob")
+# Owners a backend must refuse rather than fall back to a shared default.
+_UNUSABLE_ACTORS = pytest.mark.parametrize(
+    "actor",
+    [
+        MemoryActor("user", ""),
+        MemoryActor("user", "   "),
+        MemoryActor("user", "a" * (MAX_ACTOR_ID_LENGTH + 1)),
+        MemoryActor("team", "alice"),
+        "user:alice",
+    ],
+    ids=["empty-id", "blank-id", "long-id", "unknown-type", "not-an-actor"],
+)
 
 
 class MemoryStoreConformance:
@@ -35,7 +49,7 @@ class MemoryStoreConformance:
         loaded = store.get(ALICE, "/user/preferences/style")
 
         assert loaded is not None
-        assert (loaded.actor_id, loaded.path) == (ALICE, "/user/preferences/style")
+        assert (loaded.actor, loaded.path) == (ALICE, "/user/preferences/style")
         assert loaded.content == "Prefers tabs"
         assert loaded.description == "Code style"
         assert loaded.created_at == written.created_at
@@ -122,9 +136,9 @@ class MemoryStoreConformance:
                 store.list(ALICE, page_size=page_size)
             assert excinfo.value.code == ErrorCode.INVALID_INPUT
 
-    @pytest.mark.parametrize("actor", ["", "   "])
-    def test_missing_actor_fails_closed_on_every_operation(
-        self, store: MemoryStore, actor: str
+    @_UNUSABLE_ACTORS
+    def test_unusable_actor_fails_closed_on_every_operation(
+        self, store: MemoryStore, actor: MemoryActor
     ) -> None:
         calls = [
             lambda: store.write(actor, "/a", "x"),
@@ -223,8 +237,10 @@ class SearchableMemoryStoreConformance(MemoryStoreConformance):
 
         assert store.search(BOB, "secret") == []
 
-    @pytest.mark.parametrize("actor", ["", "   "])
-    def test_search_without_an_actor_fails_closed(self, store: MemoryStore, actor: str) -> None:
+    @_UNUSABLE_ACTORS
+    def test_search_without_a_usable_actor_fails_closed(
+        self, store: MemoryStore, actor: MemoryActor
+    ) -> None:
         with pytest.raises(OmnigentError) as excinfo:
             store.search(actor, "x")
         assert excinfo.value.code == ErrorCode.INVALID_INPUT

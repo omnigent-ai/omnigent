@@ -9,6 +9,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, defer
 
 from omnigent.db.db_models import SqlMemory, current_workspace_id
+from omnigent.db.enum_codecs import decode_memory_actor_type, encode_memory_actor_type
 from omnigent.db.utils import (
     get_or_create_engine,
     make_named_managed_session_maker,
@@ -18,10 +19,11 @@ from omnigent.db.utils import (
 from omnigent.stores.memory_store import (
     DEFAULT_PAGE_SIZE,
     MAX_PAGE_SIZE,
+    MemoryActor,
     MemoryEntry,
     MemoryPage,
     MemoryStore,
-    validate_actor_id,
+    validate_actor,
     validate_content,
     validate_limit,
     validate_path,
@@ -32,7 +34,7 @@ from omnigent.stores.memory_store import (
 def _to_entity(row: SqlMemory, *, with_content: bool = True) -> MemoryEntry:
     """Convert an ORM row to a :class:`MemoryEntry`."""
     return MemoryEntry(
-        actor_id=row.actor_id,
+        actor=MemoryActor(decode_memory_actor_type(row.actor_type), row.actor_id),
         path=row.path,
         content=row.content if with_content else "",
         description=row.description,
@@ -64,20 +66,22 @@ class SqlAlchemyMemoryStore(MemoryStore):
         )
 
     def write(
-        self, actor_id: str, path: str, content: str, description: str | None = None
+        self, actor: MemoryActor, path: str, content: str, description: str | None = None
     ) -> MemoryEntry:
-        validate_actor_id(actor_id)
+        validate_actor(actor)
         validate_path(path)
         validate_content(content, description)
         workspace_id = current_workspace_id()
+        actor_type = encode_memory_actor_type(actor.type)
         now = now_epoch()
 
         def write(session: Session) -> MemoryEntry:
-            row = session.get(SqlMemory, (workspace_id, actor_id, path))
+            row = session.get(SqlMemory, (workspace_id, actor_type, actor.id, path))
             if row is None:
                 row = SqlMemory(
                     workspace_id=workspace_id,
-                    actor_id=actor_id,
+                    actor_type=actor_type,
+                    actor_id=actor.id,
                     path=path,
                     content=content,
                     description=description,
@@ -100,27 +104,32 @@ class SqlAlchemyMemoryStore(MemoryStore):
             pass
         return run_write_transaction(self._write_session, "write_memory_retry", write)
 
-    def get(self, actor_id: str, path: str) -> MemoryEntry | None:
-        validate_actor_id(actor_id)
+    def get(self, actor: MemoryActor, path: str) -> MemoryEntry | None:
+        validate_actor(actor)
         validate_path(path)
+        key = (current_workspace_id(), encode_memory_actor_type(actor.type), actor.id, path)
         with self._session("get_memory") as session:
-            row = session.get(SqlMemory, (current_workspace_id(), actor_id, path))
+            row = session.get(SqlMemory, key)
             return None if row is None else _to_entity(row)
 
     def list(
         self,
-        actor_id: str,
+        actor: MemoryActor,
         path_prefix: str | None = None,
         page_token: str | None = None,
         page_size: int = DEFAULT_PAGE_SIZE,
     ) -> MemoryPage:
-        validate_actor_id(actor_id)
+        validate_actor(actor)
         prefix = validate_path_prefix(path_prefix)
         validate_limit(page_size, MAX_PAGE_SIZE)
         if page_token is not None:
             # The token is the last path returned; reject anything that isn't one.
             validate_path(page_token)
-        owned = (SqlMemory.workspace_id == current_workspace_id(), SqlMemory.actor_id == actor_id)
+        owned = (
+            SqlMemory.workspace_id == current_workspace_id(),
+            SqlMemory.actor_type == encode_memory_actor_type(actor.type),
+            SqlMemory.actor_id == actor.id,
+        )
         # Listings carry no bodies, so leave the content column unread.
         under = select(SqlMemory).options(defer(SqlMemory.content)).where(*owned)
         if prefix is not None:
@@ -149,10 +158,11 @@ class SqlAlchemyMemoryStore(MemoryStore):
         next_token = entries[-1].path if len(rows) > page_size else None
         return MemoryPage(entries=entries, next_page_token=next_token)
 
-    def delete(self, actor_id: str, path: str) -> bool:
-        validate_actor_id(actor_id)
+    def delete(self, actor: MemoryActor, path: str) -> bool:
+        validate_actor(actor)
         validate_path(path)
         workspace_id = current_workspace_id()
+        actor_type = encode_memory_actor_type(actor.type)
 
         def write(session: Session) -> bool:
             result = cast(
@@ -160,7 +170,8 @@ class SqlAlchemyMemoryStore(MemoryStore):
                 session.execute(
                     delete(SqlMemory).where(
                         SqlMemory.workspace_id == workspace_id,
-                        SqlMemory.actor_id == actor_id,
+                        SqlMemory.actor_type == actor_type,
+                        SqlMemory.actor_id == actor.id,
                         SqlMemory.path == path,
                     )
                 ),

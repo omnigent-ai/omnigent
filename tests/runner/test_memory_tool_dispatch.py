@@ -138,10 +138,17 @@ async def test_an_owner_supplied_by_the_model_is_never_forwarded() -> None:
     await _call(
         client,
         "memory_write",
-        {"path": "/a", "content": "x", "actor_id": "user:victim", "user_id": "victim"},
+        {
+            "path": "/a",
+            "content": "x",
+            "actor_type": "user",
+            "actor_id": "victim",
+            "user_id": "victim",
+        },
     )
-    await _call(client, "memory_search", {"query": "q", "actor_id": "user:victim"})
+    await _call(client, "memory_search", {"query": "q", "actor_id": "victim"})
 
+    assert all("actor_type" not in (call[2] or {}) for call in client.calls)
     assert all("actor_id" not in (call[2] or {}) for call in client.calls)
     assert all("user_id" not in (call[2] or {}) for call in client.calls)
 
@@ -370,4 +377,5 @@ def test_schemas_are_valid_and_never_ask_for_an_owner() -> None:
             continue
         jsonschema.Draft202012Validator.check_schema(function["parameters"])
         assert function["parameters"]["additionalProperties"] is False
-        assert not {"actor_id", "user_id", "owner"} & set(function["parameters"]["properties"])
+        owner_fields = {"actor_type", "actor_id", "user_id", "owner"}
+        assert not owner_fields & set(function["parameters"]["properties"])
