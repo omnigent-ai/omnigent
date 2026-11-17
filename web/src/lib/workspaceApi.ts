@@ -256,6 +256,8 @@ async function listDirectory(
       { path, pageSize: Math.min(LIST_PAGE_SIZE, maxEntries - data.length), pageToken },
       { signal },
     );
+    // A host that hands back the token it was given is resending a page; stop before keeping it.
+    if (pageToken && page.nextPageToken === pageToken) break;
     for (const entry of page.entries) {
       data.push({
         // The REST listing's entry id is its path.
@@ -267,10 +269,9 @@ async function listDirectory(
         modified_at: entry.modifyTime ? Number(entry.modifyTime.seconds) : null,
       });
     }
-    // A page that adds nothing, or repeats the token, would never end; report the rest as more.
-    const stalled = page.entries.length === 0 || page.nextPageToken === pageToken;
     pageToken = page.nextPageToken;
-    if (stalled) break;
+    // A page that adds nothing would never end the listing; report the rest as more.
+    if (page.entries.length === 0) break;
   } while (pageToken && data.length < maxEntries);
   /* oxlint-enable no-await-in-loop */
   return { data, hasMore: pageToken !== "" };

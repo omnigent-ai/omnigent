@@ -323,6 +323,33 @@ describe("readFileViaWorkspaceApi", () => {
     await expect(listDirectoryViaWorkspaceApi("s-list", "src", 0)).rejects.toThrow(RangeError);
   });
 
+  it("asks for pages up to the caller's limit, ending on a partial page", async () => {
+    enable("workspace_api_server_access");
+    const pageSizes: number[] = [];
+    vi.mocked(authenticatedFetch).mockImplementation(async (_input, init) => {
+      const request = fromBinary(ListDirectoryRequestSchema, init!.body as Uint8Array);
+      pageSizes.push(request.pageSize);
+      const first = Number(request.pageToken || 0);
+      const page = create(ListDirectoryResponseSchema, {
+        entries: Array.from({ length: request.pageSize }, (_, i) => ({
+          name: `${first + i}`,
+          path: `src/${first + i}`,
+        })),
+        nextPageToken: String(first + request.pageSize),
+      });
+      return new Response(toBinary(ListDirectoryResponseSchema, page), {
+        headers: { "content-type": "application/proto" },
+      });
+    });
+
+    const listed = await listDirectoryViaWorkspaceApi("s-list-limit", "src", 1500);
+
+    expect(pageSizes).toEqual([1000, 500]);
+    expect(listed?.data).toHaveLength(1500);
+    expect(listed?.data.at(-1)?.path).toBe("src/1499");
+    expect(listed?.hasMore).toBe(true);
+  });
+
   it.each([
     ["repeats its page token", 1, 2],
     ["sends an empty page with a token", 0, 1],
@@ -339,7 +366,10 @@ describe("readFileViaWorkspaceApi", () => {
         }),
     );
 
-    expect((await listDirectoryViaWorkspaceApi("s-list-stalled", "src", 1000))?.hasMore).toBe(true);
+    const listed = await listDirectoryViaWorkspaceApi("s-list-stalled", "src", 1000);
+
+    expect(listed?.hasMore).toBe(true);
+    expect(listed?.data.map((entry) => entry.path)).toEqual(entries ? ["src/a.ts"] : []);
     expect(authenticatedFetch).toHaveBeenCalledTimes(requests);
   });
 
