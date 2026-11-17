@@ -41,10 +41,6 @@ export const UNOWNED_CONTROLS: Readonly<Record<string, { count: number; reason: 
     reason:
       "Skill or plugin row's open button; its region's owner is a prop, which the guard can't read.",
   },
-  "src/pages/settings/HarnessCatalog.tsx › HarnessCatalog › SettingsDataRegion": {
-    count: 2,
-    reason: "Data region's entry is picked at runtime, which the guard can't read.",
-  },
   "src/pages/settings/HarnessCatalog.tsx › McpRow › summary": {
     count: 1,
     reason:
@@ -89,16 +85,17 @@ export const UNOWNED_CONTROLS: Readonly<Record<string, { count: number; reason: 
   "src/pages/settings/HarnessFixDialog.tsx › HarnessFixDialog › Button": {
     count: 15,
     reason:
-      "Fix dialog's own buttons; the dialog's owner is picked at runtime, which the guard can't read.",
+      "Fix dialog's own buttons; this run walks the dialog without its opener's owner, which the Harnesses section's run covers.",
   },
   "src/pages/settings/HarnessFixDialog.tsx › HarnessFixDialog › DialogContent": {
     count: 1,
     reason:
-      "Fix dialog's own buttons; the dialog's owner is picked at runtime, which the guard can't read.",
+      "Fix dialog's own buttons; this run walks the dialog without its opener's owner, which the Harnesses section's run covers.",
   },
   "src/pages/settings/HarnessFixDialog.tsx › SwitchAccountConfirm › input": {
     count: 1,
-    reason: "Fix dialog control; its owner is picked at runtime, which the guard can't read.",
+    reason:
+      "Fix dialog control; this run walks the dialog without its opener's owner, which the Harnesses section's run covers.",
   },
   "src/pages/settings/PickerVisibilitySetting.tsx › PickerVisibilitySetting › CommandInput": {
     count: 1,
@@ -108,25 +105,24 @@ export const UNOWNED_CONTROLS: Readonly<Record<string, { count: number; reason: 
     count: 1,
     reason: "Credential choice card.",
   },
-  "src/pages/settings/SettingsHarnessesSection.tsx › SettingsHarnessesSection › SettingsOverlayOwner":
-    {
-      count: 1,
-      reason: "Fix dialog's owner is picked at runtime, which the guard can't read.",
-    },
   "src/shell/HarnessCredentialForm.tsx › AdoptRow › Button": {
     count: 1,
-    reason: "Credential form control; its owner is picked at runtime, which the guard can't read.",
+    reason:
+      "Credential form control; this run walks the form without its fix dialog's owner, which the Harnesses section's run covers.",
   },
   "src/shell/HarnessCredentialForm.tsx › HarnessCredentialForm › Input": {
     count: 3,
-    reason: "Credential form control; its owner is picked at runtime, which the guard can't read.",
+    reason:
+      "Credential form control; this run walks the form without its fix dialog's owner, which the Harnesses section's run covers.",
   },
   "src/shell/HarnessCredentialForm.tsx › HarnessCredentialForm › button": {
     count: 1,
-    reason: "Credential form control; its owner is picked at runtime, which the guard can't read.",
+    reason:
+      "Button that copies the subscription login command, named by the command; not a catalog part yet.",
   },
   "src/shell/HarnessCredentialForm.tsx › SaveButton › Button": {
     count: 1,
-    reason: "Credential form control; its owner is picked at runtime, which the guard can't read.",
+    reason:
+      "Credential form control; this run walks the form without its fix dialog's owner, which the Harnesses section's run covers.",
   },
 };
