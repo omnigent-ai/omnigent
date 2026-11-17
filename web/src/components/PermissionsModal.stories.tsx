@@ -28,7 +28,10 @@ function modalEnvironment({
       <StoryQueryRouter
         route={`/c/${sessionId}`}
         seed={(queryClient) => {
-          queryClient.setQueryData(["permissions", sessionId], permissions);
+          queryClient.setQueryData(["permissions", sessionId], {
+            permissions,
+            managedByAutomation: null,
+          });
         }}
       >
         <Story />

@@ -35,7 +35,13 @@ from starlette.datastructures import Headers
 
 from omnigent.db.db_models import current_workspace_id
 from omnigent.db.utils import generate_agent_id
-from omnigent.entities import ScheduledTask, ScheduledTaskRun, StoredFile
+from omnigent.entities import (
+    ScheduledTask,
+    ScheduledTaskPermission,
+    ScheduledTaskRun,
+    SessionPermission,
+    StoredFile,
+)
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
 from omnigent.server.bundles import bundle_location
 from omnigent.server.routes._host_worktree import (
@@ -427,9 +433,13 @@ class FakePermissionStore:
         fail_grant: bool = False,
         fail_grant_users: set[str] | None = None,
         users: set[str] | None = None,
+        task_grantees: list[str] | None = None,
     ) -> None:
         self.ensured: list[str] = []
         self.grants: list[tuple[str, str, int]] = []
+        # The automation's grantees; ``None`` is a store without automation grants.
+        self.task_grantees = task_grantees
+        self.deleted_task_grants: list[str] = []
         self.grant_workspace_ids: list[int] = []
         self.fail_grant = fail_grant
         # Fail only grants to these user ids (e.g. just the public grant),
@@ -462,6 +472,34 @@ class FakePermissionStore:
             raise RuntimeError("grant failed")
         self.grants.append((user_id, conversation_id, level))
         return None
+
+    def grant_if_absent(self, user_id: str, conversation_id: str, level: int) -> bool:
+        if self.get(user_id, conversation_id) is not None:
+            return False
+        self.grant(user_id, conversation_id, level)
+        return True
+
+    def get(self, user_id: str, conversation_id: str) -> SessionPermission | None:
+        held = [g for g in self.grants if g[:2] == (user_id, conversation_id)]
+        return SessionPermission(*held[-1]) if held else None
+
+    @property
+    def supports_scheduled_task_grants(self) -> bool:
+        return self.task_grantees is not None
+
+    def list_for_scheduled_task(self, scheduled_task_id: str, **_: Any) -> tuple[list[Any], None]:
+        grantees = self.task_grantees or []
+        return [ScheduledTaskPermission(u, scheduled_task_id, LEVEL_READ) for u in grantees], None
+
+    def resolve_scheduled_task_access(self, principals: list[str], task_id: str) -> int | None:
+        return LEVEL_READ if set(principals) & set(self.task_grantees or []) else None
+
+    def list_for_session(self, conversation_id: str, **_: Any) -> tuple[list[Any], None]:
+        return [SessionPermission(*g) for g in self.grants if g[1] == conversation_id], None
+
+    def delete_for_scheduled_task(self, scheduled_task_id: str) -> int:
+        self.deleted_task_grants.append(scheduled_task_id)
+        return 0
 
 
 @dataclass
@@ -769,9 +807,11 @@ async def test_active_creates_session_grant_and_run(
     assert not [
         k for k in conv_store.created[0]["labels"] if k.startswith("omnigent.mcp_service.")
     ]
-    assert conv_store.created[0]["title"] == (
-        "[automation job] nightly" if trigger and session_mode == "continue" else "nightly"
-    )
+    title = conv_store.created[0]["title"]
+    if session_mode == "continue":
+        assert title == ("[automation job] nightly" if trigger else "nightly")
+    else:
+        assert re.fullmatch(r"nightly \(\d{4}-\d{2}-\d{2} \d{2}:\d{2}\)", title)
     # NULL owner resolved to "local" and granted LEVEL_OWNER.
     assert perm.ensured == [RESERVED_USER_LOCAL]
     assert perm.grants and perm.grants[0][0] == RESERVED_USER_LOCAL
@@ -1070,6 +1110,7 @@ async def test_deleted_owner_disables_task_and_records_failed_run() -> None:
     assert perm.ensured == []
     assert perm.grants == []
     assert {"id": "task_1", "state": "deleted"} in store.updates
+    assert perm.deleted_task_grants == ["task_1"]
     assert len(store.runs) == 1
     assert store.runs[0]["status"] == "failed"
     assert store.runs[0]["error_code"] == "owner_deleted"
@@ -2817,6 +2858,28 @@ async def test_public_grant_failure_does_not_cancel_run() -> None:
     assert not any(r.get("error_code") == "owner_grant_failed" for r in store.runs)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["grant", "list"])
+async def test_a_failed_share_never_fails_the_run(failure: str) -> None:
+    """Sharing a run with the automation's grantees is best-effort; the run still starts."""
+    perm = FakePermissionStore(
+        task_grantees=["alice@example.com", "bob@example.com"],
+        fail_grant_users={"alice@example.com"},
+    )
+    if failure == "list":
+        perm.list_for_scheduled_task = Mock(side_effect=RuntimeError("list failed"))
+    store = FakeScheduledTaskStore(rows={"task_1": _task()})
+
+    launched = await _fire_once(_deps(store, permission_store=perm))
+
+    [conv] = launched
+    shared = [g[0] for g in perm.grants if g[2] == LEVEL_READ]
+    assert shared == ([] if failure == "list" else ["bob@example.com"])
+    assert [(run["status"], run["conversation_id"]) for run in store.runs] == [
+        ("running", conv.id)
+    ]
+
+
 # ── Continuing one session ───────────────────────────────────────────────────
 
 
@@ -4475,6 +4538,25 @@ def test_session_approval_skipping_mode(
     assert fire_mod.session_approval_skipping_mode(conv) == expected
 
 
+def test_new_session_run_titles_carry_the_fire_time_in_the_task_timezone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 2026-11-13 17:05 UTC.
+    monkeypatch.setattr(fire_mod.time, "time", lambda: 1_794_589_500.0)
+
+    assert fire_mod._scheduled_session_title(_task(name="NHPC rollout check")) == (
+        "NHPC rollout check (2026-11-13 17:05)"
+    )
+    assert fire_mod._scheduled_session_title(
+        _task(name="NHPC rollout check", timezone="America/Los_Angeles")
+    ) == ("NHPC rollout check (2026-11-13 09:05)")
+    assert fire_mod._scheduled_session_title(_task(timezone="Not/AZone")) == (
+        "nightly (2026-11-13 17:05)"
+    )
+    # A continued session spans many runs, so one run's time would mislabel it.
+    assert fire_mod._scheduled_session_title(_task(session_mode="continue")) == "nightly"
+
+
 # ── Runs that start from a copy of a session ───────────────────────────────
 
 
@@ -4501,11 +4583,8 @@ async def test_a_run_starts_from_a_copy_of_the_source_session() -> None:
 
     assert conv_store.created == []
     (fork,) = conv_store.forked
-    assert (fork["source_id"], fork["agent_id"], fork["title"]) == (
-        "conv_source",
-        "ag_1",
-        "nightly",
-    )
+    assert (fork["source_id"], fork["agent_id"]) == ("conv_source", "ag_1")
+    assert fork["title"].startswith("nightly (")
     # The run rebuilds its native transcript from its own copy, never another session's file.
     assert fork["resume_source_native_session"] is False
     # It plans its own work: the source's journal stays behind.

@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { authenticatedFetch } from "@/lib/identity";
 
-import { useCloneWorkflow, useWorkflowRuns } from "./useWorkflow";
+import { useCloneWorkflow, useSaveWorkflowPlan, useWorkflowRuns } from "./useWorkflow";
 
 // Let server data change without remounting or invalidating the real query.
 vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
@@ -25,6 +25,7 @@ const COMPLETED_RUN = {
 const RUNNING_RUN = {
   ...COMPLETED_RUN,
   id: "run_new",
+  plan_graph_revision: "graph-3",
   session_id: "session_new",
   title: "New run",
   started_at: 2,
@@ -119,6 +120,38 @@ describe("useCloneWorkflow", () => {
   });
 });
 
+describe("useSaveWorkflowPlan", () => {
+  it("saves only the steps when an older server refuses the description check", async () => {
+    const steps = [{ id: "review", name: "Review", goal: null, depends_on: [] }];
+    const saved = { id: "workflow", name: "Review", description: "Review changes.", steps };
+    const proposal = {
+      steps,
+      description: "Reviews open changes.",
+      expected_description: "Review changes.",
+    };
+    // How a server from before expected_description refuses the unknown field.
+    const refusal = {
+      detail: [{ type: "extra_forbidden", loc: ["body", "expected_description"] }],
+    };
+    vi.mocked(authenticatedFetch)
+      .mockResolvedValueOnce(Response.json(refusal, { status: 422 }))
+      .mockResolvedValueOnce(Response.json(saved));
+    const client = new QueryClient();
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    );
+    const { result } = renderHook(() => useSaveWorkflowPlan("workflow"), { wrapper });
+
+    await act(async () => {
+      await expect(result.current.mutateAsync(proposal)).resolves.toEqual(saved);
+    });
+    const bodies = vi
+      .mocked(authenticatedFetch)
+      .mock.calls.map(([, init]) => JSON.parse(init!.body as string));
+    expect(bodies).toEqual([proposal, { steps }]);
+  });
+});
+
 describe("useWorkflowRuns live refresh", () => {
   it.each([
     { name: "empty", history: [] },
@@ -143,6 +176,7 @@ describe("useWorkflowRuns live refresh", () => {
         serverRuns.map((run) => run.id),
       );
       expect(result.current.data?.pages[0].runs[0].sessionStatus).toBe("running");
+      expect(result.current.data?.pages[0].runs[0].planGraphRevision).toBe("graph-3");
 
       serverRuns = [
         { ...RUNNING_RUN, session_status: "idle", background_work_running: true },

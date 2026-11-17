@@ -259,21 +259,6 @@ if TYPE_CHECKING:
 _FS_READER_CACHE_SIZE = 8
 
 
-def _workspace_direct_access_enabled() -> bool:
-    """Whether ``OMNIGENT_FEATURES`` turns on the host's workspace socket.
-
-    An unreadable feature list leaves the optional socket off rather than
-    stopping the host.
-    """
-    from omnigent.server.feature_flags import Feature, resolve_feature_flags
-
-    try:
-        return resolve_feature_flags().enabled(Feature.WORKSPACE_DIRECT_ACCESS)
-    except ValueError:
-        _logger.warning("OMNIGENT_FEATURES is invalid; workspace direct access is off")
-        return False
-
-
 # Older servers omit a create's timeout_s and wait 150 s for its reply; finish inside that.
 _LEGACY_SERVER_CREATE_BUDGET_S = 140.0
 
@@ -3843,15 +3828,15 @@ class HostProcess:
         )
 
     async def _start_workspace_socket(self) -> WorkspaceSocket | None:
-        """Open the direct workspace socket when enabled and installed, else ``None``."""
-        if not _workspace_direct_access_enabled():
-            return None
+        """Open the direct workspace socket when its extra is installed, else ``None``.
+
+        The server's ``workspace_direct_access`` decides whether anyone gets a
+        token for it; without one, every call is refused.
+        """
         try:
             from omnigent.host.workspace_service import start_workspace_socket
         except ImportError:
-            _logger.warning(
-                "workspace_direct_access needs `omnigent[workspace-api]`; direct access is off"
-            )
+            _logger.debug("No `omnigent[workspace-api]`; the workspace socket is off")
             return None
         return await start_workspace_socket(self._workspace_reader, host_id=self._identity.host_id)
 

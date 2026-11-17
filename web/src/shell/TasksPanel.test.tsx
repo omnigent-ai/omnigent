@@ -8,13 +8,14 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { FullscreenIcon } from "@/components/ai-elements/MermaidBlock";
 import { type ChildSessionInfo, useChildSessions } from "@/hooks/useChildSessions";
 import { useSavedWorkflows } from "@/hooks/useSavedWorkflows";
 import { type SessionJournalView, useSessionJournal } from "@/hooks/useSessionJournal";
 import { useOptionalLoadedConversations } from "@/hooks/useSidebarData";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { formatMessageTimestamp } from "@/lib/relativeTime";
-import type { JournalEntry } from "@/lib/sessionJournal";
+import type { JournalEntry, StepProgress } from "@/lib/sessionJournal";
 import type { ConversationState } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
 import {
@@ -28,8 +29,40 @@ import {
 } from "@/store/sessionTasksActions";
 import { journalEntry, journalPlan } from "@/test/journalFixtures";
 import { conversation, conversationPage } from "@/test/sidebarMockHelpers";
-import { TasksPanel } from "./TasksPanel";
+import { TasksPanel, type TaskMenuAction } from "./TasksPanel";
 
+// The graph has its own tests (React Flow runs out of memory in jsdom); here the
+// full-screen view lists the steps it draws, where each task stands, and its ⋯ action.
+vi.mock("@/components/workflows/WorkflowStepsGraph", () => ({
+  WorkflowGraphOverlay: (props: {
+    title: string;
+    steps: readonly { id: string; depends_on: string[] }[];
+    progress?: StepProgress[];
+    menuActionFor?: (item: StepProgress) => TaskMenuAction | undefined;
+    onClose: () => void;
+  }) => (
+    <div
+      data-testid="workflow-graph-overlay"
+      data-title={props.title}
+      data-steps={props.steps.map((step) => `${step.id}<${step.depends_on.join("+")}`).join(" ")}
+    >
+      {props.progress?.map((item) => `${item.step.id}:${item.state}`).join(" ")}
+      {props.progress?.map((item) => {
+        const menuAction = props.menuActionFor?.(item);
+        return (
+          menuAction && (
+            <button key={item.step.id} type="button" onClick={menuAction.onSelect}>
+              {`${menuAction.action} ${item.step.id}`}
+            </button>
+          )
+        );
+      })}
+      <button type="button" onClick={props.onClose}>
+        Close graph
+      </button>
+    </div>
+  ),
+}));
 vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
   ...(await importOriginal<typeof UseChildSessionsModule>()),
   useChildSessions: vi.fn(),
@@ -684,6 +717,69 @@ describe("TasksPanel", () => {
     }
   });
 
+  it("hides run controls after the final step finishes, even with unfinished earlier steps", () => {
+    showJournal([
+      journalPlan(0, ["explore"], ["work", ["explore"]], ["report", ["work"]]),
+      status(1, "explore", "done"),
+      status(2, "report", "done"),
+    ]);
+    const withdrawContinue = registerContinuePlan("conv", vi.fn());
+    const withdrawStop = registerStopWork("conv", vi.fn());
+    try {
+      setSession({ sessionStatus: "running" });
+      renderPanel();
+      expect(screen.queryByTestId("plan-stop")).toBeNull();
+      expect(screen.queryByTestId("plan-continue")).toBeNull();
+
+      setSession({ sessionStatus: "idle" });
+      expect(screen.queryByTestId("plan-stop")).toBeNull();
+      expect(screen.queryByTestId("plan-continue")).toBeNull();
+      expect(screen.queryByTestId("tasks-paused")).toBeNull();
+
+      showJournal([
+        journalPlan(0, ["explore"], ["work", ["explore"]], ["report", ["work"]]),
+        status(1, "explore", "done"),
+        status(2, "report", "done"),
+        status(3, "work", "started"),
+      ]);
+      setSession({ sessionStatus: "running" });
+      expect(screen.getByTestId("plan-stop")).toBeInTheDocument();
+      setSession({ sessionStatus: "idle" });
+      expect(screen.getByTestId("plan-continue")).toBeInTheDocument();
+
+      showJournal([
+        journalPlan(0, ["explore"], ["work", ["explore"]], ["report", ["work"]]),
+        status(1, "explore", "done"),
+        status(2, "report", "done"),
+        journalPlan(3, ["explore"], ["review", ["explore"]], ["report", ["review"]]),
+      ]);
+      setSession({ sessionStatus: "running" });
+      expect(screen.getByTestId("plan-stop")).toBeInTheDocument();
+      setSession({ sessionStatus: "idle" });
+      expect(screen.getByTestId("plan-continue")).toBeInTheDocument();
+
+      const dependencyEntries = [
+        journalPlan(0, ["review"], ["report"]),
+        status(1, "review", "started"),
+        status(2, "report", "done"),
+        journalPlan(3, ["review"], ["report", ["review"]]),
+      ];
+      showJournal(dependencyEntries);
+      setSession({ sessionStatus: "running" });
+      expect(screen.getByTestId("plan-stop")).toBeInTheDocument();
+      setSession({ sessionStatus: "idle" });
+      expect(screen.getByTestId("plan-continue")).toBeInTheDocument();
+      showJournal([...dependencyEntries, status(4, "review", "done"), status(5, "report", "done")]);
+      setSession({ sessionStatus: "running" });
+      expect(screen.queryByTestId("plan-stop")).toBeNull();
+      setSession({ sessionStatus: "idle" });
+      expect(screen.queryByTestId("plan-continue")).toBeNull();
+    } finally {
+      act(withdrawContinue);
+      act(withdrawStop);
+    }
+  });
+
   it("heads the list with the plan's name", () => {
     const named = journalPlan(0, ["baseline"]);
     named.content.name = "Cut GET /orders p95 by 20%";
@@ -693,6 +789,82 @@ describe("TasksPanel", () => {
     // The name is the heading, level with "Updated …"; the tab already says Tasks.
     expect(screen.getByRole("heading", { name: "Cut GET /orders p95 by 20%" })).toBeTruthy();
     expect(screen.queryByRole("heading", { name: "Tasks" })).toBeNull();
+  });
+
+  it("opens the plan on its graph, with where each task stands and its ⋯ action", async () => {
+    const entries = [
+      journalPlan(0, ["baseline"], ["batch", ["baseline"]], ["pool", ["baseline"]]),
+      status(1, "baseline", "done"),
+      status(2, "batch", "failed", "Reverted"),
+      status(3, "pool", "needs_input", "Raise the pool size?"),
+    ];
+    showJournal(entries);
+    const question = {
+      type: "elicitation",
+      elicitationId: "elicit_pool",
+      status: "pending",
+      phase: "workflow_request_input",
+      journalStep: "pool",
+    };
+    setSession({ blocks: [question] as unknown as ConversationState["blocks"] });
+    const taskAction = vi.fn();
+    const withdraw = registerTaskAction("conv", taskAction);
+    try {
+      const { rerender } = renderPanel();
+      const showSession = (conversationId: string) =>
+        rerender(
+          <>
+            <TasksPanel conversationId={conversationId} active />
+            <SearchProbe />
+          </>,
+        );
+      // The fullscreen glyph a run row's graph button shows too.
+      const { container: fullscreenGlyph } = render(<FullscreenIcon />);
+      expect(screen.getByTestId("tasks-plan-graph").innerHTML).toBe(fullscreenGlyph.innerHTML);
+      fireEvent.click(screen.getByTestId("tasks-plan-graph"));
+      const overlay = await screen.findByTestId("workflow-graph-overlay");
+      expect(overlay).toHaveAttribute("data-title", "The plan");
+      expect(overlay).toHaveAttribute("data-steps", "baseline< batch<baseline pool<baseline");
+      expect(overlay).toHaveTextContent("baseline:done batch:failed pool:needs_input");
+      fireEvent.click(within(overlay).getByRole("button", { name: "retry batch" }));
+      expect(taskAction).toHaveBeenCalledWith("retry", "batch");
+      // The open graph follows the journal: once batch starts again, it offers Continue.
+      showJournal([...entries, status(4, "batch", "started")]);
+      showSession("conv");
+      expect(overlay).toHaveTextContent("baseline:done batch:stopped pool:needs_input");
+      expect(within(overlay).getByRole("button", { name: "continue batch" })).toBeTruthy();
+      // Continue shows the task's question in the chat, which the graph would cover.
+      fireEvent.click(within(overlay).getByRole("button", { name: "proceed pool" }));
+      expect(screen.queryByTestId("workflow-graph-overlay")).toBeNull();
+      const search = new URLSearchParams(screen.getByTestId("search").textContent ?? "");
+      expect(search.get("message")).toBe("elicit_pool");
+
+      fireEvent.click(screen.getByTestId("tasks-plan-graph"));
+      fireEvent.click(
+        within(await screen.findByTestId("workflow-graph-overlay")).getByRole("button", {
+          name: "Close graph",
+        }),
+      );
+      expect(screen.queryByTestId("workflow-graph-overlay")).toBeNull();
+
+      // Leaving the session closes the graph, and coming back doesn't reopen it.
+      fireEvent.click(screen.getByTestId("tasks-plan-graph"));
+      await screen.findByTestId("workflow-graph-overlay");
+      showSession("other");
+      expect(screen.queryByTestId("workflow-graph-overlay")).toBeNull();
+      showSession("conv");
+      expect(screen.getByTestId("tasks-plan-graph")).toBeTruthy();
+      expect(screen.queryByTestId("workflow-graph-overlay")).toBeNull();
+    } finally {
+      act(withdraw);
+    }
+    cleanup();
+
+    // Statuses written without a plan say nothing about what waits on what.
+    showJournal([status(1, "baseline", "done")]);
+    renderPanel();
+    expect(screen.getByTestId("tasks-row")).toBeTruthy();
+    expect(screen.queryByTestId("tasks-plan-graph")).toBeNull();
   });
 
   it("says every task finished when the last one failed", () => {
@@ -778,6 +950,25 @@ describe("TasksPanel", () => {
       todos: [{ content: "Deploy", status: "in_progress", activeForm: "Deploying" }],
     });
     expect(screen.getByTestId("tasks-row")).toHaveAttribute("data-state", "running");
+
+    let withdrawStop = () => {};
+    act(() => {
+      withdrawStop = registerStopWork("conv", vi.fn());
+    });
+    try {
+      showJournal([status(1, "deploy", "done")]);
+      setSession({
+        todos: [{ content: "Deploy", status: "completed", activeForm: "Deploying" }],
+      });
+      // A status without its plan cannot declare the workflow complete.
+      expect(screen.getByTestId("plan-stop")).toBeInTheDocument();
+    } finally {
+      act(withdrawStop);
+    }
+    showJournal([]);
+    setSession({
+      todos: [{ content: "Deploy", status: "in_progress", activeForm: "Deploying" }],
+    });
 
     vi.mocked(useOptionalLoadedConversations).mockReturnValue({
       ...conversationPage([conversation("conv")]).data!,

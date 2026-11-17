@@ -26,6 +26,7 @@ from omnigent.host.frames import HostHelloFrame
 from omnigent.runtime import pending_inputs
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
+from omnigent.server.feature_flags import resolve_feature_flags
 from omnigent.server.managed_hosts import parse_sandbox_config
 from omnigent.server.routes._sessions.helpers import _HostLaunchAttempt
 from omnigent.server.routes.sessions import routes_core
@@ -145,6 +146,35 @@ async def _create(env: _Env, *, name: str = "startup-probe", **options: Any) -> 
     )
     assert response.status_code == 201, response.text
     return response.json()["id"]
+
+
+async def test_workflow_plan_is_available_while_managed_first_input_waits_for_host(
+    startup_env: _Env,
+) -> None:
+    startup_env.app.state.feature_flags = resolve_feature_flags({"OMNIGENT_FEATURES": "workflows"})
+    saved = await startup_env.client.post(
+        "/v1/workflows",
+        json={
+            "name": "Review changes",
+            "description": "Review the local changes.",
+            "steps": [
+                {"id": "review", "name": "Review the diff", "goal": "Identify regressions."}
+            ],
+        },
+    )
+    assert saved.status_code == 200, saved.text
+    workflow = saved.json()
+    session_id = await _create(startup_env, workflow_id=workflow["id"])
+    assert len(startup_env.conv_store.list_pending_inputs(session_id)) == 1
+    journal = await startup_env.client.get(f"/v1/sessions/{session_id}/journal")
+    assert journal.status_code == 200, journal.text
+    plan = journal.json()["data"][1]
+    assert plan["workflow_id"] == workflow["id"]
+    assert plan["content"]["steps"] == workflow["steps"]
+    assert plan["content"]["source"] == "workflow"
+    runs = await startup_env.client.get(f"/v1/workflows/{workflow['id']}/runs")
+    assert runs.status_code == 200, runs.text
+    assert [run["session_id"] for run in runs.json()["data"]] == [session_id]
 
 
 def _bind(env: _Env, session_id: str):

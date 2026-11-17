@@ -1628,6 +1628,8 @@ class _SessionCreateRequestBase(_SandboxProfileSelection):
         e.g. ``"ag_abc123"``. Must match a registered agent.
     :param initial_items: Initial queued events/inputs, typically a
         single user ``"message"``.
+    :param workflow_id: Saved workflow to copy into the session journal before
+        any initial input runs. Requires an owned workflow with a saved plan.
     :param title: Optional human-readable title for the session,
         e.g. ``"debugging auth flow"``.
     :param labels: Initial guardrails labels to set on the session.
@@ -1780,6 +1782,7 @@ class _SessionCreateRequestBase(_SandboxProfileSelection):
     project_id: str | None = None
     initial_items: list[SessionEventInput] = Field(default_factory=list)
     initial_input: SessionStartupInput | None = None
+    workflow_id: str | None = None
     mcp_registry_services: list[McpRegistryServiceId] = Field(
         default_factory=list, max_length=MAX_MCP_REGISTRY_SERVICES
     )
@@ -3474,10 +3477,13 @@ class WorkflowObject(WorkflowSummary):
 
     :param steps: The workflow's graph.
     :param planning_session_id: The conversation for proposing revisions, separate from runs.
+    :param description_source: The planning conversation's journal entry for the proposal
+        the description was saved from, until the description is written otherwise.
     """
 
     steps: list[WorkflowStep]
     planning_session_id: str | None = None
+    description_source: str | None = None
 
 
 class WorkflowList(BaseModel):
@@ -3503,8 +3509,8 @@ class WorkflowList(BaseModel):
 
 class WorkflowRunProgress(BaseModel):
     """
-    Where a run's steps stand: the steps of the plan that started it, counted
-    by their current status in the session.
+    Where a run's latest plan stands within its invocation, counted by each
+    step's newest status.
 
     :param total: Steps in that plan, e.g. ``5``.
     :param started: Steps in progress.
@@ -3525,6 +3531,8 @@ class WorkflowRun(BaseModel):
     One run of a saved workflow: a session that started it.
 
     :param id: The run's ID: that of the plan entry that started it.
+    :param plan_graph_revision: Stable graph ID, or the earliest position of the
+        unchanged legacy graph. ``None`` when authoritative context is unavailable.
     :param session_id: The session that ran it.
     :param title: The session's title; empty when it has none yet.
     :param started_at: Unix epoch seconds when the run's plan was written.
@@ -3534,12 +3542,13 @@ class WorkflowRun(BaseModel):
     :param background_work_running: Whether background work outlives the session's turn.
     :param archived: Whether the session is archived.
     :param progress: Where the run's steps stand.
-    :param steps: The steps of the plan that started the run.
+    :param steps: The latest plan's steps within this invocation.
     :param statuses: Each of those steps' newest status entry; a step with
         none yet is left out.
     """
 
     id: str
+    plan_graph_revision: str | int | None = None
     session_id: str
     title: str
     started_at: int
@@ -3594,6 +3603,10 @@ class UpdateWorkflowRequest(BaseModel):
     :param name: A new name.
     :param description: A new description, subject to the same character and
         stored-byte limits as creation.
+    :param expected_description: Apply ``description`` only while the stored
+        description is still this text, so one written meanwhile stays.
+    :param description_source: The journal entry ID of the planning-chat proposal
+        ``description`` comes from; a description written without one clears it.
     :param steps: New steps, replacing the old ones.
     :param planning_session_id: The private owned session for iterating on the plan.
     """
@@ -3602,6 +3615,8 @@ class UpdateWorkflowRequest(BaseModel):
 
     name: str | None = None
     description: str | None = None
+    expected_description: str | None = None
+    description_source: str | None = None
     steps: list[WorkflowStep] | None = None
     planning_session_id: str | None = None
 

@@ -16,7 +16,10 @@ from omnigent.server.accounts_store import SqlAlchemyAccountStore
 from omnigent.server.device_grant_store import DeviceGrantStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.host_store import HostStore
+from omnigent.stores.inbox_item_store import NewInboxItem
+from omnigent.stores.inbox_item_store.sqlalchemy_store import SqlAlchemyInboxItemStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+from omnigent.stores.proactive_agent_settings_store import ProactiveAgentSettingsStore
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
 from omnigent.stores.workflow_store import WorkflowStore
 
@@ -40,6 +43,7 @@ def test_account_generation_survives_delete_and_rejects_old_writes(db_uri: str) 
         for write in (
             lambda: permissions.ensure_user("alice"),
             lambda: permissions.grant("alice", uuid.uuid4().hex, 3),
+            lambda: permissions.grant_if_absent("alice", uuid.uuid4().hex, 1),
             lambda: permissions.grant_for_scheduled_task("alice", uuid.uuid4().hex, 1),
             lambda: HostStore(db_uri).upsert_on_connect(uuid.uuid4().hex, "laptop", "alice"),
             lambda: DeviceGrantStore(db_uri).create_redeemed_grant(
@@ -1176,6 +1180,7 @@ def test_target_without_registration_cannot_acquire_new_account(db_uri, existing
             for write in (
                 lambda: permissions.ensure_user("target"),
                 lambda: permissions.grant("target", uuid.uuid4().hex, 1),
+                lambda: permissions.grant_if_absent("target", uuid.uuid4().hex, 1),
                 lambda: permissions.grant_for_scheduled_task("target", uuid.uuid4().hex, 1),
             ):
                 with pytest.raises(OmnigentError, match="revoked"):
@@ -1255,3 +1260,104 @@ def test_runner_issuance_rechecks_both_owners_and_binding(db_uri, monkeypatch, c
         else:
             assert pending.result(timeout=15) is None
     assert issued == []
+
+
+def _inbox_item(user_id: str) -> NewInboxItem:
+    return NewInboxItem(
+        user_id=user_id,
+        source_session_id=uuid.uuid4().hex,
+        agent_id=uuid.uuid4().hex,
+        kind="info",
+        title="A private suggestion",
+        body_md="Only the account that got it may read it.",
+        links=[],
+        actions=[],
+        media=[],
+        primary_link=None,
+        topic="private",
+        dedupe_key="v1:private",
+    )
+
+
+def test_deleted_account_inbox_is_not_visible_after_reregistration(db_uri: str) -> None:
+    accounts = SqlAlchemyAccountStore(db_uri)
+    inbox = SqlAlchemyInboxItemStore(db_uri)
+    old = accounts.create_user_with_password("alice", "test-password-hash")
+    with account_authority_scope("alice", old.account_generation):
+        item = inbox.create(_inbox_item("alice"))
+    assert accounts.delete_user("alice") is True
+    new = accounts.create_user_with_password("alice", "replacement-password-hash")
+
+    with account_authority_scope("alice", new.account_generation):
+        assert inbox.list_for_user("alice") == ([], None)
+        assert inbox.get(item.id, "alice") is None
+        assert inbox.get_by_dedupe_key("alice", "v1:private") is None
+    with account_authority_scope("alice", old.account_generation):
+        for write in (
+            lambda: inbox.create(_inbox_item("alice")),
+            lambda: inbox.update(item.id, "alice", status="read", now=1),
+        ):
+            with pytest.raises(OmnigentError, match="revoked"):
+                write()
+
+
+def test_workspace_setting_write_rechecks_the_admin_under_its_lock(db_uri: str) -> None:
+    """A deleted or demoted admin's in-flight workspace write cannot land."""
+    accounts = SqlAlchemyAccountStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    settings = ProactiveAgentSettingsStore(db_uri)
+    # A second admin, so deleting the first one below is allowed.
+    accounts.create_user_with_password("root", "test-password-hash")
+    permissions.set_admin("root", True)
+    admin = accounts.create_user_with_password("admin", "test-password-hash")
+    permissions.set_admin("admin", True)
+    with account_authority_scope("admin", admin.account_generation):
+        settings.set_workspace_enabled(False, actor="admin", require_admin=True)
+    assert settings.read("alice") == (False, True)
+
+    # The route authorized the request while the actor was still an admin.
+    permissions.set_admin("admin", False)
+    with account_authority_scope("admin", admin.account_generation):
+        with pytest.raises(OmnigentError) as demoted:
+            settings.set_workspace_enabled(True, actor="admin", require_admin=True)
+    assert demoted.value.code == ErrorCode.FORBIDDEN
+    assert settings.read("alice") == (False, True)
+
+    permissions.set_admin("admin", True)
+    assert accounts.delete_user("admin") is True
+    with account_authority_scope("admin", admin.account_generation):
+        with pytest.raises(OmnigentError, match="revoked"):
+            settings.set_workspace_enabled(True, actor="admin", require_admin=True)
+    assert settings.read("alice") == (False, True)
+
+
+def test_prompt_write_rechecks_the_admin_under_its_lock(db_uri: str) -> None:
+    """A deleted or demoted admin's in-flight prompt write cannot land."""
+    accounts = SqlAlchemyAccountStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    settings = ProactiveAgentSettingsStore(db_uri)
+    # A second admin, so deleting the first one below is allowed.
+    accounts.create_user_with_password("root", "test-password-hash")
+    permissions.set_admin("root", True)
+    admin = accounts.create_user_with_password("admin", "test-password-hash")
+    permissions.set_admin("admin", True)
+    with account_authority_scope("admin", admin.account_generation):
+        settings.set_prompt_override(
+            "Look for stale pull requests.", actor="admin", require_admin=True
+        )
+    assert settings.read_prompt_override() == "Look for stale pull requests."
+
+    # The route authorized the request while the actor was still an admin.
+    permissions.set_admin("admin", False)
+    with account_authority_scope("admin", admin.account_generation):
+        with pytest.raises(OmnigentError) as demoted:
+            settings.set_prompt_override("Post about anything.", actor="admin", require_admin=True)
+    assert demoted.value.code == ErrorCode.FORBIDDEN
+    assert settings.read_prompt_override() == "Look for stale pull requests."
+
+    permissions.set_admin("admin", True)
+    assert accounts.delete_user("admin") is True
+    with account_authority_scope("admin", admin.account_generation):
+        with pytest.raises(OmnigentError, match="revoked"):
+            settings.set_prompt_override(None, actor="admin", require_admin=True)
+    assert settings.read_prompt_override() == "Look for stale pull requests."

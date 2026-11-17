@@ -13,6 +13,7 @@ import {
   useQueryClient,
   type QueryClient,
 } from "@tanstack/react-query";
+import { invalidateSessionGrants } from "@/hooks/usePermissions";
 import { LIST_ROW_QUERY_ROOTS } from "@/lib/sessionListCache";
 import {
   createScheduledTask,
@@ -56,10 +57,8 @@ export function useScheduledTasks() {
     staleTime: 30_000,
     // POLLING CONTRACT — read before reusing this hook.
     // The 60s interval only runs while a component that mounts this hook is
-    // mounted; TanStack Query tears the interval down on unmount. Today the sole
-    // consumer is TasksPage, which is route-scoped and lazy-loaded at /tasks — so
-    // polling happens ONLY while the user is on the Scheduled Tasks page and
-    // stops the moment they navigate away.
+    // mounted; TanStack Query tears the interval down on unmount. Its consumers
+    // are route-scoped pages, so polling stops the moment the user leaves them.
     // GUARD RAIL: do NOT mount this hook in a persistent / always-rendered spot
     // (sidebar, global layout, an app-shell badge). That would silently turn a
     // page-scoped poll into app-wide 60s background traffic. If you need a
@@ -248,6 +247,8 @@ export function useUpdateScheduledTask() {
       // A schedule/state change can shift the run history too (e.g. a
       // just-reactivated task), so refresh that task's runs if they're loaded.
       void queryClient.invalidateQueries({ queryKey: scheduledTaskRunsKey(updated.id) });
+      // Switching to new sessions stops it managing its session's sharing.
+      invalidateSessionGrants(queryClient);
     },
   });
 }
@@ -293,6 +294,8 @@ export function useDeleteScheduledTask() {
         queryClient.getQueryData<ScheduledTask>(scheduledTaskKey(id)) ??
         queryClient.getQueryData<ScheduledTask[]>(SCHEDULED_TASKS_KEY)?.find((t) => t.id === id);
       forgetScheduledTasks(queryClient, [id]);
+      // A deleted automation no longer manages its session's sharing.
+      invalidateSessionGrants(queryClient);
       // The server cleared the automation's label from the session it ran from,
       // so menus and delete warnings must stop naming the automation.
       if (deleted?.sourceSessionId) {

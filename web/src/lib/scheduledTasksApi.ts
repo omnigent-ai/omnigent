@@ -12,6 +12,7 @@
 import { authenticatedFetch } from "./identity";
 import type { JournalEntry, JournalPlanStep } from "./sessionJournal";
 import { startTimedInteraction } from "./analyticsEmit";
+import { browserAgentToolsRequestHeaders } from "@/components/BrowserPane/agentTools/preferences";
 
 export const RANDOM_WORKTREE_BASE_REF = "HEAD";
 
@@ -58,6 +59,8 @@ export interface ScheduledTask {
    * `--permission-mode` launch arg from it at fire time.
    */
   permissionMode: string | null;
+  /** MCP services every session the automation creates starts with. */
+  mcpServices: string[];
   /** `"continue"` sends every run's prompt into `sessionId` instead of a new session. */
   sessionMode: ScheduledTaskSessionMode;
   /** The session a `"continue"` task sends to; `null` until its first run creates one. */
@@ -165,6 +168,8 @@ export interface CreateScheduledTaskInput {
   reasoningEffort?: string | null;
   /** Harness-specific permission or execution mode; omit for the agent default. */
   permissionMode?: string | null;
+  /** MCP services every run starts with; omit for none. */
+  mcpServices?: string[];
   /** `"continue"` keeps one session across runs; omit for a new session per run. */
   sessionMode?: ScheduledTaskSessionMode;
   /** Host directory (requires hostId), or a repository URL for a sandbox. */
@@ -209,6 +214,8 @@ export interface UpdateScheduledTaskInput {
   modelOverride?: string | null;
   reasoningEffort?: string | null;
   permissionMode?: string | null;
+  /** Replaces the MCP services; `[]` clears them. */
+  mcpServices?: string[];
   sessionMode?: ScheduledTaskSessionMode;
   /** `null` makes a `"continue"` task's next run start the session later runs continue. */
   sessionId?: string | null;
@@ -241,6 +248,7 @@ interface ScheduledTaskWire {
   model_override: string | null;
   reasoning_effort: string | null;
   permission_mode: string | null;
+  mcp_services?: string[];
   session_mode?: ScheduledTaskSessionMode;
   session_id?: string | null;
   workspace: string | null;
@@ -330,6 +338,7 @@ function taskFromWire(wire: ScheduledTaskWire): ScheduledTask {
     modelOverride: wire.model_override,
     reasoningEffort: wire.reasoning_effort,
     permissionMode: wire.permission_mode,
+    mcpServices: wire.mcp_services ?? [],
     sessionMode: wire.session_mode ?? "new",
     sessionId: wire.session_id ?? null,
     workspace: wire.workspace,
@@ -386,10 +395,12 @@ export async function listScheduledTaskRuns(id: string): Promise<ScheduledTaskRu
   return (body.runs ?? []).map(runFromWire);
 }
 
-/** The plan a run started with: its steps and each step's newest status. */
+/** The latest plan within a run: its steps and each step's newest status. */
 export interface ScheduledTaskRunSteps {
   runId: string;
   planId: string | null;
+  /** Graph ID, or latest legacy plan position; absent on older servers. */
+  planGraphRevision?: string | number;
   isCurrent: boolean;
   /** The saved workflow the plan runs, when it named one. */
   workflowId: string | null;
@@ -417,6 +428,7 @@ export async function listScheduledTaskRunSteps(
     runs?: {
       run_id: string;
       plan_id?: string;
+      plan_graph_revision?: string | number | null;
       is_current?: boolean;
       workflow_id: string | null;
       plan_name?: string | null;
@@ -427,6 +439,7 @@ export async function listScheduledTaskRunSteps(
   return (body.runs ?? []).map((run) => ({
     runId: run.run_id,
     planId: run.plan_id ?? null,
+    planGraphRevision: run.plan_graph_revision ?? undefined,
     isCurrent: run.is_current === true,
     workflowId: run.workflow_id,
     planName: run.plan_name ?? null,
@@ -452,6 +465,7 @@ export async function createScheduledTask(input: CreateScheduledTaskInput): Prom
   if (input.modelOverride != null) body.model_override = input.modelOverride;
   if (input.reasoningEffort != null) body.reasoning_effort = input.reasoningEffort;
   if (input.permissionMode != null) body.permission_mode = input.permissionMode;
+  if (input.mcpServices?.length) body.mcp_services = input.mcpServices;
   if (input.sessionMode !== undefined) body.session_mode = input.sessionMode;
   if (input.baseBranch !== undefined) body.base_branch = input.baseBranch;
   if (input.workspace != null) body.workspace = input.workspace;
@@ -468,6 +482,8 @@ export async function createScheduledTask(input: CreateScheduledTaskInput): Prom
         "Content-Type": "application/json",
         "x-omnigent-automation-source": "ui",
         "x-omnigent-automation-template": templateId,
+        // The source copy takes its browser tools mode from this request.
+        ...browserAgentToolsRequestHeaders(),
       },
       body: JSON.stringify(body),
     });
@@ -498,6 +514,7 @@ export async function updateScheduledTask(
   if (input.modelOverride !== undefined) body.model_override = input.modelOverride;
   if (input.reasoningEffort !== undefined) body.reasoning_effort = input.reasoningEffort;
   if (input.permissionMode !== undefined) body.permission_mode = input.permissionMode;
+  if (input.mcpServices !== undefined) body.mcp_services = input.mcpServices;
   if (input.sessionMode !== undefined) body.session_mode = input.sessionMode;
   if (input.baseBranch !== undefined) body.base_branch = input.baseBranch;
   if (input.sessionId !== undefined) body.session_id = input.sessionId;

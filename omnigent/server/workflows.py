@@ -63,7 +63,7 @@ from omnigent.stores.workflow_store import (
     WorkflowStore,
     workflow_page_cursor,
 )
-from omnigent.util.uuid import normalize_uuid
+from omnigent.util.uuid import InvalidUuidError, normalize_uuid, uuid_to_bytes
 
 _logger = logging.getLogger(__name__)
 
@@ -114,6 +114,7 @@ def _object(workflow: Workflow) -> WorkflowObject:
         **_summary(workflow).model_dump(),
         steps=[WorkflowStep(**step) for step in workflow.steps],
         planning_session_id=workflow.planning_session_id,
+        description_source=workflow.description_source,
     )
 
 
@@ -126,7 +127,7 @@ def _not_found() -> OmnigentError:
 
 
 def _progress(plan: JournalEntry, statuses: dict[str, JournalEntry]) -> WorkflowRunProgress:
-    """Count the run's starting steps by their current status."""
+    """Count the run's latest steps by their current status."""
     steps = plan.content.get("steps", [])
     counts = Counter(
         statuses[step["id"]].content.get("status") if step["id"] in statuses else None
@@ -294,6 +295,15 @@ def create_workflows_router(
                 )
                 if session is None or session.archived:
                     raise OmnigentError("Planning session not found", code=ErrorCode.NOT_FOUND)
+        description_source = body.description_source
+        if description_source is not None:
+            try:
+                uuid_to_bytes(description_source)
+            except InvalidUuidError as exc:
+                raise OmnigentError(
+                    "description_source must be a journal entry ID", code=ErrorCode.INVALID_INPUT
+                ) from exc
+            description_source = normalize_uuid(description_source)
         try:
             workflow = await asyncio.to_thread(
                 store.update,
@@ -301,6 +311,8 @@ def create_workflows_router(
                 user_id=user_id,
                 name=body.name,
                 description=body.description,
+                expected_description=body.expected_description,
+                description_source=description_source,
                 steps=_steps(body.steps),
                 planning_session_id=planning_session_id,
             )
@@ -352,10 +364,14 @@ def create_workflows_router(
             if plan.conversation_id in sessions
             and _readable(user_id, sessions[plan.conversation_id])
         ]
-        statuses = journal.plan_step_statuses(readable)
+        latest_plans = journal.run_latest_plans(readable)
+        revisions = journal.plan_graph_revisions(latest_plans)
+        statuses = journal.plan_step_statuses(latest_plans)
         current_plans = journal.current_run_plan_ids(readable)
         runs = []
-        for plan, step_statuses in zip(readable, statuses, strict=True):
+        for plan, latest_plan, revision, step_statuses in zip(
+            readable, latest_plans, revisions, statuses, strict=True
+        ):
             session = sessions[plan.conversation_id]
             is_current = (
                 plan.id in current_plans
@@ -364,6 +380,7 @@ def create_workflows_router(
             runs.append(
                 WorkflowRun(
                     id=plan.id,
+                    plan_graph_revision=revision,
                     session_id=plan.conversation_id,
                     title=session.title or "",
                     started_at=plan.created_at,
@@ -377,8 +394,8 @@ def create_workflows_router(
                     else "idle",
                     background_work_running=is_current and session.background_work_running is True,
                     archived=session.archived,
-                    progress=_progress(plan, step_statuses),
-                    steps=[WorkflowStep(**step) for step in plan.content.get("steps", [])],
+                    progress=_progress(latest_plan, step_statuses),
+                    steps=[WorkflowStep(**step) for step in latest_plan.content.get("steps", [])],
                     statuses=[entry_to_response(entry) for entry in step_statuses.values()],
                 )
             )

@@ -1,13 +1,18 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { authenticatedFetch } from "@/lib/identity";
+import type * as IdentityModule from "@/lib/identity";
 import { journalEntry, journalPlan as plan } from "@/test/journalFixtures";
 import {
+  fetchJournalEntryPosition,
   currentPlan,
   failedUpstream,
   finishedTaskCount,
+  isPlanComplete,
   isRestart,
   mergeJournalEntries,
   nativeTaskProgress,
   pausedLabel,
+  planGraphRevision,
   planName,
   planSteps,
   planTally,
@@ -20,6 +25,11 @@ import {
   type JournalEntry,
   type NativeTask,
 } from "./sessionJournal";
+
+vi.mock("@/lib/identity", async (importOriginal) => ({
+  ...(await importOriginal<typeof IdentityModule>()),
+  authenticatedFetch: vi.fn(),
+}));
 
 const RUN = "0b6c5f0d8a7e4c3b9a1d2e3f4a5b6c7d";
 
@@ -242,6 +252,193 @@ describe("stepProgress", () => {
   });
 });
 
+describe("isPlanComplete", () => {
+  // Deliberately out of order: the dependency graph identifies the final step.
+  const steps = planSteps(plan(0, ["report", ["work"]], ["explore"], ["work", ["explore"]]));
+
+  it.each([undefined, "started", "needs_input", "failed", "done"])(
+    "uses the final step's newest status (%s), regardless of earlier statuses",
+    (finalStatus) => {
+      const entries = finalStatus ? [status(1, "report", finalStatus)] : [];
+      const progress = stepProgress(steps, entries, true);
+      expect(isPlanComplete(progress)).toBe(finalStatus === "done");
+    },
+  );
+
+  it("requires every independent branch to finish", () => {
+    const branches = planSteps(plan(0, ["explore"], ["code", ["explore"]], ["docs", ["explore"]]));
+    const entries = [status(1, "docs", "done")];
+    expect(isPlanComplete(stepProgress(branches, entries, false))).toBe(false);
+    entries.push(status(2, "code", "done"));
+    expect(isPlanComplete(stepProgress(branches, entries, false))).toBe(true);
+    expect(isPlanComplete([])).toBe(false);
+  });
+
+  it("does not infer unchanged legacy graphs across missing history", () => {
+    const original = plan(1, ["review"], ["report", ["review"]]);
+    const independent = plan(4, ["review"], ["report"]);
+    const reviewing = status(5, "review", "started");
+    const reported = status(6, "report", "done");
+    const restored = plan(200, ["review"], ["report", ["review"]]);
+    const sparse = [original, reviewing, reported, restored];
+    const complete = [
+      original,
+      status(2, "review", "done"),
+      status(3, "report", "done"),
+      independent,
+      reviewing,
+      reported,
+      ...Array.from({ length: 193 }, (_, index) => journalEntry(index + 7)),
+      restored,
+    ];
+    for (const entries of [sparse, complete]) {
+      const revision = planGraphRevision(entries);
+      expect(revision).toBe(200);
+      expect(isPlanComplete(stepProgress(planSteps(restored), entries, false), revision)).toBe(
+        false,
+      );
+    }
+    // The server can establish an unchanged graph despite gaps in the loaded history.
+    const saved = { ...restored, content: { ...restored.content, graph_revision: 1 } };
+    const entries = [...sparse.slice(0, -1), saved];
+    expect(planGraphRevision(entries)).toBe(1);
+    expect(isPlanComplete(stepProgress(planSteps(saved), entries, false), 1)).toBe(true);
+  });
+
+  it("reopens after a restart, new invocation, or replan with another final step", () => {
+    const entries = [status(1, "report", "done")];
+    expect(isPlanComplete(stepProgress(steps, entries, false))).toBe(true);
+    for (const next of [
+      status(2, "report", "started"),
+      status(2, "work", "started"),
+      status(2, "work", "needs_input"),
+      journalEntry(2, { kind: "plan_status", content: { status: "started" } }),
+    ]) {
+      expect(isPlanComplete(stepProgress(steps, [...entries, next], true))).toBe(false);
+    }
+    const replanned = [
+      ...steps,
+      { id: "publish", name: "Publish", goal: null, depends_on: ["report"] },
+    ];
+    expect(isPlanComplete(stepProgress(replanned, entries, false))).toBe(false);
+
+    const inserted = plan(
+      4,
+      ["explore"],
+      ["work", ["explore"]],
+      ["review", ["work"]],
+      ["report", ["review"]],
+    );
+    const insertedEntries = [
+      status(1, "explore", "done"),
+      status(2, "work", "done"),
+      status(3, "report", "done"),
+      inserted,
+    ];
+    const insertedProgress = stepProgress(planSteps(inserted), insertedEntries, false);
+    expect(isPlanComplete(insertedProgress, inserted.position)).toBe(false);
+    expect(pausedLabel(insertedProgress, insertedEntries, false)).toBe("Stopped");
+    expect(taskPreviewText(insertedProgress, null, inserted.position)).toBe("Next: review");
+    const legacyEntries = [
+      ...insertedEntries,
+      { ...inserted, position: 5, content: { ...inserted.content, graph_revision: null } },
+    ];
+    expect(pausedLabel(insertedProgress, legacyEntries, false)).toBe("Stopped");
+
+    for (const stableRevision of [true, false]) {
+      const independent = plan(0, ["review"], ["report"]);
+      const reviewing = status(1, "review", "started");
+      const reported = status(2, "report", "done");
+      const dependent = plan(3, ["review"], ["report", ["review"]]);
+      if (stableRevision) {
+        for (const entry of [independent, reviewing, reported])
+          entry.content.graph_revision = "graph-1";
+        dependent.content.graph_revision = "graph-2";
+      }
+      const dependencyEntries = [independent, reviewing, reported, dependent];
+      const revision = planGraphRevision(dependencyEntries);
+      const dependencyProgress = stepProgress(planSteps(dependent), dependencyEntries, false);
+      expect(isPlanComplete(dependencyProgress, revision)).toBe(false);
+      expect(pausedLabel(dependencyProgress, dependencyEntries, false)).toBe("Stopped");
+      expect(taskPreviewText(dependencyProgress, null, revision)).toBe("Stopped: review");
+      expect(
+        isPlanComplete(stepProgress(planSteps(dependent), dependencyEntries, true), revision),
+      ).toBe(false);
+      const finishedEntries = [
+        ...dependencyEntries,
+        status(4, "review", "done"),
+        status(5, "report", "done"),
+      ];
+      expect(
+        isPlanComplete(stepProgress(planSteps(dependent), finishedEntries, false), revision),
+      ).toBe(true);
+    }
+
+    const unchanged = plan(2, ["explore"], ["work", ["explore"]], ["report", ["work"]]);
+    const saved = { ...unchanged, position: 4, workflow_id: "a".repeat(32) };
+    const savedEntries = [
+      plan(0, ["work"], ["report", ["work"]]),
+      status(1, "work", "done"),
+      unchanged,
+      status(3, "report", "done"),
+      saved,
+    ];
+    const savedProgress = stepProgress(planSteps(saved), savedEntries, false);
+    expect(pausedLabel(savedProgress, savedEntries, false)).toBeNull();
+    expect(planGraphRevision(savedEntries)).toBe(unchanged.position);
+    expect(taskPreviewText(savedProgress, null, planGraphRevision(savedEntries))).toBe("All done");
+    const partialEntries = [
+      ...savedEntries
+        .filter((entry) => entry.kind !== "plan")
+        .map((entry) => ({
+          ...entry,
+          content: { ...entry.content, graph_revision: "graph-0" },
+        })),
+      { ...saved, content: { ...saved.content, graph_revision: "graph-0" } },
+    ];
+    expect(
+      pausedLabel(stepProgress(planSteps(saved), partialEntries, false), partialEntries, false),
+    ).toBeNull();
+    const forkedEntries = [
+      { ...saved, position: 0, content: { ...saved.content, graph_revision: "graph-0" } },
+      status(1, "work", "done"),
+      status(2, "report", "done", { content: { status: "done", graph_revision: "graph-0" } }),
+    ];
+    expect(
+      isPlanComplete(
+        stepProgress(planSteps(saved), forkedEntries, false),
+        planGraphRevision(forkedEntries),
+      ),
+    ).toBe(true);
+  });
+
+  it.each(["a", "b"])("compares %s with its own branch's completion", (upstream) => {
+    const branches = planSteps(plan(0, ["a"], ["b"], ["report-a", ["a"]], ["report-b", ["b"]]));
+    const entries = [
+      status(1, "report-a", "done"),
+      status(2, upstream, "started"),
+      status(3, "report-b", "done"),
+    ];
+    expect(isPlanComplete(stepProgress(branches, entries, true))).toBe(upstream === "b");
+  });
+
+  it("requires every native task to be done", () => {
+    const tasks: NativeTask[] = [
+      { content: "Work", status: "pending", activeForm: "Working" },
+      { content: "Report", status: "completed", activeForm: "Reporting" },
+    ];
+    expect(isPlanComplete(nativeTaskProgress(tasks, true))).toBe(false);
+    expect(
+      isPlanComplete(
+        nativeTaskProgress(
+          tasks.map((task) => ({ ...task, status: "completed" })),
+          true,
+        ),
+      ),
+    ).toBe(true);
+  });
+});
+
 describe("pausedLabel", () => {
   const chain = plan(0, ["a"], ["b", ["a"]]);
   const label = (entries: JournalEntry[], working = false) =>
@@ -259,6 +456,11 @@ describe("pausedLabel", () => {
   it("says nothing once only tasks waiting for the user are left", () => {
     expect(label([chain, status(1, "a", "done"), status(2, "b", "needs_input")])).toBeNull();
     expect(label([chain, status(1, "a", "done"), status(2, "b", "done")])).toBeNull();
+  });
+
+  it("does not offer to resume earlier steps after the final step is done", () => {
+    expect(label([chain, status(1, "b", "done")])).toBeNull();
+    expect(label([chain, status(1, "b", "done", { scheduled_task_run_id: RUN })])).toBeNull();
   });
 });
 
@@ -308,6 +510,23 @@ describe("sessionTaskList", () => {
 });
 
 describe("taskPreviewText", () => {
+  it.each([undefined, "started", "needs_input", "failed"])(
+    "summarizes a completed plan despite a stale upstream status (%s)",
+    (upstreamStatus) => {
+      const steps = planSteps(plan(0, ["work"], ["report", ["work"]]));
+      const entries = [
+        ...(upstreamStatus ? [status(1, "work", upstreamStatus)] : []),
+        status(2, "report", "done"),
+      ];
+      for (const working of [false, true]) {
+        const progress = stepProgress(steps, entries, working);
+        expect(taskPreviewText(progress)).toBe(
+          upstreamStatus === "failed" ? "Finished, 1 failed" : "All done",
+        );
+      }
+    },
+  );
+
   it("names the task in progress, else the next one, else how the list ended", () => {
     expect(taskPreviewText([])).toBeNull();
     expect(taskPreviewText(nativeTaskProgress(TODOS, true))).toBe("Documenting it");
@@ -325,6 +544,13 @@ describe("taskPreviewText", () => {
       true,
     );
     expect(taskPreviewText(asking)).toBe("Waiting for you: approve");
+    const followUp = stepProgress(
+      planSteps(plan(0, ["deploy"], ["report", ["deploy"]])),
+      [status(1, "deploy", "started"), status(2, "report", "done")],
+      true,
+      true,
+    );
+    expect(taskPreviewText(followUp)).toBe("Waiting for you: deploy");
     // A task left started while the session is idle says so.
     const stopped = stepProgress(
       planSteps(plan(0, ["deploy"])),
@@ -346,5 +572,29 @@ describe("taskPreviewText", () => {
       false,
     );
     expect(taskPreviewText(heldUp)).toBe("Failed: fix");
+  });
+});
+
+describe("fetchJournalEntryPosition", () => {
+  const respond = (body: unknown, code = 200) =>
+    vi
+      .mocked(authenticatedFetch)
+      .mockResolvedValueOnce(new Response(JSON.stringify(body), { status: code }));
+
+  it("places an entry just after the one before it, or first", async () => {
+    respond({ object: "list", data: [{ position: 4 }] });
+    await expect(fetchJournalEntryPosition("session", "entry")).resolves.toBe(5);
+    expect(vi.mocked(authenticatedFetch).mock.calls.at(-1)?.[0]).toBe(
+      "/v1/sessions/session/journal?order=desc&after=entry&limit=1",
+    );
+    respond({ object: "list", data: [] });
+    await expect(fetchJournalEntryPosition("session", "entry")).resolves.toBe(0);
+  });
+
+  it("reports an entry the journal doesn't hold, and rejects other failures", async () => {
+    respond({ error: { code: "stale_cursor", message: "stale_cursor: no such entry" } }, 400);
+    await expect(fetchJournalEntryPosition("session", "elsewhere")).resolves.toBeNull();
+    respond({ error: { code: "server_error", message: "Try again" } }, 500);
+    await expect(fetchJournalEntryPosition("session", "entry")).rejects.toThrow("500");
   });
 });

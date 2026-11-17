@@ -1109,6 +1109,139 @@
         "title": "CancelledEvent",
         "type": "object"
       },
+      "ChartBlock": {
+        "additionalProperties": false,
+        "description": "A chart drawn on the card; see `InboxChartV1`.",
+        "properties": {
+          "chart": {
+            "$ref": "#/components/schemas/InboxChartV1"
+          },
+          "type": {
+            "const": "chart",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "chart"
+        ],
+        "title": "ChartBlock",
+        "type": "object"
+      },
+      "ChartHighlight": {
+        "additionalProperties": false,
+        "description": "A shaded range between two x labels.",
+        "properties": {
+          "from": {
+            "maxLength": 40,
+            "title": "From",
+            "type": "string"
+          },
+          "to": {
+            "maxLength": 40,
+            "title": "To",
+            "type": "string"
+          }
+        },
+        "required": [
+          "from",
+          "to"
+        ],
+        "title": "ChartHighlight",
+        "type": "object"
+      },
+      "ChartMarker": {
+        "additionalProperties": false,
+        "description": "A labeled vertical line at one x label, e.g. when a change merged.",
+        "properties": {
+          "label": {
+            "maxLength": 60,
+            "minLength": 1,
+            "title": "Label",
+            "type": "string"
+          },
+          "x": {
+            "maxLength": 40,
+            "title": "X",
+            "type": "string"
+          }
+        },
+        "required": [
+          "x",
+          "label"
+        ],
+        "title": "ChartMarker",
+        "type": "object"
+      },
+      "ChartSeries": {
+        "additionalProperties": false,
+        "description": "One line or set of bars; `None` values leave gaps.",
+        "properties": {
+          "emphasis": {
+            "default": false,
+            "title": "Emphasis",
+            "type": "boolean"
+          },
+          "name": {
+            "maxLength": 60,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "values": {
+            "items": {
+              "anyOf": [
+                {
+                  "format": "double",
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "title": "Values",
+            "type": "array"
+          }
+        },
+        "required": [
+          "name",
+          "values"
+        ],
+        "title": "ChartSeries",
+        "type": "object"
+      },
+      "ChartSource": {
+        "additionalProperties": false,
+        "description": "Where the numbers came from, shown under the chart.",
+        "properties": {
+          "href": {
+            "anyOf": [
+              {
+                "maxLength": 2048,
+                "pattern": "^https?://",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Href"
+          },
+          "label": {
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Label",
+            "type": "string"
+          }
+        },
+        "required": [
+          "label"
+        ],
+        "title": "ChartSource",
+        "type": "object"
+      },
       "ChildSessionList": {
         "description": "Paginated list of child sessions; `data` is a page of `ChildSessionSummary`.",
         "properties": {
@@ -2216,6 +2349,85 @@
           "path"
         ],
         "title": "CreateDirectoryRequest",
+        "type": "object"
+      },
+      "CreateInboxItemRequest": {
+        "additionalProperties": false,
+        "description": "Body for `POST /v1/inbox/items`.",
+        "properties": {
+          "actions": {
+            "items": {
+              "$ref": "#/components/schemas/InboxItemAction"
+            },
+            "maxItems": 3,
+            "title": "Actions",
+            "type": "array"
+          },
+          "body_md": {
+            "maxLength": 8000,
+            "minLength": 1,
+            "title": "Body Md",
+            "type": "string"
+          },
+          "expires_at": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "format": "int64",
+                "maximum": 9.223372036854776e+18,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expires At"
+          },
+          "kind": {
+            "enum": [
+              "followup",
+              "info",
+              "reminder"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "links": {
+            "items": {
+              "$ref": "#/components/schemas/InboxItemLink"
+            },
+            "maxItems": 10,
+            "title": "Links",
+            "type": "array"
+          },
+          "media": {
+            "items": {
+              "$ref": "#/components/schemas/ChartBlock"
+            },
+            "maxItems": 3,
+            "title": "Media",
+            "type": "array"
+          },
+          "title": {
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Title",
+            "type": "string"
+          },
+          "topic": {
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Topic",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "title",
+          "body_md",
+          "topic"
+        ],
+        "title": "CreateInboxItemRequest",
         "type": "object"
       },
       "CreateProjectRequest": {
@@ -4173,6 +4385,162 @@
         "title": "InProgressEvent",
         "type": "object"
       },
+      "InboxChartV1": {
+        "additionalProperties": false,
+        "description": "Version 1 of the chart an Inbox item can carry.",
+        "properties": {
+          "highlight": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ChartHighlight"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "markers": {
+            "items": {
+              "$ref": "#/components/schemas/ChartMarker"
+            },
+            "maxItems": 3,
+            "title": "Markers",
+            "type": "array"
+          },
+          "series": {
+            "items": {
+              "$ref": "#/components/schemas/ChartSeries"
+            },
+            "maxItems": 4,
+            "minItems": 1,
+            "title": "Series",
+            "type": "array"
+          },
+          "source": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ChartSource"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "title": {
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Title",
+            "type": "string"
+          },
+          "type": {
+            "enum": [
+              "line",
+              "bar"
+            ],
+            "title": "Type",
+            "type": "string"
+          },
+          "unit": {
+            "anyOf": [
+              {
+                "maxLength": 16,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unit"
+          },
+          "version": {
+            "const": 1,
+            "format": "int64",
+            "title": "Version",
+            "type": "integer"
+          },
+          "x": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 60,
+            "minItems": 1,
+            "title": "X",
+            "type": "array"
+          }
+        },
+        "required": [
+          "version",
+          "type",
+          "title",
+          "x",
+          "series"
+        ],
+        "title": "InboxChartV1",
+        "type": "object"
+      },
+      "InboxItemAction": {
+        "additionalProperties": false,
+        "description": "An agent-defined action: a button that opens a session prefilled with `prompt`.",
+        "properties": {
+          "label": {
+            "maxLength": 60,
+            "minLength": 1,
+            "title": "Label",
+            "type": "string"
+          },
+          "prompt": {
+            "maxLength": 4000,
+            "minLength": 1,
+            "title": "Prompt",
+            "type": "string"
+          }
+        },
+        "required": [
+          "label",
+          "prompt"
+        ],
+        "title": "InboxItemAction",
+        "type": "object"
+      },
+      "InboxItemLink": {
+        "additionalProperties": false,
+        "description": "One evidence link on an item.",
+        "properties": {
+          "label": {
+            "anyOf": [
+              {
+                "maxLength": 200,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Label"
+          },
+          "ref": {
+            "maxLength": 2048,
+            "minLength": 1,
+            "title": "Ref",
+            "type": "string"
+          },
+          "type": {
+            "enum": [
+              "session",
+              "pr",
+              "url"
+            ],
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "ref"
+        ],
+        "title": "InboxItemLink",
+        "type": "object"
+      },
       "IncompleteDetails": {
         "description": "Details explaining why a response is incomplete.",
         "properties": {
@@ -5828,6 +6196,112 @@
         "title": "PresenceViewer",
         "type": "object"
       },
+      "ProactiveAgentPrompt": {
+        "description": "The prompt the agent runs with.",
+        "properties": {
+          "default_prompt": {
+            "description": "The bundled prompt, which a release can change.",
+            "title": "Default Prompt",
+            "type": "string"
+          },
+          "overridden": {
+            "description": "Whether an override replaces the bundled prompt.",
+            "title": "Overridden",
+            "type": "boolean"
+          },
+          "prompt": {
+            "description": "The admin's override, or the bundled prompt without one.",
+            "title": "Prompt",
+            "type": "string"
+          }
+        },
+        "required": [
+          "prompt",
+          "default_prompt",
+          "overridden"
+        ],
+        "title": "ProactiveAgentPrompt",
+        "type": "object"
+      },
+      "ProactiveAgentRuns": {
+        "description": "Result of a Run now.",
+        "properties": {
+          "skipped": {
+            "items": {
+              "$ref": "#/components/schemas/SkippedRun"
+            },
+            "title": "Skipped",
+            "type": "array"
+          },
+          "started": {
+            "items": {
+              "$ref": "#/components/schemas/StartedRun"
+            },
+            "title": "Started",
+            "type": "array"
+          },
+          "truncated": {
+            "default": false,
+            "description": "`\"*\"` matched more than `MAX_RUN_ALL_TASKS` tasks; only that many were started.",
+            "title": "Truncated",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "started",
+          "skipped"
+        ],
+        "title": "ProactiveAgentRuns",
+        "type": "object"
+      },
+      "ProactiveAgentSettings": {
+        "description": "The caller's view of the settings.",
+        "properties": {
+          "can_manage_workspace": {
+            "description": "Whether the caller may change the workspace setting.",
+            "title": "Can Manage Workspace",
+            "type": "boolean"
+          },
+          "enabled": {
+            "description": "Whether the agent runs for the caller: both settings on.",
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "user_enabled": {
+            "description": "The caller's own setting.",
+            "title": "User Enabled",
+            "type": "boolean"
+          },
+          "workspace_enabled": {
+            "description": "The admin's workspace-wide setting.",
+            "title": "Workspace Enabled",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "workspace_enabled",
+          "user_enabled",
+          "enabled",
+          "can_manage_workspace"
+        ],
+        "title": "ProactiveAgentSettings",
+        "type": "object"
+      },
+      "ProactiveAgentToggle": {
+        "additionalProperties": false,
+        "description": "Body of a settings change.",
+        "properties": {
+          "enabled": {
+            "title": "Enabled",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "enabled"
+        ],
+        "title": "ProactiveAgentToggle",
+        "type": "object"
+      },
       "ProjectOrderRequest": {
         "description": "Rank owned project IDs; unranked projects append in discovery order.\n\nNull selects alphabetical mode without erasing the remembered manual IDs.\nThe serialized preference must fit in 65,535 bytes after compression and\nframing; lists below the 10,000-ID limit can still exceed this byte limit.",
         "properties": {
@@ -6183,6 +6657,18 @@
             ],
             "default": null,
             "title": "Title"
+          },
+          "workflow_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Workflow Id"
           },
           "workspace": {
             "anyOf": [
@@ -6963,6 +7449,26 @@
         "title": "RoutingDecisionData",
         "type": "object"
       },
+      "RunProactiveAgent": {
+        "additionalProperties": false,
+        "description": "Body of a Run now: user ids, or `[\"*\"]` for every user with a task.",
+        "properties": {
+          "users": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 100,
+            "minItems": 1,
+            "title": "Users",
+            "type": "array"
+          }
+        },
+        "required": [
+          "users"
+        ],
+        "title": "RunProactiveAgent",
+        "type": "object"
+      },
       "SandboxProfileSummary": {
         "additionalProperties": false,
         "description": "Public session/host reference; execution identity stays on the server.",
@@ -7162,6 +7668,69 @@
         "title": "ScheduledRunLogContext",
         "type": "object"
       },
+      "ScheduledTaskPermissionList": {
+        "description": "One page of an automation's grants, ordered by `user_id`.",
+        "properties": {
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          },
+          "permissions": {
+            "items": {
+              "$ref": "#/components/schemas/ScheduledTaskPermissionObject"
+            },
+            "title": "Permissions",
+            "type": "array"
+          }
+        },
+        "required": [
+          "permissions",
+          "next_cursor"
+        ],
+        "title": "ScheduledTaskPermissionList",
+        "type": "object"
+      },
+      "ScheduledTaskPermissionObject": {
+        "description": "One grant on an automation.",
+        "properties": {
+          "display_name": {
+            "description": "The grantee's name for display; the ID when the server has no other name.",
+            "title": "Display Name",
+            "type": "string"
+          },
+          "level": {
+            "description": "Numeric permission level; automations grant `1` (read) only.",
+            "format": "int64",
+            "title": "Level",
+            "type": "integer"
+          },
+          "scheduled_task_id": {
+            "description": "The automation.",
+            "title": "Scheduled Task Id",
+            "type": "string"
+          },
+          "user_id": {
+            "description": "The grantee's canonical ID, e.g. `\"alice@example.com\"`.",
+            "title": "User Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "user_id",
+          "scheduled_task_id",
+          "level",
+          "display_name"
+        ],
+        "title": "ScheduledTaskPermissionObject",
+        "type": "object"
+      },
       "SendCommentsRequest": {
         "description": "Request body for `POST .../comments/send`.",
         "properties": {
@@ -7325,6 +7894,11 @@
               "restrict_to_agent_names": []
             }
           },
+          "proactive_agent_available": {
+            "default": false,
+            "title": "Proactive Agent Available",
+            "type": "boolean"
+          },
           "public_sharing_enabled": {
             "title": "Public Sharing Enabled",
             "type": "boolean"
@@ -7420,6 +7994,11 @@
             "title": "Scheduled Task Session Modes",
             "type": "boolean"
           },
+          "scheduled_task_sharing": {
+            "default": false,
+            "title": "Scheduled Task Sharing",
+            "type": "boolean"
+          },
           "scheduled_task_source_sessions": {
             "default": true,
             "title": "Scheduled Task Source Sessions",
@@ -7469,6 +8048,11 @@
             "title": "Session Create Permission Modes",
             "type": "boolean"
           },
+          "session_create_workflow_id": {
+            "default": true,
+            "title": "Session Create Workflow Id",
+            "type": "boolean"
+          },
           "session_event_types": {
             "default": [],
             "items": {
@@ -7491,6 +8075,12 @@
             "default": true,
             "title": "Session List Scoped Archives",
             "type": "boolean"
+          },
+          "session_message_max_chars": {
+            "default": 32000,
+            "format": "int64",
+            "title": "Session Message Max Chars",
+            "type": "integer"
           },
           "session_move_source_checks": {
             "default": false,
@@ -8824,6 +9414,18 @@
             ],
             "default": null,
             "title": "Title"
+          },
+          "workflow_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Workflow Id"
           },
           "workspace": {
             "anyOf": [
@@ -13813,6 +14415,30 @@
         "title": "SetCodexGoalRequest",
         "type": "object"
       },
+      "SetProactiveAgentPrompt": {
+        "additionalProperties": false,
+        "description": "Body of a prompt change; `null` restores the bundled prompt.",
+        "properties": {
+          "prompt": {
+            "anyOf": [
+              {
+                "maxLength": 16000,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prompt"
+          }
+        },
+        "required": [
+          "prompt"
+        ],
+        "title": "SetProactiveAgentPrompt",
+        "type": "object"
+      },
       "SetSharingRequest": {
         "description": "Body for `PUT /v1/sharing`.\n\nEvery field is optional so an admin can update each setting\nindependently; at least one must be present.",
         "properties": {
@@ -14064,6 +14690,30 @@
         "title": "SkillsResponse",
         "type": "object"
       },
+      "SkippedRun": {
+        "properties": {
+          "reason": {
+            "enum": [
+              "no_task",
+              "turned_off",
+              "already_running",
+              "unavailable"
+            ],
+            "title": "Reason",
+            "type": "string"
+          },
+          "user_id": {
+            "title": "User Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "user_id",
+          "reason"
+        ],
+        "title": "SkippedRun",
+        "type": "object"
+      },
       "SlashCommandData": {
         "description": "Data payload for a slash-command invocation observed in a\nharness transcript (today: Claude Code's embedded TUI).\n\nListed in `NON_CONTENT_ITEM_TYPES` so the agent loop's\nhistory filter skips it \u2014 a downstream LLM never sees this as a\nphantom tool call. Field names mirror `function_call` so the\nweb renderer can reuse the tool-card layout.\n\n**Parameters**\n\n- `agent` \u2014 Harness/agent name, e.g. `\"claude-native-ui\"`. Serialized as `\"model\"` for parity with other items.",
         "properties": {
@@ -14138,6 +14788,35 @@
           "oss"
         ],
         "title": "SmartRoutingSourcesInfo",
+        "type": "object"
+      },
+      "StartedRun": {
+        "properties": {
+          "run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run Id"
+          },
+          "task_id": {
+            "title": "Task Id",
+            "type": "string"
+          },
+          "user_id": {
+            "title": "User Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "user_id",
+          "task_id"
+        ],
+        "title": "StartedRun",
         "type": "object"
       },
       "StartupInputOptions": {
@@ -14631,6 +15310,75 @@
           }
         },
         "title": "UpdateDefaultPolicyRequest",
+        "type": "object"
+      },
+      "UpdateInboxItemRequest": {
+        "additionalProperties": false,
+        "description": "Body for `PATCH /v1/inbox/items/{item_id}`.\n\n`status` marks an open item read or unread. `resolution` closes an item\n(or reopens it with `\"none\"`) and moves its status to match;\n`\"action_taken\"` also needs `resolution_action`, the action's index.",
+        "properties": {
+          "feedback_text": {
+            "anyOf": [
+              {
+                "maxLength": 2000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Feedback Text"
+          },
+          "resolution": {
+            "anyOf": [
+              {
+                "enum": [
+                  "none",
+                  "action_taken",
+                  "already_done",
+                  "useful",
+                  "not_relevant",
+                  "incorrect",
+                  "not_now"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Resolution"
+          },
+          "resolution_action": {
+            "anyOf": [
+              {
+                "exclusiveMaximum": 3.0,
+                "format": "int64",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Resolution Action"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "enum": [
+                  "unread",
+                  "read"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Status"
+          }
+        },
+        "title": "UpdateInboxItemRequest",
         "type": "object"
       },
       "UpdateProjectRequest": {
@@ -15167,6 +15915,30 @@
             "description": "A new description, subject to the same character and stored-byte limits as creation.",
             "title": "Description"
           },
+          "description_source": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The journal entry ID of the planning-chat proposal `description` comes from; a description written without one clears it.",
+            "title": "Description Source"
+          },
+          "expected_description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Apply `description` only while the stored description is still this text, so one written meanwhile stays.",
+            "title": "Expected Description"
+          },
           "name": {
             "anyOf": [
               {
@@ -15596,6 +16368,18 @@
             "title": "Description",
             "type": "string"
           },
+          "description_source": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The planning conversation's journal entry for the proposal the description was saved from, until the description is written otherwise.",
+            "title": "Description Source"
+          },
           "id": {
             "title": "Id",
             "type": "string"
@@ -15678,6 +16462,22 @@
             "title": "Is Current",
             "type": "boolean"
           },
+          "plan_graph_revision": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Stable graph ID, or the earliest position of the unchanged legacy graph. `None` when authoritative context is unavailable.",
+            "title": "Plan Graph Revision"
+          },
           "progress": {
             "$ref": "#/components/schemas/WorkflowRunProgress",
             "description": "Where the run's steps stand."
@@ -15712,7 +16512,7 @@
             "type": "array"
           },
           "steps": {
-            "description": "The steps of the plan that started the run.",
+            "description": "The latest plan's steps within this invocation.",
             "items": {
               "$ref": "#/components/schemas/WorkflowStep"
             },
@@ -15771,7 +16571,7 @@
         "type": "object"
       },
       "WorkflowRunProgress": {
-        "description": "Where a run's steps stand: the steps of the plan that started it, counted\nby their current status in the session.",
+        "description": "Where a run's latest plan stands within its invocation, counted by each\nstep's newest status.",
         "properties": {
           "done": {
             "default": 0,
@@ -16052,7 +16852,7 @@
     },
     "/v1/agents": {
       "get": {
-        "description": "List server agents, or with `scope=user` the caller's own agents.\n\nServer agents come from `agent_store.list()`, which never returns\nuser agents. `scope=user` returns the caller's user agents newest\nfirst, at most 50 per page and paged with `after` only; `last_id`\nis the last row the server read, which may not be in `data`.\n\nPackaged built-ins the deployment suppressed via\n`OMNIGENT_SEEDED_AGENTS` are filtered out after the store page is\nread, so `first_id`, `last_id` and `has_more` describe the rows\nread, not the rows returned. A page can hold fewer than `limit` rows,\nor none; keep following `last_id` while `has_more` is true.\nSuppressing hides a row without deleting it, so a session already\nbound to one keeps working.\n\n**Returns:** An `AgentList` of agents; for server agents it also names the packaged built-ins the deployment suppressed.",
+        "description": "List server agents, or with `scope=user` the caller's own agents.\n\nServer agents come from `agent_store.list()`, which never returns\nuser agents. `scope=user` returns the caller's user agents newest\nfirst, at most 50 per page and paged with `after` only; `last_id`\nis the last row the server read, which may not be in `data`.\n\nPackaged built-ins the deployment suppressed via\n`OMNIGENT_SEEDED_AGENTS`, and the built-in proactive agent, are\nfiltered out after the store page is read, so `first_id`,\n`last_id` and `has_more` describe the rows read, not the rows\nreturned. A page can hold fewer than `limit` rows,\nor none; keep following `last_id` while `has_more` is true.\nSuppressing hides a row without deleting it, so a session already\nbound to one keeps working.\n\n**Returns:** An `AgentList` of agents; for server agents it also names the packaged built-ins the deployment suppressed.",
         "operationId": "list_builtin_agents_v1_agents_get",
         "parameters": [
           {
@@ -18292,6 +19092,211 @@
         ]
       }
     },
+    "/v1/inbox/items": {
+      "get": {
+        "description": "List the caller's items, newest first, with a bounded unread count.",
+        "operationId": "list_inbox_items_v1_inbox_items_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "items": {
+                    "enum": [
+                      "unread",
+                      "read",
+                      "done",
+                      "dismissed"
+                    ],
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Status"
+            }
+          },
+          {
+            "in": "query",
+            "name": "created_after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 9223372036854775807,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Created After"
+            }
+          },
+          {
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 64,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Inbox Items V1 Inbox Items Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Inbox Items",
+        "tags": [
+          "inbox_items"
+        ]
+      },
+      "post": {
+        "description": "Post an item to the caller's Inbox, or return the item it repeats.",
+        "operationId": "create_inbox_item_v1_inbox_items_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateInboxItemRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Create Inbox Item V1 Inbox Items Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Inbox Item",
+        "tags": [
+          "inbox_items"
+        ]
+      }
+    },
+    "/v1/inbox/items/{item_id}": {
+      "patch": {
+        "description": "Record the caller's response to one of their items.",
+        "operationId": "update_inbox_item_v1_inbox_items__item_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "item_id",
+            "required": true,
+            "schema": {
+              "title": "Item Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateInboxItemRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Update Inbox Item V1 Inbox Items  Item Id  Patch",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Inbox Item",
+        "tags": [
+          "inbox_items"
+        ]
+      }
+    },
     "/v1/info": {
       "get": {
         "description": "Runtime capabilities probe for the SPA + CLI.\n\nReturned at app boot by the frontend (and by `omnigent login` when it needs to choose between flows). Drives\nconditional route registration and chrome on the SPA side\n\u2014 when `accounts_enabled` is false, the SPA never\nregisters `/login`, `/register`, `/members` and\nnever renders the AccountMenu, so the bundle behaves\nidentically to a build without accounts for header / OIDC\ndeploys (in particular, hosted deployments).\n\nAuthentication: this endpoint is intentionally UNAUTHED\nso the SPA can probe it before holding a session cookie.\nIt exposes no sensitive state \u2014 only the active auth\nsource, the login URL, whether first-run admin setup is\nstill pending (`needs_setup`), coarse capability\nbooleans (`databricks_features`,\n`managed_sandboxes_enabled`, `dictation_available`,\n`single_user`), the short sandbox provider name\n(`sandbox_provider`) the web UI labels the new-session\nsandbox option with, and the installed\n`server_version` (already public via `/api/version`).",
@@ -18616,6 +19621,210 @@
         "summary": "List Registry",
         "tags": [
           "policy_registry"
+        ]
+      }
+    },
+    "/v1/proactive-agent/prompt": {
+      "get": {
+        "operationId": "read_prompt_v1_proactive_agent_prompt_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProactiveAgentPrompt"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Read Prompt",
+        "tags": [
+          "proactive_agent"
+        ]
+      },
+      "put": {
+        "operationId": "set_prompt_v1_proactive_agent_prompt_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetProactiveAgentPrompt"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProactiveAgentPrompt"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Set Prompt",
+        "tags": [
+          "proactive_agent"
+        ]
+      }
+    },
+    "/v1/proactive-agent/runs": {
+      "post": {
+        "operationId": "run_now_v1_proactive_agent_runs_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RunProactiveAgent"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProactiveAgentRuns"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Run Now",
+        "tags": [
+          "proactive_agent"
+        ]
+      }
+    },
+    "/v1/proactive-agent/settings": {
+      "get": {
+        "operationId": "read_settings_v1_proactive_agent_settings_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProactiveAgentSettings"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Read Settings",
+        "tags": [
+          "proactive_agent"
+        ]
+      }
+    },
+    "/v1/proactive-agent/settings/me": {
+      "put": {
+        "operationId": "set_user_setting_v1_proactive_agent_settings_me_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProactiveAgentToggle"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProactiveAgentSettings"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Set User Setting",
+        "tags": [
+          "proactive_agent"
+        ]
+      }
+    },
+    "/v1/proactive-agent/settings/workspace": {
+      "put": {
+        "operationId": "set_workspace_setting_v1_proactive_agent_settings_workspace_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProactiveAgentToggle"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProactiveAgentSettings"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Set Workspace Setting",
+        "tags": [
+          "proactive_agent"
         ]
       }
     },
@@ -19378,7 +20587,7 @@
             "schema": {
               "anyOf": [
                 {
-                  "maxLength": 64,
+                  "maxLength": 256,
                   "type": "string"
                 },
                 {
@@ -19558,6 +20767,180 @@
         ]
       }
     },
+    "/v1/scheduled-tasks/{scheduled_task_id}/permissions": {
+      "get": {
+        "description": "List the grants on one of the caller's automations with cursor pagination.\n\nThe owner holds no grant and is not listed.\n\n**Returns:** `{\"permissions\": [...], \"next_cursor\": str|null}`.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 when the caller does not own the automation, 403 for an agent or a server that cannot keep automation grants.",
+        "operationId": "list_scheduled_task_permissions_v1_scheduled_tasks__scheduled_task_id__permissions_get",
+        "parameters": [
+          {
+            "description": "The automation.",
+            "in": "path",
+            "name": "scheduled_task_id",
+            "required": true,
+            "schema": {
+              "title": "Scheduled Task Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Max grants to return (1\u20131000, default 100).",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 1000,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Cursor: user_id to start after",
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Cursor: user_id to start after",
+              "title": "After"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScheduledTaskPermissionList"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Scheduled Task Permissions",
+        "tags": [
+          "scheduled_tasks"
+        ]
+      },
+      "put": {
+        "description": "Share one of the caller's automations with a user or group.\n\nRead is the only level, and an automation is never public. A\ncontinue-session automation's session is shared with them too. Auto-creates\nthe grantee user if they don't exist yet.\n\n**Parameters**\n\n- `body` \u2014 The grant request with `user_id` and `level`.\n\n**Returns:** The resulting grant.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 when the caller does not own the automation, 403 for an agent, a server that cannot share automations or the sharing policy, 400 for an empty or over-long ID, the owner, `__public__` or a level other than read.",
+        "operationId": "grant_scheduled_task_permission_v1_scheduled_tasks__scheduled_task_id__permissions_put",
+        "parameters": [
+          {
+            "description": "The automation.",
+            "in": "path",
+            "name": "scheduled_task_id",
+            "required": true,
+            "schema": {
+              "title": "Scheduled Task Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GrantPermissionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScheduledTaskPermissionObject"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Grant Scheduled Task Permission",
+        "tags": [
+          "scheduled_tasks"
+        ]
+      }
+    },
+    "/v1/scheduled-tasks/{scheduled_task_id}/permissions/{target_user_id}": {
+      "delete": {
+        "description": "Stop sharing one of the caller's automations with a user or group.\n\nThey lose a continue-session automation's session first, then the automation\ngrant. If the session revoke fails, the request fails and the grant stays, so\nrepeating the DELETE retries it. Once the grant is gone they lose that session\nagain, and any session the automation started continuing meanwhile; the grant\nis put back if anything after its delete fails or the request is cancelled.\nSessions of earlier runs of a new-session automation keep their grants.\nIdempotent: 204 without touching anything when they hold no automation grant.\nWorks without `automations_v2`, since runs still apply existing grants.\n\n**Returns:** 204 No Content.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 when the caller does not own the automation, 403 for an agent or a server that cannot keep automation grants, 500 when the removal cannot finish.",
+        "operationId": "revoke_scheduled_task_permission_v1_scheduled_tasks__scheduled_task_id__permissions__target_user_id__delete",
+        "parameters": [
+          {
+            "description": "The automation.",
+            "in": "path",
+            "name": "scheduled_task_id",
+            "required": true,
+            "schema": {
+              "title": "Scheduled Task Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "The grantee to remove, e.g. `\"alice@example.com\"`.",
+            "in": "path",
+            "name": "target_user_id",
+            "required": true,
+            "schema": {
+              "title": "Target User Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Revoke Scheduled Task Permission",
+        "tags": [
+          "scheduled_tasks"
+        ]
+      }
+    },
     "/v1/scheduled-tasks/{scheduled_task_id}/run": {
       "post": {
         "description": "Trigger an immediate fire of one of the caller's scheduled tasks.\n\nA manual override that reuses the SHARED scheduled-fire path (the same\n`on_fire` machinery \u2014 session create, owner grant, runner launch,\nprompt dispatch, run recording). Legacy timers fire through\n`app.state.scheduled_task_run_now` and share its process-local overlap\nguard. With `automations_v2`, the request is recorded as a pending run\nthat the host's owning replica claims and starts like any occurrence, so\nRun now gets the same lease, recovery, and host routing. Each request is\nits own run; it may overlap a scheduled one.\n\nPaused tasks ARE runnable here \u2014 run-now is an explicit manual override,\nso it does not require the `active` state the scheduler enforces.\n\nFire-and-forget: like the scheduler, the session create + launch runs in\nthe background, so this returns `202 Accepted` with the task id rather\nthan the finished run. The new run row appears in the task's `/runs`\nhistory and in the LIST endpoint's `last_run_status`. Legacy timers\nreturn `409` when a fire for this task is already in flight. Both return\n`503` when the scheduler subsystem is not running.\nThe database scheduler also returns `run_id` to identify the queued run.",
@@ -19605,7 +20988,7 @@
     },
     "/v1/scheduled-tasks/{scheduled_task_id}/run-steps": {
       "get": {
-        "description": "The plan steps of one page of a scheduled task's runs, for their timelines.\n\nPages like `GET /scheduled-tasks/{id}/runs`, most recent first. Each\nrun that wrote a plan lists the steps of its first plan and each step's\nnewest status entry: one run-index lookup per run, then one\nkind-and-step lookup per step. The response is `{\"runs\": [{\"run_id\", \"workflow_id\", \"plan_name\", \"is_current\", \"steps\", \"statuses\"}], \"next_cursor\"}`.",
+        "description": "The plan steps of one page of a scheduled task's runs, for their timelines.\n\nPages like `GET /scheduled-tasks/{id}/runs`, most recent first. Each\nrun that wrote a plan lists its latest plan within that invocation and\neach step's newest status entry. The first plan's ID still guards actions.\nThe response is `{\"runs\": [{\"run_id\", \"plan_id\", \"plan_graph_revision\", \"workflow_id\", \"plan_name\", \"is_current\", \"steps\", \"statuses\"}], \"next_cursor\"}`.",
         "operationId": "list_scheduled_task_run_steps_v1_scheduled_tasks__scheduled_task_id__run_steps_get",
         "parameters": [
           {
@@ -22363,7 +23746,7 @@
     },
     "/v1/sessions/{session_id}/permissions": {
       "get": {
-        "description": "List permission grants on a session with cursor pagination.\n\nRequires manage-level access.\n\n**Returns:** `{\"permissions\": [...], \"next_cursor\": str|null}`.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if no session or no access.",
+        "description": "List permission grants on a session with cursor pagination.\n\nRequires manage-level access. `managed_by_automation` names the caller's\nshared continue-session automation that syncs this session's sharing on each\nrun, overwriting changes made here.\n\n**Returns:** `{\"permissions\": [...], \"next_cursor\": str|null, \"managed_by_automation\": {\"id\": str, \"name\": str}|null}`.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if no session or no access.",
         "operationId": "list_permissions_v1_sessions__session_id__permissions_get",
         "parameters": [
           {
