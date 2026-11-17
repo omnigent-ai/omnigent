@@ -1048,31 +1048,36 @@ describe("ServerSelectorV2", () => {
     expect(onConnect).not.toHaveBeenCalled();
   });
 
-  it.each([true, false])(
-    "a runner lookup that resolves after Back does nothing (CLI installed: %s)",
-    async (installed) => {
-      let resolveOptions: (v: { remote: boolean; bundledCli: boolean }) => void = () => {};
-      const getRunnerOptions = vi.fn(
-        () =>
-          new Promise<{ remote: boolean; bundledCli: boolean }>((resolve) => {
-            resolveOptions = resolve;
-          }),
-      );
-      const onConnect = vi.fn().mockResolvedValue({});
-      joinTypedServer({
-        installed,
-        getRunnerOptions,
-        onConnect,
-        onConnectRunner: vi.fn().mockResolvedValue({ ok: true }),
-      });
-      await waitFor(() => expect(getRunnerOptions).toHaveBeenCalledOnce());
-      fireEvent.click(screen.getByRole("button", { name: "Back" }));
-      await act(async () => resolveOptions({ remote: false, bundledCli: false }));
-      expect(onConnect).not.toHaveBeenCalled();
-      expect(screen.queryByRole("heading", { name: /how do you want to join/i })).toBeNull();
-      expect(screen.getByRole("button", { name: /join your team/i })).toBeInTheDocument();
-    },
-  );
+  it("a runner lookup that resolves after Back does nothing", async () => {
+    let resolveOptions: (v: { remote: boolean; bundledCli: boolean }) => void = () => {};
+    const getRunnerOptions = vi.fn(
+      () =>
+        new Promise<{ remote: boolean; bundledCli: boolean }>((resolve) => {
+          resolveOptions = resolve;
+        }),
+    );
+    const onConnect = vi.fn().mockResolvedValue({});
+    joinTypedServer({
+      installed: false,
+      getRunnerOptions,
+      onConnect,
+      onConnectRunner: vi.fn().mockResolvedValue({ ok: true }),
+    });
+    await waitFor(() => expect(getRunnerOptions).toHaveBeenCalledOnce());
+    fireEvent.click(screen.getByRole("button", { name: "Back" }));
+    await act(async () => resolveOptions({ remote: false, bundledCli: false }));
+    expect(onConnect).not.toHaveBeenCalled();
+    expect(screen.queryByRole("heading", { name: /how do you want to join/i })).toBeNull();
+    expect(screen.getByRole("button", { name: /join your team/i })).toBeInTheDocument();
+  });
+
+  it("with the CLI installed, the server list connects without waiting for a runner lookup", async () => {
+    const getRunnerOptions = vi.fn(() => new Promise<{ remote: boolean }>(() => {}));
+    const onConnect = vi.fn().mockResolvedValue({});
+    joinTypedServer({ installed: true, getRunnerOptions, onConnect });
+    await waitFor(() => expect(onConnect).toHaveBeenCalledOnce());
+    expect(getRunnerOptions).not.toHaveBeenCalled();
+  });
 
   it("a failed CLI install can continue on shells without connectRunner", async () => {
     const onConnect = vi.fn().mockResolvedValue({});

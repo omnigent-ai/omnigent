@@ -211,9 +211,9 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
     const hasRunner = remote || bundledCli;
     // Offer the choice only when something can install: a runner, an installer, or manual steps.
     const canInstall =
-      setup.onConnectRunner != null ||
+      setup.onConnectRunner !== undefined ||
       setup.mockInstall === true ||
-      setup.onInstallCli != null ||
+      setup.onInstallCli !== undefined ||
       setup.installSupported === false;
     const optional = !hasRunner && !isLocalInstall(url) && setup.installed === false && canInstall;
     if (!optional && !(from === "landing" && (hasRunner || isLocalInstall(url)))) return false;
@@ -319,7 +319,9 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
   };
   // Server list: a new user without the CLI may install it first; anyone else just opens.
   const joinFromServerList = async (url: string): Promise<ConnectResult> => {
-    if (!returning && (await pickRunnerFor(url, "server"))) return {};
+    // Skip the runner lookup when nothing could be offered, so the connect starts right away.
+    const mayOffer = !returning && setup.installed === false && !isLocalInstall(url);
+    if (mayOffer && (await pickRunnerFor(url, "server"))) return {};
     return connect(url);
   };
   // Open the runner step's server without a runner, showing a rejection there.
