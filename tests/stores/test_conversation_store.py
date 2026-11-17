@@ -10384,8 +10384,8 @@ async def test_sibling_family_lifecycle(tmp_path, split_database, user_id, monke
         store.set_conversation_project(first.id, project_id)
     store.set_conversation_project(source.id, project_id)
     assert all(member.project_id == project_id for member in store.get_session_family(second.id))
+    store.set_family_pin(source.id, "345", user_id=user_id)
     assert await store.delete_conversation(source.id)
-    store.set_family_pin(first.id, "345", user_id=user_id)
     assert [member.id for member in store.get_session_family(second.id)] == [first.id, second.id]
     assert store.get_conversation(second.id).labels[family_pinned_label_key(user_id)] == "345"
     later = store.create_conversation(
@@ -10525,6 +10525,62 @@ def test_archiving_a_sibling_leaves_its_family(tmp_path, split_database) -> None
         source.id,
         follow_up.id,
     ]
+
+
+def test_archive_family_leave_survives_races_and_failures(conversation_store, monkeypatch) -> None:
+    import time
+
+    from sqlalchemy import update
+
+    from omnigent.db.db_models import SqlConversation
+
+    store = conversation_store
+    source = store.create_conversation(conversation_id="1" * 32)
+    members = [store.create_conversation(conversation_id=f"{n}" * 32) for n in (2, 3, 4)]
+    for member in members:
+        store.add_new_sibling(source.id, member.id, user_id="alice")
+
+    # A member that read the old family id before the key session re-keyed it still leaves.
+    stale_meta = store._get_meta(members[0].id)
+    store.update_conversation(source.id, archived=True)
+    real_get_meta = store._get_meta
+    monkeypatch.setattr(
+        store,
+        "_get_meta",
+        lambda session_id: (
+            stale_meta if session_id == members[0].id else real_get_meta(session_id)
+        ),
+    )
+    store.update_conversation(members[0].id, archived=True)
+    monkeypatch.setattr(store, "_get_meta", real_get_meta)
+    assert store.get_conversation(members[0].id).family_id is None
+
+    # A failed leave keeps the committed archive, and a later leave repairs it.
+    def fail_leave(session_id):
+        raise RuntimeError("metadata database unavailable")
+
+    monkeypatch.setattr(store, "leave_session_family", fail_leave)
+    archived = store.update_conversation(members[1].id, archived=True)
+    monkeypatch.undo()
+    assert archived.archived
+    assert store.get_conversation(members[1].id).family_id is not None
+    store.leave_session_family(members[1].id)
+    assert store.get_conversation(members[1].id).family_id is None
+
+    # The idle check and the archive are one write: activity after the cutoff wins.
+    cutoff = int(time.time()) - 60
+    assert not store.archive_if_idle(members[2].id, cutoff)
+    assert not store.get_conversation(members[2].id).archived
+    with store._conv_engine.begin() as connection:
+        connection.execute(
+            update(SqlConversation)
+            .where(SqlConversation.id == members[2].id)
+            .values(updated_at=cutoff - 1)
+        )
+    assert store.archive_if_idle(members[2].id, cutoff)
+    assert not store.archive_if_idle(members[2].id, cutoff)
+    idle = store.get_conversation(members[2].id)
+    assert idle.archived and idle.family_id is None
 
 
 @pytest.mark.parametrize(

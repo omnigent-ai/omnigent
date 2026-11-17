@@ -1591,6 +1591,10 @@ class ConversationStore(ABC):
         """Remove a session from its sibling family; archiving calls this."""
         raise NotImplementedError
 
+    def archive_if_idle(self, conversation_id: str, idle_before: int) -> bool:
+        """Archive a session only if it has had no activity since ``idle_before``."""
+        raise NotImplementedError
+
     def get_session_family(self, session_id: str) -> list[Conversation]:
         """Return family members in stable creation order, including archived members."""
         raise NotImplementedError

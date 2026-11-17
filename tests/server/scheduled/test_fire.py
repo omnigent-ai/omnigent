@@ -5243,21 +5243,46 @@ async def test_trigger_run_archives_only_its_idle_launched_siblings(tmp_path, mo
 
     store = SqlAlchemyConversationStore(f"sqlite:///{tmp_path / 'chat.db'}")
     monitor = store.create_conversation(title="Slack trigger")
-    sessions = {
-        name: store.create_conversation(title=name)
-        for name in ("idle", "active", "owner_added", "other_automation")
-    }
+    names = ("idle", "active", "resumed", "elsewhere", "half_archived", "owner_added", "other")
+    sessions = {name: store.create_conversation(title=name) for name in names}
     for session in sessions.values():
         store.add_new_sibling(monitor.id, session.id, user_id="alice")
-    for name, task_id in (("idle", "task"), ("active", "task"), ("other_automation", "other")):
-        store.set_labels(sessions[name].id, {SCHEDULED_TASK_LAUNCH_LABEL_KEY: task_id})
+    for name, session in sessions.items():
+        if name != "owner_added":
+            label = "other" if name == "other" else "task"
+            store.set_labels(session.id, {SCHEDULED_TASK_LAUNCH_LABEL_KEY: label})
     stale = int(time.time()) - fire_mod.LAUNCHED_SESSION_IDLE_ARCHIVE_S - 60
     with store._conv_engine.begin() as connection:
         connection.execute(
             update(SqlConversation)
-            .where(SqlConversation.id != sessions["active"].id)
+            .where(SqlConversation.id.notin_([sessions["active"].id, sessions["resumed"].id]))
             .values(updated_at=stale)
         )
+        # An archive that committed before its family leave failed.
+        connection.execute(
+            update(SqlConversation)
+            .where(SqlConversation.id == sessions["half_archived"].id)
+            .values(archived=True)
+        )
+    real_families = store.get_session_families
+
+    def stale_snapshot(family_ids):
+        # "resumed" looked idle when read, then got activity before the archive write.
+        return {
+            family_id: [
+                replace(member, updated_at=stale)
+                if member.id == sessions["resumed"].id
+                else member
+                for member in members
+            ]
+            for family_id, members in real_families(family_ids).items()
+        }
+
+    monkeypatch.setattr(store, "get_session_families", stale_snapshot)
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.helpers.archive_teardown_is_elsewhere",
+        lambda conv, *args: conv.id == sessions["elsewhere"].id,
+    )
     stopped = []
     monkeypatch.setattr(
         "omnigent.server.routes._sessions.orchestration._spawn_archive_stop",
@@ -5277,7 +5302,10 @@ async def test_trigger_run_archives_only_its_idle_launched_siblings(tmp_path, mo
 
     assert stopped == [sessions["idle"].id]
     archived = {name for name, s in sessions.items() if store.get_conversation(s.id).archived}
-    assert archived == {"idle"}
+    assert archived == {"idle", "half_archived"}
     assert not store.get_conversation(monitor.id).archived
-    # The archived session left the family, freeing its slot.
-    assert sessions["idle"].id not in {m.id for m in store.get_session_family(monitor.id)}
+    # Archived members leave the family, freeing their slots.
+    family = {member.id for member in real_families([monitor.id])[monitor.id]}
+    assert family == {monitor.id} | {
+        sessions[name].id for name in ("active", "resumed", "elsewhere", "owner_added", "other")
+    }

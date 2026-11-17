@@ -1126,7 +1126,8 @@ async def archive_idle_launched_sessions(
 
     They are that session's siblings, so this reads one bounded family. Only
     members carrying this automation's launch label are archived, never the
-    session itself or nested agents the owner added. Never raises.
+    session itself or nested agents the owner added. Archived members still in
+    the family, left by an interrupted archive, are detached. Never raises.
 
     :param deps: The fire's stores and lifecycle handles.
     :param task: The automation being fired.
@@ -1134,36 +1135,51 @@ async def archive_idle_launched_sessions(
     """
     if conv.family_id is None:
         return
-    from omnigent.server.routes._sessions.helpers import _prune_session_read_state
+    from omnigent.server.routes._sessions.helpers import (
+        _prune_session_read_state,
+        archive_teardown_is_elsewhere,
+    )
     from omnigent.server.routes._sessions.orchestration import _spawn_archive_stop
 
-    cutoff = time.time() - LAUNCHED_SESSION_IDLE_ARCHIVE_S
+    store = deps.conversation_store
+    cutoff = int(time.time()) - LAUNCHED_SESSION_IDLE_ARCHIVE_S
     try:
-        families = await asyncio.to_thread(
-            deps.conversation_store.get_session_families, [conv.family_id]
-        )
-        for member in families.get(conv.family_id, []):
+        families = await asyncio.to_thread(store.get_session_families, [conv.family_id])
+    except Exception:
+        _logger.exception("scheduled fire: task %s could not read its sessions", task.id)
+        return
+    for member in families.get(conv.family_id, []):
+        try:
+            if member.id == conv.id:
+                continue
+            if member.archived:
+                await asyncio.to_thread(store.leave_session_family, member.id)
+                continue
             if (
-                member.id == conv.id
-                or member.archived
-                or member.updated_at > cutoff
+                member.updated_at > cutoff
                 or member.labels.get(SCHEDULED_TASK_LAUNCH_LABEL_KEY) != task.id
             ):
                 continue
-            await asyncio.to_thread(
-                deps.conversation_store.update_conversation, member.id, archived=True
-            )
+            # Only the replica holding the session's host tunnel can stop its runner.
+            if await asyncio.to_thread(
+                archive_teardown_is_elsewhere, member, deps.host_registry, deps.host_store
+            ):
+                continue
+            if not await asyncio.to_thread(store.archive_if_idle, member.id, cutoff):
+                continue
             _prune_session_read_state(member.id)
             _spawn_archive_stop(
                 member.id,
-                deps.conversation_store,
+                store,
                 deps.runner_router,
                 deps.host_registry,
                 host_store=deps.host_store,
                 sandbox_config=deps.sandbox_config,
             )
-    except Exception:
-        _logger.exception("scheduled fire: task %s could not archive idle sessions", task.id)
+        except Exception:
+            _logger.exception(
+                "scheduled fire: task %s could not archive idle session %s", task.id, member.id
+            )
 
 
 async def _continue_session(

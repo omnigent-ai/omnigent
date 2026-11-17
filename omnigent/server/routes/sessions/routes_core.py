@@ -220,6 +220,7 @@ from omnigent.server.routes._sessions.helpers import (
     _validate_terminal_launch_args,
     _validated_cost_control_mode_override,
     _validated_subagent_routing_override,
+    archive_teardown_is_elsewhere,
     reconcile_orphaned_running_status,
 )
 from omnigent.server.routes._sessions.orchestration import (
@@ -300,7 +301,6 @@ from omnigent.stores.conversation_store import (
     runner_seen_is_fresh,
 )
 from omnigent.stores.file_store import FileStore
-from omnigent.stores.host_store import host_is_live
 from omnigent.stores.permission_store import PermissionStore, read_all_grants
 from omnigent.stores.project_store import ProjectStore
 from omnigent.stores.session_pull_request_store import SessionSummary
@@ -463,18 +463,13 @@ async def _require_archive_teardown_replica(
     """
     if not _deployment_is_sharded():
         return
-    host_registry = getattr(request.app.state, "host_registry", None)
-    host_store = getattr(request.app.state, "host_store", None)
-    if host_registry is None or host_store is None:
-        return
     conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-    if conv is None or conv.host_id is None or conv.runner_id is None:
-        return
-    if host_registry.get(conv.host_id) is not None:
-        return
-    host = await asyncio.to_thread(host_store.get_host, conv.host_id)
-    # An offline host has no runner to stop; archiving it here loses nothing.
-    if host is not None and host_is_live(host):
+    if conv is not None and await asyncio.to_thread(
+        archive_teardown_is_elsewhere,
+        conv,
+        getattr(request.app.state, "host_registry", None),
+        getattr(request.app.state, "host_store", None),
+    ):
         raise OmnigentError(
             "host is on another replica; retry with the host's slice key",
             code=ErrorCode.WRONG_REPLICA,
