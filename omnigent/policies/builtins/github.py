@@ -786,51 +786,87 @@ def _repo_from_tokens(tokens: list[str]) -> str | None:
     return None
 
 
-def _gh_api_endpoint(rest: list[str]) -> str | None:
-    """Return the endpoint operand, excluding option values such as request fields."""
-    value_options = frozenset(
-        {
-            "-X",
-            "--method",
-            "-H",
-            "--header",
-            "-f",
-            "--field",
-            "-F",
-            "--raw-field",
-            "--input",
-            "-q",
-            "--jq",
-            "-t",
-            "--template",
-            "--hostname",
-            "-R",
-            "--repo",
-            "--cache",
-            "-p",
-            "--preview",
-        }
-    )
-    flag_only = frozenset({"--paginate", "--slurp", "--silent", "--verbose", "-i", "--include"})
+# ``gh api`` options that take a value, keyed by spelling, and its boolean flags.
+_GH_API_VALUE_OPTIONS = {
+    "--cache": "cache",
+    "-F": "field",
+    "--field": "field",
+    "-H": "header",
+    "--header": "header",
+    "--hostname": "hostname",
+    "--input": "field",
+    "-q": "jq",
+    "--jq": "jq",
+    "-X": "method",
+    "--method": "method",
+    "-p": "preview",
+    "--preview": "preview",
+    "-f": "field",
+    "--raw-field": "field",
+    "-t": "template",
+    "--template": "template",
+}
+_GH_API_BOOLEAN_OPTIONS = frozenset(
+    {"-i", "--include", "--paginate", "--silent", "--slurp", "--verbose"}
+)
+
+
+def _parse_gh_api_args(rest: list[str]) -> tuple[list[tuple[str, str]], list[str]] | None:
+    """
+    Split ``gh api`` arguments into option values and operands, as gh reads them.
+
+    A value option takes the next token whatever it looks like, so a token such
+    as ``-XGET`` after ``--input`` is that option's value and never a method.
+
+    :param rest: Tokens after ``gh api``, e.g. ``["repos/o/r/issues", "-X", "POST"]``.
+    :returns: ``(options, operands)`` with options as ``(kind, value)`` pairs, e.g.
+        ``([("method", "POST")], ["repos/o/r/issues"])``; ``None`` for an unknown
+        option or a missing value.
+    """
+    options: list[tuple[str, str]] = []
+    operands: list[str] = []
     i = 0
     while i < len(rest):
         token = rest[i]
+        i += 1
         if token == "--":
-            return rest[i + 1] if i + 1 < len(rest) else None
-        if token in value_options:
-            i += 2
+            operands.extend(rest[i:])
+            break
+        if not token.startswith("-") or token == "-":
+            operands.append(token)
             continue
-        if token.startswith("-"):
-            if (
-                "=" not in token
-                and not token.startswith(("-f", "-F", "-H", "-X", "-q", "-t"))
-                and token not in flag_only
-            ):
+        if token.startswith("--"):
+            name, equal, attached = token.partition("=")
+            if name in _GH_API_BOOLEAN_OPTIONS:
+                continue
+            kind = _GH_API_VALUE_OPTIONS.get(name)
+            if kind is None:
                 return None
-            i += 1
+            if not equal:
+                if i >= len(rest):
+                    return None
+                attached = rest[i]
+                i += 1
+            options.append((kind, attached))
             continue
-        return token
-    return None
+        # A short cluster: boolean letters, then at most one value option that
+        # takes the rest of the token or the next token.
+        for offset in range(1, len(token)):
+            short = "-" + token[offset]
+            if short in _GH_API_BOOLEAN_OPTIONS:
+                continue
+            kind = _GH_API_VALUE_OPTIONS.get(short)
+            if kind is None:
+                return None
+            attached = token[offset + 1 :].removeprefix("=")
+            if offset + 1 == len(token):
+                if i >= len(rest):
+                    return None
+                attached = rest[i]
+                i += 1
+            options.append((kind, attached))
+            break
+    return options, operands
 
 
 def _repo_from_gh_api_endpoint(endpoint: str | None) -> str | None:
@@ -974,28 +1010,76 @@ def _unparsed_git_push(args: list[str]) -> _ShellOp:
     )
 
 
-def _flag_values(tokens: list[str], names: frozenset[str]) -> list[str]:
-    """
-    Return every value given for a flag, in command-line order.
+# Long gh flags that take no value in any gh command, so the token after one
+# is never its value.
+_GH_BOOLEAN_FLAGS = frozenset(
+    {
+        "--admin",
+        "--all",
+        "--auto",
+        "--cleanup-tag",
+        "--delete-branch",
+        "--draft",
+        "--dry-run",
+        "--fill",
+        "--generate-notes",
+        "--merge",
+        "--prerelease",
+        "--private",
+        "--public",
+        "--rebase",
+        "--squash",
+        "--undo",
+        "--web",
+        "--yes",
+    }
+)
 
-    Accepts ``--flag value``, ``--flag=value``, and the attached short form
-    ``-Rvalue``. gh (cobra/pflag) keeps the last occurrence, so callers must
-    check the whole list for conflicts instead of trusting the first match.
 
-    :param tokens: Argument tokens.
-    :param names: Flag spellings to match, e.g. ``{"--repo", "-R"}``.
-    :returns: The values in order; empty when the flag is absent.
+def _gh_target_flags(rest: list[str]) -> tuple[list[str], list[str]] | None:
     """
-    values: list[str] = []
-    for i, token in enumerate(tokens):
-        for name in names:
-            if token == name:
-                if i + 1 < len(tokens):
-                    values.append(tokens[i + 1])
-            elif token.startswith(name + "="):
-                values.append(token[len(name) + 1 :])
-            elif len(name) == 2 and token.startswith(name) and len(token) > 2:
-                values.append(token[2:])
+    Return the repo and base-branch selector values of a ``gh`` subcommand.
+
+    Accepts ``--repo value``, ``--repo=value``, ``-R value`` and ``-Rvalue`` (and
+    the same for ``--base`` / ``-B``). gh keeps the last occurrence, so callers
+    check the whole list for conflicts. Subcommand options are not all known
+    here, so a selector written right after an option that may take a value
+    could be that value; such a command has no reliable target.
+
+    :param rest: Tokens after the gh command group, e.g.
+        ``["create", "-R", "example/repo", "--base", "main"]``.
+    :returns: ``(repos, bases)`` in command-line order, or ``None`` when a
+        selector may instead be the value of the option before it.
+    """
+    selectors = {"--repo": 0, "-R": 0, "--base": 1, "-B": 1}
+    values: tuple[list[str], list[str]] = ([], [])
+    may_be_value = False
+    i = 0
+    while i < len(rest):
+        token = rest[i]
+        i += 1
+        if token == "--":
+            break
+        name, equal, attached = token.partition("=")
+        if name not in selectors and not token.startswith("--") and token[:2] in selectors:
+            name, equal, attached = token[:2], "=", token[2:].removeprefix("=")
+        if name in selectors:
+            if may_be_value:
+                return None
+            if not equal:
+                if i >= len(rest):
+                    break
+                attached = rest[i]
+                i += 1
+            values[selectors[name]].append(attached)
+            may_be_value = False
+            continue
+        if not token.startswith("--") and token.startswith("-") and set(name[2:]) & {"R", "B"}:
+            # A short cluster such as ``-dR`` may end in a selector.
+            return None
+        may_be_value = (
+            token.startswith("-") and token != "-" and not equal and token not in _GH_BOOLEAN_FLAGS
+        )
     return values
 
 
@@ -1003,7 +1087,7 @@ def _conflicting_values(values: list[str], normalize: Callable[[str], str]) -> b
     """
     Return whether repeated flag values name different targets.
 
-    :param values: Values from :func:`_flag_values`, e.g. ``["example/a", "example/b"]``.
+    :param values: Values from :func:`_gh_target_flags`, e.g. ``["example/a", "example/b"]``.
     :param normalize: Reduces a value to its target, e.g. :func:`_normalize_repo`.
         Values that normalize to nothing are compared as written.
     :returns: ``True`` when two or more distinct targets are present.
@@ -1146,13 +1230,16 @@ def _classify_gh(tokens: list[str]) -> _ShellOp | None:
 
     # The global -R and the subcommand -R both select the repo. Conflicting values
     # cannot be resolved to one target, so they need approval.
-    repo_values = [*global_repos, *_flag_values(rest, frozenset({"--repo", "-R"}))]
+    target_flags = _gh_target_flags(rest)
+    if target_flags is None:
+        return _unparseable_op("gh repo or base selector may be another option's value")
+    repo_values = [*global_repos, *target_flags[0]]
     if _conflicting_values(repo_values, _normalize_repo):
         return _unparseable_op("conflicting gh repo selectors")
     explicit_repo = repo_values[-1] if repo_values else None
     repo = _normalize_repo(explicit_repo) if explicit_repo is not None else None
     # Only ``--base`` is a write destination; ``--head`` is the PR's source branch.
-    base_values = _flag_values(rest, frozenset({"--base", "-B"}))
+    base_values = target_flags[1]
     if _conflicting_values(base_values, _normalize_branch):
         return _unparseable_op("conflicting gh base branches")
     branches = _normalize_branches(base_values[-1:])
@@ -1204,28 +1291,14 @@ def _classify_gh_api(rest: list[str]) -> _ShellOp:
     :param rest: Tokens after ``gh api``, e.g. ``["repos/o/r/pulls", "-X", "POST"]``.
     :returns: A read or write :class:`_ShellOp` for the api call.
     """
-    methods: list[str] = []
-    for i, token in enumerate(rest):
-        if token in {"-X", "--method"}:
-            methods.append(rest[i + 1].upper() if i + 1 < len(rest) else "")
-        elif token.startswith(("-X=", "--method=")):
-            methods.append(token.split("=", 1)[1].upper())
-        elif token.startswith("-X") and len(token) > 2:
-            methods.append(token[2:].upper())
+    parsed = _parse_gh_api_args(rest)
+    if parsed is None:
+        return _unparseable_op("unsupported gh api option")
+    options, operands = parsed
+    methods = [value.upper() for kind, value in options if kind == "method"]
     if any(method not in {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"} for method in methods):
-        return _ShellOp(
-            kind="unparseable",
-            repo=None,
-            branches=frozenset(),
-            branch_targeted=False,
-            detail="unsupported gh api method",
-        )
-    has_fields = any(
-        t in {"-f", "--field", "-F", "--raw-field", "--input"}
-        or t.startswith(("--field=", "--raw-field=", "--input="))
-        or (t.startswith(("-f", "-F")) and "=" in t)
-        for t in rest
-    )
+        return _unparseable_op("unsupported gh api method")
+    has_fields = any(kind == "field" for kind, _ in options)
     write_methods = {"POST", "PUT", "PATCH", "DELETE"}
     # An explicit method overrides the POST that field flags imply. With several
     # methods, any write among them makes the call a write.
@@ -1233,12 +1306,12 @@ def _classify_gh_api(rest: list[str]) -> _ShellOp:
         is_write = any(method in write_methods for method in methods)
     else:
         is_write = has_fields
-    hostname_values = _flag_values(rest, frozenset({"--hostname"}))
+    hostname_values = [value for kind, value in options if kind == "hostname"]
     if _conflicting_values(hostname_values, str.lower):
         return _unparseable_op("conflicting gh api hostnames")
     hostname = hostname_values[-1] if hostname_values else None
     api_repo = (
-        _repo_from_gh_api_endpoint(_gh_api_endpoint(rest))
+        _repo_from_gh_api_endpoint(operands[0] if operands else None)
         if hostname is None or hostname.lower() in {"github.com", "api.github.com"}
         else None
     )

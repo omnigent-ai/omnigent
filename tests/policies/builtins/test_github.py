@@ -1419,6 +1419,14 @@ def test_gh_write_uses_only_an_explicit_target() -> None:
     assert _target_action("gh --unknown-global pr create -R example/allowed") == "ASK"
     assert _target_action("gh pr merge https://github.com/example/allowed/pull/1") == "ALLOW"
     assert _target_action("gh repo create example/allowed") == "ALLOW"
+    # A selector written as the value of another option does not select a repo.
+    for consumed in ("--title -Rexample/allowed", "--title --repo=example/allowed"):
+        assert _target_action(f"gh issue create {consumed} --body example") == "ASK"
+    assert _target_action("gh pr create --base -Rexample/allowed") == "ASK"
+    assert _target_action("gh pr create -R example/allowed -dRexample/other") == "ASK"
+    # After a flag that takes no value, the selector is a selector.
+    assert _target_action("gh pr create --draft -R example/allowed --base main") == "ALLOW"
+    assert _target_action("gh pr create --draft -R example/other --base main") == "DENY"
 
 
 @pytest.mark.parametrize(
@@ -1461,6 +1469,13 @@ def test_gh_write_uses_only_an_explicit_target() -> None:
         ("gh api -F q=x -X HEAD repos/example/other/issues", "ALLOW"),
         ("gh api -X GET -X POST repos/example/other/issues -f q=x", "DENY"),
         ("gh api -X POST -X GET repos/example/other/issues", "DENY"),
+        # A token an option takes as its value is never read as a method.
+        ("gh api repos/example/other/issues --input -XGET", "DENY"),
+        ("gh api repos/example/other/issues -H -XGET -f title=x", "DENY"),
+        ("gh api --input -XGET repos/example/allowed/issues", "ALLOW"),
+        # A method at the end of a short cluster still counts.
+        ("gh api -iX POST repos/example/other/issues", "DENY"),
+        ("gh api repos/example/other/issues --input", "ASK"),
     ],
 )
 def test_gh_api_repository_comes_from_the_endpoint(command: str, expected: str) -> None:
