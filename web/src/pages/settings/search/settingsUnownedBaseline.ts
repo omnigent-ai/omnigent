@@ -96,19 +96,7 @@ export const UNOWNED_CONTROLS: Readonly<Record<string, { count: number; reason: 
     count: 1,
     reason: "Global shortcut row's control, not yet catalog-owned.",
   },
-  "src/pages/settings/HarnessCatalog.tsx › BackButton › Button": {
-    count: 1,
-    reason: "Back link; owning it would rename it.",
-  },
-  "src/pages/settings/HarnessCatalog.tsx › BackButton › Link": {
-    count: 1,
-    reason: "Back link; owning it would rename it.",
-  },
   "src/pages/settings/HarnessCatalog.tsx › CatalogRow › button": {
-    count: 1,
-    reason: "Harness catalog row's control, not yet catalog-owned.",
-  },
-  "src/pages/settings/HarnessCatalog.tsx › CatalogRow › li": {
     count: 1,
     reason: "Harness catalog row's control, not yet catalog-owned.",
   },
@@ -116,15 +104,7 @@ export const UNOWNED_CONTROLS: Readonly<Record<string, { count: number; reason: 
     count: 2,
     reason: "Data region's entry is picked at runtime, which the guard can't read.",
   },
-  "src/pages/settings/HarnessCatalog.tsx › HarnessCatalog › TabsTrigger": {
-    count: 2,
-    reason: "Harness page tab, not yet declared as a tab list.",
-  },
   "src/pages/settings/HarnessCatalog.tsx › McpRow › summary": {
-    count: 1,
-    reason: "Per-harness MCP server switch; its name is per server, not yet declared.",
-  },
-  "src/pages/settings/HarnessCatalog.tsx › McpSwitch › Switch": {
     count: 1,
     reason: "Per-harness MCP server switch; its name is per server, not yet declared.",
   },
@@ -185,22 +165,6 @@ export const UNOWNED_CONTROLS: Readonly<Record<string, { count: number; reason: 
   "src/pages/settings/SettingsHarnessesSection.tsx › CredentialCard › button": {
     count: 1,
     reason: "Credential choice card.",
-  },
-  "src/pages/settings/SettingsHarnessesSection.tsx › HarnessCard › Link": {
-    count: 1,
-    reason: "Harness card link, not yet catalog-owned.",
-  },
-  "src/pages/settings/SettingsHarnessesSection.tsx › HostSelect › Button": {
-    count: 1,
-    reason: "Machine picker (HostSelect).",
-  },
-  "src/pages/settings/SettingsHarnessesSection.tsx › HostSelect › DropdownMenuContent": {
-    count: 1,
-    reason: "Machine picker (HostSelect).",
-  },
-  "src/pages/settings/SettingsHarnessesSection.tsx › HostSelect › DropdownMenuItem": {
-    count: 1,
-    reason: "Machine picker (HostSelect).",
   },
   "src/pages/settings/SettingsHarnessesSection.tsx › SettingsHarnessesSection › SettingsOverlayOwner":
     {
