@@ -1375,6 +1375,17 @@ class SqlAlchemyConversationStore(ConversationStore):
         if flushed_metadata:
 
             def delete_flushed(session: Session) -> None:
+                host_id = session.scalar(
+                    select(SqlConversationMetadata.host_id).where(
+                        SqlConversationMetadata.workspace_id == current_workspace_id(),
+                        SqlConversationMetadata.id == conversation_id,
+                    )
+                )
+                host = (
+                    session.get(SqlHost, (current_workspace_id(), host_id), with_for_update=True)
+                    if host_id is not None
+                    else None
+                )
                 session.execute(
                     delete(SqlConversationMetadata).where(
                         SqlConversationMetadata.workspace_id == current_workspace_id(),
@@ -1388,6 +1399,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                             SqlAgent.id == agent_id,
                         )
                     )
+                if host is not None:
+                    session.flush()
+                    delete_unused_host_in_session(session, host)
 
             run_write_transaction(
                 self._session_immediate, "discard_unbound_conversation_metadata", delete_flushed
