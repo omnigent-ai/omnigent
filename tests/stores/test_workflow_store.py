@@ -237,6 +237,10 @@ def test_a_description_keeps_its_proposal_until_written_otherwise(store: Workflo
     edited = store.update(saved.id, user_id=ALICE, description="From a proposal.")
     assert edited is not None and edited.description_source is None
     assert store.get(saved.id, user_id=ALICE) == edited
+    # A new planning chat's journal holds none of the old chat's proposals.
+    store.update(saved.id, user_id=ALICE, description="Again.", description_source=proposal)
+    replanned = store.update(saved.id, user_id=ALICE, planning_session_id="c" * 32)
+    assert replanned is not None and replanned.description_source is None
 
 
 def test_invalid_or_oversized_workflows_are_refused(store: WorkflowStore) -> None:

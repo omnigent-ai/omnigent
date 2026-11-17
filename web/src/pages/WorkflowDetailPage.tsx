@@ -165,13 +165,15 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
   // A proposal replaces the description only if it's newer than where the description came
   // from, so an edit made since stands: the proposal Save plan took it from, by journal order,
   // or else the workflow's last write, in whole seconds, where a tie keeps the description.
-  const savedFrom = workflow.description_source
-    ? journal.entries.find((entry) => entry.id === workflow.description_source)
-    : undefined;
+  // A source outside the loaded journal predates the oldest entry loaded.
+  const source = workflow.description_source;
+  const savedFrom = source ? journal.entries.find((entry) => entry.id === source) : undefined;
   const proposalIsNewer =
     proposal !== null &&
-    (savedFrom
-      ? proposal.position > savedFrom.position
+    (source
+      ? savedFrom
+        ? proposal.position > savedFrom.position
+        : journal.hasOlder
       : proposal.created_at > (workflow.updated_at ?? 0));
   const proposedDescription = proposalIsNewer ? planDescription(proposal) : null;
   const newDescription =
@@ -296,12 +298,13 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
                 onClick={() => {
                   if (!proposal || !proposedSteps) return;
                   setPlannerOpen(showPlanner);
-                  // The server keeps a description another client changed after this page loaded it.
+                  // Even an unchanged description records the proposal it now comes from. The
+                  // server keeps a description another client changed after this page loaded it.
                   const description =
-                    newDescription === null
+                    proposedDescription === null
                       ? {}
                       : {
-                          description: newDescription,
+                          description: proposedDescription,
                           expected_description: workflow.description,
                           description_source: proposal.id,
                         };

@@ -796,6 +796,127 @@ describe("WorkflowDetailPage", () => {
       expect(screen.getByTestId("workflow-detail-run")).toBeEnabled();
       expect(description()).toBe("Fixes one flaky test.");
     });
+
+    it("keeps a newer description unsaved when a save that kept the old one lands after it", async () => {
+      const actual = await vi.importActual<typeof WorkflowHooks>("@/hooks/useWorkflow");
+      vi.mocked(useWorkflow).mockImplementation(actual.useWorkflow);
+      mockRuns([]);
+      let stored: WorkflowDetail = {
+        ...WORKFLOW,
+        description: "Fixes one flaky test.",
+        planning_session_id: "a".repeat(32),
+        updated_at: 100,
+      };
+      const patches: Record<string, unknown>[] = [];
+      let releaseSave = () => {};
+      vi.mocked(authenticatedFetch).mockImplementation(async (_path, options) => {
+        if (options?.method === "PATCH") {
+          const body = JSON.parse(String(options.body));
+          patches.push(body);
+          await new Promise<void>((resolve) => {
+            releaseSave = resolve;
+          });
+          stored = {
+            ...stored,
+            steps: body.steps,
+            description: body.description ?? stored.description,
+            description_source:
+              body.description === undefined
+                ? stored.description_source
+                : (body.description_source ?? null),
+            updated_at: 301,
+          };
+        }
+        return new Response(JSON.stringify(stored));
+      });
+      // The first proposal changes only the steps and keeps the saved wording.
+      const first = {
+        ...saved,
+        id: "first",
+        content: { steps: edited, description: "Fixes one flaky test." },
+      };
+      const journal = {
+        entries: [first],
+        isLoading: false,
+        error: null,
+        hasOlder: false,
+        loadingOlder: false,
+        loadOlder: vi.fn(),
+        retry: vi.fn(),
+      };
+      vi.mocked(useSessionJournal).mockImplementation(() => journal);
+      const { rerender } = renderPage();
+      await screen.findByTestId("workflow-detail-title");
+
+      fireEvent.click(screen.getByRole("button", { name: "Save plan" }));
+      await waitFor(() => expect(patches).toHaveLength(1));
+      journal.entries = [
+        first,
+        {
+          ...first,
+          id: "second",
+          position: 2,
+          created_at: 200,
+          content: { steps: edited, description: "Fixes flaky tests." },
+        },
+      ];
+      rerender(<WorkflowDetailPage />);
+      await act(async () => releaseSave());
+
+      await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent("Unsaved changes"));
+      expect(description()).toBe("Fixes flaky tests.");
+      expect(patches[0]).toMatchObject({
+        description: "Fixes one flaky test.",
+        description_source: "first",
+      });
+    });
+
+    it("offers a newer proposal when the one saved is older than the loaded journal", async () => {
+      const actual = await vi.importActual<typeof WorkflowHooks>("@/hooks/useWorkflow");
+      vi.mocked(useWorkflow).mockImplementation(actual.useWorkflow);
+      mockRuns([]);
+      const stored: WorkflowDetail = {
+        ...WORKFLOW,
+        description: "Fixes one flaky test.",
+        description_source: "e".repeat(32),
+        planning_session_id: "a".repeat(32),
+        // A rename after the newer proposal moved the workflow's last write past it.
+        updated_at: 500,
+      };
+      vi.mocked(authenticatedFetch).mockImplementation(
+        async () => new Response(JSON.stringify(stored)),
+      );
+      const page = (hasOlder: boolean) => ({
+        entries: [
+          {
+            ...saved,
+            id: "newer",
+            position: 150,
+            created_at: 300,
+            content: { steps: WORKFLOW.steps, description: "Fixes flaky tests." },
+          },
+        ],
+        isLoading: false,
+        error: null,
+        hasOlder,
+        loadingOlder: false,
+        loadOlder: vi.fn(),
+        retry: vi.fn(),
+      });
+      vi.mocked(useSessionJournal).mockReturnValue(page(true));
+      renderPage();
+      await screen.findByTestId("workflow-detail-title");
+      expect(description()).toBe("Fixes flaky tests.");
+      expect(screen.getByRole("status")).toHaveTextContent("Unsaved changes");
+
+      // With the whole journal loaded, a source it lacks can't be placed, so the description stays.
+      cleanup();
+      vi.mocked(useSessionJournal).mockReturnValue(page(false));
+      renderPage();
+      await screen.findByTestId("workflow-detail-title");
+      expect(description()).toBe("Fixes one flaky test.");
+      expect(screen.getByRole("status")).toHaveTextContent("Saved plan");
+    });
   });
 
   it("shows the workflow, its steps, and the sessions that ran it", () => {
