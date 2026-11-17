@@ -16,18 +16,6 @@ export const UNOWNED_CONTROLS: Readonly<Record<string, { count: number; reason: 
     count: 1,
     reason: 'Model field\'s combobox; its accessible name includes "*".',
   },
-  "src/components/theme/ThemeColorPicker.tsx › ThemeColorPicker › button": {
-    count: 1,
-    reason: "Theme color picker popover internals, not named by a row.",
-  },
-  "src/components/theme/ThemeColorPicker.tsx › ThemeColorPicker › div": {
-    count: 1,
-    reason: "Theme color picker popover internals, not named by a row.",
-  },
-  "src/components/theme/ThemeColorPicker.tsx › ThemeColorPicker › input": {
-    count: 2,
-    reason: "Theme color picker popover internals, not named by a row.",
-  },
   "src/components/ProactiveAgentAdminControls.tsx › ProactiveAgentAdminControls › Button": {
     count: 3,
     reason: "added after the Settings catalog; no section entry yet",
@@ -40,37 +28,17 @@ export const UNOWNED_CONTROLS: Readonly<Record<string, { count: number; reason: 
     count: 1,
     reason: "added after the Settings catalog; no section entry yet",
   },
-  "src/pages/AdminGeneralPage.tsx › AdminGeneralPage › SelectContent": {
+  "src/components/theme/ThemeColorPicker.tsx › ThemeColorPicker › button": {
     count: 1,
-    reason: "Admin general page's select, not yet catalog-owned.",
+    reason: "Theme color picker popover internals, not named by a row.",
   },
-  "src/pages/AdminGeneralPage.tsx › AdminGeneralPage › SelectItem": {
+  "src/components/theme/ThemeColorPicker.tsx › ThemeColorPicker › div": {
     count: 1,
-    reason: "Admin general page's select, not yet catalog-owned.",
+    reason: "Theme color picker popover internals, not named by a row.",
   },
-  "src/pages/AdminGeneralPage.tsx › AdminGeneralPage › SelectTrigger": {
-    count: 1,
-    reason: "Admin general page's select, not yet catalog-owned.",
-  },
-  "src/pages/MembersPage.tsx › CopyableValue › Button": {
-    count: 1,
-    reason: "Members copy control and invite-result Done button, not yet catalog-owned.",
-  },
-  "src/pages/MembersPage.tsx › CopyableValue › Input": {
-    count: 1,
-    reason: "Members copy control and invite-result Done button, not yet catalog-owned.",
-  },
-  "src/pages/MembersPage.tsx › MembersPage › Button": {
+  "src/components/theme/ThemeColorPicker.tsx › ThemeColorPicker › input": {
     count: 2,
-    reason: "Members copy control and invite-result Done button, not yet catalog-owned.",
-  },
-  "src/pages/PoliciesPage.tsx › AddDefaultPolicyDialog › Button": {
-    count: 1,
-    reason: "Add default policy dialog's actions, not yet catalog-owned.",
-  },
-  "src/pages/PoliciesPage.tsx › AddDefaultPolicyDialog › button": {
-    count: 1,
-    reason: "Add default policy dialog's actions, not yet catalog-owned.",
+    reason: "Theme color picker popover internals, not named by a row.",
   },
   "src/pages/SettingsPage.tsx › AppearanceSection › Button": {
     count: 2,
@@ -83,22 +51,6 @@ export const UNOWNED_CONTROLS: Readonly<Record<string, { count: number; reason: 
   "src/pages/SettingsPage.tsx › StepperButton › button": {
     count: 1,
     reason: "Number stepper's button, not yet catalog-owned.",
-  },
-  "src/pages/SharingPage.tsx › BlockedBy › div": {
-    count: 1,
-    reason: "Sharing page's select, input or note, not yet catalog-owned.",
-  },
-  "src/pages/SharingPage.tsx › SharingPage › SelectContent": {
-    count: 2,
-    reason: "Sharing page's select, input or note, not yet catalog-owned.",
-  },
-  "src/pages/SharingPage.tsx › SharingPage › SelectItem": {
-    count: 3,
-    reason: "Sharing page's select, input or note, not yet catalog-owned.",
-  },
-  "src/pages/SharingPage.tsx › SharingPage › input": {
-    count: 1,
-    reason: "Sharing page's select, input or note, not yet catalog-owned.",
   },
   "src/pages/settings/GlobalShortcutControl.tsx › GlobalShortcutControl › Button": {
     count: 1,
