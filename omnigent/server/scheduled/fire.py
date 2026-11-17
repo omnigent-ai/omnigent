@@ -157,7 +157,12 @@ from omnigent.server.scheduled.telemetry import (
     startup_failure_stage,
 )
 from omnigent.server.schemas import SessionEventInput
-from omnigent.server.session_mcp_selection import SessionMcpSelection, session_mcp_selection
+from omnigent.server.session_mcp_selection import (
+    SessionMcpSelection,
+    mcp_selection_for,
+    run_sandbox,
+    session_mcp_label_keys,
+)
 from omnigent.stores.conversation_store import (
     CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
     SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY,
@@ -890,13 +895,14 @@ async def _run_fire_for_task(
     try:
         start_fire_stage("session_create")
         effective = await _own_task_agent(deps, effective)
+        mcp_selection = await _run_mcp_selection(
+            deps, task, effective.host_id or recorder.managed_host_id
+        )
         conv = await _create_session(
             deps,
             effective,
             labels={
-                **_session_labels(
-                    task, session_mcp_selection(deps.app_state), recorder.managed_host_id
-                ),
+                **_session_labels(task, mcp_selection, recorder.managed_host_id),
                 SCHEDULED_TASK_RUN_LABEL_KEY: recorder.run_id,
                 SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY: recorder.run_id,
             },
@@ -1908,6 +1914,16 @@ def _sandbox_workspaces(task: ScheduledTask) -> list[str]:
     return []
 
 
+async def _run_mcp_selection(
+    deps: FireDeps, task: ScheduledTask, host_id: str | None
+) -> SessionMcpSelection:
+    """The selection of the sandbox a run's session lands in, or the registry's."""
+    sandbox = await asyncio.to_thread(
+        run_sandbox, deps.sandbox_config, deps.host_store, task.execution_target, host_id
+    )
+    return mcp_selection_for(sandbox)
+
+
 def _session_labels(
     task: ScheduledTask,
     mcp_selection: SessionMcpSelection | None = None,
@@ -1915,14 +1931,14 @@ def _session_labels(
 ) -> dict[str, str]:
     """Labels a fired session starts with.
 
-    The task's MCP services become the deployment's selection labels, so every
-    run starts with the same services. A managed fire's session records the
+    The task's MCP services become its selection's labels, so every run starts
+    with the same services. A managed fire's session records the
     sandbox host id it was launched under, so the host routes by that id from
     its first connection and a relaunch keeps the same replica. A task with no
     services writes no selection labels, so a copied session keeps its own.
     """
     selection_labels = (
-        (mcp_selection or session_mcp_selection(None)).session_labels(task.mcp_services)
+        (mcp_selection or mcp_selection_for(None)).session_labels(task.mcp_services)
         if task.mcp_services
         else {}
     )
@@ -2136,11 +2152,9 @@ async def _copy_source_session_for_run(
         source.labels if source is not None else {}, agent_changed=agent_changed
     )
     if task.mcp_services and source is not None:
-        # The task's own MCP services replace the copy's rather than adding to them.
-        selection = session_mcp_selection(deps.app_state)
-        dropped = dropped | frozenset(
-            selection.session_labels(selection.selected_services(source.labels))
-        )
+        # The task's own MCP services replace the copy's rather than adding to
+        # them, whichever selection wrote the copy's.
+        dropped = dropped | session_mcp_label_keys(deps.sandbox_config, source.labels)
     project_id = await _fire_project_id(deps, task)
     try:
         conv = await asyncio.to_thread(
