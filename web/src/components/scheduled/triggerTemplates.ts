@@ -8,6 +8,11 @@ import {
   PagerDutyIcon,
   SlackIcon,
 } from "@/components/icons/IntegrationIcons";
+import {
+  opensWithSavedWorkflowRun,
+  parseSavedWorkflowRun,
+  savedWorkflowRunOpening,
+} from "@/lib/savedWorkflowRun";
 
 export type TriggerSource = "jira" | "slack" | "github" | "linear" | "pagerduty";
 
@@ -104,6 +109,11 @@ export interface TriggerPromptContext {
   taskSessionTitle?: string;
   /** The longest message to send, from {@link triggerMessageBudget}; 32,000 when omitted. */
   messageMaxChars?: number;
+  /**
+   * Whether `sys_session_create` accepts `workflow_id` here. When it does, each match's
+   * session for instructions that run a saved workflow starts as a run of that workflow.
+   */
+  workflowIdSupported?: boolean;
 }
 
 export interface TriggerConditionField {
@@ -637,7 +647,11 @@ const TASK_SESSION_TITLE_MAX_CHARS = 200;
 /** Ends whatever the manager and its workers post, since they post with the owner's account. */
 export const OMNIGENT_ATTRIBUTION = "Sent with Omnigent";
 
-/** The headings that separate a template's manager text from the owner's instructions. */
+/**
+ * The headings that separate a template's manager text from the owner's instructions.
+ * The server splits prompts on them too: keep them, POSTING_INSTRUCTIONS and
+ * splitTriggerPrompt in sync with omnigent/server/scheduled/workflow_automations.py.
+ */
 interface TriggerPromptHeadings {
   instructions: string;
   posting: string;
@@ -668,17 +682,20 @@ function slackWorkerPostingInstructions(linkBack: boolean, sessionLink: string):
   return `${POSTING_INSTRUCTIONS}\n${start}Reply in the same thread when you have a useful result or a blocker. Each later reply carries only what is new since your previous reply in that thread${linkBack ? ", without the session link" : ""}.`;
 }
 
+/** Whether `prompt` begins like a prompt rendered from a trigger template. */
+function startsLikeTemplatePrompt(prompt: string): boolean {
+  return TRIGGER_SOURCES.some((source) =>
+    prompt.startsWith(`This automation watches ${triggerServiceName(source)} `),
+  );
+}
+
 /** Separate saved template instructions without guessing at free-form prompts. */
 export function splitTriggerPrompt(prompt: string): {
   userPrompt: string;
   systemPrompt: string | null;
 } {
   const unsplit = { userPrompt: prompt, systemPrompt: null };
-  if (
-    !TRIGGER_SOURCES.some((source) =>
-      prompt.startsWith(`This automation watches ${triggerServiceName(source)} `),
-    )
-  ) {
+  if (!startsLikeTemplatePrompt(prompt)) {
     return unsplit;
   }
   const headings = triggerPromptHeadings(prompt);
@@ -712,6 +729,24 @@ export function splitTriggerPrompt(prompt: string): {
     : unsplit;
 }
 
+/**
+ * Whether the prompt an automation's runs send could run a saved workflow, read as the
+ * server reads it (omnigent/server/scheduled/workflow_automations.py): a trigger's
+ * instructions when its prompt splits, otherwise every place its instructions could start.
+ */
+export function promptMayRunSavedWorkflow(prompt: string): boolean {
+  const body = stripTriggerHeader(prompt);
+  const parts = splitTriggerPrompt(body);
+  if (parts.systemPrompt !== null || !startsLikeTemplatePrompt(body)) {
+    return parseSavedWorkflowRun(parts.userPrompt) !== null;
+  }
+  // Instructions that repeat a heading, for example, keep the prompt from splitting.
+  return body
+    .split(triggerPromptHeadings(body).instructions)
+    .slice(1)
+    .some((section) => opensWithSavedWorkflowRun(section));
+}
+
 /** Keep existing template prompts byte-for-byte when neither part changed. */
 export function combineTriggerPrompt(userPrompt: string, systemPrompt: string | null): string {
   if (systemPrompt === null) return userPrompt;
@@ -736,7 +771,8 @@ export interface TriggerWorkerSettings {
 const QUOTED_WORKER_VALUE = String.raw`"(?:[^"\\]|\\.)*"`;
 const WORKER_SETTINGS_PATTERN = new RegExp(
   `call sys_session_create with agent_id (set to your agent ID|${QUOTED_WORKER_VALUE}), ` +
-    `(placement "(?:same_host|managed)", title ${QUOTED_WORKER_VALUE})` +
+    // The saved workflow follows the instructions, so worker settings edits keep it.
+    `(placement "(?:same_host|managed)", title ${QUOTED_WORKER_VALUE}(?:, workflow_id "[0-9a-f]{32}")?)` +
     `(?:, model (${QUOTED_WORKER_VALUE}))?` +
     `(?:, reasoning_effort (${QUOTED_WORKER_VALUE}))?` +
     `(?:, permission_mode (${QUOTED_WORKER_VALUE}))?` +
@@ -746,10 +782,8 @@ const WORKER_SETTINGS_PATTERN = new RegExp(
   "g",
 );
 
-function workerSettingsMatch(prompt: string) {
-  const parts = splitTriggerPrompt(stripTriggerHeader(prompt));
-  if (parts.systemPrompt === null) return null;
-  const manager = parts.systemPrompt.split(triggerPromptHeadings(parts.systemPrompt).posting)[0];
+/** The manager text's one generated creation call, or null when there's none or more. */
+function generatedCreationCall(manager: string): RegExpMatchArray | null {
   const matches = [...manager.matchAll(WORKER_SETTINGS_PATTERN)];
   if (matches.length !== 1) return null;
   const match = matches[0];
@@ -757,7 +791,15 @@ function workerSettingsMatch(prompt: string) {
   const otherInstructions = manager
     .replace(match[0], "")
     .replace(/\bthat\s+`?sys_session_create`?\s+returned\b/gi, "");
-  if (/\bsys_session_create\b/i.test(otherInstructions)) return null;
+  return /\bsys_session_create\b/i.test(otherInstructions) ? null : match;
+}
+
+function workerSettingsMatch(prompt: string) {
+  const parts = splitTriggerPrompt(stripTriggerHeader(prompt));
+  if (parts.systemPrompt === null) return null;
+  const manager = parts.systemPrompt.split(triggerPromptHeadings(parts.systemPrompt).posting)[0];
+  const match = generatedCreationCall(manager);
+  if (match === null) return null;
   try {
     const settings: TriggerWorkerSettings = {
       agentId: match[1] === "set to your agent ID" ? null : JSON.parse(match[1]),
@@ -816,6 +858,39 @@ export function updateTriggerWorkerSettings(
   return combineTriggerPrompt(parts.userPrompt, systemPrompt);
 }
 
+const WORKFLOW_ID_ARGUMENT = /, workflow_id "[0-9a-f]{32}"$/;
+
+/**
+ * Point a trigger prompt's generated creation call at the workflow its instructions run,
+ * as {@link renderTriggerPrompt} would; leave other calls unchanged.
+ *
+ * @param prompt A trigger prompt without its header line.
+ * @param workflowIdSupported Whether `sys_session_create` accepts `workflow_id` here.
+ */
+export function syncTriggerWorkflowId(prompt: string, workflowIdSupported: boolean): string {
+  if (!startsLikeTemplatePrompt(prompt)) return prompt;
+  // The generated text, and its call, end at the first instructions heading.
+  const [manager, ...rest] = prompt.split(triggerPromptHeadings(prompt).instructions);
+  const match = rest.length > 0 ? generatedCreationCall(manager) : null;
+  if (match === null) return prompt;
+  const parts = splitTriggerPrompt(prompt);
+  // Instructions that repeat a heading keep a prompt from splitting; theirs start at the first.
+  const workflowRun =
+    parts.systemPrompt !== null
+      ? parseSavedWorkflowRun(parts.userPrompt)
+      : savedWorkflowRunOpening(rest[0]);
+  const workflowId =
+    workflowIdSupported && !isTaskSessionTriggerPrompt(prompt) ? workflowRun?.id : undefined;
+  const placement =
+    match[2].replace(WORKFLOW_ID_ARGUMENT, "") +
+    (workflowId ? `, workflow_id ${JSON.stringify(workflowId)}` : "");
+  if (placement === match[2]) return prompt;
+  const start = `call sys_session_create with agent_id ${match[1]}, `.length;
+  const call = `${match[0].slice(0, start)}${placement}${match[0].slice(start + match[2].length)}`;
+  // The call is the first of its text: it sits in the generated text, which opens the prompt.
+  return prompt.replace(match[0], () => call);
+}
+
 const SERVICE_NAMES: Record<TriggerSource, string> = {
   jira: "Jira",
   slack: "Slack",
@@ -853,7 +928,8 @@ function triggerPromptOpening(source: TriggerSource): string {
 
 /**
  * How a continue-mode prompt begins. It extends the shared opening, which the
- * server also matches to recognize a trigger automation.
+ * server also matches to recognize a trigger automation; the server matches this
+ * one to recognize a task session (omnigent/server/scheduled/workflow_automations.py).
  */
 function taskSessionPromptOpening(source: TriggerSource): string {
   return `${triggerPromptOpening(source)}, its task session,`;
@@ -960,10 +1036,17 @@ function triggerFingerprint(config: TriggerConfig, body: string): string {
   return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(16).padStart(14, "0");
 }
 
-/** What a saved config doesn't hold: the link, polling interval and task-session title. */
+/**
+ * What a saved config doesn't hold: the link, polling interval, task-session title,
+ * message budget and whether workers can start as workflow runs.
+ */
 export type TriggerConfigContext = Pick<
   TriggerPromptContext,
-  "sessionLink" | "pollingIntervalMinutes" | "taskSessionTitle" | "messageMaxChars"
+  | "sessionLink"
+  | "pollingIntervalMinutes"
+  | "taskSessionTitle"
+  | "messageMaxChars"
+  | "workflowIdSupported"
 >;
 
 /** The prompt the model receives for `config`, without the header line. */
@@ -1775,10 +1858,14 @@ export function renderTriggerPrompt(
       .join("")
       .trimEnd(),
   );
+  // Each match's session starts as a run of the workflow, so the workflow's page lists it.
+  const workflowRun =
+    !shared && ctx.workflowIdSupported ? parseSavedWorkflowRun(fields.instructions) : null;
   const createArgs = [
     `agent_id ${ctx.agentId ? JSON.stringify(ctx.agentId) : "set to your agent ID"}`,
     `placement "${ctx.placement}"`,
     `title ${shared ? taskSessionTitle : text.title}`,
+    ...(workflowRun ? [`workflow_id ${JSON.stringify(workflowRun.id)}`] : []),
     ...(ctx.model ? [`model ${JSON.stringify(ctx.model)}`] : []),
     ...(ctx.effort ? [`reasoning_effort ${JSON.stringify(ctx.effort)}`] : []),
     ...(ctx.permissionMode ? [`permission_mode ${JSON.stringify(ctx.permissionMode)}`] : []),

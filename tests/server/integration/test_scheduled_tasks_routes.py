@@ -42,6 +42,10 @@ from omnigent.server.scheduled.dispatch_scheduler import (
     PersistentTaskScheduler,
     ScheduledTaskDispatchHooks,
 )
+from omnigent.server.scheduled.workflow_automations import (
+    CONTINUED_SESSION_MESSAGE,
+    TASK_SESSION_MESSAGE,
+)
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -3949,6 +3953,144 @@ async def test_a_task_that_starts_from_a_session_can_switch_agents_but_not_conti
     cleared = await auth_client.patch(url, json={"prompt": ""}, headers=_headers())
     assert cleared.status_code == 200, cleared.text
     assert cleared.json()["source_session_id"] == created["source_session_id"]
+
+
+_WORKFLOW_PROMPT = (
+    '/workflow Run the saved workflow "Triage" (ID 0123456789abcdef0123456789abcdef).'
+)
+
+
+async def test_a_workflow_automation_starts_each_run_in_a_new_session(
+    auth_client: httpx.AsyncClient,
+) -> None:
+    refused = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(prompt=_WORKFLOW_PROMPT, session_mode="continue"),
+        headers=_headers(),
+    )
+    assert refused.status_code == 400, refused.text
+    assert refused.json()["error"]["message"] == CONTINUED_SESSION_MESSAGE
+    created = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(prompt=_WORKFLOW_PROMPT), headers=_headers()
+    )
+    assert created.status_code == 200, created.text
+    continuing = await auth_client.patch(
+        f"/v1/scheduled-tasks/{created.json()['id']}",
+        json={"session_mode": "continue"},
+        headers=_headers(),
+    )
+    assert continuing.status_code == 400, continuing.text
+
+    plain = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(session_mode="continue"), headers=_headers()
+    )
+    plain_url = f"/v1/scheduled-tasks/{plain.json()['id']}"
+    to_workflow = await auth_client.patch(
+        plain_url, json={"prompt": _WORKFLOW_PROMPT}, headers=_headers()
+    )
+    assert to_workflow.status_code == 400, to_workflow.text
+    switched = await auth_client.patch(
+        plain_url, json={"prompt": _WORKFLOW_PROMPT, "session_mode": "new"}, headers=_headers()
+    )
+    assert switched.status_code == 200, switched.text
+    assert switched.json()["session_mode"] == "new"
+
+
+async def test_a_workflow_trigger_starts_a_session_for_each_match(
+    auth_client: httpx.AsyncClient,
+) -> None:
+    prompts = json.loads(
+        (
+            Path(__file__).parents[1] / "scheduled" / "fixtures" / "workflow_trigger_prompts.json"
+        ).read_text()
+    )
+    for session_mode in ("continue", "new"):
+        refused = await auth_client.post(
+            "/v1/scheduled-tasks",
+            json=_create_body(prompt=prompts["jira_task_session"], session_mode=session_mode),
+            headers=_headers(),
+        )
+        assert refused.status_code == 400, refused.text
+        assert refused.json()["error"]["message"] == TASK_SESSION_MESSAGE
+    # The polling session continues; each match gets its own session.
+    created = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(prompt=prompts["jira_per_match"], session_mode="continue"),
+        headers=_headers(),
+    )
+    assert created.status_code == 200, created.text
+
+
+async def test_a_workflow_automation_saved_continuing_a_session_runs_until_edited(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """Pausing, renaming or rescheduling it keeps its session; changing what it runs doesn't."""
+    task = SqlAlchemyScheduledTaskStore(db_uri).create(
+        scheduled_task_id=uuid.uuid4().hex,
+        user_id="alice@example.com",
+        **_create_body(prompt=_WORKFLOW_PROMPT, session_mode="continue"),
+    )
+    url = f"/v1/scheduled-tasks/{task.id}"
+    for change in (
+        {"state": "paused"},
+        # The agent tool resends the prompt with every update.
+        {"name": "renamed", "prompt": _WORKFLOW_PROMPT},
+        {"rrule": "FREQ=DAILY;BYHOUR=9"},
+    ):
+        kept = await auth_client.patch(url, json=change, headers=_headers())
+        assert kept.status_code == 200, kept.text
+        assert kept.json()["session_mode"] == "continue"
+    edited_prompt = f"{_WORKFLOW_PROMPT}\n\nOnly bugs"
+    for change in ({"prompt": edited_prompt}, {"session_id": _owned_session(db_uri)}):
+        refused = await auth_client.patch(url, json=change, headers=_headers())
+        assert refused.status_code == 400, refused.text
+        assert refused.json()["error"]["message"] == CONTINUED_SESSION_MESSAGE
+    switched = await auth_client.patch(
+        url, json={"prompt": edited_prompt, "session_mode": "new"}, headers=_headers()
+    )
+    assert switched.status_code == 200, switched.text
+    assert (switched.json()["prompt"], switched.json()["session_mode"]) == (edited_prompt, "new")
+
+
+async def test_concurrent_edits_cant_combine_a_workflow_with_a_continued_session(
+    auth_client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each edit passes on its own snapshot; the locked row refuses the one that lands second."""
+    created = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(), headers=_headers()
+    )
+    assert created.status_code == 200, created.text
+    url = f"/v1/scheduled-tasks/{created.json()['id']}"
+    check = scheduled_tasks_routes._workflow_reuse_problem
+    checked = asyncio.Barrier(2)
+    workflow_saved = asyncio.Event()
+
+    async def check_together(prompt: str, session_mode: str) -> str | None:
+        problem = await check(prompt, session_mode)
+        await checked.wait()
+        if session_mode == "continue":
+            await workflow_saved.wait()
+        return problem
+
+    async def add_workflow() -> httpx.Response:
+        try:
+            return await auth_client.patch(
+                url, json={"prompt": _WORKFLOW_PROMPT}, headers=_headers()
+            )
+        finally:
+            workflow_saved.set()
+
+    monkeypatch.setattr(scheduled_tasks_routes, "_workflow_reuse_problem", check_together)
+    async with asyncio.timeout(10):
+        added, continued = await asyncio.gather(
+            add_workflow(),
+            auth_client.patch(url, json={"session_mode": "continue"}, headers=_headers()),
+        )
+    assert added.status_code == 200, added.text
+    assert continued.status_code == 400, continued.text
+    assert continued.json()["error"]["message"] == CONTINUED_SESSION_MESSAGE
+    saved = (await auth_client.get(url, headers=_headers())).json()
+    assert (saved["prompt"], saved["session_mode"]) == (_WORKFLOW_PROMPT, "new")
 
 
 async def test_the_copy_carries_history_for_its_own_agent_not_the_tasks(

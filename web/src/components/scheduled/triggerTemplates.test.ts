@@ -11,11 +11,13 @@ import {
   emptyTriggerFields,
   jiraAssignee,
   parseGithubReviewer,
+  promptMayRunSavedWorkflow,
   isTaskSessionTriggerPrompt,
   hasTriggerHeader,
   isTriggerPrompt,
   triggerPromptSource,
   readTriggerMessageMaxChars,
+  readTriggerWorkerPlacement,
   readTriggerWorkerSettings,
   LEGACY_MAX_INSTRUCTIONS_CHARS,
   MAX_INSTRUCTIONS_CHARS,
@@ -26,6 +28,7 @@ import {
   splitTriggerPrompt,
   stripScopePrefix,
   splitJqlOrderBy,
+  syncTriggerWorkflowId,
   triggerConditionFields,
   triggerEventDescription,
   stripTriggerHeader,
@@ -83,6 +86,102 @@ describe("saved trigger prompts", () => {
     );
     expect(readTriggerWorkerSettings(prompt)?.permissionMode).toBe("approve-for-me");
     expect(renderTriggerPrompt("jira", fields(), CTX)).not.toContain("permission_mode");
+  });
+
+  const WORKFLOW_ID = "0123456789abcdef0123456789abcdef";
+  const WORKFLOW_RUN = `/workflow Run the saved workflow "Triage" (ID ${WORKFLOW_ID}).\n\nOnly bugs`;
+
+  it.each(TRIGGER_SOURCES)(
+    "starts each %s match's session as a run of the saved workflow its instructions run",
+    (source) => {
+      const prompt = renderTriggerPrompt(source, fields({ instructions: WORKFLOW_RUN }), {
+        ...CTX,
+        model: "old",
+        workflowIdSupported: true,
+      });
+      expect(prompt).toContain(`, workflow_id "${WORKFLOW_ID}", model "old"`);
+      // The session's first message still opens with the instructions, which run the workflow skill.
+      expect(prompt).toContain("The message starts with the instructions below");
+      expect(splitTriggerPrompt(prompt).userPrompt).toBe(WORKFLOW_RUN);
+      expect(readTriggerWorkerSettings(prompt)).toEqual({ ...AGENT_DEFAULT_WORKERS, model: "old" });
+      expect(readTriggerWorkerPlacement(prompt)).toBe("same_host");
+      expect(readTriggerMessageMaxChars(prompt)).toBe(32000);
+      // Changing the worker settings keeps the workflow.
+      expect(updateTriggerWorkerSettings(prompt, { ...AGENT_DEFAULT_WORKERS, model: "new" })).toBe(
+        prompt.replace('model "old"', 'model "new"'),
+      );
+    },
+  );
+
+  it("starts workers as workflow runs only for their own sessions, on a server that can", () => {
+    const runsWorkflow = fields({ instructions: WORKFLOW_RUN });
+    const supported = { ...CTX, workflowIdSupported: true };
+    expect(renderTriggerPrompt("jira", runsWorkflow, CTX)).not.toContain("workflow_id");
+    expect(renderTriggerPrompt("jira", fields(), supported)).not.toContain("workflow_id");
+    expect(
+      renderTriggerPrompt("jira", runsWorkflow, { ...supported, taskSessionMode: "continue" }),
+    ).not.toContain("workflow_id");
+  });
+
+  it("reads a prompt's saved workflow as the server does, even when it won't split", () => {
+    const unsplittable = `${WORKFLOW_RUN}\n\nInstructions for each session:\nfirst.`;
+    const render = (instructions: string) =>
+      renderTriggerPrompt("jira", fields({ instructions }), CTX);
+    expect(promptMayRunSavedWorkflow(render(WORKFLOW_RUN))).toBe(true);
+    expect(splitTriggerPrompt(render(unsplittable)).systemPrompt).toBeNull();
+    expect(promptMayRunSavedWorkflow(render(unsplittable))).toBe(true);
+    expect(
+      promptMayRunSavedWorkflow(render(unsplittable.replace(WORKFLOW_RUN, "Triage it."))),
+    ).toBe(false);
+    expect(promptMayRunSavedWorkflow(WORKFLOW_RUN)).toBe(true);
+    expect(promptMayRunSavedWorkflow("Summarize overnight activity")).toBe(false);
+  });
+
+  it("keeps a prompt's creation call on the workflow its instructions now run", () => {
+    const supported = { ...CTX, workflowIdSupported: true };
+    const otherRun = WORKFLOW_RUN.replace(WORKFLOW_ID, "f".repeat(32));
+    const saved = renderTriggerPrompt("jira", fields({ instructions: WORKFLOW_RUN }), supported);
+    const withInstructions = (instructions: string) =>
+      combineTriggerPrompt(instructions, splitTriggerPrompt(saved).systemPrompt);
+    expect(syncTriggerWorkflowId(saved, true)).toBe(saved);
+    // Another workflow, or none, takes over the call, as a fresh render would.
+    expect(syncTriggerWorkflowId(withInstructions(otherRun), true)).toBe(
+      renderTriggerPrompt("jira", fields({ instructions: otherRun }), supported),
+    );
+    expect(syncTriggerWorkflowId(withInstructions("Investigate the ticket."), true)).toBe(
+      renderTriggerPrompt("jira", fields(), supported),
+    );
+    // A server that can't take workflow_id gets none.
+    expect(syncTriggerWorkflowId(saved, false)).toBe(
+      renderTriggerPrompt("jira", fields({ instructions: WORKFLOW_RUN }), CTX),
+    );
+    // A task session never starts as a run, and a call written by hand stays as written.
+    const taskSession = renderTriggerPrompt("jira", fields({ instructions: WORKFLOW_RUN }), {
+      ...supported,
+      taskSessionMode: "continue",
+    });
+    expect(syncTriggerWorkflowId(taskSession, true)).toBe(taskSession);
+    expect(syncTriggerWorkflowId("A handwritten automation.", true)).toBe(
+      "A handwritten automation.",
+    );
+    // Instructions that repeat the heading keep a prompt from splitting; the call still
+    // follows the workflow they open with.
+    const unsplittable = (instructions: string) =>
+      renderTriggerPrompt(
+        "jira",
+        fields({ instructions: `${instructions}\n\nInstructions for each session:\nfirst.` }),
+        supported,
+      );
+    const seeded = unsplittable(WORKFLOW_RUN);
+    expect(splitTriggerPrompt(seeded).systemPrompt).toBeNull();
+    expect(seeded).toContain(`workflow_id "${WORKFLOW_ID}"`);
+    expect(syncTriggerWorkflowId(seeded, true)).toBe(seeded);
+    expect(syncTriggerWorkflowId(seeded.replace(WORKFLOW_RUN, otherRun), true)).toBe(
+      unsplittable(otherRun),
+    );
+    expect(
+      syncTriggerWorkflowId(seeded.replace(WORKFLOW_RUN, "Investigate the ticket."), true),
+    ).toBe(unsplittable("Investigate the ticket."));
   });
 
   it.each(SOURCE_MODES)(
@@ -1144,6 +1243,71 @@ describe("trigger header", () => {
     expect(isTaskSessionTriggerPrompt(prompt)).toBe(true);
     expect(prompt).toContain('permission_mode "acceptEdits"');
     expect(prompt).toContain('"Team" = "Backend"');
+  });
+
+  it("round-trips a workflow trigger, and one saved before its workers started as runs", () => {
+    const workflowId = "a".repeat(32);
+    const saved = config("jira", {
+      instructions: `/workflow Run the saved workflow "Triage" (ID ${workflowId}).`,
+    });
+    const prompt = encodeTriggerPrompt(saved, { ...CTX, workflowIdSupported: true });
+    expect(prompt).toContain(`workflow_id "${workflowId}"`);
+    expect(decodeTriggerPrompt(prompt)).toEqual(saved);
+    const older = encodeTriggerPrompt(saved, CTX);
+    expect(older).not.toContain("workflow_id");
+    expect(decodeTriggerPrompt(older)).toEqual(saved);
+  });
+
+  it("still saves workflow trigger prompts in the layout the server reads", async () => {
+    // tests/server/scheduled/test_workflow_automations.py checks that the server reads
+    // these layouts as the form does. Only the parts it reads are kept, so this changes
+    // only with them: then update this snapshot with `vitest -u` and run those tests.
+    const layout = (saved: string) => {
+      const prompt = stripTriggerHeader(saved);
+      const mode = isTaskSessionTriggerPrompt(prompt) ? "the task session" : "each session";
+      const instructions = `\n\nInstructions for ${mode}:\n`;
+      const posting = `\n\nPosting instructions for ${mode}:\n`;
+      const opening =
+        /^This automation watches \S+ and starts one Omnigent session(?:, its task session,)?/.exec(
+          prompt,
+        )![0];
+      // The generated steps come before the instructions; after a posting heading, the
+      // server needs only that the heading is there.
+      const rest = prompt.slice(prompt.indexOf(instructions));
+      const postingAt = rest.lastIndexOf(posting);
+      return `${opening} ...${postingAt < 0 ? rest : `${rest.slice(0, postingAt + posting.length)}...`}`;
+    };
+    const scopes: Record<TriggerConfig["source"], string> = {
+      jira: "ES",
+      slack: "triage",
+      github: "example/project",
+      linear: "ENG",
+      pagerduty: "Checkout",
+    };
+    const save = (source: TriggerConfig["source"], taskSession: boolean, details = "Only bugs") =>
+      encodeTriggerPrompt(
+        {
+          ...emptyTriggerFields(source),
+          source,
+          scope: scopes[source],
+          instructions: `/workflow Run the saved workflow "Triage" (ID 0123456789abcdef0123456789abcdef).\n\n${details}`,
+          ...(taskSession ? { taskSessionMode: "continue" as const } : {}),
+          worker: WORKER,
+        },
+        { ...CTX, workflowIdSupported: true },
+      );
+    const prompts: Record<string, string> = {};
+    for (const source of TRIGGER_SOURCES) {
+      prompts[`${source}_task_session`] = layout(save(source, true));
+      prompts[`${source}_per_match`] = layout(save(source, false));
+    }
+    // Instructions that repeat the heading keep the saved prompt from splitting.
+    prompts.jira_task_session_unsplittable = layout(
+      save("jira", true, "Read the notes under\n\nInstructions for the task session:\nfirst."),
+    );
+    await expect(`${JSON.stringify(prompts, null, 2)}\n`).toMatchFileSnapshot(
+      "../../../../tests/server/scheduled/fixtures/workflow_trigger_prompts.json",
+    );
   });
 
   it("reads a header saved without the newer optional settings", () => {
