@@ -221,6 +221,12 @@ def test_message_to_items_strips_attachment_markers() -> None:
         None,
     )
     assert items[0].item_data["content"][0]["text"] == "hi"
+    # Workspace-relative markers are inline "@file" mentions and stay put.
+    inline = "compare [Attached: a.ts] with [Attached: b.ts]"
+    items = f._message_to_items(
+        2, "user", json.dumps([{"type": "text", "text": inline}]), "goose", None
+    )
+    assert items[0].item_data["content"][0]["text"] == inline
 
 
 def test_message_to_items_empty_assistant_skipped() -> None:

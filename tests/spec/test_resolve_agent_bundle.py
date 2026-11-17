@@ -62,7 +62,8 @@ def test_resolve_startup_prompt_routes_to_procedures_without_inlining_them() -> 
     tool = LoadSkillTool(spec.skills, skills_filter="none")
     prompt = build_instructions(spec, None, [tool.get_schema()])
 
-    assert len(prompt.split()) < 1500
+    # Include the shared framework guidance alongside the agent's procedure index.
+    assert len(prompt.split()) < 1600
     assert spec.skills
     for skill in spec.skills:
         assert skill.name in prompt

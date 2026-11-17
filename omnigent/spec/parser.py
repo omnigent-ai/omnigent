@@ -105,7 +105,13 @@ _YAML_1_2_BOOL_RE = re.compile(r"^(?:true|True|TRUE|false|False|FALSE)$")
 
 # ``executor.config`` keys whose YAML types must survive instead of being string-coerced.
 _STRUCTURED_EXECUTOR_CONFIG_KEYS: frozenset[str] = frozenset(
-    {"context_files", "system_prompt_mode"}
+    {
+        "broker_gateway",
+        "context_files",
+        "disable_native_tools",
+        "system_prompt_mode",
+        "web_search",
+    }
 )
 
 # Copy the resolver dict onto the subclass before mutating — it's inherited
@@ -1088,6 +1094,9 @@ def _parse_os_env_sandbox(
     env_passthrough = _parse_env_passthrough(raw.get("env_passthrough"))
     egress_rules = _parse_egress_rules(raw.get("egress_rules"))
     git_ssh = _parse_git_ssh(raw.get("git_ssh"))
+    from omnigent.inner.tcp_egress_policy import parse_tcp_egress
+
+    tcp_egress = parse_tcp_egress(raw.get("tcp_egress"), egress_rules=egress_rules or ())
     from omnigent.inner.sandbox import _default_sandbox_for_platform, _resolve_sandbox_type
 
     if "type" not in raw:
@@ -1126,6 +1135,12 @@ def _parse_os_env_sandbox(
     if git_ssh and sandbox_type not in ("linux_bwrap", "darwin_seatbelt"):
         raise OmnigentError(
             "os_env.sandbox.git_ssh requires linux_bwrap or darwin_seatbelt "
+            "for hard network enforcement",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    if tcp_egress and sandbox_type not in ("linux_bwrap", "darwin_seatbelt"):
+        raise OmnigentError(
+            "os_env.sandbox.tcp_egress requires linux_bwrap or darwin_seatbelt "
             "for hard network enforcement",
             code=ErrorCode.INVALID_INPUT,
         )
@@ -1171,6 +1186,7 @@ def _parse_os_env_sandbox(
         egress_allow_private_destinations=allow_private,
         credential_proxy=credential_proxy,
         git_ssh=git_ssh,
+        tcp_egress=tcp_egress,
     )
 
 
@@ -2908,7 +2924,7 @@ def _parse_inline_mcp_servers(
         elif url is not None:
             transport = "http"
         else:
-            # Databricks-managed server or unknown shape — no local
+            # Managed server or unknown shape — no local
             # endpoint to display; skip.
             continue
         raw_args = val.get("args", [])

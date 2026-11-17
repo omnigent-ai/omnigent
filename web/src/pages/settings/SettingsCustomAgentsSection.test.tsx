@@ -9,14 +9,12 @@ import type { AgentConfig } from "@/lib/agentsApi";
 import type { ManagedAgent } from "@/hooks/useCustomAgents";
 
 const flags = vi.hoisted(() => ({
-  feature: true,
   install: true,
   detail: true as boolean | undefined,
   edit: true as boolean | undefined,
 }));
 vi.mock("@/lib/CapabilitiesContext", () => ({
   useServerInfo: () => ({
-    features: { custom_agents_settings_ui: flags.feature },
     agent_install: flags.install,
     agent_detail: flags.detail,
     agent_config_edit: flags.edit,
@@ -24,6 +22,7 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
 }));
 vi.mock("@/lib/agentLabels", () => ({
   BRAIN_HARNESS_LABELS: { "claude-sdk": "Claude SDK" },
+  capitalizeAgentName: (name: string) => name.charAt(0).toUpperCase() + name.slice(1),
   useAcpHarnessIds: () => new Set(["jcode"]),
   useHarnessLabels: () => ({ "claude-sdk": "Claude SDK" }),
   useBrainHarnessLabels: () => ({ "claude-sdk": "Claude SDK" }),
@@ -74,7 +73,6 @@ function mount(path = "/settings/custom-agents") {
 }
 
 beforeEach(() => {
-  flags.feature = true;
   flags.install = true;
   flags.detail = true;
   flags.edit = true;
@@ -327,12 +325,8 @@ describe("Custom agents settings", () => {
     }
   });
 
-  it.each([
-    [false, true],
-    [true, false],
-  ])("does not fetch when feature=%s, install=%s", (feature, install) => {
-    flags.feature = feature;
-    flags.install = install;
+  it("does not fetch without the install capability", () => {
+    flags.install = false;
     mount();
     expect(authenticatedFetch).not.toHaveBeenCalled();
   });

@@ -459,7 +459,9 @@ def test_recording_download_failure(
     page.get_by_role("button", name="Play video: demo.webm").filter(visible=True).click()
     viewer = page.locator('[data-testid="file-viewer"]:visible')
     expect(
-        viewer.get_by_text("Unable to play this video. Download it to watch locally.")
+        viewer.get_by_text(
+            "This video couldn't be played. Download the file to open it in another app."
+        )
     ).to_be_visible()
     expect(viewer.get_by_role("button", name="Download video: demo.webm")).to_be_visible()
     expect(viewer.get_by_role("button", name="Retry")).to_be_visible()

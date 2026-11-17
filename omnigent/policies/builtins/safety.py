@@ -13,6 +13,10 @@ import json as _json
 import re as _re
 from typing import Literal
 
+from omnigent.native.permission_modes import (
+    AGENT_DEFAULT_PERMISSION_MODE_HINT,
+    APPROVAL_SKIPPING_PERMISSION_MODES,
+)
 from omnigent.policies.schema import (
     PolicyCallable,
     PolicyEvent,
@@ -24,6 +28,16 @@ from omnigent.policies.schema import (
 _ALLOW: PolicyResponse = {"result": "ALLOW"}
 
 _SYS_OS_TOOLS = frozenset({"sys_os_read", "sys_os_write", "sys_os_edit", "sys_os_shell"})
+
+# Omnigent terminal tools that run, read, or stop a terminal process.
+# ``sys_terminal_launch`` starts a configured command and ``sys_terminal_send``
+# types into it, so either runs commands the way ``sys_os_shell`` does;
+# ``sys_terminal_read`` returns pane output, including the user's own shells
+# in the session, and ``sys_terminal_close`` kills the process.
+# ``sys_terminal_list`` only names terminals, so it is not gated.
+_SYS_TERMINAL_TOOLS = frozenset(
+    {"sys_terminal_launch", "sys_terminal_send", "sys_terminal_read", "sys_terminal_close"}
+)
 
 # Claude Code / Codex native tools that MUTATE a file, surfaced via the
 # PreToolUse hook contract. Single source of truth: the write policies in
@@ -244,10 +258,13 @@ def detect_loop(window: int = 10, threshold: int = 3) -> PolicyCallable:
 def ask_on_os_tools(event: PolicyEvent) -> PolicyResponse:
     """ASK for user approval before any file or shell tool call.
 
-    Covers six tool-name families:
+    Covers these tool-name families:
 
     - **Omnigent built-in OS tools** (``sys_os_read``,
       ``sys_os_write``, ``sys_os_edit``, ``sys_os_shell``).
+    - **Omnigent terminal tools** (``sys_terminal_launch``,
+      ``sys_terminal_send``, ``sys_terminal_read``,
+      ``sys_terminal_close``). ``sys_terminal_list`` is not gated.
     - **Claude Code native tools** (``Bash``, ``Read``, ``Write``,
       ``Edit``, ``MultiEdit``, ``NotebookEdit``, ``Glob``, ``Grep``) —
       surfaced via the ``PreToolUse`` hook contract.
@@ -285,6 +302,7 @@ def ask_on_os_tools(event: PolicyEvent) -> PolicyResponse:
     tool = data.get("name", "")
     _all_os_tools = (
         _SYS_OS_TOOLS
+        | _SYS_TERMINAL_TOOLS
         | _NATIVE_OS_TOOLS
         | _CURSOR_NATIVE_OS_TOOLS
         | _PI_NATIVE_OS_TOOLS
@@ -311,6 +329,18 @@ def ask_on_os_tools(event: PolicyEvent) -> PolicyResponse:
         elif tool == "execute_code":
             code = args.get("code") if isinstance(args, dict) else None
             preview = code[:80] if isinstance(code, str) else ""
+        elif tool in _SYS_TERMINAL_TOOLS:
+            # Name the target instance, e.g. ``bash/s1``, then the launch
+            # overrides or the typed text and keys. Like the tool, a send
+            # with no ``keys`` presses ``Enter`` and ``keys=''`` presses none.
+            terminal_args = args if isinstance(args, dict) else {}
+            parts = [f"{terminal_args.get('terminal', '')}/{terminal_args.get('session', '')}"]
+            for key in ("cwd", "sandbox", "text"):
+                if key in terminal_args:
+                    parts.append(f"{key}={terminal_args[key]!r}")
+            if tool == "sys_terminal_send":
+                parts.append(f"keys={terminal_args.get('keys', 'Enter')!r}")
+            preview = " ".join(parts)
         else:
             # Omnigent tools use ``path``; Claude native tools use ``file_path``,
             # except NotebookEdit which uses ``notebook_path``.
@@ -365,7 +395,7 @@ def ask_on_add_policy(event: PolicyEvent) -> PolicyResponse:
 # ``ask_on_scheduled_task_change`` into every engine and exempts these names
 # from its no-policy fast path; both read this set so they cannot drift.
 SCHEDULED_TASK_APPROVAL_TOOLS: frozenset[str] = frozenset(
-    {"sys_scheduled_task_create", "sys_scheduled_task_update"}
+    {"sys_scheduled_task_create", "sys_scheduled_task_update", "sys_reminder_set"}
 )
 
 
@@ -394,6 +424,7 @@ _PREVIEW_VALUE_CHARS = 60
 _PREVIEW_EXTRA_CHARS = 200
 
 _SCHEDULED_TASK_REVIEW_FIELDS = frozenset({"prompt", "permission_mode"})
+_PERMISSION_MODE_VALUES = f"a mode name, or {AGENT_DEFAULT_PERMISSION_MODE_HINT}"
 
 
 def _clip(value: str) -> str:
@@ -439,7 +470,7 @@ def scheduled_task_review_error(
         hint = (
             "List the task and retry with its full prompt and permission_mode."
             if action == "update"
-            else "Retry with prompt and permission_mode (null for the agent default)."
+            else f"Retry with prompt and permission_mode: {_PERMISSION_MODE_VALUES}."
         )
         return f"Missing review fields ({', '.join(missing)}). {hint}"
     if "prompt" in args or action == "create":
@@ -448,8 +479,10 @@ def scheduled_task_review_error(
             return "The automation prompt must be a non-empty string."
     if "permission_mode" in args:
         mode = args["permission_mode"]
-        if mode is not None and (not isinstance(mode, str) or not mode.strip()):
-            return "permission_mode must be a non-empty string or null for the agent default."
+        if mode is not None and (
+            not isinstance(mode, str) or mode.strip().lower() in ("", "null")
+        ):
+            return f"permission_mode must be {_PERMISSION_MODE_VALUES}."
     if action == "update" and not args.get("scheduled_task_id"):
         return "Provide the scheduled_task_id of the automation to update."
     return None
@@ -464,6 +497,10 @@ def _scheduled_task_review(args: dict[str, object], *, action: str, subject: str
         if raw_permission_mode is None
         else str(raw_permission_mode)
     )
+    if isinstance(raw_permission_mode, str) and raw_permission_mode in (
+        APPROVAL_SKIPPING_PERMISSION_MODES
+    ):
+        permission_mode += " (skips approval prompts, so unattended runs act without asking)"
     legacy_notice = ""
     if action == "update" and _SCHEDULED_TASK_REVIEW_FIELDS.difference(args):
         legacy_notice = (
@@ -478,11 +515,13 @@ def _scheduled_task_review(args: dict[str, object], *, action: str, subject: str
                 if "agent_id" in args
                 else "unchanged (not supplied by legacy caller)"
             )
+    if args.get("session_mode") == "continue":
+        permission_mode += "; a continued session keeps its own permission mode"
     settings = _scheduled_task_settings(args, skip="prompt")
     return (
         f"Agent wants to {action} {subject}.\n"
         f"{legacy_notice}"
-        f"Effective task permission mode: {permission_mode}\n"
+        f"Task permission setting: {permission_mode}\n"
         f"Settings: {settings or '(none)'}\n"
         "Full automation instructions:\n"
         f"{prompt}\n"
@@ -490,8 +529,44 @@ def _scheduled_task_review(args: dict[str, object], *, action: str, subject: str
     )
 
 
+def _reminder_review(args: dict[str, object]) -> PolicyResponse:
+    """ASK to set a reminder, showing when it fires and its full message."""
+    message = args.get("message")
+    if not isinstance(message, str) or not message.strip():
+        return {
+            "result": "DENY",
+            "reason": "Cannot set a reminder. The reminder message must be a non-empty string.",
+        }
+    from datetime import UTC, datetime
+
+    from omnigent.tools.builtins.scheduled_tasks import resolve_reminder_time
+
+    # Resolve the time exactly as the tool will, so padding or a long fraction in
+    # the raw argument can't hide the moment being approved.
+    resolved = resolve_reminder_time(args, datetime.now(UTC))
+    if isinstance(resolved, str):
+        return {"result": "DENY", "reason": f"Cannot set a reminder. {resolved}"}
+    if args.get("at") is not None:
+        when = f"at {resolved:%Y-%m-%d %H:%M} UTC"
+    else:
+        when = f"{args['delay_seconds']} seconds after approval, rounded up to the next minute"
+    # Quote every line, so a multiline message can't pass for the prompt's own text.
+    quoted = "\n".join(f"> {line}" for line in message.splitlines())
+    return {
+        "result": "ASK",
+        "reason": (
+            f"Agent wants to set a reminder for this session {when}.\n"
+            "When it fires, this message is sent into the session as a new turn, "
+            "even if nobody is watching (each line quoted with '> '):\n"
+            f"{quoted}\n"
+            "Approve?"
+        ),
+    }
+
+
 def ask_on_scheduled_task_change(event: PolicyEvent) -> PolicyResponse:
-    """ASK for user approval before an agent creates or updates a scheduled task.
+    """ASK for user approval before an agent creates or updates a scheduled task,
+    or sets a reminder (a one-time task that continues the session).
 
     Matches ``event["target"]`` (the dispatched tool identity) rather than
     ``data["name"]``, which an earlier policy may have transformed. Reads
@@ -511,6 +586,8 @@ def ask_on_scheduled_task_change(event: PolicyEvent) -> PolicyResponse:
     args = data.get("arguments") if isinstance(data, dict) else None
     if not isinstance(args, dict):
         args = {}
+    if tool == "sys_reminder_set":
+        return _reminder_review(args)
     action = "create" if tool == "sys_scheduled_task_create" else "update"
     # Older runners expose optional review fields. Current runners enforce the
     # complete contract before dispatch, including when paired with an old server.
@@ -960,7 +1037,8 @@ POLICY_REGISTRY: list[dict[str, object]] = [
         "kind": "callable",
         "name": "Require Approval for File & Shell Operations",
         "description": "Asks for user approval before any file or shell tool call — "
-        "covers Omnigent sys_os_* tools, Claude Code and Codex native tools "
+        "covers Omnigent sys_os_* tools, the Omnigent sys_terminal_* tools that "
+        "launch, type into, read, or close a terminal, Claude Code and Codex native tools "
         "(Bash, Read, Write, Edit, MultiEdit, NotebookEdit, Glob, Grep), "
         "Cursor native tools (Shell), Pi native tools (read, bash, write, edit), "
         "opencode native tools (shell, edit, read, grep, glob), "

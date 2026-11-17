@@ -29,7 +29,11 @@ export const CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE = "default";
 // with `claude --help`. The prompting mode is spelled `default` on the
 // wire and labelled "Manual" in Claude's own UI, which this mirrors.
 export const CLAUDE_NATIVE_PERMISSION_MODES: ClaudePermissionModeOption[] = [
-  { value: "default", label: "Manual", description: "Prompts before edits and commands" },
+  {
+    value: "default",
+    label: "Manual",
+    description: "Prompts before edits and commands",
+  },
   {
     value: "auto",
     label: "Auto",
@@ -40,8 +44,16 @@ export const CLAUDE_NATIVE_PERMISSION_MODES: ClaudePermissionModeOption[] = [
     label: "Accept edits",
     description: "Auto-applies file edits; commands still prompt",
   },
-  { value: "plan", label: "Plan", description: "Plans only; makes no edits" },
-  { value: "dontAsk", label: "Don't ask", description: "Auto-denies anything not pre-approved" },
+  {
+    value: "plan",
+    label: "Plan",
+    description: "Plans only; makes no edits",
+  },
+  {
+    value: "dontAsk",
+    label: "Don't ask",
+    description: "Auto-denies anything not pre-approved",
+  },
   {
     value: "bypassPermissions",
     label: "Bypass permissions",

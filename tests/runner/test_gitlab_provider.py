@@ -17,6 +17,7 @@ from omnigent.runner.session_prs import PullRequestRef
 
 URL = "https://gitlab.com/team/sub/project/-/merge_requests/7"
 HEAD, BASE = "a" * 40, "b" * 40
+MR_PATH = "projects/team%2Fsub%2Fproject/merge_requests/7"
 
 
 @pytest.fixture(autouse=True)
@@ -24,6 +25,8 @@ def provider(monkeypatch: pytest.MonkeyPatch):
     reset_for_tests()
     monkeypatch.delenv("GITLAB_HOST", raising=False)
     monkeypatch.delenv("GLAB_HOST", raising=False)
+    monkeypatch.delenv("GITLAB_TOKEN", raising=False)
+    monkeypatch.delenv("GLAB_TOKEN", raising=False)
     yield
     reset_for_tests()
 
@@ -93,6 +96,8 @@ def api(monkeypatch: pytest.MonkeyPatch, mr: dict, change: dict) -> Mock:
     def object_response(path: str, **query):
         if path == "projects/fork%2Fsub%2Fproject":
             return {"id": 20, "forked_from_project": {"web_url": mr["web_url"].split("/-/")[0]}}
+        if path == "projects/20":
+            return {"id": 20, "web_url": "https://gitlab.com/fork/sub/project"}
         if "/repository/files/" in path:
             content = "old\n" if query["ref"] == BASE else "new\n"
             return {"encoding": "base64", "content": base64.b64encode(content.encode()).decode()}
@@ -156,15 +161,24 @@ def ref() -> PullRequestRef:
     return PullRequestRef.from_url(URL)
 
 
-def test_workspace_fork_mr_keeps_target_identity_and_details(root: str, api: Mock) -> None:
+@pytest.mark.parametrize("use_token", [False, True])
+def test_workspace_fork_mr_keeps_target_identity_and_details(
+    root: str, api: Mock, monkeypatch: pytest.MonkeyPatch, use_token: bool
+) -> None:
+    if use_token:
+        monkeypatch.setattr(module.shutil, "which", lambda name: None)
+        monkeypatch.setenv("GITLAB_TOKEN", "test-token")
     info = module.PULL_REQUESTS.workspace_info(root)
     assert info["provider"] == "gitlab" and info["auth"]["authenticated"]
+    assert (info["auth"]["cli"] is None) == use_token
+    assert module.PULL_REQUESTS.titles_available(root)
     assert info["branch"] == "feature"
     assert info["repo"]["name_with_owner"] == "team/sub/project"
     assert info["selected_pr_url"] == URL
     pr = info["pr"]
     assert pr["number"] == 7 and pr["state"] == "OPEN" and pr["is_draft"]
     assert (pr["head_sha"], pr["base_sha"]) == (HEAD, BASE)
+    assert pr["head_repository_url"] == "https://gitlab.com/fork/sub/project"
     assert pr["comments"] == [
         {
             "author": "reviewer",
@@ -183,7 +197,28 @@ def test_workspace_fork_mr_keeps_target_identity_and_details(root: str, api: Moc
 def test_explicit_reference_keeps_live_branch_and_uses_iid(root: str, api: Mock) -> None:
     info = module.PULL_REQUESTS.reference_info(root, ref())
     assert info["branch"] == "feature" and info["pr"]["number"] == 7
-    api.object.assert_called_once_with("projects/team%2Fsub%2Fproject/merge_requests/7")
+    assert [call.args[0] for call in api.object.call_args_list] == [MR_PATH, "projects/20"]
+
+
+def test_same_project_mr_links_target_repository_without_lookup(
+    root: str, api: Mock, mr: dict
+) -> None:
+    mr["source_project_id"] = mr["target_project_id"]
+    info = module.PULL_REQUESTS.reference_info(root, ref())
+    assert info["pr"]["head_repository_url"] == "https://gitlab.com/team/sub/project"
+    api.object.assert_called_once_with(MR_PATH)
+
+
+def test_deleted_fork_hides_head_repository_with_warning(root: str, api: Mock, mr: dict) -> None:
+    def response(path, **query):
+        if path == "projects/20":
+            raise GitLabError("404 Project Not Found")
+        return mr
+
+    api.object.side_effect = response
+    info = module.PULL_REQUESTS.reference_info(root, ref())
+    assert info["pr"]["number"] == 7 and info["pr"]["head_repository_url"] is None
+    assert info["warnings"] == ["GitLab source project is unavailable; file links are hidden."]
 
 
 @pytest.mark.parametrize("remote_project", ["team/sub/project", "Team/Sub/Project"])
@@ -250,6 +285,7 @@ def test_attached_mr_and_title_accept_project_path_case(
     [("fork", None, None), ("origin", "fork", None), ("origin", "origin", "fork")],
     ids=["push-u-fork", "push-default", "branch-push-override"],
 )
+@pytest.mark.parametrize("token_host", [None, "git.example.test:8443"])
 def test_fork_mr_discovery_follows_push_remote_precedence(
     root: str,
     api: Mock,
@@ -257,12 +293,19 @@ def test_fork_mr_discovery_follows_push_remote_precedence(
     tracking: str,
     push_default: str | None,
     push_remote: str | None,
+    token_host: str | None,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from omnigent.runner import pr_resource
 
+    if token_host:
+        monkeypatch.setenv("GITLAB_HOST", token_host)
+        monkeypatch.setenv("GITLAB_TOKEN", "test-token")
+        monkeypatch.setattr(module.shutil, "which", lambda name: None)
+        mr["web_url"] = URL.replace("gitlab.com", token_host)
     for args in (
         ["remote", "set-url", "origin", "https://gitlab.com/team/sub/project.git"],
-        ["remote", "add", "fork", "https://gitlab.com/fork/sub/project.git"],
+        ["remote", "add", "fork", f"https://{token_host or 'gitlab.com'}/fork/sub/project.git"],
         ["config", "branch.feature.remote", tracking],
         ["config", "branch.feature.merge", "refs/heads/feature"],
     ):
@@ -283,7 +326,7 @@ def test_fork_mr_discovery_follows_push_remote_precedence(
     api.object.side_effect = response
     info = pr_resource.pr_info(root)
     assert info["pr"] is not None, info["warnings"]
-    assert info["pr"]["url"] == URL and not info["warnings"]
+    assert info["pr"]["url"] == mr["web_url"] and not info["warnings"]
     assert api.object.call_args_list[0].args == ("projects/fork%2Fsub%2Fproject",)
 
 
@@ -320,7 +363,13 @@ def test_no_oauth_or_cli_failure_hides_checkout(
 
 
 @pytest.mark.parametrize("explicit", [False, True])
-def test_auth_failure_keeps_repo_context(root: str, api: Mock, explicit: bool) -> None:
+@pytest.mark.parametrize("use_token", [False, True])
+def test_auth_failure_keeps_repo_context(
+    root: str, api: Mock, monkeypatch: pytest.MonkeyPatch, explicit: bool, use_token: bool
+) -> None:
+    if use_token:
+        monkeypatch.setattr(module.shutil, "which", lambda name: None)
+        monkeypatch.setenv("GITLAB_TOKEN", "test-token")
     api.object.side_effect = GitLabError("Access denied")
     info = (
         module.PULL_REQUESTS.reference_info(root, ref())
@@ -332,6 +381,7 @@ def test_auth_failure_keeps_repo_context(root: str, api: Mock, explicit: bool) -
         ref().repository if explicit else "fork/sub/project"
     )
     assert info["pr"] is None and not info["auth"]["authenticated"]
+    assert (info["auth"]["cli"] is None) == use_token
     assert info["auth"]["hint"] == "Access denied"
     assert info["warnings"] == ["Access denied"]
 
@@ -448,7 +498,7 @@ def test_explicit_reference_bypasses_unavailable_workspace_inference(
 ) -> None:
     info = module.PULL_REQUESTS.reference_info(root, ref())
     assert info["auth"]["authenticated"] and info["pr"]["url"] == URL and not info["warnings"]
-    api.object.assert_called_once_with("projects/team%2Fsub%2Fproject/merge_requests/7")
+    assert [call.args[0] for call in api.object.call_args_list] == [MR_PATH, "projects/20"]
     assert module.PULL_REQUESTS.changed_files(root, ref())["data"][0]["path"] == "src/new.py"
     assert "@@" in module.PULL_REQUESTS.pr_diff(root, ref())["patch"]
     assert file_diff(root)["after"] == "new\n"
@@ -549,6 +599,95 @@ def test_gitlab_omitted_patch_keeps_file_without_line_counts(
     assert result == {"object": "session.github.pr_diff", "patch": ""}
 
 
+def test_pinned_reads_echo_the_matching_revisions(root: str, api: Mock) -> None:
+    files = module.PULL_REQUESTS.pinned_changed_files(root, ref(), head_sha=HEAD, base_sha=BASE)
+    assert files["head_sha"] == HEAD and files["base_sha"] == BASE
+    assert files["data"][0]["path"] == "src/new.py"
+    patch = module.PULL_REQUESTS.pinned_diff(root, ref(), head_sha=HEAD, base_sha=BASE)
+    assert patch["head_sha"] == HEAD and patch["base_sha"] == BASE
+    assert "--- a/src/old.py\n+++ b/src/new.py\n" in patch["patch"]
+
+
+@pytest.mark.parametrize("read", ["pinned_changed_files", "pinned_diff"])
+@pytest.mark.parametrize("override", [{"head_sha": "d" * 40}, {"base_sha": "e" * 40}])
+def test_pinned_read_refuses_a_merge_request_that_moved(
+    root: str, api: Mock, read: str, override: dict
+) -> None:
+    pins = {"head_sha": HEAD, "base_sha": BASE, **override}
+    with pytest.raises(ValueError, match="merge request changed"):
+        getattr(module.PULL_REQUESTS, read)(root, ref(), **pins)
+
+
+@pytest.mark.parametrize("read", ["pinned_changed_files", "pinned_diff"])
+def test_pinned_read_refuses_a_merge_request_that_moves_during_the_listing(
+    root: str, api: Mock, mr: dict, change: dict, read: str
+) -> None:
+    def moving_changes(path: str, **query):
+        mr["diff_refs"]["head_sha"] = "d" * 40
+        return [change], False
+
+    api.pages.side_effect = moving_changes
+    with pytest.raises(ValueError, match="merge request changed"):
+        getattr(module.PULL_REQUESTS, read)(root, ref(), head_sha=HEAD, base_sha=BASE)
+
+
+def test_partial_pinned_listing_whose_final_check_times_out_returns_it_without_pins(
+    root: str, api: Mock, change: dict
+) -> None:
+    api.pages.side_effect = lambda path, **query: ([change], True)
+    answer = api.object.side_effect
+    merge_request_reads = []
+
+    def final_check_times_out(path: str, **query):
+        # The reads are the check before the listing, the listing's own read, then the final check.
+        if path == MR_PATH:
+            merge_request_reads.append(path)
+            if len(merge_request_reads) == 3:
+                raise GitLabTimeoutError("GitLab request timed out. Refresh to retry.")
+        return answer(path, **query)
+
+    api.object.side_effect = final_check_times_out
+    result = module.PULL_REQUESTS.pinned_changed_files(root, ref(), head_sha=HEAD, base_sha=BASE)
+
+    assert result["has_more"] is True and result["warning"]
+    assert [file["path"] for file in result["data"]] == ["src/new.py"]
+    assert "head_sha" not in result and "base_sha" not in result
+
+
+@pytest.mark.parametrize("read", ["pinned_changed_files", "pinned_diff"])
+def test_pinned_read_without_prepared_diff_refs_returns_data_without_pins(
+    root: str, api: Mock, mr: dict, read: str
+) -> None:
+    mr["diff_refs"] = None
+    result = getattr(module.PULL_REQUESTS, read)(root, ref(), head_sha=HEAD, base_sha=BASE)
+    assert "src/new.py" in str(result)
+    assert "head_sha" not in result and "base_sha" not in result
+
+
+def test_incomplete_pinned_diff_echoes_the_verified_revisions(
+    root: str, api: Mock, mr: dict
+) -> None:
+    mr["changes_count"] = "1000+"
+    result = module.PULL_REQUESTS.pinned_diff(root, ref(), head_sha=HEAD, base_sha=BASE)
+    assert result["unavailable_reason"] == "incomplete_diff"
+    assert result["head_sha"] == HEAD and result["base_sha"] == BASE
+
+
+def test_panel_pinned_reads_route_to_the_gitlab_revisions(
+    root: str, api: Mock, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from omnigent.runner import pr_resource
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    session = "gitlab-pinned"
+    pr_resource.update_session_pr(root, session, URL, "attach")
+    pinned = {"session_id": session, "pr_url": URL, "head_sha": HEAD, "base_sha": BASE}
+    assert pr_resource.pr_changed_files(root, **pinned)["head_sha"] == HEAD
+    assert pr_resource.pr_diff(root, **pinned)["head_sha"] == HEAD
+    with pytest.raises(ValueError, match="merge request changed"):
+        pr_resource.pr_changed_files(root, **{**pinned, "head_sha": "d" * 40})
+
+
 def file_diff(root: str, **overrides) -> dict:
     return module.PULL_REQUESTS.file_diff(
         root,
@@ -642,6 +781,22 @@ def test_outside_checkout_still_serves_manually_linked_mr(tmp_path: Path, api: M
     assert module.PULL_REQUESTS.reference_info(str(tmp_path), ref())["pr"]["number"] == 7
 
 
+def test_commit_history_is_refused_for_merge_requests(
+    root: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from omnigent.runner import pr_resource
+    from omnigent.runner.session_prs import SessionPrRegistry
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    SessionPrRegistry("gitlab-commits").record([ref()], relationship="attached", source="test")
+    assert module.PULL_REQUESTS.capabilities.commit_history is False
+    message = "Listing commits is not supported for GitLab merge request"
+    with pytest.raises(ValueError, match=message):
+        pr_resource.pr_commits(root, session_id="gitlab-commits", pr_url=URL, head_sha=HEAD)
+    with pytest.raises(ValueError, match=message):
+        pr_resource.pr_commit_diff(root, session_id="gitlab-commits", pr_url=URL, commit_sha=BASE)
+
+
 def test_upstream_remote_precedence_preserves_other_gitlab_remotes(root: str) -> None:
     for args in (
         ["remote", "add", "upstream", "https://gitlab.com/team/sub/project.git"],
@@ -728,20 +883,34 @@ def test_generic_attach_failure_does_not_persist(
     assert SessionPrRegistry("gitlab-panel").list() == []
 
 
+@pytest.mark.parametrize("auth_source", ["glab", "GITLAB_HOST", "GLAB_HOST"])
+@pytest.mark.parametrize("ssh", [False, True])
 def test_private_port_remote_resolves_through_generic_panel(
-    root: str, api: Mock, mr: dict, monkeypatch: pytest.MonkeyPatch
+    root: str, api: Mock, mr: dict, monkeypatch: pytest.MonkeyPatch, auth_source: str, ssh: bool
 ) -> None:
     from omnigent.runner import pr_resource
 
     host = "git.example.test:8443"
-    monkeypatch.setenv("OMNIGENT_GIT_PROVIDER_GITLAB_HOSTS", host)
+    if auth_source == "glab":
+        monkeypatch.setenv("OMNIGENT_GIT_PROVIDER_GITLAB_HOSTS", host)
+    else:
+        monkeypatch.setenv(auth_source, host)
+        monkeypatch.setenv("GITLAB_TOKEN", "test-token")
+        monkeypatch.setattr(module.shutil, "which", lambda name: None)
+    remote = (
+        "git@git.example.test:fork/sub/project.git"
+        if ssh
+        else f"https://{host}/fork/sub/project.git"
+    )
     subprocess.run(
-        ["git", "-C", root, "remote", "set-url", "origin", f"https://{host}/fork/sub/project.git"],
+        ["git", "-C", root, "remote", "set-url", "origin", remote],
         check=True,
     )
     mr["web_url"] = URL.replace("gitlab.com", host)
     info = pr_resource.pr_info(root)
     assert info["provider"] == "gitlab" and info["pr"]["url"] == mr["web_url"]
+    assert info["auth"]["authenticated"]
+    assert (info["auth"]["cli"] is None) == (auth_source != "glab")
 
 
 @pytest.mark.parametrize(

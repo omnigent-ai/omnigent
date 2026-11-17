@@ -1,20 +1,49 @@
 import type * as TerminalsModule from "@/hooks/useTerminals";
 import type * as SessionsApi from "@/lib/sessionsApi";
 import type * as FilesPanelModule from "@/shell/FilesPanel";
-import { type ComponentProps, useContext, useState } from "react";
-import { act, cleanup, fireEvent, render, screen, within, waitFor } from "@testing-library/react";
+import type * as GridSessionsModule from "./GridSessionsContext";
+import {
+  type ComponentProps,
+  type ReactElement,
+  type ReactNode,
+  useContext,
+  useState,
+} from "react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render as renderComponent,
+  screen,
+  within,
+  waitFor,
+} from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { emitUiOpenFile } from "@/lib/uiFileRequests";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, expect, it, onTestFinished, vi } from "vitest";
-import { FileViewerContext } from "@/shell/FileViewerContext";
+import { type FileNavigationGuard, FileViewerContext } from "@/shell/FileViewerContext";
 import type { WorkspacePanel } from "@/shell/WorkspacePanel";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import { RearrangeableGrid } from "./GridWorkspace";
 import { splitGrid } from "./gridLayout";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useTerminalFirst } from "@/shell/TerminalFirstContext";
-import { retrySession } from "@/lib/sessionsApi";
+import { retrySession, updateSession } from "@/lib/sessionsApi";
+import { toast } from "sonner";
 import { revealFolderInFilesPanel } from "@/shell/FilesPanel";
+import { selectPullRequestInPanel } from "@/shell/PullRequestPanel";
+
+const queryClient = new QueryClient();
+const LINKED_PR = "https://github.com/example/app/pull/42";
+
+function render(ui: ReactElement) {
+  return renderComponent(ui, {
+    wrapper: ({ children }) => (
+      <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+    ),
+  });
+}
 
 const fixture = vi.hoisted(() => ({
   labels: {} as Record<string, string>,
@@ -23,13 +52,25 @@ const fixture = vi.hoisted(() => ({
   terminalPending: false,
   composerDisabled: false,
   hostOnline: undefined as boolean | undefined,
+  livenessKind: "online",
   failedChat: "",
   failedTerminal: "",
   renderError: new Error("Grid surface render failed"),
+  // Set while a cell's viewer holds unsaved edits and is asking to discard them.
+  discardEdits: null as (() => void) | null,
 }));
 vi.mock("@/lib/sessionsApi", async (original) => ({
   ...(await original<typeof SessionsApi>()),
   retrySession: vi.fn(async () => ({ recovered: true })),
+  updateSession: vi.fn(async () => ({ labels: {} })),
+}));
+vi.mock("@/components/HostBadge", () => ({
+  HostBadge: ({ sessionId, readOnly }: { sessionId: string; readOnly?: boolean }) => (
+    <span>
+      Host for {sessionId}
+      {readOnly && " (status only)"}
+    </span>
+  ),
 }));
 vi.mock("@/components/blocks/TerminalView", () => ({
   TerminalView: ({
@@ -47,26 +88,39 @@ vi.mock("@/components/blocks/TerminalView", () => ({
 }));
 
 vi.mock("@/canvas/CanvasWorkspace", () => ({ CanvasWorkspace: () => null }));
+vi.mock("@/shell/PullRequestPanel", () => ({ selectPullRequestInPanel: vi.fn() }));
 vi.mock("@/shell/FilesPanel", async (original) => ({
   ...(await original<typeof FilesPanelModule>()),
   revealFolderInFilesPanel: vi.fn(),
 }));
-vi.mock("@/hooks/useSidebarData", () => ({ useLoadedConversations: () => ({}) }));
+vi.mock("@/hooks/useSidebarData", () => ({
+  useLoadedConversations: () => ({}),
+  useOptionalLoadedConversations: () => undefined,
+}));
 
 vi.mock("@/hooks/useSession", () => ({
   useSession: (id: string) => ({
     session: {
+      id,
       title: id,
+      harness: "claude-native",
       agentId: `agent-${id}`,
       labels: fixture.labels,
       permissionLevel: fixture.permissionLevel,
     },
   }),
   useRootSessionId: (id: string) => id,
+  sessionQueryOptions: (id: string) => ({
+    queryKey: ["session", id],
+    queryFn: async () => ({ id, title: id }),
+  }),
 }));
 vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: () => true }));
 vi.mock("@/hooks/useConversationEntryState", () => ({
-  useConversationEntryState: () => ({ terminalPending: fixture.terminalPending }),
+  useConversationEntryState: () => ({
+    terminalPending: fixture.terminalPending,
+    claudePermissionMode: "default",
+  }),
 }));
 vi.mock("@/hooks/RunnerHealthProvider", () => ({
   useRunnerHealthRegistration: () => {},
@@ -76,7 +130,7 @@ vi.mock("@/hooks/RunnerHealthProvider", () => ({
 vi.mock("@/hooks/useBrowserAgentRelay", () => ({ useBrowserAgentRelay: () => {} }));
 vi.mock("@/hooks/useSessionLiveness", () => ({
   livenessRowFromSession: () => null,
-  useSessionLiveness: () => ({ kind: "online" }),
+  useSessionLiveness: () => ({ kind: fixture.livenessKind }),
 }));
 vi.mock("@/hooks/useChildSessions", () => ({ useChildSessions: () => ({ children: [] }) }));
 vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
@@ -88,15 +142,21 @@ vi.mock("@/hooks/useTerminals", async (importOriginal) => ({
   useTerminals: () => ({ terminals: fixture.terminals }),
   useDeleteTerminal: () => ({}),
 }));
-vi.mock("./GridSessionsContext", () => ({
+vi.mock("./GridSessionsContext", async (original) => ({
+  ...(await original<typeof GridSessionsModule>()),
   useGridSessions: () => {
     const [selectedSessionId, selectSession] = useState("first");
     return { closePane: vi.fn(), selectedSessionId, selectSession };
   },
-  gridTitle: () => "Test grid",
 }));
 vi.mock("@/components/chat/SideChatPane", () => ({
-  SideChatPane: ({ childId }: { childId: string }) => {
+  SideChatPane: ({
+    childId,
+    gridComposer,
+  }: {
+    childId: string;
+    gridComposer?: { leading?: ReactNode; trailing?: ReactNode };
+  }) => {
     const context = useContext(FileViewerContext)!;
     const terminal = useTerminalFirst();
     if (childId === fixture.failedChat) throw fixture.renderError;
@@ -112,9 +172,24 @@ vi.mock("@/components/chat/SideChatPane", () => ({
         <button type="button" onClick={() => context.registerNavigationGuard?.(() => {})}>
           Block navigation
         </button>
+        <button
+          type="button"
+          onClick={() =>
+            context.registerNavigationGuard?.((_path, _options, navigate) => {
+              fixture.discardEdits = navigate;
+            })
+          }
+        >
+          Edit file
+        </button>
         <button type="button" onClick={() => context.openFolder?.("/workspace/experimental")}>
           Open folder
         </button>
+        <button type="button" onClick={() => context.openGithubTab(LINKED_PR)}>
+          Open PR
+        </button>
+        {gridComposer?.leading}
+        {gridComposer?.trailing}
       </>
     );
   },
@@ -158,6 +233,7 @@ vi.mock("@/shell/WorkspacePanel", () => ({
 
 afterEach(() => {
   cleanup();
+  queryClient.clear();
   localStorage.clear();
   sessionStorage.clear();
   fixture.labels = {};
@@ -166,9 +242,60 @@ afterEach(() => {
   fixture.terminalPending = false;
   fixture.composerDisabled = false;
   fixture.hostOnline = undefined;
+  fixture.livenessKind = "online";
   fixture.failedChat = "";
   fixture.failedTerminal = "";
+  fixture.discardEdits = null;
   vi.restoreAllMocks();
+});
+
+/** A two-cell grid of "first" and "second". */
+const twoCellGrid = () => (
+  <MemoryRouter>
+    <TooltipProvider>
+      <RearrangeableGrid
+        grid={{ id: "two-cells", layout: splitGrid("first", "first", "second", "right")! }}
+      />
+    </TooltipProvider>
+  </MemoryRouter>
+);
+
+it("shows each cell's session controls and targets that session's permission mode", async () => {
+  fixture.labels = { "omnigent.wrapper": "claude-code-native-ui" };
+  document.title = "Single session";
+  const view = render(twoCellGrid());
+  // Named from the cells' snapshots; neither session is on a loaded sidebar page.
+  await waitFor(() => expect(document.title).toBe("first + second"));
+  const second = within(screen.getByRole("region", { name: "second" }));
+  // Host and harness are read-only here; switch hosts and models full screen.
+  expect(second.getByText("Host for second (status only)")).toBeInTheDocument();
+  expect(second.getByTestId("grid-harness-status")).toHaveAccessibleName("Claude Code");
+  fireEvent.pointerDown(second.getByRole("button", { name: "Permission mode: Manual" }), {
+    button: 0,
+  });
+  fireEvent.click(screen.getByTestId("composer-permission-option-auto"));
+  await waitFor(() =>
+    expect(updateSession).toHaveBeenCalledWith("second", { claudePermissionMode: "auto" }),
+  );
+  // A rejected switch reports why and frees the chip for another try.
+  const toastError = vi.spyOn(toast, "error").mockReturnValue("error");
+  vi.mocked(updateSession).mockRejectedValueOnce(new Error("Runner unavailable"));
+  const chip = () => second.getByRole("button", { name: "Permission mode: Manual" });
+  fireEvent.pointerDown(chip(), { button: 0 });
+  fireEvent.click(screen.getByTestId("composer-permission-option-plan"));
+  await waitFor(() => expect(toastError).toHaveBeenCalledWith("Runner unavailable"));
+  await waitFor(() => expect(chip()).toBeEnabled());
+  // Only the owner can switch modes.
+  fixture.permissionLevel = 2;
+  view.rerender(twoCellGrid());
+  expect(chip()).toBeDisabled();
+  fixture.permissionLevel = null;
+  // Like the main composer, an unreachable session's chip can't switch modes.
+  fixture.livenessKind = "host_offline";
+  view.rerender(twoCellGrid());
+  expect(second.getByRole("button", { name: "Permission mode: Manual" })).toBeDisabled();
+  view.unmount();
+  expect(document.title).toBe("Single session");
 });
 
 it("opens agent-requested files only in the active workspace and respects navigation guards", () => {
@@ -193,7 +320,61 @@ it("opens agent-requested files only in the active workspace and respects naviga
   expect(screen.getByTestId("workspace-first")).not.toHaveTextContent("blocked.md");
 });
 
-it("browses a chat-linked folder in the Files tab of that pane's workspace", () => {
+/** The shell's file-viewer context, collecting the guards registered with it. */
+function shellFileViewerContext(guards: Set<FileNavigationGuard>) {
+  return {
+    openFile: vi.fn(),
+    registerNavigationGuard: (guard: FileNavigationGuard) => {
+      guards.add(guard);
+      return () => void guards.delete(guard);
+    },
+    openGithubTab: vi.fn(),
+    isChangedPath: () => false,
+    conversationId: undefined,
+    workspaceRoot: null,
+    workspaceHome: null,
+  };
+}
+
+it("asks each cell's viewer before the shell's Close leaves the grid", () => {
+  // Stands in for AppShell: its Close runs every registered guard, then leaves.
+  const shellGuards = new Set<FileNavigationGuard>();
+  const shellContext = shellFileViewerContext(shellGuards);
+  const leave = vi.fn();
+  const closeFromShell = () => {
+    const guards = [...shellGuards];
+    const next = (index: number): void => {
+      const guard = guards[index];
+      if (guard) guard(null, undefined, () => next(index + 1));
+      else leave();
+    };
+    next(0);
+  };
+  render(
+    <MemoryRouter>
+      <TooltipProvider>
+        <FileViewerContext.Provider value={shellContext}>
+          <RearrangeableGrid
+            grid={{ id: "dirty-close", layout: splitGrid("first", "first", "second", "right")! }}
+          />
+        </FileViewerContext.Provider>
+      </TooltipProvider>
+    </MemoryRouter>,
+  );
+  const second = screen.getByRole("region", { name: "second" });
+  fireEvent.click(within(second).getByText("Edit file"));
+
+  // Keep editing: the viewer never calls back, so the grid stays.
+  act(() => closeFromShell());
+  expect(fixture.discardEdits).not.toBeNull();
+  expect(leave).not.toHaveBeenCalled();
+
+  // Discard changes: leaving goes ahead.
+  act(() => fixture.discardEdits?.());
+  expect(leave).toHaveBeenCalledOnce();
+});
+
+it("opens chat-linked folders and PRs in that pane's workspace", () => {
   writeSessionWorkspaceState("first", { rightRailTab: "subagents" });
   render(
     <MemoryRouter>
@@ -208,7 +389,9 @@ it("browses a chat-linked folder in the Files tab of that pane's workspace", () 
   const first = within(screen.getByRole("region", { name: "first (active)" }));
   fireEvent.click(first.getByText("Block navigation"));
   fireEvent.click(first.getByText("Open folder"));
+  fireEvent.click(first.getByText("Open PR"));
   expect(revealFolderInFilesPanel).not.toHaveBeenCalledWith("first", expect.anything());
+  expect(selectPullRequestInPanel).not.toHaveBeenCalled();
   expect(screen.getByTestId("workspace-first")).toHaveAttribute("data-tab", "subagents");
   expect(screen.getByTestId("workspace-first")).toHaveAttribute("aria-hidden", "true");
 
@@ -219,6 +402,12 @@ it("browses a chat-linked folder in the Files tab of that pane's workspace", () 
   expect(workspace).toHaveAttribute("data-testid", "workspace-second");
   expect(workspace).toHaveAttribute("data-tab", "files");
   expect(workspace).toHaveTextContent("No file");
+
+  fireEvent.click(
+    within(screen.getByRole("region", { name: "second (active)" })).getByText("Open PR"),
+  );
+  expect(selectPullRequestInPanel).toHaveBeenCalledWith(queryClient, "second", LINKED_PR);
+  expect(workspace).toHaveAttribute("data-tab", "github");
 });
 
 it("keeps cell views, input, permissions and shortcut targets independent", async () => {

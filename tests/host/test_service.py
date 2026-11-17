@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import os
 import plistlib
+import shlex
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -178,15 +181,174 @@ def test_enable_systemd_user_service(tmp_path: Path, monkeypatch: pytest.MonkeyP
     ]
 
 
+def _recorded_command(installed: service.HostService) -> list[str]:
+    contents = installed.path.read_bytes()
+    if installed.kind == "launchd":
+        return list(plistlib.loads(contents)["ProgramArguments"])
+    (exec_start,) = (
+        line for line in contents.decode().splitlines() if line.startswith("ExecStart=")
+    )
+    return shlex.split(exec_start.removeprefix("ExecStart="))
+
+
+@pytest.mark.parametrize("system", ["Darwin", "Linux"])
+def test_wrapper_launched_service_survives_interpreter_cache_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, system: str
+) -> None:
+    """Re-enabling through a wrapper replaces a service pinned to its disposable cache venv."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "state"))
+    monkeypatch.setattr(service.platform, "system", lambda: system)
+    monkeypatch.setattr(service.os, "getuid", lambda: 501)
+    cache_venv = tmp_path / "cache" / "wrapper-venv"
+    cache_python = cache_venv / "bin" / "python"
+    cache_python.parent.mkdir(parents=True)
+    cache_python.write_text("")
+    cache_python.chmod(0o755)
+    monkeypatch.setattr(service.sys, "executable", str(cache_python))
+    wrapper = tmp_path / "tool bin" / "my wrapper"
+    wrapper.parent.mkdir()
+    wrapper.write_text("#!/bin/sh\n")
+    wrapper.chmod(0o755)
+    calls = _capture_runs(monkeypatch)
+    environment = {"HOME": str(tmp_path), "PATH": f"{wrapper.parent}:/usr/bin:/bin"}
+    stale = service.enable_user_host_service("https://example.com", environment=environment)
+    assert _recorded_command(stale)[0] == str(cache_python)
+    calls.clear()
+    shutil.rmtree(cache_venv)
+
+    installed = service.enable_user_host_service(
+        "https://example.com",
+        environment={
+            **environment,
+            "OMNIGENT_WRAPPER_COMMAND": shlex.join(
+                [str(wrapper), "omni", "--profile", 'team "quoted"\\config']
+            ),
+        },
+    )
+
+    command = _recorded_command(installed)
+    assert os.access(command[0], os.X_OK), f"service launches missing {command[0]}"
+    assert command == [
+        str(wrapper),
+        "omni",
+        "--profile",
+        'team "quoted"\\config',
+        "host-service-entry",
+        "--server",
+        "https://example.com",
+    ]
+    if system == "Linux":
+        assert (
+            f'ExecStart="{wrapper}" "omni" "--profile" '
+            '"team \\"quoted\\"\\\\config" "host-service-entry" '
+            '"--server" "https://example.com"'
+        ) in installed.path.read_text().splitlines()
+    reloads = {
+        "Darwin": [
+            ["launchctl", "bootout", f"gui/501/{installed.label}"],
+            ["launchctl", "bootstrap", "gui/501", str(installed.path)],
+        ],
+        "Linux": [
+            ["systemctl", "--user", "daemon-reload"],
+            ["systemctl", "--user", "enable", "--now", installed.label],
+            ["systemctl", "--user", "restart", installed.label],
+        ],
+    }
+    assert calls == reloads[system]
+
+
+@pytest.mark.parametrize(
+    ("configured", "wrapper_mode", "error"),
+    [
+        pytest.param("wrapper omni", None, "Cannot find 'wrapper'", id="missing"),
+        pytest.param("wrapper omni", 0o644, "Cannot find 'wrapper'", id="not-executable"),
+        pytest.param(
+            "wrapper 'omni", 0o755, "Cannot parse OMNIGENT_WRAPPER_COMMAND", id="bad-quote"
+        ),
+    ],
+)
+@pytest.mark.parametrize("existing_definition", [False, True], ids=["fresh", "existing"])
+def test_service_refuses_unusable_wrapper(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    configured: str,
+    wrapper_mode: int | None,
+    error: str,
+    existing_definition: bool,
+) -> None:
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    monkeypatch.setattr(service.platform, "system", lambda: "Linux")
+    calls = _capture_runs(monkeypatch)
+    if wrapper_mode is not None:
+        (tmp_path / "wrapper").write_text("#!/bin/sh\n")
+        (tmp_path / "wrapper").chmod(wrapper_mode)
+    environment = {"PATH": str(tmp_path), "OMNIGENT_WRAPPER_COMMAND": configured}
+    definition = tmp_path / "xdg/systemd/user/omnigent-host.service"
+    previous = b"[Service]\nExecStart=/missing/cache/python -m omnigent.host.service_entry\n"
+    if existing_definition:
+        definition.parent.mkdir(parents=True)
+        definition.write_bytes(previous)
+
+    with pytest.raises(service.HostServiceError, match=error):
+        service.validate_user_host_service(None, environment=environment)
+    with pytest.raises(service.HostServiceError, match=error):
+        service.enable_user_host_service(None, environment=environment)
+
+    assert calls == []
+    if existing_definition:
+        assert definition.read_bytes() == previous
+    else:
+        assert not definition.exists()
+
+
+@pytest.mark.parametrize("by_path", [False, True], ids=["path-lookup", "absolute-path"])
+@pytest.mark.parametrize(
+    "symlink_parent", [False, True], ids=["direct", "symlink-parent-traversal"]
+)
+def test_wrapper_command_keeps_quoted_words(
+    tmp_path: Path, by_path: bool, symlink_parent: bool
+) -> None:
+    wrapper = tmp_path / "tool $dir" / "my wrapper"
+    wrapper.parent.mkdir()
+    wrapper.write_text("#!/bin/sh\n")
+    wrapper.chmod(0o755)
+    selected = wrapper
+    if symlink_parent:
+        nested = wrapper.parent / "nested"
+        nested.mkdir()
+        alias = tmp_path / "alias"
+        alias.symlink_to(nested, target_is_directory=True)
+        link = wrapper.with_name("wrapper link")
+        link.symlink_to(wrapper)
+        wrapper = link
+        selected = alias / ".." / link.name
+    executable = shlex.quote(str(selected) if by_path else selected.name)
+
+    command = service._service_command(
+        None,
+        {
+            "PATH": str(selected.parent),
+            "OMNIGENT_WRAPPER_COMMAND": f"{executable} 'omni cli' --flag",
+        },
+    )
+
+    assert command == [str(wrapper), "omni cli", "--flag", "host-service-entry", "--local"]
+    assert shutil.which(command[0]) == command[0]
+    if symlink_parent:
+        assert Path(command[0]).is_symlink()
+
+
 def test_systemd_unit_escapes_specifiers_and_literal_dollars() -> None:
     unit = service._systemd_unit(
-        command=["/opt/$tools/python", "--server", "https://example.com/%h/$target"],
+        command=["/opt/%literal/$tools/python", "--server", "https://example.com/%h/$target"],
         environment={"CONFIG": "$HOME/%h"},
     ).decode()
 
     assert 'Environment="CONFIG=$HOME/%%h"' in unit
     assert (
-        'ExecStart="/opt/$$tools/python" "--server" "https://example.com/%%h/$$target"'
+        'ExecStart="/opt/%%literal/$tools/python" "--server" "https://example.com/%%h/$$target"'
     ) in unit
 
 

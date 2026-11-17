@@ -9,6 +9,7 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 from playwright.sync_api import Page, Route, expect
 
+from tests._helpers.pull_request_ui import open_session_pull_requests
 from tests.e2e_ui.conftest import fetch_with_retry, open_right_rail, stub_session_pull_requests
 
 HOST = "git.example.test:8443"
@@ -258,8 +259,9 @@ def test_gitlab_panel_summary_and_diff(
         panel.get_by_role("tab", name="Pull Requests").click()
     else:
         indicator = page.get_by_test_id("composer-pr-link")
-        expect(indicator).to_have_accessible_name("!7", timeout=30_000)
-        indicator.click()
+        if not mobile:
+            expect(indicator).to_have_accessible_name("!7", timeout=30_000)
+        open_session_pull_requests(page, mobile=mobile)
         panel = (
             page.get_by_test_id("github-panel-drawer")
             if mobile
@@ -355,7 +357,7 @@ def test_gitlab_unlink_last_mr_clears_selection(
         panel = page.get_by_role("complementary", name="Workspace")
         panel.get_by_role("tab", name="Pull Requests").click()
     else:
-        page.get_by_test_id("composer-pr-link").click()
+        open_session_pull_requests(page, mobile=mobile)
         panel = (
             page.get_by_test_id("github-panel-drawer")
             if mobile

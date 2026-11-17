@@ -465,8 +465,11 @@ UNRESOLVED_ATTACHMENT_MARKER_PATTERN = r"\[Attachment [^\]]+ could not be loaded
 
 # TUI forwarders strip local file paths from mirrored chat bubbles.
 # Codex's binary file inputs also use the "[Attached file: ...]" shape.
+# Only absolute paths are materialized uploads; a workspace-relative marker is
+# an inline "@file" mention from the web composer and stays in the sentence.
 ATTACHMENT_MARKER_STRIP_PATTERN = (
-    rf"\[Attached(?: file)?:[^\]]*\]|{UNRESOLVED_ATTACHMENT_MARKER_PATTERN}"
+    r"\[Attached(?: file)?: (?:/|[A-Za-z]:[\\/]|\\\\)[^\]]*\]"
+    rf"|{UNRESOLVED_ATTACHMENT_MARKER_PATTERN}"
 )
 
 

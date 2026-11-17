@@ -876,6 +876,35 @@ async def test_observe_distinct_ids_each_fire_once(
 
 
 @pytest.mark.asyncio
+async def test_observe_ignores_non_blocking_request(
+    conv_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    A child's non-blocking question does not wake the parent, since the child keeps working.
+    """
+    parent = conv_store.create_conversation(kind="default", title="parent")
+    child = conv_store.create_conversation(
+        kind="sub_agent", title="codex:async", parent_conversation_id=parent.id
+    )
+    dispatch = _RecordingDispatch()
+    notifier = SubagentBlockNotifier(
+        conversation_store=conv_store,
+        wake_dispatch=dispatch,
+        loop=asyncio.get_event_loop(),
+    )
+    question = _request_event("elicit_question", message="Codex needs input")
+    question["params"]["is_blocking"] = False
+
+    notifier.observe(child.id, question)
+    assert not elicitation_armed(notifier, "elicit_question")
+    notifier.observe(child.id, _request_event("elicit_approval", message="approve B"))
+    await _wait_for_calls(dispatch, expected=1)
+
+    assert len(dispatch.calls) == 1
+    assert "approve B" in dispatch.calls[0].notice
+
+
+@pytest.mark.asyncio
 async def test_observe_wake_targets_only_recorded_parent_not_other_trees(
     conv_store: SqlAlchemyConversationStore,
 ) -> None:

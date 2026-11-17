@@ -45,7 +45,7 @@ producer did not supply them; do not infer ownership from timestamps alone.
 | `native_input_execution_started` / `native_input_execution_finished` | The executor call and its bounded result, including cancellation or an explicitly reported undelivered input. `executor_returned` alone does not prove a transcript record exists. `executor_stream_ended` means the executor exited without reporting a final result. |
 | `native_input_steering_started` / `native_input_steering_finished` | A direct in-band harness injection carrying its own input identity. `executor_accepted` means the executor accepted the injection; `executor_refused` means it returned false. `executor_ambiguous` means the harness's reply to a submission it may have accepted was lost; the runner treats the input as consumed and does not resend it. `cancelled` means the injection was interrupted, and `error` means it raised an exception. Acceptance does not prove transcript persistence. |
 | `claude_native_delivery_finished` | Claude's existing stages, verification, retries, and local delivery ID, now joined to the original input. `draft_cleared` means the submitted draft disappeared; it does not prove native transcript persistence. Other delivery outcomes remain `unknown`. |
-| `codex_native_delivery_attempt` / `codex_native_delivery_finished` | One pair per RPC, with `turn_start` or `turn_steer` and an `rpc_accepted`, `rpc_accepted_missing_turn_id`, `rpc_rejected_draining`, `rpc_rejected_compacting`, `rpc_error`, or `cancelled` outcome. The missing-ID outcome means the RPC returned without a nonempty turn ID. A recovered stale steer, drain rejection, or compaction refusal generates separate pairs for the rejected and retried requests. No new delivery events are emitted without an input identity. |
+| `codex_native_delivery_attempt` / `codex_native_delivery_finished` | One pair per RPC, with `turn_start` or `turn_steer` and an `rpc_accepted`, `rpc_accepted_missing_turn_id`, `rpc_rejected_draining`, `rpc_rejected_compacting`, `rpc_error`, or `cancelled` outcome. The missing-ID outcome means the RPC returned without a nonempty turn ID. When a `turn_start` or `turn_steer` reply is lost in transit (`rpc_error`), one bounded `thread/read` looks for the input's exact `clientUserMessageId` receipt in that thread; a match adds a second `codex_native_delivery_finished` with the same `native_rpc_attempt_id` and the `native_receipt_confirmed` outcome, and the input counts as delivered rather than resent. A recovered stale steer, drain rejection, or compaction refusal generates separate pairs for the rejected and retried requests. No new delivery events are emitted without an input identity. |
 | `codex_native_delivery_reconnecting` | Codex explicitly refused the input while draining. One reconnect is attempted before retrying that RPC, with the same input identity. A missing or changed session, thread, or transport prevents resubmission. |
 | `codex_native_compaction_wait` | Codex explicitly refused steering during compaction. Records `waiting`, then `settled`, `timed_out`, `session_changed`, `cancelled`, or `error`. The turn ID is the refused compaction turn. |
 | `codex_app_server_draining` | Initialization was refused while draining, before a turn could be submitted. The sender's input remains undelivered. |
@@ -86,6 +86,10 @@ emit these input-delivery events.
   A later transcript match clears it without saving a missing-message error.
 - `reported_undelivered`: the runner explicitly reported that this particular
   input had not reached the harness.
+- `reported_undelivered_from_runner_copy`: as above, but the server's queued
+  copy had already expired, so the message was saved from the content the
+  runner reported with it. This happens when the runner's human-wait hold runs
+  out on messages queued behind an unanswered prompt.
 
 Skipped inputs also carry a bounded `cause_class`:
 

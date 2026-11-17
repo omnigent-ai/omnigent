@@ -33,7 +33,7 @@ import subprocess
 import threading
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Collection, Iterator
+from collections.abc import Awaitable, Callable, Collection, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -68,6 +68,11 @@ _GIT_DISCOVERY_ENV = frozenset(
         "GIT_CONFIG_PARAMETERS",
     }
 )
+
+
+# Global options that keep read-only status/diff from refreshing and writing
+# the index. ``--no-optional-locks`` alone does not stop ``git diff`` doing so.
+_LOCK_FREE_GIT_READ_OPTIONS = ("--no-optional-locks", "-c", "diff.autoRefreshIndex=false")
 
 
 def _anchored_git_env() -> dict[str, str]:
@@ -164,6 +169,14 @@ _SKIP_DIRS: frozenset[str] = frozenset(
     }
 )
 
+# Caps on reading untracked files to count their lines, per changes listing.
+# Each read reserves the listed size plus one byte, which detects a grown file.
+_UNTRACKED_LINES_MAX_FILES = 1_000
+_UNTRACKED_LINES_MAX_FILE_BYTES = 1024 * 1024
+_UNTRACKED_LINES_MAX_TOTAL_BYTES = 8 * 1024 * 1024
+# Git's content heuristic for binary files: a NUL within the first 8000 bytes.
+_BINARY_SNIFF_BYTES = 8000
+
 # Cursor plumbing Omnigent writes into ``<workspace>/.cursor`` at session launch
 # (cursor-agent reads project config only there). Session infrastructure, not
 # user edits; only these exact paths are hidden, other ``.cursor`` content shows.
@@ -174,6 +187,45 @@ _CURSOR_PLUMBING_PATHS: frozenset[str] = frozenset(
         ".cursor/omnigent-hook.sh",
     }
 )
+
+
+def _count_untracked_lines(root: Path, records: list[dict[str, Any]], untracked: set[str]) -> None:
+    """Set ``untracked_lines`` on each untracked record, newest first.
+
+    Counts newline-terminated lines (plus an unterminated last line) in files
+    that pass Git's NUL-byte content check; ``.gitattributes`` overrides are
+    not applied. Binary, oversized, grown, unsafe, unreadable and over-budget
+    files get ``None``; one budget bounds the reads of a whole listing. Tracked
+    records are left alone, so ``lines_added`` keeps meaning "tracked lines".
+
+    :param root: Directory the record paths are relative to.
+    :param records: Records to annotate in place, newest first.
+    :param untracked: Record paths ``git status`` reported as ``??``.
+    """
+    from omnigent.runner.environment_filesystem import read_regular_file_beneath
+
+    budget = _UNTRACKED_LINES_MAX_TOTAL_BYTES
+    files_left = _UNTRACKED_LINES_MAX_FILES
+    for record in records:
+        if record["path"] not in untracked:
+            continue
+        size = record["bytes"]
+        data = None
+        if (
+            files_left > 0
+            and size is not None
+            and size <= _UNTRACKED_LINES_MAX_FILE_BYTES
+            and size < budget
+        ):
+            # Spend the allowance before reading, so a read that fails midway still counts.
+            files_left -= 1
+            budget -= size + 1
+            data = read_regular_file_beneath(root, record["path"], size)
+        if data is None or len(data) > size or b"\0" in data[:_BINARY_SNIFF_BYTES]:
+            record["untracked_lines"] = None
+        else:
+            trailing = 1 if data and not data.endswith(b"\n") else 0
+            record["untracked_lines"] = data.count(b"\n") + trailing
 
 
 def _is_ephemeral(path: str) -> bool:
@@ -466,7 +518,8 @@ def _parse_git_porcelain_line(line: str) -> tuple[str, str, bool, bool] | None:
 
     Status mapping:
 
-    - ``??`` (untracked) and ``A`` (staged new file) → ``"created"``
+    - ``??`` (untracked), ``A`` (staged new file) and `` A`` (``git add -N``,
+      no HEAD version) → ``"created"``
     - ``D`` in either column → ``"deleted"``
     - Everything else (``M``, ``R``, ``C``, ``U``, …) → ``"modified"``
 
@@ -496,7 +549,7 @@ def _parse_git_porcelain_line(line: str) -> tuple[str, str, bool, bool] | None:
         path_part = _strip_git_quotes(path_part)
 
     x, y = xy[0], xy[1]
-    if (x == "?" and y == "?") or x == "A":
+    if xy in ("??", " A") or x == "A":
         operation = "created"
     elif x == "D" or y == "D":
         operation = "deleted"
@@ -593,13 +646,68 @@ class FilesystemRegistry(ABC):
         """
         return
 
+    def revert_generation(self, path: str, *, session_id: str) -> int | None:
+        """Return *path*'s change count for a revert check, or ``None`` without one.
+
+        ``None`` means a change that restores *session_id*'s original would
+        still leave *path* in Changes, so callers need not read its text.
+
+        :param path: Path relative to the workspace root, e.g. ``"src/foo.py"``.
+        :param session_id: The session making the change, e.g. ``"conv_abc123"``.
+        """
+        return None
+
+    async def record_tracked_change(
+        self,
+        path: str,
+        operation: str,
+        session_id: str,
+        read_text: Callable[[], Awaitable[str | None]],
+    ) -> None:
+        """Record a tracked write, then drop *path* if it restored the session's original.
+
+        :param path: Path relative to the workspace root, e.g. ``"src/foo.py"``.
+        :param operation: One of ``"created"``, ``"modified"``, or ``"deleted"``.
+        :param session_id: The session that made the change, e.g. ``"conv_abc123"``.
+        :param read_text: Returns the file's complete text through the
+            environment that made the change, or ``None``. Called only when
+            :meth:`revert_generation` allows a revert check.
+        """
+        self.record_change(path, operation, session_id)
+        generation = (
+            None if operation == "deleted" else self.revert_generation(path, session_id=session_id)
+        )
+        if generation is not None:
+            self._drop_if_reverted(path, session_id, await read_text(), generation)
+
+    def _drop_if_reverted(
+        self, path: str, session_id: str, current_text: str | None, generation: int
+    ) -> None:
+        """Drop *session_id*'s events for *path* when *current_text* is its original.
+
+        :param current_text: The file's complete text, read after the change was recorded.
+        :param generation: What :meth:`revert_generation` returned before the
+            read. A change of *path* recorded since then makes *current_text* stale.
+        """
+        return
+
+    def forget_original(self, path: str, *, session_id: str) -> None:
+        """Make *session_id*'s original for *path* unknown, so no write drops *path*.
+
+        :param path: Path relative to the workspace root, e.g. ``"src/foo.py"``.
+        :param session_id: The session whose original is dropped, e.g. ``"conv_abc123"``.
+        """
+        return
+
     # ── Concrete: snapshot (no-op default) ────────────────────────
 
     def needs_snapshot(self, path: str) -> bool:
         """Whether an observed edit still needs an original outside Git."""
         return False
 
-    def seed_snapshot(self, path: str, content: str, *, session_id: str | None = None) -> None:
+    def seed_snapshot(
+        self, path: str, content: str | None, *, session_id: str | None = None
+    ) -> None:
         """Seed a pre-write snapshot for *path*.
 
         Part of the base interface so callers can call it unconditionally on any
@@ -609,7 +717,8 @@ class FilesystemRegistry(ABC):
         in memory for use by the diff endpoint.
 
         :param path: Path relative to the workspace root.
-        :param content: File content before the write/edit.
+        :param content: File content before the write/edit, or ``None`` when
+            the writer could not read its complete text.
         :param session_id: Optional session scope for the snapshot.
         """
         return
@@ -701,7 +810,10 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
     Changes are recorded via :meth:`record_change`, which is called by the
     file-write (PUT) and file-edit (PATCH) handlers after a successful
     operation.  No filesystem-watcher thread is started — only tool-call
-    operations appear in the Files panel.
+    operations appear in the Files panel.  A tracked write that restores the
+    content the session saw before its first change to a path drops that
+    path from the session's changes; edits and deletes from a shell are not
+    tracked.
 
     Each session maintains its own event list so changes are naturally isolated
     between sessions.  Events are not persisted; they are lost on server restart
@@ -729,6 +841,12 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
         # registered by that session.  Used by ``unregister_conversation`` to
         # evict snapshot entries when a session ends, preventing unbounded growth.
         self._snapshot_sessions: dict[str, set[str]] = {}
+        # Per-session originals: session_id → {normalized path → complete text
+        # before the session's first change there, or ``None`` when unknown}.
+        self._session_originals: dict[str, dict[str, str | None]] = {}
+        # Per-session change counts: session_id → {normalized path → changes
+        # recorded there}, which tells a revert check that its read is stale.
+        self._change_generations: dict[str, dict[str, int]] = {}
 
     def record_change(
         self,
@@ -760,6 +878,8 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
         with self._snapshots_lock:
             self._snapshots.setdefault(norm, "" if operation == "created" else None)
             self._snapshot_sessions.setdefault(session_id, set()).add(norm)
+            # A snapshot seeded after the session's first change is not its original.
+            self._session_originals.setdefault(session_id, {}).setdefault(norm, None)
         bytes_: int | None = None
         modified_at: int | None = None
         if operation != "deleted":
@@ -781,7 +901,50 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
             unstaged=True,
         )
         with self._lock:
+            generations = self._change_generations.setdefault(session_id, {})
+            generations[norm] = generations.get(norm, 0) + 1
             self._session_events.setdefault(session_id, []).append(fe)
+
+    def revert_generation(self, path: str, *, session_id: str) -> int | None:
+        norm = _normalize_path(path, self._cwd)
+        if norm is None or self._revertible_original(session_id, norm) is None:
+            return None
+        with self._lock:
+            return self._change_generations.get(session_id, {}).get(norm, 0)
+
+    def _drop_if_reverted(
+        self, path: str, session_id: str, current_text: str | None, generation: int
+    ) -> None:
+        norm = _normalize_path(path, self._cwd)
+        if norm is None or current_text is None:
+            return
+        if current_text != self._revertible_original(session_id, norm):
+            return
+        with self._lock:
+            if self._change_generations.get(session_id, {}).get(norm, 0) != generation:
+                return
+            events = self._session_events.get(session_id, [])
+            events[:] = [event for event in events if event.path != norm]
+
+    def forget_original(self, path: str, *, session_id: str) -> None:
+        norm = _normalize_path(path, self._cwd)
+        if norm is None:
+            return
+        with self._snapshots_lock:
+            self._session_originals.setdefault(session_id, {})[norm] = None
+
+    def _revertible_original(self, session_id: str, norm: str) -> str | None:
+        """Return *session_id*'s original for *norm*, unless its first change created the file."""
+        with self._snapshots_lock:
+            original = self._session_originals.get(session_id, {}).get(norm)
+        if original is None:
+            return None
+        with self._lock:
+            first = next(
+                (e.operation for e in self._session_events.get(session_id, []) if e.path == norm),
+                None,
+            )
+        return None if first == "created" else original
 
     def unregister_conversation(self, conversation_id: str) -> None:
         """Drop the event list and evict any snapshot entries for *conversation_id*.
@@ -791,7 +954,9 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
         """
         with self._lock:
             self._session_events.pop(conversation_id, None)
+            self._change_generations.pop(conversation_id, None)
         with self._snapshots_lock:
+            self._session_originals.pop(conversation_id, None)
             paths = self._snapshot_sessions.pop(conversation_id, set())
             for p in paths:
                 self._snapshots.pop(p, None)
@@ -920,7 +1085,9 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
         with self._snapshots_lock:
             return norm not in self._snapshots
 
-    def seed_snapshot(self, path: str, content: str, *, session_id: str | None = None) -> None:
+    def seed_snapshot(
+        self, path: str, content: str | None, *, session_id: str | None = None
+    ) -> None:
         """Seed a pre-write snapshot for *path* if one does not already exist.
 
         Must be called **before** writing new content to the file so the
@@ -929,19 +1096,22 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
 
         :param path: Normalized path relative to the workspace root,
             e.g. ``"src/foo.py"``.
-        :param content: Current file content before the upcoming write.
+        :param content: Current file content before the upcoming write, or
+            ``None`` when it could not be read whole, which seeds no snapshot.
         :param session_id: Optional session identifier.  When provided,
             the path is registered under this session so that
-            :meth:`unregister_conversation` can evict it later.
+            :meth:`unregister_conversation` can evict it later, and
+            *content* becomes the session's original unless it has one.
         """
         norm = _normalize_path(path, self._cwd)
         if norm is None:
             return
         with self._snapshots_lock:
-            if norm not in self._snapshots:
+            if norm not in self._snapshots and content is not None:
                 self._snapshots[norm] = content
             if session_id:
                 self._snapshot_sessions.setdefault(session_id, set()).add(norm)
+                self._session_originals.setdefault(session_id, {}).setdefault(norm, content)
 
 
 # ── Git-backed implementation ─────────────────────────────────────────────────
@@ -1167,6 +1337,18 @@ class GitFilesystemRegistry(FilesystemRegistry):
         :param limit: Maximum number of records to return.
         :returns: List of file-record dicts, newest first.
         """
+        records, untracked = self._list_git_changes()
+        records = records[:limit]
+        _count_untracked_lines(self._cwd, records, untracked)
+        return records
+
+    def _list_git_changes(self) -> tuple[list[dict[str, Any]], set[str]]:
+        """Return every change record, newest first, and the untracked paths.
+
+        :returns: ``(records, untracked)``; *untracked* holds the paths
+            ``git status`` reported as ``??``.
+        :raises GitStatusUnavailable: When ``git status`` cannot answer.
+        """
         # ``--untracked-files=all`` forces git to expand entirely-untracked
         # directories into their individual files.  Without it, a new file
         # inside a brand-new directory tree collapses to a single ``?? dir/``
@@ -1220,6 +1402,7 @@ class GitFilesystemRegistry(FilesystemRegistry):
 
         numstat = self._run_git_numstat()
         records: list[dict[str, Any]] = []
+        untracked: set[str] = set()
         for line in result.stdout.decode("utf-8", errors="replace").splitlines():
             parsed = _parse_git_porcelain_line(line)
             if parsed is None:
@@ -1228,6 +1411,8 @@ class GitFilesystemRegistry(FilesystemRegistry):
             rel_path = self._git_to_rel(git_path)
             if rel_path is None:
                 continue
+            if line.startswith("??"):
+                untracked.add(rel_path)
             if _is_ephemeral(rel_path) or _is_harness_plumbing(rel_path):
                 continue
             # Skip runner-internal and build directories (e.g. terminals/,
@@ -1244,7 +1429,7 @@ class GitFilesystemRegistry(FilesystemRegistry):
         # its own ``git status``, which can take tens of seconds on a big repo.
         self._last_changes = [r["path"] for r in records if r["status"] != "deleted"]
         records.sort(key=lambda r: (r["modified_at"] or 0, r["path"]), reverse=True)
-        return records[:limit]
+        return records, untracked
 
     def get_changed_file(self, session_id: str, path: str) -> dict[str, Any] | None:
         """Return the change record for a single *path*, or ``None``.
@@ -1365,6 +1550,9 @@ class GitFilesystemRegistry(FilesystemRegistry):
     def _run_git(self, argv: list[str]) -> subprocess.CompletedProcess[bytes]:
         if self._run_git_command is not None:
             return self._run_git_command(argv[1:], self._git_root, _git_timeout_seconds())
+        # These background reads must not take index.lock, or the agent's own
+        # `git add`/`git commit` fails while a slow status is running.
+        argv = [argv[0], *_LOCK_FREE_GIT_READ_OPTIONS, *argv[1:]]
         return subprocess.run(
             argv, cwd=str(self._git_root), capture_output=True, timeout=_git_timeout_seconds()
         )
@@ -1503,6 +1691,11 @@ class MultiRepositoryFilesystemRegistry(AgentEditFilesystemRegistry):
     def needs_snapshot(self, path: str) -> bool:
         return self._owner(path) is None and super().needs_snapshot(path)
 
+    def revert_generation(self, path: str, *, session_id: str) -> int | None:
+        if self._owner(path) is not None:
+            return None
+        return super().revert_generation(path, session_id=session_id)
+
     def with_git_runner(self, run_git: GitCommandRunner) -> MultiRepositoryFilesystemRegistry:
         """Bind one request's executor while sharing the existing fallback history."""
         reader = copy.copy(self)
@@ -1571,22 +1764,24 @@ class MultiRepositoryFilesystemRegistry(AgentEditFilesystemRegistry):
     def list_changed_files(self, conversation_id: str, *, limit: int) -> list[dict[str, Any]]:
         roots = self._repository_roots()
         records = self._list_observed_files(conversation_id, limit=10_001, excluded_roots=roots)
+        untracked: set[str] = set()
         for prefix, root in sorted(roots.items()):
             try:
-                records.extend(
-                    self._prefix(record, prefix)
-                    for record in self._reader(root).list_changed_files(
-                        conversation_id, limit=10_001
-                    )
-                )
+                repository_records, repository_untracked = self._reader(root)._list_git_changes()
             except GitStatusUnavailable as exc:
                 raise GitStatusUnavailable(
                     f"Repository {prefix or root.name!r}: {exc.reason}"
                 ) from exc
+            records.extend(self._prefix(record, prefix) for record in repository_records)
+            untracked.update(
+                f"{prefix}/{path}" if prefix else path for path in repository_untracked
+            )
             if len(records) > 10_000:
                 raise GitStatusUnavailable("Workspace exceeds 10000 changed files")
         records.sort(key=lambda record: (record["modified_at"] or 0, record["path"]), reverse=True)
-        return records[:limit]
+        records = records[:limit]
+        _count_untracked_lines(self._cwd, records, untracked)
+        return records
 
     def get_changed_file(self, session_id: str, path: str) -> dict[str, Any] | None:
         owner = self._owner(path)

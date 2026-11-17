@@ -48,14 +48,20 @@ async def test_native_wrappers_share_daemon_terminal_helpers() -> None:
     )
 
 
-async def test_launch_or_reuse_daemon_runner_reuses_online_runner() -> None:
+async def test_launch_or_reuse_daemon_runner_reuses_online_runner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """
     An already-bound, still-online runner is reused — no new launch.
 
     Resuming into a live session must not spawn a second runner. If the
     helper POSTed to ``/runners`` here it would 400 ("already bound") or
-    spawn a duplicate; reuse keeps the existing one.
+    spawn a duplicate; reuse keeps the existing one, along with the
+    environment it was launched with.
     """
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_SESSION_ENV_PASSTHROUGH", "ARCATERM_CAPABILITY")
+    monkeypatch.setenv("ARCATERM_CAPABILITY", "capability-for-pane-2")
     posted: list[str] = []
 
     requests: list[httpx.Request] = []
@@ -83,6 +89,7 @@ async def test_launch_or_reuse_daemon_runner_reuses_online_runner() -> None:
     assert runner_id == "runner_live"
     # No launch POST fired — proves the online runner was reused, not respawned.
     assert posted == []
+    assert not (tmp_path / "session-env").exists()
 
     launch_ids = {r.headers["X-Omnigent-Launch-Id"] for r in requests}
     assert len(launch_ids) == 1
@@ -120,6 +127,28 @@ async def test_launch_or_reuse_daemon_runner_launches_when_unbound() -> None:
 
     assert runner_id == "runner_new"
     assert launched["body"] == {"session_id": "conv_a", "workspace": "/work"}
+
+
+async def test_launch_or_reuse_daemon_runner_rejects_reserved_forwarded_names_before_launching(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A forwarded-name list that could replace runner wiring fails before any request."""
+    monkeypatch.setenv("OMNIGENT_SESSION_ENV_PASSTHROUGH", "ARCATERM_CAPABILITY,RUNNER_SERVER_URL")
+    requests: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(f"{request.method} {request.url.path}")
+        return httpx.Response(200, json={"runner_id": "runner_new"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://e.com"
+    ) as client:
+        with pytest.raises(click.ClickException, match="RUNNER_SERVER_URL"):
+            await daemon_launch.launch_or_reuse_daemon_runner(
+                client, host_id="host_1", session_id="conv_a", workspace="/work"
+            )
+
+    assert requests == []
 
 
 @pytest.mark.parametrize("retry_launch", [False, True])

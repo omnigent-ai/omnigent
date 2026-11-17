@@ -334,6 +334,32 @@ def test_refresh_config_auth_headers_preserves_launch_written_headers(tmp_path: 
     assert payload["authHeaders"]["X-Omnigent-Runner-Tunnel-Token"] == "tunnel-tok"
 
 
+def test_refresh_config_auth_headers_replaces_user_agent_in_any_casing(tmp_path: Path) -> None:
+    """A fresh ``User-Agent`` replaces a persisted lowercase ``user-agent``, not duplicating it."""
+    bridge_dir = tmp_path / "bridge"
+    pi_native_bridge.write_extension_files(
+        bridge_dir,
+        session_id="conv_abc",
+        server_url="http://omnigent.test",
+        conversation_url="http://omnigent.test/c/conv_abc",
+        auth_headers={"Authorization": "Bearer stale", "user-agent": "omnigent-cli/0.1 old"},
+    )
+
+    assert (
+        pi_native_bridge.refresh_config_auth_headers(
+            bridge_dir,
+            {"Authorization": "Bearer fresh", "User-Agent": "omnigent-runner/0.1 new"},
+        )
+        is True
+    )
+
+    payload = json.loads(pi_native_bridge.config_path(bridge_dir).read_text(encoding="utf-8"))
+    assert payload["authHeaders"] == {
+        "Authorization": "Bearer fresh",
+        "User-Agent": "omnigent-runner/0.1 new",
+    }
+
+
 def test_inject_relay_into_config_writes_relay_fields(tmp_path: Path) -> None:
     """inject_relay_into_config writes relayUrl and relayToken into config.json."""
     from omnigent.harnesses.pi_native import bridge as pi_native_bridge

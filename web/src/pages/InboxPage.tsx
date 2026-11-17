@@ -42,6 +42,10 @@
  * what clears an approval.
  */
 
+import type { AutomationFailure } from "@/lib/scheduledTasksApi";
+import { describeRunFailure } from "@/lib/scheduleText";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isFeatureEnabled } from "@/lib/capabilities";
 import type { Query } from "@tanstack/react-query";
 import type { Session } from "@/lib/types";
 import { useEffect, useId, useRef, useState, type ReactNode } from "react";
@@ -55,11 +59,22 @@ import {
   CircleCheckIcon,
   HandIcon,
   InboxIcon,
+  LightbulbIcon,
   Loader2Icon,
   SquarePenIcon,
+  ChevronDownIcon,
   type LucideIcon,
 } from "lucide-react";
 import { ApprovalCard, type SubmitApprovalFn } from "@/components/blocks/ApprovalCard";
+import { SuggestionMedia } from "@/components/inbox/SuggestionMedia";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { useProactiveInbox } from "@/hooks/useProactiveInbox";
+import { useProactiveAgentSettings } from "@/hooks/useProactiveAgentSettings";
 import { FilePathAwareMessageResponse } from "@/components/blocks/ChatMarkdown";
 import { ElicitationMessage } from "@/components/blocks/ElicitationMessage";
 import { PageScroll } from "@/components/PageScroll";
@@ -105,8 +120,26 @@ import { latestOutput } from "@/lib/lastAssistantText";
 import { isEditorLevel } from "@/lib/permissionsApi";
 import { randomUUID } from "@/lib/randomUUID";
 import { describeSendFailure } from "@/lib/sendFailure";
+import {
+  acknowledgeLocalElicitationResolution,
+  affectedSessionIds,
+  beginLocalElicitationResolution,
+  cancelLocalElicitationResolution,
+} from "@/lib/localElicitationResolutions";
+import { newSessionLocation } from "@/lib/newSessionHandoff";
+import {
+  DISMISS_REASONS,
+  OPEN_SUGGESTION_STATUSES,
+  PROACTIVE_AGENT_DISPLAY_NAME,
+  suggestionKindLabel,
+  suggestionLinkTarget,
+  suggestionPreview,
+  unreadCountText,
+  type Suggestion,
+  type SuggestionUpdate,
+} from "@/lib/proactiveInbox";
 import { relativeTime } from "@/lib/relativeTime";
-import { Link } from "@/lib/routing";
+import { Link, useNavigate } from "@/lib/routing";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import {
   ApiError,
@@ -119,6 +152,7 @@ import {
 import { userColor, userInitials } from "@/lib/userBadge";
 import { cn } from "@/lib/utils";
 import { FileViewerContext } from "@/shell/FileViewerContext";
+import type { Conversation } from "@/hooks/useConversations";
 import { conversationDisplayLabel, getConversationAgentType } from "@/shell/sidebarNav";
 
 /** Optimistic verdicts keyed by elicitation id, mirroring the chat store's flip. */
@@ -154,6 +188,7 @@ const INBOX_TABS: { value: InboxFilter; label: string }[] = [
   { value: "all", label: "All" },
   { value: "unread", label: "Unread" },
   { value: "awaiting", label: "Awaiting response" },
+  { value: "advisor", label: PROACTIVE_AGENT_DISPLAY_NAME },
 ];
 
 const EMPTY_STATES: Record<InboxFilter, { title: string; body: string }> = {
@@ -169,17 +204,24 @@ const EMPTY_STATES: Record<InboxFilter, { title: string; body: string }> = {
     title: "No approvals waiting",
     body: "When an agent needs your input, it will show up here.",
   },
+  advisor: {
+    title: `No suggestions from ${PROACTIVE_AGENT_DISPLAY_NAME}`,
+    body: "Follow-ups, related information, and reminders about your recent work will show up here.",
+  },
 };
 
 // Enough trailing items to step past a tool call or two after the final reply.
 const PREVIEW_SCAN_ITEMS = 12;
+const UNREAD_ONLY = ["unread"] as const;
 const PREVIEW_MAX_CHARS = 280;
 
 /** One inbox card, tagged by kind, with the epoch-seconds time it sorts and groups by. */
 type InboxEntry =
   | { kind: "approval"; key: string; at: number; item: InboxItem }
   | { kind: "comment"; key: string; at: number; item: CommentInboxItem }
-  | { kind: "unread"; key: string; at: number; item: UnreadInboxItem };
+  | { kind: "unread"; key: string; at: number; item: UnreadInboxItem }
+  | { kind: "automation"; key: string; at: number; item: AutomationFailure }
+  | { kind: "suggestion"; key: string; at: number; item: Suggestion };
 
 const TILE_TONES = {
   yellow: "bg-status-yellow/12 text-status-yellow",
@@ -189,19 +231,63 @@ const TILE_TONES = {
 
 // Compact action buttons inside an expanded card.
 const OUTLINE_ACTION =
-  "rounded-md border-button-border bg-transparent text-ui text-muted-foreground hover:text-foreground";
+  "mobile-touch-target mobile-app:h-auto mobile-app:whitespace-normal rounded-md border-button-border bg-transparent text-ui text-muted-foreground hover:text-foreground";
 const PRIMARY_ACTION =
-  "rounded-md bg-foreground text-ui text-card hover:bg-foreground/80 [&_svg]:text-card";
+  "mobile-touch-target mobile-app:h-auto mobile-app:whitespace-normal rounded-md bg-foreground text-ui text-card hover:bg-foreground/80 [&_svg]:text-card";
 
 export function InboxPage() {
   const queryClient = useQueryClient();
   const { trackClick } = useOmnigentAnalytics();
+  useEffect(() => {
+    void queryClient.invalidateQueries({ queryKey: ["automation-inbox"] });
+  }, [queryClient]);
   const {
     inbox: conversationsQuery,
-    inboxRows: allRows,
+    // Server counts, not the answer overlay: a card answered here stays listed,
+    // with its delivery state, until the server drops the prompt.
+    serverInboxRows: allRows,
     comments: commentInbox,
+    automationInbox,
+    identityReady,
   } = useSidebarData();
-  const [filter, setFilter] = useState<InboxFilter>(readInboxFilter);
+  const navigate = useNavigate();
+  const taskDetailsEnabled = isFeatureEnabled(useServerInfo(), "automations_v2");
+  const [storedFilter, setFilter] = useState<InboxFilter>(readInboxFilter);
+  const {
+    available: advisorAvailable,
+    settings: advisorSettings,
+    query: advisorSettingsQuery,
+  } = useProactiveAgentSettings();
+  // The Omni Advisor tab exists only while the agent is on for the viewer. While
+  // the settings are still loading it shows only where it was already selected,
+  // so a viewer who turned the agent off never sees it appear and vanish.
+  const advisorTab =
+    advisorAvailable &&
+    (advisorSettings?.enabled === true ||
+      (advisorSettings === undefined && storedFilter === "advisor"));
+  // The tab lists the agent's own items, which the settings identify; until
+  // they arrive it is still assembling, and a failed first read is a failure
+  // to show there. A failed refetch keeps the settings it had.
+  const advisorSettingsPending = advisorAvailable && advisorSettingsQuery.isPending;
+  const advisorSettingsFailed =
+    advisorAvailable && advisorSettingsQuery.isError && advisorSettings === undefined;
+  const filter: InboxFilter = storedFilter === "advisor" && !advisorTab ? "all" : storedFilter;
+  const advisorOnly = filter === "advisor";
+  const isAdvisorItem = (item: Suggestion) =>
+    advisorSettings !== undefined && item.agentId === advisorSettings.agent_id;
+  // The Unread tab pages through unread suggestions only, so an older unread
+  // one is reachable behind newer read ones.
+  const proactiveInbox = useProactiveInbox(
+    identityReady,
+    filter === "unread" ? UNREAD_ONLY : OPEN_SUGGESTION_STATUSES,
+  );
+  // Suggestions expanded while unread, kept on screen until collapsed even
+  // though marking them read takes them out of the Unread list.
+  const [pinnedSuggestions, setPinnedSuggestions] = useState<Record<string, Suggestion>>({});
+  // Pins outlive the list they came from, so drop them once the agent is off.
+  useEffect(() => {
+    if (!proactiveInbox.enabled) setPinnedSuggestions({});
+  }, [proactiveInbox.enabled]);
   const [responded, setResponded] = useState<RespondedMap>({});
   const pendingSubmissions = useRef(new Map<string, RespondedMap[string]>());
   // Manual expand/collapse toggles keyed by entry key. Anything not in
@@ -255,8 +341,10 @@ export function InboxPage() {
   // sidebar) drops the row immediately instead of on the next list poll.
   useUnseenTick();
   const unreadItems = collectUnreadInboxItems(allRows, isConversationUnseen);
-  const showApprovals = filter !== "unread";
-  const showUnread = filter !== "awaiting";
+  const showApprovals = filter === "all" || filter === "awaiting";
+  // Unread sessions, file comments, and automation results.
+  const showUnread = filter === "all" || filter === "unread";
+  const showSuggestions = filter !== "awaiting";
 
   // Latest-output preview per unread session. `updated_at` in the key
   // refetches after a new turn; a failed fetch just leaves the row bare.
@@ -307,19 +395,68 @@ export function InboxPage() {
   const visibleApprovals = showApprovals ? items : [];
   const visibleComments = showUnread ? commentInbox.items : [];
   const visibleUnread = showUnread ? unreadItems : [];
-  const visibleCount = visibleApprovals.length + visibleComments.length + visibleUnread.length;
-  const totalCount = items.length + commentInbox.items.length + unreadItems.length;
+  const visibleAutomations = showUnread ? automationInbox.items : [];
+  const listedSuggestionIds = new Set(proactiveInbox.items.map((item) => item.id));
+  // Only the Unread list drops a suggestion once it is read; elsewhere a
+  // dismissal or action hides the card at once.
+  const pinned =
+    filter === "unread"
+      ? Object.values(pinnedSuggestions).filter((item) => !listedSuggestionIds.has(item.id))
+      : [];
+  const listedSuggestions = [...proactiveInbox.items, ...pinned];
+  const visibleSuggestions =
+    showSuggestions && proactiveInbox.enabled
+      ? advisorOnly
+        ? listedSuggestions.filter(isAdvisorItem)
+        : listedSuggestions
+      : [];
+  const visibleCount =
+    visibleApprovals.length +
+    visibleComments.length +
+    visibleUnread.length +
+    visibleAutomations.length +
+    visibleSuggestions.length;
+  const totalCount =
+    items.length +
+    commentInbox.items.length +
+    unreadItems.length +
+    automationInbox.items.length +
+    proactiveInbox.items.length;
   const summary = [
     items.length > 0 && (items.length === 1 ? "1 approval" : `${items.length} approvals`),
     commentInbox.items.length > 0 &&
       (commentInbox.items.length === 1 ? "1 comment" : `${commentInbox.items.length} comments`),
     unreadItems.length > 0 && `${unreadItems.length} unread`,
+    automationInbox.items.length > 0 &&
+      (automationInbox.items.length === 1
+        ? "1 failed automation"
+        : `${automationInbox.items.length} failed automations`),
+    // Count what is listed, like the other entries; the unread total is the
+    // server's and can reach past the loaded pages.
+    proactiveInbox.items.length > 0 &&
+      `${proactiveInbox.items.length === 1 ? "1 suggestion" : `${proactiveInbox.items.length} suggestions`}${
+        proactiveInbox.unreadCount > 0
+          ? ` (${unreadCountText(proactiveInbox.unreadCount, proactiveInbox.unreadCountCapped)} unread)`
+          : ""
+      }`,
   ]
     .filter(Boolean)
     .join(" · ");
   const emptyState = EMPTY_STATES[filter];
 
   const groups = groupInboxEntries<InboxEntry>([
+    ...visibleSuggestions.map((item) => ({
+      kind: "suggestion" as const,
+      key: `suggestion:${item.id}`,
+      at: item.createdAt,
+      item,
+    })),
+    ...visibleAutomations.map((item) => ({
+      kind: "automation" as const,
+      key: `automation:${item.runId}`,
+      at: item.finishedAt ?? item.scheduledAt,
+      item,
+    })),
     ...visibleApprovals.map((item) => ({
       kind: "approval" as const,
       key: `approval:${item.elicitation.elicitationId}`,
@@ -376,13 +513,19 @@ export function InboxPage() {
   // would be a lie. Failed snapshots also block the empty state (their
   // approvals exist, we just couldn't fetch them) and get a banner.
   const assembling =
-    conversationsQuery.isLoading ||
-    isFetchingNextPage ||
-    snapshotQueries.some((q) => q.isLoading) ||
-    commentInbox.isLoading;
+    (!advisorOnly &&
+      (conversationsQuery.isLoading ||
+        isFetchingNextPage ||
+        snapshotQueries.some((q) => q.isLoading) ||
+        commentInbox.isLoading)) ||
+    (showUnread && automationInbox.isLoading) ||
+    (showSuggestions && (proactiveInbox.isLoading || (advisorOnly && advisorSettingsPending)));
   const failedSnapshots = snapshotQueries.filter((q) => q.isError);
-  const failedSessionCount =
-    failedSnapshots.length + commentInbox.failedCount + Number(Boolean(conversationsQuery.isError));
+  const failedSessionCount = advisorOnly
+    ? 0
+    : failedSnapshots.length +
+      commentInbox.failedCount +
+      Number(Boolean(conversationsQuery.isError));
 
   // Mirrors `chatStore.submitApproval`: optimistic flip → resolve POST →
   // rollback on error. Success invalidates the session list so the row's
@@ -400,6 +543,15 @@ export function InboxPage() {
       };
       pendingSubmissions.current.set(elicitationId, verdict);
       setResponded((prev) => ({ ...prev, [elicitationId]: verdict }));
+      const holdToken = beginLocalElicitationResolution(
+        elicitationId,
+        affectedSessionIds(
+          [item.row.id, item.resolveSessionId],
+          (knownSessionId) =>
+            queryClient.getQueryData<Session>(["session", knownSessionId])?.parentSessionId,
+        ),
+        { nativeDelivery: Boolean(item.elicitation.nativeDelivery) },
+      );
       void approve(item.resolveSessionId, elicitationId, {
         action,
         ...(content === undefined ? {} : { content }),
@@ -408,6 +560,7 @@ export function InboxPage() {
         () => {
           if (pendingSubmissions.current.get(elicitationId) !== verdict) return;
           pendingSubmissions.current.delete(elicitationId);
+          acknowledgeLocalElicitationResolution(elicitationId, holdToken);
           clearAskUserQuestionDraft(elicitationId);
           void queryClient.invalidateQueries({ queryKey: ["conversations"] });
           if (item.elicitation.nativeDelivery) {
@@ -420,6 +573,7 @@ export function InboxPage() {
         () => {
           if (pendingSubmissions.current.get(elicitationId) !== verdict) return;
           pendingSubmissions.current.delete(elicitationId);
+          cancelLocalElicitationResolution(elicitationId, holdToken);
           // Roll back to pending so the buttons reappear and the user
           // can retry — same recovery the chat store uses.
           setResponded((prev) => {
@@ -432,12 +586,155 @@ export function InboxPage() {
     };
   };
 
+  const rowsById = new Map(allRows.map((row) => [row.id, row]));
   const renderEntry = (entry: InboxEntry) => {
     const expanded = expandedOverrides[entry.key] ?? entry.key === defaultExpandedKey;
     const onToggle = () => {
       trackClick(`inbox.${entry.kind}.toggle_expanded`, "button");
       setExpandedOverrides((prev) => ({ ...prev, [entry.key]: !expanded }));
     };
+    if (entry.kind === "suggestion") {
+      const { item } = entry;
+      const unpin = () => setPinnedSuggestions(({ [item.id]: _pinned, ...rest }) => rest);
+      // Keep expanded read suggestions visible on Unread until the server
+      // accepts their resolution.
+      const resolve = (change: SuggestionUpdate) =>
+        void proactiveInbox.update(item.id, change).then((accepted) => {
+          if (accepted) unpin();
+        });
+      const onToggleSuggestion = () => {
+        if (!expanded && item.status === "unread") {
+          setPinnedSuggestions((prev) => ({ ...prev, [item.id]: { ...item, status: "read" } }));
+          proactiveInbox.update(item.id, { status: "read" });
+        }
+        if (expanded) unpin();
+        onToggle();
+      };
+      const takeAction = (index: number) => {
+        const action = item.actions[index];
+        if (!action) return;
+        resolve({ resolution: "action_taken", resolutionAction: index });
+        // The user reviews and sends the prompt from the composer.
+        navigate(newSessionLocation(action.prompt, []));
+      };
+      const fromAdvisor = isAdvisorItem(item);
+      return (
+        <InboxCard
+          key={entry.key}
+          testId="inbox-suggestion"
+          dataKind={item.kind}
+          tile={<KindTile icon={LightbulbIcon} tone="gray" />}
+          kindLabel={
+            fromAdvisor
+              ? `${PROACTIVE_AGENT_DISPLAY_NAME} · ${suggestionKindLabel(item.kind)}`
+              : suggestionKindLabel(item.kind)
+          }
+          title={item.title}
+          preview={suggestionPreview(item.bodyMd)}
+          at={entry.at}
+          unread={item.status === "unread"}
+          expanded={expanded}
+          onToggle={onToggleSuggestion}
+        >
+          <p className="text-ui font-medium">{item.title}</p>
+          {/* No session is open here, so file paths stay plain text. */}
+          <FileViewerContext.Provider value={null}>
+            <FilePathAwareMessageResponse>{item.bodyMd}</FilePathAwareMessageResponse>
+          </FileViewerContext.Provider>
+          <SuggestionMedia media={item.media} />
+          <SuggestionLinks item={item} />
+          {/* Omni Advisor runs in hidden sessions; any other agent's session is the source. */}
+          {!fromAdvisor && (
+            <SuggestionOrigin
+              sessionId={item.sourceSessionId}
+              row={rowsById.get(item.sourceSessionId)}
+            />
+          )}
+          <InboxActions>
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button
+                  variant="outline"
+                  size="xs"
+                  className={OUTLINE_ACTION}
+                  componentId="inbox.suggestion.dismiss"
+                >
+                  Dismiss <ChevronDownIcon className="size-3.5" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="min-w-52">
+                {DISMISS_REASONS.map((reason) => (
+                  <DropdownMenuItem
+                    key={reason.resolution}
+                    onSelect={() => {
+                      trackClick(`inbox.suggestion.dismiss.${reason.resolution}`, "button");
+                      resolve({ resolution: reason.resolution });
+                    }}
+                  >
+                    {reason.label}
+                  </DropdownMenuItem>
+                ))}
+              </DropdownMenuContent>
+            </DropdownMenu>
+            {item.actions.map((action, index) => (
+              <Button
+                // Agent actions are a fixed list per item; the label can repeat.
+                // oxlint-disable-next-line react/no-array-index-key
+                key={index}
+                size="xs"
+                className={index === 0 ? PRIMARY_ACTION : OUTLINE_ACTION}
+                variant={index === 0 ? undefined : "outline"}
+                onClick={() => takeAction(index)}
+                componentId="inbox.suggestion.action"
+              >
+                {action.label}
+              </Button>
+            ))}
+          </InboxActions>
+        </InboxCard>
+      );
+    }
+    if (entry.kind === "automation") {
+      const { item } = entry;
+      const failure = describeRunFailure(item.errorCode, "failed");
+      const reason = failure.stage ? `${failure.stage} · ${failure.reason}` : failure.reason;
+      return (
+        <InboxCard
+          key={entry.key}
+          testId="inbox-automation-item"
+          tile={<KindTile icon={AlertTriangleIcon} tone="red" />}
+          kindLabel="Automation failed"
+          title={item.taskName}
+          preview={reason}
+          at={entry.at}
+          unread
+          expanded={expanded}
+          onToggle={onToggle}
+        >
+          <p className="text-ui font-medium">{item.taskName}</p>
+          <p className="mt-2 text-ui text-muted-foreground">{reason}</p>
+          <InboxActions>
+            <Button asChild size="xs" className={PRIMARY_ACTION}>
+              <Link
+                to={taskDetailsEnabled ? `/tasks/${item.taskId}` : "/tasks"}
+                componentId="inbox.automation.open"
+              >
+                Open automation <ArrowRightIcon className="size-3.5" />
+              </Link>
+            </Button>
+            <Button
+              variant="outline"
+              size="xs"
+              className={OUTLINE_ACTION}
+              onClick={() => automationInbox.markRead(item.runId)}
+              componentId="inbox.automation.mark_read"
+            >
+              <CheckIcon className="size-3.5" /> Mark as read
+            </Button>
+          </InboxActions>
+        </InboxCard>
+      );
+    }
     const title = conversationDisplayLabel(entry.item.row);
 
     if (entry.kind === "approval") {
@@ -489,6 +786,7 @@ export function InboxPage() {
             response={verdict ?? null}
             askUserQuestion={item.elicitation.askUserQuestion}
             exitPlanMode={item.elicitation.exitPlanMode}
+            fileEdit={item.elicitation.fileEdit}
             codexCommand={item.elicitation.codexCommand}
             allowAllEdits={item.elicitation.allowAllEdits}
             allowAutoMode={item.elicitation.allowAutoMode}
@@ -565,10 +863,14 @@ export function InboxPage() {
               {/* Deep-link into the file browser with this comment selected —
                   opening it there marks it seen, which clears this item. */}
               <Link
-                to={`/c/${entry.item.row.id}?file=${encodeURIComponent(comment.path)}&comment=${encodeURIComponent(comment.id)}`}
+                to={
+                  comment.anchor_metadata
+                    ? `/c/${entry.item.row.id}`
+                    : `/c/${entry.item.row.id}?file=${encodeURIComponent(comment.path)}&comment=${encodeURIComponent(comment.id)}`
+                }
                 componentId="inbox.comment.open_file"
               >
-                Open file
+                {comment.anchor_metadata ? "Open session" : "Open file"}
                 <ArrowRightIcon className="size-3.5" />
               </Link>
             </Button>
@@ -805,12 +1107,22 @@ export function InboxPage() {
         componentId="inbox.filter"
         className="mb-4"
       >
-        <TabsList variant="pill" aria-label="Inbox filter" className="gap-1">
-          {INBOX_TABS.map(({ value, label }) => (
-            <TabsTrigger key={value} value={value} className="h-7 flex-none px-3">
-              {label}
-            </TabsTrigger>
-          ))}
+        <TabsList
+          variant="pill"
+          aria-label="Inbox filter"
+          className="gap-1 mobile-app:max-w-full mobile-app:flex-wrap mobile-app:justify-start"
+        >
+          {INBOX_TABS.filter(({ value }) => value !== "advisor" || advisorTab).map(
+            ({ value, label }) => (
+              <TabsTrigger
+                key={value}
+                value={value}
+                className="h-7 mobile-touch-target mobile-app:h-auto flex-none mobile-app:whitespace-normal px-3"
+              >
+                {label}
+              </TabsTrigger>
+            ),
+          )}
         </TabsList>
       </Tabs>
 
@@ -839,6 +1151,48 @@ export function InboxPage() {
         </div>
       )}
 
+      {advisorOnly && advisorSettingsFailed && (
+        <div role="alert" className="mb-4 flex items-center gap-2 text-ui text-destructive">
+          Couldn’t load {PROACTIVE_AGENT_DISPLAY_NAME} settings, so its suggestions are not shown.
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => void advisorSettingsQuery.refetch()}
+            componentId="inbox.retry_advisor_settings"
+          >
+            Retry settings
+          </Button>
+        </div>
+      )}
+
+      {showSuggestions && proactiveInbox.isError && (
+        <div role="alert" className="mb-4 flex items-center gap-2 text-ui text-destructive">
+          Couldn’t load suggestions.
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => void proactiveInbox.refetch()}
+            componentId="inbox.retry_suggestions"
+          >
+            Retry suggestions
+          </Button>
+        </div>
+      )}
+
+      {showUnread && automationInbox.isError && (
+        <div role="alert" className="mb-4 flex items-center gap-2 text-ui text-destructive">
+          Couldn’t load automation failures.
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => void automationInbox.refetch()}
+            componentId="inbox.retry_automations"
+          >
+            Retry automations
+          </Button>
+        </div>
+      )}
+
       {assembling && visibleCount === 0 && (
         <div className="flex items-center gap-2 py-12 text-ui text-muted-foreground">
           <Loader2Icon className="size-4 animate-spin" />
@@ -846,15 +1200,24 @@ export function InboxPage() {
         </div>
       )}
 
-      {!assembling && failedSessionCount === 0 && visibleCount === 0 && (
-        <div className="flex flex-col items-center gap-2 py-16 text-center">
-          <InboxIcon className="size-8 text-muted-foreground/50" />
-          <p className="text-ui font-medium">
-            {hasNextPage ? "Nothing waiting in these sessions" : emptyState.title}
-          </p>
-          <p className="text-sm text-muted-foreground">{emptyState.body}</p>
-        </div>
-      )}
+      {!assembling &&
+        failedSessionCount === 0 &&
+        !(showUnread && automationInbox.isError) &&
+        !(advisorOnly && advisorSettingsFailed) &&
+        !(showSuggestions && proactiveInbox.isError) &&
+        visibleCount === 0 && (
+          <div className="flex flex-col items-center gap-2 py-16 text-center">
+            <InboxIcon className="size-8 text-muted-foreground/50" />
+            <p className="text-ui font-medium">
+              {(!advisorOnly && hasNextPage) ||
+              (showUnread && automationInbox.hasNextPage) ||
+              (showSuggestions && proactiveInbox.hasNextPage)
+                ? "Nothing waiting in the loaded items"
+                : emptyState.title}
+            </p>
+            <p className="text-sm text-muted-foreground">{emptyState.body}</p>
+          </div>
+        )}
 
       <div className="flex flex-col gap-4">
         {groups.map((group) => (
@@ -870,7 +1233,7 @@ export function InboxPage() {
           </div>
         )}
       </div>
-      {hasNextPage && (
+      {!advisorOnly && hasNextPage && (
         <Button
           variant="outline"
           disabled={conversationsQuery.isFetching}
@@ -879,6 +1242,28 @@ export function InboxPage() {
           className="mt-4"
         >
           {isFetchingNextPage ? "Loading…" : "Load more sessions"}
+        </Button>
+      )}
+      {showSuggestions && proactiveInbox.hasNextPage && (
+        <Button
+          variant="outline"
+          disabled={proactiveInbox.isFetchingNextPage}
+          onClick={() => void proactiveInbox.fetchNextPage()}
+          componentId="inbox.load_more_suggestions"
+          className="mt-4"
+        >
+          {proactiveInbox.isFetchingNextPage ? "Loading…" : "Load more suggestions"}
+        </Button>
+      )}
+      {showUnread && automationInbox.hasNextPage && (
+        <Button
+          variant="outline"
+          disabled={automationInbox.isFetching}
+          onClick={() => void automationInbox.fetchNextPage()}
+          componentId="inbox.load_more_automations"
+          className="mt-4"
+        >
+          {automationInbox.isFetchingNextPage ? "Loading…" : "Check more automations"}
         </Button>
       )}
     </PageScroll>
@@ -992,8 +1377,80 @@ function SessionLine({ title, detail }: { title: string; detail?: string }) {
   );
 }
 
+/** The session whose agent posted a suggestion, named when the sidebar has it loaded. */
+function SuggestionOrigin({ sessionId, row }: { sessionId: string; row?: Conversation }) {
+  const title = row ? conversationDisplayLabel(row) : undefined;
+  const agentLabel = row ? getConversationAgentType(row) : undefined;
+  return (
+    <p
+      className="flex items-center gap-1.5 text-sm text-muted-foreground"
+      data-testid="inbox-suggestion-origin"
+    >
+      <SquarePenIcon aria-hidden className="size-3 shrink-0" />
+      <span className="shrink-0">Posted from</span>
+      <Link
+        to={`/c/${encodeURIComponent(sessionId)}`}
+        componentId="inbox.suggestion.open_origin"
+        className="truncate underline underline-offset-2"
+      >
+        {title ?? "its session"}
+      </Link>
+      {agentLabel && agentLabel !== title && <span className="shrink-0">· {agentLabel}</span>}
+    </p>
+  );
+}
+
+/** What a suggestion is based on: sessions open here, other links in a new tab. */
+function SuggestionLinks({ item }: { item: Suggestion }) {
+  const headingId = useId();
+  const seen = new Set<string>();
+  const links = item.links.flatMap((link) => {
+    const target = suggestionLinkTarget(link);
+    const key = target && (target.kind === "session" ? target.path : target.href);
+    if (!target || !key || seen.has(key)) return [];
+    seen.add(key);
+    return [{ key, link, target }];
+  });
+  if (links.length === 0) return null;
+  return (
+    <section aria-labelledby={headingId} className="flex flex-col gap-1 text-sm">
+      <h3 id={headingId} className="text-xs font-medium text-muted-foreground">
+        Source
+      </h3>
+      <ul className="flex flex-col gap-1">
+        {links.map(({ key, link, target }) => (
+          <li key={key} className="truncate">
+            {target.kind === "session" ? (
+              <Link
+                to={target.path}
+                componentId="inbox.suggestion.open_session"
+                className="underline underline-offset-2"
+              >
+                {link.label ?? "Open session"}
+              </Link>
+            ) : (
+              <a
+                href={target.href}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="underline underline-offset-2"
+              >
+                {link.label ?? link.ref}
+              </a>
+            )}
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
+}
+
 function InboxActions({ children }: { children: ReactNode }) {
-  return <div className="flex items-center justify-end gap-1 pt-0.5">{children}</div>;
+  return (
+    <div className="flex items-center justify-end gap-1 pt-0.5 mobile-app:flex-col mobile-app:items-stretch">
+      {children}
+    </div>
+  );
 }
 
 /**

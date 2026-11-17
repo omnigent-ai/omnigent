@@ -15,7 +15,7 @@
 #
 # The confidential set is declared explicitly rather than inferred from a
 # per-document label, so the policy works on any Google Drive tenant — nothing
-# depends on Databricks-internal classification labels.
+# depends on deployment-specific classification labels.
 #
 # The very same "create a new doc and write the summary there" action is allowed
 # before the agent has opened the strategy doc, and denied after — the action

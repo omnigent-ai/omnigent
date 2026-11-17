@@ -5,7 +5,7 @@ session's shell**, regardless of the task — not just recording.
 
 ## Package installs go through the Databricks registry proxies
 
-You run inside a **Databricks-network session**, where **direct access to the
+You run inside a **network-restricted session**, where **direct access to the
 public npm and PyPI registries is blocked** (a supply-chain security control). So
 any command that fetches from `registry.npmjs.org` or `pypi.org` — `npm`/`pnpm`/
 `npx`/`yarn install`, `pip install`, `uv pip install`, `uv sync`, `pytest`/

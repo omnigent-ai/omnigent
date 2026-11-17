@@ -254,36 +254,33 @@ async def test_delete_session_not_found(client: httpx.AsyncClient) -> None:
     assert resp.status_code == 404
 
 
-async def test_delete_session_when_runner_offline(client: httpx.AsyncClient) -> None:
+async def test_delete_session_when_runner_offline(
+    client: httpx.AsyncClient, app, monkeypatch
+) -> None:
     """An offline bound runner must not block ``DELETE /v1/sessions/{id}``.
 
     Reproduces the production failure where ``RunnerRouter.
-    client_for_session_resources`` raises ``RUNNER_UNAVAILABLE``
+    client_for_session_control`` raises ``RUNNER_UNAVAILABLE``
     because the bound runner has disconnected. The handler must
     catch that, skip runner-side cleanup, and still tear down
     server-owned state (tasks, files, the conversation row) so the
     chat actually disappears from the UI.
     """
+    from unittest.mock import ANY, Mock
+
     from omnigent.errors import ErrorCode, OmnigentError
-    from omnigent.runtime import _globals, set_runner_router
 
     snapshot = await create_test_session(client)
     conv_id = snapshot["id"]
 
-    class _OfflineRunnerRouter:
-        def client_for_session_resources(self, session_id: str) -> object:
-            del session_id
-            raise OmnigentError(
-                "runner 'runner_token_offline' is offline",
-                code=ErrorCode.RUNNER_UNAVAILABLE,
-            )
-
-    prior = _globals._runner_router
-    set_runner_router(_OfflineRunnerRouter())  # type: ignore[arg-type]
-    try:
-        del_resp = await client.delete(f"/v1/sessions/{conv_id}")
-    finally:
-        set_runner_router(prior)
+    offline = Mock(
+        side_effect=OmnigentError(
+            "runner 'runner_token_offline' is offline", code=ErrorCode.RUNNER_UNAVAILABLE
+        )
+    )
+    monkeypatch.setattr(app.state.runner_router, "client_for_session_control", offline)
+    del_resp = await client.delete(f"/v1/sessions/{conv_id}")
+    offline.assert_called_once_with(conv_id, conversation=ANY)
 
     assert del_resp.status_code == 200
     assert del_resp.json()["deleted"] is True

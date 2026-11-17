@@ -17,14 +17,15 @@ import base64
 import binascii
 import contextlib
 import logging
+import math
 import os
 import random
 import sys
 import time
 import uuid
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
-from typing import TypeAlias
+from dataclasses import dataclass, replace
+from typing import TypeAlias, TypedDict, cast
 from urllib.parse import quote, urlsplit, urlunsplit
 
 from starlette.types import ASGIApp, Message, Scope
@@ -156,6 +157,10 @@ _GRACEFUL_SHUTDOWN_CLOSE_TIMEOUT_S = 5.0
 # end-of-stream sentinel is enqueued. A task still running past this is
 # cancelled — a stuck stream must not wedge shutdown forever.
 _GRACEFUL_SHUTDOWN_DRAIN_TIMEOUT_S = 5.0
+# Leave time for credential retries before a proxy's 24-hour hard close.
+_DEFAULT_TUNNEL_RENEWAL_S = 23 * 3600.0 + 50 * 60.0
+_TUNNEL_RENEWAL_RETRY_S = 60.0
+_TUNNEL_RENEWAL_REASON = "scheduled tunnel renewal"
 RUNNER_TUNNEL_REJECTION_PREFIX = "runner tunnel rejected by server "
 # Raised instead of the rejection above when the runner had no credential
 # to send, so the message names the local cause rather than the server.
@@ -211,6 +216,34 @@ _LOGIN_REDIRECT_FATAL_ATTEMPTS = 3
 # for credentials is not reported as hung.
 _SIGN_IN_PENDING_WAIT_S = RUNNER_SIGN_IN_PENDING_WAIT_S
 _SIGN_IN_PENDING_POLL_INTERVAL_S = 2.0
+
+
+def _tunnel_renewal_interval_s() -> float | None:
+    """Read the connection age limit; zero disables proactive renewal."""
+    raw = os.environ.get("OMNIGENT_RUNNER_TUNNEL_RENEWAL_S")
+    if raw is None:
+        return _DEFAULT_TUNNEL_RENEWAL_S
+    try:
+        value = float(raw)
+        if math.isfinite(value) and value >= 0:
+            return value or None
+    except ValueError:
+        pass
+    _logger.warning(
+        "Invalid OMNIGENT_RUNNER_TUNNEL_RENEWAL_S; using the default connection age",
+        extra={"session_id": runner_primary_session_id()},
+    )
+    return _DEFAULT_TUNNEL_RENEWAL_S
+
+
+def _tunnel_renewal_delay_s(interval_s: float) -> float:
+    """Pick this connection's renewal age; jitter only shortens the interval.
+
+    Subtracts up to the smaller of five minutes or 1% so a fleet started
+    together does not renew in lockstep.
+    """
+    jitter_s = min(300.0, interval_s * 0.01)
+    return random.uniform(interval_s - jitter_s, interval_s)
 
 
 async def dispatch_via_asgi(
@@ -351,6 +384,13 @@ async def dispatch_via_asgi(
         raise
 
 
+class _TunnelActivityKwargs(TypedDict, total=False):
+    """Optional activity callbacks forwarded to each tunnel connection."""
+
+    on_activity: Callable[[], None]
+    report_keep_warm: Callable[[], bool]
+
+
 async def serve_tunnel(
     app: _ASGIApp,
     *,
@@ -362,6 +402,7 @@ async def serve_tunnel(
     auth_token_factory: Callable[[], str | None] | None = None,
     on_reconnect: Callable[[], Awaitable[None]] | None = None,
     on_activity: Callable[[], None] | None = None,
+    report_keep_warm: Callable[[], bool] | None = None,
     shutdown_event: asyncio.Event | None = None,
     on_graceful_shutdown: Callable[[], None] | None = None,
     direct_attach_port: int | None = None,
@@ -404,6 +445,9 @@ async def serve_tunnel(
     :param on_activity: Optional sync callback fired for real
         server-to-runner work frames. Tunnel pings are excluded so
         keepalives do not keep an otherwise idle runner alive.
+    :param report_keep_warm: Optional sync callback whose result rides on each
+        pong as ``keep_warm``, so the server extends a managed sandbox only while
+        the runner wants it kept warm.
     :param shutdown_event: Optional event that, when set, requests a
         *graceful* tunnel shutdown: the current connection stops reading new
         frames, waits for in-flight ``GET /stream`` dispatch tasks to finish
@@ -420,6 +464,8 @@ async def serve_tunnel(
         otherwise never returns during normal operation.
     """
     delay_s = _INITIAL_RECONNECT_DELAY_S
+    renewal_interval_s = _tunnel_renewal_interval_s()
+    auth_prepared = False
     tunnel_url = _tunnel_url(server_url, runner_id)
     # Set on the first accepted WS upgrade. Distinguishes a runner that
     # never authenticated (login redirects turn fatal after a short
@@ -494,7 +540,9 @@ async def serve_tunnel(
         disconnect_error: BaseException | None = None
         close_details: _CloseDetails | None = None
         try:
-            auth_token = await _refresh_auth_token(auth_token, auth_token_factory)
+            if not auth_prepared:
+                auth_token = await _refresh_auth_token(auth_token, auth_token_factory)
+            auth_prepared = False
             pending = (
                 await _sign_in_pending(auth_token_factory)
                 if not ever_connected and not sign_in_wait_ended
@@ -551,9 +599,53 @@ async def serve_tunnel(
         server_recycle = False
         attempt += 1
         connection_id = uuid.uuid4().hex
+
+        async def _prepare_renewal(connection_id: str = connection_id) -> bool:
+            nonlocal auth_token, auth_prepared
+            fresh = auth_token
+            failure: str | None = None
+            error_type: str | None = None
+            if auth_token_factory is not None:
+                try:
+                    # Bootstrap factories must resolve a replacement instead of
+                    # returning the initial bearer they retain until rejection.
+                    refresh = getattr(auth_token_factory, "refresh", None)
+                    provider = (
+                        cast("Callable[[], str | None]", refresh)
+                        if callable(refresh)
+                        else auth_token_factory
+                    )
+                    fresh = await asyncio.to_thread(provider)
+                    if not fresh and auth_token is not None:
+                        failure = "credential_unavailable"
+                except Exception as exc:  # noqa: BLE001 — keep a working socket open
+                    failure = "credential_refresh_failed"
+                    error_type = type(exc).__name__
+            if failure is not None:
+                _logger.warning(
+                    "runner tunnel renewal deferred: %s",
+                    failure,
+                    extra=debug_event(
+                        "runner_tunnel_renewal_deferred",
+                        session_id=runner_primary_session_id(),
+                        runner_id=runner_id,
+                        connection_id=connection_id,
+                        reason=failure,
+                        error_type=error_type,
+                    ),
+                )
+                return False
+            auth_token = fresh
+            auth_prepared = True
+            return True
+
         diagnostics = TunnelDiagnostics()
         try:
-            activity_kwargs = {"on_activity": on_activity} if on_activity is not None else {}
+            activity_kwargs: _TunnelActivityKwargs = {}
+            if on_activity is not None:
+                activity_kwargs["on_activity"] = on_activity
+            if report_keep_warm is not None:
+                activity_kwargs["report_keep_warm"] = report_keep_warm
             close_details = await _serve_tunnel_once(
                 app,
                 tunnel_url=tunnel_url,
@@ -575,6 +667,8 @@ async def serve_tunnel(
                 disconnected_monotonic=disconnected_monotonic,
                 event_dispatcher=event_dispatcher,
                 diagnostics=diagnostics,
+                renewal_interval_s=renewal_interval_s,
+                on_prepare_renewal=_prepare_renewal,
                 **activity_kwargs,
             )
             # A graceful shutdown drains and closes the connection cleanly,
@@ -582,6 +676,9 @@ async def serve_tunnel(
             if shutdown_event is not None and shutdown_event.is_set():
                 return
             delay_s = _INITIAL_RECONNECT_DELAY_S
+            if close_details is not None and close_details.scheduled_renewal:
+                recycle = True
+                retry_reason = f"{_TUNNEL_RENEWAL_REASON}; reconnecting promptly"
         except asyncio.CancelledError as exc:
             disconnect_error = exc
             raise
@@ -712,12 +809,14 @@ async def serve_tunnel(
             local_shutdown = (
                 shutdown_event is not None and shutdown_event.is_set()
             ) or isinstance(disconnect_error, asyncio.CancelledError)
+            scheduled_renewal = close_details is not None and close_details.scheduled_renewal
             if connected_this_attempt:
                 record_websocket_disconnected(
                     "runner",
                     disconnect_error,
                     local_shutdown=local_shutdown,
                     resumed_from_suspend=woke_from_suspend,
+                    scheduled_renewal=scheduled_renewal,
                 )
             terminal_error = sys.exception()
             if terminal_error is not None or (
@@ -816,6 +915,7 @@ async def serve_tunnel(
                     disconnect_error,
                     local_shutdown=local_shutdown,
                     resumed_from_suspend=resumed_from_suspend,
+                    scheduled_renewal=scheduled_renewal,
                 ),
                 error_type=(
                     type(disconnect_error).__name__ if disconnect_error is not None else None
@@ -1040,6 +1140,7 @@ async def _serve_tunnel_once(
     auth_token: str | None = None,
     tunnel_token: str | None = None,
     on_activity: Callable[[], None] | None = None,
+    report_keep_warm: Callable[[], bool] | None = None,
     shutdown_event: asyncio.Event | None = None,
     on_graceful_shutdown: Callable[[], None] | None = None,
     on_connected: Callable[[], None] | None = None,
@@ -1053,6 +1154,8 @@ async def _serve_tunnel_once(
     disconnected_monotonic: float | None = None,
     event_dispatcher: RunnerEventDispatcher | None = None,
     diagnostics: TunnelDiagnostics | None = None,
+    renewal_interval_s: float | None = None,
+    on_prepare_renewal: Callable[[], Awaitable[bool]] | None = None,
 ) -> _CloseDetails:
     """Serve one WebSocket connection until it closes.
 
@@ -1073,6 +1176,8 @@ async def _serve_tunnel_once(
     :param on_activity: Optional sync callback fired for real work
         frames received from the server. Ping keepalives do not
         trigger it.
+    :param report_keep_warm: Optional keep-warm report attached to each pong;
+        see :func:`serve_tunnel`.
     :param shutdown_event: Optional event whose set state ends the read
         loop and triggers the graceful drain (see ``_graceful_drain``).
     :param on_graceful_shutdown: Optional sync callback fired once, before
@@ -1097,6 +1202,10 @@ async def _serve_tunnel_once(
         connection ended, or ``None``. The gap to this connect is the
         outage the server saw.
     :param diagnostics: This attempt's observations, retained for disconnect logging.
+    :param renewal_interval_s: Connection age for proactive renewal; ``None``
+        disables it. Jitter only shortens this interval.
+    :param on_prepare_renewal: Prepare credentials while the old socket works;
+        ``False`` defers renewal without interrupting its traffic.
     :returns: The close details the connection retained once it ended.
     """
     import websockets
@@ -1112,6 +1221,7 @@ async def _serve_tunnel_once(
     # name the workspace or it routes to the account. Both empty for
     # single-workspace hosts / local unauthenticated runs.
     from omnigent.cli_auth import databricks_request_headers
+    from omnigent.telemetry.request_headers import pop_client_user_agent
 
     headers: dict[str, str] = {"Origin": OMNIGENT_INTERNAL_WS_ORIGIN}
     # Co-locate this runner's tunnel with its host's on one server replica: the
@@ -1123,6 +1233,8 @@ async def _serve_tunnel_once(
     )
     if tunnel_token:
         headers[RUNNER_TUNNEL_TOKEN_HEADER] = tunnel_token
+    # websockets adds its own User-Agent on top of additional_headers; send only ours.
+    user_agent = pop_client_user_agent(headers)
     # Verifying SSL context from a real CA bundle for wss:// — a bare default
     # context loads zero roots on uv / python-build-standalone Pythons (no
     # OpenSSL default cert path). Local runners use ws:// and pass ssl=None.
@@ -1159,6 +1271,7 @@ async def _serve_tunnel_once(
         websockets.connect(
             tunnel_url,
             additional_headers=headers,
+            user_agent_header=user_agent,
             open_timeout=_RUNNER_TUNNEL_OPEN_TIMEOUT_S,
             close_timeout=close_timeout,
             max_size=RUNNER_TUNNEL_MAX_MESSAGE_BYTES,
@@ -1177,6 +1290,7 @@ async def _serve_tunnel_once(
             protocol_ping_timeout_s=getattr(ws, "ping_timeout", None),
             protocol_keepalive_source="websockets_connection",
         )
+        connected_at = time.monotonic()
 
         async def send_text(data: str) -> None:
             await diagnostics.send(ws.send, data)
@@ -1192,6 +1306,7 @@ async def _serve_tunnel_once(
                 dispatch_tasks,
                 ws_channels,
                 on_activity=on_activity,
+                report_keep_warm=report_keep_warm,
                 event_dispatcher=event_dispatcher,
                 diagnostics=diagnostics,
                 passive_dispatch_tasks=passive_dispatch_tasks,
@@ -1282,6 +1397,8 @@ async def _serve_tunnel_once(
                 reconnect=reconnect,
                 attempt=attempt,
                 downtime_s=_round_seconds(downtime_s),
+                # Spawn-to-connected time of a fresh runner (fork or exec included).
+                process_age_ms=None if reconnect else _process_age_ms(),
                 pid=os.getpid(),
                 **diagnostics.snapshot(),
             ),
@@ -1313,13 +1430,51 @@ async def _serve_tunnel_once(
             watch_for_resume(_on_resume_from_suspend),
             name=f"runner-suspend-watch:{runner_id}",
         )
+
+        renewal_requested = False
+
+        async def _renew_connection() -> None:
+            nonlocal renewal_requested
+            assert renewal_interval_s is not None and on_prepare_renewal is not None
+            delay = _tunnel_renewal_delay_s(renewal_interval_s)
+            await asyncio.sleep(max(0.0, connected_at + delay - time.monotonic()))
+            while shutdown_event is None or not shutdown_event.is_set():
+                if await on_prepare_renewal():
+                    if shutdown_event is not None and shutdown_event.is_set():
+                        return
+                    _logger.info(
+                        "renewing runner tunnel before its maximum lifetime",
+                        extra=debug_event(
+                            "runner_tunnel_renewal_started",
+                            session_id=runner_primary_session_id(),
+                            runner_id=runner_id,
+                            connection_id=connection_id,
+                            connection_age_s=_round_seconds(time.monotonic() - connected_at),
+                        ),
+                    )
+                    # A transport recycle must not invoke the idle-shutdown hook,
+                    # which finishes session streams and stops reconnecting.
+                    renewal_requested = True
+                    await ws.close(code=1001, reason=_TUNNEL_RENEWAL_REASON)
+                    return
+                await asyncio.sleep(_TUNNEL_RENEWAL_RETRY_S)
+
+        renewal_task = (
+            asyncio.create_task(_renew_connection(), name=f"runner-tunnel-renewal:{runner_id}")
+            if renewal_interval_s is not None and on_prepare_renewal is not None
+            else None
+        )
         try:
             if shutdown_event is None:
                 while True:
                     try:
                         await receive_frame()
                     except ConnectionClosedOK as exc:
-                        if _websocket_close_code(exc) in _TUNNEL_RECYCLE_CLOSE_CODES:
+                        # The server echoes our renewal 1001; it is not a recycle.
+                        if (
+                            not renewal_requested
+                            and _websocket_close_code(exc) in _TUNNEL_RECYCLE_CLOSE_CODES
+                        ):
                             # A server recycle (e.g. 1001) must reach
                             # serve_tunnel's handler for the spread-jitter
                             # reconnect, not end quietly like an ordinary
@@ -1372,8 +1527,8 @@ async def _serve_tunnel_once(
                                 dispatch_tasks,
                                 on_graceful_shutdown,
                             )
-                            # Only the idle watchdog sets shutdown_event; tell the
-                            # server this exit attests no active work.
+                            # Only idle exits (idle watchdog, or a hung-up host's
+                            # finished work) set shutdown_event: attest no active work.
                             await ws.close(code=1000, reason=RUNNER_IDLE_SHUTDOWN_CLOSE_REASON)
                             break
                         try:
@@ -1383,7 +1538,10 @@ async def _serve_tunnel_once(
                             # ``ws.recv()`` loop above: ends silently unless
                             # the code is a server recycle (e.g. 1001), which
                             # must reach serve_tunnel's handler instead.
-                            if _websocket_close_code(exc) in _TUNNEL_RECYCLE_CLOSE_CODES:
+                            if (
+                                not renewal_requested
+                                and _websocket_close_code(exc) in _TUNNEL_RECYCLE_CLOSE_CODES
+                            ):
                                 raise
                             break
                 finally:
@@ -1395,6 +1553,10 @@ async def _serve_tunnel_once(
                         await shutdown_wait
         finally:
             diagnostics.freeze()
+            if renewal_task is not None:
+                renewal_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await renewal_task
             if event_dispatcher is not None:
                 event_dispatcher.disconnected()
             if reconnect_task is not None:
@@ -1408,7 +1570,8 @@ async def _serve_tunnel_once(
             await _cancel_ws_channels(ws_channels)
     # Read after the context closed the socket: a clean 1000/1001 close ends
     # the iteration without an exception, and only the connection knows its frames.
-    return _CloseDetails.from_connection(ws)
+    details = _CloseDetails.from_connection(ws)
+    return replace(details, scheduled_renewal=True) if renewal_requested else details
 
 
 async def _graceful_drain(
@@ -1501,11 +1664,12 @@ async def _send_hello(
         pass
 
     from omnigent.harnesses.codex_native.side_chat import CAP_SIDE_CHAT_SETTINGS
-    from omnigent.host.frames import CAP_MCP_REGISTRY
+    from omnigent.host.frames import CAP_MCP_REGISTRY, CAP_TCP_EGRESS
     from omnigent.inner.native_attachments import (
         CAP_FILESYSTEM_ATTACHMENT_DELIVERY,
         CAP_FILESYSTEM_ATTACHMENTS,
     )
+    from omnigent.runner.background_titles.service import CAP_LONG_BACKGROUND_TITLE_INSTRUCTIONS
 
     await send_text(
         encode_frame(
@@ -1516,7 +1680,9 @@ async def _send_hello(
                     CAP_FILESYSTEM_ATTACHMENTS,
                     CAP_FILESYSTEM_ATTACHMENT_DELIVERY,
                     CAP_MCP_REGISTRY,
+                    CAP_TCP_EGRESS,
                     CAP_SIDE_CHAT_SETTINGS,
+                    CAP_LONG_BACKGROUND_TITLE_INSTRUCTIONS,
                     *([EVENT_INGEST_CAPABILITY] if event_dispatcher is not None else []),
                 ],
                 telemetry_opt_out=_tel_opt_out,
@@ -1545,6 +1711,7 @@ async def _handle_tunnel_frame(
     ws_channels: dict[str, _RunnerWSChannel],
     *,
     on_activity: Callable[[], None] | None = None,
+    report_keep_warm: Callable[[], bool] | None = None,
     event_dispatcher: RunnerEventDispatcher | None = None,
     diagnostics: TunnelDiagnostics | None = None,
     passive_dispatch_tasks: set[asyncio.Task[None]] | None = None,
@@ -1562,6 +1729,8 @@ async def _handle_tunnel_frame(
         state map.
     :param on_activity: Optional sync callback fired for non-ping
         frames that represent real runner work.
+    :param report_keep_warm: Optional keep-warm report attached to each pong;
+        see :func:`serve_tunnel`.
     :param diagnostics: Connection-local application frame and heartbeat observations.
     :param passive_dispatch_tasks: Connection-owned subscriptions that can safely reconnect.
     :returns: None.
@@ -1587,7 +1756,8 @@ async def _handle_tunnel_frame(
     elif isinstance(frame, PingFrame):
         if diagnostics is not None:
             diagnostics.app_ping_received()
-        await send_text(encode_frame(PongFrame(ts=frame.ts)))
+        keep_warm = _keep_warm_for_pong(report_keep_warm)
+        await send_text(encode_frame(PongFrame(ts=frame.ts, keep_warm=keep_warm)))
         if diagnostics is not None:
             diagnostics.app_pong_sent()
     elif isinstance(frame, RequestFrame):
@@ -1663,6 +1833,24 @@ async def _handle_tunnel_frame(
         if closing_channel is None:
             return
         closing_channel.inbound.put_nowait(("close", (frame.code, frame.reason)))
+
+
+def _keep_warm_for_pong(report_keep_warm: Callable[[], bool] | None) -> bool | None:
+    """Return the pong's ``keep_warm`` report; ``None`` if the runner does not report.
+
+    A failing callback reports ``True``: keeping a sandbox warm for one extra
+    interval is cheaper than letting an in-use one stop.
+
+    :param report_keep_warm: The runner's keep-warm callback, if any.
+    :returns: The value for the next pong's ``keep_warm``.
+    """
+    if report_keep_warm is None:
+        return None
+    try:
+        return bool(report_keep_warm())
+    except Exception:  # a keep-warm report must never break the pong
+        _logger.debug("runner keep-warm report failed; reporting True", exc_info=True)
+        return True
 
 
 async def _cancel_dispatch_tasks(dispatch_tasks: dict[str, asyncio.Task[None]]) -> None:
@@ -1950,12 +2138,14 @@ class _CloseDetails:
     :param reason: The connection's close reason.
     :param rcvd_code: Code of the close frame the peer sent, if any.
     :param sent_code: Code of the close frame this side sent, if any.
+    :param scheduled_renewal: Whether this side closed it for a planned renewal.
     """
 
     code: int | None = None
     reason: str | None = None
     rcvd_code: int | None = None
     sent_code: int | None = None
+    scheduled_renewal: bool = False
 
     @classmethod
     def from_error(cls, exc: BaseException) -> _CloseDetails:
@@ -1988,3 +2178,39 @@ class _CloseDetails:
 def _round_seconds(value: float | None) -> float | None:
     """Round a duration for a debug-log attribute; ``None`` passes through."""
     return None if value is None else round(value, 3)
+
+
+def _process_age_ms() -> int | None:
+    """Milliseconds since this process was created, or ``None`` if unknown.
+
+    On Linux both readings come from the kernel's boot-relative clock, so the
+    age is exact to a clock tick. psutil's creation time there is built on a
+    whole-second boot timestamp, which can be off by up to a second.
+    """
+    linux_age = _linux_process_age_ms()
+    if linux_age is not None:
+        return linux_age
+    import psutil
+
+    try:
+        created_at = psutil.Process().create_time()
+    except psutil.Error:
+        return None
+    return round((time.time() - created_at) * 1000)
+
+
+def _linux_process_age_ms(proc_root: str = "/proc") -> int | None:
+    """Process age from ``/proc/uptime`` and ``/proc/self/stat``; ``None`` off Linux.
+
+    :param proc_root: The procfs mount, e.g. ``"/proc"``; tests point it elsewhere.
+    """
+    try:
+        with open(f"{proc_root}/uptime", encoding="ascii") as uptime_file:
+            uptime_s = float(uptime_file.read().split()[0])
+        with open(f"{proc_root}/self/stat", encoding="ascii") as stat_file:
+            # Field 22 (starttime), counted after the parenthesized command name.
+            start_ticks = int(stat_file.read().rsplit(")", 1)[1].split()[19])
+        ticks_per_s = os.sysconf("SC_CLK_TCK")
+    except (OSError, ValueError, IndexError):
+        return None
+    return round((uptime_s - start_ticks / ticks_per_s) * 1000)
