@@ -141,6 +141,10 @@ implements them separately, so a fix for one harness does not reach the others.
     stopped by its usage or budget limit fails the session, and so does a
     system error that Codex reports outside a turn; during a turn, the turn's
     own outcome decides.
+  - Claude Code: `/goal` runs inside Claude Code, and its goal does not change
+    the session status. Omnigent reads the goal from the session's Claude
+    transcript for the composer's goal indicator; see `goal-command` in
+    [composer.md](composer.md).
   - Background work shows the working spinner with the tooltip "Working in the
     background". The composer lists running Claude background shells and Codex
     background terminals as "1 background task" with each one's command. Claude's
@@ -612,6 +616,10 @@ Cross-harness journeys:
     `tests/harnesses/codex_native/forwarder/test_background_work.py::test_active_goal_keeps_the_session_working_until_it_ends`
     and
     `tests/harnesses/codex_native/forwarder/test_background_work.py::test_goal_stopped_by_a_limit_fails_the_session_once`.
+  - Claude Code goal read from the transcript:
+    `tests/harnesses/claude_native/test_claude_native_goal_state.py::test_goal_state_transitions`
+    and
+    `tests/runner/test_claude_goal_runner.py::test_reads_the_goal_from_the_bridge_transcript`.
   - Codex background terminal, in the sidebar and the composer:
     `tests/harnesses/codex_native/forwarder/test_background_work.py::test_running_background_terminal_keeps_the_session_working_after_its_turn`
     and

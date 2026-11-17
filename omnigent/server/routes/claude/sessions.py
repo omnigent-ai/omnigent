@@ -19,6 +19,7 @@ from omnigent.server.routes.sessions import (
     _CLAUDE_NATIVE_WRAPPER_LABEL_KEY,
     _forward_session_change_to_runner,
 )
+from omnigent.server.routes.sessions.routes_events import _raise_if_runner_on_another_replica
 from omnigent.server.schemas import ClaudeGoalReadResponse
 from omnigent.stores import ConversationStore
 from omnigent.stores.permission_store import PermissionStore
@@ -31,16 +32,17 @@ _UNAVAILABLE = ClaudeGoalReadResponse(goal=None, available=False)
 
 async def _read_claude_goal_from_runner(
     session_id: str, runner_router: RunnerRouter | None
-) -> ClaudeGoalReadResponse:
+) -> ClaudeGoalReadResponse | None:
     """
     Ask the session's runner for the goal in its Claude transcript.
 
-    An absent or older runner, or a reply in any other shape, reads as
-    unavailable so the browser keeps its last snapshot.
+    An older runner, or a reply in any other shape, reads as unavailable so
+    the browser keeps its last snapshot.
 
     :param session_id: Session id, e.g. ``"conv_abc123"``.
     :param runner_router: Router resolving the session's runner client.
-    :returns: The runner's goal read, or an unavailable read.
+    :returns: The runner's goal read, an unavailable read, or ``None`` when
+        no runner client resolves on this replica.
     """
     try:
         result = await _forward_session_change_to_runner(
@@ -49,7 +51,9 @@ async def _read_claude_goal_from_runner(
     except OmnigentError as exc:
         _logger.debug("Claude goal read skipped for session=%s: %s", session_id, exc)
         return _UNAVAILABLE
-    if result is None or result.status_code != 200:
+    if result is None:
+        return None
+    if result.status_code != 200:
         return _UNAVAILABLE
     try:
         return ClaudeGoalReadResponse.model_validate(json.loads(result.body))
@@ -81,8 +85,9 @@ def register_claude_session_routes(
         :param request: The incoming FastAPI request (for auth).
         :param session_id: Session id, e.g. ``"conv_abc123"``.
         :returns: The current goal and whether the runner could read it.
-        :raises OmnigentError: 404 for a missing session or 400 for a session
-            that is not Claude-native.
+        :raises OmnigentError: 404 for a missing session, 400 for a session
+            that is not Claude-native, or ``WRONG_REPLICA`` when its runner is
+            live on another replica.
         """
         user_id = _get_user_id(request, auth_provider)
         await _require_access(
@@ -103,4 +108,9 @@ def register_claude_session_routes(
                 "claude_goal is only supported for claude-native sessions",
                 code=ErrorCode.INVALID_INPUT,
             )
-        return await _read_claude_goal_from_runner(session_id, runner_router)
+        goal_read = await _read_claude_goal_from_runner(session_id, runner_router)
+        if goal_read is None:
+            # A runner live on another replica is not offline; let the browser re-address.
+            await _raise_if_runner_on_another_replica(conv, request.app.state, conversation_store)
+            return _UNAVAILABLE
+        return goal_read

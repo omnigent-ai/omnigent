@@ -11,6 +11,7 @@ from typing import Any
 
 import httpx
 import pytest
+from fastapi import FastAPI
 
 from omnigent._wrapper_labels import (
     CLAUDE_NATIVE_WRAPPER_VALUE,
@@ -18,9 +19,11 @@ from omnigent._wrapper_labels import (
     WRAPPER_LABEL_KEY,
 )
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes.claude import sessions as claude
 from omnigent.server.routes.sessions import _RunnerForwardResult
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+from omnigent.stores.host_store import HostStore
 from tests.server.helpers import create_session_for_agent, create_test_agent
 
 UNAVAILABLE = {"goal": None, "available": False}
@@ -131,3 +134,31 @@ async def test_unknown_session_is_not_found(client: httpx.AsyncClient) -> None:
     response = await client.get("/v1/sessions/conv_missing/claude_goal")
 
     assert response.status_code == 404, response.text
+
+
+@pytest.mark.parametrize(("host_online", "expected_code"), [(True, 400), (False, 200)])
+async def test_a_runner_on_another_replica_is_re_addressed_not_unavailable(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    db_uri: str,
+    host_online: bool,
+    expected_code: int,
+) -> None:
+    session_id = await _session(client, db_uri, CLAUDE_NATIVE_WRAPPER_VALUE)
+    host_id = "host_0123456789abcdef0123456789abcdef"
+    hosts = HostStore(db_uri)
+    hosts.upsert_on_connect(host_id, "laptop", "alice@example.com")
+    if not host_online:
+        hosts.set_offline(host_id)
+    SqlAlchemyConversationStore(db_uri).set_host_id(session_id, host_id, workspace="/workspace")
+    # The host has no tunnel on this replica's registry.
+    app.state.host_registry = HostRegistry()
+    app.state.host_store = hosts
+
+    response = await client.get(f"/v1/sessions/{session_id}/claude_goal")
+
+    assert response.status_code == expected_code, response.text
+    if host_online:
+        assert response.json()["error"]["code"] == ErrorCode.WRONG_REPLICA
+    else:
+        assert response.json() == UNAVAILABLE

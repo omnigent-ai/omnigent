@@ -122,7 +122,8 @@ describe("useGoalState", () => {
       expect(result.current.goalRevision).toBeGreaterThan(confirmedRevision);
       const expectCheckUpdatePublished = async (checkUpdate: Partial<Goal>) => {
         const revisionBeforeCheck = result.current.goalRevision;
-        const checkedGoal = { ...changedGoal, ...checkUpdate };
+        // Build on the published goal so only this field differs from it.
+        const checkedGoal = { ...result.current.goal!, ...checkUpdate };
         mockGetGoal.mockResolvedValue({ goal: checkedGoal });
         await act(async () => window.dispatchEvent(new Event("focus")));
         expect(result.current.goal).toEqual(checkedGoal);
