@@ -16,6 +16,7 @@ from __future__ import annotations
 import io
 import os
 import re
+import shlex
 import subprocess
 import sys
 import traceback
@@ -701,6 +702,15 @@ def test_issue_url_scrubs_repr_escaped_home(
         ),
         (r"/mnt/cache\/home/example/file", r"/mnt/cache\/home/example/file"),
         ("/home/example/project", "~/project"),
+        (
+            "https://example.test/cache/file:///home/example/file.py",
+            "https://example.test/cache/file:///home/example/file.py",
+        ),
+        ("/mnt/file:///home/example/file.py", "/mnt/file:///home/example/file.py"),
+        (
+            r"/mnt/cache\file:///home/example/file.py",
+            r"/mnt/cache\file:///home/example/file.py",
+        ),
     ],
     ids=[
         "mount-prefix",
@@ -709,6 +719,9 @@ def test_issue_url_scrubs_repr_escaped_home(
         "doubled-slash-url",
         "backslash-mount",
         "home-itself",
+        "file-url-in-url",
+        "file-url-in-mount",
+        "file-url-after-backslash",
     ],
 )
 def test_scrub_keeps_home_text_inside_other_paths(
@@ -723,6 +736,35 @@ def test_scrub_redacts_home_in_file_url(monkeypatch: pytest.MonkeyPatch) -> None
     """A ``file://`` URL to the home directory still exposes it, so it is scrubbed."""
     monkeypatch.setattr(Path, "home", lambda: Path("/home/example"))
     assert ch._scrub("file:///home/example/notes.txt") == "file://~/notes.txt"
+
+
+@pytest.mark.parametrize(
+    "home_directory",
+    ["/home/example", "/home/O'Brien", r"C:\Users\O'Brien"],
+    ids=["plain-home", "posix-apostrophe", "windows-apostrophe"],
+)
+def test_command_line_keeps_sibling_argument_with_spaces(
+    data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    home_directory: str,
+) -> None:
+    """Public shell quoting preserves siblings and redacts homes, including apostrophes."""
+    ch.install_crash_handler("omnigent", "omnigent-ai/omnigent")
+    home_path = Path(home_directory)
+    monkeypatch.setattr(Path, "home", lambda: home_path)
+    argv = ["omnigent", "run", f"{home_path} backup/config.yaml", f"{home_path}/project/file.py"]
+    monkeypatch.setattr(sys, "argv", argv)
+    exc = _make_exc()
+    tb_text = "".join(traceback.format_exception(exc))
+    report = ch._build_report(exc, tb_text, source="test")
+    assert tb_text in report
+    report_command = report.split("## Command\n\n```\n", 1)[1].split("\n```", 1)[0]
+    assert shlex.split(report_command) == argv
+    url, body_included = ch._issue_url(exc, tb_text)
+    assert body_included is True
+    assert len(url) <= ch._MAX_URL_LENGTH
+    command = _description_of(url).split("**Command:**\n```\n", 1)[1].split("\n```", 1)[0]
+    assert shlex.split(command) == ["omnigent", "run", argv[2], "~/project/file.py"]
 
 
 def test_issue_url_redacts_multiline_bearer_before_truncation(data_dir: Path) -> None:
