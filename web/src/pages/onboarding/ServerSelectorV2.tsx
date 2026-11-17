@@ -5,7 +5,7 @@
  * `omnigentSetup` bridge via the `setup` prop.
  */
 
-import { type CSSProperties, useRef, useState } from "react";
+import { type CSSProperties, useEffect, useRef, useState } from "react";
 import { Settings } from "lucide-react";
 import { AnimatedOmnigentPanel } from "@/components/onboarding/AnimatedOmnigentPanel";
 import {
@@ -193,8 +193,12 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
     bundledCli: boolean;
   } | null>(null);
   const [runnerError, setRunnerError] = useState<string>();
-  // Bumped per pick, so a slow lookup can't replace a newer pick's runner step.
+  // Bumped per pick and on every step change, so a slow lookup can't act after a
+  // newer pick or after the user navigated away.
   const runnerPick = useRef(0);
+  useEffect(() => {
+    runnerPick.current += 1;
+  }, [step]);
   // Resolves false when `url` just opens. A server with no runner offers the
   // optional install choice when the CLI is missing; from the landing, a server
   // the shell offers a runner for (and the local install) gets the full step.
@@ -205,7 +209,13 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
     const remote = options?.remote === true;
     const bundledCli = options?.bundledCli === true;
     const hasRunner = remote || bundledCli;
-    const optional = !hasRunner && !isLocalInstall(url) && setup.installed === false;
+    // Offer the choice only when something can install: a runner, an installer, or manual steps.
+    const canInstall =
+      setup.onConnectRunner != null ||
+      setup.mockInstall === true ||
+      setup.onInstallCli != null ||
+      setup.installSupported === false;
+    const optional = !hasRunner && !isLocalInstall(url) && setup.installed === false && canInstall;
     if (!optional && !(from === "landing" && (hasRunner || isLocalInstall(url)))) return false;
     setRunnerTarget({ url, from, optional, remote, bundledCli });
     setRunnerError(undefined);
@@ -355,7 +365,10 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
   const terminalUrl = terminalTarget.url;
   // Laptop setup offered as an optional choice, so a failure can still open the server.
   const optionalLaptop =
-    terminalTarget.kind === "connect" && terminalTarget.back === "runner" && runnerTarget?.optional;
+    terminalTarget.kind === "connect" &&
+    terminalTarget.back === "runner" &&
+    runnerTarget?.optional &&
+    !skipInstall;
   const connectAnyway =
     terminalUrl !== undefined &&
     (terminalTarget.kind === "local" || remoteRunnerFailed || manualInstall || optionalLaptop)
@@ -489,7 +502,7 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
             onJustJoin={runnerTarget.optional ? () => openFromRunner(runnerTarget.url) : undefined}
             onInstall={async (runner) => {
               if (!setup.onConnectRunner) {
-                await openFromRunner(runnerTarget.url, needsInstall);
+                await openFromRunner(runnerTarget.url, needsInstall || runnerTarget.optional);
                 return;
               }
               // No local install for a remote runner, or when the host CLI is bundled.

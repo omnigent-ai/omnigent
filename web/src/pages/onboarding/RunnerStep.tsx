@@ -1,7 +1,5 @@
-// Onboarding: "Where do you work today?", shown after picking a preset server
-// from the landing. Pick the runner (a remote environment when offered, else
-// this laptop), then install/open. From the server list it instead offers
-// "Just join" or installing the CLI to connect this laptop first.
+// Onboarding "Where do you work today?": pick a runner (remote or this laptop), then
+// install/open; a new user without the CLI may instead "Just join" or install it first.
 
 import { useState } from "react";
 import { Cloud, Laptop, LogIn } from "lucide-react";
@@ -45,9 +43,10 @@ export function RunnerStep({
   /** Offer "Just join" (picked by default), which opens the server without a runner. */
   onJustJoin?: () => void;
 }) {
-  const [runner, setRunner] = useState<Runner | "join">(
-    onJustJoin ? "join" : remoteAvailable ? "remote" : "local",
-  );
+  const [runner, setRunner] = useState<Runner | "join">(() => {
+    if (onJustJoin) return "join";
+    return remoteAvailable ? "remote" : "local";
+  });
 
   return (
     <div className="flex h-full flex-col px-2 pb-1 pt-3">
