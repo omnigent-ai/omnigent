@@ -89,6 +89,18 @@ export const ADMIN_VIEW_ENTRY = settingsEntry({
   keywords: ["admin", "administrator", "access", "permissions", "view"],
 });
 
+/** The desktop app's shortcut that brings it forward; a row only desktop builds show. */
+export const GLOBAL_SHORTCUT_ENTRY = settingsEntry({
+  id: "global-shortcut",
+  section: "general",
+  label: "Show Omnigent from anywhere",
+  description: "Brings Omnigent to the front from any app.",
+  keywords: ["shortcut", "hotkey", "keyboard", "global", "desktop", "bring to front", "window"],
+  // Named by the chord it holds, or by the prompt while it records one.
+  parts: { recorder: "Shortcut" },
+  nameTemplates: { recorder: { before: "Shortcut: " } },
+});
+
 export const GENERAL_SETTINGS = [
   SUBMIT_WITH_MOD_ENTER_ENTRY,
   ALWAYS_STEER_ENTRY,
@@ -98,4 +110,5 @@ export const GENERAL_SETTINGS = [
   TERMINAL_CLIPBOARD_ENTRY,
   OPEN_LINKS_IN_APP_ENTRY,
   ADMIN_VIEW_ENTRY,
+  GLOBAL_SHORTCUT_ENTRY,
 ] as const;

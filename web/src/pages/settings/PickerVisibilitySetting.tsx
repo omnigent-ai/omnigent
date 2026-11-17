@@ -132,11 +132,11 @@ export function PickerVisibilitySetting() {
             align="end"
             className="p-0"
           >
-            <Command
-              label="Filter harnesses and agents"
-              {...settingsControlProps(PICKER_VISIBILITY_ENTRY, "filter")}
-            >
-              <CommandInput placeholder="Filter harnesses and agents…" />
+            <Command label="Filter harnesses and agents">
+              <CommandInput
+                placeholder="Filter harnesses and agents…"
+                {...settingsControlProps(PICKER_VISIBILITY_ENTRY, "filter")}
+              />
               <CommandList>
                 <CommandEmpty>No entries match.</CommandEmpty>
                 {groups.map((group) => (

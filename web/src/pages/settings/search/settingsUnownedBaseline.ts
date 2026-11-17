@@ -6,7 +6,8 @@
 export const UNOWNED_CONTROLS: Readonly<Record<string, { count: number; reason: string }>> = {
   "src/components/McpRegistry.tsx › ServiceConnection › Button": {
     count: 2,
-    reason: "Managed MCP service connect button, not yet catalog-owned.",
+    reason:
+      "Services row's connect button; its action depends on the connection, which the guard can't read as one row action.",
   },
   "src/components/ModelValueCombobox.tsx › ModelValueCombobox › button": {
     count: 1,
@@ -28,14 +29,6 @@ export const UNOWNED_CONTROLS: Readonly<Record<string, { count: number; reason: 
     count: 2,
     reason: "Theme color picker popover internals, not named by a row.",
   },
-  "src/pages/settings/GlobalShortcutControl.tsx › GlobalShortcutControl › Button": {
-    count: 1,
-    reason: "Global shortcut row's control, not yet catalog-owned.",
-  },
-  "src/pages/settings/GlobalShortcutControl.tsx › GlobalShortcutControl › Switch": {
-    count: 1,
-    reason: "Global shortcut row's control, not yet catalog-owned.",
-  },
   "src/pages/settings/HarnessCatalog.tsx › CatalogRow › button": {
     count: 1,
     reason:
@@ -44,7 +37,7 @@ export const UNOWNED_CONTROLS: Readonly<Record<string, { count: number; reason: 
   "src/pages/settings/HarnessCatalog.tsx › McpRow › summary": {
     count: 1,
     reason:
-      "MCP server row's open trigger, named by the server's own data, as its list's rows are.",
+      "Tool disclosure in an MCP server row; the row's entry is a prop, which a data region can't name.",
   },
   "src/pages/settings/HarnessCatalog.tsx › PluginPage › SettingsDataRegion": {
     count: 1,
@@ -96,10 +89,6 @@ export const UNOWNED_CONTROLS: Readonly<Record<string, { count: number; reason: 
     count: 1,
     reason:
       "Fix dialog control; this run walks the dialog without its opener's owner, which the Harnesses section's run covers.",
-  },
-  "src/pages/settings/PickerVisibilitySetting.tsx › PickerVisibilitySetting › CommandInput": {
-    count: 1,
-    reason: "Picker visibility filter input, not yet catalog-owned.",
   },
   "src/pages/settings/SettingsHarnessesSection.tsx › CredentialCard › button": {
     count: 1,

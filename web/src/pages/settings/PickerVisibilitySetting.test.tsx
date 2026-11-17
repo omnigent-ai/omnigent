@@ -100,7 +100,7 @@ describe("PickerVisibilitySetting", () => {
     expect(option("Claude Code")).toHaveAttribute("aria-checked", "true");
     expect(summary()).toHaveTextContent("Showing 2 of 3. Hidden: Codex.");
 
-    fireEvent.change(screen.getByPlaceholderText("Filter harnesses and agents…"), {
+    fireEvent.change(screen.getByRole("combobox", { name: "Filter harnesses and agents" }), {
       target: { value: "poll" },
     });
     expect(option("Polly")).toBeInTheDocument();
