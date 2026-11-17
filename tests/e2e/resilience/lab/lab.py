@@ -439,7 +439,11 @@ class Lab:
             snapshot: dict[str, Any] = {"session_id": session_id, "read_status": "unavailable"}
             try:
                 if self.observer is not None:
-                    response = self.observer.get(f"/v1/sessions/{session_id}", timeout=remaining)
+                    response = self.observer.get(
+                        f"/v1/sessions/{session_id}",
+                        params={"include_items": "false"},
+                        timeout=remaining,
+                    )
                     response.raise_for_status()
                     data = response.json()
                     snapshot.update(

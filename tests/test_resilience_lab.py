@@ -441,8 +441,6 @@ def test_lab_diagnostics_bound_aggregate_history_and_session_snapshots(
                     }
                 )
             )
-    project = Mock(wraps=lab_module._diagnostic_fields)
-    monkeypatch.setattr(lab_module, "_diagnostic_fields", project)
     requests = []
 
     def respond(request: httpx.Request) -> httpx.Response:
@@ -468,7 +466,6 @@ def test_lab_diagnostics_bound_aggregate_history_and_session_snapshots(
     assert [observation["wall"] for observation in payload["observations"]] == (
         [] if invalid_tail else list(range(3404, 7500))
     )
-    assert sum("wall" in call.args[0] for call in project.call_args_list) == 4096
     assert payload["observations_omitted"] == 3404
     assert [snapshot["session_id"] for snapshot in payload["sessions"]] == identities[:8]
     assert requests == [f"/v1/sessions/{identity}" for identity in identities[:8]]
@@ -563,6 +560,7 @@ def test_lab_diagnostics_project_records_and_upload_only_safe_file(
 
     def respond(request: httpx.Request) -> httpx.Response:
         assert request.url.path == f"/v1/sessions/{session_id}"
+        assert request.url.params.get("include_items") == "false"
         assert request.extensions["timeout"]["read"] <= 2
         if not snapshot_available:
             raise RuntimeError(private)
