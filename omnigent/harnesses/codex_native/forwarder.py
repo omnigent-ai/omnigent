@@ -6909,7 +6909,6 @@ async def _post_missed_turn_start(
             or params.get("threadId") != state.thread_id
         ):
             return
-        forwarder_state.running_reported_turn_id = turn_id
         # A failure already posted for the turn, such as a stopped goal's, stays its status.
         if _turn_failure_already_posted(forwarder_state, turn_id):
             return
@@ -6918,6 +6917,7 @@ async def _post_missed_turn_start(
             session_id,
             _CodexTurnStatusEdge(status="running", turn_id=turn_id, source="item:recovered"),
         )
+        forwarder_state.running_reported_turn_id = turn_id
 
 
 def _turn_started_status_edge(

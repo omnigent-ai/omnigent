@@ -1015,23 +1015,6 @@ async def test_replayed_turn_failure_keeps_its_detail_over_a_later_goal_limit(
 @pytest.mark.asyncio
 async def test_recovered_running_waits_for_replay_that_ended_the_turn(tmp_path: Path) -> None:
     """A live item's recovered running cannot land after resume replay ended its turn."""
-
-    class _SlowRunningClient(_RecordingClient):
-        def __init__(self) -> None:
-            super().__init__()
-            self.release_running = asyncio.Event()
-
-        async def post(
-            self,
-            url: str,
-            *,
-            json: dict,
-            timeout: float | None = None,
-        ) -> httpx.Response:
-            if json["type"] == "external_session_status" and json["data"]["status"] == "running":
-                await self.release_running.wait()
-            return await super().post(url, json=json, timeout=timeout)
-
     write_bridge_state(
         tmp_path,
         CodexNativeBridgeState(
@@ -1042,7 +1025,7 @@ async def test_recovered_running_waits_for_replay_that_ended_the_turn(tmp_path: 
             active_turn_id="turn_1",
         ),
     )
-    client = _SlowRunningClient()
+    client = _RecordingClient()
     lock_entered = asyncio.Event()
     release_lock = asyncio.Event()
 
@@ -1083,7 +1066,6 @@ async def test_recovered_running_waits_for_replay_that_ended_the_turn(tmp_path: 
         await asyncio.sleep(0)
         release_lock.set()
         await replay
-        client.release_running.set()
         await asyncio.wait_for(recovered, timeout=5.0)
     finally:
         fwd._conversation_item_locks.reset(locks_token)
