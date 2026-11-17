@@ -27480,7 +27480,7 @@
     },
     "/v1/sessions/{session_id}/timers/{timer_id}": {
       "delete": {
-        "description": "Cancel one of the calling session's kept timers; only its own runner calls this.",
+        "description": "Cancel one of the calling session's kept timers; only its own runner calls this.\n\nAnswers `status` `\"cancelled\"` or `\"not_found\"` with a 200, so a 404 from\na gate in front of this route never reads as a timer that is gone.",
         "operationId": "cancel_session_timer_v1_sessions__session_id__timers__timer_id__delete",
         "parameters": [
           {

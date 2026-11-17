@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import dataclasses
 import json
 import logging
@@ -4995,17 +4996,25 @@ async def _execute_timer_cancel(
                 timeout=30.0,
             )
         except Exception as exc:  # noqa: BLE001
-            return json.dumps({"error": f"sys_timer_cancel failed: {exc}"})
-        # An older server, or one that doesn't keep timers, has no such route.
-        if resp.status_code not in (404, 405) and resp.status_code >= 300:
+            return json.dumps(
+                {"error": f"sys_timer_cancel failed, so the timer may still be set: {exc}"}
+            )
+        answer: _JsonObject = {}
+        if resp.status_code < 300:
+            with contextlib.suppress(ValueError):
+                answer = _string_object_dict(resp.json()) or {}
+        status = answer.get("status")
+        # Only the timer route says whether the server holds the timer; any other reply,
+        # such as a gate's 404 or an older server's, leaves it possibly still set.
+        if status not in ("cancelled", "not_found"):
             return json.dumps(
                 {
-                    "error": f"sys_timer_cancel: the server returned {resp.status_code}, "
-                    "so the timer may still be set",
+                    "error": f"sys_timer_cancel: the server returned {resp.status_code} "
+                    "without confirming, so the timer may still be set",
                     "details": resp.text[:1000],
                 }
             )
-        cancelled = resp.status_code < 300
+        return json.dumps({"timer_id": timer_id, "status": status})
     return json.dumps({"timer_id": timer_id, "status": "cancelled" if cancelled else "not_found"})
 
 

@@ -5593,8 +5593,14 @@ async def test_no_marker_for_a_session_its_automations_owner_does_not_own(
 _TIMER_TOKEN = "session-timer-token"
 
 
-def _timer_app(db_uri: str, tmp_path: Path, *, timers: bool = True) -> FastAPI:
-    app = _build_app(db_uri, tmp_path, persistent=True, timers=timers)
+def _timer_app(
+    db_uri: str,
+    tmp_path: Path,
+    *,
+    timers: bool = True,
+    automations: Callable[[], bool] | None = None,
+) -> FastAPI:
+    app = _build_app(db_uri, tmp_path, persistent=True, timers=timers, automations=automations)
     _make_user(db_uri)
     _register_host(app, _HOST_ID, "alice@example.com")
     return app
@@ -5673,7 +5679,8 @@ async def test_a_sessions_own_runner_keeps_and_cancels_its_timer(
         url = f"/v1/sessions/{session_id}/timers/{timer['timer_id']}"
         cancelled = await client.delete(url, headers=_runner_headers(session_id))
         assert cancelled.json() == {"timer_id": timer["timer_id"], "status": "cancelled"}
-        assert (await client.delete(url, headers=_runner_headers(session_id))).status_code == 404
+        again = await client.delete(url, headers=_runner_headers(session_id))
+        assert (again.status_code, again.json()["status"]) == (200, "not_found")
 
 
 async def test_a_one_shot_timer_fires_on_the_minute_after_its_delay(
@@ -5736,30 +5743,31 @@ async def test_only_a_sessions_own_runner_keeps_a_timer_the_server_can_keep(
 async def test_only_the_session_that_set_a_timer_cancels_it(
     runtime_init: None, db_uri: str, tmp_path: Path
 ) -> None:
-    app = _timer_app(db_uri, tmp_path)
+    gate = {"automations": True}
+    app = _timer_app(db_uri, tmp_path, automations=lambda: gate["automations"])
     session_id = _runner_session(db_uri)
     other = _runner_session(db_uri)
+    url = f"/v1/sessions/{session_id}/timers"
     async with _off_host_client(app) as client:
         created = await client.post(
-            f"/v1/sessions/{session_id}/timers",
-            json={"seconds": 600, "repeat": True},
-            headers=_runner_headers(session_id),
+            url, json={"seconds": 600, "repeat": True}, headers=_runner_headers(session_id)
         )
         assert created.status_code == 200, created.text
         timer_id = created.json()["timer_id"]
         # With no source session, from another session's runner, and under that session.
         refused = [
-            await client.delete(
-                f"/v1/sessions/{session_id}/timers/{timer_id}", headers=_headers()
-            ),
-            await client.delete(
-                f"/v1/sessions/{session_id}/timers/{timer_id}", headers=_runner_headers(other)
-            ),
+            await client.delete(f"{url}/{timer_id}", headers=_headers()),
+            await client.delete(f"{url}/{timer_id}", headers=_runner_headers(other)),
             await client.delete(
                 f"/v1/sessions/{other}/timers/{timer_id}", headers=_runner_headers(other)
             ),
         ]
-    assert [response.status_code for response in refused] == [403, 403, 404]
+        # Behind a closed automations gate, the route isn't reached at all.
+        gate["automations"] = False
+        gated = await client.delete(f"{url}/{timer_id}", headers=_runner_headers(session_id))
+    assert [response.status_code for response in refused] == [403, 403, 200]
+    assert refused[2].json()["status"] == "not_found"
+    assert gated.status_code == 404
     [timer] = SqlAlchemyScheduledTaskStore(db_uri).list()
     assert (timer.kind, timer.state) == ("timer", "active")
 
@@ -5771,34 +5779,32 @@ async def test_a_session_keeps_at_most_ten_timers(
     session_id = _runner_session(db_uri)
     url = f"/v1/sessions/{session_id}/timers"
     async with _off_host_client(app) as client:
-        # Sets racing for the last places can't each pass the cap.
-        results = await asyncio.gather(
-            *(
-                client.post(
-                    url, json={"seconds": 600, "repeat": True}, headers=_runner_headers(session_id)
-                )
-                for _ in range(12)
+        kept = [
+            await client.post(
+                url, json={"seconds": 600, "repeat": True}, headers=_runner_headers(session_id)
             )
+            for _ in range(10)
+        ]
+        assert all(result.status_code == 200 for result in kept), [r.text for r in kept]
+        refused = await client.post(
+            url, json={"seconds": 600, "repeat": True}, headers=_runner_headers(session_id)
         )
-        kept = [result for result in results if result.status_code == 200]
-        refused = [result for result in results if result.status_code != 200]
-        assert len(kept) == 10, [result.text for result in refused]
-        assert [result.status_code for result in refused] == [400, 400]
-        assert all("already keeps 10 timers" in r.json()["error"]["message"] for r in refused)
-        # Cancelling one makes room for another.
+        assert refused.status_code == 400
+        assert "already keeps 10 timers" in refused.json()["error"]["message"]
+        # Cancelling one makes room for another; the store test covers racing creates.
         cancelled = await client.delete(
             f"{url}/{kept[0].json()['timer_id']}", headers=_runner_headers(session_id)
         )
-        assert cancelled.status_code == 200, cancelled.text
+        assert cancelled.json()["status"] == "cancelled", cancelled.text
         again = await client.post(
             url, json={"seconds": 600, "repeat": True}, headers=_runner_headers(session_id)
         )
         assert again.status_code == 200, again.text
 
 
-@pytest.mark.parametrize(("delivered", "cancel_status"), [(False, 200), (True, 404)])
+@pytest.mark.parametrize(("delivered", "outcome"), [(False, "cancelled"), (True, "not_found")])
 async def test_cancelling_a_one_shot_timer_stops_a_firing_still_on_its_way(
-    runtime_init: None, db_uri: str, tmp_path: Path, delivered: bool, cancel_status: int
+    runtime_init: None, db_uri: str, tmp_path: Path, delivered: bool, outcome: str
 ) -> None:
     app = _timer_app(db_uri, tmp_path)
     session_id = _runner_session(db_uri)
@@ -5831,4 +5837,5 @@ async def test_cancelling_a_one_shot_timer_stops_a_firing_still_on_its_way(
             f"/v1/sessions/{session_id}/timers/{timer['timer_id']}",
             headers=_runner_headers(session_id),
         )
-    assert cancelled.status_code == cancel_status, cancelled.text
+    assert cancelled.status_code == 200, cancelled.text
+    assert cancelled.json()["status"] == outcome

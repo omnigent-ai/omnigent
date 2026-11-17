@@ -1890,7 +1890,11 @@ def create_scheduled_tasks_router(
     async def cancel_session_timer(
         request: Request, session_id: str, timer_id: str
     ) -> dict[str, Any]:
-        """Cancel one of the calling session's kept timers; only its own runner calls this."""
+        """Cancel one of the calling session's kept timers; only its own runner calls this.
+
+        Answers ``status`` ``"cancelled"`` or ``"not_found"`` with a 200, so a 404 from
+        a gate in front of this route never reads as a timer that is gone.
+        """
         owner = _owner(request)
         source_id = _own_runner_session(request, owner, session_id)
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
@@ -1905,7 +1909,7 @@ def create_scheduled_tasks_router(
             # A one-shot timer that fired has nothing left to cancel, as in memory.
             or (task.state == "completed" and not await _firing_in_flight(task.id))
         ):
-            raise OmnigentError("Timer not found", code=ErrorCode.NOT_FOUND)
+            return {"timer_id": timer_id, "status": "not_found"}
         await asyncio.to_thread(store.delete, task.id)
         return {"timer_id": timer_id, "status": "cancelled"}
 

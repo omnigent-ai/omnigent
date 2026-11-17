@@ -209,7 +209,7 @@ def _timer_server(
     *,
     keeps: bool,
     create: httpx.Response | httpx.HTTPError | None = None,
-    delete_status: int = 200,
+    delete: httpx.Response | None = None,
 ) -> tuple[Any, list[httpx.Request]]:
     """A server that may keep timers, recording each request it gets."""
     calls: list[httpx.Request] = []
@@ -220,7 +220,7 @@ def _timer_server(
             return httpx.Response(200, json={"scheduled_task_timers": keeps})
         if request.url.path.startswith(f"/v1/sessions/{_SESSION}/timers"):
             if request.method == "DELETE":
-                return httpx.Response(delete_status, json={"status": "cancelled"})
+                return delete or httpx.Response(200, json={"status": "cancelled"})
             if isinstance(create, httpx.HTTPError):
                 raise create
             return create or httpx.Response(200, json=_KEPT_TIMER)
@@ -377,15 +377,24 @@ async def test_a_timer_create_that_may_have_landed_is_not_doubled_in_the_runner(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("delete_status", "status"),
-    [(200, "cancelled"), (404, "not_found"), (405, "not_found"), (403, None), (503, None)],
+    ("reply", "status"),
+    [
+        (httpx.Response(200, json={"status": "cancelled"}), "cancelled"),
+        (httpx.Response(200, json={"status": "not_found"}), "not_found"),
+        # A gate in front of the route, or an older server without it, says nothing of the timer.
+        (httpx.Response(404, json={"detail": "not found"}), None),
+        (httpx.Response(405, text="method not allowed"), None),
+        (httpx.Response(403, json={"error": {"message": "forbidden"}}), None),
+        (httpx.Response(503, text="unavailable"), None),
+    ],
+    ids=["cancelled", "not-found", "gate-404", "older-server-405", "refused-403", "down-503"],
 )
 async def test_cancelling_a_kept_timer_goes_to_the_server(
-    delete_status: int, status: str | None
+    reply: httpx.Response, status: str | None
 ) -> None:
     from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 
-    handler, calls = _timer_server(keeps=True, delete_status=delete_status)
+    handler, calls = _timer_server(keeps=True, delete=reply)
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(handler), base_url="http://server"
     ) as server_client:
@@ -397,7 +406,7 @@ async def test_cancelling_a_kept_timer_goes_to_the_server(
         )
     result = json.loads(output)
     if status is None:
-        # Anything but a missing timer leaves it possibly still set, so it isn't "not found".
+        # Only the timer route's own answer says the timer is gone.
         assert "may still be set" in result["error"]
     else:
         assert result == {"timer_id": _KEPT_TIMER["timer_id"], "status": status}
