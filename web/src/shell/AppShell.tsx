@@ -135,7 +135,11 @@ import {
 import { useResizableInlinePanel } from "@/hooks/useResizableInlinePanel";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { ChatHeader } from "./ChatHeader";
-import { ProjectHomeTitle, ProjectNewSessionButton } from "@/projectHome/ProjectHomeHeader";
+import {
+  ProjectBoardSearch,
+  ProjectHomeTitle,
+  ProjectNewSessionButton,
+} from "@/projectHome/ProjectHomeHeader";
 import { projectNameFromHomePath } from "@/projectHome/projectHomeNavigation";
 import { MobileHeaderControlsProvider } from "./MobileHeaderControlsSlot";
 import { CREATED_BY_SESSION_LABEL_KEY } from "./CreatedBySession";
@@ -3183,7 +3187,10 @@ function AppShellImpl() {
                     }
                     pageActions={
                       projectHomeName !== null ? (
-                        <ProjectNewSessionButton projectName={projectHomeName} />
+                        <>
+                          <ProjectBoardSearch />
+                          <ProjectNewSessionButton projectName={projectHomeName} />
+                        </>
                       ) : undefined
                     }
                     boundAgent={boundAgent}

@@ -4,8 +4,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type * as ConversationsModule from "@/hooks/useConversations";
 import {
+  ProjectBoardSearch,
   ProjectHomeTitle,
   ProjectNewSessionButton,
+  useProjectBoardSearchStore,
   useProjectComposerStore,
 } from "./ProjectHomeHeader";
 
@@ -59,6 +61,7 @@ function renderButton() {
 beforeEach(() => {
   mocks.isMobile = false;
   useProjectComposerStore.setState({ open: false });
+  useProjectBoardSearchStore.setState({ query: "" });
   vi.clearAllMocks();
 });
 
@@ -107,6 +110,24 @@ describe("ProjectHomeTitle", () => {
 
     act(() => onDeleted());
     expect(screen.getByTestId("location")).toHaveTextContent(/^\/$/);
+  });
+});
+
+describe("ProjectBoardSearch", () => {
+  it("shares its text with the board, clears it, and is left off phones", () => {
+    const { unmount } = render(<ProjectBoardSearch />);
+    fireEvent.change(screen.getByRole("searchbox", { name: "Filter sessions" }), {
+      target: { value: "login" },
+    });
+    expect(useProjectBoardSearchStore.getState().query).toBe("login");
+    fireEvent.click(screen.getByRole("button", { name: "Clear filter" }));
+    expect(useProjectBoardSearchStore.getState().query).toBe("");
+    expect(screen.queryByRole("button", { name: "Clear filter" })).toBeNull();
+    unmount();
+
+    mocks.isMobile = true;
+    render(<ProjectBoardSearch />);
+    expect(screen.queryByRole("searchbox")).toBeNull();
   });
 });
 

@@ -1,6 +1,6 @@
 import type { Conversation } from "@/hooks/useConversations";
 import { sessionFamilyGroups } from "@/lib/sessionFamilies";
-import { STATUS_BUCKETS, type StatusBucket } from "@/shell/sidebarNav";
+import { filterConversations, STATUS_BUCKETS, type StatusBucket } from "@/shell/sidebarNav";
 
 export interface KanbanCard {
   /** The family's head row, or the lone session. */
@@ -39,6 +39,11 @@ export function kanbanColumns(
     columns.get(column)!.push({ conversation: members[0], members, column });
   }
   return columns;
+}
+
+/** Cards with any session matching the search, by the sidebar search's title-or-id rule. */
+export function filterKanbanCards(cards: readonly KanbanCard[], searchQuery: string): KanbanCard[] {
+  return cards.filter((card) => filterConversations(card.members, searchQuery).length > 0);
 }
 
 /** How recently a session must have been created to count as a new arrival. */

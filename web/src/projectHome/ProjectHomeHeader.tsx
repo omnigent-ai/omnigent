@@ -2,12 +2,16 @@ import {
   MessageCirclePlusIcon,
   MoreHorizontalIcon,
   PencilIcon,
+  SearchIcon,
   Settings2Icon,
   Trash2Icon,
+  XIcon,
 } from "lucide-react";
+import { useRef } from "react";
 import { create } from "zustand";
 import { ProjectLandingIcon } from "@/components/ProjectIconPicker";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -31,6 +35,17 @@ interface ProjectComposerState {
 export const useProjectComposerStore = create<ProjectComposerState>((set) => ({
   open: false,
   setOpen: (open) => set({ open }),
+}));
+
+interface ProjectBoardSearchState {
+  query: string;
+  setQuery: (query: string) => void;
+}
+
+/** The project home's card filter; the header's search box and the page share it. */
+export const useProjectBoardSearchStore = create<ProjectBoardSearchState>((set) => ({
+  query: "",
+  setQuery: (query) => set({ query }),
 }));
 
 /** The project home's header title: its editable icon tile and name. */
@@ -121,6 +136,48 @@ function ProjectHomeActions({
         </DropdownMenuContent>
       </DropdownMenu>
       {dialogs}
+    </div>
+  );
+}
+
+/** Filters the board to matching cards. Desktop only; the phone header has no room. */
+export function ProjectBoardSearch() {
+  const isMobile = useIsMobileViewport();
+  const query = useProjectBoardSearchStore((state) => state.query);
+  const setQuery = useProjectBoardSearchStore((state) => state.setQuery);
+  const inputRef = useRef<HTMLInputElement>(null);
+  if (isMobile) return null;
+  return (
+    <div className="relative w-56">
+      <SearchIcon
+        aria-hidden
+        className="pointer-events-none absolute top-1/2 left-2.5 size-3.5 -translate-y-1/2 text-muted-foreground"
+      />
+      <Input
+        ref={inputRef}
+        type="search"
+        value={query}
+        onChange={(event) => setQuery(event.target.value)}
+        placeholder="Filter sessions…"
+        aria-label="Filter sessions"
+        data-testid="project-board-search"
+        className="pr-8 pl-8 [&::-webkit-search-cancel-button]:appearance-none"
+      />
+      {query && (
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon-xs"
+          aria-label="Clear filter"
+          className="absolute top-1/2 right-1 -translate-y-1/2 text-muted-foreground"
+          onClick={() => {
+            setQuery("");
+            inputRef.current?.focus();
+          }}
+        >
+          <XIcon />
+        </Button>
+      )}
     </div>
   );
 }

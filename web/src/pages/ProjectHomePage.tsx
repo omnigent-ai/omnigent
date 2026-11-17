@@ -2,7 +2,10 @@ import { useEffect, type KeyboardEvent } from "react";
 import { PageScroll } from "@/components/PageScroll";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useParams } from "@/lib/routing";
-import { useProjectComposerStore } from "@/projectHome/ProjectHomeHeader";
+import {
+  useProjectBoardSearchStore,
+  useProjectComposerStore,
+} from "@/projectHome/ProjectHomeHeader";
 import { ProjectKanbanBoard } from "@/projectHome/ProjectKanbanBoard";
 import { NewChatLandingScreen } from "@/shell/NewChatDialog";
 
@@ -13,6 +16,10 @@ export function ProjectHomePage() {
   const composerOpen = useProjectComposerStore((state) => state.open) && !isMobile;
   const setComposerOpen = useProjectComposerStore((state) => state.setOpen);
   useEffect(() => () => setComposerOpen(false), [setComposerOpen]);
+  const searchQuery = useProjectBoardSearchStore((state) => state.query);
+  const setSearchQuery = useProjectBoardSearchStore((state) => state.setQuery);
+  // Each project starts unfiltered.
+  useEffect(() => () => setSearchQuery(""), [projectName, setSearchQuery]);
 
   function closeOnEscape(event: KeyboardEvent<HTMLDivElement>) {
     // Portaled menus bubble through React too; they handle their own Escape.
@@ -38,6 +45,7 @@ export function ProjectHomePage() {
       >
         <ProjectKanbanBoard
           projectName={projectName}
+          searchQuery={searchQuery}
           overlayClearance={composerOpen ? "10rem" : undefined}
         />
       </PageScroll>

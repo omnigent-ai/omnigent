@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { Conversation } from "@/hooks/useConversations";
 import type { StatusBucket } from "@/shell/sidebarNav";
-import { kanbanColumns, kanbanDropAction, takeArrivals } from "./projectKanban";
+import { filterKanbanCards, kanbanColumns, kanbanDropAction, takeArrivals } from "./projectKanban";
 
 const family = { id: "family", representative_id: "parent", pinned: false };
 const row = (id: string, created_at: number, inFamily = false) =>
@@ -42,6 +42,23 @@ describe("project kanban", () => {
     expect(kanbanDropAction(card("Unread"), "Working")).toBeNull();
     expect(kanbanDropAction(card("Done"), "Draft")).toBeNull();
     expect(kanbanDropAction(card("Needs attention"), "Done")).toBeNull();
+  });
+
+  it("keeps cards with any session matching the search, ignoring case and padding", () => {
+    const titled = (id: string, title: string) => ({ id, title }) as Conversation;
+    const card = (...members: Conversation[]) => ({
+      conversation: members[0],
+      members,
+      column: "Done" as const,
+    });
+    const lone = card(titled("a", "Fix login bug"));
+    const withNested = card(titled("b", "Refactor"), titled("c", "Add LOGIN test"));
+    const unrelated = card(titled("d", "Update docs"));
+    const cards = [lone, withNested, unrelated];
+
+    expect(filterKanbanCards(cards, "  login ")).toEqual([lone, withNested]);
+    expect(filterKanbanCards(cards, "missing")).toEqual([]);
+    expect(filterKanbanCards(cards, " ")).toEqual(cards);
   });
 
   it("reports only newly created rows as arrivals, once each", () => {

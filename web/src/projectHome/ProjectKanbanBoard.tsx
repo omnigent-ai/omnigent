@@ -62,6 +62,7 @@ import {
   useSessionBranch,
 } from "@/shell/sessionRowMeta";
 import {
+  filterKanbanCards,
   KANBAN_COLUMNS,
   kanbanColumns,
   kanbanDropAction,
@@ -125,9 +126,12 @@ function columnOf(row: Conversation): StatusBucket {
 
 export function ProjectKanbanBoard({
   projectName,
+  searchQuery = "",
   overlayClearance,
 }: {
   projectName: string;
+  /** Shows only cards with a session whose title or id contains it. */
+  searchQuery?: string;
   /** Room below each lane's last card, so it can scroll clear of an overlay such as the composer. */
   overlayClearance?: string;
 }) {
@@ -215,7 +219,8 @@ export function ProjectKanbanBoard({
                 <KanbanColumn
                   key={column}
                   column={column}
-                  cards={columns.get(column)!}
+                  cards={filterKanbanCards(columns.get(column)!, searchQuery)}
+                  emptyLabel={searchQuery.trim() ? "No matching sessions" : "No sessions"}
                   dropAllowed={dragged !== null && kanbanDropAction(dragged, column) !== null}
                   suppressClick={() => Date.now() - dragEndedAt.current < DRAG_CLICK_SUPPRESS_MS}
                   overlayClearance={overlayClearance}
@@ -247,12 +252,14 @@ export function ProjectKanbanBoard({
 function KanbanColumn({
   column,
   cards,
+  emptyLabel,
   dropAllowed,
   suppressClick,
   overlayClearance,
 }: {
   column: StatusBucket;
   cards: KanbanCard[];
+  emptyLabel: string;
   /** Whether the card being dragged can drop here. */
   dropAllowed: boolean;
   suppressClick: () => boolean;
@@ -265,9 +272,9 @@ function KanbanColumn({
       aria-label={column}
       data-testid={`kanban-column-${column}`}
       className={cn(
-        "flex max-w-[calc(440px+1rem)] min-w-52 flex-1 basis-0 flex-col rounded-xl bg-muted/50 px-2 pt-2 transition-colors",
-        dropAllowed && "outline-1 outline-muted-foreground/50 outline-dashed",
-        dropAllowed && isOver && "bg-primary/10 outline-primary",
+        "flex max-w-[calc(440px+1rem)] min-w-52 flex-1 basis-0 flex-col rounded-xl border border-transparent bg-muted/30 px-2 pt-2 transition-colors",
+        dropAllowed && "border-dashed border-muted-foreground/50",
+        dropAllowed && isOver && "border-primary bg-primary/10",
       )}
     >
       <h2 className="flex shrink-0 items-center justify-between px-1.5 pt-1.5 pb-3 text-sm font-medium text-muted-foreground">
@@ -285,7 +292,7 @@ function KanbanColumn({
           </li>
         ))}
         {cards.length === 0 && (
-          <li className="px-1.5 py-1 text-sm text-muted-foreground">No sessions</li>
+          <li className="px-1.5 py-1 text-sm text-muted-foreground">{emptyLabel}</li>
         )}
       </ul>
     </section>
@@ -315,7 +322,7 @@ function DraggableKanbanCard({
         if (suppressClick()) event.preventDefault();
       }}
       className={cn(
-        "block rounded-lg focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none",
+        "block rounded-xl focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none",
         isDragging && "opacity-40",
       )}
     >
@@ -372,7 +379,7 @@ function KanbanCardBody({ card, className }: { card: KanbanCard; className?: str
   return (
     <div
       className={cn(
-        "flex flex-col gap-1.5 rounded-lg border bg-card p-3 text-ui text-foreground shadow-sm transition-[color,background-color,border-color,box-shadow] duration-700",
+        "flex flex-col gap-1.5 rounded-xl border bg-card p-3 text-ui text-foreground shadow-sm transition-[color,background-color,border-color,box-shadow] duration-700",
         arrived && "border-primary/60 ring-2 ring-primary/20",
         className,
       )}
