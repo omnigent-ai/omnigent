@@ -1,5 +1,6 @@
 import type * as TerminalsModule from "@/hooks/useTerminals";
 import type * as SessionsApi from "@/lib/sessionsApi";
+import type { Session } from "@/lib/types";
 import type * as FilesPanelModule from "@/shell/FilesPanel";
 import type * as GridSessionsModule from "./GridSessionsContext";
 import {
@@ -171,7 +172,8 @@ vi.mock("@/components/chat/SideChatPane", () => ({
           aria-label="Message"
           disabled={fixture.composerDisabled}
           onKeyDown={(event) => {
-            if (event.key === "Tab" && event.shiftKey) gridComposer?.cyclePermissionMode?.();
+            if (event.key === "Tab" && event.shiftKey && gridComposer?.cyclePermissionMode?.())
+              event.preventDefault();
           }}
         />
         <button type="button" onClick={() => terminal?.setView("terminal")}>
@@ -432,7 +434,7 @@ function renderClaudeCells() {
   return render(twoCellGrid());
 }
 
-/** Shift+Tab in the named cell's composer. */
+/** Shift+Tab in the named cell's composer; false when the cell took the key. */
 function pressShiftTab(cellName: string) {
   return fireEvent.keyDown(
     within(screen.getByRole("region", { name: cellName })).getByLabelText("Message"),
@@ -440,26 +442,42 @@ function pressShiftTab(cellName: string) {
   );
 }
 
+/** Waits until the named cell's chip is enabled, so its switch has settled. */
+async function settled(cellName: string) {
+  await waitFor(() =>
+    expect(
+      within(screen.getByRole("region", { name: cellName })).getByRole("button", {
+        name: "Permission mode: Manual",
+      }),
+    ).toBeEnabled(),
+  );
+}
+
+/** A PATCH response in which the server confirms *mode* for a claude-native session. */
+const claudeSessionConfirming = (mode: string) =>
+  ({ labels: { "omnigent.claude_native.permission_mode": mode } }) as unknown as Session;
+
 it("steps only the Shift+Tab cell's session to its next mode, for its owner and while reachable", async () => {
   const view = renderClaudeCells();
-  pressShiftTab("second");
+  expect(pressShiftTab("second")).toBe(false);
   await waitFor(() =>
     expect(updateSession).toHaveBeenCalledWith("second", { claudePermissionMode: "auto" }),
   );
   expect(updateSession).toHaveBeenCalledTimes(1);
+  await settled("second");
 
   // The mocked PATCH cleared this cell's mode; restore it so only the gate can stop a press.
   // Only the owner can switch modes.
   conversationRegistry.acquire("second").setState({ claudePermissionMode: "default" });
   fixture.permissionLevel = 2;
   view.rerender(twoCellGrid());
-  pressShiftTab("second");
+  expect(pressShiftTab("second")).toBe(true);
   // Like the main composer, an unreachable session doesn't cycle.
   conversationRegistry.acquire("second").setState({ claudePermissionMode: "default" });
   fixture.permissionLevel = null;
   fixture.livenessKind = "host_offline";
   view.rerender(twoCellGrid());
-  pressShiftTab("second");
+  expect(pressShiftTab("second")).toBe(true);
   expect(updateSession).toHaveBeenCalledTimes(1);
   view.unmount();
 });
@@ -467,8 +485,8 @@ it("steps only the Shift+Tab cell's session to its next mode, for its owner and 
 it("holds a cell's Shift+Tab while its switch is in flight", () => {
   const view = renderClaudeCells();
   vi.mocked(updateSession).mockReturnValueOnce(new Promise<never>(() => {}));
-  pressShiftTab("second");
-  pressShiftTab("second");
+  expect(pressShiftTab("second")).toBe(false);
+  expect(pressShiftTab("second")).toBe(false);
   expect(updateSession).toHaveBeenCalledTimes(1);
   view.unmount();
 });
@@ -479,6 +497,36 @@ it("moves a cell past the mode its session refused on the next Shift+Tab", async
   vi.mocked(updateSession).mockRejectedValueOnce(new Error("Runner unavailable"));
   pressShiftTab("second");
   await waitFor(() => expect(toastError).toHaveBeenCalledWith("Runner unavailable"));
+  await settled("second");
+  pressShiftTab("second");
+  await waitFor(() =>
+    expect(updateSession).toHaveBeenLastCalledWith("second", {
+      claudePermissionMode: "acceptEdits",
+    }),
+  );
+  view.unmount();
+});
+
+it("steps a cell on from the mode its session confirmed", async () => {
+  const view = renderClaudeCells();
+  vi.mocked(updateSession).mockResolvedValueOnce(claudeSessionConfirming("auto"));
+  pressShiftTab("second");
+  await settled("second");
+  pressShiftTab("second");
+  await waitFor(() =>
+    expect(updateSession).toHaveBeenLastCalledWith("second", {
+      claudePermissionMode: "acceptEdits",
+    }),
+  );
+  view.unmount();
+});
+
+it("moves a cell past the mode its session confirmed as a different one", async () => {
+  const view = renderClaudeCells();
+  // The server kept the session in Manual rather than the requested Auto.
+  vi.mocked(updateSession).mockResolvedValueOnce(claudeSessionConfirming("default"));
+  pressShiftTab("second");
+  await settled("second");
   pressShiftTab("second");
   await waitFor(() =>
     expect(updateSession).toHaveBeenLastCalledWith("second", {
