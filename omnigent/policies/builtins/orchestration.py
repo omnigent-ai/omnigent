@@ -447,6 +447,9 @@ def spawn_bounds(
         attribute, returning a V0 decision dict.
     """
     counted = set(dispatch_tools)
+    if "sys_session_create" in counted:
+        # Starts a session through sys_session_create, so it spends the same budget.
+        counted.add("sys_automation_start_worker")
     state = {"count": 0}
 
     def _evaluate(event: _Json) -> _Json:

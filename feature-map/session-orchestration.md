@@ -97,6 +97,14 @@ MCP independent creation.
   nothing. Covered by
   `tests/server/integration/test_session_orchestration.py::test_launches_from_a_run_tree_are_shared_with_the_automation_grantees`
   and `tests/server/scheduled/test_run_sharing.py`.
+  `sys_automation_start_worker` starts those workers through the same create
+  path with only the item's details: the runner prepends the instructions after
+  `Instructions for each session:` in the run's prompt. It registers for `spawn`
+  agents with the automations tool group, works only in a session carrying the
+  server-set `omnigent.scheduled_task_origin` label (so never in a worker),
+  and counts as `sys_session_create` in `spawn_bounds`. The template falls back
+  to the full `sys_session_create` message when a runner doesn't offer it.
+  Covered by `tests/runner/test_automation_worker.py`.
 - `projects`: `sys_project_list` pages the owner's projects oldest first and
   their own sessions with each one's project, marking the calling session; a
   legacy label folder shows only as a session's project. It also forwards the

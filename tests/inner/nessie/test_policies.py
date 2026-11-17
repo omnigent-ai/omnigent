@@ -319,6 +319,25 @@ def test_spawn_bounds_only_counts_configured_dispatch_tools() -> None:
     assert _result(evaluate(_tool_call("sys_session_send", agent="claude_code"))) == "DENY"
 
 
+def test_spawn_bounds_counts_automation_worker_starts_with_session_creates() -> None:
+    """An automation worker start is a session create, so the two share one budget."""
+    evaluate = spawn_bounds(
+        max_dispatches_per_turn=2,
+        dispatch_tools=("sys_session_send", "sys_session_create"),
+    )
+    assert _result(evaluate(_tool_call("sys_session_create", agent_id="ag_1"))) == "ALLOW"
+    assert _result(evaluate(_tool_call("sys_automation_start_worker", agent_id="ag_1"))) == "ALLOW"
+    assert _result(evaluate(_tool_call("sys_automation_start_worker", agent_id="ag_1"))) == "DENY"
+
+    sends_only = spawn_bounds(max_dispatches_per_turn=1)
+    assert (
+        _result(sends_only(_tool_call("sys_automation_start_worker", agent_id="ag_1"))) == "ALLOW"
+    )
+    assert (
+        _result(sends_only(_tool_call("sys_automation_start_worker", agent_id="ag_1"))) == "ALLOW"
+    )
+
+
 @pytest.mark.parametrize(
     "child_args,expected",
     [

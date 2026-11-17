@@ -9,6 +9,7 @@ from typing import Any
 import httpx
 
 from omnigent.scheduled_context import AUTOMATION_CONTEXT_OPEN
+from omnigent.stores.conversation_store import SCHEDULED_TASK_ORIGIN_LABEL_KEY
 from omnigent.tools.builtins.session_message import SESSION_MESSAGE_MAX_CHARS
 
 _TOOL = "sys_automation_start_worker"
@@ -28,6 +29,9 @@ _PEER_MESSAGE_PREFIX = "[Message from session "
 _HISTORY_PAGE_LIMIT = 50
 _HISTORY_MAX_PAGES = 4
 _REQUEST_TIMEOUT_S = 30.0
+
+# The independent placements the template's workers use; a child would change their lifetime.
+_WORKER_PLACEMENTS = frozenset({"same_host", "managed"})
 
 # The sys_session_create arguments a worker start passes through unchanged.
 _FORWARDED_ARGS = (
@@ -102,6 +106,15 @@ def _message_text(item: dict[str, Any]) -> str:
     )
 
 
+async def _is_automation_session(client: httpx.AsyncClient, conversation_id: str) -> bool:
+    """Whether a fire started this session: the server sets the origin label, never a client."""
+    response = await client.get(f"/v1/sessions/{conversation_id}", timeout=_REQUEST_TIMEOUT_S)
+    if response.status_code != 200:
+        raise RuntimeError(f"reading this session returned {response.status_code}")
+    labels = response.json().get("labels")
+    return isinstance(labels, dict) and bool(labels.get(SCHEDULED_TASK_ORIGIN_LABEL_KEY))
+
+
 async def _latest_automation_prompt(client: httpx.AsyncClient, conversation_id: str) -> str | None:
     """The newest user message in the session that an automation sent, or ``None``."""
     cursor: str | None = None
@@ -127,6 +140,12 @@ async def _latest_automation_prompt(client: httpx.AsyncClient, conversation_id: 
     return None
 
 
+# The template tells the model to fall back to sys_session_create on this refusal.
+_NO_INSTRUCTIONS = (
+    "this session has no worker instructions; start the worker with sys_session_create instead"
+)
+
+
 def _error(message: str, **extra: Any) -> str:
     return json.dumps({"error": f"{_TOOL}: {message}", **extra})
 
@@ -149,6 +168,8 @@ async def execute_automation_start_worker(
     """
     if server_client is None or conversation_id is None:
         return _error("requires an authenticated runner session")
+    if args.get("placement") not in _WORKER_PLACEMENTS:
+        return _error("placement must be same_host or managed")
     details = args.get("details")
     if not isinstance(details, str) or not details.strip():
         return _error("details must be a nonempty string")
@@ -161,15 +182,16 @@ async def execute_automation_start_worker(
             return _error("message_max_chars must be a positive integer")
         max_chars = min(max_chars, requested_max)
     try:
+        # Only the automation's own session: its workers' first messages carry untrusted
+        # text, so a worker must not read its own message as instructions.
+        if not await _is_automation_session(server_client, conversation_id):
+            return _error(_NO_INSTRUCTIONS)
         prompt_text = await _latest_automation_prompt(server_client, conversation_id)
     except (httpx.HTTPError, RuntimeError, ValueError) as exc:
         return _error(f"couldn't read the automation prompt: {exc}")
     instructions = worker_instructions(prompt_text) if prompt_text is not None else None
     if instructions is None:
-        return _error(
-            "this session has no automation prompt with worker instructions; "
-            "start the worker with sys_session_create instead"
-        )
+        return _error(_NO_INSTRUCTIONS)
     try:
         message = build_worker_message(
             instructions,

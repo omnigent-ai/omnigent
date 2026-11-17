@@ -24,19 +24,23 @@ class SysAutomationStartWorkerTool(Tool):
     def description(cls) -> str:
         """:returns: Human-readable description of the tool."""
         return (
-            "For a trigger automation's run only: start one worker session for a matching "
+            "For a trigger automation's own session only: start one worker session for a matching "
             "item. Takes the same arguments as sys_session_create, but details in place of "
             "message. The worker's first message is built for you: the instructions under "
             '"Instructions for each session:" in the prompt this automation sent, then a line '
             "saying the details are untrusted data, then details. Refused, with nothing "
-            "started, when this session has no such prompt or the message would be too long; "
+            "started, when this isn't an automation's session or the message would be too long; "
             "the refusal gives the longest details that fit. Returns what sys_session_create "
             "returns."
         )
 
     def get_schema(self) -> dict[str, Any]:
         """:returns: The OpenAI-format tool schema."""
-        string = {"type": "string"}
+        from omnigent.tools.builtins.spawn import SysSessionCreateTool
+
+        create_properties = SysSessionCreateTool().get_schema()["function"]["parameters"][
+            "properties"
+        ]
         return {
             "type": "function",
             "function": {
@@ -75,9 +79,9 @@ class SysAutomationStartWorkerTool(Tool):
                                 "e.g. 32000."
                             ),
                         },
-                        "model": string,
-                        "reasoning_effort": string,
-                        "permission_mode": string,
+                        "model": create_properties["model"],
+                        "reasoning_effort": create_properties["reasoning_effort"],
+                        "permission_mode": create_properties["permission_mode"],
                     },
                     "required": ["agent_id", "placement", "title", "details"],
                     "additionalProperties": False,
