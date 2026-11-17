@@ -749,11 +749,16 @@ Cross-harness journeys:
   terminal causes a refusal and stays open with the applied model and saved
   default unchanged; dismiss it with Escape, then retry the model request.
   If cancellation leaves a model picker, status view or cache-cost decision
-  open, the next routed Chat prompt waits while the person dismisses that
-  control in Terminal. It then resumes once after a fresh model receipt;
-  cancellation sends no key to an unobserved control. Caller cancellation,
-  preservation during the hold, and human dismissal/resume are covered by
-  `tests/inner/test_claude_native_executor.py::test_cancelled_model_switch_cleans_only_observed_owned_controls`.
+  open, the next routed Chat prompt waits up to eight minutes for the person
+  to dismiss that control in Terminal. The cancelled request stays cancelled.
+  The subsequent prompt resumes once after the person returns to an empty
+  composer and a fresh model receipt is obtained. An unrelated draft is
+  preserved and causes a refusal. Cancellation sends no key to an unobserved
+  control. Caller cancellation and fresh-receipt resume are covered by
+  `tests/inner/test_claude_native_executor.py::test_cancelled_model_switch_cleans_only_observed_owned_controls`;
+  No-selected confirmation, changed picker/draft preservation, cancellation
+  and hold expiry are covered by
+  `tests/inner/test_claude_native_executor.py::test_model_control_hold_preserves_user_changes_until_dismissal`.
   A fresh terminal still starts on the saved default.
   Run `OMNIGENT_E2E_CLAUDE_NATIVE=1 uv run --no-sync pytest tests/e2e/test_claude_native_managed_model_switch.py --reruns 0`.
   Requires Claude Code 2.1.323 or newer and tmux; use a clean container if

@@ -1716,6 +1716,7 @@ async def test_cancelled_model_switch_cleans_only_observed_owned_controls(
             loop = asyncio.get_running_loop()
             preserved_pane = composer._capture_pane("", "")
             preserved_keys = list(composer.sends)
+            prior_status_queries = composer.status_queries
             messages: list[str] = []
             probe = claude_native_executor.claude_pane_ready
 
@@ -1728,7 +1729,8 @@ async def test_cancelled_model_switch_cleans_only_observed_owned_controls(
 
             def deliver(_bridge: Path, *, content: str, timeout_s: float = 30.0) -> None:
                 assert dismissed.is_set()
-                assert composer.overlay is None and composer.status_queries >= 1
+                assert composer.overlay is None
+                assert composer.status_queries > prior_status_queries
                 assert composer.model == "private-glm[1m]"
                 messages.append(content)
 
@@ -1768,6 +1770,113 @@ async def test_cancelled_model_switch_cleans_only_observed_owned_controls(
             task.cancel()
         with contextlib.suppress(asyncio.CancelledError, RuntimeError):
             await asyncio.wait_for(task, 2)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("finish", ["resume", "draft", "cancel", "expire"])
+async def test_model_control_hold_preserves_user_changes_until_dismissal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, finish: str
+) -> None:
+    monkeypatch.setattr(claude_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_bridge, "_BRIDGE_ROOT", tmp_path)
+    monkeypatch.delenv("IS_SANDBOX", raising=False)
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.delenv(claude_bridge.REQUEST_SESSION_ID_ENV_VAR, raising=False)
+    composer = _SessionModelComposer(cache_cost_label="Choice 1")
+    composer.overlay = "cache-cost"
+    bridge_dir = _session_model_bridge(tmp_path, composer)
+    composer.install(monkeypatch)
+    modal_seen, picker_seen = asyncio.Event(), asyncio.Event()
+    loop = asyncio.get_running_loop()
+    probe = claude_native_executor.claude_pane_ready
+    messages: list[str] = []
+    no_selected = True
+
+    def capture(socket_path: str, target: str) -> str:
+        pane = composer._capture_pane(socket_path, target)
+        if composer.overlay == "cache-cost" and no_selected:
+            pane = pane.replace("❯ 1.", "  1.").replace("     2.", "   ❯ 2.")
+        return pane
+
+    def ready(directory: Path) -> bool:
+        assert composer.sends == [] and messages == []
+        result = probe(directory)
+        if composer.overlay == "cache-cost":
+            assert "❯ 2. No, go back" in capture("", "")
+            loop.call_soon_threadsafe(modal_seen.set)
+        elif composer.overlay == "picker":
+            loop.call_soon_threadsafe(picker_seen.set)
+        return result
+
+    def deliver(_bridge: Path, *, content: str, timeout_s: float = 30.0) -> None:
+        assert composer.status_queries == 1 and composer.overlay is None
+        assert composer.model == "private-glm[1m]"
+        messages.append(content)
+
+    monkeypatch.setattr(claude_bridge, "_capture_pane", capture)
+    monkeypatch.setattr(claude_native_executor, "claude_pane_ready", ready)
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", deliver)
+    monkeypatch.setattr(claude_native_executor, "_MESSAGE_HOLD_POLL_S", 0.001)
+    if finish == "expire":
+        monkeypatch.setattr(claude_native_executor, "_MESSAGE_HOLD_S", 0.25)
+    killed = Mock(side_effect=AssertionError("a model-control hold reaped its pane"))
+    monkeypatch.setattr(claude_native_executor, "kill_session", killed)
+    executor = ClaudeNativeExecutor(bridge_dir)
+
+    async def follow_up() -> list[Any]:
+        return [
+            event
+            async for event in executor.run_turn(
+                messages=[{"role": "user", "content": "the next routed prompt"}],
+                tools=[],
+                system_prompt="",
+                config=ExecutorConfig(model="private-glm[1m]"),
+            )
+        ]
+
+    turn = asyncio.create_task(follow_up())
+    try:
+        await asyncio.wait_for(modal_seen.wait(), 2)
+        assert not turn.done() and composer.sends == [] and messages == []
+        composer.overlay = "picker"
+        composer.options[0] = "a-persons-replacement-model"
+        no_selected = False
+        changed_picker = capture("", "")
+        await asyncio.wait_for(picker_seen.wait(), 2)
+        assert capture("", "") == changed_picker
+        assert not turn.done() and composer.sends == [] and messages == []
+        if finish in {"resume", "draft"}:
+            composer.text = "a person's unrelated draft" if finish == "draft" else ""
+            composer.cursor = len(composer.text)
+            composer.overlay = None
+        if finish == "cancel":
+            turn.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(turn, 2)
+        else:
+            events = await asyncio.wait_for(turn, 2)
+            if finish == "resume":
+                assert events == [TurnComplete(response=None)]
+                assert messages == ["the next routed prompt"]
+            else:
+                assert len(events) == 1 and isinstance(events[0], ExecutorError)
+                assert events[0].undelivered is True
+                if finish == "draft":
+                    assert "unrelated draft" in events[0].message
+                    assert composer.text == "a person's unrelated draft"
+                else:
+                    assert "model-switch confirmation" in events[0].message
+        if finish != "resume":
+            assert composer.sends == [] and messages == []
+            assert composer.status_queries == 0 and composer.model == "claude-sonnet-5-5"
+        if finish in {"cancel", "expire"}:
+            assert capture("", "") == changed_picker
+        killed.assert_not_called()
+    finally:
+        if not turn.done():
+            turn.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await turn
 
 
 @pytest.mark.asyncio
