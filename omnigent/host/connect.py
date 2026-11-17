@@ -553,6 +553,9 @@ except ValueError:
 # full default timeout on each reconnect after an established tunnel drops.
 _INITIAL_CONNECT_OPEN_TIMEOUT_S = 10.0
 _RECONNECT_OPEN_TIMEOUT_S = 3.0
+# Each consecutive reconnect handshake timeout doubles the next one up to this
+# cap, so a replica that is slow to accept during a handoff is still reached.
+_RECONNECT_OPEN_TIMEOUT_CAP_S = 30.0
 # Consecutive handshake recycle failures before the prompt cadence gives way
 # to normal backoff. An ingress cycle is brief; sustained 502 responses are an
 # outage and shouldn't hammer the endpoint twice a second.
@@ -1409,6 +1412,8 @@ class HostProcess:
         # Past a bound the reconnect loop escalates instead of fast-recycling.
         self._recycle_streak = 0
         self._silent_connect_streak = 0
+        # Reset to the short default by an accepted upgrade.
+        self._reconnect_open_timeout_s = _RECONNECT_OPEN_TIMEOUT_S
         # Per-connection markers feeding the silent-connect streak.
         self._conn_upgrade_accepted = False
         self._conn_frame_received = False
@@ -5431,6 +5436,11 @@ class HostProcess:
         from omnigent.telemetry.request_headers import pop_client_user_agent
 
         user_agent = pop_client_user_agent(ws_headers)
+        open_timeout = (
+            self._reconnect_open_timeout_s
+            if self._ever_connected
+            else _INITIAL_CONNECT_OPEN_TIMEOUT_S
+        )
         try:
             ws_cm = websockets.asyncio.client.connect(
                 url,
@@ -5438,11 +5448,7 @@ class HostProcess:
                 user_agent_header=user_agent,
                 max_size=100 * 1024 * 1024,
                 ssl=ssl_ctx,
-                open_timeout=(
-                    _RECONNECT_OPEN_TIMEOUT_S
-                    if self._ever_connected
-                    else _INITIAL_CONNECT_OPEN_TIMEOUT_S
-                ),
+                open_timeout=open_timeout,
                 # Align the host->server tunnel's protocol keepalive to the same
                 # 90 s app-level budget as the runner tunnel (not the 20 s library
                 # default that drops a busy-but-healthy tunnel with 1011 — #1116).
@@ -5451,6 +5457,12 @@ class HostProcess:
                 ping_timeout=TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
             )
             ws = await ws_cm.__aenter__()
+        except TimeoutError:
+            if self._ever_connected:
+                self._reconnect_open_timeout_s = min(
+                    open_timeout * 2, _RECONNECT_OPEN_TIMEOUT_CAP_S
+                )
+            raise
         except (InvalidURI, InvalidStatus) as exc:
             if isinstance(exc, InvalidURI) or exc.response.status_code in (401, 403):
                 # Rediscover repaired credentials instead of reusing a rejected SDK cache.
@@ -5481,6 +5493,7 @@ class HostProcess:
         # A completed upgrade proves the endpoint healthy — the next drop's
         # prompt reconnect is wanted again.
         self._recycle_streak = 0
+        self._reconnect_open_timeout_s = _RECONNECT_OPEN_TIMEOUT_S
         record_websocket_connected("host", reconnect=reconnect)
         connection_id = uuid.uuid4().hex
         connected_at = time.monotonic()
