@@ -2245,44 +2245,6 @@ async def test_events_model_change_names_the_step_a_blocked_terminal_needs(
     assert response.json() == expected
 
 
-async def test_cancelled_model_control_drains_the_worker_without_late_keys(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import threading
-
-    started = threading.Event()
-    release = threading.Event()
-    finished = threading.Event()
-    keys: list[str] = []
-
-    def operation() -> None:
-        started.set()
-        try:
-            assert release.wait(2)
-            claude_native_bridge._check_injection_cancelled()
-            keys.append("late s")
-        finally:
-            finished.set()
-
-    deadline = native_controls._ClaudeControlDeadline()
-    task = asyncio.create_task(native_controls._drive_claude_pane(deadline, operation))
-    try:
-        assert await asyncio.to_thread(started.wait, 2)
-        task.cancel()
-        await asyncio.sleep(0)
-        assert not task.done()
-        release.set()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-        assert finished.is_set() and deadline.is_set()
-        assert keys == []
-    finally:
-        release.set()
-        if not task.done():
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-
-
 def _injection_deadline() -> float | None:
     """The instant the bridge call running now stops sending keys at, if bound."""
     flag = claude_native_bridge._INJECTION_CANCEL_EVENT.get()

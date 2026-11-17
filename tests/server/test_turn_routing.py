@@ -1370,9 +1370,13 @@ async def test_replay_hold_keeps_a_replacement_pending_prompt_untouched(
     assert pending is not None and pending.prompt == "replacement"
 
 
-@pytest.mark.parametrize("hold_s", [0, 30], ids=["zero-budget", "resumed-worker"])
+@pytest.mark.parametrize(
+    ("hold_s", "cancel"),
+    [(0, False), (30, False), (30, True)],
+    ids=["zero-budget", "resumed-worker", "task-cancellation"],
+)
 async def test_replay_hold_expires_without_sending_or_discarding_the_prompt(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, hold_s: int
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, hold_s: int, cancel: bool
 ) -> None:
     import threading
     from types import SimpleNamespace
@@ -1385,6 +1389,7 @@ async def test_replay_hold_expires_without_sending_or_discarding_the_prompt(
     )
     pending_before = read_pending_replay(tmp_path)
     assert pending_before is not None
+    pending_bytes = (tmp_path / turn_routing.PENDING_FILE).read_bytes()
     client = _FakeServerClient()
     loop = asyncio.get_running_loop()
     clock = SimpleNamespace(now=0.0)
@@ -1393,6 +1398,7 @@ async def test_replay_hold_expires_without_sending_or_discarding_the_prompt(
     expire = threading.Event()
     release = threading.Event()
     drained = threading.Event()
+    keys: list[str] = []
     attempts = 0
 
     def select(_bridge: Path, **kwargs: object) -> None:
@@ -1408,7 +1414,8 @@ async def test_replay_hold_expires_without_sending_or_discarding_the_prompt(
             loop.call_soon_threadsafe(resumed.set)
             assert expire.wait(timeout=2)
             bridge._check_injection_cancelled()
-            raise AssertionError("the resumed worker ignored its expired hold")
+            keys.append("late control")
+            raise AssertionError("the resumed worker ignored its expired or cancelled hold")
         finally:
             loop.call_soon_threadsafe(cleaning.set)
             assert release.wait(timeout=2)
@@ -1432,7 +1439,12 @@ async def test_replay_hold_expires_without_sending_or_discarding_the_prompt(
     try:
         if hold_s:
             await asyncio.wait_for(resumed.wait(), timeout=2)
-            clock.now += hold_s
+            if cancel:
+                replay.cancel()
+                await asyncio.sleep(0)
+                assert not replay.done(), "cancellation returned before its worker drained"
+            else:
+                clock.now += hold_s
             expire.set()
             await asyncio.wait_for(cleaning.wait(), timeout=2)
             await asyncio.sleep(0)
@@ -1440,8 +1452,13 @@ async def test_replay_hold_expires_without_sending_or_discarding_the_prompt(
             assert not drained.is_set()
             assert not client.posts
             assert read_pending_replay(tmp_path) == pending_before
+            assert (tmp_path / turn_routing.PENDING_FILE).read_bytes() == pending_bytes
             release.set()
-        await asyncio.wait_for(replay, timeout=2)
+        if cancel:
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(replay, timeout=2)
+        else:
+            await asyncio.wait_for(replay, timeout=2)
     finally:
         expire.set()
         release.set()
@@ -1450,7 +1467,9 @@ async def test_replay_hold_expires_without_sending_or_discarding_the_prompt(
     assert attempts == (2 if hold_s else 1)
     assert drained.is_set() is bool(hold_s)
     assert not client.messages
+    assert keys == []
     assert read_pending_replay(tmp_path) == pending_before
+    assert (tmp_path / turn_routing.PENDING_FILE).read_bytes() == pending_bytes
 
 
 async def test_replay_leaves_the_model_alone_for_codex(

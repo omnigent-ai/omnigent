@@ -768,12 +768,19 @@ class SessionOnlyModelSwitch:
         raw_model = raw.get("model")
         hint = raw_model.get("id") if isinstance(raw_model, dict) else raw_model
         hinted_current = isinstance(hint, str) and self.status_matches(hint, exact_context=True)
+        unsupported_version_message = (
+            "Automatic model changes require Claude Code 2.1.323 or newer. You can "
+            "continue using the current model in Terminal. Update Claude Code and "
+            "relaunch this terminal to enable automatic model changes."
+        )
         if self.choice.status_only and not hinted_current:
             raise self.refuse(
                 f"Claude's current model does not exactly match {self.model}, which has no "
                 "session-only picker choice. The dependent prompt was not sent.",
                 unsupported=True,
             )
+        if not can_change_model and not hinted_current:
+            raise self.refuse(unsupported_version_message, unsupported=True)
         pane = self.pane()
         draft = _draft(pane)
         if draft:
@@ -794,12 +801,7 @@ class SessionOnlyModelSwitch:
             )
 
         if not can_change_model:
-            raise self.refuse(
-                "Automatic model changes require Claude Code 2.1.323 or newer. You can "
-                "continue using the current model in Terminal. Update Claude Code and "
-                "relaunch this terminal to enable automatic model changes.",
-                unsupported=True,
-            )
+            raise self.refuse(unsupported_version_message, unsupported=True)
 
         self.phase = "picker"
         self.command("/model")

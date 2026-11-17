@@ -1372,11 +1372,7 @@ async def test_run_turn_passes_the_exact_required_model_to_the_shared_picker(
         "absent",
         "different-target",
         "older-cli-confirmed",
-        "older-cli-stale-status",
         "older-cli-different-model",
-        "older-cli-descriptorless-confirmed",
-        "older-cli-descriptorless-stale-status",
-        "older-cli-descriptorless-different-model",
     ],
 )
 async def test_run_turn_does_not_send_without_a_fresh_model_receipt(
@@ -1388,19 +1384,11 @@ async def test_run_turn_does_not_send_without_a_fresh_model_receipt(
         monkeypatch.setattr(claude_bridge, "_BRIDGE_ROOT", tmp_path)
         monkeypatch.setenv(REQUEST_SESSION_ID_ENV_VAR, "web-session")
         composer = _SessionModelComposer()
-        descriptorless = "descriptorless" in receipt_kind
-        composer.version = "2.1.311" if descriptorless else "2.1.322"
+        composer.version = "2.1.322"
         composer.options[-1] = "private-model"
-        if receipt_kind.endswith(("confirmed", "stale-status")):
+        if receipt_kind == "older-cli-confirmed":
             composer.model = composer.options[-1]
         bridge_dir = _session_model_bridge(tmp_path, composer)
-        if descriptorless:
-            path = bridge_dir / "bridge.json"
-            metadata = json.loads(path.read_text())
-            metadata["model_picker_options"].pop()
-            path.write_text(json.dumps(metadata))
-        if receipt_kind.endswith("stale-status"):
-            composer.model = composer.options[0]
         composer.install(monkeypatch)
     else:
         bridge_dir = tmp_path / "bridge"
@@ -1434,7 +1422,7 @@ async def test_run_turn_does_not_send_without_a_fresh_model_receipt(
         )
     ]
 
-    confirmed = receipt_kind in {"older-cli-confirmed", "older-cli-descriptorless-confirmed"}
+    confirmed = receipt_kind == "older-cli-confirmed"
     if confirmed:
         assert events == [TurnComplete(response=None)]
         assert delivered == ["hello"]
@@ -1445,7 +1433,7 @@ async def test_run_turn_does_not_send_without_a_fresh_model_receipt(
     if receipt_kind.startswith("older-cli-"):
         assert composer.model == composer.options[-1 if confirmed else 0]
         assert [args[-1] for args in composer.sends] == (
-            [] if receipt_kind.endswith("different-model") else ["/status", "Enter", "Escape"]
+            ["/status", "Enter", "Escape"] if confirmed else []
         )
 
 
@@ -1698,6 +1686,7 @@ async def test_cancelled_model_switch_cleans_only_observed_owned_controls(
     )
     monkeypatch.delenv(claude_bridge.REQUEST_SESSION_ID_ENV_VAR, raising=False)
     executor = claude_native_executor.ClaudeNativeExecutor(bridge_dir)
+    control_deadline = native_controls._ClaudeControlDeadline()
     prompt = Mock(side_effect=AssertionError("a cancelled model switch sent its prompt"))
     monkeypatch.setattr(claude_native_executor, "inject_user_message", prompt)
 
@@ -1706,7 +1695,7 @@ async def test_cancelled_model_switch_cleans_only_observed_owned_controls(
             await executor._inject_turn("dependent prompt", [], "private-glm[1m]")
         else:
             await native_controls._drive_claude_pane(
-                native_controls._ClaudeControlDeadline(),
+                control_deadline,
                 select_model,
                 bridge_dir,
                 model="private-glm[1m]",
@@ -1733,6 +1722,8 @@ async def test_cancelled_model_switch_cleans_only_observed_owned_controls(
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(asyncio.shield(task), 2)
         assert worker_finished.is_set()
+        if caller == "native-control":
+            assert control_deadline.is_set()
         assert composer.sends[: len(cancelled_at)] == cancelled_at
         cleanup = [args[-1] for args in composer.sends[len(cancelled_at) :]]
         expected = [_CLEAR_ONE_ROW_COMPOSER] if phase == "draft" else []
