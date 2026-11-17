@@ -210,28 +210,48 @@ async def test_lazy_metadata_policy_failure_is_structured_and_recovers(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("stream", "pause_snapshot"),
-    [(False, False), (True, False), (True, True)],
-    ids=["session-init", "direct-stream", "direct-stream-snapshot"],
+    ("setup_path", "pause_at"),
+    [
+        ("session-init", "resolver"),
+        ("direct-stream", "resolver"),
+        ("direct-stream", "snapshot"),
+        ("background", "gate"),
+    ],
+    ids=["session-init", "direct-stream", "direct-stream-snapshot", "background-gate"],
 )
 async def test_session_init_does_not_reinstate_spec_superseded_by_reset(
-    stream: bool, pause_snapshot: bool
+    setup_path: str, pause_at: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A reset during init or direct-stream setup wins over its cache write.
+    """A reset during session or turn setup wins over its cache write.
 
-    Pause the resolver or the earlier snapshot lookup, reset, then release the
-    old request. The next skills read must resolve v2. Both versions declare the
-    same harness so provenance checks cannot hide a stale cache write.
+    Pause resolution, snapshot lookup, or background gating, reset, then release
+    setup. Both versions declare the same harness so provenance checks cannot
+    hide a stale cache write.
     """
+    from omnigent.runner import app as runner_app
+
     lookup_entered = asyncio.Event()
     release_lookup = asyncio.Event()
     resolver_calls = 0
+    background_task: asyncio.Task[Any] | None = None
+    original_gate = runner_app._apply_agent_start_gate
+
+    async def gate(spec: AgentSpec, harness: str) -> AgentSpec:
+        nonlocal background_task
+        gated_spec = await original_gate(spec, harness)
+        if pause_at == "gate" and not lookup_entered.is_set():
+            background_task = asyncio.current_task()
+            lookup_entered.set()
+            await release_lookup.wait()
+        return gated_spec
+
+    monkeypatch.setattr(runner_app, "_apply_agent_start_gate", gate)
 
     async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
         nonlocal resolver_calls
         del agent_id, session_id
         resolver_calls += 1
-        if resolver_calls == 1 and not pause_snapshot:
+        if resolver_calls == 1 and pause_at == "resolver":
             lookup_entered.set()
             await release_lookup.wait()
         spec = _spec("v1" if resolver_calls == 1 else "v2")
@@ -240,7 +260,7 @@ async def test_session_init_does_not_reinstate_spec_superseded_by_reset(
 
     class SnapshotClient(_SessionSnapshotServerClient):
         async def get(self, url: str, **kwargs: Any) -> NullServerClient._Response:
-            if pause_snapshot and url == f"/v1/sessions/{_SESSION_ID}":
+            if pause_at == "snapshot" and url == f"/v1/sessions/{_SESSION_ID}":
                 lookup_entered.set()
                 await release_lookup.wait()
             return await super().get(url, **kwargs)
@@ -253,10 +273,16 @@ async def test_session_init_does_not_reinstate_spec_superseded_by_reset(
         resource_registry=SessionResourceRegistry(terminal_registry=None),
     )
 
+    is_turn = setup_path != "session-init"
+    stream = setup_path == "direct-stream"
     async with _runner_client(app) as client:
         setup_task = asyncio.create_task(
             client.post(
-                f"/v1/sessions/{_SESSION_ID}/events?stream=true" if stream else "/v1/sessions",
+                (
+                    f"/v1/sessions/{_SESSION_ID}/events" + ("?stream=true" if stream else "")
+                    if is_turn
+                    else "/v1/sessions"
+                ),
                 json=(
                     {
                         "type": "message",
@@ -264,7 +290,7 @@ async def test_session_init_does_not_reinstate_spec_superseded_by_reset(
                         "agent_id": _AGENT_ID,
                         "harness_override": "claude-sdk",
                     }
-                    if stream
+                    if is_turn
                     else {"session_id": _SESSION_ID, "agent_id": _AGENT_ID}
                 ),
             )
@@ -280,9 +306,15 @@ async def test_session_init_does_not_reinstate_spec_superseded_by_reset(
 
         release_lookup.set()
         setup_resp = await asyncio.wait_for(setup_task, timeout=30)
-        assert setup_resp.status_code == (200 if stream else 201), setup_resp.text
+        assert setup_resp.status_code == (
+            202 if setup_path == "background" else 200 if stream else 201
+        ), setup_resp.text
+        if setup_path == "background":
+            assert background_task is not None
+            await asyncio.wait_for(background_task, timeout=10)
         if stream:
             assert "response.failed" not in setup_resp.text, setup_resp.text
+        if is_turn:
             assert manager.get_client_calls
 
         skills_resp = await client.post(

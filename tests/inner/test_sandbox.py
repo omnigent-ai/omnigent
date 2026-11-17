@@ -97,19 +97,34 @@ def test_exec_launcher_rejects_writable_launcher_directory(
 def test_exec_launcher_accepts_dedicated_scratch_directory(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    from omnigent.inner import sandbox
+
     launcher_dir = tmp_path / "launchers"
     launcher_dir.mkdir()
     scratch = launcher_dir / "scratch"
     scratch.mkdir()
     monkeypatch.setattr("omnigent.inner.sandbox.tempfile.tempdir", str(launcher_dir))
     policy = dataclasses.replace(
-        _noop_policy(), active=True, backend_type="linux_bwrap", write_roots=[scratch]
+        _noop_policy(),
+        active=True,
+        backend_type="linux_bwrap",
+        read_roots=[scratch],
+        write_roots=[scratch],
     )
+    encode = mock.Mock(wraps=sandbox._encode_json_arg)
+    monkeypatch.setattr(sandbox, "_encode_json_arg", encode)
 
     path = pathlib.Path(create_exec_launcher(sys.executable, policy, cwd=str(scratch)))
     try:
         assert path.parent == launcher_dir
         assert path.stat().st_mode & 0o777 == 0o700
+        # Launcher imports need the package, not the rest of the checkout.
+        encode.assert_called_once()
+        assert set(encode.call_args.args[0]["read_roots"]) == {
+            str(scratch.resolve()),
+            str((sandbox._project_root() / "omnigent").resolve()),
+        }
+        assert policy.read_roots == [scratch]
     finally:
         path.unlink()
 

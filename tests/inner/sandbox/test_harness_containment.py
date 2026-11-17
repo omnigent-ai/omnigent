@@ -97,6 +97,8 @@ def _prepared_launch(
         if fault != "backend" or harness in ("claude-sdk", "codex")
         # Codex resolution rollback has a dedicated worker-preflight scenario.
         if (harness, fault) != ("codex", "resolve")
+        # Per-adapter OSError cases cover wiring; one unsupported resolver suffices.
+        if fault != "unsupported" or harness == "codex"
     ]
     + [pytest.param("codex", "backend-oserror", id="backend-oserror-codex")],
 )
