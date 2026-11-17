@@ -50,6 +50,7 @@ import {
   harnessFixMode,
   harnessStatus,
   type HarnessFixMode,
+  type HarnessFixResult,
 } from "@/lib/harnessFix";
 import { useSettingsRoute } from "../../shell/settingsNav";
 import {
@@ -63,7 +64,6 @@ import {
   HARNESSES_GRID_ENTRY,
   type NativeHarnessId,
   type FixOpener,
-  harnessFixOwner,
 } from "./search/catalog/harnesses";
 import { SettingsItem } from "./search/SettingsItem";
 import {
@@ -171,6 +171,34 @@ export const SettingsHarnessesSection = () => {
     mode: HarnessFixMode;
     opener: FixOpener;
   } | null>(null);
+  // The fix dialog's result: record the host's new state and the notice it leaves behind.
+  const handleFixed = ({
+    configuredHarnesses,
+    credentialKind,
+    version,
+    gatewayInference,
+    harnessAccounts,
+  }: HarnessFixResult) => {
+    if (!fixTarget) return;
+    const { host: fixedHost, entry } = fixTarget;
+    applyHarnessFixResult(queryClient, fixedHost.host_id, {
+      configuredHarnesses,
+      harnessAccounts,
+      gatewayInference,
+    });
+    if (credentialKind) {
+      setCredentialKinds((current) => ({
+        ...current,
+        [hostHarnessKey(fixedHost.host_id, entry.harness)]: credentialKind,
+      }));
+    }
+    setReadyNotice({
+      harness: entry.harness,
+      hostId: fixedHost.host_id,
+      version,
+      account: harnessAccounts?.[harnessAccountKey(entry.harness)],
+    });
+  };
   const openFix = (
     entry: HarnessEntry,
     targetHost: Host,
@@ -284,10 +312,10 @@ export const SettingsHarnessesSection = () => {
           </div>
         </>
       )}
-      {fixTarget && (
+      {fixTarget?.opener === "setUp" && (
         <SettingsOverlayOwner
-          entry={harnessFixOwner(fixTarget.entry.harness, fixTarget.opener)}
-          opener={fixTarget.opener}
+          entry={HARNESS_CARD_ENTRIES.entry(fixTarget.entry.harness)}
+          opener="setUp"
         >
           <HarnessFixDialog
             open
@@ -296,32 +324,39 @@ export const SettingsHarnessesSection = () => {
             host={fixTarget.host}
             harness={fixTarget.entry.harness}
             harnessLabel={fixTarget.entry.name}
-            onFixed={({
-              configuredHarnesses,
-              credentialKind,
-              version,
-              gatewayInference,
-              harnessAccounts,
-            }) => {
-              const { host: fixedHost, entry } = fixTarget;
-              applyHarnessFixResult(queryClient, fixedHost.host_id, {
-                configuredHarnesses,
-                harnessAccounts,
-                gatewayInference,
-              });
-              if (credentialKind) {
-                setCredentialKinds((current) => ({
-                  ...current,
-                  [hostHarnessKey(fixedHost.host_id, entry.harness)]: credentialKind,
-                }));
-              }
-              setReadyNotice({
-                harness: entry.harness,
-                hostId: fixedHost.host_id,
-                version,
-                account: harnessAccounts?.[harnessAccountKey(entry.harness)],
-              });
-            }}
+            onFixed={handleFixed}
+          />
+        </SettingsOverlayOwner>
+      )}
+      {fixTarget?.opener === "fixAction" && (
+        <SettingsOverlayOwner
+          entry={HARNESS_DETAIL_ENTRIES.entry(fixTarget.entry.harness)}
+          opener="fixAction"
+        >
+          <HarnessFixDialog
+            open
+            onOpenChange={(open) => !open && setFixTarget(null)}
+            mode={fixTarget.mode}
+            host={fixTarget.host}
+            harness={fixTarget.entry.harness}
+            harnessLabel={fixTarget.entry.name}
+            onFixed={handleFixed}
+          />
+        </SettingsOverlayOwner>
+      )}
+      {fixTarget?.opener === "credentialAction" && (
+        <SettingsOverlayOwner
+          entry={HARNESS_CREDENTIAL_ENTRIES.entry(fixTarget.entry.harness)}
+          opener="credentialAction"
+        >
+          <HarnessFixDialog
+            open
+            onOpenChange={(open) => !open && setFixTarget(null)}
+            mode={fixTarget.mode}
+            host={fixTarget.host}
+            harness={fixTarget.entry.harness}
+            harnessLabel={fixTarget.entry.name}
+            onFixed={handleFixed}
           />
         </SettingsOverlayOwner>
       )}

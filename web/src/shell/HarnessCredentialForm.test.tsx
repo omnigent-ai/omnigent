@@ -9,7 +9,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { Host } from "@/hooks/useHosts";
-import { harnessFixOwner } from "@/pages/settings/search/catalog/harnesses";
+import { HARNESS_DETAIL_ENTRIES } from "@/pages/settings/search/catalog/harnesses";
 import { SettingsOverlayOwner } from "@/pages/settings/search/settingsOwnership";
 import { HarnessCredentialForm } from "./HarnessCredentialForm";
 
@@ -364,7 +364,7 @@ function countOrDividers(container: HTMLElement): number {
 describe("HarnessCredentialForm as a Settings overlay", () => {
   it("names its controls as parts of the fix dialog's opener, and keeps its names elsewhere", () => {
     const { unmount } = render(
-      <SettingsOverlayOwner entry={harnessFixOwner("codex-native", "fixAction")} opener="fixAction">
+      <SettingsOverlayOwner entry={HARNESS_DETAIL_ENTRIES.entry("codex-native")} opener="fixAction">
         <HarnessCredentialForm harness="codex" host={HOST} command={null} onDone={vi.fn()} />
       </SettingsOverlayOwner>,
     );

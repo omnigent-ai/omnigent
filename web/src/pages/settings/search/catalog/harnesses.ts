@@ -85,6 +85,8 @@ export const FIX_DIALOG_PARTS = {
   copyLoginCommand: "Copy login command",
   copyOmniSetup: "Copy omni setup",
   copyTmuxInstall: "Copy brew install tmux",
+  switchConfirm: "Sign out and switch",
+  accountHint: "Account to sign in with",
 } as const;
 
 /** The credential choice's two cards, named by their labels. */
@@ -190,7 +192,6 @@ export type HarnessSkillEntry = SettingsEntry;
 export interface InventoryPageEntries {
   readonly family: InventoryHarness;
   readonly harness: InventoryPageHarnessId;
-  readonly detail: InventoryHarnessDetailEntry;
   readonly plugin: HarnessPluginEntry;
   readonly skill?: HarnessSkillEntry;
   readonly mcp: SettingsEntry;
@@ -206,8 +207,6 @@ export function harnessInventoryPage(harness: NativeHarnessId): InventoryPageEnt
   return {
     family,
     harness,
-    // Only the inventory pages' builds add the tab list, so this is the one place that names it.
-    detail: HARNESS_DETAIL_ENTRIES.entry(harness) as InventoryHarnessDetailEntry,
     plugin: HARNESS_PLUGIN_ENTRIES.entry(harness),
     skill: hasSkillPage(family) ? HARNESS_SKILL_ENTRIES.entry(harness) : undefined,
     mcp: MCP_SERVER_LIST_ENTRIES.entry(harness),
@@ -285,8 +284,6 @@ export const HARNESS_CREDENTIAL_ENTRIES = settingsEntryFamily({
       parts: {
         credentialAction: "Reconfigure",
         ...FIX_DIALOG_PARTS,
-        switchConfirm: "Sign out and switch",
-        accountHint: "Account to sign in with",
       },
       partChoices: FIX_DIALOG_PART_CHOICES,
       nameAlternatives: {
@@ -296,9 +293,6 @@ export const HARNESS_CREDENTIAL_ENTRIES = settingsEntryFamily({
       presence: {
         credentialAction: { states: ["has a credential action"] },
         ...fixDialogPresence("credentialAction"),
-        // Only switching an account confirms it, and only a credential action switches.
-        switchConfirm: { overlay: "credentialAction" },
-        accountHint: { overlay: "credentialAction" },
       },
       overlays: { credentialAction: FIX_DIALOG_OVERLAY },
     }),
@@ -444,13 +438,6 @@ export const MCP_SERVER_LIST_ENTRIES = settingsEntryFamily({
     };
   },
 });
-
-/** The entry whose overlay is the fix dialog a harness opens from `opener`. */
-export function harnessFixOwner(harness: NativeHarnessId, opener: FixOpener): SettingsEntry {
-  if (opener === "setUp") return HARNESS_CARD_ENTRIES.entry(harness);
-  if (opener === "credentialAction") return HARNESS_CREDENTIAL_ENTRIES.entry(harness);
-  return HARNESS_DETAIL_ENTRIES.entry(harness);
-}
 
 export const HARNESS_SETTINGS: readonly SettingsEntry[] = [
   HARNESSES_GRID_ENTRY,

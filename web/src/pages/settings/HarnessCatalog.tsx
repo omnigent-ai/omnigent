@@ -273,7 +273,10 @@ export function HarnessCatalog({
           {ownList(
             "skills",
             own.skills.length,
-            <SettingsDataRegion entry={entries.detail} region="skills">
+            <SettingsDataRegion
+              entry={HARNESS_DETAIL_ENTRIES.entry(entries.harness)}
+              region="skills"
+            >
               <ul className="flex flex-col gap-2">
                 {own.skills.map((skill) => (
                   <CatalogRow
@@ -294,7 +297,10 @@ export function HarnessCatalog({
           {ownList(
             "plugins",
             own.plugins.length,
-            <SettingsDataRegion entry={entries.detail} region="plugins">
+            <SettingsDataRegion
+              entry={HARNESS_DETAIL_ENTRIES.entry(entries.harness)}
+              region="plugins"
+            >
               <ul className="flex flex-col gap-2">
                 {own.plugins.map((plugin) => {
                   const mcps = pluginMcps(plugin);

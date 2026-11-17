@@ -8,7 +8,7 @@ import { copyText } from "@/lib/clipboard";
 import { HARNESS_CREDENTIAL_COPY } from "@/lib/harnessSetup";
 import { authenticatedFetch } from "@/lib/identity";
 import { HarnessFixDialog, type HarnessFixDialogProps } from "./HarnessFixDialog";
-import { harnessFixOwner } from "./search/catalog/harnesses";
+import { HARNESS_DETAIL_ENTRIES } from "./search/catalog/harnesses";
 import { SettingsOverlayOwner } from "./search/settingsOwnership";
 
 vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
@@ -1717,7 +1717,7 @@ describe("HarnessFixDialog as a Settings overlay", () => {
     render(
       <QueryClientProvider client={client}>
         <SettingsOverlayOwner
-          entry={harnessFixOwner("cursor-native", "fixAction")}
+          entry={HARNESS_DETAIL_ENTRIES.entry("cursor-native")}
           opener="fixAction"
         >
           <HarnessFixDialog
@@ -1759,7 +1759,7 @@ describe("HarnessFixDialog's credential step as a Settings overlay", () => {
     render(
       <QueryClientProvider client={client}>
         <SettingsOverlayOwner
-          entry={harnessFixOwner("codex-native", "fixAction")}
+          entry={HARNESS_DETAIL_ENTRIES.entry("codex-native")}
           opener="fixAction"
         >
           <HarnessFixDialog {...baseProps} mode="reconfigure" />
