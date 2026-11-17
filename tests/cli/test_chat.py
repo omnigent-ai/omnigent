@@ -4882,6 +4882,7 @@ def _fake_sessions_chat_cls(
     *,
     extra_turns: list[str] | None = None,
     pending_status: str = "running",
+    turn_gate: asyncio.Event | None = None,
 ) -> type:
     """
     Build a ``SessionsChat`` replacement whose ``query`` is ``query_impl``.
@@ -4900,6 +4901,7 @@ def _fake_sessions_chat_cls(
         ``last_turn_saw_waiting`` returns ``False``.
     :param pending_status: Snapshot status while extra turns remain, e.g.
         ``"waiting"`` for a claude-native turn whose background agent runs.
+    :param turn_gate: Optional caller-controlled gate before an extra turn completes.
     :returns: A class usable as a drop-in for ``SessionsChat``.
     """
     _extra = list(extra_turns or [])
@@ -4922,6 +4924,8 @@ def _fake_sessions_chat_cls(
             return await query_impl(prompt)  # type: ignore[return-value]
 
         async def await_turn(self, *, timeout: float | None = None) -> QueryResult:
+            if turn_gate is not None:
+                await turn_gate.wait()
             if self._pending:
                 text = self._pending.pop(0)
                 return QueryResult(text=text, files=[])
@@ -5067,8 +5071,10 @@ async def test_query_sessions_once_returns_text_without_reconcile_on_success(
     assert client.sessions.list_items_calls == 0  # no reconcile on success
 
 
+@pytest.mark.parametrize("timeout_override", [None, "3300"], ids=["default", "extended"])
 async def test_query_sessions_once_multi_turn_async_orchestrator(
     monkeypatch: pytest.MonkeyPatch,
+    timeout_override: str | None,
 ) -> None:
     """Extra auto-woken turns are collected and joined with the first turn's text.
 
@@ -5080,23 +5086,33 @@ async def test_query_sessions_once_multi_turn_async_orchestrator(
     If this fails, multi-turn orchestrators like polly will always produce
     partial output (only turn 1's narration, never the final synthesis).
     """
+    monkeypatch.delenv("OMNIGENT_HEADLESS_TIMEOUT_S", raising=False)
+    if timeout_override is not None:
+        monkeypatch.setenv("OMNIGENT_HEADLESS_TIMEOUT_S", timeout_override)
+        monkeypatch.setattr(chat_module, "_LOOP_TIMEOUT_S", 0.001)
+    turn_gate = asyncio.Event()
+    release = asyncio.get_running_loop().call_later(0.02, turn_gate.set)
     monkeypatch.setattr(
         "omnigent_client.SessionsChat",
         _fake_sessions_chat_cls(
             _return_text,
             extra_turns=["<!-- POLLY_REVIEW_START -->\n## Summary\nLooks good."],
+            turn_gate=turn_gate,
         ),
     )
     client = _FakeAPClient([], list_items_must_not_be_called=True)
-    result = await _query_sessions_once(
-        client=client,
-        agent_name="polly",
-        tool_handler=None,
-        prompt="review this PR",
-        session_bundle=b"bundle-bytes",
-        session_bundle_filename="agent.tar.gz",
-        runner_id="runner_test",
-    )
+    try:
+        result = await _query_sessions_once(
+            client=client,
+            agent_name="polly",
+            tool_handler=None,
+            prompt="review this PR",
+            session_bundle=b"bundle-bytes",
+            session_bundle_filename="agent.tar.gz",
+            runner_id="runner_test",
+        )
+    finally:
+        release.cancel()
     assert result is not None
     assert "direct answer" in result
     assert "<!-- POLLY_REVIEW_START -->" in result
@@ -5170,8 +5186,10 @@ async def test_query_sessions_once_raises_on_lost_terminal_event_without_text(
         await asyncio.wait_for(_run_one_shot(client, _never_return, monkeypatch), timeout=10)
 
 
+@pytest.mark.parametrize("timeout_override", [None, "3300"], ids=["default", "extended"])
 async def test_query_sessions_once_slow_first_turn_not_truncated(
     monkeypatch: pytest.MonkeyPatch,
+    timeout_override: str | None,
 ) -> None:
     """A healthy first turn that outlasts the guard is not cut short.
 
@@ -5185,6 +5203,10 @@ async def test_query_sessions_once_slow_first_turn_not_truncated(
     longer than the guard window (exit 0, partial answer).
     """
     monkeypatch.setattr(chat_module, "_PER_TURN_TIMEOUT_S", 0.05)
+    monkeypatch.delenv("OMNIGENT_HEADLESS_TIMEOUT_S", raising=False)
+    if timeout_override is not None:
+        monkeypatch.setenv("OMNIGENT_HEADLESS_TIMEOUT_S", timeout_override)
+        monkeypatch.setattr(chat_module, "_LOOP_TIMEOUT_S", 0.001)
     client = _FakeAPClient(
         [_item_user("do the big refactor"), _item_assistant("intermediate note")]
     )
@@ -5209,6 +5231,12 @@ async def test_query_sessions_once_slow_first_turn_not_truncated(
             return await _never_return(prompt)
 
         async def await_turn(self, *, timeout: float | None = None) -> QueryResult:
+            turn_gate = asyncio.Event()
+            release = asyncio.get_running_loop().call_later(0.02, turn_gate.set)
+            try:
+                await turn_gate.wait()
+            finally:
+                release.cancel()
             self._polls_left -= 1
             if self._polls_left <= 0:
                 client.sessions._items.append(_item_assistant("FULL final answer"))
@@ -5230,6 +5258,59 @@ async def test_query_sessions_once_slow_first_turn_not_truncated(
     )
     assert result is not None
     assert "FULL final answer" in result
+
+
+@pytest.mark.parametrize("timeout", ["", "0", "-1", "nan", "inf", "-inf", "1e309", "invalid"])
+async def test_query_sessions_once_rejects_invalid_headless_timeout(
+    monkeypatch: pytest.MonkeyPatch, timeout: str
+) -> None:
+    monkeypatch.setenv("OMNIGENT_HEADLESS_TIMEOUT_S", timeout)
+
+    async def must_not_query(_prompt: str) -> QueryResult:
+        raise AssertionError("Invalid timeout must be rejected before sending the prompt")
+
+    with pytest.raises(click.ClickException, match="must be a positive finite number of seconds"):
+        await _run_one_shot(_FakeAPClient([]), must_not_query, monkeypatch)
+
+
+@pytest.mark.parametrize("phase", ["recovery", "drain"])
+async def test_query_sessions_once_headless_timeout_cancels_pending_wait(
+    monkeypatch: pytest.MonkeyPatch, phase: str
+) -> None:
+    monkeypatch.setenv("OMNIGENT_HEADLESS_TIMEOUT_S", "0.02")
+    monkeypatch.setattr(chat_module, "_PER_TURN_TIMEOUT_S", 0.01)
+    cancelled = asyncio.Event()
+
+    class PendingChat(
+        _fake_sessions_chat_cls(_never_return if phase == "recovery" else _return_text)
+    ):
+        @property
+        def status(self) -> str:
+            return "running"
+
+        async def await_turn(self, *, timeout: float | None = None) -> QueryResult:
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+            raise AssertionError("unreachable")
+
+    monkeypatch.setattr("omnigent_client.SessionsChat", PendingChat)
+    pending = _query_sessions_once(
+        client=_FakeAPClient([_item_user("say hi")]),
+        agent_name="hello_world",
+        tool_handler=None,
+        prompt="say hi",
+        session_bundle=b"bundle-bytes",
+        session_bundle_filename="agent.tar.gz",
+        runner_id="runner_test",
+    )
+    if phase == "recovery":
+        with pytest.raises(RuntimeError, match=r"no\s+persisted assistant text"):
+            await asyncio.wait_for(pending, timeout=1)
+    else:
+        assert await asyncio.wait_for(pending, timeout=1) == "direct answer"
+    assert cancelled.is_set()
 
 
 async def test_persisted_turn_text_anchors_on_last_user_message() -> None:

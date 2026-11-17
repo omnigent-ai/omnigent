@@ -408,6 +408,12 @@ omnigent run examples/polly/ --harness <harness>
 omnigent run examples/debby/ --harness <harness>
 ```
 
+Add `-p "your prompt"` to run headlessly. The CLI waits up to 30 minutes for
+first-turn recovery or additional asynchronous turns. Set
+`OMNIGENT_HEADLESS_TIMEOUT_S` to a positive finite number of seconds for that
+invocation to change this wait budget; separate process or job deadlines still
+apply.
+
 **🐙 Polly** is a multi-agent coding orchestrator who writes no code herself.
 She's the tech lead: she plans, delegates the work to coding sub-agents
 (Claude Code, Codex, or Pi) in parallel git worktrees, then routes each diff
