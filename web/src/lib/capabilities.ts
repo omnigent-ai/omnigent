@@ -277,6 +277,12 @@ export interface ServerInfo {
    */
   session_create_permission_modes?: boolean;
   /**
+   * True when a session create (and so ``sys_session_create``) accepts
+   * ``workflow_id``. Runners refuse the field on older servers, so trigger
+   * templates start workers as workflow runs only here. Fails to ``false``.
+   */
+  session_create_workflow_id?: boolean;
+  /**
    * True when a scheduled task can start every run from a copy of an existing
    * session (``source_session_id``). Gates the session menu's "Create
    * automation…" item. Fails to ``false``.
@@ -522,6 +528,7 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   session_search_scope: false,
   scheduled_task_session_modes: false,
   session_create_permission_modes: false,
+  session_create_workflow_id: false,
   scheduled_task_mcp_services: false,
   scheduled_task_source_sessions: false,
   scheduled_task_subhour: false,
@@ -711,6 +718,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           session_search_scope: data.session_search_scope === true,
           scheduled_task_session_modes: data.scheduled_task_session_modes === true,
           session_create_permission_modes: data.session_create_permission_modes === true,
+          session_create_workflow_id: data.session_create_workflow_id === true,
           scheduled_task_mcp_services: data.scheduled_task_mcp_services === true,
           scheduled_task_source_sessions: data.scheduled_task_source_sessions === true,
           scheduled_task_subhour: data.scheduled_task_subhour === true,

@@ -6,6 +6,7 @@ import {
   splitTriggerPrompt,
   stripTriggerHeader,
 } from "@/components/scheduled/triggerTemplates";
+import { parseSavedWorkflowRun } from "@/lib/savedWorkflowRun";
 import type { WorkflowStep } from "@/lib/workflowGraphLayout";
 
 /** The framework skill that plans and runs a workflow (`/workflow <description>`). */
@@ -186,12 +187,10 @@ export function runSavedWorkflowPrompt(
   return details.trim() ? `${request}\n\n${details.trim()}` : request;
 }
 
-// A savedWorkflowMessage without the plan review, as New automation stores it.
-const SAVED_WORKFLOW_RUN =
-  /^[/$]workflow Run the saved workflow "(.+)" \(ID ([0-9a-f]{32})\)\.(?:\n\n([\s\S]*))?$/;
-
 /**
  * Read back a {@link savedWorkflowMessage}, directly or inside a trigger prompt.
+ * Keep in sync with omnigent/server/scheduled/workflow_automations.py, which reads
+ * prompts the same way to keep these automations off a reused session.
  *
  * @returns The workflow's ID and name and the run's details, or `null` for any other text.
  */
@@ -201,9 +200,7 @@ export function parseSavedWorkflowMessage(
   const instructions =
     decodeTriggerPrompt(text)?.instructions ??
     splitTriggerPrompt(stripTriggerHeader(text)).userPrompt;
-  const match = SAVED_WORKFLOW_RUN.exec(instructions.trim());
-  if (!match) return null;
-  return { id: match[2], name: match[1], details: (match[3] ?? "").trim() };
+  return parseSavedWorkflowRun(instructions);
 }
 
 /** The automations whose prompt runs the saved workflow *workflowId*, in list order. */

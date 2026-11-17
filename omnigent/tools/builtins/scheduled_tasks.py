@@ -158,7 +158,9 @@ class SysScheduledTaskCreateTool(Tool):
                                 "Optional. 'new' (default) starts a new session for every "
                                 "run. 'continue' sends every run's prompt into one session, "
                                 "keeping its context: session_id when given, otherwise the "
-                                "session the first run creates."
+                                "session the first run creates. A prompt that runs a saved "
+                                "workflow ('/workflow Run the saved workflow ...') needs "
+                                "'new': every workflow run gets its own session."
                             ),
                         },
                         "session_id": {
@@ -345,7 +347,8 @@ class SysScheduledTaskUpdateTool(Tool):
                             "enum": ["new", "continue"],
                             "description": (
                                 "'new' starts a new session for every run; 'continue' sends "
-                                "every run's prompt into one session."
+                                "every run's prompt into one session. A prompt that runs a "
+                                "saved workflow needs 'new'."
                             ),
                         },
                         "session_id": {

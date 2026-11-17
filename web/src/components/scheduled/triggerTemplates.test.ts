@@ -16,6 +16,7 @@ import {
   isTriggerPrompt,
   triggerPromptSource,
   readTriggerMessageMaxChars,
+  readTriggerWorkerPlacement,
   readTriggerWorkerSettings,
   LEGACY_MAX_INSTRUCTIONS_CHARS,
   MAX_INSTRUCTIONS_CHARS,
@@ -83,6 +84,43 @@ describe("saved trigger prompts", () => {
     );
     expect(readTriggerWorkerSettings(prompt)?.permissionMode).toBe("approve-for-me");
     expect(renderTriggerPrompt("jira", fields(), CTX)).not.toContain("permission_mode");
+  });
+
+  const WORKFLOW_ID = "0123456789abcdef0123456789abcdef";
+  const WORKFLOW_RUN = `/workflow Run the saved workflow "Triage" (ID ${WORKFLOW_ID}).\n\nOnly bugs`;
+
+  it.each(TRIGGER_SOURCES)(
+    "starts each %s match's session as a run of the saved workflow its instructions run",
+    (source) => {
+      const prompt = renderTriggerPrompt(source, fields({ instructions: WORKFLOW_RUN }), {
+        ...CTX,
+        model: "old",
+        workflowIdSupported: true,
+      });
+      expect(prompt).toContain(
+        `, workflow_id "${WORKFLOW_ID}", model "old", and a message under 32000 characters.`,
+      );
+      // The session's first message still opens with the instructions, which run the workflow skill.
+      expect(prompt).toContain("The message starts with the instructions below");
+      expect(splitTriggerPrompt(prompt).userPrompt).toBe(WORKFLOW_RUN);
+      expect(readTriggerWorkerSettings(prompt)).toEqual({ ...AGENT_DEFAULT_WORKERS, model: "old" });
+      expect(readTriggerWorkerPlacement(prompt)).toBe("same_host");
+      expect(readTriggerMessageMaxChars(prompt)).toBe(32000);
+      // Changing the worker settings keeps the workflow.
+      expect(updateTriggerWorkerSettings(prompt, { ...AGENT_DEFAULT_WORKERS, model: "new" })).toBe(
+        prompt.replace('model "old"', 'model "new"'),
+      );
+    },
+  );
+
+  it("starts workers as workflow runs only for their own sessions, on a server that can", () => {
+    const runsWorkflow = fields({ instructions: WORKFLOW_RUN });
+    const supported = { ...CTX, workflowIdSupported: true };
+    expect(renderTriggerPrompt("jira", runsWorkflow, CTX)).not.toContain("workflow_id");
+    expect(renderTriggerPrompt("jira", fields(), supported)).not.toContain("workflow_id");
+    expect(
+      renderTriggerPrompt("jira", runsWorkflow, { ...supported, taskSessionMode: "continue" }),
+    ).not.toContain("workflow_id");
   });
 
   it.each(SOURCE_MODES)(
@@ -1144,6 +1182,19 @@ describe("trigger header", () => {
     expect(isTaskSessionTriggerPrompt(prompt)).toBe(true);
     expect(prompt).toContain('permission_mode "acceptEdits"');
     expect(prompt).toContain('"Team" = "Backend"');
+  });
+
+  it("round-trips a workflow trigger, and one saved before its workers started as runs", () => {
+    const workflowId = "a".repeat(32);
+    const saved = config("jira", {
+      instructions: `/workflow Run the saved workflow "Triage" (ID ${workflowId}).`,
+    });
+    const prompt = encodeTriggerPrompt(saved, { ...CTX, workflowIdSupported: true });
+    expect(prompt).toContain(`workflow_id "${workflowId}"`);
+    expect(decodeTriggerPrompt(prompt)).toEqual(saved);
+    const older = encodeTriggerPrompt(saved, CTX);
+    expect(older).not.toContain("workflow_id");
+    expect(decodeTriggerPrompt(older)).toEqual(saved);
   });
 
   it("reads a header saved without the newer optional settings", () => {

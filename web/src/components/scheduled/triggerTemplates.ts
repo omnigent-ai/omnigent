@@ -8,6 +8,7 @@ import {
   PagerDutyIcon,
   SlackIcon,
 } from "@/components/icons/IntegrationIcons";
+import { parseSavedWorkflowRun } from "@/lib/savedWorkflowRun";
 
 export type TriggerSource = "jira" | "slack" | "github" | "linear" | "pagerduty";
 
@@ -104,6 +105,11 @@ export interface TriggerPromptContext {
   taskSessionTitle?: string;
   /** The longest message to send, from {@link triggerMessageBudget}; 32,000 when omitted. */
   messageMaxChars?: number;
+  /**
+   * Whether `sys_session_create` accepts `workflow_id` here. When it does, each match's
+   * session for instructions that run a saved workflow starts as a run of that workflow.
+   */
+  workflowIdSupported?: boolean;
 }
 
 export interface TriggerConditionField {
@@ -637,7 +643,11 @@ const TASK_SESSION_TITLE_MAX_CHARS = 200;
 /** Ends whatever the manager and its workers post, since they post with the owner's account. */
 export const OMNIGENT_ATTRIBUTION = "Sent with Omnigent";
 
-/** The headings that separate a template's manager text from the owner's instructions. */
+/**
+ * The headings that separate a template's manager text from the owner's instructions.
+ * The server splits prompts on them too: keep them, POSTING_INSTRUCTIONS and
+ * splitTriggerPrompt in sync with omnigent/server/scheduled/workflow_automations.py.
+ */
 interface TriggerPromptHeadings {
   instructions: string;
   posting: string;
@@ -736,7 +746,8 @@ export interface TriggerWorkerSettings {
 const QUOTED_WORKER_VALUE = String.raw`"(?:[^"\\]|\\.)*"`;
 const WORKER_SETTINGS_PATTERN = new RegExp(
   `call sys_session_create with agent_id (set to your agent ID|${QUOTED_WORKER_VALUE}), ` +
-    `(placement "(?:same_host|managed)", title ${QUOTED_WORKER_VALUE})` +
+    // The saved workflow follows the instructions, so worker settings edits keep it.
+    `(placement "(?:same_host|managed)", title ${QUOTED_WORKER_VALUE}(?:, workflow_id "[0-9a-f]{32}")?)` +
     `(?:, model (${QUOTED_WORKER_VALUE}))?` +
     `(?:, reasoning_effort (${QUOTED_WORKER_VALUE}))?` +
     `(?:, permission_mode (${QUOTED_WORKER_VALUE}))?` +
@@ -853,7 +864,8 @@ function triggerPromptOpening(source: TriggerSource): string {
 
 /**
  * How a continue-mode prompt begins. It extends the shared opening, which the
- * server also matches to recognize a trigger automation.
+ * server also matches to recognize a trigger automation; the server matches this
+ * one to recognize a task session (omnigent/server/scheduled/workflow_automations.py).
  */
 function taskSessionPromptOpening(source: TriggerSource): string {
   return `${triggerPromptOpening(source)}, its task session,`;
@@ -944,7 +956,9 @@ function canonicalConfig(config: TriggerConfig): SavedTriggerConfig {
 
 /**
  * Detects edits made outside the form: a hash of the config and the body it
- * rendered. Change detection only (cyrb53), not a security boundary.
+ * rendered. Change detection only (cyrb53), not a security boundary. The server
+ * checks it the same way; keep this and canonicalConfig in sync with
+ * omnigent/server/scheduled/workflow_automations.py.
  */
 function triggerFingerprint(config: TriggerConfig, body: string): string {
   const text = `${JSON.stringify(canonicalConfig(config))}\n${body}`;
@@ -960,10 +974,17 @@ function triggerFingerprint(config: TriggerConfig, body: string): string {
   return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(16).padStart(14, "0");
 }
 
-/** What a saved config doesn't hold: the link, polling interval and task-session title. */
+/**
+ * What a saved config doesn't hold: the link, polling interval, task-session title,
+ * message budget and whether workers can start as workflow runs.
+ */
 export type TriggerConfigContext = Pick<
   TriggerPromptContext,
-  "sessionLink" | "pollingIntervalMinutes" | "taskSessionTitle" | "messageMaxChars"
+  | "sessionLink"
+  | "pollingIntervalMinutes"
+  | "taskSessionTitle"
+  | "messageMaxChars"
+  | "workflowIdSupported"
 >;
 
 /** The prompt the model receives for `config`, without the header line. */
@@ -1775,10 +1796,14 @@ export function renderTriggerPrompt(
       .join("")
       .trimEnd(),
   );
+  // Each match's session starts as a run of the workflow, so the workflow's page lists it.
+  const workflowRun =
+    !shared && ctx.workflowIdSupported ? parseSavedWorkflowRun(fields.instructions) : null;
   const createArgs = [
     `agent_id ${ctx.agentId ? JSON.stringify(ctx.agentId) : "set to your agent ID"}`,
     `placement "${ctx.placement}"`,
     `title ${shared ? taskSessionTitle : text.title}`,
+    ...(workflowRun ? [`workflow_id ${JSON.stringify(workflowRun.id)}`] : []),
     ...(ctx.model ? [`model ${JSON.stringify(ctx.model)}`] : []),
     ...(ctx.effort ? [`reasoning_effort ${JSON.stringify(ctx.effort)}`] : []),
     ...(ctx.permissionMode ? [`permission_mode ${JSON.stringify(ctx.permissionMode)}`] : []),

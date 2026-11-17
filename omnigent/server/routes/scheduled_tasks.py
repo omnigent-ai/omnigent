@@ -83,6 +83,7 @@ from omnigent.server.scheduled.rrule import (
 from omnigent.server.scheduled.run_reconciler import force_fail_stale_runs
 from omnigent.server.scheduled.run_sharing import delete_task_grants
 from omnigent.server.scheduled.telemetry import log_task_created
+from omnigent.server.scheduled.workflow_automations import workflow_session_reuse_error
 from omnigent.server.session_mcp_selection import MAX_SESSION_MCP_SERVICES, session_mcp_selection
 from omnigent.server.workflows import require_workflows
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
@@ -152,7 +153,8 @@ class CreateScheduledTaskRequest(BaseModel):
     mcp_services: list[str] = Field(default_factory=list, max_length=MAX_SESSION_MCP_SERVICES)
     max_cost_usd: float | None = Field(default=None, gt=0)
     # "continue" sends every run's prompt into one session: ``session_id`` when
-    # given, else the session the first run creates.
+    # given, else the session the first run creates. A prompt that runs a saved
+    # workflow needs "new" (see ``workflow_session_reuse_error``).
     session_mode: Literal["new", "continue"] = "new"
     session_id: str | None = Field(default=None, min_length=1)
     # Unpinned connected-host tasks resolve an online host and its home at fire time.
@@ -421,6 +423,16 @@ def _validate_timezone_or_400(timezone: str) -> None:
             f"invalid timezone {timezone!r}: must be a valid IANA timezone name",
             code=ErrorCode.INVALID_INPUT,
         ) from exc
+
+
+async def _require_new_workflow_sessions(prompt: str, session_mode: str) -> None:
+    """Raise a 400 if an automation that runs a saved workflow would reuse a session.
+
+    Runs in a thread: reading a prompt edited outside the form can take a pass over all of it.
+    """
+    problem = await asyncio.to_thread(workflow_session_reuse_error, prompt, session_mode)
+    if problem is not None:
+        raise OmnigentError(problem, code=ErrorCode.INVALID_INPUT)
 
 
 _AGENT_AUTOMATION_ACTION = "Agent automation changes"
@@ -1005,6 +1017,7 @@ def create_scheduled_tasks_router(
             permission_store=permission_store,
         )
         _reject_proactive_agent(body.agent_id)
+        await _require_new_workflow_sessions(body.prompt, body.session_mode)
         await _validate_rrule_or_400(
             body.rrule,
             body.session_mode,
@@ -1605,6 +1618,16 @@ def create_scheduled_tasks_router(
         if fields.get("mcp_services") is None:
             fields.pop("mcp_services", None)
         target_session_mode = fields.get("session_mode", existing.session_mode)
+        # A null prompt keeps the saved one.
+        target_prompt = existing.prompt if fields.get("prompt") is None else fields["prompt"]
+        # An automation saved before workflows needed new sessions keeps running until an
+        # update changes what it runs or the session it uses.
+        if (
+            target_prompt != existing.prompt
+            or target_session_mode != existing.session_mode
+            or fields.get("session_id", existing.session_id) != existing.session_id
+        ):
+            await _require_new_workflow_sessions(target_prompt, target_session_mode)
         target_execution = fields.get("execution_target") or existing.execution_target
         if body.rrule is not None or {"session_mode", "execution_target"}.intersection(fields):
             await _validate_rrule_or_400(
