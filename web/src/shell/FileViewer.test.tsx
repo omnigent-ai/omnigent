@@ -21,6 +21,8 @@ import { MemoryRouter, useSearchParams } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { toast } from "sonner";
 import { copyText } from "@/lib/clipboard";
+import { DEFAULT_DATA_CONTROLS, FALLBACK_SERVER_INFO } from "@/lib/capabilities";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import type { Comment } from "@/hooks/useComments";
 import { isFilePositionPending } from "./filePositionState";
 
@@ -2112,6 +2114,22 @@ describe("FileViewer view-settings menu", () => {
     expect(screen.getByRole("menuitem", { name: "Wrap lines" })).toBeInTheDocument();
     // Hiding whitespace changes only means something in the diff view.
     expect(screen.queryByRole("menuitem", { name: "Hide whitespace changes" })).toBeNull();
+  });
+
+  it("leaves Download out when the server turns downloads off", () => {
+    render(
+      <CapabilitiesProvider
+        info={{
+          ...FALLBACK_SERVER_INFO,
+          data_controls: { ...DEFAULT_DATA_CONTROLS, allowDownloads: false },
+        }}
+      >
+        {viewerTree({ open: true })}
+      </CapabilitiesProvider>,
+    );
+    openSettingsMenu();
+    expect(screen.getByRole("menuitem", { name: "Find in file" })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "Download file" })).toBeNull();
   });
 
   it("toggling Wrap lines in a code file flips the code viewer's wrapLines prop", () => {

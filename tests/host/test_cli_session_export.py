@@ -55,6 +55,13 @@ _ITEMS_PAGE = {
 }
 
 
+def _mock_older_server() -> None:
+    """Answer the export route with 404, as a server that predates it does."""
+    respx.get(url__regex=r"/v1/sessions/[^/]+/export").mock(
+        return_value=httpx.Response(404, json={"error": {"message": "Not found"}})
+    )
+
+
 def _patch_server(base_url: str = _BASE) -> Any:
     """Patch the CLI so it uses *base_url* without spawning a real server."""
     return patch(
@@ -66,6 +73,7 @@ def _patch_server(base_url: str = _BASE) -> Any:
 @respx.mock
 def test_session_export_writes_jsonl(tmp_path: Path) -> None:
     """Export writes one session_meta line then one item line per item."""
+    _mock_older_server()
     respx.get(f"{_BASE}/v1/sessions/conv_abc123").mock(
         return_value=httpx.Response(200, json=_SESSION_META)
     )
@@ -103,6 +111,7 @@ def test_session_export_spog_url_sends_workspace_selector(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
     """A pasted SPOG URL keeps its ``?o=`` selector in request headers."""
+    _mock_older_server()
     monkeypatch.setattr(
         "omnigent.cli._workspace_api_server_url",
         lambda _server: _SPOG_API,
@@ -135,6 +144,7 @@ def test_session_export_spog_url_sends_workspace_selector(
 @respx.mock
 def test_session_export_default_filename(tmp_path: Path) -> None:
     """Without --output, the file is named <session_id>.jsonl in cwd."""
+    _mock_older_server()
     respx.get(f"{_BASE}/v1/sessions/conv_abc123").mock(
         return_value=httpx.Response(200, json=_SESSION_META)
     )
@@ -158,6 +168,7 @@ def test_session_export_default_filename(tmp_path: Path) -> None:
 @respx.mock
 def test_session_export_missing_session_errors(tmp_path: Path) -> None:
     """Export of an unknown session id exits non-zero with a clear message."""
+    _mock_older_server()
     respx.get(f"{_BASE}/v1/sessions/conv_doesnotexist").mock(
         return_value=httpx.Response(404, json={"error": "not found"})
     )
@@ -183,6 +194,7 @@ def test_session_export_missing_session_errors(tmp_path: Path) -> None:
 @respx.mock
 def test_session_export_items_ordered_ascending(tmp_path: Path) -> None:
     """Items in the JSONL appear in ascending position order (user then assistant)."""
+    _mock_older_server()
     respx.get(f"{_BASE}/v1/sessions/conv_abc123").mock(
         return_value=httpx.Response(200, json=_SESSION_META)
     )
@@ -209,6 +221,7 @@ def test_session_export_items_ordered_ascending(tmp_path: Path) -> None:
 @respx.mock
 def test_session_export_pagination(tmp_path: Path) -> None:
     """Export follows has_more cursors to fetch all pages."""
+    _mock_older_server()
     page1 = {
         "data": [
             {
@@ -263,3 +276,49 @@ def test_session_export_pagination(tmp_path: Path) -> None:
     item_records = [r for r in records if r["record_type"] == "item"]
     assert len(item_records) == 2
     assert [r["id"] for r in item_records] == ["msg_1", "msg_2"]
+
+
+@respx.mock
+def test_session_export_uses_the_server_export(tmp_path: Path) -> None:
+    """A server that builds exports is asked for its JSONL, which is written as served."""
+    served = [
+        {"record_type": "session_meta", **_SESSION_META, "outputs_omitted": True},
+        *({"record_type": "item", **item} for item in _ITEMS_PAGE["data"]),
+    ]
+    export_route = respx.get(f"{_BASE}/v1/sessions/conv_abc123/export").mock(
+        return_value=httpx.Response(
+            200, content="".join(json.dumps(line) + "\n" for line in served).encode()
+        )
+    )
+    items_route = respx.get(f"{_BASE}/v1/sessions/conv_abc123/items")
+
+    out_file = tmp_path / "out.jsonl"
+    with _patch_server():
+        result = CliRunner().invoke(
+            cli, ["session", "export", "--id", "conv_abc123", "--output", str(out_file)]
+        )
+
+    assert result.exit_code == 0, result.output
+    assert "Exported 2 item(s)" in result.output
+    assert "Tool outputs were left out" in result.output
+    assert export_route.calls[0].request.url.params["format"] == "jsonl"
+    assert not items_route.called
+    assert [json.loads(line) for line in out_file.read_text().splitlines()] == served
+
+
+@respx.mock
+def test_session_export_fails_on_a_server_export_refusal(tmp_path: Path) -> None:
+    """A refusal other than 404 fails the export instead of building it from the items."""
+    respx.get(f"{_BASE}/v1/sessions/conv_abc123/export").mock(
+        return_value=httpx.Response(403, json={"error": {"message": "Forbidden"}})
+    )
+    items_route = respx.get(f"{_BASE}/v1/sessions/conv_abc123/items")
+
+    with _patch_server():
+        result = CliRunner().invoke(
+            cli,
+            ["session", "export", "--id", "conv_abc123", "--output", str(tmp_path / "out.jsonl")],
+        )
+
+    assert result.exit_code != 0
+    assert not items_route.called

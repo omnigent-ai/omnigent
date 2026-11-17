@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Spinner } from "@/components/ui/spinner";
+import { dataControls } from "@/lib/capabilities";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
 import type { ExtensionCatalogItem, ExtensionPage } from "./types";
 import { buildExtensionDocument, createExtensionNonce, loadExtensionBundle } from "./rpc/host";
 import {
@@ -34,19 +36,39 @@ interface DocumentState {
   identity: ExtensionIdentity;
 }
 
-export function ExtensionViewHost({
-  extension,
-  page,
-  refresh,
-  methods = NO_HOST_METHODS,
-  events = NO_HOST_EVENTS,
-}: {
+interface ExtensionViewHostProps {
   extension: ExtensionCatalogItem;
   page: ExtensionPage;
   refresh: () => Promise<ExtensionCatalogItem[]>;
   methods?: Readonly<Record<string, HostMethod>>;
   events?: Readonly<Record<string, unknown>>;
-}) {
+}
+
+export function ExtensionViewHost(props: ExtensionViewHostProps) {
+  // An extension page runs its bundle as inline script in a srcdoc frame, which
+  // inherits the server's enforced policy and so could never start.
+  if (dataControls(useServerInfo()).contentSecurityPolicy === "enforce") {
+    return (
+      <div role="alert" className="flex h-full items-center justify-center p-6">
+        <div className="max-w-md rounded-lg border bg-card p-6 text-center">
+          <h1 className="font-semibold">{props.page.title} is unavailable</h1>
+          <p className="mt-2 text-sm text-muted-foreground">
+            This server's Content-Security-Policy doesn't allow extension pages to run.
+          </p>
+        </div>
+      </div>
+    );
+  }
+  return <ExtensionView {...props} />;
+}
+
+function ExtensionView({
+  extension,
+  page,
+  refresh,
+  methods = NO_HOST_METHODS,
+  events = NO_HOST_EVENTS,
+}: ExtensionViewHostProps) {
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const portRef = useRef<MessagePort | null>(null);
   const identityRef = useRef<ExtensionIdentity | null>(null);

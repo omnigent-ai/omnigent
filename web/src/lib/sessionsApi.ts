@@ -1719,8 +1719,21 @@ export async function fetchSessionItemsPage(
  * item (`record_type: "item"`) in chronological order, so the file
  * round-trips through `omnigent session import`. Records keep the raw
  * wire shape rather than the SPA's parsed types for that parity.
+ *
+ * The server builds the file (`GET /v1/sessions/{id}/export`), applying its
+ * data-handling controls. Only a 404, an older server without the route, has
+ * the file assembled here instead; an unknown session then fails here too.
  */
 export async function exportSessionTranscript(sessionId: string): Promise<string> {
+  const res = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(sessionId)}/export?format=jsonl`,
+  );
+  if (res.ok) return res.text();
+  if (res.status !== 404) throw await apiErrorFromResponse(res);
+  return assembleSessionTranscript(sessionId);
+}
+
+async function assembleSessionTranscript(sessionId: string): Promise<string> {
   const metaParams = new URLSearchParams({
     include_items: "false",
     include_liveness: "false",
@@ -1754,6 +1767,17 @@ export async function exportSessionTranscript(sessionId: string): Promise<string
   }
   /* oxlint-enable no-await-in-loop */
   return lines.join("\n") + "\n";
+}
+
+/** Whether an exported transcript says the server left tool outputs out. */
+export function transcriptOmitsOutputs(jsonl: string): boolean {
+  const end = jsonl.indexOf("\n");
+  const firstLine = end === -1 ? jsonl : jsonl.slice(0, end);
+  try {
+    return (JSON.parse(firstLine) as { outputs_omitted?: unknown }).outputs_omitted === true;
+  } catch {
+    return false;
+  }
 }
 
 /**

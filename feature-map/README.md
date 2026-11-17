@@ -173,6 +173,9 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
   custom-agent targets, fork access checks, archive, reconnect, and resume.
 - [Video recordings](./video-rendering.md) covers inline chat playback, remote
   recording links, file previews, and download fallbacks.
+- [Data-handling controls](./data-handling-controls.md) covers leaving tool
+  outputs out of exports, turning downloads off, and the opt-in
+  Content-Security-Policy for the web UI.
 - [Tool calls in chat](./tool-calls.md) covers tool-call rows and their edit
   counts, the expanded field, error and Raw views, and tool-run folding.
 - [Sandbox profiles](./sandbox-profiles.md) covers provider-owned discovery,

@@ -1,5 +1,5 @@
 import { isAdminViewEnabled } from "@/lib/adminView";
-import { z } from "zod";
+import { z } from "@/lib/zod";
 import { getOmnigentServerIdentity } from "./host";
 import { getCurrentUserId } from "./identity";
 import type { NativeModelOption } from "./types";

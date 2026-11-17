@@ -23,6 +23,8 @@ import {
   workspaceFileMediaUrl,
 } from "@/hooks/useFileContent";
 import { showToast } from "@/components/ui/toast";
+import { dataControls } from "@/lib/capabilities";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { followLinkWithPopupFallback } from "@/lib/openLinkInApp";
 import { cn } from "@/lib/utils";
 import { formatVideoTime } from "@/lib/video";
@@ -33,6 +35,9 @@ const TOO_LARGE_MESSAGE =
   "This video is larger than 200 MB, so it can't be played here. Download it to watch it in another app.";
 const LOCAL_FAILURE_MESSAGE =
   "This video couldn't be played. Download the file to open it in another app.";
+// Playing a workspace recording streams the whole file, which is a download.
+const DOWNLOADS_OFF_MESSAGE =
+  "This server doesn't allow downloads, so recordings from the workspace can't be played here.";
 
 type VideoSource = { conversationId: string; path: string } | { src: string };
 export type VideoPlayerProps = VideoSource & {
@@ -53,6 +58,8 @@ function VideoPlayerContent(props: VideoPlayerProps) {
   const remoteSrc = "src" in props ? props.src : undefined;
   const conversationId = "conversationId" in props ? props.conversationId : undefined;
   const path = "path" in props ? props.path : undefined;
+  const { allowDownloads } = dataControls(useServerInfo());
+  const playbackBlocked = !remoteSrc && !allowDownloads;
   const [requested, setRequested] = useState(false);
   const [blobSrc, setBlobSrc] = useState<string>();
   // Resolved once per Play so a later routing-key change can't swap the source mid-playback.
@@ -185,7 +192,7 @@ function VideoPlayerContent(props: VideoPlayerProps) {
             >
               <ExternalLinkIcon aria-hidden="true" className="size-4" />
             </a>
-          ) : chapters.length > 0 ? (
+          ) : !allowDownloads ? null : chapters.length > 0 ? (
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
                 <button
@@ -307,7 +314,14 @@ function VideoPlayerContent(props: VideoPlayerProps) {
                 compact ? "aspect-[16/10]" : "aspect-video max-h-[70vh]",
               )}
             >
-              {failed ? (
+              {playbackBlocked ? (
+                <>
+                  <VideoIcon className="size-8" />
+                  <span role="status" className="text-center">
+                    {DOWNLOADS_OFF_MESSAGE}
+                  </span>
+                </>
+              ) : failed ? (
                 <>
                   <VideoIcon className="size-8" />
                   <span role="status" className="text-center">
@@ -318,7 +332,7 @@ function VideoPlayerContent(props: VideoPlayerProps) {
                         : LOCAL_FAILURE_MESSAGE}
                   </span>
                   <span className="flex gap-2">
-                    {!remoteSrc && (
+                    {!remoteSrc && allowDownloads && (
                       <button
                         type="button"
                         className="rounded-md border px-3 py-1.5 hover:bg-accent"
@@ -387,7 +401,9 @@ function VideoPlayerContent(props: VideoPlayerProps) {
                     type="button"
                     key={`${chapter.time}:${chapter.end}:${chapter.title}`}
                     aria-current={index === activeChapter ? "step" : undefined}
-                    disabled={failed || (duration !== null && chapter.time >= duration)}
+                    disabled={
+                      failed || playbackBlocked || (duration !== null && chapter.time >= duration)
+                    }
                     className={cn(
                       "flex shrink-0 items-start gap-2 rounded-md p-2 text-left hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50",
                       index === activeChapter && "bg-accent text-accent-foreground",

@@ -2774,6 +2774,40 @@
         "title": "DailyCost",
         "type": "object"
       },
+      "DataControlsInfo": {
+        "description": "A deployment's data-handling controls; see `omnigent/server/data_controls.py`.",
+        "properties": {
+          "allow_downloads": {
+            "default": true,
+            "description": "`False` when raw file downloads are refused, so clients hide their download buttons.",
+            "title": "Allow Downloads",
+            "type": "boolean"
+          },
+          "content_security_policy": {
+            "default": "off",
+            "description": "`\"off\"`, `\"report-only\"` or `\"enforce\"` for the web UI's HTML responses.",
+            "enum": [
+              "off",
+              "report-only",
+              "enforce"
+            ],
+            "title": "Content Security Policy",
+            "type": "string"
+          },
+          "include_outputs": {
+            "default": "request",
+            "description": "`\"request\"` lets an export choose whether tool outputs are included; `\"never\"` strips them from every export.",
+            "enum": [
+              "request",
+              "never"
+            ],
+            "title": "Include Outputs",
+            "type": "string"
+          }
+        },
+        "title": "DataControlsInfo",
+        "type": "object"
+      },
       "ElicitationRequestEvent": {
         "description": "Synchronous request for a decision from upstream.\n\nEmitted by Omnigent (or, under the new contract, by a harness)\nwhen the LLM / a tool / a policy needs a verdict before\nproceeding. The consumer replies via\n`POST /v1/sessions/{session_id}/events` with\n`type == \"approval\"` and\n`omnigent.server.schemas.ElicitationResult` fields in\n`data`. This preserves MCP request/reply correlation by id\nwithout threading elicitations through PATCH.\n\nWire shape matches the existing emit at\n`omnigent/runtime/policies/approval.py:175`.",
         "properties": {
@@ -7738,6 +7772,14 @@
             "title": "Comment Anchor Metadata",
             "type": "boolean"
           },
+          "data_controls": {
+            "$ref": "#/components/schemas/DataControlsInfo",
+            "default": {
+              "allow_downloads": true,
+              "content_security_policy": "off",
+              "include_outputs": "request"
+            }
+          },
           "databricks_features": {
             "title": "Databricks Features",
             "type": "boolean"
@@ -7982,6 +8024,11 @@
             },
             "title": "Session Event Types",
             "type": "array"
+          },
+          "session_export": {
+            "default": false,
+            "title": "Session Export",
+            "type": "boolean"
           },
           "session_fork_workspaces": {
             "default": true,
@@ -22787,6 +22834,74 @@
         ]
       }
     },
+    "/v1/sessions/{session_id}/export": {
+      "get": {
+        "description": "Download a session as the JSONL transcript `omnigent session import` reads.\n\nThe first line is the session snapshot `GET /sessions/{id}` returns,\nwith `\"record_type\": \"session_meta\"` and `outputs_omitted`; each\nfurther line is one item from `GET /sessions/{id}/items`. When\noutputs are left out, tool outputs are replaced with a placeholder.\n\n**Parameters**\n\n- `export_format` \u2014 `\"jsonl\"`.\n\n**Returns:** The transcript as a `.jsonl` attachment.\n\n**Raises**\n\n- `OmnigentError` \u2014 403 without READ; 404 when no session exists.",
+        "operationId": "export_session_v1_sessions__session_id__export_get",
+        "parameters": [
+          {
+            "description": "Session to export, e.g. `\"conv_abc123\"`.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "The export format; only `\"jsonl\"` today.",
+            "in": "query",
+            "name": "format",
+            "required": true,
+            "schema": {
+              "description": "The export format; only `\"jsonl\"` today.",
+              "pattern": "^jsonl$",
+              "title": "Format",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Whether tool outputs are included. A deployment with `data_controls.include_outputs: never` leaves them out regardless.",
+            "in": "query",
+            "name": "outputs",
+            "required": false,
+            "schema": {
+              "default": true,
+              "description": "Whether tool outputs are included. A deployment with `data_controls.include_outputs: never` leaves them out regardless.",
+              "title": "Outputs",
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/jsonl": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "The session as JSONL: a `session_meta` line, then one `item` line per item in order."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Export Session",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
     "/v1/sessions/{session_id}/items": {
       "get": {
         "description": "List items in a session with cursor-based pagination.\n\nDelegates to the conversation items store \u2014 session_id is\nthe conversation_id. Same pagination contract as\n`GET /v1/conversations/{id}/items`.\n\n**Returns:** A page of flattened conversation items, documented as `SessionItemList`.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if no session exists.",
@@ -24722,7 +24837,7 @@
             }
           },
           {
-            "description": "When `True`, stream the complete file as an attachment with no size cap instead of the capped JSON envelope. A directory rejects it with 400.",
+            "description": "When `True`, stream the complete file as an attachment with no size cap instead of the capped JSON envelope. A directory rejects it with 400, and a deployment that turns downloads off with 403.",
             "in": "query",
             "name": "download",
             "required": false,
@@ -24764,7 +24879,7 @@
                 }
               }
             },
-            "description": "File content or directory listing as JSON; the raw file as an attachment when `download=true`."
+            "description": "File content or directory listing as JSON; the raw file as an attachment when `download=true`, unless the deployment turns downloads off (403)."
           },
           "422": {
             "content": {

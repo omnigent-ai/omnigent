@@ -759,6 +759,66 @@ packaged built-in agents](docker/README.md#trimming-the-packaged-built-in-agents
 an agent it removes stays hidden even when `restrict_to_agent_names` lists it.
 Both keys are served on the unauthenticated `GET /v1/info`.
 
+## Data-handling controls for regulated deployments
+
+Three optional controls keep tool outputs and files from leaving through
+exports and downloads, and lock down the web UI. Set them in a `data_controls:`
+block in the same server config, or with the environment variables beside
+them, which win over the file. They take effect on the next server start, and a
+value the server doesn't recognize stops it from starting.
+
+```yaml
+data_controls:
+  include_outputs: never            # OMNIGENT_EXPORT_INCLUDE_OUTPUTS: request (default) | never
+  allow_downloads: false            # OMNIGENT_ALLOW_DOWNLOADS: true (default) | false
+  content_security_policy: enforce  # OMNIGENT_CONTENT_SECURITY_POLICY: off (default) | report-only | enforce
+```
+
+- **`include_outputs`** applies to every session export the server builds:
+  the web Export menu item, `omnigent session export` and
+  `GET /v1/sessions/{id}/export`. With `request`, the request decides
+  (`?outputs=false` leaves them out). With `never`, the server replaces every
+  tool output, terminal and slash-command output and provider-native tool
+  result with a placeholder, and drops the transcript copy a compaction keeps,
+  whatever the request asks for. An item type it doesn't know keeps only its
+  ids. The export keeps the messages, tool calls and compaction summaries, so
+  it still reads in order and `omnigent session import` accepts it, and its
+  `session_meta` line says `"outputs_omitted": true`. There is no `always`:
+  forcing outputs into an export a user asked to trim protects nothing. The
+  setting governs exports the server builds; the transcript view and the items
+  API still show outputs, because that is where the agent's work is read.
+- **`allow_downloads: false`** refuses the full-file download stream
+  (`GET .../filesystem/{path}?download=true`) with 403 "Downloads are turned
+  off on this server.", and the web UI hides its Download buttons in the Files
+  tree, the Changes list, the file viewer's menu and recording players.
+  Previews keep working: they read through the viewer's capped JSON read.
+  Workspace recordings can't be played, since a player streams the whole file
+  and offers its own save. Files a user uploaded into the conversation stay
+  reachable at `GET .../resources/files/{id}/content`, which the transcript uses
+  to render them inline and a rewind uses to attach them again. Saving a code
+  block, table or diagram from a reply is unchanged, as it copies text already
+  on screen.
+- **`content_security_policy`** sends a strict policy on the web UI's HTML
+  responses, as `Content-Security-Policy` (`enforce`) or
+  `Content-Security-Policy-Report-Only` (`report-only`, which only logs
+  violations in the browser console; there is no reporting endpoint). Scripts
+  load only from the server, plus two inline scripts allowed by their hashes:
+  the one the server writes for a base path, and the HTML preview's link helper.
+  WebAssembly may compile, for the syntax highlighter, but JavaScript `eval`
+  may not. Styles may be inline, because the diagram renderer and editor inject
+  them. Images, fonts, media, workers and requests stay on the server's origin
+  or local `blob:`/`data:` URLs. The policy has no `frame-ancestors`, so the VS
+  Code extension can still embed the app. Under it, remote images and videos
+  (for example, those in a GitHub pull request description) don't load, HTML
+  previews can't run their own inline or remote scripts, extension pages don't
+  run under `enforce` (they say so), and an OpenTelemetry collector on another
+  origin is unreachable from the browser. Dictation loads its audio worklet
+  from a built file instead of a `blob:` URL. Changing the mode reaches open
+  browsers on their next load. Try `report-only` first.
+
+All three are reported on the unauthenticated `GET /v1/info` as
+`data_controls`, so clients can adapt.
+
 ## Adding a new deploy target
 
 Drop a new subdirectory under `deploy/<target>/` with a `README.md`

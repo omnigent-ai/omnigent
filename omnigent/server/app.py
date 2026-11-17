@@ -101,6 +101,16 @@ from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
     RunnerBackgroundTitleGenerator,
 )
+from omnigent.server.data_controls import (
+    ContentSecurityPolicyMode,
+    app_data_controls,
+    content_security_policy_header,
+    inline_script_hashes,
+    load_data_controls,
+)
+from omnigent.server.data_controls import (
+    content_security_policy as build_content_security_policy,
+)
 from omnigent.server.disconnect_evidence import DisconnectEvidence, drop_attributes
 from omnigent.server.feature_flags import (
     DeploymentGate,
@@ -269,6 +279,22 @@ class PickerInfo(BaseModel):
     default_agent_name: str | None = None
 
 
+class DataControlsInfo(BaseModel):
+    """A deployment's data-handling controls; see ``omnigent/server/data_controls.py``.
+
+    :param include_outputs: ``"request"`` lets an export choose whether tool
+        outputs are included; ``"never"`` strips them from every export.
+    :param allow_downloads: ``False`` when raw file downloads are refused, so
+        clients hide their download buttons.
+    :param content_security_policy: ``"off"``, ``"report-only"`` or
+        ``"enforce"`` for the web UI's HTML responses.
+    """
+
+    include_outputs: Literal["request", "never"] = "request"
+    allow_downloads: bool = True
+    content_security_policy: Literal["off", "report-only", "enforce"] = "off"
+
+
 class FilesystemAttachmentsInfo(BaseModel):
     """Which uploads native sessions receive as files, for client-side checks."""
 
@@ -423,6 +449,9 @@ class ServerInfoResponse(BaseModel):
     sibling_other_project_standalone: bool = False
     branding: BrandingInfo
     picker: PickerInfo = PickerInfo()
+    # ``GET /v1/sessions/{id}/export?format=jsonl`` exists; older servers omit it.
+    session_export: bool = False
+    data_controls: DataControlsInfo = DataControlsInfo()
 
 
 def _resolve_extension_state(
@@ -2010,7 +2039,10 @@ def create_app(
         key of the same name, read at startup.
     :param server_config: Resolved non-secret server settings. The optional
         ``session_title_instructions`` string augments the isolated automatic
-        title prompt. ``None`` loads the standard server config.
+        title prompt. Its optional ``data_controls`` block sets the export,
+        download and Content-Security-Policy controls (see
+        :mod:`omnigent.server.data_controls`). ``None`` loads the standard
+        server config.
     :param base_path: Public URL prefix the server is served under by a
         reverse proxy, e.g. ``"/proxy/6767"`` (code-server port proxy).
         ``None`` reads ``OMNIGENT_WEB_BASE_PATH``; empty/``"/"`` is a normal
@@ -2046,6 +2078,7 @@ def create_app(
     resolved_server_config = load_server_config() if server_config is None else server_config
     branding_snapshot = load_branding_snapshot(resolved_server_config)
     picker_curation = load_picker_curation(resolved_server_config)
+    data_controls = load_data_controls(resolved_server_config)
     title_instructions = session_title_instructions(resolved_server_config)
     trigger_poll_minutes = automation_trigger_poll_minutes(resolved_server_config)
     resolved_feature_flags = feature_flags or resolve_feature_flags()
@@ -2601,6 +2634,7 @@ def create_app(
     app.state.sandbox_config = sandbox_config
     app.state.branding_snapshot = branding_snapshot
     app.state.picker_curation = picker_curation
+    app.state.data_controls = data_controls
     app.state.feature_flags = resolved_feature_flags
     app.state.harness_install = app_harness_install
     app.state.mcp_disabled_servers = app_mcp_disabled_servers
@@ -4024,6 +4058,8 @@ def create_app(
                 "automation_trigger_poll_minutes": trigger_poll_minutes,
                 "branding": branding_snapshot.config(),
                 "picker": picker_curation.config(),
+                "session_export": True,
+                "data_controls": app_data_controls(app.state).info(),
             }
         )
 
@@ -5779,7 +5815,12 @@ def create_app(
         app.mount(
             "/",
             _RangeAwareGZipMiddleware(
-                _SPAStaticFiles(directory=web_ui_dist, html=True, base_path=resolved_base_path),
+                _SPAStaticFiles(
+                    directory=web_ui_dist,
+                    html=True,
+                    base_path=resolved_base_path,
+                    content_security_policy=data_controls.content_security_policy,
+                ),
                 minimum_size=_WEB_UI_GZIP_MINIMUM_SIZE,
             ),
             name="web-ui",
@@ -5829,17 +5870,41 @@ class _SPAStaticFiles(StaticFiles):
     The HTML shell is rebased for the deployment ``base_path`` once at
     startup (see :func:`_rewrite_web_ui_index`) and served from memory with
     a content ``etag`` so ``If-None-Match`` revalidation still yields ``304``.
+    With a ``content_security_policy`` mode other than off, every HTML
+    response carries the policy, allowing the shell's own inline scripts by hash.
     """
 
-    def __init__(self, *args: Any, base_path: str = "", **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *args: Any,
+        base_path: str = "",
+        content_security_policy: ContentSecurityPolicyMode = ContentSecurityPolicyMode.OFF,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(*args, **kwargs)
         self._index_html: bytes | None = None
         self._index_etag: str | None = None
+        self._csp_header: tuple[str, str] | None = None
         index_file = Path(self.directory) / "index.html"  # type: ignore[arg-type]
         if index_file.is_file():
             html = _rewrite_web_ui_index(index_file.read_text(encoding="utf-8"), base_path)
             self._index_html = html.encode("utf-8")
-            self._index_etag = f'"{hashlib.md5(self._index_html).hexdigest()}"'
+            header = content_security_policy_header(content_security_policy)
+            if header:
+                policy = build_content_security_policy(inline_script_hashes(html))
+                self._csp_header = (header, policy)
+            # The policy is part of the etag: a 304 can't take back a cached
+            # header, so changing the mode must hand browsers a fresh 200.
+            fingerprint = self._index_html
+            if self._csp_header is not None:
+                fingerprint += "\n".join(self._csp_header).encode()
+            self._index_etag = f'"{hashlib.md5(fingerprint).hexdigest()}"'
+
+    def _with_csp(self, response: Response) -> Response:
+        """Attach the configured policy to an HTML response."""
+        if self._csp_header is not None:
+            response.headers[self._csp_header[0]] = self._csp_header[1]
+        return response
 
     def _shell_response(self, scope: Scope) -> Response:
         """Serve the rebased HTML shell from memory, honoring ``If-None-Match``."""
@@ -5872,7 +5937,9 @@ class _SPAStaticFiles(StaticFiles):
         # from the rebased in-memory copy rather than the file on disk, so
         # asset refs and the injected base-path global reflect `base_path`.
         if self._index_html is not None and path in ("", ".", "index.html"):
-            return _apply_web_ui_cache_headers(self._shell_response(scope), "index.html")
+            return self._with_csp(
+                _apply_web_ui_cache_headers(self._shell_response(scope), "index.html")
+            )
         try:
             response = await super().get_response(path, scope)
         except StarletteHTTPException as exc:
@@ -5903,7 +5970,11 @@ class _SPAStaticFiles(StaticFiles):
                 )
             else:
                 raise
-        return _apply_web_ui_cache_headers(response, served_path)
+        response = _apply_web_ui_cache_headers(response, served_path)
+        content_type = response.headers.get("content-type", "")
+        if served_path == "index.html" or content_type.startswith("text/html"):
+            self._with_csp(response)
+        return response
 
 
 def _is_web_ui_api_fallback_path(path: str) -> bool:

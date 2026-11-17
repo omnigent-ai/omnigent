@@ -44,6 +44,8 @@ class BrowserSession:
     runner_online: bool = True
     host_online: bool = True
     features: dict[str, bool] = field(default_factory=dict)
+    # Extra ``/v1/info`` fields, read on every probe, e.g. ``{"data_controls": {...}}``.
+    info: dict[str, object] = field(default_factory=dict)
 
     def __iter__(self) -> Iterator[str]:
         yield self.contract.base_url
@@ -70,7 +72,7 @@ def seeded_session(browser_contract: BrowserContract) -> BrowserSession:
     }
     browser_contract.json(
         "/v1/info",
-        {
+        lambda _request: {
             "accounts_enabled": False,
             "single_user": True,
             "login_url": None,
@@ -96,6 +98,7 @@ def seeded_session(browser_contract: BrowserContract) -> BrowserSession:
                 "logos": {"main": None, "loading": None, "favicon": None},
                 "powered_by": True,
             },
+            **session.info,
         },
     )
     browser_contract.json("/v1/me", {"user_id": "local", "is_admin": True})

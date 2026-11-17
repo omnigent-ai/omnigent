@@ -1,6 +1,8 @@
 import { startTransition, Suspense } from "react";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { DEFAULT_DATA_CONTROLS, FALLBACK_SERVER_INFO } from "@/lib/capabilities";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { EmbeddedProvider } from "@/lib/embedded";
 import { setOmnigentHostConfig, type HtmlPreviewFrameProps } from "@/lib/host";
 import type { Comment } from "@/hooks/useComments";
@@ -160,6 +162,33 @@ describe("HtmlCommentViewer", () => {
     expect(srcDoc).toContain("data-omni-nonce=");
     expect(srcDoc).not.toContain("new Function");
   });
+
+  it.each(["enforce", "report-only"] as const)(
+    "loads the bridge from a file when the server sends a %s policy",
+    (contentSecurityPolicy) => {
+      const { container } = render(
+        <CapabilitiesProvider
+          info={{
+            ...FALLBACK_SERVER_INFO,
+            data_controls: { ...DEFAULT_DATA_CONTROLS, contentSecurityPolicy },
+          }}
+        >
+          <HtmlCommentViewer
+            conversationId="conv_1"
+            scrollKey={null}
+            content="<html><head></head><body><p>doc</p></body></html>"
+            truncated={false}
+            comments={[]}
+            activeSelection={null}
+            onSetActiveSelection={() => {}}
+          />
+        </CapabilitiesProvider>,
+      );
+      const iframe = container.querySelector('iframe[title="HTML preview"]') as HTMLIFrameElement;
+      // The srcdoc frame inherits the policy, which blocks an inline bridge script.
+      expect(iframe.getAttribute("srcdoc")).toContain("htmlCommentBridgeRuntime.js");
+    },
+  );
 
   it("starts the diagnostic timer only after the iframe loads", () => {
     vi.useFakeTimers();

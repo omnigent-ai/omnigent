@@ -383,6 +383,47 @@ export interface ServerInfo {
    * an older server, which means no restriction.
    */
   picker?: PickerCuration;
+  /** The deployment's export, download and CSP controls; defaults on older servers. */
+  data_controls?: DataControls;
+}
+
+/** A deployment's data-handling controls, as reported by ``/v1/info``. */
+export interface DataControls {
+  /** ``"never"`` when exports always leave tool outputs out. */
+  includeOutputs: "request" | "never";
+  /** False when the server refuses raw file downloads. */
+  allowDownloads: boolean;
+  /** Whether the web UI is served under a Content-Security-Policy. */
+  contentSecurityPolicy: "off" | "report-only" | "enforce";
+}
+
+/** No controls: what an older server, or a failed probe, means. */
+export const DEFAULT_DATA_CONTROLS: DataControls = {
+  includeOutputs: "request",
+  allowDownloads: true,
+  contentSecurityPolicy: "off",
+};
+
+/**
+ * The data-handling controls a probe reported, or the defaults.
+ *
+ * @param info Probe result, or "loading" before it resolves.
+ * @returns The controls; downloads stay offered while loading and on an older
+ *   server, since the server refuses them itself when they are off.
+ */
+export function dataControls(info: ServerInfo | "loading"): DataControls {
+  return info === "loading" ? DEFAULT_DATA_CONTROLS : (info.data_controls ?? DEFAULT_DATA_CONTROLS);
+}
+
+function parseDataControls(raw: unknown): DataControls {
+  if (raw === null || typeof raw !== "object") return DEFAULT_DATA_CONTROLS;
+  const value = raw as Record<string, unknown>;
+  const csp = value.content_security_policy;
+  return {
+    includeOutputs: value.include_outputs === "never" ? "never" : "request",
+    allowDownloads: value.allow_downloads !== false,
+    contentSecurityPolicy: csp === "enforce" || csp === "report-only" ? csp : "off",
+  };
 }
 
 /** The deployment's New Chat picker curation, as reported by ``/v1/info``. */
@@ -526,6 +567,7 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   comment_anchor_metadata: false,
   branding: null,
   picker: UNRESTRICTED_PICKER,
+  data_controls: DEFAULT_DATA_CONTROLS,
 };
 
 /**
@@ -749,6 +791,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
             data.scheduled_task_approval_skipping_modes === true,
           branding: parseBranding(data.branding),
           picker: parsePicker(data.picker),
+          data_controls: parseDataControls(data.data_controls),
         };
         return cachedServerInfo;
       }

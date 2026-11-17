@@ -9,8 +9,11 @@
 import { DownloadIcon } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { downloadWorkspaceFile } from "@/hooks/useFileContent";
+import { dataControls } from "@/lib/capabilities";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { cn } from "@/lib/utils";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { ROW_ACTION_SIZE_CLASS } from "./fileStatusUtils";
 
 interface FileDownloadButtonProps {
   /** Session ID used to fetch file content. */
@@ -29,10 +32,20 @@ interface FileDownloadButtonProps {
  * icon turns red for three seconds with a "Download failed" tooltip, then
  * resets automatically.
  *
+ * A deployment that turns downloads off gets an empty slot of the same size,
+ * so the row's other actions stay where they are.
+ *
  * :param conversationId: Session ID used to fetch file content from the API.
  * :param path: Workspace-relative path of the file to download.
  */
 export function FileDownloadButton({ conversationId, path }: FileDownloadButtonProps) {
+  const { allowDownloads } = dataControls(useServerInfo());
+  if (!allowDownloads)
+    return <span className={cn("shrink-0", ROW_ACTION_SIZE_CLASS)} aria-hidden />;
+  return <FileDownloadAction conversationId={conversationId} path={path} />;
+}
+
+function FileDownloadAction({ conversationId, path }: FileDownloadButtonProps) {
   const [downloading, setDownloading] = useState(false);
   const [downloadError, setDownloadError] = useState(false);
   const errorTimerRef = useRef<number>(0);

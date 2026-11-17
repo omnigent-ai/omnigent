@@ -91,6 +91,8 @@ import {
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { downloadWorkspaceFile, useFileContent } from "@/hooks/useFileContent";
 import { isVideoFile } from "@/lib/video";
+import { dataControls } from "@/lib/capabilities";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { useFileDiff } from "@/hooks/useFileDiff";
 import { useInertRef } from "@/hooks/useInertRef";
 import {
@@ -605,6 +607,7 @@ function FileViewerBody({
     [],
   );
 
+  const { allowDownloads } = dataControls(useServerInfo());
   const downloadFile = useCallback(() => {
     downloadWorkspaceFile(conversationId, path).catch(() => toast.error("Download failed"));
   }, [conversationId, path]);
@@ -1426,7 +1429,7 @@ function FileViewerBody({
       onSelect: () => revealInFileManager(revealTarget),
     });
   }
-  if (!isDeletedFile && (fileQuery.data || isVideo)) {
+  if (allowDownloads && !isDeletedFile && (fileQuery.data || isVideo)) {
     settingsMenu.push({
       key: "download",
       label: "Download file",

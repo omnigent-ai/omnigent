@@ -8,6 +8,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 // resolveServerInfo is imported dynamically inside each probe (below) so every
 // test starts from a fresh module cache; only the pure helpers are static.
 import {
+  DEFAULT_DATA_CONTROLS,
+  dataControls,
   pickerCuration,
   sandboxOptionLabel,
   sandboxProviderOptions,
@@ -607,6 +609,35 @@ describe("picker curation", () => {
   it("treats a loading probe and a missing block as unrestricted", () => {
     expect(pickerCuration("loading").restrictToAgentNames.size).toBe(0);
     expect(pickerCuration(info({})).defaultAgentName).toBeNull();
+  });
+});
+
+describe("resolveServerInfo data_controls", () => {
+  it("reads the deployment's controls", async () => {
+    const parsed = await probe({
+      data_controls: {
+        include_outputs: "never",
+        allow_downloads: false,
+        content_security_policy: "report-only",
+      },
+    });
+    expect(dataControls(parsed)).toEqual({
+      includeOutputs: "never",
+      allowDownloads: false,
+      contentSecurityPolicy: "report-only",
+    });
+  });
+
+  it.each([
+    ["an older server", {}],
+    ["a malformed block", { data_controls: { allow_downloads: "no", include_outputs: 1 } }],
+  ])("keeps every control off for %s", async (_label, body) => {
+    const parsed = await probe(body);
+    expect(dataControls(parsed)).toEqual(DEFAULT_DATA_CONTROLS);
+  });
+
+  it("offers downloads while the probe loads", () => {
+    expect(dataControls("loading").allowDownloads).toBe(true);
   });
 });
 

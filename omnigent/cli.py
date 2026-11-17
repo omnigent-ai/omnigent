@@ -7590,6 +7590,8 @@ def session_export(session_id: str, output: str | None, server: str | None) -> N
     subsequent line is one conversation item
     (``"record_type": "item"``).  The file preserves full turn order
     and is independent of ``omnigent import``, which reads native harness history.
+    A server set to leave tool outputs out of exports replaces them with a
+    placeholder.
 
     \b
     Examples:
@@ -7620,7 +7622,34 @@ def session_export(session_id: str, output: str | None, server: str | None) -> N
         timeout=30.0,
         trust_env=_trust_env_for(base_url),
     ) as client:
-        # Fetch session metadata (items fetched separately via pagination).
+        # The server builds the export, applying its data-handling controls.
+        # Only a 404 (an older server without the route) builds it here.
+        with client.stream(
+            "GET", f"/v1/sessions/{session_id}/export", params={"format": "jsonl"}
+        ) as export:
+            if export.status_code != 404:
+                if export.is_error:
+                    export.read()
+                    raise click.ClickException(
+                        f"Export of {session_id!r} failed ({export.status_code}): {export.text}"
+                    )
+                n_items = 0
+                outputs_omitted = False
+                with out_path.open("w", encoding="utf-8") as fh:
+                    for line in export.iter_lines():
+                        if not line:
+                            continue
+                        fh.write(line + "\n")
+                        record = json.loads(line)
+                        if record.get("record_type") == "session_meta":
+                            outputs_omitted = record.get("outputs_omitted") is True
+                        n_items += record.get("record_type") == "item"
+                click.echo(f"Exported {n_items} item(s) from {session_id} to {out_path}")
+                if outputs_omitted:
+                    click.echo("Tool outputs were left out, as the server's settings require.")
+                return
+
+        # An older server: fetch session metadata, then the items page by page.
         resp = client.get(
             f"/v1/sessions/{session_id}",
             params={"include_items": "false", "include_liveness": "false"},

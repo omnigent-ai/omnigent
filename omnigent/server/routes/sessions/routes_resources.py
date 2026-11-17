@@ -60,6 +60,7 @@ from omnigent.server.auth import (
     LEVEL_READ,
     AuthProvider,
 )
+from omnigent.server.data_controls import require_downloads_allowed
 from omnigent.server.feature_flags import Feature, FeatureFlags
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.permissions import check_session_access
@@ -3251,7 +3252,8 @@ def register_resources_routes(
             200: {
                 "description": (
                     "File content or directory listing as JSON; the raw file "
-                    "as an attachment when `download=true`."
+                    "as an attachment when `download=true`, unless the "
+                    "deployment turns downloads off (403)."
                 ),
                 "content": {
                     "application/octet-stream": {
@@ -3291,7 +3293,8 @@ def register_resources_routes(
         :param order: Sort order, ``"asc"`` or ``"desc"``.
         :param download: When ``True``, stream the complete file as an
             attachment with no size cap instead of the capped JSON
-            envelope. A directory rejects it with 400.
+            envelope. A directory rejects it with 400, and a deployment
+            that turns downloads off with 403.
         :param scope: ``workspace`` also confines owner reads, including symlinks.
         :returns: File content or directory listing, or the raw file.
         """
@@ -3320,6 +3323,7 @@ def register_resources_routes(
         qs = urllib.parse.urlencode({**params, **scope_params})
         runner_rel = _runner_path_segment(relative_path, absolute=absolute)
         if download:
+            require_downloads_allowed(request.app.state)
             download_response = await _stream_download_from_runner(
                 request,
                 session_id,

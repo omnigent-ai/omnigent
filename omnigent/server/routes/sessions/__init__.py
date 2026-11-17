@@ -951,6 +951,7 @@ def create_sessions_router(
         router,
         conversation_store=conversation_store,
         agent_store=agent_store,
+        agent_cache=agent_cache,
         auth_provider=auth_provider,
         permission_store=permission_store,
         liveness_lookup=liveness_lookup,

@@ -2,7 +2,7 @@
 // pick and options, host, working directory), keyed by project id and ignored
 // once the project's stored settings change after that start.
 
-import { z } from "zod";
+import { z } from "@/lib/zod";
 import { AUTO_NATIVE_HARNESS_ID } from "./agentLabels";
 import type { HarnessOptions } from "./modePreferences";
 import type { ProjectConfig } from "./projectsApi";

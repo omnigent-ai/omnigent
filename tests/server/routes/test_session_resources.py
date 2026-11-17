@@ -4731,6 +4731,40 @@ async def test_filesystem_download_streams_runner_attachment(
 
 
 @pytest.mark.asyncio
+async def test_filesystem_download_refused_when_downloads_are_off(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+) -> None:
+    """With downloads off the raw stream is refused before the runner is asked,
+    while the capped viewer read of the same file still answers."""
+    from omnigent.server.data_controls import DOWNLOADS_DISABLED_MESSAGE, DataControls
+
+    app.state.data_controls = DataControls(allow_downloads=False)
+    fake_runner = _FakeRunnerClient(
+        payload={
+            "object": "session.environment.filesystem.file_content",
+            "path": "data/big.bin",
+            "content": "preview",
+            "encoding": "utf-8",
+            "truncated": False,
+        }
+    )
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    refused = await client.get(_DOWNLOAD_URL)
+    assert refused.status_code == 403
+    assert refused.json()["error"] == {
+        "code": "forbidden",
+        "message": DOWNLOADS_DISABLED_MESSAGE,
+    }
+    assert fake_runner.calls == []
+
+    preview = await client.get(_DOWNLOAD_URL.removesuffix("?download=true"))
+    assert preview.status_code == 200, preview.text
+    assert len(fake_runner.calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_filesystem_download_rejects_runner_without_download_support(
     client: httpx.AsyncClient,
 ) -> None:
