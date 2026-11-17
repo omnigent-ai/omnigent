@@ -14131,27 +14131,58 @@ def test_model_command_uses_a_fresh_status_for_same_model_requests(
     assert [args[-1] for args in composer.sends].count("s") == (0 if already_selected else 1)
 
 
+@pytest.mark.parametrize(
+    ("model", "picker_value", "reported"),
+    [
+        ("private-glm[1m]", "private-glm[1m]", "private-glm"),
+        (
+            "system.ai.claude-opus-4-8[1m]",
+            "opus",
+            "opus (system.ai.claude-opus-4-8)",
+        ),
+    ],
+    ids=["bare-private", "wrapped-public"],
+)
 def test_model_command_explicitly_selects_context_when_status_omits_the_marker(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    model: str,
+    picker_value: str,
+    reported: str,
 ) -> None:
     composer = _SessionModelComposer()
-    composer.model = composer.options[-1]
+    composer.options[-1] = composer.model = model
     bridge_dir = _session_model_bridge(tmp_path, composer)
+    claude_native_bridge.record_model_vocabulary(
+        bridge_dir,
+        launch_env=None,
+        launch_model=None,
+        picker_values=[picker_value],
+        picker_options=[
+            {
+                "value": picker_value,
+                "model": model,
+                "display_name": "Choice 1",
+                "enabled": True,
+                "provenance": "structured",
+            }
+        ],
+    )
     composer.install(monkeypatch)
 
     def capture(socket_path: str, target: str) -> str:
         pane = composer._capture_pane(socket_path, target)
         if composer.overlay == "status":
-            return pane.replace("Model: private-glm[1m]", "Model: private-glm")
+            return pane.replace(f"Model: {model}", f"Model: {reported}")
         return pane
 
     monkeypatch.setattr(claude_native_bridge, "_capture_pane", capture)
 
-    result = claude_native_bridge.inject_model_command(bridge_dir, model="private-glm[1m]")
+    result = claude_native_bridge.inject_model_command(bridge_dir, model=model)
 
     assert not result.already_selected
-    assert result.resolved_model == "private-glm[1m]"
-    assert result.status_model == "private-glm"
+    assert result.resolved_model == model
+    assert result.status_model == reported
     assert composer.submitted == ["/status", "/model", "/status"]
     assert [args[-1] for args in composer.sends].count("s") == 1
 
@@ -14322,6 +14353,71 @@ def test_model_command_leaves_default_settings_and_legacy_settings_paths_untouch
             "claude-opus-5-5[1m]",
             False,
         ),
+        (
+            "opus",
+            "opus",
+            "system.ai.claude-opus-4-8[1m]",
+            {"ANTHROPIC_DEFAULT_OPUS_MODEL": "system.ai.claude-opus-4-8[1m]"},
+            "opus (system.ai.claude-opus-4-8)",
+            True,
+        ),
+        (
+            "sonnet",
+            "sonnet",
+            "claude-sonnet-4-20250514",
+            {"ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-sonnet-4-20250514"},
+            "sonnet (claude-sonnet-4-20250514)",
+            True,
+        ),
+        (
+            "opus",
+            "opus",
+            "system.ai.claude-opus-4-8[1m]",
+            {},
+            "sonnet (system.ai.claude-opus-4-8)",
+            False,
+        ),
+        (
+            "opus",
+            "opus",
+            "system.ai.claude-opus-4-8[1m]",
+            {},
+            "opus (system.ai.claude-opus-5)",
+            False,
+        ),
+        ("opus", "opus", "PrivateModel", {}, "opus (PrivateModel)", False),
+        (
+            "opus",
+            "opus",
+            "system.ai.claude-opus-4-8[1m]",
+            {},
+            "opus (Choice 1)",
+            False,
+        ),
+        (
+            "opus",
+            "opus",
+            "system.ai.claude-opus-4-8",
+            {},
+            "opus (system.ai.claude-opus-4-8[1m])",
+            False,
+        ),
+        (
+            "opus",
+            "opus",
+            "system.ai.claude-opus-4-8",
+            {},
+            "opus ((system.ai.claude-opus-4-8))",
+            False,
+        ),
+        (
+            "best",
+            "best",
+            "system.ai.claude-opus-4-8",
+            {},
+            "best (system.ai.claude-opus-4-8)",
+            False,
+        ),
     ],
     ids=[
         "pinned-alias",
@@ -14339,6 +14435,15 @@ def test_model_command_leaves_default_settings_and_legacy_settings_paths_untouch
         "different-public-generation",
         "unmarked-different-public-generation",
         "marked-status-for-plain-public-pin",
+        "captured-opus-wrapper",
+        "sonnet-wrapper",
+        "wrapper-wrong-alias",
+        "wrapper-wrong-generation",
+        "private-wrapper-not-inferred",
+        "wrapper-label-not-an-id",
+        "wrapper-marked-status-for-plain-pin",
+        "wrapper-nested-parentheses",
+        "wrapper-unknown-alias",
     ],
 )
 def test_model_command_verifies_alias_context_and_private_model_identity(

@@ -288,6 +288,11 @@ _UCODE_CLAUDE_TIER_TO_ENV: dict[str, str] = {
     "sonnet": _ANTHROPIC_DEFAULT_SONNET_MODEL_ENV,
     "haiku": _ANTHROPIC_DEFAULT_HAIKU_MODEL_ENV,
 }
+_CLAUDE_PUBLIC_PICKER_MODEL = re.compile(
+    r"(?:system\.ai\.|databricks-)?claude-(?:opus|sonnet|haiku|fable)-"
+    r"\d+(?:-\d+)*(?:\[1m\])?",
+    re.IGNORECASE,
+)
 # The 4 family aliases above pin one model ID each. Claude Code has exactly
 # one more independently-selectable /model picker slot beyond those
 # families — ANTHROPIC_CUSTOM_MODEL_OPTION — used here to surface Sonnet 5
@@ -1352,6 +1357,25 @@ def _parse_claude_legacy_models(stdout: str) -> list[dict[str, Any]]:
     return []
 
 
+def _claude_alias_pins(claude_config: ClaudeNativeUcodeConfig | None) -> dict[str, str]:
+    """Read alias pins with configured values overriding inherited ones."""
+    configured_env = claude_config.env if claude_config is not None else {}
+    return {
+        alias: configured_env.get(env_var, os.environ.get(env_var, ""))
+        for alias, env_var in ALIAS_MODEL_ENV_VARS.items()
+    }
+
+
+def _claude_picker_model_key(model: str) -> str:
+    """Fold recognized public identities while preserving private IDs literally."""
+    if (
+        _CLAUDE_PUBLIC_PICKER_MODEL.fullmatch(model)
+        or model.lower().removesuffix("[1m]") in ALIAS_MODEL_ENV_VARS
+    ):
+        return model.lower()
+    return model
+
+
 async def probe_claude_model_options(
     claude_config: ClaudeNativeUcodeConfig | None,
 ) -> ClaudeModelProbe | None:
@@ -1364,6 +1388,7 @@ async def probe_claude_model_options(
     :param claude_config: The resolved native launch config, or ``None``.
     :returns: The probe result, or ``None`` when both discovery methods fail.
     """
+    launch_pins = _claude_alias_pins(claude_config)
     text = await _run_claude_model_probe(claude_config, stream_input=True)
     models = _parse_claude_picker_models(text) if text is not None else None
     structured = models is not None
@@ -1387,6 +1412,7 @@ async def probe_claude_model_options(
         for value in (model["value"], model.get("resolvedModel"))
         if isinstance(value, str) and value
     )
+    disabled_keys = {_claude_picker_model_key(value) for value in disabled_models}
     enabled = [
         model
         for model in models
@@ -1402,17 +1428,16 @@ async def probe_claude_model_options(
         resolution = dict(resolutions.get(alias, {}))
         resolved = model.get("resolvedModel")
         if isinstance(resolved, str) and resolved:
+            if _claude_picker_model_key(resolved) in disabled_keys:
+                continue
             resolution["model"] = resolved
-            # The structured picker can omit the explicit context from resolvedModel.
+            # Resolved IDs can omit context carried by the picker value or its launch pin.
+            context_value = launch_pins.get(alias.lower()) or alias
             if (
                 structured
-                and re.fullmatch(
-                    r"(?:system\.ai\.|databricks-)?claude-(?:opus|sonnet|haiku|fable)-"
-                    r"\d+(?:-\d+)*\[1m\]",
-                    alias,
-                    re.IGNORECASE,
-                )
-                and alias[:-4].lower() == resolved.lower()
+                and context_value.lower().endswith("[1m]")
+                and _CLAUDE_PUBLIC_PICKER_MODEL.fullmatch(context_value)
+                and context_value[:-4].lower() == resolved.lower()
             ):
                 resolution["model"] = f"{resolved}[1m]"
         label = model.get("displayName")
@@ -1426,7 +1451,7 @@ async def probe_claude_model_options(
             "enabled": model.get("disabled") is not True,
             "provenance": "structured" if structured else "legacy",
         }
-        if row["model"] in disabled_models:
+        if _claude_picker_model_key(str(row["model"])) in disabled_keys:
             continue
         if row["model"] in seen_models:
             existing = next(item for item in alias_rows if item["model"] == row["model"])
@@ -1470,7 +1495,8 @@ def claude_catalog_fingerprint(claude_config: ClaudeNativeUcodeConfig | None) ->
     ambient_transport = claude_ambient_transport() if uses_cli_settings else None
     return fingerprint_of(
         "claude-native",
-        "control-picker-v5",
+        "control-picker-v6",
+        sorted(_claude_alias_pins(claude_config).items()),
         sorted(claude_config.env.items()) if claude_config is not None else None,
         claude_config.api_key_helper if claude_config is not None else None,
         claude_config.model if claude_config is not None else None,
@@ -1511,6 +1537,7 @@ async def claude_model_catalog(
     if probe.empty_picker:
         return []
     rows = list(probe.alias_rows)
+    disabled_keys = {_claude_picker_model_key(value) for value in probe.disabled_models}
     declared_models = set(claude_config.routable_models) if claude_config is not None else set()
     _non_canonical = (
         claude_config is not None and not _serves_canonical_anthropic_ids(claude_config)
@@ -1538,7 +1565,11 @@ async def claude_model_catalog(
             out.append({**row, "isDefault": True})
         else:
             out.append({key: value for key, value in row.items() if key != "isDefault"})
-    if default_model and not marked and default_model not in probe.disabled_models:
+    if (
+        default_model
+        and not marked
+        and _claude_picker_model_key(default_model) not in disabled_keys
+    ):
         # Append the observed default as its own honest row — but never
         # claim a bare Anthropic id is launchable on an endpoint that
         # rejects that spelling.

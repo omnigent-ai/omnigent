@@ -771,16 +771,23 @@ Cross-harness journeys:
   A new runner cannot repair an older server's rollback behavior.
 - **`model-and-effort`, Claude browser selection and refusal (nightly):**
   `tests/e2e_ui/chat/test_claude_model_picker.py::test_claude_native_picker_repeated_pins_reach_the_real_terminal`
-  proves alias picks through the gear, model pill and Ctrl+Shift+M using
+  checks alias picks through the gear, model pill and Ctrl+Shift+M using
   the real browser, server, owned isolated host, runner and CLI. Subsequent
-  mock requests preserve the wire model's generation; native status and
-  `requestedModel` retain `[1m]`, with a correlated `context-1m` request beta.
-  Chat and the transcript each contain the reply once.
+  turns require exactly one matching streaming provider request and one user
+  message/reply pair in Chat, persisted history and the native transcript.
+  Requests, native `requestedModel` and fresh status must name the exact
+  concrete generation. Claude Code 2.1.323 treats Opus 4.8 as native 1M: its
+  public wire and status IDs omit `[1m]` without requiring a `context-1m` beta.
+  Each Opus turn must instead report a fresh 1,000,000-token context matching
+  its unique prompt ID, native session and transcript path. This normalization
+  applies only to that exact public model spelling; private IDs stay literal.
+  Every pick still requires success before the next prompt.
   `tests/e2e_ui/chat/test_claude_model_picker.py::test_claude_native_refusal_preserves_a_newer_same_model_selection`
   pauses its owned CLI to force a real unconfirmed switch; a late 503 preserves
   a newer same-value model write and its effort while the applied model stays
   unchanged. See [Composer](./composer.md) for visible outcomes and prerequisites.
-  These cases do not cover live providers or a post-refusal retry.
+  These cases do not cover live providers, inference beyond 200K tokens or a
+  post-refusal retry.
 - **`picker-entry-visibility`:**
   `web/src/shell/AgentHarnessPicker.test.tsx` covers the picker rows a hidden
   entry drops and when the picker points at Settings,

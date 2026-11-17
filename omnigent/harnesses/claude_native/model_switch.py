@@ -562,14 +562,28 @@ class SessionOnlyModelSwitch:
                 self.wait(lambda text: _draft(text) == "" and _status(text) is None, seconds=1.0)
 
     def status_matches(self, actual: str, *, exact_context: bool) -> bool:
+        from omnigent.models.claude_model_vocabulary import CLAUDE_MODEL_ALIASES
+
         expected = {self.choice.model}
         canonical = _known_claude_id(self.choice.model)
         if canonical:
             expected.add(canonical)
-        if actual in expected:
+        actual_ids = {actual}
+        if (
+            canonical
+            and self.choice.structured
+            and self.choice.value.lower().removesuffix("[1m]") in CLAUDE_MODEL_ALIASES
+        ):
+            wrapped = re.fullmatch(
+                rf"{re.escape(self.choice.value)} \(([^()\r\n]+)\)", actual, re.IGNORECASE
+            )
+            if wrapped and _known_claude_id(wrapped[1]):
+                actual_ids.add(wrapped[1])
+        if actual_ids & expected:
             return True
         if not exact_context and any(
-            value.endswith("[1m]") and actual == value.removesuffix("[1m]") for value in expected
+            value.endswith("[1m]") and value.removesuffix("[1m]") in actual_ids
+            for value in expected
         ):
             return True
         return bool(
