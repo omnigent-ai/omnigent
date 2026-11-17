@@ -209,9 +209,8 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
     const remote = options?.remote === true;
     const bundledCli = options?.bundledCli === true;
     const hasRunner = remote || bundledCli;
-    // Offer the choice only when something can install: a runner, an installer, or manual steps.
+    // Offer the choice only when the CLI can be installed: in-app, or by manual steps.
     const canInstall =
-      setup.onConnectRunner !== undefined ||
       setup.mockInstall === true ||
       setup.onInstallCli !== undefined ||
       setup.installSupported === false;
@@ -387,6 +386,12 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
     terminalTarget.kind,
     setup.localServerRunning === true,
   );
+  // Back from the join choice keeps the server the user just added to the list.
+  const pickedFromList = runnerTarget?.from === "server" ? runnerTarget.url : undefined;
+  const serverStepRecents =
+    pickedFromList !== undefined && !setup.recentServers.includes(pickedFromList)
+      ? [pickedFromList, ...setup.recentServers]
+      : setup.recentServers;
   // Whether the server step is showing its URL-input ("add") view vs the list —
   // reported up so the band can show the hero icons only in the add view.
   const [serverAddMode, setServerAddMode] = useState(false);
@@ -546,7 +551,7 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
           <ServerSelectStep
             initialUrl={setup.initialUrl}
             error={setup.error}
-            recentServers={setup.recentServers}
+            recentServers={serverStepRecents}
             managedServers={setup.managedServers}
             managedServerNames={setup.managedServerNames}
             serverNames={setup.serverNames}
