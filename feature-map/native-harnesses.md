@@ -30,9 +30,10 @@ implements them separately, so a fix for one harness does not reach the others.
   and add shared guidance for showing workspace screenshots; Pi authors can keep
   or replace its base prompt and disable automatic context files.
 - `long-term-memory`: on a server with memory on, Claude Code, Codex and Pi
-  sessions start with a note on the `memory_*` tools and a quoted list of up to
-  100 saved paths, and can save and recall memories across sessions and
-  harnesses. With memory off, or against an older server, they get neither the
+  sessions start with a note on the `memory_*` tools and a quoted index of up to
+  100 saved memories (path, short description, last-updated date; the session's
+  project first), and can save and recall memories across sessions and
+  harnesses. Claude Code's own auto memory is off in those sessions. With memory off, or against an older server, they get neither the
   tools nor the note. `memory_search` is offered only when the server's memory
   backend can search; the default backend cannot.
 - `pi-host-mcp`: managed Pi sessions (pi-native with an Omnigent provider, and the
@@ -707,9 +708,12 @@ Cross-harness journeys:
   `tests/runner/test_app_native_startup_instructions.py::test_startup_instructions_without_memory_are_unchanged`.
   `tests/runner/test_app_sessions_native_terminals_autocreate.py::test_auto_create_pi_terminal_launches_required_terminal`
   checks that the Pi launch passes the note through.
-  `tests/runner/test_memory_guidance.py::test_saved_paths_are_listed_as_quoted_data_not_as_instructions`
+  `tests/runner/test_memory_guidance.py::test_saved_memories_are_listed_as_quoted_data_not_as_instructions`,
+  `tests/runner/test_memory_guidance.py::test_the_sessions_project_comes_first_then_the_user_and_feedback`
   and `tests/runner/test_memory_guidance.py::test_without_search_the_guidance_never_mentions_memory_search`
   cover the note's content.
+  `tests/runner/test_app_sessions_native_terminals_autocreate.py::test_auto_create_claude_terminal_turns_its_own_memory_off_with_omnigent_memory`
+  covers Claude Code launching with its own auto memory off.
   `tests/runner/test_runner_entry.py::test_runner_offers_memory_tools_only_when_the_server_says_memory_is_available`,
   `tests/runner/test_memory_tool_dispatch.py::test_without_backend_search_memory_search_is_neither_offered_nor_proxied`
   and `tests/server/integration/test_memory_routes.py::test_by_default_the_routes_and_the_capability_are_off`
@@ -1517,13 +1521,14 @@ the message arrives as a new turn about 15 minutes later, and that
   the relay cancels its pending approval when the client disconnects. A timeout
   after execution starts has an unknown outcome and cannot undo a committed write.
 
-- Long-term memory is separate from a harness's own memory. Claude Code keeps
-  its own auto-memory on the host, which can answer a recall question on its own
-  and make `long-term-memory` look like it works when it doesn't. For a
-  cross-harness check, turn Claude Code's auto-memory off
-  (`CLAUDE_CODE_DISABLE_AUTO_MEMORY=1` in its launch environment), or recall
-  from a different harness. Codex asks for approval before each memory tool
-  call unless it has been allowed for the session.
+- Long-term memory is separate from a harness's own memory. With memory on,
+  Claude Code launches with its own auto memory off, but a
+  `CLAUDE_CODE_DISABLE_AUTO_MEMORY` value already in the runner's environment is
+  kept, and a Claude Code session started outside Omnigent still uses its own. Its
+  host-local notes can then answer a recall question by themselves and make
+  `long-term-memory` look like it works when it doesn't, so recall from a
+  different harness for a cross-harness check. Codex asks for approval before
+  each memory tool call unless it has been allowed for the session.
 
 - For user/project defaults and startup-argument precedence, use
   [Preferences and config defaults](./preferences.md). The read-only Startup

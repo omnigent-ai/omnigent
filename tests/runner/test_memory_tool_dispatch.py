@@ -241,6 +241,36 @@ def test_memory_names_are_the_runners_only_for_an_agent_with_memory() -> None:
     assert should_dispatch_locally(other_builtin)
 
 
+@pytest.mark.parametrize(
+    ("name", "args", "body", "expected"),
+    [
+        (
+            "memory_get",
+            {"path": "/a"},
+            {"path": "/a", "content": "x", "created_at": 1_794_554_629, "updated_at": 0},
+            {"path": "/a", "content": "x", "created_at": "2026-11-13", "updated_at": "1970-01-01"},
+        ),
+        (
+            "memory_list",
+            {},
+            {"entries": [{"path": "/a", "updated_at": 1_794_554_629}], "next_page_token": None},
+            {"entries": [{"path": "/a", "updated_at": "2026-11-13"}], "next_page_token": None},
+        ),
+        (
+            "memory_search",
+            {"query": "q"},
+            {"hits": [{"entry": {"path": "/a", "updated_at": 1_794_554_629}, "score": 2}]},
+            {"hits": [{"entry": {"path": "/a", "updated_at": "2026-11-13"}, "score": 2}]},
+        ),
+    ],
+    ids=["get", "list", "search"],
+)
+async def test_memory_results_show_dates_so_the_model_can_tell_their_age(
+    name: str, args: dict[str, object], body: object, expected: object
+) -> None:
+    assert await _call(_RecordingClient(_Resp(body=body)), name, args) == expected
+
+
 def test_memory_names_are_not_reserved() -> None:
     from omnigent.tools.builtins import BUILTIN_NAMES
 

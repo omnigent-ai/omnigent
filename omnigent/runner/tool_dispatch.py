@@ -5854,7 +5854,32 @@ async def _execute_memory_tool(
         return json.dumps(
             {"error": f"server returned {resp.status_code}", "details": resp.text[:500]}
         )
-    return json.dumps(resp.json())
+    return json.dumps(_with_memory_dates(resp.json()))
+
+
+def _with_memory_dates(value: object) -> object:
+    """
+    Show a memory result's Unix timestamps as UTC dates, e.g. ``"2026-11-15"``.
+
+    A date tells the model how old a memory is; an epoch number does not.
+
+    :param value: A decoded ``/v1/memory`` response.
+    :returns: The same structure with ``created_at`` and ``updated_at`` as dates.
+    """
+    if isinstance(value, list):
+        return [_with_memory_dates(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    converted: dict[str, object] = {}
+    for key, item in value.items():
+        if key in ("created_at", "updated_at") and type(item) is int and item >= 0:
+            try:
+                converted[key] = datetime.fromtimestamp(item, UTC).strftime("%Y-%m-%d")
+            except (OverflowError, OSError, ValueError):
+                converted[key] = item
+        else:
+            converted[key] = _with_memory_dates(item)
+    return converted
 
 
 @dataclass

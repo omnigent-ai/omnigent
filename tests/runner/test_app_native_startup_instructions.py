@@ -76,8 +76,8 @@ def memory_guidance(monkeypatch: pytest.MonkeyPatch) -> list[tuple[object, ...]]
     """Stub the memory index fetch and record each call."""
     calls: list[tuple[object, ...]] = []
 
-    async def _guidance(*args: object) -> str:
-        calls.append(args)
+    async def _guidance(*args: object, workspace: object = None) -> str:
+        calls.append((*args, workspace))
         return "MEMORY GUIDANCE"
 
     monkeypatch.setattr("omnigent.runner.native.orchestration.memory_startup_guidance", _guidance)
@@ -93,13 +93,16 @@ async def test_startup_instructions_join_stable_text_notes_and_memory_in_order(
     spec = _spec("Be a concise assistant.")
     client = object()
 
-    text = await _native_startup_instructions(spec, client, "sess", "ROUTING NOTE", None)
+    text = await _native_startup_instructions(
+        spec, client, "sess", "ROUTING NOTE", None, workspace="/work/omnigent"
+    )
 
     assert text == (
         f"Be a concise assistant.\n\n{WORKSPACE_IMAGE_INSTRUCTION}"
         "\n\nROUTING NOTE\n\nMEMORY GUIDANCE"
     )
-    assert memory_guidance == [(client, "sess", spec)]
+    # The workspace reaches the guidance, which names the session's project from it.
+    assert memory_guidance == [(client, "sess", spec, "/work/omnigent")]
 
 
 @pytest.mark.asyncio
@@ -124,7 +127,7 @@ async def test_startup_instructions_without_memory_are_unchanged(
     """With memory unavailable the result is the pre-memory value, byte for byte."""
     from omnigent.runner.native.orchestration import _native_startup_instructions
 
-    async def _no_memory(*_args: object) -> None:
+    async def _no_memory(*_args: object, workspace: object = None) -> None:
         return None
 
     monkeypatch.setattr("omnigent.runner.native.orchestration.memory_startup_guidance", _no_memory)

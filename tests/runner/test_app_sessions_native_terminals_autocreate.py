@@ -79,7 +79,7 @@ from omnigent.runner.resource_registry import (
 )
 from omnigent.runner.session_init_protocol import RunnerSessionInitEnvelope
 from omnigent.runtime.prompt import WORKSPACE_IMAGE_INSTRUCTION
-from omnigent.spec.types import AgentSpec, ExecutorSpec
+from omnigent.spec.types import AgentSpec, ExecutorSpec, ToolGroupsConfig
 from omnigent.stores.conversation_store import FORK_CARRY_HISTORY_LABEL_KEY
 from omnigent.terminals import TerminalRegistry
 from tests._helpers.managed_mcp import expand_entry_value
@@ -251,7 +251,7 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
 
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
 
-    async def _memory_guidance(*_args: Any) -> str | None:
+    async def _memory_guidance(*_args: Any, workspace: Any = None) -> str | None:
         return memory_guidance
 
     monkeypatch.setattr(
@@ -2492,6 +2492,94 @@ async def test_auto_create_claude_terminal_passes_startup_instructions(
     assert args[idx + 1] == (
         f"Be a concise, careful coding assistant.\n\n{WORKSPACE_IMAGE_INSTRUCTION}"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("server_memory", "spec_memory", "preset", "expected"),
+    [
+        (True, True, None, "1"),
+        (False, True, None, None),
+        (True, False, None, None),
+        (True, True, "0", None),
+    ],
+    ids=["memory-on", "server-memory-off", "agent-memory-off", "already-set"],
+)
+async def test_auto_create_claude_terminal_turns_its_own_memory_off_with_omnigent_memory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    server_memory: bool,
+    spec_memory: bool,
+    preset: str | None,
+    expected: str | None,
+) -> None:
+    """With Omnigent memory on, Claude Code launches with its own auto memory off.
+
+    Only when the server confirms memory is on, so a session never loses both, and
+    an explicit value in the runner's environment wins.
+    """
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    if preset is None:
+        monkeypatch.delenv("CLAUDE_CODE_DISABLE_AUTO_MEMORY", raising=False)
+    else:
+        monkeypatch.setenv("CLAUDE_CODE_DISABLE_AUTO_MEMORY", preset)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
+        _no_op_forwarder,
+    )
+    captured: dict[str, Any] = {}
+
+    class _FakeResourceRegistry(SessionResourceRegistry):
+        terminal_registry = None
+
+        async def launch_required_terminal(
+            self,
+            *,
+            session_id: str,
+            terminal_name: str,
+            session_key: str,
+            spec: Any,
+            resource_role: str | None = None,
+            parent_os_env: Any = None,
+        ) -> SessionResourceView:
+            del terminal_name, session_key
+            captured["spec"] = spec
+            return SessionResourceView(
+                id="terminal_claude_main",
+                type="terminal",
+                session_id=session_id,
+                name="claude:main",
+                metadata={"terminal_name": "claude", "session_key": "main", "running": True},
+            )
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/info":
+            return httpx.Response(200, json={"memory": server_memory})
+        if request.url.path == "/v1/memory/entries":
+            return httpx.Response(200, json={"entries": [], "next_page_token": None})
+        return httpx.Response(200, json={"labels": {}})
+
+    fake_client = httpx.AsyncClient(
+        base_url="http://test-server", transport=httpx.MockTransport(_handle_request)
+    )
+    agent_spec = AgentSpec(
+        spec_version=1,
+        name="claude-agent",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+        tool_groups=ToolGroupsConfig(memory=spec_memory),
+    )
+
+    await _auto_create_claude_terminal(
+        "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6",
+        _FakeResourceRegistry(),
+        lambda _sid, _evt: None,
+        server_client=fake_client,
+        agent_spec=agent_spec,
+    )
+
+    assert captured["spec"].env.get("CLAUDE_CODE_DISABLE_AUTO_MEMORY") == expected
 
 
 @pytest.mark.asyncio

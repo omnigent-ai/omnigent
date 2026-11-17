@@ -32,17 +32,40 @@ tool replaces a request tool of the same name.
 
 A memory is markdown text of up to 16,000 bytes (UTF-8) at an absolute path,
 with an optional one-line description. Path segments use letters, digits, spaces,
-`-`, `_` and `.`, and don't start or end with a space. The startup guidance suggests `/user/preferences/<topic>`,
-`/projects/<repo>/<topic>` and `/procedure/<name>`.
+`-`, `_` and `.`, and don't start or end with a space.
 
 When a Claude Code, Codex or Pi session starts, its startup instructions get a
-short note on using these tools plus an index of up to 100 saved paths. The paths
-are listed as a quoted JSON list under a note that they are saved data, not
-instructions, because a model wrote them. Descriptions and contents are left
-out, because they would be repeated into the instructions of every later
-session; the agent reads a memory with `memory_get`. The index is
-built once per launch, so a memory saved later in the session is found with
-`memory_list`, or `memory_search` where the backend can search.
+short note on using these tools and on what to save:
+
+- under `/user/<topic>`, who the user is and how they like to work;
+- under `/feedback/<topic>`, corrections the user gave and approaches they
+  confirmed, with why;
+- under `/projects/<repo>/<topic>`, project context the code and history don't show;
+- under `/reference/<topic>`, where to find things outside the project.
+
+It tells the agent to skip what the code, git history or the repository's
+instruction files already say, to update an existing memory rather than add a
+near-duplicate, and to check old project facts against the code. It names the
+session's project: the repository name of the `origin` remote, or else the main
+checkout's directory name, so every machine, clone and worktree of a repository
+uses the same `/projects/<repo>` path.
+
+The note ends with an index of up to 100 saved memories (about 8,000
+characters): each memory's path, its description shortened to one line of up to
+120 characters, and the date it was last updated. The session's project comes
+first, then `/user` and `/feedback`, then the rest. A model wrote the paths and
+descriptions, possibly from untrusted input, so the index is a quoted JSON list
+under a note that it is data, not instructions, and descriptions lose line
+breaks and formatting characters. Contents are left out; the agent reads a
+memory with `memory_get`, whose result, like the other tools', shows dates
+rather than timestamps. The index is built once per launch, so a memory saved
+later in the session is found with `memory_list`, or `memory_search` where the
+backend can search.
+
+Claude Code has its own machine-local auto memory. In a session with Omnigent
+memory on, Claude Code launches with `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`, so the
+agent keeps one set of memories. Its existing notes stay on disk, unused in those
+sessions. A value already set in the runner's environment is kept.
 
 ## Whose memory it is
 

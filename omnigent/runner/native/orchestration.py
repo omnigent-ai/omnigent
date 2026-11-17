@@ -2986,7 +2986,7 @@ async def _auto_create_pi_terminal(
         if system_prompt_mode == "replace" and raw_author_instructions(pi_spec) is None:
             raise ValueError("system_prompt_mode='replace' requires non-empty instructions")
     startup_instructions = await _native_startup_instructions(
-        agent_spec, server_client, session_id
+        agent_spec, server_client, session_id, workspace=workspace
     )
     instructions_path = write_agent_instructions(bridge_dir, startup_instructions)
     provider_args: list[str] = []
@@ -5878,7 +5878,7 @@ async def _auto_create_codex_terminal(
 
         _codex_routing_note = smart_routing_spawn_note("codex-native")
     _codex_developer_instructions = await _native_startup_instructions(
-        agent_spec, server_client, session_id, _codex_routing_note
+        agent_spec, server_client, session_id, _codex_routing_note, workspace=workspace
     )
     # SDK initialization can block on DNS/auth before model discovery times out.
     # Keep it off the runner loop so heartbeats and other sessions can progress.
@@ -7869,6 +7869,7 @@ async def _native_startup_instructions(
     server_client: httpx.AsyncClient | None,
     session_id: str,
     *launch_notes: str | None,
+    workspace: str | Path | None = None,
 ) -> str:
     """
     Compose a native harness's startup instructions, including long-term memory.
@@ -7881,14 +7882,59 @@ async def _native_startup_instructions(
         fetch the memory index.
     :param session_id: The session being launched.
     :param launch_notes: Additional framework notes, in order; ``None`` skipped.
+    :param workspace: The session's working directory, which names its project
+        in the memory guidance.
     :returns: The joined text.
     """
     parts = [
         _native_startup_instructions_from_spec(agent_spec),
         *launch_notes,
-        await memory_startup_guidance(server_client, session_id, agent_spec),
+        await memory_startup_guidance(server_client, session_id, agent_spec, workspace=workspace),
     ]
     return "\n\n".join(part for part in parts if part)
+
+
+# Claude Code's own setting for its machine-local auto memory.
+_CLAUDE_AUTO_MEMORY_OFF_ENV = "CLAUDE_CODE_DISABLE_AUTO_MEMORY"
+# A slow server must not delay the launch.
+_CLAUDE_AUTO_MEMORY_CHECK_SECONDS = 5.0
+
+
+async def _claude_auto_memory_env(
+    agent_spec: AgentSpec | ResolvedSpec | None, server_client: httpx.AsyncClient | None
+) -> dict[str, str]:
+    """
+    Turn Claude Code's own auto memory off when the session has Omnigent memory.
+
+    Two memory systems would keep separate, possibly conflicting notes, and
+    Claude Code's stays on the host, so a sandboxed session would lose it. It is
+    turned off only when the agent has the memory tools and the server confirms
+    memory is on, so a session never loses both. A value already set in the
+    runner's environment is kept.
+
+    :param agent_spec: The session's agent spec, or ``None``.
+    :param server_client: The runner's client for the Omnigent server.
+    :returns: ``{"CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1"}`` when Omnigent memory
+        is on, otherwise ``{}``.
+    """
+    spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
+    if (
+        spec is None
+        or not spec.tool_groups.memory
+        or server_client is None
+        or _CLAUDE_AUTO_MEMORY_OFF_ENV in os.environ
+    ):
+        return {}
+    from omnigent.runner.tool_dispatch import _server_has_memory
+
+    try:
+        has_memory = await asyncio.wait_for(
+            _server_has_memory(server_client), timeout=_CLAUDE_AUTO_MEMORY_CHECK_SECONDS
+        )
+    except Exception:
+        _logger.debug("memory availability unknown; leaving Claude auto memory on", exc_info=True)
+        return {}
+    return {_CLAUDE_AUTO_MEMORY_OFF_ENV: "1"} if has_memory else {}
 
 
 def _cursor_native_model_from_spec(agent_spec: AgentSpec | ResolvedSpec | None) -> str | None:
@@ -9972,7 +10018,7 @@ async def _auto_create_claude_terminal(
         model_overrides=claude_config.model_overrides if claude_config is not None else None,
         subagent_router_dir=subagent_router_dir,
         append_system_prompt=await _native_startup_instructions(
-            agent_spec, server_client, session_id, routed_spawn_note
+            agent_spec, server_client, session_id, routed_spawn_note, workspace=workspace
         ),
         allowed_tools=routed_spawn_tools,
         # The route-turn hook is registered only when this session can
@@ -10009,6 +10055,7 @@ async def _auto_create_claude_terminal(
         validate_claude_hook_interpreter_compatibility(resolved_claude)
 
     claude_terminal_env_unset = _claude_terminal_env_unset(claude_config)
+    claude_auto_memory_env = await _claude_auto_memory_env(agent_spec, server_client)
 
     # Inherit the agent's os_env so its sandbox (e.g. ``type: none``),
     # egress_rules and env_passthrough are honoured. Without ``sandbox`` here
@@ -10033,6 +10080,7 @@ async def _auto_create_claude_terminal(
                 client_surface=resource_registry.client_surface(session_id),
             ),
             **claude_terminal_relay_env(bridge_dir),
+            **claude_auto_memory_env,
         },
         # Names to strip (see ``_claude_terminal_env_unset``). Dropping
         # ``DATABRICKS_CONFIG_PROFILE`` matters because Claude's MCP servers

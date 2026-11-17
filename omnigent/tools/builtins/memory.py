@@ -21,7 +21,7 @@ from omnigent.stores.memory_store import MAX_DESCRIPTION_LENGTH, MAX_SEARCH_LIMI
 from omnigent.tools.base import Tool
 
 _PATH_DESCRIPTION = (
-    "Absolute path, e.g. '/user/preferences/testing' or '/projects/<repo>/gotchas'. "
+    "Absolute path, e.g. '/feedback/testing' or '/projects/<repo>/gotchas'. "
     "Group related memories under a shared prefix."
 )
 _PREFIX_DESCRIPTION = (
