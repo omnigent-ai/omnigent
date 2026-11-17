@@ -1099,14 +1099,11 @@ async def test_recovered_running_waits_for_replay_that_ended_the_turn(tmp_path: 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("overlapping", [False, True])
+@pytest.mark.parametrize("live_first", [False, True])
 async def test_live_item_does_not_republish_running_that_resume_reported(
-    tmp_path: Path, overlapping: bool
+    tmp_path: Path, overlapping: bool, live_first: bool
 ) -> None:
-    """A live item does not republish the running edge that resume replay already reported.
-
-    When the item waits behind the replay's delivery scope, the replay's running
-    edge is what it must see before deciding to publish.
-    """
+    """Live recovery and resume publish running once, whichever owns delivery first."""
     write_bridge_state(
         tmp_path,
         CodexNativeBridgeState(
@@ -1129,14 +1126,15 @@ async def test_live_item_does_not_republish_running_that_resume_reported(
     }
 
     async def replay() -> None:
-        await fwd._post_resume_turn_status(
-            client,  # type: ignore[arg-type]
-            session_id="conv_x",
-            bridge_dir=tmp_path,
-            thread_id="thread_1",
-            turns=[{"id": "turn_1", "status": "inProgress", "items": []}],
-            forwarder_state=state,
-        )
+        async with fwd._conversation_item_delivery_scope("conv_x"):
+            await fwd._post_resume_turn_status(
+                client,  # type: ignore[arg-type]
+                session_id="conv_x",
+                bridge_dir=tmp_path,
+                thread_id="thread_1",
+                turns=[{"id": "turn_1", "status": "inProgress", "items": []}],
+                forwarder_state=state,
+            )
 
     async def live() -> None:
         await fwd._post_missed_turn_start(
@@ -1150,14 +1148,15 @@ async def test_live_item_does_not_republish_running_that_resume_reported(
 
     locks_token = fwd._conversation_item_locks.set({})
     try:
+        first, second = (live, replay) if live_first else (replay, live)
         if not overlapping:
-            await replay()
-            await live()
+            await first()
+            await second()
         else:
             async with fwd._conversation_item_delivery_scope("conv_x"):
-                waiting = asyncio.create_task(live())
+                waiting = asyncio.create_task(second())
                 await asyncio.sleep(0)
-                await replay()
+                await first()
             await asyncio.wait_for(waiting, timeout=5.0)
     finally:
         fwd._conversation_item_locks.reset(locks_token)

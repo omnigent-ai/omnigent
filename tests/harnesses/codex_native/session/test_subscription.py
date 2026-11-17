@@ -8,6 +8,7 @@ import json
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock
 
 import click
 import httpx
@@ -1334,10 +1335,13 @@ def test_supervise_forwarder_continues_after_event_handler_failure(
     assert "Codex forwarder event handling failed" in caplog.text
 
 
+@pytest.mark.parametrize("status_publish_fails", [False, True])
 def test_supervise_forwarder_reports_running_from_first_live_item_of_missed_turn(
+    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    status_publish_fails: bool,
 ) -> None:
-    """A fresh thread subscribes after its first turn started; its first live item reports it."""
+    """First-item recovery is best effort and never consumes the original live item."""
     _write_forwarder_bridge(tmp_path, active_turn_id="turn_1")
     user_message = {
         "type": "userMessage",
@@ -1352,6 +1356,11 @@ def test_supervise_forwarder_reports_running_from_first_live_item_of_missed_turn
         ]
     )
     posted: list[dict[str, Any]] = []
+    handle_event = AsyncMock(wraps=codex_native_forwarder._handle_event)
+    monkeypatch.setattr(codex_native_forwarder, "_handle_event", handle_event)
+    if status_publish_fails:
+        status_poster = AsyncMock(side_effect=RuntimeError("credential resolution failed"))
+        monkeypatch.setattr(codex_native_forwarder, "_post_turn_status_edge", status_poster)
 
     asyncio.run(
         codex_native_forwarder.supervise_forwarder(
@@ -1366,9 +1375,16 @@ def test_supervise_forwarder_reports_running_from_first_live_item_of_missed_turn
         )
     )
 
-    assert [body["data"] for body in posted if body["type"] == "external_session_status"] == [
-        _expected_status_data("running", "turn_1")
+    assert [call.kwargs["event"]["method"] for call in handle_event.await_args_list] == [
+        "item/started",
+        "item/completed",
     ]
+    statuses = [body["data"] for body in posted if body["type"] == "external_session_status"]
+    if status_publish_fails:
+        status_poster.assert_awaited_once()
+        assert statuses == []
+    else:
+        assert statuses == [_expected_status_data("running", "turn_1")]
 
 
 def test_codex_discover_thread_and_forward_writes_routing_summary_on_timeout(

@@ -2926,14 +2926,19 @@ async def supervise_forwarder(
                         parent_thread_id=target.thread_id,
                         event=event,
                     )
-                    await _post_missed_turn_start(
-                        ap_client,
-                        session_id=target.session_id,
-                        bridge_dir=bridge_dir,
-                        thread_id=target.thread_id,
-                        event=event,
-                        forwarder_state=forwarder_state,
-                    )
+                    try:
+                        await _post_missed_turn_start(
+                            ap_client,
+                            session_id=target.session_id,
+                            bridge_dir=bridge_dir,
+                            thread_id=target.thread_id,
+                            event=event,
+                            forwarder_state=forwarder_state,
+                        )
+                    except Exception:
+                        _logger.warning(
+                            "Codex forwarder missed turn-start recovery failed", exc_info=True
+                        )
                     handle = functools.partial(
                         _handle_event,
                         ap_client,
@@ -3789,6 +3794,14 @@ async def _post_resume_turn_status(
         and edge.status != "failed"
     ):
         # A failure posted for this turn, such as a stopped goal's, stays the last word.
+        return
+    if (
+        edge is not None
+        and edge.status == "running"
+        and edge.turn_id is not None
+        and forwarder_state is not None
+        and forwarder_state.running_reported_turn_id == edge.turn_id
+    ):
         return
     await _post_turn_status_edge(client, session_id, edge)
     if edge is not None and edge.status == "failed" and forwarder_state is not None:
