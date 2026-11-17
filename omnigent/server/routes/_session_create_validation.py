@@ -92,9 +92,6 @@ async def resolve_project_session_create(
             continue
         if field not in fields_set and field in config and field in body.__class__.model_fields:
             updates[field] = config[field]
-    # The request's own agent_id was checked by its route; a project's saved
-    # agent is the caller's to edit, so it must not name the hidden agent either.
-    reject_proactive_agent_id(updates.get("agent_id"))
     if repository is not None and not {"workspace", "workspaces"} & fields_set:
         updates["workspaces"] = [repository]
     saved_provider = config.get("sandbox_provider")
@@ -121,6 +118,10 @@ async def resolve_project_session_create(
 
     if getattr(resolved, "agent_id", None) is None and "agent_id" in body.__class__.model_fields:
         raise OmnigentError("agent_id is required", code=ErrorCode.INVALID_INPUT)
+    if "agent_id" in updates:
+        # The request's own agent_id was checked by its route; a project's saved
+        # agent is the caller's to edit, so it must not name the hidden agent either.
+        reject_proactive_agent_id(resolved.agent_id)
     if getattr(resolved, "git", None) is not None and getattr(resolved, "host_id", None) is None:
         raise OmnigentError(
             "git worktree creation requires host_id",

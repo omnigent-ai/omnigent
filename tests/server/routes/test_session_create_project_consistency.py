@@ -385,7 +385,17 @@ async def test_legacy_multi_error_order_starts_with_agent_id(
     ]
 
 
-@pytest.mark.parametrize("config_field", [("workspace", 123), ("git", "yes")])
+@pytest.mark.parametrize(
+    "config_field",
+    [
+        ("workspace", 123),
+        ("git", "yes"),
+        # The proactive-agent guard reads agent_id only after it validates.
+        ("agent_id", 123),
+        ("agent_id", ["not", "an", "id"]),
+        ("agent_id", {"id": "x"}),
+    ],
+)
 async def test_malformed_project_config_is_structured_400(
     project_create_client: httpx.AsyncClient,
     config_field: tuple[str, object],
