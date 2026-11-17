@@ -526,6 +526,38 @@ def test_issue_url_scrubs_home_directory_and_tokens(
     assert "sk-a***" in title
 
 
+@pytest.mark.parametrize(
+    ("traceback_line", "expected_fragment", "home_survives"),
+    [
+        ("Home: (/home/example-user)\n", "Home: (~)", False),
+        ("Home: [/home/example-user]\n", "Home: [~]", False),
+        ("Home:{/home/example-user}\n", "Home:{~}", False),
+        (
+            '  File "/home/example-user-backup/module.py", line 1\n',
+            '"/home/example-user-backup/module.py"',
+            True,
+        ),
+    ],
+    ids=["parenthesized", "bracketed", "braced", "hyphenated-sibling"],
+)
+def test_issue_url_scrubs_punctuation_bounded_home_path(
+    data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    traceback_line: str,
+    expected_fragment: str,
+    home_survives: bool,
+) -> None:
+    """Punctuation around the home path is scrubbed; longer sibling names are left alone."""
+    ch.install_crash_handler("omnigent", "omnigent-ai/omnigent")
+    monkeypatch.setattr(Path, "home", lambda: Path("/home/example-user"))
+    tb_text = "Traceback (most recent call last):\n" + traceback_line + "ImportError: failure\n"
+    url, body_included = ch._issue_url(ImportError("failure"), tb_text)
+    assert body_included is True
+    body = _description_of(url)
+    assert expected_fragment in body
+    assert ("/home/example-user" in body) is home_survives
+
+
 def test_issue_url_redacts_multiline_bearer_before_truncation(data_dir: Path) -> None:
     """A credential split across lines is redacted before the head is cut away."""
     ch.install_crash_handler("omnigent", "omnigent-ai/omnigent")

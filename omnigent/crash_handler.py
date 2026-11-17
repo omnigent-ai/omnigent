@@ -466,7 +466,8 @@ def _scrub(text: str) -> str:
     with contextlib.suppress(Exception):
         home = str(Path.home())
         if home and home != os.sep:
-            text = re.sub(re.escape(home) + r"(?=$|[/\\\s'\"`])", "~", text)
+            # Only a whole path component: ``/home/al`` must not rewrite ``/home/alice``.
+            text = re.sub(re.escape(home) + r"(?![A-Za-z0-9_.\-])", "~", text)
     return text
 
 
@@ -485,9 +486,10 @@ def _issue_url(exc: BaseException, tb_text: str) -> tuple[str, bool]:
     Returns ``(url, body_included)``. The template, title, version, and
     OS are always prefilled. The Description holds the exception and the
     traceback; when the full traceback would exceed :data:`_MAX_URL_LENGTH`
-    its leading frames are cut, so the exception line and innermost frames
-    survive. The Description is omitted when the exception summary and
-    command without a traceback do not fit (``body_included is False``).
+    its leading frames are cut to fit. A kept traceback always ends with the
+    final exception line, and a long summary can leave its block empty.
+    The Description is omitted when the exception summary and command
+    without a traceback do not fit (``body_included is False``).
 
     Field IDs (``version``, ``os``, ``description``) come from
     ``.github/ISSUE_TEMPLATE/bug_report.yml``; keep in sync if it changes.
