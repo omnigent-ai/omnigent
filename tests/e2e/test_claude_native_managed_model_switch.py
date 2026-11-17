@@ -18,11 +18,11 @@ import pytest
 from omnigent.entities.session_resources import SessionResourceView
 from omnigent.harnesses.claude_native import bridge
 from omnigent.harnesses.claude_native import main as claude_native
-from omnigent.harnesses.claude_native.status import sync_raw_status_context
 from omnigent.models import model_catalog_store
 from omnigent.runner import create_runner_app
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from tests._helpers.polling import poll_until_async
+from tests.harnesses.claude_native._model_status_oracle import _status_model_matches
 from tests.runner.conftest import _FakeProcessManager, _runner_client, _ScriptedHarnessClient
 from tests.runner.helpers import NullServerClient
 
@@ -60,22 +60,6 @@ async def _wait_for_picker(socket_path: Path) -> str:
             return pane
         await asyncio.sleep(0.1)
     pytest.fail(f"Claude did not open its model picker:\n{_capture_pane(socket_path)[-3000:]}")
-
-
-def _status_model_matches(bridge_dir: Path, expected: str) -> bool:
-    try:
-        raw = json.loads((bridge_dir / bridge.CONTEXT_RAW_FILE).read_text())
-    except (OSError, ValueError):
-        return False
-    native_session = bridge.read_claude_session_id(bridge_dir)
-    if not isinstance(raw, dict) or not native_session or raw.get("session_id") != native_session:
-        return False
-    sync_raw_status_context(bridge_dir, None)
-    # Native-1M Opus 4.8 omits this public suffix; every other identity stays literal.
-    actual = bridge.read_claude_status_model(bridge_dir)
-    return actual == expected or (
-        expected == "system.ai.claude-opus-4-8[1m]" and actual == "system.ai.claude-opus-4-8"
-    )
 
 
 async def _wait_for_model(
@@ -256,7 +240,6 @@ async def test_runner_switches_managed_glm_in_a_real_claude_terminal(
                     json={
                         "type": "model_change",
                         "model": alias,
-                        "preserve_unconfirmed_model": True,
                     },
                 )
                 assert response.status_code == 204, response.text
@@ -272,7 +255,6 @@ async def test_runner_switches_managed_glm_in_a_real_claude_terminal(
                     json={
                         "type": "model_change",
                         "model": model,
-                        "preserve_unconfirmed_model": True,
                     },
                 )
                 assert response.status_code == 204, response.text
@@ -288,7 +270,6 @@ async def test_runner_switches_managed_glm_in_a_real_claude_terminal(
                 json={
                     "type": "model_change",
                     "model": _TARGET_MODEL,
-                    "preserve_unconfirmed_model": True,
                 },
             )
             assert refused.status_code == 503, refused.text
@@ -316,7 +297,6 @@ async def test_runner_switches_managed_glm_in_a_real_claude_terminal(
                 json={
                     "type": "model_change",
                     "model": _TARGET_MODEL,
-                    "preserve_unconfirmed_model": True,
                 },
             )
             assert recovered.status_code == 204, recovered.text

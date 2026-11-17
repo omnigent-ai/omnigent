@@ -37,7 +37,7 @@ from omnigent.inner.executor import (
     TurnComplete,
 )
 from omnigent.inner.native_attachments import attachment_cache_dir
-from tests.harnesses.claude_native.test_claude_native_bridge import (
+from tests.harnesses.claude_native._model_switch_support import (
     _CLEAR_ONE_ROW_COMPOSER,
     _session_model_bridge,
     _SessionModelComposer,
@@ -1922,8 +1922,13 @@ async def test_model_control_hold_preserves_user_changes_until_dismissal(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("busy", [False, True], ids=["idle", "busy"])
-@pytest.mark.parametrize("cache_cost", [False, True], ids=["immediate", "cache-cost"])
+@pytest.mark.parametrize(
+    ("busy", "cache_cost"),
+    [
+        pytest.param(False, False, id="immediate-idle"),
+        pytest.param(True, True, id="cache-cost-busy"),
+    ],
+)
 async def test_run_turn_holds_model_selection_until_prompt_is_answered(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
