@@ -7439,6 +7439,46 @@ describe("CreateScheduledTaskDialog workflow", () => {
     fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "Triage it." } });
     await waitFor(() => expect(screen.getByTestId("create-scheduled-task-submit")).toBeEnabled());
   });
+
+  it.each(["switching", "clearing"] as const)(
+    "moves a trigger edited as its prompt off its old workflow when %s it",
+    async (change) => {
+      const weeklyReport = {
+        id: "fedcba9876543210fedcba9876543210",
+        name: "Weekly report",
+        description: "Summarizes the week.",
+      };
+      savedWorkflowsList.current = [WORKFLOW, weeklyReport];
+      // Saved without a header, each match's session starts as a run of WORKFLOW.
+      const saved = renderTriggerPrompt(
+        "github",
+        { ...emptyTriggerFields("github"), scope: "acme/app", instructions: run("") },
+        { placement: "same_host", sessionLink: "", workflowIdSupported: true },
+      );
+      expect(saved).toContain(`workflow_id "${WORKFLOW.id}"`);
+      const view = renderGithubTrigger(true, { session_create_workflow_id: true });
+      reopenTrigger(view, saved, false);
+      fireEvent.pointerDown(screen.getByTestId("task-workflow-trigger"), { button: 0 });
+      if (change === "switching") {
+        fireEvent.click(screen.getByText(weeklyReport.name));
+      } else {
+        fireEvent.click(screen.getByTestId("workflow-picker-clear"));
+        fireEvent.change(screen.getByTestId("task-prompt-input"), {
+          target: { value: "Triage it." },
+        });
+      }
+      fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+
+      await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+      const updated = updateMutateAsync.mock.calls[0][0].input.prompt as string;
+      expect(updated).not.toContain(`workflow_id "${WORKFLOW.id}"`);
+      if (change === "switching") {
+        expect(updated).toContain(`workflow_id "${weeklyReport.id}"`);
+      } else {
+        expect(updated).not.toContain("workflow_id");
+      }
+    },
+  );
 });
 
 describe("CreateScheduledTaskDialog MCP services", () => {

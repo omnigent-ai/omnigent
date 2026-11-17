@@ -27,6 +27,7 @@ import {
   splitTriggerPrompt,
   stripScopePrefix,
   splitJqlOrderBy,
+  syncTriggerWorkflowId,
   triggerConditionFields,
   triggerEventDescription,
   stripTriggerHeader,
@@ -121,6 +122,35 @@ describe("saved trigger prompts", () => {
     expect(
       renderTriggerPrompt("jira", runsWorkflow, { ...supported, taskSessionMode: "continue" }),
     ).not.toContain("workflow_id");
+  });
+
+  it("keeps a prompt's creation call on the workflow its instructions now run", () => {
+    const supported = { ...CTX, workflowIdSupported: true };
+    const otherRun = WORKFLOW_RUN.replace(WORKFLOW_ID, "f".repeat(32));
+    const saved = renderTriggerPrompt("jira", fields({ instructions: WORKFLOW_RUN }), supported);
+    const withInstructions = (instructions: string) =>
+      combineTriggerPrompt(instructions, splitTriggerPrompt(saved).systemPrompt);
+    expect(syncTriggerWorkflowId(saved, true)).toBe(saved);
+    // Another workflow, or none, takes over the call, as a fresh render would.
+    expect(syncTriggerWorkflowId(withInstructions(otherRun), true)).toBe(
+      renderTriggerPrompt("jira", fields({ instructions: otherRun }), supported),
+    );
+    expect(syncTriggerWorkflowId(withInstructions("Investigate the ticket."), true)).toBe(
+      renderTriggerPrompt("jira", fields(), supported),
+    );
+    // A server that can't take workflow_id gets none.
+    expect(syncTriggerWorkflowId(saved, false)).toBe(
+      renderTriggerPrompt("jira", fields({ instructions: WORKFLOW_RUN }), CTX),
+    );
+    // A task session never starts as a run, and a call written by hand stays as written.
+    const taskSession = renderTriggerPrompt("jira", fields({ instructions: WORKFLOW_RUN }), {
+      ...supported,
+      taskSessionMode: "continue",
+    });
+    expect(syncTriggerWorkflowId(taskSession, true)).toBe(taskSession);
+    expect(syncTriggerWorkflowId("A handwritten automation.", true)).toBe(
+      "A handwritten automation.",
+    );
   });
 
   it.each(SOURCE_MODES)(

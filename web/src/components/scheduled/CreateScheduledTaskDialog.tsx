@@ -84,6 +84,7 @@ import {
   readTriggerWorkerSettings,
   renderTriggerConfigPrompt,
   splitTriggerPrompt,
+  syncTriggerWorkflowId,
   TRIGGER_SOURCES,
   stripTriggerHeader,
   TRIGGER_TEMPLATES,
@@ -1102,9 +1103,15 @@ export function CreateScheduledTaskDialog({
     ...triggerFields,
     instructions: withWorkflow(triggerFields.instructions),
   };
+  // Whether each match's session can start as a run of the trigger's saved workflow.
+  const workflowIdSupported =
+    workflowsEnabled && info !== "loading" && info.session_create_workflow_id === true;
   // The prompt when no trigger form is open: as typed, or an older trigger's instructions
-  // inside its saved template text.
-  const freeTextPrompt = combineTriggerPrompt(withWorkflow(prompt), systemPrompt);
+  // inside its saved template text, whose creation call follows the workflow they run.
+  const freeTextPrompt = syncTriggerWorkflowId(
+    combineTriggerPrompt(withWorkflow(prompt), systemPrompt),
+    workflowIdSupported,
+  );
   // Each run of a saved workflow gets its own new session, whether the workflow was
   // picked or its message typed, as the server requires.
   const runsSavedWorkflow =
@@ -1160,8 +1167,7 @@ export function CreateScheduledTaskDialog({
       schedule.preset === "custom" && schedule.customFreq === "minutely" ? schedule.interval : 60,
     taskSessionTitle: name,
     messageMaxChars: messageBudget.messageMaxChars,
-    workflowIdSupported:
-      workflowsEnabled && info !== "loading" && info.session_create_workflow_id === true,
+    workflowIdSupported,
   };
   // An edit keeps the saved workers; a new trigger's workers run where the manager
   // runs (beside it on a connected host, or each in its own sandbox).

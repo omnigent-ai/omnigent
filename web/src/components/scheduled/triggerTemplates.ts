@@ -827,6 +827,35 @@ export function updateTriggerWorkerSettings(
   return combineTriggerPrompt(parts.userPrompt, systemPrompt);
 }
 
+const WORKFLOW_ID_ARGUMENT = /, workflow_id "[0-9a-f]{32}"$/;
+
+/**
+ * Start each match's session as a run of the saved workflow the instructions run, or of
+ * none, as {@link renderTriggerPrompt} would. A trigger edited as its prompt text keeps
+ * its saved creation call, so a changed or cleared workflow must not leave the old one.
+ *
+ * @param prompt A trigger prompt without its header line.
+ * @param workflowIdSupported Whether `sys_session_create` accepts `workflow_id` here.
+ * @returns The prompt with that call updated, or unchanged when no generated call is found.
+ */
+export function syncTriggerWorkflowId(prompt: string, workflowIdSupported: boolean): string {
+  const parsed = workerSettingsMatch(prompt);
+  if (parsed === null) return prompt;
+  const { parts, match } = parsed;
+  const workflowRun =
+    workflowIdSupported && !isTaskSessionTriggerPrompt(prompt)
+      ? parseSavedWorkflowRun(parts.userPrompt)
+      : null;
+  const placement =
+    match[2].replace(WORKFLOW_ID_ARGUMENT, "") +
+    (workflowRun ? `, workflow_id ${JSON.stringify(workflowRun.id)}` : "");
+  if (placement === match[2]) return prompt;
+  const start = `call sys_session_create with agent_id ${match[1]}, `.length;
+  const call = `${match[0].slice(0, start)}${placement}${match[0].slice(start + match[2].length)}`;
+  const systemPrompt = parts.systemPrompt!.replace(match[0], () => call);
+  return combineTriggerPrompt(parts.userPrompt, systemPrompt);
+}
+
 const SERVICE_NAMES: Record<TriggerSource, string> = {
   jira: "Jira",
   slack: "Slack",
