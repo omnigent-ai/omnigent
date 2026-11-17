@@ -1013,6 +1013,23 @@ describe("ServerSelectorV2", () => {
     expect(onConnectRunner).not.toHaveBeenCalled();
   });
 
+  it("a failed CLI install can be retried, then connects this laptop and opens the server", async () => {
+    const onConnect = vi.fn().mockResolvedValue({});
+    const onConnectRunner = vi.fn().mockResolvedValue({ ok: true });
+    const onInstallCli = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: false, error: "Installer failed" })
+      .mockResolvedValueOnce({ ok: true });
+    joinTypedServer({ installed: false, onInstallCli, onConnectRunner, onConnect });
+    fireEvent.click(await screen.findByRole("radio", { name: /install cli first/i }));
+    fireEvent.click(screen.getByRole("button", { name: "Install Omnigent" }));
+    await screen.findByText("Installer failed");
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await waitFor(() => expect(onConnect).toHaveBeenCalledOnce());
+    expect(onInstallCli).toHaveBeenCalledTimes(2);
+    expect(onConnectRunner).toHaveBeenCalledWith("https://team.example.com/", "local");
+  });
+
   it("a failed laptop connect after the install can retry or continue without a host", async () => {
     const onConnect = vi.fn().mockResolvedValue({});
     const onConnectRunner = vi.fn().mockResolvedValue({ ok: false, error: "no host" });
@@ -1041,20 +1058,12 @@ describe("ServerSelectorV2", () => {
     expect(onConnectRunner).toHaveBeenCalledTimes(3);
   });
 
-  it("a shell that can't install anything opens directly instead of offering the choice", async () => {
+  it.each<[string, Partial<ServerSelectorV2Setup>]>([
+    ["can't install anything", {}],
+    ["can connect a runner but not install", { onConnectRunner: vi.fn() }],
+  ])("a shell that %s opens directly instead of offering the choice", async (_n, over) => {
     const onConnect = vi.fn().mockResolvedValue({});
-    joinTypedServer({ installed: false, onConnect });
-    await waitFor(() => expect(onConnect).toHaveBeenCalledOnce());
-    expect(screen.queryByRole("heading", { name: /how do you want to join/i })).toBeNull();
-  });
-
-  it("a shell that can connect a runner but not install opens directly", async () => {
-    const onConnect = vi.fn().mockResolvedValue({});
-    joinTypedServer({
-      installed: false,
-      onConnect,
-      onConnectRunner: vi.fn().mockResolvedValue({ ok: true }),
-    });
+    joinTypedServer({ installed: false, onConnect, ...over });
     await waitFor(() => expect(onConnect).toHaveBeenCalledOnce());
     expect(screen.queryByRole("heading", { name: /how do you want to join/i })).toBeNull();
   });
@@ -1114,11 +1123,39 @@ describe("ServerSelectorV2", () => {
   );
 
   it("Back from the join choice returns to the server list", async () => {
-    joinTypedServer({ installed: false, onInstallCli: vi.fn().mockResolvedValue({ ok: true }) });
+    joinTypedServer({
+      installed: false,
+      onInstallCli: vi.fn().mockResolvedValue({ ok: true }),
+      onRemoveServer: vi.fn(),
+    });
     await screen.findByRole("heading", { name: /how do you want to join/i });
     fireEvent.click(screen.getByRole("button", { name: "Back" }));
     expect(screen.getByText("team.example.com")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Open Omnigent" })).toBeEnabled();
+    fireEvent.pointerDown(
+      screen.getByRole("button", { name: /More options for team.example.com/ }),
+      {
+        button: 0,
+      },
+    );
+    fireEvent.click(screen.getByRole("menuitem", { name: "Delete from list" }));
+    expect(screen.queryByText("team.example.com")).not.toBeInTheDocument();
+  });
+
+  it("Back from the join choice keeps every server added this session", async () => {
+    joinTypedServer({ installed: false, onInstallCli: vi.fn().mockResolvedValue({ ok: true }) });
+    await screen.findByRole("heading", { name: /how do you want to join/i });
+    fireEvent.click(screen.getByRole("button", { name: "Back" }));
+    fireEvent.click(screen.getByRole("button", { name: "Add server" }));
+    fireEvent.change(screen.getByLabelText("Server URL"), {
+      target: { value: "second.example.com" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Join" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open Omnigent" }));
+    await screen.findByRole("heading", { name: /how do you want to join/i });
+    fireEvent.click(screen.getByRole("button", { name: "Back" }));
+    expect(screen.getByText("team.example.com")).toBeInTheDocument();
+    expect(screen.getByText("second.example.com")).toBeInTheDocument();
   });
 
   it.each<[string, Partial<ServerSelectorV2Setup>]>([

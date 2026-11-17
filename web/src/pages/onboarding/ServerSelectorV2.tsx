@@ -386,12 +386,9 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
     terminalTarget.kind,
     setup.localServerRunning === true,
   );
-  // Back from the join choice keeps the server the user just added to the list.
+  // Servers added on the server step this session; they survive Back from the join choice.
+  const [sessionServers, setSessionServers] = useState<string[]>([]);
   const pickedFromList = runnerTarget?.from === "server" ? runnerTarget.url : undefined;
-  const serverStepRecents =
-    pickedFromList !== undefined && !setup.recentServers.includes(pickedFromList)
-      ? [pickedFromList, ...setup.recentServers]
-      : setup.recentServers;
   // Whether the server step is showing its URL-input ("add") view vs the list —
   // reported up so the band can show the hero icons only in the add view.
   const [serverAddMode, setServerAddMode] = useState(false);
@@ -551,7 +548,17 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
           <ServerSelectStep
             initialUrl={setup.initialUrl}
             error={setup.error}
-            recentServers={serverStepRecents}
+            recentServers={setup.recentServers}
+            initialAddedServers={sessionServers}
+            onAddedServersChange={setSessionServers}
+            initialSelected={
+              pickedFromList !== undefined &&
+              [...sessionServers, ...setup.managedServers, ...setup.recentServers].includes(
+                pickedFromList,
+              )
+                ? pickedFromList
+                : undefined
+            }
             managedServers={setup.managedServers}
             managedServerNames={setup.managedServerNames}
             serverNames={setup.serverNames}

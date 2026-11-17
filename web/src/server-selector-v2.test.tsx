@@ -131,6 +131,43 @@ it("shows manual instructions without an installer and detects the CLI after ins
   expect(startLocalServer).toHaveBeenCalledOnce();
 });
 
+it("a remote server's manual install is rechecked, then connects this laptop and opens it", async () => {
+  const getCliStatus = vi
+    .fn()
+    .mockResolvedValueOnce({ installed: false, installSupported: false })
+    .mockResolvedValueOnce({ installed: false, installSupported: false })
+    .mockResolvedValueOnce({ installed: true, installSupported: false });
+  const connectRunner = vi.fn().mockResolvedValue({ ok: true });
+  const setServerUrl = vi.fn().mockResolvedValue({});
+  stubBridge({
+    getRecentServers: async () => [],
+    getCliStatus,
+    connectRunner,
+    setServerUrl,
+  });
+  render(<BridgeSetupApp />);
+  fireEvent.click(await screen.findByRole("button", { name: /join your team/i }));
+  fireEvent.change(await screen.findByLabelText("Server URL"), {
+    target: { value: "team.example.com" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Join" }));
+  fireEvent.click(screen.getByRole("button", { name: "Open Omnigent" }));
+  fireEvent.click(await screen.findByRole("radio", { name: /install cli first/i }));
+  fireEvent.click(screen.getByRole("button", { name: "Install Omnigent" }));
+  expect(screen.getByRole("link", { name: "Installation instructions" })).toBeInTheDocument();
+  expect(connectRunner).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByRole("button", { name: "Check again" }));
+  await screen.findByRole("alert");
+  fireEvent.click(screen.getByRole("button", { name: "Check again" }));
+  await waitFor(() =>
+    expect(setServerUrl).toHaveBeenCalledWith("https://team.example.com/", expect.anything()),
+  );
+  expect(connectRunner).toHaveBeenCalledWith("https://team.example.com/", "local");
+  expect(connectRunner.mock.invocationCallOrder[0]).toBeLessThan(
+    setServerUrl.mock.invocationCallOrder[0],
+  );
+});
+
 it("keeps remote connections available without a CLI or installer", async () => {
   const setServerUrl = vi.fn().mockResolvedValue({});
   const startLocalServer = vi.fn();
