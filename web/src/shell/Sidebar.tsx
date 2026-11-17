@@ -579,6 +579,12 @@ interface SidebarProps {
    */
   onOpenSearch?: () => void;
   /**
+   * Start a new session, which may ask for a project first. A plain left click
+   * on a "New session" link calls this instead of following it; modified
+   * clicks still open the composer in a new tab. Optional for standalone tests.
+   */
+  onNewSession?: () => void;
+  /**
    * Whether the sidebar is peeking.
    */
   peek?: boolean;
@@ -805,6 +811,7 @@ function SidebarImpl({
   onOpen,
   dragProgress = null,
   onOpenSearch,
+  onNewSession,
   peek,
 }: SidebarProps) {
   const sidebarData = useSidebarData();
@@ -946,6 +953,13 @@ function SidebarImpl({
     if (e.button !== 0) return;
     if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
     if (isMobileViewport() && !isSideBySideSidebarViewport()) onClose();
+  });
+  // Runs after onNavClick, which has already closed the mobile drawer.
+  const onNewSessionClick = useStableCallback((e: MouseEvent<HTMLAnchorElement>) => {
+    if (!onNewSession || e.defaultPrevented || e.button !== 0) return;
+    if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+    e.preventDefault();
+    onNewSession();
   });
 
   // Which top-level nav button to highlight for the current route.
@@ -1437,6 +1451,7 @@ function SidebarImpl({
                   onClick={(e) => {
                     switchTab("mine");
                     onNavClick(e);
+                    onNewSessionClick(e);
                   }}
                 >
                   <MessageCirclePlusIcon
@@ -1623,6 +1638,7 @@ function SidebarImpl({
                     conversationsQuery={displayQuery}
                     scrollContainerRef={scrollContainerRef}
                     onRowClick={onNavClick}
+                    onNewSessionClick={onNewSessionClick}
                     searchQuery=""
                     newSessionProjectName={newSessionProjectName}
                     activeTab={availableTab}
@@ -2122,6 +2138,8 @@ interface ConversationListProps {
   // The scrollable ancestor, used as the infinite-scroll observer root.
   scrollContainerRef: RefObject<HTMLElement | null>;
   onRowClick: (e: MouseEvent<HTMLAnchorElement>) => void;
+  /** Click handler for the "New session" link (see SidebarProps.onNewSession). */
+  onNewSessionClick?: (e: MouseEvent<HTMLAnchorElement>) => void;
   searchQuery: string;
   /** Project selected on the new-session composer route, if any. */
   newSessionProjectName: string | null;
@@ -2166,6 +2184,7 @@ function ConversationList({
   conversationsQuery,
   scrollContainerRef,
   onRowClick,
+  onNewSessionClick,
   searchQuery,
   newSessionProjectName,
   activeTab,
@@ -3295,6 +3314,7 @@ function ConversationList({
                 event.stopPropagation();
                 onActiveTabChange("mine");
                 onRowClick(event);
+                onNewSessionClick?.(event);
               }}
             >
               <MessageCirclePlusIcon className="size-3.5" />

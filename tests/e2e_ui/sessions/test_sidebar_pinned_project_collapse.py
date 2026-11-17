@@ -27,7 +27,7 @@ from playwright.sync_api import Locator, Page, expect
 
 from tests._helpers.polling import poll_until
 from tests._helpers.session import send_user_text
-from tests.e2e_ui.conftest import configure_mock_llm
+from tests.e2e_ui.conftest import DISABLE_NEW_CHAT_PROJECT_PROMPT_SCRIPT, configure_mock_llm
 
 
 def _set_title(base_url: str, session_id: str, title: str) -> None:
@@ -94,6 +94,9 @@ def test_click_pinned_project_session_keeps_project_collapsed(
     _file_into_project(base_url, session_a, project)
     _file_into_project(base_url, session_b, project)
 
+    # This test files sessions into a project; New session must still open the
+    # composer rather than the project picker.
+    page.add_init_script(DISABLE_NEW_CHAT_PROJECT_PROMPT_SCRIPT)
     page.goto(f"{base_url}/c/{session_a}")
 
     row_a = _row(page, session_a)
