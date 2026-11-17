@@ -1812,7 +1812,7 @@ export function renderTriggerPrompt(
           `Post each pending link-back, the same way as below${shared ? ", with the conversation_id on its entry. Don't send anything to the task session for them" : ". Don't start sessions for them"}; one that fails again stays pending.`,
         ]
       : []),
-    `Note the current UTC time; it ends this run's window. Then search from 5 minutes before the check time${text.watermark ? ` or from the "${WATCHING_SINCE}" time, whichever is later` : ""}, because new items can take a few minutes to appear. ${text.search()} ${text.leaveOut ?? "Leave out results created after the time you noted; the next run picks them up."} ${text.readOrder}`,
+    `Note the current UTC time: the "Run time:" line near the end of this message gives it, so don't check the clock unless that line is missing. It ends this run's window. Then search from 5 minutes before the check time${text.watermark ? ` or from the "${WATCHING_SINCE}" time, whichever is later` : ""}, because new items can take a few minutes to appear. ${text.search()} ${text.leaveOut ?? "Leave out results created after the time you noted; the next run picks them up."} ${text.readOrder}`,
     shared
       ? (text.skip ??
         `Skip any ${text.item} you already sent to the task session, or that is on a "${DELIVERY_PENDING}" line. Your replies and your own earlier calls in this session that sent task messages, with their results, are the record of what you sent: check them first. For results they don't show, also read your task session's latest items with ${taskSessionHistory} and skip any ${text.item} that a task message from your session there names by its title. Only the latest items are there, so older sends rely on your own record.`)
