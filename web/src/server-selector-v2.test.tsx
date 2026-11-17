@@ -168,6 +168,40 @@ it("a remote server's manual install is rechecked, then connects this laptop and
   );
 });
 
+it("a remote server's automatic install runs once, and Retry reconnects the laptop before opening", async () => {
+  const installCli = vi.fn().mockResolvedValue({ ok: true, installed: true });
+  const connectRunner = vi
+    .fn()
+    .mockResolvedValueOnce({ ok: false, error: "no host" })
+    .mockResolvedValueOnce({ ok: true });
+  const setServerUrl = vi.fn().mockResolvedValue({});
+  stubBridge({
+    getRecentServers: async () => [],
+    getCliStatus: async () => ({ installed: false, installSupported: true }),
+    installCli,
+    connectRunner,
+    setServerUrl,
+  });
+  render(<BridgeSetupApp />);
+  fireEvent.click(await screen.findByRole("button", { name: /join your team/i }));
+  fireEvent.change(await screen.findByLabelText("Server URL"), {
+    target: { value: "team.example.com" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Join" }));
+  fireEvent.click(screen.getByRole("button", { name: "Open Omnigent" }));
+  fireEvent.click(await screen.findByRole("radio", { name: /install cli first/i }));
+  fireEvent.click(screen.getByRole("button", { name: "Install Omnigent" }));
+  await screen.findByText("no host");
+  expect(setServerUrl).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+  await waitFor(() => expect(setServerUrl).toHaveBeenCalledOnce());
+  expect(installCli).toHaveBeenCalledOnce();
+  expect(connectRunner).toHaveBeenCalledTimes(2);
+  expect(connectRunner.mock.invocationCallOrder[1]).toBeLessThan(
+    setServerUrl.mock.invocationCallOrder[0],
+  );
+});
+
 it("keeps remote connections available without a CLI or installer", async () => {
   const setServerUrl = vi.fn().mockResolvedValue({});
   const startLocalServer = vi.fn();

@@ -198,7 +198,7 @@ export function ServerSelectStep({
   // reloads with ?url=), else empty. The default localhost is a listed recent,
   // not something to type.
   const [typedUrl, setTypedUrl] = useState(
-    error && initialUrl && initialUrl !== DEFAULT_LOCAL ? initialUrl : "",
+    !initialSelected && error && initialUrl && initialUrl !== DEFAULT_LOCAL ? initialUrl : "",
   );
   const [invalid, setInvalid] = useState(false);
   // Message from a rejected connect, so a failed Join shows something.
@@ -278,11 +278,17 @@ export function ServerSelectStep({
   };
 
   // Connect to the selected server.
+  const [joining, setJoining] = useState(false);
   const join = async () => {
-    if (selected === null) return;
+    if (selected === null || joining) return;
     setConnectError(null);
-    const result = await onConnect(selected);
-    setConnectError(result.error ?? null);
+    setJoining(true);
+    try {
+      const result = await onConnect(selected);
+      setConnectError(result.error ?? null);
+    } finally {
+      setJoining(false);
+    }
   };
 
   const removeServer = (url: string) => {
@@ -526,7 +532,7 @@ export function ServerSelectStep({
             </Button>
             <Button
               disabled={selected === null}
-              loading={connection !== null}
+              loading={connection !== null || joining}
               onClick={join}
               size="lg"
             >

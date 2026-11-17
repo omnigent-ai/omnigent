@@ -1142,6 +1142,45 @@ describe("ServerSelectorV2", () => {
     expect(screen.queryByText("team.example.com")).not.toBeInTheDocument();
   });
 
+  it("a removed session server stays removed after another trip through the join choice", async () => {
+    joinTypedServer({
+      installed: false,
+      onInstallCli: vi.fn().mockResolvedValue({ ok: true }),
+      onRemoveServer: vi.fn(),
+    });
+    await screen.findByRole("heading", { name: /how do you want to join/i });
+    fireEvent.click(screen.getByRole("button", { name: "Back" }));
+    fireEvent.click(screen.getByRole("button", { name: "Add server" }));
+    fireEvent.change(screen.getByLabelText("Server URL"), {
+      target: { value: "second.example.com" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Join" }));
+    fireEvent.pointerDown(
+      screen.getByRole("button", { name: /More options for team.example.com/ }),
+      { button: 0 },
+    );
+    fireEvent.click(screen.getByRole("menuitem", { name: "Delete from list" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open Omnigent" }));
+    await screen.findByRole("heading", { name: /how do you want to join/i });
+    fireEvent.click(screen.getByRole("button", { name: "Back" }));
+    expect(screen.getByText("second.example.com")).toBeInTheDocument();
+    expect(screen.queryByText("team.example.com")).not.toBeInTheDocument();
+  });
+
+  it("Open shows it is busy and ignores repeat clicks while the runner lookup is pending", async () => {
+    const getRunnerOptions = vi.fn(() => new Promise<{ remote: boolean }>(() => {}));
+    joinTypedServer({
+      installed: false,
+      onInstallCli: vi.fn().mockResolvedValue({ ok: true }),
+      getRunnerOptions,
+    });
+    await waitFor(() => expect(getRunnerOptions).toHaveBeenCalledOnce());
+    const busy = screen.getByRole("button", { busy: true });
+    expect(busy).toBeDisabled();
+    fireEvent.click(busy);
+    expect(getRunnerOptions).toHaveBeenCalledOnce();
+  });
+
   it("Back from the join choice keeps every server added this session", async () => {
     joinTypedServer({ installed: false, onInstallCli: vi.fn().mockResolvedValue({ ok: true }) });
     await screen.findByRole("heading", { name: /how do you want to join/i });
