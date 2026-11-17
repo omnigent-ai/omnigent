@@ -17,7 +17,11 @@ import {
 } from "./search/catalog/harnesses";
 import { settingsControlProps } from "./search/settingsControl";
 import { SettingsItem } from "./search/SettingsItem";
-import { SettingsContent, SettingsDataRegion } from "./search/settingsOwnership";
+import {
+  SettingsContent,
+  SettingsDataRegion,
+  useSettingsOwnership,
+} from "./search/settingsOwnership";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import type { Host } from "@/hooks/useHosts";
 import {
@@ -59,25 +63,32 @@ export function BackButton({
   onClick?: () => void;
   componentId?: string;
 }) {
-  return (
+  // Inside a Settings owner, named and found as its part, around its label where the part is
+  // named by a template; elsewhere, by its visible label.
+  const owned = useSettingsOwnership();
+  const className = "mb-4 -ml-2.5 font-normal";
+  // A link renders as the button when it goes somewhere; otherwise the button acts itself.
+  return to !== undefined ? (
+    <Button asChild variant="ghost" size="sm" className={className} onClick={onClick}>
+      <Link
+        to={to}
+        componentId={componentId}
+        {...owned.control({ name: { runtime: label }, outside: {} })}
+      >
+        <ArrowLeftIcon />
+        {label}
+      </Link>
+    </Button>
+  ) : (
     <Button
-      asChild={to !== undefined}
       variant="ghost"
       size="sm"
-      className="mb-4 -ml-2.5 font-normal"
+      className={className}
       onClick={onClick}
+      {...owned.control({ name: { runtime: label }, outside: {} })}
     >
-      {to !== undefined ? (
-        <Link to={to} componentId={componentId}>
-          <ArrowLeftIcon />
-          {label}
-        </Link>
-      ) : (
-        <>
-          <ArrowLeftIcon />
-          {label}
-        </>
-      )}
+      <ArrowLeftIcon />
+      {label}
     </Button>
   );
 }

@@ -202,7 +202,7 @@ describe("Custom agents settings", () => {
     );
     mount("/settings/custom-agents/a1");
     expect(await screen.findByRole("alert")).toHaveTextContent("Could not load this agent");
-    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    fireEvent.click(screen.getByRole("button", { name: "Retry loading this agent" }));
     expect(await screen.findByRole("heading", { name: "research" })).toBeVisible();
     expect(vi.mocked(authenticatedFetch).mock.calls.map(([url]) => url)).toEqual([
       "/v1/agents/a1",
@@ -417,10 +417,10 @@ describe("editing custom agents", () => {
       return response({});
     });
     mount("/settings/custom-agents/new");
-    const name = await screen.findByRole("textbox", { name: "Name *" });
+    const name = await screen.findByRole("textbox", { name: "Name" });
     expect(document.querySelector('[data-settings-item="custom-agent-create"]')).not.toBeNull();
     expect(name).toHaveAttribute("data-settings-control", "custom-agent-create:name");
-    expect(screen.getByRole("textbox", { name: "Model *" })).toHaveAttribute(
+    expect(screen.getByRole("textbox", { name: "Model" })).toHaveAttribute(
       "data-settings-control",
       "custom-agent-create:model",
     );
@@ -456,7 +456,7 @@ describe("editing custom agents", () => {
     configResponses();
     await openEditor();
     fireEvent.click(screen.getByRole("button", { name: "Add server" }));
-    expect(screen.getByRole("textbox", { name: "Server name" })).toBeVisible();
+    expect(screen.getByRole("textbox", { name: "Name for server 1" })).toBeVisible();
   });
   it.each([false, undefined])("keeps old servers read-only for edits: %s", async (edit) => {
     flags.edit = edit;
@@ -540,10 +540,10 @@ describe("editing custom agents", () => {
     expect(screen.getByLabelText("Description")).toBe(description);
     expect(description).toHaveValue("Unsaved second draft");
     expect(screen.getByRole("button", { name: "Save changes" })).toBeEnabled();
-    expect(screen.getByRole("button", { name: "Custom agents" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Back to Custom agents" })).toBeVisible();
     expect(warning).toHaveTextContent("Could not refresh this agent");
 
-    fireEvent.click(within(warning).getByRole("button", { name: "Retry" }));
+    fireEvent.click(within(warning).getByRole("button", { name: "Retry loading this agent" }));
     await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
     expect(screen.getByLabelText("Description")).toBe(description);
     expect(description).toHaveValue("Unsaved second draft");
@@ -571,10 +571,10 @@ describe("editing custom agents", () => {
     configResponses();
     await openEditor();
     fireEvent.change(screen.getByLabelText("Description"), { target: { value: "Unsaved" } });
-    fireEvent.click(screen.getByRole("button", { name: "Custom agents" }));
+    fireEvent.click(screen.getByRole("button", { name: "Back to Custom agents" }));
     fireEvent.click(await screen.findByRole("button", { name: "Keep editing" }));
     expect(screen.getByLabelText("Description")).toHaveValue("Unsaved");
-    fireEvent.click(screen.getByRole("button", { name: "Custom agents" }));
+    fireEvent.click(screen.getByRole("button", { name: "Back to Custom agents" }));
     fireEvent.click(await screen.findByRole("button", { name: "Discard changes" }));
     expect(await screen.findByRole("heading", { name: "Custom agents" })).toBeVisible();
     expect(
