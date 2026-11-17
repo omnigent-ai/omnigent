@@ -1773,24 +1773,38 @@ def create_scheduled_tasks_router(
         elif "permission_mode" in fields and continuing.continues_session:
             await _require_mode_fits_session(request, continuing)
         project_owner = _project_owner(owner)
+        cancellation: asyncio.CancelledError | None = None
         try:
             # On the derived fields, so a session the update clears counts as a change.
             await require_agent_keeps_shared_target(request, fields, existing, permission_store)
             if fields.get("project_id") is not None:
                 fields["project_id"] = await _owned_project_id(project_owner, fields["project_id"])
-            updated = store.update(
-                scheduled_task_id,
-                expected_schedule=existing,
-                # Rechecked under the task's lock, so a grant made meanwhile counts.
-                guard=agent_shared_target_guard(request, fields, permission_store),
-                **fields,
+            # Off the event loop: a deployment's store may call out while it writes.
+            updating = asyncio.ensure_future(
+                asyncio.to_thread(
+                    store.update,
+                    scheduled_task_id,
+                    expected_schedule=existing,
+                    # Rechecked under the task's lock, so a grant made meanwhile counts.
+                    guard=agent_shared_target_guard(request, fields, permission_store),
+                    **fields,
+                )
             )
+            try:
+                updated = await asyncio.shield(updating)
+            except asyncio.CancelledError as cancelled:
+                # The write runs on; settle it as usual, then let the cancel propagate.
+                cancellation = cancelled
+                await await_cleanup_task(updating)
+                updated = updating.result()
             if updated is None:
                 raise OmnigentError("Scheduled task not found", code=ErrorCode.NOT_FOUND)
         except Exception as exc:
             # The task never bound the copy, so nothing else uses it.
             if new_copy is not None:
                 agent_store.delete(new_copy.id)
+            if cancellation is not None:
+                raise cancellation from exc
             if isinstance(exc, RRuleSearchError):
                 raise OmnigentError(
                     "Could not calculate the next run time for this schedule. "
@@ -1803,6 +1817,8 @@ def create_scheduled_tasks_router(
             request.app.state, "scheduled_task_dispatch_enabled", False
         ):
             scheduler.update(updated)
+        if cancellation is not None:
+            raise cancellation
         latest_status = store.list_latest_run_status_for_tasks([updated.id])
         return _to_response(
             updated,

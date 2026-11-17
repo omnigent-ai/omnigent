@@ -2126,6 +2126,75 @@ async def test_delete_cleanup_failure_still_returns_success_off_event_loop(
     assert store.get(created["id"]) is None
 
 
+@pytest.mark.parametrize("task_deleted", [False, True])
+@pytest.mark.parametrize("cancelled", [False, True])
+async def test_update_writes_off_the_event_loop_and_a_cancel_waits_for_it(
+    auth_client, auth_app, db_uri, monkeypatch, cancelled, task_deleted
+):
+    import threading
+
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+    scheduler = auth_app.state.scheduled_task_scheduler
+    assert scheduler.next_run_at(created["id"]) is not None
+    request_thread = threading.get_ident()
+    update = SqlAlchemyScheduledTaskStore.update
+    writing, release = threading.Event(), threading.Event()
+    write_threads: list[int] = []
+
+    def slow_update(self, scheduled_task_id, **kwargs):
+        write_threads.append(threading.get_ident())
+        writing.set()
+        assert release.wait(15)
+        if task_deleted:
+            # Deleted while the request switched its agent, so the update finds no task.
+            self.delete(scheduled_task_id)
+        return update(self, scheduled_task_id, **kwargs)
+
+    copy_id = uuid.uuid4().hex
+    deleted_agents: list[str] = []
+    # Stands in for another user's agent, which binding copies for the task.
+    monkeypatch.setattr(
+        scheduled_tasks_routes, "agent_for_user", lambda *args: SimpleNamespace(id=copy_id)
+    )
+    monkeypatch.setattr(
+        SqlAlchemyAgentStore, "delete", lambda self, agent_id: deleted_agents.append(agent_id)
+    )
+    monkeypatch.setattr(SqlAlchemyScheduledTaskStore, "update", slow_update)
+    pending = asyncio.ensure_future(
+        auth_client.patch(
+            f"/v1/scheduled-tasks/{created['id']}",
+            json={"agent_id": builtin_agent_id(CODEX_NATIVE_AGENT_NAME), "state": "paused"},
+            headers=_headers(),
+        )
+    )
+    try:
+        assert await asyncio.to_thread(writing.wait, 15)
+        if cancelled:
+            # As when the client disconnects: the request waits for the write.
+            pending.cancel()
+            await asyncio.wait([pending], timeout=0.5)
+            assert not pending.done()
+    finally:
+        release.set()
+    if cancelled:
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+    else:
+        assert (await pending).status_code == (404 if task_deleted else 200)
+    assert write_threads and request_thread not in write_threads
+    # A cancelled request still finishes what follows the write.
+    saved = SqlAlchemyScheduledTaskStore(db_uri).get(created["id"])
+    if task_deleted:
+        assert saved is None
+        assert deleted_agents == [copy_id]
+    else:
+        assert (saved.agent_id, saved.state) == (copy_id, "paused")
+        assert deleted_agents == []
+        assert scheduler.next_run_at(created["id"]) is None
+
+
 @pytest.mark.parametrize("operation", ["create", "update"])
 async def test_schedule_search_failure_returns_400_and_rolls_back(
     auth_client,
