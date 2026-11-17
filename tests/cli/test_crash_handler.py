@@ -554,6 +554,22 @@ def test_issue_url_drops_body_when_command_alone_is_too_long(
             "file:///C:/Users/example-user/notes.txt",
             "file:///~/notes.txt",
         ),
+        (
+            "C:\\Users\\example user",
+            "file:///C:/Users/example%20user/private.txt",
+            "file:///~/private.txt",
+        ),
+        (
+            "C:\\Users\\example user",
+            "file:///c:/users/example%20user/private.txt",
+            "file:///~/private.txt",
+        ),
+        ("C:\\Users\\example user", "file:///C%3A/Users/example%20user/a", "file:///~/a"),
+        ("C:\\Users\\example user", "C%3A%5CUsers%5Cexample%20user%5Cx", "~%5Cx"),
+        ("C:\\Users\\example user", "c%3a%5cusers%5cexample%20user%5cx", "~%5cx"),
+        ("/home/example user", "file://localhost/home/example%20user/x", "~/x"),
+        ("/home/example-user", "~example-user/x", "~/x"),
+        ("/home/example-user", "%2Fhome%2Fexample-user%2Fx", "~%2Fx"),
         # Privacy-first: siblings that share the home prefix are rewritten on purpose.
         ("/home/example-user", "/home/example-user-backup/x", "~-backup/x"),
         ("/home/example-user", "/home/example-user&backup/x", "~&backup/x"),
@@ -581,6 +597,14 @@ def test_issue_url_drops_body_when_command_alone_is_too_long(
         "windows-forward-slash",
         "windows-doubled-backslash",
         "windows-file-url",
+        "windows-file-url-encoded-space",
+        "windows-file-url-lowercase-drive",
+        "windows-file-url-encoded-colon",
+        "windows-percent-backslash",
+        "windows-lowercase-hex",
+        "localhost-file-url",
+        "tilde-user",
+        "percent-encoded-path",
         "hyphen-sibling",
         "ampersand-sibling",
         "parenthesis-sibling",
@@ -595,6 +619,21 @@ def test_scrub_replaces_home_at_path_boundaries(
     """The home path is replaced wherever it starts a path, whatever follows it."""
     monkeypatch.setattr(Path, "home", lambda: Path(home_directory))
     assert ch._scrub(text) == expected
+
+
+def test_issue_url_scrubs_encoded_windows_file_uri(
+    data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A Windows file URI with an encoded space in the home path is scrubbed everywhere."""
+    ch.install_crash_handler("omnigent", "omnigent-ai/omnigent")
+    monkeypatch.setattr(Path, "home", lambda: Path("C:\\Users\\example user"))
+    uri = "file:///C:/Users/example%20user/private.txt"
+    exc = ImportError(f"cannot open {uri}")
+    tb_text = f'Traceback (most recent call last):\n  File "{uri}", line 1\nImportError: x\n'
+    url, body_included = ch._issue_url(exc, tb_text)
+    assert body_included is True
+    assert "example" not in urllib.parse.unquote_plus(url)
+    assert "file:///~/private.txt" in _description_of(url)
 
 
 def test_issue_url_redacts_tokens_before_title_cutoff(

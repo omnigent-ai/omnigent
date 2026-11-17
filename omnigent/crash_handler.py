@@ -466,24 +466,33 @@ def _scrub(text: str) -> str:
     Privacy-first: the home path is replaced wherever it starts a path, whatever
     follows it, so a sibling sharing the prefix (``/home/user-backup``) is rewritten
     too. A home path embedded in another name (``/mnt/home/user``) is left alone.
+    Matching ignores case, so drive letters and percent-encoding hex digits in any
+    case are covered.
     """
     text = _redact(text)
     with contextlib.suppress(Exception):
         home = str(Path.home())
         if home and home != os.sep:
-            forms = {
-                home,
-                home.replace("\\", "/"),
-                home.replace("\\", "\\\\"),
-                urllib.parse.quote(home),
-            }
+            native = home
+            forward = home.replace("\\", "/")
+            forms = {native, forward, native.replace("\\", "\\\\")}
+            # Percent-encoding differs by how separators and the drive colon are escaped.
+            for raw in (native, forward):
+                forms.update(urllib.parse.quote(raw, safe=safe) for safe in ("", "/", ":/"))
+            if Path(home).name:
+                forms.add("~" + Path(home).name)  # shell ``~user`` shorthand
             variants = {
                 escaped
                 for form in forms
                 for escaped in (form, form.replace("'", "\\'"), form.replace('"', '\\"'))
             }
+            # ``file://localhost`` ends in a letter, so its path needs the prefixed forms.
+            variants |= {
+                "file://localhost" + v if v.startswith("/") else f"file://localhost/{v}"
+                for v in set(variants)
+            }
             alternation = "|".join(map(re.escape, sorted(variants, key=len, reverse=True)))
-            text = re.sub(rf"(?<![\w.\-~])(?:{alternation})", "~", text)
+            text = re.sub(rf"(?<![\w.\-~])(?:{alternation})", "~", text, flags=re.IGNORECASE)
     return text
 
 
