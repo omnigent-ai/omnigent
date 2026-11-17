@@ -136,13 +136,12 @@ export function SharingPage() {
   // Settings a higher-level one overrides are greyed out and show their
   // effective value; the saved value returns once the blocker is lifted.
   const sharingOff = current === "off";
-  const publicBlockedReason = sharingOff ? "Turn sharing on to use public access." : null;
-  const defaultPublicBlockedReason = sharingOff
-    ? "Turn sharing on to change the default visibility."
-    : !publicEnabled
-      ? "Turn on public access to change the default visibility."
-      : null;
+  const publicBlockedReason = sharingOff ? PUBLIC_ACCESS_ENTRY.parts.blocked : null;
   const defaultPublicBlockedByPart = sharingOff ? "blockedBySharing" : "blockedByPublicAccess";
+  const defaultPublicBlockedReason =
+    sharingOff || !publicEnabled
+      ? DEFAULT_PUBLIC_SESSIONS_ENTRY.parts[defaultPublicBlockedByPart]
+      : null;
   const effectivePublic = publicEnabled && !sharingOff;
   const effectiveDefaultPublic = defaultPublicBlockedReason ? "off" : defaultPublic;
   const publicDisabled = !publicEditable || setMode.isPending || publicBlockedReason !== null;
