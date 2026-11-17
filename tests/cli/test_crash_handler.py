@@ -482,6 +482,7 @@ def _description_of(url: str) -> str:
 )
 def test_issue_url_retains_tail_of_long_traceback(
     data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
     padding: str,
     frame_template: str,
     exception_type: type[Exception],
@@ -489,6 +490,7 @@ def test_issue_url_retains_tail_of_long_traceback(
     last_frame: str,
 ) -> None:
     """Encoded Unicode and deep library frames both retain their final diagnostics."""
+    monkeypatch.setattr(Path, "home", lambda: data_dir / "home")
     ch.install_crash_handler("omnigent", "omnigent-ai/omnigent")
     frames = "".join(frame_template.format(index=index) for index in range(120))
     exception_line = f"{exception_type.__qualname__}: {message}"
@@ -656,33 +658,50 @@ def test_issue_url_redacts_tokens_before_title_cutoff(
     assert "sk-a***" in title
 
 
+@pytest.mark.parametrize(
+    ("home_directory", "home_uri", "redacted_uri"),
+    [
+        ("/home/example user", "file:///home/example%20user", "file://~"),
+        (r"C:\Users\example user", "file:///C:/Users/example%20user", "file:///~"),
+    ],
+    ids=["posix", "windows"],
+)
 def test_issue_url_scrubs_notes_before_truncation(
-    data_dir: Path, monkeypatch: pytest.MonkeyPatch
+    data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    home_directory: str,
+    home_uri: str,
+    redacted_uri: str,
 ) -> None:
     ch.install_crash_handler("omnigent", "omnigent-ai/omnigent")
-    home = Path("/home/example user")
+    home = Path(home_directory)
     monkeypatch.setattr(Path, "home", lambda: home)
+    monkeypatch.setattr(
+        sys, "argv", ["omnigent", "run", f"{home_uri}?download=1", f"{home_uri}#section"]
+    )
     noted_exc = _make_exc("failure")
     noted_exc.add_note("x" * 9000)
     noted_exc.add_note(f"Home: ({home})")
     noted_exc.add_note(f"Home: {home}... {home}!!!")
-    noted_exc.add_note(f"URI: {home.as_uri()}/private.txt")
+    noted_exc.add_note(f"URI: {home_uri}/private.txt")
     noted_tb = "".join(
         traceback.format_exception(type(noted_exc), noted_exc, noted_exc.__traceback__)
     )
     report = ch._build_report(noted_exc, noted_tb, source="test")
     assert noted_tb in report
-    assert f"URI: {home.as_uri()}/private.txt" in report
+    assert f"URI: {home_uri}/private.txt" in report
+    assert f"{home_uri}?download=1 {home_uri}#section" in report
     noted_url, body_included = ch._issue_url(noted_exc, noted_tb)
     assert body_included is True
     assert len(noted_url) <= ch._MAX_URL_LENGTH
     assert str(home) not in urllib.parse.unquote_plus(noted_url)
-    assert home.as_uri() not in urllib.parse.unquote_plus(noted_url)
+    assert home_uri not in urllib.parse.unquote_plus(noted_url)
     noted_body = _description_of(noted_url)
     assert "truncated" in noted_body
     assert "Home: (~)" in noted_body
     assert "Home: ~... ~!!!" in noted_body
-    assert "URI: file://~/private.txt" in noted_body
+    assert f"URI: {redacted_uri}/private.txt" in noted_body
+    assert f"{redacted_uri}?download=1 {redacted_uri}#section" in noted_body
 
 
 def test_issue_url_oversized_final_note_leaves_empty_traceback(data_dir: Path) -> None:
