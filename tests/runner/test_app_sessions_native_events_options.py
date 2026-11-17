@@ -1830,6 +1830,12 @@ async def _post_claude_control(
         monkeypatch.setattr(f"{module}._auto_create_claude_terminal", refuse_auto_create)
         monkeypatch.setattr(f"{module}._launch_claude", launch_stub)
     monkeypatch.setattr(claude_native_bridge, "inject_model_command", select)
+
+    def unexpected_input(*_args: Any, **_kwargs: Any) -> None:
+        pytest.fail("A control event must use its actuator without delivering a prompt")
+
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", unexpected_input)
+    monkeypatch.setattr(claude_native_bridge, "inject_user_message", unexpected_input)
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.main.resolve_native_claude_config", lambda **kwargs: None
     )
@@ -1887,64 +1893,6 @@ async def test_events_model_change_requires_the_same_immediate_picker_receipt(
 
     assert response.status_code == 204, response.text
     assert calls == ["claude-opus-4-7"]
-    assert _drain_session_event_queue(_session_event_queues_ref.get(_BOOT_SESSION_ID)) == []
-
-
-@pytest.mark.parametrize("outcome", ["confirmed", "refused", "unconfirmed"])
-async def test_events_legacy_model_change_requires_a_receipt_and_preserves_refusal_semantics(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    outcome: str,
-) -> None:
-    from omnigent.runner.app import _session_event_queues_ref
-
-    settings = tmp_path / "settings.json"
-    settings.write_text('{"model":"saved-default","permissions":{"allow":[]}}\n')
-    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
-    baseline = (settings.read_bytes(), settings.stat().st_ino, settings.stat().st_mtime_ns)
-    selections: list[str] = []
-
-    async def drain_creation_events(_client: httpx.AsyncClient) -> None:
-        _drain_session_event_queue(_session_event_queues_ref.get(_BOOT_SESSION_ID))
-
-    def unexpected_input(*_args: Any, **_kwargs: Any) -> None:
-        pytest.fail("A model event must use the shared selector without delivering a prompt")
-
-    monkeypatch.setattr(claude_native_bridge, "_run_tmux", unexpected_input)
-    monkeypatch.setattr(claude_native_bridge, "inject_user_message", unexpected_input)
-
-    def select(_bridge: Path, *, model: str, **_kwargs: Any) -> Any:
-        selections.append(model)
-        assert _injection_deadline() is not None
-        if outcome == "confirmed":
-            return claude_native_bridge.ClaudeModelSwitchResult(
-                model, model, model, model, "native-session"
-            )
-        raise claude_native_bridge.ClaudeModelSwitchRefused(
-            "Fresh status was lost after selection."
-            if outcome == "unconfirmed"
-            else "Draft occupied.",
-            phase="status" if outcome == "unconfirmed" else "preflight",
-            model_may_have_changed=outcome == "unconfirmed",
-        )
-
-    response = await _post_claude_control(
-        monkeypatch,
-        tmp_path,
-        select,
-        event_payload={"type": "model_change", "model": "claude-opus-4-7"},
-        before_control=drain_creation_events,
-    )
-
-    assert selections == ["claude-opus-4-7"]
-    assert response.status_code == (204 if outcome == "confirmed" else 503), response.text
-    if outcome != "confirmed":
-        assert response.json()["error"] == (
-            "claude_native_model_unconfirmed"
-            if outcome == "unconfirmed"
-            else "claude_native_model_failed"
-        )
-    assert (settings.read_bytes(), settings.stat().st_ino, settings.stat().st_mtime_ns) == baseline
     assert _drain_session_event_queue(_session_event_queues_ref.get(_BOOT_SESSION_ID)) == []
 
 
@@ -2062,7 +2010,16 @@ async def test_events_model_change_settles_held_metadata_lock_without_late_write
 async def test_events_model_change_refuses_unsupported_queued_or_unconfirmed_states(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, phase: str
 ) -> None:
-    def refuse(*args: Any, **kwargs: Any) -> None:
+    from omnigent.runner.app import _session_event_queues_ref
+
+    selections: list[str] = []
+
+    async def drain_creation_events(_client: httpx.AsyncClient) -> None:
+        _drain_session_event_queue(_session_event_queues_ref.get(_BOOT_SESSION_ID))
+
+    def refuse(_bridge: Path, *, model: str, **_kwargs: Any) -> None:
+        selections.append(model)
+        assert _injection_deadline() is not None
         raise claude_native_bridge.ClaudeModelSwitchRefused(
             "Session-only model selection refused; inspect the terminal before retrying.",
             phase=phase,
@@ -2070,9 +2027,17 @@ async def test_events_model_change_refuses_unsupported_queued_or_unconfirmed_sta
             model_may_have_changed=phase in {"commit", "status"},
         )
 
-    response = await _post_claude_control(monkeypatch, tmp_path, refuse, pane_status="running")
+    response = await _post_claude_control(
+        monkeypatch,
+        tmp_path,
+        refuse,
+        pane_status="running",
+        before_control=drain_creation_events,
+    )
 
+    assert selections == ["claude-opus-4-7"]
     assert response.status_code == 503, response.text
+    assert _drain_session_event_queue(_session_event_queues_ref.get(_BOOT_SESSION_ID)) == []
     if phase in {"commit", "status"}:
         assert response.json()["error"] == "claude_native_model_unconfirmed"
         assert "may have changed" in response.json()["detail"]
