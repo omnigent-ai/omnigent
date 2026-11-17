@@ -79,7 +79,7 @@ def _fake_policy(spec, cwd):
     return SandboxPolicy("darwin_seatbelt", True, [], [cwd], [], True)
 
 
-def test_isolation_restarts_an_existing_helper_before_reusing_the_environment(
+def test_isolation_restarts_the_helper_only_when_the_credential_boundary_changes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(os_module, "resolve_sandbox", _fake_policy)
@@ -89,15 +89,34 @@ def test_isolation_restarts_an_existing_helper_before_reusing_the_environment(
     process.poll.return_value = None
     environment._helper._proc = process
     secret = tmp_path.parent / "private-callback-credential"
-    access = ClaudeModelAccess(
-        "https://model.test", "authorization", lambda: "parent-only-secret", (secret,)
-    )
+
+    def session_access(base_url: str = "https://model.test") -> ClaudeModelAccess:
+        return ClaudeModelAccess(
+            base_url, "authorization", lambda: "parent-only-secret", (secret,)
+        )
+
+    access = session_access()
     try:
         environment.isolate_model_credentials(access)
         process.terminate.assert_called_once()
         assert environment._helper._proc is None
         assert secret in environment.sandbox.credential_source_paths
         assert environment._helper._model_access is access
+
+        # Each callback derives a new access object with a fresh placeholder.
+        process.reset_mock()
+        environment._helper._proc = process
+        rederived = session_access()
+        assert rederived.placeholder != access.placeholder
+        environment.isolate_model_credentials(rederived)
+        process.terminate.assert_not_called()
+        assert environment._helper._proc is process
+        assert environment._helper._model_access is access
+
+        changed = session_access("https://other-model.test")
+        environment.isolate_model_credentials(changed)
+        process.terminate.assert_called_once()
+        assert environment._helper._model_access is changed
     finally:
         environment.close()
 
@@ -161,7 +180,9 @@ async def test_callback_spawn_has_private_env_protected_bundle_and_authenticated
     assert bundle / "config.yaml" in policy.credential_source_paths
     from omnigent.inner.seatbelt_sandbox import _build_profile
 
-    assert "securityd|secd|keychain" in _build_profile(policy, workspace)
+    profile = _build_profile(policy, workspace)
+    assert '(global-name "com.apple.SecurityServer")' in profile
+    assert "securityd|secd|keychain" in profile
     assert start.call_args.kwargs["rules"] == []
     assert start.call_args.kwargs["require_auth"] is True
     assert start.call_args.kwargs["model_access"].credential() == "parent-only-provider-secret"

@@ -477,9 +477,10 @@ class _HelperProcessClient:
             if not self.sandbox.active:
                 return self.sandbox
             protected = access.protect_sources(self.sandbox, self.cwd)
-            if self._model_access is not access:
+            # Callbacks re-derive equal access; keep the running relay's placeholder.
+            if self._model_access != access:
                 self._stop_locked()
-            self._model_access = access
+                self._model_access = access
             self.sandbox = protected
             return protected
 

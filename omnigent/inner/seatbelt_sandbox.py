@@ -1154,7 +1154,11 @@ def _build_profile(
 
     if policy.credential_source_paths is not None:
         # Keychain reads use securityd IPC and can bypass filesystem denials.
-        lines.append('(deny mach-lookup (global-name-regex #".*(securityd|secd|keychain).*"))')
+        # File keychains use com.apple.SecurityServer, which the regex cannot match.
+        lines.append(
+            '(deny mach-lookup (global-name "com.apple.SecurityServer") '
+            '(global-name-regex #".*(securityd|secd|keychain).*"))'
+        )
 
     return "\n".join(lines) + "\n"
 

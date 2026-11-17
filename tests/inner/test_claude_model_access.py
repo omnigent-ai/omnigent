@@ -17,10 +17,12 @@ import pytest
 
 import omnigent.inner.terminal as terminal_mod
 from omnigent.inner.claude_model_access import (
+    _MAX_REQUEST_BODY_BYTES,
     HELPER_ENV,
     ClaudeAuthRequired,
     ClaudeModelAccess,
     _ClaudeCredential,
+    _ClaudeRelay,
     resolve_claude_model_access,
 )
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
@@ -28,6 +30,7 @@ from omnigent.inner.egress.ca import ensure_ca, ensure_ca_bundle
 from omnigent.inner.egress.certs import HostCertCache
 from omnigent.inner.egress.proxy import EgressProxy
 from omnigent.inner.egress.rules import parse_rules
+from omnigent.inner.model_signer_service import _parse_strict_request_headers
 from omnigent.inner.model_signing import SigningRejected, _validate_headers
 from omnigent.inner.sandbox import SandboxPolicy, _default_sandbox_for_platform
 from omnigent.inner.terminal import TerminalInstance
@@ -244,6 +247,25 @@ def test_rejects_out_of_scope_requests(overrides: dict) -> None:
     access = ClaudeModelAccess("https://model.test/gateway", "authorization", lambda: "secret")
     with pytest.raises(SigningRejected):
         _request(access, **overrides)
+
+
+def test_relay_accepts_provider_sized_bodies_without_raising_the_shared_limit() -> None:
+    access = ClaudeModelAccess("https://model.test/gateway", "authorization", lambda: "secret")
+    attachment = "A" * (12 * 1024 * 1024)
+    body = json.dumps({"model": "claude-test", "messages": [{"content": attachment}]}).encode()
+    assert _request(access, body=body).body == body
+    headers = f"Host: model.test\r\nContent-Length: {len(body)}\r\n\r\n".encode()
+    assert _ClaudeRelay._request_headers(headers)[1] == len(body)
+    assert _ClaudeRelay._parse_inner_content_length(headers) == len(body)
+    with pytest.raises(SigningRejected):
+        _parse_strict_request_headers(headers)
+    oversized = _MAX_REQUEST_BODY_BYTES + 1
+    with pytest.raises(SigningRejected):
+        _ClaudeRelay._request_headers(
+            f"Host: model.test\r\nContent-Length: {oversized}\r\n\r\n".encode()
+        )
+    with pytest.raises(SigningRejected):
+        _request(access, body=b" " * oversized)
 
 
 @pytest.mark.parametrize(

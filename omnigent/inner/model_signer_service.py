@@ -166,7 +166,7 @@ def _parse_strict_header_lines(
 
 
 def _parse_strict_request_headers(
-    raw: bytes, *, allow_connection_close: bool = False
+    raw: bytes, *, allow_connection_close: bool = False, max_body_bytes: int = _MAX_BODY_BYTES
 ) -> tuple[list[tuple[str, str]], int]:
     parsed = _parse_strict_header_lines(raw)
     by_name = {name.lower(): value for name, value in parsed}
@@ -190,7 +190,7 @@ def _parse_strict_request_headers(
     if len(length_raw) > 20:
         raise SigningRejected("Content-Length exceeds the configured limit")
     length = int(length_raw)
-    if length > _MAX_BODY_BYTES:
+    if length > max_body_bytes:
         raise SigningRejected("request body exceeds the configured limit")
     # Keep-alive controls only the client-to-relay connection. Never include
     # this hop-by-hop header in the reconstructed upstream request.

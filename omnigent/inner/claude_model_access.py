@@ -68,6 +68,8 @@ _SECRET_ENV = frozenset(
 )
 _BYPASS_ENV = frozenset({"ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy"})
 _BETA = re.compile(r"[a-z0-9][a-z0-9.-]{0,100}(?:,[a-z0-9][a-z0-9.-]{0,100})*\Z")
+# Match the Messages API request limit so attachments the provider accepts still pass.
+_MAX_REQUEST_BODY_BYTES = 32 * 1024 * 1024
 
 
 def _is_claude_credential_env_name(name: str) -> bool:
@@ -222,14 +224,19 @@ class ClaudeAuthRequired(ProviderAuthRequired):
 
 @dataclass(frozen=True)
 class ClaudeModelAccess:
-    """Trusted authority, never serialized into a sandbox policy or launcher."""
+    """Trusted authority, never serialized into a sandbox policy or launcher.
+
+    Equality covers the endpoint and credential sources, not per-instance secrets.
+    """
 
     base_url: str
     auth_header: str
-    credential: Callable[[], str] = field(repr=False)
+    credential: Callable[[], str] = field(repr=False, compare=False)
     source_paths: tuple[Path, ...] = ()
     oauth: bool = False
-    placeholder: str = field(default_factory=lambda: "oa_cred_" + secrets.token_urlsafe(32))
+    placeholder: str = field(
+        default_factory=lambda: "oa_cred_" + secrets.token_urlsafe(32), compare=False
+    )
     auth_executable: _TrustedExecutable | None = field(default=None, repr=False)
     source_env_names: frozenset[str] = frozenset()
     _attribution_headers: tuple[tuple[str, str], ...] = field(init=False, default=(), repr=False)
@@ -403,7 +410,7 @@ class ClaudeModelAccess:
             raise SigningRejected("unsupported model request credential or encoding")
         if normalized.get("content-type") != "application/json":
             raise SigningRejected("model requests require JSON")
-        if len(body) > 10 * 1024 * 1024:
+        if len(body) > _MAX_REQUEST_BODY_BYTES:
             raise SigningRejected("model request body is too large")
         _validate_json_body(body)
         payload = json.loads(body)
@@ -563,12 +570,16 @@ class _ClaudeRelay(_SignerRelay):
         parsed = _parse_strict_header_lines(headers_raw)
         if not any(name.lower() == "content-length" for name, _ in parsed):
             headers_raw = headers_raw[:-2] + b"Content-Length: 0\r\n\r\n"
-        _, length = _parse_strict_request_headers(headers_raw, allow_connection_close=True)
+        _, length = _parse_strict_request_headers(
+            headers_raw, allow_connection_close=True, max_body_bytes=_MAX_REQUEST_BODY_BYTES
+        )
         return length
 
     @staticmethod
     def _request_headers(raw: bytes) -> tuple[list[tuple[str, str]], int]:
-        return _parse_strict_request_headers(raw, allow_connection_close=True)
+        return _parse_strict_request_headers(
+            raw, allow_connection_close=True, max_body_bytes=_MAX_REQUEST_BODY_BYTES
+        )
 
     async def _assert_destination_allowed(self, host: str, port: int) -> str | None:
         if host.lower() == self._access.host and port != 443:
