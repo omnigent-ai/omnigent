@@ -484,7 +484,7 @@ def _scrub(text: str) -> str:
                 + "|"
                 # Not inside a longer path or URL (``/mnt/home/user``, ``cache//home/user``);
                 # ``file://`` URLs still point at the home itself.
-                + r"(?:(?<![\w.\-~/])|(?<=file://))"
+                + r"(?:(?<![\w.\-~/\\])|(?<=file://))"
                 + home_pattern
                 + r"""(?=$|[/\\\s'"`)\]}>]|[.,;:!?]+(?=$|[\s'"`)\]}>]))"""
             )

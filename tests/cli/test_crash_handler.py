@@ -311,13 +311,30 @@ def test_interactive_yes_copies_and_opens_browser(
     # handle_crash writes through real_stderr(); point it at our capture.
     monkeypatch.setattr(ch, "real_stderr", lambda: stream)
     monkeypatch.setattr(sys, "stdin", io.StringIO("y\n"))
-    ch.handle_crash(_make_exc("yes-branch"), interactive=True, source="test")
+    exc = _make_exc("yes-branch")
+    early_sentinel = "EARLY_TRACEBACK_SENTINEL"
+    exc.add_note(early_sentinel)
+    exc.add_note("x" * 30000)
+    exc.add_note("FINAL_TRACEBACK_DETAIL")
+    full_tb = "".join(traceback.format_exception(exc))
+    ch.handle_crash(exc, interactive=True, source="test")
 
     out = _strip_ansi(stream.getvalue())
     assert "copied" in calls and "yes-branch" in calls["copied"]
     assert calls["url"].startswith("https://github.com/omnigent-ai/omnigent/issues/new?")
     assert "template=bug_report.yml" in calls["url"]
     assert "review and submit" in out
+    reports = list((data_dir / "crashes").glob("crash-*.md"))
+    assert len(reports) == 1
+    saved_report = reports[0].read_text(encoding="utf-8")
+    assert saved_report == calls["copied"]
+    assert full_tb in saved_report
+    assert early_sentinel in saved_report
+    assert len(calls["url"]) <= ch._MAX_URL_LENGTH
+    body = _description_of(calls["url"])
+    assert early_sentinel not in body
+    assert "FINAL_TRACEBACK_DETAIL" in body
+    assert "Traceback truncated to fit this link" in body
 
 
 def test_interactive_no_saves_path_and_link(
@@ -414,52 +431,60 @@ def _description_of(url: str) -> str:
     return urllib.parse.parse_qs(urllib.parse.urlparse(url).query).get("description", [""])[0]
 
 
-def test_issue_url_truncates_non_ascii_traceback(data_dir: Path) -> None:
-    """Non-ASCII content expands 6x under URL-encoding; the tail still fits."""
+@pytest.mark.parametrize(
+    ("padding", "frame_template", "exception_type", "message", "last_frame"),
+    [
+        pytest.param(
+            "é",
+            '  File "répertoire/modèle_{index}.py", line {index}, in échec\n',
+            ValueError,
+            "crash",
+            'File "répertoire/modèle_119.py", line 119, in échec',
+            id="unicode-encoding",
+        ),
+        pytest.param(
+            "X",
+            '  File "/home/example/.cache/app/lib/python3.12/site-packages/pkg/'
+            'module_{index}.py", line {index}, in load\n'
+            "    return importlib.import_module(name)\n",
+            ImportError,
+            "/lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.33' not found",
+            'File "/home/example/.cache/app/lib/python3.12/site-packages/pkg/'
+            'module_119.py", line 119, in load',
+            id="realistic-frames",
+        ),
+    ],
+)
+def test_issue_url_retains_tail_of_long_traceback(
+    data_dir: Path,
+    padding: str,
+    frame_template: str,
+    exception_type: type[Exception],
+    message: str,
+    last_frame: str,
+) -> None:
+    """Encoded Unicode and deep library frames both retain their final diagnostics."""
     ch.install_crash_handler("omnigent", "omnigent-ai/omnigent")
-    frames = "".join(
-        f'  File "répertoire/modèle_{i}.py", line {i}, in échec\n' for i in range(120)
-    )
-    huge_non_ascii = "é" * 30000 + "\n" + frames + "ValueError: crash\n"
-    url, body_included = ch._issue_url(_make_exc("crash"), huge_non_ascii)
-    assert len(url) <= ch._MAX_URL_LENGTH
-    assert body_included is True
-    body = _description_of(url)
-    assert "truncated" in body
-    traceback_body = body.split("**Traceback:**\n", 1)[1]
-    assert 'File "répertoire/modèle_119.py", line 119, in échec' in traceback_body
-    assert "ValueError: crash" in traceback_body
-
-
-def test_issue_url_prefills_tail_of_long_realistic_traceback(data_dir: Path) -> None:
-    """Long site-packages paths in a deep traceback must not drop the description."""
-    ch.install_crash_handler("omnigent", "omnigent-ai/omnigent")
-    frames = "".join(
-        f'  File "/home/example/.cache/app/lib/python3.12/site-packages/pkg/module_{i}.py", '
-        f"line {i}, in load\n"
-        "    return importlib.import_module(name)\n"
-        for i in range(120)
-    )
+    frames = "".join(frame_template.format(index=index) for index in range(120))
+    exception_line = f"{exception_type.__qualname__}: {message}"
     tb_text = (
         "Traceback (most recent call last):\n"
-        + "X" * 30000
+        + padding * 30000
         + "\n"
         + frames
-        + "ImportError: /lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.33' not found\n"
+        + exception_line
+        + "\n"
     )
-    exc = ImportError("/lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.33' not found")
+    exc = exception_type(message)
     url, body_included = ch._issue_url(exc, tb_text)
     assert len(url) <= ch._MAX_URL_LENGTH
     assert body_included is True
     body = _description_of(url)
     assert "truncated" in body
-    assert body.count("X") < 30000
+    assert body.count(padding) < 30000
     traceback_body = body.split("**Traceback:**\n", 1)[1]
-    assert (
-        "ImportError: /lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.33' not found"
-        in traceback_body
-    )
-    assert "module_119.py" in traceback_body
+    assert last_frame in traceback_body
+    assert exception_line in traceback_body
 
 
 def test_issue_url_drops_body_when_summary_alone_is_too_long(data_dir: Path) -> None:
@@ -674,9 +699,17 @@ def test_issue_url_scrubs_repr_escaped_home(
             "https://example.test/cache//home/example/file",
             "https://example.test/cache//home/example/file",
         ),
+        (r"/mnt/cache\/home/example/file", r"/mnt/cache\/home/example/file"),
         ("/home/example/project", "~/project"),
     ],
-    ids=["mount-prefix", "url-path", "doubled-slash-mount", "doubled-slash-url", "home-itself"],
+    ids=[
+        "mount-prefix",
+        "url-path",
+        "doubled-slash-mount",
+        "doubled-slash-url",
+        "backslash-mount",
+        "home-itself",
+    ],
 )
 def test_scrub_keeps_home_text_inside_other_paths(
     monkeypatch: pytest.MonkeyPatch, text: str, expected: str
