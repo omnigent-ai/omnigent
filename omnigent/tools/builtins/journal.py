@@ -23,6 +23,7 @@ from typing import Any
 from omnigent.entities.session_journal import (
     JOURNAL_KINDS,
     NOTE_BODY_MAX_BYTES,
+    PLAN_DESCRIPTION_MAX_CHARS,
     PLAN_MAX_STEPS,
     PLAN_NAME_MAX_CHARS,
     STEP_ID_MAX_CHARS,
@@ -166,6 +167,16 @@ class SysJournalWritePlanTool(Tool):
                     "description": (
                         "Only on the plan that starts a run of a saved workflow: its ID, "
                         "from sys_workflow_load."
+                    ),
+                },
+                "description": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": PLAN_DESCRIPTION_MAX_CHARS,
+                    "description": (
+                        "Only in a workflow page's planning chat: the workflow's description "
+                        "for this proposal, what it does and what a run needs. Save plan "
+                        "stores it with the steps."
                     ),
                 },
             },

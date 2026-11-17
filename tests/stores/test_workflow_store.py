@@ -191,6 +191,54 @@ def test_an_update_keeps_what_it_leaves_out_and_checks_the_result(store: Workflo
     assert store.update(saved.id, user_id=BOB, name="mine") is None
 
 
+def test_a_description_written_meanwhile_outlives_a_stale_replacement(
+    store: WorkflowStore,
+) -> None:
+    saved = _save(store, "deploy")
+    assert store.update(saved.id, user_id=ALICE, description="Edited elsewhere.") is not None
+    kept = store.update(
+        saved.id,
+        user_id=ALICE,
+        description="From an older proposal.",
+        expected_description=saved.description,
+        steps=[{"id": "only", "name": "Only"}],
+    )
+    assert kept is not None and kept.description == "Edited elsewhere."
+    assert kept.steps == [{"id": "only", "name": "Only", "goal": None, "depends_on": []}]
+    replaced = store.update(
+        saved.id,
+        user_id=ALICE,
+        description="From the newest proposal.",
+        expected_description="Edited elsewhere.",
+    )
+    assert replaced is not None and replaced.description == "From the newest proposal."
+    assert store.get(saved.id, user_id=ALICE) == replaced
+
+
+def test_a_description_keeps_its_proposal_until_written_otherwise(store: WorkflowStore) -> None:
+    saved = _save(store, "deploy")
+    assert saved.description_source is None
+    proposal, newer = "a" * 32, "b" * 32
+    proposed = store.update(
+        saved.id, user_id=ALICE, description="From a proposal.", description_source=proposal
+    )
+    assert proposed is not None and proposed.description_source == proposal
+    kept = store.update(saved.id, user_id=ALICE, steps=[{"id": "only", "name": "Only"}])
+    assert kept is not None and kept.description_source == proposal
+    stale = store.update(
+        saved.id,
+        user_id=ALICE,
+        description="From a stale page.",
+        expected_description="Not the description.",
+        description_source=newer,
+    )
+    assert stale is not None
+    assert (stale.description, stale.description_source) == ("From a proposal.", proposal)
+    edited = store.update(saved.id, user_id=ALICE, description="From a proposal.")
+    assert edited is not None and edited.description_source is None
+    assert store.get(saved.id, user_id=ALICE) == edited
+
+
 def test_invalid_or_oversized_workflows_are_refused(store: WorkflowStore) -> None:
     with pytest.raises(InvalidWorkflowError, match="description must not be empty"):
         store.create(user_id=ALICE, name="x", description=" ", steps=STEPS)

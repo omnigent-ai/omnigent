@@ -60,7 +60,7 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { Link, useNavigate, useParams } from "@/lib/routing";
 import { formatRunTimestamp } from "@/lib/scheduleText";
 import { cn } from "@/lib/utils";
-import { currentPlan, planSteps, type StepState } from "@/lib/sessionJournal";
+import { currentPlan, planDescription, planSteps, type StepState } from "@/lib/sessionJournal";
 import { ApiError } from "@/lib/sessionsApi";
 import {
   describeWorkflowRun,
@@ -162,12 +162,29 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
   const runList = runs.data?.pages.flatMap((page) => page.runs) ?? [];
   const proposal = canReadProposal ? currentPlan(journal.entries) : null;
   const proposedSteps = proposal ? planSteps(proposal) : null;
+  // A proposal replaces the description only if it's newer than where the description came
+  // from, so an edit made since stands: the proposal Save plan took it from, by journal order,
+  // or else the workflow's last write, in whole seconds, where a tie keeps the description.
+  const savedFrom = workflow.description_source
+    ? journal.entries.find((entry) => entry.id === workflow.description_source)
+    : undefined;
+  const proposalIsNewer =
+    proposal !== null &&
+    (savedFrom
+      ? proposal.position > savedFrom.position
+      : proposal.created_at > (workflow.updated_at ?? 0));
+  const proposedDescription = proposalIsNewer ? planDescription(proposal) : null;
+  const newDescription =
+    proposedSteps?.length && proposedDescription !== workflow.description
+      ? proposedDescription
+      : null;
   const stepSignature = (steps: typeof workflow.steps) =>
     JSON.stringify(
       steps.map(({ id, name, goal, depends_on }) => [id, name, goal ?? null, depends_on]),
     );
   const hasChanges =
-    !!proposedSteps?.length && stepSignature(proposedSteps) !== stepSignature(workflow.steps);
+    !!proposedSteps?.length &&
+    (stepSignature(proposedSteps) !== stepSignature(workflow.steps) || newDescription !== null);
   const isDraft = workflow.is_draft ?? workflow.steps.length === 0;
   const canRun = !isDraft && !hasChanges;
   // Expanded, the planner covers the page, which keeps its width underneath so
@@ -256,7 +273,10 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
             </Button>
           </div>
         </div>
-        <WorkflowDescription workflowId={workflow.id} text={workflow.description} />
+        <WorkflowDescription
+          workflowId={workflow.id}
+          text={newDescription ?? workflow.description}
+        />
 
         <section className="mt-6">
           <div className="mb-3 flex items-center justify-between gap-3">
@@ -274,9 +294,21 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
                 disabled={savePlan.isPending}
                 loading={savePlan.isPending}
                 onClick={() => {
-                  if (!proposedSteps) return;
+                  if (!proposal || !proposedSteps) return;
                   setPlannerOpen(showPlanner);
-                  savePlan.mutate(proposedSteps, { onSuccess: () => showToast("Plan saved") });
+                  // The server keeps a description another client changed after this page loaded it.
+                  const description =
+                    newDescription === null
+                      ? {}
+                      : {
+                          description: newDescription,
+                          expected_description: workflow.description,
+                          description_source: proposal.id,
+                        };
+                  savePlan.mutate(
+                    { steps: proposedSteps, ...description },
+                    { onSuccess: () => showToast("Plan saved") },
+                  );
                 }}
               >
                 <SaveIcon className="size-4" /> Save plan

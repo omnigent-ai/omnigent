@@ -101,6 +101,12 @@ export function planName(entry: JournalEntry | null): string | null {
   return typeof name === "string" && name.trim() ? name : null;
 }
 
+/** The workflow description a planning chat proposed with this plan, or null. */
+export function planDescription(entry: JournalEntry): string | null {
+  const description = entry.content.description;
+  return typeof description === "string" && description.trim() ? description : null;
+}
+
 /** The label a step's status shows. A started step runs only while the session works. */
 export function stepStatusLabel(
   status: StepStatus,

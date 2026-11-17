@@ -3477,10 +3477,13 @@ class WorkflowObject(WorkflowSummary):
 
     :param steps: The workflow's graph.
     :param planning_session_id: The conversation for proposing revisions, separate from runs.
+    :param description_source: The planning conversation's journal entry for the proposal
+        the description was saved from, until the description is written otherwise.
     """
 
     steps: list[WorkflowStep]
     planning_session_id: str | None = None
+    description_source: str | None = None
 
 
 class WorkflowList(BaseModel):
@@ -3600,6 +3603,10 @@ class UpdateWorkflowRequest(BaseModel):
     :param name: A new name.
     :param description: A new description, subject to the same character and
         stored-byte limits as creation.
+    :param expected_description: Apply ``description`` only while the stored
+        description is still this text, so one written meanwhile stays.
+    :param description_source: The journal entry ID of the planning-chat proposal
+        ``description`` comes from; a description written without one clears it.
     :param steps: New steps, replacing the old ones.
     :param planning_session_id: The private owned session for iterating on the plan.
     """
@@ -3608,6 +3615,8 @@ class UpdateWorkflowRequest(BaseModel):
 
     name: str | None = None
     description: str | None = None
+    expected_description: str | None = None
+    description_source: str | None = None
     steps: list[WorkflowStep] | None = None
     planning_session_id: str | None = None
 
