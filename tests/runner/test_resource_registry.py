@@ -3725,7 +3725,7 @@ def test_session_workspace_uses_platform_temp_default(
         [
             sys.executable,
             "-c",
-            "import importlib, json, sys, tempfile\n"
+            "import importlib, json, os, sys, tempfile\n"
             "from omnigent import _platform\n"
             "from omnigent.runner import resource_registry\n"
             "_platform.IS_WINDOWS = sys.argv[1] == 'True'\n"
@@ -3735,6 +3735,12 @@ def test_session_workspace_uses_platform_temp_default(
             "if sys.argv[2] != 'default':\n"
             "    tempfile.gettempdir = unavailable_tempdir\n"
             "importlib.reload(resource_registry)\n"
+            "if sys.argv[2] == 'tmpdir':\n"
+            "    imported_workspace = resource_registry._session_workspace('conv_temp')\n"
+            "    os.environ['TMPDIR'] += '-changed'\n"
+            "    assert resource_registry._session_workspace('conv_temp') == imported_workspace\n"
+            "    del os.environ['TMPDIR']\n"
+            "    assert resource_registry._session_workspace('conv_temp') == imported_workspace\n"
             "print(json.dumps(resource_registry._session_workspace('conv_temp')))\n",
             str(windows),
             root_source,
