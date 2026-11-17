@@ -7,8 +7,8 @@ reaches the runner with no turn to cancel. ``test_orphaned_running_session_stop`
 same symptom when the runner is gone; this covers it with the runner still connected.
 
 Journey: run one in-process turn to completion, persist ``running`` on the row, restart the
-server so its status cache is cold, then send ``interrupt`` (the web UI's Stop) and expect the
-snapshot and the session list to report ``idle``.
+server so its status cache is cold, then send ``interrupt`` or ``stop_session`` and expect the
+snapshot, session list, and stored row to report ``idle``.
 
 Excluded from default ``pytest`` runs via ``--ignore=tests/e2e``. Invoke with::
 
@@ -62,8 +62,9 @@ def _listed_status(client: httpx.Client, session_id: str) -> str | None:
 
 
 @pytest.mark.timeout(300)
+@pytest.mark.parametrize("stop_type", ["interrupt", "stop_session"])
 def test_stop_clears_a_stale_running_session(
-    tmp_path: Path, isolated_mock_llm_server_url: str
+    tmp_path: Path, isolated_mock_llm_server_url: str, stop_type: str
 ) -> None:
     """Stop on an idle session whose row still says ``running`` settles it to ``idle``."""
     mock = isolated_mock_llm_server_url
@@ -111,11 +112,20 @@ def test_stop_clears_a_stale_running_session(
             # A lost idle edge: running on the row, then a restart so no cache contradicts it.
             store = SqlAlchemyConversationStore(stack.database_uri)
             store.set_session_live_status(session_id, "running")
+            stored = store.get_conversation(session_id)
+            assert stored is not None and stored.live_status == "running", "precondition"
             stack.restart_server()
             assert _snapshot_status(client, session_id) == "running", "precondition"
             assert _listed_status(client, session_id) == "running", "precondition"
 
-            stopped = client.post(f"/v1/sessions/{session_id}/events", json={"type": "interrupt"})
+            stopped = client.post(f"/v1/sessions/{session_id}/events", json={"type": stop_type})
             assert stopped.status_code < 400, stopped.text
             poll_until(lambda: _snapshot_status(client, session_id) == "idle", timeout_s=30)
             assert _listed_status(client, session_id) == "idle"
+            poll_until(
+                lambda: (
+                    (stored := store.get_conversation(session_id)) is not None
+                    and stored.live_status == "idle"
+                ),
+                timeout_s=30,
+            )
