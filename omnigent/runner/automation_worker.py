@@ -33,6 +33,9 @@ _HISTORY_PAGE_LIMIT = 50
 _HISTORY_MAX_PAGES = 4
 _REQUEST_TIMEOUT_S = 30.0
 
+# Room for at least the fence lines and a short item.
+_MIN_DETAILS_CHARS = 100
+
 # The independent placements the template's workers use; a child would change their lifetime.
 _WORKER_PLACEMENTS = frozenset({"same_host", "managed"})
 
@@ -214,6 +217,12 @@ async def execute_automation_start_worker(
             max_chars=max_chars,
         )
     except WorkerMessageTooLongError as exc:
+        if exc.details_max_chars < _MIN_DETAILS_CHARS:
+            # Shortening can't help, so the template's stop-on-refusal rule applies.
+            return _error(
+                f"the worker instructions leave no room for details in {max_chars} characters; "
+                "no worker can be started"
+            )
         return _error(
             f"the message would be over {max_chars} characters; shorten details to at most "
             f"{exc.details_max_chars} characters and call again",

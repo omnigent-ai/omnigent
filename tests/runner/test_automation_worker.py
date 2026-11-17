@@ -141,18 +141,26 @@ async def test_starts_worker_with_instructions_untrusted_line_and_details(
 @pytest.mark.asyncio
 async def test_too_long_message_is_refused_with_the_details_budget() -> None:
     prefix_chars = len(f"{INSTRUCTIONS}\n\n{UNTRUSTED_DETAILS_LINE}\n")
-    limit = prefix_chars + 10
+    limit = prefix_chars + 100
 
     output, created = await _start(
-        _args(details="x" * 11, message_max_chars=limit), [_user_item(_automation_prompt())]
+        _args(details="x" * 101, message_max_chars=limit), [_user_item(_automation_prompt())]
     )
     assert created == []
-    assert output["details_max_chars"] == 10
+    assert output["details_max_chars"] == 100
 
     output, created = await _start(
-        _args(details="x" * 10, message_max_chars=limit), [_user_item(_automation_prompt())]
+        _args(details="x" * 100, message_max_chars=limit), [_user_item(_automation_prompt())]
     )
     assert len(created[0]["message"]) == limit
+
+    # Instructions that leave almost no room: shortening can't help, so no retry hint.
+    output, created = await _start(
+        _args(message_max_chars=prefix_chars + 10), [_user_item(_automation_prompt())]
+    )
+    assert created == []
+    assert "no room for details" in output["error"]
+    assert "details_max_chars" not in output
 
 
 @pytest.mark.asyncio
