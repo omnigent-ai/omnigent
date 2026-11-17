@@ -105,10 +105,7 @@ function workspaceSocketRequest(request, routes = {}) {
     return Promise.reject(new Error("not a workspace socket on this machine"));
   }
   const proves = async () => {
-    const { socketPath: local, dropConnection } = await forwards.localSocket(
-      destination,
-      socketPath,
-    );
+    const { socketPath: local, dropForward } = await forwards.localSocket(destination, socketPath);
     const probe = {
       "content-type": "application/json",
       "content-length": String(PROBE_BODY.byteLength),
@@ -118,7 +115,8 @@ function workspaceSocketRequest(request, routes = {}) {
     try {
       ok = (await send(local, PROBE_PATH, probe, PROBE_BODY)).status === 200;
     } finally {
-      if (!ok) dropConnection();
+      // The connection may serve other hosts; it closes once idle, or now if it is gone.
+      if (!ok) dropForward();
     }
     return ok;
   };

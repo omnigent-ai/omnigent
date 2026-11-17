@@ -10,7 +10,12 @@
 //   └──────────────────────────────────┴──────────────────┘
 
 import { FileViewerContext, useWorkspacePaths, type FilePosition } from "./FileViewerContext";
-import { revealInFileManager, revealLabel, useRevealTarget } from "./RevealInFileManager";
+import {
+  revealInFileManager,
+  revealLabel,
+  useRevealTarget,
+  useSessionHostId,
+} from "./RevealInFileManager";
 import { OpenInSplitButton, useOpenInActions } from "./OpenInMenu";
 import {
   dismissFilePosition,
@@ -94,7 +99,6 @@ import { useHostSshTarget } from "@/hooks/useHostSshTarget";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled } from "@/lib/capabilities";
 import { workspaceSocketBridge } from "@/lib/nativeBridge";
-import { getSessionHost } from "@/lib/sessionHost";
 import { isVideoFile } from "@/lib/video";
 import { useFileDiff } from "@/hooks/useFileDiff";
 import { useInertRef } from "@/hooks/useInertRef";
@@ -474,10 +478,8 @@ function FileViewerBody({
   // The host's SSH alias lets the desktop read a host on another machine directly.
   const directReads =
     workspaceSocketBridge() !== null && isFeatureEnabled(serverInfo, "workspace_direct_access");
-  const sshTarget = useHostSshTarget(
-    directReads ? getSessionHost(conversationId) : null,
-    conversationId,
-  );
+  const sessionHostId = useSessionHostId(conversationId);
+  const sshTarget = useHostSshTarget(directReads ? sessionHostId : null, conversationId);
   // Video playback reads the complete binary on demand, never the capped JSON preview.
   const fileQuery = useFileContent(
     conversationId,

@@ -179,18 +179,23 @@ describe("readFileViaWorkspaceApi", () => {
     expect(socket).toHaveBeenCalledTimes(1);
   });
 
-  it("offers the host's SSH alias, and retries the socket once a read brings one", async () => {
+  it("offers the host's SSH alias, and retries the socket only for a new one", async () => {
     enable("workspace_direct_access", "workspace_api_server_access");
     serve(textFile);
     socket.mockRejectedValueOnce(new Error("not a workspace socket on this machine"));
+    socket.mockRejectedValueOnce(new Error("SSH alias not allowed or not verified for this host"));
     socket.mockImplementation(async () => fromSocket(textFile()));
 
     await readFileViaWorkspaceApi("s-alias", "notes.md");
     await readFileViaWorkspaceApi("s-alias", "notes.md", undefined, "my-box");
+    await readFileViaWorkspaceApi("s-alias", "notes.md", undefined, "my-box");
+    await readFileViaWorkspaceApi("s-alias", "notes.md", undefined, "other-box");
 
-    expect(socket).toHaveBeenCalledTimes(2);
+    expect(
+      socket.mock.calls.map(([request]) => (request as { sshTarget?: string }).sshTarget),
+    ).toEqual([undefined, "my-box", "other-box"]);
     expect(socket.mock.calls[0]![0]).not.toHaveProperty("sshTarget");
-    expect(socket.mock.calls[1]![0]).toMatchObject({ hostId: "host-1", sshTarget: "my-box" });
+    expect(socket.mock.calls[1]![0]).toMatchObject({ hostId: "host-1" });
   });
 
   it.each(["not_found", "unavailable"])(

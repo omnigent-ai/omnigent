@@ -363,17 +363,20 @@ const sshHosts = createSshHostStore(() => path.join(app.getPath("userData"), "ss
 const workspaceSshForwards = createWorkspaceSshForwards();
 const sshTargetChecks = createSshTargetChecks({ record: sshHosts.record });
 
-/** Ask, in a dialog the page can't draw over, before SSH runs with an alias the page suggested. */
+/**
+ * Ask, in a dialog the page can't draw over, before SSH runs with a destination
+ * the page suggested. Null when there is no window to ask in.
+ */
 async function approveSshTarget(win, serverUrl, alias) {
-  if (!win || win.isDestroyed()) return false;
+  if (!win || win.isDestroyed()) return null;
   const { response } = await dialog.showMessageBox(win, {
     type: "question",
     buttons: ["Not now", "Allow"],
     defaultId: 0,
     cancelId: 0,
-    message: `Read this session's files over SSH with "${alias}"?`,
+    message: `Read this session's files over SSH from "${alias}"?`,
     detail:
-      `${new URL(serverUrl).host} says this session's host runs on the machine your SSH config calls "${alias}". ` +
+      `${new URL(serverUrl).host} says this session's host runs on the SSH destination "${alias}". ` +
       "Omnigent would connect with your SSH config and keys, check that the host is there, and read files from it directly instead of through the server.\n\n" +
       `Allow only if you recognize "${alias}".`,
   });

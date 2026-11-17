@@ -77,9 +77,11 @@ source with Rust.
   workspace API methods and their own headers, with size limits.
 - **SSH destinations.** Main records which destination reaches each host
   (`ssh-hosts.json` in the app's data folder, mode 0600), per server. A page
-  can only suggest a plain alias. Main runs no SSH for it, so no config, proxy or
-  `Match exec` either, until the user allows it. It records the alias only after
-  the host accepts that session's token over it. One question is open at a time.
+  can suggest any destination without a user or options, such as an alias or a
+  host name. Main runs no SSH for it, so no config, proxy or `Match exec`
+  either, until the user allows it in a native dialog. The user's consent is
+  the only check on which destination is tried. Main records it only after the
+  host accepts that session's token over it. One question is open at a time.
 - **No password or host-key prompts.** SSH runs with `BatchMode=yes` and the
   user's own SSH config, so a password or an unknown host key fails, and the
   read goes through the server. An SSH agent's confirmation dialog, or a

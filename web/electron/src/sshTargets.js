@@ -30,6 +30,8 @@ function createSshTargetChecks(deps) {
   const allowed = new Set();
   // Per server and alias, whichever host it was offered for, until restart.
   const declined = new Set();
+  // Also kept here, so a record that fails to save isn't probed on every read.
+  const proven = new Set();
   const failedUntil = new Map();
   const pending = new Map();
   let asking = false;
@@ -38,10 +40,11 @@ function createSshTargetChecks(deps) {
     const key = JSON.stringify([serverUrl, hostId, alias]);
     if (!allowed.has(key)) {
       asking = true;
-      const approved = await approve().catch(() => false);
+      // null: the question couldn't be shown, so nothing is remembered.
+      const answer = await approve().catch(() => null);
       asking = false;
-      if (!approved) {
-        declined.add(JSON.stringify([serverUrl, alias]));
+      if (answer !== true) {
+        if (answer === false) declined.add(JSON.stringify([serverUrl, alias]));
         return false;
       }
       allowed.add(key);
@@ -51,6 +54,7 @@ function createSshTargetChecks(deps) {
       failedUntil.set(key, now() + RETRY_MS);
       return false;
     }
+    proven.add(key);
     try {
       deps.record(serverUrl, hostId, alias);
     } catch (error) {
@@ -68,12 +72,13 @@ function createSshTargetChecks(deps) {
      * @param {string} serverUrl
      * @param {string} hostId
      * @param {string} alias A value `suggestedAlias` accepted.
-     * @param {{approve: () => Promise<boolean>, proves: () => Promise<boolean>}} steps
-     *   Ask the user; then make a token-checked call over `alias`.
+     * @param {{approve: () => Promise<boolean | null>, proves: () => Promise<boolean>}} steps
+     *   Ask the user (null if it couldn't); then make a token-checked call over `alias`.
      * @returns {Promise<boolean>}
      */
     verify(serverUrl, hostId, alias, steps) {
       const key = JSON.stringify([serverUrl, hostId, alias]);
+      if (proven.has(key)) return Promise.resolve(true);
       const inFlight = pending.get(key);
       if (inFlight) return inFlight;
       if (declined.has(JSON.stringify([serverUrl, alias]))) return Promise.resolve(false);
