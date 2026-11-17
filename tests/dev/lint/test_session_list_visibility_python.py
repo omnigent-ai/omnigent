@@ -223,7 +223,7 @@ def test_specializes_generic_helper_for_sessions_path() -> None:
         ("omnigent/cli.py", '        "visibility": "all",\n'),
         (
             "omnigent/runner/tool_dispatch.py",
-            '        if path == "/v1/sessions":\n            params["visibility"] = "all"\n',
+            '    if path == "/v1/sessions":\n        params["visibility"] = "all"\n',
         ),
     ],
 )

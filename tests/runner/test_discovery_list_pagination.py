@@ -581,6 +581,51 @@ async def test_sys_session_list_continuation_reports_failed_server_read(
     assert "error" not in retried
 
 
+@pytest.mark.asyncio
+async def test_sys_session_list_bounds_oversized_failure_message() -> None:
+    """An oversized server error keeps the healthy sub-agent row and the retry cursor."""
+    rows = _session_rows(large=False, count=10)
+    failing = True
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions/conv_caller/child_sessions":
+            child = {
+                "id": "conv_child",
+                "title": "researcher:catalog",
+                "tool": "researcher",
+                "session_name": "catalog",
+            }
+            return httpx.Response(200, json={"data": [child]})
+        if request.url.path == "/v1/sessions/conv_caller":
+            return httpx.Response(200, json={"id": "conv_caller", "parent_session_id": None})
+        if request.url.path == "/v1/sessions":
+            if failing:
+                message = "x" * 200_000
+                return httpx.Response(503, json={"error": {"code": "busy", "message": message}})
+            return _server_page(request, rows)
+        raise AssertionError(f"unexpected path {request.url.path}")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server"
+    ) as client:
+        failed = await _call_session(client, {})
+        failing = False
+        retried = await _call_session(client, {"cursor": failed["page"]["next_cursor"]})
+
+    child = {"agent": "researcher", "title": "catalog", "conversation_id": "conv_child"}
+    assert failed["sub_agents"] == [child]
+    assert failed["sessions"] == []
+    assert failed["page"]["has_more"] == {"sessions": True}
+    assert "HTTP 503: xxx" in failed["error"]
+    assert "[truncated]" in failed["error"]
+    assert len(failed["error"]) < 1_000
+    assert retried["sub_agents"] == [child]
+    assert [row["session_id"] for row in retried["sessions"]] == [
+        f"conv_{index:02d}" for index in range(10)
+    ]
+    assert "error" not in retried
+
+
 _VIEWER = "alice@example.com"
 _OTHER_USER = "bob@example.com"
 
@@ -1172,15 +1217,18 @@ async def test_cursor_envelope_is_strict_and_bounded(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    "broken_response",
+    ("broken_response", "cause"),
     [
-        pytest.param(httpx.Response(503), id="failed-status"),
-        pytest.param(httpx.Response(200, text="not json"), id="malformed-json"),
+        pytest.param(httpx.Response(503), "HTTP 503)", id="failed-status"),
+        pytest.param(
+            httpx.Response(200, text="not json"), "a malformed list response", id="malformed-json"
+        ),
         pytest.param(
             httpx.Response(
                 200,
                 json={"data": [], "has_more": "false", "last_id": None},
             ),
+            "a malformed list response",
             id="invalid-envelope",
         ),
     ],
@@ -1189,6 +1237,7 @@ async def test_cursor_envelope_is_strict_and_bounded(tmp_path: Path) -> None:
 async def test_unusable_server_envelope_remains_retryable(
     tmp_path: Path,
     broken_response: httpx.Response,
+    cause: str,
 ) -> None:
     """An unusable 200 response does not falsely exhaust its source."""
     broken = False
@@ -1221,7 +1270,7 @@ async def test_unusable_server_envelope_remains_retryable(
 
     assert failed["builtins"] == []
     assert failed["page"]["has_more"]["builtins"] is True
-    assert failed["error"].startswith("Could not read builtins (the server returned ")
+    assert failed["error"].startswith(f"Could not read builtins (the server returned {cause}")
     assert "error" not in retried
     assert [row["agent_id"] for row in retried["builtins"]] == ["ag_03", "ag_04", "ag_05"]
 

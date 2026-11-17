@@ -817,6 +817,8 @@ def _encode_discovery_cursor(
 
 
 _MALFORMED_DISCOVERY_PAGE = "the server returned a malformed list response"
+# Bounded so a failed source's diagnostic cannot crowd healthy rows and the retry cursor out.
+_DISCOVERY_FAILURE_MESSAGE_MAX_CHARS = 500
 
 
 @dataclass(frozen=True)
@@ -6542,7 +6544,9 @@ async def _fetch_discovery_page(
     except Exception as exc:  # noqa: BLE001
         return _DiscoveryPage([], False, failure=f"the request failed: {type(exc).__name__}")
     if resp.status_code != 200:
-        message = _omnigent_error_message(resp)
+        message = _truncate_activity(
+            _omnigent_error_message(resp), max_chars=_DISCOVERY_FAILURE_MESSAGE_MAX_CHARS
+        )
         detail = f": {message}" if message else ""
         return _DiscoveryPage(
             [], False, failure=f"the server returned HTTP {resp.status_code}{detail}"
