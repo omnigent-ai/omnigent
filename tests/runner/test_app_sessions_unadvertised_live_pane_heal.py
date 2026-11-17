@@ -110,7 +110,6 @@ def _mock_model_picker(
             {
                 "type": "model_change",
                 "model": "claude-opus-4-7",
-                "preserve_unconfirmed_model": True,
             },
             "claude-opus-4-7",
         ),
@@ -191,7 +190,6 @@ async def test_stale_advertisement_is_rewritten_for_the_live_pane(
             json={
                 "type": "model_change",
                 "model": "claude-opus-4-7",
-                "preserve_unconfirmed_model": True,
             },
         )
 
@@ -234,7 +232,6 @@ async def test_failed_readvertise_keeps_pane_and_surfaces_inject_failure(
             json={
                 "type": "model_change",
                 "model": "claude-opus-4-7",
-                "preserve_unconfirmed_model": True,
             },
         )
 
@@ -279,7 +276,6 @@ async def test_live_advertised_pane_advertisement_is_left_untouched(
             json={
                 "type": "model_change",
                 "model": "claude-opus-4-7",
-                "preserve_unconfirmed_model": True,
             },
         )
 

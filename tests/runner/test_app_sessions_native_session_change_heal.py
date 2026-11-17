@@ -189,7 +189,6 @@ async def _open_claude_native_session(
             {
                 "type": "model_change",
                 "model": "claude-opus-4-7",
-                "preserve_unconfirmed_model": True,
             },
             "claude-opus-4-7",
         ),
@@ -355,7 +354,6 @@ async def test_model_change_heals_before_read_model_env(
             json={
                 "type": "model_change",
                 "model": "claude-opus-4-7",
-                "preserve_unconfirmed_model": True,
             },
         )
 

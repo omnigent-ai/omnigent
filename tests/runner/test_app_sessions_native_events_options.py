@@ -1705,7 +1705,6 @@ async def test_events_compact_on_non_native_session_is_204_noop(
             {
                 "type": "model_change",
                 "model": "claude-opus-4-7",
-                "preserve_unconfirmed_model": True,
             },
             "inject_model_command",
         ),
@@ -1851,7 +1850,7 @@ async def _post_claude_control(
             f"/v1/sessions/{_BOOT_SESSION_ID}/events",
             json=event_payload
             if event_payload is not None
-            else {"type": "model_change", "model": model, "preserve_unconfirmed_model": True},
+            else {"type": "model_change", "model": model},
         )
     assert launch_calls == [_BOOT_SESSION_ID]
     assert not native_create_calls
@@ -1891,43 +1890,62 @@ async def test_events_model_change_requires_the_same_immediate_picker_receipt(
     assert _drain_session_event_queue(_session_event_queues_ref.get(_BOOT_SESSION_ID)) == []
 
 
-@pytest.mark.parametrize(
-    "negotiation",
-    [
-        {},
-        {"preserve_unconfirmed_model": False},
-        {"preserve_unconfirmed_model": None},
-        {"preserve_unconfirmed_model": 1},
-        {"preserve_unconfirmed_model": "true"},
-    ],
-    ids=["legacy-server", "false", "null", "integer", "string"],
-)
-async def test_events_model_change_requires_an_uncertainty_aware_server_before_selection(
+@pytest.mark.parametrize("outcome", ["confirmed", "refused", "unconfirmed"])
+async def test_events_legacy_model_change_requires_a_receipt_and_preserves_refusal_semantics(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
-    negotiation: dict[str, Any],
+    outcome: str,
 ) -> None:
-    committed: list[str] = []
+    from omnigent.runner.app import _session_event_queues_ref
+
+    settings = tmp_path / "settings.json"
+    settings.write_text('{"model":"saved-default","permissions":{"allow":[]}}\n')
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    baseline = (settings.read_bytes(), settings.stat().st_ino, settings.stat().st_mtime_ns)
+    selections: list[str] = []
+
+    async def drain_creation_events(_client: httpx.AsyncClient) -> None:
+        _drain_session_event_queue(_session_event_queues_ref.get(_BOOT_SESSION_ID))
+
+    def unexpected_input(*_args: Any, **_kwargs: Any) -> None:
+        pytest.fail("A model event must use the shared selector without delivering a prompt")
+
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", unexpected_input)
+    monkeypatch.setattr(claude_native_bridge, "inject_user_message", unexpected_input)
 
     def select(_bridge: Path, *, model: str, **_kwargs: Any) -> Any:
-        committed.append(model)
+        selections.append(model)
+        assert _injection_deadline() is not None
+        if outcome == "confirmed":
+            return claude_native_bridge.ClaudeModelSwitchResult(
+                model, model, model, model, "native-session"
+            )
         raise claude_native_bridge.ClaudeModelSwitchRefused(
-            "Fresh status was lost after selection.",
-            phase="status",
-            model_may_have_changed=True,
+            "Fresh status was lost after selection."
+            if outcome == "unconfirmed"
+            else "Draft occupied.",
+            phase="status" if outcome == "unconfirmed" else "preflight",
+            model_may_have_changed=outcome == "unconfirmed",
         )
 
     response = await _post_claude_control(
         monkeypatch,
         tmp_path,
         select,
-        event_payload={"type": "model_change", "model": "claude-opus-4-7", **negotiation},
+        event_payload={"type": "model_change", "model": "claude-opus-4-7"},
+        before_control=drain_creation_events,
     )
 
-    assert committed == []
-    assert response.status_code == 503, response.text
-    assert response.json()["error"] == "claude_native_model_unsupported"
-    assert "Update the Omnigent server" in response.json()["detail"]
+    assert selections == ["claude-opus-4-7"]
+    assert response.status_code == (204 if outcome == "confirmed" else 503), response.text
+    if outcome != "confirmed":
+        assert response.json()["error"] == (
+            "claude_native_model_unconfirmed"
+            if outcome == "unconfirmed"
+            else "claude_native_model_failed"
+        )
+    assert (settings.read_bytes(), settings.stat().st_ino, settings.stat().st_mtime_ns) == baseline
+    assert _drain_session_event_queue(_session_event_queues_ref.get(_BOOT_SESSION_ID)) == []
 
 
 @pytest.mark.parametrize("receipt_kind", ["absent", "different-target"])

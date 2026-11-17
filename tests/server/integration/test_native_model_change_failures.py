@@ -583,7 +583,6 @@ async def test_cancelled_claude_model_change_keeps_intent_after_losing_the_reply
             {
                 "type": "model_change",
                 "model": session.requested_model,
-                "preserve_unconfirmed_model": True,
             }
         ]
         assert session.tunnel.dispatch_errors == []
@@ -662,26 +661,26 @@ async def test_refused_model_change_preserves_newer_silent_selection(
 @pytest.mark.parametrize(
     "concurrent_selection", [False, True], ids=["original", "newer-selection"]
 )
-async def test_legacy_claude_model_request_refuses_before_commit_and_preserves_newer_metadata(
+@pytest.mark.parametrize("outcome", ["confirmed", "refused", "unconfirmed"])
+async def test_legacy_claude_model_request_preserves_outcomes_and_newer_metadata(
     client: httpx.AsyncClient,
     native_session: _NativeSession,
     monkeypatch: pytest.MonkeyPatch,
     concurrent_selection: bool,
+    outcome: str,
 ) -> None:
     session = native_session
     assert session.claude is not None
-    session.claude.confirm = False
-    session.claude.model_may_have_changed = True
+    session.claude.confirm = outcome == "confirmed"
+    session.claude.model_may_have_changed = outcome == "unconfirmed"
     monkeypatch.setattr(claude_bridge, "inject_model_command", session.claude.select)
     forward = routes_core._forward_session_change_to_runner
 
     async def legacy_forward(
         session_id: str, router: Any, event: dict[str, Any], **kwargs: Any
     ) -> Any:
-        # An older server sends this event without the uncertainty capability.
-        legacy_event = {
-            key: value for key, value in event.items() if key != "preserve_unconfirmed_model"
-        }
+        # Older servers send only the original type/model fields.
+        legacy_event = {"type": event["type"], "model": event["model"]}
         return await forward(session_id, router, legacy_event, **kwargs)
 
     monkeypatch.setattr(routes_core, "_forward_session_change_to_runner", legacy_forward)
@@ -702,7 +701,7 @@ async def test_legacy_claude_model_request_refuses_before_commit_and_preserves_n
     else:
         response = await _pick_model(client, session)
 
-    assert session.claude.commands == []
+    assert session.claude.commands == [session.requested_model]
     assert session.tunnel.dispatch_errors == []
     requests = [
         json.loads(frame.body or "{}")
@@ -710,20 +709,110 @@ async def test_legacy_claude_model_request_refuses_before_commit_and_preserves_n
         if isinstance(frame, RequestFrame) and frame.path.endswith("/events")
     ]
     assert requests == [{"type": "model_change", "model": session.requested_model}]
-    assert response.status_code == 400, response.text
-    assert session.runner_replies[0].status_code == 503
-    assert session.runner_replies[0].json()["error"] == "claude_native_model_unsupported"
-    assert "Update the Omnigent server" in response.text
-    assert (
-        claude_bridge.read_claude_status_model(session.claude.bridge_dir) == session.previous_model
+    assert len(session.runner_replies) == 1
+    if outcome == "confirmed":
+        assert response.status_code == 200, response.text
+        assert session.runner_replies[0].status_code == 204
+        assert session.errors == session.notices == []
+    elif outcome == "unconfirmed":
+        session.assert_unconfirmed(response)
+    else:
+        assert response.status_code == 503, response.text
+        assert session.runner_replies[0].status_code == 503
+        assert session.runner_replies[0].json()["error"] == "claude_native_model_failed"
+        assert [error["code"] for error in session.errors] == ["model_change_not_applied"]
+    assert claude_bridge.read_claude_status_model(session.claude.bridge_dir) == (
+        session.previous_model if outcome == "refused" else session.requested_model
     )
     saved = session.store.get_conversation(session.session_id)
     assert saved.model_override == (
-        session.requested_model if concurrent_selection else session.previous_model
+        session.requested_model
+        if concurrent_selection or outcome != "refused"
+        else session.previous_model
     )
     assert saved.reasoning_effort == ("low" if concurrent_selection else "high")
     if concurrent_selection:
         assert saved.title == "Newer metadata"
+
+
+@pytest.mark.parametrize(
+    ("confirmed", "newer_same_selection"),
+    [(True, False), (False, False), (False, True)],
+    ids=["confirmed", "refused", "refused-newer-selection"],
+)
+async def test_new_server_accepts_legacy_runner_replies_without_losing_newer_metadata(
+    client: httpx.AsyncClient,
+    native_session: _NativeSession,
+    monkeypatch: pytest.MonkeyPatch,
+    confirmed: bool,
+    newer_same_selection: bool,
+) -> None:
+    """Freeze the older peer's wire contract; its CLI actuator is outside this test."""
+    session = native_session
+    requests: list[dict[str, Any]] = []
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def legacy_runner(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert request.url.path == f"/v1/sessions/{session.session_id}/events"
+        event = json.loads(request.content)
+        assert event == {"type": "model_change", "model": session.requested_model}
+        requests.append(event)
+        entered.set()
+        await release.wait()
+        if confirmed:
+            return httpx.Response(204)
+        return httpx.Response(
+            503,
+            json={
+                "error": "claude_native_model_failed",
+                "detail": "The terminal refused the selection.",
+            },
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(legacy_runner), base_url="http://legacy-runner"
+    ) as peer:
+        monkeypatch.setattr(
+            "omnigent.server.routes.sessions._get_runner_client", AsyncMock(return_value=peer)
+        )
+        monkeypatch.setattr(
+            routes_core,
+            "ensure_runner_connected",
+            AsyncMock(return_value=(peer, session.store.get_conversation(session.session_id))),
+        )
+        pending = asyncio.create_task(_pick_model(client, session))
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=5)
+            metadata: dict[str, Any] = {
+                "title": "Changed while older runner replied",
+                "reasoning_effort": "low",
+                "silent": True,
+            }
+            if newer_same_selection:
+                metadata["model_override"] = session.requested_model
+            newer = await client.patch(f"/v1/sessions/{session.session_id}", json=metadata)
+            assert newer.status_code == 200, newer.text
+            release.set()
+            response = await asyncio.wait_for(pending, timeout=5)
+        finally:
+            release.set()
+            if not pending.done():
+                pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
+
+    assert requests == [{"type": "model_change", "model": session.requested_model}]
+    assert response.status_code == (200 if confirmed else 503), response.text
+    saved = session.store.get_conversation(session.session_id)
+    assert saved.title == "Changed while older runner replied"
+    assert saved.reasoning_effort == "low"
+    assert saved.model_override == (
+        session.requested_model if confirmed or newer_same_selection else session.previous_model
+    )
+    assert [error["code"] for error in session.errors] == (
+        [] if confirmed else ["model_change_not_applied"]
+    )
+    assert session.runner_replies == []
 
 
 @pytest.mark.parametrize("unconfirmed", [False, True], ids=["refused", "unconfirmed"])

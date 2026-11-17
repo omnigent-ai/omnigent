@@ -4511,8 +4511,6 @@ def register_core_routes(
                     "model": updated.model_override,
                     **negotiation,
                 }
-                if claude_native:
-                    model_event["preserve_unconfirmed_model"] = True
                 _model_forward = await _forward_session_change_to_runner(
                     session_id,
                     runner_router,
