@@ -51,6 +51,7 @@ of the agent YAML.
 | `cancellable` | Optional | Whether the session can be cancelled. Defaults to `true`. |
 | `timers` | Optional | Whether timer tools are exposed. Defaults to `false`. |
 | `tool_groups` | Optional | Opt out of framework-owned tool groups the agent cannot use. Every group defaults to `true`. |
+| `data_queries` | Optional | Declare which tool calls run data queries or read data sources, for display. Built-in SQL CLI patterns apply by default. |
 
 ## Executor
 
@@ -1180,6 +1181,78 @@ The session read tools (`sys_session_list` / `sys_session_get_history` /
 have no key: any agent in a multi-agent session needs the reads, and async work
 handles point at the cancel tool. [`ui_open_file`](agent-ui-api.md) asks current
 session viewers to open a workspace-relative file without switching sessions.
+
+## Data queries
+
+Clients that show an agent's data work (the queries behind an answer, a
+notebook export, SQL cells) need to know which tool calls ran a query, what
+SQL they ran, against which source, and how many rows came back. The
+`data_queries` block tells them, so they don't guess from tool names.
+
+```yaml
+data_queries:
+  builtins: true                # the default; false turns the built-in CLI patterns off
+  rules:
+    - name: warehouse_sql
+      mcp: {server: warehouse, tool: execute_sql}
+      sql: {argument: statement}
+      source: {arguments: [catalog, schema]}   # joined with "." -> main.sales
+      row_count: {result: manifest.total_row_count}
+    - name: catalog_reads        # no sql: every matching call is a source read
+      mcp: {server: catalog}
+      source: {argument: table}
+    - name: warehouse_cli
+      shell: wh sql run         # argv prefix; flags between the words are skipped
+      value_flags: [--profile]  # flags that take a separate value word
+      sql: {positional: 0}
+      source: [{flag: [--db, -d]}, {value: default warehouse}]
+      row_count: {result: rows}
+```
+
+Each rule has a unique `name` and exactly one matcher:
+
+- `mcp:` matches a tool by `server` and/or `tool`. Claude's
+  `mcp__server__tool` and the SDK harnesses' `server__tool` names both match;
+  without `server`, an unprefixed tool of that name matches too.
+- `shell:` matches a shell tool call (`sys_os_shell`, `Bash`, Codex `shell`
+  and the other harnesses' shell tools) whose command starts with this argv
+  prefix, as a string or a list of words. The first word matches a binary's
+  basename, so `/usr/local/bin/psql` matches `psql`. Leading `VAR=value`
+  assignments, wrappers such as `env`, `sudo` and `timeout`, `bash -c '...'`
+  and each command of a `&&`, `;` or `|` chain are read through.
+
+`sql`, `source` and `row_count` each take one locator, or a list tried in order:
+
+| Locator | Rules | Reads |
+| --- | --- | --- |
+| `argument: path` | `mcp` | A dotted path into the arguments, e.g. `params.sql`. |
+| `arguments: [paths]` | `mcp` (source) | Several argument paths joined with `.`. |
+| `flag: -c` or `[-c, --command]` | `shell` | A flag's value: `--flag value` or `--flag=value`. |
+| `positional: N` | `shell` | The Nth word after the prefix that isn't a flag, a flag's value or a redirection. |
+| `result: path` | source and row_count (`mcp`); row_count (`shell`) | A dotted path into the JSON result (`""` is the whole result). |
+| `value: text` | source | A fixed name. |
+
+A rule with `sql` matches only calls whose SQL it finds; otherwise the next
+rule is tried. A rule with only `source` marks every call it matches as a data
+source read. A `row_count` is a number, a digit string, or a list (its
+length). Passwords in a source (`postgres://user:secret@host`, `password=...`)
+are masked on a best-effort basis; the session's items still carry the
+arguments as recorded. Spec rules are tried in order, before the built-ins.
+
+Built-in patterns cover `psql -c`/`--command`, `bq query`, `duckdb -c`,
+`sqlite3 <db> <sql>`, `mysql -e` and `mariadb -e`, `snowsql -q`,
+`clickhouse client --query` (and `clickhouse-client`), and `trino`/`presto
+--execute`. A command needs its SQL on the command line to count, so an
+interactive session, `--help`, `--version`, a script read from a file or a
+heredoc, and a command built with `$(...)` are not classified.
+
+Classification is display metadata only. A query run through a CLI stays an
+ordinary shell tool call: the shell tool's policies, approvals and sandbox
+apply to it exactly as before, and nothing is executed to classify it.
+Clients read the result from `GET /v1/sessions/{id}/data_queries`, which
+needs read access to the session. The block is strict, so a typo fails the
+load, and it is read the same way from a `config.yaml` bundle and a
+single-file agent YAML.
 
 ## Complete example
 

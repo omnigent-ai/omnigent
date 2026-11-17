@@ -4080,6 +4080,64 @@ class SessionItemList(BaseModel):
     has_more: bool = False
 
 
+class SessionDataQuery(BaseModel):
+    """
+    A session tool call classified as a data query or a data-source read.
+
+    Display metadata from the recorded call; it never changes how the call
+    was authorized or run.
+
+    :param id: The ``function_call`` item's ID, e.g. ``"fc_abc123"``.
+    :param call_id: The tool call's ID, e.g. ``"toolu_01"``.
+    :param response_id: The turn that made the call, e.g. ``"resp_abc"``.
+    :param output_item_id: The ``function_call_output`` item's ID, or
+        ``None`` while the call has no recorded output.
+    :param tool_name: The recorded tool name, e.g. ``"Bash"``.
+    :param kind: ``"query"`` when the call carries SQL, ``"source"`` when it
+        only reads a data source.
+    :param matcher: ``"mcp"`` (matched by tool name) or ``"shell"`` (by argv prefix).
+    :param sql: The SQL text as the call passed it, or ``None``.
+    :param source: The connection, database or table, passwords redacted.
+    :param row_count: Rows the result reports, or ``None``.
+    :param rule: The matching rule's name, e.g. ``"psql"``.
+    :param origin: ``"spec"`` for an agent spec rule, ``"builtin"`` for a
+        built-in CLI pattern.
+    """
+
+    id: str
+    call_id: str
+    response_id: str
+    output_item_id: str | None = None
+    tool_name: str
+    kind: Literal["query", "source"]
+    matcher: Literal["mcp", "shell"]
+    sql: str | None = None
+    source: str | None = None
+    row_count: int | None = None
+    rule: str
+    origin: Literal["spec", "builtin"]
+
+
+class SessionDataQueryList(BaseModel):
+    """
+    A page of a session's data queries, oldest first.
+
+    :param data: The classified calls in this page.
+    :param first_id: ``id`` of the first entry, or ``None`` when empty.
+    :param last_id: ``id`` of the last entry, or ``None`` when empty.
+    :param has_more: Whether the scan stopped before the session's end.
+    :param next_after: Item cursor to pass as ``after`` for the next page;
+        ``None`` when ``has_more`` is false.
+    """
+
+    object: Literal["list"] = "list"
+    data: list[SessionDataQuery] = Field(default_factory=list)
+    first_id: str | None = None
+    last_id: str | None = None
+    has_more: bool = False
+    next_after: str | None = None
+
+
 class SideChatSummary(BaseModel):
     """
     A side chat listed in its parent session's Workspace rail.
