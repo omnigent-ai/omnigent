@@ -1097,7 +1097,24 @@ async def test_live_item_does_not_republish_running_that_resume_reported(
             active_turn_id="turn_1",
         ),
     )
-    client = _RecordingClient()
+    post_entered = asyncio.Event()
+    release_post = asyncio.Event()
+    competing_started = asyncio.Event()
+    publication_attempts = 0
+
+    class PendingStatusClient(_RecordingClient):
+        async def post(
+            self, url: str, *, json: dict[str, Any], timeout: float | None = None
+        ) -> httpx.Response:
+            nonlocal publication_attempts
+            if json["type"] == "external_session_status" and json["data"]["status"] == "running":
+                publication_attempts += 1
+                if overlapping and publication_attempts == 1:
+                    post_entered.set()
+                    await release_post.wait()
+            return await super().post(url, json=json, timeout=timeout)
+
+    client = PendingStatusClient()
     state = fwd._CodexForwarderState()
     live_item = {
         "method": "item/completed",
@@ -1129,6 +1146,7 @@ async def test_live_item_does_not_republish_running_that_resume_reported(
             forwarder_state=state,
         )
 
+    publishers: list[asyncio.Task[None]] = []
     locks_token = fwd._conversation_item_locks.set({})
     try:
         first, second = (live, replay) if live_first else (replay, live)
@@ -1136,12 +1154,29 @@ async def test_live_item_does_not_republish_running_that_resume_reported(
             await first()
             await second()
         else:
-            async with fwd._conversation_item_delivery_scope("conv_x"):
-                waiting = asyncio.create_task(second())
-                await asyncio.sleep(0)
-                await first()
+            publishing = asyncio.create_task(first())
+            publishers.append(publishing)
+            await asyncio.wait_for(post_entered.wait(), timeout=5.0)
+            assert state.running_reported_turn_id is None
+            assert client.posts == []
+
+            async def compete() -> None:
+                competing_started.set()
+                await second()
+
+            waiting = asyncio.create_task(compete())
+            publishers.append(waiting)
+            await asyncio.wait_for(competing_started.wait(), timeout=5.0)
+            assert not waiting.done()
+            assert publication_attempts == 1
+            release_post.set()
+            await asyncio.wait_for(publishing, timeout=5.0)
             await asyncio.wait_for(waiting, timeout=5.0)
     finally:
+        release_post.set()
+        for publisher in publishers:
+            publisher.cancel()
+        await asyncio.gather(*publishers, return_exceptions=True)
         fwd._conversation_item_locks.reset(locks_token)
 
     statuses = [
@@ -1150,6 +1185,7 @@ async def test_live_item_does_not_republish_running_that_resume_reported(
         if body["type"] == "external_session_status"
     ]
     assert statuses == ["running"]
+    assert publication_attempts == 1
 
 
 def _fail_first_running_publish(monkeypatch: pytest.MonkeyPatch, mode: str) -> list[str]:

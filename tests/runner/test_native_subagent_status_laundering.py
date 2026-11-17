@@ -501,7 +501,12 @@ _STEER_ACCEPTED_AT = 5000.0
 
 
 def _drive_steer_lifecycle(
-    events: list[str], *, parent_id: str, child_id: str
+    events: list[str],
+    *,
+    parent_id: str,
+    child_id: str,
+    previous_response_id: str,
+    current_response_id: str,
 ) -> subagent_work._SubagentWorkEntry | None:
     """Apply the events in order to a drained previous dispatch and the steer that follows it.
 
@@ -518,15 +523,8 @@ def _drive_steer_lifecycle(
     fresh: subagent_work._SubagentWorkEntry | None = None
     previous_request = subagent_work.begin_subagent_child_acceptance(child_id)
     steer_request = None
-    previous_acceptance = NativeTurnAcceptance(child_id, "thread_lifecycle", "codex_previous")
-    steer_acceptance = NativeTurnAcceptance(
-        child_id,
-        "thread_lifecycle",
-        "codex_previous"
-        if "accept_prev" in events
-        and not {"settle_prev", "forget_session", "forget_parent"}.intersection(events)
-        else "codex_steer",
-    )
+    previous_acceptance = NativeTurnAcceptance(child_id, "thread_lifecycle", previous_response_id)
+    steer_acceptance = NativeTurnAcceptance(child_id, "thread_lifecycle", current_response_id)
     try:
         for event in events:
             if event == "accept_prev":
@@ -598,89 +596,178 @@ def _drive_steer_lifecycle(
 
 
 @pytest.mark.parametrize(
-    ("events", "expected_start"),
+    ("events", "previous_response_id", "current_response_id", "expected_start"),
     [
         # The steer's acceptance and registration, in each order, with a drain anywhere.
-        (["accept_steer", "register"], _STEER_ACCEPTED_AT),
-        (["accept_steer", "drain_old", "register"], _STEER_ACCEPTED_AT),
-        (["register", "accept_steer", "drain_old"], _STEER_ACCEPTED_AT),
-        (["register", "drain_old", "accept_steer"], _STEER_ACCEPTED_AT),
+        pytest.param(
+            ["accept_steer", "register"],
+            "codex_previous",
+            "codex_steer",
+            _STEER_ACCEPTED_AT,
+            id="events0-5000.0",
+        ),
+        pytest.param(
+            ["accept_steer", "drain_old", "register"],
+            "codex_previous",
+            "codex_steer",
+            _STEER_ACCEPTED_AT,
+            id="events1-5000.0",
+        ),
+        pytest.param(
+            ["register", "accept_steer", "drain_old"],
+            "codex_previous",
+            "codex_steer",
+            _STEER_ACCEPTED_AT,
+            id="events2-5000.0",
+        ),
+        pytest.param(
+            ["register", "drain_old", "accept_steer"],
+            "codex_previous",
+            "codex_steer",
+            _STEER_ACCEPTED_AT,
+            id="events3-5000.0",
+        ),
         # A previous turn's acceptance that settled, with no report, must not bound the steer.
-        (["accept_prev", "settle_prev", "accept_steer", "register"], _STEER_ACCEPTED_AT),
-        (["accept_prev", "settle_prev", "register", "accept_steer"], _STEER_ACCEPTED_AT),
+        pytest.param(
+            ["accept_prev", "settle_prev", "accept_steer", "register"],
+            "codex_previous",
+            "codex_steer",
+            _STEER_ACCEPTED_AT,
+            id="events4-5000.0",
+        ),
+        pytest.param(
+            ["accept_prev", "settle_prev", "register", "accept_steer"],
+            "codex_previous",
+            "codex_steer",
+            _STEER_ACCEPTED_AT,
+            id="events5-5000.0",
+        ),
         pytest.param(
             ["settle_prev", "accept_prev", "accept_steer", "register"],
+            "codex_previous",
+            "codex_steer",
             _STEER_ACCEPTED_AT,
             id="settled-before-delayed-acceptance",
         ),
         pytest.param(
             ["settle_prev", "accept_prev", "drain_old", "accept_steer", "register"],
+            "codex_previous",
+            "codex_steer",
             _STEER_ACCEPTED_AT,
             id="settled-before-delayed-acceptance-and-drain",
         ),
         pytest.param(
             ["settle_prev", "accept_steer", "accept_prev", "register"],
+            "codex_previous",
+            "codex_steer",
             _STEER_ACCEPTED_AT,
             id="stale-acceptance-after-current-acceptance",
         ),
         pytest.param(
             ["begin_steer", "settle_prev", "accept_prev", "accept_steer", "register"],
+            "codex_previous",
+            "codex_steer",
             _STEER_ACCEPTED_AT,
             id="current-request-spans-previous-settlement",
         ),
         # A previous turn's running report that settled must not exempt the steered turn.
-        (
+        pytest.param(
             ["accept_prev", "run_prev", "settle_prev", "accept_steer", "register"],
+            "codex_previous",
+            "codex_steer",
             _STEER_ACCEPTED_AT,
+            id="events10-5000.0",
         ),
-        (["run_prev", "settle_prev", "accept_steer", "register"], _STEER_ACCEPTED_AT),
+        pytest.param(
+            ["run_prev", "settle_prev", "accept_steer", "register"],
+            "codex_previous",
+            "codex_steer",
+            _STEER_ACCEPTED_AT,
+            id="events11-5000.0",
+        ),
         # Deleting the session forgets evidence from the old child lifetime.
-        (["accept_prev", "forget_session", "accept_steer", "register"], _STEER_ACCEPTED_AT),
+        pytest.param(
+            ["accept_prev", "forget_session", "accept_steer", "register"],
+            "codex_previous",
+            "codex_steer",
+            _STEER_ACCEPTED_AT,
+            id="events12-5000.0",
+        ),
         pytest.param(
             ["accept_prev", "forget_session", "accept_prev", "accept_steer", "register"],
+            "codex_previous",
+            "codex_steer",
             _STEER_ACCEPTED_AT,
             id="deleted-session-rejects-outstanding-finalizer",
         ),
         pytest.param(
             ["accept_prev", "forget_parent", "accept_prev", "accept_steer", "register"],
+            "codex_previous",
+            "codex_steer",
             _STEER_ACCEPTED_AT,
             id="deleted-parent-rejects-outstanding-finalizer",
         ),
         # A previous turn that never settled still owns its silence; the steer joins it.
-        (["accept_prev", "accept_steer", "register"], _PREVIOUS_ACCEPTED_AT),
-        (["accept_prev", "register", "accept_steer"], _PREVIOUS_ACCEPTED_AT),
+        pytest.param(
+            ["accept_prev", "accept_steer", "register"],
+            "codex_previous",
+            "codex_previous",
+            _PREVIOUS_ACCEPTED_AT,
+            id="events15-1000.0",
+        ),
+        pytest.param(
+            ["accept_prev", "register", "accept_steer"],
+            "codex_previous",
+            "codex_previous",
+            _PREVIOUS_ACCEPTED_AT,
+            id="events16-1000.0",
+        ),
         pytest.param(
             ["begin_steer", "settle_unidentified", "accept_steer", "register"],
+            "codex_previous",
+            "codex_steer",
             None,
             id="unidentified-settlement-during-request-stays-unbounded",
         ),
         pytest.param(
             ["settle_unidentified", "accept_steer", "register"],
+            "codex_previous",
+            "codex_steer",
             _STEER_ACCEPTED_AT,
             id="new-request-after-unidentified-settlement-is-attributable",
         ),
         pytest.param(
             ["register", "accept_steer", "run_prev"],
+            "codex_previous",
+            "codex_steer",
             _STEER_ACCEPTED_AT,
             id="stale-running-after-current-acceptance",
         ),
         pytest.param(
             ["register", "run_prev", "accept_steer"],
+            "codex_previous",
+            "codex_steer",
             _STEER_ACCEPTED_AT,
             id="stale-running-before-current-acceptance",
         ),
         pytest.param(
             ["register", "accept_steer", "settle_prev"],
+            "codex_previous",
+            "codex_steer",
             _STEER_ACCEPTED_AT,
             id="stale-settlement-after-current-acceptance",
         ),
         pytest.param(
             ["register", "run_prev", "settle_prev", "accept_steer"],
+            "codex_previous",
+            "codex_steer",
             _STEER_ACCEPTED_AT,
             id="previous-start-settled-before-current-acceptance",
         ),
         pytest.param(
             ["run_prev", "register", "settle_prev", "accept_steer"],
+            "codex_previous",
+            "codex_steer",
             _STEER_ACCEPTED_AT,
             id="retained-previous-start-settled-before-current-acceptance",
         ),
@@ -688,14 +775,23 @@ def _drive_steer_lifecycle(
 )
 @pytest.mark.asyncio
 async def test_steered_turn_is_bounded_from_its_own_acceptance(
-    events: list[str], expected_start: float | None
+    events: list[str],
+    previous_response_id: str,
+    current_response_id: str,
+    expected_start: float | None,
 ) -> None:
     """Only an attributable unresolved acceptance can bound a silent steered turn."""
     parent_id, child_id = "conv_parent_lifecycle", "conv_child_lifecycle"
     inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
     subagent_work._session_inboxes_ref[parent_id] = inbox
     try:
-        fresh = _drive_steer_lifecycle(events, parent_id=parent_id, child_id=child_id)
+        fresh = _drive_steer_lifecycle(
+            events,
+            parent_id=parent_id,
+            child_id=child_id,
+            previous_response_id=previous_response_id,
+            current_response_id=current_response_id,
+        )
         assert fresh is not None
         assert fresh.child_start_reported is False
         assert fresh.awaiting_child_start_since == expected_start
@@ -738,30 +834,62 @@ async def test_steered_turn_is_bounded_from_its_own_acceptance(
 
 
 @pytest.mark.parametrize(
-    "events",
+    ("events", "previous_response_id", "current_response_id"),
     [
         # The steered turn reports running before or after its registration: never bounded.
-        ["accept_steer", "run_steer", "register"],
-        ["register", "accept_steer", "run_steer"],
-        ["accept_steer", "register", "run_steer"],
-        ["accept_steer", "drain_old", "run_steer", "register"],
+        pytest.param(
+            ["accept_steer", "run_steer", "register"],
+            "codex_previous",
+            "codex_steer",
+            id="events0",
+        ),
+        pytest.param(
+            ["register", "accept_steer", "run_steer"],
+            "codex_previous",
+            "codex_steer",
+            id="events1",
+        ),
+        pytest.param(
+            ["accept_steer", "register", "run_steer"],
+            "codex_previous",
+            "codex_steer",
+            id="events2",
+        ),
+        pytest.param(
+            ["accept_steer", "drain_old", "run_steer", "register"],
+            "codex_previous",
+            "codex_steer",
+            id="events3",
+        ),
         pytest.param(
             ["run_steer", "register", "accept_steer"],
+            "codex_previous",
+            "codex_steer",
             id="running-before-registration-and-acceptance",
         ),
         pytest.param(
             ["register", "run_unidentified", "settle_unidentified", "accept_steer"],
+            "codex_previous",
+            "codex_steer",
             id="unidentified-start-remains-unbounded",
         ),
     ],
 )
 @pytest.mark.asyncio
-async def test_steered_turn_that_reports_running_is_never_bounded(events: list[str]) -> None:
+async def test_steered_turn_that_reports_running_is_never_bounded(
+    events: list[str], previous_response_id: str, current_response_id: str
+) -> None:
     """A steer into a turn whose running report arrived is exempt from the launch bound."""
     parent_id, child_id = "conv_parent_running", "conv_child_running"
     subagent_work._session_inboxes_ref[parent_id] = asyncio.Queue()
     try:
-        fresh = _drive_steer_lifecycle(events, parent_id=parent_id, child_id=child_id)
+        fresh = _drive_steer_lifecycle(
+            events,
+            parent_id=parent_id,
+            child_id=child_id,
+            previous_response_id=previous_response_id,
+            current_response_id=current_response_id,
+        )
         assert fresh is not None
         assert fresh.child_start_reported is True
         assert fresh.awaiting_child_start_since is None
