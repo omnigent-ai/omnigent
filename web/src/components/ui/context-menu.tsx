@@ -2,6 +2,7 @@ import * as React from "react";
 import * as ContextMenuPrimitive from "radix-ui/context-menu";
 
 import { getEmbedRoot } from "@/lib/host";
+import { withMacTitlebarClearance } from "@/lib/macTitlebar";
 import { cn } from "@/lib/utils";
 import { CheckIcon, ChevronRightIcon } from "lucide-react";
 import { MobileMenuGlassSurface } from "@/components/MobileMenuGlassSurface";
@@ -29,6 +30,7 @@ function ContextMenuTrigger({
 function ContextMenuContent({
   className,
   children,
+  collisionPadding,
   ...props
 }: React.ComponentProps<typeof ContextMenuPrimitive.Content>) {
   // Context menus position at the pointer (no trigger anchor), so there's no
@@ -37,6 +39,7 @@ function ContextMenuContent({
     <ContextMenuPrimitive.Portal container={getEmbedRoot() ?? undefined}>
       <ContextMenuPrimitive.Content
         data-slot="context-menu-content"
+        collisionPadding={withMacTitlebarClearance(collisionPadding)}
         className={cn(
           "mobile-menu-glass max-md:relative",
           "menu-surface z-50 max-h-(--radix-context-menu-content-available-height) w-max min-w-32 origin-(--radix-context-menu-content-transform-origin) overflow-x-hidden overflow-y-auto whitespace-nowrap rounded-[12px] border border-border bg-popover p-2 text-popover-foreground shadow-menu duration-150 ease-[cubic-bezier(0.16,1,0.3,1)] data-[side=bottom]:slide-in-from-top-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2 data-[state=closed]:overflow-hidden data-open:animate-in data-open:fade-in-0 data-open:zoom-in-95 data-closed:animate-out data-closed:fade-out-0 data-closed:zoom-out-95",
@@ -242,7 +245,7 @@ function ContextMenuSubContent({
       <ContextMenuPrimitive.SubContent
         data-slot="context-menu-sub-content"
         sideOffset={sideOffset}
-        collisionPadding={collisionPadding}
+        collisionPadding={withMacTitlebarClearance(collisionPadding)}
         className={cn(
           "mobile-menu-glass max-md:relative",
           "menu-surface z-50 w-max min-w-[96px] origin-(--radix-context-menu-content-transform-origin) overflow-hidden whitespace-nowrap rounded-[12px] border border-border bg-popover p-2 text-popover-foreground shadow-menu duration-150 ease-[cubic-bezier(0.16,1,0.3,1)] data-[side=bottom]:slide-in-from-top-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2 data-open:animate-in data-open:fade-in-0 data-open:zoom-in-95 data-closed:animate-out data-closed:fade-out-0 data-closed:zoom-out-95",

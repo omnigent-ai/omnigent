@@ -1265,6 +1265,7 @@ aside[aria-label="Workspace"][data-maximized] {
  * The preload supplies zoom; older shells fall back to 100%.
  * The embed build maps html selectors onto the .omnigent-app scope root. */
 html[data-electron-mac] {
+  /* Menus mirror this in lib/macTitlebar.ts to clear the title bar. */
   --mac-titlebar-height: calc(48px / var(--omnigent-electron-zoom, 1));
   --mac-traffic-light-width: calc(88px / var(--omnigent-electron-zoom, 1));
   /* The lights plus the collapsed cluster: four 1.5rem icons with 0.25rem gaps. */
