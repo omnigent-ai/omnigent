@@ -117,6 +117,27 @@ def task_sandbox(
     return deployment.default
 
 
+def run_sandbox(
+    deployment: ManagedSandboxDeployment | None,
+    host_store: Any,
+    execution_target: str,
+    host_id: str | None,
+) -> ManagedSandboxConfig | None:
+    """The provider of the sandbox a scheduled run lands in, or ``None`` on a connected host.
+
+    A run on an existing sandbox host (*host_id*, when its row exists) stays on
+    that host's recorded provider, which need not be today's default; a host that
+    does not exist yet is provisioned on the default. Blocking: reads the host row.
+    """
+    sandbox = task_sandbox(deployment, execution_target)
+    if deployment is None or sandbox is None or host_id is None or host_store is None:
+        return sandbox
+    host = host_store.get_host(host_id)
+    if host is None or host.sandbox_provider is None:
+        return sandbox
+    return deployment.recorded(host.sandbox_provider)
+
+
 def host_sandbox(app_state: Any, host_id: str | None) -> ManagedSandboxConfig | None:
     """The provider behind an existing *host_id*, or ``None`` for a connected host.
 

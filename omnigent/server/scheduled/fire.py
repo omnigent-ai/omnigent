@@ -160,8 +160,8 @@ from omnigent.server.schemas import SessionEventInput
 from omnigent.server.session_mcp_selection import (
     SessionMcpSelection,
     mcp_selection_for,
+    run_sandbox,
     session_mcp_label_keys,
-    task_sandbox,
 )
 from omnigent.stores.conversation_store import (
     CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
@@ -1917,18 +1917,10 @@ def _sandbox_workspaces(task: ScheduledTask) -> list[str]:
 async def _run_mcp_selection(
     deps: FireDeps, task: ScheduledTask, host_id: str | None
 ) -> SessionMcpSelection:
-    """The selection of the sandbox a managed run's session lands in, or the registry's.
-
-    A run that joins, wakes or relaunches an existing sandbox host stays on that
-    host's recorded provider, which need not be today's default; only a host that
-    does not exist yet is provisioned on the default.
-    """
-    sandbox = task_sandbox(deps.sandbox_config, task.execution_target)
-    if sandbox is None or host_id is None or deps.host_store is None:
-        return mcp_selection_for(sandbox)
-    host = await asyncio.to_thread(deps.host_store.get_host, host_id)
-    if host is not None and host.sandbox_provider is not None:
-        sandbox = deps.sandbox_config.recorded(host.sandbox_provider)
+    """The selection of the sandbox a run's session lands in, or the registry's."""
+    sandbox = await asyncio.to_thread(
+        run_sandbox, deps.sandbox_config, deps.host_store, task.execution_target, host_id
+    )
     return mcp_selection_for(sandbox)
 
 

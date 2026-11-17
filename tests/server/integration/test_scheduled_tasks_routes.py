@@ -1277,6 +1277,66 @@ async def test_mcp_services_use_the_selection_of_where_the_task_runs(
     assert info.json()["scheduled_task_mcp_services"] is True
 
 
+class _RejectAll(_ProviderSelection):
+    def validate(self, request, services, *, spec, user_id):
+        from omnigent.errors import ErrorCode, OmnigentError
+
+        raise OmnigentError("not offered here", code=ErrorCode.INVALID_INPUT)
+
+
+@pytest.mark.parametrize("edit", ["unchanged-services", "new-agent"])
+async def test_a_continuing_sandbox_task_is_checked_against_the_sandbox_it_keeps(
+    auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str, edit: str
+) -> None:
+    import dataclasses
+
+    from omnigent.server.scheduled.schedule import continued_sandbox_host_id
+    from omnigent.stores.host_store import HostStore
+
+    _make_user(db_uri)
+    older = _ProviderSelection()
+    older_provider = dataclasses.replace(
+        _sandbox_deployment().default, provider="older", mcp_selection=older
+    )
+    auth_app.state.sandbox_config = ManagedSandboxDeployment(configs=(older_provider,))
+    created = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_sandbox_body(session_mode="continue", mcp_services=["system.ai.github"]),
+        headers=_headers(),
+    )
+    assert created.status_code == 200, created.text
+    task_id = created.json()["id"]
+    task = SqlAlchemyScheduledTaskStore(db_uri).get(task_id)
+    assert task is not None
+    # The task's sandbox runs on "older"; the default has since moved to a provider
+    # that doesn't offer these services.
+    HostStore(db_uri).reserve_sandbox_host(
+        host_id=continued_sandbox_host_id(task_id, task.workspace_id),
+        name="automation-sandbox",
+        user_id="alice@example.com",
+        provider="older",
+    )
+    newer_provider = dataclasses.replace(
+        _sandbox_deployment().default, provider="newer", mcp_selection=_RejectAll()
+    )
+    auth_app.state.sandbox_config = ManagedSandboxDeployment(
+        configs=(newer_provider, older_provider)
+    )
+
+    # Resending the services, or changing the agent, revalidates the ones the task keeps.
+    patch = (
+        {"mcp_services": ["system.ai.github"]}
+        if edit == "unchanged-services"
+        else {"agent_id": builtin_agent_id(CODEX_NATIVE_AGENT_NAME)}
+    )
+    updated = await auth_client.patch(
+        f"/v1/scheduled-tasks/{task_id}", json=patch, headers=_headers()
+    )
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["mcp_services"] == ["system.ai.github"]
+    assert len(older.checked) == 2
+
+
 async def test_mcp_services_that_do_not_fit_the_column_are_rejected(
     auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str
 ) -> None:
