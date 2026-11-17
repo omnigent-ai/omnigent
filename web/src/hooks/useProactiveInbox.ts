@@ -22,6 +22,7 @@ import {
 } from "@/lib/proactiveInbox";
 import { useRebasePath } from "@/lib/routing";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { useProactiveAgentSettings } from "./useProactiveAgentSettings";
 import { useViewerId } from "./useViewerId";
 
 type Pages = InfiniteData<SuggestionPage, string | null>;
@@ -117,6 +118,7 @@ function cachedStatus(
 
 /**
  * Agent-posted suggestions for the Inbox, when the server offers agent Inbox items.
+ * Older servers do not say; there only Omni Advisor posts, so its settings decide.
  *
  * Updates show at once and stay overlaid on every fetched page until their
  * PATCH settles; the server's reply, with the viewer's unread total after the
@@ -131,6 +133,7 @@ export function useProactiveInbox(
   statuses: readonly SuggestionStatus[] = OPEN_SUGGESTION_STATUSES,
 ) {
   const info = useServerInfo();
+  const { settings: advisorSettings } = useProactiveAgentSettings();
   const viewerId = useViewerId();
   const rebasePath = useRebasePath();
   const queryClient = useQueryClient();
@@ -141,7 +144,9 @@ export function useProactiveInbox(
     viewerId,
   ];
   const scopeKeyText = JSON.stringify(scopeKey);
-  const enabled = identityReady && info !== "loading" && info.inbox_items_available === true;
+  const offered =
+    info !== "loading" && (info.inbox_items_available ?? advisorSettings?.enabled === true);
+  const enabled = identityReady && offered;
   const query = useInfiniteQuery({
     queryKey: [...scopeKey, [...statuses]],
     queryFn: ({ pageParam }) => listSuggestions(pageParam, statuses),

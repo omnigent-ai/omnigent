@@ -251,7 +251,12 @@ export function InboxPage() {
     identityReady,
   } = useSidebarData();
   const navigate = useNavigate();
-  const taskDetailsEnabled = isFeatureEnabled(useServerInfo(), "automations_v2");
+  const serverInfo = useServerInfo();
+  const taskDetailsEnabled = isFeatureEnabled(serverInfo, "automations_v2");
+  // Older servers do not report agent Inbox items, so there suggestions load
+  // only once Omni Advisor's settings say it is on.
+  const legacyInboxServer =
+    serverInfo !== "loading" && serverInfo.inbox_items_available === undefined;
   const [storedFilter, setFilter] = useState<InboxFilter>(readInboxFilter);
   const {
     available: advisorAvailable,
@@ -521,7 +526,8 @@ export function InboxPage() {
         snapshotQueries.some((q) => q.isLoading) ||
         commentInbox.isLoading)) ||
     (showUnread && automationInbox.isLoading) ||
-    (showSuggestions && (proactiveInbox.isLoading || (advisorOnly && advisorSettingsPending)));
+    (showSuggestions &&
+      (proactiveInbox.isLoading || ((advisorOnly || legacyInboxServer) && advisorSettingsPending)));
   const failedSnapshots = snapshotQueries.filter((q) => q.isError);
   const failedSessionCount = advisorOnly
     ? 0

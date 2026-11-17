@@ -173,13 +173,19 @@ function commentInboxStub(overrides: Partial<CommentInbox> = {}): CommentInbox {
 function renderPage(
   queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } }),
   taskDetailsEnabled = false,
+  // A server that predates agent Inbox items does not report them.
+  serverPredatesAgentItems = false,
 ) {
   // Fresh client per render so cached queries never leak between tests. A
   // fresh element per render too: React skips an identical element object.
   const tree = () => (
     <QueryClientProvider client={queryClient}>
       <CapabilitiesProvider
-        info={{ ...FALLBACK_SERVER_INFO, features: { automations_v2: taskDetailsEnabled } }}
+        info={{
+          ...FALLBACK_SERVER_INFO,
+          features: { automations_v2: taskDetailsEnabled },
+          inbox_items_available: serverPredatesAgentItems ? undefined : true,
+        }}
       >
         <SidebarDataProvider>
           <MemoryRouter>
@@ -1933,6 +1939,13 @@ describe("agent suggestions", () => {
     expect(screen.queryByRole("tab", { name: "Omni Advisor" })).toBeNull();
     // Other agents' items do not wait on Omni Advisor's settings.
     expect(screen.queryByText("Loading inbox…")).toBeNull();
+  });
+
+  it("waits on the Omni Advisor settings where the server predates agent items", () => {
+    advisor.settings = undefined;
+    stub({ items: [], enabled: false });
+    renderPage(undefined, false, true);
+    expect(screen.getByText("Loading inbox…")).toBeInTheDocument();
   });
 
   it("keeps loading while the Omni Advisor settings are unknown", () => {

@@ -4132,42 +4132,56 @@ async def test_runner_hides_scheduled_task_tools_only_when_server_turns_automati
 
 
 @pytest.mark.asyncio
-async def test_runner_keeps_user_inbox_tools_only_when_the_server_turns_them_on(tmp_path):
-    from omnigent.automations_availability import USER_INBOX_HEADER
+@pytest.mark.parametrize(
+    ("headers", "opted_in", "kept"),
+    [
+        ({"X-Omnigent-Agent-Inbox": "1", "X-Omnigent-User-Inbox": "1"}, False, True),
+        ({"X-Omnigent-Agent-Inbox": "0", "X-Omnigent-User-Inbox": "0"}, True, False),
+        # A server that predates default-on agent items sends only the first
+        # header and accepts posts only from agents that opt in.
+        ({"X-Omnigent-User-Inbox": "1"}, False, False),
+        ({"X-Omnigent-User-Inbox": "1"}, True, True),
+        ({"X-Omnigent-User-Inbox": "0"}, True, False),
+        # A server without the Inbox routes, so the tools would only fail.
+        ({}, True, False),
+    ],
+    ids=[
+        "default-on",
+        "turned-off",
+        "legacy-omitted",
+        "legacy-opted-in",
+        "legacy-off",
+        "no-inbox-server",
+    ],
+)
+async def test_runner_keeps_user_inbox_tools_only_where_the_server_accepts_them(
+    tmp_path, headers, opted_in, kept
+):
+    from omnigent.automations_availability import AGENT_INBOX_HEADER, USER_INBOX_HEADER
     from omnigent.tools.manager import ToolManager
     from tests.server.helpers import build_agent_bundle
 
-    # The group is on by default, so a plain agent gets the tools where offered.
-    bundle = build_agent_bundle("inbox-agent")
-    # No header is a server without the Inbox routes, so the tools would only fail.
-    gate_headers = [{USER_INBOX_HEADER: "0"}, {USER_INBOX_HEADER: "1"}, {}]
+    assert {AGENT_INBOX_HEADER, USER_INBOX_HEADER} >= set(headers)
+    bundle = build_agent_bundle(
+        "inbox-agent", tool_groups={"user_inbox": True} if opted_in else None
+    )
 
     def handler(request):
         return httpx.Response(
             200,
             content=bundle,
-            headers={
-                "X-Agent-Version": "1",
-                "X-Agent-Session-Scoped": "true",
-                **gate_headers.pop(0),
-            },
+            headers={"X-Agent-Version": "1", "X-Agent-Session-Scoped": "true", **headers},
         )
 
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(handler), base_url="http://server.test"
     ) as client:
-        results = [
-            await _resolve_agent_spec_from_server(
-                client, _AgentSpecCache(tmp_path), "ag_inbox", session_id="session"
-            )
-            for _ in range(3)
-        ]
+        result = await _resolve_agent_spec_from_server(
+            client, _AgentSpecCache(tmp_path), "ag_inbox", session_id="session"
+        )
 
-    def advertised(spec):
-        names = {schema["function"]["name"] for schema in ToolManager(spec).get_tool_schemas()}
-        return {"sys_user_inbox_post", "sys_user_inbox_list"} <= names
-
-    assert [advertised(result.spec) for result in results] == [False, True, False]
+    names = {schema["function"]["name"] for schema in ToolManager(result.spec).get_tool_schemas()}
+    assert ({"sys_user_inbox_post", "sys_user_inbox_list"} <= names) is kept
 
 
 async def test_runner_selection_changes_without_rewriting_cached_bundle(tmp_path):

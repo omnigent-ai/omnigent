@@ -365,7 +365,10 @@ export interface ServerInfo {
    * absent on older servers (off).
    */
   scheduled_task_sharing?: boolean;
-  /** Agents can post items to this caller's Inbox (``/v1/inbox/items``). */
+  /**
+   * Agents can post items to this caller's Inbox (``/v1/inbox/items``).
+   * Absent on servers that predate it, where only Omni Advisor posts.
+   */
   inbox_items_available?: boolean;
   /**
    * The deployment offers the proactive agent (Omni Advisor) to this caller;
@@ -745,7 +748,11 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           scheduled_task_projects: data.scheduled_task_projects === true,
           scheduled_task_inbox: data.scheduled_task_inbox === true,
           scheduled_task_sharing: data.scheduled_task_sharing === true,
-          inbox_items_available: data.inbox_items_available === true,
+          // Kept absent for older servers, which the Inbox treats differently from off.
+          inbox_items_available:
+            typeof data.inbox_items_available === "boolean"
+              ? data.inbox_items_available
+              : undefined,
           proactive_agent_available: data.proactive_agent_available === true,
           scheduled_task_harness_settings: data.scheduled_task_harness_settings === true,
           scheduled_task_approval_skipping_modes:

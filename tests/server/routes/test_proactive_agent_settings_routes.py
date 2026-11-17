@@ -177,7 +177,7 @@ async def test_a_deployment_gate_that_is_off_wins_over_both_settings(
 async def test_the_bundle_download_offers_the_inbox_tools_whatever_the_advisor_setting(
     db_uri: str, tmp_path: Path
 ) -> None:
-    from omnigent.automations_availability import USER_INBOX_HEADER
+    from omnigent.automations_availability import AGENT_INBOX_HEADER, USER_INBOX_HEADER
     from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ
     from tests.server.helpers import build_agent_bundle
 
@@ -192,7 +192,9 @@ async def test_the_bundle_download_offers_the_inbox_tools_whatever_the_advisor_s
     url = f"/v1/sessions/{session_id}/agent/contents"
 
     async with _client(db_uri, tmp_path) as client:
-        assert (await client.get(url, headers=_ALICE)).headers[USER_INBOX_HEADER] == "1"
+        first = await client.get(url, headers=_ALICE)
+        # The second header tells newer runners that agents need not opt in.
+        assert (first.headers[USER_INBOX_HEADER], first.headers[AGENT_INBOX_HEADER]) == ("1", "1")
         # Omni Advisor's setting is about that agent only; every agent keeps its tools.
         await client.put(
             "/v1/proactive-agent/settings/me", json={"enabled": False}, headers=_ALICE
@@ -215,6 +217,7 @@ async def test_the_bundle_download_offers_the_inbox_tools_whatever_the_advisor_s
         app.state.inbox_items_enabled_for = failing_check
         degraded = await client.get(child_url, headers=_ALICE)
         assert (degraded.status_code, degraded.headers[USER_INBOX_HEADER]) == (200, "0")
+        assert degraded.headers[AGENT_INBOX_HEADER] == "0"
         assert degraded.content == good.content
 
     # With the Inbox off for the deployment, no agent gets the tools.

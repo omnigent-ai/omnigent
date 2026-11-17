@@ -1483,8 +1483,10 @@ def _load_agent_spec_bundle(
 ) -> ResolvedSpec:
     """Hash, load and publish a validated bundle while its cache lock is held."""
     from omnigent.automations_availability import (
+        AGENT_INBOX_HEADER,
         AUTOMATIONS_HEADER,
         USER_INBOX_HEADER,
+        with_only_opted_in_user_inbox_tools,
         without_scheduled_task_tools,
         without_user_inbox_tools,
     )
@@ -1523,9 +1525,16 @@ def _load_agent_spec_bundle(
     # Older servers send no header; keep the tools there, as before.
     if resp.headers.get(AUTOMATIONS_HEADER) == "0":
         spec = without_scheduled_task_tools(spec)
-    # Servers that predate the Inbox routes send no header either, so the Inbox
-    # tools need the server to turn them on.
-    if resp.headers.get(USER_INBOX_HEADER) != "1":
+    # The Inbox tools need the server to turn them on: servers that predate the
+    # Inbox routes send neither header, and those that predate default-on agent
+    # items send only the first and accept posts only from agents that opt in.
+    agent_inbox = resp.headers.get(AGENT_INBOX_HEADER)
+    if agent_inbox is not None:
+        if agent_inbox != "1":
+            spec = without_user_inbox_tools(spec)
+    elif resp.headers.get(USER_INBOX_HEADER) == "1":
+        spec = with_only_opted_in_user_inbox_tools(spec)
+    else:
         spec = without_user_inbox_tools(spec)
     _apply_host_interactive_shells(spec)
     return ResolvedSpec(spec=spec, workdir=dest)
