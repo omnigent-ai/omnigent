@@ -271,13 +271,34 @@ export function declarationKey(declaration: ts.Declaration, name: string): strin
 }
 
 export function guardSettingsSource(input: SettingsGuardInput): GuardViolation[] {
-  return new SettingsSourceGuard(input).run();
+  if (input.entryFunctions) return new SettingsSourceGuard(input).run();
+  // Whole tree: an entry that is only rendered inside owners is checked through them, so a
+  // survey walk finds those entries first and the real walk leaves them out.
+  const ownerOnlyEntries = new SettingsSourceGuard(input).ownerOnlyEntries();
+  return new SettingsSourceGuard(input, ownerOnlyEntries).run();
+}
+
+/** `file:position` for a function, the key a walk records it under. */
+function nodeKey(node: ts.Node): string {
+  return `${node.getSourceFile().fileName}:${node.pos}`;
+}
+
+/** How a walk reached a function: under an owner, and from which entry it was reached unowned. */
+interface Reach {
+  owned: boolean;
+  /** Entries whose walks reached the function without an owner; module-level code is `""`. */
+  unownedFrom: Set<string>;
 }
 
 class SettingsSourceGuard {
   private readonly checker: ts.TypeChecker;
   private readonly violations = new Map<string, GuardViolation>();
   private readonly visited = new Set<string>();
+  private readonly reaches = new Map<string, Reach>();
+  /** The entry whose walk is in progress; module-level code has none. */
+  private currentEntry = "";
+  /** Whole-tree entries walked on their own, as opposed to skipped. */
+  private readonly walkedEntries = new Set<string>();
   private entryMembers: Map<SettingsEntry, string> | undefined;
   /** `settingsContentComponents(...)` calls, walked after everything else. */
   private readonly pendingContentMaps: {
@@ -298,9 +319,36 @@ class SettingsSourceGuard {
 
   private readonly input: SettingsGuardInput;
 
-  constructor(input: SettingsGuardInput) {
+  /** Whole-tree entries left out, as walked through their owners instead. */
+  private readonly skippedEntries: ReadonlySet<string>;
+
+  constructor(input: SettingsGuardInput, skippedEntries: ReadonlySet<string> = new Set()) {
     this.input = input;
+    this.skippedEntries = skippedEntries;
     this.checker = input.program.getTypeChecker();
+  }
+
+  /**
+   * Entries a walk reaches under an owner, where every unowned walk reaching them starts at
+   * another such entry or at itself. Each is checked through its owners, not on its own.
+   */
+  ownerOnlyEntries(): Set<string> {
+    this.run();
+    const ownerOnly = new Set(
+      [...this.walkedEntries].filter((key) => this.reaches.get(key)?.owned),
+    );
+    let removed = true;
+    while (removed) {
+      removed = false;
+      for (const key of ownerOnly) {
+        const unownedFrom = this.reaches.get(key)!.unownedFrom;
+        if ([...unownedFrom].some((entry) => entry !== key && !ownerOnly.has(entry))) {
+          ownerOnly.delete(key);
+          removed = true;
+        }
+      }
+    }
+    return ownerOnly;
   }
 
   run(): GuardViolation[] {
@@ -344,7 +392,13 @@ class SettingsSourceGuard {
         continue;
       }
       for (const { name, node } of functions) {
-        if (!referenced.has(name)) this.visitFunction(node, name, {});
+        if (referenced.has(name)) continue;
+        const key = nodeKey(node);
+        if (this.skippedEntries.has(key)) continue;
+        this.walkedEntries.add(key);
+        this.currentEntry = key;
+        this.visitFunction(node, name, {});
+        this.currentEntry = "";
       }
     }
   }
@@ -365,6 +419,7 @@ class SettingsSourceGuard {
   }
 
   private visitFunction(node: ts.Node, name: string, context: Context) {
+    this.recordReach(node, context);
     const key = `${node.getSourceFile().fileName}:${node.pos}|${contextSignature(context)}`;
     if (this.visited.has(key)) return;
     this.visited.add(key);
@@ -377,6 +432,14 @@ class SettingsSourceGuard {
       { node, owner: context.settingsOwner, overlayOwner: context.overlayOwner },
     ];
     this.visit(node, { ...context, scopes }, name);
+  }
+
+  private recordReach(node: ts.Node, context: Context) {
+    const key = nodeKey(node);
+    const reach = this.reaches.get(key) ?? { owned: false, unownedFrom: new Set<string>() };
+    this.reaches.set(key, reach);
+    if (context.settingsOwner || context.overlayOwner) reach.owned = true;
+    else reach.unownedFrom.add(this.currentEntry);
   }
 
   private visit(node: ts.Node, context: Context, functionName?: string): void {
