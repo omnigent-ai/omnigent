@@ -635,7 +635,7 @@ describe("Slack DM triggers", () => {
     expect(prompt).toContain("users.list for a handle or display name");
     // A channel list saved to a file is searched with one command instead of several tries.
     expect(prompt).toContain(
-      `get the IDs with one command on that file, jq -c '.result | fromjson | (.channels[] | select(.name == "eng-support") | {id, name}), .response_metadata.next_cursor' <file>`,
+      `get the IDs by running one command on that file with your shell tool, jq -c '.result | fromjson | (.channels[] | select(.name == "eng-support") | {id, name}), .response_metadata.next_cursor' <file>`,
     );
   });
 
@@ -653,6 +653,24 @@ describe("Slack DM triggers", () => {
 
     expect(named).toContain('select(.name == "eng-support" or .name == "bugs")');
     expect(idsOnly).not.toContain("select(.name ==");
+  });
+
+  it("lowercases channel names and gives no command for a name Slack can't have", () => {
+    const mixedCase = renderTriggerPrompt(
+      "slack",
+      slack({ scope: "#Eng-Support", scopeOperator: "is" }),
+      CTX,
+    );
+    // A quote in the scope must not end the command's shell quoting.
+    const quoted = renderTriggerPrompt(
+      "slack",
+      slack({ scope: "x' ; touch pwned ; '", scopeOperator: "is" }),
+      CTX,
+    );
+
+    expect(mixedCase).toContain('select(.name == "eng-support")');
+    expect(quoted).not.toContain("jq -c");
+    expect(quoted).not.toContain("touch pwned ;'");
   });
 
   it("asks a privacy filter for author columns only when a condition names an author", () => {
