@@ -631,6 +631,7 @@ def test_issue_url_scrubs_each_home_in_quoted_command(
     assert title == f"[Crash] CalledProcessError: {expected_message}"
     assert summary == f"`CalledProcessError: {expected_message}`"
     assert f"{home}/.config/app.toml" not in _description_of(url)
+    assert f"{home}/" not in urllib.parse.unquote_plus(url)
 
 
 @pytest.mark.parametrize(
