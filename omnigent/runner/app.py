@@ -205,6 +205,7 @@ from omnigent.runner.subagent_work import (
     _SubagentWorkEntry,
     _truncate_child_preview,
     arm_subagent_child_start_timeout,
+    forget_subagent_child_start_report,
     get_subagent_work,
     is_codex_native_subagent_wrapper,
     latest_wake_eligible_subagent_work,
@@ -8140,6 +8141,8 @@ def create_runner_app(
                 resource_registry.note_external_session_status(conversation_id, status)
                 if status in ("running", "waiting"):
                     note_subagent_child_start_reported(conversation_id)
+                else:
+                    forget_subagent_child_start_report(conversation_id)
                 child_status = (
                     "idle" if terminal_status == "completed" else terminal_status or status
                 )

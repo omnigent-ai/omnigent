@@ -194,6 +194,8 @@ class _SubagentDeliveryAck:
 
 _subagent_work_by_child: dict[str, _SubagentWorkEntry] = {}
 _subagent_work_by_parent: dict[str, set[str]] = {}
+# Children that reported running or waiting with no dispatch entry, until they settle.
+_children_reporting_start: set[str] = set()
 _drained_delivered_subagent_children: set[str] = set()
 # Optimistic (grace-timer) cancellations, delivered then drained, kept so a
 # surviving child's confirmed completion can still correct the parent under the
@@ -358,14 +360,38 @@ def note_subagent_child_start_reported(child_session_id: str) -> None:
     """
     Record that the child itself reported its turn running or waiting.
 
+    A child with no dispatch entry is remembered too, so a later steer that
+    registers one knows the turn it joins has already started.
+
     :param child_session_id: Child session id, e.g. ``"conv_child456"``.
     :returns: None.
     """
     entry = _subagent_work_by_child.get(child_session_id)
     if entry is None:
+        _children_reporting_start.add(child_session_id)
         return
     entry.child_start_reported = True
     entry.awaiting_child_start_since = None
+
+
+def forget_subagent_child_start_report(child_session_id: str) -> None:
+    """
+    Drop the start report kept for a child whose turn has settled.
+
+    :param child_session_id: Child session id, e.g. ``"conv_child456"``.
+    :returns: None.
+    """
+    _children_reporting_start.discard(child_session_id)
+
+
+def child_start_already_reported(child_session_id: str) -> bool:
+    """
+    Return whether the child reported its current turn running without a dispatch entry.
+
+    :param child_session_id: Child session id, e.g. ``"conv_child456"``.
+    :returns: ``True`` when a running or waiting edge arrived and no settled edge followed.
+    """
+    return child_session_id in _children_reporting_start
 
 
 def arm_subagent_child_start_timeout(child_session_id: str, *, now: float | None = None) -> None:
@@ -411,6 +437,7 @@ def unregister_subagent_work(
         same child are acknowledged as already delivered.
     :returns: None.
     """
+    _children_reporting_start.discard(child_session_id)
     entry = _subagent_work_by_child.get(child_session_id)
     if entry is None:
         return

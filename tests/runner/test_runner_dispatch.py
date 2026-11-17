@@ -13642,7 +13642,6 @@ def _running_child_server_handler(
     child_busy: bool = False,
     delete_posts: list[int] | None = None,
     events_status: int = 200,
-    event_status: str = "buffered",
 ) -> Any:
     """Build a MockTransport handler for a named-mode in-flight-send test.
 
@@ -13652,9 +13651,8 @@ def _running_child_server_handler(
     accidental untracked create is caught. ``events_status`` forces the child's
     /events response code (e.g. 500 to exercise a post failure), and any DELETE
     of the child is recorded in ``delete_posts`` so a test can assert a still-live
-    turn is never torn down. ``event_status`` is the disposition the child's
-    /events answers with: ``buffered`` when the message joins a running turn,
-    ``accepted`` when it starts a new one.
+    turn is never torn down. The child's /events answers with the server's real
+    ``queued`` acknowledgement, which does not say whether the message started a turn.
     """
 
     async def _handler(request: httpx.Request) -> httpx.Response:
@@ -13690,10 +13688,9 @@ def _running_child_server_handler(
             return httpx.Response(204)
         if request.method == "POST" and path == f"/v1/sessions/{child_id}/events":
             event_posts.append(json.loads(request.content))
-            return httpx.Response(
-                events_status,
-                json={"ok": events_status < 400, "status": event_status},
-            )
+            if events_status >= 400:
+                return httpx.Response(events_status, json={"error": "event post failed"})
+            return httpx.Response(202, json={"queued": True, "item_id": "item_steer"})
         return httpx.Response(404, json={"error": str(request.url)})
 
     return _handler
@@ -13868,11 +13865,15 @@ async def test_named_send_adopts_busy_child_as_running_not_launching(
         create_posts=create_posts,
         child_busy=True,
     )
+    # The busy child already reported running for its in-flight turn, before any entry existed.
+    subagent_work.note_subagent_child_start_reported(child_id)
     try:
         output = await _run_named_continuation(parent_id, handler)
         work = subagent_work.get_subagent_work(child_id)
         assert work is not None
-        # A codex child reported its in-flight turn's start before this entry existed.
+        assert work.child_start_reported is True
+        # The steer's own finished turn arms the launch bound; the start already reported
+        # keeps it disarmed, so a steer into a running turn is never reaped.
         subagent_work.arm_subagent_child_start_timeout(child_id)
         reaped = subagent_work.reap_stalled_subagent_launches(
             now=work.created_at + 7200.0, timeout_s=180.0
@@ -13936,7 +13937,6 @@ async def test_named_send_registers_fresh_when_tracked_turn_already_ended(
         event_posts=event_posts,
         create_posts=create_posts,
         child_busy=True,
-        event_status="accepted",
     )
     inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
     reaped: list[subagent_work._SubagentWorkEntry] = []
@@ -13944,8 +13944,8 @@ async def test_named_send_registers_fresh_when_tracked_turn_already_ended(
         output = await _run_named_continuation(parent_id, handler)
         work = subagent_work.get_subagent_work(child_id)
         assert work is not None
-        # The new turn accepted its prompt and reports nothing, so its launch bound
-        # must fire and wake the parent, instead of being exempted as an old turn.
+        # The child never reported running for the turn this steer started, so its
+        # launch bound must fire and wake the parent.
         assert work.child_start_reported is False
         assert work.delivered is False
         subagent_work._session_inboxes_ref[parent_id] = inbox
@@ -14635,3 +14635,19 @@ async def test_eager_mcp_cache_keeps_named_child_scope_after_revision_change(mon
             assert response.status_code == 200, response.text
             assert "Worker instructions." in recording.posted_bodies[-1]["instructions"]
             assert "Root instructions." not in recording.posted_bodies[-1]["instructions"]
+
+
+def test_child_start_report_is_forgotten_once_the_child_settles() -> None:
+    """A child's running report without an entry is cleared when its turn settles.
+
+    Otherwise a steer after the turn completed would be exempted from the launch bound
+    as if its turn were already running.
+    """
+    child_id = "conv_child_settled"
+    try:
+        subagent_work.note_subagent_child_start_reported(child_id)
+        assert subagent_work.child_start_already_reported(child_id)
+        subagent_work.forget_subagent_child_start_report(child_id)
+        assert not subagent_work.child_start_already_reported(child_id)
+    finally:
+        subagent_work.forget_subagent_child_start_report(child_id)
