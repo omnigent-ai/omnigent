@@ -1248,7 +1248,7 @@ describe("browserIpc — Chrome cookie import", () => {
       webContents: makeWebContents({ url: "https://idp.example.net/authorize?client=app" }),
       ...options,
     });
-    context.registry.get("conv_1").lastRequestedUrl = "https://workspace.example.com/start";
+    context.registry.get("conv_1").openedSite = { url: "https://workspace.example.com/start" };
     return context;
   }
 
@@ -1351,7 +1351,7 @@ describe("browserIpc — Chrome cookie import", () => {
     const { ipcMain, event, registry } = setupSignInRedirect({ chromeCookieStore: store });
     store.importSiteCookies = async (args) => {
       assert.equal(args.beforeWrite(), true);
-      registry.get("conv_1").lastRequestedUrl = "https://unrelated.test/";
+      registry.get("conv_1").openedSite = { url: "https://unrelated.test/" };
       assert.equal(args.beforeWrite(), false);
       return {
         ok: false,
@@ -1366,6 +1366,38 @@ describe("browserIpc — Chrome cookie import", () => {
     });
     assert.equal(r.ok, false);
     assert.equal("openedUrl" in r, false);
+  });
+
+  it("goes back to the opened site's newest address, never one it has left", async () => {
+    const importWhile = async (moveOpenedSite) => {
+      const store = stubOpenedSiteStore();
+      const { ipcMain, event, registry } = setupSignInRedirect({ chromeCookieStore: store });
+      const importSiteCookies = store.importSiteCookies;
+      store.importSiteCookies = (args) =>
+        moveOpenedSite(registry.get("conv_1"), args, () => importSiteCookies(args));
+      return ipcMain.invoke("omnigent:browser-chrome-cookie-import", event, {
+        conversationId: "conv_1",
+        profileId: "Default",
+        expectedHost: "idp.example.net",
+        openedHost: "workspace.example.com",
+      });
+    };
+    // Another path on the same site, requested during the Keychain wait.
+    const samePath = await importWhile((entry, args, write) => {
+      entry.openedSite = { url: "https://workspace.example.com/project/b" };
+      assert.equal(args.beforeWrite(), true);
+      return write();
+    });
+    assert.equal(samePath.ok, true);
+    assert.equal(samePath.openedUrl, "https://workspace.example.com/project/b");
+
+    const leftSite = await importWhile(async (entry, _args, write) => {
+      const result = await write();
+      entry.openedSite = { url: "https://unrelated.test/" };
+      return result;
+    });
+    assert.equal(leftSite.ok, true);
+    assert.equal("openedUrl" in leftSite, false);
   });
 
   it("surfaces a closed view as an error instead of throwing", async () => {

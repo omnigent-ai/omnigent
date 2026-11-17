@@ -419,6 +419,7 @@ function makeEventCapturingRegistry(extra = {}) {
   let handlers; // { [event]: fn } for the single created view
   let windowOpenHandler;
   let nextWebContentsId = 1;
+  let currentUrl = "";
   const registry = createBrowserViewRegistry({
     WebContentsViewCtor: () => {
       handlers = {};
@@ -429,6 +430,7 @@ function makeEventCapturingRegistry(extra = {}) {
           loadURL(url) {
             loaded.push(url);
           },
+          getURL: () => currentUrl,
           close() {},
           copy() {
             copyCalls += 1;
@@ -474,8 +476,87 @@ function makeEventCapturingRegistry(extra = {}) {
     },
     fireContextMenu: (params) => handlers["context-menu"]({}, params),
     windowOpen: (url, disposition) => windowOpenHandler({ url, disposition }),
+    emit: (event, ...args) => handlers[event](...args),
+    commit: (url) => {
+      currentUrl = url;
+    },
   };
 }
+
+describe("browserViewRegistry — opened site for the Chrome cookie import", () => {
+  const pageFrame = { routingId: 1 };
+  const start = (url, details = {}) => [
+    { url, isMainFrame: true, isSameDocument: false, initiator: null, ...details },
+  ];
+  const signInRedirect = () => {
+    const tab = makeEventCapturingRegistry();
+    tab.registry.openOrNavigate("conv_1", "https://workspace.example.com/start");
+    tab.emit("did-start-navigation", ...start("https://workspace.example.com/start"));
+    tab.commit("https://workspace.example.com/login");
+    tab.emit(
+      "did-start-navigation",
+      ...start("https://idp.example.net/authorize", { initiator: pageFrame }),
+    );
+    tab.commit("https://idp.example.net/authorize");
+    return tab;
+  };
+  const opened = (tab) => tab.registry.get("conv_1").openedSite?.url;
+
+  it("keeps the opened site through page-driven redirects and sign-in steps", () => {
+    const tab = signInRedirect();
+    tab.emit(
+      "did-start-navigation",
+      ...start("https://idp.example.net/#otp", { isSameDocument: true }),
+    );
+    tab.emit("did-start-navigation", ...start("https://ads.example.org/", { isMainFrame: false }));
+    tab.emit("input-event", {}, { type: "mouseMove" });
+    tab.emit(
+      "did-start-navigation",
+      ...start("https://device.example.org/check", { initiator: pageFrame }),
+    );
+    tab.commit("https://idp.example.net/authorize");
+    tab.emit("input-event", {}, { type: "keyDown" });
+    tab.emit(
+      "did-start-navigation",
+      ...start("https://idp.example.net/verify", { initiator: pageFrame }),
+    );
+    assert.equal(opened(tab), "https://workspace.example.com/start");
+  });
+
+  it("moves the opened site to another host the user, agent or history opens", () => {
+    const leave = {
+      "a click in the page": (tab) => {
+        tab.emit("input-event", {}, { type: "mouseDown" });
+        tab.emit(
+          "did-start-navigation",
+          ...start("https://other.example.org/", { initiator: pageFrame }),
+        );
+      },
+      "a back or forward step": (tab) =>
+        tab.emit("did-start-navigation", ...start("https://other.example.org/")),
+      "an older Electron event": (tab) =>
+        tab.emit("did-start-navigation", {}, "https://other.example.org/", false, true),
+      "the address bar": (tab) =>
+        tab.registry.openOrNavigate("conv_1", "https://other.example.org/"),
+    };
+    for (const [name, navigate] of Object.entries(leave)) {
+      const tab = signInRedirect();
+      navigate(tab);
+      assert.equal(opened(tab), "https://other.example.org/", name);
+    }
+  });
+
+  it("does not count stale page input as the user's navigation", () => {
+    const tab = signInRedirect();
+    tab.emit("input-event", {}, { type: "mouseDown" });
+    tab.registry.get("conv_1").lastPageInputAt -= 5001;
+    tab.emit(
+      "did-start-navigation",
+      ...start("https://device.example.org/check", { initiator: pageFrame }),
+    );
+    assert.equal(opened(tab), "https://workspace.example.com/start");
+  });
+});
 
 describe("browserViewRegistry — redirect/nav guard (SSRF: allowlist on every hop)", () => {
   it("uses the same live Arca context for initial URL, redirect, frame and popup", () => {

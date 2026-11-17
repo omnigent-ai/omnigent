@@ -27,15 +27,16 @@ it(
     const recordDir = RECORDING
       ? process.env.OMNIGENT_DESKTOP_RECORD_DIR
       : path.join(scratch, "recordings");
-    // Chrome is signed in to the workspace; its IdP cookie alone does not skip the security key.
-    writeChromeProfile(path.join(scratch, "machine"), [
-      { hostKey: "workspace.localhost", name: "workspace_session", value: "chrome-workspace" },
-      { hostKey: "idp.localhost", name: "idp_device", value: "chrome-device" },
-    ]);
-    const sites = await startSsoSites({ workspaceSessions: ["chrome-workspace"], idpSessions: [] });
+    let sites;
     let backend;
     let desktop;
     try {
+      // Chrome is signed in to the workspace; its IdP cookie alone does not skip the security key.
+      writeChromeProfile(path.join(scratch, "machine"), [
+        { hostKey: "workspace.localhost", name: "workspace_session", value: "chrome-workspace" },
+        { hostKey: "idp.localhost", name: "idp_device", value: "chrome-device" },
+      ]);
+      sites = await startSsoSites({ workspaceSessions: ["chrome-workspace"] });
       backend = await startDesignBackend(scratch);
       ({ desktop } = await launchThisMachineDesktop({
         backend,
@@ -88,7 +89,7 @@ it(
         `expected the workspace signed in, got ${JSON.stringify(landing)}; ` +
           `requests ${JSON.stringify(sites.requests)}`,
       );
-      assert.equal(landing.url, sites.workspaceUrl);
+      assert.equal(landing?.url, sites.workspaceUrl);
     } finally {
       try {
         if (desktop) {
@@ -100,7 +101,7 @@ it(
         }
       } finally {
         if (backend) await backend.close();
-        await sites.close();
+        if (sites) await sites.close();
         fs.rmSync(scratch, { recursive: true, force: true });
       }
     }

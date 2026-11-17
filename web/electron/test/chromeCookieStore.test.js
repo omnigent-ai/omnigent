@@ -433,6 +433,29 @@ describe("chromeCookieStore — import scopes", () => {
     assert.equal(store.openedSiteScope("idp.example.net", "not a host!"), null);
   });
 
+  it("refuses an opened site inside the page's tree or not a host before reading Chrome", async () => {
+    const touched = [];
+    const sentinel = (name) => () => {
+      touched.push(name);
+      throw new Error(`${name} must not run`);
+    };
+    for (const openedHost of ["files.example.com", "not a host!"]) {
+      // oxlint-disable-next-line no-await-in-loop -- each refusal is checked in turn
+      const result = await store.importSiteCookies({
+        host: "example.com",
+        openedHost,
+        profileId: "Default",
+        cookiesApi: { set: sentinel("cookie write") },
+        rootDir: path.join(os.tmpdir(), "omnigent-chrome-opened-unread"),
+        fsImpl: new Proxy({}, { get: (_target, name) => sentinel(`fs.${String(name)}`) }),
+        run: sentinel("sqlite3"),
+        readPassword: sentinel("Keychain"),
+      });
+      assert.deepEqual(result, { ok: false, error: "That site isn't available for this tab." });
+    }
+    assert.deepEqual(touched, []);
+  });
+
   it("counts the site's own cookies when no clock is passed", () => {
     const rows = [
       { hostKey: ".example.com", name: "shared", expiresUtc: chromeExpiresUtc(1_900_000_000) },
@@ -797,31 +820,6 @@ describe("chromeCookieStore — sqlite3 reader", { skip: !hasSqlite3 }, () => {
       // SID applies to both sites but is written once; files.example.com's
       // host-only cookie is never sent to example.com.
       assert.deepEqual(written.map((cookie) => cookie.name).sort(), ["SID", "parentonly"]);
-    } finally {
-      fs.rmSync(root, { recursive: true, force: true });
-    }
-  });
-
-  it("refuses an opened site inside the page's tree or not a host", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "omnigent-chrome-opened-bad-"));
-    try {
-      fs.mkdirSync(path.join(root, "Default"));
-      makeCookieDb(path.join(root, "Default", "Cookies"));
-      const written = [];
-      for (const openedHost of ["files.example.com", "not a host!"]) {
-        // oxlint-disable-next-line no-await-in-loop -- each refusal is checked in turn
-        const result = await store.importSiteCookies({
-          host: "example.com",
-          openedHost,
-          profileId: "Default",
-          cookiesApi: { set: async (cookie) => written.push(cookie) },
-          rootDir: root,
-          readPassword: async () => "test-password",
-        });
-        assert.equal(result.ok, false);
-        assert.match(result.error, /site isn't available/);
-      }
-      assert.deepEqual(written, []);
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }

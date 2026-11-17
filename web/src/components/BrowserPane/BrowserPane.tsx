@@ -502,7 +502,7 @@ export function BrowserPane({
         `Imported ${imported} ${suffix} from Chrome${unusable > 0 ? ` (${unusable} couldn't be used)` : ""}.`,
       );
       // Reloading a sign-in page would just repeat its challenge.
-      if (result.openedUrl) navigateTo(result.openedUrl);
+      if (result.openedUrl && bridge.browserOpenOrNavigate) navigateTo(result.openedUrl);
       else void bridge.browserReload?.(conversationId);
     } catch {
       toast.error("Couldn't import cookies from Chrome.");

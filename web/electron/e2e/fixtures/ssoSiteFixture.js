@@ -5,7 +5,6 @@
 const http = require("node:http");
 
 const WORKSPACE_SESSION = "workspace_session";
-const IDP_SESSION = "idp_session";
 
 const SECURITY_KEY_PAGE = `<!doctype html><title>Sign In</title>
 <h2>Verify with Security Key or Biometric Authenticator</h2>
@@ -39,10 +38,10 @@ function parseCookies(header = "") {
 }
 
 /**
- * @param {{ workspaceSessions: string[], idpSessions: string[] }} accepted
- *   Session cookie values each host treats as signed in.
+ * @param {{ workspaceSessions: string[] }} accepted
+ *   Session cookie values the workspace treats as signed in.
  */
-async function startSsoSites({ workspaceSessions, idpSessions }) {
+async function startSsoSites({ workspaceSessions }) {
   const requests = [];
   const server = http.createServer((request, response) => {
     const host = (request.headers.host ?? "").split(":")[0];
@@ -54,13 +53,6 @@ async function startSsoSites({ workspaceSessions, idpSessions }) {
       response.end(body);
     };
     if (host === "workspace.localhost") {
-      if (url.pathname === "/callback" && url.searchParams.get("code") === "granted") {
-        workspaceSessions.push("issued-after-sign-in");
-        return send(302, {
-          "Set-Cookie": `${WORKSPACE_SESSION}=issued-after-sign-in; Path=/; HttpOnly`,
-          Location: "/",
-        });
-      }
       if (workspaceSessions.includes(cookies[WORKSPACE_SESSION])) {
         return send(
           200,
@@ -74,10 +66,6 @@ async function startSsoSites({ workspaceSessions, idpSessions }) {
       });
     }
     if (host === "idp.localhost" && url.pathname === "/authorize") {
-      const redirect = url.searchParams.get("redirect_uri") ?? "";
-      if (idpSessions.includes(cookies[IDP_SESSION]) && redirect) {
-        return send(302, { Location: `${redirect}?code=granted` });
-      }
       return send(200, { "Content-Type": "text/html" }, SECURITY_KEY_PAGE);
     }
     return send(404, { "Content-Type": "text/plain" }, "not found");
@@ -100,4 +88,4 @@ async function startSsoSites({ workspaceSessions, idpSessions }) {
   };
 }
 
-module.exports = { startSsoSites, WORKSPACE_SESSION, IDP_SESSION };
+module.exports = { startSsoSites, WORKSPACE_SESSION };

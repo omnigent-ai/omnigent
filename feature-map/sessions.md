@@ -210,7 +210,9 @@ the header menu), and each place is a separate entry point.
   per-tab. On macOS the browser toolbar can also import the current site's
   cookies from a local Chrome profile into that same session jar (Site scope
   picks the host or a parent domain); the copy is in-memory and never written
-  back to Chrome.
+  back to Chrome. After a sign-in redirect to another site, the dialog also
+  offers the site the tab opened, checked by default; with it included, the tab
+  returns there instead of reloading the sign-in page.
 - `canvas-workspace`: Main and project boards show only your sessions, including
   cached previews and reloads. Canvas collapses the shared sidebar on entry; clicking a
   card opens its session beside the project board. Switching cards keeps

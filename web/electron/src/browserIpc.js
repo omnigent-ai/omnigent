@@ -869,11 +869,9 @@ function registerBrowserIpc({
   });
 
   // ── Import cookies from Google Chrome (macOS) ────────────────────────────
-  // Copies only the current site's cookies into this conversation's in-memory
-  // partition: a metadata-only preview (no Keychain), then the import. The site
-  // comes from the view's real URL in main and is re-checked before writing.
-  // When a redirect moved the tab off the site it opened, that site can be
-  // included too.
+  // Copies the current site's cookies (plus the opened site after a sign-in
+  // redirect) into this conversation's partition: metadata-only preview, then
+  // the import. Sites come from main's view state and are re-checked before writing.
 
   const siteForEntry = (entry) => {
     let parsed;
@@ -889,12 +887,12 @@ function registerBrowserIpc({
     return { host: parsed.hostname };
   };
 
-  // The address this tab was asked to open, which a sign-in redirect to another
-  // site doesn't change. Main-owned, so the renderer can't substitute a site.
+  // The site the user or agent last sent this tab to, which a sign-in redirect
+  // doesn't change. Main-owned, so the renderer can't substitute a site.
   const openedSiteForEntry = (entry) => {
     let parsed;
     try {
-      parsed = new URL(entry.lastRequestedUrl ?? "");
+      parsed = new URL(entry.openedSite?.url ?? "");
     } catch {
       return null;
     }
@@ -1022,7 +1020,10 @@ function registerBrowserIpc({
       });
       // Reloading the sign-in page would only repeat its challenge; the opened
       // site can use its own imported session instead.
-      return opened && result?.ok ? { ...result, openedUrl: opened.url } : result;
+      const openedNow = opened && result?.ok ? openedSiteForEntry(entry) : null;
+      return openedNow && openedMatches(openedNow.host)
+        ? { ...result, openedUrl: openedNow.url }
+        : result;
     } catch (e) {
       const msg = e && e.message ? e.message : String(e);
       if (msg.includes("Object has been destroyed")) return { ok: false, error: "browser closed" };

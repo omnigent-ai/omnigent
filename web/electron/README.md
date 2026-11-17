@@ -831,15 +831,16 @@ Scope is deliberately narrow:
   `blogspot.com`) that reads every tenant's cookies for the suffix; the dialog
   names the scope before anything is read, and the user has to confirm.
 - When a sign-in redirect moved the tab to another site (an IdP challenge), the
-  dialog also offers the site the tab opened, checked by default. That site
-  comes from main's record of the address the tab was asked to open, never from
-  the renderer, and only the cookies Chrome sends to that host itself are read
-  (its host-only cookies and the domain cookies that reach it, not its
-  subdomains'). The native prompt names it, `beforeWrite` re-checks it, and
-  afterwards the tab goes back to the opened address instead of reloading the
-  sign-in page, which would only repeat its challenge. A link clicked inside the
-  page doesn't update that record, so the offered site is the last address
-  typed or opened by the agent.
+  dialog also offers the site the tab opened, checked by default. Main tracks
+  that site from the view's own navigations, never from the renderer: an
+  address-bar or agent load, a back/forward step, or a navigation within five
+  seconds of a click or key press in the page sets it when it reaches another
+  host, while redirects and page-driven loads keep it. Only the cookies Chrome
+  sends to that host itself are read (its host-only cookies and the domain
+  cookies that reach it, not its subdomains'). The native prompt names it,
+  `beforeWrite` re-checks it, and afterwards the tab goes back to the opened
+  address instead of reloading the sign-in page, which would only repeat its
+  challenge.
 - `browser-chrome-cookie-preview` reports only counts and profile names, and
   touches no Keychain, so the confirmation dialog opens without a system prompt.
   The import re-derives the host from the view's own URL main-side and refuses if

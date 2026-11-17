@@ -32,6 +32,11 @@ const { agentInputInFlight } = require("./browserInput");
 // Each view is a separate renderer process; the cap bounds memory per window.
 const DEFAULT_CAP = 20;
 
+// Chromium's transient user-activation lifespan: page input this recent makes the
+// next navigation the user's (or agent's), not a page-driven redirect.
+const PAGE_INPUT_NAVIGATION_WINDOW_MS = 5000;
+const PAGE_INPUT_TYPES = new Set(["mouseDown", "keyDown", "rawKeyDown"]);
+
 // Map WebSocket handshakes onto the HTTP URL rules.
 function httpUrlForWebSocket(url) {
   return url.replace(/^ws(s?):/, "http$1:");
@@ -190,6 +195,10 @@ function createBrowserViewRegistry({
       // Last URL we EXPLICITLY requested (not getURL(), which drifts as the page
       // navigates) — lets openOrNavigate skip reissuing loadURL on a re-mount.
       lastRequestedUrl: "",
+      // { url } of the site the user or agent last sent this tab to; redirects
+      // after that keep it, so the Chrome cookie import can see past a sign-in hop.
+      openedSite: null,
+      lastPageInputAt: 0,
       // Enables navigation guards; renderer IPC always sets it.
       navigationPolicyEnforced: false,
       agentContext: null,
@@ -229,6 +238,7 @@ function createBrowserViewRegistry({
     attachViewContextMenu(entry);
     attachAgentNavGuard(conversationId, entry);
     attachRecentSessionInput(entry);
+    attachOpenedSiteTracker(entry);
     return { ok: true, entry, created: true };
   }
 
@@ -338,6 +348,28 @@ function createBrowserViewRegistry({
     wc.on("will-frame-navigate", (event) => {
       // will-frame-navigate passes a single event whose `.url` is the target.
       guard(event, event && event.url);
+    });
+  }
+
+  // Browser-initiated navigations (address bar, history, popup reuse) and ones
+  // right after page input move the opened site when they leave the current host.
+  function attachOpenedSiteTracker(entry) {
+    const wc = entry.view && entry.view.webContents;
+    if (!wc || typeof wc.on !== "function") return;
+    wc.on("input-event", (_event, input) => {
+      if (PAGE_INPUT_TYPES.has(input?.type)) entry.lastPageInputAt = Date.now();
+    });
+    // Electron passes a details event (newer) and positional flags (older).
+    wc.on("did-start-navigation", (details, positionalUrl, isInPlace, isMainFrame) => {
+      if ((details?.isMainFrame ?? isMainFrame) === false) return;
+      if (details?.isSameDocument ?? isInPlace) return;
+      const target = details?.url ?? positionalUrl;
+      const driven =
+        !details?.initiator ||
+        Date.now() - entry.lastPageInputAt <= PAGE_INPUT_NAVIGATION_WINDOW_MS;
+      if (driven && hostnameOf(target) !== hostnameOf(wc.getURL?.())) {
+        entry.openedSite = { url: target };
+      }
     });
   }
 
@@ -640,6 +672,7 @@ function createBrowserViewRegistry({
       // drifts with in-page nav — stops a re-mount from refreshing to the initial URL.
       if (created || force || entry.lastRequestedUrl !== url) {
         entry.lastRequestedUrl = url;
+        entry.openedSite = { url };
         try {
           entry.view.webContents.loadURL(url);
         } catch (e) {
