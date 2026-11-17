@@ -154,10 +154,13 @@ executor:
     disable_native_tools: true
 ```
 
-The values must be YAML booleans. They apply on every Codex route, including
-ChatGPT login, API-key providers and brokered gateways. They only restrict
-tools: `web_search: true` and `disable_native_tools: false` do not re-enable
-tools that the runner's operator turned off.
+The switches accept YAML booleans; omitting either switch or setting it to YAML
+`null` leaves it unset and preserves operator restrictions. Boolean settings
+apply on every Codex route, including ChatGPT login, API-key providers and brokered
+gateways. They only restrict tools: `web_search: true` and
+`disable_native_tools: false` do not re-enable tools that the runner's operator
+turned off. Locked profiles still require `web_search: false` and
+`disable_native_tools: true`, and `broker_gateway` rejects `null`.
 
 ### Pi context files
 
