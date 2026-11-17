@@ -13931,7 +13931,7 @@ async def test_named_send_registers_fresh_when_tracked_turn_already_ended(
     stale.delivered = True
     stale_work_id = stale.work_id
 
-    handler = _running_child_server_handler(
+    base_handler = _running_child_server_handler(
         parent_id,
         child_id,
         stamped=stamped,
@@ -13939,6 +13939,15 @@ async def test_named_send_registers_fresh_when_tracked_turn_already_ended(
         create_posts=create_posts,
         child_busy=True,
     )
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == f"/v1/sessions/{child_id}/events":
+            # An inbox drain consumes the stale result while the steer's POST is in flight.
+            subagent_work.unregister_subagent_work(
+                child_id, work_id=stale_work_id, remember_drained_delivery=True
+            )
+        return await base_handler(request)
+
     inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
     reaped: list[subagent_work._SubagentWorkEntry] = []
     # Codex accepts the new turn before the message POST returns to the parent, so the
@@ -14641,20 +14650,28 @@ async def test_eager_mcp_cache_keeps_named_child_scope_after_revision_change(mon
             assert "Root instructions." not in recording.posted_bodies[-1]["instructions"]
 
 
-def test_child_start_report_is_forgotten_once_the_child_settles() -> None:
-    """A child's running report without an entry is cleared when its turn settles.
+def test_child_start_evidence_is_cleared_once_the_child_settles() -> None:
+    """A settled turn's start evidence must not reach the next steer.
 
     Otherwise a steer after the turn completed would be exempted from the launch bound
-    as if its turn were already running.
+    by a running report that belongs to a turn that is gone, or bounded from an
+    acceptance that belongs to one.
     """
-    child_id = "conv_child_settled"
+    parent_id, child_id = "conv_parent_settled", "conv_child_settled"
+    subagent_work._session_inboxes_ref[parent_id] = asyncio.Queue()
     try:
         subagent_work.note_subagent_child_start_reported(child_id)
-        assert subagent_work.child_start_already_reported(child_id)
-        subagent_work.forget_subagent_child_start_report(child_id)
-        assert not subagent_work.child_start_already_reported(child_id)
+        subagent_work.arm_subagent_child_start_timeout(child_id, now=1.0)
+        subagent_work.note_subagent_child_turn_settled(child_id)
+        fresh = subagent_work.register_subagent_work(
+            parent_session_id=parent_id, child_session_id=child_id, agent="codex", title="review"
+        )
+        subagent_work.apply_child_start_evidence(fresh)
+        assert fresh.child_start_reported is False
+        assert fresh.awaiting_child_start_since is None
     finally:
-        subagent_work.forget_subagent_child_start_report(child_id)
+        subagent_work.unregister_subagent_work_for_session(child_id)
+        subagent_work._session_inboxes_ref.pop(parent_id, None)
 
 
 @pytest.mark.asyncio

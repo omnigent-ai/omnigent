@@ -487,3 +487,161 @@ async def test_native_prompt_delivery_acknowledges_the_launch() -> None:
         )
     finally:
         subagent_work.unregister_subagent_work(child_id)
+
+
+# Start-bound lifecycle for a steered Codex child. Evidence belongs to the child's turn:
+# a settled turn clears it, a registration consumes it once, and draining or replacing a
+# dispatch entry never touches it. Each case interleaves the events of a previous turn
+# (``*_prev``) with the steered turn that the parent's send starts.
+
+_START_BUDGET_S = 180.0
+_PREVIOUS_ACCEPTED_AT = 1000.0
+_STEER_ACCEPTED_AT = 5000.0
+
+
+def _drive_steer_lifecycle(
+    events: list[str], *, parent_id: str, child_id: str
+) -> subagent_work._SubagentWorkEntry | None:
+    """Apply the events in order to a drained previous dispatch and the steer that follows it.
+
+    ``accept_prev`` / ``run_prev`` / ``settle_prev`` belong to the previous turn; ``accept_steer``
+    / ``run_steer`` to the steered turn; ``register`` is the steer's fresh registration;
+    ``drain_old`` drains the previous dispatch's result; ``forget_session`` deletes the child.
+    """
+    previous = subagent_work.register_subagent_work(
+        parent_session_id=parent_id, child_session_id=child_id, agent="codex", title="review"
+    )
+    previous.status = "completed"
+    previous.delivered = True
+    previous_work_id = previous.work_id
+    fresh: subagent_work._SubagentWorkEntry | None = None
+    for event in events:
+        if event == "accept_prev":
+            subagent_work.arm_subagent_child_start_timeout(child_id, now=_PREVIOUS_ACCEPTED_AT)
+        elif event == "run_prev" or event == "run_steer":
+            subagent_work.note_subagent_child_start_reported(child_id)
+        elif event == "settle_prev":
+            subagent_work.note_subagent_child_turn_settled(child_id)
+        elif event == "accept_steer":
+            subagent_work.arm_subagent_child_start_timeout(child_id, now=_STEER_ACCEPTED_AT)
+        elif event == "drain_old":
+            subagent_work.unregister_subagent_work(
+                child_id, work_id=previous_work_id, remember_drained_delivery=True
+            )
+        elif event == "forget_session":
+            subagent_work.unregister_subagent_work_for_session(child_id)
+        elif event == "register":
+            fresh = subagent_work.register_subagent_work(
+                parent_session_id=parent_id,
+                child_session_id=child_id,
+                agent="codex",
+                title="review",
+            )
+            fresh.status = "running"
+            subagent_work.apply_child_start_evidence(fresh)
+        else:
+            raise AssertionError(f"unknown event {event!r}")
+    return fresh
+
+
+@pytest.mark.parametrize(
+    ("events", "expected_start"),
+    [
+        # The steer's acceptance and registration, in each order, with a drain anywhere.
+        (["accept_steer", "register"], _STEER_ACCEPTED_AT),
+        (["accept_steer", "drain_old", "register"], _STEER_ACCEPTED_AT),
+        (["register", "accept_steer", "drain_old"], _STEER_ACCEPTED_AT),
+        (["register", "drain_old", "accept_steer"], _STEER_ACCEPTED_AT),
+        # A previous turn's acceptance that settled, with no report, must not bound the steer.
+        (["accept_prev", "settle_prev", "accept_steer", "register"], _STEER_ACCEPTED_AT),
+        (["accept_prev", "settle_prev", "register", "accept_steer"], _STEER_ACCEPTED_AT),
+        # A previous turn's running report that settled must not exempt the steered turn.
+        (
+            ["accept_prev", "run_prev", "settle_prev", "accept_steer", "register"],
+            _STEER_ACCEPTED_AT,
+        ),
+        (["run_prev", "settle_prev", "accept_steer", "register"], _STEER_ACCEPTED_AT),
+        # Deleting the session forgets evidence from the old child lifetime.
+        (["accept_prev", "forget_session", "accept_steer", "register"], _STEER_ACCEPTED_AT),
+        # A previous turn that never settled still owns its silence; the steer joins it.
+        (["accept_prev", "accept_steer", "register"], _PREVIOUS_ACCEPTED_AT),
+    ],
+)
+@pytest.mark.asyncio
+async def test_steered_turn_is_bounded_from_its_own_acceptance(
+    events: list[str], expected_start: float
+) -> None:
+    """A steered turn that accepts and stays silent is failed, counted from its own acceptance."""
+    parent_id, child_id = "conv_parent_lifecycle", "conv_child_lifecycle"
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    subagent_work._session_inboxes_ref[parent_id] = inbox
+    try:
+        fresh = _drive_steer_lifecycle(events, parent_id=parent_id, child_id=child_id)
+        assert fresh is not None
+        assert fresh.child_start_reported is False
+        assert fresh.awaiting_child_start_since == expected_start
+        # Still inside the budget from its own acceptance: the steer keeps its full budget.
+        assert (
+            subagent_work.reap_stalled_subagent_launches(
+                now=expected_start + _START_BUDGET_S - 1.0, timeout_s=_START_BUDGET_S
+            )
+            == []
+        )
+        reaped = subagent_work.reap_stalled_subagent_launches(
+            now=expected_start + _START_BUDGET_S + 1.0, timeout_s=_START_BUDGET_S
+        )
+        assert [entry.child_session_id for entry in reaped] == [child_id]
+        assert fresh.status == "failed"
+        notice = inbox.get_nowait()
+        assert notice["status"] == "failed"
+        assert "no turn start" in notice["output"]
+    finally:
+        subagent_work.unregister_subagent_work(child_id)
+        subagent_work._session_inboxes_ref.pop(parent_id, None)
+
+
+@pytest.mark.parametrize(
+    "events",
+    [
+        # The steered turn reports running before or after its registration: never bounded.
+        ["accept_steer", "run_steer", "register"],
+        ["register", "accept_steer", "run_steer"],
+        ["accept_steer", "register", "run_steer"],
+        ["accept_steer", "drain_old", "run_steer", "register"],
+    ],
+)
+@pytest.mark.asyncio
+async def test_steered_turn_that_reports_running_is_never_bounded(events: list[str]) -> None:
+    """A steer into a turn whose running report arrived is exempt from the launch bound."""
+    parent_id, child_id = "conv_parent_running", "conv_child_running"
+    subagent_work._session_inboxes_ref[parent_id] = asyncio.Queue()
+    try:
+        fresh = _drive_steer_lifecycle(events, parent_id=parent_id, child_id=child_id)
+        assert fresh is not None
+        assert fresh.child_start_reported is True
+        assert fresh.awaiting_child_start_since is None
+        assert (
+            subagent_work.reap_stalled_subagent_launches(
+                now=_STEER_ACCEPTED_AT + 10 * _START_BUDGET_S, timeout_s=_START_BUDGET_S
+            )
+            == []
+        )
+    finally:
+        subagent_work.unregister_subagent_work(child_id)
+        subagent_work._session_inboxes_ref.pop(parent_id, None)
+
+
+@pytest.mark.asyncio
+async def test_drain_of_a_previous_result_keeps_a_newer_acceptance() -> None:
+    """Draining an old result must not delete the acceptance of the turn that followed it."""
+    parent_id, child_id = "conv_parent_drain", "conv_child_drain"
+    subagent_work._session_inboxes_ref[parent_id] = asyncio.Queue()
+    try:
+        fresh = _drive_steer_lifecycle(
+            ["accept_steer", "drain_old"], parent_id=parent_id, child_id=child_id
+        )
+        assert fresh is None  # the drain removed the previous entry; nothing registered yet
+        assert subagent_work._children_accepted_at[child_id] == _STEER_ACCEPTED_AT
+    finally:
+        subagent_work.unregister_subagent_work(child_id)
+        subagent_work._session_inboxes_ref.pop(parent_id, None)
