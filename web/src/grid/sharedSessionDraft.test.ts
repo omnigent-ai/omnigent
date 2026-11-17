@@ -1,0 +1,195 @@
+import { act, renderHook } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import type { Comment } from "@/hooks/useComments";
+import { serializeReplyDraft, type StoredReplyDraft } from "@/lib/replyDraft";
+import {
+  clearSessionDrafts,
+  getSessionDraft,
+  setSessionDraft,
+  type SessionDraft,
+} from "@/lib/sessionDrafts";
+import { useChatStore, type SideChatComposerDraft } from "@/store/chatStore";
+import { useSharedSessionDraft } from "./sharedSessionDraft";
+
+const sessionId = "conv_cell";
+const initialComposers = useChatStore.getState().sideChatComposers;
+
+const reviewComment = {
+  id: "review",
+  conversation_id: sessionId,
+  path: "src/app.ts",
+  body: "Rename this",
+  status: "draft",
+  start_index: 0,
+  end_index: 0,
+  created_at: 1,
+  updated_at: 1,
+  created_by: null,
+  anchor_content: null,
+  anchor_metadata: {
+    pr_url: "https://github.example.com/acme/app/pull/1",
+    side: "RIGHT",
+    line: 4,
+    head_sha: "a".repeat(40),
+    base_sha: "b".repeat(40),
+  },
+} as Comment;
+
+/** The cell's composer entry, as the cell's composer edits it. */
+function cellComposer(): SideChatComposerDraft | undefined {
+  return useChatStore.getState().sideChatComposers[sessionId];
+}
+
+/** Edit the cell's composer the way its textarea and attachment controls do. */
+function editCell(next: Partial<SideChatComposerDraft>): void {
+  act(() =>
+    useChatStore
+      .getState()
+      .updateSideChatComposer(sessionId, (current) => ({ ...current, ...next })),
+  );
+}
+
+function seedDraft(draft: SessionDraft): void {
+  setSessionDraft(sessionId, draft);
+}
+
+beforeEach(() => {
+  clearSessionDrafts();
+  useChatStore.setState({ sideChatComposers: {} });
+});
+
+afterEach(() => {
+  clearSessionDrafts();
+  useChatStore.setState({ sideChatComposers: initialComposers });
+});
+
+describe("a grid cell's shared draft", () => {
+  it("starts the cell from the session draft's text, quote cards and attachments", () => {
+    const file = new File(["notes"], "notes.txt", { type: "text/plain" });
+    const replyDraft: StoredReplyDraft = {
+      version: 1,
+      quotes: [{ before: "Intro", text: "Quoted line" }],
+      text: "Reply",
+    };
+    seedDraft({ text: serializeReplyDraft(replyDraft), replyDraft, files: [file] });
+
+    renderHook(() => useSharedSessionDraft(sessionId));
+
+    expect(cellComposer()).toMatchObject({ text: "Reply", files: [file] });
+    expect(cellComposer()?.quotes).toEqual([
+      expect.objectContaining({ before: "Intro", text: "Quoted line" }),
+    ]);
+  });
+
+  it("writes the cell's text, quotes and attachments back to the session draft", () => {
+    seedDraft({ text: "", files: [] });
+    renderHook(() => useSharedSessionDraft(sessionId));
+    const file = new File(["x"], "a.txt");
+
+    editCell({ text: "Typed in the cell", files: [file] });
+    expect(getSessionDraft(sessionId)).toMatchObject({
+      text: "Typed in the cell",
+      files: [file],
+    });
+
+    editCell({ quotes: [{ id: "q", before: "Above", text: "Quoted" }] });
+    expect(getSessionDraft(sessionId)).toMatchObject({
+      text: serializeReplyDraft({
+        quotes: [{ before: "Above", text: "Quoted" }],
+        text: "Typed in the cell",
+      }),
+      replyDraft: {
+        version: 1,
+        quotes: [{ before: "Above", text: "Quoted" }],
+        text: "Typed in the cell",
+      },
+    });
+  });
+
+  it("keeps the session's review comments while the cell writes", () => {
+    seedDraft({ text: "", files: [], reviewComments: [reviewComment] });
+    renderHook(() => useSharedSessionDraft(sessionId));
+
+    editCell({ text: "Address the comment" });
+
+    expect(getSessionDraft(sessionId)).toMatchObject({
+      text: "Address the comment",
+      reviewComments: [reviewComment],
+    });
+  });
+
+  it("drops a tag once its token is deleted, so retyping the token stays literal", () => {
+    seedDraft({
+      text: "Read @src/app.ts first",
+      files: [],
+      mentions: {
+        files: [{ path: "src/app.ts", isDir: false, token: "@src/app.ts" }],
+        sessions: [],
+      },
+    });
+    renderHook(() => useSharedSessionDraft(sessionId));
+
+    editCell({ text: "Read the file first" });
+    expect(getSessionDraft(sessionId)?.mentions).toBeUndefined();
+
+    editCell({ text: "Read @src/app.ts first" });
+    expect(getSessionDraft(sessionId)?.mentions).toBeUndefined();
+  });
+
+  it("keeps a tag while its token stays in the text", () => {
+    seedDraft({
+      text: "Read @src/app.ts",
+      files: [],
+      mentions: {
+        files: [{ path: "src/app.ts", isDir: false, token: "@src/app.ts" }],
+        sessions: [],
+      },
+    });
+    renderHook(() => useSharedSessionDraft(sessionId));
+
+    editCell({ text: "Read @src/app.ts carefully" });
+
+    expect(getSessionDraft(sessionId)?.mentions?.files).toEqual([
+      { path: "src/app.ts", isDir: false, token: "@src/app.ts" },
+    ]);
+  });
+
+  it("empties the session draft and its tags when the cell's composer is cleared", () => {
+    seedDraft({
+      text: "Read @src/app.ts",
+      files: [],
+      mentions: {
+        files: [{ path: "src/app.ts", isDir: false, token: "@src/app.ts" }],
+        sessions: [],
+      },
+    });
+    renderHook(() => useSharedSessionDraft(sessionId));
+
+    act(() => useChatStore.getState().clearSideChatComposer(sessionId));
+
+    expect(getSessionDraft(sessionId)).toBeUndefined();
+  });
+
+  it("puts back the composer entry a sub-agent tab keeps when the cell unmounts", () => {
+    const subAgentDraft: SideChatComposerDraft = { text: "Sub-agent question", files: [] };
+    useChatStore.setState({ sideChatComposers: { [sessionId]: subAgentDraft } });
+    seedDraft({ text: "Shared draft", files: [] });
+
+    const { unmount } = renderHook(() => useSharedSessionDraft(sessionId));
+    expect(cellComposer()?.text).toBe("Shared draft");
+
+    unmount();
+
+    expect(cellComposer()).toBe(subAgentDraft);
+  });
+
+  it("leaves no composer entry behind when the cell unmounts and none existed before", () => {
+    seedDraft({ text: "Shared draft", files: [] });
+
+    const { unmount } = renderHook(() => useSharedSessionDraft(sessionId));
+    unmount();
+
+    expect(cellComposer()).toBeUndefined();
+    expect(getSessionDraft(sessionId)?.text).toBe("Shared draft");
+  });
+});

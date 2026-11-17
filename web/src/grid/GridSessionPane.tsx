@@ -75,6 +75,7 @@ import { selectPullRequestInPanel } from "@/shell/PullRequestPanel";
 import { citedFilePosition } from "@/shell/filePositionState";
 import { useGridSessions } from "./GridSessionsContext";
 import { useGridPermissionControl, type GridPermissionControl } from "./useGridPermissionControl";
+import { useSharedSessionDraft } from "./sharedSessionDraft";
 
 export type GridWorkspacePanelProps = Pick<
   ComponentProps<typeof WorkspacePanel>,
@@ -108,6 +109,8 @@ export function GridSessionPane({
   const serverInfo = useServerInfo();
   const permissionLevel = session?.permissionLevel ?? (canEdit ? null : 1);
   const grids = useGridSessions()!;
+  // The cell's composer and the full-screen composer share this session's draft.
+  useSharedSessionDraft(sessionId);
   const title = session?.title || "Session";
   const {
     attributes,

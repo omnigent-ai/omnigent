@@ -51,6 +51,7 @@ import {
   skillMenuDescription,
 } from "@/components/SlashCommandMenu";
 import { ComposerAttachments } from "@/components/ComposerAttachments";
+import { ComposerLocalReviewChips } from "@/components/composer/ComposerLocalReviewChips";
 import { ReplyDraftBlocks } from "@/components/composer/ReplyDraftBlocks";
 import { Button } from "@/components/ui/button";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -93,6 +94,19 @@ import {
   serializeReplyDraft,
   snapshotReplyDraft,
 } from "@/lib/replyDraft";
+import {
+  buildOutgoingMessage,
+  carriesMessageContext,
+  type ComposerSendContext,
+} from "@/lib/outgoingComposerMessage";
+import {
+  composerInlineMentions,
+  presentTaggedMentions,
+  recallFileMentions,
+  recallSessionMentions,
+} from "@/lib/composerMentions";
+import { clearLocalReviewContexts } from "@/lib/localReviewContext";
+import { getSessionDraft, setSessionMentions, useSessionReviewComments } from "@/lib/sessionDrafts";
 import { interrupt } from "@/lib/sessionsApi";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
 
@@ -107,6 +121,27 @@ const SIDE_CHAT_COPY_ID_PREFIX_LEN = 12;
 /** A `pending:` tab has no child session yet; its first send creates the fork. */
 function isPendingSideChat(id: string): boolean {
   return id.startsWith("pending:");
+}
+
+/**
+ * A grid cell's edited message: its session tags come back as tokens, as in the
+ * full-screen composer, and the tags the cell held before are dropped.
+ */
+function loadRecalledGridText(childId: string, text: string): void {
+  const sessions = recallSessionMentions(text);
+  const files = recallFileMentions(
+    sessions.main,
+    sessions.sessions.map((session) => session.token!),
+  );
+  // Text first: the shared draft keeps only tags whose token the new text has.
+  useChatStore.getState().updateSideChatComposer(childId, (current) => ({
+    ...current,
+    text: files.text,
+    files: [],
+    quotes: [],
+    autoFocus: true,
+  }));
+  setSessionMentions(childId, { files: files.files, sessions: sessions.sessions });
 }
 
 const TEXT_INPUT_TYPES = new Set(["text", "search", "email", "url", "password", "number", "tel"]);
@@ -190,7 +225,10 @@ export function SideChatPane({
   readOnly?: boolean;
   /** Display an existing session with its complete history and scoped composer. */
   fullSession?: boolean;
-  /** A grid cell's composer: one row tall, with the cell session's controls. */
+  /**
+   * A grid cell's composer: one row tall, with the cell session's controls. It sends
+   * the session's shared draft (tags, review comments) as the full-screen composer does.
+   */
   gridComposer?: GridComposerSlots;
 }) {
   const pending = isPendingSideChat(childId);
@@ -245,14 +283,19 @@ export function SideChatPane({
       const draft = useChatStore.getState().sideChatComposers[childId];
       return Boolean(draft && (draft.text.trim() || draft.files.length || draft.quotes?.length));
     },
-    loadText: (text) =>
+    loadText: (text) => {
+      if (gridComposer) {
+        loadRecalledGridText(childId, text);
+        return;
+      }
       useChatStore.getState().updateSideChatComposer(childId, (current) => ({
         ...current,
         text,
         files: [],
         quotes: [],
         autoFocus: true,
-      })),
+      }));
+    },
     focusComposer: () =>
       useChatStore.getState().updateSideChatComposer(childId, (current) => ({
         ...current,
@@ -603,6 +646,9 @@ function SideChatComposer({
   // it between subtrees and unmounts it, and so does switching rail tabs.
   const composer = useChatStore((s) => s.sideChatComposers[childId]);
   const { text, files } = composer ?? EMPTY_SIDE_CHAT_COMPOSER;
+  // A grid cell's tags and review comments come from its session's shared draft.
+  const gridCell = gridComposer !== undefined;
+  const reviewComments = useSessionReviewComments(gridCell ? childId : null);
   const updateComposer = useChatStore((s) => s.updateSideChatComposer);
   const clearComposer = useChatStore((s) => s.clearSideChatComposer);
   const enqueueMessage = useChatStore((s) => s.enqueueMessage);
@@ -645,7 +691,10 @@ function SideChatComposer({
     if (!failed) return;
     const { accepted, errors } = validateAttachments(failed.files, attachmentPolicy);
     errors.forEach((message) => toast.error(message));
-    updateComposer(childId, () => ({ text: failed.text, files: accepted }));
+    // A grid cell restores its session tags as tokens, as the full-screen composer does.
+    const recalled = gridCell ? recallSessionMentions(failed.text) : null;
+    updateComposer(childId, () => ({ text: recalled?.main ?? failed.text, files: accepted }));
+    if (recalled) setSessionMentions(childId, { files: [], sessions: recalled.sessions });
     // Track the displayed draft for delivery; filtered files require a fresh send ID.
     const entry = conversationRegistry.peek(childId)!;
     const restored = entry.getState().restoredSendDraft;
@@ -654,7 +703,7 @@ function SideChatComposer({
         restoredSendDraft: { ...restored, files: accepted, replyDraft: undefined },
         pendingRetryStableId: errors.length > 0 ? null : entry.getState().pendingRetryStableId,
       });
-  }, [fullSession, childId, failedSendDraft, updateComposer, attachmentPolicy]);
+  }, [fullSession, childId, failedSendDraft, updateComposer, attachmentPolicy, gridCell]);
   useEffect(() => {
     if (!fullSession || !restoredSendDraft?.delivered) return;
     const entry = conversationRegistry.peek(childId);
@@ -663,17 +712,15 @@ function SideChatComposer({
     const current = useChatStore.getState().sideChatComposers[childId] ?? EMPTY_SIDE_CHAT_COMPOSER;
     entry!.setState({ restoredSendDraft: null });
     if (current.quotes?.length) return;
+    // A grid cell shows the restored text with its session tags as tokens.
+    const shown = gridCell
+      ? { ...restored, text: recallSessionMentions(restored.text).main }
+      : restored;
     if (
-      restoredSendDraftUnchanged(
-        restored,
-        restored.stableId,
-        current.text,
-        current.files,
-        undefined,
-      )
+      restoredSendDraftUnchanged(shown, restored.stableId, current.text, current.files, undefined)
     )
       clearComposer(childId);
-  }, [fullSession, childId, restoredSendDraft, clearComposer]);
+  }, [fullSession, childId, restoredSendDraft, clearComposer, gridCell]);
   const setText = useCallback(
     (next: string) => updateComposer(childId, (current) => ({ ...current, text: next })),
     [childId, updateComposer],
@@ -815,7 +862,9 @@ function SideChatComposer({
     return () => document.removeEventListener("focusin", cancelOnOtherInput);
   }, [autoFocus, ready, dropFocusRequest]);
   const canSend =
-    serializeReplyDraft({ quotes, text }).trim().length > 0 || (!pending && files.length > 0);
+    serializeReplyDraft({ quotes, text }).trim().length > 0 ||
+    (!pending && files.length > 0) ||
+    reviewComments.length > 0;
   const addFiles = (incoming: File[]) => {
     const { accepted, errors } = validateAttachments(incoming, attachmentPolicy);
     errors.forEach((message) => toast.error(message));
@@ -957,10 +1006,21 @@ function SideChatComposer({
       return;
     }
     if ((busy && fullSession) || !canSend || agentId === null) return;
+    // A grid cell's tags and review comments are read from its session's draft as it sends.
+    const sharedDraft = gridCell ? getSessionDraft(childId) : undefined;
+    const tags = presentTaggedMentions(sharedDraft?.mentions, [
+      text,
+      ...quotes.map((replyQuote) => replyQuote.before),
+    ]);
+    const sendContext: ComposerSendContext = {
+      mentions: composerInlineMentions(tags?.files ?? [], tags?.sessions ?? [], harness ?? null),
+      reviewComments: sharedDraft?.reviewComments ?? [],
+    };
     // On in-process harnesses /help and skills resolve locally; native TUIs
-    // (claude-native, codex-native) read the text themselves, and a quote or
-    // attachment is always an ordinary message.
-    const routeLocally = !nativeSession && quotes.length === 0 && files.length === 0;
+    // (claude-native, codex-native) read the text themselves, and a quote, attachment,
+    // tag or review comment is always an ordinary message.
+    const routeLocally =
+      !nativeSession && !carriesMessageContext({ quotes, text }, files, sendContext);
     // A lone command token with skill discovery in flight has nothing to run
     // yet; only hold when the submission would route locally.
     if (routeLocally && slashCompletion.pendingCompletion) return;
@@ -994,7 +1054,11 @@ function SideChatComposer({
       return;
     }
     const outgoing = files.length > 0 ? files : undefined;
-    const message = serializeReplyDraft({ quotes, text: trimmed });
+    // A grid cell sends what the full-screen composer sends: tags expanded, review comments kept.
+    const composed = gridCell
+      ? buildOutgoingMessage({ quotes, text }, trimmed, sendContext)
+      : { text: serializeReplyDraft({ quotes, text: trimmed }), replyDraft: undefined };
+    const message = composed.text;
     const child = conversationRegistry.peek(childId)?.getState();
     if (
       queues &&
@@ -1017,8 +1081,12 @@ function SideChatComposer({
     // A running Codex chat refuses a steered /compact; keep the draft as the main composer does.
     if (isCompactControl(harness, message, outgoing) && rejectBusyCompact(childId)) return;
     clearComposer(childId);
+    if (gridCell) clearLocalReviewContexts(childId);
     onSend();
-    void send(message, agentId, outgoing, { pinnedConversationId: childId }).finally(refreshLabels);
+    void send(message, agentId, outgoing, {
+      pinnedConversationId: childId,
+      ...(composed.replyDraft ? { replyDraft: composed.replyDraft } : {}),
+    }).finally(refreshLabels);
   };
 
   const handleKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>, intent: ComposerKeyIntent) => {
@@ -1164,11 +1232,16 @@ function SideChatComposer({
               />
             ),
           attachments:
-            !pending && files.length > 0 ? (
-              <ComposerAttachments
-                files={files}
-                onRemove={(index) => setFiles((prev) => prev.filter((_, i) => i !== index))}
-              />
+            (!pending && files.length > 0) || reviewComments.length > 0 ? (
+              <>
+                {!pending && files.length > 0 && (
+                  <ComposerAttachments
+                    files={files}
+                    onRemove={(index) => setFiles((prev) => prev.filter((_, i) => i !== index))}
+                  />
+                )}
+                <ComposerLocalReviewChips comments={reviewComments} />
+              </>
             ) : undefined,
         }}
         actions={{

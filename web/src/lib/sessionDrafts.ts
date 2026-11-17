@@ -119,6 +119,16 @@ export function setSessionDraft(conversationId: string, draft: SessionDraft): vo
   notifyListeners();
 }
 
+/** Replace a session draft's tags, keeping its text, attachments and review comments. */
+export function setSessionMentions(
+  conversationId: string,
+  mentions: TaggedMentions | undefined,
+): void {
+  const tagged = mentions && (mentions.files.length > 0 || mentions.sessions.length > 0);
+  const draft = sessionDrafts.get(conversationId) ?? { text: "", files: [] };
+  setSessionDraft(conversationId, { ...draft, mentions: tagged ? mentions : undefined });
+}
+
 /** Remove a draft and ignore any late cleanup write for the retired id. */
 export function retireSessionDraft(conversationId: string): SessionDraft | undefined {
   const draft = sessionDrafts.get(conversationId);
