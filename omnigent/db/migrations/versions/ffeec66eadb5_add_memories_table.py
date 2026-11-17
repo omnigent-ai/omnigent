@@ -1,8 +1,18 @@
 """Add the ``memories`` table for long-term memory.
 
 Schema only: a new table keyed by ``(workspace_id, actor_type, actor_id, path)``
-that nothing reads or writes until the memory feature ships. Deployment and rollback order is in
-``docs/memories-table-migration.md``.
+that nothing reads or writes until the memory feature ships. This migration runs
+online.
+
+Deploy this revision before the feature, which stays off until a server sets
+``OMNIGENT_FEATURES=memory``. The feature release can roll back to this release
+at any time: the table stays and nothing reads it, and turning the flag off has
+the same effect without a deploy. A binary older than this revision rejects it at
+startup, so it is not a rollback target once a database has migrated.
+
+The downgrade drops the table and every stored memory. It is for development
+recovery; a production removal follows the staged procedure in
+``docs/DATABASE_BEST_PRACTICES.md``.
 """
 
 import sqlalchemy as sa
