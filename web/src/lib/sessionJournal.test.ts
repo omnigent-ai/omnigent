@@ -65,6 +65,14 @@ describe("latestStatusText", () => {
     expect(latestStatusText([entries[1]!, entries[3]!])).toBeNull();
     expect(latestStatusText([])).toBeNull();
   });
+
+  it("counts a started status that has words", () => {
+    const entries = [
+      status(2, "explore", "done", { content: { status: "done", text: "Found it" } }),
+      status(5, "fix", "started", { content: { status: "started", text: "Retrying the build" } }),
+    ];
+    expect(latestStatusText(entries)).toEqual({ status: "started", text: "Retrying the build" });
+  });
 });
 
 describe("mergeJournalEntries", () => {

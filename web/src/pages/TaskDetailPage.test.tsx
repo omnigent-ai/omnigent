@@ -1790,6 +1790,7 @@ describe("runs of a saved workflow", () => {
       run({ id: "run_1", status: "succeeded", conversationId: "c_9" }),
       run({ id: "run_2", status: "succeeded", conversationId: "c_8" }),
       run({ id: "run_3", status: "succeeded", conversationId: "c_7" }),
+      run({ id: "run_4", status: "succeeded", conversationId: "c_6" }),
     ]);
     const written = (position: number, step: string, status: string, text: string | null) => ({
       ...STEPS.statuses[0]!,
@@ -1826,11 +1827,22 @@ describe("runs of a saved workflow", () => {
             ],
           },
         ],
+        [
+          "run_4",
+          {
+            ...STEPS,
+            runId: "run_4",
+            statuses: [
+              written(1, "explore", "done", "Found it"),
+              written(2, "fix", "started", "Retrying the build"),
+            ],
+          },
+        ],
       ]),
     );
     renderWithWorkflows();
 
-    const [first, second, third] = screen
+    const [first, second, third, fourth] = screen
       .getAllByTestId("task-detail-run")
       .map((row) => within(row).getByTestId("run-status-text"));
     expect(first).toHaveTextContent("Done: Found it");
@@ -1843,6 +1855,9 @@ describe("runs of a saved workflow", () => {
     expect(second).toHaveAttribute("title", "CI is down");
     // A started step has no words, so the newest ones are shown.
     expect(third).toHaveTextContent("Waiting for you: Approve the deploy?");
+    // A started step that has words shows them, after its own prefix.
+    expect(fourth).toHaveTextContent("Started: Retrying the build");
+    expect(fourth).toHaveAttribute("data-run-status", "started");
   });
 
   it("shows no status text for a run without a plan, or whose agent gave no words", () => {
