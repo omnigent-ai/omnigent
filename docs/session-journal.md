@@ -110,7 +110,7 @@ spec can drop it with `tool_groups.journal: false` (see
 | Tool                                                               | Does                                                                                                                                                                                                                                                                            |
 | ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `sys_journal_read(conversation_id?, kind?, step?, cursor?, limit?)` | Returns entries as compact lines, oldest first within the page, and `page.next_cursor` for older ones. With no arguments it reads the caller's newest entries. `kind: "plan"` returns plans with their full graphs. Another session's journal needs read access to that session. |
-| `sys_journal_write_plan(name, steps, workflow_id?)`                | Sets the session's plan: its name and the whole graph; returns `{id, position, version}`. `workflow_id` names the saved workflow the plan starts a run of.                                                                                                                      |
+| `sys_journal_write_plan(name, steps, workflow_id?, description?)`  | Sets the session's plan: its name and the whole graph; returns `{id, position, version}`. `workflow_id` names the saved workflow the plan starts a run of. `description` is a workflow planning chat's proposed workflow description; the server refuses one too large to save as the workflow's. |
 | `sys_journal_write_status(status, step?, text?)`                    | Records a step's status. `step` may be left out when the plan has one step. Every status needs every step it depends on to be done first; otherwise the write fails with `step_not_ready`, naming them.                                                                         |
 | `sys_journal_write_note(body, step?)`                               | Adds a note.                                                                                                                                                                                                                                                                    |
 | `sys_workflow_request_input(step, questions)`                      | Asks the user about a task in the current plan and waits a few minutes for the answer. It marks the task `needs_input` with the first question, raises the questions as an elicitation in the Inbox with the options as buttons, and returns `{answered, answers}`, or `{answered: false, still_open: true}` when no answer came in time; a later answer reaches the session as a message. |
@@ -205,7 +205,12 @@ and the agent writes its plan in the journal and saves it without another
 confirmation. An explicit request to draft, review or try it before saving
 still controls that order. Creating a workflow does not run its steps.
 In the workflow page's planning chat, the agent publishes proposals only;
-**Save plan** applies them to the workflow that already exists.
+**Save plan** applies them to the workflow that already exists. Each proposal
+carries a description written for its steps, which the page shows until you
+save and Save plan stores with them. A proposal replaces the description only
+if it is newer than where that description came from: the proposal it was
+saved from, or else the workflow's last change. A description another client
+saved after the page loaded stays.
 
 Authoring reads the referenced SOPs, runbooks and relevant linked procedures
 before proposing execution steps. The plan carries forward their actions,
@@ -408,7 +413,11 @@ it ran.
 - `GET /v1/workflows/{id}`: one workflow, with its steps. Another user's
   workflow is 404.
 - `PATCH /v1/workflows/{id}`: any of `name`, `description` and `steps`; fields
-  left out keep their values.
+  left out keep their values. With `expected_description`, the new description
+  applies only while the stored one is still that text. `description_source`
+  names the planning-chat proposal the description comes from; the workflow
+  returns it until the description is written without one or another planning
+  chat is attached.
 - `DELETE /v1/workflows/{id}`: deletes it.
 
 Workflows live in `workflows`, keyed by workspace and ID, with encoded JSON

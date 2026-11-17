@@ -1,6 +1,9 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { authenticatedFetch } from "@/lib/identity";
+import type * as IdentityModule from "@/lib/identity";
 import { journalEntry, journalPlan as plan } from "@/test/journalFixtures";
 import {
+  fetchJournalEntryPosition,
   currentPlan,
   failedUpstream,
   finishedTaskCount,
@@ -22,6 +25,11 @@ import {
   type JournalEntry,
   type NativeTask,
 } from "./sessionJournal";
+
+vi.mock("@/lib/identity", async (importOriginal) => ({
+  ...(await importOriginal<typeof IdentityModule>()),
+  authenticatedFetch: vi.fn(),
+}));
 
 const RUN = "0b6c5f0d8a7e4c3b9a1d2e3f4a5b6c7d";
 
@@ -564,5 +572,29 @@ describe("taskPreviewText", () => {
       false,
     );
     expect(taskPreviewText(heldUp)).toBe("Failed: fix");
+  });
+});
+
+describe("fetchJournalEntryPosition", () => {
+  const respond = (body: unknown, code = 200) =>
+    vi
+      .mocked(authenticatedFetch)
+      .mockResolvedValueOnce(new Response(JSON.stringify(body), { status: code }));
+
+  it("places an entry just after the one before it, or first", async () => {
+    respond({ object: "list", data: [{ position: 4 }] });
+    await expect(fetchJournalEntryPosition("session", "entry")).resolves.toBe(5);
+    expect(vi.mocked(authenticatedFetch).mock.calls.at(-1)?.[0]).toBe(
+      "/v1/sessions/session/journal?order=desc&after=entry&limit=1",
+    );
+    respond({ object: "list", data: [] });
+    await expect(fetchJournalEntryPosition("session", "entry")).resolves.toBe(0);
+  });
+
+  it("reports an entry the journal doesn't hold, and rejects other failures", async () => {
+    respond({ error: { code: "stale_cursor", message: "stale_cursor: no such entry" } }, 400);
+    await expect(fetchJournalEntryPosition("session", "elsewhere")).resolves.toBeNull();
+    respond({ error: { code: "server_error", message: "Try again" } }, 500);
+    await expect(fetchJournalEntryPosition("session", "entry")).rejects.toThrow("500");
   });
 });
