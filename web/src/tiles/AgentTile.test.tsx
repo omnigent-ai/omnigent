@@ -2,7 +2,7 @@ import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
-import { AgentTile, type AgentTileVariant } from "./AgentTile";
+import { AgentTile, type AgentTileVariant, type TileReorder } from "./AgentTile";
 
 // The chat pane has its own suite; the stub records how the tile configures it.
 vi.mock("@/components/chat/SideChatPane", () => ({
@@ -41,6 +41,8 @@ function renderTile(
     variant: AgentTileVariant;
     starred: boolean;
     onToggleStar: (conversation: Conversation) => void;
+    onToggleFullScreen: (sessionId: string) => void;
+    reorder: TileReorder;
   }> & {
     conversation?: Conversation;
   } = {},
@@ -58,6 +60,8 @@ function renderTile(
         onOpenSingle={onOpenSingle}
         starred={props.starred}
         onToggleStar={props.onToggleStar}
+        onToggleFullScreen={props.onToggleFullScreen}
+        reorder={props.reorder}
       />
     </TooltipProvider>,
   );
@@ -135,5 +139,26 @@ describe("AgentTile", () => {
 
     fireEvent.click(title);
     expect(screen.queryByTestId("tile-details")).not.toBeInTheDocument();
+  });
+
+  it("moves with the arrow keys on its reorder handle", () => {
+    const reorder = { onMove: vi.fn(), onMoveBy: vi.fn() };
+    renderTile({ reorder });
+    const handle = screen.getByTestId("tile-reorder-handle");
+    fireEvent.keyDown(handle, { key: "ArrowRight" });
+    fireEvent.keyDown(handle, { key: "ArrowUp" });
+    expect(reorder.onMoveBy.mock.calls).toEqual([
+      ["conv_1", 1],
+      ["conv_1", -1],
+    ]);
+  });
+
+  it("goes full screen from its button or a title double-click", () => {
+    const onToggleFullScreen = vi.fn();
+    const { onActivate } = renderTile({ onToggleFullScreen });
+    fireEvent.click(screen.getByRole("button", { name: "Full screen Fix authentication" }));
+    fireEvent.doubleClick(screen.getByTestId("agent-tile-title"));
+    expect(onToggleFullScreen).toHaveBeenCalledTimes(2);
+    expect(onActivate).not.toHaveBeenCalled();
   });
 });
