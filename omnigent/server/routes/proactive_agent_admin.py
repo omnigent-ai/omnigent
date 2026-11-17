@@ -105,11 +105,13 @@ def create_proactive_agent_admin_router(
     async def require_admin(request: Request) -> None:
         if not offered():
             raise HTTPException(status_code=404, detail="not found")
+        # Authenticate first: a server without a permission store still checks
+        # who is calling, it just has no admins to compare against.
+        user_id = require_user(request, auth_provider) or RESERVED_USER_LOCAL
         # The CLI gives a local single-user server a permission store too, and
         # its one user is no administrator in it; the settings routes agree.
         if permission_store is None or local_single_user_enabled():
             return
-        user_id = require_user(request, auth_provider) or RESERVED_USER_LOCAL
         if not await asyncio.to_thread(permission_store.is_admin, user_id):
             raise OmnigentError(
                 "Admin privileges required to manage the proactive agent",
@@ -134,8 +136,16 @@ def create_proactive_agent_admin_router(
     @router.put("/proactive-agent/prompt", response_model=ProactiveAgentPrompt)
     async def set_prompt(request: Request, body: SetProactiveAgentPrompt) -> ProactiveAgentPrompt:
         prompt = body.prompt if body.prompt and body.prompt.strip() else None
+        actor = require_user(request, auth_provider) or RESERVED_USER_LOCAL
         try:
-            await asyncio.to_thread(store.set_prompt_override, prompt)
+            # The store re-checks the actor under its account lock as it writes.
+            await asyncio.to_thread(
+                lambda: store.set_prompt_override(
+                    prompt,
+                    actor=actor,
+                    require_admin=permission_store is not None and not local_single_user_enabled(),
+                )
+            )
         except ValueError as exc:
             raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
         # A new bundle version: the next run of every user's task uses it.
