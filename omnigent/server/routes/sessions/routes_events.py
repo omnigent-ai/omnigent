@@ -742,10 +742,9 @@ async def _resume_codex_side_chat(
     user_id: str | None,
     permission_store: PermissionStore | None,
 ) -> Conversation:
-    """Restore a native side thread on its parent's authorized live runner."""
+    """Use a live side thread or restore it through its parent."""
     from omnigent.harnesses.claude_native.bridge import url_component
 
-    live_runner_id = None
     if (
         conv.parent_conversation_id is not None
         and conv.runner_id is not None
@@ -759,7 +758,7 @@ async def _resume_codex_side_chat(
             and parent.runner_id == conv.runner_id
             and await _get_runner_client(parent.id, runner_router, conversation=parent) is not None
         ):
-            live_runner_id = conv.runner_id
+            return conv
     runner_client, conv = await _recover_side_chat_runner_via_source(
         conv,
         app_state=request.app.state,
@@ -815,19 +814,6 @@ async def _resume_codex_side_chat(
     if not isinstance(payload, dict):
         payload = {}
     resumed = response.status_code == 200 and payload.get("resumed") is True
-    # Older runners send unknown controls to the subprocess path, which native chats bypass.
-    if (
-        live_runner_id is not None
-        and conv.runner_id == live_runner_id
-        and (
-            (response.status_code < 400 and "resumed" not in payload)
-            or (
-                response.status_code in (409, 503)
-                and payload.get("error") in ("no_live_harness", "no_harness")
-            )
-        )
-    ):
-        return conv
     if response.status_code >= 400:
         from omnigent.server.routes._sessions.orchestration import _codex_side_chat_runner_error
 

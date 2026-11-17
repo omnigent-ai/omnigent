@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, Mock
 
 import httpx
 import pytest
+from fastapi import FastAPI
 
 from omnigent.db.utils import generate_agent_id
 from omnigent.entities import Conversation
@@ -134,17 +135,16 @@ async def test_side_chat_binding_unchanged_when_source_runner_unavailable(
     [
         ("replaced", 200, {"resumed": True}, True),
         ("unavailable", 200, {"resumed": True}, False),
-        ("live", 200, {"queued": False}, True),
-        ("live", 409, {"error": "no_live_harness"}, True),
-        ("live", 503, {"error": "no_harness"}, True),
+        ("live", 422, {"detail": [{"type": "union_tag_invalid"}]}, True),
         ("closed", 200, {"queued": False}, False),
         ("closed", 409, {"error": "no_live_harness"}, False),
+        ("closed", 422, {"detail": [{"type": "union_tag_invalid"}]}, False),
         ("unbound", 503, {"error": "no_harness"}, False),
         ("mismatched", 200, {"queued": False}, False),
         ("advanced", 409, {"error": "no_live_harness"}, False),
         ("offline", 503, {"error": "no_harness"}, False),
-        ("live", 503, {"error": "codex_side_chat_unavailable"}, False),
-        ("live", 200, {"resumed": False}, False),
+        ("closed", 503, {"error": "codex_side_chat_unavailable"}, False),
+        ("closed", 200, {"resumed": False}, False),
     ],
 )
 async def test_native_side_chat_resume_revalidates_runner_after_parent_initialization(
@@ -164,7 +164,7 @@ async def test_native_side_chat_resume_revalidates_runner_after_parent_initializ
     )
     if state == "mismatched":
         store.replace_runner_id(side.id, "runner-stale")
-    closed = state in ("replaced", "unavailable", "closed")
+    closed = state in ("replaced", "unavailable", "closed", "advanced")
     store.set_labels(
         side.id,
         {
@@ -202,9 +202,11 @@ async def test_native_side_chat_resume_revalidates_runner_after_parent_initializ
         if state in ("replaced", "unavailable", "advanced"):
             store.replace_runner_id(source.id, "runner-next")
 
-    monkeypatch.setattr(orchestration, "ensure_runner_connected", ensure)
+    ensure_connected = AsyncMock(side_effect=ensure)
+    initialize = AsyncMock(side_effect=initialize_parent)
+    monkeypatch.setattr(orchestration, "ensure_runner_connected", ensure_connected)
     monkeypatch.setattr(sessions, "_get_runner_client", client_for)
-    monkeypatch.setattr(routes_events, "_recover_retry_session", initialize_parent)
+    monkeypatch.setattr(routes_events, "_recover_retry_session", initialize)
     kwargs = {
         "request": SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace())),
         "conv": side,
@@ -230,7 +232,11 @@ async def test_native_side_chat_resume_revalidates_runner_after_parent_initializ
             else ErrorCode.RUNNER_UNAVAILABLE
         )
         assert (store.get_conversation(side.id).labels.get("omnigent.closed") == "true") == closed
-    if state == "unavailable":
+    if state == "live":
+        ensure_connected.assert_not_awaited()
+        initialize.assert_not_awaited()
+        first_runner.post.assert_not_awaited()
+    elif state == "unavailable":
         next_runner.post.assert_not_awaited()
     else:
         expected_runner.post.assert_awaited_once_with(
@@ -357,6 +363,7 @@ async def test_side_chat_recovery_follows_source_only_advancement(
 
 @pytest.mark.parametrize("native", [False, True], ids=["generic", "codex-native"])
 async def test_side_chat_recovery_gates_on_source_edit_access_at_the_routes(
+    auth_app: FastAPI,
     auth_client: httpx.AsyncClient,
     client: httpx.AsyncClient,
     db_uri: str,
@@ -368,7 +375,8 @@ async def test_side_chat_recovery_gates_on_source_edit_access_at_the_routes(
     Protects ``user_id``/``permission_store`` propagation through the message
     and Resume entry points: a caller who can edit the side chat but not its
     source gets the plain unavailable error with no recovery attempt, while
-    the source's owner reaches recovery through the same routes.
+    the source's owner reaches recovery. An editor may use an existing live
+    native binding without owning its runner.
     """
     store = SqlAlchemyConversationStore(db_uri)
     permissions = SqlAlchemyPermissionStore(db_uri)
@@ -443,6 +451,46 @@ async def test_side_chat_recovery_gates_on_source_edit_access_at_the_routes(
     assert [c.kwargs["session_id"] for c in ensure.await_args_list] == (
         [source.id] if native else [side.id, source.id]
     )
+    if native:
+        permissions.grant(_OTHER, source.id, LEVEL_READ)
+        store.set_host_id(source.id, _HOST_ID, workspace="/workspace")
+        runner = AsyncMock()
+        runner.post.return_value = httpx.Response(202)
+        ensure.reset_mock()
+        ensure.side_effect = None
+        ensure.return_value = (runner, store.get_conversation(source.id))
+        monkeypatch.setattr(
+            auth_app.state.runner_router, "runner_owner", Mock(return_value=_OWNER)
+        )
+        monkeypatch.setattr(sessions, "_get_runner_client", AsyncMock(return_value=runner))
+        monkeypatch.setattr(routes_events, "_ensure_runner_relay_ready", AsyncMock())
+
+        read_only = await auth_client.post(
+            f"/v1/sessions/{side.id}/events",
+            json=message,
+            headers={"X-Forwarded-Email": _OTHER},
+        )
+        assert read_only.status_code == 403, read_only.text
+        ensure.assert_not_awaited()
+        runner.post.assert_not_awaited()
+
+        permissions.grant(_OTHER, source.id, LEVEL_EDIT)
+        edited = await auth_client.post(
+            f"/v1/sessions/{side.id}/events",
+            json=message,
+            headers={"X-Forwarded-Email": _OTHER},
+        )
+
+        assert edited.status_code == 202, edited.text
+        ensure.assert_not_awaited()
+        runner.post.assert_awaited_once_with(
+            f"/v1/sessions/{source.id}/events",
+            json={
+                "type": "message",
+                "content": message["data"]["content"],
+                "codex_side_thread_id": "thread-side",
+            },
+        )
 
 
 @pytest.mark.parametrize(
