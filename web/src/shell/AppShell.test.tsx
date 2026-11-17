@@ -6908,13 +6908,16 @@ describe("mark-unread shortcut", () => {
     renderShell("/c/conv_linked");
     const pressShortcut = () =>
       fireEvent.keyDown(window, { key: "u", code: "KeyU", ctrlKey: true, altKey: true });
-    pressShortcut();
-    expect(isExplicitlyUnread("conv_linked")).toBe(true);
-    expect(isConversationUnseen("conv_linked", 6_000, "idle")).toBe(true);
-    pressShortcut();
-    expect(isExplicitlyUnread("conv_linked")).toBe(false);
-    expect(isConversationUnseen("conv_linked", 6_000, "idle")).toBe(false);
-    now.mockRestore();
+    try {
+      pressShortcut();
+      expect(isExplicitlyUnread("conv_linked")).toBe(true);
+      expect(isConversationUnseen("conv_linked", 6_000, "idle")).toBe(true);
+      pressShortcut();
+      expect(isExplicitlyUnread("conv_linked")).toBe(false);
+      expect(isConversationUnseen("conv_linked", 6_000, "idle")).toBe(false);
+    } finally {
+      now.mockRestore();
+    }
   });
 
   it("leaves a sub-agent session's read state alone", () => {

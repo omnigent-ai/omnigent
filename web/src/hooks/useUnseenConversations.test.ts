@@ -341,6 +341,20 @@ describe("toggleConversationUnread", () => {
     expect(reloaded.isExplicitlyUnread("conv-1")).toBe(false);
     expect(reloaded.isConversationUnseen("conv-1", 5_000, "idle")).toBe(false);
   });
+
+  it("keeps an unread mark made before the first list response arrives", async () => {
+    const mod = await loadFresh();
+    vi.useFakeTimers({ now: 6_000_000 });
+    expect(mod.toggleConversationUnread("conv-1", 5_000)).toBe(true);
+
+    // The in-flight list response still says the session was read.
+    mod.seedReadState([
+      { id: "conv-1", viewer_last_seen: 5_000, viewer_unread: false, updated_at: 5_000 },
+    ]);
+
+    expect(mod.isExplicitlyUnread("conv-1")).toBe(true);
+    expect(mod.isConversationUnseen("conv-1", 5_000, "idle")).toBe(true);
+  });
 });
 
 describe("clearUnreadOverride", () => {
