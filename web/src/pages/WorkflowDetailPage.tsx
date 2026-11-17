@@ -165,16 +165,15 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
   // A proposal replaces the description only if it's newer than where the description came
   // from, so an edit made since stands: the proposal Save plan took it from, by journal order,
   // or else the workflow's last write, in whole seconds, where a tie keeps the description.
-  // A source outside the loaded journal predates the oldest entry loaded.
+  // A source outside the loaded journal predates the oldest entry loaded; with the whole
+  // journal loaded, a source it lacks came from an earlier planning chat.
   const source = workflow.description_source;
   const savedFrom = source ? journal.entries.find((entry) => entry.id === source) : undefined;
   const proposalIsNewer =
     proposal !== null &&
-    (source
-      ? savedFrom
-        ? proposal.position > savedFrom.position
-        : journal.hasOlder
-      : proposal.created_at > (workflow.updated_at ?? 0));
+    (savedFrom
+      ? proposal.position > savedFrom.position
+      : (!!source && journal.hasOlder) || proposal.created_at > (workflow.updated_at ?? 0));
   const proposedDescription = proposalIsNewer ? planDescription(proposal) : null;
   const newDescription =
     proposedSteps?.length && proposedDescription !== workflow.description

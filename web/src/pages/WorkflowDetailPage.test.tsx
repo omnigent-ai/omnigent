@@ -871,6 +871,37 @@ describe("WorkflowDetailPage", () => {
       });
     });
 
+    it("offers a newer proposal when the saved one came from an earlier planning chat", async () => {
+      const stored: WorkflowDetail = {
+        ...WORKFLOW,
+        description: "Fixes one flaky test.",
+        description_source: "f".repeat(32),
+        planning_session_id: "a".repeat(32),
+        updated_at: 500,
+      };
+      const newer = {
+        ...saved,
+        id: "newer",
+        created_at: 600,
+        content: { steps: WORKFLOW.steps, description: "Fixes flaky tests." },
+      };
+      await renderWith(newer, () => stored);
+      vi.mocked(useSessionJournal).mockReturnValue({
+        entries: [newer],
+        isLoading: false,
+        error: null,
+        hasOlder: false,
+        loadingOlder: false,
+        loadOlder: vi.fn(),
+        retry: vi.fn(),
+      });
+      cleanup();
+      renderPage();
+      await screen.findByTestId("workflow-detail-title");
+      expect(description()).toBe("Fixes flaky tests.");
+      expect(screen.getByRole("status")).toHaveTextContent("Unsaved changes");
+    });
+
     it("offers a newer proposal when the one saved is older than the loaded journal", async () => {
       const actual = await vi.importActual<typeof WorkflowHooks>("@/hooks/useWorkflow");
       vi.mocked(useWorkflow).mockImplementation(actual.useWorkflow);
