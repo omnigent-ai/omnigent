@@ -295,6 +295,9 @@ describe.each([
   "scheduled_task_sandbox_workspaces",
   "scheduled_task_inbox",
   "scheduled_task_sharing",
+  "scheduled_task_shared_with_me",
+  "proactive_agent_available",
+  "session_create_workflow_id",
 ] as const)("resolveServerInfo %s", (capability) => {
   it.each([
     [true, true],
@@ -322,6 +325,17 @@ it.each([
   expect(
     (await probe({ automation_trigger_poll_minutes: advertised })).automation_trigger_poll_minutes,
   ).toBe(expected);
+});
+
+it.each([
+  [32000, 32000],
+  [undefined, undefined],
+  [0, undefined],
+  ["32000", undefined],
+])("parses the session message limit %j as %j", async (advertised, expected) => {
+  expect((await probe({ session_message_max_chars: advertised })).session_message_max_chars).toBe(
+    expected,
+  );
 });
 
 describe("resolveServerInfo scheduled_task_session_modes", () => {

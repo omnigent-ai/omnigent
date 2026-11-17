@@ -19,6 +19,8 @@ import { authenticatedFetch } from "./identity";
 import { isAndroidShell, isElectronShell, isIOSShell } from "@/lib/nativeBridge";
 import { sessionRoutingHostId, setSessionHost, setSessionParent } from "./sessionHost";
 import { backgroundSessionTitlesRequestHeaders } from "./backgroundSessionTitlesPreferences";
+import { browserAgentToolsRequestHeaders } from "@/components/BrowserPane/agentTools/preferences";
+import { timezoneRequestHeaders } from "./timezones";
 import { parseBackgroundTasks } from "./sse";
 import type {
   BackgroundTaskInfo,
@@ -680,6 +682,7 @@ export async function createSession(
       "Content-Type": "application/json",
       "X-Omnigent-Client": getClientSurface(),
       ...backgroundSessionTitlesRequestHeaders(),
+      ...timezoneRequestHeaders(),
     },
     body: JSON.stringify(body),
   });
@@ -755,7 +758,11 @@ export async function importLocalSessions(
   const body = { host_id: hostId, source, limit, session_id: sessionId };
   const res = await authenticatedFetch("/v1/imports/local/stream", {
     method: "POST",
-    headers: { "Content-Type": "application/json", "X-Omnigent-Client": getClientSurface() },
+    headers: {
+      "Content-Type": "application/json",
+      "X-Omnigent-Client": getClientSurface(),
+      ...browserAgentToolsRequestHeaders(),
+    },
     body: JSON.stringify(body),
   });
   // Older server without the streaming endpoint: fall back to the buffered
@@ -862,7 +869,11 @@ async function importLocalSessionsBuffered(
 ): Promise<LocalImportResult> {
   const res = await authenticatedFetch("/v1/imports/local", {
     method: "POST",
-    headers: { "Content-Type": "application/json", "X-Omnigent-Client": getClientSurface() },
+    headers: {
+      "Content-Type": "application/json",
+      "X-Omnigent-Client": getClientSurface(),
+      ...browserAgentToolsRequestHeaders(),
+    },
     body: JSON.stringify({ host_id: hostId, source, limit }),
   });
   const wire = await readJsonOrThrow<{
@@ -939,6 +950,7 @@ export async function createBundledSession(
     headers: {
       "X-Omnigent-Client": getClientSurface(),
       ...backgroundSessionTitlesRequestHeaders(),
+      ...timezoneRequestHeaders(),
     },
     body: form,
   });
@@ -1092,7 +1104,11 @@ export async function forkSession(
   }
   const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sourceId)}/fork`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", "X-Omnigent-Client": getClientSurface() },
+    headers: {
+      "Content-Type": "application/json",
+      "X-Omnigent-Client": getClientSurface(),
+      ...browserAgentToolsRequestHeaders(), // this app's advanced browser tools switch
+    },
     body: JSON.stringify(body),
   });
   return sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res));

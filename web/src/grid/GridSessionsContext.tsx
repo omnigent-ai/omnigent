@@ -178,6 +178,15 @@ function EnabledGridSessionsProvider({ children }: { children: ReactNode }) {
   return <GridSessionsContext.Provider value={value}>{children}</GridSessionsContext.Provider>;
 }
 
-export function gridTitle(grid: SessionGrid): string {
-  return `${grid.name || "Grid"} · ${gridSessionIds(grid.layout).length} sessions`;
+/** The grid's name, or its sessions' titles in pane order. */
+export function gridTitle(
+  grid: SessionGrid,
+  sessionTitles: ReadonlyMap<string, string | null | undefined>,
+): string {
+  return (
+    grid.name ||
+    gridSessionIds(grid.layout)
+      .map((id) => sessionTitles.get(id) || "Session")
+      .join(" + ")
+  );
 }

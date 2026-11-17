@@ -564,7 +564,8 @@ export function PermissionsModal(props: PermissionsModalProps) {
               </Button>
             </div>
           )}
-          <Button variant="outline" onClick={() => onOpenChange(false)}>
+          {/* Right-aligned with or without the link buttons, e.g. for an automation. */}
+          <Button variant="outline" className="sm:ml-auto" onClick={() => onOpenChange(false)}>
             Done
           </Button>
         </DialogFooter>

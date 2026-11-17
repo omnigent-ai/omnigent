@@ -20,11 +20,13 @@ import {
   useScheduledTaskRuns,
   useScheduledTaskRunSteps,
   useScheduledTasks,
+  useSharedScheduledTasks,
   useUpdateScheduledTask,
 } from "./useScheduledTasks";
 
 vi.mock("@/lib/scheduledTasksApi", () => ({
   listScheduledTasks: vi.fn(),
+  listSharedScheduledTasks: vi.fn(),
   getScheduledTask: vi.fn(),
   listScheduledTaskRuns: vi.fn(),
   listScheduledTaskRunSteps: vi.fn(),
@@ -47,6 +49,7 @@ const TASK: api.ScheduledTask = {
   modelOverride: null,
   reasoningEffort: null,
   permissionMode: null,
+  mcpServices: [],
   sessionMode: "new",
   sessionId: null,
   workspace: null,
@@ -105,6 +108,41 @@ describe("useScheduledTasks", () => {
     const { result } = renderHook(() => useScheduledTasks(), { wrapper });
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
     expect(result.current.data).toEqual([TASK]);
+  });
+});
+
+describe("useSharedScheduledTasks", () => {
+  const SHARED = { ...TASK, id: "st_shared", viewerRole: "viewer" as const };
+
+  it("pages by cursor and paints the shared task's detail from its cache", async () => {
+    vi.mocked(api.listSharedScheduledTasks)
+      .mockResolvedValueOnce({ tasks: [], nextCursor: "st_0" })
+      .mockResolvedValueOnce({ tasks: [SHARED], nextCursor: null });
+    let resolveDetail: (task: api.ScheduledTask) => void = () => {};
+    vi.mocked(api.getScheduledTask).mockReturnValue(
+      new Promise((resolve) => {
+        resolveDetail = resolve;
+      }),
+    );
+    const { wrapper } = makeWrapper();
+    const { result } = renderHook(() => useSharedScheduledTasks(true), { wrapper });
+    await waitFor(() => expect(result.current.hasNextPage).toBe(true));
+    expect(api.listSharedScheduledTasks).toHaveBeenLastCalledWith(null);
+    await act(() => result.current.fetchNextPage());
+    await waitFor(() => expect(result.current.hasNextPage).toBe(false));
+    expect(api.listSharedScheduledTasks).toHaveBeenLastCalledWith("st_0");
+    expect(result.current.data?.pages.flatMap((page) => page.tasks)).toEqual([SHARED]);
+
+    const detail = renderHook(() => useScheduledTask("st_shared"), { wrapper });
+    expect(detail.result.current.data).toEqual(SHARED);
+    resolveDetail(SHARED);
+  });
+
+  it("does not fetch while disabled", () => {
+    vi.mocked(api.listSharedScheduledTasks).mockClear();
+    const { wrapper } = makeWrapper();
+    renderHook(() => useSharedScheduledTasks(false), { wrapper });
+    expect(api.listSharedScheduledTasks).not.toHaveBeenCalled();
   });
 });
 
@@ -388,6 +426,32 @@ describe("useScheduledTaskRuns live refresh", () => {
     await refreshSession("running", 3);
     await refreshSession("idle", 4);
     expect(api.listScheduledTaskRunSteps).toHaveBeenCalledTimes(7);
+  });
+
+  it("asks for no steps while disabled, even with a run in flight", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: false });
+    try {
+      const { wrapper } = makeWrapper();
+      // A viewer's history: in flight, with none of its session's data.
+      const runs = [{ ...RUNNING_RUN, conversationStatus: null, conversationUpdatedAt: null }];
+      vi.mocked(api.listScheduledTaskRunSteps).mockResolvedValueOnce([]);
+      const { rerender } = renderHook(
+        ({ enabled }) => useScheduledTaskRunSteps("st_1", runs, enabled),
+        { wrapper, initialProps: { enabled: false } },
+      );
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000);
+      });
+      expect(api.listScheduledTaskRunSteps).not.toHaveBeenCalled();
+
+      rerender({ enabled: true });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(api.listScheduledTaskRunSteps).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("keeps refetching a >20s run until it settles, WITHOUT a remount", async () => {

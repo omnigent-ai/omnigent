@@ -74,6 +74,7 @@ from omnigent.stores.conversation_store import (
     SCHEDULED_TASK_SOURCE_LABEL_KEY,
     SessionActivity,
 )
+from omnigent.stores.permission_store import PermissionStore
 from tests.server.helpers import build_agent_bundle
 
 # The trigger form's saved state; see encodeTriggerPrompt in web/.../triggerTemplates.ts.
@@ -497,6 +498,11 @@ class FakePermissionStore:
     def list_for_session(self, conversation_id: str, **_: Any) -> tuple[list[Any], None]:
         return [SessionPermission(*g) for g in self.grants if g[1] == conversation_id], None
 
+    # Its session reads are already direct, as the store defaults assume.
+    get_direct = PermissionStore.get_direct
+    list_direct_for_session = PermissionStore.list_direct_for_session
+    public_grantees = PermissionStore.public_grantees
+
     def delete_for_scheduled_task(self, scheduled_task_id: str) -> int:
         self.deleted_task_grants.append(scheduled_task_id)
         return 0
@@ -807,9 +813,11 @@ async def test_active_creates_session_grant_and_run(
     assert not [
         k for k in conv_store.created[0]["labels"] if k.startswith("omnigent.mcp_service.")
     ]
-    assert conv_store.created[0]["title"] == (
-        "[automation job] nightly" if trigger and session_mode == "continue" else "nightly"
-    )
+    title = conv_store.created[0]["title"]
+    if session_mode == "continue":
+        assert title == ("[automation job] nightly" if trigger else "nightly")
+    else:
+        assert re.fullmatch(r"nightly \(\d{4}-\d{2}-\d{2} \d{2}:\d{2}\)", title)
     # NULL owner resolved to "local" and granted LEVEL_OWNER.
     assert perm.ensured == [RESERVED_USER_LOCAL]
     assert perm.grants and perm.grants[0][0] == RESERVED_USER_LOCAL
@@ -1644,6 +1652,7 @@ async def test_sent_prompt_tells_the_agent_no_one_is_watching(
         sessions_routes, "_dispatch_session_event_to_runner", _dispatch_session_event_to_runner
     )
     task = _task(prompt=f"{header}Merge the open Dependabot PRs.\n")
+    monkeypatch.setattr(fire_mod.time, "time", lambda: 1_794_895_414.9)
 
     await fire_mod._send_prompt(
         _deps(FakeScheduledTaskStore(rows={"task_1": task})),
@@ -1656,7 +1665,8 @@ async def test_sent_prompt_tells_the_agent_no_one_is_watching(
         [
             {
                 "type": "input_text",
-                "text": f"Merge the open Dependabot PRs.\n\n{fire_mod.UNATTENDED_RUN_NOTE}",
+                "text": "Merge the open Dependabot PRs.\n\n"
+                + fire_mod.unattended_run_note(1_794_895_414),
             }
         ]
     ]
@@ -2414,9 +2424,13 @@ async def test_managed_fire_saves_prompt_then_launches_fresh_sandbox(
     assert [label[REQUESTED_HOST_ID_LABEL_KEY] for label in labels] == launched_host_ids
     for saved in startup.enqueued:
         assert saved["user_id"] == RESERVED_USER_LOCAL
-        assert saved["event"].data["content"] == [
-            {"type": "input_text", "text": f"do the thing\n\n{fire_mod.UNATTENDED_RUN_NOTE}"}
-        ]
+        [content] = saved["event"].data["content"]
+        assert content["type"] == "input_text"
+        run_time = re.search(r"\(Unix time (\d+)\)", content["text"])
+        assert run_time is not None
+        assert content["text"] == "do the thing\n\n" + fire_mod.unattended_run_note(
+            int(run_time.group(1))
+        )
         assert saved["headers"].get("x-omnigent-background-session-titles") == "on"
     for call in managed_launch.await_args_list:
         assert call.kwargs["sandbox_config"] is config
@@ -4536,6 +4550,34 @@ def test_session_approval_skipping_mode(
     assert fire_mod.session_approval_skipping_mode(conv) == expected
 
 
+def test_unattended_run_note_opens_with_the_run_time_in_utc() -> None:
+    note = fire_mod.unattended_run_note(1_794_895_414.9)
+
+    assert note == fire_mod.UNATTENDED_RUN_NOTE.replace(
+        "<omnigent-automation-context>\n",
+        "<omnigent-automation-context>\nRun time: 2026-11-17T06:03:34Z (Unix time 1794895414).\n",
+    )
+
+
+def test_new_session_run_titles_carry_the_fire_time_in_the_task_timezone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 2026-11-13 17:05 UTC.
+    monkeypatch.setattr(fire_mod.time, "time", lambda: 1_794_589_500.0)
+
+    assert fire_mod._scheduled_session_title(_task(name="NHPC rollout check")) == (
+        "NHPC rollout check (2026-11-13 17:05)"
+    )
+    assert fire_mod._scheduled_session_title(
+        _task(name="NHPC rollout check", timezone="America/Los_Angeles")
+    ) == ("NHPC rollout check (2026-11-13 09:05)")
+    assert fire_mod._scheduled_session_title(_task(timezone="Not/AZone")) == (
+        "nightly (2026-11-13 17:05)"
+    )
+    # A continued session spans many runs, so one run's time would mislabel it.
+    assert fire_mod._scheduled_session_title(_task(session_mode="continue")) == "nightly"
+
+
 # ── Runs that start from a copy of a session ───────────────────────────────
 
 
@@ -4562,11 +4604,8 @@ async def test_a_run_starts_from_a_copy_of_the_source_session() -> None:
 
     assert conv_store.created == []
     (fork,) = conv_store.forked
-    assert (fork["source_id"], fork["agent_id"], fork["title"]) == (
-        "conv_source",
-        "ag_1",
-        "nightly",
-    )
+    assert (fork["source_id"], fork["agent_id"]) == ("conv_source", "ag_1")
+    assert fork["title"].startswith("nightly (")
     # The run rebuilds its native transcript from its own copy, never another session's file.
     assert fork["resume_source_native_session"] is False
     # It plans its own work: the source's journal stays behind.

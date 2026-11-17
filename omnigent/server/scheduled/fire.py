@@ -23,7 +23,8 @@ firing:
    with the automation's grantees (:mod:`~omnigent.server.scheduled.run_sharing`).
 #. **Launches the runner and dispatches the prompt** so the agent actually runs
    (a seeded prompt with no launched runner would just sit as history). The
-   message ends with :data:`UNATTENDED_RUN_NOTE`, since no one watches the run.
+   message ends with :data:`UNATTENDED_RUN_NOTE`, since no one watches the run;
+   the note opens with the run time.
 #. **Records the run** — stamps ``last_run_at`` + ``last_run_conversation_id`` on
    the task row and writes a ``scheduled_task_runs`` history row.
 
@@ -70,8 +71,10 @@ import uuid
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Literal, Protocol
+from zoneinfo import ZoneInfo
 
 from fastapi import HTTPException
 from sqlalchemy.exc import IntegrityError
@@ -96,6 +99,7 @@ from omnigent.server.managed_hosts import (
     parse_repo_workspace,
     read_managed_repo_workspaces,
 )
+from omnigent.server.proactive_agent import fire_skip_reason, is_proactive_task
 from omnigent.server.routes._session_create_validation import (
     validate_existing_host_workspace,
     validate_session_agent,
@@ -130,6 +134,7 @@ from omnigent.server.scheduled.schedule import (
     continued_sandbox_host_id,
     is_trigger_automation,
     strip_trigger_header,
+    task_timezone,
 )
 from omnigent.server.scheduled.source_session import (
     SourceCopyIncompleteError,
@@ -446,14 +451,23 @@ class _NewRunRecorder:
 def _scheduled_session_title(task: ScheduledTask) -> str:
     if is_trigger_automation(task):
         return f"[automation job] {task.name}"
-    return task.name
+    if task.session_mode == "continue":
+        return task.name
+    # Every run of a new-session task would otherwise share the task's name,
+    # leaving the sidebar with a column of identical titles.
+    return f"{task.name} ({format_run_time(time.time(), task_timezone(task))})"
+
+
+def format_run_time(epoch_seconds: float, timezone: ZoneInfo) -> str:
+    """Render a fire time like ``2026-11-13 09:05`` in the task's timezone."""
+    return f"{datetime.fromtimestamp(epoch_seconds, timezone):%Y-%m-%d %H:%M}"
 
 
 # Follows the prompt in every message a fire sends. No one watches a run, so a
 # question or a permission request stalls it instead of reaching a person. Only
 # the sent message carries it: the task keeps the prompt its owner wrote, so the
 # automation pages never show it. The chat hides it by exact text, so a change
-# here also goes in AUTOMATION_CONTEXT_NOTE in web/src/lib/systemMessage.ts.
+# here or to its run-time line also goes in web/src/lib/systemMessage.ts.
 UNATTENDED_RUN_NOTE = (
     "<omnigent-automation-context>\n"
     "Note: an Omnigent automation sent this message, and no one is watching this run. "
@@ -477,9 +491,26 @@ UNATTENDED_RUN_NOTE = (
 )
 
 
+_AUTOMATION_CONTEXT_OPEN = "<omnigent-automation-context>\n"
+
+
+def unattended_run_note(sent_at: float) -> str:
+    """:data:`UNATTENDED_RUN_NOTE`, opening with the time the fire sent it.
+
+    The run time saves the agent a clock lookup; the chat hides this line with the note.
+    """
+    seconds = int(sent_at)
+    run_time = f"{datetime.fromtimestamp(seconds, UTC):%Y-%m-%dT%H:%M:%SZ}"
+    return UNATTENDED_RUN_NOTE.replace(
+        _AUTOMATION_CONTEXT_OPEN,
+        f"{_AUTOMATION_CONTEXT_OPEN}Run time: {run_time} (Unix time {seconds}).\n",
+        1,
+    )
+
+
 def _prompt_event(prompt: str) -> SessionEventInput:
     """Build the user-message event that carries a task's prompt to the runner."""
-    text = f"{strip_trigger_header(prompt).rstrip()}\n\n{UNATTENDED_RUN_NOTE}"
+    text = f"{strip_trigger_header(prompt).rstrip()}\n\n{unattended_run_note(time.time())}"
     return SessionEventInput(
         type="message",
         data={"role": "user", "content": [{"type": "input_text", "text": text}]},
@@ -757,6 +788,12 @@ async def _run_fire_for_task(
     if await _owner_is_deleted(deps, task):
         await _disable_for_deleted_owner(deps, task, recorder)
         return
+    if is_proactive_task(task):
+        skip = await asyncio.to_thread(fire_skip_reason, deps.app_state, deps.agent_store, task)
+        if skip is not None:
+            _logger.info("scheduled fire: proactive task %s skipped: %s", task.id, skip)
+            await recorder.finish("skipped", error=skip, error_code="proactive_agent_off")
+            return
     managed = task.execution_target == "managed_sandbox"
     if not managed and task.execution_target != "connected_host":
         _logger.info(

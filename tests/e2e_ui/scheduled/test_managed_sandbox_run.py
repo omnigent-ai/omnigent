@@ -104,7 +104,8 @@ async def _drive_delivery(rig: ManagedReplicas) -> None:
         ).json()
         assert state["host_local"] is True, "the host tunnel was expected on replica B"
         assert len(_persisted_messages(snapshot, "user", _PROMPT)) == 1
-        assert len(_persisted_messages(snapshot, "user", UNATTENDED_RUN_NOTE)) == 1
+        note_body = UNATTENDED_RUN_NOTE.partition("\n")[2]
+        assert len(_persisted_messages(snapshot, "user", note_body)) == 1
         assert snapshot["pending_inputs"] == []
         # The note goes only to the session; the automation keeps the prompt as written.
         task = (await client.get(f"{rig.a}/v1/scheduled-tasks/{task_id}")).json()
