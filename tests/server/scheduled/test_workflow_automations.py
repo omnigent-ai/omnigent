@@ -1,21 +1,19 @@
 """Which automations run a saved workflow, read from the prompt their runs send.
 
-``fixtures/workflow_trigger_prompts.json`` holds prompts ``encodeTriggerPrompt`` in
-web/src/components/scheduled/triggerTemplates.ts saves for triggers whose instructions
-run a saved workflow, for every source in both modes, so these tests check the server
-against what the form writes. A web test keeps the file in step with the form.
+``fixtures/workflow_trigger_prompts.json`` holds, for every source in both modes, the
+layout of a prompt the trigger form in web/src/components/scheduled/triggerTemplates.ts
+saves when its instructions run a saved workflow: the opening, then the instructions
+between their headings, which is what the server reads. A web test keeps the file in
+step with the form.
 """
 
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
 from pathlib import Path
-from typing import Any
 
 import pytest
 
-from omnigent.server.scheduled.schedule import strip_trigger_header
 from omnigent.server.scheduled.workflow_automations import (
     CONTINUED_SESSION_MESSAGE,
     TASK_SESSION_MESSAGE,
@@ -28,6 +26,11 @@ PROMPTS: dict[str, str] = json.loads(
 )
 WORKFLOW_RUN = '/workflow Run the saved workflow "Triage" (ID 0123456789abcdef0123456789abcdef).'
 SOURCES = ["jira", "slack", "github", "linear", "pagerduty"]
+
+
+def _header(**state: object) -> str:
+    """A trigger form header line holding *state*."""
+    return f"<!-- omnigent-trigger v1 {json.dumps(state)} -->\n"
 
 
 @pytest.mark.parametrize("session_mode", ["new", "continue"])
@@ -60,8 +63,7 @@ def test_a_schedule_that_runs_a_saved_workflow_cant_continue_a_session(
         WORKFLOW_RUN.replace('"Triage"', '"Tri\N{LINE SEPARATOR}age"'),
         f"\x1c{WORKFLOW_RUN}",
         # Only the prompt below a trigger header runs.
-        f"<!-- omnigent-trigger v1 {json.dumps({'instructions': WORKFLOW_RUN})} -->\n"
-        "Summarize overnight activity",
+        f"{_header(instructions=WORKFLOW_RUN)}Summarize overnight activity",
     ],
 )
 def test_other_prompts_can_continue_a_session(prompt: str) -> None:
@@ -75,57 +77,43 @@ def test_a_workflow_trigger_cant_send_every_match_to_one_task_session(
 ) -> None:
     task_session = PROMPTS[f"{source}_task_session"]
     per_match = PROMPTS[f"{source}_per_match"]
-    # Without its header, as saved before headers, a prompt reads the same.
-    for prompt in (task_session, strip_trigger_header(task_session)):
+    # A header line above the prompt changes nothing.
+    for prompt in (task_session, _header(source=source) + task_session):
         assert _workflow_reading(prompt) == (True, True)
         assert workflow_session_reuse_error(prompt, session_mode) == TASK_SESSION_MESSAGE
     # Its polling session continues, and each match gets its own session.
-    for prompt in (per_match, strip_trigger_header(per_match)):
+    for prompt in (per_match, _header(source=source) + per_match):
         assert _workflow_reading(prompt) == (True, False)
         assert workflow_session_reuse_error(prompt, session_mode) is None
 
 
-def test_a_header_left_stale_by_an_edit_outside_the_form_is_ignored() -> None:
-    prompt = PROMPTS["jira_task_session"]
-    edited = prompt.replace(f"{WORKFLOW_RUN}\n\nOnly bugs\n", "Triage the ticket.\n")
-    assert edited != prompt
-    # The header still names the workflow, but the prompt the model gets doesn't.
-    assert _workflow_reading(edited) == (False, True)
-    assert workflow_session_reuse_error(edited, "continue") is None
-
-
 def test_reads_instructions_that_keep_the_prompt_from_splitting() -> None:
     prompt = PROMPTS["jira_task_session_unsplittable"]
-    for reading_of in (prompt, strip_trigger_header(prompt)):
-        assert _workflow_reading(reading_of) == (True, True)
+    assert _workflow_reading(prompt) == (True, True)
     assert workflow_session_reuse_error(prompt, "continue") == TASK_SESSION_MESSAGE
     # The same layout with other instructions runs no saved workflow.
     assert _workflow_reading(prompt.replace(WORKFLOW_RUN, "Triage the ticket.")) == (False, True)
 
 
-def _edit_header(prompt: str, edit: Callable[[dict[str, Any]], dict[str, Any]]) -> str:
-    body = strip_trigger_header(prompt)
-    line = prompt[: len(prompt) - len(body)]
-    raw = json.loads(line.removeprefix("<!-- omnigent-trigger v1 ").removesuffix(" -->\n"))
-    return f"<!-- omnigent-trigger v1 {json.dumps(edit(raw))} -->\n{body}"
-
-
 @pytest.mark.parametrize(
-    "edit",
+    "header",
     [
-        lambda raw: {**raw, "instructions": "Triage the ticket."},
-        lambda raw: {key: value for key, value in raw.items() if key != "taskSessionMode"},
-        lambda raw: {**raw, "taskSessionMode": "continue"},
+        # What the form saved before the prompt was edited outside it.
+        _header(instructions=WORKFLOW_RUN, taskSessionMode="continue"),
+        _header(instructions="Triage the ticket."),
+        _header(instructions="Triage the ticket.", taskSessionMode="continue"),
     ],
-    ids=["other-instructions", "per-match", "task-session"],
+    ids=["names-the-workflow", "other-instructions", "other-instructions-task-session"],
 )
 @pytest.mark.parametrize(
-    "name", ["jira_task_session", "jira_per_match", "jira_task_session_unsplittable"]
+    "prompt",
+    [
+        PROMPTS["jira_task_session"],
+        PROMPTS["jira_per_match"],
+        PROMPTS["jira_task_session_unsplittable"],
+        PROMPTS["jira_task_session"].replace(f"{WORKFLOW_RUN}\n\nOnly bugs", "Triage the ticket."),
+    ],
+    ids=["task-session", "per-match", "unsplittable", "without-the-workflow"],
 )
-def test_a_header_never_changes_what_the_prompt_runs(
-    name: str, edit: Callable[[dict[str, Any]], dict[str, Any]]
-) -> None:
-    prompt = PROMPTS[name]
-    edited = _edit_header(prompt, edit)
-    assert edited != prompt
-    assert _workflow_reading(edited) == _workflow_reading(prompt)
+def test_a_header_never_changes_what_the_prompt_runs(prompt: str, header: str) -> None:
+    assert _workflow_reading(header + prompt) == _workflow_reading(prompt)

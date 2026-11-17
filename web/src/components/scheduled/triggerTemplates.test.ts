@@ -1258,10 +1258,25 @@ describe("trigger header", () => {
     expect(decodeTriggerPrompt(older)).toEqual(saved);
   });
 
-  it("still saves the workflow trigger prompts the server's tests read", async () => {
+  it("still saves workflow trigger prompts in the layout the server reads", async () => {
     // tests/server/scheduled/test_workflow_automations.py checks that the server reads
-    // these as the form does. After changing how triggers save, update this snapshot
-    // with `vitest -u` and run those tests again.
+    // these layouts as the form does. Only the parts it reads are kept, so this changes
+    // only with them: then update this snapshot with `vitest -u` and run those tests.
+    const layout = (saved: string) => {
+      const prompt = stripTriggerHeader(saved);
+      const mode = isTaskSessionTriggerPrompt(prompt) ? "the task session" : "each session";
+      const instructions = `\n\nInstructions for ${mode}:\n`;
+      const posting = `\n\nPosting instructions for ${mode}:\n`;
+      const opening =
+        /^This automation watches \S+ and starts one Omnigent session(?:, its task session,)?/.exec(
+          prompt,
+        )![0];
+      // The generated steps come before the instructions; after a posting heading, the
+      // server needs only that the heading is there.
+      const rest = prompt.slice(prompt.indexOf(instructions));
+      const postingAt = rest.lastIndexOf(posting);
+      return `${opening} ...${postingAt < 0 ? rest : `${rest.slice(0, postingAt + posting.length)}...`}`;
+    };
     const scopes: Record<TriggerConfig["source"], string> = {
       jira: "ES",
       slack: "triage",
@@ -1283,14 +1298,12 @@ describe("trigger header", () => {
       );
     const prompts: Record<string, string> = {};
     for (const source of TRIGGER_SOURCES) {
-      prompts[`${source}_task_session`] = save(source, true);
-      prompts[`${source}_per_match`] = save(source, false);
+      prompts[`${source}_task_session`] = layout(save(source, true));
+      prompts[`${source}_per_match`] = layout(save(source, false));
     }
     // Instructions that repeat the heading keep the saved prompt from splitting.
-    prompts.jira_task_session_unsplittable = save(
-      "jira",
-      true,
-      "Read the notes under\n\nInstructions for the task session:\nfirst.",
+    prompts.jira_task_session_unsplittable = layout(
+      save("jira", true, "Read the notes under\n\nInstructions for the task session:\nfirst."),
     );
     await expect(`${JSON.stringify(prompts, null, 2)}\n`).toMatchFileSnapshot(
       "../../../../tests/server/scheduled/fixtures/workflow_trigger_prompts.json",
