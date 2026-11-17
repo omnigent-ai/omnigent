@@ -266,7 +266,7 @@ describe("ServerSelectorV2", () => {
     expect(screen.getByText(/connecting to the local server/i)).toBeInTheDocument();
   });
 
-  it("a new MDM user's typed URL with no runner to set up opens directly, without installing", async () => {
+  it("a new MDM user's typed URL with no runner to set up and the CLI installed opens directly", async () => {
     const getRunnerOptions = vi.fn().mockResolvedValue({ remote: false, bundledCli: false });
     const onConnect = vi.fn().mockResolvedValue({});
     const onInstallCli = vi.fn().mockResolvedValue({ ok: true });
@@ -274,7 +274,7 @@ describe("ServerSelectorV2", () => {
     render(
       <ServerSelectorV2
         setup={makeSetup({
-          installed: false,
+          installed: true,
           managedServers: ["https://team.example.com/"],
           getRunnerOptions,
           onConnect,
@@ -296,6 +296,75 @@ describe("ServerSelectorV2", () => {
     expect(screen.queryByRole("heading", { name: /where do you work today/i })).toBeNull();
     expect(onInstallCli).not.toHaveBeenCalled();
     expect(onConnectRunner).not.toHaveBeenCalled();
+  });
+
+  // A new MDM user without the CLI joins a server that has no runner to set up.
+  function joinManagedServer(over: Partial<ServerSelectorV2Setup>) {
+    render(
+      <ServerSelectorV2
+        setup={makeSetup({
+          installed: false,
+          managedServers: ["https://team.example.com/"],
+          getRunnerOptions: vi.fn().mockResolvedValue({ remote: false, bundledCli: false }),
+          ...over,
+        })}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /join your team \(team\)/i }));
+  }
+
+  it("a new MDM user without the CLI can just join a server with no runner", async () => {
+    const onConnect = vi.fn().mockResolvedValue({});
+    const onInstallCli = vi.fn().mockResolvedValue({ ok: true });
+    const onConnectRunner = vi.fn().mockResolvedValue({ ok: true });
+    joinManagedServer({ onConnect, onInstallCli, onConnectRunner });
+    await screen.findByRole("heading", { name: /how do you want to join/i });
+    expect(screen.getByRole("radio", { name: /just join/i })).toBeChecked();
+    fireEvent.click(screen.getByRole("button", { name: "Open Omnigent" }));
+    await waitFor(() =>
+      expect(onConnect).toHaveBeenCalledWith("https://team.example.com/", expect.any(Function)),
+    );
+    expect(onInstallCli).not.toHaveBeenCalled();
+    expect(onConnectRunner).not.toHaveBeenCalled();
+  });
+
+  it("a new MDM user's typed URL gets the choice, and Install CLI first connects this laptop", async () => {
+    const calls: string[] = [];
+    const record = <T,>(name: string, result: T) =>
+      vi.fn(async () => {
+        calls.push(name);
+        return result;
+      });
+    const onConnectRunner = record("runner", { ok: true });
+    render(
+      <ServerSelectorV2
+        setup={makeSetup({
+          installed: false,
+          managedServers: ["https://team.example.com/"],
+          getRunnerOptions: vi.fn().mockResolvedValue({ remote: false, bundledCli: false }),
+          onInstallCli: record("install", { ok: true }),
+          onConnectRunner,
+          onConnect: record("connect", {}),
+        })}
+      />,
+    );
+    openPresetDropdown();
+    fireEvent.change(screen.getByLabelText("Server URL"), {
+      target: { value: "https://typed.example.com" },
+    });
+    fireEvent.keyDown(screen.getByLabelText("Server URL"), { key: "Enter" });
+    fireEvent.click(screen.getByRole("button", { name: "Join your team (typed.example.com)" }));
+    fireEvent.click(await screen.findByRole("radio", { name: /install cli first/i }));
+    fireEvent.click(screen.getByRole("button", { name: "Install Omnigent" }));
+    await waitFor(() => expect(calls).toEqual(["install", "runner", "connect"]));
+    expect(onConnectRunner).toHaveBeenCalledWith("https://typed.example.com/", "local");
+  });
+
+  it("Back from the MDM join choice returns to the landing", async () => {
+    joinManagedServer({});
+    await screen.findByRole("heading", { name: /how do you want to join/i });
+    fireEvent.click(screen.getByRole("button", { name: "Back" }));
+    expect(screen.getByRole("button", { name: /join your team \(team\)/i })).toBeInTheDocument();
   });
 
   it("a new MDM user's typed local install keeps the runner step", async () => {
