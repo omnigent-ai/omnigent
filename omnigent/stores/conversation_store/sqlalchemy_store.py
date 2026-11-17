@@ -1371,10 +1371,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         flushed_metadata: bool = False,
         agent_id: str | None = None,
     ) -> None:
-        """Undo an unpublished conversation when its metadata write failed.
-
-        Rows flushed before a failed COMMIT may still have committed, so they go first.
-        """
+        """Undo an unpublished conversation and any rows a failed COMMIT may have applied."""
         if flushed_metadata:
 
             def delete_flushed(session: Session) -> None:
