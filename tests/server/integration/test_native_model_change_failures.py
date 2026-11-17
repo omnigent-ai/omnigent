@@ -193,6 +193,14 @@ class _NativeSession:
             and event["item"].get("level") == "info"
         ]
 
+    def assert_model_request(self) -> None:
+        requests = [
+            json.loads(frame.body or "{}")
+            for frame in self.tunnel.frames
+            if isinstance(frame, RequestFrame) and frame.path.endswith("/events")
+        ]
+        assert requests == [{"type": "model_change", "model": self.requested_model}]
+
     def assert_model(self, model: str) -> None:
         saved = self.store.get_conversation(self.session_id)
         assert saved.model_override == model
@@ -452,7 +460,11 @@ async def _held_model_reply(
         session.runner.event_hooks["response"].remove(hold_reply)
 
 
-@pytest.mark.parametrize("confirmed", [False, True], ids=["timeout", "confirmed"])
+@pytest.mark.parametrize(
+    ("confirmed", "newer_metadata"),
+    [(False, False), (True, False), (True, True)],
+    ids=["refused", "confirmed", "confirmed-newer-metadata"],
+)
 @pytest.mark.parametrize(
     "native_session", ["claude-native", "custom-claude-native"], indirect=True
 )
@@ -461,21 +473,49 @@ async def test_claude_model_confirmation_controls_public_patch_and_rollback(
     native_session: _NativeSession,
     monkeypatch: pytest.MonkeyPatch,
     confirmed: bool,
+    newer_metadata: bool,
 ) -> None:
     session = native_session
     assert session.claude is not None
     session.claude.confirm = confirmed
     monkeypatch.setattr(claude_bridge, "inject_model_command", session.claude.select)
 
-    response = await _pick_model(client, session)
+    if newer_metadata:
+        async with _held_model_reply(client, session) as (first, release_reply):
+            newer = await client.patch(
+                f"/v1/sessions/{session.session_id}",
+                json={
+                    "model_override": session.requested_model,
+                    "reasoning_effort": "low",
+                    "title": "Newer metadata",
+                    "silent": True,
+                },
+            )
+            assert newer.status_code == 200, newer.text
+            release_reply.set()
+            response = await asyncio.wait_for(first, timeout=5)
+    else:
+        response = await _pick_model(client, session)
 
     assert session.claude.commands == [session.requested_model]
     assert session.tunnel.dispatch_errors == []
+    session.assert_model_request()
+    assert len(session.runner_replies) == 1
     if confirmed:
         assert response.status_code == 200, response.text
         assert session.runner_replies[0].status_code == 204
-        session.assert_model(session.requested_model)
+        if newer_metadata:
+            saved = session.store.get_conversation(session.session_id)
+            assert saved.model_override == session.requested_model
+            assert saved.reasoning_effort == "low"
+            assert saved.title == "Newer metadata"
+            assert claude_bridge.read_claude_status_model(session.claude.bridge_dir) == (
+                session.requested_model
+            )
+        else:
+            session.assert_model(session.requested_model)
         assert session.errors == []
+        assert session.notices == []
     else:
         session.assert_refused(response)
         refused = session.runner_replies[0].json()
@@ -511,6 +551,7 @@ async def test_unconfirmed_claude_model_change_keeps_intent_without_claiming_an_
     response = await _pick_model(client, session)
 
     session.assert_unconfirmed(response)
+    session.assert_model_request()
     assert len(session.runner_replies) == 1
     assert pane.commands == [session.requested_model]
     saved = session.store.get_conversation(session.session_id)
@@ -691,7 +732,12 @@ async def test_refused_model_change_preserves_newer_silent_selection(
     async with _held_model_reply(client, session) as (first, release_refusal):
         newer = await client.patch(
             f"/v1/sessions/{session.session_id}",
-            json={"model_override": newer_model or "default", "silent": True},
+            json={
+                "model_override": newer_model or "default",
+                "reasoning_effort": "low",
+                "title": "Newer metadata",
+                "silent": True,
+            },
         )
         assert newer.status_code == 200, newer.text
         if newer_model is not None:
@@ -709,89 +755,15 @@ async def test_refused_model_change_preserves_newer_silent_selection(
         assert session.errors[0]["code"] == "model_change_not_applied"
     saved = session.store.get_conversation(session.session_id)
     assert saved.model_override == newer_model
-    assert saved.reasoning_effort == "high"
+    assert saved.reasoning_effort == "low"
+    assert saved.title == "Newer metadata"
     assert claude_bridge.read_claude_status_model(session.claude.bridge_dir) == (
         newer_model or (session.requested_model if unconfirmed else session.previous_model)
     )
     assert session.claude.commands == [session.requested_model]
     assert session.tunnel.dispatch_errors == []
-
-
-@pytest.mark.parametrize(
-    "concurrent_selection", [False, True], ids=["original", "newer-selection"]
-)
-@pytest.mark.parametrize("outcome", ["confirmed", "refused", "unconfirmed"])
-async def test_legacy_claude_model_request_preserves_outcomes_and_newer_metadata(
-    client: httpx.AsyncClient,
-    native_session: _NativeSession,
-    monkeypatch: pytest.MonkeyPatch,
-    concurrent_selection: bool,
-    outcome: str,
-) -> None:
-    session = native_session
-    assert session.claude is not None
-    session.claude.confirm = outcome == "confirmed"
-    session.claude.model_may_have_changed = outcome == "unconfirmed"
-    monkeypatch.setattr(claude_bridge, "inject_model_command", session.claude.select)
-    forward = routes_core._forward_session_change_to_runner
-
-    async def legacy_forward(
-        session_id: str, router: Any, event: dict[str, Any], **kwargs: Any
-    ) -> Any:
-        # Older servers send only the original type/model fields.
-        legacy_event = {"type": event["type"], "model": event["model"]}
-        return await forward(session_id, router, legacy_event, **kwargs)
-
-    monkeypatch.setattr(routes_core, "_forward_session_change_to_runner", legacy_forward)
-    if concurrent_selection:
-        async with _held_model_reply(client, session) as (first, release_reply):
-            newer = await client.patch(
-                f"/v1/sessions/{session.session_id}",
-                json={
-                    "model_override": session.requested_model,
-                    "reasoning_effort": "low",
-                    "title": "Newer metadata",
-                    "silent": True,
-                },
-            )
-            assert newer.status_code == 200, newer.text
-            release_reply.set()
-            response = await asyncio.wait_for(first, timeout=5)
-    else:
-        response = await _pick_model(client, session)
-
-    assert session.claude.commands == [session.requested_model]
-    assert session.tunnel.dispatch_errors == []
-    requests = [
-        json.loads(frame.body or "{}")
-        for frame in session.tunnel.frames
-        if isinstance(frame, RequestFrame) and frame.path.endswith("/events")
-    ]
-    assert requests == [{"type": "model_change", "model": session.requested_model}]
+    session.assert_model_request()
     assert len(session.runner_replies) == 1
-    if outcome == "confirmed":
-        assert response.status_code == 200, response.text
-        assert session.runner_replies[0].status_code == 204
-        assert session.errors == session.notices == []
-    elif outcome == "unconfirmed":
-        session.assert_unconfirmed(response)
-    else:
-        assert response.status_code == 503, response.text
-        assert session.runner_replies[0].status_code == 503
-        assert session.runner_replies[0].json()["error"] == "claude_native_model_failed"
-        assert [error["code"] for error in session.errors] == ["model_change_not_applied"]
-    assert claude_bridge.read_claude_status_model(session.claude.bridge_dir) == (
-        session.previous_model if outcome == "refused" else session.requested_model
-    )
-    saved = session.store.get_conversation(session.session_id)
-    assert saved.model_override == (
-        session.requested_model
-        if concurrent_selection or outcome != "refused"
-        else session.previous_model
-    )
-    assert saved.reasoning_effort == ("low" if concurrent_selection else "high")
-    if concurrent_selection:
-        assert saved.title == "Newer metadata"
 
 
 @pytest.mark.parametrize(
