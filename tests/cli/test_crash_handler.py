@@ -17,6 +17,7 @@ import io
 import os
 import re
 import sys
+import urllib.parse
 from pathlib import Path
 
 import pytest
@@ -371,9 +372,7 @@ def test_noninteractive_falls_back_to_link(
 def test_issue_url_is_prefilled_title(data_dir: Path) -> None:
     ch.install_crash_handler("omnigent", "omnigent-ai/omnigent")
     exc = _make_exc("oops: bad [brackets] & spaces")
-    url, body_included = ch._issue_url(
-        exc, ch._issue_body(exc, "Traceback...\nValueError: oops\n")
-    )
+    url, body_included = ch._issue_url(exc, "Traceback...\nValueError: oops\n")
     # Uses the repo's bug-report template.
     assert "template=bug_report.yml" in url
     assert url.startswith("https://github.com/omnigent-ai/omnigent/issues/new?")
@@ -409,40 +408,88 @@ def test_excepthook_defers_keyboard_interrupt(
 # --------------------------------------------------------------------------- #
 # URL length truncation
 # --------------------------------------------------------------------------- #
-def test_issue_url_drops_body_when_too_long(data_dir: Path) -> None:
-    """A traceback so large it would blow the URL limit drops the body."""
-    ch.install_crash_handler("omnigent", "omnigent-ai/omnigent")
-    huge_tb = "X" * 30000  # would produce a ~30KB URL
-    url, body_included = ch._issue_url(
-        _make_exc("big crash"), ch._issue_body(_make_exc("big crash"), huge_tb)
-    )
-    assert len(url) <= ch._MAX_URL_LENGTH
-    assert body_included is False
-    assert "description=" not in url  # body dropped entirely
+def _description_of(url: str) -> str:
+    return urllib.parse.parse_qs(urllib.parse.urlparse(url).query).get("description", [""])[0]
 
 
-def test_issue_url_drops_non_ascii_body_when_too_long(data_dir: Path) -> None:
-    """Non-ASCII content expands 6x under URL-encoding — body must be dropped."""
+def test_issue_url_truncates_huge_traceback_keeping_its_tail(data_dir: Path) -> None:
+    """A traceback too large for the URL keeps its final lines, not the whole body."""
     ch.install_crash_handler("omnigent", "omnigent-ai/omnigent")
-    huge_non_ascii = "é" * 30000
-    url, body_included = ch._issue_url(
-        _make_exc("crash"), ch._issue_body(_make_exc("crash"), huge_non_ascii)
+    huge_tb = "X" * 30000 + "\nValueError: big crash\n"
+    url, body_included = ch._issue_url(_make_exc("big crash"), huge_tb)
+    assert len(url) <= ch._MAX_URL_LENGTH
+    assert body_included is True
+    body = _description_of(url)
+    assert "truncated" in body
+    assert "ValueError: big crash" in body
+    assert body.count("X") < 30000
+
+
+def test_issue_url_truncates_non_ascii_traceback(data_dir: Path) -> None:
+    """Non-ASCII content expands 6x under URL-encoding; the tail still fits."""
+    ch.install_crash_handler("omnigent", "omnigent-ai/omnigent")
+    huge_non_ascii = "é" * 30000 + "\nValueError: crash\n"
+    url, body_included = ch._issue_url(_make_exc("crash"), huge_non_ascii)
+    assert len(url) <= ch._MAX_URL_LENGTH
+    assert body_included is True
+    assert "ValueError: crash" in _description_of(url)
+
+
+def test_issue_url_prefills_tail_of_long_realistic_traceback(data_dir: Path) -> None:
+    """Long site-packages paths in a deep traceback must not drop the description."""
+    ch.install_crash_handler("omnigent", "omnigent-ai/omnigent")
+    frames = "".join(
+        f'  File "/home/example/.cache/app/lib/python3.12/site-packages/pkg/module_{i}.py", '
+        f"line {i}, in load\n"
+        "    return importlib.import_module(name)\n"
+        for i in range(120)
     )
+    tb_text = (
+        "Traceback (most recent call last):\n"
+        + frames
+        + "ImportError: /lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.33' not found\n"
+    )
+    exc = ImportError("/lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.33' not found")
+    url, body_included = ch._issue_url(exc, tb_text)
+    assert len(url) <= ch._MAX_URL_LENGTH
+    assert body_included is True
+    body = _description_of(url)
+    assert "GLIBC_2.33" in body
+    assert "module_119.py" in body  # innermost frame survives the cut
+
+
+def test_issue_url_drops_body_when_summary_alone_is_too_long(data_dir: Path) -> None:
+    """If even the exception summary cannot fit, the body is dropped."""
+    ch.install_crash_handler("omnigent", "omnigent-ai/omnigent")
+    huge_message = ValueError("m" * 30000)
+    url, body_included = ch._issue_url(huge_message, "Traceback...\n")
     assert len(url) <= ch._MAX_URL_LENGTH
     assert body_included is False
+    assert "description=" not in url
+
+
+def test_issue_url_scrubs_home_directory_and_tokens(
+    data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The title and body must not carry the user's home path or raw tokens."""
+    ch.install_crash_handler("omnigent", "omnigent-ai/omnigent")
+    monkeypatch.setenv("HOME", "/home/example-user")
+    exc = ImportError("cannot open /home/example-user/.config/app.toml with sk-abcdefghijklmnop")
+    tb_text = 'Traceback (most recent call last):\n  File "/home/example-user/app.py", line 1\n'
+    url, _ = ch._issue_url(exc, tb_text + "ImportError: cannot open\n")
+    decoded_url = urllib.parse.unquote_plus(url)
+    assert "example-user" not in decoded_url
+    assert "~/app.py" in _description_of(url)
+    assert "sk-abcdefghijklmnop" not in decoded_url
 
 
 def test_issue_url_keeps_short_body_intact(data_dir: Path) -> None:
-    """A normal-sized traceback is kept in the URL."""
+    """A normal-sized traceback is kept in full, with no truncation note."""
     ch.install_crash_handler("omnigent", "omnigent-ai/omnigent")
     short_tb = 'Traceback (most recent call last):\n  File "app.py", line 10\nValueError: boom\n'
-    url, body_included = ch._issue_url(
-        _make_exc("boom"), ch._issue_body(_make_exc("boom"), short_tb)
-    )
+    url, body_included = ch._issue_url(_make_exc("boom"), short_tb)
     assert len(url) <= ch._MAX_URL_LENGTH
     assert body_included is True
-    import urllib.parse as up
-
-    body = up.parse_qs(up.urlparse(url).query).get("description", [""])[0]
+    body = _description_of(url)
     assert "truncated" not in body
     assert "ValueError: boom" in body

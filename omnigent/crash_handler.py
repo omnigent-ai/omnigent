@@ -9,9 +9,9 @@ Design notes
 * **No token is shipped.** We can't embed a GitHub credential in a
   distributed binary — anyone could extract it. Instead we open the
   repo's bug-report template in the browser with the title, version,
-  OS, and the full traceback pre-filled into the Description field via
-  URL query params. The clipboard carries the full report as a backup
-  in case the URL is too long and the description gets truncated.
+  OS, and the traceback pre-filled into the Description field via URL
+  query params. The leading frames are cut if the URL would be too long;
+  the clipboard carries the full report as a backup.
 * **One chokepoint.** ``sys.excepthook`` (main thread) +
   ``threading.excepthook`` (background threads) + ``faulthandler``
   (C-level segfaults, captured to a file since the process is already
@@ -350,8 +350,9 @@ def _build_report(exc: BaseException, tb_text: str, *, source: str) -> str:
 
 ---
 
-> The full traceback is also pre-filled into the GitHub issue's
-> Description field when filing from the crash prompt. Review the
+> The traceback is also pre-filled into the GitHub issue's Description
+> field when filing from the crash prompt (leading frames are cut if it
+> is too long for the link). Review the
 > **Command** line above for secrets before submitting.
 """
 
@@ -398,7 +399,7 @@ def _rotate(d: Path, keep: int) -> None:
 def _interactive_flow(
     report_md: str, report_path: Path, exc: BaseException, tb_text: str, stream: TextIO
 ) -> None:
-    url, body_included = _issue_url(exc, _issue_body(exc, tb_text))
+    url, body_included = _issue_url(exc, tb_text)
     if _prompt_yes_no(
         "Help us fix it — file a GitHub issue with this report? [Y/n] ",
         stream,
@@ -426,70 +427,103 @@ def _interactive_flow(
 
 def _fallback_notice(report_path: Path, exc: BaseException, tb_text: str, stream: TextIO) -> None:
     """Non-interactive: just state where the report is and where to file."""
-    url, _ = _issue_url(exc, _issue_body(exc, tb_text))
+    url, _ = _issue_url(exc, tb_text)
     _print(stream, "")
     _print(stream, f"A crash report was saved to: {report_path}")
     _print(stream, f"File an issue: {url}")
     _print(stream, "")
 
 
-def _issue_body(exc: BaseException, tb_text: str) -> str:
+def _issue_body(exc: BaseException, tb_text: str, *, truncated: bool = False) -> str:
     """Build the markdown for the issue template's Description field.
 
     Leaner than :func:`_build_report`: the version and OS live in their
     own prefilled template fields, so they're omitted here to avoid
     duplication. What remains is the exception summary, the command
-    that triggered the crash, and the **full** traceback (every frame,
-    real paths) — exactly what a developer needs to reproduce and fix it.
+    that triggered the crash, and the traceback. When ``truncated``,
+    ``tb_text`` is only the tail of the traceback and the body says so.
     """
     exc_type = type(exc).__qualname__
     msg = str(exc).strip() or "(no message)"
-    return (
+    note = (
+        "_Traceback truncated to fit this link; the full report was saved locally._\n"
+        if truncated
+        else ""
+    )
+    return _scrub(
         "This crash was auto-reported by Omnigent's crash handler.\n\n"
         f"**Exception:** `{exc_type}: {msg}`\n\n"
         "**Command:**\n"
         f"```\n{_command_line()}\n```\n\n"
         "**Traceback:**\n"
-        f"```\n{tb_text}```\n"
+        f"{note}```\n{tb_text}```\n"
     )
 
 
-def _issue_url(exc: BaseException, body: str = "") -> tuple[str, bool]:
+def _scrub(text: str) -> str:
+    """Redact tokens and the home directory from text bound for a public issue."""
+    text = _redact(text)
+    with contextlib.suppress(Exception):
+        home = str(Path.home())
+        if home and home != os.sep:
+            text = text.replace(home, "~")
+    return text
+
+
+def _tail(text: str, length: int) -> str:
+    """Last ``length`` characters of ``text``, starting after a line break when one exists."""
+    if length >= len(text):
+        return text
+    tail = text[len(text) - length :]
+    newline = tail.find("\n")
+    return tail[newline + 1 :] if newline != -1 else tail
+
+
+def _issue_url(exc: BaseException, tb_text: str) -> tuple[str, bool]:
     """Pre-filled ``bug_report.yml`` issue URL.
 
-    Returns ``(url, body_included)``: the URL has the template, title,
-    version, and OS prefilled always; the Description (full traceback)
-    is included only if it fits :data:`_MAX_URL_LENGTH`. When the body
-    is dropped (``body_included is False``), the caller should tell the
-    user to paste the report from the clipboard instead.
+    Returns ``(url, body_included)``. The template, title, version, and
+    OS are always prefilled. The Description holds the exception and the
+    traceback; when the full traceback would exceed :data:`_MAX_URL_LENGTH`
+    its leading frames are cut, so the exception line and innermost frames
+    survive. The Description is omitted only when the summary alone does
+    not fit (``body_included is False``).
 
     Field IDs (``version``, ``os``, ``description``) come from
     ``.github/ISSUE_TEMPLATE/bug_report.yml``; keep in sync if it changes.
     """
     first_line = (str(exc).strip().splitlines() or [""])[0]
-    title = f"[Crash] {type(exc).__qualname__}: {first_line[:140]}"
+    title = _scrub(f"[Crash] {type(exc).__qualname__}: {first_line[:140]}")
     repo = _CONFIG["repo"]
     version = _CONFIG.get("version", "unknown")
     os_str = platform.platform(terse=True)
     base = f"https://github.com/{repo}/issues/new?"
-
     params = {
         "template": "bug_report.yml",
         "title": title,
         "version": version,
         "os": os_str,
     }
-    if not body:
-        return base + urllib.parse.urlencode(params), False
 
-    # Try the full body in the URL. If it would exceed the safe limit,
-    # drop the description entirely — the clipboard carries the full
-    # report and the caller tells the user to paste it. No half-measures.
-    params["description"] = body
-    url = base + urllib.parse.urlencode(params)
-    if len(url) <= _MAX_URL_LENGTH:
-        return url, True
-    params.pop("description")
+    def url_with_body(body: str) -> str:
+        return base + urllib.parse.urlencode({**params, "description": body})
+
+    full_url = url_with_body(_issue_body(exc, tb_text))
+    if len(full_url) <= _MAX_URL_LENGTH:
+        return full_url, True
+
+    # URL length grows with the kept tail, so binary-search the longest tail that fits.
+    low, high = 0, len(tb_text)
+    while low < high:
+        keep = (low + high + 1) // 2
+        candidate = url_with_body(_issue_body(exc, _tail(tb_text, keep), truncated=True))
+        if len(candidate) <= _MAX_URL_LENGTH:
+            low = keep
+        else:
+            high = keep - 1
+    truncated_url = url_with_body(_issue_body(exc, _tail(tb_text, low), truncated=True))
+    if len(truncated_url) <= _MAX_URL_LENGTH:
+        return truncated_url, True
     return base + urllib.parse.urlencode(params), False
 
 
