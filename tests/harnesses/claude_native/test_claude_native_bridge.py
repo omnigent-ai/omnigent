@@ -4772,8 +4772,10 @@ def test_augment_claude_args_disables_auto_mode_setup_offer(
         ((), None),
         (("--permission-mode", "default"), "default"),
         (("--permission-mode", "auto"), "auto"),
+        (("--permission-mode", "plan"), "plan"),
+        (("--permission-mode", "dontAsk"), "dontAsk"),
     ],
-    ids=["none", "default", "auto"],
+    ids=["none", "default", "auto", "plan", "dont-ask"],
 )
 def test_augment_claude_args_allows_reading_session_attachments(
     launch_args: tuple[str, ...],
@@ -4802,7 +4804,11 @@ def test_augment_claude_args_allows_reading_session_attachments(
 
     permissions = settings.get("permissions", {})
     assert permissions.get("defaultMode") == default_mode
-    assert permissions.get("allow") == [f"Read(/{attachment.parent.as_posix()}/**)"]
+    assert permissions.get("allow") == [
+        f"Read(/{attachment.parent.as_posix()}/**)",
+        "mcp__omnigent__sys_scheduled_task_create",
+        "mcp__omnigent__sys_scheduled_task_update",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -4825,7 +4831,13 @@ def test_augment_claude_args_omits_attachment_rule_for_pattern_cache_path(
         )
     )
 
-    assert settings.get("permissions") == expected_permissions
+    assert settings.get("permissions") == {
+        **(expected_permissions or {}),
+        "allow": [
+            "mcp__omnigent__sys_scheduled_task_create",
+            "mcp__omnigent__sys_scheduled_task_update",
+        ],
+    }
 
 
 @pytest.mark.parametrize(
@@ -5843,21 +5855,25 @@ async def test_caller_settings_writes_drain_before_cancelled_launch_cleanup(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("last_owner", "reactivate", "delete_again", "malformed_lifecycle"),
+    ("last_owner", "reactivation", "delete_again", "malformed_lifecycle"),
     [
-        pytest.param("request", False, False, False, id="request-current"),
-        pytest.param("terminal", False, False, False, id="terminal-current"),
-        pytest.param("request", True, True, False, id="request-reactivated"),
-        pytest.param("terminal", True, True, False, id="terminal-reactivated"),
-        pytest.param("request", True, False, False, id="request-reactivated-active"),
-        pytest.param("terminal", True, False, False, id="terminal-reactivated-active"),
-        pytest.param("terminal", True, False, True, id="terminal-malformed"),
+        pytest.param("request", None, False, False, id="request-current"),
+        pytest.param("terminal", None, False, False, id="terminal-current"),
+        pytest.param("request", "same-session", True, False, id="request-reactivated"),
+        pytest.param("terminal", "same-session", True, False, id="terminal-reactivated"),
+        pytest.param("request", "same-session", False, False, id="request-reactivated-active"),
+        pytest.param("terminal", "same-session", False, False, id="terminal-reactivated-active"),
+        pytest.param("terminal", "same-session", False, True, id="terminal-malformed"),
+        pytest.param("request", "new-session", True, False, id="request-rotated"),
+        pytest.param("terminal", "new-session", True, False, id="terminal-rotated"),
+        pytest.param("request", "new-session", False, False, id="request-rotated-active"),
+        pytest.param("terminal", "new-session", False, False, id="terminal-rotated-active"),
     ],
 )
 async def test_claude_bridge_deletion_waits_for_every_settings_owner(
     tmp_path: Path,
     last_owner: str,
-    reactivate: bool,
+    reactivation: str | None,
     delete_again: bool,
     malformed_lifecycle: bool,
 ) -> None:
@@ -5894,14 +5910,17 @@ async def test_claude_bridge_deletion_waits_for_every_settings_owner(
     claim = next(bridge_dir.glob(f"claude-settings-{first.generation}.terminal-*.owner"))
     bridge_inode = bridge_dir.stat().st_ino
     claim_inode = claim.stat().st_ino
+    lease_path = baselines[0].with_suffix(".lease.lock")
+    lease_inode = lease_path.stat().st_ino
     original_lifecycle = json.loads(lifecycle_path.read_text())
     config_bytes = (bridge_dir / "bridge.json").read_bytes()
+    current_session = "conv_rotated" if reactivation == "new-session" else "conv_owned"
     try:
         request_claude_bridge_deletion(bridge_dir, "conv_owned")
         pending = json.loads(lifecycle_path.read_text())
         assert pending["incarnation"] == original_lifecycle["incarnation"]
         assert pending["delete_for_session"] == "conv_owned"
-        if reactivate:
+        if reactivation:
             assert first._request_fd is not None
             binding = os.pread(first._request_fd, 33, 0)
             assert len(binding) == 32
@@ -5910,7 +5929,7 @@ async def test_claude_bridge_deletion_waits_for_every_settings_owner(
             )
             if malformed_lifecycle:
                 lifecycle_path.write_text("{")
-            prepare_bridge_dir("conv_owned", workspace=tmp_path)
+            prepare_bridge_dir(current_session, bridge_id="conv_owned", workspace=tmp_path)
             reactivated = json.loads(lifecycle_path.read_text())
             assert "delete_for_session" not in reactivated
             assert (
@@ -5919,6 +5938,7 @@ async def test_claude_bridge_deletion_waits_for_every_settings_owner(
             )
             assert bridge_dir.stat().st_ino == bridge_inode
             assert claim.stat().st_ino == claim_inode
+            assert lease_path.stat().st_ino == lease_inode
             assert os.pread(first._request_fd, 33, 0) == binding
             with pytest.raises(ValueError, match="expired"):
                 acquire_claude_settings_request(bridge_dir, first.generation)
@@ -5946,7 +5966,7 @@ async def test_claude_bridge_deletion_waits_for_every_settings_owner(
                     pass
                 assert current.acknowledge(current.generation)
             if delete_again:
-                request_claude_bridge_deletion(bridge_dir, "conv_owned")
+                request_claude_bridge_deletion(bridge_dir, current_session)
             config_bytes = (bridge_dir / "bridge.json").read_bytes()
         first.close()
         assert [path.read_bytes() for path in baselines] == baseline_bytes
@@ -5955,14 +5975,14 @@ async def test_claude_bridge_deletion_waits_for_every_settings_owner(
         if last_owner == "terminal":
             second.close()
             assert baselines[0].read_bytes() == baseline_bytes[0]
-            if reactivate:
+            if reactivation:
                 assert baselines[1].read_bytes() == baseline_bytes[1]
             else:
                 assert not baselines[1].exists()
         else:
             await instance.close()
             assert not claim.exists()
-            if reactivate:
+            if reactivation:
                 assert baselines[0].read_bytes() == baseline_bytes[0]
             else:
                 assert not baselines[0].exists()
@@ -5973,18 +5993,18 @@ async def test_claude_bridge_deletion_waits_for_every_settings_owner(
         else:
             second.close()
         assert not claim.exists()
-        if reactivate and not delete_again:
+        if reactivation and not delete_again:
             assert [path.read_bytes() for path in baselines] == baseline_bytes
             assert prune_unused_claude_settings(bridge_dir) == 2
-            request_claude_bridge_deletion(bridge_dir, "conv_owned")
+            request_claude_bridge_deletion(bridge_dir, current_session)
         assert not bridge_dir.exists()
-        if reactivate:
+        if reactivation:
             assert (reactivated["incarnation"] == original_lifecycle["incarnation"]) is (
-                not malformed_lifecycle
+                not malformed_lifecycle and reactivation == "same-session"
             )
             assert reactivated["admission_epoch"] != binding.decode()
         assert (bridge_dir.parent / ".locks" / f"{bridge_dir.name}.lock").exists()
-        request_claude_bridge_deletion(bridge_dir, "conv_owned")
+        request_claude_bridge_deletion(bridge_dir, current_session)
         assert not bridge_dir.exists()
     finally:
         first.close()
@@ -6529,6 +6549,7 @@ def test_claude_settings_lifecycle_reader_rejects_invalid_fields(
         "new-session-reactivated",
         "new-session-claim-replaced",
         "new-session-claim-symlink",
+        "new-session-lease-replaced",
     ],
 )
 async def test_claude_settings_close_preserves_uncertain_bridge_state(
@@ -6586,6 +6607,7 @@ async def test_claude_settings_close_preserves_uncertain_bridge_state(
         "new-session-reactivated",
         "new-session-claim-replaced",
         "new-session-claim-symlink",
+        "new-session-lease-replaced",
     }:
         if state == "legacy-reactivated":
             lifecycle_path.write_text(
@@ -6614,12 +6636,6 @@ async def test_claude_settings_close_preserves_uncertain_bridge_state(
             claim.write_text("replacement-owned")
         else:
             claim.symlink_to(tmp_path / "original-claim")
-    elif state == "lease-replaced":
-        lock_path = settings_generation_path(bridge_dir, request.generation).with_suffix(
-            ".lease.lock"
-        )
-        lock_path.rename(tmp_path / "original-lease")
-        lock_path.write_text("replacement-owned")
     elif state == "claim-unlink-failure":
         unlink = Path.unlink
 
@@ -6629,12 +6645,20 @@ async def test_claude_settings_close_preserves_uncertain_bridge_state(
             return unlink(path, *args, **kwargs)
 
         monkeypatch.setattr(Path, "unlink", fail_claim_unlink)
-    else:
+    elif state in {"different-incarnation", "changed-bridge-identity"}:
         if state == "different-incarnation":
             lifecycle["incarnation"] = "0" * 32
         else:
             lifecycle["bridge_identity"] = [0, 1]
         lifecycle_path.write_text(json.dumps(lifecycle))
+    if state in {"lease-replaced", "new-session-lease-replaced"}:
+        lock_path = settings_generation_path(bridge_dir, request.generation).with_suffix(
+            ".lease.lock"
+        )
+        lock_path.rename(tmp_path / "original-lease")
+        lock_path.write_text("replacement-owned")
+        if state == "new-session-lease-replaced":
+            request_claude_bridge_deletion(bridge_dir, "conv_other")
     if state in {"new-session-claim-replaced", "new-session-claim-symlink"}:
         claim.rename(tmp_path / "original-claim")
         if state == "new-session-claim-replaced":

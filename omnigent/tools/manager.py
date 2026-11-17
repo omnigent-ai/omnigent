@@ -49,6 +49,8 @@ from omnigent.tools.builtins import (
     SysSessionUpdateTool,
     SysTimerCancelTool,
     SysTimerSetTool,
+    SysUserInboxListTool,
+    SysUserInboxPostTool,
     UpdateCommentTool,
     any_skill_has_resources,
     get_builtin_tool,
@@ -196,6 +198,8 @@ class ToolManager:
         self._register_comment_tools()
         self._register_policy_tools()
         self._register_scheduled_task_tools()
+        self._register_journal_tools()
+        self._register_user_inbox_tools()
         self._register_browser_tools()
 
     def _register_policy_tools(self) -> None:
@@ -234,6 +238,28 @@ class ToolManager:
             SysScheduledTaskDeleteTool(),
             SysReminderSetTool(),
         ):
+            self._tools[tool.name()] = tool
+
+    def _register_journal_tools(self) -> None:
+        """
+        Auto-register the ``sys_journal_*`` tools for the session's journal.
+
+        Registered without spec opt-in, so every agent can keep a plan, step
+        statuses and notes; ``tool_groups.journal: false`` drops all four. The
+        runner dispatches them via the server's ``/v1/sessions/{id}/journal``.
+        """
+        if not self._spec.tool_groups.journal:
+            return
+        from omnigent.tools.builtins.journal import JOURNAL_TOOLS
+
+        for tool_class in JOURNAL_TOOLS:
+            self._tools[tool_class.name()] = tool_class()
+
+    def _register_user_inbox_tools(self) -> None:
+        """Register the owner-Inbox tools for agents that opt in."""
+        if not self._spec.tool_groups.user_inbox:
+            return
+        for tool in (SysUserInboxPostTool(), SysUserInboxListTool()):
             self._tools[tool.name()] = tool
 
     def _register_async_inbox_tools(self) -> None:
@@ -629,6 +655,11 @@ class ToolManager:
             BrowserScreenshotTool,
         ):
             self._tools[_cls.name()] = _cls()
+        # The advanced browser tools, and click / type with their trusted-input options.
+        # Imported here: the tool classes build on this module's registry.
+        from omnigent.tools.builtins.browser_advanced import register_browser_agent_tools
+
+        register_browser_agent_tools(self._tools)
 
     def _register_os_env_tools(self, *, schema_only: bool = False) -> None:
         """

@@ -25,7 +25,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   **Copy message to new session** opens it with a one-time `?handoff=` token
   instead, naming an in-memory copy of the message's text and attachments. That
   copy replaces the whole parked draft, even with no text or no attachments; the
-  token leaves the URL and is released once the composer takes it.
+  token leaves the URL and is released once the composer takes it. An agent
+  suggestion's action button in the Inbox uses the same handoff with the action's
+  prompt, so the viewer edits and sends it.
 - `offline-hosts`: the new-session host picker keeps other offline hosts collapsed,
   revealing five at a time in server recency order in a scrollable list. The selected
   offline host and desktop reconnect action stay visible. Closing the menu resets it.
@@ -153,6 +155,40 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   row opens the same dialog as **+ → Goal**. `/goal <objective>` keeps its
   existing message path. Sessions without the control keep sending the text
   or invoking a same-named skill. States: no goal, existing goal, read-only.
+  Drafts with attachments are sent as ordinary messages and do not set a goal.
+  Leading `/goal` takes precedence over a same-named slash skill; inline goal
+  skills and Codex native `$goal` skills remain available. For plain-text drafts
+  without quotes, mentions or review comments, mixed-case and newline-separated
+  goal commands use the same canonical message path. Drafts carrying that
+  context retain their existing handling.
+  In Codex native Chat, the goal indicator follows commands and native goal
+  changes without reopening the dialog. Sending an objective or resuming native
+  activity promptly retries the goal while setup finishes. Automatic refresh
+  runs while the runner is online and Chat is visible, without starting an idle
+  native session. Failed or unavailable reads keep the last goal and slow down
+  refreshes; returning to the tab retries immediately. Confirmed deletion clears
+  the indicator. Opening the dialog shows read errors, and goal creation and
+  editing remain available while runner status is offline or unknown.
+  Refreshes preserve edited dialog fields while untouched fields follow current
+  goal state. Reopening or switching sessions discards old drafts, including when
+  the opening read fails. Earlier reads and updates cannot replace another
+  session's goal fields. Reconnecting retains this session's last goal, edited
+  fields and operation errors in the same open dialog. A fresh goal response
+  releases opening-read loading even if an earlier read is still pending.
+  A pending Save, Clear, Pause or Resume stays busy after closing and reopening
+  the same session until the request and its refresh attempt finish. An
+  acknowledged Clear removes the indicator even if the dialog was closed and
+  the next refresh fails. Other sessions remain independently editable.
+  A timed-out update may already have taken effect; refresh the goal before
+  retrying.
+  Older runner versions may leave the indicator stale after clearing a goal
+  in the native terminal, or show a read error when no goal exists. Inspect the
+  native goal, then update and reconnect the session's owning runner on its
+  existing host/workspace binding and refresh. Repeating refresh against the
+  same older runner cannot resolve this ambiguity. With older servers, an
+  unavailable session can also appear to have no goal. See the
+  [Goal API compatibility notes](../omnigent/server/codex-API.md) for version
+  requirements.
 - `slash-rewind`: in claude-sdk and Claude Code native sessions, `/rewind` opens
   a searchable list of the session's prompts, newest first. Choosing one
   continues the conversation in a new session holding only the history before
@@ -424,6 +460,11 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   deployment stays under its mount path. Browser proof:
   `tests/browser_ui/chat/test_prompt_url.py`; router and draft edge cases:
   `web/src/shell/NewChatDialog.test.tsx` (`prompt URL handoff`).
+- From the Inbox, expand an Omni Advisor suggestion and click one of its action
+  buttons. The New Chat composer opens with the action's prompt as an editable
+  draft, through the same one-time handoff token; nothing is sent until Send.
+  Component proof: `web/src/pages/InboxPage.test.tsx` (`takes an agent action
+  and opens the composer with its prompt`).
 
 - In the managed desktop app, choose **Arclet Sandbox** and submit a task with
   missing or expired laptop credentials. Click **Refresh dbcert** in the yellow
@@ -562,6 +603,13 @@ Other connection providers alone do not enable the managed MCP picker.
   `tests/browser_ui/chat/test_composer_geometry_contract.py::test_landing_and_live_cards_share_the_geometry_contract`
   uses the built SPA with mocked APIs (no server required), comparing touch and
   mouse input at phone, tablet, and desktop widths.
+
+- **`prompt-link`, Inbox action handoff:** with an Omni Advisor suggestion in
+  the Inbox, expand it and click an action. The New Chat composer should open
+  with the action's prompt filled in and editable, the handoff token gone from
+  the URL, and no session created until Send. Component coverage:
+  `web/src/pages/InboxPage.test.tsx` (`takes an agent action and opens the
+  composer with its prompt`).
 
 - **`blocked-start`:** on a fresh new-session page with no working directory,
   enter a prompt or attach a file. Hover disabled Start, click it, then move
@@ -789,6 +837,19 @@ Other connection providers alone do not enable the managed MCP picker.
   also checks Polly's command-backed dialog, full objective forwarding, and
   same-named skills when Goal is unavailable. New-session and side-chat
   composers do not expose this session Goal dialog.
+  `web/src/components/goal/useGoalState.test.tsx` covers external goal changes,
+  session switches, and polling races; `GoalDialog.test.tsx` in that directory
+  covers preserving drafts during background updates. Manually, in a started
+  Codex native Chat, send `/goal <objective>` while idle and during work. The
+  goal indicator should appear within a few seconds without reopening controls.
+  Open Goal, change the objective, budget, and mode, and wait ten seconds:
+  the unsaved edits should remain. Pause or resume the goal and confirm the
+  indicator follows its status; then delete the test goal. During a temporary
+  goal-read failure, the indicator should remain. Restore connectivity and
+  return to the tab to confirm it refreshes without reopening Goal.
+  If goal setup times out or loses its reply, the goal may already have been
+  saved even though the objective message was not delivered. Inspect Goal
+  before resending: another `/goal <objective>` sets that objective again.
 - **`session-mcp-status`, in-session composer:** component coverage lives in
   `web/src/pages/ChatPage.composer.test.tsx`. Manually open a started session,
   select `/mcp`, and expect the effective MCP names and descriptions under

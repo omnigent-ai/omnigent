@@ -1,5 +1,6 @@
 import type { AssistantMessagePhase } from "./conversationItems";
 import type { NativePermissionDelivery } from "./nativePermissionDelivery";
+import type { JournalEntry } from "./sessionJournal";
 // Mirrors sdks/python-client/omnigent_client/_events.py.
 //
 // Hand-ported. When _events.py changes, update this file and the
@@ -222,6 +223,8 @@ export interface ElicitationRequest {
    * PermissionRequest for non-AskUserQuestion tools).
    */
   askUserQuestion?: Record<string, unknown> | null;
+  /** Producer-supplied extra (workflow questions only): the ID of the plan step the question is about. */
+  journalStep?: string;
   /**
    * Producer-supplied extra (claude-native only): the FULL
    * ``ExitPlanMode`` tool_input, untruncated — present when the
@@ -911,6 +914,17 @@ export interface SessionChildSessionUpdatedEvent {
 }
 
 /**
+ * `session.journal.appended` — an entry was appended to the session's journal.
+ * Transient: a client that reconnects catches up from the REST journal.
+ */
+export interface SessionJournalAppendedEvent {
+  type: "session_journal_appended";
+  conversationId: string;
+  /** The new entry, shaped like a `GET …/journal` entry. */
+  entry: JournalEntry;
+}
+
+/**
  * `session.changed_files.invalidated` — the session's changed-files list
  * may have changed; the consumer should refetch it. Coarse signal (no
  * per-file payload).
@@ -1077,6 +1091,7 @@ export type StreamEvent =
   | SessionResourceCreatedEvent
   | SessionResourceDeletedEvent
   | SessionChildSessionUpdatedEvent
+  | SessionJournalAppendedEvent
   | SessionChangedFilesInvalidatedEvent
   | SessionTerminalActivityEvent
   | SessionModelOptionsEvent

@@ -10,6 +10,7 @@ vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
 import { SidebarDataProvider } from "@/hooks/useSidebarData";
 import { conversationPage } from "@/test/sidebarMockHelpers";
 import * as automationInboxHook from "@/hooks/useAutomationInbox";
+import * as proactiveInboxHook from "@/hooks/useProactiveInbox";
 import { PINNED_LABEL_KEY } from "@/lib/sessionListCache";
 import { sidebarConfig, type SidebarConfig } from "@/lib/sidebarConfig";
 // Integration tests for the Sidebar's session list. The search box no
@@ -1229,6 +1230,44 @@ describe("Sidebar session list", () => {
     },
   );
 
+  it("calls a capped suggestion count a floor, since the server stopped counting at it", () => {
+    const proactiveInbox = vi.spyOn(proactiveInboxHook, "useProactiveInbox");
+    const base = proactiveInbox.getMockImplementation()?.(true);
+    proactiveInbox.mockReturnValue({
+      ...(base as ReturnType<typeof proactiveInboxHook.useProactiveInbox>),
+      items: [],
+      unreadCount: 100,
+      unreadCountCapped: true,
+    });
+    try {
+      mockConversations([]);
+      renderSidebar();
+      const inbox = within(screen.getByTestId("inbox-button"));
+      expect(inbox.getByLabelText("At least 100 inbox items waiting")).toHaveTextContent("100+");
+      cleanup();
+
+      // Unchecked automations qualify the same label rather than replacing it.
+      const automationInbox = vi.spyOn(automationInboxHook, "useAutomationInbox");
+      automationInbox.mockReturnValue({
+        items: [],
+        hasNextPage: true,
+      } as unknown as ReturnType<typeof automationInboxHook.useAutomationInbox>);
+      try {
+        mockConversations([]);
+        renderSidebar();
+        expect(
+          within(screen.getByTestId("inbox-button")).getByLabelText(
+            "At least 100 inbox items waiting; more automations not yet checked",
+          ),
+        ).toHaveTextContent("100+");
+      } finally {
+        automationInbox.mockRestore();
+      }
+    } finally {
+      proactiveInbox.mockRestore();
+    }
+  });
+
   it.each(["/", "/inbox"])("counts an unread session in the Inbox badge on %s", (route) => {
     seedReadState([{ id: "conv_unread", viewer_last_seen: 199 }]);
     mockConversations([conv("conv_unread", "Codex", { status: "idle", updated_at: 200 })]);
@@ -1275,6 +1314,25 @@ describe("Sidebar session list", () => {
     const usage = screen.getByTestId("usage-nav");
     expect(usage).toHaveAttribute("href", "/usage");
     expect(usage).toHaveClass("bg-[var(--sidebar-active)]");
+  });
+
+  it("hides Workflows navigation while the release feature is off", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar();
+
+    expect(screen.queryByTestId("workflows-nav")).toBeNull();
+  });
+
+  it("shows and highlights Workflows navigation when the release feature is on", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar(true, "/workflows", undefined, {
+      ...FALLBACK_SERVER_INFO,
+      features: { workflows: true },
+    });
+
+    const workflows = screen.getByTestId("workflows-nav");
+    expect(workflows).toHaveAttribute("href", "/workflows");
+    expect(workflows).toHaveClass("bg-[var(--sidebar-active)]");
   });
 
   it("hides Canvas navigation while the release feature is off", () => {
@@ -1462,6 +1520,17 @@ describe("Sidebar session list", () => {
     expect(screen.getByTestId("new-chat-button")).toBeInTheDocument();
     expect(screen.getByTestId("scheduled-tasks-nav")).toBeInTheDocument();
     expect(screen.getByTestId("inbox-button")).toBeInTheDocument();
+  });
+
+  it("marks Workflows active (not New session) on a workflow's page", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar(true, "/workflows/1e7bf4052f44451895933c8413947d27", undefined, {
+      ...FALLBACK_SERVER_INFO,
+      features: { workflows: true },
+    });
+
+    expect(screen.getByTestId("workflows-nav")).toHaveClass("bg-[var(--sidebar-active)]");
+    expect(screen.getByTestId("new-chat-button")).not.toHaveClass("bg-[var(--sidebar-active)]");
   });
 
   it("marks Automations active (not New session) on /tasks/:taskId (detail route)", () => {

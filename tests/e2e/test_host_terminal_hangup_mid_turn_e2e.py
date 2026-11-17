@@ -39,7 +39,7 @@ from tests.e2e.conftest import (
 )
 from tests.e2e.helpers import final_assistant_text
 
-_HOST_ONLINE_TIMEOUT_S = 120.0
+_HOST_READY_TIMEOUT_S = 120.0
 _RUNNER_ONLINE_TIMEOUT_S = 90.0
 _GATE_TIMEOUT_S = 60.0
 _TURN_TIMEOUT_S = 120.0
@@ -206,18 +206,29 @@ def test_terminal_hangup_lets_in_flight_turn_finish(
         )
         try:
 
-            def _host_online() -> bool:
+            def _host_ready() -> bool:
                 try:
                     rows = client.get("/v1/hosts").json().get("hosts", [])
+                    if not any(
+                        r.get("host_id") == terminal.host_id and r.get("status") == "online"
+                        for r in rows
+                    ):
+                        return False
+                    # Persisted online status can precede the tunnel's RPC registration.
+                    return (
+                        client.get(
+                            f"/v1/hosts/{terminal.host_id}/filesystem",
+                            params={"limit": 1},
+                            timeout=2.0,
+                        ).status_code
+                        == 200
+                    )
                 except (httpx.HTTPError, ValueError):
                     return False  # server still warming up; let _wait_until retry
-                return any(
-                    r.get("host_id") == terminal.host_id and r.get("status") == "online"
-                    for r in rows
-                )
 
-            assert _wait_until(_host_online, _HOST_ONLINE_TIMEOUT_S), (
-                f"host never came online\n{terminal.log_path.read_text(errors='replace')[-4000:]}"
+            assert _wait_until(_host_ready, _HOST_READY_TIMEOUT_S), (
+                "host tunnel never answered an RPC\n"
+                f"{terminal.log_path.read_text(errors='replace')[-4000:]}"
             )
             bundle = bundle_files({"config.yaml": _AGENT_YAML.format(model=model).encode()})
             created = post_session_bundle(client.post, "/v1/sessions", bundle)

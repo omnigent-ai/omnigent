@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import logging
 import threading
 import time
@@ -22,7 +23,13 @@ import httpx
 import pytest
 
 from omnigent.entities import ScheduledTask, ScheduledTaskRun
-from omnigent.server.auth import RESERVED_USER_LOCAL
+from omnigent.server.auth import (
+    LEVEL_EDIT,
+    LEVEL_OWNER,
+    LEVEL_READ,
+    RESERVED_USER_LOCAL,
+    RESERVED_USER_PUBLIC,
+)
 from omnigent.server.managed_hosts import ManagedLaunchTracker
 from omnigent.server.scheduled import fire as fire_mod
 from omnigent.server.scheduled import telemetry
@@ -42,6 +49,7 @@ from omnigent.server.scheduled.schedule import (
 )
 from omnigent.server.startup_inputs import STARTUP_LABEL
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
 from tests.server.scheduled.test_fire import (
     FakeAgentStore,
@@ -105,7 +113,11 @@ class _Claimed:
 
 
 def _claim(
-    store: SqlAlchemyScheduledTaskStore, *, one_time: bool = False, **kwargs: Any
+    store: SqlAlchemyScheduledTaskStore,
+    *,
+    agent_id: str = _AGENT_ID,
+    one_time: bool = False,
+    **kwargs: Any,
 ) -> _Claimed:
     """Create a due task and claim its first occurrence, as the scheduler's poll would.
 
@@ -120,7 +132,7 @@ def _claim(
         "do the thing",
         "FREQ=HOURLY;COUNT=1" if one_time else "FREQ=HOURLY",
         None,
-        _AGENT_ID,
+        agent_id,
         "UTC",
         **kwargs,
     )
@@ -471,6 +483,44 @@ async def test_continued_session_fire_runs_on_the_claimed_run(store, one_time) -
     assert store.get(claimed.task.id).state == ("completed" if one_time else "active")
 
 
+async def test_a_continued_fire_names_its_run_on_the_session_before_sending(store) -> None:
+    """What the agent records about this firing goes to its run, on any replica.
+
+    The session names the claimed run before the prompt goes in. That label is
+    stored with the session, so a report that arrives after a restart, or on a
+    replica that never saw the fire, still lands on this run rather than on the
+    earlier run, which the session's run row does not name until delivery.
+    """
+    from omnigent.stores.conversation_store import SCHEDULED_TASK_RUN_LABEL_KEY
+
+    claimed = _claim(store, session_mode="continue", session_id=_CONV_ID)
+    conversations = _ExistingConversationStore(
+        _FakeConversation(
+            id=_CONV_ID,
+            agent_id=_AGENT_ID,
+            host_id=_HOST_ID,
+            workspace="/repo",
+            labels={SCHEDULED_TASK_RUN_LABEL_KEY: "e" * 32},
+        )
+    )
+    at_dispatch: list[tuple[str | None, str | None]] = []
+
+    async def dispatch(conv: Any, task: ScheduledTask) -> None:
+        at_dispatch.append(
+            (
+                conversations.label_writes.get(_CONV_ID, {}).get(SCHEDULED_TASK_RUN_LABEL_KEY),
+                conv.labels.get(SCHEDULED_TASK_RUN_LABEL_KEY),
+            )
+        )
+
+    executor = ClaimedRunExecutor(
+        _deps(store, conversation_store=conversations), launch_dispatch=dispatch
+    )
+    await executor.fire(claimed.task, claimed.lease)
+
+    assert at_dispatch == [(claimed.lease.run.id, claimed.lease.run.id)]
+
+
 async def test_a_continue_tasks_first_claimed_run_keeps_its_session(store) -> None:
     claimed = _claim(store, session_mode="continue")
     conversations = _ConversationStore()
@@ -497,6 +547,155 @@ def _second_claim(store: SqlAlchemyScheduledTaskStore, claimed: _Claimed) -> Sta
     assert pending is not None
     _, run = pending
     return StartupLease(store, run, now=claimed.clock.now, lease_seconds=_LEASE_SECONDS)
+
+
+def _share_task(permissions: SqlAlchemyPermissionStore, task_id: str, *grantees: str) -> None:
+    for grantee in grantees:
+        permissions.ensure_user(grantee)
+        permissions.grant_for_scheduled_task(grantee, task_id, LEVEL_READ)
+
+
+def _session_levels(permissions: SqlAlchemyPermissionStore, session_id: str) -> dict[str, int]:
+    grants, _ = permissions.list_for_session(session_id)
+    return {grant.user_id: grant.level for grant in grants}
+
+
+def _dispatch_recording_shares(
+    permissions: SqlAlchemyPermissionStore, seen: list[dict[str, int]]
+) -> AsyncMock:
+    """A launch seam that records the session's grants as dispatch finds them."""
+
+    async def dispatch(conv: Any, task: ScheduledTask) -> None:
+        seen.append(_session_levels(permissions, conv.id))
+
+    return AsyncMock(side_effect=dispatch)
+
+
+async def test_each_claimed_run_shares_its_new_session_with_the_current_grants(
+    store, db_uri, monkeypatch
+) -> None:
+    from omnigent.stores import permission_store
+
+    # Smaller pages, so the grantees span more than one.
+    monkeypatch.setattr(permission_store, "MAX_GRANTS_PAGE_SIZE", 2)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    claimed = _claim(store)
+    grantees = ["alice@example.com", "bob@example.com", "carol@example.com"]
+    _share_task(permissions, claimed.task.id, *grantees)
+    conversations = _ConversationStore()
+    dispatched: list[dict[str, int]] = []
+    executor = ClaimedRunExecutor(
+        _deps(store, conversation_store=conversations, permission_store=permissions),
+        launch_dispatch=_dispatch_recording_shares(permissions, dispatched),
+    )
+
+    await executor.fire(claimed.task, claimed.lease)
+    # Removing a grantee changes later runs only.
+    permissions.revoke_for_scheduled_task("bob@example.com", claimed.task.id)
+    await executor.fire(claimed.task, _second_claim(store, claimed))
+
+    first, second = conversations.ids
+    owner = {RESERVED_USER_LOCAL: LEVEL_OWNER}
+    first_shares = {**owner, **dict.fromkeys(grantees, LEVEL_READ)}
+    second_shares = {**owner, "alice@example.com": LEVEL_READ, "carol@example.com": LEVEL_READ}
+    # Each session was shared before its prompt was dispatched.
+    assert dispatched == [first_shares, second_shares]
+    assert _session_levels(permissions, first) == first_shares
+    assert _session_levels(permissions, second) == second_shares
+    assert [run.status for run in _runs(store, claimed.task)] == ["running", "running"]
+
+
+@pytest.mark.parametrize("replaced", ["before_the_recheck", "after_the_recheck"])
+async def test_a_grantee_replaced_during_a_run_is_not_given_the_session(
+    store, db_uri, monkeypatch, replaced
+) -> None:
+    from omnigent.server.accounts_store import SqlAlchemyAccountStore
+    from omnigent.server.scheduled import run_sharing
+
+    accounts = SqlAlchemyAccountStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    claimed = _claim(store)
+    accounts.create_user_with_password("alice@example.com", "first-hash")
+    _share_task(permissions, claimed.task.id, "alice@example.com", "bob@example.com")
+    announced: list[str | None] = []
+    monkeypatch.setattr(
+        run_sharing, "_announce_session_added", lambda user_id, _: announced.append(user_id)
+    )
+    # Alice's account is deleted and her name registered again: as the run looks up her
+    # share of the session, or as it writes her account row after the recheck.
+    hooked = "get" if replaced == "before_the_recheck" else "ensure_user"
+    original = getattr(permissions, hooked)
+
+    def replace_alice_first(*args: Any, **kwargs: Any) -> Any:
+        if args[0] == "alice@example.com":
+            monkeypatch.setattr(permissions, hooked, original)
+            assert accounts.delete_user("alice@example.com")
+            accounts.create_user_with_password("alice@example.com", "second-hash")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(permissions, hooked, replace_alice_first)
+    conversations = _ConversationStore()
+    executor = ClaimedRunExecutor(
+        _deps(store, conversation_store=conversations, permission_store=permissions),
+        launch_dispatch=AsyncMock(),
+    )
+
+    await executor.fire(claimed.task, claimed.lease)
+
+    [session_id] = conversations.ids
+    assert _session_levels(permissions, session_id) == {
+        RESERVED_USER_LOCAL: LEVEL_OWNER,
+        "bob@example.com": LEVEL_READ,
+    }
+    assert announced == ["bob@example.com"]
+    assert [run.status for run in _runs(store, claimed.task)] == ["running"]
+
+
+async def test_a_claimed_continue_run_syncs_its_session_once_the_automation_is_shared(
+    store, db_uri
+) -> None:
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    claimed = _claim(store, session_mode="continue", session_id=_CONV_ID)
+    # Alice was shared by hand at Edit, Carol by hand only.
+    hand_made = {
+        RESERVED_USER_LOCAL: LEVEL_OWNER,
+        RESERVED_USER_PUBLIC: LEVEL_READ,
+        "alice@example.com": LEVEL_EDIT,
+        "carol@example.com": LEVEL_READ,
+    }
+    for user_id, level in hand_made.items():
+        permissions.ensure_user(user_id)
+        permissions.grant(user_id, _CONV_ID, level)
+    conversations = _ExistingConversationStore(
+        _FakeConversation(id=_CONV_ID, agent_id=_AGENT_ID, host_id=_HOST_ID, workspace="/repo")
+    )
+    dispatched: list[dict[str, int]] = []
+    executor = ClaimedRunExecutor(
+        _deps(store, conversation_store=conversations, permission_store=permissions),
+        launch_dispatch=_dispatch_recording_shares(permissions, dispatched),
+    )
+
+    # Nobody has shared the automation yet, so runs leave the session's sharing alone.
+    await executor.fire(claimed.task, claimed.lease)
+    permissions.ensure_user("dave@example.com")
+    permissions.grant("dave@example.com", _CONV_ID, LEVEL_READ)
+    await executor.fire(claimed.task, _second_claim(store, claimed))
+    with_dave = {**hand_made, "dave@example.com": LEVEL_READ}
+    assert _session_levels(permissions, _CONV_ID) == with_dave
+    # Once it is shared, the next run syncs the session to its grants.
+    _share_task(permissions, claimed.task.id, "alice@example.com", "bob@example.com")
+    await executor.fire(claimed.task, _second_claim(store, claimed))
+
+    synced = {
+        RESERVED_USER_LOCAL: LEVEL_OWNER,
+        RESERVED_USER_PUBLIC: LEVEL_READ,
+        "alice@example.com": LEVEL_EDIT,
+        "bob@example.com": LEVEL_READ,
+    }
+    # The sync ran before the third run's prompt was dispatched.
+    assert dispatched == [hand_made, with_dave, synced]
+    assert _session_levels(permissions, _CONV_ID) == synced
+    assert [run.status for run in _runs(store, claimed.task)] == ["succeeded"] * 3
 
 
 async def test_a_second_run_sends_into_a_session_another_run_is_using(store) -> None:
@@ -697,6 +896,59 @@ async def test_unsupported_target_skips_the_claimed_run(store) -> None:
     [run] = _runs(store, claimed.task)
     assert (run.status, run.error_code) == ("skipped", "unsupported_target")
     dispatch.assert_not_awaited()
+
+
+async def test_proactive_gate_is_checked_as_the_task_owner(store) -> None:
+    from omnigent.server.proactive_agent import PROACTIVE_AGENT_ID
+
+    owner: contextvars.ContextVar[str | None] = contextvars.ContextVar("owner", default=None)
+    seen: list[tuple[str | None, str]] = []
+
+    @contextlib.asynccontextmanager
+    async def identity(task: ScheduledTask) -> AsyncIterator[None]:
+        token = owner.set("task-owner")
+        try:
+            yield
+        finally:
+            owner.reset(token)
+
+    def enabled_for(user_id: str) -> bool:
+        seen.append((owner.get(), user_id))
+        return False
+
+    claimed = _claim(store, agent_id=PROACTIVE_AGENT_ID)
+    deps = _deps(store)
+    # The agent is shipped, so only the gate can skip the run.
+    deps.agent_store = FakeAgentStore({PROACTIVE_AGENT_ID: _FakeAgent(PROACTIVE_AGENT_ID)})
+    deps.app_state = SimpleNamespace(proactive_agent_enabled_for=enabled_for)
+    dispatch = AsyncMock()
+
+    await ClaimedRunExecutor(deps, fire_identity=identity, launch_dispatch=dispatch).fire(
+        claimed.task, claimed.lease
+    )
+
+    [run] = _runs(store, claimed.task)
+    assert (run.status, run.error_code) == ("skipped", "proactive_agent_off")
+    # Checked for the task's owner, inside the owner's identity scope.
+    assert seen == [("task-owner", claimed.task.user_id or "local")]
+    dispatch.assert_not_awaited()
+    assert store.get(claimed.task.id).state == "active"
+
+
+async def test_proactive_task_skips_when_its_agent_is_not_shipped(store) -> None:
+    from omnigent.server.proactive_agent import PROACTIVE_AGENT_ID
+
+    claimed = _claim(store, agent_id=PROACTIVE_AGENT_ID)
+    deps = _deps(store)
+    deps.app_state = SimpleNamespace(proactive_agent_enabled_for=lambda _user: True)
+    dispatch = AsyncMock()
+
+    await ClaimedRunExecutor(deps, launch_dispatch=dispatch).fire(claimed.task, claimed.lease)
+
+    [run] = _runs(store, claimed.task)
+    assert (run.status, run.error_code) == ("skipped", "proactive_agent_off")
+    dispatch.assert_not_awaited()
+    assert store.get(claimed.task.id).state == "active"
 
 
 async def test_lost_lease_stops_before_the_prompt_is_sent(store) -> None:

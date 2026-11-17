@@ -458,15 +458,11 @@ class ClaudeSettingsLease:
     _claim_fd: int | None = None
     _session_id: str | None = None
 
-    def _identity_matches(
-        self, lifecycle: _ClaudeSettingsLifecycle, *, lease_fd: int | None = None
-    ) -> bool:
+    def _resource_identity_matches(self, *, lease_fd: int | None = None) -> bool:
         lease_fd = self._fd if lease_fd is None else lease_fd
         if (
             self._bridge_fd is None
             or _fd_identity(self._bridge_fd) != _directory_identity(self.bridge_dir)
-            or lifecycle.session_id != self._session_id
-            or not _lifecycle_matches_bridge(self.bridge_dir, lifecycle)
             or lease_fd is None
             or not _file_matches_fd(
                 settings_generation_path(self.bridge_dir, self.generation).with_suffix(
@@ -482,6 +478,15 @@ class ClaudeSettingsLease:
             ):
                 return False
         return True
+
+    def _identity_matches(
+        self, lifecycle: _ClaudeSettingsLifecycle, *, lease_fd: int | None = None
+    ) -> bool:
+        return (
+            self._resource_identity_matches(lease_fd=lease_fd)
+            and lifecycle.session_id == self._session_id
+            and _lifecycle_matches_bridge(self.bridge_dir, lifecycle)
+        )
 
     def _require_current(self) -> _ClaudeSettingsLifecycle:
         lifecycle = _require_incarnation(
@@ -566,11 +571,18 @@ class ClaudeSettingsLease:
                     self._terminal_claim.unlink(missing_ok=True)
                     self._terminal_claim = None
                 lifecycle = _read_lifecycle(self.bridge_dir)
-                if lifecycle is None or lifecycle.incarnation != self._incarnation:
+                if (
+                    lifecycle is None
+                    or not self._resource_identity_matches(lease_fd=fd)
+                    or not _lifecycle_matches_bridge(self.bridge_dir, lifecycle)
+                ):
                     return
-                if not self._identity_matches(lifecycle, lease_fd=fd):
-                    return
+                same_incarnation = lifecycle.incarnation == self._incarnation
                 same_epoch = lifecycle.epoch == (self._admission_epoch or self._incarnation)
+                if same_incarnation and lifecycle.session_id != self._session_id:
+                    return
+                if not same_incarnation and same_epoch:
+                    return
                 if not same_epoch and (
                     lifecycle.session_id is None or lifecycle.bridge_identity is None
                 ):
@@ -582,7 +594,7 @@ class ClaudeSettingsLease:
                     _retire_unused(self.bridge_dir, self.generation)
                 _complete_bridge_deletion(
                     self.bridge_dir,
-                    self._incarnation,
+                    lifecycle.incarnation,
                     admission_epoch=lifecycle.epoch,
                 )
         except (OSError, ValueError):

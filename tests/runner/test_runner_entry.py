@@ -4131,6 +4131,44 @@ async def test_runner_hides_scheduled_task_tools_only_when_server_turns_automati
     assert [advertised(result.spec) for result in results] == [False, True, True]
 
 
+@pytest.mark.asyncio
+async def test_runner_hides_user_inbox_tools_only_when_the_server_turns_them_off(tmp_path):
+    from omnigent.automations_availability import USER_INBOX_HEADER
+    from omnigent.tools.manager import ToolManager
+    from tests.server.helpers import build_agent_bundle
+
+    bundle = build_agent_bundle("inbox-agent", tool_groups={"user_inbox": True})
+    # "1" is on; no header is an older server, which keeps the tools.
+    gate_headers = [{USER_INBOX_HEADER: "0"}, {USER_INBOX_HEADER: "1"}, {}]
+
+    def handler(request):
+        return httpx.Response(
+            200,
+            content=bundle,
+            headers={
+                "X-Agent-Version": "1",
+                "X-Agent-Session-Scoped": "true",
+                **gate_headers.pop(0),
+            },
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server.test"
+    ) as client:
+        results = [
+            await _resolve_agent_spec_from_server(
+                client, _AgentSpecCache(tmp_path), "ag_inbox", session_id="session"
+            )
+            for _ in range(3)
+        ]
+
+    def advertised(spec):
+        names = {schema["function"]["name"] for schema in ToolManager(spec).get_tool_schemas()}
+        return {"sys_user_inbox_post", "sys_user_inbox_list"} <= names
+
+    assert [advertised(result.spec) for result in results] == [False, True, True]
+
+
 async def test_runner_selection_changes_without_rewriting_cached_bundle(tmp_path):
     import json
 

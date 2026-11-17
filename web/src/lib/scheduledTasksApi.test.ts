@@ -110,6 +110,18 @@ describe("listScheduledTasks", () => {
     fetchMock.mockResolvedValueOnce(mockResponse({}));
     await expect(listScheduledTasks()).resolves.toEqual([]);
   });
+
+  // Servers that predate task MCP services omit the key.
+  it.each([
+    ["absent", {}, []],
+    ["present", { mcp_services: ["github", "slack"] }, ["github", "slack"]],
+  ])("maps a task's MCP services (%s)", async (_, extra, mcpServices) => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({ scheduled_tasks: [{ ...TASK_WIRE, ...extra }] }),
+    );
+    const [task] = await listScheduledTasks();
+    expect(task.mcpServices).toEqual(mcpServices);
+  });
 });
 
 describe("getScheduledTask", () => {
@@ -251,6 +263,26 @@ describe("createScheduledTask", () => {
     expect(JSON.stringify(analytics.mock.calls)).not.toContain("private");
   });
 
+  it("sends the browser tools mode header so the source copy keeps it", async () => {
+    const win = window as unknown as { omnigentDesktop?: unknown };
+    const before = win.omnigentDesktop;
+    win.omnigentDesktop = { browserTabs: () => undefined };
+    try {
+      fetchMock.mockResolvedValueOnce(mockResponse(TASK_WIRE));
+      await createScheduledTask({
+        name: "n",
+        prompt: "p",
+        rrule: "FREQ=DAILY",
+        agentId: "agent",
+        sourceSessionId: "conv_1",
+      });
+      const [, init] = fetchMock.mock.calls[0];
+      expect(new Headers(init.headers).get("X-Omnigent-Browser-Agent-Tools")).toBe("on");
+    } finally {
+      win.omnigentDesktop = before;
+    }
+  });
+
   it("includes the host/workspace pair and timezone when provided", async () => {
     fetchMock.mockResolvedValueOnce(mockResponse(TASK_WIRE));
     await createScheduledTask({
@@ -279,6 +311,16 @@ describe("createScheduledTask", () => {
     expect(bodies[0].project_id).toBe("proj_1");
     expect(bodies[1]).not.toHaveProperty("project_id");
   });
+
+  it("sends picked MCP services and omits an empty pick", async () => {
+    fetchMock.mockResolvedValue(mockResponse(TASK_WIRE));
+    const base = { name: "n", prompt: "p", rrule: "FREQ=DAILY", agentId: "ag_1" };
+    await createScheduledTask({ ...base, mcpServices: ["github"] });
+    await createScheduledTask({ ...base, mcpServices: [] });
+    const bodies = fetchMock.mock.calls.map(([, init]) => JSON.parse(init.body));
+    expect(bodies[0].mcp_services).toEqual(["github"]);
+    expect(bodies[1]).not.toHaveProperty("mcp_services");
+  });
 });
 
 describe("updateScheduledTask", () => {
@@ -299,6 +341,15 @@ describe("updateScheduledTask", () => {
     fetchMock.mockResolvedValueOnce(mockResponse({ ...TASK_WIRE, project_id: projectId }));
     await updateScheduledTask("st_1", { projectId });
     expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({ project_id: projectId });
+  });
+
+  it.each([
+    ["replaces the MCP services", ["slack"]],
+    ["sends an explicit [] to turn them all off", []],
+  ])("%s", async (_, mcpServices) => {
+    fetchMock.mockResolvedValueOnce(mockResponse({ ...TASK_WIRE, mcp_services: mcpServices }));
+    await updateScheduledTask("st_1", { mcpServices });
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({ mcp_services: mcpServices });
   });
 });
 

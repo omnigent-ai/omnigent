@@ -278,12 +278,47 @@ def resolve_harness_skills(ctx: SkillSourceContext, harness: str | None) -> list
     return [s for s in _dedup(provider(native_ctx)) if s.user_invocable]
 
 
+# Skills Omnigent ships, each for agents that have the tool group it drives.
+FRAMEWORK_SKILLS_DIR = Path(__file__).resolve().parent.parent / "resources" / "skills"
+_FRAMEWORK_SKILL_GROUPS = {"workflow": "journal", "save-workflow": "journal"}
+
+
+def framework_skill_names(spec: AgentSpec | None = None) -> list[str]:
+    """Names of the skills Omnigent ships for the agent's tool groups, e.g. ``["workflow"]``.
+
+    Each lives in ``FRAMEWORK_SKILLS_DIR / name``. Without a spec, return every
+    framework name so reused bundles can remove disabled framework-owned links.
+    """
+    return [
+        name
+        for name, group in _FRAMEWORK_SKILL_GROUPS.items()
+        if spec is None or getattr(spec.tool_groups, group)
+    ]
+
+
+def framework_skills(spec: AgentSpec) -> list[SkillSpec]:
+    """The skills Omnigent ships for the agent's tool groups, e.g. ``workflow``.
+
+    Like bundled skills, they ignore ``skills_filter``; an agent drops one by
+    turning its tool group off, e.g. ``tool_groups.journal: false``.
+    """
+    names = set(framework_skill_names(spec))
+    if not names or not FRAMEWORK_SKILLS_DIR.is_dir():
+        return []
+    return [
+        skill
+        for skill in _discover_skills(FRAMEWORK_SKILLS_DIR, skipped=[])
+        if skill.name in names
+    ]
+
+
 def resolve_session_skills(
     spec: AgentSpec,
     roots: tuple[Path, ...],
     bundle_dir: Path | None,
     *,
     warnings: list[str] | None = None,
+    workflows_enabled: bool = False,
 ) -> list[SkillSpec]:
     """Use identical precedence and filters for menu discovery and invocation."""
     from omnigent.harness_aliases import canonicalize_harness
@@ -315,6 +350,9 @@ def resolve_session_skills(
         if resolved_dir is not None:
             seen_dirs.add(resolved_dir)
         merged.append(skill)
+    # Last, so an agent's or user's own skill of the same name wins.
+    if workflows_enabled:
+        merged.extend(skill for skill in framework_skills(spec) if skill.name not in seen)
     return merged
 
 
