@@ -2994,36 +2994,3 @@ def test_inbox_mysql_deep_page_seeks_to_cursor(store):
         float(value) for value in re.findall(r"actual time=[^)]*? rows=([\d.]+)", plans[0])
     ]
     assert examined and max(examined) <= 51, plans[0]
-
-
-def test_run_starts_list_every_run_of_each_conversation_oldest_first(
-    store: SqlAlchemyScheduledTaskStore,
-) -> None:
-    """Runs of any task count, a run not yet fired starts when it was scheduled."""
-    first = _seed_running_run(store, "starts")
-    other = _seed_running_run(store, "starts_other")
-    shared, lone = _uid("conv_starts"), _uid("conv_starts_other")
-    store.create(
-        scheduled_task_id=_uid("task_starts_peer"),
-        name="peer",
-        prompt="p",
-        rrule="FREQ=MINUTELY",
-        user_id="u",
-        agent_id=_uid("ag"),
-        timezone="UTC",
-    )
-    queued = _uid("run_starts_queued")
-    store.create_run(
-        run_id=queued,
-        scheduled_task_id=_uid("task_starts_peer"),
-        status="scheduled",
-        scheduled_at=50,
-        conversation_id=shared,
-    )
-    assert store.list_run_starts_for_conversations([shared, lone, _uid("conv_absent")]) == {
-        shared: [(queued, 50), (first, 101)],
-        lone: [(other, 101)],
-    }
-    assert store.list_run_starts_for_conversations([]) == {}
-    with workspace_scope(11):
-        assert store.list_run_starts_for_conversations([shared]) == {}

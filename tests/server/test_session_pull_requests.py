@@ -335,104 +335,46 @@ def _stored(url: str, **overrides: Any) -> StoredPullRequest:
     return StoredPullRequest(**{**fields, **overrides})
 
 
-def _run(
-    *,
-    owns_session: bool,
-    finished_at: float | None = 2_000.0,
-    next_started_at: float | None = None,
-) -> server_prs.RunWindow:
-    return server_prs.RunWindow(
-        run_id="run",
-        started_at=1_000.0,
-        finished_at=finished_at,
-        next_started_at=next_started_at,
-        owns_session=owns_session,
-    )
-
-
-def _picked(window: server_prs.RunWindow, *entries: StoredPullRequest) -> list[str]:
+def _picked(run_id: str, *entries: StoredPullRequest, created_session: bool = False) -> list[str]:
     stored = SessionPullRequests(entries=list(entries), synced=True)
-    return [entry.url for entry in server_prs.run_pull_requests(window, stored, now=5_000.0)]
-
-
-C = "https://github.com/example/three/pull/3"
-
-
-def test_a_run_in_a_continued_session_gets_the_prs_first_seen_while_it_ran() -> None:
-    entries = (
-        _stored(A, relationship="worked_on", first_seen_at=500.0),
-        _stored(B, relationship="worked_on", first_seen_at=1_500.0),
-        # Reports of the turn's last calls land shortly after it ends.
-        _stored(C, first_seen_at=2_000.0 + server_prs.RUN_ATTRIBUTION_GRACE_S),
-        _stored("https://github.com/example/four/pull/4", first_seen_at=2_500.0),
-    )
-    assert _picked(_run(owns_session=False), *entries) == [C, B]
-    # A run still going covers everything seen since it started.
-    assert _picked(_run(owns_session=False, finished_at=None), *entries) == [
-        C,
-        "https://github.com/example/four/pull/4",
-        B,
+    return [
+        entry.url
+        for entry in server_prs.run_pull_requests(run_id, stored, created_session=created_session)
     ]
 
 
-def test_a_pr_seen_after_the_next_run_started_is_only_that_runs() -> None:
-    """The grace after a run ends never reaches into the session's next run."""
+C = "https://github.com/example/three/pull/3"
+D = "https://github.com/example/four/pull/4"
+
+
+def test_a_run_gets_the_prs_first_stored_during_its_turn_created_first() -> None:
+    """However long after delivery its agent opened them, and none from other runs."""
     entries = (
-        _stored(A, first_seen_at=1_990.0),
-        _stored(B, first_seen_at=2_050.0),
-        _stored(C, first_seen_at=2_060.0),
+        _stored(A, relationship="worked_on", first_seen_at=500.0, run_id="run"),
+        _stored(B, relationship="created", first_seen_at=9_000.0, run_id="run"),
+        _stored(C, run_id="other"),
+        _stored(D, relationship="attached"),
     )
-    assert _picked(_run(owns_session=False, next_started_at=2_050.0), *entries) == [A]
-    assert _picked(_run(owns_session=False), *entries) == [A, B, C]
+    assert _picked("run", *entries) == [B, A]
+    assert _picked("other", *entries) == [C]
 
 
-@pytest.mark.parametrize(
-    ("session_runs", "created_at", "owns", "next_started_at"),
-    [
-        # The run created its session and is its only run.
-        ([("run", 1_000.0)], 1_002.0, True, None),
-        # Creation is a little before the recorded start on legacy timers.
-        ([("run", 1_000.0)], 1_000.0 - server_prs.RUN_SESSION_CREATION_SLACK_S, True, None),
-        # A session the run continued existed before it.
-        ([("run", 1_000.0)], 500.0, False, None),
-        ([("run", 1_000.0)], None, False, None),
-        # Several runs share the session, whichever of them a page lists.
-        ([("run", 1_000.0), ("later", 3_000.0)], 1_002.0, False, 3_000.0),
-        ([("earlier", 200.0), ("run", 1_000.0)], 150.0, False, None),
-    ],
-)
-def test_a_runs_window_comes_from_every_run_of_its_session(
-    session_runs: list[tuple[str, float]],
-    created_at: float | None,
-    owns: bool,
-    next_started_at: float | None,
-) -> None:
-    window = server_prs.run_window(
-        "run",
-        started_at=1_000.0,
-        finished_at=1_100.0,
-        session_runs=session_runs,
-        session_created_at=created_at,
-    )
-    assert (window.owns_session, window.next_started_at) == (owns, next_started_at)
-
-
-def test_a_run_that_owns_its_session_gets_its_prs_created_first() -> None:
+def test_unrecorded_prs_go_to_the_run_that_created_the_session() -> None:
+    """User links and PRs stored before runs were recorded carry no run."""
     entries = (
-        _stored(A, relationship="attached", first_seen_at=3_000.0),
-        _stored(B, relationship="worked_on", first_seen_at=1_200.0),
-        _stored(C, relationship="created", first_seen_at=1_800.0),
-        _stored("https://github.com/example/four/pull/4", relationship="inferred"),
+        _stored(A, run_id=None),
+        _stored(B, relationship="attached"),
+        _stored(C, run_id="run"),
     )
-    assert _picked(_run(owns_session=True), *entries) == [C, B, A]
+    assert _picked("run", *entries, created_session=True) == [A, C, B]
+    assert _picked("run", *entries) == [C]
 
 
-def test_a_branch_inferred_pr_shows_only_as_the_lone_pr_of_a_runs_own_session() -> None:
-    inferred = _stored(A, relationship="inferred", first_seen_at=1_500.0)
-    assert _picked(_run(owns_session=True), inferred) == [A]
-    assert _picked(_run(owns_session=False), inferred) == []
-    other = _stored(B, relationship="inferred", first_seen_at=1_600.0)
-    assert _picked(_run(owns_session=True), inferred, other) == []
+def test_a_branch_inferred_pr_shows_only_as_a_runs_lone_pr() -> None:
+    inferred = _stored(A, relationship="inferred", run_id="run")
+    assert _picked("run", inferred) == [A]
+    assert _picked("run", inferred, _stored(B, relationship="inferred", run_id="run")) == []
+    assert _picked("run", inferred, _stored(C, run_id="run")) == [C]
 
 
 @pytest.mark.parametrize(

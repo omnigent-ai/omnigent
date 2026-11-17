@@ -350,12 +350,58 @@ def test_one_report_stores_every_fetched_state_each_ordered_on_its_own(
     assert stored.get(B).title == "Abandoned"  # type: ignore[union-attr]
 
 
-def test_read_many_reads_each_session_in_one_query(store: SessionPullRequestStore) -> None:
+def test_read_many_reads_each_session_in_one_query(
+    store: SessionPullRequestStore, db_uri: str
+) -> None:
+    from omnigent.db.utils import get_or_create_engine
+
     store.apply_report(SESSION, [_report(A)], fetched=_fetch(A), requested_at=1_000.0)
     store.apply_report(OTHER, [_report(B)], complete=True)
-    read = store.read_many([SESSION, OTHER, MISSING, SESSION])
+    statements: list[str] = []
+
+    def record(_conn: object, _cursor: object, statement: str, *_args: object) -> None:
+        statements.append(statement)
+
+    engine = get_or_create_engine(db_uri)
+    sa.event.listen(engine, "before_cursor_execute", record)
+    try:
+        read = store.read_many([SESSION, OTHER, MISSING, SESSION])
+    finally:
+        sa.event.remove(engine, "before_cursor_execute", record)
+    assert len([s for s in statements if s.lstrip().upper().startswith("SELECT")]) == 1
     assert set(read) == {SESSION, OTHER}
     assert [entry.url for entry in read[SESSION].entries] == [A]
     assert read[SESSION].entries[0].state == "OPEN"
     assert (read[OTHER].synced, read[SESSION].synced) == (True, False)
     assert store.read_many([]) == {}
+
+
+def test_a_pr_keeps_the_run_its_session_served_when_the_server_first_stored_it(
+    store: SessionPullRequestStore, conversations: SqlAlchemyConversationStore
+) -> None:
+    """The run label at first sight sticks; later runs, chat and user links add none."""
+    from omnigent.stores.conversation_store import SCHEDULED_TASK_RUN_LABEL_KEY
+
+    C = "https://github.com/example/three/pull/3"
+    D = "https://github.com/example/four/pull/4"
+    first_run, second_run = "a" * 32, "b" * 32
+    conversations.set_labels(SESSION, {SCHEDULED_TASK_RUN_LABEL_KEY: first_run})
+    store.apply_report(SESSION, [_report(A)])
+    conversations.set_labels(SESSION, {SCHEDULED_TASK_RUN_LABEL_KEY: second_run})
+    store.apply_report(SESSION, [_report(A, relationship="created"), _report(B)])
+    # The user writing to the session ends the run's turn.
+    assert conversations.clear_scheduled_run_label(SESSION, second_run)
+    store.apply_report(SESSION, [_report(C)])
+    conversations.set_labels(SESSION, {SCHEDULED_TASK_RUN_LABEL_KEY: first_run})
+    store.attach(SESSION, _report(D))
+    stored = store.read(SESSION)
+    assert stored is not None
+    assert {entry.url: entry.run_id for entry in stored.entries} == {
+        A: first_run,
+        B: second_run,
+        C: None,
+        D: None,
+    }
+    # Another session's run doesn't leak in.
+    store.apply_report(OTHER, [_report(A)])
+    assert store.read(OTHER).entries[0].run_id is None  # type: ignore[union-attr]

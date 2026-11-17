@@ -89,7 +89,10 @@ from omnigent.server.session_mcp_selection import MAX_SESSION_MCP_SERVICES, sess
 from omnigent.server.workflows import require_workflows
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
 from omnigent.stores.artifact_store import ArtifactStore
-from omnigent.stores.conversation_store import SCHEDULED_TASK_RUN_LABEL_KEY
+from omnigent.stores.conversation_store import (
+    SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY,
+    SCHEDULED_TASK_RUN_LABEL_KEY,
+)
 from omnigent.stores.permission_store import MAX_SHARED_SCHEDULED_TASKS_PAGE_SIZE
 from omnigent.stores.project_store import ProjectStore
 from omnigent.stores.scheduled_task_store import (
@@ -1565,20 +1568,15 @@ def create_scheduled_tasks_router(
     ) -> dict[str, Any]:
         """The pull requests each of one page of a scheduled task's runs created or worked on.
 
-        Pages and authorizes like ``GET /scheduled-tasks/{id}/runs``, most recent first,
-        and reads only what the server stores, so it answers while hosts are offline.
-        A run that created its session and is its only run gets that session's PRs.
-        Otherwise a run gets those first seen from its start until two minutes after
-        it finished, but before its session's next run started, so a PR shows on
-        one run however the history is paged and whatever session mode the task
-        has now. Branch-inferred PRs are left out unless one is the only PR of a
-        run's own session. Each PR carries the state its host last fetched, with
-        ``state_checked_at``. A session that isn't imported yet, or has an open or
-        unknown state older than five minutes, is refreshed in the background, and
-        ``refresh_pending`` says a later read may show more. The response is
-        ``{"runs": [{"run_id", "pull_requests": [...]}], "refresh_pending",
-        "next_cursor"}``, listing only runs with PRs. PRs are session content, so
-        someone it is shared with always gets no runs.
+        Pages and authorizes like ``GET /scheduled-tasks/{id}/runs``, most recent
+        first, and reads only what the server stores, so it answers while hosts
+        are offline. :func:`omnigent.server.session_pull_requests.run_pull_requests`
+        decides which of a session's PRs belong to a run. Each PR carries the state
+        its host last fetched, with ``state_checked_at``. ``refresh_pending`` says a
+        background refresh of a listed session started, so a later read may show
+        more. The response is ``{"runs": [{"run_id", "pull_requests": [...]}],
+        "refresh_pending", "next_cursor"}``, listing only runs with PRs. PRs are
+        session content, so someone it is shared with always gets no runs.
         """
         from omnigent.server import session_pull_requests as server_prs
 
@@ -1592,9 +1590,8 @@ def create_scheduled_tasks_router(
         if pull_request_store is None or not served:
             return {**empty, "next_cursor": next_cursor}
         conversation_ids = list(dict.fromkeys(run.conversation_id or "" for run in served))
-        stored, session_runs, sessions = await asyncio.gather(
+        stored, sessions = await asyncio.gather(
             asyncio.to_thread(pull_request_store.read_many, conversation_ids),
-            asyncio.to_thread(store.list_run_starts_for_conversations, conversation_ids),
             asyncio.to_thread(conversation_store.get_conversations, conversation_ids),
         )
         now = time.time()
@@ -1610,14 +1607,11 @@ def create_scheduled_tasks_router(
             if prs is None:
                 continue
             session = sessions.get(conversation_id)
-            window = server_prs.run_window(
-                run.id,
-                started_at=float(run.fired_at if run.fired_at is not None else run.scheduled_at),
-                finished_at=float(run.finished_at) if run.finished_at is not None else None,
-                session_runs=session_runs.get(conversation_id, []),
-                session_created_at=float(session.created_at) if session is not None else None,
+            created_session = (
+                session is not None
+                and session.labels.get(SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY) == run.id
             )
-            picked = server_prs.run_pull_requests(window, prs, now=now)
+            picked = server_prs.run_pull_requests(run.id, prs, created_session=created_session)
             if picked:
                 rows.append(
                     {

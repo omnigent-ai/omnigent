@@ -6060,12 +6060,17 @@ async def test_recipients_read_an_automation_its_runs_and_their_steps(
 async def test_each_run_lists_the_prs_it_created_or_worked_on(
     workflows_client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A run's own session gives it all its PRs; runs sharing a session split them by time.
+    """A PR belongs to the run whose turn the session was in when the server first stored it.
 
-    Each PR lands on one run however the history is paged, and switching the task
-    from continuing a session to new sessions doesn't move historical PRs.
+    A continued session's run records finishing when its prompt is delivered, so
+    PRs its agent opens minutes later still count, while chat between runs adds
+    none. Paging and switching the task to new sessions don't move PRs.
     """
     from omnigent.server import session_pull_requests as server_prs
+    from omnigent.stores.conversation_store import (
+        SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY,
+        SCHEDULED_TASK_RUN_LABEL_KEY,
+    )
     from omnigent.stores.session_pull_request_store import (
         FetchedState,
         PullRequestReport,
@@ -6073,11 +6078,12 @@ async def test_each_run_lists_the_prs_it_created_or_worked_on(
     )
 
     client = workflows_client
+    conversations = SqlAlchemyConversationStore(db_uri)
     shared = _owned_session(db_uri)
     task_id = await _create_task(client, session_mode="continue", session_id=shared)
     prs = SessionPullRequestStore(db_uri)
 
-    def link(session: str, number: int, seen_at: float, relationship: str = "worked_on") -> str:
+    def link(session: str, number: int, relationship: str = "worked_on") -> str:
         url = f"https://github.com/example/repo/pull/{number}"
         report = PullRequestReport(
             url=url,
@@ -6086,20 +6092,29 @@ async def test_each_run_lists_the_prs_it_created_or_worked_on(
             repository="example/repo",
             number=number,
             relationship=relationship,  # type: ignore[arg-type]
-            first_seen_at=seen_at,
-            last_seen_at=seen_at,
+            first_seen_at=1.0,
+            last_seen_at=1.0,
             title=f"Change {number}",
         )
         prs.apply_report(session, [report], complete=True)
         return url
 
-    # The newest run started a session of its own, created after it started.
-    own = _owned_session(db_uri)
+    def serve(session: str, run_id: str) -> None:
+        conversations.set_labels(session, {SCHEDULED_TASK_RUN_LABEL_KEY: run_id})
+
     newest, later, earlier = uuid.uuid4().hex, uuid.uuid4().hex, uuid.uuid4().hex
-    for run_id, start, finish, session in (
-        (newest, 3000, 3100, own),
-        (later, 2000, 2100, shared),
-        (earlier, 1000, 1990, shared),
+    # The newest run started a session of its own, which already had a PR stored
+    # before runs were recorded.
+    own = _owned_session(db_uri)
+    legacy = link(own, 1, "created")
+    conversations.set_labels(own, {SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY: newest})
+    serve(own, newest)
+    inferred = link(own, 2, "inferred")
+    # Each continued run "finished" when its prompt was delivered.
+    for run_id, start, session in (
+        (newest, 3000, own),
+        (later, 2000, shared),
+        (earlier, 1000, shared),
     ):
         _seed_run(
             db_uri,
@@ -6107,24 +6122,27 @@ async def test_each_run_lists_the_prs_it_created_or_worked_on(
             run_id,
             scheduled_at=start,
             fired_at=start,
-            finished_at=finish,
+            finished_at=start + 1,
             conversation_id=session,
         )
     _seed_run(db_uri, task_id, uuid.uuid4().hex, status="skipped", conversation_id=None)
-    created = link(own, 1, 3050, "created")
-    link(own, 2, 3060, "inferred")
-    first = link(shared, 3, 1050)
-    second = link(shared, 4, 2050)
-    # Seen within the earlier run's grace, but after the later run started.
-    overlap = link(shared, 5, 2010)
-    # The shared session's states were fetched just now; the other session's never were.
+    serve(shared, earlier)
+    # Minutes after delivery, the agent is still working on the earlier run.
+    first = link(shared, 3)
+    # The user writes to the session, then opens a PR by chatting.
+    assert conversations.clear_scheduled_run_label(shared, earlier)
+    chat = link(shared, 4)
+    serve(shared, later)
+    second = link(shared, 5, "created")
+    # Seen again during the later run, the first PR stays the earlier run's.
+    link(shared, 3)
     prs.apply_report(
         shared,
         [],
         fetched=[
             FetchedState(url=first, number=3, state="OPEN", is_draft=False),
-            FetchedState(url=second, number=4, state="MERGED", is_draft=False),
-            FetchedState(url=overlap, number=5, state="CLOSED", is_draft=False),
+            FetchedState(url=chat, number=4, state="CLOSED", is_draft=False),
+            FetchedState(url=second, number=5, state="MERGED", is_draft=False),
         ],
         requested_at=time.time(),
     )
@@ -6149,23 +6167,26 @@ async def test_each_run_lists_the_prs_it_created_or_worked_on(
                 return rows
 
     expected = [
-        (newest, [(created, None)]),
-        (later, [(overlap, "CLOSED"), (second, "MERGED")]),
+        (newest, [(legacy, None)]),
+        (later, [(second, "MERGED")]),
         (earlier, [(first, "OPEN")]),
     ]
     assert await attribution(20) == expected
     assert await attribution(1) == expected
+    # The session lists every PR; the runs leave out chat and the branch's PR.
+    session_prs = (
+        await client.get(f"/v1/sessions/{shared}/pull-requests", headers=_headers())
+    ).json()
+    assert {pr["url"] for pr in session_prs["data"]} == {first, chat, second}
+    assert inferred not in {pr for _, run_prs in expected for pr, _ in run_prs}
     assert set(refreshed) == {own}
-    body = (await client.get(url, headers=_headers())).json()
-    assert body["refresh_pending"] is True
-    assert body["runs"][0]["pull_requests"][0]["relationship"] == "created"
+    assert (await client.get(url, headers=_headers())).json()["refresh_pending"] is True
 
     switched = await client.patch(
         f"/v1/scheduled-tasks/{task_id}", json={"session_mode": "new"}, headers=_headers()
     )
     assert switched.json()["session_mode"] == "new", switched.text
     assert await attribution(20) == expected
-    assert await attribution(1) == expected
 
     # PRs are session content, which a recipient's history leaves out.
     assert (await _share(client, task_id, "bob@example.com")).status_code == 200

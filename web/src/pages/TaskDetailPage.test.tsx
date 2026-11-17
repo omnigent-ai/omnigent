@@ -2183,7 +2183,7 @@ describe("run pull requests", () => {
     );
   });
 
-  it("shows each run's PRs with their state, each opening the PR", () => {
+  it("sums up each run's PRs on its first line and lists them when clicked", () => {
     setTask(task());
     setRuns([
       run({ id: "run_1", conversationId: "conv_1" }),
@@ -2198,14 +2198,21 @@ describe("run pull requests", () => {
       true,
     );
     const [first, second, third] = screen.getAllByTestId("task-detail-run");
-    const chips = (row: HTMLElement) => within(row).queryAllByTestId("run-pull-request");
-    expect(chips(first!).map((chip) => chip.dataset.prStatus)).toEqual([
-      "merged",
-      "closed",
-      "draft",
-    ]);
-    const [merged, closed] = chips(first!);
-    expect(merged).toHaveTextContent("Merged#1Change 1");
+    const summary = within(first!).getByTestId("run-pull-requests");
+    expect(summary).toHaveTextContent("PRs: 1 draft, 1 merged, 1 closed");
+    expect(summary.tagName).toBe("BUTTON");
+    // A control of its own, so it sits outside the row's link to its session.
+    expect(within(first!).getByTestId("run-open")).not.toContainElement(summary);
+    expect(within(second!).getByTestId("run-pull-requests")).toHaveTextContent(
+      "PRs: 1 open, 1 unknown",
+    );
+    expect(within(third!).queryByTestId("run-pull-requests")).toBeNull();
+
+    fireEvent.click(summary);
+    const list = screen.getByTestId("run-pull-request-list");
+    const rows = within(list).getAllByTestId("run-pull-request");
+    expect(rows.map((row) => row.dataset.prStatus)).toEqual(["merged", "closed", "draft"]);
+    const [merged, closed] = rows;
     expect(merged).toHaveAttribute("data-pr-relationship", "created");
     const link = within(merged!).getByRole("link");
     expect(link).toHaveAttribute("href", "https://github.com/example/repo/pull/1");
@@ -2213,18 +2220,31 @@ describe("run pull requests", () => {
     expect(link).toHaveAccessibleName(
       "example/repo #1 · Merged · Change 1 · Opened by this run (opens in a new tab)",
     );
-    // The PR links sit outside the row's link to its session.
-    expect(within(first!).getByTestId("run-open")).not.toContainElement(link);
-    // Closed means closed without merging; merged PRs say Merged.
-    expect(closed).toHaveTextContent("Closed#2");
-    expect(within(closed!).getByRole("link").title).toContain("Closed without merging");
+    expect(closed).toHaveTextContent("Closed without merging");
 
-    const [stale, unknown] = chips(second!);
-    expect(stale).toHaveTextContent("Open#4");
-    expect(within(stale!).getByRole("link").title).toContain("Open as of 2h ago");
-    expect(unknown).toHaveAttribute("data-pr-status", "unknown");
-    expect(unknown).toHaveTextContent("Status unknown#5");
-    expect(within(third!).queryByTestId("run-pull-requests")).toBeNull();
+    fireEvent.click(within(second!).getByTestId("run-pull-requests"));
+    const [stale] = within(screen.getByTestId("run-pull-request-list")).getAllByTestId(
+      "run-pull-request",
+    );
+    expect(stale).toHaveTextContent("Open · as of 2h ago");
+  });
+
+  it("names a run's single PR in its summary", () => {
+    vi.mocked(hooks.useScheduledTaskRunPullRequests).mockReturnValue(
+      new Map([
+        ["run_1", { runId: "run_1", pullRequests: [pr(212, { state: "MERGED" })] }],
+        ["run_2", { runId: "run_2", pullRequests: [pr(7, { state: null })] }],
+      ]),
+    );
+    setTask(task());
+    setRuns([
+      run({ id: "run_1", conversationId: "conv_1" }),
+      run({ id: "run_2", conversationId: "conv_2" }),
+    ]);
+    renderWithRunPullRequests();
+    expect(
+      screen.getAllByTestId("run-pull-requests").map((summary) => summary.textContent),
+    ).toEqual(["PR #212 merged", "PR #7"]);
   });
 
   it("asks for no PRs from a server without the route, or for a viewer", () => {

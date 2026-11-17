@@ -466,18 +466,6 @@ class ScheduledTaskStore(ABC):
         """Read one run by ID in the current workspace."""
         raise NotImplementedError
 
-    def list_run_starts_for_conversations(
-        self, conversation_ids: builtins.list[str]
-    ) -> dict[str, builtins.list[tuple[str, int]]]:
-        """Return every run of each conversation, of any task, as ``(run_id, started_at)``.
-
-        ``started_at`` is the run's ``fired_at``, else its ``scheduled_at``. Runs are
-        oldest first. Workspace-scoped; conversations without runs are absent.
-
-        :param conversation_ids: Conversations to look up; an empty list reads nothing.
-        """
-        raise NotImplementedError
-
     @abstractmethod
     def list_runs(
         self,

@@ -15,7 +15,7 @@
  * an invented summary line.
  */
 
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   CalendarOffIcon,
   ChevronDownIcon,
@@ -912,9 +912,26 @@ function RunRow({
   const statusText = useMemo(() => (steps ? latestStatusText(steps.statuses) : null), [steps]);
   const sessionId = run.conversationId;
   const showTasks = progress.length > 0 && sessionId != null;
-  // PR chips are links of their own, so they sit under the row's link, as tasks do.
   const showPullRequests = (pullRequests?.length ?? 0) > 0;
-  const belowLink = showTasks || showPullRequests;
+  // The PR summary and task buttons are controls of their own, so they sit over
+  // the row's link rather than in it.
+  const overlaid = showTasks || showPullRequests;
+  // The run's first line leaves room for the PR summary over its right end.
+  const summaryRef = useRef<HTMLSpanElement>(null);
+  const [summaryWidth, setSummaryWidth] = useState(0);
+  useLayoutEffect(() => {
+    const element = summaryRef.current;
+    if (!element) {
+      setSummaryWidth(0);
+      return;
+    }
+    const measure = () => setSummaryWidth(element.getBoundingClientRect().width);
+    measure();
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(measure);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [showPullRequests]);
   const [graphOpen, setGraphOpen] = useState(false);
   // The saved workflow the run's plan follows, when the Workflows page can open it.
   const workflowId = isFeatureEnabled(useServerInfo(), "workflows")
@@ -955,7 +972,10 @@ function RunRow({
         <RunStatusIcon run={run} unread={unread} showSessionActivity={showSessionActivity} />
       </span>
       <span className="flex min-w-0 flex-1 flex-col">
-        <span className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
+        <span
+          className="flex flex-wrap items-baseline gap-x-2 gap-y-1"
+          style={summaryWidth ? { paddingRight: summaryWidth } : undefined}
+        >
           <span className="text-sm font-normal">{timestamp ?? "—"}</span>
           {duration && (
             <span className="text-xs text-muted-foreground" data-testid="run-duration">
@@ -1037,8 +1057,10 @@ function RunRow({
       className={cn(
         "relative rounded-lg",
         highlighted && "animate-message-highlight",
-        // The row's timeline and PRs sit under its link, so the whole row lights up, once.
-        belowLink && "transition-colors hover:bg-muted has-[a:focus-visible]:bg-muted",
+        // The row's timeline, PRs and buttons sit over or under its link, so the whole
+        // row lights up, once.
+        overlaid &&
+          "transition-colors hover:bg-muted has-[a:focus-visible]:bg-muted has-[button:focus-visible]:bg-muted",
       )}
       style={highlighted ? { animationDuration: `${RUN_HIGHLIGHT_DURATION_MS}ms` } : undefined}
     >
@@ -1051,7 +1073,7 @@ function RunRow({
             "cursor-pointer focus-visible:outline-none",
             showTasks
               ? buttonPadding
-              : !belowLink && "transition-colors hover:bg-muted focus-visible:bg-muted",
+              : !overlaid && "transition-colors hover:bg-muted focus-visible:bg-muted",
           )}
         >
           {body}
@@ -1059,38 +1081,40 @@ function RunRow({
       ) : (
         <div className={commonClassName}>{body}</div>
       )}
-      {showPullRequests && pullRequests && (
-        <RunPullRequests
-          pullRequests={pullRequests}
-          nowMs={now.getTime()}
-          className={cn("pr-3 pl-10", showTasks ? "pb-1" : "pb-2.5")}
+      {showTasks && (
+        <RunTimeline
+          sessionId={sessionId}
+          progress={progress}
+          menuActionFor={taskMenus}
+          className="pr-3 pb-2.5 pl-10"
         />
       )}
-      {showTasks && (
-        <>
-          <RunTimeline
-            sessionId={sessionId}
-            progress={progress}
-            menuActionFor={taskMenus}
-            className="pr-3 pb-2.5 pl-10"
-          />
-          <div className="absolute top-1.5 right-2 z-10 flex items-center gap-0.5">
-            {control && steps?.planId && (
-              <RunPlanButton
-                sessionId={sessionId}
-                runId={steps.planId}
-                planName={steps?.planName ?? null}
-                control={control}
-                refreshKeys={refreshKeys}
+      {overlaid && (
+        <div className="absolute top-1.5 right-2 z-10 flex items-center gap-0.5">
+          {showPullRequests && pullRequests && (
+            <span ref={summaryRef} className="flex h-7 min-w-0 items-center pr-2 pl-3">
+              <RunPullRequests pullRequests={pullRequests} nowMs={now.getTime()} />
+            </span>
+          )}
+          {showTasks && (
+            <>
+              {control && steps?.planId && (
+                <RunPlanButton
+                  sessionId={sessionId}
+                  runId={steps.planId}
+                  planName={steps?.planName ?? null}
+                  control={control}
+                  refreshKeys={refreshKeys}
+                />
+              )}
+              {workflowId && <RunWorkflowButton workflowId={workflowId} />}
+              <RunGraphButton
+                runName={`the ${timestamp ?? ""} run`}
+                onClick={() => setGraphOpen(true)}
               />
-            )}
-            {workflowId && <RunWorkflowButton workflowId={workflowId} />}
-            <RunGraphButton
-              runName={`the ${timestamp ?? ""} run`}
-              onClick={() => setGraphOpen(true)}
-            />
-          </div>
-        </>
+            </>
+          )}
+        </div>
       )}
       {graphOpen && showTasks && steps && (
         <WorkflowGraphOverlay
