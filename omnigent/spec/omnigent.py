@@ -49,6 +49,7 @@ from omnigent.inner.tools import (
     _schema_from_callable,
 )
 from omnigent.llms.routing import infer_harness_from_model as _infer_harness_from_model
+from omnigent.spec.data_queries import parse_data_queries
 from omnigent.spec.parser import parse_tool_groups, resolve_memory_tool_group
 from omnigent.spec.types import (
     AgentSpec,
@@ -1160,6 +1161,8 @@ def agent_def_to_agent_spec(
         own_tool_names=[t.name for t in local_tools] + [m.name for m in mcp_servers],
         agent_name=name,
     )
+    # ``data_queries:`` is not on AgentDef either; the same parser keeps both dialects strict.
+    data_queries = parse_data_queries(raw_yaml.get("data_queries") if raw_yaml else None)
 
     return AgentSpec(
         spec_version=_SYNTHETIC_SPEC_VERSION,
@@ -1178,6 +1181,7 @@ def agent_def_to_agent_spec(
         timers=agent_def.timers,
         spawn=agent_def.spawn,
         tool_groups=tool_groups,
+        data_queries=data_queries,
         # AgentDef.agent_session_sharing is the raw YAML string
         # ("none"/"non-public"/"public"); map it to the SharePolicy enum
         # AgentSpec expects.
