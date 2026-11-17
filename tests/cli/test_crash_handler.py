@@ -518,11 +518,12 @@ def test_issue_url_scrubs_home_directory_and_tokens(
         f'  File "{home}name/module.py", line 3\n'
         f'  File "{home}.backup/module.py", line 4\n'
         f'  File "{home} backup/module.py", line 5\n'
-        f"  File '{home} backup/native.py', line 6\n"
+        f"  File '{home}, backup/native.py', line 6\n"
         f'  File "{home}/child directory/app.py", line 7\n'
         f'  File "{home}\\child directory\\native.py", line 8\n'
+        f"Sibling paths: {home}.backup/module.py {home},backup/module.py\n"
         f"Home: \"{home}\" '{home}' `{home}` {home}\n"
-        f"Home: ({home}) [{home}] {{{home}}} <{home}> {home}, {home}.\n"
+        f"Home: ({home}) [{home}] {{{home}}} <{home}> {home}, {home}. {home}... {home}!!!\n"
     )
     url, _ = ch._issue_url(exc, tb_text + "ImportError: cannot open\n")
     decoded_url = urllib.parse.unquote_plus(url)
@@ -534,11 +535,12 @@ def test_issue_url_scrubs_home_directory_and_tokens(
     assert f'File "{home}name/module.py"' in body
     assert f'File "{home}.backup/module.py"' in body
     assert f'File "{home} backup/module.py"' in body
-    assert f"File '{home} backup/native.py'" in body
+    assert f"File '{home}, backup/native.py'" in body
     assert 'File "~/child directory/app.py"' in body
     assert 'File "~\\child directory\\native.py"' in body
+    assert f"Sibling paths: {home}.backup/module.py {home},backup/module.py\n" in body
     assert "Home: \"~\" '~' `~` ~\n" in body
-    assert "Home: (~) [~] {~} <~> ~, ~.\n" in body
+    assert "Home: (~) [~] {~} <~> ~, ~. ~... ~!!!\n" in body
     assert ch._scrub(home) == "~"
     assert token not in decoded_url
     title = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)["title"][0]
@@ -548,6 +550,7 @@ def test_issue_url_scrubs_home_directory_and_tokens(
     noted_exc = _make_exc("failure")
     noted_exc.add_note("x" * 9000)
     noted_exc.add_note(f"Home: ({home})")
+    noted_exc.add_note(f"Home: {home}... {home}!!!")
     noted_tb = "".join(
         traceback.format_exception(type(noted_exc), noted_exc, noted_exc.__traceback__)
     )
@@ -558,6 +561,7 @@ def test_issue_url_scrubs_home_directory_and_tokens(
     noted_body = _description_of(noted_url)
     assert "truncated" in noted_body
     assert "Home: (~)" in noted_body
+    assert "Home: ~... ~!!!" in noted_body
 
 
 def test_issue_url_redacts_multiline_bearer_before_truncation(data_dir: Path) -> None:

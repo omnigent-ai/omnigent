@@ -471,7 +471,7 @@ def _scrub(text: str) -> str:
                 rf"""(?P<quote>['"`]){re.escape(home)}(?P<suffix>[^\r\n]*?)(?P=quote)"""
                 + "|"
                 + re.escape(home)
-                + r"""(?=$|[/\\\s'"`)\]}>]|[.,;:!?](?=$|[\s'"`)\]}>]))"""
+                + r"""(?=$|[/\\\s'"`)\]}>]|[.,;:!?]+(?=$|[\s'"`)\]}>]))"""
             )
 
             def redact_home(match: re.Match[str]) -> str:
