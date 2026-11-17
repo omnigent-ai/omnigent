@@ -3571,6 +3571,8 @@ class WorkflowRun(BaseModel):
     :param descendant_runs_cursor: Continues ``descendant_runs`` from
         ``GET /v1/workflows/{workflow_id}/runs/{id}/descendant_runs``;
         ``None`` when they are all here.
+    :param descendant_runs_active: Whether any run below this one, on any
+        page, is working or waiting for input.
     """
 
     id: str
@@ -3591,6 +3593,7 @@ class WorkflowRun(BaseModel):
     descendant_runs: list[WorkflowRun] = Field(default_factory=list)
     descendant_run_count: int = 0
     descendant_runs_cursor: str | None = None
+    descendant_runs_active: bool = False
 
 
 class WorkflowRunList(BaseModel):

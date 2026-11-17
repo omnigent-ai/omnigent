@@ -244,6 +244,7 @@ describe("useWorkflowRuns runs below a run", () => {
             ],
             descendant_run_count: 3,
             descendant_runs_cursor: "session_old",
+            descendant_runs_active: true,
           },
         ],
         next_cursor: null,
@@ -261,6 +262,7 @@ describe("useWorkflowRuns runs below a run", () => {
       startedBy: undefined,
       descendantRunCount: 3,
       descendantRunsCursor: "session_old",
+      descendantRunsActive: true,
     });
     expect(run?.descendantRuns).toEqual([
       expect.objectContaining({
@@ -270,6 +272,7 @@ describe("useWorkflowRuns runs below a run", () => {
         startedBy: { sessionId: "session_new", title: "New run" },
         descendantRuns: [],
         descendantRunsCursor: null,
+        descendantRunsActive: false,
       }),
     ]);
   });
@@ -299,5 +302,15 @@ describe("useWorkflowRuns runs below a run", () => {
       nextCursor: "more",
     });
     expect(result.current.hasNextPage).toBe(true);
+
+    // A loaded page keeps refreshing, so a run on it shows where it stands now.
+    vi.mocked(authenticatedFetch).mockImplementation(async () =>
+      Response.json({
+        data: [{ ...COMPLETED_RUN, progress: { ...COMPLETED_RUN.progress, needs_input: 1 } }],
+        next_cursor: "more",
+      }),
+    );
+    await act(() => vi.advanceTimersByTimeAsync(10_000));
+    expect(result.current.data?.pages[0]?.runs[0]?.progress.needsInput).toBe(1);
   });
 });

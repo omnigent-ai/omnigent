@@ -212,6 +212,7 @@ interface RawRun {
   descendant_runs?: RawRun[];
   descendant_run_count?: number;
   descendant_runs_cursor?: string | null;
+  descendant_runs_active?: boolean;
 }
 
 function toWorkflowRun(run: RawRun): WorkflowRun {
@@ -242,6 +243,7 @@ function toWorkflowRun(run: RawRun): WorkflowRun {
     descendantRuns: (run.descendant_runs ?? []).map(toWorkflowRun),
     descendantRunCount: run.descendant_run_count,
     descendantRunsCursor: run.descendant_runs_cursor ?? null,
+    descendantRunsActive: run.descendant_runs_active ?? false,
   };
 }
 
@@ -301,5 +303,7 @@ export function useWorkflowRunDescendants(workflowId: string, run: WorkflowRun, 
     getNextPageParam: (page) => page.nextCursor,
     enabled: enabled && cursor !== null,
     staleTime: 10_000,
+    // Loaded pages keep up with their runs, as the first page does.
+    refetchInterval: 10_000,
   });
 }

@@ -1661,6 +1661,25 @@ describe("WorkflowDetailPage", () => {
     expect(within(list).queryByTestId("workflow-run-descendants-more")).toBeNull();
   });
 
+  it("opens the list below a run when one past the first page is waiting", () => {
+    mockWorkflow({});
+    mockSavedWorkflows([]);
+    mockRuns([
+      {
+        ...run("a".repeat(32), "Land stack", { done: 2 }),
+        descendantRuns: [run("b".repeat(32), "Ready #1", { done: 2 })],
+        descendantRunCount: 21,
+        descendantRunsCursor: "b".repeat(32),
+        descendantRunsActive: true,
+      },
+    ]);
+    renderPage();
+
+    const toggle = screen.getByTestId("workflow-run-descendants-toggle");
+    expect(toggle).toHaveTextContent("Ran 21 workflows");
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+  });
+
   it("links a run another session started back to that session", () => {
     mockWorkflow({});
     const starter = "a".repeat(32);
@@ -1706,6 +1725,18 @@ describe("WorkflowDetailPage", () => {
     cleanup();
 
     mockRuns([run(session, "Land stack", {})]);
+    tasksTab();
+    expect(screen.queryByTestId("tasks-descendant-runs")).toBeNull();
+    cleanup();
+
+    // A run the session's next automation occurrence already ended isn't its current run.
+    mockRuns([
+      {
+        ...run(session, "Land stack", {}),
+        isCurrent: false,
+        descendantRuns: [run("d".repeat(32), "Ready #2", {})],
+      },
+    ]);
     tasksTab();
     expect(screen.queryByTestId("tasks-descendant-runs")).toBeNull();
   });

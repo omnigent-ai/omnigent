@@ -180,6 +180,12 @@ def _started_during(
     ]
 
 
+def _run_active(run: WorkflowRun) -> bool:
+    """Whether a run is working or waiting for input, as its row shows it."""
+    working = run.is_current and (run.session_status == "running" or run.background_work_running)
+    return working or run.progress.needs_input > 0
+
+
 def require_workflows(request: Request) -> None:
     """Reject workflow and journal requests unless the server enables workflows."""
     flags = getattr(request.app.state, "feature_flags", FeatureFlags())
@@ -488,11 +494,20 @@ def create_workflows_router(
         }
         children: dict[str, list[Conversation]] = {}
         first_runs: dict[str, JournalEntry] = {}
+        # Each family gets its own budget, so a page of runs in different
+        # families lists every one's runs, as each run's own page does.
+        visited: Counter[str] = Counter()
         frontier = [member.id for members in direct.values() for member in members]
-        while frontier and len(children) < MAX_SESSION_FAMILY_MEMBERS:
-            level = [
-                session_id for session_id in dict.fromkeys(frontier) if session_id not in children
-            ][: MAX_SESSION_FAMILY_MEMBERS - len(children)]
+        while frontier:
+            level = []
+            for session_id in dict.fromkeys(frontier):
+                family = known[session_id].family_id or session_id
+                if session_id in children or visited[family] >= MAX_SESSION_FAMILY_MEMBERS:
+                    continue
+                visited[family] += 1
+                level.append(session_id)
+            if not level:
+                break
             found = journal.first_workflow_runs(level)
             first_runs.update(found)
             run_ends = dict(zip(found, journal.next_run_starts(list(found.values())), strict=True))
@@ -586,15 +601,24 @@ def create_workflows_router(
         )
         started_by = _started_by(known, user_id)
         for run in runs:
+            ids = below[run.id]
             run.started_by = started_by(run.session_id)
-            run.descendant_run_count = len(below[run.id])
+            run.descendant_run_count = len(ids)
             run.descendant_runs, run.descendant_runs_cursor = _descendant_page(
-                journal,
-                below[run.id],
-                first_runs,
-                user_id,
-                after=None,
-                limit=_DESCENDANT_RUNS_PAGE,
+                journal, ids, first_runs, user_id, after=None, limit=_DESCENDANT_RUNS_PAGE
+            )
+            # A run past the first page that's working or waiting opens the list too.
+            off_page = ids[_DESCENDANT_RUNS_PAGE:] if run.descendant_runs_cursor else []
+            run.descendant_runs_active = any(map(_run_active, run.descendant_runs)) or (
+                bool(off_page)
+                and any(
+                    map(
+                        _run_active,
+                        _runs(
+                            journal, [first_runs[session_id] for session_id in off_page], user_id
+                        ),
+                    )
+                )
             )
             for descendant in run.descendant_runs:
                 descendant.started_by = started_by(descendant.session_id)
@@ -645,7 +669,15 @@ def create_workflows_router(
                 return WorkflowRunList()
             plan = await asyncio.to_thread(journal.current_workflow_run, session.id)
             wanted = normalize_uuid(workflow_id)
-            plans = [plan] if plan is not None and plan.workflow_id == wanted else []
+            # An automation's next occurrence ends the run before its first journal write.
+            occurrence = session.labels.get(SCHEDULED_TASK_RUN_LABEL_KEY)
+            plans = (
+                [plan]
+                if plan is not None
+                and plan.workflow_id == wanted
+                and plan.scheduled_task_run_id == occurrence
+                else []
+            )
         else:
             workflow = await asyncio.to_thread(_store().get, workflow_id, user_id=user_id)
             if workflow is None:

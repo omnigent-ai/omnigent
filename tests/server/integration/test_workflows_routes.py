@@ -619,6 +619,7 @@ async def test_runs_list_the_workflow_runs_their_sessions_started(
         "Ready #2",
     ]
     assert run["descendant_run_count"] == 3 and run["descendant_runs_cursor"] is None
+    assert run["descendant_runs_active"] is False
     # Workflow names come from the server, so ownership doesn't depend on a loaded list.
     assert run["workflow_name"] == "Land a stack"
     assert {below["workflow_name"] for below in run["descendant_runs"]} == {"Ready a PR"}
@@ -677,7 +678,13 @@ async def test_a_runs_descendants_continue_page_by_page_in_order(
     await _run(client, root, stack, "root-run")
     first = await start(root, "Ready #1", 110)
     fix = await start(first, "Ready #1 fix", 120)
-    await start(root, "Ready #2", 130)
+    waiting = await start(root, "Ready #2", 130)
+    asked = await client.post(
+        f"/v1/sessions/{waiting}/journal",
+        json=_write("status", {"status": "needs_input", "text": "Which PR?"}, "ask", step="build"),
+        headers=_runner(waiting),
+    )
+    assert asked.status_code == 200, asked.text
     titles = ["Ready #1", "Ready #1 fix", "Ready #2"]
 
     (run,) = (await client.get(f"/v1/workflows/{stack['id']}/runs", headers=_headers())).json()[
@@ -686,6 +693,8 @@ async def test_a_runs_descendants_continue_page_by_page_in_order(
     assert run["descendant_run_count"] == 3
     assert [below["title"] for below in run["descendant_runs"]] == titles[:2]
     assert run["descendant_runs_cursor"] == fix
+    # A run waiting past the first page still says the list has work going on.
+    assert run["descendant_runs_active"] is True
     url = f"/v1/workflows/{stack['id']}/runs/{run['id']}/descendant_runs"
     rest = await client.get(
         url,
@@ -764,3 +773,34 @@ async def test_a_session_filter_lists_its_current_run_for_anyone_who_can_read_it
     for session_id in (private, uuid4().hex, "not-a-session"):
         refused = await client.get(url, params={"session_id": session_id}, headers=_headers(BOB))
         assert refused.status_code == 404, session_id
+    # An automation's next occurrence ends the run before it writes anything.
+    SqlAlchemyConversationStore(db_uri).set_labels(
+        shared, {SCHEDULED_TASK_RUN_LABEL_KEY: "next-occurrence"}
+    )
+    assert run_ids(await client.get(url, params={"session_id": shared}, headers=_headers())) == []
+
+
+async def test_each_family_lists_the_runs_below_it_up_to_its_own_cap(
+    client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("omnigent.server.workflows.MAX_SESSION_FAMILY_MEMBERS", 2)
+    stack = await _save_workflow(client, "Land a stack")
+    ready = await _save_workflow(client, "Ready a PR")
+    conversations = SqlAlchemyConversationStore(db_uri)
+    roots = []
+    for name in ("First", "Second"):
+        root = _session(db_uri, title=f"{name} stack")
+        await _run(client, root, stack, f"{name}-run")
+        for number in range(2):
+            worker = _session(
+                db_uri, title=f"{name} #{number}", labels={CREATED_BY_SESSION_LABEL_KEY: root}
+            )
+            conversations.add_new_sibling(root, worker, user_id=ALICE)
+            await _run(client, worker, ready, f"{name}-{number}")
+        roots.append(root)
+
+    listed = (await client.get(f"/v1/workflows/{stack['id']}/runs", headers=_headers())).json()
+    # Together the families pass the cap, but neither does alone.
+    assert {
+        run["session_id"]: run["descendant_run_count"] for run in listed["data"]
+    } == dict.fromkeys(roots, 2)

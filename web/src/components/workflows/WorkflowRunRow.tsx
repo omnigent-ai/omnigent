@@ -84,6 +84,7 @@ export function WorkflowRunRow({
   // An action refreshes the list showing the row, and the run's own workflow's.
   const refreshKeys = [
     ["workflow-runs", workflowId],
+    ["workflow-run-descendants", workflowId],
     ...(run.workflowId && run.workflowId !== workflowId ? [["workflow-runs", run.workflowId]] : []),
   ];
   const taskMenus = useRunTaskMenus(canAct ? run.sessionId : null, refreshKeys, run.id);
@@ -230,6 +231,7 @@ export function DescendantRuns({
     : !!run.descendantRunsCursor;
   const active =
     isWorkflowRunWorking(run) ||
+    run.descendantRunsActive === true ||
     descendants.some(
       (descendant) => isWorkflowRunWorking(descendant) || descendant.progress.needsInput > 0,
     );
@@ -305,7 +307,7 @@ export function SessionDescendantRuns({
   const runs = useWorkflowRuns(workflowId, sessionId);
   const now = useNow();
   const listed = runs.data?.pages[0]?.runs ?? [];
-  const run = listed.find((candidate) => candidate.isCurrent) ?? listed[0];
+  const run = listed.find((candidate) => candidate.isCurrent);
   if (!run?.descendantRuns?.length) return null;
   return (
     <section
