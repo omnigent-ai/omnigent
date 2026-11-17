@@ -1895,8 +1895,8 @@ def _accumulate_session_usage(
     conversation_store: ConversationStore,
 ) -> float | None:
     """
-    Increment the session's cumulative token counters from a
-    ``response.completed`` event's usage data.
+    Increment the session's cumulative token counters from a terminal
+    response event's usage data (completed, failed, cancelled or incomplete).
 
     Called synchronously from the relay loop. Builds a usage delta from
     the response's ``usage`` field and atomically applies it to the
@@ -1917,8 +1917,8 @@ def _accumulate_session_usage(
     (its presence is what distinguishes a priced ``$0.00`` from
     "unpriced"; see :func:`_priced_cost_for_display`).
 
-    :param resp_obj: The ``response`` dict from the
-        ``response.completed`` SSE event.
+    :param resp_obj: The ``response`` dict from a terminal
+        response SSE event.
     :param session_id: Session/conversation identifier,
         e.g. ``"conv_abc123"``.
     :param conversation_store: Store for reading and writing
@@ -10671,11 +10671,9 @@ async def _relay_runner_stream_once(
                                 session_id,
                                 conversation_store,
                             )
-                    if evt_type == "response.completed":
-                        # Persist the turn's usage (cost + token buckets) so
-                        # policy callables can read
-                        # event["context"]["usage"]["total_cost_usd"] and the
-                        # subtree roll-up below sees the new totals.
+                    if evt_type in _TERMINAL_RESPONSE_EVENT_TYPES:
+                        # Persist every terminal turn's usage (failed/stopped turns also made
+                        # model calls) for policy callables and the subtree roll-up below.
                         _accumulate_session_usage(
                             event.get("response", {}),
                             session_id,
@@ -10716,6 +10714,7 @@ async def _relay_runner_stream_once(
                                 ),
                             )
                         )
+                        _context_labels: dict[str, str] = {}
                         if evt_type == "response.completed":
                             # Persist the context-window indicator labels for an
                             # in-process turn (claude-sdk / openai-agents / pi):
@@ -10741,6 +10740,7 @@ async def _relay_runner_stream_once(
                                     session_id,
                                     _context_labels,
                                 )
+                        if evt_type == "response.completed" or _resp_usage:
                             # Push the server-computed cost AND token breakdown
                             # to the web client's session indicator, rolled up
                             # over the spawn subtree. The session's own event
