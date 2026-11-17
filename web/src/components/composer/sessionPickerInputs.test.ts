@@ -6,10 +6,18 @@ import { useChatStore } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
 import { useSessionPickerInputs } from "./sessionPickerInputs";
 
-// The catalog lookups are network queries; this test reads only the session's own state.
+// The catalog lookups are network queries. Each test sets the probe's answer, and the
+// harness the hook asked it for is recorded here.
+const hostProbe = vi.hoisted(() => ({
+  options: undefined as NativeModelOption[] | undefined,
+  harness: "",
+}));
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: () => ({ data: undefined }),
-  useHostModelOptions: () => ({ data: undefined }),
+  useHostModelOptions: (_hostId: string | null, harness: string) => {
+    hostProbe.harness = harness;
+    return { data: hostProbe.options };
+  },
 }));
 vi.mock("@/lib/agentLabels", async (importOriginal) => ({
   ...(await importOriginal<typeof AgentLabels>()),
@@ -28,6 +36,8 @@ afterEach(() => {
   cleanup();
   conversationRegistry.clear();
   useChatStore.setState(initialState, true);
+  hostProbe.options = undefined;
+  hostProbe.harness = "";
 });
 
 it("reads a background session's options and model, not the active conversation's", () => {
@@ -68,4 +78,39 @@ it("uses the launch preview only while the active conversation has no catalog", 
   act(() => useChatStore.setState({ codexModelOptions: ACTIVE_OPTIONS }));
   expect(result.current.codexModelOptions).toBe(ACTIVE_OPTIONS);
   expect(result.current.modelsFromLaunchPreview).toBe(false);
+});
+
+it("prefers the host's probed catalog over the launch preview, unless the session is configured", () => {
+  const PROBED = [codexModel("gpt-probed", "xhigh")];
+  const PREVIEW = [codexModel("gpt-preview", "medium")];
+  hostProbe.options = PROBED;
+  useChatStore.setState({ conversationId: "active", codexModelOptions: [] });
+  const session = {
+    id: "active",
+    hostId: "host-1",
+    harness: "codex-native",
+    labels: {},
+    agentName: null,
+    parentSessionId: null,
+  } as unknown as Session;
+
+  const { result } = renderHook(() =>
+    useSessionPickerInputs(undefined, session, { launchPreviewOptions: PREVIEW }),
+  );
+  expect(hostProbe.harness).toBe("codex-native");
+  expect(result.current.codexModelOptions).toBe(PROBED);
+  expect(result.current.modelsFromLaunchPreview).toBe(false);
+
+  const configured = renderHook(() =>
+    useSessionPickerInputs(
+      undefined,
+      { ...session, inferenceConfigured: true },
+      {
+        launchPreviewOptions: PREVIEW,
+      },
+    ),
+  );
+  expect(configured.result.current.codexModelOptions).toBe(
+    useChatStore.getState().codexModelOptions,
+  );
 });
