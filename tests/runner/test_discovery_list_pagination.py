@@ -617,8 +617,19 @@ async def test_sys_session_list_restarts_after_stale_cursor() -> None:
 
 
 @pytest.mark.asyncio
-async def test_sys_session_list_bounds_oversized_failure_message() -> None:
-    """An oversized server error keeps the healthy sub-agent row and the retry cursor."""
+@pytest.mark.parametrize(
+    ("title", "reason"),
+    [
+        ("catalog", "HTTP 503: xxx"),
+        (
+            "x" * (tool_dispatch._DISCOVERY_LIST_OUTPUT_MAX_CHARS - 1_000),
+            "Could not read sessions. page.next_cursor retries the same position",
+        ),
+    ],
+    ids=["small-fixed-section", "near-budget-fixed-section"],
+)
+async def test_sys_session_list_bounds_oversized_failure_message(title: str, reason: str) -> None:
+    """An oversized server error shrinks to fit beside the healthy sub-agent row and cursor."""
     rows = _session_rows(large=False, count=10)
     failing = True
 
@@ -626,9 +637,9 @@ async def test_sys_session_list_bounds_oversized_failure_message() -> None:
         if request.url.path == "/v1/sessions/conv_caller/child_sessions":
             child = {
                 "id": "conv_child",
-                "title": "researcher:catalog",
+                "title": f"researcher:{title}",
                 "tool": "researcher",
-                "session_name": "catalog",
+                "session_name": title,
             }
             return httpx.Response(200, json={"data": [child]})
         if request.url.path == "/v1/sessions/conv_caller":
@@ -647,17 +658,16 @@ async def test_sys_session_list_bounds_oversized_failure_message() -> None:
         failing = False
         retried = await _call_session(client, {"cursor": failed["page"]["next_cursor"]})
 
-    child = {"agent": "researcher", "title": "catalog", "conversation_id": "conv_child"}
+    child = {"agent": "researcher", "title": title, "conversation_id": "conv_child"}
     assert failed["sub_agents"] == [child]
     assert failed["sessions"] == []
     assert failed["page"]["has_more"] == {"sessions": True}
-    assert "HTTP 503: xxx" in failed["error"]
-    assert "[truncated]" in failed["error"]
+    assert reason in failed["error"]
     assert len(failed["error"]) < 1_000
     assert retried["sub_agents"] == [child]
-    assert [row["session_id"] for row in retried["sessions"]] == [
-        f"conv_{index:02d}" for index in range(10)
-    ]
+    listed = [row["session_id"] for row in retried["sessions"]]
+    assert listed
+    assert listed == [f"conv_{index:02d}" for index in range(len(listed))]
     assert "error" not in retried
 
 
