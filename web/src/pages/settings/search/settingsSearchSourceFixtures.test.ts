@@ -985,6 +985,48 @@ export function Region({ rows }: { rows: string[] }) {
   );
 }
 `,
+  ownerRow: `${IMPORTS}
+import { useSettingsOwnership } from "@/pages/settings/search/settingsOwnership";
+export function OwnerRow() {
+  const owned = useSettingsOwnership();
+  return <button {...owned.control({ outside: { "aria-label": "Open" } })} />;
+}
+`,
+  ownerSection: `${IMPORTS}
+import { FIXTURE_COPY } from "@/pages/settings/search/catalog/guardFixture";
+import { SettingsOwner } from "@/pages/settings/search/settingsOwnership";
+import { OwnerRow } from "@/pages/settings/guard-fixtures/ownerRow";
+export function OwnerSection() {
+  return (
+    <SettingsOwner entry={FIXTURE_COPY} part="open">
+      <OwnerRow />
+    </SettingsOwner>
+  );
+}
+`,
+  ownerRowAlsoUnowned: `${IMPORTS}
+import { OwnerRow } from "@/pages/settings/guard-fixtures/ownerRow";
+export function UnownedSection() {
+  return <OwnerRow />;
+}
+`,
+  unnamedRow: `${IMPORTS}
+export function UnnamedRow() {
+  return <input aria-label="A control of its own" />;
+}
+`,
+  unnamedSection: `${IMPORTS}
+import { FIXTURE_COPY } from "@/pages/settings/search/catalog/guardFixture";
+import { SettingsOwner } from "@/pages/settings/search/settingsOwnership";
+import { UnnamedRow } from "@/pages/settings/guard-fixtures/unnamedRow";
+export function UnnamedSection() {
+  return (
+    <SettingsOwner entry={FIXTURE_COPY} part="open">
+      <UnnamedRow />
+    </SettingsOwner>
+  );
+}
+`,
 };
 
 const guard = createFixtureGuard(FIXTURES);
@@ -1325,6 +1367,33 @@ describe("a shared dialog's overlay owner", () => {
     expect(siteReasons("overlayWrongOwner")).toEqual([
       ...dialogControls,
       'overlayWrongOwner.tsx › WrongOpener › SettingsOverlayOwner: fixture.fix-setUp-alpha declares no overlay for "fixAction".',
+    ]);
+  });
+});
+
+describe("Settings source guard's whole-tree pass on a component rendered inside owners", () => {
+  const reasons = (names: string[]) =>
+    check(names.map((name) => fixtureFile(name))).map(
+      (violation) => `${violation.site.replace(/^.*\//, "")}: ${violation.reason}`,
+    );
+  const ownerRowReason =
+    "ownerRow.tsx › OwnerRow › button: A shared component's control is owned only under a SettingsOwner at its Settings site.";
+
+  it("checks a component through its owner, not on its own, when no walk renders it unowned", () => {
+    expect(reasons(["ownerSection", "ownerRow"])).toEqual([]);
+  });
+
+  it("still checks a component on its own when no walk renders it", () => {
+    expect(reasons(["ownerRow"])).toEqual([ownerRowReason]);
+  });
+
+  it("still checks a component on its own when another walk renders it unowned", () => {
+    expect(reasons(["ownerSection", "ownerRow", "ownerRowAlsoUnowned"])).toEqual([ownerRowReason]);
+  });
+
+  it("still fails a control its owner doesn't name, in a component rendered inside it", () => {
+    expect(reasons(["unnamedSection", "unnamedRow"])).toEqual([
+      "unnamedRow.tsx › UnnamedRow › input: A Settings control needs settingsControlProps(entry, part) from a catalog entry.",
     ]);
   });
 });
