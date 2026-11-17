@@ -15,6 +15,8 @@ from omnigent.server.session_mcp_selection import (
     RegistryMcpSelection,
     host_sandbox,
     mcp_selection_for,
+    session_mcp_label_keys,
+    session_mcp_services,
     task_sandbox,
 )
 from omnigent.spec.types import AgentSpec, MCPServerConfig
@@ -180,17 +182,38 @@ class _PerServiceSelection:
 _SPEC = AgentSpec(spec_version=1, name="agent")
 
 
+def _session(session_id, *, host_id=None, labels=None, kind="default", runner_id=None):
+    return SimpleNamespace(
+        id=session_id,
+        host_id=host_id,
+        labels=labels or {},
+        kind=kind,
+        runner_id=runner_id,
+        parent_conversation_id=None,
+        root_conversation_id=None,
+    )
+
+
+class _Sessions:
+    def __init__(self, *sessions) -> None:
+        self._sessions = {session.id: session for session in sessions}
+
+    def get_conversation(self, session_id):
+        return self._sessions.get(session_id)
+
+
 async def _inherit(
     selection,
     worker_labels,
     *,
     spec=_SPEC,
-    source_labels=None,
+    source=None,
+    sessions=(),
     worker_host_id=None,
     new_sandbox=False,
     new_sandbox_provider=None,
 ):
-    # The source runs in a "box" sandbox, whose provider records services its own way.
+    # By default the source runs in a "box" sandbox, whose provider records services its own way.
     deployment = ManagedSandboxDeployment(
         configs=(_provider("box", selection), _provider("plain"))
     )
@@ -198,17 +221,24 @@ async def _inherit(
         deployment,
         {"source-host": "box", "box-host": "box", "plain-host": "plain", "laptop": None},
     )
+    if source is None:
+        source = _session(
+            "source", host_id="source-host", labels={"deployment.mcp.source-only": "1"}
+        )
+    body = SimpleNamespace(
+        labels=worker_labels,
+        host_id=worker_host_id,
+        host_type="managed" if new_sandbox else "external",
+        sandbox_provider=new_sandbox_provider,
+    )
     return await _inherited_mcp_labels(
         SimpleNamespace(app=SimpleNamespace(state=state)),
-        {"deployment.mcp.source-only": "1"} if source_labels is None else source_labels,
-        worker_labels,
+        source,
+        body,
+        _Sessions(source, *sessions),
         spec=spec,
         user_id="alice",
-        host_id=worker_host_id,
         runner_id=None,
-        source_host_id="source-host",
-        new_sandbox_provider=new_sandbox_provider,
-        new_sandbox=new_sandbox,
     )
 
 
@@ -258,3 +288,48 @@ async def test_worker_with_its_own_selection_inherits_nothing() -> None:
 )
 async def test_worker_drops_a_selection_it_cannot_check(selection, spec) -> None:
     assert await _inherit(selection, {}, spec=spec) == {}
+
+
+@pytest.mark.asyncio
+async def test_worker_of_a_hostless_side_chat_inherits_on_its_sources_sandbox() -> None:
+    from omnigent.stores.conversation_store import SIDE_CHAT_LABEL_KEY, SIDE_CHAT_SOURCE_LABEL_KEY
+
+    run = _session("run", host_id="source-host", runner_id="runner")
+    side_chat = _session(
+        "side",
+        runner_id="runner",
+        labels={
+            "deployment.mcp.source-only": "1",
+            SIDE_CHAT_LABEL_KEY: "1",
+            SIDE_CHAT_SOURCE_LABEL_KEY: "run",
+        },
+    )
+    # The side chat has no host of its own; its worker runs on the run's sandbox.
+    assert await _inherit(_PerServiceSelection(), {}, source=side_chat, sessions=(run,)) == {
+        "deployment.mcp.source-only": "1"
+    }
+
+
+@pytest.mark.asyncio
+async def test_worker_reads_the_source_one_way_and_writes_the_other() -> None:
+    # A registry-selected source on a connected host, and a worker in a new "box"
+    # sandbox, whose selection accepts the service and records it its own way.
+    source = _session("source", host_id="laptop", labels={"omnigent.mcp_service.linear": "1"})
+    assert await _inherit(
+        _PerServiceSelection(), {}, source=source, new_sandbox=True, new_sandbox_provider="box"
+    ) == {"deployment.mcp.linear": "1"}
+
+
+def test_a_sessions_services_are_read_whichever_selection_wrote_them() -> None:
+    deployment = ManagedSandboxDeployment(
+        configs=(_provider("box", _PerServiceSelection()), _provider("plain"))
+    )
+    provider_labels = {"deployment.mcp.slack": "1", "other": "x"}
+    registry_labels = {"omnigent.mcp_service.github": "1"}
+
+    assert session_mcp_services(deployment, provider_labels) == ("slack",)
+    assert session_mcp_services(deployment, registry_labels) == ("github",)
+    assert session_mcp_label_keys(deployment, provider_labels) == {"deployment.mcp.slack"}
+    assert session_mcp_label_keys(deployment, registry_labels) == {"omnigent.mcp_service.github"}
+    # Without a provider of its own, only the registry's labels are read.
+    assert session_mcp_services(None, provider_labels) == ()

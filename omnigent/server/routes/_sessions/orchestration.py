@@ -416,7 +416,11 @@ from omnigent.server.schemas import (
     SessionStatusEvent,
     SessionUsageEvent,
 )
-from omnigent.server.session_mcp_selection import host_sandbox, mcp_selection_for
+from omnigent.server.session_mcp_selection import (
+    mcp_selection_for,
+    session_mcp_services,
+    worker_sandbox,
+)
 from omnigent.server.startup_inputs import (
     STARTUP_LABEL,
     StartupInputContext,
@@ -12437,56 +12441,58 @@ async def _resolve_native_smart_routing(
 
 async def _inherited_mcp_labels(
     request: Request,
-    source_labels: Mapping[str, str],
-    labels: Mapping[str, str],
+    created_by: Conversation,
+    body: SessionCreateInput,
+    conversation_store: ConversationStore,
     *,
     spec: AgentSpec | None,
     user_id: str | None,
-    host_id: str | None,
     runner_id: str | None,
-    source_host_id: str | None,
-    new_sandbox_provider: str | None,
-    new_sandbox: bool,
 ) -> dict[str, str]:
-    """The source session's MCP selection labels for a worker it starts.
+    """The MCP selection labels a worker that *created_by* starts inherits.
 
-    The source's services are read with its own sandbox provider's selection
-    and written with the worker's, so a worker in a provider that configures
-    MCP servers differently does not get labels it cannot read.
+    The source's services are read whichever selection wrote them, and written
+    with the selection of where the worker runs, so a worker in a provider that
+    configures MCP servers differently gets labels it can read, or none.
 
     Empty when the worker already carries a selection, the source has none, or
     the worker's agent could not be loaded to check for name collisions. A
     selection the worker cannot use (a disconnected account, a name its agent
     uses for a custom server, a runtime without registry support, or services
-    only the source's provider configures) is dropped whole, so the worker
-    still starts.
+    only another provider configures) is dropped whole, so the worker still
+    starts.
     """
+    from omnigent.runner.routing import routing_host_id
     from omnigent.server.runtime_compatibility import registry_services, require_runtime_support
 
-    source_sandbox = await asyncio.to_thread(host_sandbox, request.app.state, source_host_id)
-    if new_sandbox:
-        deployment = getattr(request.app.state, "sandbox_config", None)
-        worker_sandbox = (
-            deployment.for_provider(new_sandbox_provider) if deployment is not None else None
-        )
-    elif host_id is not None:
-        worker_sandbox = await asyncio.to_thread(host_sandbox, request.app.state, host_id)
-    else:
-        # Without a host of its own, the worker runs where its source does.
-        worker_sandbox = source_sandbox
-    selection = mcp_selection_for(worker_sandbox)
-    services = mcp_selection_for(source_sandbox).selected_services(source_labels)
-    if not services or selection.selected_services(labels) or spec is None:
+    state = request.app.state
+    deployment = getattr(state, "sandbox_config", None)
+    services = session_mcp_services(deployment, created_by.labels)
+    if not services or session_mcp_services(deployment, body.labels or {}) or spec is None:
         return {}
+    new_sandbox = body.host_type == "managed"
+    host_id = body.host_id
+    if host_id is None and not new_sandbox:
+        # Without a host of its own, the worker runs where its source's runner does,
+        # which for a side chat is its source's host.
+        host_id = await asyncio.to_thread(routing_host_id, created_by, conversation_store)
+    sandbox = await asyncio.to_thread(
+        worker_sandbox,
+        state,
+        new_sandbox=new_sandbox,
+        new_sandbox_provider=body.sandbox_provider,
+        host_id=host_id,
+    )
+    selection = mcp_selection_for(sandbox)
     inherited = selection.session_labels(services)
     try:
         await asyncio.to_thread(selection.validate, request, services, spec=spec, user_id=user_id)
         require_runtime_support(
             registry_services(selected_mcp_spec(spec, inherited)),
-            host_id=host_id,
+            host_id=body.host_id,
             runner_id=runner_id,
-            host_registry=getattr(request.app.state, "host_registry", None),
-            tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
+            host_registry=getattr(state, "host_registry", None),
+            tunnel_registry=getattr(state, "tunnel_registry", None),
         )
     except OmnigentError as exc:
         if exc.code == ErrorCode.WRONG_REPLICA:
@@ -12513,8 +12519,7 @@ async def _create_session_from_existing_agent(
     created_by_session_id: str | None = None,
     created_by_project_id: str | None = None,
     created_by_scheduled_task_id: str | None = None,
-    created_by_labels: Mapping[str, str] | None = None,
-    created_by_host_id: str | None = None,
+    created_by: Conversation | None = None,
     launched_by_scheduled_task_id: str | None = None,
 ) -> tuple[SessionResponse, Conversation, SessionCreateInput]:
     """
@@ -12550,10 +12555,8 @@ async def _create_session_from_existing_agent(
         no project is filed there, so it sits beside the session that started it.
     :param created_by_scheduled_task_id: The automation whose run is that source, if
         any. A worker whose request carries no launch args runs in its permission mode.
-    :param created_by_labels: That source's labels. A worker that picks no MCP
-        services of its own starts with the source's.
-    :param created_by_host_id: That source's host, whose sandbox provider decides
-        how its MCP services are read.
+    :param created_by: That source session. A worker that picks no MCP services of
+        its own starts with the source's.
     :param launched_by_scheduled_task_id: The automation whose run's tree that source
         is in, if any, stamped as the worker's ``SCHEDULED_TASK_LAUNCH_LABEL_KEY``.
     :returns: The newly created session snapshot, its conversation row, and
@@ -13010,18 +13013,15 @@ async def _create_session_from_existing_agent(
         runner_router=runner_router,
     )
     inherited_mcp_labels: dict[str, str] = {}
-    if created_by_labels and not body.mcp_registry_services and not body.sub_agent_name:
+    if created_by is not None and not body.mcp_registry_services and not body.sub_agent_name:
         inherited_mcp_labels = await _inherited_mcp_labels(
             request,
-            created_by_labels,
-            body.labels or {},
+            created_by,
+            body,
+            conversation_store,
             spec=selection_spec,
             user_id=user_id,
-            host_id=body.host_id,
             runner_id=inherited_runner_id,
-            source_host_id=created_by_host_id,
-            new_sandbox_provider=body.sandbox_provider,
-            new_sandbox=body.host_type == "managed",
         )
 
     selected_harness = (
@@ -13232,7 +13232,7 @@ async def _create_session_from_existing_agent(
     client_surface = resolve_session_surface(
         request.headers,
         parent_labels=_parent_for_routing.labels if _parent_for_routing is not None else None,
-        source_labels=created_by_labels,
+        source_labels=created_by.labels if created_by is not None else None,
         requested_labels=initial_labels,
     )
     initial_labels[CLIENT_SURFACE_LABEL_KEY] = client_surface

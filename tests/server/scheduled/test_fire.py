@@ -529,6 +529,7 @@ class _FakeSandboxConfig:
         self.managed_launch_supported = managed_launch_supported
         # The provider a managed run launches on, and how it records MCP services.
         self.default = SimpleNamespace(provider="box", mcp_selection=mcp_selection)
+        self.configs = (self.default,)
 
 
 class FakeHostStore:
@@ -4728,6 +4729,43 @@ async def test_a_copied_run_keeps_a_one_label_selection_unless_the_task_has_one(
     # The copy's own label survives unless the task writes its selection over it.
     assert (selection.key in fork["dropped_label_keys"]) == (written is not None)
     assert fork["extra_labels"].get(selection.key) == written
+
+
+@pytest.mark.asyncio
+async def test_a_copied_run_drops_a_registry_selection_its_provider_cannot_read() -> None:
+    # The source picked a registry service on a connected host; the task runs in a
+    # sandbox whose provider records services its own way.
+    selection = _ListLabelSelection()
+    conv_store = FakeConversationStore()
+    conv_store.get_conversation = lambda conversation_id: _FakeConversation(  # type: ignore[method-assign]
+        id=conversation_id, agent_id="ag_1", labels={"omnigent.mcp_service.slack": "1"}
+    )
+    store = FakeScheduledTaskStore(
+        rows={
+            "task_1": _task(
+                source_session_id="conv_source",
+                mcp_services=("github",),
+                execution_target="managed_sandbox",
+            )
+        }
+    )
+
+    async def _launch(conv: Any, task: Any) -> None:
+        pass
+
+    deps = _deps(
+        store,
+        conversation_store=conv_store,
+        permission_store=FakePermissionStore(),
+        sandbox_config=_FakeSandboxConfig(mcp_selection=selection),
+    )
+    await build_on_fire(deps, launch_dispatch=_launch)(0, "task_1")
+    await _drain()
+
+    (fork,) = conv_store.forked
+    # The task's services replace the source's, not add to them.
+    assert "omnigent.mcp_service.slack" in fork["dropped_label_keys"]
+    assert fork["extra_labels"][selection.key] == '["github"]'
 
 
 @pytest.mark.asyncio

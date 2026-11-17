@@ -160,6 +160,7 @@ from omnigent.server.schemas import SessionEventInput
 from omnigent.server.session_mcp_selection import (
     SessionMcpSelection,
     mcp_selection_for,
+    session_mcp_label_keys,
     task_sandbox,
 )
 from omnigent.stores.conversation_store import (
@@ -2143,11 +2144,9 @@ async def _copy_source_session_for_run(
         source.labels if source is not None else {}, agent_changed=agent_changed
     )
     if task.mcp_services and source is not None:
-        # The task's own MCP services replace the copy's rather than adding to them.
-        selection = _task_mcp_selection(deps, task)
-        dropped = dropped | frozenset(
-            selection.session_labels(selection.selected_services(source.labels))
-        )
+        # The task's own MCP services replace the copy's rather than adding to
+        # them, whichever selection wrote the copy's.
+        dropped = dropped | session_mcp_label_keys(deps.sandbox_config, source.labels)
     project_id = await _fire_project_id(deps, task)
     try:
         conv = await asyncio.to_thread(

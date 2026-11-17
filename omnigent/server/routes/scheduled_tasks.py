@@ -88,6 +88,7 @@ from omnigent.server.session_mcp_selection import (
     MAX_SESSION_MCP_SERVICES,
     SessionMcpSelection,
     mcp_selection_for,
+    session_mcp_services,
     task_sandbox,
 )
 from omnigent.server.workflows import require_workflows
@@ -754,10 +755,7 @@ def create_scheduled_tasks_router(
         )
 
     def _require_mcp_services_fit_session(
-        request: Request,
-        session: Conversation,
-        services: tuple[str, ...],
-        execution_target: str,
+        request: Request, session: Conversation, services: tuple[str, ...]
     ) -> None:
         """Reject saved *services* the continued *session* does not run.
 
@@ -766,7 +764,9 @@ def create_scheduled_tasks_router(
         """
         if not services:
             return
-        running = _task_mcp_selection(request, execution_target).selected_services(session.labels)
+        running = session_mcp_services(
+            getattr(request.app.state, "sandbox_config", None), session.labels
+        )
         if set(services) != set(running):
             raise OmnigentError(
                 "The picked session runs different MCP services. Select the ones it "
@@ -1118,9 +1118,7 @@ def create_scheduled_tasks_router(
                         session_id=body.session_id,
                     ),
                 )
-                _require_mcp_services_fit_session(
-                    request, picked, mcp_services, body.execution_target
-                )
+                _require_mcp_services_fit_session(request, picked, mcp_services)
                 # The session cannot move, so the task routes every run to its host.
                 if host_id is None and body.execution_target != "managed_sandbox":
                     host_id = picked.host_id
@@ -1836,10 +1834,7 @@ def create_scheduled_tasks_router(
         if fields.get("session_id") is not None:
             picked = await _require_continuable(request, continuing)
             _require_mcp_services_fit_session(
-                request,
-                picked,
-                fields.get("mcp_services", existing.mcp_services),
-                target_execution,
+                request, picked, fields.get("mcp_services", existing.mcp_services)
             )
             # The session cannot move, so the task routes every run to its host.
             if (

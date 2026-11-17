@@ -132,6 +132,63 @@ def host_sandbox(app_state: Any, host_id: str | None) -> ManagedSandboxConfig | 
     return deployment.for_provider(host.sandbox_provider)
 
 
+def worker_sandbox(
+    app_state: Any,
+    *,
+    new_sandbox: bool,
+    new_sandbox_provider: str | None,
+    host_id: str | None,
+) -> ManagedSandboxConfig | None:
+    """The provider a worker session runs in, or ``None`` on a connected host.
+
+    A new sandbox runs on the provider it names (the deployment default when it
+    names none). Otherwise *host_id* is the existing host it runs on: the one it
+    names, or the one its source's runner routes through. Blocking: reads the host row.
+    """
+    if new_sandbox:
+        deployment = getattr(app_state, "sandbox_config", None)
+        return deployment.for_provider(new_sandbox_provider) if deployment is not None else None
+    return host_sandbox(app_state, host_id)
+
+
+def _known_selections(
+    deployment: ManagedSandboxDeployment | None,
+) -> tuple[SessionMcpSelection, ...]:
+    """The registry, then each provider's own selection."""
+    configs = deployment.configs if deployment is not None else ()
+    return (
+        RegistryMcpSelection(),
+        *(config.mcp_selection for config in configs if config.mcp_selection is not None),
+    )
+
+
+def session_mcp_services(
+    deployment: ManagedSandboxDeployment | None, labels: Mapping[str, str]
+) -> tuple[str, ...]:
+    """The services a session's *labels* select, whichever selection wrote them.
+
+    One selection writes a session's labels, so reading with every selection this
+    deployment knows needs no lookup of where the session runs.
+    """
+    return tuple(
+        dict.fromkeys(
+            service
+            for selection in _known_selections(deployment)
+            for service in selection.selected_services(labels)
+        )
+    )
+
+
+def session_mcp_label_keys(
+    deployment: ManagedSandboxDeployment | None, labels: Mapping[str, str]
+) -> frozenset[str]:
+    """The keys of *labels* that record a selection, whichever selection wrote them."""
+    keys: set[str] = set()
+    for selection in _known_selections(deployment):
+        keys.update(selection.session_labels(selection.selected_services(labels)))
+    return frozenset(keys)
+
+
 def _unique_services(services: Sequence[str]) -> tuple[str, ...]:
     unique = tuple(dict.fromkeys(services))
     if len(unique) > MAX_SESSION_MCP_SERVICES:
