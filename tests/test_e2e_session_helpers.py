@@ -55,6 +55,7 @@ def test_pi_launch_waits_for_its_input_ready_marker(tmp_path: Path, monkeypatch,
     drained = []
     stopped = []
     keys = []
+    startup_message = "Managed-tool setup is still pending"
 
     def expect(pattern, *, timeout):
         clock.now = 0.4
@@ -65,6 +66,10 @@ def test_pi_launch_waits_for_its_input_ready_marker(tmp_path: Path, monkeypatch,
         drained.append(clock.now)
         if startup == "exit":
             raise journey.pexpect.EOF("Pi exited during managed-tool setup")
+        if len(drained) == 1:
+            output = f"\x1b[33m{startup_message}\x1b[0m\n"
+            child.logfile_read.write(output)
+            return output
         if startup == "ready" and len(drained) == 2:
             marker.touch()
             return "Omnigent linked"
@@ -98,12 +103,18 @@ def test_pi_launch_waits_for_its_input_ready_marker(tmp_path: Path, monkeypatch,
             child.logfile_read.close()
     else:
         expected = journey.pexpect.EOF if startup == "exit" else AssertionError
-        with pytest.raises(expected):
+        with pytest.raises(expected) as failure:
             journey._launch_pi(env)
         assert stopped == [child] and child.logfile_read.closed
         assert keys == []
         if startup == "wrong-session":
             assert 1 <= clock.now <= 1.1, "readiness reset the original launch budget"
+            assert startup_message not in child.before
+            assert startup_message in str(failure.value)
+            assert "\x1b[" not in str(failure.value)
+            transcript = data / "logs" / "pi-terminal.log"
+            assert str(transcript) in str(failure.value)
+            assert startup_message in transcript.read_text()
 
 
 def _item(role: str, text: str, response_id: str, *, nested: bool) -> dict:

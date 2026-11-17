@@ -202,7 +202,7 @@ def _launch_pi(env: dict[str, str]) -> tuple[Any, str, str]:
         return child, match.group(1), match.group(2)
     except pexpect.TIMEOUT as exc:
         child.logfile_read.flush()
-        output = child.before or ""
+        output = transcript.read_text()
         _teardown(child, env)
         raise AssertionError(
             f"omnigent pi did not publish its session link/model and input-ready marker "
