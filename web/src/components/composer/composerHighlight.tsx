@@ -28,7 +28,7 @@ export function splitKnownSlashCommand(
 ): { before: string; token: string; after: string } | null {
   const token = matchSlashCommandInvocation(value, commands)?.command;
   if (token === undefined) return null;
-  const before = /^\s*/.exec(value)?.[0] ?? "";
+  const before = value.match(/^\s*/)?.[0] ?? "";
   return { before, token, after: value.slice(before.length + token.length) };
 }
 
@@ -48,7 +48,7 @@ export function splitNativeShellCommand(
     if (!value.startsWith("!") || value.slice(1).trim() === "") return null;
     return { before: "", token: "!", after: value.slice(1) };
   }
-  const before = /^\s*/.exec(value)?.[0] ?? "";
+  const before = value.match(/^\s*/)?.[0] ?? "";
   const rest = value.slice(before.length);
   if (!rest.startsWith("!") || rest.startsWith("!!")) return null;
   if (rest.slice(1).trim() === "") return null;
