@@ -1401,8 +1401,12 @@ describe("renderTriggerPrompt", () => {
     expect(prompt).toContain(
       'Skip any ticket you already started a session for, or that is on a "Delivery pending:" line. Check the sessions your earlier replies in this session say you started first.',
     );
+    // A finished previous run saw nothing after its checkpoint, so newer results skip the listing.
     expect(prompt).toContain(
-      "For results not listed there, call sys_session_list once with include_archived true, and created_by_this_session true when the tool offers it, following next_cursor through every page, and look for sessions whose created_by_session_id is your session ID",
+      'If the last message you wrote before this run\'s message is a reply with a "Checked through:" line and no "Delivery pending:" entries, your previous run finished, so a result created after that "Checked through:" time can\'t have a session yet: start it without the check below.',
+    );
+    expect(prompt).toContain(
+      "For other results not listed there, call sys_session_list once with include_archived true, and created_by_this_session true when the tool offers it, following next_cursor through every page, and look for sessions whose created_by_session_id is your session ID",
     );
     // Older runners silently ignore include_archived; their rows lack the archived field.
     expect(prompt).toContain(

@@ -2591,7 +2591,6 @@ def register_core_routes(
         pinned: bool = Query(default=False),
         expand_families: bool = Query(default=False),
         visibility: str = Query(default="all", pattern="^(all|mine|shared|archived)$"),
-        created_by_session_id: str | None = Query(default=None),
     ) -> dict[str, Any]:
         """
         List sessions with cursor-based pagination.
@@ -2658,9 +2657,6 @@ def register_core_routes(
             ``"all"`` (default) returns all accessible non-archived
             sessions, matching the legacy behaviour. ``include_archived``
             adds archived rows to ``"mine"``, ``"shared"`` and ``"all"``.
-        :param created_by_session_id: When set, return only sessions
-            started by this session (its ``omnigent.created_by_session_id``
-            label), e.g. a trigger manager's workers. Older servers ignore it.
         :returns: A :class:`PaginatedList` of
             :class:`SessionListItem`.
         """
@@ -2757,7 +2753,6 @@ def register_core_routes(
                     pinned=pinned,
                     # Pins are per-user: filter to the caller's own pin key.
                     pinned_owner=user_id,
-                    created_by_session_id=created_by_session_id or None,
                 )
                 # Side chats surface only as Workspace-rail tabs, so drop any
                 # side-chat-labeled fork from the sidebar list (it is still a

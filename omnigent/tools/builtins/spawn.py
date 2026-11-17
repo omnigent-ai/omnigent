@@ -613,7 +613,8 @@ class SysSessionListTool(Tool):
                             "description": (
                                 "Optional: list only sessions this session started "
                                 "(created_by_session_id is your session ID) in the "
-                                "global 'sessions' view. Defaults to false."
+                                "global 'sessions' view, in one call where possible; "
+                                "sub_agents is then empty. Defaults to false."
                             ),
                         },
                         "limit": {
