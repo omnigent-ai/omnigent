@@ -84,7 +84,12 @@ from omnigent.server.scheduled.run_reconciler import force_fail_stale_runs
 from omnigent.server.scheduled.run_sharing import delete_task_grants
 from omnigent.server.scheduled.telemetry import log_task_created
 from omnigent.server.scheduled.workflow_automations import workflow_session_reuse_error
-from omnigent.server.session_mcp_selection import MAX_SESSION_MCP_SERVICES, session_mcp_selection
+from omnigent.server.session_mcp_selection import (
+    MAX_SESSION_MCP_SERVICES,
+    SessionMcpSelection,
+    mcp_selection_for,
+    task_sandbox,
+)
 from omnigent.server.workflows import require_workflows
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
 from omnigent.stores.artifact_store import ArtifactStore
@@ -688,10 +693,19 @@ def create_scheduled_tasks_router(
             return {}
         return await asyncio.to_thread(display_names_or_ids, permission_store, owners)
 
+    def _task_mcp_selection(request: Request, execution_target: str) -> SessionMcpSelection:
+        """The selection a task's runs use: its sandbox provider's, or the registry's."""
+        deployment = getattr(request.app.state, "sandbox_config", None)
+        return mcp_selection_for(task_sandbox(deployment, execution_target))
+
     async def _validated_mcp_services(
-        request: Request, services: list[str], agent: Agent, owner: str
+        request: Request,
+        services: list[str],
+        agent: Agent,
+        owner: str,
+        execution_target: str,
     ) -> tuple[str, ...]:
-        """Check *services* with the deployment's session MCP selection."""
+        """Check *services* with the selection of where the task runs."""
         if not services:
             return ()
         spec = None
@@ -708,7 +722,7 @@ def create_scheduled_tasks_router(
             except (KeyError, AttributeError, ValueError, ImportError, OSError):
                 # The fire path reports an unloadable agent; skip only the spec check.
                 spec = None
-        selection = session_mcp_selection(request.app.state)
+        selection = _task_mcp_selection(request, execution_target)
         validated = await asyncio.to_thread(
             selection.validate, request, services, spec=spec, user_id=owner
         )
@@ -740,7 +754,10 @@ def create_scheduled_tasks_router(
         )
 
     def _require_mcp_services_fit_session(
-        request: Request, session: Conversation, services: tuple[str, ...]
+        request: Request,
+        session: Conversation,
+        services: tuple[str, ...],
+        execution_target: str,
     ) -> None:
         """Reject saved *services* the continued *session* does not run.
 
@@ -749,7 +766,7 @@ def create_scheduled_tasks_router(
         """
         if not services:
             return
-        running = session_mcp_selection(request.app.state).selected_services(session.labels)
+        running = _task_mcp_selection(request, execution_target).selected_services(session.labels)
         if set(services) != set(running):
             raise OmnigentError(
                 "The picked session runs different MCP services. Select the ones it "
@@ -1075,7 +1092,9 @@ def create_scheduled_tasks_router(
             source: Conversation | None = None
             source_up_to = ""
             carry = False
-            mcp_services = await _validated_mcp_services(request, body.mcp_services, agent, owner)
+            mcp_services = await _validated_mcp_services(
+                request, body.mcp_services, agent, owner, body.execution_target
+            )
             if body.session_id is not None:
                 # A picked session keeps the agent it runs, so the task takes no copy.
                 bound = agent
@@ -1099,7 +1118,9 @@ def create_scheduled_tasks_router(
                         session_id=body.session_id,
                     ),
                 )
-                _require_mcp_services_fit_session(request, picked, mcp_services)
+                _require_mcp_services_fit_session(
+                    request, picked, mcp_services, body.execution_target
+                )
                 # The session cannot move, so the task routes every run to its host.
                 if host_id is None and body.execution_target != "managed_sandbox":
                     host_id = picked.host_id
@@ -1705,8 +1726,12 @@ def create_scheduled_tasks_router(
                     agent=agent,
                     agent_cache=agent_cache,
                 )
-        if "mcp_services" in fields or (agent_changed and existing.mcp_services):
-            # A rebound agent must still accept the services the task keeps.
+        if "mcp_services" in fields or (
+            existing.mcp_services
+            and (agent_changed or target_execution != existing.execution_target)
+        ):
+            # A rebound agent, or a sandbox provider in place of a host or the
+            # reverse, must still accept the services the task keeps.
             mcp_agent = await validate_session_agent(
                 user_id=owner_id,
                 agent_id=target_agent_id,
@@ -1719,6 +1744,7 @@ def create_scheduled_tasks_router(
                 list(fields.get("mcp_services", existing.mcp_services)),
                 mcp_agent,
                 owner,
+                target_execution,
             )
         switching_to_managed = target_execution == "managed_sandbox"
         if not switching_to_managed and "workspace" in fields and fields["workspace"] is None:
@@ -1810,7 +1836,10 @@ def create_scheduled_tasks_router(
         if fields.get("session_id") is not None:
             picked = await _require_continuable(request, continuing)
             _require_mcp_services_fit_session(
-                request, picked, fields.get("mcp_services", existing.mcp_services)
+                request,
+                picked,
+                fields.get("mcp_services", existing.mcp_services),
+                target_execution,
             )
             # The session cannot move, so the task routes every run to its host.
             if (

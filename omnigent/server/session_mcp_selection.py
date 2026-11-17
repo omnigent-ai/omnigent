@@ -5,9 +5,10 @@ server creates on someone's behalf, a scheduled task's fired sessions and the
 workers a session starts, must start with the same services, so the server
 needs to turn a stored list of service names into session labels and read it
 back. The registry default writes ``omnigent.mcp_service.<id>`` labels, which
-the runner applies when it loads the agent spec. A deployment that configures
-MCP servers some other way (for example, inside a sandbox at launch) passes its
-own :class:`SessionMcpSelection` to ``create_app``.
+the runner applies when it loads the agent spec, so it works wherever a session
+runs. A sandbox provider that configures MCP servers inside the sandbox at launch
+sets its own :class:`SessionMcpSelection` as its config's ``mcp_selection``; the
+server uses it only for sessions in that provider's sandboxes.
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ from omnigent.server.schemas import MAX_MCP_REGISTRY_SERVICES, MCP_REGISTRY_SERV
 if TYPE_CHECKING:
     from fastapi import Request
 
+    from omnigent.server.managed_hosts import ManagedSandboxConfig, ManagedSandboxDeployment
     from omnigent.spec.types import AgentSpec
 
 _REGISTRY_SERVICE_ID = re.compile(MCP_REGISTRY_SERVICE_ID_PATTERN)
@@ -100,10 +102,34 @@ class RegistryMcpSelection:
         )
 
 
-def session_mcp_selection(app_state: Any) -> SessionMcpSelection:
-    """The deployment's selection, or the registry default when none is configured."""
-    configured = getattr(app_state, "session_mcp_selection", None) if app_state else None
+def mcp_selection_for(sandbox: ManagedSandboxConfig | None) -> SessionMcpSelection:
+    """The selection for a session in *sandbox*'s provider, or the registry's outside one."""
+    configured = sandbox.mcp_selection if sandbox is not None else None
     return configured if configured is not None else RegistryMcpSelection()
+
+
+def task_sandbox(
+    deployment: ManagedSandboxDeployment | None, execution_target: str
+) -> ManagedSandboxConfig | None:
+    """The provider a scheduled task's new runs launch in, or ``None`` on a connected host."""
+    if execution_target != "managed_sandbox" or deployment is None:
+        return None
+    return deployment.default
+
+
+def host_sandbox(app_state: Any, host_id: str | None) -> ManagedSandboxConfig | None:
+    """The provider behind an existing *host_id*, or ``None`` for a connected host.
+
+    Blocking: reads the host row.
+    """
+    deployment = getattr(app_state, "sandbox_config", None)
+    host_store = getattr(app_state, "host_store", None)
+    if host_id is None or deployment is None or host_store is None:
+        return None
+    host = host_store.get_host(host_id)
+    if host is None or host.sandbox_provider is None:
+        return None
+    return deployment.for_provider(host.sandbox_provider)
 
 
 def _unique_services(services: Sequence[str]) -> tuple[str, ...]:

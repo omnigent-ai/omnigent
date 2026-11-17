@@ -523,8 +523,12 @@ class _FakeHost:
 class _FakeSandboxConfig:
     """Minimal stand-in for ManagedSandboxDeployment in fire tests."""
 
-    def __init__(self, *, managed_launch_supported: bool = True) -> None:
+    def __init__(
+        self, *, managed_launch_supported: bool = True, mcp_selection: Any | None = None
+    ) -> None:
         self.managed_launch_supported = managed_launch_supported
+        # The provider a managed run launches on, and how it records MCP services.
+        self.default = SimpleNamespace(provider="box", mcp_selection=mcp_selection)
 
 
 class FakeHostStore:
@@ -843,32 +847,45 @@ class _ListLabelSelection:
         return tuple(json.loads(labels.get("deployment.mcp_services", "[]")))
 
 
+_REGISTRY_LABELS = {"omnigent.mcp_service.github": "1", "omnigent.mcp_service.linear": "1"}
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("app_state", "expected"),
+    ("execution_target", "provider_selection", "expected"),
     [
+        ("connected_host", None, _REGISTRY_LABELS),
+        ("managed_sandbox", None, _REGISTRY_LABELS),
         (
-            None,
-            {"omnigent.mcp_service.github": "1", "omnigent.mcp_service.linear": "1"},
-        ),
-        (
-            SimpleNamespace(session_mcp_selection=_ListLabelSelection()),
+            "managed_sandbox",
+            _ListLabelSelection(),
             {"deployment.mcp_services": '["github", "linear"]'},
         ),
+        # A provider's own selection never applies to a run on a connected host.
+        ("connected_host", _ListLabelSelection(), _REGISTRY_LABELS),
     ],
-    ids=["registry-default", "deployment-override"],
+    ids=["host", "sandbox-provider-without-one", "sandbox-provider-selection", "host-ignores-it"],
 )
 async def test_every_fired_session_starts_with_the_task_mcp_services(
-    app_state: Any, expected: dict[str, str]
+    execution_target: str, provider_selection: Any, expected: dict[str, str]
 ) -> None:
     conv_store = FakeConversationStore()
-    store = FakeScheduledTaskStore(rows={"task_1": _task(mcp_services=("github", "linear"))})
+    store = FakeScheduledTaskStore(
+        rows={
+            "task_1": _task(mcp_services=("github", "linear"), execution_target=execution_target)
+        }
+    )
 
     async def _launch(conv: Any, task: Any) -> None:
         return None
 
     on_fire = build_on_fire(
-        _deps(store, conversation_store=conv_store, app_state=app_state),
+        _deps(
+            store,
+            conversation_store=conv_store,
+            permission_store=FakePermissionStore(),
+            sandbox_config=_FakeSandboxConfig(mcp_selection=provider_selection),
+        ),
         launch_dispatch=_launch,
     )
     await on_fire(0, "task_1")
@@ -4686,7 +4703,13 @@ async def test_a_copied_run_keeps_a_one_label_selection_unless_the_task_has_one(
         id=conversation_id, agent_id="ag_1", labels={selection.key: '["slack"]'}
     )
     store = FakeScheduledTaskStore(
-        rows={"task_1": _task(source_session_id="conv_source", mcp_services=task_services)}
+        rows={
+            "task_1": _task(
+                source_session_id="conv_source",
+                mcp_services=task_services,
+                execution_target="managed_sandbox",
+            )
+        }
     )
 
     async def _launch(conv: Any, task: Any) -> None:
@@ -4695,7 +4718,8 @@ async def test_a_copied_run_keeps_a_one_label_selection_unless_the_task_has_one(
     deps = _deps(
         store,
         conversation_store=conv_store,
-        app_state=SimpleNamespace(session_mcp_selection=selection),
+        permission_store=FakePermissionStore(),
+        sandbox_config=_FakeSandboxConfig(mcp_selection=selection),
     )
     await build_on_fire(deps, launch_dispatch=_launch)(0, "task_1")
     await _drain()

@@ -157,7 +157,11 @@ from omnigent.server.scheduled.telemetry import (
     startup_failure_stage,
 )
 from omnigent.server.schemas import SessionEventInput
-from omnigent.server.session_mcp_selection import SessionMcpSelection, session_mcp_selection
+from omnigent.server.session_mcp_selection import (
+    SessionMcpSelection,
+    mcp_selection_for,
+    task_sandbox,
+)
 from omnigent.stores.conversation_store import (
     CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
     SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY,
@@ -894,9 +898,7 @@ async def _run_fire_for_task(
             deps,
             effective,
             labels={
-                **_session_labels(
-                    task, session_mcp_selection(deps.app_state), recorder.managed_host_id
-                ),
+                **_session_labels(task, _task_mcp_selection(deps, task), recorder.managed_host_id),
                 SCHEDULED_TASK_RUN_LABEL_KEY: recorder.run_id,
                 SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY: recorder.run_id,
             },
@@ -1908,6 +1910,11 @@ def _sandbox_workspaces(task: ScheduledTask) -> list[str]:
     return []
 
 
+def _task_mcp_selection(deps: FireDeps, task: ScheduledTask) -> SessionMcpSelection:
+    """The selection *task*'s runs use: its sandbox provider's, or the registry's."""
+    return mcp_selection_for(task_sandbox(deps.sandbox_config, task.execution_target))
+
+
 def _session_labels(
     task: ScheduledTask,
     mcp_selection: SessionMcpSelection | None = None,
@@ -1915,14 +1922,14 @@ def _session_labels(
 ) -> dict[str, str]:
     """Labels a fired session starts with.
 
-    The task's MCP services become the deployment's selection labels, so every
-    run starts with the same services. A managed fire's session records the
+    The task's MCP services become its selection's labels, so every run starts
+    with the same services. A managed fire's session records the
     sandbox host id it was launched under, so the host routes by that id from
     its first connection and a relaunch keeps the same replica. A task with no
     services writes no selection labels, so a copied session keeps its own.
     """
     selection_labels = (
-        (mcp_selection or session_mcp_selection(None)).session_labels(task.mcp_services)
+        (mcp_selection or mcp_selection_for(None)).session_labels(task.mcp_services)
         if task.mcp_services
         else {}
     )
@@ -2137,7 +2144,7 @@ async def _copy_source_session_for_run(
     )
     if task.mcp_services and source is not None:
         # The task's own MCP services replace the copy's rather than adding to them.
-        selection = session_mcp_selection(deps.app_state)
+        selection = _task_mcp_selection(deps, task)
         dropped = dropped | frozenset(
             selection.session_labels(selection.selected_services(source.labels))
         )
