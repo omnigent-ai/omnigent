@@ -1,4 +1,4 @@
-import { act, renderHook } from "@testing-library/react";
+import { act, cleanup, renderHook } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
 import {
   CODE_BLOCK_WORD_WRAP_STORAGE_KEY,
@@ -120,4 +120,24 @@ it("keeps an unsaved choice when reading storage also fails", () => {
   vi.restoreAllMocks();
   expect(localStorage.getItem(CODE_BLOCK_WORD_WRAP_STORAGE_KEY)).toBe("false");
   expect(readCodeBlockWordWrap()).toBe(true);
+});
+
+it("drops an unsaved choice on another window's write even with no reader mounted", () => {
+  const first = renderHook(() => useCodeBlockWordWrap());
+  const saveFails = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+    throw new Error("quota exceeded");
+  });
+  act(() => writeCodeBlockWordWrap(false));
+  expect(first.result.current).toBe(false);
+  saveFails.mockRestore();
+  first.unmount();
+
+  // sessionStorage and other keys are not this preference.
+  window.dispatchEvent(new StorageEvent("storage", { key: null, storageArea: sessionStorage }));
+  window.dispatchEvent(new StorageEvent("storage", { key: "omnigent:another-preference" }));
+  expect(renderHook(() => useCodeBlockWordWrap()).result.current).toBe(false);
+  cleanup();
+
+  window.dispatchEvent(new StorageEvent("storage", { key: CODE_BLOCK_WORD_WRAP_STORAGE_KEY }));
+  expect(renderHook(() => useCodeBlockWordWrap()).result.current).toBe(true);
 });

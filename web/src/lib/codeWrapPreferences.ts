@@ -40,23 +40,25 @@ export function notifyCodeBlockWordWrapChanged(): void {
   preference.notifyChanged();
 }
 
-// Another window's write replaces this tab's unsaved choice. Registered before the
-// preference's own listener, so readers re-read after it is cleared.
-function subscribe(listener: () => void): () => void {
-  const onStorage = (event: StorageEvent) => {
-    if (event.key === null || event.key === CODE_BLOCK_WORD_WRAP_STORAGE_KEY) {
-      unsavedWrap = undefined;
+// Another window's write replaces this tab's unsaved choice, even with no block mounted.
+// Registered at load, so it runs before any reader's listener re-reads.
+if (typeof window !== "undefined") {
+  window.addEventListener("storage", (event) => {
+    if (event.key !== null && event.key !== CODE_BLOCK_WORD_WRAP_STORAGE_KEY) return;
+    try {
+      if (event.storageArea !== null && event.storageArea !== window.localStorage) return;
+    } catch {
+      // Unreadable storage: readers re-read too, as in the preference's own listener.
     }
-  };
-  window.addEventListener("storage", onStorage);
-  const unsubscribe = preference.subscribe(listener);
-  return () => {
-    window.removeEventListener("storage", onStorage);
-    unsubscribe();
-  };
+    unsavedWrap = undefined;
+  });
 }
 
 /** Live value of the preference, including changes made in other windows. */
 export function useCodeBlockWordWrap(): boolean {
-  return useSyncExternalStore(subscribe, readCodeBlockWordWrap, () => DEFAULT_CODE_BLOCK_WORD_WRAP);
+  return useSyncExternalStore(
+    preference.subscribe,
+    readCodeBlockWordWrap,
+    () => DEFAULT_CODE_BLOCK_WORD_WRAP,
+  );
 }
