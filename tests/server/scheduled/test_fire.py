@@ -3884,6 +3884,25 @@ async def test_a_timer_whose_session_cannot_take_it_is_cancelled(
 
 
 @pytest.mark.asyncio
+async def test_a_timer_that_cannot_be_cancelled_still_records_its_failed_firing() -> None:
+    store = FakeScheduledTaskStore(rows={"task_1": _timer()})
+    update = store.update
+
+    def _fail_cancel(scheduled_task_id: str, **kwargs: Any) -> ScheduledTask | None:
+        if kwargs.get("state") == "deleted":
+            raise RuntimeError("database unavailable")
+        return update(scheduled_task_id, **kwargs)
+
+    store.update = _fail_cancel  # type: ignore[method-assign]
+
+    await _fire_once(_deps(store, conversation_store=_ExistingConversationStore()))
+
+    assert [(run["status"], run["error_code"]) for run in store.runs] == [
+        ("failed", "continued_session_missing")
+    ]
+
+
+@pytest.mark.asyncio
 async def test_a_continued_session_that_cannot_be_stamped_records_a_failed_run() -> None:
     """Without the label, the journal entries could land on another run, so nothing is sent."""
     conv_store = _ExistingConversationStore(_continued_session())

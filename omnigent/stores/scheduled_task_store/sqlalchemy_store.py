@@ -613,7 +613,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             ) or (
                 row.kind == encode_scheduled_task_kind("timer") and not fits_timer(_to_entity(row))
             ):
-                # A reminder that comes to recur, or one that leaves its session, is an automation.
+                # A reminder or timer that no longer fits its kind becomes an automation.
                 row.kind = encode_scheduled_task_kind("automation")
                 changed = True
             # Becoming or ceasing to be a trigger changes who picks the next poll.

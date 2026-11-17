@@ -227,8 +227,10 @@ runner. Its message is hidden (`is_meta`), like an in-memory timer's firing. It
 fires in the permission mode its session already runs, even one that skips
 approval. It never starts a session: when its session is gone or can no longer
 take it, the firing fails and the timer is cancelled. A cancel that lands after a
-firing was claimed still stops it: the firing reads the timer again just before
-sending and records `skipped` (`task_deleted`). A timer counts its interval from
+firing was claimed still stops it until delivery starts: the firing reads the timer
+again before it wakes the runner and records `skipped` (`task_deleted`). A firing
+already being delivered still arrives, as with an in-memory timer that just fired.
+A timer counts its interval from
 when it was set, not from midnight, so it first fires a whole interval later, and
 a repeating timer's `COUNT` ends it seven days after it was set. It goes through
 the same busy check as a trigger, but while its session is running, waiting on an

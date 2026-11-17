@@ -5739,19 +5739,23 @@ async def test_a_session_keeps_at_most_ten_timers(
     session_id = _runner_session(db_uri)
     url = f"/v1/sessions/{session_id}/timers"
     async with _off_host_client(app) as client:
-        for _ in range(10):
-            kept = await client.post(
-                url, json={"seconds": 600, "repeat": True}, headers=_runner_headers(session_id)
+        # Sets racing for the last places can't each pass the cap.
+        results = await asyncio.gather(
+            *(
+                client.post(
+                    url, json={"seconds": 600, "repeat": True}, headers=_runner_headers(session_id)
+                )
+                for _ in range(12)
             )
-            assert kept.status_code == 200, kept.text
-        refused = await client.post(
-            url, json={"seconds": 600, "repeat": True}, headers=_runner_headers(session_id)
         )
-        assert refused.status_code == 400
-        assert "already keeps 10 timers" in refused.json()["error"]["message"]
+        kept = [result for result in results if result.status_code == 200]
+        refused = [result for result in results if result.status_code != 200]
+        assert len(kept) == 10, [result.text for result in refused]
+        assert [result.status_code for result in refused] == [400, 400]
+        assert all("already keeps 10 timers" in r.json()["error"]["message"] for r in refused)
         # Cancelling one makes room for another.
         cancelled = await client.delete(
-            f"{url}/{kept.json()['timer_id']}", headers=_runner_headers(session_id)
+            f"{url}/{kept[0].json()['timer_id']}", headers=_runner_headers(session_id)
         )
         assert cancelled.status_code == 200, cancelled.text
         again = await client.post(

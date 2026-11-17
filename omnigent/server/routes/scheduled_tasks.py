@@ -19,6 +19,7 @@ import asyncio
 import contextlib
 import logging
 import uuid
+import weakref
 from collections.abc import AsyncIterator, Callable
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -419,6 +420,18 @@ _TIMER_NAME_CHARS = 60
 _MAX_TIMERS_PER_SESSION = 10
 # A note is echoed in every firing, so keep it a label, not a transcript.
 _TIMER_NOTE_MAX_CHARS = 1000
+
+# custom-lint: disable-next=workspace-scoped-cache -- lock; collision only serializes
+_timer_set_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
+
+
+def _timer_set_lock(session_id: str) -> asyncio.Lock:
+    """Return the lock serializing one session's timer count check and create."""
+    lock = _timer_set_locks.get(session_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _timer_set_locks[session_id] = lock
+    return lock
 
 
 class SetSessionTimerRequest(BaseModel):
@@ -1823,21 +1836,22 @@ def create_scheduled_tasks_router(
                 code=ErrorCode.INVALID_INPUT,
             )
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
-        kept = [
-            task
-            for task in await asyncio.to_thread(store.list, owner_user_id=owner_id)
-            if task.kind == "timer" and task.session_id == conv.id and task.state == "active"
-        ]
-        if len(kept) >= _MAX_TIMERS_PER_SESSION:
-            raise OmnigentError(
-                f"This session already keeps {_MAX_TIMERS_PER_SESSION} timers; cancel one with "
-                "sys_timer_cancel first",
-                code=ErrorCode.INVALID_INPUT,
-            )
         rrule, fire_at = durable_timer_rule(seconds, repeat, datetime.now(UTC))
         await _validate_rrule_or_400(rrule, "continue", "connected_host", allow_single_fire=True)
         name = _timer_name(note, seconds, repeat)
-        async with _allocated_task_id(owner_id, name) as task_id:
+        # Held through the create, so concurrent sets can't each pass the cap.
+        async with _timer_set_lock(conv.id), _allocated_task_id(owner_id, name) as task_id:
+            kept = [
+                task
+                for task in await asyncio.to_thread(store.list, owner_user_id=owner_id)
+                if task.kind == "timer" and task.session_id == conv.id and task.state == "active"
+            ]
+            if len(kept) >= _MAX_TIMERS_PER_SESSION:
+                raise OmnigentError(
+                    f"This session already keeps {_MAX_TIMERS_PER_SESSION} timers; cancel one "
+                    "with sys_timer_cancel first",
+                    code=ErrorCode.INVALID_INPUT,
+                )
             timer_id = durable_timer_id(task_id)
             shape = ScheduledTask(
                 id=task_id,

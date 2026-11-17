@@ -1167,12 +1167,12 @@ async def _continue_session(
     if problem is not None:
         reason, error_code = problem
         _logger.warning("scheduled fire: task %s cannot continue its session: %s", task.id, reason)
-        if task.kind == "timer":
-            # Its session can't take it now, so later firings would fail the same way.
-            await asyncio.to_thread(deps.scheduled_task_store.update, task.id, state="deleted")
         await recorder.finish(
             "failed", error=f"{reason}; {_recovery_hint(task)}", error_code=error_code
         )
+        if task.kind == "timer":
+            # Its session can't take it now, so later firings would fail the same way.
+            await asyncio.to_thread(deps.scheduled_task_store.update, task.id, state="deleted")
         return
     assert conv is not None
     agent = await asyncio.to_thread(deps.agent_store.get, task.agent_id)
