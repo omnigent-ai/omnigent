@@ -236,22 +236,30 @@ async def native_session(
     request: pytest.FixtureRequest,
 ) -> AsyncIterator[_NativeSession]:
     isolate_provider_resolution(monkeypatch, tmp_path / "config")
-    harness = getattr(request, "param", "claude-native")
+    session_kind = getattr(request, "param", "claude-native")
+    custom_agent = session_kind == "custom-claude-native"
+    harness = "claude-native" if custom_agent else session_kind
     is_claude = harness == "claude-native"
     previous_model = "claude-opus-4-6" if is_claude else "gpt-5.4"
     requested_model = "claude-opus-4-7" if is_claude else "gpt-6-sol"
     wrapper = "claude-code-native-ui" if is_claude else "codex-native-ui"
-    agent = await create_test_agent(client)
+    agent = await create_test_agent(
+        client,
+        executor={"type": "omnigent", "config": {"harness": harness}} if custom_agent else None,
+    )
     created = await client.post(
         "/v1/sessions",
         json={
             "agent_id": agent["id"],
-            "labels": {"omnigent.wrapper": wrapper},
+            "labels": {} if custom_agent else {"omnigent.wrapper": wrapper},
             "model_override": previous_model,
             "reasoning_effort": "high",
         },
     )
     assert created.status_code == 201, created.text
+    if custom_agent:
+        assert created.json()["harness"] == harness
+        assert "omnigent.wrapper" not in created.json()["labels"]
     session_id = created.json()["id"]
     store = SqlAlchemyConversationStore(db_uri)
     host = HostStore(db_uri).upsert_on_connect(
@@ -427,6 +435,9 @@ async def _held_model_reply(
 
 
 @pytest.mark.parametrize("confirmed", [False, True], ids=["timeout", "confirmed"])
+@pytest.mark.parametrize(
+    "native_session", ["claude-native", "custom-claude-native"], indirect=True
+)
 async def test_claude_model_confirmation_controls_public_patch_and_rollback(
     client: httpx.AsyncClient,
     native_session: _NativeSession,
@@ -498,6 +509,9 @@ async def test_unconfirmed_claude_model_change_keeps_intent_without_claiming_an_
     assert session.tunnel.dispatch_errors == []
 
 
+@pytest.mark.parametrize(
+    "native_session", ["claude-native", "custom-claude-native"], indirect=True
+)
 async def test_cancelled_claude_model_change_keeps_intent_after_losing_the_reply(
     client: httpx.AsyncClient,
     native_session: _NativeSession,
@@ -566,7 +580,11 @@ async def test_cancelled_claude_model_change_keeps_intent_after_losing_the_reply
         assert session.runner_replies == []
         requests = [frame for frame in session.tunnel.frames if isinstance(frame, RequestFrame)]
         assert [json.loads(frame.body or "{}") for frame in requests] == [
-            {"type": "model_change", "model": session.requested_model}
+            {
+                "type": "model_change",
+                "model": session.requested_model,
+                "preserve_unconfirmed_model": True,
+            }
         ]
         assert session.tunnel.dispatch_errors == []
         assert pane.commands == [session.requested_model]
@@ -639,6 +657,73 @@ async def test_refused_model_change_preserves_newer_silent_selection(
     )
     assert session.claude.commands == [session.requested_model]
     assert session.tunnel.dispatch_errors == []
+
+
+@pytest.mark.parametrize(
+    "concurrent_selection", [False, True], ids=["original", "newer-selection"]
+)
+async def test_legacy_claude_model_request_refuses_before_commit_and_preserves_newer_metadata(
+    client: httpx.AsyncClient,
+    native_session: _NativeSession,
+    monkeypatch: pytest.MonkeyPatch,
+    concurrent_selection: bool,
+) -> None:
+    session = native_session
+    assert session.claude is not None
+    session.claude.confirm = False
+    session.claude.model_may_have_changed = True
+    monkeypatch.setattr(claude_bridge, "inject_model_command", session.claude.select)
+    forward = routes_core._forward_session_change_to_runner
+
+    async def legacy_forward(
+        session_id: str, router: Any, event: dict[str, Any], **kwargs: Any
+    ) -> Any:
+        # An older server sends this event without the uncertainty capability.
+        legacy_event = {
+            key: value for key, value in event.items() if key != "preserve_unconfirmed_model"
+        }
+        return await forward(session_id, router, legacy_event, **kwargs)
+
+    monkeypatch.setattr(routes_core, "_forward_session_change_to_runner", legacy_forward)
+    if concurrent_selection:
+        async with _held_model_reply(client, session) as (first, release_reply):
+            newer = await client.patch(
+                f"/v1/sessions/{session.session_id}",
+                json={
+                    "model_override": session.requested_model,
+                    "reasoning_effort": "low",
+                    "title": "Newer metadata",
+                    "silent": True,
+                },
+            )
+            assert newer.status_code == 200, newer.text
+            release_reply.set()
+            response = await asyncio.wait_for(first, timeout=5)
+    else:
+        response = await _pick_model(client, session)
+
+    assert session.claude.commands == []
+    assert session.tunnel.dispatch_errors == []
+    requests = [
+        json.loads(frame.body or "{}")
+        for frame in session.tunnel.frames
+        if isinstance(frame, RequestFrame) and frame.path.endswith("/events")
+    ]
+    assert requests == [{"type": "model_change", "model": session.requested_model}]
+    assert response.status_code == 400, response.text
+    assert session.runner_replies[0].status_code == 503
+    assert session.runner_replies[0].json()["error"] == "claude_native_model_unsupported"
+    assert "Update the Omnigent server" in response.text
+    assert (
+        claude_bridge.read_claude_status_model(session.claude.bridge_dir) == session.previous_model
+    )
+    saved = session.store.get_conversation(session.session_id)
+    assert saved.model_override == (
+        session.requested_model if concurrent_selection else session.previous_model
+    )
+    assert saved.reasoning_effort == ("low" if concurrent_selection else "high")
+    if concurrent_selection:
+        assert saved.title == "Newer metadata"
 
 
 @pytest.mark.parametrize("unconfirmed", [False, True], ids=["refused", "unconfirmed"])

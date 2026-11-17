@@ -4414,6 +4414,10 @@ def register_core_routes(
         negotiation: dict[str, object] = (
             {"rollback_on_refusal": True, "cold_start_settings": True} if codex_native else {}
         )
+        native_agent = _native_coding_agent_for_session(updated)
+        claude_native = native_agent is not None and native_agent.harness == "claude-native"
+        if claude_native:
+            negotiation["preserve_unconfirmed_model"] = True
         settings_forward_timeout = (
             _CODEX_SETTINGS_FORWARD_TIMEOUT_S if codex_native else _TUI_INJECT_FORWARD_TIMEOUT_S
         )
@@ -4518,12 +4522,7 @@ def register_core_routes(
             # bind-time auto-applies, so only an explicit /model lands a note.
             if _is_native_terminal_session(updated):
                 # A lost Claude reply may follow a committed selection.
-                if (
-                    _model_forward is None
-                    and wake_for_model_change
-                    and updated.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
-                    == _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE
-                ) or (
+                if (_model_forward is None and wake_for_model_change and claude_native) or (
                     _model_forward is not None
                     and _runner_reply_field(_model_forward.body, "error")
                     == "claude_native_model_unconfirmed"

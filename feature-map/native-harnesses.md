@@ -766,9 +766,13 @@ Cross-harness journeys:
   calls and does not verify browser rendering or live gateway servability.
   Each switch keeps its initially resolved target descriptor; later catalog
   refreshes do not invalidate that selection. The live picker and fresh status
-  must still confirm that target. Preserving uncertainty after an unconfirmed
-  switch requires an upgraded server, preferably deployed before the runner.
-  A new runner cannot repair an older server's rollback behavior.
+  must still confirm that target. The server advertises support for preserving
+  uncertain model intent on each live change. New runners refuse requests from
+  an older server before preparing or controlling the terminal; update the
+  server and reconnect to enable live selection. The runner capability guard
+  and public refusal/concurrent-metadata behavior are covered by
+  `tests/runner/test_app_sessions_native_events_options.py::test_events_model_change_requires_an_uncertainty_aware_server_before_selection`
+  and `tests/server/integration/test_native_model_change_failures.py::test_legacy_claude_model_request_refuses_before_commit_and_preserves_newer_metadata`.
 - **`model-and-effort`, Claude browser selection and refusal (nightly):**
   `tests/e2e_ui/chat/test_claude_model_picker.py::test_claude_native_picker_repeated_pins_reach_the_real_terminal`
   checks alias picks through the gear, model pill and Ctrl+Shift+M using

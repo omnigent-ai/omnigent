@@ -8378,6 +8378,18 @@ def create_runner_app(
                         conversation_id,
                         model,
                     )
+                if model and model.strip() and body.get("preserve_unconfirmed_model") is not True:
+                    return JSONResponse(
+                        status_code=503,
+                        content={
+                            "error": "claude_native_model_unsupported",
+                            "detail": (
+                                "Update the Omnigent server and reconnect before changing "
+                                "Claude's model. This server cannot preserve an unconfirmed "
+                                "selection."
+                            ),
+                        },
+                    )
                 return await _handle_claude_native_model_change(
                     conversation_id,
                     model,

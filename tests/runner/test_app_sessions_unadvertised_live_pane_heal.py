@@ -106,7 +106,14 @@ def _mock_model_picker(
 @pytest.mark.parametrize(
     ("event", "expected_input"),
     [
-        ({"type": "model_change", "model": "claude-opus-4-7"}, "claude-opus-4-7"),
+        (
+            {
+                "type": "model_change",
+                "model": "claude-opus-4-7",
+                "preserve_unconfirmed_model": True,
+            },
+            "claude-opus-4-7",
+        ),
         ({"type": "effort_change", "effort": "high"}, "/effort high"),
     ],
     ids=["model_change", "effort_change"],
@@ -181,7 +188,11 @@ async def test_stale_advertisement_is_rewritten_for_the_live_pane(
     async with _runner_client(app) as client:
         resp = await client.post(
             f"/v1/sessions/{conv_id}/events",
-            json={"type": "model_change", "model": "claude-opus-4-7"},
+            json={
+                "type": "model_change",
+                "model": "claude-opus-4-7",
+                "preserve_unconfirmed_model": True,
+            },
         )
 
     assert resp.status_code == 204, resp.text
@@ -220,7 +231,11 @@ async def test_failed_readvertise_keeps_pane_and_surfaces_inject_failure(
     async with _runner_client(app) as client:
         resp = await client.post(
             f"/v1/sessions/{conv_id}/events",
-            json={"type": "model_change", "model": "claude-opus-4-7"},
+            json={
+                "type": "model_change",
+                "model": "claude-opus-4-7",
+                "preserve_unconfirmed_model": True,
+            },
         )
 
     assert resp.status_code == 503, resp.text
@@ -261,7 +276,11 @@ async def test_live_advertised_pane_advertisement_is_left_untouched(
     async with _runner_client(app) as client:
         resp = await client.post(
             f"/v1/sessions/{conv_id}/events",
-            json={"type": "model_change", "model": "claude-opus-4-7"},
+            json={
+                "type": "model_change",
+                "model": "claude-opus-4-7",
+                "preserve_unconfirmed_model": True,
+            },
         )
 
     assert resp.status_code == 204, resp.text

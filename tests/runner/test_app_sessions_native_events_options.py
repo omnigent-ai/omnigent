@@ -1701,7 +1701,14 @@ async def test_events_compact_on_non_native_session_is_204_noop(
     # here for both effort_change and model_change.
     [
         ({"type": "effort_change", "effort": "high"}, "inject_slash_command"),
-        ({"type": "model_change", "model": "claude-opus-4-7"}, "inject_model_command"),
+        (
+            {
+                "type": "model_change",
+                "model": "claude-opus-4-7",
+                "preserve_unconfirmed_model": True,
+            },
+            "inject_model_command",
+        ),
     ],
     ids=["effort_change", "model_change"],
 )
@@ -1844,7 +1851,7 @@ async def _post_claude_control(
             f"/v1/sessions/{_BOOT_SESSION_ID}/events",
             json=event_payload
             if event_payload is not None
-            else {"type": "model_change", "model": model},
+            else {"type": "model_change", "model": model, "preserve_unconfirmed_model": True},
         )
     assert launch_calls == [_BOOT_SESSION_ID]
     assert not native_create_calls
@@ -1882,6 +1889,45 @@ async def test_events_model_change_requires_the_same_immediate_picker_receipt(
     assert response.status_code == 204, response.text
     assert calls == ["claude-opus-4-7"]
     assert _drain_session_event_queue(_session_event_queues_ref.get(_BOOT_SESSION_ID)) == []
+
+
+@pytest.mark.parametrize(
+    "negotiation",
+    [
+        {},
+        {"preserve_unconfirmed_model": False},
+        {"preserve_unconfirmed_model": None},
+        {"preserve_unconfirmed_model": 1},
+        {"preserve_unconfirmed_model": "true"},
+    ],
+    ids=["legacy-server", "false", "null", "integer", "string"],
+)
+async def test_events_model_change_requires_an_uncertainty_aware_server_before_selection(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    negotiation: dict[str, Any],
+) -> None:
+    committed: list[str] = []
+
+    def select(_bridge: Path, *, model: str, **_kwargs: Any) -> Any:
+        committed.append(model)
+        raise claude_native_bridge.ClaudeModelSwitchRefused(
+            "Fresh status was lost after selection.",
+            phase="status",
+            model_may_have_changed=True,
+        )
+
+    response = await _post_claude_control(
+        monkeypatch,
+        tmp_path,
+        select,
+        event_payload={"type": "model_change", "model": "claude-opus-4-7", **negotiation},
+    )
+
+    assert committed == []
+    assert response.status_code == 503, response.text
+    assert response.json()["error"] == "claude_native_model_unsupported"
+    assert "Update the Omnigent server" in response.json()["detail"]
 
 
 @pytest.mark.parametrize("receipt_kind", ["absent", "different-target"])
