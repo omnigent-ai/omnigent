@@ -7905,11 +7905,6 @@
               "restrict_to_agent_names": []
             }
           },
-          "proactive_agent_admin_available": {
-            "default": false,
-            "title": "Proactive Agent Admin Available",
-            "type": "boolean"
-          },
           "proactive_agent_available": {
             "default": false,
             "title": "Proactive Agent Available",
