@@ -1,6 +1,8 @@
 import {
   type KeyboardEvent,
+  type MutableRefObject,
   type ReactNode,
+  useCallback,
   useId,
   useLayoutEffect,
   useMemo,
@@ -64,6 +66,8 @@ export interface QuickPickProps<Value> {
    * two-line rows, with the field in a muted well and a button that clears it.
    */
   presentation?: QuickPickPresentation;
+  /** Receives the query field, such as to focus it from outside the picker. */
+  inputRef?: MutableRefObject<HTMLInputElement | null>;
   className?: string;
 }
 
@@ -144,6 +148,7 @@ export function QuickPick<Value>({
   loop = false,
   fillHeight = false,
   presentation = "default",
+  inputRef,
   className,
 }: QuickPickProps<Value>) {
   const baseId = useId();
@@ -162,7 +167,14 @@ export function QuickPick<Value>({
   const sections = useMemo(() => sectionsOf(rows), [rows]);
   const resultCount = rows.filter((row) => row.kind === "item").length;
   const showEmpty = !collapsed && resultCount === 0;
-  const queryFieldRef = useRef<HTMLInputElement>(null);
+  const queryFieldRef = useRef<HTMLInputElement | null>(null);
+  const setQueryField = useCallback(
+    (node: HTMLInputElement | null) => {
+      queryFieldRef.current = node;
+      if (inputRef) inputRef.current = node;
+    },
+    [inputRef],
+  );
 
   // Until the user picks a row for this query, the top row stays active as results arrive.
   // Any query change forgets the pick, so returning to an earlier query starts at the top.
@@ -356,7 +368,7 @@ export function QuickPick<Value>({
       >
         <SearchIcon aria-hidden className="size-4 shrink-0 text-muted-foreground" />
         <input
-          ref={queryFieldRef}
+          ref={setQueryField}
           role="combobox"
           aria-label={label}
           aria-expanded={!collapsed}

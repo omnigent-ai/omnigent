@@ -23,7 +23,7 @@ import {
   supportsDesktopCommands,
 } from "@/lib/nativeBridge";
 import { matchesShortcut } from "@/lib/shortcuts/registry";
-import { shortcutPageGroups } from "@/lib/shortcuts/shortcutPage";
+import { type ShortcutPageGroup, shortcutPageGroups } from "@/lib/shortcuts/shortcutPage";
 import { ShortcutSettingsRow } from "@/pages/settings/search/ShortcutSettingsRow";
 
 // Custom event the dialog listens for, so non-adjacent surfaces (e.g. the
@@ -41,16 +41,13 @@ export function openKeyboardShortcuts(): void {
  * keeps the compact inline list; Settings uses section headings with bordered
  * list cards to match the rest of its content.
  */
-export function KeyboardShortcutsList({
-  variant = "compact",
-}: {
-  variant?: "compact" | "settings";
-}) {
+/** The Keyboard shortcuts page's groups here, computed at render so tests can vary the runtime. */
+export function useShortcutPageGroups(): ShortcutPageGroup[] {
   // Feature-based, stable per session; computed at render so tests can vary it.
   const isMobileViewport = useIsMobileViewport();
   const preventsKeyboardSubmit = isMobileViewport;
   const serverInfo = useServerInfo();
-  const groups = shortcutPageGroups({
+  return shortcutPageGroups({
     native: isNativeShell(),
     electron: isElectronShell(),
     browser: supportsBrowser(),
@@ -62,6 +59,14 @@ export function KeyboardShortcutsList({
     desktopCommands: supportsDesktopCommands(),
     siblingSessions: serverInfo !== "loading" && serverInfo.sibling_sessions === true,
   });
+}
+
+export function KeyboardShortcutsList({
+  variant = "compact",
+}: {
+  variant?: "compact" | "settings";
+}) {
+  const groups = useShortcutPageGroups();
   const settings = variant === "settings";
   return (
     <div className={settings ? "flex flex-col gap-10" : undefined}>

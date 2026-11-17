@@ -83,7 +83,7 @@ export function settingsSectionPath(id: SettingsSectionId): string {
   return `/settings/${id}`;
 }
 
-interface SettingsNavItem {
+export interface SettingsNavItem {
   id: SettingsSectionId;
   label: string;
   icon: typeof PaletteIcon;
@@ -258,6 +258,31 @@ export function useTrackSettingsReturn(): void {
  * Settings nav rendered inside the sidebar card, replacing the conversation
  * list on /settings. Its Back row matches the navigation rows below it.
  */
+/** The sections Settings shows here: this viewer's, this deploy's and this build's. */
+export function useSettingsNavGroups(harnessesOffered = true): SettingsNavGroup[] {
+  const info = useServerInfo();
+  // Account section shows whenever there's a login session (accounts OR OIDC).
+  const hasAuthSession = info !== "loading" && info.login_url !== null;
+  // Admin gating for the Members / Policies sub-categories. Sourced from
+  // `/v1/me` (mode-agnostic) so the group appears for admins under OIDC too,
+  // not just accounts deploys. Non-admins never see it.
+  const isAdmin = useIsAdmin();
+  const integrationsEnabled =
+    info !== "loading" && (info.enabled_connections ?? []).some((provider) => provider !== "mcp");
+  const mcpEnabled = info !== "loading" && (info.enabled_connections ?? []).includes("mcp");
+  return settingsNavGroups(
+    hasAuthSession,
+    isElectronShell(),
+    isAdmin,
+    isSingleUserMode(info),
+    integrationsEnabled,
+    customAgentsSettingsEnabled(info),
+    mcpEnabled,
+    adminGeneralSettingsAvailable(info),
+    harnessesOffered,
+  );
+}
+
 export function SettingsSidebarBody({
   onNavClick,
   onCollapse,
@@ -269,28 +294,8 @@ export function SettingsSidebarBody({
   /** False when the deployment curated out every harness, which drops Harnesses. */
   harnessesOffered?: boolean;
 }) {
-  const info = useServerInfo();
-  // Account section shows whenever there's a login session (accounts OR OIDC).
-  const hasAuthSession = info !== "loading" && info.login_url !== null;
-  // Admin gating for the Members / Policies sub-categories. Sourced from
-  // `/v1/me` (mode-agnostic) so the group appears for admins under OIDC too,
-  // not just accounts deploys. Non-admins never see it.
-  const isAdmin = useIsAdmin();
-  const integrationsEnabled =
-    info !== "loading" && (info.enabled_connections ?? []).some((provider) => provider !== "mcp");
-  const mcpEnabled = info !== "loading" && (info.enabled_connections ?? []).includes("mcp");
   const { section } = useSettingsRoute();
-  const groups = settingsNavGroups(
-    hasAuthSession,
-    isElectronShell(),
-    isAdmin,
-    isSingleUserMode(info),
-    integrationsEnabled,
-    customAgentsSettingsEnabled(info),
-    mcpEnabled,
-    adminGeneralSettingsAvailable(info),
-    harnessesOffered,
-  );
+  const groups = useSettingsNavGroups(harnessesOffered);
 
   return (
     <>
@@ -319,6 +324,18 @@ export function SettingsSidebarBody({
             Back
           </Link>
         </Button>
+        {onCollapse && (
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-xs"
+            aria-label="Close sidebar"
+            onClick={onCollapse}
+            className="size-6 text-muted-foreground hover:text-foreground"
+          >
+            <PanelRightOpenIcon className="size-4" />
+          </Button>
+        )}
         {onCollapse && (
           <Button
             type="button"
