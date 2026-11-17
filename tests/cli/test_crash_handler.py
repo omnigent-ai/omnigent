@@ -669,9 +669,14 @@ def test_issue_url_scrubs_repr_escaped_home(
     [
         ("/mnt/home/example/project", "/mnt/home/example/project"),
         ("https://example.com/home/example/file", "https://example.com/home/example/file"),
+        ("/mnt/cache//home/example/file", "/mnt/cache//home/example/file"),
+        (
+            "https://example.test/cache//home/example/file",
+            "https://example.test/cache//home/example/file",
+        ),
         ("/home/example/project", "~/project"),
     ],
-    ids=["mount-prefix", "url-path", "home-itself"],
+    ids=["mount-prefix", "url-path", "doubled-slash-mount", "doubled-slash-url", "home-itself"],
 )
 def test_scrub_keeps_home_text_inside_other_paths(
     monkeypatch: pytest.MonkeyPatch, text: str, expected: str
@@ -679,6 +684,12 @@ def test_scrub_keeps_home_text_inside_other_paths(
     """A home path embedded in a longer path or URL is another location, so it stays intact."""
     monkeypatch.setattr(Path, "home", lambda: Path("/home/example"))
     assert ch._scrub(text) == expected
+
+
+def test_scrub_redacts_home_in_file_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A ``file://`` URL to the home directory still exposes it, so it is scrubbed."""
+    monkeypatch.setattr(Path, "home", lambda: Path("/home/example"))
+    assert ch._scrub("file:///home/example/notes.txt") == "file://~/notes.txt"
 
 
 def test_issue_url_redacts_multiline_bearer_before_truncation(data_dir: Path) -> None:
