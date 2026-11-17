@@ -7923,6 +7923,32 @@ async def test_reconnect_uses_shorter_handshake_timeout(
     assert [call["open_timeout"] for call in spy.calls] == [10.0, 3.0]
 
 
+async def test_reconnect_handshake_timeout_grows_until_an_upgrade_is_accepted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A replica slow to accept during a handoff gets longer handshakes, up to a cap."""
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    monkeypatch.setattr("omnigent.host.connect.configured_harness_map", dict)
+    monkeypatch.setattr("omnigent.host.connect.gateway_inference_map", dict)
+    handshake_timeout = TimeoutError("timed out during handshake")
+    spy = _ConnectSpy([None, *[handshake_timeout] * 5, None, asyncio.CancelledError()])
+    _patch_connect(monkeypatch, spy)
+    host = _host()
+
+    await host.run()
+
+    assert [call["open_timeout"] for call in spy.calls] == [
+        10.0,
+        3.0,
+        6.0,
+        12.0,
+        24.0,
+        30.0,
+        30.0,
+        3.0,
+    ]
+
+
 @pytest.mark.parametrize("sent_close", [None, Close(1011, "keepalive ping timeout")])
 async def test_host_records_accepted_connection_and_disconnect(
     monkeypatch: pytest.MonkeyPatch,

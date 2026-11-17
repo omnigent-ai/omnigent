@@ -66,6 +66,7 @@ SIDE_CHAT_DISPLAY_NAME = "Side chat"
 CAP_SIDE_CHAT_SETTINGS = "codex_side_chat_settings"
 EFFORT_RESET_LABEL = "omnigent.side_chat.effort_reset"
 _NICKNAME_LABEL_KEY = "omnigent.codex_native.agent_nickname"
+PARENT_REFERENCE_ITEM_LABEL = "omnigent.codex_native.side_chat_parent_item_id"
 
 _SIDE_PREFIX = "/side "
 
@@ -213,9 +214,18 @@ async def _rebuild_side_chat_rollout(
     if model_provider is None:
         raise RuntimeError("The parent Codex provider is not available. Try again.")
     try:
-        parent_items = await _fetch_all_session_items_for_codex_resume(active.ap_client, parent_id)
-        # shortcut: timestamps approximate the fork boundary until an exact item cutoff is stored.
-        parent_items = [item for item in parent_items if item["created_at"] <= child["created_at"]]
+        parent_items: list[_JsonObject] = []
+        parent_item_id = child["labels"].get(PARENT_REFERENCE_ITEM_LABEL)
+        if parent_item_id:
+            saved_items = await _fetch_all_session_items_for_codex_resume(
+                active.ap_client, parent_id
+            )
+            for item in saved_items:
+                parent_items.append(item)
+                if item["id"] == parent_item_id:
+                    break
+            else:
+                raise RuntimeError("This side chat's saved reference boundary is unavailable.")
         parent_items = await resolve_session_item_file_references(
             active.ap_client, session_id=parent_id, items=parent_items
         )
@@ -242,13 +252,19 @@ async def _rebuild_side_chat_rollout(
         terminal_launch_args=parent.get("terminal_launch_args"),
     )
     records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    reference_instructions = SIDE_REFERENCE_ONLY_INSTRUCTIONS
+    if parent_item_id is None:
+        reference_instructions += (
+            " The original parent reference context was not saved for this side conversation "
+            "and is unavailable. Do not assume you know the parent's history."
+        )
     boundary = {
         "timestamp": records[0]["timestamp"],
         "type": "response_item",
         "payload": {
             "type": "message",
             "role": "developer",
-            "content": [{"type": "input_text", "text": SIDE_REFERENCE_ONLY_INSTRUCTIONS}],
+            "content": [{"type": "input_text", "text": reference_instructions}],
         },
     }
     if any(record.get("payload") == boundary["payload"] for record in records):
@@ -559,6 +575,8 @@ async def parent_side_chat_settings(
 async def open_side_chat_on_client(
     codex_client: CodexAppServerClient,
     *,
+    ap_client: httpx.AsyncClient,
+    parent_session_id: str,
     parent_thread_id: str,
     question: str,
     bridge_dir: Path | None = None,
@@ -569,11 +587,12 @@ async def open_side_chat_on_client(
 
     Forks an ephemeral child of ``parent_thread_id`` on the parent's current
     model and effort, and submits ``question`` as its first turn.
-    Registration/surfacing is the forwarder's job (it observes the fork's
-    ``thread/started`` on the shared event stream), so this does not touch the
-    Omnigent server.
+    Saves the parent's last committed item before forking, so restoration never
+    inherits later parent messages. The forwarder still backfills the child.
 
     :param codex_client: Connected Codex app-server client (built from bridge state).
+    :param ap_client: HTTP client pointed at the Omnigent server.
+    :param parent_session_id: Parent Omnigent conversation id.
     :param parent_thread_id: The active (main) Codex thread id to fork from.
     :param question: The ``/side`` question, submitted as the first turn.
     :param bridge_dir: Parent session's bridge directory, read for its current
@@ -582,11 +601,25 @@ async def open_side_chat_on_client(
     :param developer_instructions: Reference-only boundary instructions.
     :returns: The child Codex thread id, or ``None`` if the fork failed.
     """
+    from omnigent.harnesses.claude_native.bridge import url_component
+    from omnigent.harnesses.codex_native import forwarder as _fwd
+
     settings = (
         await parent_side_chat_settings(codex_client, bridge_dir)
         if bridge_dir is not None
         else None
     )
+    response = await ap_client.get(
+        f"/v1/sessions/{url_component(parent_session_id)}/items",
+        params={"limit": 1, "order": "desc"},
+    )
+    response.raise_for_status()
+    items = response.json().get("data")
+    if not isinstance(items, list):
+        raise RuntimeError("Could not save this side chat's parent reference boundary.")
+    parent_item_id = items[0].get("id") if items and isinstance(items[0], dict) else ""
+    if not isinstance(parent_item_id, str) or (items and not parent_item_id):
+        raise RuntimeError("Could not save this side chat's parent reference boundary.")
     child_thread_id = await fork_ephemeral_side_thread(
         codex_client,
         parent_thread_id,
@@ -595,6 +628,15 @@ async def open_side_chat_on_client(
     )
     if child_thread_id is None:
         return None
+    child_session_id = await _fwd._register_child_session(
+        ap_client,
+        parent_session_id=parent_session_id,
+        parent_thread_id=parent_thread_id,
+        child_thread_id=child_thread_id,
+        item={"agent_nickname": SIDE_CHAT_DISPLAY_NAME, "parent_item_id": parent_item_id},
+    )
+    if child_session_id is None:
+        raise RuntimeError("Could not save this side chat's parent reference boundary.")
     await submit_side_turn(codex_client, child_thread_id, question)
     return child_thread_id
 

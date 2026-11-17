@@ -9342,16 +9342,14 @@ async def _auto_create_claude_terminal(
     )
 
     _pre_wipe_claude_sid = _read_csid_pre_wipe(_bridge_dir_for_bridge_id(bridge_id))
-    # Resolved once here and reused below (env_spec) so the bridge's own
-    # sys_os_* tools and the terminal process see the same sandbox — the
-    # agent's declared os_env.sandbox, already overridden by any
-    # enforce_sandbox/force_sandbox policy verdict upstream.
+    # The agent's declared os_env.sandbox, already overridden by any
+    # enforce_sandbox/force_sandbox policy verdict upstream; the terminal
+    # process runs under it (env_spec below).
     agent_os_env = _agent_os_env_from_spec(agent_spec)
     bridge_dir = prepare_bridge_dir(
         session_id,
         bridge_id=bridge_id,
         workspace=Path(workspace),
-        sandbox=(agent_os_env.sandbox if agent_os_env is not None else None),
     )
     # Cancel any surviving forwarder BEFORE wiping its cursor/seen state, else it
     # re-posts with fresh dedup state alongside the forwarder spawned below.
@@ -9989,8 +9987,6 @@ async def _auto_create_claude_terminal(
     # egress_rules and env_passthrough are honoured. Without ``sandbox`` here
     # and ``parent_os_env`` below, launch_terminal falls back to
     # _default_sandbox_for_platform (linux_bwrap), overriding the YAML config.
-    # ``agent_os_env`` was already resolved above for ``prepare_bridge_dir``,
-    # so the terminal process and the bridge's sys_os_* tools agree.
     env_spec = TerminalEnvSpec(
         os_env=OSEnvSpec(
             type="caller_process",
