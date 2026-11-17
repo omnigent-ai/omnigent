@@ -1536,13 +1536,7 @@ function SidebarImpl({
                         inboxCountIncomplete,
                         inboxCountCapped,
                       )}
-                      className={cn(
-                        "ml-auto inline-flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-10 font-medium text-[var(--sidebar-active-foreground)] tabular-nums",
-                        // The active Inbox row already paints the translucent
-                        // --sidebar-active wash; repainting it on the nested
-                        // badge would double-composite to a darker fill.
-                        isInboxPage ? "bg-transparent" : "bg-[var(--sidebar-active)]",
-                      )}
+                      className="ml-auto inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-primary-cta px-1 text-sm text-primary-cta-foreground tabular-nums"
                     >
                       {inboxCount > 0 ? inboxCount : ""}
                       {inboxCountIncomplete || inboxCountCapped ? "+" : ""}
@@ -1827,6 +1821,26 @@ function ProjectFolder({
     expanded ? conversations.findIndex((c) => c.id === activeConversationId) : -1,
   );
   const visibleCount = display.rows.length;
+  // The project-scoped composer lists a ghost row at the top of the folder, as a
+  // nested-agent draft does under its parent, until the session is created.
+  const draftRow = useMemo<Conversation | null>(() => {
+    if (!active || archived || selectionMode) return null;
+    const now = Math.floor(Date.now() / 1000);
+    const labels: Record<string, string> = projectId === null ? { [PROJECT_LABEL_KEY]: name } : {};
+    return {
+      id: `project-draft:${name}`,
+      object: "conversation",
+      title: "New session",
+      created_at: now,
+      updated_at: now,
+      labels,
+      permission_level: null,
+      ...(projectId !== null ? { project_id: projectId } : {}),
+      provisional: true,
+      project_draft_name: name,
+    };
+  }, [active, archived, selectionMode, name, projectId]);
+  const headerActive = active && draftRow === null;
   // A Show more click records the list's size; the rows it adds slide in once
   // they render (after the next server page, when one is needed).
   const listRef = useRef<HTMLUListElement>(null);
@@ -1961,23 +1975,28 @@ function ProjectFolder({
             <FolderOpenIcon
               className={cn(
                 "ui-icon",
-                active ? "text-[var(--sidebar-active-foreground)]" : "text-muted-foreground",
+                headerActive ? "text-[var(--sidebar-active-foreground)]" : "text-muted-foreground",
               )}
             />
           ) : (
             <FolderIcon
               className={cn(
                 "ui-icon",
-                active ? "text-[var(--sidebar-active-foreground)]" : "text-muted-foreground",
+                headerActive ? "text-[var(--sidebar-active-foreground)]" : "text-muted-foreground",
               )}
             />
           )
         }
-        active={active}
+        active={headerActive}
         marker={marker}
-        conversations={display.rows}
+        conversations={draftRow ? [draftRow, ...display.rows] : display.rows}
         heldConversations={
-          expanded ? undefined : conversations.filter((_row, index) => index === heldIndex)
+          expanded
+            ? undefined
+            : [
+                ...(draftRow ? [draftRow] : []),
+                ...conversations.filter((_row, index) => index === heldIndex),
+              ]
         }
         listRef={listRef}
         activeConversationId={activeConversationId}
@@ -4713,7 +4732,11 @@ function ConversationSection({
                       : undefined
                   }
                   onToggleFamily={() => onToggleFamily(conv.family!.id)}
-                  isActive={conv.id === activeConversationId || !!conv.nested_draft_source_id}
+                  isActive={
+                    conv.id === activeConversationId ||
+                    !!conv.nested_draft_source_id ||
+                    conv.project_draft_name !== undefined
+                  }
                   inActiveGrid={gridMembers.has(conv.id)}
                   gridSelected={conv.id === grids?.selectedSessionId}
                   gridsEnabled={grids?.enabled ?? false}
@@ -6144,6 +6167,9 @@ function ConversationRowImpl({
             // The optimistic first-prompt label is a placeholder until the
             // server's title lands — dim it so it doesn't read as final.
             isProvisionalLabel && "italic text-muted-foreground",
+            (conversation.nested_draft_source_id ||
+              conversation.project_draft_name !== undefined) &&
+              "italic",
           )}
         >
           {label}
@@ -6176,7 +6202,9 @@ function ConversationRowImpl({
             ? "#"
             : conversation.nested_draft_source_id
               ? `/?sibling=${encodeURIComponent(conversation.nested_draft_source_id)}`
-              : `/c/${conversation.id}`
+              : conversation.project_draft_name !== undefined
+                ? `/?project=${encodeURIComponent(conversation.project_draft_name)}`
+                : `/c/${conversation.id}`
         }
         componentId="sidebar.conversation_switcher"
         aria-keyshortcuts={
@@ -6878,6 +6906,7 @@ const RENDERED_CONVERSATION_FIELDS: readonly (keyof Conversation)[] = [
   "blocked_on",
   "provisional",
   "nested_draft_source_id",
+  "project_draft_name",
   "shared_with_others",
   "family",
 ];

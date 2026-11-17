@@ -256,6 +256,8 @@ export interface Conversation {
   provisional?: boolean;
   /** Client-only composer destination before a nested draft is submitted. */
   nested_draft_source_id?: string;
+  /** Client-only project whose new-session composer this ghost row reopens. */
+  project_draft_name?: string;
   /**
    * Total review comments (any status) on this session. Together with
    * `comments_updated_at` it forms a change fingerprint: an add or edit

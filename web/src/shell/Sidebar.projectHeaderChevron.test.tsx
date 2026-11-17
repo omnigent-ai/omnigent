@@ -120,16 +120,18 @@ describe("project folder header icon/chevron", () => {
     expect(classOf(trailing)).not.toMatch(/md:group-hover:opacity-100/);
   });
 
-  it("highlights the project row instead of global New session for a project-scoped composer", () => {
+  it("lists a highlighted ghost row under the project for a project-scoped composer", () => {
     renderSidebar("/?project=My%20Project");
 
     const header = headerButton("My Project");
-    expect(header).toHaveAttribute("aria-current", "page");
-    expect(header).toHaveClass(
+    expect(header).not.toHaveAttribute("aria-current");
+    expect(header).not.toHaveClass("bg-[var(--sidebar-active)]");
+    expect(header.querySelector(".lucide-folder")).toHaveClass("text-muted-foreground");
+
+    const ghost = within(header.closest("section")!).getByRole("link", { name: /^New session$/ });
+    expect(ghost).toHaveAttribute("href", "/?project=My%20Project");
+    expect(ghost).toHaveClass(
       "bg-[var(--sidebar-active)]",
-      "text-[var(--sidebar-active-foreground)]",
-    );
-    expect(header.querySelector(".lucide-folder")).toHaveClass(
       "text-[var(--sidebar-active-foreground)]",
     );
 
