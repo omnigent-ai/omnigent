@@ -9260,6 +9260,7 @@ async def _auto_create_claude_terminal(
         validate_claude_hook_interpreter_compatibility,
     )
     from omnigent.harnesses.claude_native.forwarder import reset_transcript_forward_state
+    from omnigent.inner.bundle_skills import claude_agents_skill_overlay
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
 
     workspace = str(
@@ -9953,6 +9954,8 @@ async def _auto_create_claude_terminal(
         # actually route; otherwise every submit would pay its round trip.
         turn_routing=_claude_turn_router is not None,
     )
+    skill_overlay = claude_agents_skill_overlay(bridge_dir)
+    trusted_added_dirs = (skill_overlay,) if str(skill_overlay) in claude_args else ()
 
     # Apply the per-harness startup command/args override from config
     # (``harness.claude-native.{command,args}`` in ~/.omnigent/config.yaml) so a
@@ -10030,6 +10033,7 @@ async def _auto_create_claude_terminal(
         ensure_claude_workspace_trusted(
             _claude_terminal_launch_cwd(env_spec, agent_os_env),
             env=_claude_terminal_launch_env(env_spec),
+            added_dirs=trusted_added_dirs,
         )
     except BaseException as seed_error:
         # No forwarder owns the routers yet, so release the ones this launch started.

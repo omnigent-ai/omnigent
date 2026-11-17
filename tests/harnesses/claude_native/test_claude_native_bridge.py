@@ -10254,15 +10254,20 @@ def test_ensure_trusted_creates_config_when_missing(
     A fresh host (no ``~/.claude.json``) gets both first-run gates set.
 
     This is the core workspace-trust case: an ``omnigent host`` machine that
-    has never run Claude interactively. Both the global onboarding gate
-    and the per-workspace trust gate must be pre-accepted so Claude does
-    not block on its TUI prompts.
+    has never run Claude interactively. The global onboarding gate and the
+    workspace and added-directory trust gates must be pre-accepted so Claude
+    does not block on its TUI prompts.
     """
     config_path = _redirect_home(monkeypatch, tmp_path / "home")
     workspace = tmp_path / "worktrees" / "feature-x"
     workspace.mkdir(parents=True)
+    added_dir = tmp_path / "bridge" / "agent-skills"
+    added_dir.mkdir(parents=True)
+    (tmp_path / "bridge-link").symlink_to(tmp_path / "bridge", target_is_directory=True)
 
-    ensure_claude_workspace_trusted(workspace)
+    ensure_claude_workspace_trusted(
+        workspace, added_dirs=(tmp_path / "bridge-link" / "agent-skills",)
+    )
 
     data = json.loads(config_path.read_text())
     # Global onboarding gate — without this Claude shows the theme/login
@@ -10274,6 +10279,9 @@ def test_ensure_trusted_creates_config_when_missing(
     # Per-directory trust gate, keyed by the RESOLVED absolute path —
     # without this Claude shows "Do you trust the files in this folder?".
     assert data["projects"][str(workspace.resolve())]["hasTrustDialogAccepted"] is True
+    # Without this Claude 2.1.326+ asks "Adding a new directory", and Escape exits.
+    assert data["projects"][str(added_dir.resolve())]["hasTrustDialogAccepted"] is True
+    assert str(tmp_path / "bridge-link" / "agent-skills") not in data["projects"]
 
 
 def test_ensure_trusted_declines_auto_default_question_for_onboarded_user(
@@ -10363,16 +10371,21 @@ def test_ensure_trusted_idempotent_does_not_rewrite(
     config_path = _redirect_home(monkeypatch, tmp_path / "home")
     workspace = tmp_path / "worktrees" / "feature-z"
     workspace.mkdir(parents=True)
+    added_dir = tmp_path / "bridge" / "agent-skills"
+    added_dir.mkdir(parents=True)
     already = {
         "hasCompletedOnboarding": True,
         "hasSeenAutoDefaultNudge": True,
-        "projects": {str(workspace.resolve()): {"hasTrustDialogAccepted": True}},
+        "projects": {
+            str(workspace.resolve()): {"hasTrustDialogAccepted": True},
+            str(added_dir.resolve()): {"hasTrustDialogAccepted": True},
+        },
     }
     # Compact, no indentation — distinct from the helper's indent=2 output.
     config_path.write_text(json.dumps(already, separators=(",", ":")))
     before = config_path.read_bytes()
 
-    ensure_claude_workspace_trusted(workspace)
+    ensure_claude_workspace_trusted(workspace, added_dirs=(added_dir,))
 
     # Byte-identical → the helper detected no change and never wrote.
     assert config_path.read_bytes() == before
