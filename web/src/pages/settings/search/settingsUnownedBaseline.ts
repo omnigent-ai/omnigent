@@ -28,18 +28,6 @@ export const UNOWNED_CONTROLS: Readonly<Record<string, { count: number; reason: 
     count: 2,
     reason: "Theme color picker popover internals, not named by a row.",
   },
-  "src/pages/SettingsPage.tsx › AppearanceSection › Button": {
-    count: 2,
-    reason: "Reset dialog's Cancel button, a dialog action not yet declared.",
-  },
-  "src/pages/SettingsPage.tsx › AppearanceSection › input": {
-    count: 1,
-    reason: "Hidden file input bound to a row part, not yet declared.",
-  },
-  "src/pages/SettingsPage.tsx › StepperButton › button": {
-    count: 1,
-    reason: "Number stepper's button, not yet catalog-owned.",
-  },
   "src/pages/settings/GlobalShortcutControl.tsx › GlobalShortcutControl › Button": {
     count: 1,
     reason: "Global shortcut row's control, not yet catalog-owned.",
