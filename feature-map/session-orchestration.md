@@ -53,6 +53,10 @@ MCP independent creation.
   of the owner's saved workflows, with that workflow's plan already in its
   journal. With workflows disabled, or on a server that doesn't advertise
   `session_create_workflow_id`, the tool refuses it before creating anything.
+  An optional `session_id_placeholder` names text in `message` that the runner
+  replaces with the new session's ID for `same_host` and `host` placements, where it
+  sends the first message itself; the message is sent unchanged when the argument is
+  absent, for `managed` placement, or when filling it in would exceed the message limit.
   With `sibling_sessions` enabled they share one sidebar family and do not appear
   as child agents; with it disabled they remain standalone.
   Managed creation uses the server's configured default sandbox provider. A

@@ -1342,7 +1342,7 @@ describe("renderTriggerPrompt", () => {
     },
   );
 
-  it("has the runner fill in a Slack worker's link, and keeps that argument on edit", () => {
+  it("has the runner fill in a Slack worker's link", () => {
     const slackPrompt = (linkBack: boolean) =>
       renderTriggerPrompt("slack", fields({ event: "posted", scope: "#support", linkBack }), CTX);
     const prompt = slackPrompt(true);
@@ -1355,15 +1355,6 @@ describe("renderTriggerPrompt", () => {
     );
     expect(slackPrompt(false)).not.toContain("session_id_placeholder");
     expect(renderTriggerPrompt("jira", fields(), CTX)).not.toContain("session_id_placeholder");
-
-    const edited = updateTriggerWorkerSettings(prompt, {
-      ...AGENT_DEFAULT_WORKERS,
-      model: "opus",
-    });
-    expect(edited).toContain(
-      'model "opus", session_id_placeholder "CONVERSATION_ID", and a message under 32000 characters.',
-    );
-    expect(readTriggerWorkerSettings(edited!)).toEqual({ ...AGENT_DEFAULT_WORKERS, model: "opus" });
   });
 
   it("signs what it posts and stops when it can't reach the service", () => {

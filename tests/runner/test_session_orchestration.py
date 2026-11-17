@@ -933,6 +933,47 @@ async def test_session_id_placeholder_is_filled_only_where_the_runner_sends_the_
 
 
 @pytest.mark.asyncio
+async def test_session_id_placeholder_is_left_when_filling_it_would_exceed_the_limit():
+    session_id = uuid4().hex
+    # Exactly at the server's limit, so filling in a longer ID would push it over.
+    message = "CONVERSATION_ID" + "x" * (32_000 - len("CONVERSATION_ID"))
+    posts = []
+
+    def respond(request):
+        if request.url.path == "/v1/info":
+            return httpx.Response(200, json={"session_message_max_chars": 32_000})
+        posts.append(request)
+        if request.url.path.endswith("/events"):
+            return httpx.Response(202, json={"queued": True})
+        return httpx.Response(
+            201, json={"id": session_id, "agent_id": "worker", "family": {"id": "manager"}}
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://server"
+    ) as client:
+        result = json.loads(
+            await execute_tool(
+                tool_name="sys_session_create",
+                arguments=json.dumps(
+                    {
+                        "agent_id": "worker",
+                        "placement": "same_host",
+                        "message": message,
+                        "session_id_placeholder": "CONVERSATION_ID",
+                    }
+                ),
+                server_client=client,
+                conversation_id="manager",
+            )
+        )
+
+    # The task still arrives, with the placeholder the worker resolves itself.
+    assert result["initial_message"] == {"queued": True}
+    assert json.loads(posts[1].content)["data"]["message"] == message
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "placeholder", ["", "  ", 1, "x" * 65], ids=["empty", "blank", "non_text", "too_long"]
 )

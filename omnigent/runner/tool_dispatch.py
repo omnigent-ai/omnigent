@@ -3887,6 +3887,8 @@ async def _execute_session_create(
         info_data: _JsonObject = {}
         # Independent first tasks are delivered after creation, so check the server's
         # limit first rather than leave a session without its task.
+        # The longest first task the server takes; filling in the session ID must stay under it.
+        first_task_max_chars = min(LEGACY_SESSION_MESSAGE_MAX_CHARS, SESSION_MESSAGE_MAX_CHARS)
         long_first_task = (
             placement in ("same_host", "host")
             and isinstance(message, str)
@@ -3907,6 +3909,7 @@ async def _execute_session_create(
             server_max_chars = info_data.get("session_message_max_chars")
             if not isinstance(server_max_chars, int) or isinstance(server_max_chars, bool):
                 server_max_chars = LEGACY_SESSION_MESSAGE_MAX_CHARS
+            first_task_max_chars = min(server_max_chars, SESSION_MESSAGE_MAX_CHARS)
             if len(str(message)) > server_max_chars:
                 return json.dumps(
                     {
@@ -4056,10 +4059,13 @@ async def _execute_session_create(
         if placement in ("same_host", "host") and args.get("message"):
             from omnigent.runner.session_message import execute_message_tool
 
-            # The runner sends this message itself, so it can name the new session's ID.
+            # The runner sends this message itself, so it can name the new session's ID,
+            # unless that would push the task over the limit; the worker then looks it up.
             initial_text = args["message"]
             if session_id_placeholder is not None and isinstance(initial_text, str):
-                initial_text = initial_text.replace(session_id_placeholder, data["id"])
+                filled = initial_text.replace(session_id_placeholder, data["id"])
+                if len(filled) <= first_task_max_chars:
+                    initial_text = filled
             initial_message = json.loads(
                 await execute_message_tool(
                     {"session_id": data["id"], "message": initial_text},
