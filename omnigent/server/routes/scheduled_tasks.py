@@ -425,14 +425,37 @@ def _validate_timezone_or_400(timezone: str) -> None:
         ) from exc
 
 
-async def _require_new_workflow_sessions(prompt: str, session_mode: str) -> None:
-    """Raise a 400 if an automation that runs a saved workflow would reuse a session.
+async def _workflow_reuse_problem(prompt: str, session_mode: str) -> str | None:
+    """Why an automation that runs a saved workflow can't reuse a session, if it would.
 
     Runs in a thread: reading a prompt edited outside the form can take a pass over all of it.
     """
-    problem = await asyncio.to_thread(workflow_session_reuse_error, prompt, session_mode)
+    return await asyncio.to_thread(workflow_session_reuse_error, prompt, session_mode)
+
+
+def _refuse_workflow_reuse(problem: str | None) -> None:
     if problem is not None:
         raise OmnigentError(problem, code=ErrorCode.INVALID_INPUT)
+
+
+def _workflow_reuse_change(
+    task: ScheduledTask, requested: dict[str, Any]
+) -> tuple[str, str] | None:
+    """The prompt and session mode an update leaves *task* with, if it changes them or
+    the session; None otherwise.
+
+    An automation saved before workflows needed new sessions keeps running until an
+    update changes what it runs or the session it uses.
+    """
+    prompt = task.prompt if requested.get("prompt") is None else requested["prompt"]
+    session_mode = requested.get("session_mode", task.session_mode)
+    if (
+        prompt == task.prompt
+        and session_mode == task.session_mode
+        and requested.get("session_id", task.session_id) == task.session_id
+    ):
+        return None
+    return prompt, session_mode
 
 
 _AGENT_AUTOMATION_ACTION = "Agent automation changes"
@@ -1017,7 +1040,7 @@ def create_scheduled_tasks_router(
             permission_store=permission_store,
         )
         _reject_proactive_agent(body.agent_id)
-        await _require_new_workflow_sessions(body.prompt, body.session_mode)
+        _refuse_workflow_reuse(await _workflow_reuse_problem(body.prompt, body.session_mode))
         await _validate_rrule_or_400(
             body.rrule,
             body.session_mode,
@@ -1618,16 +1641,18 @@ def create_scheduled_tasks_router(
         if fields.get("mcp_services") is None:
             fields.pop("mcp_services", None)
         target_session_mode = fields.get("session_mode", existing.session_mode)
-        # A null prompt keeps the saved one.
-        target_prompt = existing.prompt if fields.get("prompt") is None else fields["prompt"]
-        # An automation saved before workflows needed new sessions keeps running until an
-        # update changes what it runs or the session it uses.
-        if (
-            target_prompt != existing.prompt
-            or target_session_mode != existing.session_mode
-            or fields.get("session_id", existing.session_id) != existing.session_id
-        ):
-            await _require_new_workflow_sessions(target_prompt, target_session_mode)
+        # The caller's own changes, before the ones derived below.
+        requested_session = {
+            name: fields[name]
+            for name in ("prompt", "session_mode", "session_id")
+            if name in fields
+        }
+        # Checked on this snapshot, then again on the locked row for a concurrent edit.
+        workflow_checks: dict[tuple[str, str], str | None] = {}
+        snapshot_change = _workflow_reuse_change(existing, requested_session)
+        if snapshot_change is not None:
+            workflow_checks[snapshot_change] = await _workflow_reuse_problem(*snapshot_change)
+            _refuse_workflow_reuse(workflow_checks[snapshot_change])
         target_execution = fields.get("execution_target") or existing.execution_target
         if body.rrule is not None or {"session_mode", "execution_target"}.intersection(fields):
             await _validate_rrule_or_400(
@@ -1797,6 +1822,19 @@ def create_scheduled_tasks_router(
             await _require_mode_fits_session(request, continuing)
         project_owner = _project_owner(owner)
         cancellation: asyncio.CancelledError | None = None
+        # Rechecked under the task's lock, so a grant made meanwhile counts.
+        shared_target_guard = agent_shared_target_guard(request, fields, permission_store)
+
+        def guard(locked: ScheduledTask) -> None:
+            if shared_target_guard is not None:
+                shared_target_guard(locked)
+            # Another update may have changed the prompt or session mode since the snapshot.
+            locked_change = _workflow_reuse_change(locked, requested_session)
+            if locked_change is not None:
+                if locked_change not in workflow_checks:
+                    workflow_checks[locked_change] = workflow_session_reuse_error(*locked_change)
+                _refuse_workflow_reuse(workflow_checks[locked_change])
+
         try:
             # On the derived fields, so a session the update clears counts as a change.
             await require_agent_keeps_shared_target(request, fields, existing, permission_store)
@@ -1808,8 +1846,7 @@ def create_scheduled_tasks_router(
                     store.update,
                     scheduled_task_id,
                     expected_schedule=existing,
-                    # Rechecked under the task's lock, so a grant made meanwhile counts.
-                    guard=agent_shared_target_guard(request, fields, permission_store),
+                    guard=guard,
                     **fields,
                 )
             )
