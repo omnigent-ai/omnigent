@@ -2510,6 +2510,7 @@ async def test_list_runs_includes_conversation_read_state_fields(
     assert all(row["session_cost_usd"] == 2.5 for row in shared.values())
     assert shared[continued_id]["conversation_status"] == "running"
     assert shared[succeeded_id]["conversation_status"] is None
+    assert shared[succeeded_id]["status"] == "succeeded"
     assert shared[continued_id]["conversation_pending_approvals"] == 1
     assert shared[succeeded_id]["conversation_pending_approvals"] == 0
     pending_elicitations.resolve(conv.id, shared_elicitation_id)
