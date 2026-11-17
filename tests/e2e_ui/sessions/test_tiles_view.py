@@ -98,6 +98,14 @@ def test_nav_toggle_opens_tiles_and_carries_the_active_agent(
     # Click the tile itself, not a control, to make it the active agent.
     _tile(page, session_b).get_by_test_id("agent-tile-subline").click()
     expect(_tile(page, session_b)).to_have_attribute("data-active", "true")
+
+    # Full screen shows only that agent; Escape returns to the grid.
+    _tile(page, session_b).get_by_role("button", name=re.compile("^Full screen")).click()
+    expect(page.get_by_test_id("tiles-full-screen")).to_be_visible()
+    expect(_tile(page, session_a)).to_have_count(0)
+    page.keyboard.press("Escape")
+    expect(page.get_by_test_id("tiles-full-screen")).to_have_count(0)
+    expect(_tile(page, session_a)).to_be_visible()
     expect(page).to_have_url(f"{base_url}/tiles?active={session_b}")
 
     expect(toggle).to_have_text("Single agent")

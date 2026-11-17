@@ -3,7 +3,8 @@
 // active agent in a large pane beside a live strip, Cards shows status only.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useNavigate, useSearchParams } from "@/lib/routing";
+import { useNavigate, useRebasePath, useSearchParams } from "@/lib/routing";
+import { isElectronShell } from "@/lib/nativeBridge";
 import {
   LayersIcon,
   LayoutGridIcon,
@@ -16,7 +17,17 @@ import type { Conversation } from "@/hooks/useConversations";
 import { useSidebarData } from "@/hooks/useSidebarData";
 import { cn } from "@/lib/utils";
 import { getConnectionProtocol, maxLiveConversations } from "@/store/conversationRegistry";
-import { AgentTile, type AgentTileVariant } from "@/tiles/AgentTile";
+import { AgentTile, type AgentTileVariant, type TileReorder } from "@/tiles/AgentTile";
+import {
+  applyTileOrder,
+  moveTile,
+  moveTileBy,
+  pruneTileOrder,
+  readTileOrder,
+  useTileOrder,
+  writeTileOrder,
+} from "@/tiles/tileOrder";
+import { useTilesShortcuts } from "@/tiles/useTilesShortcuts";
 import { ColumnsPicker } from "@/tiles/ColumnsPicker";
 import { TileGrid, type TileResize } from "@/tiles/TileGrid";
 import { fittingColumns, setTileColumns, useTileColumns } from "@/tiles/tileLayout";
@@ -118,12 +129,37 @@ export function TilesPage() {
       writeTileStack(pruned);
     }
   }, [rows, stackState]);
+  useEffect(() => {
+    if (rows.length === 0) return;
+    const saved = readTileOrder();
+    const pruned = pruneTileOrder(saved, new Set(rows.map((row) => row.id)));
+    if (pruned.length !== saved.length) writeTileOrder(pruned);
+  }, [rows]);
   const counts = useMemo(() => statusCounts(activeTiles), [activeTiles]);
   const projects = useMemo(() => projectsOf(activeTiles), [activeTiles]);
   const filtering = statusFilter !== "all" || projectFilter !== null || query !== "";
   const favorite = useTileFavorite();
   const tilesById = useMemo(() => new Map(tiles.map((tile) => [tile.id, tile])), [tiles]);
-  const orderedIds = useMemo(() => tiles.map((tile) => tile.id), [tiles]);
+  const tileOrder = useTileOrder();
+  const orderedIds = useMemo(
+    () =>
+      applyTileOrder(
+        tiles.map((tile) => tile.id),
+        tileOrder,
+      ),
+    [tiles, tileOrder],
+  );
+  const orderedIdsRef = useRef(orderedIds);
+  orderedIdsRef.current = orderedIds;
+  const reorder = useMemo<TileReorder>(
+    () => ({
+      onMove: (id, targetId) =>
+        writeTileOrder(moveTile(readTileOrder(), orderedIdsRef.current, id, targetId)),
+      onMoveBy: (id, delta) =>
+        writeTileOrder(moveTileBy(readTileOrder(), orderedIdsRef.current, id, delta)),
+    }),
+    [],
+  );
   const activeId = resolveActiveId(tiles, chosenId);
   const activeIdRef = useRef(activeId);
   activeIdRef.current = activeId;
@@ -186,6 +222,28 @@ export function TilesPage() {
     [updateParams, view],
   );
   const openSingle = useCallback((sessionId: string) => navigate(`/c/${sessionId}`), [navigate]);
+  const rebasePath = useRebasePath();
+  // The desktop shell sends window.open to the system browser, so pop-out is browser-only.
+  const popOut = useMemo(
+    () =>
+      isElectronShell()
+        ? undefined
+        : (sessionId: string) =>
+            window.open(
+              rebasePath(`/c/${sessionId}`),
+              `omnigent-agent-${sessionId}`,
+              "popup,width=960,height=820",
+            ),
+    [rebasePath],
+  );
+  const [fullScreenId, setFullScreenId] = useState<string | null>(null);
+  const toggleFullScreen = useCallback(
+    (sessionId: string) => {
+      setFullScreenId((current) => (current === sessionId ? null : sessionId));
+      activate(sessionId);
+    },
+    [activate],
+  );
 
   const chosenColumns = useTileColumns();
   const [gridWidth, setGridWidth] = useState(0);
@@ -194,6 +252,18 @@ export function TilesPage() {
   const waiting = counts["needs-you"];
   const activeTile = activeId ? (tilesById.get(activeId) ?? null) : null;
   const showWorkspace = view !== "cards" && activeTile !== null;
+  const fullScreenTile =
+    fullScreenId && view !== "cards" ? (tilesById.get(fullScreenId) ?? null) : null;
+  useTilesShortcuts({
+    ids: orderedIds,
+    activeId,
+    onActivate: activate,
+    fullScreen: fullScreenTile !== null,
+    onToggleFullScreen: () => {
+      if (fullScreenTile) setFullScreenId(null);
+      else if (activeId && view !== "cards") toggleFullScreen(activeId);
+    },
+  });
 
   const renderTile = (id: string, variant: AgentTileVariant, resize?: TileResize) => {
     const conversation = tilesById.get(id);
@@ -211,6 +281,10 @@ export function TilesPage() {
         starDisabled={favorite.saving}
         onToggleStar={canFavorite(conversation) ? favorite.toggle : undefined}
         onPark={park}
+        fullScreen={id === fullScreenTile?.id}
+        onToggleFullScreen={variant === "card" ? undefined : toggleFullScreen}
+        onPopOut={popOut}
+        reorder={fullScreenTile ? undefined : reorder}
       />
     );
     return id === activeId && tileFileContext ? (
@@ -347,6 +421,10 @@ export function TilesPage() {
           <div className="flex flex-1 items-center justify-center text-sm text-muted-foreground">
             No active agents. Sessions that are running, waiting on you, or used in the last two
             days appear here.
+          </div>
+        ) : fullScreenTile ? (
+          <div className="flex min-h-0 flex-1 p-3" data-testid="tiles-full-screen">
+            {renderTile(fullScreenTile.id, "tile")}
           </div>
         ) : view === "focus" && activeTile ? (
           <div className="flex min-h-0 flex-1 gap-3 p-3">
