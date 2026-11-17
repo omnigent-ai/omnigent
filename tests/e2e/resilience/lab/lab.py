@@ -78,6 +78,8 @@ _LAUNCHED_RUNNER = re.compile(r"Launched runner \S+ for workspace .*? \(pid=(\d+
 _POLL_S = 0.25
 _STARTUP_TIMEOUT_S = 120.0
 _DIAGNOSTIC_LIMIT = 4096
+_DIAGNOSTIC_SESSION_LIMIT = 8
+_DIAGNOSTIC_SNAPSHOT_BUDGET_S = 2.0
 _DIAGNOSTIC_ID = re.compile(
     r"(?:(?:conv_)?[0-9a-f]{32}|[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})\Z"
 )
@@ -370,10 +372,12 @@ class Lab:
             "observations": [],
             "observations_omitted": 0,
             "sessions": [],
+            "snapshot_budget_exhausted": False,
             "native_lifecycle": self._diagnostic_lifecycle(),
         }
         session_ids: set[str] = set()
-        for event in retained:
+        observations_remaining = _DIAGNOSTIC_LIMIT
+        for event in reversed(retained):
             if event.source == "lab" and event.kind == "session_created":
                 identity = _diagnostic_fields(event.fields).get("session_id")
                 if identity:
@@ -383,10 +387,14 @@ class Lab:
                 observations = event.fields.get("observations", [])
                 if not isinstance(observations, list):
                     continue
-                payload["observations_omitted"] += max(0, len(observations) - _DIAGNOSTIC_LIMIT)
+                count = min(len(observations), observations_remaining)
+                observations_remaining -= count
+                payload["observations_omitted"] += len(observations) - count
                 if identity:
                     session_ids.add(identity)
-                for observation in observations[-_DIAGNOSTIC_LIMIT:]:
+                if not count:
+                    continue
+                for observation in reversed(observations[-count:]):
                     if isinstance(observation, dict):
                         safe = _diagnostic_fields(observation)
                         if identity and {"wall", "source", "status"} <= safe.keys():
@@ -404,11 +412,21 @@ class Lab:
                         "kind": event.kind,
                     }
                 )
-        for session_id in sorted(session_ids):
+        payload["events"].reverse()
+        payload["observations"].reverse()
+        selected_sessions = sorted(session_ids)[:_DIAGNOSTIC_SESSION_LIMIT]
+        payload["sessions_omitted"] = len(session_ids) - len(selected_sessions)
+        deadline = time.monotonic() + _DIAGNOSTIC_SNAPSHOT_BUDGET_S
+        for index, session_id in enumerate(selected_sessions):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                payload["sessions_omitted"] += len(selected_sessions) - index
+                payload["snapshot_budget_exhausted"] = True
+                break
             snapshot: dict[str, Any] = {"session_id": session_id, "read_status": "unavailable"}
             try:
                 if self.observer is not None:
-                    response = self.observer.get(f"/v1/sessions/{session_id}", timeout=2.0)
+                    response = self.observer.get(f"/v1/sessions/{session_id}", timeout=remaining)
                     response.raise_for_status()
                     data = response.json()
                     snapshot.update(

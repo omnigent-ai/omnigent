@@ -14,6 +14,7 @@ import yaml
 
 from tests._helpers.server_runner import ServerRunner
 from tests.e2e.resilience import conftest as resilience_fixtures
+from tests.e2e.resilience.lab import lab as lab_module
 from tests.e2e.resilience.lab.events import EventLog
 from tests.e2e.resilience.lab.lab import Lab, LabConfig
 from tests.e2e.resilience.lab.observe import Observation, SessionWatcher
@@ -286,26 +287,131 @@ def test_lab_fixture_retains_failure_evidence_without_moving_working_root(
         lab.write_diagnostics.assert_not_called()
 
 
+@pytest.mark.parametrize("snapshot_budget", [False, True], ids=["export-error", "snapshot-budget"])
 def test_lab_diagnostic_failure_still_stops_all_labs(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    snapshot_budget: bool,
 ) -> None:
-    labs = [Mock(), Mock()]
-    for lab in labs:
-        lab.start.return_value = lab
-        lab.write_diagnostics.side_effect = OSError("private-diagnostic-error")
-    monkeypatch.setattr(resilience_fixtures, "Lab", Mock(side_effect=labs))
-    monkeypatch.setattr(resilience_fixtures, "require_tmux", lambda: None)
-    request = SimpleNamespace(node=SimpleNamespace(_resilience_call=SimpleNamespace(failed=True)))
-    fixture = resilience_fixtures.lab_factory.__wrapped__(request, tmp_path)
-    start = next(fixture)
-    start()
-    start()
-    with pytest.raises(StopIteration):
-        next(fixture)
+    clock = SimpleNamespace(now=0.0)
+    monkeypatch.setattr(
+        lab_module, "time", SimpleNamespace(time=lambda: 123.0, monotonic=lambda: clock.now)
+    )
+    timeouts = []
+    stop_times = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        timeouts.append(request.extensions["timeout"]["read"])
+        clock.now += 0.75 if len(timeouts) % 2 else 1.25
+        if len(timeouts) % 2 == 0:
+            raise httpx.ReadTimeout("private-diagnostic-error", request=request)
+        return httpx.Response(200, json={"status": "idle"})
+
+    labs = []
+    with httpx.Client(
+        base_url="http://example.test", transport=httpx.MockTransport(respond)
+    ) as observer:
+        for index in range(2):
+            lab = Lab.__new__(Lab)
+            lab.root = tmp_path / f"working-{index}"
+            lab.events = EventLog()
+            lab.observer = observer
+            lab.start = Mock(return_value=lab)
+            lab.stop = Mock(side_effect=lambda: stop_times.append(clock.now))
+            lab.remove = Mock()
+            lab.describe = Mock(return_value="synthetic lab")
+            for session in range(10):
+                lab.events.emit("lab", "session_created", session_id=f"conv_{session:032x}")
+            if not snapshot_budget:
+                lab.write_diagnostics = Mock(side_effect=OSError("private-diagnostic-error"))
+            labs.append(lab)
+        monkeypatch.setattr(resilience_fixtures, "Lab", Mock(side_effect=labs))
+        monkeypatch.setattr(resilience_fixtures, "require_tmux", lambda: None)
+        request = SimpleNamespace(
+            node=SimpleNamespace(_resilience_call=SimpleNamespace(failed=True))
+        )
+        fixture = resilience_fixtures.lab_factory.__wrapped__(request, tmp_path)
+        start = next(fixture)
+        start()
+        start()
+        with pytest.raises(StopIteration):
+            next(fixture)
     for lab in labs:
         lab.stop.assert_called_once_with()
         lab.remove.assert_not_called()
     assert "private-diagnostic-error" not in capsys.readouterr().out
+    if snapshot_budget:
+        assert timeouts == [2.0, 1.25, 2.0, 1.25]
+        assert stop_times == [2.0, 4.0]
+        for index in range(2):
+            raw = (tmp_path / "resilience-diagnostics" / f"lab-{index}.json").read_text()
+            payload = json.loads(raw)
+            assert [snapshot["read_status"] for snapshot in payload["sessions"]] == [
+                "ok",
+                "unavailable",
+            ]
+            assert payload["sessions_omitted"] == 8
+            assert payload["snapshot_budget_exhausted"] is True
+            assert "private-diagnostic-error" not in raw
+
+
+@pytest.mark.parametrize("invalid_tail", [False, True], ids=["valid-tail", "invalid-tail"])
+def test_lab_diagnostics_bound_aggregate_history_and_session_snapshots(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, invalid_tail: bool
+) -> None:
+    monkeypatch.setattr(
+        lab_module, "time", SimpleNamespace(time=lambda: 123.0, monotonic=lambda: 0.0)
+    )
+    lab = Lab.__new__(Lab)
+    lab.root = tmp_path / "working"
+    lab.events = EventLog()
+    identities = [f"conv_{index:032x}" for index in range(10)]
+    for identity in identities:
+        lab.events.emit("lab", "session_created", session_id=identity)
+    for index in range(3):
+        lab.events.emit(
+            "observer",
+            "timeline",
+            session_id=identities[index],
+            observations=[
+                {
+                    "wall": wall,
+                    "source": "snapshot",
+                    "status": "private-invalid-status"
+                    if invalid_tail and wall >= 3404
+                    else "running",
+                }
+                for wall in range(index * 2500, (index + 1) * 2500)
+            ],
+        )
+    project = Mock(wraps=lab_module._diagnostic_fields)
+    monkeypatch.setattr(lab_module, "_diagnostic_fields", project)
+    requests = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request.url.path)
+        return httpx.Response(200, json={"status": "idle"})
+
+    destination = tmp_path / "resilience-diagnostics" / "lab-0.json"
+    with httpx.Client(
+        base_url="http://example.test", transport=httpx.MockTransport(respond)
+    ) as observer:
+        lab.observer = observer
+        lab.write_diagnostics(destination)
+    raw = destination.read_text()
+    payload = json.loads(raw)
+    assert [event["session_id"] for event in payload["events"]] == identities
+    assert [observation["wall"] for observation in payload["observations"]] == (
+        [] if invalid_tail else list(range(3404, 7500))
+    )
+    assert sum("wall" in call.args[0] for call in project.call_args_list) == 4096
+    assert payload["observations_omitted"] == 3404
+    assert [snapshot["session_id"] for snapshot in payload["sessions"]] == identities[:8]
+    assert requests == [f"/v1/sessions/{identity}" for identity in identities[:8]]
+    assert payload["sessions_omitted"] == 2
+    assert payload["snapshot_budget_exhausted"] is False
+    assert "private-invalid-status" not in raw
 
 
 @pytest.mark.parametrize("snapshot_available", [True, False])
