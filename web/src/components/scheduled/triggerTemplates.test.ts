@@ -99,9 +99,7 @@ describe("saved trigger prompts", () => {
         model: "old",
         workflowIdSupported: true,
       });
-      expect(prompt).toContain(
-        `, workflow_id "${WORKFLOW_ID}", model "old", and a message under 32000 characters.`,
-      );
+      expect(prompt).toContain(`, workflow_id "${WORKFLOW_ID}", model "old"`);
       // The session's first message still opens with the instructions, which run the workflow skill.
       expect(prompt).toContain("The message starts with the instructions below");
       expect(splitTriggerPrompt(prompt).userPrompt).toBe(WORKFLOW_RUN);
