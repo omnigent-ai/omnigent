@@ -137,6 +137,30 @@ export function previewText(
 }
 
 /**
+ * The first `count` sentences of assistant text as plain prose: code blocks and
+ * heading lines are dropped, and list/quote markers and emphasis are stripped.
+ *
+ * :param text: The full assistant message text.
+ * :param count: How many sentences to keep.
+ * :returns: The sentences joined by spaces; empty when no prose remains.
+ */
+export function leadingSentences(text: string, count: number): string {
+  const prose = text
+    .replace(/```[\s\S]*?(?:```|$)/g, "\n")
+    .split("\n")
+    .filter((line) => !/^\s*#{1,6}\s/.test(line))
+    .map((line) => line.replace(/^\s*(?:>\s?|[-*+]\s+|\d+[.)]\s+)/, "").trim())
+    .filter((line) => line.length > 0)
+    .join("\n")
+    .replace(/\*\*|__|`/g, "");
+  const sentences = new Intl.Segmenter(undefined, { granularity: "sentence" }).segment(prose);
+  return [...sentences]
+    .slice(0, count)
+    .map(({ segment }) => segment.trim())
+    .join(" ");
+}
+
+/**
  * Best-effort fetch of the agent's final message text for a session, ready to
  * use as a notification body. Returns `undefined` on any failure or when the
  * session has no trailing assistant text (e.g. it ended on a tool call), so
@@ -154,6 +178,18 @@ export async function fetchLastAssistantText(
   sessionId: string,
   maxChars: number = DEFAULT_MAX_CHARS,
 ): Promise<string | undefined> {
+  const text = await fetchLastAssistantMessage(sessionId);
+  return text === undefined ? undefined : previewText(text, maxChars);
+}
+
+/**
+ * Best-effort fetch of the agent's final message for a session, untrimmed.
+ * Same scan and failure handling as {@link fetchLastAssistantText}.
+ *
+ * :param sessionId: Session/conversation id, e.g. ``"conv_abc123"``.
+ * :returns: The full assistant text, or ``undefined``.
+ */
+export async function fetchLastAssistantMessage(sessionId: string): Promise<string | undefined> {
   try {
     const params = new URLSearchParams({ limit: String(SCAN_ITEMS), order: "desc" });
     // Session-scoped, so it carries the session's host key (see `authenticatedFetch`).
@@ -165,7 +201,7 @@ export async function fetchLastAssistantText(
     const items = Array.isArray(json.data) ? json.data : [];
     for (const item of items) {
       const text = extractAssistantText(item);
-      if (text !== undefined) return previewText(text, maxChars);
+      if (text !== undefined) return text;
     }
     return undefined;
   } catch {

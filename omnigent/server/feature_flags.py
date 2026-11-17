@@ -50,6 +50,7 @@ class Feature(StrEnum):
     SIDEBAR_WINDOWED_ROWS = "sidebar_windowed_rows"
     WORKFLOWS = "workflows"
     SESSION_OVERVIEW = "session_overview"
+    PROJECT_KANBAN = "project_kanban"
     PROJECT_REPOSITORY_CREATION = "project_repository_creation"
     WORKSPACE_DIRECT_ACCESS = "workspace_direct_access"
     WORKSPACE_API_SERVER_ACCESS = "workspace_api_server_access"
@@ -247,6 +248,12 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         description="Session cost sidebar beside chat, toggled from a header cost chip",
         owner="web",
         review_by_release="0.25.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.PROJECT_KANBAN,
+        description="Project home page opened from a project row: composer above a sessions board",
+        owner="web",
+        review_by_release="0.27.0",
     ),
     FeatureDefinition(
         feature=Feature.PROJECT_REPOSITORY_CREATION,

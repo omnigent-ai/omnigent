@@ -61,6 +61,7 @@ import {
   ClockPlusIcon,
   CircleAlertIcon,
   CircleStopIcon,
+  CornerDownRightIcon,
   FolderGit2Icon,
   FolderIcon,
   FolderInputIcon,
@@ -204,12 +205,7 @@ import { isOwnerLevel } from "@/lib/permissionsApi";
 import { useHosts, type Host } from "@/hooks/useHosts";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import {
-  isFeatureEnabled,
-  isSingleUserMode,
-  sandboxOptionLabel,
-  SHARING_OFF_REASON,
-} from "@/lib/capabilities";
+import { isFeatureEnabled, isSingleUserMode, SHARING_OFF_REASON } from "@/lib/capabilities";
 import { useBranding } from "@/lib/branding";
 import { relativeTime } from "@/lib/relativeTime";
 import { showToast } from "@/components/ui/toast";
@@ -228,7 +224,6 @@ import { isSessionStoppable } from "@/lib/sessionStop";
 import { SidebarEditRow } from "./SidebarEditRow";
 import { isInClosedSidebar, registerSidebarRename } from "./sidebarRename";
 import { hasSessionDraft, useHasSessionDraft, useSessionDraftIds } from "@/lib/sessionDrafts";
-import { useNow } from "@/hooks/useNow";
 import { useOptimisticTitle } from "@/lib/optimisticTitles";
 import type { SessionState } from "@/hooks/useSessionState";
 import { useSessionBadgeStates } from "@/hooks/useSessionBadgeStates";
@@ -295,7 +290,6 @@ import {
   computeNextActiveOverride,
   conversationDisplayLabel,
   dedupeConversationsById,
-  getConversationAgentType,
   EXPANDED_PROJECT_SECTIONS_STORAGE_KEY,
   groupConversations,
   moveCustomOrder,
@@ -320,18 +314,8 @@ import {
 } from "./sidebarNav";
 import { SidebarServerPicker } from "./SidebarServerPicker";
 import { isRowFullyVisible } from "./sidebarRowVisibility";
-import { ComposerAgentIcon } from "@/components/ComposerAgentIcon";
 import { useHarnessLabels } from "@/lib/agentLabels";
-import {
-  NATIVE_CODING_AGENTS,
-  nativeCodingAgentForSession,
-  nativeCodingAgentForWrapper,
-  type NativeCodingAgentIconKind,
-  WRAPPER_LABEL_KEY,
-} from "@/lib/nativeCodingAgents";
-import AntigravityColor from "@lobehub/icons/es/Antigravity/components/Color";
-import DevinColor from "@lobehub/icons/es/Devin/components/Color";
-import KiroColor from "@lobehub/icons/es/Kiro/components/Color";
+import { NATIVE_CODING_AGENTS, nativeCodingAgentForSession } from "@/lib/nativeCodingAgents";
 import { usePullRequestInfo } from "@/hooks/usePullRequests";
 import {
   getPullRequestStatus,
@@ -339,15 +323,14 @@ import {
   pullRequestStatusPresentation,
   type PullRequestStatusSummary,
 } from "@/lib/pullRequestStatus";
-import { matchWorktree } from "@/hooks/useHostWorktrees";
-import { useSessionWorktrees } from "@/hooks/useSessionWorktrees";
 import {
-  deriveRepoName,
-  localMachineLabel,
-  resolveThisMachineHostId,
-  SANDBOX_REPO_LABEL_KEY,
-} from "./NewChatDialog";
-import { useDesktopHostId } from "./RevealInFileManager";
+  SessionEnvironmentLabel,
+  SessionHarnessIcon,
+  sessionLocationLabel,
+  sessionRepoName,
+  SessionUpdatedLabel,
+  useSessionBranch,
+} from "./sessionRowMeta";
 import { ForkSessionDialog } from "./ForkSessionDialog";
 import { CreateAutomationFromSessionDialog } from "@/components/scheduled/CreateAutomationFromSessionDialog";
 import {
@@ -372,6 +355,7 @@ import {
 } from "./sidebarStyles";
 import { MAIN_CANVAS_ID } from "@/canvas/canvasLayout";
 import { CANVAS_QUERY_PARAM, canvasLocation, isCanvasPathname } from "@/canvas/canvasNavigation";
+import { projectHomePath, projectNameFromHomePath } from "@/projectHome/projectHomeNavigation";
 import { getEmbedRoot } from "../lib/host";
 import {
   ARCHIVE_SESSION_KEYS,
@@ -610,6 +594,7 @@ function useActiveNavItem(): {
   isUsagePage: boolean;
   activeExtensionPageId: string | null;
   newSessionProjectName: string | null;
+  projectHomeName: string | null;
 } {
   const { conversationId: activeConversationId, gridId } = useParams<{
     conversationId: string;
@@ -634,8 +619,13 @@ function useActiveNavItem(): {
   const isUsagePage = !isExtensionRoute && leaf === "usage";
   const activeExtensionPageId =
     resolveExtensionPageFromPath(extensions, location.pathname)?.page.id ?? null;
+  const projectHomeName =
+    !isExtensionRoute && isFeatureEnabled(serverInfo, "project_kanban")
+      ? projectNameFromHomePath(location.pathname)
+      : null;
   const isNewSessionRoute =
     activeConversationId == null &&
+    projectHomeName == null &&
     (gridId == null || !isFeatureEnabled(serverInfo, "grid_sessions_display_ui")) &&
     !isInboxPage &&
     !isCanvasPage &&
@@ -661,6 +651,7 @@ function useActiveNavItem(): {
     isUsagePage,
     activeExtensionPageId,
     newSessionProjectName,
+    projectHomeName,
   };
 }
 
@@ -962,7 +953,14 @@ function SidebarImpl({
     isUsagePage,
     activeExtensionPageId,
     newSessionProjectName,
+    projectHomeName,
   } = useActiveNavItem();
+  const navigate = useNavigate();
+  const projectKanban = isFeatureEnabled(serverInfo, "project_kanban");
+  const openProjectHome = useStableCallback((projectName: string) => {
+    if (projectName !== projectHomeName) navigate(projectHomePath(projectName));
+    if (isMobileViewport() && !isSideBySideSidebarViewport()) onClose();
+  });
   const automationsEnabled = useAutomationsEnabled();
 
   // On /settings the card keeps its chrome but swaps the conversation list
@@ -1623,6 +1621,8 @@ function SidebarImpl({
                     onRowClick={onNavClick}
                     searchQuery=""
                     newSessionProjectName={newSessionProjectName}
+                    projectHomeName={projectHomeName}
+                    onOpenProjectHome={projectKanban ? openProjectHome : undefined}
                     activeTab={availableTab}
                     onActiveTabChange={switchTab}
                     multiUser={multiUser}
@@ -1684,7 +1684,9 @@ function ProjectFolder({
   activeConversationId,
   expanded,
   active,
+  homeActive,
   onToggleCollapsed,
+  onActivate,
   collapsedFamilies,
   onToggleFamily,
   pinnedConversationIds,
@@ -1734,7 +1736,11 @@ function ProjectFolder({
   expanded: boolean;
   /** Whether the new-session composer is currently scoped to this project. */
   active: boolean;
+  /** Whether this project's home page is open. */
+  homeActive: boolean;
   onToggleCollapsed: () => void;
+  /** Header click outside its chevron; unset leaves the whole header a collapse toggle. */
+  onActivate?: () => void;
   collapsedFamilies: ReadonlySet<string>;
   onToggleFamily: (familyId: string) => void;
   pinnedConversationIds: string[];
@@ -1844,7 +1850,7 @@ function ProjectFolder({
       project_draft_name: name,
     };
   }, [active, archived, selectionMode, name, projectId]);
-  const headerActive = active && draftRow === null;
+  const headerActive = (active && draftRow === null) || homeActive;
   // A Show more click records the list's size; the rows it adds slide in once
   // they render (after the next server page, when one is needed).
   const listRef = useRef<HTMLUListElement>(null);
@@ -2009,6 +2015,7 @@ function ProjectFolder({
         // Projects default collapsed: shown only when explicitly expanded.
         collapsed={!expanded}
         onToggleCollapsed={onToggleCollapsed}
+        onActivate={onActivate}
         collapsedFamilies={collapsedFamilies}
         onToggleFamily={onToggleFamily}
         onRowClick={onRowClick}
@@ -2148,6 +2155,10 @@ interface ConversationListProps {
   searchQuery: string;
   /** Project selected on the new-session composer route, if any. */
   newSessionProjectName: string | null;
+  /** Project whose home page is open, if any. */
+  projectHomeName: string | null;
+  /** Opens a project's home; when set, clicking a project row opens it instead of toggling. */
+  onOpenProjectHome?: (projectName: string) => void;
   activeTab: SidebarTab;
   onActiveTabChange: (tab: SidebarTab) => void;
   /** Multi-user server; gates the "Shared" filter option. */
@@ -2191,6 +2202,8 @@ function ConversationList({
   onRowClick,
   searchQuery,
   newSessionProjectName,
+  projectHomeName,
+  onOpenProjectHome,
   activeTab,
   onActiveTabChange,
   multiUser,
@@ -3614,7 +3627,16 @@ function ConversationList({
                             activeConversationId={displayedActiveId}
                             expanded={expandedProjects.includes(group.name)}
                             active={newSessionProjectName === group.name}
+                            homeActive={projectHomeName === group.name}
                             onToggleCollapsed={() => toggleProjectExpanded(group.name)}
+                            onActivate={
+                              onOpenProjectHome
+                                ? () => {
+                                    expandProject(group.name);
+                                    onOpenProjectHome(group.name);
+                                  }
+                                : undefined
+                            }
                             collapsedFamilies={collapsedFamilies}
                             onToggleFamily={toggleFamily}
                             pinnedConversationIds={pinnedConversationIds}
@@ -3900,6 +3922,7 @@ function SectionHeader({
   actionFocusVisible,
   collapsed,
   onToggleCollapsed,
+  onActivate,
   contextMenu,
   contextMenuDisabled,
 }: {
@@ -3925,6 +3948,9 @@ function SectionHeader({
   actionFocusVisible?: boolean;
   collapsed: boolean;
   onToggleCollapsed: () => void;
+  /** When set, a header click outside its chevron runs this instead of toggling;
+      the chevron and Left/Right arrows still collapse and expand. */
+  onActivate?: () => void;
   /** Optional context-menu content for the header button. */
   contextMenu?: ReactNode;
   /** Suppresses the header context menu while another interaction owns it. */
@@ -3960,7 +3986,16 @@ function SectionHeader({
       aria-disabled={undefined}
       // Touch retains scrolling and long-press menus, which include move actions.
       onMouseDown={(event) => headerDrag?.listeners?.onMouseDown?.(event)}
-      onKeyDown={(event) => headerDrag?.listeners?.onKeyDown?.(event)}
+      onKeyDown={(event) => {
+        const arrowExpands =
+          event.key === "ArrowRight" ? true : event.key === "ArrowLeft" ? false : null;
+        if (onActivate && arrowExpands !== null) {
+          event.preventDefault();
+          if (collapsed === arrowExpands) onToggleCollapsed();
+          return;
+        }
+        headerDrag?.listeners?.onKeyDown?.(event);
+      }}
       data-project-order-name={headerDrag ? title : undefined}
       type="button"
       aria-expanded={!collapsed}
@@ -3970,7 +4005,9 @@ function SectionHeader({
         // keeping the hover-revealed controls up at rest. Keyboard toggles
         // (detail 0) keep focus for the ring.
         if (event.detail > 0) event.currentTarget.blur();
-        onToggleCollapsed();
+        const onToggle = (event.target as Element).closest("[data-section-toggle]") !== null;
+        if (onActivate && !onToggle) onActivate();
+        else onToggleCollapsed();
       }}
       className={cn(
         headerDrag &&
@@ -4002,7 +4039,10 @@ function SectionHeader({
         // chevron on desktop hover/focus, so the caret takes the icon's place
         // rather than trailing the name. Mobile (no hover) keeps the folder
         // icon and shows the trailing chevron below.
-        <span className="relative flex size-4 shrink-0 items-center justify-center">
+        <span
+          data-section-toggle
+          className="relative flex size-4 shrink-0 items-center justify-center"
+        >
           <span className="flex md:transition-opacity md:group-hover:opacity-0 md:group-focus-visible:opacity-0">
             {icon}
           </span>
@@ -4021,6 +4061,7 @@ function SectionHeader({
             reveal it on desktop hover/focus; icon headers show it only on mobile
             (no hover) since desktop swaps the folder for the chevron above. */}
       <ChevronRightIcon
+        data-section-toggle
         className={cn(
           "size-3.5 shrink-0 transition-[transform,opacity]",
           !collapsed && "rotate-90",
@@ -4527,6 +4568,7 @@ function ConversationSection({
   pinnedConversationIds,
   collapsed,
   onToggleCollapsed,
+  onActivate,
   collapsedFamilies,
   onToggleFamily,
   onRowClick,
@@ -4568,6 +4610,8 @@ function ConversationSection({
   /** Whether this section is currently collapsed. */
   collapsed: boolean;
   onToggleCollapsed: () => void;
+  /** Header click outside its chevron (see SectionHeader). */
+  onActivate?: () => void;
   collapsedFamilies: ReadonlySet<string>;
   onToggleFamily: (familyId: string) => void;
   onRowClick: (e: MouseEvent<HTMLAnchorElement>) => void;
@@ -4611,6 +4655,18 @@ function ConversationSection({
     const representative = familyRepresentative(row);
     return representative !== undefined && representative.id !== row.id;
   };
+  // Counts loaded rows only; an unsent nested-agent draft isn't a session yet.
+  const familyNestedCount = (row: Conversation) => {
+    const members = row.family ? families.get(row.family.id) : undefined;
+    if (!members || members[0].id !== row.id) return undefined;
+    return members.filter((member) => member !== row && !member.nested_draft_source_id).length;
+  };
+  const familyParentTitle = (row: Conversation) => {
+    const representative = familyRepresentative(row);
+    return representative && representative.id !== row.id
+      ? conversationDisplayLabel(representative)
+      : undefined;
+  };
   const visibleFamilyRows = orderSessionFamilies(rows, collapsedFamilies);
   const reorderRows = visibleFamilyRows.filter((row) => !isNestedFamilyRow(row));
 
@@ -4643,6 +4699,7 @@ function ConversationSection({
             hasPersistentAction={persistentHeaderAction != null}
             collapsed={isCollapsed}
             onToggleCollapsed={onToggleCollapsed}
+            onActivate={selectionMode ? undefined : onActivate}
             headerDrag={headerDrag}
             contextMenu={headerContextMenu}
             contextMenuDisabled={selectionMode}
@@ -4728,6 +4785,8 @@ function ConversationSection({
                   key={nestedSessionSidebarKey(conv.id)}
                   conversation={conv}
                   familyIndented={isNestedFamilyRow(conv)}
+                  familyNestedCount={familyNestedCount(conv)}
+                  familyParentTitle={familyParentTitle(conv)}
                   familyExpanded={
                     conv.family &&
                     familyRepresentative(conv)?.id === conv.id &&
@@ -5308,61 +5367,6 @@ function SessionSharedHint() {
   );
 }
 
-/** Where a session runs: local machine, a sandbox provider, or the host's name (id while unresolved). */
-function sessionLocationLabel(
-  conversation: Conversation,
-  hostsById: ReadonlyMap<string, Host>,
-): string {
-  if (!conversation.host_id) return "Local machine";
-  const host = hostsById.get(conversation.host_id);
-  return host?.sandbox_provider
-    ? sandboxOptionLabel(host.sandbox_provider)
-    : (host?.name ?? conversation.host_id);
-}
-
-/** A row's short environment: the sandbox type, this device, or "Remote"; the tooltip names the host. */
-function sessionEnvironmentLabel(
-  conversation: Conversation,
-  hostsById: ReadonlyMap<string, Host>,
-  desktopHostId: string | null,
-): string {
-  const hostId = conversation.host_id;
-  if (!hostId || hostsById.get(hostId)?.sandbox_provider) {
-    return sessionLocationLabel(conversation, hostsById);
-  }
-  const onlineHostIds = [...hostsById.values()]
-    .filter((h) => h.status === "online" && !h.sandbox_provider)
-    .map((h) => h.host_id);
-  return hostId === resolveThisMachineHostId(desktopHostId, isCurrentServerLocal(), onlineHostIds)
-    ? localMachineLabel(navigator.userAgent)
-    : "Remote";
-}
-
-/** A managed-sandbox session's repo name from its first `omnigent.sandbox.repo` label; null otherwise. */
-function sessionRepoName(conversation: Conversation): string | null {
-  const labels = conversation.labels ?? {};
-  const workspace = labels[`${SANDBOX_REPO_LABEL_KEY}.0`] ?? labels[SANDBOX_REPO_LABEL_KEY];
-  // Label value is `<url>[#<branch>]`; the name is derived from the url part.
-  return workspace ? deriveRepoName(workspace.split("#")[0]!) : null;
-}
-
-// Its own component so only rows showing Environment subscribe to the desktop host id.
-function SessionEnvironmentLabel({
-  conversation,
-  hostsById,
-}: {
-  conversation: Conversation;
-  hostsById: ReadonlyMap<string, Host>;
-}) {
-  return sessionEnvironmentLabel(conversation, hostsById, useDesktopHostId());
-}
-
-// Its own component so only rows showing the timestamp subscribe to the shared clock.
-function SessionUpdatedLabel({ updatedAt }: { updatedAt: number }) {
-  const now = useNow();
-  return relativeTime(updatedAt * 1000, now.getTime());
-}
-
 // A row's second line: the "Show" environment and branch, each omitted when empty.
 function SessionMetaLine({
   environment,
@@ -5419,10 +5423,21 @@ function SessionTooltipDetail({
   );
 }
 
+// The divider-topped group holding a session card's label/value rows.
+function SessionTooltipDetailsBlock({ children }: { children: ReactNode }) {
+  return <div className="mt-2.5 flex flex-col gap-1 border-t border-border pt-2.5">{children}</div>;
+}
+
 // The tooltip's detail rows. Repo, PR and a non-worktree branch come from the
 // session's GitHub info, fetched only while the tooltip is open (Radix mounts
 // its content on open) and shared with the GitHub panel's cache.
-function SessionTooltipDetails({ conversation }: { conversation: Conversation }) {
+function SessionTooltipDetails({
+  conversation,
+  familyDetail,
+}: {
+  conversation: Conversation;
+  familyDetail?: ReactNode;
+}) {
   const viewerId = useContext(ViewerIdContext);
   // Only a workspace-bound session has a checkout to read GitHub state from.
   const githubInfo = usePullRequestInfo(conversation.workspace ? conversation.id : undefined);
@@ -5457,9 +5472,18 @@ function SessionTooltipDetails({ conversation }: { conversation: Conversation })
   // The stored state may be old while the host is offline; say how old.
   const asOf = fromStored ? stateAsOf(stored?.state_checked_at) : null;
   const branch = conversation.git_branch ?? github?.branch ?? null;
-  if (createdBy === null && repo === null && prNumber === null && branch === null) return null;
+  if (
+    !familyDetail &&
+    createdBy === null &&
+    repo === null &&
+    prNumber === null &&
+    branch === null
+  ) {
+    return null;
+  }
   return (
-    <div className="mt-2.5 flex flex-col gap-1 border-t border-border pt-2.5">
+    <SessionTooltipDetailsBlock>
+      {familyDetail}
       {createdBy !== null && (
         <SessionTooltipDetail
           label="Created by"
@@ -5490,51 +5514,38 @@ function SessionTooltipDetails({ conversation }: { conversation: Conversation })
           {branch}
         </SessionTooltipDetail>
       )}
-    </div>
+    </SessionTooltipDetailsBlock>
   );
 }
 
-// Brand-color glyphs for harnesses ComposerAgentIcon draws in mono. Claude and Codex
-// are already in color there; Kimi's color mark is white-on-dark, and Cursor,
-// OpenCode, Pi and Goose have none.
-const TOOLTIP_COLOR_ICONS: Partial<
-  Record<NativeCodingAgentIconKind, ComponentType<{ size?: number; className?: string }>>
-> = { antigravity: AntigravityColor, devin: DevinColor, kiro: KiroColor };
-
-// The session's harness glyph. `withFallback` draws the agent's generic icon for
-// sessions without a known harness, the way project rows fall back to a folder.
-function SessionHarnessIcon({
-  conversation,
-  testId,
-  withFallback = false,
+/** Tooltip detail row naming a session's place in its family: parent or nested. */
+function SessionFamilyDetail({
+  nestedCount,
+  parentTitle,
 }: {
-  conversation: Conversation;
-  testId: string;
-  withFallback?: boolean;
+  nestedCount?: number;
+  parentTitle?: string;
 }) {
-  const nativeAgent = nativeCodingAgentForWrapper(conversation.labels?.[WRAPPER_LABEL_KEY]);
-  const ColorIcon = nativeAgent ? TOOLTIP_COLOR_ICONS[nativeAgent.iconKind] : undefined;
-  const harnessAgent = nativeAgent
-    ? { name: nativeAgent.agentName, harness: nativeAgent.harness }
-    : conversation.agent_name === "nessie"
-      ? { name: "nessie", harness: null }
-      : withFallback
-        ? { name: conversation.agent_name ?? "", harness: conversation.harness ?? null }
-        : null;
-  if (!harnessAgent) return null;
+  if (nestedCount) {
+    return (
+      <SessionTooltipDetail
+        label="Nested sessions"
+        icon={ListChevronsUpDownIcon}
+        testId="session-tooltip-family"
+      >
+        {nestedCount}
+      </SessionTooltipDetail>
+    );
+  }
+  if (parentTitle === undefined) return null;
   return (
-    <span
-      role="img"
-      aria-label={`${getConversationAgentType(conversation)} harness`}
-      data-testid={testId}
-      className="flex shrink-0"
+    <SessionTooltipDetail
+      label="Nested in"
+      icon={CornerDownRightIcon}
+      testId="session-tooltip-family"
     >
-      {ColorIcon ? (
-        <ColorIcon size={16} className="shrink-0" />
-      ) : (
-        <ComposerAgentIcon agent={harnessAgent} className="size-4" />
-      )}
-    </span>
+      {parentTitle}
+    </SessionTooltipDetail>
   );
 }
 
@@ -5545,11 +5556,13 @@ function LegacySessionTooltipContent({
   hostsById,
   hasError,
   shared,
+  familyDetail,
 }: {
   conversation: Conversation;
   hostsById: ReadonlyMap<string, Host>;
   hasError: boolean;
   shared: boolean;
+  familyDetail?: ReactNode;
 }) {
   return (
     <TooltipContent
@@ -5584,6 +5597,7 @@ function LegacySessionTooltipContent({
           <span className="truncate">{conversation.git_branch}</span>
         </p>
       )}
+      {familyDetail && <SessionTooltipDetailsBlock>{familyDetail}</SessionTooltipDetailsBlock>}
       {shared && <SessionSharedHint />}
       {hasError && <SessionErrorHint />}
     </TooltipContent>
@@ -5595,11 +5609,13 @@ function SessionTooltipContent({
   hostsById,
   hasError,
   shared,
+  familyDetail,
 }: {
   conversation: Conversation;
   hostsById: ReadonlyMap<string, Host>;
   hasError: boolean;
   shared: boolean;
+  familyDetail?: ReactNode;
 }) {
   const serverInfo = useContext(ServerInfoContext);
   if (!isFeatureEnabled(serverInfo, "sidebar_grouping_ui")) {
@@ -5609,6 +5625,7 @@ function SessionTooltipContent({
         hostsById={hostsById}
         hasError={hasError}
         shared={shared}
+        familyDetail={familyDetail}
       />
     );
   }
@@ -5634,7 +5651,7 @@ function SessionTooltipContent({
           <span className="truncate">{sessionLocationLabel(conversation, hostsById)}</span>
         </span>
       </p>
-      <SessionTooltipDetails conversation={conversation} />
+      <SessionTooltipDetails conversation={conversation} familyDetail={familyDetail} />
       {shared && <SessionSharedHint />}
       {hasError && <SessionErrorHint />}
     </TooltipContent>
@@ -5649,6 +5666,8 @@ function ConversationRowImpl({
   conversation,
   familyIndented = false,
   familyExpanded,
+  familyNestedCount,
+  familyParentTitle,
   onToggleFamily,
   isActive,
   inActiveGrid,
@@ -5670,6 +5689,10 @@ function ConversationRowImpl({
   conversation: Conversation;
   familyIndented?: boolean;
   familyExpanded?: boolean;
+  /** Loaded nested sessions under this family parent, for its tooltip. */
+  familyNestedCount?: number;
+  /** The family parent's title, for a nested session's tooltip. */
+  familyParentTitle?: string;
   onToggleFamily?: () => void;
   // Computed by the list owner against the resolved top-level root (so a
   // sub-agent view keeps its owning row highlighted). A prop, not a per-row
@@ -5900,19 +5923,7 @@ function ConversationRowImpl({
     <SessionEnvironmentLabel conversation={conversation} hostsById={hostsById} />
   ) : null;
   const metaRepo = show.includes("repo") ? sessionRepoName(conversation) : null;
-  const loadBranch = show.includes("branch") && gitBranch === null;
-  const { data: worktrees } = useSessionWorktrees(
-    loadBranch ? conversation.id : null,
-    loadBranch ? conversation.host_id : null,
-    loadBranch ? conversation.workspace : null,
-  );
-  const workspaceWorktree =
-    loadBranch && worktrees?.status === "ok" && conversation.workspace
-      ? matchWorktree(worktrees.worktrees, conversation.workspace)
-      : null;
-  const metaBranch = show.includes("branch")
-    ? (gitBranch ?? (workspaceWorktree?.detached ? null : (workspaceWorktree?.branch ?? null)))
-    : null;
+  const metaBranch = useSessionBranch(conversation, show.includes("branch"));
   // Overlays (checkbox, badges, controls; each also `-translate-y-1/2`) center on
   // the row, or on the title line — padding + half its 20px box — above a meta line.
   const overlayTop =
@@ -6160,6 +6171,11 @@ function ConversationRowImpl({
     reorder: canReorder && !isProvisionalRow ? { previousId, nextId } : undefined,
   };
 
+  const familyDetail =
+    familyNestedCount || familyParentTitle !== undefined ? (
+      <SessionFamilyDetail nestedCount={familyNestedCount} parentTitle={familyParentTitle} />
+    ) : null;
+
   const rowText = (
     <>
       {/* Row 1: the session name. Working, needs-approval, unseen, and draft
@@ -6387,6 +6403,7 @@ function ConversationRowImpl({
               gitBranch={gitBranch}
               hasError={sessionState?.kind === "error"}
               shared={showSharedIndicator}
+              familyDetail={familyDetail}
             />
           </HoverCard>
         ) : isMobile ? (
@@ -6399,6 +6416,7 @@ function ConversationRowImpl({
               hostsById={hostsById}
               hasError={sessionState?.kind === "error"}
               shared={showSharedIndicator}
+              familyDetail={familyDetail}
             />
           </Tooltip>
         )
@@ -6423,6 +6441,7 @@ function ConversationRowImpl({
             gitBranch={gitBranch}
             hasError={sessionState?.kind === "error"}
             shared={showSharedIndicator}
+            familyDetail={familyDetail}
           />
         </HoverCard>
       ) : isMobile ? (
@@ -6457,6 +6476,7 @@ function ConversationRowImpl({
             hostsById={hostsById}
             hasError={sessionState?.kind === "error"}
             shared={showSharedIndicator}
+            familyDetail={familyDetail}
           />
         </Tooltip>
       )}
@@ -6939,6 +6959,8 @@ const ConversationRow = memo(ConversationRowImpl, (prev, next) => {
   return (
     prev.familyIndented === next.familyIndented &&
     prev.familyExpanded === next.familyExpanded &&
+    prev.familyNestedCount === next.familyNestedCount &&
+    prev.familyParentTitle === next.familyParentTitle &&
     prev.isActive === next.isActive &&
     prev.inActiveGrid === next.inActiveGrid &&
     prev.gridSelected === next.gridSelected &&
@@ -7013,6 +7035,7 @@ function PinnedProjectFlyoutContent({
   gitBranch,
   hasError,
   shared,
+  familyDetail,
 }: {
   title: string;
   projectName: string;
@@ -7020,6 +7043,7 @@ function PinnedProjectFlyoutContent({
   gitBranch: string | null;
   hasError: boolean;
   shared: boolean;
+  familyDetail?: ReactNode;
 }) {
   return (
     <HoverCardContent
@@ -7046,6 +7070,7 @@ function PinnedProjectFlyoutContent({
           <span className="truncate">{gitBranch}</span>
         </p>
       )}
+      {familyDetail && <SessionTooltipDetailsBlock>{familyDetail}</SessionTooltipDetailsBlock>}
       {shared && <SessionSharedHint />}
       {hasError && <SessionErrorHint />}
     </HoverCardContent>

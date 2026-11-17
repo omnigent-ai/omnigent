@@ -210,6 +210,28 @@ describe("project folder header icon/chevron", () => {
   });
 });
 
+it("opens the project home from the row and collapses it only from the chevron", () => {
+  localStorage.clear();
+  renderSidebarAt({ features: { project_kanban: true } });
+  const header = headerButton("My Project");
+  const title = within(header).getByText("My Project");
+  expect(header).toHaveAttribute("aria-expanded", "false");
+
+  fireEvent.click(title);
+  expect(header).toHaveAttribute("aria-expanded", "true");
+  expect(header).toHaveAttribute("aria-current", "page");
+  expect(screen.getByTestId("new-chat-button")).not.toHaveClass("bg-[var(--sidebar-active)]");
+  expect(
+    within(header.closest("section")!).queryByRole("link", { name: /^New session$/ }),
+  ).toBeNull();
+
+  fireEvent.click(title);
+  expect(header).toHaveAttribute("aria-expanded", "true");
+  fireEvent.click(header.querySelector("[data-section-toggle]")!);
+  expect(header).toHaveAttribute("aria-expanded", "false");
+  expect(header).toHaveAttribute("aria-current", "page");
+});
+
 it("opens New project without toggling the Projects header", () => {
   renderSidebar();
   const projects = headerButton("Projects");

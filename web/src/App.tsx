@@ -57,6 +57,10 @@ const InboxPage = withPageView(
 // The shell owns the board so selecting a conversation never unmounts it.
 const CanvasLandingPage = withPageView("canvas", () => null);
 const GridPage = withPageView("grid", () => null);
+const ProjectHomePage = withPageView(
+  "project_home",
+  lazy(() => import("@/pages/ProjectHomePage").then((m) => ({ default: m.ProjectHomePage }))),
+);
 const TasksPage = lazy(() => import("@/pages/TasksPage").then((m) => ({ default: m.TasksPage })));
 const UsagePage = withPageView(
   "usage",
@@ -198,6 +202,14 @@ function AppRoutes({ basename }: AppProps) {
             }
           />
           <Route path={`${prefix}/inbox`} element={<InboxPage />} />
+          <Route
+            path={`${prefix}/projects/:projectName`}
+            element={
+              <FeatureGatedPage feature="project_kanban">
+                <ProjectHomePage />
+              </FeatureGatedPage>
+            }
+          />
           <Route
             path={`${prefix}/canvas`}
             element={

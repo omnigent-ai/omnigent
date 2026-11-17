@@ -4,6 +4,7 @@ import {
   extractErrorText,
   fetchLastAssistantText,
   latestOutput,
+  leadingSentences,
   previewText,
 } from "./lastAssistantText";
 
@@ -119,6 +120,26 @@ describe("latestOutput", () => {
     expect(latestOutput([reply(manyLines)])?.fullText).toBe(manyLines);
     // Blank lines between paragraphs are dropped from the preview but lose no text.
     expect(latestOutput([reply("one\n\ntwo")])).toEqual({ key: "one\n\ntwo", preview: "one\ntwo" });
+  });
+});
+
+describe("leadingSentences", () => {
+  it("keeps the first sentences of the prose, without markdown", () => {
+    const text = [
+      "## Summary",
+      "I reviewed **three** subscriptions. Netflix renews on `May 2`! Spotify is unused.",
+      "```ts",
+      "const ignored = true.",
+      "```",
+    ].join("\n");
+    expect(leadingSentences(text, 2)).toBe(
+      "I reviewed three subscriptions. Netflix renews on May 2!",
+    );
+    expect(leadingSentences("- Fixed the badge\n- Added a test", 2)).toBe(
+      "Fixed the badge Added a test",
+    );
+    expect(leadingSentences("Only one.", 2)).toBe("Only one.");
+    expect(leadingSentences("```\ncode only\n```", 2)).toBe("");
   });
 });
 

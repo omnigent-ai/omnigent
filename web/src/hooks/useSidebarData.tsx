@@ -16,6 +16,7 @@ import {
   readSidebarViewPreferences,
   sidebarBaseOrdering,
   writeSidebarViewPreferences,
+  type SidebarShowField,
   type SidebarViewPreferences,
 } from "@/lib/sidebarViewPreferences";
 import { parseProjectSessionsQueryKey, recentlyCreatedSessions } from "@/lib/sessionListCache";
@@ -407,6 +408,11 @@ export function useLoadedConversations() {
 /** Loaded rows when a SidebarDataProvider is mounted, else ``undefined``. */
 export function useOptionalLoadedConversations() {
   return useContext(SidebarDataContext)?.loadedData;
+}
+
+/** The sidebar's "Show" row metadata when a SidebarDataProvider is mounted, else none. */
+export function useOptionalSidebarShow(): readonly SidebarShowField[] {
+  return useContext(SidebarDataContext)?.view.show ?? DEFAULT_SIDEBAR_VIEW.show;
 }
 
 /** The caller's own sessions when a SidebarDataProvider is mounted, else ``undefined``. */

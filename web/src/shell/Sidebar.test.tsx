@@ -2487,6 +2487,32 @@ describe("Sidebar sections", () => {
     },
   );
 
+  it("names each row's family role in its tooltip", async () => {
+    const family = { id: "family", representative_id: "conv_parent", pinned: false };
+    mockConversations([
+      conv("conv_parent", "Claude Code", { updated_at: 3, created_at: 1, family }),
+      conv("conv_nested_a", "Claude Code", { updated_at: 2, created_at: 2, family }),
+      conv("conv_nested_b", "Claude Code", { updated_at: 1, created_at: 3, family }),
+    ]);
+    renderSidebar();
+
+    fireEvent.pointerMove(screen.getByRole("link", { name: /conv_parent/ }), {
+      pointerType: "mouse",
+    });
+    expect(await screen.findByTestId("session-tooltip-family")).toHaveTextContent(
+      /^Nested sessions\s*2$/,
+    );
+    cleanup();
+
+    renderSidebar();
+    fireEvent.pointerMove(screen.getByRole("link", { name: /conv_nested_a/ }), {
+      pointerType: "mouse",
+    });
+    expect(await screen.findByTestId("session-tooltip-family")).toHaveTextContent(
+      /^Nested in\s*conv_parent$/,
+    );
+  });
+
   it("toggles the family when its parent row is clicked", () => {
     const family = { id: "family", representative_id: "conv_parent", pinned: false };
     mockConversations([
