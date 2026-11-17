@@ -6196,6 +6196,64 @@
         "title": "PresenceViewer",
         "type": "object"
       },
+      "ProactiveAgentPrompt": {
+        "description": "The prompt the agent runs with.",
+        "properties": {
+          "default_prompt": {
+            "description": "The bundled prompt, which a release can change.",
+            "title": "Default Prompt",
+            "type": "string"
+          },
+          "overridden": {
+            "description": "Whether an override replaces the bundled prompt.",
+            "title": "Overridden",
+            "type": "boolean"
+          },
+          "prompt": {
+            "description": "The admin's override, or the bundled prompt without one.",
+            "title": "Prompt",
+            "type": "string"
+          }
+        },
+        "required": [
+          "prompt",
+          "default_prompt",
+          "overridden"
+        ],
+        "title": "ProactiveAgentPrompt",
+        "type": "object"
+      },
+      "ProactiveAgentRuns": {
+        "description": "Result of a Run now.",
+        "properties": {
+          "skipped": {
+            "items": {
+              "$ref": "#/components/schemas/SkippedRun"
+            },
+            "title": "Skipped",
+            "type": "array"
+          },
+          "started": {
+            "items": {
+              "$ref": "#/components/schemas/StartedRun"
+            },
+            "title": "Started",
+            "type": "array"
+          },
+          "truncated": {
+            "default": false,
+            "description": "`\"*\"` matched more than `MAX_RUN_ALL_TASKS` tasks; only that many were started.",
+            "title": "Truncated",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "started",
+          "skipped"
+        ],
+        "title": "ProactiveAgentRuns",
+        "type": "object"
+      },
       "ProactiveAgentSettings": {
         "description": "The caller's view of the settings.",
         "properties": {
@@ -7389,6 +7447,26 @@
           "rationale"
         ],
         "title": "RoutingDecisionData",
+        "type": "object"
+      },
+      "RunProactiveAgent": {
+        "additionalProperties": false,
+        "description": "Body of a Run now: user ids, or `[\"*\"]` for every user with a task.",
+        "properties": {
+          "users": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 100,
+            "minItems": 1,
+            "title": "Users",
+            "type": "array"
+          }
+        },
+        "required": [
+          "users"
+        ],
+        "title": "RunProactiveAgent",
         "type": "object"
       },
       "SandboxProfileSummary": {
@@ -14337,6 +14415,30 @@
         "title": "SetCodexGoalRequest",
         "type": "object"
       },
+      "SetProactiveAgentPrompt": {
+        "additionalProperties": false,
+        "description": "Body of a prompt change; `null` restores the bundled prompt.",
+        "properties": {
+          "prompt": {
+            "anyOf": [
+              {
+                "maxLength": 16000,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prompt"
+          }
+        },
+        "required": [
+          "prompt"
+        ],
+        "title": "SetProactiveAgentPrompt",
+        "type": "object"
+      },
       "SetSharingRequest": {
         "description": "Body for `PUT /v1/sharing`.\n\nEvery field is optional so an admin can update each setting\nindependently; at least one must be present.",
         "properties": {
@@ -14588,6 +14690,30 @@
         "title": "SkillsResponse",
         "type": "object"
       },
+      "SkippedRun": {
+        "properties": {
+          "reason": {
+            "enum": [
+              "no_task",
+              "turned_off",
+              "already_running",
+              "unavailable"
+            ],
+            "title": "Reason",
+            "type": "string"
+          },
+          "user_id": {
+            "title": "User Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "user_id",
+          "reason"
+        ],
+        "title": "SkippedRun",
+        "type": "object"
+      },
       "SlashCommandData": {
         "description": "Data payload for a slash-command invocation observed in a\nharness transcript (today: Claude Code's embedded TUI).\n\nListed in `NON_CONTENT_ITEM_TYPES` so the agent loop's\nhistory filter skips it \u2014 a downstream LLM never sees this as a\nphantom tool call. Field names mirror `function_call` so the\nweb renderer can reuse the tool-card layout.\n\n**Parameters**\n\n- `agent` \u2014 Harness/agent name, e.g. `\"claude-native-ui\"`. Serialized as `\"model\"` for parity with other items.",
         "properties": {
@@ -14662,6 +14788,35 @@
           "oss"
         ],
         "title": "SmartRoutingSourcesInfo",
+        "type": "object"
+      },
+      "StartedRun": {
+        "properties": {
+          "run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run Id"
+          },
+          "task_id": {
+            "title": "Task Id",
+            "type": "string"
+          },
+          "user_id": {
+            "title": "User Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "user_id",
+          "task_id"
+        ],
+        "title": "StartedRun",
         "type": "object"
       },
       "StartupInputOptions": {
@@ -16697,7 +16852,7 @@
     },
     "/v1/agents": {
       "get": {
-        "description": "List server agents, or with `scope=user` the caller's own agents.\n\nServer agents come from `agent_store.list()`, which never returns\nuser agents. `scope=user` returns the caller's user agents newest\nfirst, at most 50 per page and paged with `after` only; `last_id`\nis the last row the server read, which may not be in `data`.\n\nPackaged built-ins the deployment suppressed via\n`OMNIGENT_SEEDED_AGENTS` are filtered out after the store page is\nread, so `first_id`, `last_id` and `has_more` describe the rows\nread, not the rows returned. A page can hold fewer than `limit` rows,\nor none; keep following `last_id` while `has_more` is true.\nSuppressing hides a row without deleting it, so a session already\nbound to one keeps working.\n\n**Returns:** An `AgentList` of agents; for server agents it also names the packaged built-ins the deployment suppressed.",
+        "description": "List server agents, or with `scope=user` the caller's own agents.\n\nServer agents come from `agent_store.list()`, which never returns\nuser agents. `scope=user` returns the caller's user agents newest\nfirst, at most 50 per page and paged with `after` only; `last_id`\nis the last row the server read, which may not be in `data`.\n\nPackaged built-ins the deployment suppressed via\n`OMNIGENT_SEEDED_AGENTS`, and the built-in proactive agent, are\nfiltered out after the store page is read, so `first_id`,\n`last_id` and `has_more` describe the rows read, not the rows\nreturned. A page can hold fewer than `limit` rows,\nor none; keep following `last_id` while `has_more` is true.\nSuppressing hides a row without deleting it, so a session already\nbound to one keeps working.\n\n**Returns:** An `AgentList` of agents; for server agents it also names the packaged built-ins the deployment suppressed.",
         "operationId": "list_builtin_agents_v1_agents_get",
         "parameters": [
           {
@@ -19466,6 +19621,107 @@
         "summary": "List Registry",
         "tags": [
           "policy_registry"
+        ]
+      }
+    },
+    "/v1/proactive-agent/prompt": {
+      "get": {
+        "operationId": "read_prompt_v1_proactive_agent_prompt_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProactiveAgentPrompt"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Read Prompt",
+        "tags": [
+          "proactive_agent"
+        ]
+      },
+      "put": {
+        "operationId": "set_prompt_v1_proactive_agent_prompt_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetProactiveAgentPrompt"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProactiveAgentPrompt"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Set Prompt",
+        "tags": [
+          "proactive_agent"
+        ]
+      }
+    },
+    "/v1/proactive-agent/runs": {
+      "post": {
+        "operationId": "run_now_v1_proactive_agent_runs_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RunProactiveAgent"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProactiveAgentRuns"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Run Now",
+        "tags": [
+          "proactive_agent"
         ]
       }
     },

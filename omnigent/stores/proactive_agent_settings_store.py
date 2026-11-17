@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 
 import zstandard
-from sqlalchemy import LargeBinary, and_, or_, select, type_coerce
+from sqlalchemy import LargeBinary, and_, delete, or_, select, type_coerce
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -34,6 +34,12 @@ WORKSPACE_SETTINGS_USER = "__workspace_settings__"
 # through the user-setting path; that path refuses the reserved name as well.
 _WORKSPACE_KEY = "proactive_agent.v1.workspace_enabled"
 _USER_KEY = "proactive_agent.v1.enabled"
+_PROMPT_KEY = "proactive_agent.v1.prompt"
+# Longest prompt override, in UTF-8 bytes, so the stored value stays under the
+# 16,383-byte cap for a database value even uncompressed.
+MAX_PROMPT_OVERRIDE_BYTES = 16_000
+# The stored JSON text may be longer than the prompt (escapes); readers stop here.
+_MAX_STORED_PROMPT_BYTES = 4 * MAX_PROMPT_OVERRIDE_BYTES
 
 
 def _decode_enabled(raw: bytes | str | memoryview | None) -> bool:
@@ -125,8 +131,54 @@ class ProactiveAgentSettingsStore:
 
         run_write_transaction(self._session_immediate, "write_proactive_agent_user_setting", write)
 
-    def _write(self, session: Session, owner: str, key: str, enabled: bool) -> None:
-        value = json.dumps(enabled)
+    def read_prompt_override(self) -> str | None:
+        """Return the admin's replacement for the agent's built-in prompt, if any."""
+        stmt = select(type_coerce(SqlPreference.value, LargeBinary)).where(
+            SqlPreference.workspace_id == current_workspace_id(),
+            SqlPreference.user_id == WORKSPACE_SETTINGS_USER,
+            SqlPreference.key == _PROMPT_KEY,
+        )
+        with self._session("read_proactive_agent_prompt") as session:
+            raw = session.scalar(stmt)
+        if raw is None:
+            return None
+        try:
+            prompt = json.loads(decode(raw, max_decoded_bytes=_MAX_STORED_PROMPT_BYTES) or "")
+        except (ValueError, TypeError):
+            return None
+        return prompt if isinstance(prompt, str) and prompt.strip() else None
+
+    def set_prompt_override(self, prompt: str | None) -> None:
+        """Replace the agent's built-in prompt for the workspace; ``None`` restores it.
+
+        :raises ValueError: If *prompt* is longer than
+            :data:`MAX_PROMPT_OVERRIDE_BYTES` bytes of UTF-8, or its JSON text is
+            longer than readers accept.
+        """
+        if prompt is not None and len(prompt.encode("utf-8")) > MAX_PROMPT_OVERRIDE_BYTES:
+            raise ValueError(f"the prompt is longer than {MAX_PROMPT_OVERRIDE_BYTES} bytes")
+        if (
+            prompt is not None
+            and len(json.dumps(prompt).encode("utf-8")) > _MAX_STORED_PROMPT_BYTES
+        ):
+            raise ValueError("the prompt has too many characters that need escaping")
+
+        def write(session: Session) -> None:
+            if prompt is None:
+                session.execute(
+                    delete(SqlPreference).where(
+                        SqlPreference.workspace_id == current_workspace_id(),
+                        SqlPreference.user_id == WORKSPACE_SETTINGS_USER,
+                        SqlPreference.key == _PROMPT_KEY,
+                    )
+                )
+            else:
+                self._write(session, WORKSPACE_SETTINGS_USER, _PROMPT_KEY, prompt)
+
+        run_write_transaction(self._session_immediate, "write_proactive_agent_prompt", write)
+
+    def _write(self, session: Session, owner: str, key: str, setting: bool | str) -> None:
+        value = json.dumps(setting)
         values = {
             "workspace_id": current_workspace_id(),
             "user_id": owner,

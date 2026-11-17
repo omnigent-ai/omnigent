@@ -38,6 +38,11 @@ from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.bundles import agent_for_user
 from omnigent.server.feature_flags import DeploymentGate, deployment_gate_enabled
 from omnigent.server.managed_hosts import parse_repo_workspace
+from omnigent.server.proactive_agent import (
+    PROACTIVE_AGENT_IDS,
+    is_proactive_task,
+    reject_proactive_agent_id,
+)
 from omnigent.server.routes._agent_origin import require_agent_origin
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._host_launch import resolve_host_owner
@@ -88,6 +93,7 @@ from omnigent.tools.browser_agent_tools import (
     BROWSER_AGENT_TOOLS_CREATION_LABEL_KEYS,
     browser_agent_tools_creation_labels,
 )
+from omnigent.util.uuid import normalize_uuid
 
 _logger = logging.getLogger(__name__)
 
@@ -591,9 +597,12 @@ def create_scheduled_tasks_router(
         enumerable across users.
         """
         task = store.get(scheduled_task_id)
-        if task is None or not owns_scheduled_task(task, owner):
+        # Proactive tasks are framework-owned and never shown to their owner.
+        if task is None or is_proactive_task(task) or not owns_scheduled_task(task, owner):
             raise OmnigentError("Scheduled task not found", code=ErrorCode.NOT_FOUND)
         return task
+
+    _reject_proactive_agent = reject_proactive_agent_id
 
     async def _validated_mcp_services(
         request: Request, services: list[str], agent: Agent, owner: str
@@ -693,6 +702,12 @@ def create_scheduled_tasks_router(
             )
         if conv.agent_id is None:
             raise OmnigentError("The session has no agent to copy", code=ErrorCode.INVALID_INPUT)
+        # Its copy would carry the hidden proactive agent into a user automation.
+        if normalize_uuid(conv.agent_id) in PROACTIVE_AGENT_IDS:
+            raise OmnigentError(
+                "An automation can't start from a proactive agent's session",
+                code=ErrorCode.INVALID_INPUT,
+            )
         from omnigent.server.scheduled.source_session import last_finished_response_id
 
         # Runs start from the history through the last finished reply, so there must be one.
@@ -940,6 +955,7 @@ def create_scheduled_tasks_router(
             conversation_store=conversation_store,
             permission_store=permission_store,
         )
+        _reject_proactive_agent(body.agent_id)
         await _validate_rrule_or_400(
             body.rrule,
             body.session_mode,
@@ -1128,7 +1144,7 @@ def create_scheduled_tasks_router(
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
         tasks = [
             t
-            for t in store.list(owner_user_id=owner_id)
+            for t in store.list(owner_user_id=owner_id, exclude_agent_ids=PROACTIVE_AGENT_IDS)
             if owns_scheduled_task(t, owner_id) and (kind == "all" or t.kind == "automation")
         ]
         task_ids = [t.id for t in tasks]
@@ -1175,6 +1191,7 @@ def create_scheduled_tasks_router(
             check_generation=current_account_user() is not None,
             after=cursor,
             limit=limit,
+            exclude_agent_ids=PROACTIVE_AGENT_IDS,
         )
         return AutomationFailurePage(
             data=failures,
@@ -1429,6 +1446,7 @@ def create_scheduled_tasks_router(
         )
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
         stored = _require_owned(scheduled_task_id, owner_id)
+        _reject_proactive_agent(body.agent_id)
         existing = without_legacy_sandbox_workspace(stored)
         legacy_workspace = existing.workspace != stored.workspace
         if body.timezone is not None:
