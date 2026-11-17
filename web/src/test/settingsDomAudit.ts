@@ -93,9 +93,11 @@ function describe(element: Element): string {
 
 function parseControlId(value: string): { id: string; part?: string } {
   const separator = value.indexOf(":");
-  return separator === -1
-    ? { id: value }
-    : { id: value.slice(0, separator), part: value.slice(separator + 1) };
+  // A row's main control is `id:`, the same form its hash takes, and names no part.
+  if (separator === -1 || separator === value.length - 1) {
+    return { id: separator === -1 ? value : value.slice(0, separator) };
+  }
+  return { id: value.slice(0, separator), part: value.slice(separator + 1) };
 }
 
 /**
@@ -853,15 +855,10 @@ function isPartHelp(control: Element, name: string, entryFor: EntryLookup): bool
   if (!rowElement || !row?.entry || !control.matches("button")) return false;
   const entry = row.entry;
   // Each part's name, and the sub-label a part (or the main control) shows when it differs.
-  const labels: [string | undefined, string][] = [
-    ...Object.entries(entry.parts ?? {}).map(([part, partName]): [string, string] => [
-      part,
-      partName,
-    ]),
-    ...Object.entries(entry.partLabels ?? {}).map(([part, label]): [string | undefined, string] => [
-      part === "" ? undefined : part,
-      label,
-    ]),
+  // The main control's sub-label is keyed "", which is also its control id's part.
+  const labels: [string, string][] = [
+    ...Object.entries(entry.parts ?? {}),
+    ...Object.entries(entry.partLabels ?? {}),
   ];
   return labels.some(([part, label]) => {
     if (name !== `About ${label}`) return false;

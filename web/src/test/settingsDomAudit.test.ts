@@ -664,7 +664,8 @@ describe("a row's plumbing and sub-labels", () => {
     partLabels: { "": "Theme palette", contrast: "Contrast" },
   };
   const entries = new Map([SYNC, THEME].map((entry) => [entry.id, entry]));
-  const MAIN = `<button role="combobox" aria-labelledby="settings-fixture.theme-label" data-settings-control="fixture.theme"></button>`;
+  // The main control as settingsControlProps renders it: `id:`, naming no part.
+  const MAIN = `<button role="combobox" aria-labelledby="settings-fixture.theme-label" data-settings-control="fixture.theme:"></button>`;
   const CONTRAST = `<input type="range" aria-label="Theme contrast" data-settings-control="fixture.theme:contrast">`;
   const row = (body: string) =>
     `<div data-settings-item="fixture.theme"><span id="settings-fixture.theme-label">Color theme</span>${body}</div>`;
