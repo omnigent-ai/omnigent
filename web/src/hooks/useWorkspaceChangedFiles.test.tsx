@@ -1150,6 +1150,14 @@ function dirEntry(path: string, type: "file" | "directory" = "file") {
   };
 }
 
+/** A listing the workspace API answers with, in its REST-shaped entries. */
+function apiListing(paths: string[], hasMore = false) {
+  return {
+    data: paths.map((path) => ({ ...dirEntry(path), name: path.split("/").pop() ?? path })),
+    hasMore,
+  };
+}
+
 function FileExistsProbe({
   id,
   path,
@@ -1191,6 +1199,25 @@ function FileExistenceProbe({
 describe("useWorkspaceFileExists", () => {
   beforeEach(() => {
     onlineMock.mockReturnValue(true);
+  });
+
+  it("checks the parent through the workspace API, leaving a miss open when it has more", async () => {
+    vi.mocked(listDirectoryViaWorkspaceApi).mockResolvedValueOnce(
+      apiListing(["docs/target.md"], true),
+    );
+    const found: { exists: boolean; settled: boolean }[] = [];
+    const missing: { exists: boolean; settled: boolean }[] = [];
+    render(
+      <Wrap>
+        <FileExistenceProbe id="conv_api" path="docs/target.md" onResult={(r) => found.push(r)} />
+        <FileExistenceProbe id="conv_api" path="docs/unseen.md" onResult={(r) => missing.push(r)} />
+      </Wrap>,
+    );
+
+    await waitFor(() => expect(found.at(-1)).toEqual({ exists: true, settled: true }));
+    expect(missing.at(-1)).toEqual({ exists: false, settled: false });
+    expect(listDirectoryViaWorkspaceApi).toHaveBeenCalledWith("conv_api", "docs", 10_000);
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("lists the parent directory and reports an existing file as present", async () => {
@@ -1821,6 +1848,24 @@ describe("browse-location listings normalize to paths relative to the location",
     expect(onPaths).toHaveBeenLastCalledWith(["summary.md", "q3.csv"]);
   });
 
+  it("strips the echoed prefix from a workspace API listing too", async () => {
+    fetchMock.mockResolvedValueOnce(environmentResponse());
+    vi.mocked(listDirectoryViaWorkspaceApi).mockResolvedValueOnce(
+      apiListing(["reports/summary.md", "reports/q3.csv"]),
+    );
+    const onPaths = vi.fn();
+
+    render(
+      <Wrap>
+        <AllFilesPathsProbe id="conv_rel_api" location="reports" onPaths={onPaths} />
+      </Wrap>,
+    );
+    await waitFor(() => expect(onPaths).toHaveBeenCalled());
+
+    expect(onPaths).toHaveBeenLastCalledWith(["summary.md", "q3.csv"]);
+    expect(listDirectoryViaWorkspaceApi).toHaveBeenCalledWith("conv_rel_api", "reports", 1000);
+  });
+
   it("leaves an absolute location's already-bare paths alone", async () => {
     fetchMock
       .mockResolvedValueOnce(environmentResponse())
@@ -1835,6 +1880,7 @@ describe("browse-location listings normalize to paths relative to the location",
     await waitFor(() => expect(onPaths).toHaveBeenCalled());
 
     expect(onPaths).toHaveBeenLastCalledWith(["summary.md"]);
+    expect(listDirectoryViaWorkspaceApi).not.toHaveBeenCalled();
   });
 
   it.each([

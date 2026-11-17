@@ -321,4 +321,47 @@ describe("readFileViaWorkspaceApi", () => {
     // Stops at the caller's limit and reports that more remain.
     expect((await listDirectoryViaWorkspaceApi("s-list", "src", 1))?.hasMore).toBe(true);
   });
+
+  it("leaves a listing the host answers with an error to REST, and keeps the route for reads", async () => {
+    enable("workspace_api_server_access");
+    vi.mocked(authenticatedFetch).mockImplementation(async (input) =>
+      String(input).endsWith("/ListDirectory")
+        ? Response.json({ code: "not_found", message: "not a directory" }, { status: 404 })
+        : new Response(textFile(), { headers: CONNECT_HEADERS }),
+    );
+
+    expect(await listDirectoryViaWorkspaceApi("s-list-error", "notes.md", 1000)).toBeNull();
+    expect((await readFileViaWorkspaceApi("s-list-error", "notes.md"))?.content).toBe("héllo");
+  });
+
+  it("starts a listing over on the next route when one fails part way", async () => {
+    enable("workspace_direct_access", "workspace_api_server_access");
+    const firstPage = create(ListDirectoryResponseSchema, {
+      entries: [{ name: "a.ts", path: "src/a.ts", type: EntryType.FILE }],
+      nextPageToken: "src/a.ts",
+    });
+    socket.mockResolvedValueOnce({
+      status: 200,
+      headers: { "content-type": "application/proto" },
+      body: toBinary(ListDirectoryResponseSchema, firstPage),
+    });
+    socket.mockRejectedValueOnce(new Error("the SSH connection closed"));
+    const serverTokens: string[] = [];
+    vi.mocked(authenticatedFetch).mockImplementation(async (input, init) => {
+      if (String(input).endsWith("/direct-access")) {
+        return Response.json({
+          host_id: "host-1",
+          socket_path: "/tmp/omnigent-workspace-x/workspace.sock",
+          token: "tok",
+          expires_at: Date.now() / 1000 + 300,
+        });
+      }
+      serverTokens.push(fromBinary(ListDirectoryRequestSchema, init!.body as Uint8Array).pageToken);
+      return Response.json({ code: "internal", message: "tunnel down" }, { status: 500 });
+    });
+
+    expect(await listDirectoryViaWorkspaceApi("s-list-partial", "src", 1000)).toBeNull();
+    expect(socket).toHaveBeenCalledTimes(2);
+    expect(serverTokens).toEqual([""]);
+  });
 });
