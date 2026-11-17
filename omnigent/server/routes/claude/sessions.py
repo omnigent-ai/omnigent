@@ -43,12 +43,16 @@ async def _read_claude_goal_from_runner(
     :param runner_router: Router resolving the session's runner client.
     :returns: The runner's goal read, an unavailable read, or ``None`` when
         no runner client resolves on this replica.
+    :raises OmnigentError: ``WRONG_REPLICA`` when the bound runner's tunnel is
+        on another replica.
     """
     try:
         result = await _forward_session_change_to_runner(
             session_id, runner_router, dict(_CLAUDE_GOAL_GET_EVENT)
         )
     except OmnigentError as exc:
+        if exc.code == ErrorCode.WRONG_REPLICA:
+            raise
         _logger.debug("Claude goal read skipped for session=%s: %s", session_id, exc)
         return _UNAVAILABLE
     if result is None:

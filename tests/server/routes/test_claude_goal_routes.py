@@ -18,7 +18,7 @@ from omnigent._wrapper_labels import (
     CODEX_NATIVE_WRAPPER_VALUE,
     WRAPPER_LABEL_KEY,
 )
-from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.errors import ErrorCode, OmnigentError, WrongReplicaError
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes.claude import sessions as claude
 from omnigent.server.routes.sessions import _RunnerForwardResult
@@ -162,3 +162,20 @@ async def test_a_runner_on_another_replica_is_re_addressed_not_unavailable(
         assert response.json()["error"]["code"] == ErrorCode.WRONG_REPLICA
     else:
         assert response.json() == UNAVAILABLE
+
+
+async def test_a_bound_runner_on_another_replica_is_re_addressed(
+    client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session_id = await _session(client, db_uri, CLAUDE_NATIVE_WRAPPER_VALUE)
+    _StagedForward(
+        monkeypatch,
+        WrongReplicaError(
+            "runner is on another replica", host_id="host_0123456789abcdef0123456789abcdef"
+        ),
+    )
+
+    response = await client.get(f"/v1/sessions/{session_id}/claude_goal")
+
+    assert response.status_code == 400, response.text
+    assert response.json()["error"]["code"] == ErrorCode.WRONG_REPLICA

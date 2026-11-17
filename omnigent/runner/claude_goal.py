@@ -46,9 +46,9 @@ class ClaudeGoalRunner:
 
     def forget(self, conv_id: str) -> None:
         """Drop the cached bridge id and transcript reader for a released session."""
-        self._read_tokens.pop(conv_id, None)
         self._bridge_ids.pop(conv_id, None)
         with self._readers_lock:
+            self._read_tokens.pop(conv_id, None)
             self._readers.pop(conv_id, None)
 
     def rebind(self, conv_id: str, bridge_id: str) -> None:
@@ -61,7 +61,7 @@ class ClaudeGoalRunner:
         self.forget(conv_id)
         self._bridge_ids[conv_id] = bridge_id
 
-    def _read(self, conv_id: str, bridge_id: str) -> tuple[bool, ClaudeGoal | None]:
+    def _read(self, conv_id: str, bridge_id: str, token: object) -> tuple[bool, ClaudeGoal | None]:
         """Return ``(available, goal)``; unavailable until a transcript is readable."""
         from omnigent.harnesses.claude_native.bridge import (
             bridge_dir_for_bridge_id,
@@ -72,6 +72,9 @@ class ClaudeGoalRunner:
         if transcript_path is None:
             return False, None
         with self._readers_lock:
+            # A session forgotten or rebound since this read began must not get its reader back.
+            if self._read_tokens.get(conv_id) is not token:
+                return False, None
             reader = self._readers.get(conv_id)
             if reader is None or reader.transcript_path != transcript_path:
                 reader = self._readers[conv_id] = ClaudeGoalStateReader(transcript_path)
@@ -113,7 +116,7 @@ class ClaudeGoalRunner:
                 return _unavailable()
             if bridge_id != conv_id:
                 self._bridge_ids[conv_id] = bridge_id
-        available, goal = await asyncio.to_thread(self._read, conv_id, bridge_id)
+        available, goal = await asyncio.to_thread(self._read, conv_id, bridge_id, token)
         # A rebind during the lookup or read makes this answer describe the old transcript.
         if not available or self._read_tokens.get(conv_id) is not token:
             return _unavailable()

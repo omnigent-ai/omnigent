@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from pathlib import Path
 
 import httpx
@@ -205,3 +206,41 @@ async def test_a_lookup_answered_after_a_rebind_is_discarded(
 
     assert await pending == UNAVAILABLE
     assert await _get(runner) == {"goal": None, "available": True}
+
+
+@pytest.mark.parametrize("rebound", [True, False], ids=["rebind", "release"])
+async def test_a_transcript_read_finishing_after_a_rebind_or_release_is_discarded(
+    tmp_path: Path,
+    transcripts: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    rebound: bool,
+) -> None:
+    inherited = tmp_path / "inherited.jsonl"
+    inherited.write_text(json.dumps(GOAL_SET) + "\n")
+    own = tmp_path / "own.jsonl"
+    own.write_text("")
+    transcripts.update(bridge_inherited=inherited, bridge_own=own)
+    reading, finish = threading.Event(), threading.Event()
+    resolve_transcript = bridge.read_transcript_path
+
+    def slow_resolve_transcript(bridge_dir: Path) -> Path | None:
+        if bridge_dir.name == "bridge_inherited":
+            reading.set()
+            finish.wait(5)
+        return resolve_transcript(bridge_dir)
+
+    monkeypatch.setattr(bridge, "read_transcript_path", slow_resolve_transcript)
+    runner = ClaudeGoalRunner(bridge_id_for_session=_BridgeIds("bridge_inherited"))
+    pending = asyncio.create_task(_get(runner))
+    assert await asyncio.to_thread(reading.wait, 5)
+    if rebound:
+        runner.rebind(SESSION, "bridge_own")
+    else:
+        runner.forget(SESSION)
+    finish.set()
+
+    assert await pending == UNAVAILABLE
+    # The stale read must not leave a transcript reader cached for the session.
+    assert SESSION not in runner._readers
+    if rebound:
+        assert await _get(runner) == {"goal": None, "available": True}
