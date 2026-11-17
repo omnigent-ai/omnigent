@@ -1015,6 +1015,7 @@ async def test_replayed_turn_failure_keeps_its_detail_over_a_later_goal_limit(
 @pytest.mark.asyncio
 async def test_recovered_running_waits_for_replay_that_ended_the_turn(tmp_path: Path) -> None:
     """A live item's recovered running cannot land after resume replay ended its turn."""
+
     write_bridge_state(
         tmp_path,
         CodexNativeBridgeState(
@@ -1149,3 +1150,238 @@ async def test_live_item_does_not_republish_running_that_resume_reported(
         if body["type"] == "external_session_status"
     ]
     assert statuses == ["running"]
+
+
+def _fail_first_running_publish(monkeypatch: pytest.MonkeyPatch, mode: str) -> list[str]:
+    """Make the first ``running`` status publish fail, then pass later publishes through.
+
+    ``mode`` is how the failed publish fails: ``"rejected"`` answers HTTP 500 without
+    raising, ``"raised"`` raises, and ``"cancelled"`` is cancelled mid-publish.
+
+    :returns: The outcome of each ``running`` publish attempt, in order.
+    """
+    real_post_session_event = fwd._post_session_event
+    outcomes: list[str] = []
+
+    async def flaky(client, session_id, *, event_type, data, **kwargs):  # type: ignore[no-untyped-def]
+        is_running = event_type == "external_session_status" and data.get("status") == "running"
+        if is_running and not outcomes:
+            outcomes.append(mode)
+            if mode == "raised":
+                raise RuntimeError("credential resolution failed")
+            if mode == "cancelled":
+                raise asyncio.CancelledError()
+            return httpx.Response(500, json={"error": "server unavailable"})
+        if is_running:
+            outcomes.append("accepted")
+        return await real_post_session_event(
+            client, session_id, event_type=event_type, data=data, **kwargs
+        )
+
+    monkeypatch.setattr(fwd, "_post_session_event", flaky)
+    return outcomes
+
+
+def _running_statuses(client: _RecordingClient) -> list[str]:
+    """Return the statuses of the external session status posts the server accepted."""
+    return [
+        body["data"]["status"]
+        for _, body in client.posts
+        if body["type"] == "external_session_status"
+    ]
+
+
+def _live_item(item_id: str) -> dict:
+    """Return a live ``item/completed`` notification for the active turn of ``thread_1``."""
+    return {
+        "method": "item/completed",
+        "params": {
+            "threadId": "thread_1",
+            "turnId": "turn_1",
+            "item": {"type": "agentMessage", "id": item_id, "text": "Working."},
+        },
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["rejected", "raised"])
+async def test_failed_running_publish_is_retried_by_the_next_live_item(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, mode: str
+) -> None:
+    """A missed-start running publish that fails once does not suppress recovery.
+
+    The turn's first item fails to publish running; the next live item of the same turn
+    still recovers running, and the turn is reported running exactly once.
+    """
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_x",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id="thread_1",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id="turn_1",
+        ),
+    )
+    outcomes = _fail_first_running_publish(monkeypatch, mode)
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState()
+    locks_token = fwd._conversation_item_locks.set({})
+    try:
+        for item_id in ("item_1", "item_2"):
+            # The supervisor logs a raised publish and keeps delivering later items.
+            with contextlib.suppress(RuntimeError):
+                await fwd._post_missed_turn_start(
+                    client,  # type: ignore[arg-type]
+                    session_id="conv_x",
+                    bridge_dir=tmp_path,
+                    thread_id="thread_1",
+                    event=_live_item(item_id),
+                    forwarder_state=state,
+                )
+    finally:
+        fwd._conversation_item_locks.reset(locks_token)
+
+    assert outcomes == [mode, "accepted"]
+    assert _running_statuses(client) == ["running"]
+    assert state.running_reported_turn_id == "turn_1"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_running_publish_is_retried_by_the_next_live_item(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A cancelled running publish leaves the turn unmarked, so the next item publishes it."""
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_x",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id="thread_1",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id="turn_1",
+        ),
+    )
+    outcomes = _fail_first_running_publish(monkeypatch, "cancelled")
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState()
+    locks_token = fwd._conversation_item_locks.set({})
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await fwd._post_missed_turn_start(
+                client,  # type: ignore[arg-type]
+                session_id="conv_x",
+                bridge_dir=tmp_path,
+                thread_id="thread_1",
+                event=_live_item("item_1"),
+                forwarder_state=state,
+            )
+        assert state.running_reported_turn_id is None
+        await fwd._post_missed_turn_start(
+            client,  # type: ignore[arg-type]
+            session_id="conv_x",
+            bridge_dir=tmp_path,
+            thread_id="thread_1",
+            event=_live_item("item_2"),
+            forwarder_state=state,
+        )
+    finally:
+        fwd._conversation_item_locks.reset(locks_token)
+
+    assert outcomes == ["cancelled", "accepted"]
+    assert _running_statuses(client) == ["running"]
+
+
+@pytest.mark.asyncio
+async def test_failed_resume_running_publish_does_not_suppress_live_recovery(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A resume replay whose running publish is rejected leaves the turn for live recovery."""
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_x",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id="thread_1",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id="turn_1",
+        ),
+    )
+    outcomes = _fail_first_running_publish(monkeypatch, "rejected")
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState()
+    locks_token = fwd._conversation_item_locks.set({})
+    try:
+        await fwd._post_resume_turn_status(
+            client,  # type: ignore[arg-type]
+            session_id="conv_x",
+            bridge_dir=tmp_path,
+            thread_id="thread_1",
+            turns=[{"id": "turn_1", "status": "inProgress", "items": []}],
+            forwarder_state=state,
+        )
+        assert state.running_reported_turn_id is None
+        await fwd._post_missed_turn_start(
+            client,  # type: ignore[arg-type]
+            session_id="conv_x",
+            bridge_dir=tmp_path,
+            thread_id="thread_1",
+            event=_live_item("item_1"),
+            forwarder_state=state,
+        )
+    finally:
+        fwd._conversation_item_locks.reset(locks_token)
+
+    assert outcomes == ["rejected", "accepted"]
+    assert _running_statuses(client) == ["running"]
+
+
+@pytest.mark.asyncio
+async def test_failed_turn_started_publish_does_not_suppress_live_recovery(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A turn/started whose running publish is rejected leaves the turn for live recovery."""
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_x",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id="thread_1",
+            codex_home=str(tmp_path / "codex-home"),
+        ),
+    )
+    outcomes = _fail_first_running_publish(monkeypatch, "rejected")
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState()
+    locks_token = fwd._conversation_item_locks.set({})
+    try:
+        await fwd._handle_event(
+            client,  # type: ignore[arg-type]
+            session_id="conv_x",
+            bridge_dir=tmp_path,
+            event={
+                "method": "turn/started",
+                "params": {
+                    "threadId": "thread_1",
+                    "turn": {"id": "turn_1", "status": "inProgress"},
+                },
+            },
+            usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_x"),  # type: ignore[arg-type]
+            elicitation_tracker=fwd._CodexElicitationTaskTracker(),
+            expected_thread_id="thread_1",
+            forwarder_state=state,
+        )
+        assert state.running_reported_turn_id is None
+        await fwd._post_missed_turn_start(
+            client,  # type: ignore[arg-type]
+            session_id="conv_x",
+            bridge_dir=tmp_path,
+            thread_id="thread_1",
+            event=_live_item("item_1"),
+            forwarder_state=state,
+        )
+    finally:
+        fwd._conversation_item_locks.reset(locks_token)
+
+    assert outcomes == ["rejected", "accepted"]
+    assert _running_statuses(client) == ["running"]
