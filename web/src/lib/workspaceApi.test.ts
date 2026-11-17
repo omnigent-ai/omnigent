@@ -179,6 +179,21 @@ describe("readFileViaWorkspaceApi", () => {
     expect(socket).toHaveBeenCalledTimes(1);
   });
 
+  it("reads through the server while the desktop holds a question, and tries the socket next time", async () => {
+    enable("workspace_direct_access", "workspace_api_server_access");
+    serve(textFile);
+    const busy = new TextEncoder().encode('{"code":"unavailable"}');
+    socket.mockResolvedValueOnce(fromSocket(busy, 503));
+    socket.mockImplementation(async () => fromSocket(textFile()));
+
+    expect(
+      (await readFileViaWorkspaceApi("s-held", "notes.md", undefined, "my-box"))?.content,
+    ).toBe("héllo");
+    await readFileViaWorkspaceApi("s-held", "notes.md", undefined, "my-box");
+
+    expect(socket).toHaveBeenCalledTimes(2);
+  });
+
   it("offers the host's SSH alias, and retries the socket only for a new one", async () => {
     enable("workspace_direct_access", "workspace_api_server_access");
     serve(textFile);

@@ -4,6 +4,7 @@
 // asks the user before it runs SSH with one, and records it only after a call
 // the host checks a token for succeeds over it.
 
+const { canonicalHostId } = require("./sshHosts");
 const { validateDestination } = require("./ssh_connect");
 
 // An allowed alias that fails is not tried again for this long.
@@ -28,29 +29,41 @@ function suggestedAlias(alias) {
 function createSshTargetChecks(deps) {
   const now = deps.now ?? Date.now;
   const allowed = new Set();
-  // Per server and alias, whichever host it was offered for, until restart.
+  // Servers the user said "Not now" to, so a server can't keep asking with new names.
   const declined = new Set();
   // Also kept here, so a record that fails to save isn't probed on every read.
   const proven = new Set();
   const failedUntil = new Map();
+  // When the host last refused a suggestion's probe; a second refusal soon after is a failure.
+  const refusedAt = new Map();
   const pending = new Map();
-  let asking = false;
+  // Servers with a question open; their other suggestions wait for a later read.
+  const asking = new Set();
 
-  async function check(serverUrl, hostId, alias, { approve, proves }) {
-    const key = JSON.stringify([serverUrl, hostId, alias]);
+  async function check(key, serverUrl, hostId, alias, { approve, proves }) {
     if (!allowed.has(key)) {
-      asking = true;
+      asking.add(serverUrl);
       // null: the question couldn't be shown, so nothing is remembered.
-      const answer = await approve().catch(() => null);
-      asking = false;
+      const answer = await Promise.resolve()
+        .then(approve)
+        .catch(() => null);
+      asking.delete(serverUrl);
       if (answer !== true) {
-        if (answer === false) declined.add(JSON.stringify([serverUrl, alias]));
+        if (answer === false) declined.add(serverUrl);
         return false;
       }
       allowed.add(key);
     }
-    // Unreachable, refused or not this host: the read goes through the server.
-    if (!(await proves().catch(() => false))) {
+    const proof = await proves().catch(() => false);
+    const refusedRecently = now() - (refusedAt.get(key) ?? -Infinity) < RETRY_MS;
+    refusedAt.delete(key);
+    // A token refused once (it expired during the question, say) is the page's to renew.
+    if (proof === "refused" && !refusedRecently) {
+      refusedAt.set(key, now());
+      return proof;
+    }
+    // Unreachable, not this host, or refusing renewed tokens too: the read goes through the server.
+    if (proof !== true) {
       failedUntil.set(key, now() + RETRY_MS);
       return false;
     }
@@ -66,26 +79,29 @@ function createSshTargetChecks(deps) {
   return {
     /**
      * Resolve true once the user allows `alias` and it proves to reach `hostId`
-     * (and is recorded), else false. Concurrent checks of one suggestion share
-     * one attempt, and only one question is open at a time.
+     * (and is recorded), "refused" the first time the host there refuses the
+     * call's token, "busy" while another question for the server is open, else
+     * false. Concurrent checks of one suggestion share one attempt.
      *
      * @param {string} serverUrl
      * @param {string} hostId
      * @param {string} alias A value `suggestedAlias` accepted.
-     * @param {{approve: () => Promise<boolean | null>, proves: () => Promise<boolean>}} steps
+     * @param {{approve: () => Promise<boolean | null>, proves: () => Promise<boolean | "refused">}} steps
      *   Ask the user (null if it couldn't); then make a token-checked call over `alias`.
-     * @returns {Promise<boolean>}
+     * @returns {Promise<boolean | "refused" | "busy">}
      */
     verify(serverUrl, hostId, alias, steps) {
-      const key = JSON.stringify([serverUrl, hostId, alias]);
+      const key = JSON.stringify([serverUrl, canonicalHostId(hostId), alias]);
       if (proven.has(key)) return Promise.resolve(true);
       const inFlight = pending.get(key);
       if (inFlight) return inFlight;
-      if (declined.has(JSON.stringify([serverUrl, alias]))) return Promise.resolve(false);
+      if (declined.has(serverUrl)) return Promise.resolve(false);
       if ((failedUntil.get(key) ?? 0) > now()) return Promise.resolve(false);
       failedUntil.delete(key);
-      if (asking && !allowed.has(key)) return Promise.resolve(false);
-      const attempt = check(serverUrl, hostId, alias, steps).finally(() => pending.delete(key));
+      if (asking.has(serverUrl) && !allowed.has(key)) return Promise.resolve("busy");
+      const attempt = check(key, serverUrl, hostId, alias, steps).finally(() =>
+        pending.delete(key),
+      );
       pending.set(key, attempt);
       return attempt;
     },
