@@ -31,6 +31,7 @@ def test_catalog_rows_render_for_every_native_picker(
     """The real chat page consumes runner-owned rows for every picker family."""
     chat = chat_session_contract
     chat.contract.json(f"/v1/sessions/{chat.session_id}/codex_goal", {"goal": None})
+    chat.contract.json(f"/v1/sessions/{chat.session_id}/claude_goal", {"goal": None, "available": True})
     for harness in (
         "claude-native",
         "codex-native",
@@ -625,6 +626,8 @@ def test_side_chat_model_settings_before_and_after_first_message(
     contract.json(path, patch, method="PATCH")
     contract.json(f"{path}/events", message, method="POST")
     contract.json(f"{path}/agent", chat._agent())
+    for session_path in (f"/v1/sessions/{chat.session_id}", path):
+        contract.json(f"{session_path}/claude_goal", {"goal": None, "available": True})
     for resource in ("items", "child_sessions", "side_chats", "resources/terminals"):
         contract.json(f"{path}/{resource}", list_payload([]))
     contract.response(f"{path}/read-state", method="PUT")

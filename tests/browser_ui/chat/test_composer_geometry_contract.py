@@ -532,6 +532,7 @@ def test_picker_rows_follow_the_row_grid(
     chat.update_session(
         labels={"omnigent.wrapper": "claude-code-native-ui"}, reasoning_effort="high"
     )
+    chat.contract.json(f"/v1/sessions/{chat.session_id}/claude_goal", {"goal": None, "available": True})
     _surface(page, chat, surface, viewport)
     if surface == "landing":
         page.get_by_test_id("new-chat-landing-agent-select").click()
