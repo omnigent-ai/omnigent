@@ -6935,9 +6935,14 @@ describe("chatStore — delivered-but-unacked send", () => {
   const errorCards = () =>
     useChatStore.getState().blocks.filter((block): block is ErrorBlock => block.type === "error");
 
-  /** Hold every events POST for conv_existing open until answered. */
-  function holdEventPosts(): { answer: () => void; aborted: () => boolean } {
-    let answer: () => void = () => {};
+  /** Hold every events POST for conv_existing open; `answer` and `fail` settle the first. */
+  function holdEventPosts(): {
+    answer: () => void;
+    fail: (reason: Error) => void;
+    aborted: () => boolean;
+    count: () => number;
+  } {
+    const held: { resolve: (response: Response) => void; reject: (reason: unknown) => void }[] = [];
     let aborted = false;
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
       if (String(input).endsWith("/v1/sessions/conv_existing/events") && init?.method === "POST") {
@@ -6947,12 +6952,17 @@ describe("chatStore — delivered-but-unacked send", () => {
             aborted = true;
             reject(init.signal?.reason);
           });
-          answer = () => resolve(mockResponse({ queued: true, item_id: "ci_mock" }));
+          held.push({ resolve, reject });
         });
       }
       return defaultFetchHandler(input, init);
     });
-    return { answer: () => answer(), aborted: () => aborted };
+    return {
+      answer: () => held[0]?.resolve(mockResponse({ queued: true, item_id: "ci_mock" })),
+      fail: (reason) => held[0]?.reject(reason),
+      aborted: () => aborted,
+      count: () => held.length,
+    };
   }
 
   it.each([
@@ -7022,6 +7032,7 @@ describe("chatStore — delivered-but-unacked send", () => {
       }),
     ]);
     expect(post.aborted()).toBe(false);
+    expect(post.count()).toBe(1);
 
     // The POST left running can still deliver the message.
     post.answer();
@@ -7083,9 +7094,62 @@ describe("chatStore — delivered-but-unacked send", () => {
     expect(useChatStore.getState().status).toBe("streaming");
     const queued = useChatStore.getState().queuedMessages;
     expect(sendableQueuedHead(queued, "conv_existing")?.text).toBe("check the rollback plan");
+    expect(post.count()).toBe(1);
     post.answer();
     await sent;
     expect(errorCards()).toEqual([]);
+  });
+
+  it("hands back a native send whose POST fails after another message's receipt took its bubble", async () => {
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+      isNativeTerminalSession: true,
+    });
+    const post = holdEventPosts();
+
+    const sent = useChatStore.getState().send("deploy", "agent_xyz");
+    await vi.waitFor(() => expect(post.count()).toBe(1));
+    // A message typed in the terminal carries no pending id, so it takes the head bubble.
+    commitMirror("1".repeat(32), "typed in the terminal");
+    expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+    post.fail(new TypeError("Failed to fetch"));
+    await sent;
+
+    expect(useChatStore.getState().failedSendDraft).toMatchObject({ text: "deploy" });
+    expect(errorCards()).toEqual([
+      expect.objectContaining({ unansweredSend: expect.objectContaining({ text: "deploy" }) }),
+    ]);
+  });
+
+  it("hands back an unanswered untouched retry of a refused send", async () => {
+    vi.useFakeTimers();
+    onTestFinished(() => {
+      vi.useRealTimers();
+    });
+    const stableId = "e".repeat(32);
+    armRestoredDraft(stableId, { serverRefused: true });
+    // The refused attempt's item stays in the transcript under the id the retry reuses.
+    useChatStore.setState({
+      blocks: itemsToBlocks([{ ...userMessage("refused_first", "resend me"), id: stableId }]),
+    });
+    holdEventPosts();
+    let settled = false;
+
+    void useChatStore
+      .getState()
+      .send("resend me", "agent_xyz")
+      .then(() => {
+        settled = true;
+      });
+    await vi.advanceTimersByTimeAsync(SEND_UNANSWERED_GIVE_UP_MS);
+
+    expect(settled).toBe(true);
+    expect(useChatStore.getState().failedSendDraft).toMatchObject({
+      text: "resend me",
+      stableId,
+      serverRefused: true,
+    });
   });
 
   it("retracts the failed-send draft and card when its message commits under the send's stable id", async () => {
