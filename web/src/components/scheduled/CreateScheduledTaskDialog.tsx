@@ -157,7 +157,9 @@ import type { Session } from "@/lib/types";
 
 const PROVIDER_DEFAULT = "provider-default";
 const PERMISSION_SELECT_DEFAULT = "__agent_default__";
-const DEFAULT_AUTOMATION_PROJECT = "Omnigent Automation";
+const DEFAULT_AUTOMATION_PROJECT = "Automations";
+// The default's earlier name. Users who already have this folder keep using it.
+const LEGACY_AUTOMATION_PROJECT = "Omnigent Automation";
 const AUTOMATION_CONTROL_TRIGGER_CLASS_NAME =
   "h-9! min-h-9! max-w-full justify-start gap-1.5 rounded-lg border border-input bg-transparent py-2 pr-2 pl-2.5 text-ui leading-5 font-normal md:min-h-9! [&_svg]:p-0! [&>svg:last-child]:ml-auto [&>svg:last-child]:text-muted-foreground [&>svg:last-child]:opacity-100 [&_[data-testid$='-agent-model-value']]:font-normal";
 const AUTOMATION_ADVANCED_CONTROL_TRIGGER_CLASS_NAME = `${AUTOMATION_CONTROL_TRIGGER_CLASS_NAME} border-transparent`;
@@ -810,8 +812,11 @@ export function CreateScheduledTaskDialog({
   // A picked project is shown by its id, so a rename elsewhere shows the new name.
   const pickedProject =
     pickedProjectId !== null ? projects.find((p) => p.id === pickedProjectId) : undefined;
+  const defaultProject = projects.some((p) => p.name === LEGACY_AUTOMATION_PROJECT)
+    ? LEGACY_AUTOMATION_PROJECT
+    : DEFAULT_AUTOMATION_PROJECT;
   const effectiveProjectChoice =
-    projectChoice ?? (!isEdit && projectsSupported ? DEFAULT_AUTOMATION_PROJECT : null);
+    projectChoice ?? (!isEdit && projectsSupported ? defaultProject : null);
   const projectName = pickedProject?.name ?? effectiveProjectChoice ?? savedProjectName ?? "";
   const projectIcon = (pickedProject ?? projects.find((p) => p.name === projectName))?.icon;
   // The saved project has no name while the list loads, if it fails to load,

@@ -3923,6 +3923,10 @@ function SectionHeader({
   const actionFocusFade = actionFocusVisible
     ? "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]_:focus-visible]/header:opacity-0"
     : "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]:focus-within]/header:opacity-0";
+  // A dot marker's slot is narrower than the revealed folder controls, so the
+  // title adds the difference to clear them, matching the unmarked pr-14.
+  const titleClearsRevealedControls =
+    icon != null && hasAction && showsMarker && isDotMarker(marker ?? null);
   const button = (
     <button
       ref={
@@ -3993,7 +3997,16 @@ function SectionHeader({
         </span>
       ) : null}
       {/* Project folder names sit heavier than their session rows. */}
-      <span className={cn("min-w-0 truncate", icon && "font-medium")}>{title}</span>
+      <span
+        className={cn(
+          "min-w-0 truncate",
+          icon && "font-medium",
+          titleClearsRevealedControls &&
+            "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:mr-5 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]:focus-within]/header:mr-5 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:mr-5",
+        )}
+      >
+        {title}
+      </span>
       {/* Trailing chevron, rotating on expand. Headers without a leading icon
             reveal it on desktop hover/focus; icon headers show it only on mobile
             (no hover) since desktop swaps the folder for the chevron above. */}

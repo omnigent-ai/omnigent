@@ -3798,6 +3798,14 @@ describe("Sidebar collapsed project marker", () => {
       "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:opacity-0",
       "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]:focus-within]/header:opacity-0",
     );
+    // The revealed controls are wider than the dot slot, so a long title
+    // truncates before them instead of running under the New session button.
+    const header = screen.getByRole("button", { name: /^Customer X/ });
+    expect(within(header).getByText("Customer X")).toHaveClass(
+      "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:mr-5",
+      "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]:focus-within]/header:mr-5",
+      "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:mr-5",
+    );
   });
 
   // The "awaiting" pill is wider than the dot markers; constraining it to the
@@ -3815,6 +3823,11 @@ describe("Sidebar collapsed project marker", () => {
 
     const slot = screen.getByTestId("session-state-badge").parentElement!;
     expect(slot).not.toHaveClass("w-6");
+    // The pill already clears the revealed controls; no extra title reserve.
+    const header = screen.getByRole("button", { name: /^Customer X/ });
+    expect(within(header).getByText("Customer X")).not.toHaveClass(
+      "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:mr-5",
+    );
   });
 });
 

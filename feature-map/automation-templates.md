@@ -89,7 +89,8 @@ to customize.
   saved source restores its prompt. A note warns that saving replaces the old trigger, and the
   save always starts a new polling session (the reset checkbox is locked on); a
   task-session trigger's first match after that starts a new task session.
-- `default-project`: new automations select Omnigent Automation. Saving reuses or
+- `default-project`: new automations select Automations, or an existing
+  Omnigent Automation project from before the rename. Saving reuses or
   creates that project; canceling creates nothing. The project picker can choose
   another project or remove the default. Editing preserves the saved project.
 - `workspace`: connected-host setup disables workspace browsing while the

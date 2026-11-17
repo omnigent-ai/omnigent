@@ -1075,7 +1075,8 @@ def test_scheduled_task_trigger_template_creates_polling_manager_task(
     _open_automations_page(page, live_server)
     if entry == "templates":
         page.set_viewport_size({"width": 1280, "height": 650})
-        heading = page.get_by_role("heading", name="Automations", exact=True)
+        # Level 1, so the sidebar's "Automations" project folder heading can't match.
+        heading = page.get_by_role("heading", name="Automations", exact=True, level=1)
         original_heading = heading.bounding_box()
         assert original_heading is not None
         page.get_by_role("tab", name="Templates", exact=True).click()
@@ -1154,7 +1155,7 @@ def test_scheduled_task_trigger_template_creates_polling_manager_task(
     created = next(t for t in tasks if t["name"] == name)
     assert created["session_mode"] == "continue", created
     projects = httpx.get(f"{live_server}/v1/projects", timeout=10).json()["data"]
-    automation_projects = [p for p in projects if p["name"] == "Omnigent Automation"]
+    automation_projects = [p for p in projects if p["name"] == "Automations"]
     assert len(automation_projects) == 1
     assert created["project_id"] == automation_projects[0]["id"]
     assert created["rrule"].startswith("FREQ=MINUTELY;INTERVAL=10"), created
