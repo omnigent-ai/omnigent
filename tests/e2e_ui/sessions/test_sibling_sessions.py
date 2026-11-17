@@ -303,8 +303,15 @@ async def _drive(rig: ManagedReplicas) -> None:
 
                     # Only the representative offers pin actions.
                     await menu(fresh_id)
-                    await expect(page.get_by_test_id("move-to-project")).to_have_count(0)
+                    await expect(page.get_by_test_id("move-to-project")).to_have_text(
+                        "Move session"
+                    )
                     await expect(page.get_by_test_id("pin-conversation")).to_have_count(0)
+                    await page.get_by_test_id("move-to-project").hover()
+                    await expect(
+                        page.get_by_role("menuitem", name="Remove from nest", exact=True)
+                    ).to_be_visible()
+                    await page.keyboard.press("Escape")
                     await page.keyboard.press("Escape")
                     member_row = page.locator(f'li[data-sidebar-session-id="{fresh_id}"]')
                     await expect(
@@ -340,7 +347,7 @@ async def _drive(rig: ManagedReplicas) -> None:
                     # Project moves are family-wide.
                     await menu(sibling_id)
                     await page.get_by_test_id("move-to-project").hover()
-                    await page.get_by_placeholder("Search or create project").fill("Sibling demo")
+                    await page.get_by_placeholder("Search destinations").fill("Sibling demo")
                     await page.get_by_role(
                         "menuitem", name=re.compile("Create.*Sibling demo")
                     ).click()

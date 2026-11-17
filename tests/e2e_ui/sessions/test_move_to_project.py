@@ -1,7 +1,7 @@
 """Browser e2e for moving a session into a project from the sidebar.
 
 Drives the real move flow the ``useConversations`` unit tests cover in
-isolation: open the session row's context menu, pick *Add to project* →
+isolation: open the session row's context menu, pick *Move session* →
 a first-class project, and assert the row regroups from the flat
 **Sessions** section into the (auto-expanded) project folder — then that
 the membership actually committed server-side (``project_id`` on
@@ -43,7 +43,7 @@ def test_move_session_into_project_regroups_sidebar_row(
     page: Page,
     live_server: str,
 ) -> None:
-    """Add-to-project moves the row into the folder and persists server-side."""
+    """Moving a session into a project regroups its row and persists server-side."""
     uniq = uuid.uuid4().hex[:6]
     project_name = f"E2E Move {uniq}"
     title = f"e2e-move-{uniq}"
@@ -61,9 +61,9 @@ def test_move_session_into_project_regroups_sidebar_row(
         row = page.get_by_text(title, exact=True).first
         expect(row).to_be_visible()
 
-        # Context menu → "Add to project" flyout → pick the seeded project.
+        # Context menu → "Move session" flyout → pick the seeded project.
         row.click(button="right")
-        submenu = page.get_by_role("menuitem", name="Add to project")
+        submenu = page.get_by_test_id("move-to-project")
         expect(submenu).to_be_visible()
         submenu.hover()
         target = page.get_by_role("menuitem", name=project_name)
