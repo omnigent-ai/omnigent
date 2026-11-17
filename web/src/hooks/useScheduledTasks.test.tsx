@@ -17,6 +17,7 @@ import {
   useDeleteScheduledTask,
   useRunScheduledTaskNow,
   useScheduledTask,
+  useScheduledTaskRunPullRequests,
   useScheduledTaskRuns,
   useScheduledTaskRunSteps,
   useScheduledTasks,
@@ -30,6 +31,7 @@ vi.mock("@/lib/scheduledTasksApi", () => ({
   getScheduledTask: vi.fn(),
   listScheduledTaskRuns: vi.fn(),
   listScheduledTaskRunSteps: vi.fn(),
+  listScheduledTaskRunPullRequests: vi.fn(),
   createScheduledTask: vi.fn(),
   updateScheduledTask: vi.fn(),
   deleteScheduledTask: vi.fn(),
@@ -611,5 +613,67 @@ describe("useScheduledTaskRuns live refresh", () => {
     vi.mocked(api.listScheduledTaskRuns).mockResolvedValue([RUNNING_RUN]);
     renderHook(() => useScheduledTaskRuns("st_1", false), { wrapper });
     expect(api.listScheduledTaskRuns).not.toHaveBeenCalled();
+  });
+});
+
+describe("useScheduledTaskRunPullRequests", () => {
+  const pullRequest = (state: string | null): api.ScheduledTaskRunPullRequest => ({
+    url: "https://github.com/example/repo/pull/1",
+    provider: "github",
+    repository: "example/repo",
+    number: 1,
+    relationship: "created",
+    state,
+  });
+
+  it("asks again each minute only while a settled run has an open or unknown PR", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: false });
+    try {
+      const { wrapper, queryClient } = makeWrapper();
+      const runs = [{ ...SUCCEEDED_RUN, id: "run_1" }];
+      vi.mocked(api.listScheduledTaskRunPullRequests)
+        .mockResolvedValueOnce([{ runId: "run_1", pullRequests: [pullRequest("OPEN")] }])
+        .mockResolvedValue([{ runId: "run_1", pullRequests: [pullRequest("MERGED")] }]);
+      const { result } = renderHook(() => useScheduledTaskRunPullRequests("st_1", runs, true), {
+        wrapper,
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(result.current.get("run_1")?.pullRequests[0]?.state).toBe("OPEN");
+      expect(api.listScheduledTaskRunPullRequests).toHaveBeenCalledWith("st_1", { limit: 20 });
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(60_000);
+      });
+      expect(api.listScheduledTaskRunPullRequests).toHaveBeenCalledTimes(2);
+      const [cached] = queryClient.getQueriesData<api.ScheduledTaskRunPullRequests[]>({
+        queryKey: ["scheduled-task-run-pull-requests", "st_1"],
+      });
+      expect(cached?.[1]?.[0]?.pullRequests[0]?.state).toBe("MERGED");
+      // Every PR has settled, so nothing asks again.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(180_000);
+      });
+      expect(api.listScheduledTaskRunPullRequests).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("asks for nothing while disabled", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: false });
+    try {
+      const { wrapper } = makeWrapper();
+      renderHook(() => useScheduledTaskRunPullRequests("st_1", [RUNNING_RUN], false), {
+        wrapper,
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000);
+      });
+      expect(api.listScheduledTaskRunPullRequests).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

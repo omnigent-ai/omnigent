@@ -36,6 +36,7 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/component
 import { showToast } from "@/components/ui/toast";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { CreateScheduledTaskDialog } from "@/components/scheduled/CreateScheduledTaskDialog";
+import { RunPullRequests } from "@/components/scheduled/RunPullRequests";
 import {
   automationOwnerName,
   isSharedWithViewer,
@@ -65,6 +66,7 @@ import {
   useRunScheduledTaskNow,
   useScheduledTask,
   scheduledTaskRunsKey,
+  useScheduledTaskRunPullRequests,
   useScheduledTaskRuns,
   useScheduledTaskRunSteps,
   useUpdateScheduledTask,
@@ -103,7 +105,11 @@ import {
 } from "@/lib/capabilities";
 import { canShareAutomation } from "@/lib/permissionsApi";
 import { ScheduledTaskApiError } from "@/lib/scheduledTasksApi";
-import type { ScheduledTaskRun, ScheduledTaskRunSteps } from "@/lib/scheduledTasksApi";
+import type {
+  ScheduledTaskRun,
+  ScheduledTaskRunPullRequest,
+  ScheduledTaskRunSteps,
+} from "@/lib/scheduledTasksApi";
 import {
   latestStatusText,
   stepProgress,
@@ -155,6 +161,12 @@ function TaskDetail({ taskId }: { taskId: string }) {
   const runStepsEnabled =
     isFeatureEnabled(info, "workflows") && !(task != null && isSharedWithViewer(task));
   const runSteps = useScheduledTaskRunSteps(taskId, runs, runStepsEnabled);
+  // PRs are session content too, so a viewer gets none.
+  const runPullRequestsEnabled =
+    info !== "loading" &&
+    info.scheduled_task_run_pull_requests === true &&
+    !(task != null && isSharedWithViewer(task));
+  const runPullRequests = useScheduledTaskRunPullRequests(taskId, runs, runPullRequestsEnabled);
 
   const updateMutation = useUpdateScheduledTask();
   const deleteMutation = useDeleteScheduledTask();
@@ -732,6 +744,9 @@ function TaskDetail({ taskId }: { taskId: string }) {
               now={now}
               highlighted={run.id === highlightedRunId}
               steps={runStepsEnabled ? runSteps.get(run.id) : undefined}
+              pullRequests={
+                runPullRequestsEnabled ? runPullRequests.get(run.id)?.pullRequests : undefined
+              }
             />
           ))}
         </ul>
@@ -872,12 +887,15 @@ function RunRow({
   now,
   highlighted,
   steps,
+  pullRequests,
 }: {
   run: ScheduledTaskRun;
   now: Date;
   highlighted: boolean;
   /** The run's latest plan, independent of the automation's current prompt. */
   steps?: ScheduledTaskRunSteps;
+  /** The PRs the run created or worked on. */
+  pullRequests?: readonly ScheduledTaskRunPullRequest[];
 }) {
   const timestamp = formatRunTimestamp(run.firedAt ?? run.scheduledAt, now);
   // A workflow run's tasks, as the workflow's page shows them.
@@ -894,6 +912,9 @@ function RunRow({
   const statusText = useMemo(() => (steps ? latestStatusText(steps.statuses) : null), [steps]);
   const sessionId = run.conversationId;
   const showTasks = progress.length > 0 && sessionId != null;
+  // PR chips are links of their own, so they sit under the row's link, as tasks do.
+  const showPullRequests = (pullRequests?.length ?? 0) > 0;
+  const belowLink = showTasks || showPullRequests;
   const [graphOpen, setGraphOpen] = useState(false);
   // The saved workflow the run's plan follows, when the Workflows page can open it.
   const workflowId = isFeatureEnabled(useServerInfo(), "workflows")
@@ -1016,8 +1037,8 @@ function RunRow({
       className={cn(
         "relative rounded-lg",
         highlighted && "animate-message-highlight",
-        // The row's timeline sits under its link, so the whole row lights up, once.
-        showTasks && "transition-colors hover:bg-muted has-[a:focus-visible]:bg-muted",
+        // The row's timeline and PRs sit under its link, so the whole row lights up, once.
+        belowLink && "transition-colors hover:bg-muted has-[a:focus-visible]:bg-muted",
       )}
       style={highlighted ? { animationDuration: `${RUN_HIGHLIGHT_DURATION_MS}ms` } : undefined}
     >
@@ -1028,13 +1049,22 @@ function RunRow({
           className={cn(
             commonClassName,
             "cursor-pointer focus-visible:outline-none",
-            showTasks ? buttonPadding : "transition-colors hover:bg-muted focus-visible:bg-muted",
+            showTasks
+              ? buttonPadding
+              : !belowLink && "transition-colors hover:bg-muted focus-visible:bg-muted",
           )}
         >
           {body}
         </Link>
       ) : (
         <div className={commonClassName}>{body}</div>
+      )}
+      {showPullRequests && pullRequests && (
+        <RunPullRequests
+          pullRequests={pullRequests}
+          nowMs={now.getTime()}
+          className={cn("pr-3 pl-10", showTasks ? "pb-1" : "pb-2.5")}
+        />
       )}
       {showTasks && (
         <>

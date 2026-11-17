@@ -17,6 +17,7 @@ import logging
 import threading
 import time
 from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass
 from typing import Annotated, Any
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, ValidationError
@@ -42,6 +43,9 @@ _RELATIONSHIPS = frozenset({"created", "worked_on", "attached", "inferred"})
 # How long a stored state counts as current; older open PRs are refreshed when listed.
 FRESHNESS_S = 300.0
 _ATTEMPTS_MAX = 10_000
+# A PR first seen this soon after its run finished still belongs to it: the runner
+# reports what it saw after the turn's last tool call.
+RUN_ATTRIBUTION_GRACE_S = 120.0
 
 # custom-lint: disable-next=workspace-scoped-cache -- keyed by database URL; queries scope rows
 _stores: dict[str, SessionPullRequestStore] = {}
@@ -132,6 +136,38 @@ def fetched_state(info: Mapping[str, Any]) -> FetchedState | None:
     )
 
 
+def listed_states(entries: object) -> list[FetchedState]:
+    """Read the states a host looked up for listed PRs while it refreshed their titles.
+
+    Hosts that look up only titles leave ``state`` out of the entries, so this is empty.
+
+    :param entries: The ``prs`` of a ``session.github.info`` payload.
+    """
+    if not isinstance(entries, list):
+        return []
+    states: list[FetchedState] = []
+    for entry in entries[:_MAX_REPORTED_PRS]:
+        if not isinstance(entry, dict):
+            continue
+        url, number, state, title = (
+            entry.get("url"),
+            entry.get("number"),
+            entry.get("state"),
+            entry.get("title"),
+        )
+        if isinstance(url, str) and isinstance(number, int) and isinstance(state, str):
+            states.append(
+                FetchedState(
+                    url=url,
+                    number=number,
+                    state=state,
+                    is_draft=entry.get("is_draft") is True,
+                    title=title if isinstance(title, str) else None,
+                )
+            )
+    return states
+
+
 def ingest_info(
     store: SessionPullRequestStore,
     session_id: str,
@@ -139,7 +175,7 @@ def ingest_info(
     *,
     requested_at: float,
 ) -> SessionPullRequests | None:
-    """Merge a host payload's PRs and the selected PR's state into the store.
+    """Merge a host payload's PRs and the states it fetched into the store.
 
     :param store: The server's PR store.
     :param session_id: The session the payload describes.
@@ -151,7 +187,11 @@ def ingest_info(
     return store.apply_report(
         session_id,
         parse_reports(info.get("prs")),
-        fetched=fetched_state(info),
+        # The selected PR's full read wins over its listed entry from the same response.
+        fetched=[
+            *listed_states(info.get("prs")),
+            *([selected] if (selected := fetched_state(info)) is not None else []),
+        ],
         requested_at=requested_at,
         complete=info.get("tracking_available") is True and isinstance(info.get("prs"), list),
     )
@@ -269,6 +309,78 @@ def needs_refresh(summary: SessionSummary, *, now: float) -> bool:
         return False
     checked = primary.state_checked_at
     return checked is None or now - checked >= FRESHNESS_S
+
+
+def has_stale_state(stored: SessionPullRequests, *, now: float) -> bool:
+    """Whether any of a session's PRs is open, or of unknown state, as of :data:`FRESHNESS_S` ago.
+
+    Unlike :func:`needs_refresh`, which looks only at the first PR, this covers
+    every PR, for surfaces that show them all.
+    """
+    if not stored.synced:
+        return True
+    return any(
+        entry.state in (None, "OPEN")
+        and (entry.state_checked_at is None or now - entry.state_checked_at >= FRESHNESS_S)
+        for entry in stored.entries
+    )
+
+
+@dataclass(frozen=True)
+class RunWindow:
+    """When one automation run worked in its session.
+
+    :ivar run_id: The run's id.
+    :ivar started_at: Epoch seconds the run was dispatched.
+    :ivar finished_at: Epoch seconds the run ended, or ``None`` while it runs.
+    :ivar owns_session: Whether the run's session is its own, as in a task that starts
+        a new session per run; a continued session is shared by many runs.
+    """
+
+    run_id: str
+    started_at: float
+    finished_at: float | None
+    owns_session: bool
+
+
+def run_pull_requests(
+    window: RunWindow, stored: SessionPullRequests, *, now: float
+) -> list[StoredPullRequest]:
+    """Pick the PRs one automation run created or worked on from its session's PRs.
+
+    A run that owns its session gets all of them. A run in a continued session
+    gets the PRs first seen while it ran, so each PR shows on the run that
+    linked it and not on later ones that only touched it. Branch-inferred PRs
+    are left out, since being checked out on a branch is not work on its PR,
+    except when one is the only PR of a session the run owns: that is most
+    likely the run's own branch.
+
+    :param window: The run.
+    :param stored: Its session's PRs.
+    :param now: Epoch seconds, the end of a run that has not finished.
+    :returns: The run's PRs, created ones first, then in the order they were first seen.
+    """
+    if window.owns_session:
+        picked = list(stored.entries)
+    else:
+        end = (window.finished_at if window.finished_at is not None else now) + (
+            RUN_ATTRIBUTION_GRACE_S
+        )
+        picked = [
+            entry for entry in stored.entries if window.started_at <= entry.first_seen_at <= end
+        ]
+    explicit = [entry for entry in picked if entry.relationship != "inferred"]
+    if not explicit and window.owns_session and len(picked) == 1:
+        explicit = picked
+    return sorted(
+        explicit, key=lambda entry: (entry.relationship != "created", entry.first_seen_at)
+    )
+
+
+def request_refresh(session_id: str) -> None:
+    """Refresh a session's stored PRs in the background, at most once per :data:`FRESHNESS_S`."""
+    if _installed is not None:
+        _installed.request(session_id)
 
 
 class PullRequestRefresher:

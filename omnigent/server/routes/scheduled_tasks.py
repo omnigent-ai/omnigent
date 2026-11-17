@@ -19,7 +19,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import time
 import uuid
+from collections import Counter
 from collections.abc import AsyncIterator, Callable
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -1554,6 +1556,67 @@ def create_scheduled_tasks_router(
             ],
             "next_cursor": next_cursor,
         }
+
+    @router.get("/scheduled-tasks/{scheduled_task_id}/run-pull-requests")
+    async def list_scheduled_task_run_pull_requests(
+        request: Request,
+        scheduled_task_id: str,
+        limit: int = Query(default=20, ge=1, le=50),
+        after: str | None = Query(default=None),
+    ) -> dict[str, Any]:
+        """The pull requests each of one page of a scheduled task's runs created or worked on.
+
+        Pages and authorizes like ``GET /scheduled-tasks/{id}/runs``, most recent first,
+        and reads only what the server stores, so it answers while hosts are offline.
+        A run that started its own session gets that session's PRs; a run in a
+        continued session gets those first seen while it ran. Branch-inferred PRs
+        are left out unless one is the only PR of a run's own session. Each PR
+        carries the state its host last fetched, with ``state_checked_at``; a
+        session with an open or unknown state older than five minutes is
+        refreshed in the background for a later read. The response is
+        ``{"runs": [{"run_id", "pull_requests": [...]}], "next_cursor"}``, listing
+        only runs with PRs. PRs are session content, so someone it is shared with
+        always gets ``{"runs": [], "next_cursor": null}``.
+        """
+        from omnigent.server import session_pull_requests as server_prs
+
+        task, role = await _require_readable(request, scheduled_task_id)
+        if role == "viewer":
+            return {"runs": [], "next_cursor": None}
+        runs, next_cursor = store.list_runs(scheduled_task_id, limit=limit, after_id=after)
+        pull_request_store = server_prs.open_store(conversation_store)
+        served = [run for run in runs if run.conversation_id is not None]
+        if pull_request_store is None or not served:
+            return {"runs": [], "next_cursor": next_cursor}
+        stored = await asyncio.to_thread(
+            pull_request_store.read_many, [run.conversation_id or "" for run in served]
+        )
+        now = time.time()
+        for conversation_id, prs in stored.items():
+            if server_prs.has_stale_state(prs, now=now):
+                server_prs.request_refresh(conversation_id)
+        runs_per_session = Counter(run.conversation_id for run in served)
+        rows: list[dict[str, Any]] = []
+        for run in served:
+            prs = stored.get(run.conversation_id or "")
+            if prs is None:
+                continue
+            window = server_prs.RunWindow(
+                run_id=run.id,
+                started_at=float(run.fired_at if run.fired_at is not None else run.scheduled_at),
+                finished_at=float(run.finished_at) if run.finished_at is not None else None,
+                owns_session=task.session_mode != "continue"
+                and runs_per_session[run.conversation_id] == 1,
+            )
+            picked = server_prs.run_pull_requests(window, prs, now=now)
+            if picked:
+                rows.append(
+                    {
+                        "run_id": run.id,
+                        "pull_requests": [server_prs.entry_payload(entry) for entry in picked],
+                    }
+                )
+        return {"runs": rows, "next_cursor": next_cursor}
 
     @router.post("/scheduled-tasks/{scheduled_task_id}/run", status_code=202)
     async def run_scheduled_task_now(

@@ -379,6 +379,11 @@ export interface ServerInfo {
    */
   scheduled_task_shared_with_me?: boolean;
   /**
+   * True when `GET /v1/scheduled-tasks/{id}/run-pull-requests` lists each run's PRs;
+   * absent on older servers (off), including ones that store session PRs.
+   */
+  scheduled_task_run_pull_requests?: boolean;
+  /**
    * The deployment offers the proactive agent (Omni Advisor) to this caller;
    * whether it is on for them is at ``GET /v1/proactive-agent/settings``.
    */
@@ -760,6 +765,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           scheduled_task_sharing: data.scheduled_task_sharing === true,
           inbox_items_available: data.inbox_items_available === true,
           scheduled_task_shared_with_me: data.scheduled_task_shared_with_me === true,
+          scheduled_task_run_pull_requests: data.scheduled_task_run_pull_requests === true,
           proactive_agent_available: data.proactive_agent_available === true,
           scheduled_task_harness_settings: data.scheduled_task_harness_settings === true,
           scheduled_task_approval_skipping_modes:

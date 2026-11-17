@@ -486,6 +486,25 @@ class SessionPullRequestStore:
             synced=stored.synced,
         )
 
+    def read_many(self, conversation_ids: Sequence[str]) -> dict[str, SessionPullRequests]:
+        """Return each session's linked PRs in one query, as :meth:`read` returns one session's.
+
+        :param conversation_ids: Sessions to read; ones without a metadata row are absent.
+        """
+        if not conversation_ids:
+            return {}
+        stmt = self._rows(list(dict.fromkeys(conversation_ids)))
+        with self._session("list_many_session_pull_requests") as session:
+            rows = session.execute(stmt).all()
+        result: dict[str, SessionPullRequests] = {}
+        for row in rows:
+            try:
+                result[row.id] = _result(_decode(row.pull_requests))
+            except UnreadablePullRequestsError:
+                _logger.warning("Unreadable session pull request document", exc_info=True)
+                result[row.id] = SessionPullRequests(entries=[], synced=False)
+        return result
+
     def summaries(self, conversation_ids: Sequence[str]) -> dict[str, SessionSummary]:
         """Return each session's first linked PR and whether it is synced, in one query.
 
@@ -514,7 +533,7 @@ class SessionPullRequestStore:
         conversation_id: str,
         reports: Sequence[PullRequestReport],
         *,
-        fetched: FetchedState | None = None,
+        fetched: FetchedState | Sequence[FetchedState] | None = None,
         requested_at: float | None = None,
         complete: bool = False,
     ) -> SessionPullRequests | None:
@@ -524,7 +543,7 @@ class SessionPullRequestStore:
 
         :param conversation_id: The session, e.g. ``"conv_abc123"``.
         :param reports: PRs as the runner's or host's registry describes them.
-        :param fetched: The state the host fetched for one of the session's PRs, if any.
+        :param fetched: The states the host fetched for the session's PRs, if any.
         :param requested_at: Epoch seconds the server sent the request the report
             answers, or ``None`` for a report the runner pushed. Orders fetches:
             one older than the newest seen is ignored.
@@ -534,31 +553,37 @@ class SessionPullRequestStore:
         :raises UnreadablePullRequestsError: The stored document cannot be read.
         """
         unique = list({report.url: report for report in reports}.values())
-        accepted: tuple[tuple[int, str, str], float] | None = None
-        if fetched is not None and requested_at is not None and fetched.state in _STATES:
-            key = (current_workspace_id(), conversation_id, fetched.url)
-            if requested_at >= self._watermarks.get(key):
-                accepted = (key, requested_at)
+        fetches = [fetched] if isinstance(fetched, FetchedState) else list(fetched or ())
+        # Only a fetch the server requested is ordered; each against its own PR's fetches.
+        checked_at = requested_at if requested_at is not None else 0.0
+        accepted: list[tuple[FetchedState, tuple[int, str, str]]] = []
+        for fetch in {fetch.url: fetch for fetch in fetches}.values():
+            key = (current_workspace_id(), conversation_id, fetch.url)
+            if (
+                requested_at is not None
+                and fetch.state in _STATES
+                and checked_at >= self._watermarks.get(key)
+            ):
+                accepted.append((fetch, key))
         synced_at = time.time()
 
         def change(document: _Document) -> _Document:
             updated = _merge_reports(document, unique, requested_at) if unique else document
             if complete and updated.synced_at is None:
                 updated = replace(updated, synced_at=synced_at)
-            if accepted is not None and fetched is not None:
-                entry = next((pr for pr in updated.prs if pr.url == fetched.url), None)
-                checked_at = accepted[1]
+            for fetch, _ in accepted:
+                entry = next((pr for pr in updated.prs if pr.url == fetch.url), None)
                 if (
                     entry is not None
-                    and entry.number == fetched.number
+                    and entry.number == fetch.number
                     and (entry.state_checked_at is None or checked_at >= entry.state_checked_at)
                 ):
-                    updated = _apply_fetch(updated, fetched, checked_at)
+                    updated = _apply_fetch(updated, fetch, checked_at)
             return updated
 
         result = self._update("apply_session_pull_request_report", conversation_id, change)
-        if accepted is not None:
-            self._watermarks.advance(*accepted)
+        for _, key in accepted:
+            self._watermarks.advance(key, checked_at)
         return result
 
     def check_room(self, conversation_id: str, url: str) -> None:

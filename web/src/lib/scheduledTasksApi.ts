@@ -9,6 +9,7 @@
 // omit both and the server resolves the owner's connected host + its home dir
 // at fire time. Sandbox tasks instead accept a repository URL as workspace.
 
+import type { GitProviderDisplay } from "./gitProviders";
 import { authenticatedFetch } from "./identity";
 import type { JournalEntry, JournalPlanStep } from "./sessionJournal";
 import { startTimedInteraction } from "./analyticsEmit";
@@ -489,6 +490,54 @@ export async function listScheduledTaskRunSteps(
     planName: run.plan_name ?? null,
     steps: run.steps,
     statuses: run.statuses,
+  }));
+}
+
+/** One PR a run created or worked on, as the server stores it. */
+export interface ScheduledTaskRunPullRequest {
+  url: string;
+  /** Git provider id, e.g. "github". */
+  provider: string;
+  provider_display?: GitProviderDisplay | null;
+  /** Base repository, e.g. "owner/repo". */
+  repository: string;
+  number: number;
+  title?: string | null;
+  relationship: "created" | "worked_on" | "attached" | "inferred";
+  /** "OPEN" | "MERGED" | "CLOSED" as the host last fetched it; null until it did. */
+  state?: string | null;
+  is_draft?: boolean;
+  /** Epoch seconds of that fetch, or null. */
+  state_checked_at?: number | null;
+}
+
+/** The PRs one run created or worked on, with the state each host last fetched. */
+export interface ScheduledTaskRunPullRequests {
+  runId: string;
+  pullRequests: ScheduledTaskRunPullRequest[];
+}
+
+/**
+ * The PRs of one page of a task's runs, most recent first, paged like
+ * {@link listScheduledTaskRuns}. Runs without PRs are left out.
+ *
+ * @param after - The ID of the run before the page, e.g. the previous page's last.
+ */
+export async function listScheduledTaskRunPullRequests(
+  id: string,
+  { limit, after }: { limit: number; after?: string },
+): Promise<ScheduledTaskRunPullRequests[]> {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (after) params.set("after", after);
+  const res = await authenticatedFetch(
+    `/v1/scheduled-tasks/${encodeURIComponent(id)}/run-pull-requests?${params}`,
+  );
+  const body = await readJsonOrThrow<{
+    runs?: { run_id: string; pull_requests?: ScheduledTaskRunPullRequest[] }[];
+  }>(res);
+  return (body.runs ?? []).map((run) => ({
+    runId: run.run_id,
+    pullRequests: run.pull_requests ?? [],
   }));
 }
 

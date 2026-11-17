@@ -329,3 +329,33 @@ async def test_deleting_the_session_drops_its_pull_requests(
     assert await conversations.delete_conversation(SESSION)
     assert store.read(SESSION) is None
     assert _urls(store, OTHER) == [A]
+
+
+def test_one_report_stores_every_fetched_state_each_ordered_on_its_own(
+    store: SessionPullRequestStore,
+) -> None:
+    """A title refresh's states land together, each ordered against its own PR's fetches."""
+    store.apply_report(SESSION, [_report(A), _report(B)])
+    store.apply_report(SESSION, [], fetched=[_fetch(A, "MERGED")], requested_at=2_000.0)
+    store.apply_report(
+        SESSION,
+        [],
+        fetched=[_fetch(A, "OPEN"), _fetch(B, "CLOSED", title="Abandoned")],
+        requested_at=1_000.0,
+    )
+    stored = store.read(SESSION)
+    assert stored is not None
+    states = {entry.url: (entry.state, entry.state_checked_at) for entry in stored.entries}
+    assert states == {A: ("MERGED", 2_000.0), B: ("CLOSED", 1_000.0)}
+    assert stored.get(B).title == "Abandoned"  # type: ignore[union-attr]
+
+
+def test_read_many_reads_each_session_in_one_query(store: SessionPullRequestStore) -> None:
+    store.apply_report(SESSION, [_report(A)], fetched=_fetch(A), requested_at=1_000.0)
+    store.apply_report(OTHER, [_report(B)], complete=True)
+    read = store.read_many([SESSION, OTHER, MISSING, SESSION])
+    assert set(read) == {SESSION, OTHER}
+    assert [entry.url for entry in read[SESSION].entries] == [A]
+    assert read[SESSION].entries[0].state == "OPEN"
+    assert (read[OTHER].synced, read[SESSION].synced) == (True, False)
+    assert store.read_many([]) == {}

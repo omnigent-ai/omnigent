@@ -422,6 +422,9 @@ class ServerInfoResponse(BaseModel):
     # under the same conditions as ``scheduled_task_sharing``. Older servers that
     # advertise sharing lack the route.
     scheduled_task_shared_with_me: bool = False
+    # ``GET /v1/scheduled-tasks/{id}/run-pull-requests``, the PRs of each run, served
+    # beside ``session_pull_requests``. Older servers that store session PRs lack it.
+    scheduled_task_run_pull_requests: bool = False
     # Session PATCH and project create check the agent tool's calling session;
     # absent on older servers, where moves must not run.
     session_move_source_checks: bool = False
@@ -4133,6 +4136,10 @@ def create_app(
                 "codex_nonblocking_decline": True,
                 "session_rewind": True,
                 "session_pull_requests": session_pull_requests.open_store(conversation_store)
+                is not None,
+                "scheduled_task_run_pull_requests": session_pull_requests.open_store(
+                    conversation_store
+                )
                 is not None,
                 "session_journal": frontend_features[Feature.WORKFLOWS.value]
                 and session_journal.open_store(conversation_store) is not None,

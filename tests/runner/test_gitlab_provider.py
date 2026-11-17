@@ -747,6 +747,25 @@ def test_file_access_failure_is_not_reported_as_deleted(root: str, api: Mock, mr
         file_diff(root)
 
 
+@pytest.mark.parametrize(
+    ("state", "expected"), [("opened", "OPEN"), ("merged", "MERGED"), ("closed", "CLOSED")]
+)
+def test_status_lookup_maps_merge_request_states(
+    root: str, api: Mock, mr: dict, state: str, expected: str
+) -> None:
+    mr["state"] = state
+    status, timed_out = module.PULL_REQUESTS.pr_status(root, ref(), time.monotonic() + 8)
+    assert not timed_out and status is not None
+    assert (status.title, status.state, status.is_draft) == (mr["title"], expected, True)
+
+
+def test_status_lookup_timeout_contract(root: str, api: Mock) -> None:
+    api.object.side_effect = GitLabTimeoutError()
+    assert module.PULL_REQUESTS.pr_status(root, ref(), time.monotonic()) == (None, True)
+    api.object.side_effect = GitLabError("denied")
+    assert module.PULL_REQUESTS.pr_status(root, ref(), time.monotonic()) == (None, False)
+
+
 def test_title_timeout_contract(root: str, api: Mock) -> None:
     api.object.side_effect = GitLabTimeoutError()
     assert module.PULL_REQUESTS.pr_title(root, ref(), time.monotonic()) == (None, True)

@@ -1637,6 +1637,37 @@ def test_pr_title_caps_the_request_timeout_at_the_deadline(
     assert 0 < request.extensions["timeout"]["read"] <= 1.5
 
 
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [("active", "OPEN"), ("completed", "MERGED"), ("abandoned", "CLOSED"), ("notSet", None)],
+)
+def test_pr_status_reads_the_state_with_the_title(
+    facet: AzureDevOpsPullRequests,
+    tmp_path: Path,
+    ado_transport: RecordingTransport,
+    status: str,
+    expected: str | None,
+) -> None:
+    ado_transport.route("GET", PULL, json=pull_request(status=status, isDraft=True))
+
+    result, timed_out = facet.pr_status(str(tmp_path), reference(), time.monotonic() + 1.5)
+
+    assert not timed_out and result is not None
+    assert (result.title, result.state, result.is_draft) == ("Add the pipeline", expected, True)
+
+
+def test_pr_status_timeout_reports_the_deadline(
+    facet: AzureDevOpsPullRequests, tmp_path: Path, ado_transport: RecordingTransport
+) -> None:
+    def hang(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("timed out", request=request)
+
+    ado_transport.route("GET", PULL, handler=hang)
+
+    assert facet.pr_status(str(tmp_path), reference(), time.monotonic() + 1.5) == (None, True)
+    assert facet.pr_status(str(tmp_path), reference(), time.monotonic() - 1) == (None, True)
+
+
 def test_pr_title_timeout_reports_the_deadline(
     facet: AzureDevOpsPullRequests, tmp_path: Path, ado_transport: RecordingTransport
 ) -> None:

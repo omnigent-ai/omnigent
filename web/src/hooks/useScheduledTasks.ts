@@ -21,6 +21,7 @@ import {
   createScheduledTask,
   deleteScheduledTask,
   getScheduledTask,
+  listScheduledTaskRunPullRequests,
   listScheduledTaskRuns,
   listScheduledTaskRunSteps,
   listScheduledTasks,
@@ -31,6 +32,7 @@ import {
   type ScheduledTask,
   type SharedScheduledTasksPage,
   type ScheduledTaskRun,
+  type ScheduledTaskRunPullRequests,
   type ScheduledTaskRunSteps,
   type UpdateScheduledTaskInput,
 } from "@/lib/scheduledTasksApi";
@@ -254,6 +256,57 @@ export function useScheduledTaskRunSteps(
     }),
     combine: (results) =>
       new Map(results.flatMap((result) => result.data ?? []).map((steps) => [steps.runId, steps])),
+  });
+}
+
+/** How often a page with an open PR asks again, after the server refreshed stale states. */
+const RUN_PULL_REQUESTS_OPEN_REFETCH_MS = 60_000;
+
+/**
+ * The PRs each of an automation's runs created or worked on, by run ID. Pages
+ * 20 runs at a time like {@link useScheduledTaskRunSteps}. The server refreshes
+ * stale states in the background when asked, so a page with an open PR asks
+ * again each minute to pick them up.
+ *
+ * @param runs - The task's runs, most recent first, from `useScheduledTaskRuns`.
+ * @param enabled - Whether to fetch: the server lists run PRs and the caller owns
+ *     the automation, since a viewer gets none.
+ */
+export function useScheduledTaskRunPullRequests(
+  id: string,
+  runs: readonly ScheduledTaskRun[] | undefined,
+  enabled: boolean,
+): ReadonlyMap<string, ScheduledTaskRunPullRequests> {
+  const pages: ScheduledTaskRun[][] = [];
+  for (let start = 0; start < (runs?.length ?? 0); start += RUN_STEPS_PAGE) {
+    pages.push((runs ?? []).slice(start, start + RUN_STEPS_PAGE));
+  }
+  const newestUnsettled = hasUnsettledRun(pages[0]);
+  return useQueries({
+    queries: pages.map((page, index) => {
+      const after = index === 0 ? undefined : pages[index - 1]!.at(-1)!.id;
+      return {
+        queryKey: [
+          "scheduled-task-run-pull-requests",
+          id,
+          after ?? null,
+          page.map((run) => [run.id, run.status, run.conversationUpdatedAt]),
+        ],
+        queryFn: () => listScheduledTaskRunPullRequests(id, { limit: RUN_STEPS_PAGE, after }),
+        enabled,
+        staleTime: 30_000,
+        refetchInterval: (query: { state: { data?: ScheduledTaskRunPullRequests[] } }) =>
+          index === 0 && newestUnsettled
+            ? RUNS_REFETCH_INTERVAL_MS
+            : query.state.data?.some((run) =>
+                  run.pullRequests.some((pr) => pr.state == null || pr.state === "OPEN"),
+                )
+              ? RUN_PULL_REQUESTS_OPEN_REFETCH_MS
+              : false,
+      };
+    }),
+    combine: (results) =>
+      new Map(results.flatMap((result) => result.data ?? []).map((prs) => [prs.runId, prs])),
   });
 }
 

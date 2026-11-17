@@ -21,6 +21,7 @@ from omnigent.runner.git_providers import (
     PR_DIFF_OBJECT,
     ProviderCapabilities,
     PullRequestFacet,
+    PullRequestStatus,
     ReviewerRef,
     gitlab_observer,
     local_git,
@@ -506,6 +507,27 @@ class GitLabPullRequests:
             return None, True
         except ValueError:
             return None, False
+
+    def pr_status(
+        self, root: str, reference: PullRequestRef, deadline: float
+    ) -> tuple[PullRequestStatus | None, bool]:
+        from omnigent.runner.gitlab_client import GitLabTimeoutError
+
+        try:
+            mr = _mr(_client(root, reference.host, deadline), reference)
+        except GitLabTimeoutError:
+            return None, True
+        except ValueError:
+            return None, False
+        title = mr.get("title")
+        return (
+            PullRequestStatus(
+                title=title.strip() or None if isinstance(title, str) else None,
+                state=_STATES[mr["state"]],
+                is_draft=bool(mr.get("draft") or mr.get("work_in_progress")),
+            ),
+            False,
+        )
 
     def verify_accessible(self, root: str, reference: PullRequestRef) -> None:
         _mr(_client(root, reference.host), reference)

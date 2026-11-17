@@ -13,6 +13,7 @@ from omnigent.server import session_pull_requests as server_prs
 from omnigent.server.routes._sessions import helpers
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.session_pull_request_store import (
+    SessionPullRequests,
     SessionPullRequestStore,
     SessionSummary,
     StoredPullRequest,
@@ -109,6 +110,26 @@ def test_ingest_stores_the_selected_prs_state_and_answers_with_the_server_list(
     assert answered["selected_pr_url"] == A
     # Payloads without session tracking are passed through untouched.
     assert server_prs.answer({"available": False}, stored) == {"available": False}
+
+
+def test_ingest_stores_the_states_a_title_refresh_read_for_unselected_prs(
+    store: SessionPullRequestStore,
+) -> None:
+    """The selected PR's full read wins over its own listed entry from the same response."""
+    info = _info(
+        _entry(A, 42, state="CLOSED"),
+        _entry(B, 7, state="MERGED", title="Shipped"),
+        _entry("https://github.com/example/three/pull/3", 3),
+    )
+    stored = server_prs.ingest_info(store, SESSION, info, requested_at=50.0)
+    assert stored is not None
+    states = {entry.url: (entry.state, entry.state_checked_at) for entry in stored.entries}
+    assert states == {
+        A: ("OPEN", 50.0),
+        B: ("MERGED", 50.0),
+        "https://github.com/example/three/pull/3": (None, None),
+    }
+    assert stored.get(B).title == "Shipped"  # type: ignore[union-attr]
 
 
 def test_a_branch_pr_the_selection_does_not_name_keeps_no_state(
@@ -303,3 +324,79 @@ def test_only_a_completed_turn_notifies_the_refresher(monkeypatch: pytest.Monkey
     helpers._publish_status(session, "waiting")
     helpers._publish_status(session, "idle", persist_live_status=False)
     assert notified == [session]
+
+
+def _stored(url: str, **overrides: Any) -> StoredPullRequest:
+    fields = {
+        key: value
+        for key, value in _entry(url, int(url.rsplit("/", 1)[1])).items()
+        if key not in ("source", "title_checked_at", "title_lookup_timed_out")
+    }
+    return StoredPullRequest(**{**fields, **overrides})
+
+
+def _run(*, owns_session: bool, finished_at: float | None = 2_000.0) -> server_prs.RunWindow:
+    return server_prs.RunWindow(
+        run_id="run", started_at=1_000.0, finished_at=finished_at, owns_session=owns_session
+    )
+
+
+def _picked(window: server_prs.RunWindow, *entries: StoredPullRequest) -> list[str]:
+    stored = SessionPullRequests(entries=list(entries), synced=True)
+    return [entry.url for entry in server_prs.run_pull_requests(window, stored, now=5_000.0)]
+
+
+C = "https://github.com/example/three/pull/3"
+
+
+def test_a_run_in_a_continued_session_gets_the_prs_first_seen_while_it_ran() -> None:
+    entries = (
+        _stored(A, relationship="worked_on", first_seen_at=500.0),
+        _stored(B, relationship="worked_on", first_seen_at=1_500.0),
+        # Reports of the turn's last calls land shortly after it ends.
+        _stored(C, first_seen_at=2_000.0 + server_prs.RUN_ATTRIBUTION_GRACE_S),
+        _stored("https://github.com/example/four/pull/4", first_seen_at=2_500.0),
+    )
+    assert _picked(_run(owns_session=False), *entries) == [C, B]
+    # A run still going covers everything seen since it started.
+    assert _picked(_run(owns_session=False, finished_at=None), *entries) == [
+        C,
+        "https://github.com/example/four/pull/4",
+        B,
+    ]
+
+
+def test_a_run_that_owns_its_session_gets_its_prs_created_first() -> None:
+    entries = (
+        _stored(A, relationship="attached", first_seen_at=3_000.0),
+        _stored(B, relationship="worked_on", first_seen_at=1_200.0),
+        _stored(C, relationship="created", first_seen_at=1_800.0),
+        _stored("https://github.com/example/four/pull/4", relationship="inferred"),
+    )
+    assert _picked(_run(owns_session=True), *entries) == [C, B, A]
+
+
+def test_a_branch_inferred_pr_shows_only_as_the_lone_pr_of_a_runs_own_session() -> None:
+    inferred = _stored(A, relationship="inferred", first_seen_at=1_500.0)
+    assert _picked(_run(owns_session=True), inferred) == [A]
+    assert _picked(_run(owns_session=False), inferred) == []
+    other = _stored(B, relationship="inferred", first_seen_at=1_600.0)
+    assert _picked(_run(owns_session=True), inferred, other) == []
+
+
+@pytest.mark.parametrize(
+    ("entries", "synced", "expected"),
+    [
+        ((), False, True),
+        ((), True, False),
+        ((_stored(A, state="MERGED", state_checked_at=0.0),), True, False),
+        ((_stored(A, state="OPEN", state_checked_at=900.0),), True, False),
+        ((_stored(A, state="OPEN", state_checked_at=600.0),), True, True),
+        ((_stored(A, state="MERGED", state_checked_at=990.0), _stored(B)), True, True),
+    ],
+)
+def test_any_open_or_unknown_pr_past_freshness_makes_a_session_stale(
+    entries: tuple[StoredPullRequest, ...], synced: bool, expected: bool
+) -> None:
+    stored = SessionPullRequests(entries=list(entries), synced=synced)
+    assert server_prs.has_stale_state(stored, now=1_000.0) is expected
