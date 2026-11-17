@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import re
+from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -23,6 +26,84 @@ class _PollingClock:
     def sleep(self, seconds: float) -> None:
         # A zero-delay poll still advances time so non-completion remains bounded.
         self.now += max(seconds, 0.1)
+
+
+@pytest.mark.parametrize("startup", ["ready", "wrong-session", "exit"])
+def test_pi_launch_waits_for_its_input_ready_marker(tmp_path: Path, monkeypatch, startup) -> None:
+    from omnigent.harnesses.pi_native.bridge import bridge_dir_for_session_id
+    from tests._helpers import polling
+    from tests.e2e import test_pi_native_smart_routing as journey
+
+    clock = _PollingClock()
+    monkeypatch.setattr(journey, "time", clock)
+    monkeypatch.setattr(polling, "time", clock)
+    monkeypatch.setattr(journey, "_LAUNCH_TIMEOUT", 1)
+    executable = tmp_path / "bin" / "python"
+    executable.parent.mkdir()
+    executable.with_name("omnigent").touch()
+    monkeypatch.setattr(journey, "sys", SimpleNamespace(executable=str(executable)))
+    session = "a" * 32
+    data = tmp_path / ".omnigent"
+    env = {"HOME": str(tmp_path), "OMNIGENT_DATA_DIR": str(data)}
+    bridge_root = data / "pi-native"
+    marker = bridge_root / bridge_dir_for_session_id(session).name / "input_ready"
+    marker.parent.mkdir(parents=True)
+    other_marker = bridge_root / bridge_dir_for_session_id("b" * 32).name / "input_ready"
+    other_marker.parent.mkdir()
+    other_marker.touch()
+    child = SimpleNamespace(logfile_read=None, before=f"Model scope: {journey._DEFAULT_MODEL}")
+    drained = []
+    stopped = []
+    keys = []
+
+    def expect(pattern, *, timeout):
+        clock.now = 0.4
+        child.match = re.search(pattern, f"Web UI: http://127.0.0.1:6767/c/{session}")
+        assert child.match is not None
+
+    def read_nonblocking(_size, *, timeout):
+        drained.append(clock.now)
+        if startup == "exit":
+            raise journey.pexpect.EOF("Pi exited during managed-tool setup")
+        if startup == "ready" and len(drained) == 2:
+            marker.touch()
+            return "Omnigent linked"
+        raise journey.pexpect.TIMEOUT("managed-tool setup is pending")
+
+    def teardown(actual_child, actual_env):
+        assert actual_child is child and actual_env is env
+        stopped.append(child)
+        child.logfile_read.close()
+
+    def send_keys(command, **_kwargs):
+        assert marker.is_file(), "TUI input was sent before Pi enabled submission"
+        keys.append(command)
+
+    child.expect = expect
+    child.read_nonblocking = read_nonblocking
+    monkeypatch.setattr(journey.pexpect, "spawn", lambda *_args, **_kwargs: child)
+    monkeypatch.setattr(journey, "_teardown", teardown)
+    monkeypatch.setattr(journey, "subprocess", SimpleNamespace(run=send_keys))
+
+    if startup == "ready":
+        try:
+            launched, server, conversation = journey._launch_pi(env)
+            assert launched is child and conversation == session
+            assert server == "http://127.0.0.1:6767"
+            assert marker.is_file() and len(drained) == 2
+            journey._tmux_type(("test.sock", "main"), "one prompt")
+            assert [command[6:] for command in keys] == [["-l", "one prompt"], ["Enter"]]
+            assert not stopped
+        finally:
+            child.logfile_read.close()
+    else:
+        expected = journey.pexpect.EOF if startup == "exit" else AssertionError
+        with pytest.raises(expected):
+            journey._launch_pi(env)
+        assert stopped == [child] and child.logfile_read.closed
+        assert keys == []
+        if startup == "wrong-session":
+            assert 1 <= clock.now <= 1.1, "readiness reset the original launch budget"
 
 
 def _item(role: str, text: str, response_id: str, *, nested: bool) -> dict:

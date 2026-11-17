@@ -39,7 +39,9 @@ from typing import Any
 import httpx
 import pytest
 
+from omnigent.harnesses.pi_native.bridge import bridge_dir_for_session_id
 from tests._helpers.live_server import isolated_process_env
+from tests._helpers.polling import poll_until
 from tests.e2e._harness_probes import cli_unavailable_reason
 from tests.e2e.conftest import configure_mock_llm, get_mock_requests
 from tests.e2e.omnigent._pexpect_harness import strip_ansi
@@ -164,6 +166,7 @@ def _launch_pi(env: dict[str, str]) -> tuple[Any, str, str]:
     transcript = Path(env["HOME"]) / ".omnigent" / "logs" / "pi-terminal.log"
     transcript.parent.mkdir(parents=True, exist_ok=True)
     child.logfile_read = transcript.open("w")
+    deadline = time.monotonic() + _LAUNCH_TIMEOUT
     try:
         child.expect(
             r"(?:Web UI|Omnigent):[ \t]*(https?://[^\s\x1b]+/c/[0-9a-f]{32})",
@@ -175,14 +178,35 @@ def _launch_pi(env: dict[str, str]) -> tuple[Any, str, str]:
         assert match, f"could not parse Web UI url: {web_url!r}"
         # The persistent footer can follow the first model render.
         if _DEFAULT_MODEL not in startup_output:
-            child.expect(_DEFAULT_MODEL, timeout=_LAUNCH_TIMEOUT)
+            child.expect(_DEFAULT_MODEL, timeout=max(0, deadline - time.monotonic()))
+        # Pi renders the model before managed-tool setup enables Enter.
+        # Its session_start extension runs after that input gate opens.
+        marker = (
+            Path(env["OMNIGENT_DATA_DIR"])
+            / "pi-native"
+            / bridge_dir_for_session_id(match.group(2)).name
+            / "input_ready"
+        )
+
+        def input_ready() -> bool:
+            if marker.is_file():
+                return True
+            with contextlib.suppress(pexpect.TIMEOUT):
+                child.read_nonblocking(65536, timeout=0.1)
+            return marker.is_file()
+
+        try:
+            poll_until(input_ready, timeout_s=max(0, deadline - time.monotonic()), interval_s=0.1)
+        except AssertionError as exc:
+            raise pexpect.TIMEOUT(f"Pi input-ready marker did not appear: {marker}") from exc
         return child, match.group(1), match.group(2)
     except pexpect.TIMEOUT as exc:
         child.logfile_read.flush()
         output = child.before or ""
         _teardown(child, env)
         raise AssertionError(
-            f"omnigent pi did not publish its session link/model within {_LAUNCH_TIMEOUT}s "
+            f"omnigent pi did not publish its session link/model and input-ready marker "
+            f"within {_LAUNCH_TIMEOUT}s "
             f"('Web UI' in the raw output: {'Web UI' in output}); transcript: {transcript}\n"
             f"{strip_ansi(output)[:2000]}\n...\n{strip_ansi(output)[-1000:]}"
         ) from exc
