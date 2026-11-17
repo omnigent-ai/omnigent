@@ -253,7 +253,11 @@ async def test_runner_switches_managed_glm_in_a_real_claude_terminal(
             for alias in ("opus", "opus[1m]"):
                 response = await client.post(
                     f"/v1/sessions/{session_id}/events",
-                    json={"type": "model_change", "model": alias},
+                    json={
+                        "type": "model_change",
+                        "model": alias,
+                        "preserve_unconfirmed_model": True,
+                    },
                 )
                 assert response.status_code == 204, response.text
                 await _wait_for_model(bridge_dir, _INITIAL_MODEL, socket_path)
@@ -265,7 +269,11 @@ async def test_runner_switches_managed_glm_in_a_real_claude_terminal(
             for model in (_TARGET_MODEL, _INITIAL_MODEL):
                 response = await client.post(
                     f"/v1/sessions/{session_id}/events",
-                    json={"type": "model_change", "model": model},
+                    json={
+                        "type": "model_change",
+                        "model": model,
+                        "preserve_unconfirmed_model": True,
+                    },
                 )
                 assert response.status_code == 204, response.text
                 await _wait_for_model(bridge_dir, model, socket_path)
@@ -277,7 +285,11 @@ async def test_runner_switches_managed_glm_in_a_real_claude_terminal(
             saved_settings = settings_path.read_bytes()
             refused = await client.post(
                 f"/v1/sessions/{session_id}/events",
-                json={"type": "model_change", "model": _TARGET_MODEL},
+                json={
+                    "type": "model_change",
+                    "model": _TARGET_MODEL,
+                    "preserve_unconfirmed_model": True,
+                },
             )
             assert refused.status_code == 503, refused.text
             assert refused.json()["error"] == "claude_native_model_failed"
@@ -301,7 +313,11 @@ async def test_runner_switches_managed_glm_in_a_real_claude_terminal(
             )
             recovered = await client.post(
                 f"/v1/sessions/{session_id}/events",
-                json={"type": "model_change", "model": _TARGET_MODEL},
+                json={
+                    "type": "model_change",
+                    "model": _TARGET_MODEL,
+                    "preserve_unconfirmed_model": True,
+                },
             )
             assert recovered.status_code == 204, recovered.text
             await _wait_for_model(bridge_dir, _TARGET_MODEL, socket_path)
