@@ -167,6 +167,7 @@ def test_incomplete_reviews_are_rejected_regardless_of_size(review: str) -> None
         ((177653, "Tail."), 0, "", False, "run", None, " \t"),
         ((177652, "Tail."), 0, "", False, "run", None, "\t"),
         ((177651, "Tail."), 0, "", False, "run", None, ""),
+        (("Reason." + " " * 135000 + "Tail.",), 0, "", False, "run", None, None),
     ],
     ids=[
         "many-rows",
@@ -184,6 +185,7 @@ def test_incomplete_reviews_are_rejected_regardless_of_size(review: str) -> None
         "terminal-after-delimiter",
         "terminal-in-whitespace",
         "terminal-before-newline",
+        "interior-whitespace",
     ],
 )
 def test_long_review_parts_preserve_all_assessments_and_markdown_context(
@@ -227,7 +229,10 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
     composed = _HELPERS["compose_review"](
         review, {"markdown": "Computed counts", "test_files": ["tests/test_parser.py"]}
     )
-    if oversized_field is not None or terminal_remainder is not None:
+    unrenderable_whitespace = any(
+        " " * _HELPERS["COMMENT_BYTE_LIMIT"] in rationale for rationale in rationales
+    )
+    if oversized_field is not None or terminal_remainder is not None or unrenderable_whitespace:
         review_path = tmp_path / "review.md"
         review_path.write_text(composed, encoding="utf-8")
         receipt = tmp_path / "receipt.txt"
@@ -245,8 +250,15 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
         monkeypatch.setattr(
             subprocess, "run", lambda argv, **kwargs: posts.append(Path(argv[-1]).read_text())
         )
-    if oversized_field is not None:
-        with pytest.raises(ValueError, match="assessment fields exceed comment capacity"):
+    if oversized_field is not None or unrenderable_whitespace:
+        message = (
+            "assessment fragments need all five populated fields"
+            if unrenderable_whitespace
+            else "assessment fields exceed comment capacity"
+        )
+        if unrenderable_whitespace:
+            assert _HELPERS["COMMENT_BYTE_LIMIT"] == 60000
+        with pytest.raises(ValueError, match=message):
             _HELPERS["publish_review"](review_path, receipt)
         assert not posts
         assert not receipt.exists()

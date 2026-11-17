@@ -12,6 +12,7 @@ from pathlib import Path, PurePosixPath
 TESTS = "Tests and test support"
 CATEGORIES = (TESTS, "Documentation", "Dependencies and lockfiles", "Implementation / other")
 TEST_FIELD_COUNT = 5
+TEST_HEADER = ["test / case", "behavior protected", "layer", "needed?", "action / rationale"]
 COMMENT_BYTE_LIMIT = 60000
 LINKED_ISSUE_BODY_LIMIT = 4096
 LINKED_ISSUES_QUERY = """query($owner: String!, $name: String!, $number: Int!) {
@@ -206,7 +207,7 @@ def compose_review(review: str, stats: dict) -> str:
         section_starts[name] = summary.end() + matches[0].end()
     rows = []
     if stats["test_files"]:
-        header = ["test / case", "behavior protected", "layer", "needed?", "action / rationale"]
+        header = TEST_HEADER
         header_seen = False
         for line in sections["Tests"].splitlines():
             if not line.strip().startswith("|"):
@@ -311,12 +312,13 @@ def split_review(review: str, byte_limit: int) -> list[str]:
     return parts
 
 
-def _markdown_context(text: str) -> tuple[str, str, str]:
-    """Reopen details, fenced code and table context at a comment boundary."""
+def _markdown_context(text: str, *, validate_assessments: bool = False) -> tuple[str, str, str]:
+    """Reopen Markdown context and optionally validate final assessment rows."""
     details = 0
     fence = ""
     fence_line = ""
     table_header = ""
+    assessment_table = False
     previous = ""
     for line in text.splitlines():
         if fence:
@@ -327,6 +329,7 @@ def _markdown_context(text: str) -> tuple[str, str, str]:
         if opening:
             fence, fence_line = opening[1], line
             table_header = ""
+            assessment_table = False
             continue
         if line.lstrip().startswith(("<details>", "</details>")):
             for tag in re.findall(r"</?details>", line):
@@ -337,8 +340,20 @@ def _markdown_context(text: str) -> tuple[str, str, str]:
                 re.fullmatch(r"\s*:?-+:?\s*", cell) for cell in cells
             ):
                 table_header = previous + "\n" + line + "\n"
+                assessment_table = [
+                    cell.strip().lower() for cell in split_table_row(previous.strip().strip("|"))
+                ] == TEST_HEADER
+            elif (
+                validate_assessments
+                and assessment_table
+                and (len(cells) != TEST_FIELD_COUNT or not all(cell.strip() for cell in cells))
+            ):
+                raise ValueError(
+                    "Polly review assessment fragments need all five populated fields."
+                )
         else:
             table_header = ""
+            assessment_table = False
         previous = line
     prefix = "<details>\n<summary>Review continued</summary>\n\n" * details
     suffix = "\n\n</details>" * details
@@ -387,9 +402,14 @@ def review_comments(review: str, *, head_sha: str, run_id: str, run_url: str) ->
             f"<sub>Automated review by Polly · [workflow run]({run_url})</sub>\n"
         )
 
+    def validated(comments: list[str]) -> list[str]:
+        for comment in comments:
+            _markdown_context(comment, validate_assessments=True)
+        return comments
+
     single = wrap(review, 1, 1)
     if len(single.encode("utf-8")) <= COMMENT_BYTE_LIMIT:
-        return [single]
+        return validated([single])
     byte_limit = COMMENT_BYTE_LIMIT
     while True:
         chunks = split_review(review, byte_limit)
@@ -406,7 +426,7 @@ def review_comments(review: str, *, head_sha: str, run_id: str, run_url: str) ->
             comments.append(wrap(prefix + chunk + suffix, part, len(chunks)))
         overflow = max(len(comment.encode("utf-8")) for comment in comments) - COMMENT_BYTE_LIMIT
         if overflow <= 0:
-            return comments
+            return validated(comments)
         byte_limit -= overflow
 
 
