@@ -460,6 +460,15 @@ def _issue_body(exc: BaseException, tb_text: str, *, truncated: bool = False) ->
     )
 
 
+# Percent-encoded ASCII that is not a name character (``%2F``, ``%3A``, ``%20``, ...).
+# Hex case is ignored by the compiled pattern, so this covers every spelling.
+_ENCODED_BOUNDARY = "|".join(
+    f"%{code:02X}"
+    for code in range(0x20, 0x7F)
+    if not (chr(code).isalnum() or chr(code) in "_.-~")
+)
+
+
 def _scrub(text: str) -> str:
     """Replace the home directory with ``~`` in text bound for a public issue.
 
@@ -492,7 +501,12 @@ def _scrub(text: str) -> str:
                 for v in set(variants)
             }
             alternation = "|".join(map(re.escape, sorted(variants, key=len, reverse=True)))
-            text = re.sub(rf"(?<![\w.\-~])(?:{alternation})", "~", text, flags=re.IGNORECASE)
+            text = re.sub(
+                rf"(?:(?<![\w.\-~])|(?<={_ENCODED_BOUNDARY}))(?:{alternation})",
+                "~",
+                text,
+                flags=re.IGNORECASE,
+            )
     return text
 
 
