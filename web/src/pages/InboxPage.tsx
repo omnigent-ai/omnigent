@@ -1159,7 +1159,7 @@ export function InboxPage() {
         </div>
       )}
 
-      {advisorOnly && advisorSettingsFailed && (
+      {(advisorOnly || legacyInboxServer) && advisorSettingsFailed && (
         <div role="alert" className="mb-4 flex items-center gap-2 text-ui text-destructive">
           Couldn’t load {PROACTIVE_AGENT_DISPLAY_NAME} settings, so its suggestions are not shown.
           <Button
@@ -1211,7 +1211,7 @@ export function InboxPage() {
       {!assembling &&
         failedSessionCount === 0 &&
         !(showUnread && automationInbox.isError) &&
-        !(advisorOnly && advisorSettingsFailed) &&
+        !((advisorOnly || legacyInboxServer) && advisorSettingsFailed) &&
         !(showSuggestions && proactiveInbox.isError) &&
         visibleCount === 0 && (
           <div className="flex flex-col items-center gap-2 py-16 text-center">

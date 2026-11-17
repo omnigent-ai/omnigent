@@ -1976,6 +1976,32 @@ describe("agent suggestions", () => {
     expect(advisor.refetch).toHaveBeenCalledOnce();
   });
 
+  it.each(["all", "unread"])(
+    "shows a settings load failure on %s where the server predates agent items",
+    (filter) => {
+      window.localStorage.setItem("omnigent:inbox-filter", filter);
+      advisor.settings = undefined;
+      advisor.failed = true;
+      stub({ items: [], enabled: false });
+      renderPage(undefined, false, true);
+
+      expect(screen.getByRole("alert")).toHaveTextContent("Couldn’t load Omni Advisor settings");
+      expect(screen.queryByText(/Nothing waiting on you|You’re all caught up/)).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: "Retry settings" }));
+      expect(advisor.refetch).toHaveBeenCalledOnce();
+    },
+  );
+
+  it("does not let a settings load failure hide other agents' items on a current server", () => {
+    advisor.settings = undefined;
+    advisor.failed = true;
+    stub({ items: [], enabled: true });
+    renderPage();
+
+    expect(screen.queryByText(/Couldn’t load Omni Advisor settings/)).toBeNull();
+    expect(screen.getByText("Nothing waiting on you")).toBeInTheDocument();
+  });
+
   it("keeps showing suggestions when a settings refetch fails but the settings are cached", () => {
     window.localStorage.setItem("omnigent:inbox-filter", "advisor");
     advisor.failed = true;
