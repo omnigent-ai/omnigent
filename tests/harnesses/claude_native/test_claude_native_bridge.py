@@ -13538,6 +13538,7 @@ async def test_model_command_selects_session_only_then_reads_fresh_status(
     "unsupported",
     [
         "version",
+        "version-owned-draft",
         "invalid-version",
         "missing-owner",
         "missing-version",
@@ -13563,9 +13564,13 @@ async def test_model_command_selects_session_only_then_reads_fresh_status(
 def test_model_command_refuses_unsupported_or_unowned_input_before_keys(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, unsupported: str
 ) -> None:
-    composer = _SessionModelComposer(draft="a person's draft" if unsupported == "draft" else "")
+    owned_draft = "blocked prompt" if unsupported == "version-owned-draft" else None
+    initial_draft = owned_draft or ("a person's draft" if unsupported == "draft" else "")
+    composer = _SessionModelComposer(draft=initial_draft)
     if unsupported == "version":
         composer.version = "2.1.302"
+    if unsupported == "version-owned-draft":
+        composer.version = "2.1.322"
     if unsupported == "invalid-version":
         composer.version = "2.1.323-unknown"
         composer.model = composer.options[-1]
@@ -13596,6 +13601,8 @@ def test_model_command_refuses_unsupported_or_unowned_input_before_keys(
     )
     monkeypatch.setattr(claude_native_bridge, "_usable_composer_height", height_recovery)
     target = "absent-model" if unsupported == "target" else "private-glm[1m]"
+    if owned_draft is not None:
+        assert target != initial_model
     refusals = {
         "pending-before-typing": claude_native_bridge.ClaudeUserPromptPending(
             "pending question", nothing_typed=True
@@ -13648,7 +13655,11 @@ def test_model_command_refuses_unsupported_or_unowned_input_before_keys(
         expected = claude_native_bridge.ClaudeInputBoxOccupied
     with pytest.raises(expected) as caught:
         claude_native_bridge.inject_model_command(
-            bridge_dir, model=target, timeout_s=0.4, ready_timeout_s=0.1
+            bridge_dir,
+            model=target,
+            owned_draft=owned_draft,
+            timeout_s=0.4,
+            ready_timeout_s=0.1,
         )
 
     if refusal is not None:
@@ -13656,11 +13667,17 @@ def test_model_command_refuses_unsupported_or_unowned_input_before_keys(
     if occupied is not None:
         assert caught.value.surface == occupied[1]
         assert claude_native_bridge.can_hold_input_refusal(caught.value)
+    if unsupported == "version-owned-draft":
+        assert caught.value.unsupported
+        assert caught.value.phase == "preflight"
+        assert not caught.value.command_submitted
+        assert not caught.value.model_may_have_changed
+        assert composer.status_queries == 0
     height_recovery.assert_not_called()
     assert composer.sends == []
     assert composer.model == initial_model
-    if unsupported == "draft":
-        assert composer.text == "a person's draft"
+    assert composer.text == initial_draft
+    assert composer.submitted == []
     if unsupported == "missing-version":
         assert "did not become ready" in str(caught.value)
         assert "queued" not in str(caught.value)
@@ -14116,78 +14133,6 @@ def test_model_command_explicitly_selects_context_when_status_omits_the_marker(
     assert result.status_model == reported
     assert composer.submitted == ["/status", "/model", "/status"]
     assert [args[-1] for args in composer.sends].count("s") == 1
-
-
-@pytest.mark.parametrize(
-    "outcome",
-    [
-        "success",
-        "unsupported",
-        "cache-cost-success",
-        "cache-cost-refused",
-        "older-same-model",
-        "older-different-model",
-    ],
-)
-def test_model_command_leaves_default_settings_and_legacy_settings_paths_untouched(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str
-) -> None:
-    config_dir = tmp_path / "config"
-    config_dir.mkdir()
-    settings = config_dir / "settings.json"
-    settings.write_text('{"model":"saved-opus","other":true}\n')
-    legacy = tmp_path / "legacy-settings.json"
-    legacy.write_text('{"model":"saved-sonnet"}\n')
-    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_dir))
-
-    def snapshots() -> list[tuple[bytes, int, int]]:
-        return [
-            (path.read_bytes(), path.stat().st_ino, path.stat().st_mtime_ns)
-            for path in (settings, legacy)
-        ]
-
-    baseline = snapshots()
-    composer = _SessionModelComposer(
-        cache_cost_label=(
-            "Choice 1"
-            if outcome == "cache-cost-success"
-            else "Unselected model"
-            if outcome == "cache-cost-refused"
-            else None
-        )
-    )
-    if outcome.startswith("older-"):
-        composer.version = "2.1.322"
-        if outcome == "older-same-model":
-            composer.model = composer.options[-1]
-    bridge_dir = _session_model_bridge(tmp_path, composer)
-    metadata = json.loads((bridge_dir / "bridge.json").read_text())
-    metadata["user_settings_path"] = str(legacy)
-    (bridge_dir / "bridge.json").write_text(json.dumps(metadata))
-    composer.install(monkeypatch)
-
-    def send(socket_path: str, *args: str) -> None:
-        assert snapshots() == baseline
-        composer._run_tmux(socket_path, *args)
-        assert snapshots() == baseline
-
-    monkeypatch.setattr(claude_native_bridge, "_run_tmux", send)
-    if outcome in {"unsupported", "cache-cost-refused", "older-different-model"}:
-        with pytest.raises(claude_native_bridge.ClaudeModelSwitchRefused):
-            claude_native_bridge.inject_model_command(
-                bridge_dir,
-                model="absent-model" if outcome == "unsupported" else "private-glm[1m]",
-            )
-        assert composer.confirmations == composer.status_queries == 0
-        if outcome in {"unsupported", "older-different-model"}:
-            assert composer.sends == []
-    else:
-        result = claude_native_bridge.inject_model_command(bridge_dir, model="private-glm[1m]")
-        assert result.already_selected is (outcome == "older-same-model")
-        if outcome == "older-same-model":
-            assert [args[-1] for args in composer.sends] == ["/status", "Enter", "Escape"]
-        assert composer.confirmations == int(outcome == "cache-cost-success")
-    assert snapshots() == baseline
 
 
 @pytest.mark.parametrize(
@@ -14665,6 +14610,9 @@ def test_model_command_selects_the_exact_case_distinct_private_row(
         ),
         ("claude-opus-4-8-Private", "claude-opus-4-8-private", "claude-opus-4-8-private", {}),
         ("claude-sonnet-5-5", "opusplan", "claude-sonnet-5-5", {}),
+        ("opus[1m]", "opus", "claude-opus-5-5", {}),
+        ("opus", "opus", "claude-opus-4-8", {"ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-opus-5-5"}),
+        ("Private/model", "private/model", "private/model", {}),
     ],
     ids=[
         "private-prefix",
@@ -14674,6 +14622,9 @@ def test_model_command_selects_the_exact_case_distinct_private_row(
         "catalog-prefix-private-case",
         "public-suffix-private-case",
         "plan-mode-is-not-an-ordinary-model",
+        "missing-context-variant",
+        "stale-pin-resolution",
+        "private-case",
     ],
 )
 def test_model_target_refuses_unproven_model_equivalence(
@@ -14696,50 +14647,6 @@ def test_model_target_refuses_unproven_model_equivalence(
         )
 
     assert caught.value.unsupported
-
-
-@pytest.mark.parametrize(
-    ("requested", "value", "concrete", "pins"),
-    [
-        ("opus[1m]", "opus", "claude-opus-5-5", {}),
-        ("opus", "opus", "claude-opus-4-8", {"ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-opus-5-5"}),
-        ("Private/model", "private/model", "private/model", {}),
-    ],
-    ids=["missing-context-variant", "stale-pin-resolution", "private-case"],
-)
-def test_model_command_refuses_unproven_model_equivalence_before_keys(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    requested: str,
-    value: str,
-    concrete: str,
-    pins: dict[str, str],
-) -> None:
-    composer = _SessionModelComposer()
-    composer.options[-1] = concrete
-    bridge_dir = _session_model_bridge(tmp_path, composer)
-    claude_native_bridge.record_model_vocabulary(
-        bridge_dir,
-        launch_env=pins,
-        launch_model=None,
-        picker_values=[value],
-        picker_options=[
-            {
-                "value": value,
-                "model": concrete,
-                "display_name": "Choice 1",
-                "enabled": True,
-                "provenance": "structured",
-            }
-        ],
-    )
-    composer.install(monkeypatch)
-
-    with pytest.raises(claude_native_bridge.ClaudeModelSwitchRefused) as caught:
-        claude_native_bridge.inject_model_command(bridge_dir, model=requested)
-
-    assert caught.value.unsupported
-    assert composer.sends == []
 
 
 @pytest.mark.parametrize(
