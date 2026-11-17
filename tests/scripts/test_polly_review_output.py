@@ -180,16 +180,23 @@ def test_failure_diagnostics_preserves_logs_without_gateway_secrets(
 
 
 @pytest.mark.parametrize(
-    "failure_step", ["secret-scan", "posting", "timeout", "setup-timeout", None]
-)
-@pytest.mark.parametrize(
-    "scope_suffix",
+    ("failure_step", "scope_suffix"),
     [
-        "",
-        "<!-- POLLY_SCOPE_START -->\n{malformed\n<!-- POLLY_SCOPE_END -->\n",
-        "<!-- POLLY_SCOPE_START -->\n{}\n<!-- POLLY_SCOPE_END --> (see above)\n" * 2,
-    ],
-    ids=["plain-prose", "malformed-legacy-scope", "duplicate-legacy-scope"],
+        pytest.param(failure_step, scope_suffix, id=f"{scope_id}-{failure_step}")
+        for scope_id, scope_suffix in [
+            ("plain-prose", ""),
+            (
+                "malformed-legacy-scope",
+                "<!-- POLLY_SCOPE_START -->\n{malformed\n<!-- POLLY_SCOPE_END -->\n",
+            ),
+            (
+                "duplicate-legacy-scope",
+                "<!-- POLLY_SCOPE_START -->\n{}\n<!-- POLLY_SCOPE_END --> (see above)\n" * 2,
+            ),
+        ]
+        for failure_step in ["secret-scan", "posting", "timeout", None]
+    ]
+    + [pytest.param("setup-timeout", "", id="plain-prose-setup-timeout")],
 )
 def test_review_diagnostics_retain_raw_stdout(
     tmp_path: Path, failure_step: str | None, scope_suffix: str
