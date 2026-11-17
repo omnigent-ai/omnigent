@@ -40,19 +40,37 @@ function setComposerEntry(key: string, composer: SideChatComposerDraft | undefin
   else store.clearSideChatComposer(key);
 }
 
-/** Whether the composer already shows the session draft's text and attachments. */
+/** Whether the composer already shows the session draft's text, quotes and attachments. */
 function sameDraftContent(
   draft: SessionDraft | undefined,
   composer: SideChatComposerDraft | undefined,
 ): boolean {
+  const quotes = composer?.quotes ?? [];
+  const text = composer?.text ?? "";
   const files = composer?.files ?? [];
   const draftFiles = draft?.files ?? [];
-  const text = serializeReplyDraft({ quotes: composer?.quotes ?? [], text: composer?.text ?? "" });
   return (
-    (draft?.text ?? "") === text &&
+    (draft?.text ?? "") === serializeReplyDraft({ quotes, text }) &&
+    JSON.stringify(draft?.replyDraft ?? null) ===
+      JSON.stringify(snapshotReplyDraft({ quotes, text }) ?? null) &&
     files.length === draftFiles.length &&
     files.every((file, index) => file === draftFiles[index])
   );
+}
+
+/** The entry for a draft's content, keeping the entry's own flags such as a focus request. */
+function mergeSessionDraft(
+  composer: SideChatComposerDraft | undefined,
+  draft: SessionDraft | undefined,
+): SideChatComposerDraft | undefined {
+  const seeded = draft ? composerFromSessionDraft(draft) : undefined;
+  if (!composer) return seeded;
+  return {
+    ...composer,
+    text: seeded?.text ?? "",
+    files: seeded?.files ?? [],
+    quotes: seeded?.quotes,
+  };
 }
 
 function sameComposerContent(
@@ -78,8 +96,9 @@ export function useSharedSessionDraft(sessionId: string): void {
     let written: SideChatComposerDraft | undefined;
     const reseed = () => {
       const draft = getSessionDraft(sessionId);
-      if (sameDraftContent(draft, useChatStore.getState().sideChatComposers[key])) return;
-      written = draft ? composerFromSessionDraft(draft) : undefined;
+      const composer = useChatStore.getState().sideChatComposers[key];
+      if (sameDraftContent(draft, composer)) return;
+      written = mergeSessionDraft(composer, draft);
       setComposerEntry(key, written);
     };
     reseed();

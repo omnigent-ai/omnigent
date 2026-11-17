@@ -1047,9 +1047,11 @@ Other connection providers alone do not enable the managed MCP picker.
   `web/src/pages/ChatPage.composer.test.tsx`, and
   `web/src/components/chat/SideChatPane.test.tsx`. Grid session panes and
   sub-agent Workspace tabs render the same `SideChatPane`, whose Edit logic has
-  component coverage; their own wiring is checked by hand: open
-  a grid pane or a writable Workspace tab, click Edit on a message you sent
-  there, and confirm that pane's composer fills while the main one stays empty.
+  component coverage; their own wiring is checked by hand. Open a writable
+  Workspace tab, click Edit on a message you sent there, and confirm that tab's
+  composer fills while the main one stays empty. In a grid pane, Edit fills that
+  cell's composer, which shares the session's draft: after switching to the
+  full-screen view, the same text, tags and review comments show in its composer.
 - **`delivered-send-recovery`, in-session composer (desktop and mobile):**
   `tests/e2e_ui/mobile/test_composer_after_unacked_send.py::test_composer_stays_empty_after_delivered_but_unacked_send`
   runs with a phone viewport. Run the same lost-ack journey at a desktop viewport

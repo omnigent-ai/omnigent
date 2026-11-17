@@ -1807,18 +1807,7 @@ describe("grid cell composer shares its session's draft", () => {
 
   it("restores a failed grid send with its session tag as a token, and resends it unchanged", () => {
     const sent = `Compare [Session: "Fix CI" id=sess_fix subagent=no]\n\n${SESSION_MENTION_HINT}`;
-    conversationRegistry.acquire(childId).setState({
-      sessionStatus: "idle",
-      abortController: new AbortController(),
-      failedSendDraft: {
-        conversationId: childId,
-        text: sent,
-        files: [],
-        stableId: "retry-stable",
-      },
-    });
-    renderHook(() => useSharedSessionDraft(childId));
-    renderPane(<SideChatPane childId={childId} fullSession gridComposer={{}} />);
+    failedGridSend(sent);
 
     expect(screen.getByTestId("side-chat-input")).toHaveValue("Compare @Fix CI");
     fireEvent.click(screen.getByTestId("side-chat-send"));

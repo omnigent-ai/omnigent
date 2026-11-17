@@ -231,6 +231,31 @@ describe("a grid cell's shared draft", () => {
     expect(getSessionDraft(sessionId)?.mentions).toBeUndefined();
   });
 
+  it("keeps the cell's focus request when another writer changes its draft", () => {
+    seedDraft({ text: "Shared draft", files: [] });
+    renderHook(() => useSharedSessionDraft(sessionId));
+    editCell({ autoFocus: true });
+
+    act(() => setSessionDraft(sessionId, { text: "Rewound prompt", files: [] }));
+
+    expect(cellComposer()).toMatchObject({ text: "Rewound prompt", autoFocus: true });
+  });
+
+  it("re-reads a draft whose quote cards became plain text with the same serialized text", () => {
+    const replyDraft: StoredReplyDraft = {
+      version: 1,
+      quotes: [{ before: "Intro", text: "Quoted" }],
+      text: "Reply",
+    };
+    seedDraft({ text: serializeReplyDraft(replyDraft), replyDraft, files: [] });
+    renderHook(() => useSharedSessionDraft(sessionId));
+
+    act(() => setSessionDraft(sessionId, { text: serializeReplyDraft(replyDraft), files: [] }));
+
+    expect(cellComposer()?.quotes ?? []).toEqual([]);
+    expect(cellComposer()?.text).toBe(serializeReplyDraft(replyDraft));
+  });
+
   it("empties the session draft and its tags when the cell's composer is cleared", () => {
     seedDraft({
       text: "Read @src/app.ts",
