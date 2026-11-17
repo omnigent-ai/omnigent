@@ -93,7 +93,7 @@ def _validate_provenance_chain(path: Path) -> None:
     while True:
         info = current.lstat()
         if info.st_uid not in (0, os.getuid()):
-            raise PermissionError("trusted ucode executable has unsafe ownership")
+            raise PermissionError("trusted authentication executable has unsafe ownership")
         writable = info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
         # Root-owned sticky temporary roots are safe traversal boundaries:
         # another user cannot replace this user's private child directory.
@@ -101,7 +101,9 @@ def _validate_provenance_chain(path: Path) -> None:
             stat.S_ISDIR(info.st_mode) and info.st_uid == 0 and bool(info.st_mode & stat.S_ISVTX)
         )
         if writable and not sticky_temp_root and not stat.S_ISLNK(info.st_mode):
-            raise PermissionError("trusted ucode executable has unsafe writable path component")
+            raise PermissionError(
+                "trusted authentication executable has unsafe writable path component"
+            )
         if current.parent == current:
             return
         current = current.parent

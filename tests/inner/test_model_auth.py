@@ -114,7 +114,9 @@ def test_interpreter_rejects_foreign_owned_leaf_and_symlink(
         return info
 
     monkeypatch.setattr(Path, "lstat", foreign_lstat)
-    with pytest.raises(PermissionError, match="unsafe ownership"):
+    with pytest.raises(
+        PermissionError, match="trusted authentication executable has unsafe ownership"
+    ):
         _pin_auth_python_runtime(executable)
 
 

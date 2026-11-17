@@ -2630,10 +2630,12 @@ class ClaudeSDKExecutor(Executor):
         self._prepared_cli: PreparedClaudeCli | None = None
         self._cli_wrapper_path: str | None = None
         self._cli_path: str | None = _find_system_claude()
+        cli_source = "system"
         if self._cli_path is None and self._os_env_spec is not None:
             sandbox_spec = self._os_env_spec.sandbox or OSEnvSandboxSpec()
             if sandbox_spec.type != "none":
                 self._cli_path = _find_bundled_claude()
+                cli_source = "SDK-bundled"
                 if self._cli_path is None:
                     raise OSError("Sandboxed Claude requires a system or SDK-bundled CLI")
         self._real_cli_path = self._cli_path
@@ -2674,7 +2676,7 @@ class ClaudeSDKExecutor(Executor):
                 if prepared.cli_path != self._cli_path:
                     self._cli_wrapper_path = prepared.cli_path
                     self._cli_path = prepared.cli_path
-            logger.info("Using system claude CLI: %s", self._cli_path)
+            logger.info("Using %s claude CLI: %s", cli_source, self._cli_path)
         else:
             logger.info("No system claude found; SDK will use bundled CLI")
 
