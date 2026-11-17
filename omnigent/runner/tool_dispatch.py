@@ -1827,11 +1827,15 @@ async def _send_to_in_flight_child(
                 work_id=work_id,
             )
             fresh.status = "running"
-            # Only a child that already reported its turn running needs no start
-            # report; a turn the post started is still unconfirmed.
+            # A child that already reported its turn running needs no start bound. Otherwise
+            # the bound starts from the acceptance that finished before this entry existed.
             fresh.child_start_reported = _subagent_work.child_start_already_reported(
                 child_session_id
             )
+            if not fresh.child_start_reported:
+                fresh.awaiting_child_start_since = _subagent_work.take_child_acceptance(
+                    child_session_id
+                )
             # Best-effort dispatch-id stamp for restart recovery only; the
             # in-memory entry above already makes the completion deliverable, so
             # a stamp failure degrades recovery but never live delivery.

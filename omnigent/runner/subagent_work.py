@@ -194,8 +194,11 @@ class _SubagentDeliveryAck:
 
 _subagent_work_by_child: dict[str, _SubagentWorkEntry] = {}
 _subagent_work_by_parent: dict[str, set[str]] = {}
-# Children that reported running or waiting with no dispatch entry, until they settle.
+# Children that reported running or waiting, until their turn settles.
 _children_reporting_start: set[str] = set()
+# Acceptance times for children whose entry did not exist yet, or was terminal, when the
+# accepted prompt's turn finished starting. A steer registers its entry after that.
+_children_accepted_at: dict[str, float] = {}
 _drained_delivered_subagent_children: set[str] = set()
 # Optimistic (grace-timer) cancellations, delivered then drained, kept so a
 # surviving child's confirmed completion can still correct the parent under the
@@ -366,9 +369,10 @@ def note_subagent_child_start_reported(child_session_id: str) -> None:
     :param child_session_id: Child session id, e.g. ``"conv_child456"``.
     :returns: None.
     """
+    _children_reporting_start.add(child_session_id)
+    _children_accepted_at.pop(child_session_id, None)
     entry = _subagent_work_by_child.get(child_session_id)
     if entry is None:
-        _children_reporting_start.add(child_session_id)
         return
     entry.child_start_reported = True
     entry.awaiting_child_start_since = None
@@ -386,12 +390,22 @@ def forget_subagent_child_start_report(child_session_id: str) -> None:
 
 def child_start_already_reported(child_session_id: str) -> bool:
     """
-    Return whether the child reported its current turn running without a dispatch entry.
+    Return whether the child reported its current turn running, and the turn has not settled.
 
     :param child_session_id: Child session id, e.g. ``"conv_child456"``.
     :returns: ``True`` when a running or waiting edge arrived and no settled edge followed.
     """
     return child_session_id in _children_reporting_start
+
+
+def take_child_acceptance(child_session_id: str) -> float | None:
+    """
+    Hand over the acceptance time recorded before the child's dispatch entry existed.
+
+    :param child_session_id: Child session id, e.g. ``"conv_child456"``.
+    :returns: The recorded acceptance time, or ``None`` when none is pending.
+    """
+    return _children_accepted_at.pop(child_session_id, None)
 
 
 def arm_subagent_child_start_timeout(child_session_id: str, *, now: float | None = None) -> None:
@@ -405,15 +419,17 @@ def arm_subagent_child_start_timeout(child_session_id: str, *, now: float | None
     :param now: Clock override for tests, e.g. ``time.time()``.
     :returns: None.
     """
-    entry = _subagent_work_by_child.get(child_session_id)
-    if (
-        entry is None
-        or entry.status != "running"
-        or entry.child_start_reported
-        or entry.awaiting_child_start_since is not None
-    ):
+    stamp = time.time() if now is None else now
+    if child_start_already_reported(child_session_id):
         return
-    entry.awaiting_child_start_since = time.time() if now is None else now
+    entry = _subagent_work_by_child.get(child_session_id)
+    if entry is None or entry.status != "running":
+        # The accepted turn can finish starting before a steer registers its entry.
+        _children_accepted_at[child_session_id] = stamp
+        return
+    if entry.child_start_reported or entry.awaiting_child_start_since is not None:
+        return
+    entry.awaiting_child_start_since = stamp
 
 
 def unregister_subagent_work(
@@ -438,6 +454,7 @@ def unregister_subagent_work(
     :returns: None.
     """
     _children_reporting_start.discard(child_session_id)
+    _children_accepted_at.pop(child_session_id, None)
     entry = _subagent_work_by_child.get(child_session_id)
     if entry is None:
         return
