@@ -575,6 +575,7 @@ describe("Slack DM triggers", () => {
     );
     expect(prompt).toContain('title "Slack <channel> <message ts>"');
     expect(prompt).toContain("the sender, the direct message's channel ID");
+    expect(prompt).not.toContain("Slack IDs:");
     const parts = splitTriggerPrompt(prompt);
     expect(combineTriggerPrompt(parts.userPrompt, parts.systemPrompt)).toBe(prompt);
   });
@@ -594,6 +595,7 @@ describe("Slack DM triggers", () => {
     expect(prompt).toContain("Every other top-level message counts.");
     expect(prompt).toContain("the names resolve to fewer than two people besides you");
     expect(prompt).toContain("that can read your group DMs.");
+    expect(prompt).not.toContain("Slack IDs:");
   });
 
   it("prefixes bare channel names with # in a channel trigger", () => {
@@ -624,6 +626,13 @@ describe("Slack DM triggers", () => {
     expect(prompt).toContain("If you read a channel with conversations.history, call it once");
     expect(prompt).toContain('pass "Output one JSON object per line for every message');
     expect(prompt).toContain("archives/<channel ID>/p<ts without its dot>");
+    expect(prompt).toContain(
+      "read every page, following the cursor only while has_more is true, before handling any message, then handle them oldest first",
+    );
+    // A partial run keeps its window instead of skipping pages it never read.
+    expect(prompt).toContain("otherwise the previous check time");
+    expect(prompt).toContain("If a saved ID stops working, for example with channel_not_found");
+    expect(prompt).toContain("users.list for a handle or display name");
   });
 
   it("asks a privacy filter for author columns only when a condition names an author", () => {
@@ -644,12 +653,6 @@ describe("Slack DM triggers", () => {
 
     expect(withAuthor).toContain("adding one yes/no column per author ID the conditions name");
     expect(withoutAuthor).not.toContain("yes/no column per author ID");
-  });
-
-  it("leaves DM triggers' lookups unchanged", () => {
-    const prompt = renderTriggerPrompt("slack", slack({ event: "dm", scope: "@alice" }), CTX);
-
-    expect(prompt).not.toContain("Slack IDs:");
   });
 });
 
@@ -1475,7 +1478,9 @@ describe("renderTriggerPrompt", () => {
       CTX,
     );
     expect(unfiltered).toContain("Watch: new Slack messages in #eng-support\n");
-    expect(unfiltered).toContain("Every other top-level message counts.");
+    expect(unfiltered).toContain("Every top-level message counts.");
+    // Bot posts still count, so a channel of alerts or a bot author can match.
+    expect(unfiltered).not.toContain("bot_id set");
   });
 
   it("renders the Linear search, reading every newest-first page before starting sessions", () => {
