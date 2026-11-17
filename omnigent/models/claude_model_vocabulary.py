@@ -92,6 +92,11 @@ _CATALOG_PREFIXES: tuple[str, ...] = ("databricks-", "system.ai.")
 #: their own ids around this core, so it is what maps a served id back to the
 #: canonical spelling Claude Code emits (see :func:`canonical_claude_id`).
 _CANONICAL_ID_PREFIX = "claude-"
+_PUBLIC_PICKER_MODEL = re.compile(
+    r"(?:system\.ai\.|databricks-)?(claude-(?:opus|sonnet|haiku|fable)-"
+    r"\d+(?:-\d+)*(?:\[1m\])?)",
+    re.IGNORECASE,
+)
 _SEGMENT_RE = re.compile(r"[^a-z0-9]+")
 
 
@@ -119,6 +124,20 @@ def normalized_model_id(model: str) -> str:
     :returns: The comparable bare id, e.g. ``"claude-sonnet-5"``.
     """
     return prefix_folded_model_id(model).removesuffix("[1m]")
+
+
+def public_claude_model_id(model: str) -> str | None:
+    """Return the canonical public ID only for an exact supported family/version spelling."""
+    match = _PUBLIC_PICKER_MODEL.fullmatch(model)
+    return match[1].lower() if match is not None else None
+
+
+def claude_picker_model_key(model: str) -> str:
+    """Fold public model/alias case while preserving every private ID literally."""
+    folded = model.lower()
+    if folded.removesuffix("[1m]") in CLAUDE_MODEL_ALIASES or public_claude_model_id(model):
+        return folded
+    return model
 
 
 def alias_pins(env: Mapping[str, str] | None = None) -> dict[str, str]:

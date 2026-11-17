@@ -138,7 +138,9 @@ from omnigent.models.claude_model_vocabulary import (
     CUSTOM_MODEL_OPTION_NAME_ENV_VAR,
     LEGACY_CUSTOM_SLOT_ROW_ID,
     claude_model_alias,
+    claude_picker_model_key,
     picker_model_options,
+    public_claude_model_id,
     served_canonical_overrides,
 )
 from omnigent.native._native_resume_hint import echo_native_resume_hint
@@ -288,11 +290,6 @@ _UCODE_CLAUDE_TIER_TO_ENV: dict[str, str] = {
     "sonnet": _ANTHROPIC_DEFAULT_SONNET_MODEL_ENV,
     "haiku": _ANTHROPIC_DEFAULT_HAIKU_MODEL_ENV,
 }
-_CLAUDE_PUBLIC_PICKER_MODEL = re.compile(
-    r"(?:system\.ai\.|databricks-)?claude-(?:opus|sonnet|haiku|fable)-"
-    r"\d+(?:-\d+)*(?:\[1m\])?",
-    re.IGNORECASE,
-)
 # The 4 family aliases above pin one model ID each. Claude Code has exactly
 # one more independently-selectable /model picker slot beyond those
 # families — ANTHROPIC_CUSTOM_MODEL_OPTION — used here to surface Sonnet 5
@@ -1365,16 +1362,6 @@ def _claude_alias_pins(configured_env: Mapping[str, str]) -> dict[str, str]:
     }
 
 
-def _claude_picker_model_key(model: str) -> str:
-    """Fold recognized public identities while preserving private IDs literally."""
-    if (
-        _CLAUDE_PUBLIC_PICKER_MODEL.fullmatch(model)
-        or model.lower().removesuffix("[1m]") in ALIAS_MODEL_ENV_VARS
-    ):
-        return model.lower()
-    return model
-
-
 async def probe_claude_model_options(
     claude_config: ClaudeNativeUcodeConfig | None,
 ) -> ClaudeModelProbe | None:
@@ -1411,7 +1398,7 @@ async def probe_claude_model_options(
         for value in (model["value"], model.get("resolvedModel"))
         if isinstance(value, str) and value
     )
-    disabled_keys = {_claude_picker_model_key(value) for value in disabled_models}
+    disabled_keys = {claude_picker_model_key(value) for value in disabled_models}
     enabled = [
         model
         for model in models
@@ -1427,7 +1414,7 @@ async def probe_claude_model_options(
         resolution = dict(resolutions.get(alias, {}))
         resolved = model.get("resolvedModel")
         if isinstance(resolved, str) and resolved:
-            if _claude_picker_model_key(resolved) in disabled_keys:
+            if claude_picker_model_key(resolved) in disabled_keys:
                 continue
             resolution["model"] = resolved
             # Resolved IDs can omit context carried by the picker value or its launch pin.
@@ -1435,7 +1422,7 @@ async def probe_claude_model_options(
             if (
                 structured
                 and context_value.lower().endswith("[1m]")
-                and _CLAUDE_PUBLIC_PICKER_MODEL.fullmatch(context_value)
+                and public_claude_model_id(context_value) is not None
                 and context_value[:-4].lower() == resolved.lower()
             ):
                 resolution["model"] = f"{resolved}[1m]"
@@ -1450,7 +1437,7 @@ async def probe_claude_model_options(
             "enabled": model.get("disabled") is not True,
             "provenance": "structured" if structured else "legacy",
         }
-        if _claude_picker_model_key(str(row["model"])) in disabled_keys:
+        if claude_picker_model_key(str(row["model"])) in disabled_keys:
             continue
         if row["model"] in seen_models:
             existing = next(item for item in alias_rows if item["model"] == row["model"])
@@ -1536,7 +1523,7 @@ async def claude_model_catalog(
     if probe.empty_picker:
         return []
     rows = list(probe.alias_rows)
-    disabled_keys = {_claude_picker_model_key(value) for value in probe.disabled_models}
+    disabled_keys = {claude_picker_model_key(value) for value in probe.disabled_models}
     declared_models = set(claude_config.routable_models) if claude_config is not None else set()
     _non_canonical = (
         claude_config is not None and not _serves_canonical_anthropic_ids(claude_config)
@@ -1567,7 +1554,7 @@ async def claude_model_catalog(
     if (
         default_model
         and not marked
-        and _claude_picker_model_key(default_model) not in disabled_keys
+        and claude_picker_model_key(default_model) not in disabled_keys
     ):
         # Append the observed default as its own honest row — but never
         # claim a bare Anthropic id is launchable on an endpoint that

@@ -14140,6 +14140,45 @@ def test_model_command_rechecks_an_owned_draft_before_clearing_it(
 
 
 @pytest.mark.parametrize(
+    ("expected", "actual", "matches"),
+    [
+        ("system.ai.claude-opus-4-8[1m]", "system.ai.claude-opus-4-8", True),
+        ("system.ai.claude-opus-4-8[1m]", "system.ai.claude-opus-4-8[1m]", True),
+        ("system.ai.claude-opus-4-8", "system.ai.claude-opus-4-8[1m]", False),
+        ("system.ai.claude-opus-5[1m]", "system.ai.claude-opus-5", False),
+        ("private-model[1m]", "private-model", False),
+        ("private-model[1m]", "private-model[1m]", True),
+        ("system.ai.claude-opus-4-8-Private[1m]", "system.ai.claude-opus-4-8-Private", False),
+        ("system.ai.claude-opus-4-8[1m]", "system.ai.claude-opus-5", False),
+    ],
+    ids=[
+        "documented-native-context-spelling",
+        "exact-context-spelling",
+        "context-is-not-added-to-a-plain-request",
+        "other-public-generation-is-literal",
+        "private-context-is-literal",
+        "exact-private-context",
+        "public-looking-private-context-is-literal",
+        "wrong-generation",
+    ],
+)
+def test_managed_model_status_check_preserves_exact_context_identity(
+    tmp_path: Path, expected: str, actual: str, matches: bool
+) -> None:
+    from tests.e2e.test_claude_native_managed_model_switch import _status_model_matches
+
+    composer = _SessionModelComposer()
+    composer.model = actual
+    bridge_dir = _session_model_bridge(tmp_path, composer)
+    raw_path = bridge_dir / claude_native_bridge.CONTEXT_RAW_FILE
+    raw = json.loads(raw_path.read_text())
+    raw["context_window"] = {"context_window_size": 1_000_000}
+    raw_path.write_text(json.dumps(raw))
+
+    assert _status_model_matches(bridge_dir, expected) is matches
+
+
+@pytest.mark.parametrize(
     ("raw_target", "actual_target", "already_selected", "status_queries"),
     [(True, True, True, 1), (True, False, False, 2), (False, True, False, 1)],
     ids=["fresh-same-model", "stale-target-hint", "stale-other-hint"],
@@ -14371,6 +14410,22 @@ def test_model_command_leaves_default_settings_and_legacy_settings_paths_untouch
         ),
         ("Private/Model-B", "Private/Model-B", "Private/Model-B", {}, "private/model-b", False),
         (
+            "claude-private-A",
+            "claude-private-A",
+            "claude-private-A",
+            {},
+            "claude-private-a",
+            False,
+        ),
+        (
+            "system.ai.claude-opus-4-8-Private",
+            "system.ai.claude-opus-4-8-Private",
+            "system.ai.claude-opus-4-8-Private",
+            {},
+            "claude-opus-4-8-private",
+            False,
+        ),
+        (
             "opus",
             "opus",
             "system.ai.claude-opus-5-5[1m]",
@@ -14427,6 +14482,7 @@ def test_model_command_leaves_default_settings_and_legacy_settings_paths_untouch
             False,
         ),
         ("opus", "opus", "PrivateModel", {}, "opus (PrivateModel)", False),
+        ("opus", "opus", "claude-private-A", {}, "opus (claude-private-A)", False),
         (
             "opus",
             "opus",
@@ -14473,6 +14529,8 @@ def test_model_command_leaves_default_settings_and_legacy_settings_paths_untouch
         "private-context-marker-is-literal",
         "private-prefix-is-not-public",
         "private-case-is-exact",
+        "public-prefix-private-case-is-exact",
+        "public-suffix-private-case-is-exact",
         "different-public-generation",
         "unmarked-different-public-generation",
         "marked-status-for-plain-public-pin",
@@ -14481,6 +14539,7 @@ def test_model_command_leaves_default_settings_and_legacy_settings_paths_untouch
         "wrapper-wrong-alias",
         "wrapper-wrong-generation",
         "private-wrapper-not-inferred",
+        "public-prefix-private-wrapper-not-inferred",
         "wrapper-label-not-an-id",
         "wrapper-marked-status-for-plain-pin",
         "wrapper-nested-parentheses",
@@ -14629,6 +14688,36 @@ def test_model_target_refuses_descriptors_without_one_proven_ordinary_choice(
 
 
 @pytest.mark.parametrize(
+    "models",
+    [
+        ("claude-private-A", "claude-private-a"),
+        ("system.ai.claude-opus-4-8-Private", "system.ai.claude-opus-4-8-private"),
+    ],
+    ids=["private-family", "private-suffix"],
+)
+@pytest.mark.parametrize("selected", [0, 1])
+def test_model_command_selects_the_exact_case_distinct_private_row(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    models: tuple[str, str],
+    selected: int,
+) -> None:
+    requested = models[selected]
+    composer = _SessionModelComposer()
+    composer.options = ["private-initial-model", *models]
+    composer.model = composer.options[0]
+    bridge_dir = _session_model_bridge(tmp_path, composer)
+    composer.install(monkeypatch)
+
+    result = claude_native_bridge.inject_model_command(bridge_dir, model=requested)
+
+    assert result.requested_model == result.picker_value == requested
+    assert result.resolved_model == result.status_model == composer.model == requested
+    assert composer.submitted == ["/model", "/status"]
+    assert composer.status_queries == 1
+
+
+@pytest.mark.parametrize(
     ("requested", "value", "concrete", "pins"),
     [
         ("opus[1m]", "opus", "claude-opus-5-5", {}),
@@ -14636,6 +14725,25 @@ def test_model_target_refuses_descriptors_without_one_proven_ordinary_choice(
         ("claude-opus-5-5", "private-claude-opus-5-5", "private-claude-opus-5-5", {}),
         ("Private/model", "private/model", "private/model", {}),
         ("Private/model[1M]", "Private/model[1m]", "Private/model[1m]", {}),
+        ("claude-private-A", "claude-private-a", "claude-private-a", {}),
+        (
+            "system.ai.claude-private-A",
+            "system.ai.claude-private-a",
+            "system.ai.claude-private-a",
+            {},
+        ),
+        (
+            "databricks-claude-private-A",
+            "databricks-claude-private-a",
+            "databricks-claude-private-a",
+            {},
+        ),
+        (
+            "claude-opus-4-8-Private",
+            "claude-opus-4-8-private",
+            "claude-opus-4-8-private",
+            {},
+        ),
         ("claude-sonnet-5-5", "opusplan", "claude-sonnet-5-5", {}),
     ],
     ids=[
@@ -14644,6 +14752,10 @@ def test_model_target_refuses_descriptors_without_one_proven_ordinary_choice(
         "private-prefix",
         "private-case",
         "private-context-case",
+        "public-prefix-private-case",
+        "gateway-prefix-private-case",
+        "catalog-prefix-private-case",
+        "public-suffix-private-case",
         "plan-mode-is-not-an-ordinary-model",
     ],
 )
@@ -14656,6 +14768,7 @@ def test_model_command_refuses_unproven_model_equivalence_before_keys(
     pins: dict[str, str],
 ) -> None:
     composer = _SessionModelComposer()
+    composer.options[-1] = concrete
     bridge_dir = _session_model_bridge(tmp_path, composer)
     claude_native_bridge.record_model_vocabulary(
         bridge_dir,

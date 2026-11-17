@@ -10,6 +10,11 @@ from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 
+from omnigent.models.claude_model_vocabulary import (
+    claude_picker_model_key,
+    public_claude_model_id,
+)
+
 
 class ClaudeModelSwitchRefused(RuntimeError):
     """A client-safe refusal; the prompt is unsent but the live model may have changed."""
@@ -239,23 +244,6 @@ def _draft(pane: str) -> str | None:
     return "\n".join([text, *(row[len(continuation_prefix) :] for row in box.rows[1:])])
 
 
-def _known_claude_id(model: str) -> str | None:
-    from omnigent.models.claude_model_vocabulary import canonical_claude_id
-
-    if model.lower().startswith(("claude-", "system.ai.claude-", "databricks-claude-")):
-        return canonical_claude_id(model)
-    return None
-
-
-def _normalized_public_model(model: str) -> str:
-    from omnigent.models.claude_model_vocabulary import CLAUDE_MODEL_ALIASES
-
-    folded = model.lower()
-    if folded.removesuffix("[1m]") in CLAUDE_MODEL_ALIASES or _known_claude_id(model):
-        return folded
-    return model
-
-
 def _target(
     model: str,
     options: Sequence[Mapping[str, object]] | None,
@@ -264,11 +252,11 @@ def _target(
 ) -> _Target:
     from omnigent.models.claude_model_vocabulary import CLAUDE_MODEL_ALIASES, alias_pins
 
-    requested = _normalized_public_model(model.strip())
+    requested = claude_picker_model_key(model.strip())
     pins = alias_pins(env)
     base = requested.removesuffix("[1m]")
     pinned = pins.get(base)
-    resolved = _normalized_public_model(pinned or requested)
+    resolved = claude_picker_model_key(pinned or requested)
     if requested.endswith("[1m]") and not resolved.endswith("[1m]"):
         resolved += "[1m]"
     candidates = [
@@ -280,35 +268,35 @@ def _target(
         option
         for option in candidates
         if isinstance(option.get("value"), str)
-        and _normalized_public_model(str(option["value"])) == requested
+        and claude_picker_model_key(str(option["value"])) == requested
     ]
     matched = exact or [
         option
         for option in candidates
         if isinstance(option.get("model"), str)
-        and _normalized_public_model(str(option["model"])) == resolved
+        and claude_picker_model_key(str(option["model"])) == resolved
     ]
-    canonical = _known_claude_id(resolved)
+    canonical = public_claude_model_id(resolved)
     if not matched and canonical:
         matched = [
             option
             for option in candidates
             if isinstance(option.get("model"), str)
-            and _known_claude_id(str(option["model"])) == canonical
+            and public_claude_model_id(str(option["model"])) == canonical
         ]
         if not matched and not resolved.endswith("[1m]"):
             matched = [
                 option
                 for option in candidates
                 if isinstance(option.get("model"), str)
-                and _known_claude_id(
-                    _normalized_public_model(str(option["model"])).removesuffix("[1m]")
+                and public_claude_model_id(
+                    claude_picker_model_key(str(option["model"])).removesuffix("[1m]")
                 )
                 == canonical
             ]
     if len(matched) > 1:
         concrete_models = {
-            _normalized_public_model(str(option["model"]))
+            claude_picker_model_key(str(option["model"]))
             for option in matched
             if isinstance(option.get("model"), str) and option["model"]
         }
@@ -319,17 +307,17 @@ def _target(
                 for option in matched
                 if isinstance(option.get("value"), str)
                 and (
-                    _normalized_public_model(str(option["value"])) == concrete_model
-                    or _normalized_public_model(str(option["value"])).removesuffix("[1m]")
+                    claude_picker_model_key(str(option["value"])) == concrete_model
+                    or claude_picker_model_key(str(option["value"])).removesuffix("[1m]")
                     in CLAUDE_MODEL_ALIASES
-                    or _known_claude_id(str(option["value"])) is not None
+                    or public_claude_model_id(str(option["value"])) is not None
                 )
             ]
             preferred = exact or ordinary
             matched = sorted(
                 preferred,
                 key=lambda option: (
-                    _normalized_public_model(str(option["value"])) != concrete_model,
+                    claude_picker_model_key(str(option["value"])) != concrete_model,
                     option.get("provenance") != "structured",
                     str(option["value"]),
                     str(option.get("display_name", "")),
@@ -346,8 +334,8 @@ def _target(
         if isinstance(value, str) and value and isinstance(concrete, str) and concrete:
             if (
                 requested.endswith("[1m]")
-                and not _normalized_public_model(concrete).endswith("[1m]")
-            ) or (pinned and _normalized_public_model(concrete) != resolved):
+                and not claude_picker_model_key(concrete).endswith("[1m]")
+            ) or (pinned and claude_picker_model_key(concrete) != resolved):
                 matched = []
             else:
                 label = option.get("display_name")
@@ -367,8 +355,8 @@ def _target(
                     )
                     and (
                         not isinstance(item.get("model"), str)
-                        or _normalized_public_model(str(item["model"]))
-                        != _normalized_public_model(concrete)
+                        or claude_picker_model_key(str(item["model"]))
+                        != claude_picker_model_key(concrete)
                     )
                     for item in candidates
                 ):
@@ -573,7 +561,7 @@ class SessionOnlyModelSwitch:
         from omnigent.models.claude_model_vocabulary import CLAUDE_MODEL_ALIASES
 
         expected = {self.choice.model}
-        canonical = _known_claude_id(self.choice.model)
+        canonical = public_claude_model_id(self.choice.model)
         if canonical:
             expected.add(canonical)
         actual_ids = {actual}
@@ -585,7 +573,7 @@ class SessionOnlyModelSwitch:
             wrapped = re.fullmatch(
                 rf"{re.escape(self.choice.value)} \(([^()\r\n]+)\)", actual, re.IGNORECASE
             )
-            if wrapped and _known_claude_id(wrapped[1]):
+            if wrapped and public_claude_model_id(wrapped[1]):
                 actual_ids.add(wrapped[1])
         if actual_ids & expected:
             return True

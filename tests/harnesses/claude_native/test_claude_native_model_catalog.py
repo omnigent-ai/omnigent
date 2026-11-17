@@ -828,22 +828,37 @@ async def test_context_normalization_cannot_admit_a_disabled_resolution(
     assert await claude_native.claude_model_catalog(None) == []
 
 
+@pytest.mark.parametrize(
+    ("enabled", "disabled"),
+    [
+        ("PrivateModel", "privatemodel"),
+        ("claude-private-A", "claude-private-a"),
+        ("system.ai.claude-opus-4-8-Private", "system.ai.claude-opus-4-8-private"),
+    ],
+    ids=["private-id", "public-prefix-private-id", "public-suffix-private-id"],
+)
 async def test_disabled_private_model_keeps_its_literal_identity(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, enabled: str, disabled: str
 ) -> None:
+    from omnigent.harnesses.claude_native.model_switch import ClaudeModelSwitchRefused, _target
+
     _stub_picker(
         monkeypatch,
         [
-            {"value": "private-enabled", "resolvedModel": "PrivateModel"},
-            {"value": "private-disabled", "resolvedModel": "privatemodel", "disabled": True},
+            {"value": "private-enabled", "resolvedModel": enabled},
+            {"value": "private-disabled", "resolvedModel": disabled, "disabled": True},
         ],
-        default="PrivateModel",
+        default=enabled,
     )
     probe = await claude_native.probe_claude_model_options(None)
     assert probe is not None
     assert [(row["id"], row["model"]) for row in probe.alias_rows] == [
-        ("private-enabled", "PrivateModel")
+        ("private-enabled", enabled)
     ]
+    options = picker_model_options(probe.alias_rows)
+    assert _target(enabled, options, [], {}).model == enabled
+    with pytest.raises(ClaudeModelSwitchRefused, match="no unambiguous"):
+        _target(disabled, options, [], {})
 
 
 @pytest.mark.parametrize("alias", ["OPUS", "SONNET", "HAIKU", "FABLE"])

@@ -71,9 +71,11 @@ def _status_model_matches(bridge_dir: Path, expected: str) -> bool:
     if not isinstance(raw, dict) or not native_session or raw.get("session_id") != native_session:
         return False
     sync_raw_status_context(bridge_dir, None)
-    # Recent Claude builds omit the context-window suffix in statusLine model IDs.
+    # Native-1M Opus 4.8 omits this public suffix; every other identity stays literal.
     actual = bridge.read_claude_status_model(bridge_dir)
-    return actual is not None and actual.removesuffix("[1m]") == expected.removesuffix("[1m]")
+    return actual == expected or (
+        expected == "system.ai.claude-opus-4-8[1m]" and actual == "system.ai.claude-opus-4-8"
+    )
 
 
 async def _wait_for_model(
