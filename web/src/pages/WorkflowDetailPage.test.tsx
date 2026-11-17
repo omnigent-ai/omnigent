@@ -44,7 +44,10 @@ vi.mock("@/hooks/useWorkflow", async (importOriginal) => {
   const actual = await importOriginal<typeof WorkflowHooks>();
   return { ...actual, useWorkflow: vi.fn(), useWorkflowRuns: vi.fn() };
 });
-vi.mock("@/hooks/useSessionJournal", () => ({ useSessionJournal: vi.fn() }));
+vi.mock("@/hooks/useSessionJournal", async (importOriginal) => ({
+  ...(await importOriginal<typeof SessionJournalHooks>()),
+  useSessionJournal: vi.fn(),
+}));
 vi.mock("@/hooks/useSession", () => ({ useSession: vi.fn() }));
 vi.mock("@/hooks/useIsMobileViewport", () => ({ useIsMobileViewport: vi.fn() }));
 vi.mock("@/hooks/useSidebarData", async (importOriginal) => ({
@@ -697,6 +700,21 @@ describe("WorkflowDetailPage", () => {
     ];
     const description = () => screen.getByTestId("workflow-detail-description").textContent;
 
+    // The server's answers to where an entry sits in the journal.
+    const placedAfter = (position: number) =>
+      Promise.resolve(new Response(JSON.stringify({ object: "list", data: [{ position }] })));
+    const notInJournal = () =>
+      Promise.resolve(
+        new Response(JSON.stringify({ error: { code: "stale_cursor", message: "stale_cursor" } }), {
+          status: 400,
+        }),
+      );
+    function serve(stored: () => WorkflowDetail, place: () => Promise<Response>) {
+      vi.mocked(authenticatedFetch).mockImplementation(async (path) =>
+        String(path).includes("/journal?") ? place() : new Response(JSON.stringify(stored())),
+      );
+    }
+
     async function renderWith(newer: JournalEntry, stored: () => WorkflowDetail) {
       const actual = await vi.importActual<typeof WorkflowHooks>("@/hooks/useWorkflow");
       vi.mocked(useWorkflow).mockImplementation(actual.useWorkflow);
@@ -795,6 +813,217 @@ describe("WorkflowDetailPage", () => {
       await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent("Saved plan"));
       expect(screen.getByTestId("workflow-detail-run")).toBeEnabled();
       expect(description()).toBe("Fixes one flaky test.");
+    });
+
+    it("keeps a newer description unsaved when a save that kept the old one lands after it", async () => {
+      const actual = await vi.importActual<typeof WorkflowHooks>("@/hooks/useWorkflow");
+      vi.mocked(useWorkflow).mockImplementation(actual.useWorkflow);
+      mockRuns([]);
+      let stored: WorkflowDetail = {
+        ...WORKFLOW,
+        description: "Fixes one flaky test.",
+        planning_session_id: "a".repeat(32),
+        updated_at: 100,
+      };
+      const patches: Record<string, unknown>[] = [];
+      let releaseSave = () => {};
+      vi.mocked(authenticatedFetch).mockImplementation(async (_path, options) => {
+        if (options?.method === "PATCH") {
+          const body = JSON.parse(String(options.body));
+          patches.push(body);
+          await new Promise<void>((resolve) => {
+            releaseSave = resolve;
+          });
+          stored = {
+            ...stored,
+            steps: body.steps,
+            description: body.description ?? stored.description,
+            description_source:
+              body.description === undefined
+                ? stored.description_source
+                : (body.description_source ?? null),
+            updated_at: 301,
+          };
+        }
+        return new Response(JSON.stringify(stored));
+      });
+      // The first proposal changes only the steps and keeps the saved wording.
+      const first = {
+        ...saved,
+        id: "first",
+        content: { steps: edited, description: "Fixes one flaky test." },
+      };
+      const journal = {
+        entries: [first],
+        isLoading: false,
+        error: null,
+        hasOlder: false,
+        loadingOlder: false,
+        loadOlder: vi.fn(),
+        retry: vi.fn(),
+      };
+      vi.mocked(useSessionJournal).mockImplementation(() => journal);
+      const { rerender } = renderPage();
+      await screen.findByTestId("workflow-detail-title");
+
+      fireEvent.click(screen.getByRole("button", { name: "Save plan" }));
+      await waitFor(() => expect(patches).toHaveLength(1));
+      journal.entries = [
+        first,
+        {
+          ...first,
+          id: "second",
+          position: 2,
+          created_at: 200,
+          content: { steps: edited, description: "Fixes flaky tests." },
+        },
+      ];
+      rerender(<WorkflowDetailPage />);
+      await act(async () => releaseSave());
+
+      await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent("Unsaved changes"));
+      expect(description()).toBe("Fixes flaky tests.");
+      expect(patches[0]).toMatchObject({
+        description: "Fixes one flaky test.",
+        description_source: "first",
+      });
+    });
+
+    it("offers a newer proposal when the saved one came from an earlier planning chat", async () => {
+      const stored: WorkflowDetail = {
+        ...WORKFLOW,
+        description: "Fixes one flaky test.",
+        description_source: "f".repeat(32),
+        planning_session_id: "a".repeat(32),
+        updated_at: 500,
+      };
+      const newer = {
+        ...saved,
+        id: "newer",
+        created_at: 600,
+        content: { steps: WORKFLOW.steps, description: "Fixes flaky tests." },
+      };
+      const actual = await vi.importActual<typeof WorkflowHooks>("@/hooks/useWorkflow");
+      vi.mocked(useWorkflow).mockImplementation(actual.useWorkflow);
+      mockRuns([]);
+      vi.mocked(useSessionJournal).mockReturnValue({
+        entries: [newer],
+        isLoading: false,
+        error: null,
+        hasOlder: false,
+        loadingOlder: false,
+        loadOlder: vi.fn(),
+        retry: vi.fn(),
+      });
+      serve(() => stored, notInJournal);
+      renderPage();
+      await screen.findByTestId("workflow-detail-title");
+      await waitFor(() => expect(description()).toBe("Fixes flaky tests."));
+      expect(screen.getByRole("status")).toHaveTextContent("Unsaved changes");
+    });
+
+    it("offers a newer proposal when the one saved is older than the loaded journal", async () => {
+      const actual = await vi.importActual<typeof WorkflowHooks>("@/hooks/useWorkflow");
+      vi.mocked(useWorkflow).mockImplementation(actual.useWorkflow);
+      mockRuns([]);
+      const stored: WorkflowDetail = {
+        ...WORKFLOW,
+        description: "Fixes one flaky test.",
+        description_source: "e".repeat(32),
+        planning_session_id: "a".repeat(32),
+        // A rename after the newer proposal moved the workflow's last write past it.
+        updated_at: 500,
+      };
+      serve(
+        () => stored,
+        () => placedAfter(9),
+      );
+      const page = (hasOlder: boolean) => ({
+        entries: [
+          {
+            ...saved,
+            id: "newer",
+            position: 150,
+            created_at: 300,
+            content: { steps: WORKFLOW.steps, description: "Fixes flaky tests." },
+          },
+        ],
+        isLoading: false,
+        error: null,
+        hasOlder,
+        loadingOlder: false,
+        loadOlder: vi.fn(),
+        retry: vi.fn(),
+      });
+      vi.mocked(useSessionJournal).mockReturnValue(page(true));
+      renderPage();
+      await screen.findByTestId("workflow-detail-title");
+      await waitFor(() => expect(description()).toBe("Fixes flaky tests."));
+      expect(screen.getByRole("status")).toHaveTextContent("Unsaved changes");
+
+      // A source the journal doesn't hold came from another planning chat: the workflow's
+      // last write is newer than the proposal, so the description stays.
+      let answered = false;
+      serve(
+        () => stored,
+        () => notInJournal().finally(() => (answered = true)),
+      );
+      cleanup();
+      vi.mocked(useSessionJournal).mockReturnValue(page(false));
+      renderPage();
+      await screen.findByTestId("workflow-detail-title");
+      await waitFor(() => expect(answered).toBe(true));
+      await act(async () => {});
+      expect(description()).toBe("Fixes one flaky test.");
+      expect(screen.getByRole("status")).toHaveTextContent("Saved plan");
+    });
+
+    it("keeps a description saved elsewhere while a stale journal lacks its proposal", async () => {
+      const actual = await vi.importActual<typeof WorkflowHooks>("@/hooks/useWorkflow");
+      vi.mocked(useWorkflow).mockImplementation(actual.useWorkflow);
+      mockRuns([]);
+      // Another tab saved proposal "p2" after this tab cached a journal ending at "saved".
+      const stored: WorkflowDetail = {
+        ...WORKFLOW,
+        description: "Fixes flaky tests.",
+        description_source: "p2",
+        planning_session_id: "a".repeat(32),
+        updated_at: 500,
+      };
+      vi.mocked(useSessionJournal).mockReturnValue({
+        entries: [saved],
+        isLoading: false,
+        error: null,
+        hasOlder: true,
+        loadingOlder: false,
+        loadOlder: vi.fn(),
+        retry: vi.fn(),
+      });
+      const expectSaved = () => {
+        expect(description()).toBe("Fixes flaky tests.");
+        expect(screen.getByRole("status")).toHaveTextContent("Saved plan");
+        expect(screen.queryByRole("button", { name: "Save plan" })).toBeNull();
+      };
+
+      // Until the server places "p2", the cached proposal isn't offered.
+      let place = () => {};
+      const placed = new Response(
+        JSON.stringify({ object: "list", data: [{ position: saved.position }] }),
+      );
+      serve(
+        () => stored,
+        () =>
+          new Promise<Response>((resolve) => {
+            place = () => resolve(placed);
+          }),
+      );
+      renderPage();
+      await screen.findByTestId("workflow-detail-title");
+      expectSaved();
+      // Placed after the cached proposal, it keeps the saved description.
+      await act(async () => place());
+      await act(async () => {});
+      expectSaved();
     });
   });
 

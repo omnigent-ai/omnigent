@@ -416,7 +416,8 @@ it ran.
   left out keep their values. With `expected_description`, the new description
   applies only while the stored one is still that text. `description_source`
   names the planning-chat proposal the description comes from; the workflow
-  returns it until the description is written without one.
+  returns it until the description is written without one or another planning
+  chat is attached.
 - `DELETE /v1/workflows/{id}`: deletes it.
 
 Workflows live in `workflows`, keyed by workspace and ID, with encoded JSON
