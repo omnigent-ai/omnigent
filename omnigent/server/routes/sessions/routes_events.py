@@ -269,6 +269,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _child_session_summaries_from_conversations,
     _codex_side_chat_fork_lost,
     _codex_side_chat_thread_id,
+    _deliver_answer_to_stopped_session,
     _dispatch_session_event_to_runner,
     _enrich_terminal_status_with_subagent_output,
     _ensure_native_terminal_ready,
@@ -981,6 +982,7 @@ def register_events_routes(
     register_runner_ingest: Callable[[Callable[..., Awaitable[EventAckFrame]]], None]
     | None = None,
     register_startup_dispatch: Callable[[StartupDispatch], None] | None = None,
+    register_message_dispatch: Callable[[Callable[..., Awaitable[Any]]], None] | None = None,
     clear_session_into_fresh_session: Callable[
         [Request, Conversation, Callable[[], Awaitable[None]]], Awaitable[str]
     ]
@@ -2293,6 +2295,16 @@ def register_events_routes(
             # to the runner for runner-side (policy) elicitations.
             # The dedicated URL endpoint (``.../elicitations/{eid}/
             # resolve``) routes through the same helper.
+            delivered = await _deliver_answer_to_stopped_session(
+                request,
+                session_id,
+                conv,
+                body.data,
+                runner_router,
+                _post_event_impl,
+            )
+            if delivered is not None:
+                return delivered
             await _resolve_elicitation(session_id, body.data, runner_router, conversation_store)
             # Apply any policy writes deferred by the relay tool-call ASK gate
             # (e.g. a cost-budget checkpoint) now that the verdict is in.
@@ -3984,6 +3996,8 @@ def register_events_routes(
 
     if register_startup_dispatch is not None:
         register_startup_dispatch(_post_event_impl)
+    if register_message_dispatch is not None:
+        register_message_dispatch(_post_event_impl)
 
     # ── GET /sessions/{session_id}/stream ────────────────────────
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from fastapi import (
@@ -43,6 +44,7 @@ from omnigent.server.routes._sessions.helpers import (
     _apply_pending_policy_ask_writes,
 )
 from omnigent.server.routes._sessions.orchestration import (
+    _deliver_answer_to_stopped_session,
     _resolve_elicitation,
 )
 from omnigent.server.schemas import (
@@ -68,8 +70,13 @@ def register_elicitations_routes(
     runner_router: RunnerRouter | None = None,
     auth_provider: AuthProvider | None = None,
     permission_store: PermissionStore | None = None,
+    message_dispatch: list[Callable[..., Awaitable[Any]]] | None = None,
 ) -> None:
-    """Register the elicitations routes on router."""
+    """Register the elicitations routes on router.
+
+    :param message_dispatch: Holds the events route's message handler once it is
+        registered; an answer on a stopped session is sent through it.
+    """
 
     @router.post(
         "/sessions/{session_id}/elicitations/{elicitation_id}/resolve",
@@ -85,7 +92,7 @@ def register_elicitations_routes(
         session_id: str,
         elicitation_id: str,
         body: ElicitationResult,
-    ) -> dict[str, bool]:
+    ) -> dict[str, Any]:
         """
         Resolve an outstanding elicitation by its URL (URL-based
         elicitation).
@@ -119,7 +126,9 @@ def register_elicitations_routes(
             (``"accept"`` / ``"decline"`` / ``"cancel"``) plus
             optional form ``content``.
         :returns: ``{"queued": False}`` — resolution is synchronous
-            and persists no conversation item.
+            and persists no conversation item. An answer to a question on
+            a session whose runner is gone returns the message path's
+            acknowledgement, or ``{"queued": True}`` while that answer is in flight.
         :raises OmnigentError: 404 if no session exists.
         """
         user_id = _get_user_id(request, auth_provider)
@@ -132,6 +141,16 @@ def register_elicitations_routes(
             if conv is None:
                 raise _session_not_found()
         _resolve_data = {"elicitation_id": elicitation_id, **body.model_dump(exclude_none=True)}
+        delivered = await _deliver_answer_to_stopped_session(
+            request,
+            session_id,
+            conv,
+            _resolve_data,
+            runner_router,
+            message_dispatch[0] if message_dispatch else None,
+        )
+        if delivered is not None:
+            return delivered
         await _resolve_elicitation(session_id, _resolve_data, runner_router, conversation_store)
         # Apply any policy writes deferred by the relay tool-call ASK gate
         # (e.g. a cost-budget checkpoint) now that the verdict is in.

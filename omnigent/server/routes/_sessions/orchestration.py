@@ -34,7 +34,7 @@ from omnigent.db.utils import (
     rollback_shared_reads,
     shared_read_scope,
 )
-from omnigent.db.workspace_cache import WorkspaceScopedCache
+from omnigent.db.workspace_cache import WorkspaceScopedCache, WorkspaceScopedSet
 from omnigent.debug_logging import debug_event, runner_log_scope
 from omnigent.entities import (
     Agent,
@@ -2661,13 +2661,7 @@ async def _resolve_native_delivery(
     fingerprint = _harness_elicitation_request_fingerprint(
         ElicitationRequestParams.model_validate(params)
     )
-    _prune_pre_resolved_harness_elicitations()
-    _harness_pre_resolved_elicitations[elicitation_id] = _PreResolvedHarnessElicitation(
-        session_id=session_id,
-        created_at=time.time(),
-        result=result,
-        request_fingerprint=fingerprint,
-    )
+    _store_pre_resolved_harness_elicitation(elicitation_id, session_id, result, fingerprint)
     waiting = {
         **event,
         "params": {
@@ -2772,20 +2766,14 @@ async def _resolve_elicitation(
                 # waiter's request fingerprint rides along so a LATER,
                 # different question reusing the id can't inherit it.
                 _parked_for_fingerprint = _harness_parked_elicitations.get(elicitation_id)
-                _prune_pre_resolved_harness_elicitations()
-                _harness_pre_resolved_elicitations[elicitation_id] = (
-                    _PreResolvedHarnessElicitation(
-                        session_id=session_id,
-                        created_at=time.time(),
-                        result=verdict_result,
-                        request_fingerprint=(
-                            _parked_for_fingerprint.request_fingerprint
-                            if _parked_for_fingerprint is not None
-                            else None
-                        ),
-                    )
+                _store_pre_resolved_harness_elicitation(
+                    elicitation_id,
+                    session_id,
+                    verdict_result,
+                    _parked_for_fingerprint.request_fingerprint
+                    if _parked_for_fingerprint is not None
+                    else None,
                 )
-                _prune_pre_resolved_harness_elicitations()
     elif harness_future is None and isinstance(elicitation_id, str) and elicitation_id:
         # Nothing parked (severed long-poll mid-retry, or a runner-side
         # id that just ages out) — tombstone the verdict so a re-park
@@ -2800,23 +2788,15 @@ async def _resolve_elicitation(
             # resolved fan-out below drains it), so fingerprint the
             # tombstone with the question's params: a later, different
             # question that reuses this id must not inherit the verdict.
-            gap_fingerprint: str | None = None
             pending_entry = pending_elicitations.lookup(elicitation_id, conversation_id=session_id)
-            if pending_entry is not None:
-                try:
-                    gap_fingerprint = _harness_elicitation_request_fingerprint(
-                        ElicitationRequestParams.model_validate(pending_entry[1].get("params"))
-                    )
-                except ValidationError:
-                    gap_fingerprint = None
-            _prune_pre_resolved_harness_elicitations()
-            _harness_pre_resolved_elicitations[elicitation_id] = _PreResolvedHarnessElicitation(
-                session_id=session_id,
-                created_at=time.time(),
-                result=pre_resolved,
-                request_fingerprint=gap_fingerprint,
+            gap_fingerprint = (
+                _harness_elicitation_fingerprint_or_none(pending_entry[1].get("params"))
+                if pending_entry is not None
+                else None
             )
-            _prune_pre_resolved_harness_elicitations()
+            _store_pre_resolved_harness_elicitation(
+                elicitation_id, session_id, pre_resolved, gap_fingerprint
+            )
     # Wake a currently-parked long-poll via resolved_elsewhere, not only its
     # Future: setting the Future alone races the sever/re-park cycle and the
     # ASK-gated call hangs. Set the event directly; the signal helper's
@@ -2844,6 +2824,157 @@ async def _resolve_elicitation(
     # Runner-side elicitations (policy approvals, scaffold dispatch)
     # resolve when the canonical approval event reaches the runner.
     await _forward_approval_to_runner(session_id, data, runner_router)
+
+
+def _store_pre_resolved_harness_elicitation(
+    elicitation_id: str,
+    session_id: str,
+    result: ElicitationResult,
+    request_fingerprint: str | None,
+) -> None:
+    """Keep a verdict so a re-park of the same question adopts it (session-checked, TTL-pruned)."""
+    _prune_pre_resolved_harness_elicitations()
+    _harness_pre_resolved_elicitations[elicitation_id] = _PreResolvedHarnessElicitation(
+        session_id=session_id,
+        created_at=time.time(),
+        result=result,
+        request_fingerprint=request_fingerprint,
+    )
+    _prune_pre_resolved_harness_elicitations()
+
+
+def _harness_elicitation_fingerprint_or_none(params: Any) -> str | None:
+    """Fingerprint a question's params, or ``None`` when they do not validate."""
+    try:
+        return _harness_elicitation_request_fingerprint(
+            ElicitationRequestParams.model_validate(params)
+        )
+    except ValidationError:
+        return None
+
+
+# Answers on a stopped session that are being delivered as a message, per replica.
+_stopped_session_answers_in_flight: WorkspaceScopedSet[tuple[str, str]] = WorkspaceScopedSet()
+_STOPPED_SESSION_ANSWER_HEADER = (
+    "[System: the user answered your earlier AskUserQuestion on the question card after this "
+    "session stopped. That tool call was interrupted, so its result was not recorded. "
+    "Continue with these answers.]"
+)
+
+
+def _stopped_session_answer_text(
+    questions: list[dict[str, Any]], content: Mapping[str, Any] | None
+) -> str:
+    """
+    Render AskUserQuestion answers as one message: a fixed header, then a Q/A pair each.
+
+    The card keys each answer by its question text; a multi-select answer is a list.
+    """
+    lines = [_STOPPED_SESSION_ANSWER_HEADER]
+    for question in questions:
+        text = str(question.get("question", ""))
+        raw = (content or {}).get(text)
+        if isinstance(raw, list):
+            answer = ", ".join(str(item) for item in raw)
+        elif raw is None or raw == "":
+            answer = "(no answer)"
+        else:
+            answer = str(raw)
+        lines.append(f"Q: {text}\nA: {answer}")
+    return "\n\n".join(lines)
+
+
+async def _deliver_answer_to_stopped_session(
+    request: Any,
+    session_id: str,
+    conv: Conversation,
+    data: Mapping[str, Any],
+    runner_router: RunnerRouter | None,
+    post_event: Callable[..., Awaitable[Any]] | None,
+) -> dict[str, Any] | None:
+    """
+    Send an AskUserQuestion answer as a user message when the session's runner is gone.
+
+    The message path relaunches the runner; the card closes only after it accepts the message,
+    so its errors propagate and leave the card open.
+    :returns: The message path's acknowledgement, ``{"queued": True}`` while the same answer is
+        in flight, or ``None`` when out of scope.
+    """
+    elicitation_id = data.get("elicitation_id")
+    if post_event is None or not isinstance(request, Request) or data.get("action") != "accept":
+        return None
+    if not isinstance(elicitation_id, str) or not elicitation_id:
+        return None
+    try:
+        result = ElicitationResult.model_validate(
+            {key: value for key, value in data.items() if key != "elicitation_id"}
+        )
+    except ValidationError:
+        return None
+    entry = pending_elicitations.lookup(elicitation_id, conversation_id=session_id)
+    params = entry[1].get("params") if entry is not None else None
+    if not isinstance(params, dict) or params.get("target_session_id") not in (None, session_id):
+        return None
+    ask = params.get("ask_user_question")
+    questions = ask.get("questions") if isinstance(ask, dict) else None
+    if (
+        params.get("policy_name") != "claude_native_permission"
+        or not isinstance(questions, list)
+        or conv.kind == "sub_agent"
+        or not _is_native_terminal_session(conv)
+    ):
+        return None
+    if await _get_runner_client(session_id, runner_router, conversation=conv) is not None:
+        return None
+    key = (session_id, elicitation_id)
+    if key in _stopped_session_answers_in_flight:
+        return {"queued": True}
+    _stopped_session_answers_in_flight.add(key)
+    _logger.info(
+        "Delivering an answer to %s as a message: the session's runner is gone",
+        elicitation_id,
+        extra={"session_id": session_id},
+    )
+    try:
+        message = SessionEventInput(
+            type="message",
+            data={
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": _stopped_session_answer_text(questions, result.content),
+                    }
+                ],
+            },
+        )
+        with contextlib.ExitStack() as in_flight:
+            acknowledgement = await post_event(request, session_id, message, in_flight=in_flight)
+        _close_answered_card(session_id, elicitation_id, params)
+        return acknowledgement
+    finally:
+        _stopped_session_answers_in_flight.discard(key)
+
+
+def _close_answered_card(session_id: str, elicitation_id: str, params: dict[str, Any]) -> None:
+    """
+    Close a question card whose answer went to the session as a message.
+
+    A stale hook wait gets a cancel, so it cannot deliver the answer again; a re-park of
+    the same question adopts that cancel. Other tabs see the card as answered.
+    """
+    cancel = ElicitationResult(action="cancel")
+    owned = _harness_elicitation_owners.get(elicitation_id) == session_id
+    future = _harness_elicitation_registry.get(elicitation_id)
+    if future is not None and owned and not future.done():
+        future.set_result(cancel)
+    parked = _harness_parked_elicitations.get(elicitation_id)
+    if parked is not None and owned:
+        parked.resolved_elsewhere.set()
+    _store_pre_resolved_harness_elicitation(
+        elicitation_id, session_id, cancel, _harness_elicitation_fingerprint_or_none(params)
+    )
+    _publish_elicitation_resolved(session_id, elicitation_id, action="accept")
 
 
 def _spawn_native_approval_popup_forward(
@@ -15180,6 +15311,7 @@ __all__ = [
     "_child_session_summaries_from_conversations",
     "_create_session_from_bundle",
     "_create_session_from_existing_agent",
+    "_deliver_answer_to_stopped_session",
     "_detached_stop_tasks",
     "_dispatch_session_event_to_runner",
     "_drive_terminal_resolved_elicitation",

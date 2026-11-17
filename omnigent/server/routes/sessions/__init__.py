@@ -984,6 +984,7 @@ def create_sessions_router(
         permission_store=permission_store,
     )
 
+    message_dispatch: list[Callable[..., Any]] = []
     register_elicitations_routes(
         router,
         conversation_store=conversation_store,
@@ -991,6 +992,7 @@ def create_sessions_router(
         runner_router=runner_router,
         auth_provider=auth_provider,
         permission_store=permission_store,
+        message_dispatch=message_dispatch,
     )
 
     register_events_routes(
@@ -1010,6 +1012,7 @@ def create_sessions_router(
         runner_tunnel_tokens=runner_tunnel_tokens,
         register_runner_ingest=register_runner_ingest,
         register_startup_dispatch=register_startup_dispatch,
+        register_message_dispatch=message_dispatch.append,
         clear_session_into_fresh_session=clear_session_into_fresh_session,
     )
 
