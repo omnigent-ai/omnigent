@@ -2,6 +2,7 @@ import { settingsEntry } from "./types";
 
 export const MEMBERS_INVITE_ENTRY = settingsEntry({
   id: "members-invite",
+  available: (availability) => availability.accountsEnabled,
   section: "members",
   label: "Invite member",
   description:
