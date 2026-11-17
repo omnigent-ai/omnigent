@@ -560,6 +560,16 @@ def _drive_steer_lifecycle(
         # A previous turn's acceptance that settled, with no report, must not bound the steer.
         (["accept_prev", "settle_prev", "accept_steer", "register"], _STEER_ACCEPTED_AT),
         (["accept_prev", "settle_prev", "register", "accept_steer"], _STEER_ACCEPTED_AT),
+        pytest.param(
+            ["settle_prev", "accept_prev", "accept_steer", "register"],
+            _STEER_ACCEPTED_AT,
+            id="settled-before-delayed-acceptance",
+        ),
+        pytest.param(
+            ["settle_prev", "accept_prev", "drain_old", "accept_steer", "register"],
+            _STEER_ACCEPTED_AT,
+            id="settled-before-delayed-acceptance-and-drain",
+        ),
         # A previous turn's running report that settled must not exempt the steered turn.
         (
             ["accept_prev", "run_prev", "settle_prev", "accept_steer", "register"],
