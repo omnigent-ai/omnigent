@@ -593,28 +593,51 @@ def _parse_bundle(directory: Path, config_yaml: str) -> AgentSpec:
 @pytest.mark.parametrize(
     "provider_config", [{}, _openai_default_config()], ids=["codex-login", "key-provider"]
 )
+@pytest.mark.parametrize(
+    ("web_search_yaml", "disable_native_tools_yaml", "tool_env"),
+    [
+        (
+            "false",
+            "true",
+            {
+                "HARNESS_CODEX_ENABLE_WEB_SEARCH": "false",
+                "HARNESS_CODEX_DISABLE_NATIVE_TOOLS": "true",
+            },
+        ),
+        ("null", "null", {}),
+    ],
+    ids=["restrictive", "null"],
+)
 def test_codex_spec_tool_switches_reach_ordinary_spawn_env(
-    config_home: Path, tmp_path: Path, provider_config: dict[str, object]
+    config_home: Path,
+    tmp_path: Path,
+    provider_config: dict[str, object],
+    web_search_yaml: str,
+    disable_native_tools_yaml: str,
+    tool_env: dict[str, str],
 ) -> None:
     _write_config(config_home, provider_config)
     spec = _parse_bundle(
         tmp_path / "codex-worker",
-        """\
+        f"""\
 spec_version: 1
 name: codex-worker
 prompt: You are a worker.
 executor:
   config:
     harness: codex
-    disable_native_tools: true
-    web_search: false
+    disable_native_tools: {disable_native_tools_yaml}
+    web_search: {web_search_yaml}
 """,
     )
 
     env = _build_codex_spawn_env(spec)
 
-    assert env["HARNESS_CODEX_DISABLE_NATIVE_TOOLS"] == "true"
-    assert env["HARNESS_CODEX_ENABLE_WEB_SEARCH"] == "false"
+    assert {
+        key: value
+        for key, value in env.items()
+        if key in ("HARNESS_CODEX_ENABLE_WEB_SEARCH", "HARNESS_CODEX_DISABLE_NATIVE_TOOLS")
+    } == tool_env
 
 
 def test_locked_codex_profile_yaml_builds_brokered_spawn_env(

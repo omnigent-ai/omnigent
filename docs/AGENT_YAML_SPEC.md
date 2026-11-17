@@ -162,6 +162,9 @@ gateways. They only restrict tools: `web_search: true` and
 turned off. Locked profiles still require `web_search: false` and
 `disable_native_tools: true`, and `broker_gateway` rejects `null`.
 
+Upgrade runners before relying on these restrictions on ordinary routes. Older
+runners ignore the spec's tool switches on those routes.
+
 ### Pi context files
 
 With `harness: pi` or `pi-native`, Pi automatically appends context files such
