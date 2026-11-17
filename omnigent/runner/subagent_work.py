@@ -215,12 +215,11 @@ class _AcceptedChildTurn:
 
 _subagent_work_by_child: dict[str, _SubagentWorkEntry] = {}
 _subagent_work_by_parent: dict[str, set[str]] = {}
-# Start evidence for a child's current turn. Both maps belong to the child's turn lifecycle,
-# not to any dispatch entry: a settled turn clears them, a registration consumes them, and
-# draining or replacing an entry never touches them.
-# Children whose current turn reported running or waiting, until that turn settles.
+# Turn evidence survives dispatch draining or replacement until the matching settlement.
+# Registration consumes accepted turns; reported starts remain until settlement.
 _children_reporting_start: dict[str, str | None] = {}
 _children_accepted_turns: dict[str, _AcceptedChildTurn] = {}
+# Pending request evidence survives settlement until delivery finalization or deletion.
 _pending_child_acceptances: dict[str, set[_ChildAcceptanceRequest]] = {}
 _drained_delivered_subagent_children: set[str] = set()
 # Optimistic (grace-timer) cancellations, delivered then drained, kept so a
