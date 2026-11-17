@@ -5573,7 +5573,14 @@ async def test_recovery_binding_is_durable_before_host_receives_launch(
     monkeypatch.setattr(store, "replace_runner_id", bind_runner)
     registry = app.state.host_registry
     task = asyncio.create_task(
-        _launch_runner_on_host(conv, store, registry, registry.get(_HOST_ID), recovery=intent)
+        _launch_runner_on_host(
+            conv,
+            store,
+            registry,
+            registry.get(_HOST_ID),
+            recovery=intent,
+            recovery_allowed=lambda: True,
+        )
     )
     frame = await _wait_for_launch(comm, budget_s=5)
     assert frame is not None and frame.recovery
