@@ -1875,6 +1875,25 @@ describe("SettingsPage", () => {
     ).toHaveAttribute("aria-labelledby", "settings-hide-unconfigured-harnesses-label");
   });
 
+  it("renders the sidebar rows and their pins from their Settings catalog entries", () => {
+    renderPage("/settings/appearance");
+    for (const id of [
+      "workspace-panel-default",
+      "workspace-tabs",
+      "default-workspace-tab",
+      "session-row-quick-actions",
+      "project-folder-pagination",
+    ]) {
+      expect(document.querySelector(`[data-settings-item="${id}"]`)).not.toBeNull();
+    }
+    expect(
+      document.querySelector('[data-settings-control="workspace-tabs:pinPullRequests"]'),
+    ).toHaveAttribute("aria-label", "Pin Pull Requests");
+    expect(
+      document.querySelector('[data-settings-control="project-folder-pagination:pageSize"]'),
+    ).toHaveAttribute("aria-label", 'Sessions to show before "Show more"');
+  });
+
   it("renders the Sandbox Integrations rows from their Settings catalog entries", async () => {
     mocks.enabledConnections = ["github", "databricks"];
     renderPage("/settings/integrations");

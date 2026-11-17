@@ -120,8 +120,13 @@ import {
   TERMINAL_THEME_ENTRY,
   THEME_MODE_ENTRY,
   TRANSCRIPT_VIEW_DEFAULT_ENTRY,
+  DEFAULT_WORKSPACE_TAB_ENTRY,
+  PROJECT_FOLDER_PAGINATION_ENTRY,
+  SESSION_ROW_QUICK_ACTIONS_ENTRY,
   UI_FONT_FAMILY_ENTRY,
   UI_FONT_SIZE_ENTRY,
+  WORKSPACE_PANEL_DEFAULT_ENTRY,
+  WORKSPACE_TABS_ENTRY,
 } from "@/pages/settings/search/catalog/appearance";
 import { MCP_SERVICES_ENTRY } from "@/pages/settings/search/catalog/mcp";
 import {
@@ -554,6 +559,18 @@ const workspaceTabCards: {
   { value: "tasks", label: "Tasks", icon: ListChecksIcon },
 ];
 
+/** Each tab's pin control, named on the Sidebar tabs row. */
+const WORKSPACE_TAB_PIN_PARTS: Record<
+  DefaultWorkspaceTab,
+  "pinFiles" | "pinChanges" | "pinPullRequests" | "pinAgents" | "pinTasks"
+> = {
+  files: "pinFiles",
+  changes: "pinChanges",
+  github: "pinPullRequests",
+  subagents: "pinAgents",
+  tasks: "pinTasks",
+};
+
 /** Inline icon and label for compact settings choices. */
 function iconButtonBody(Icon: ComponentType<{ className?: string }>, label: string) {
   return (
@@ -704,31 +721,35 @@ function TranscriptViewDefaultControl() {
  */
 function WorkspacePanelDefaultControl() {
   const [value, setValue] = useState(() => readWorkspacePanelDefault());
-  const labelId = useId();
   const choose = useCallback((next: WorkspacePanelDefault) => {
     setValue(next);
     writeWorkspacePanelDefault(next);
   }, []);
   return (
-    <ThemeSubsection
-      labelId={labelId}
-      title="Workspace panel"
-      helper="Show the Workspace panel in new chats. Opening or closing it updates this default; existing chats keep their layout."
-    >
-      <CardRadioGroup<WorkspacePanelDefault>
-        compact
-        labelledBy={labelId}
-        value={value}
-        onSelect={choose}
-        componentId="settings.appearance.workspace_panel"
-        className="flex flex-wrap gap-2"
-        items={workspacePanelCards.map((card) => ({
-          value: card.value,
-          testId: `workspace-panel-default-${card.value}`,
-          body: iconButtonBody(card.icon, card.label),
-        }))}
-      />
-    </ThemeSubsection>
+    <SettingsItem entry={WORKSPACE_PANEL_DEFAULT_ENTRY}>
+      <ThemeSubsection
+        labelId={settingsLabelId(WORKSPACE_PANEL_DEFAULT_ENTRY)}
+        descriptionId={settingsDescriptionId(WORKSPACE_PANEL_DEFAULT_ENTRY)}
+        title="Workspace panel"
+        helper="Show the Workspace panel in new chats. Opening or closing it updates this default; existing chats keep their layout."
+      >
+        <SettingsOwner entry={WORKSPACE_PANEL_DEFAULT_ENTRY}>
+          <CardRadioGroup<WorkspacePanelDefault>
+            compact
+            labelledBy={settingsLabelId(WORKSPACE_PANEL_DEFAULT_ENTRY)}
+            value={value}
+            onSelect={choose}
+            componentId="settings.appearance.workspace_panel"
+            className="flex flex-wrap gap-2"
+            items={workspacePanelCards.map((card) => ({
+              value: card.value,
+              testId: `workspace-panel-default-${card.value}`,
+              body: iconButtonBody(card.icon, card.label),
+            }))}
+          />
+        </SettingsOwner>
+      </ThemeSubsection>
+    </SettingsItem>
   );
 }
 
@@ -736,8 +757,8 @@ function WorkspacePanelDefaultControl() {
 function WorkspaceTabsControl() {
   const [value, setValue] = useState(() => readDefaultWorkspaceTab());
   const [pinned, setPinned] = useState(() => readPinnedWorkspaceTabs());
-  const labelId = useId();
-  const pinnedLabelId = useId();
+  const labelId = settingsLabelId(DEFAULT_WORKSPACE_TAB_ENTRY);
+  const pinnedLabelId = settingsLabelId(WORKSPACE_TABS_ENTRY);
   const pinnedCards = workspaceTabCards.filter((card) => pinned.includes(card.value));
   const firstTab = pinnedCards.find((card) => card.value === value) ?? pinnedCards[0];
   const previewTabs = firstTab
@@ -756,89 +777,97 @@ function WorkspaceTabsControl() {
   };
   return (
     <div className="flex flex-col gap-4">
-      <ThemeSubsection
-        labelId={pinnedLabelId}
-        title="Sidebar tabs"
-        helper="Pin the pages you use most. Everything else stays in the + menu."
-      >
-        <div
-          role="img"
-          aria-label={`Sidebar preview: ${previewTabs.length ? `${previewTabs.map((tab) => tab.label).join(", ")} pinned` : "all pages in the + menu"}.`}
-          className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-border bg-muted/25 px-3 py-2.5"
+      <SettingsItem entry={WORKSPACE_TABS_ENTRY}>
+        <ThemeSubsection
+          labelId={pinnedLabelId}
+          descriptionId={settingsDescriptionId(WORKSPACE_TABS_ENTRY)}
+          title="Sidebar tabs"
+          helper="Pin the pages you use most. Everything else stays in the + menu."
         >
-          <span className="text-sm text-muted-foreground">Sidebar preview</span>
-          <div aria-hidden="true" className="flex shrink-0 items-center gap-1">
-            {previewTabs.map(({ value: tab, icon: Icon }) => (
-              <span
-                key={tab}
-                className={cn(
-                  "flex size-7 items-center justify-center rounded-md text-muted-foreground",
-                  tab === firstTab?.value && "bg-background text-foreground shadow-xs",
-                )}
-              >
-                <Icon className="size-4" />
-              </span>
-            ))}
-            {previewTabs.length > 0 && <span className="mx-1 h-4 w-px bg-border" />}
-            <span className="flex size-7 items-center justify-center text-muted-foreground">
-              <PlusIcon className="size-4" />
-            </span>
-          </div>
-        </div>
-        <div role="group" aria-labelledby={pinnedLabelId} className="divide-y divide-border">
-          {workspaceTabCards.map(({ value: tab, label, icon: Icon }) => {
-            const isPinned = pinned.includes(tab);
-            return (
-              <div key={tab} className="flex items-center gap-3 py-2.5">
-                <Icon aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
-                <span className="flex-1 text-ui">{label}</span>
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="sm"
-                  aria-label={`Pin ${label}`}
-                  aria-pressed={isPinned}
-                  title={`${isPinned ? "Unpin" : "Pin"} ${label}`}
-                  onClick={() => togglePin(tab, !isPinned)}
+          <div
+            role="img"
+            aria-label={`Sidebar preview: ${previewTabs.length ? `${previewTabs.map((tab) => tab.label).join(", ")} pinned` : "all pages in the + menu"}.`}
+            className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-border bg-muted/25 px-3 py-2.5"
+          >
+            <span className="text-sm text-muted-foreground">Sidebar preview</span>
+            <div aria-hidden="true" className="flex shrink-0 items-center gap-1">
+              {previewTabs.map(({ value: tab, icon: Icon }) => (
+                <span
+                  key={tab}
                   className={cn(
-                    "min-w-24",
-                    isPinned
-                      ? "bg-primary/8 text-primary hover:bg-primary/12"
-                      : "text-muted-foreground",
+                    "flex size-7 items-center justify-center rounded-md text-muted-foreground",
+                    tab === firstTab?.value && "bg-background text-foreground shadow-xs",
                   )}
-                  componentId={`settings.appearance.pin_workspace_${tab}`}
                 >
-                  <PinIcon
-                    aria-hidden="true"
-                    className={cn("size-3.5", isPinned && "fill-current")}
-                  />
-                  {isPinned ? "Pinned" : "Pin"}
-                </Button>
-              </div>
-            );
-          })}
-        </div>
-      </ThemeSubsection>
+                  <Icon className="size-4" />
+                </span>
+              ))}
+              {previewTabs.length > 0 && <span className="mx-1 h-4 w-px bg-border" />}
+              <span className="flex size-7 items-center justify-center text-muted-foreground">
+                <PlusIcon className="size-4" />
+              </span>
+            </div>
+          </div>
+          <div role="group" aria-labelledby={pinnedLabelId} className="divide-y divide-border">
+            {workspaceTabCards.map(({ value: tab, label, icon: Icon }) => {
+              const isPinned = pinned.includes(tab);
+              return (
+                <div key={tab} className="flex items-center gap-3 py-2.5">
+                  <Icon aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
+                  <span className="flex-1 text-ui">{label}</span>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    {...settingsControlProps(WORKSPACE_TABS_ENTRY, WORKSPACE_TAB_PIN_PARTS[tab])}
+                    aria-pressed={isPinned}
+                    title={`${isPinned ? "Unpin" : "Pin"} ${label}`}
+                    onClick={() => togglePin(tab, !isPinned)}
+                    className={cn(
+                      "min-w-24",
+                      isPinned
+                        ? "bg-primary/8 text-primary hover:bg-primary/12"
+                        : "text-muted-foreground",
+                    )}
+                    componentId={`settings.appearance.pin_workspace_${tab}`}
+                  >
+                    <PinIcon
+                      aria-hidden="true"
+                      className={cn("size-3.5", isPinned && "fill-current")}
+                    />
+                    {isPinned ? "Pinned" : "Pin"}
+                  </Button>
+                </div>
+              );
+            })}
+          </div>
+        </ThemeSubsection>
+      </SettingsItem>
       {firstTab && (
         <div className="border-t border-border pt-4">
-          <ThemeSubsection
-            labelId={labelId}
-            title="Default Workspace tab"
-            helper="Open this tab first, including in existing chats after reopening or refreshing. Later choices are remembered; file links still open their target."
-          >
-            <CardRadioGroup<DefaultWorkspaceTab>
-              compact
-              labelledBy={labelId}
-              value={firstTab.value}
-              onSelect={choose}
-              className="flex flex-wrap gap-2"
-              items={pinnedCards.map((card) => ({
-                value: card.value,
-                testId: `workspace-tab-default-${card.value}`,
-                body: iconButtonBody(card.icon, card.label),
-              }))}
-            />
-          </ThemeSubsection>
+          <SettingsItem entry={DEFAULT_WORKSPACE_TAB_ENTRY}>
+            <ThemeSubsection
+              labelId={labelId}
+              descriptionId={settingsDescriptionId(DEFAULT_WORKSPACE_TAB_ENTRY)}
+              title="Default Workspace tab"
+              helper="Open this tab first, including in existing chats after reopening or refreshing. Later choices are remembered; file links still open their target."
+            >
+              <SettingsOwner entry={DEFAULT_WORKSPACE_TAB_ENTRY}>
+                <CardRadioGroup<DefaultWorkspaceTab>
+                  compact
+                  labelledBy={labelId}
+                  value={firstTab.value}
+                  onSelect={choose}
+                  className="flex flex-wrap gap-2"
+                  items={pinnedCards.map((card) => ({
+                    value: card.value,
+                    testId: `workspace-tab-default-${card.value}`,
+                    body: iconButtonBody(card.icon, card.label),
+                  }))}
+                />
+              </SettingsOwner>
+            </ThemeSubsection>
+          </SettingsItem>
         </div>
       )}
     </div>
@@ -1117,18 +1146,12 @@ function ProjectFolderPaginationControl() {
   const pageSize = useProjectFolderPageSize();
   // The text being typed; null shows the saved size, so a bad entry reverts on blur.
   const [draft, setDraft] = useState<string | null>(null);
-  const collapseLabelId = useId();
-  const pageSizeLabelId = useId();
   return (
-    <>
+    <SettingsItem entry={PROJECT_FOLDER_PAGINATION_ENTRY}>
       <div className="flex items-start justify-between gap-6">
-        <SettingsLabel
-          label='Collapse project sessions behind "Show more"'
-          labelId={collapseLabelId}
-          description="An expanded project folder lists its first sessions and a Show more row for the rest. Turn this off to list every session, loading more as you scroll."
-        />
+        <SettingsEntryLabel entry={PROJECT_FOLDER_PAGINATION_ENTRY} />
         <Switch
-          aria-labelledby={collapseLabelId}
+          {...settingsControlProps(PROJECT_FOLDER_PAGINATION_ENTRY)}
           checked={collapse}
           onCheckedChange={writeProjectFolderCollapse}
           data-testid="project-folder-collapse-toggle"
@@ -1140,7 +1163,6 @@ function ProjectFolderPaginationControl() {
         <div className="mt-4 flex items-center justify-between gap-6 border-t border-border pt-4">
           <SettingsLabel
             label='Sessions to show before "Show more"'
-            labelId={pageSizeLabelId}
             description={`Each Show more click reveals this many more. Use a whole number from ${PROJECT_FOLDER_PAGE_SIZE_MIN} to ${PROJECT_FOLDER_PAGE_SIZE_MAX}.`}
           />
           <Input
@@ -1149,7 +1171,7 @@ function ProjectFolderPaginationControl() {
             min={PROJECT_FOLDER_PAGE_SIZE_MIN}
             max={PROJECT_FOLDER_PAGE_SIZE_MAX}
             step={1}
-            aria-labelledby={pageSizeLabelId}
+            {...settingsControlProps(PROJECT_FOLDER_PAGINATION_ENTRY, "pageSize")}
             data-testid="project-folder-page-size-input"
             className="h-9 w-20 shrink-0 tabular-nums"
             value={draft ?? String(pageSize)}
@@ -1165,30 +1187,28 @@ function ProjectFolderPaginationControl() {
           />
         </div>
       )}
-    </>
+    </SettingsItem>
   );
 }
 
 /** On by default: sidebar rows show hover Pin and Archive buttons beside the "…" menu. */
 function SessionRowQuickActionsControl() {
   const shown = useSessionRowQuickActions();
-  const labelId = useId();
   return (
-    <div className="flex items-start justify-between gap-6">
-      <SettingsLabel
-        label="Show Pin and Archive buttons on session rows"
-        labelId={labelId}
-        description={`Turn this off to keep Pin and Archive in the session row's "…" menu and right-click menu only, so they are harder to click by mistake.`}
-      />
+    <SettingsItem
+      entry={SESSION_ROW_QUICK_ACTIONS_ENTRY}
+      className="flex items-start justify-between gap-6"
+    >
+      <SettingsEntryLabel entry={SESSION_ROW_QUICK_ACTIONS_ENTRY} />
       <Switch
-        aria-labelledby={labelId}
+        {...settingsControlProps(SESSION_ROW_QUICK_ACTIONS_ENTRY)}
         checked={shown}
         onCheckedChange={writeSessionRowQuickActions}
         data-testid="session-row-quick-actions-toggle"
         className="mt-0.5 shrink-0"
         componentId="settings.appearance.session_row_quick_actions"
       />
-    </div>
+    </SettingsItem>
   );
 }
 

@@ -188,6 +188,73 @@ export const SHOW_FINAL_ANSWER_ENTRY = settingsEntry({
   keywords: ["fold", "progress", "narration", "worked", "transcript", "collapse"],
 });
 
+export const WORKSPACE_PANEL_DEFAULT_ENTRY = settingsEntry({
+  id: "workspace-panel-default",
+  section: "appearance",
+  label: "Workspace panel",
+  description:
+    "Show the Workspace panel in new chats. Opening or closing it updates this default; existing chats keep their layout.",
+  keywords: ["workspace", "panel", "rail", "collapsed", "open"],
+  choices: ["Open", "Collapsed"],
+});
+
+export const WORKSPACE_TABS_ENTRY = settingsEntry({
+  id: "workspace-tabs",
+  section: "appearance",
+  label: "Sidebar tabs",
+  description: "Pin the pages you use most. Everything else stays in the + menu.",
+  keywords: [
+    "pin",
+    "tabs",
+    "workspace",
+    "sidebar",
+    "files",
+    "changes",
+    "pull requests",
+    "agents",
+    "tasks",
+  ],
+  parts: {
+    pinFiles: "Pin Files",
+    pinChanges: "Pin Changes",
+    pinPullRequests: "Pin Pull Requests",
+    pinAgents: "Pin Agents",
+    pinTasks: "Pin Tasks",
+  },
+  focus: "pinFiles",
+});
+
+export const DEFAULT_WORKSPACE_TAB_ENTRY = settingsEntry({
+  id: "default-workspace-tab",
+  section: "appearance",
+  label: "Default Workspace tab",
+  description:
+    "Open this tab first, including in existing chats after reopening or refreshing. Later choices are remembered; file links still open their target.",
+  keywords: ["workspace", "tab", "default", "first"],
+  choices: ["Files", "Changes", "Pull Requests", "Agents", "Tasks"],
+  // Shown only while a tab is pinned; until then, its reveal goes to the pins.
+  revealedBy: "workspace-tabs",
+});
+
+export const SESSION_ROW_QUICK_ACTIONS_ENTRY = settingsEntry({
+  id: "session-row-quick-actions",
+  section: "appearance",
+  label: "Show Pin and Archive buttons on session rows",
+  description: `Turn this off to keep Pin and Archive in the session row's "…" menu and right-click menu only, so they are harder to click by mistake.`,
+  keywords: ["pin", "archive", "hover", "quick actions", "row buttons", "sidebar", "accidental"],
+});
+
+export const PROJECT_FOLDER_PAGINATION_ENTRY = settingsEntry({
+  id: "project-folder-pagination",
+  section: "appearance",
+  label: 'Collapse project sessions behind "Show more"',
+  description:
+    "An expanded project folder lists its first sessions and a Show more row for the rest. Turn this off to list every session, loading more as you scroll.",
+  keywords: ["project", "folder", "sessions", "show more", "pagination", "sidebar"],
+  parts: { pageSize: 'Sessions to show before "Show more"' },
+  presence: { pageSize: { states: ["collapsed"] } },
+});
+
 export const APPEARANCE_SETTINGS = [
   THEME_MODE_ENTRY,
   TERMINAL_THEME_ENTRY,
@@ -203,4 +270,9 @@ export const APPEARANCE_SETTINGS = [
   PICKER_VISIBILITY_ENTRY,
   SHOW_FINAL_ANSWER_ENTRY,
   PEER_SESSION_MESSAGES_ENTRY,
+  WORKSPACE_PANEL_DEFAULT_ENTRY,
+  WORKSPACE_TABS_ENTRY,
+  DEFAULT_WORKSPACE_TAB_ENTRY,
+  SESSION_ROW_QUICK_ACTIONS_ENTRY,
+  PROJECT_FOLDER_PAGINATION_ENTRY,
 ] as const;
