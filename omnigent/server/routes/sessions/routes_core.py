@@ -1629,6 +1629,18 @@ def register_core_routes(
                         "Sender host/workspace is invalid for independent creation",
                         code=ErrorCode.INVALID_INPUT,
                     ) from exc
+        running_task = None
+        if source is not None and "project_id" not in body.model_fields_set:
+            from omnigent.server.scheduled.harness_settings import automation_running_in
+
+            # A worker an automation's run starts goes in the automation's current
+            # project, which may differ from the one its kept session was filed in.
+            running_task = await automation_running_in(
+                getattr(request.app.state, "scheduled_task_store", None),
+                source.labels.get(SCHEDULED_TASK_ORIGIN_LABEL_KEY),
+                source_session_id=source.id,
+                user_id=user_id,
+            )
         agent_sibling = False
         if source is not None and request.app.state.feature_flags.enabled(
             Feature.SIBLING_SESSIONS
@@ -1665,6 +1677,8 @@ def register_core_routes(
                 # An agent that names another project gets a standalone session there;
                 # the source and destination checks above still apply.
                 body.sibling_source_id = None
+            elif running_task is not None and running_task.project_id != sibling_source.project_id:
+                body.sibling_source_id = None
             else:
                 body.sibling_source_id = sibling_source.id
                 body.project_id = sibling_source.project_id
@@ -1696,7 +1710,13 @@ def register_core_routes(
             background_title_coordinator=background_title_coordinator,
             project_store=project_store,
             created_by_session_id=source.id if source is not None else None,
-            created_by_project_id=source.project_id if source is not None else None,
+            created_by_project_id=(
+                running_task.project_id
+                if running_task is not None
+                else source.project_id
+                if source is not None
+                else None
+            ),
             created_by_scheduled_task_id=(
                 source.labels.get(SCHEDULED_TASK_ORIGIN_LABEL_KEY) if source is not None else None
             ),

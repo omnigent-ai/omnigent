@@ -19,12 +19,16 @@ from omnigent.server.routes._sessions import common as sessions_common
 from omnigent.server.routes._sessions import orchestration
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
-from omnigent.stores.conversation_store import CREATED_BY_SESSION_LABEL_KEY
+from omnigent.stores.conversation_store import (
+    CREATED_BY_SESSION_LABEL_KEY,
+    SCHEDULED_TASK_ORIGIN_LABEL_KEY,
+)
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
+from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
 from tests.server.integration.test_sessions_attribution import _bind_runner
 from tests.server.integration.test_sessions_harness_override import _stub_late_runner_bind
 from tests.server.integration.test_sessions_permissions import _create_session_as
@@ -234,6 +238,60 @@ async def test_a_project_named_in_the_request_wins_over_the_source_project(
     # Only the source's own project keeps the worker in the source's family.
     nested = orchestration_environment and requested == "source"
     assert worker.family_id == (source["id"] if nested else None)
+
+
+@pytest.mark.parametrize(
+    ("automation_project", "is_run", "expected_project"),
+    [
+        pytest.param("moved", True, "moved", id="moved"),
+        pytest.param("poller", True, "poller", id="unchanged"),
+        pytest.param(None, True, None, id="cleared"),
+        # A session the automation no longer runs in keeps filing workers beside it.
+        pytest.param("moved", False, "poller", id="not-its-run"),
+    ],
+)
+async def test_an_automation_run_files_workers_in_the_automations_current_project(
+    auth_client,
+    auth_app,
+    db_uri,
+    monkeypatch,
+    automation_project,
+    is_run,
+    expected_project,
+    orchestration_environment,
+):
+    auth_client.headers["X-Forwarded-Email"] = "alice"
+    poller = await _create_session_as(auth_client, "", "alice")
+    projects = {
+        "poller": await _project(auth_client, "Automation V1"),
+        "moved": await _project(auth_client, "Automation V2"),
+        None: None,
+    }
+    await _file(auth_client, db_uri, poller["id"], projects["poller"])
+    schedules = SqlAlchemyScheduledTaskStore(db_uri)
+    task = schedules.create(
+        scheduled_task_id=uuid.uuid4().hex,
+        name="PR Review",
+        prompt="Start a session for each new pull request",
+        rrule="FREQ=HOURLY",
+        user_id="alice",
+        agent_id=poller["agent_id"],
+        timezone="UTC",
+        session_mode="continue" if is_run else "new",
+        session_id=poller["id"] if is_run else None,
+        project_id=projects[automation_project],
+    )
+    SqlAlchemyConversationStore(db_uri).set_labels(
+        poller["id"], {SCHEDULED_TASK_ORIGIN_LABEL_KEY: task.id}
+    )
+    monkeypatch.setattr(auth_app.state, "scheduled_task_store", schedules, raising=False)
+
+    worker_id = await _start_worker(auth_client, auth_app, db_uri, monkeypatch, poller)
+
+    worker = SqlAlchemyConversationStore(db_uri).get_conversation(worker_id)
+    assert worker.project_id == projects[expected_project]
+    nested = orchestration_environment and expected_project == "poller"
+    assert worker.family_id == (poller["id"] if nested else None)
 
 
 @_NESTED_ONLY

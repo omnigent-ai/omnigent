@@ -7,6 +7,7 @@ import logging
 from typing import Any
 
 from omnigent.db.workspace_cache import WorkspaceScopedCache
+from omnigent.entities.scheduled_task import ScheduledTask
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_aliases import canonicalize_harness, is_native_harness
 from omnigent.native.permission_modes import (
@@ -128,6 +129,33 @@ def _is_automation_run_session(
     return bool(scheduled_task_store.has_active_run(task.id, source_session_id))
 
 
+async def automation_running_in(
+    scheduled_task_store: Any,
+    scheduled_task_id: str | None,
+    *,
+    source_session_id: str | None,
+    user_id: str | None,
+) -> ScheduledTask | None:
+    """The automation whose run is *source_session_id*, for a session that run creates.
+
+    ``None`` when the creator is not one of the automation's runs (a fork keeps the
+    origin label but not the run), or the automation is deleted or another user's.
+    """
+    if scheduled_task_store is None or not scheduled_task_id:
+        return None
+    task = await asyncio.to_thread(scheduled_task_store.get, scheduled_task_id)
+    # ``get`` still returns soft-deleted rows, and deleting a task doesn't stop its run.
+    if task is None or task.state == "deleted":
+        return None
+    if (task.user_id or RESERVED_USER_LOCAL) != (user_id or RESERVED_USER_LOCAL):
+        return None
+    if not await asyncio.to_thread(
+        _is_automation_run_session, scheduled_task_store, task, source_session_id
+    ):
+        return None
+    return task
+
+
 async def automation_session_launch_options(
     scheduled_task_store: Any,
     scheduled_task_id: str | None,
@@ -143,17 +171,15 @@ async def automation_session_launch_options(
     is deleted, has no mode or belongs to another user, or the new session's harness
     has no such mode.
     """
-    if scheduled_task_store is None or not scheduled_task_id or harness is None:
+    if harness is None:
         return None
-    task = await asyncio.to_thread(scheduled_task_store.get, scheduled_task_id)
-    # ``get`` still returns soft-deleted rows, and deleting a task doesn't stop its run.
-    if task is None or task.state == "deleted" or task.permission_mode is None:
-        return None
-    if (task.user_id or RESERVED_USER_LOCAL) != (user_id or RESERVED_USER_LOCAL):
-        return None
-    if not await asyncio.to_thread(
-        _is_automation_run_session, scheduled_task_store, task, source_session_id
-    ):
+    task = await automation_running_in(
+        scheduled_task_store,
+        scheduled_task_id,
+        source_session_id=source_session_id,
+        user_id=user_id,
+    )
+    if task is None or task.permission_mode is None:
         return None
     harness = canonicalize_harness(harness) or harness
     options = permission_mode_launch_options(harness, task.permission_mode)

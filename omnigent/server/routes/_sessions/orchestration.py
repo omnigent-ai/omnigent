@@ -12478,8 +12478,8 @@ async def _create_session_from_existing_agent(
         to the runner.
     :param artifact_store: Optional binary content store for the same.
     :param created_by_session_id: Server-authorized source of an independent worker.
-    :param created_by_project_id: That source's project. A worker whose request names
-        no project is filed there, so it sits beside the session that started it.
+    :param created_by_project_id: Where a worker whose request names no project is
+        filed: its source's project, or the automation's when the source is its run.
     :param created_by_scheduled_task_id: The automation whose run is that source, if
         any. A worker whose request carries no launch args runs in its permission mode.
     :param created_by_labels: That source's labels. A worker that picks no MCP

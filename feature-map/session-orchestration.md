@@ -59,7 +59,9 @@ MCP independent creation.
   sibling stays in its creator's project, and an unavailable source project is
   rejected before creation; a different requested project makes a standalone
   session in that project. Without a requested project, a standalone session is
-  filed in its creator's project, if that project still exists. A `project_name`
+  filed in its creator's project, if that project still exists. A session an
+  automation's run creates uses the automation's current project instead, and is
+  standalone when that differs from its creator's. A `project_name`
   argument files the session in the owner's project with that name instead,
   created if missing. On an older server that has `sibling_sessions` on and no
   `sibling_other_project_standalone` in `/v1/info`, the tool refuses
