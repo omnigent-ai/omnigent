@@ -176,6 +176,8 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
   recording links, file previews, and download fallbacks.
 - [Tool calls in chat](./tool-calls.md) covers tool-call rows and their edit
   counts, the expanded field, error and Raw views, and tool-run folding.
+- [Data queries](./data-queries.md) covers the `data_queries:` spec block, the
+  built-in SQL CLI patterns, and the session data-queries API.
 - [Sandbox profiles](./sandbox-profiles.md) covers provider-owned discovery,
   desktop and mobile profile selection, and the boundary between browser
   request proof and live resource/network enforcement.

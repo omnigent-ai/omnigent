@@ -851,6 +851,7 @@ def build_agent_bundle(
     include_llm: bool = True,
     tool_groups: dict[str, bool] | None = None,
     os_env: dict[str, Any] | None = None,
+    data_queries: dict[str, Any] | None = None,
 ) -> bytes:
     """
     Build a minimal valid agent bundle (tar.gz) for testing.
@@ -892,6 +893,8 @@ def build_agent_bundle(
         Set ``False`` for model-less harness tests.
     :param tool_groups: Optional ``tool_groups:`` block written verbatim,
         e.g. ``{"user_inbox": True}``. ``None`` omits it.
+    :param data_queries: Optional ``data_queries:`` block written verbatim,
+        e.g. ``{"builtins": False}``. ``None`` omits it.
     :returns: A gzipped tar archive containing the generated
         ``config.yaml`` plus optional sub-agent and skill files.
     """
@@ -919,6 +922,8 @@ def build_agent_bundle(
         config["terminals"] = terminals
     if tool_groups is not None:
         config["tool_groups"] = tool_groups
+    if data_queries is not None:
+        config["data_queries"] = data_queries
     if executor is not None:
         config["executor"] = dict(executor)
         config["executor"].setdefault("config", {}).setdefault("harness", "claude-sdk")

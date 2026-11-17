@@ -36,6 +36,7 @@ from omnigent.inner.datamodel import (
 )
 from omnigent.inner.git_ssh_policy import parse_git_ssh_bindings as _parse_git_ssh
 from omnigent.inner.sandbox import containment_prefix
+from omnigent.spec.data_queries import parse_data_queries
 from omnigent.spec.types import (
     DEFAULT_ASK_TIMEOUT,
     AgentSpec,
@@ -322,6 +323,9 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
     # granting named users; ``public`` also allows ``__public__``
     # anonymous read.
     agent_session_sharing = _parse_share_policy(raw.get("agent_session_sharing"))
+    # Top-level ``data_queries:`` declares which tool calls run queries or
+    # read data sources; display metadata only, never a policy input.
+    data_queries = parse_data_queries(raw.get("data_queries"))
 
     # Honor ``prompt:`` as the legacy alias for ``instructions:`` (per
     # ``_OMNIGENT_SYSTEM_PROMPT_KEYS``); ``instructions:`` wins if both set.
@@ -361,6 +365,7 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
         spawn=spawn,
         tool_groups=tool_groups,
         agent_session_sharing=agent_session_sharing,
+        data_queries=data_queries,
     )
 
 

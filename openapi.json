@@ -9544,6 +9544,187 @@
         "title": "SessionCreatedEvent",
         "type": "object"
       },
+      "SessionDataQuery": {
+        "description": "A session tool call classified as a data query or a data-source read.\n\nDisplay metadata from the recorded call; it never changes how the call\nwas authorized or run.",
+        "properties": {
+          "call_id": {
+            "description": "The tool call's ID, e.g. `\"toolu_01\"`.",
+            "title": "Call Id",
+            "type": "string"
+          },
+          "id": {
+            "description": "The `function_call` item's ID, e.g. `\"fc_abc123\"`.",
+            "title": "Id",
+            "type": "string"
+          },
+          "kind": {
+            "description": "`\"query\"` when the call carries SQL, `\"source\"` when it only reads a data source.",
+            "enum": [
+              "query",
+              "source"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "matcher": {
+            "description": "`\"mcp\"` (matched by tool name) or `\"shell\"` (by argv prefix).",
+            "enum": [
+              "mcp",
+              "shell"
+            ],
+            "title": "Matcher",
+            "type": "string"
+          },
+          "origin": {
+            "description": "`\"spec\"` for an agent spec rule, `\"builtin\"` for a built-in CLI pattern.",
+            "enum": [
+              "spec",
+              "builtin"
+            ],
+            "title": "Origin",
+            "type": "string"
+          },
+          "output_item_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The `function_call_output` item's ID, or `None` while the call has no recorded output.",
+            "title": "Output Item Id"
+          },
+          "response_id": {
+            "description": "The turn that made the call, e.g. `\"resp_abc\"`.",
+            "title": "Response Id",
+            "type": "string"
+          },
+          "row_count": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Rows the result reports, or `None`.",
+            "title": "Row Count"
+          },
+          "rule": {
+            "description": "The matching rule's name, e.g. `\"psql\"`.",
+            "title": "Rule",
+            "type": "string"
+          },
+          "source": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The connection, database or table, passwords redacted.",
+            "title": "Source"
+          },
+          "sql": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The SQL text as the call passed it, or `None`.",
+            "title": "Sql"
+          },
+          "tool_name": {
+            "description": "The recorded tool name, e.g. `\"Bash\"`.",
+            "title": "Tool Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "call_id",
+          "response_id",
+          "tool_name",
+          "kind",
+          "matcher",
+          "rule",
+          "origin"
+        ],
+        "title": "SessionDataQuery",
+        "type": "object"
+      },
+      "SessionDataQueryList": {
+        "description": "A page of a session's data queries, oldest first.",
+        "properties": {
+          "data": {
+            "description": "The classified calls in this page.",
+            "items": {
+              "$ref": "#/components/schemas/SessionDataQuery"
+            },
+            "title": "Data",
+            "type": "array"
+          },
+          "first_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "`id` of the first entry, or `None` when empty.",
+            "title": "First Id"
+          },
+          "has_more": {
+            "default": false,
+            "description": "Whether the scan stopped before the session's end.",
+            "title": "Has More",
+            "type": "boolean"
+          },
+          "last_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "`id` of the last entry, or `None` when empty.",
+            "title": "Last Id"
+          },
+          "next_after": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Item cursor to pass as `after` for the next page; `None` when `has_more` is false.",
+            "title": "Next After"
+          },
+          "object": {
+            "const": "list",
+            "default": "list",
+            "title": "Object",
+            "type": "string"
+          }
+        },
+        "title": "SessionDataQueryList",
+        "type": "object"
+      },
       "SessionErrorItem": {
         "description": "`error` item: common fields plus `ErrorData`.",
         "properties": {
@@ -23243,6 +23424,90 @@
         "summary": "Update Comment",
         "tags": [
           "comments"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/data_queries": {
+      "get": {
+        "description": "List the session's tool calls that ran data queries or read data sources.\n\nEach call is classified by the agent spec's `data_queries:` rules,\nthen the built-in SQL CLI patterns (`psql -c`, `bq query` and\nothers) unless the spec turns them off. A turn's Sources are the\nentries whose `response_id` is that turn's.\n\n**Returns:** A page of `SessionDataQuery`, oldest first.\n\n**Raises**\n\n- `OmnigentError` \u2014 403 without read access; 404 if no session exists.",
+        "operationId": "list_session_data_queries_v1_sessions__session_id__data_queries_get",
+        "parameters": [
+          {
+            "description": "Session identifier, e.g. `\"conv_abc123\"`.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Most entries to return (1-500, default 100).",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 500,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "`next_after` from the previous page.",
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionDataQueryList"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The `after`/`before` cursor names an item that no longer exists (it was deleted, or archived out of the filtered set) so the keyset bound cannot be resolved. The `error.code` is `stale_cursor`. Enumeration cannot continue from this cursor: restart from the first page, without a cursor."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Session Data Queries",
+        "tags": [
+          "sessions"
         ]
       }
     },

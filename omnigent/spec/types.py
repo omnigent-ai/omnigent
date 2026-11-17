@@ -910,6 +910,102 @@ class ToolGroupsConfig:
     user_inbox: bool = True
 
 
+@dataclass(frozen=True)
+class DataQueryLocator:
+    """
+    Where one value of a data query (its SQL, source or row count) lives.
+
+    Exactly one way of locating it is set. Several locators for one value
+    are tried in order, so ``(flag -d, positional 0)`` reads ``psql``'s
+    database from ``-d`` and falls back to its first positional word.
+
+    :param argument: Dotted path into an MCP call's arguments, e.g.
+        ``"statement"`` or ``"params.sql"``.
+    :param arguments: Dotted paths whose values join with ``.``, e.g.
+        ``("catalog", "schema", "table")`` reads ``main.sales.orders``.
+    :param flag: A shell command's flag (and its aliases) whose value holds
+        it, e.g. ``("-c", "--command")``; ``--flag value`` and
+        ``--flag=value`` both count.
+    :param positional: Index among a shell command's positional words after
+        its matched prefix, e.g. ``0`` for ``sqlite3``'s database file.
+    :param result: Dotted path into the call's JSON result, e.g.
+        ``"manifest.total_row_count"``; ``""`` is the result itself.
+    :param value: A fixed value, e.g. ``"prod warehouse"`` (sources only).
+    :param output_pattern: Built-in only: a regex whose last match's first
+        group, read from the result's text, is the value (``psql``'s
+        ``(3 rows)`` footer). Specs can't set it.
+    """
+
+    argument: str | None = None
+    arguments: tuple[str, ...] = ()
+    flag: tuple[str, ...] = ()
+    positional: int | None = None
+    result: str | None = None
+    value: str | None = None
+    output_pattern: str | None = None
+
+
+@dataclass(frozen=True)
+class DataQueryRule:
+    """
+    One way to recognize a tool call as a data query or a data-source read.
+
+    A rule matches either an MCP tool by name or a shell command by its
+    argv prefix, never both. A rule with a ``sql`` locator matches only a
+    call whose SQL it finds; a rule with only ``source`` matches every call
+    its matcher selects.
+
+    :param name: Stable rule name reported on each match, e.g. ``"psql"``.
+    :param mcp_server: MCP server the tool belongs to, e.g. ``"warehouse"``;
+        ``None`` matches any server and unprefixed tools.
+    :param mcp_tool: MCP tool name, e.g. ``"execute_sql"``; ``None`` matches
+        every tool of ``mcp_server``.
+    :param shell_prefix: Argv prefix a shell command starts with, e.g.
+        ``("bq", "query")``. The first word matches a binary's basename;
+        flags between prefix words are skipped.
+    :param value_flags: Shell flags that take a separate value word, so
+        positional words skip it, e.g. ``("-h", "--host")``.
+    :param sql: Where the SQL text is, tried in order.
+    :param source: Where the data source (connection, database or table) is.
+    :param row_count: Where the number of rows returned is.
+    :param bundled_short_flags: Built-in only: read bundled short flags, so
+        ``psql -tAc 'SELECT 1'`` gives ``-c`` its value. Specs can't set it.
+    """
+
+    name: str
+    mcp_server: str | None = None
+    mcp_tool: str | None = None
+    shell_prefix: tuple[str, ...] = ()
+    value_flags: tuple[str, ...] = ()
+    sql: tuple[DataQueryLocator, ...] = ()
+    source: tuple[DataQueryLocator, ...] = ()
+    row_count: tuple[DataQueryLocator, ...] = ()
+    bundled_short_flags: bool = False
+
+    @property
+    def is_shell(self) -> bool:
+        """Whether the rule matches shell commands rather than MCP tools."""
+        return bool(self.shell_prefix)
+
+
+@dataclass(frozen=True)
+class DataQueriesSpec:
+    """
+    The agent's declared data-query tools, from the top-level ``data_queries:`` block.
+
+    Classification is display metadata only: it never changes how a call is
+    authorized, sandboxed or run.
+
+    :param rules: Spec rules in declaration order; they take precedence over
+        the built-in CLI patterns.
+    :param builtins: Whether the built-in CLI patterns (``psql -c``,
+        ``bq query`` and the like) apply after the spec's rules.
+    """
+
+    rules: tuple[DataQueryRule, ...] = ()
+    builtins: bool = True
+
+
 @dataclass
 class SkillSpec:
     """
@@ -1611,6 +1707,9 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
         ``non-public`` (grant named users only), or ``public`` (also
         allow ``__public__`` link access). **Defaults to
         ``SharePolicy.NONE``.**
+    :param data_queries: The agent's declared data-query tools. YAML key is
+        ``data_queries:``. ``None`` means no block: the built-in CLI
+        patterns still apply. See :class:`DataQueriesSpec`.
     """
 
     spec_version: int
@@ -1664,6 +1763,7 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
     spawn: bool = False
     tool_groups: ToolGroupsConfig = field(default_factory=ToolGroupsConfig)
     agent_session_sharing: SharePolicy = SharePolicy.NONE
+    data_queries: DataQueriesSpec | None = None
     source_rel_dir: str | None = field(default=None, compare=False)
 
     @property
