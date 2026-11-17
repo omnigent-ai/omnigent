@@ -22375,7 +22375,7 @@
     },
     "/v1/sessions/{session_id}/claude_goal": {
       "get": {
-        "description": "Read the `/goal` of a Claude-native session from its runner.\n\nClaude Code sets and clears goals through its own `/goal` command,\nso this route only reads them.\n\n**Returns:** The current goal and whether the runner could read it.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 for a missing session or 400 for a session that is not Claude-native.",
+        "description": "Read the `/goal` of a Claude-native session from its runner.\n\nClaude Code sets and clears goals through its own `/goal` command,\nso this route only reads them.\n\n**Returns:** The current goal and whether the runner could read it.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 for a missing session, 400 for a session that is not Claude-native, or `WRONG_REPLICA` when its runner is live on another replica.",
         "operationId": "get_claude_goal_v1_sessions__session_id__claude_goal_get",
         "parameters": [
           {
