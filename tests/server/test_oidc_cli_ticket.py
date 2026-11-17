@@ -526,7 +526,7 @@ async def test_legacy_upgrade_page_does_not_promise_a_store_update() -> None:
     assert "security update" not in page.text
     assert "Update the Omnigent app through" not in page.text
     assert rejected.status_code == 400
-    assert "ask your administrator" in rejected.json()["error"]
+    assert "if the app store has no compatible build yet" in rejected.json()["error"]
 
 
 async def test_legacy_upgrade_notice_cannot_issue_credentials(tmp_path: Path) -> None:
