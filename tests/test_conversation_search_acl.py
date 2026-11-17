@@ -134,9 +134,9 @@ def test_search_prefetches_permissions_from_separate_database(tmp_path: Path) ->
         scoped = store.search(
             "sapphire", conversation_id=denied[0].id, accessible_by="caller@example.com"
         )
-        # One window of two holds only denied matches, so a capped search stops there.
+        # The two top-ranked candidates are denied, so a search capped there finds nothing.
         with patch(
-            "omnigent.stores.conversation_store.sqlalchemy_store._SEARCH_MAX_CANDIDATE_WINDOWS", 1
+            "omnigent.stores.conversation_store.sqlalchemy_store._SEARCH_MAX_CANDIDATES", 2
         ):
             capped = store.search("sapphire", limit=1, accessible_by="caller@example.com")
             # A scoped search ranks only its own conversation, so the cap is not reached.
@@ -177,6 +177,10 @@ def test_search_item_lookups_probe_primary_key_without_sql_functions(tmp_path: P
 
     # SQLite-only function calls are avoided so older SQLite builds work.
     assert all("unhex" not in statement.lower() for statement, _ in captured)
+    # The ranked match is evaluated once, with a limit and no offset paging.
+    candidate_queries = [s for s, _ in captured if "conversation_items_fts" in s]
+    assert len(candidate_queries) == 1
+    assert "LIMIT" in candidate_queries[0] and "OFFSET" not in candidate_queries[0]
     item_plans = []
     with store._conv_session("test_search_acl") as session:
         for statement, parameters in captured:

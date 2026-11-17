@@ -224,9 +224,9 @@ _SEARCH_SCOPES = frozenset({"all", "title", "content"})
 # database. Bounds the metadata lookup to one indexed IN batch.
 _SEARCH_CANDIDATE_WINDOW = 200
 
-# Windows one search may examine. Bounds the total work when most ranked
-# matches are unreadable; readable matches ranked below it are not returned.
-_SEARCH_MAX_CANDIDATE_WINDOWS = 10
+# Ranked candidates one search reads. Bounds the total work when most matches
+# are unreadable; readable matches ranked below it are not returned.
+_SEARCH_MAX_CANDIDATES = 2_000
 
 # Escapes LIKE wildcards in a search query. ``/``, as SQLAlchemy's own
 # ``autoescape`` uses, sidesteps MySQL's backslash handling in string literals.
@@ -2742,30 +2742,27 @@ class SqlAlchemyConversationStore(ConversationStore):
                 params = {"query": like_pattern, "ws": workspace_id}
                 if conversation_id is not None:
                     params["cid"] = uuid_to_bytes(conversation_id)
-            statement = text(f"{candidate_sql} LIMIT :limit OFFSET :offset")
+            # Read the ranked candidates once, so the match is not evaluated again.
+            ranked_keys = list(
+                dict.fromkeys(
+                    (_binary_id_hex(conv), _binary_id_hex(item))
+                    for conv, item in session.execute(
+                        text(f"{candidate_sql} LIMIT :limit"),
+                        {**params, "limit": _SEARCH_MAX_CANDIDATES},
+                    ).fetchall()
+                )
+            )
 
-            def fetch_candidate_keys(window: int, offset: int) -> list[tuple[str, str]]:
-                rows = session.execute(
-                    statement, {**params, "limit": window, "offset": offset}
-                ).fetchall()
-                return [(_binary_id_hex(conv), _binary_id_hex(item)) for conv, item in rows]
-
-            # Rank candidates in windows and keep only permitted, existing items
+            # Check candidates in windows and keep only permitted, existing items
             # in this workspace, so denied or foreign matches never use up the limit.
             item_keys: list[tuple[str, str]] = []
-            seen: set[tuple[str, str]] = set()
-            offset = 0
-            for _ in range(_SEARCH_MAX_CANDIDATE_WINDOWS):
+            for start in range(0, len(ranked_keys), _SEARCH_CANDIDATE_WINDOW):
                 if len(item_keys) >= limit:
                     break
-                raw_keys = fetch_candidate_keys(_SEARCH_CANDIDATE_WINDOW, offset)
-                if not raw_keys:
-                    break
-                offset += len(raw_keys)
                 candidates = [
                     key
-                    for key in dict.fromkeys(raw_keys)
-                    if (conversation_key is None or key[0] == conversation_key) and key not in seen
+                    for key in ranked_keys[start : start + _SEARCH_CANDIDATE_WINDOW]
+                    if conversation_key is None or key[0] == conversation_key
                 ]
                 if candidates:
                     permitted = self._permitted_conversation_hexes(
@@ -2786,12 +2783,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                             )
                         ).all()
                     )
-                    for key in candidates:
-                        if key in existing:
-                            seen.add(key)
-                            item_keys.append(key)
-                if len(raw_keys) < _SEARCH_CANDIDATE_WINDOW:
-                    break
+                    item_keys.extend(key for key in candidates if key in existing)
             item_keys = item_keys[:limit]
             if not item_keys:
                 return []
