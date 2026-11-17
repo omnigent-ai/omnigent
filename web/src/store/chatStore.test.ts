@@ -114,6 +114,9 @@ import {
   pumpStreamEvents,
   retryConversationLoad,
   SEND_STILL_SENDING_AFTER_MS,
+  SEND_UNANSWERED_GIVE_UP_MS,
+  SEND_UNANSWERED_MESSAGE,
+  SEND_UNANSWERED_TITLE,
   SESSION_READ_TIMEOUT_MS,
   SSE_MAX_STREAM_AGE_MS,
   SSE_STALE_RECYCLE_MS,
@@ -6931,6 +6934,26 @@ describe("chatStore — delivered-but-unacked send", () => {
   const errorCards = () =>
     useChatStore.getState().blocks.filter((block): block is ErrorBlock => block.type === "error");
 
+  /** Hold every events POST for conv_existing open until answered. */
+  function holdEventPosts(): { answer: () => void; aborted: () => boolean } {
+    let answer: () => void = () => {};
+    let aborted = false;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith("/v1/sessions/conv_existing/events") && init?.method === "POST") {
+        // Rejects on abort like a real fetch, so the settled send shows it was never cancelled.
+        return new Promise<Response>((resolve, reject) => {
+          init.signal?.addEventListener("abort", () => {
+            aborted = true;
+            reject(init.signal?.reason);
+          });
+          answer = () => resolve(mockResponse({ queued: true, item_id: "ci_mock" }));
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    return { answer: () => answer(), aborted: () => aborted };
+  }
+
   it.each([
     ["message", () => useChatStore.getState().send("summarize the deploy status", "agent_xyz")],
     [
@@ -6946,17 +6969,7 @@ describe("chatStore — delivered-but-unacked send", () => {
       conversationId: "conv_existing",
       abortController: new AbortController(),
     });
-    let answerPost: () => void = () => {};
-    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
-      if (String(input).endsWith("/v1/sessions/conv_existing/events") && init?.method === "POST") {
-        // Rejects on abort like a real fetch, so the settled send shows it was never cancelled.
-        return new Promise<Response>((resolve, reject) => {
-          init.signal?.addEventListener("abort", () => reject(init.signal?.reason));
-          answerPost = () => resolve(mockResponse({ queued: true, item_id: "ci_mock" }));
-        });
-      }
-      return defaultFetchHandler(input, init);
-    });
+    const post = holdEventPosts();
     const pending = () => useChatStore.getState().pendingUserMessages;
 
     const sent = sendInput();
@@ -6966,9 +6979,96 @@ describe("chatStore — delivered-but-unacked send", () => {
     await vi.advanceTimersByTimeAsync(1);
     expect(pending()[0]!.stillSending).toBe(true);
 
-    answerPost();
+    post.answer();
     await sent;
     expect(pending()).toEqual([expect.objectContaining({ posted: true })]);
+  });
+
+  it("hands back a message whose POST stays unanswered, leaving the POST running", async () => {
+    vi.useFakeTimers();
+    onTestFinished(() => {
+      vi.useRealTimers();
+    });
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+    });
+    const post = holdEventPosts();
+    const pending = () => useChatStore.getState().pendingUserMessages;
+
+    const sent = useChatStore.getState().send("summarize the deploy status", "agent_xyz");
+    await vi.advanceTimersByTimeAsync(SEND_UNANSWERED_GIVE_UP_MS - 1);
+    expect(pending()).toEqual([expect.objectContaining({ stillSending: true })]);
+    expect(useChatStore.getState().failedSendDraft).toBeNull();
+    await vi.advanceTimersByTimeAsync(1);
+
+    expect(pending()).toEqual([]);
+    await sent;
+    expect(useChatStore.getState().status).toBe("idle");
+    const draft = useChatStore.getState().failedSendDraft;
+    expect(draft).toMatchObject({ text: "summarize the deploy status", serverRefused: false });
+    const stableId = draft?.stableId;
+    expect(stableId).toBeTruthy();
+    expect(errorCards()).toEqual([
+      expect.objectContaining({
+        title: SEND_UNANSWERED_TITLE,
+        message: SEND_UNANSWERED_MESSAGE,
+        unansweredSend: { stableId },
+      }),
+    ]);
+    expect(post.aborted()).toBe(false);
+
+    // The POST left running can still deliver the message.
+    post.answer();
+    handleSessionEvent({
+      type: "session_input_consumed",
+      itemId: stableId!,
+      itemType: "message",
+      data: {
+        role: "user",
+        content: [{ type: "input_text", text: "summarize the deploy status" }],
+      },
+    });
+    expect(useChatStore.getState().failedSendDraft).toBeNull();
+    expect(errorCards()).toEqual([]);
+  });
+
+  it("keeps waiting on an unanswered POST whose message the runner already took", async () => {
+    vi.useFakeTimers();
+    onTestFinished(() => {
+      vi.useRealTimers();
+    });
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+    });
+    const post = holdEventPosts();
+    let settled = false;
+
+    const sent = useChatStore
+      .getState()
+      .send("summarize the deploy status", "agent_xyz", undefined, { stableId: "stable_taken" })
+      .then(() => {
+        settled = true;
+      });
+    await vi.advanceTimersByTimeAsync(0);
+    handleSessionEvent({
+      type: "session_input_consumed",
+      itemId: "stable_taken",
+      itemType: "message",
+      data: {
+        role: "user",
+        content: [{ type: "input_text", text: "summarize the deploy status" }],
+      },
+    });
+    await vi.advanceTimersByTimeAsync(SEND_UNANSWERED_GIVE_UP_MS);
+
+    expect(settled).toBe(false);
+    expect(useChatStore.getState().failedSendDraft).toBeNull();
+    expect(errorCards()).toEqual([]);
+    post.answer();
+    await sent;
+    expect(errorCards()).toEqual([]);
   });
 
   it("retracts the failed-send draft and card when its message commits under the send's stable id", async () => {

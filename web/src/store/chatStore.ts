@@ -2038,6 +2038,12 @@ export const SESSION_READ_TIMEOUT_MS = 15_000;
 export const ACTIVE_SESSION_STATUS_RECONCILE_TIMEOUT_MS = SESSION_READ_TIMEOUT_MS;
 // A send whose POST is still open after this says so on its bubble.
 export const SEND_STILL_SENDING_AFTER_MS = 10_000;
+// A message send still unanswered after this hands its message back for a retry.
+// Longer than the server's own runner waits (a sandbox wake gives up after 240s).
+export const SEND_UNANSWERED_GIVE_UP_MS = 300_000;
+export const SEND_UNANSWERED_TITLE = "No answer from the server";
+export const SEND_UNANSWERED_MESSAGE =
+  "The server didn't answer, so this message may not have been sent. Send it again to retry.";
 // After the stream reconnects, `reconcileActiveSessionStatus` runs once
 // immediately — but a server that just restarted may not have reprocessed the
 // in-flight turn's completion yet, so that read can see a stale "running" and
@@ -3039,17 +3045,20 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         initialDispatched = true;
       }
       const postResult = await withStillSendingMark(sessionId, tempId, () =>
-        postEvent(
-          sessionId,
-          {
-            type: "message",
-            data: {
-              role: "user",
-              content: serverContent,
-              stable_id: stableId,
+        giveUpOnUnansweredSend(
+          stableId,
+          postEvent(
+            sessionId,
+            {
+              type: "message",
+              data: {
+                role: "user",
+                content: serverContent,
+                stable_id: stableId,
+              },
             },
-          },
-          { holdWhenHostOffline: true },
+            { holdWhenHostOffline: true },
+          ),
         ),
       );
       // Policy denied the input — the server returned immediately
@@ -3147,9 +3156,13 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // (`failedSendDraft` is conversation-scoped); the composer reads whichever
       // conversation is active and guards on the id before restoring.
       const draftSessionId = postedSessionId ?? submitConversationId;
-      // A first message that never left the browser goes back to the composer;
-      // what was queued behind it waits for an explicit retry rather than going first.
-      if (initialDraft && !initialDispatched && draftSessionId !== null) {
+      // A first message that never left the browser, or a send the server may still
+      // be holding, goes back to the composer; what was queued behind it waits for
+      // an explicit retry rather than going first.
+      if (
+        draftSessionId !== null &&
+        ((initialDraft && !initialDispatched) || err instanceof UnansweredSendError)
+      ) {
         suspendQueuedMessages(draftSessionId);
       }
       // A coded error confirms refusal; a transport failure leaves delivery
@@ -3222,6 +3235,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         ? null
         : {
             ...makeClientErrorBlock(message, code),
+            ...(err instanceof UnansweredSendError ? { title: SEND_UNANSWERED_TITLE } : {}),
             ...(serverRefused
               ? {}
               : { unansweredSend: { stableId, ...(sentText ? { text: sentText } : {}) } }),
@@ -4169,6 +4183,24 @@ async function withStillSendingMark<T>(
   } finally {
     clearTimeout(timer);
   }
+}
+
+class UnansweredSendError extends Error {}
+
+/**
+ * Fail a message send whose POST goes unanswered for SEND_UNANSWERED_GIVE_UP_MS,
+ * unless a live acknowledgement shows the runner took it. The POST keeps running;
+ * an unedited retry reuses the send's stable id, which the server deduplicates.
+ */
+function giveUpOnUnansweredSend<T>(stableId: string, post: Promise<T>): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      if (inFlightSends.get(stableId) !== true) {
+        reject(new UnansweredSendError(SEND_UNANSWERED_MESSAGE));
+      }
+    }, SEND_UNANSWERED_GIVE_UP_MS);
+    post.then(resolve, reject).finally(() => clearTimeout(timer));
+  });
 }
 
 /**
