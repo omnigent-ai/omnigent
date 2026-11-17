@@ -167,7 +167,14 @@ def _sandbox() -> ManagedSandboxDeployment:
     )
 
 
-def _app(db_uri: str, tmp_path: Path, *, enabled: bool, sandbox: bool = True) -> FastAPI:
+def _app(
+    db_uri: str,
+    tmp_path: Path,
+    *,
+    enabled: bool,
+    sandbox: bool = True,
+    auth_provider: Any = None,
+) -> FastAPI:
     artifacts = LocalArtifactStore(str(tmp_path / "artifacts"))
     agents = SqlAlchemyAgentStore(db_uri)
     conversations = SqlAlchemyConversationStore(db_uri)
@@ -184,6 +191,7 @@ def _app(db_uri: str, tmp_path: Path, *, enabled: bool, sandbox: bool = True) ->
         # A callable, like a deployment's per-request gate.
         proactive_agent=lambda: enabled,
         proactive_agent_settings_store=ProactiveAgentSettingsStore(db_uri),
+        auth_provider=auth_provider,
     )
     # The lifespan seeds built-in agents; these tests skip it.
     app.state.seed_builtin_agents = lambda: _ensure_default_agents(agents, artifacts, cache)
@@ -447,6 +455,17 @@ async def test_a_reregistered_account_gets_a_new_task(db_uri: str) -> None:
     assert again.id == fresh.id
     assert (fresh.state, fresh.account_generation) == ("active", new.account_generation)
     assert store.get(first.id).state == "deleted"
+
+    # Cleanup later removes the old row, emptying the slot below the live task.
+    cursor = store.purge_deleted_tasks()
+    while cursor is not None:
+        cursor = store.purge_deleted_tasks(after=cursor)
+    assert store.get(first.id) is None
+    with account_authority_scope("alice", new.account_generation):
+        # A process that starts after the purge finds the live task, not the empty slot.
+        later = await ProactiveProvisioner().provision(store, _SEEDED_AGENTS, "alice", "UTC", None)
+    assert later.id == fresh.id
+    assert store.get(first.id) is None
 
 
 async def test_a_proactive_run_cannot_seed_an_automation(client: httpx.AsyncClient) -> None:
