@@ -4715,6 +4715,17 @@ function registerIpc() {
     return { remote: internal && arca.resolveArcaPath() !== null, bundledCli: internal };
   });
 
+  // In-flight laptop sign-ins started from the setup page, per window, so Cancel can stop one.
+  const runnerConnects = new Map();
+  ipcMain.handle("omnigent:cancel-runner-connect", (event) => {
+    if (!isSetupPageSender(event)) {
+      throw new Error("cancel-runner-connect is only available to the setup page");
+    }
+    const controller = runnerConnects.get(event.sender);
+    controller?.abort();
+    return controller !== undefined;
+  });
+
   // Setup page → connect the runner picked in onboarding to `url`, streaming
   // output, before the window opens the server. The Install click on this
   // bundled page is the user's consent, so no enrollment dialog here.
@@ -4753,9 +4764,18 @@ function registerIpc() {
     }
     log(`$ ${omnigentCli.cliCommandParts(cliCommand).displayName} host --server ${target}`);
     log("Signing in to the server if needed…");
-    const auth = await serverManager.ensureServerAuth(cliCommand, target, {
-      onLogin: () => log("If a browser window opens, finish signing in there."),
-    });
+    const controller = new AbortController();
+    runnerConnects.set(event.sender, controller);
+    let auth;
+    try {
+      auth = await serverManager.ensureServerAuth(cliCommand, target, {
+        onLogin: () => log("If a browser window opens, finish signing in there."),
+        signal: controller.signal,
+      });
+    } finally {
+      if (runnerConnects.get(event.sender) === controller) runnerConnects.delete(event.sender);
+    }
+    if (auth.canceled) return { ok: false, canceled: true };
     if (!auth.ok) {
       return {
         ok: false,

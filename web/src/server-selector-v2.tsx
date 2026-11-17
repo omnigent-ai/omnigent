@@ -34,6 +34,7 @@ interface OmnigentSetup {
   forgetRecentServer?: (url: string) => Promise<string[]>;
   getRunnerOptions?: (url: string) => Promise<{ remote?: boolean; bundledCli?: boolean } | null>;
   connectRunner?: (url: string, runner: Runner) => Promise<Partial<SetupResult>>;
+  cancelRunnerConnect?: () => Promise<boolean>;
   onRunnerConnectLog?: (cb: (line: string) => void) => () => void;
   checkServer?: (url: string) => Promise<{ status: "ok" | "reachable" | "unreachable" }>;
   copyText: (text: string) => Promise<unknown>;
@@ -316,6 +317,9 @@ export function BridgeSetupApp() {
             return { ok: false, error: e instanceof Error ? e.message : String(e) };
           }
         }
+      : undefined,
+    onCancelRunnerConnect: setupBridge()?.cancelRunnerConnect
+      ? async () => (await setupBridge()?.cancelRunnerConnect?.()) === true
       : undefined,
     onRunnerLog: setupBridge()?.onRunnerConnectLog
       ? (cb) => setupBridge()?.onRunnerConnectLog?.(cb) ?? (() => {})

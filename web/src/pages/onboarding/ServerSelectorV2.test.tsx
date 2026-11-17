@@ -1030,6 +1030,27 @@ describe("ServerSelectorV2", () => {
     expect(onConnectRunner).toHaveBeenCalledWith("https://team.example.com/", "local");
   });
 
+  it.each([
+    ["the install", { onInstallCli: vi.fn(() => new Promise<{ ok: boolean }>(() => {})) }],
+    [
+      "the laptop sign-in",
+      {
+        onInstallCli: vi.fn().mockResolvedValue({ ok: true }),
+        onConnectRunner: vi.fn(() => new Promise<{ ok: boolean }>(() => {})),
+      },
+    ],
+  ])("Cancel during %s returns to the join choice and stops it", async (_name, over) => {
+    const onCancelRunnerConnect = vi.fn().mockResolvedValue(true);
+    const onConnect = vi.fn().mockResolvedValue({});
+    joinTypedServer({ installed: false, onConnect, onCancelRunnerConnect, ...over });
+    fireEvent.click(await screen.findByRole("radio", { name: /install cli first/i }));
+    fireEvent.click(screen.getByRole("button", { name: "Install Omnigent" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Cancel" }));
+    await screen.findByRole("heading", { name: /how do you want to join/i });
+    expect(onCancelRunnerConnect).toHaveBeenCalledOnce();
+    expect(onConnect).not.toHaveBeenCalled();
+  });
+
   it("a failed laptop connect after the install can retry or continue without a host", async () => {
     const onConnect = vi.fn().mockResolvedValue({});
     const onConnectRunner = vi.fn().mockResolvedValue({ ok: false, error: "no host" });

@@ -122,6 +122,8 @@ export interface ServerSelectorV2Setup {
   /** Connect the picked runner to `url` before opening it. Absent → the runner
    *  step just opens the server. */
   onConnectRunner?: (url: string, runner: Runner) => Promise<SetupResult>;
+  /** Stop the in-flight onConnectRunner sign-in; resolves whether one was running. */
+  onCancelRunnerConnect?: () => Promise<boolean>;
   /** Subscribe to onConnectRunner's output lines; returns an unsubscribe. */
   onRunnerLog?: (cb: (line: string) => void) => () => void;
   /** Remove a recent server from the saved list, if the shell supports it. */
@@ -537,6 +539,10 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
               onRun={runTerminal}
               onSetupLog={terminalRunner ? setup.onRunnerLog : setup.onSetupLog}
               onBack={() => setStep(terminalTarget.back)}
+              onCancel={() => {
+                void setup.onCancelRunnerConnect?.();
+                setStep(terminalTarget.back);
+              }}
               onConnectAnyway={connectAnyway}
               runningLabel={terminalCopy.label}
               runningHint={terminalCopy.hint}

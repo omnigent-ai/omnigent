@@ -675,8 +675,10 @@ function loadNavigationHarness({
     "./server_manager": {
       shutdown: async () => {},
       onChange: () => {},
-      ensureServerAuth: async () => serverAuthResult,
-      ensureHostConnected: async () => hostConnectResult,
+      ensureServerAuth: async (...args) =>
+        typeof serverAuthResult === "function" ? serverAuthResult(...args) : serverAuthResult,
+      ensureHostConnected: async (...args) =>
+        typeof hostConnectResult === "function" ? hostConnectResult(...args) : hostConnectResult,
       restartHost: async () => ({ ok: true }),
       disconnectHost: async () => ({ ok: true }),
       startLocalServer: async () => ({ ok: false }),
@@ -5063,6 +5065,40 @@ describe("onboarding runner IPC", () => {
     assert.equal(result.errorMessage, "The omnigent CLI was not found.");
     assert.equal(result.errorAction, "Install it or set its path.");
     assert.equal(result.error, `${result.errorMessage} ${result.errorAction}`);
+  });
+
+  it("Cancel stops a pending laptop sign-in without connecting the host", async (t) => {
+    let signal;
+    let hostConnected = false;
+    const h = harness(t, {
+      cliPath: "/usr/local/bin/omnigent",
+      hostConnectResult: () => {
+        hostConnected = true;
+        return { ok: true };
+      },
+      serverAuthResult: (_cli, _url, options) => {
+        ({ signal } = options);
+        return new Promise((resolve) => {
+          signal.addEventListener("abort", () => resolve({ ok: false, canceled: true }));
+        });
+      },
+    });
+    const sender = setupSender();
+    const event = { sender, senderFrame: setupFrame(h) };
+    const connecting = h.ipc.get("omnigent:connect-runner")(event, server, "local");
+    await until(() => signal !== undefined, "sign-in started");
+
+    assert.equal(await h.ipc.get("omnigent:cancel-runner-connect")(event), true);
+
+    assert.deepEqual(plain(await connecting), { ok: false, canceled: true });
+    assert.equal(signal.aborted, true);
+    assert.equal(hostConnected, false);
+    // Nothing left to cancel once it has finished.
+    assert.equal(await h.ipc.get("omnigent:cancel-runner-connect")(event), false);
+    assert.throws(
+      () => h.ipc.get("omnigent:cancel-runner-connect")({ sender, senderFrame: { url: server } }),
+      /only available to the setup page/,
+    );
   });
 
   it("passes separate authentication message and action fields to the setup page", async (t) => {

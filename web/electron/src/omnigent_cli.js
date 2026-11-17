@@ -474,16 +474,16 @@ function cliFailureOf(err) {
  *
  * @param {Parameters<typeof cliCommandParts>[0]} command
  * @param {string[]} args
- * @param {{ timeoutMs?: number }} [opts]
+ * @param {{ timeoutMs?: number, signal?: AbortSignal }} [opts] `signal` kills the child when aborted.
  * @returns {Promise<{ code: number, stdout: string, stderr: string, failure?: CliFailure }>}
  */
-function runCli(command, args, { timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
+function runCli(command, args, { timeoutMs = DEFAULT_TIMEOUT_MS, signal } = {}) {
   const { executable, prefixArgs } = cliCommandParts(command);
   return new Promise((resolve) => {
     execFile(
       executable,
       [...prefixArgs, ...args],
-      { timeout: timeoutMs, encoding: "utf8" },
+      { timeout: timeoutMs, encoding: "utf8", ...(signal ? { signal } : {}) },
       (err, stdout, stderr) => {
         const code = err ? (typeof err.code === "number" ? err.code : 1) : 0;
         resolve({
@@ -540,11 +540,11 @@ function serverAuthed(serverUrl) {
  *
  * @param {string} cliPath
  * @param {string} serverUrl
- * @param {{ timeoutMs?: number }} [opts]
+ * @param {{ timeoutMs?: number, signal?: AbortSignal }} [opts]
  * @returns {Promise<{ ok: boolean, output: string, failure?: CliFailure }>}
  */
-async function loginServer(cliPath, serverUrl, { timeoutMs = LOGIN_TIMEOUT_MS } = {}) {
-  const res = await runCli(cliPath, ["login", serverUrl], { timeoutMs });
+async function loginServer(cliPath, serverUrl, { timeoutMs = LOGIN_TIMEOUT_MS, signal } = {}) {
+  const res = await runCli(cliPath, ["login", serverUrl], { timeoutMs, signal });
   return {
     ok: res.code === 0,
     output: (res.stdout || res.stderr).trim(),

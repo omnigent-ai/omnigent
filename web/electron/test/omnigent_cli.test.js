@@ -92,6 +92,18 @@ describe("runCli", () => {
     },
   );
 
+  it("kills the child when its signal aborts", { timeout: 10000 }, async () => {
+    const controller = new AbortController();
+    const started = Date.now();
+    const pending = runCli(nodeScript("setTimeout(() => {}, 60000)"), [], {
+      signal: controller.signal,
+    });
+    controller.abort();
+    const res = await pending;
+    assert.notEqual(res.code, 0);
+    assert.ok(Date.now() - started < 5000, "the abort ended the run before its 60s sleep");
+  });
+
   it("does not mistake execFile's maxBuffer kill for a timeout", async () => {
     // 2 MiB of stdout overflows execFile's default 1 MiB maxBuffer.
     const res = await runCli(nodeScript('process.stdout.write("x".repeat(2 * 1024 * 1024))'), []);

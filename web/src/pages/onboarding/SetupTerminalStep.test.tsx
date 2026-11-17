@@ -208,6 +208,35 @@ describe("SetupTerminalStep", () => {
     expect(bar()).toBe("70%");
   });
 
+  it("offers Cancel while the action is still running, and not once it has finished", async () => {
+    const onCancel = vi.fn();
+    let finish: (v: { ok: boolean }) => void = () => {};
+    const onRun = vi.fn(
+      () =>
+        new Promise<{ ok: boolean }>((resolve) => {
+          finish = resolve;
+        }),
+    );
+    render(<SetupTerminalStep onRun={onRun} onBack={vi.fn()} onCancel={onCancel} />);
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(onCancel).toHaveBeenCalledOnce();
+    await act(async () => finish({ ok: false }));
+    expect(screen.queryByRole("button", { name: "Cancel" })).not.toBeInTheDocument();
+  });
+
+  it("leaves the server connect's own Cancel alone", () => {
+    render(
+      <SetupTerminalStep
+        onRun={() => new Promise(() => {})}
+        onBack={vi.fn()}
+        onCancel={vi.fn()}
+        onCancelConnect={vi.fn()}
+        connection={{ phase: "connecting" }}
+      />,
+    );
+    expect(screen.getAllByRole("button", { name: /cancel/i })).toHaveLength(1);
+  });
+
   it("fires onBack from Back on the failure screen", async () => {
     const onBack = vi.fn();
     render(<SetupTerminalStep onRun={vi.fn().mockResolvedValue({ ok: false })} onBack={onBack} />);
