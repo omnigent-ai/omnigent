@@ -1894,6 +1894,23 @@ describe("SettingsPage", () => {
     ).toHaveAttribute("aria-label", 'Sessions to show before "Show more"');
   });
 
+  it("renders the General composer, session and sub-agent rows from their Settings catalog entries", () => {
+    renderPage("/settings/general");
+    for (const id of [
+      "submit-with-mod-enter",
+      "always-steer",
+      "background-session-titles",
+      "open-subagents-in-panel",
+    ]) {
+      expect(document.querySelector(`[data-settings-item="${id}"]`)).not.toBeNull();
+    }
+    expect(
+      document
+        .querySelector('[data-settings-control="always-steer"]')
+        ?.getAttribute("aria-labelledby"),
+    ).toBe("settings-always-steer-label");
+  });
+
   it("renders the Sandbox Integrations rows from their Settings catalog entries", async () => {
     mocks.enabledConnections = ["github", "databricks"];
     renderPage("/settings/integrations");

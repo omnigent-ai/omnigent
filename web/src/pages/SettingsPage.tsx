@@ -109,6 +109,12 @@ import {
   settingsRuntimeChoiceProps,
 } from "@/pages/settings/search/settingsOwnership";
 import {
+  ALWAYS_STEER_ENTRY,
+  BACKGROUND_SESSION_TITLES_ENTRY,
+  OPEN_SUBAGENTS_IN_PANEL_ENTRY,
+  SUBMIT_WITH_MOD_ENTER_ENTRY,
+} from "@/pages/settings/search/catalog/general";
+import {
   APPEARANCE_DATA_ENTRY,
   CODE_FONT_FAMILY_ENTRY,
   CODE_FONT_SIZE_ENTRY,
@@ -1893,46 +1899,39 @@ function DatabricksIntegrationControl() {
  */
 function AlwaysSteerControl() {
   const [value, setValue] = useState(() => readAlwaysSteer());
-  const labelId = useId();
   const toggle = useCallback((next: boolean) => {
     setValue(next);
     writeAlwaysSteer(next);
   }, []);
   return (
-    <div className="flex items-start justify-between gap-6">
-      <SettingsLabel
-        label="Always steer"
-        labelId={labelId}
-        className="flex-1"
-        description="Send follow-ups into the running turn. Harnesses without steering support use them on the next turn."
-      />
+    <SettingsItem entry={ALWAYS_STEER_ENTRY} className="flex items-start justify-between gap-6">
+      <SettingsEntryLabel entry={ALWAYS_STEER_ENTRY} className="flex-1" />
       <Switch
-        aria-labelledby={labelId}
+        {...settingsControlProps(ALWAYS_STEER_ENTRY)}
         checked={value}
         onCheckedChange={toggle}
         data-testid="always-steer-toggle"
         className="mt-0.5 shrink-0"
         componentId="settings.general.always_steer"
       />
-    </div>
+    </SettingsItem>
   );
 }
 
 function ComposerSendShortcutControl() {
   const [enabled, setEnabled] = useState(() => readSubmitWithModEnter());
-  const labelId = useId();
-  const descriptionId = useId();
   const toggle = useCallback((next: boolean) => {
     setEnabled(next);
     writeSubmitWithModEnter(next);
   }, []);
 
   return (
-    <div className="flex items-start justify-between gap-6">
-      <SettingsLabel
-        label={`Submit with ${MOD_KEY} + Enter on desktop`}
-        labelId={labelId}
-        descriptionId={descriptionId}
+    <SettingsItem
+      entry={SUBMIT_WITH_MOD_ENTER_ENTRY}
+      className="flex items-start justify-between gap-6"
+    >
+      <SettingsEntryLabel
+        entry={SUBMIT_WITH_MOD_ENTER_ENTRY}
         className="flex-1"
         description={
           <>
@@ -1942,15 +1941,14 @@ function ComposerSendShortcutControl() {
         }
       />
       <Switch
-        aria-labelledby={labelId}
-        aria-describedby={descriptionId}
+        {...settingsControlProps(SUBMIT_WITH_MOD_ENTER_ENTRY)}
         checked={enabled}
         onCheckedChange={toggle}
         data-testid="composer-submit-with-mod-enter-toggle"
         className="mt-0.5 shrink-0"
         componentId="settings.general.submit_with_mod_enter"
       />
-    </div>
+    </SettingsItem>
   );
 }
 
@@ -1993,8 +1991,6 @@ function OpenLinksInAppControl() {
 
 function BackgroundSessionTitlesControl() {
   const [enabled, setEnabled] = useState(readBackgroundSessionTitlesEnabled);
-  const labelId = useId();
-  const descriptionId = useId();
 
   const toggle = useCallback((next: boolean) => {
     setEnabled(next);
@@ -2002,31 +1998,25 @@ function BackgroundSessionTitlesControl() {
   }, []);
 
   return (
-    <div className="flex items-start justify-between gap-6">
-      <SettingsLabel
-        label="Automatically name new sessions"
-        labelId={labelId}
-        descriptionId={descriptionId}
-        className="flex-1"
-        description="Name sessions after the first message. Turn off to keep default names."
-      />
+    <SettingsItem
+      entry={BACKGROUND_SESSION_TITLES_ENTRY}
+      className="flex items-start justify-between gap-6"
+    >
+      <SettingsEntryLabel entry={BACKGROUND_SESSION_TITLES_ENTRY} className="flex-1" />
       <Switch
-        aria-labelledby={labelId}
-        aria-describedby={descriptionId}
+        {...settingsControlProps(BACKGROUND_SESSION_TITLES_ENTRY)}
         checked={enabled}
         onCheckedChange={toggle}
         data-testid="background-session-titles-toggle"
         className="mt-0.5 shrink-0"
         componentId="settings.general.background_session_titles"
       />
-    </div>
+    </SettingsItem>
   );
 }
 
 function OpenSubagentsInPanelControl() {
   const [enabled, setEnabled] = useState(readOpenSubagentsInPanel);
-  const labelId = useId();
-  const descriptionId = useId();
 
   const toggle = useCallback((next: boolean) => {
     // Sub-agent clicks read the stored value, so only show what was saved.
@@ -2035,24 +2025,20 @@ function OpenSubagentsInPanelControl() {
   }, []);
 
   return (
-    <div className="flex items-start justify-between gap-6">
-      <SettingsLabel
-        label="Open sub-agents in the Workspace panel"
-        labelId={labelId}
-        descriptionId={descriptionId}
-        className="flex-1"
-        description="Open sub-agent chats beside the main chat. On phones, they still open full screen."
-      />
+    <SettingsItem
+      entry={OPEN_SUBAGENTS_IN_PANEL_ENTRY}
+      className="flex items-start justify-between gap-6"
+    >
+      <SettingsEntryLabel entry={OPEN_SUBAGENTS_IN_PANEL_ENTRY} className="flex-1" />
       <Switch
-        aria-labelledby={labelId}
-        aria-describedby={descriptionId}
+        {...settingsControlProps(OPEN_SUBAGENTS_IN_PANEL_ENTRY)}
         checked={enabled}
         onCheckedChange={toggle}
         data-testid="open-subagents-in-panel-toggle"
         className="mt-0.5 shrink-0"
         componentId="settings.general.open_subagents_in_panel"
       />
-    </div>
+    </SettingsItem>
   );
 }
 
