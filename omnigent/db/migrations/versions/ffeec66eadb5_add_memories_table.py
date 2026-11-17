@@ -1,16 +1,15 @@
 """Add the ``memories`` table for long-term memory.
 
-Schema only: a new table keyed by ``(workspace_id, actor_id, path)`` that nothing
-reads or writes until the memory feature ships. Deployment and rollback order is in
+Schema only: a new table keyed by ``(workspace_id, actor_type, actor_id, path)``
+that nothing reads or writes until the memory feature ships. Deployment and rollback order is in
 ``docs/memories-table-migration.md``.
 """
 
 import sqlalchemy as sa
 from alembic import op
+from sqlalchemy.dialects.mysql import VARBINARY
 from sqlalchemy.dialects.mysql import VARCHAR as MySQLVarchar
 from sqlalchemy.dialects.postgresql import VARCHAR as PGVarchar
-
-from omnigent.db.envelope import EnvelopedText
 
 revision: str = "ffeec66eadb5"
 down_revision: str | None = "f7c2d8a4b901"
@@ -24,7 +23,7 @@ _SQLITE_FAMILY = frozenset({"sqlite", "cloudflare_d1"})
 # at up to four bytes per character, envelopes at their stored size.
 _SQLITE_CHECKS = {
     "ck_memories_workspace_id_integer": "typeof(workspace_id) = 'integer'",
-    "ck_memories_actor_id_bytes": "length(CAST(actor_id AS BLOB)) <= 640",
+    "ck_memories_actor_id_bytes": "length(CAST(actor_id AS BLOB)) <= 512",
     "ck_memories_path_bytes": "length(CAST(path AS BLOB)) <= 2048",
     "ck_memories_content_bytes": "length(CAST(content AS BLOB)) <= 16383",
     "ck_memories_description_bytes": (
@@ -46,6 +45,17 @@ def _exact(length: int) -> sa.types.TypeEngine[str]:
     )
 
 
+def _binary(length: int) -> sa.types.TypeEngine[bytes]:
+    """
+    Bounded binary storage for an envelope column.
+
+    The model declares these columns with the application's ``EnvelopedText``;
+    the migration spells out the stored type so later changes to that class
+    cannot change what this revision creates.
+    """
+    return sa.LargeBinary().with_variant(VARBINARY(length), "mysql")
+
+
 def upgrade() -> None:
     bind = op.get_bind()
     if sa.inspect(bind).has_table(_TABLE):
@@ -58,19 +68,22 @@ def upgrade() -> None:
     op.create_table(
         _TABLE,
         sa.Column("workspace_id", sa.BigInteger(), nullable=False),
+        sa.Column("actor_type", sa.SmallInteger(), nullable=False),
         sa.Column(
             "actor_id",
-            sa.String(160).with_variant(
-                MySQLVarchar(160, charset="utf8mb4", collation="utf8mb4_0900_bin"), "mysql"
+            sa.String(128).with_variant(
+                MySQLVarchar(128, charset="utf8mb4", collation="utf8mb4_0900_bin"), "mysql"
             ),
             nullable=False,
         ),
         sa.Column("path", _exact(512), nullable=False),
-        sa.Column("content", EnvelopedText(16_383), nullable=False),
-        sa.Column("description", EnvelopedText(2_100), nullable=True),
+        sa.Column("content", _binary(16_383), nullable=False),
+        sa.Column("description", _binary(2_100), nullable=True),
         sa.Column("created_at", sa.BigInteger(), nullable=False),
         sa.Column("updated_at", sa.BigInteger(), nullable=False),
-        sa.PrimaryKeyConstraint("workspace_id", "actor_id", "path"),
+        sa.PrimaryKeyConstraint("workspace_id", "actor_type", "actor_id", "path"),
+        # Actor type codes: 1 = user.
+        sa.CheckConstraint("actor_type IN (1)", name="ck_memories_actor_type"),
         *checks,
     )
 

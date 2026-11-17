@@ -10,7 +10,7 @@ import pytest
 import sqlalchemy as sa
 from alembic import command
 from sqlalchemy.dialects import mysql, postgresql
-from sqlalchemy.exc import IntegrityError, StatementError
+from sqlalchemy.exc import IntegrityError, OperationalError, StatementError
 from sqlalchemy.schema import CreateTable
 
 from omnigent.db.db_models import (
@@ -18,18 +18,21 @@ from omnigent.db.db_models import (
     MEMORY_DESCRIPTION_MAX_STORED_BYTES,
     SqlMemory,
 )
+from omnigent.db.enum_codecs import MEMORY_ACTOR_TYPE
 from omnigent.db.envelope import seal_text
 from omnigent.db.utils import _build_alembic_config, get_or_create_engine
 
 _REVISION = "ffeec66eadb5"
 _PREVIOUS = "f7c2d8a4b901"
 _MEMORIES = SqlMemory.__table__
+_USER = MEMORY_ACTOR_TYPE["user"]
 
 
 def _row(path: str, content: str = "x", **overrides: object) -> dict[str, object]:
     return {
         "workspace_id": 0,
-        "actor_id": "user:alice",
+        "actor_type": _USER,
+        "actor_id": "alice",
         "path": path,
         "content": content,
         "description": None,
@@ -63,7 +66,8 @@ def _assert_sqlite_rejects_out_of_bound_values(engine: sa.Engine) -> None:
     """Raw SQL bypasses the column types; the table's own checks must still hold."""
     raw = {**_row("/bounds"), "content": seal_text("x"), "description": None}
     oversized = {
-        "actor_id": "u" * 641,
+        "actor_type": "user",
+        "actor_id": "u" * 513,
         "path": "/" + "p" * 2_048,
         "content": b"\x01\x00" + b"x" * MEMORY_CONTENT_MAX_STORED_BYTES,
         "description": b"\x01\x00" + b"x" * MEMORY_DESCRIPTION_MAX_STORED_BYTES,
@@ -72,9 +76,9 @@ def _assert_sqlite_rejects_out_of_bound_values(engine: sa.Engine) -> None:
         "updated_at": "not a number",
     }
     insert = sa.text(
-        "INSERT INTO memories (workspace_id, actor_id, path, content, description, "
-        "created_at, updated_at) VALUES (:workspace_id, :actor_id, :path, :content, "
-        ":description, :created_at, :updated_at)"
+        "INSERT INTO memories (workspace_id, actor_type, actor_id, path, content, "
+        "description, created_at, updated_at) VALUES (:workspace_id, :actor_type, "
+        ":actor_id, :path, :content, :description, :created_at, :updated_at)"
     )
     for column, value in oversized.items():
         with pytest.raises(IntegrityError, match="CHECK"), engine.begin() as connection:
@@ -94,6 +98,7 @@ def test_memories_upgrade_and_downgrade(tmp_path: Path) -> None:
         columns, primary_key, _ = _shape(engine)
         assert [name for name, *_ in columns] == [
             "workspace_id",
+            "actor_type",
             "actor_id",
             "path",
             "content",
@@ -104,7 +109,7 @@ def test_memories_upgrade_and_downgrade(tmp_path: Path) -> None:
         # A new table declares no database defaults: the application supplies every value.
         assert all(default is None for *_, default in columns)
         assert [name for name, _, nullable, _ in columns if nullable] == ["description"]
-        assert primary_key == ["workspace_id", "actor_id", "path"]
+        assert primary_key == ["workspace_id", "actor_type", "actor_id", "path"]
         with engine.begin() as connection:
             connection.execute(
                 _MEMORIES.insert().values(**_row("/a", "Prefers tabs", description="Tabs"))
@@ -147,7 +152,8 @@ def test_columns_declare_their_bounds_and_byte_order_per_engine() -> None:
     postgresql_ddl = str(CreateTable(_MEMORIES).compile(dialect=postgresql.dialect()))
 
     exact = "CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin NOT NULL"
-    assert f"actor_id VARCHAR(160) {exact}" in mysql_ddl
+    assert "actor_type SMALLINT NOT NULL" in mysql_ddl
+    assert f"actor_id VARCHAR(128) {exact}" in mysql_ddl
     assert f"path VARCHAR(512) {exact}" in mysql_ddl
     assert "content VARBINARY(16383) NOT NULL" in mysql_ddl
     assert "description VARBINARY(2100)," in mysql_ddl
@@ -155,9 +161,12 @@ def test_columns_declare_their_bounds_and_byte_order_per_engine() -> None:
     assert "content BYTEA NOT NULL" in postgresql_ddl
     assert "DEFAULT" not in mysql_ddl
     assert "DEFAULT" not in postgresql_ddl
-    # The SQLite-only checks stay off other engines.
-    assert "CHECK" not in mysql_ddl
-    assert "CHECK" not in postgresql_ddl
+    # Every engine checks the actor type, against exactly the codec's codes; the
+    # SQLite-only bounds stay off the others.
+    actor_types = ", ".join(str(code) for code in sorted(MEMORY_ACTOR_TYPE.values()))
+    for ddl in (mysql_ddl, postgresql_ddl):
+        assert f"CONSTRAINT ck_memories_actor_type CHECK (actor_type IN ({actor_types}))" in ddl
+        assert ddl.count("CHECK") == 1
 
 
 def test_envelope_writes_enforce_the_stored_byte_limits(tmp_path: Path) -> None:
@@ -205,24 +214,26 @@ def test_paths_and_owners_compare_byte_for_byte_on_this_engine(db_uri: str) -> N
         "/q",
     ]
     rows = [_row(path) for path in paths] + [
-        _row("/p/a", actor_id="user:Alice"),
-        _row("/p/a", actor_id="user:alicé"),
+        _row("/p/a", actor_id="Alice"),
+        _row("/p/a", actor_id="alicé"),
     ]
     engine = get_or_create_engine(db_uri)
     with engine.begin() as connection:
         connection.execute(_MEMORIES.insert(), rows)
-        alice = _MEMORIES.c.actor_id == "user:alice"
+        alice = (_MEMORIES.c.actor_type == _USER, _MEMORIES.c.actor_id == "alice")
         under = (
             connection.execute(
                 sa.select(_MEMORIES.c.path)
-                .where(alice, _MEMORIES.c.path >= "/p/", _MEMORIES.c.path < "/p0")
+                .where(*alice, _MEMORIES.c.path >= "/p/", _MEMORIES.c.path < "/p0")
                 .order_by(_MEMORIES.c.path)
             )
             .scalars()
             .all()
         )
         ordered = (
-            connection.execute(sa.select(_MEMORIES.c.path).where(alice).order_by(_MEMORIES.c.path))
+            connection.execute(
+                sa.select(_MEMORIES.c.path).where(*alice).order_by(_MEMORIES.c.path)
+            )
             .scalars()
             .all()
         )
@@ -234,4 +245,18 @@ def test_paths_and_owners_compare_byte_for_byte_on_this_engine(db_uri: str) -> N
 
     assert under == sorted(["/p/a", "/p/a ", "/p/b/c", "/p/é", "/p/\x01"], key=str.encode)
     assert ordered == sorted(paths, key=str.encode)
-    assert sorted(owners) == ["user:Alice", "user:alice", "user:alicé"]
+    assert sorted(owners) == ["Alice", "alice", "alicé"]
+
+
+def test_an_unknown_actor_type_is_rejected_on_this_engine(db_uri: str) -> None:
+    """The type check holds on every engine, not only where SQLite needs bounds."""
+    engine = get_or_create_engine(db_uri)
+    unknown = max(MEMORY_ACTOR_TYPE.values()) + 1
+    # Drivers differ in the error class for a CHECK violation. CockroachDB names the
+    # expression instead of the constraint.
+    violation = r"ck_memories_actor_type|CHECK constraint \(actor_type IN"
+    with pytest.raises((IntegrityError, OperationalError), match=violation):
+        with engine.begin() as connection:
+            connection.execute(_MEMORIES.insert().values(**_row("/a", actor_type=unknown)))
+    with engine.begin() as connection:
+        connection.execute(_MEMORIES.insert().values(**_row("/a")))

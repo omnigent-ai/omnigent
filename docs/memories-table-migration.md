@@ -7,8 +7,9 @@ Nothing in this change reads or writes it.
 | Column | Type | Notes |
 | --- | --- | --- |
 | `workspace_id` | `BIGINT NOT NULL` | Primary key, part 1. No database default: the application supplies it |
-| `actor_id` | `VARCHAR(160) NOT NULL` | Primary key, part 2: whose memory it is, such as `user:<id>` for a user id of up to 128 characters. Compared byte for byte |
-| `path` | `VARCHAR(512) NOT NULL` | Primary key, part 3. Compared byte for byte |
+| `actor_type` | `SMALLINT NOT NULL` | Primary key, part 2: the kind of owner, as a stable code. `1` is a user, the only type so far. A CHECK on every engine allows only known codes, so a new type needs a migration |
+| `actor_id` | `VARCHAR(128) NOT NULL` | Primary key, part 3: the owner's id within its type, such as a user id. Compared byte for byte |
+| `path` | `VARCHAR(512) NOT NULL` | Primary key, part 4. Compared byte for byte |
 | `content` | Envelope, at most 16,383 stored bytes | `VARBINARY(16383)` on MySQL |
 | `description` | Envelope, at most 2,100 stored bytes, nullable | `VARBINARY(2100)` on MySQL. A one-line summary of up to 512 characters |
 | `created_at`, `updated_at` | `BIGINT NOT NULL` | Unix epoch seconds |
@@ -20,8 +21,9 @@ trailing spaces, and order control characters by byte, so `utf8mb4_0900_bin`
 needs MySQL 8.0.17 or later.
 
 The primary key serves both access patterns the memory feature needs: a read by
-`(workspace_id, actor_id, path)`, and a listing of one actor's paths in key order,
-paged by the last path returned. Listing under a prefix reads the key range
+`(workspace_id, actor_type, actor_id, path)`, and a listing of one actor's paths
+in key order, paged by the last path returned. With the type ahead of the id, the
+memories of every owner of one type in a workspace are also one key range. Listing under a prefix reads the key range
 `[prefix + "/", prefix + "0")`, which is exact because paths compare by byte.
 There is no secondary index.
 

@@ -666,8 +666,9 @@ def _on_sqlite_family(
 # a description is 512 characters of up to four bytes each, plus framing.
 MEMORY_CONTENT_MAX_STORED_BYTES = 16_383
 MEMORY_DESCRIPTION_MAX_STORED_BYTES = 2_100
-# A user id of up to 128 characters, plus an owner-kind prefix such as ``user:``.
-MEMORY_ACTOR_ID_MAX_LENGTH = 160
+# The owner's id within its ``actor_type``: for a user, up to the 128 characters
+# other tables store for a user id.
+MEMORY_ACTOR_ID_MAX_LENGTH = 128
 # Exact comparison on MySQL, whose default collation ignores case and accents and
 # would let two owners share one memory.
 _MEMORY_ACTOR_ID = String(MEMORY_ACTOR_ID_MAX_LENGTH).with_variant(
@@ -686,10 +687,12 @@ _MEMORY_PATH = (
 
 class SqlMemory(OmnigentBase):
     """
-    Long-term memory entries, one row per ``(workspace, actor, path)``.
+    Long-term memory entries, one row per ``(workspace, actor type, actor, path)``.
 
     :param workspace_id: Tenant scope; stamped from :func:`current_workspace_id`.
-    :param actor_id: Whose memory this is, e.g. ``"user:alice"``.
+    :param actor_type: Kind of owner, as a ``MEMORY_ACTOR_TYPE`` code (``1`` for
+        a user).
+    :param actor_id: The owner's id within its type, e.g. ``"alice"``.
     :param path: Absolute entry path, e.g. ``"/projects/api/gotchas"``, compared
         byte for byte.
     :param content: Entry body, in an opaque storage envelope.
@@ -704,6 +707,7 @@ class SqlMemory(OmnigentBase):
     workspace_id: Mapped[int] = mapped_column(
         BigInteger, primary_key=True, nullable=False, default=current_workspace_id
     )
+    actor_type: Mapped[int] = mapped_column(SmallInteger, primary_key=True, autoincrement=False)
     actor_id: Mapped[str] = mapped_column(_MEMORY_ACTOR_ID, primary_key=True)
     path: Mapped[str] = mapped_column(_MEMORY_PATH, primary_key=True)
     content: Mapped[str] = mapped_column(
@@ -716,6 +720,8 @@ class SqlMemory(OmnigentBase):
     updated_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
 
     __table_args__ = (
+        # MEMORY_ACTOR_TYPE codes: user.
+        CheckConstraint("actor_type IN (1)", name="ck_memories_actor_type"),
         # SQLite ignores declared lengths and types, so bound every column there:
         # strings at up to four bytes per character, envelopes at their stored size.
         CheckConstraint(
