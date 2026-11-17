@@ -603,6 +603,16 @@ def test_issue_url_drops_body_when_command_alone_is_too_long(
         ("C:\\Users\\example user", "C%3A%5CUsers%5Cexample%20user%5Cx", "~%5Cx"),
         ("C:\\Users\\example user", "c%3a%5cusers%5cexample%20user%5cx", "~%5cx"),
         ("/home/example user", "file://localhost/home/example%20user/x", "~/x"),
+        (
+            "/home/example-user",
+            "file%3A%2F%2Flocalhost%2Fhome%2Fexample-user%2Fprivate.txt",
+            "~%2Fprivate.txt",
+        ),
+        (
+            "C:\\Users\\example user",
+            "file%3A%2F%2Flocalhost%2FC%3A%2FUsers%2Fexample%20user%2Fprivate.txt",
+            "~%2Fprivate.txt",
+        ),
         ("/home/example-user", "~example-user/x", "~/x"),
         ("/home/example-user", "%2Fhome%2Fexample-user%2Fx", "~%2Fx"),
         (
@@ -658,6 +668,8 @@ def test_issue_url_drops_body_when_command_alone_is_too_long(
         "windows-percent-backslash",
         "windows-lowercase-hex",
         "localhost-file-url",
+        "fully-encoded-localhost-file-uri",
+        "fully-encoded-localhost-windows-file-uri",
         "tilde-user",
         "percent-encoded-path",
         "fully-encoded-file-uri",
@@ -680,38 +692,14 @@ def test_scrub_replaces_home_at_path_boundaries(
     assert ch._scrub(text) == expected
 
 
-@pytest.mark.parametrize(
-    ("home_directory", "uri", "expected"),
-    [
-        (
-            "C:\\Users\\example user",
-            "file:///C:/Users/example%20user/private.txt",
-            "file:///~/private.txt",
-        ),
-        (
-            "/home/example-user",
-            "file%3A%2F%2F%2Fhome%2Fexample-user%2Fprivate.txt",
-            "file%3A%2F%2F~%2Fprivate.txt",
-        ),
-        (
-            "C:\\Users\\example user",
-            "file%3A%2F%2F%2FC%3A%2FUsers%2Fexample%20user%2Fprivate.txt",
-            "file%3A%2F%2F%2F~%2Fprivate.txt",
-        ),
-        (
-            "/home/example-user",
-            "file%3a%2F%2f%2fhome%2Fexample-user%2fprivate.txt",
-            "file%3a%2F%2f~%2fprivate.txt",
-        ),
-    ],
-    ids=["encoded-space-windows", "fully-encoded", "fully-encoded-windows", "mixed-case-hex"],
-)
 def test_issue_url_scrubs_encoded_home_in_title_and_description(
-    data_dir: Path, monkeypatch: pytest.MonkeyPatch, home_directory: str, uri: str, expected: str
+    data_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A percent-encoded file URI to the home directory is scrubbed in title and description."""
     ch.install_crash_handler("omnigent", "omnigent-ai/omnigent")
-    monkeypatch.setattr(Path, "home", lambda: Path(home_directory))
+    monkeypatch.setattr(Path, "home", lambda: Path(r"C:\Users\example user"))
+    uri = "file%3A%2F%2F%2FC%3A%2FUsers%2Fexample%20user%2Fprivate.txt"
+    expected = "file%3A%2F%2F%2F~%2Fprivate.txt"
     exc = ImportError(f"cannot open {uri}")
     tb_text = f'Traceback (most recent call last):\n  File "{uri}", line 1\nImportError: x\n'
     url, body_included = ch._issue_url(exc, tb_text)
@@ -743,12 +731,24 @@ def test_issue_url_redacts_tokens_before_title_cutoff(
 
 
 @pytest.mark.parametrize(
-    ("home_directory", "home_uri", "redacted_uri"),
+    ("home_directory", "home_uri", "redacted_uri", "uri_separator"),
     [
-        ("/home/example user", "file:///home/example%20user", "file://~"),
-        (r"C:\Users\example user", "file:///C:/Users/example%20user", "file:///~"),
+        ("/home/example user", "file:///home/example%20user", "file://~", "/"),
+        (r"C:\Users\example user", "file:///C:/Users/example%20user", "file:///~", "/"),
+        (
+            "/home/example-user",
+            "file%3A%2F%2Flocalhost%2Fhome%2Fexample-user",
+            "~",
+            "%2F",
+        ),
+        (
+            r"C:\Users\example user",
+            "file%3A%2F%2Flocalhost%2FC%3A%2FUsers%2Fexample%20user",
+            "~",
+            "%2F",
+        ),
     ],
-    ids=["posix", "windows"],
+    ids=["posix", "windows", "encoded-localhost-posix", "encoded-localhost-windows"],
 )
 def test_issue_url_scrubs_notes_before_truncation(
     data_dir: Path,
@@ -756,6 +756,7 @@ def test_issue_url_scrubs_notes_before_truncation(
     home_directory: str,
     home_uri: str,
     redacted_uri: str,
+    uri_separator: str,
 ) -> None:
     ch.install_crash_handler("omnigent", "omnigent-ai/omnigent")
     home = Path(home_directory)
@@ -767,25 +768,30 @@ def test_issue_url_scrubs_notes_before_truncation(
     noted_exc.add_note("x" * 9000)
     noted_exc.add_note(f"Home: ({home})")
     noted_exc.add_note(f"Home: {home}... {home}!!!")
-    noted_exc.add_note(f"URI: {home_uri}/private.txt")
+    noted_exc.add_note(f"URI: {home_uri}{uri_separator}private.txt")
+    noted_exc.add_note("Final diagnostic: failure")
     noted_tb = "".join(
         traceback.format_exception(type(noted_exc), noted_exc, noted_exc.__traceback__)
     )
     report = ch._build_report(noted_exc, noted_tb, source="test")
     assert noted_tb in report
-    assert f"URI: {home_uri}/private.txt" in report
+    assert f"URI: {home_uri}{uri_separator}private.txt" in report
     assert f"{home_uri}?download=1 {home_uri}#section" in report
     noted_url, body_included = ch._issue_url(noted_exc, noted_tb)
     assert body_included is True
     assert len(noted_url) <= ch._MAX_URL_LENGTH
     assert str(home) not in urllib.parse.unquote_plus(noted_url)
     assert home_uri not in urllib.parse.unquote_plus(noted_url)
+    assert "example" not in urllib.parse.unquote_plus(noted_url)
     noted_body = _description_of(noted_url)
     assert "truncated" in noted_body
     assert "Home: (~)" in noted_body
     assert "Home: ~... ~!!!" in noted_body
-    assert f"URI: {redacted_uri}/private.txt" in noted_body
+    assert f"URI: {redacted_uri}{uri_separator}private.txt" in noted_body
     assert f"{redacted_uri}?download=1 {redacted_uri}#section" in noted_body
+    assert "Final diagnostic: failure" in noted_body.split("**Traceback:**\n", 1)[1]
+    report_path = ch._save_report(report)
+    assert report_path.read_text(encoding="utf-8") == report
 
 
 def test_issue_url_oversized_final_note_leaves_empty_traceback(data_dir: Path) -> None:

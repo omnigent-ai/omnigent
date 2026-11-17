@@ -485,8 +485,11 @@ def _scrub(text: str) -> str:
             native = home
             forward = home.replace("\\", "/")
             forms = {native, forward, native.replace("\\", "\\\\")}
+            localhost_uri = "file://localhost" + (
+                forward if forward.startswith("/") else "/" + forward
+            )
             # Percent-encoding differs by how separators and the drive colon are escaped.
-            for raw in (native, forward):
+            for raw in (native, forward, localhost_uri):
                 forms.update(urllib.parse.quote(raw, safe=safe) for safe in ("", "/", ":/"))
             if Path(home).name:
                 forms.add("~" + Path(home).name)  # shell ``~user`` shorthand
