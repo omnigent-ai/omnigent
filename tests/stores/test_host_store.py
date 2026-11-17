@@ -141,16 +141,17 @@ def _register_shared_sandbox(host_store: HostStore) -> str:
 
 @contextmanager
 def _metadata_commit_fails_after_applying(engine, before_raise=lambda: None):
-    inserted = False
+    armed, inserted = True, False
 
     def on_execute(_connection, _cursor, statement, *_args):
         nonlocal inserted
-        inserted = inserted or statement.startswith("INSERT INTO omnigent_conversation_metadata")
+        if armed and statement.startswith("INSERT INTO omnigent_conversation_metadata"):
+            inserted = True
 
     def on_commit(_session: Session) -> None:
-        nonlocal inserted
+        nonlocal armed, inserted
         if inserted:
-            inserted = False
+            armed, inserted = False, False
             before_raise()
             raise OperationalError("COMMIT", None, sqlite3.OperationalError("database is locked"))
 
@@ -188,29 +189,63 @@ def test_failed_create_releases_last_shared_sandbox_binding(
 
 
 @pytest.mark.parametrize("split_database", [False, True])
-def test_failed_replacement_create_keeps_binding_for_retry(
+def test_failed_create_keeps_same_id_replacement(
     host_store: HostStore, db_uri: str, split_database, tmp_path
 ) -> None:
     host_id = _register_shared_sandbox(host_store)
     conversations = SqlAlchemyConversationStore(
         db_uri, f"sqlite:///{tmp_path / 'messages.db'}" if split_database else None
     )
-    first = conversations.create_conversation(host_id=host_id, workspace="/work")
-    assert asyncio.run(conversations.delete_conversation(first.id, preserve_host_binding=host_id))
+    conversation_id = uuid.uuid4().hex
+
+    def replace_conversation() -> None:
+        assert asyncio.run(
+            conversations.delete_conversation(conversation_id, preserve_host_binding=host_id)
+        )
+        conversations.create_conversation(
+            conversation_id=conversation_id, host_id=host_id, workspace="/replacement"
+        )
 
     with (
-        _metadata_commit_fails_after_applying(conversations._engine),
+        _metadata_commit_fails_after_applying(conversations._engine, replace_conversation),
         pytest.raises(OperationalError, match="database is locked"),
     ):
         conversations.create_conversation(
-            conversation_id=first.id, host_id=host_id, workspace="/replacement"
+            conversation_id=conversation_id, host_id=host_id, workspace="/work"
         )
-    assert conversations.get_conversation(first.id) is None
-    assert host_store.delete_host(host_id, keep_if_bound=True) is None
-    conversations.create_conversation(
-        conversation_id=first.id, host_id=host_id, workspace="/replacement"
+    replacement = conversations.get_conversation(conversation_id)
+    assert replacement is not None
+    assert (replacement.host_id, replacement.workspace) == (host_id, "/replacement")
+    assert host_store.get_host(host_id) is not None
+
+
+@pytest.mark.parametrize("split_database", [False, True])
+def test_failed_metadata_cleanup_keeps_deletable_session(
+    host_store: HostStore, db_uri: str, split_database, tmp_path
+) -> None:
+    host_id = _register_shared_sandbox(host_store)
+    conversations = SqlAlchemyConversationStore(
+        db_uri, f"sqlite:///{tmp_path / 'messages.db'}" if split_database else None
     )
-    assert conversations.get_conversation(first.id).host_id == host_id
+
+    def fail_cleanup(_connection, _cursor, statement, *_args):
+        if statement.startswith("DELETE FROM omnigent_conversation_metadata"):
+            raise OperationalError(statement, None, sqlite3.OperationalError("disk I/O error"))
+
+    event.listen(conversations._engine, "before_cursor_execute", fail_cleanup)
+    try:
+        with (
+            _metadata_commit_fails_after_applying(conversations._engine),
+            pytest.raises(OperationalError, match="database is locked"),
+        ):
+            conversations.create_conversation(host_id=host_id, workspace="/work")
+    finally:
+        event.remove(conversations._engine, "before_cursor_execute", fail_cleanup)
+    [kept_id] = conversations.list_host_conversation_ids(host_id)
+    assert conversations.get_conversation(kept_id) is not None
+    assert asyncio.run(conversations.delete_conversation(kept_id))
+    assert host_store.get_host(host_id) is None
+    assert host_store.get_host(host_id, include_deleted=True).deleted_at is not None
 
 
 @pytest.mark.parametrize("split_database", [False, True])

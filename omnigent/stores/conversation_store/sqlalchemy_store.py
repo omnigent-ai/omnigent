@@ -1322,8 +1322,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
                 meta_sess.add(meta)
                 meta_sess.flush()
-                # A replacement's row stays for a retry under the same id to resume.
-                flushed_new_metadata = previous is None
+                flushed_new_metadata = True
                 return meta
 
             try:
@@ -1332,8 +1331,14 @@ class SqlAlchemyConversationStore(ConversationStore):
                     "insert_conversation_metadata",
                     insert_metadata,
                 )
-            except Exception:
-                self._discard_unbound_conversation(new_id, flushed_metadata=flushed_new_metadata)
+            except Exception as exc:
+                # Only a generated id proves that the rows under it still belong to this attempt.
+                if conversation_id is None:
+                    self._discard_unbound_conversation(
+                        new_id, flushed_metadata=flushed_new_metadata
+                    )
+                elif isinstance(exc, OmnigentError):
+                    self._discard_unbound_conversation(new_id)
                 raise
             return _to_conversation(row, meta, creation_labels)
         except IntegrityError as exc:
@@ -1403,9 +1408,18 @@ class SqlAlchemyConversationStore(ConversationStore):
                     session.flush()
                     delete_unused_host_in_session(session, host)
 
-            run_write_transaction(
-                self._session_immediate, "discard_unbound_conversation_metadata", delete_flushed
-            )
+            try:
+                run_write_transaction(
+                    self._session_immediate,
+                    "discard_unbound_conversation_metadata",
+                    delete_flushed,
+                )
+            except Exception:
+                # Keeping the conversation row leaves a session that normal deletion can release.
+                _logger.exception(
+                    "could not discard metadata for conversation %s", conversation_id
+                )
+                return
 
         def write(session: Session) -> bool:
             keys = list(
