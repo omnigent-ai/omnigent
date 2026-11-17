@@ -2988,13 +2988,13 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
 @pytest.mark.usefixtures("_isolated_session_status_cache")
 @pytest.mark.parametrize("tunnel_three_layer_stack", [True], indirect=True)
 @pytest.mark.parametrize(
-    "provider_enabled",
+    "host_enabled",
     [pytest.param(False, id="legacy-fallback"), pytest.param(True, id="automatic-recovery")],
 )
-async def test_root_reconnect_requires_provider_opt_in_before_suppressing_legacy_recovery(
+async def test_root_reconnect_requires_host_opt_in_before_suppressing_legacy_recovery(
     tunnel_three_layer_stack: _TunnelStack,
     monkeypatch: pytest.MonkeyPatch,
-    provider_enabled: bool,
+    host_enabled: bool,
 ) -> None:
     from omnigent.host.frames import HostHelloFrame
     from omnigent.runtime import get_conversation_store
@@ -3009,19 +3009,20 @@ async def test_root_reconnect_requires_provider_opt_in_before_suppressing_legacy
     host_id = "a" * 32
     store.set_host_id(session_id, host_id, workspace="/restored")
     service = stack.ap_app.state.host_session_recoverer
+    service.deployment_gate = True
     service.sandbox_config = ManagedSandboxDeployment.single(
         ManagedSandboxConfig(
             server_url="https://server.example.test",
             launcher_factory=lambda: None,
             token_ttl_s=3600,
             provider="test",
-            host_config={"host": {"recover_interrupted_sessions": provider_enabled}},
+            host_config={"host": {"recover_interrupted_sessions": host_enabled}},
         )
     )
     monkeypatch.setattr(
         service.host_store,
         "get_host",
-        lambda _: SimpleNamespace(sandbox_provider="test", deleted_at=None),
+        lambda _: SimpleNamespace(sandbox_provider=None, deleted_at=None, user_id=None),
     )
     stack.ap_app.state.host_registry.register(
         host_id,
@@ -3030,10 +3031,10 @@ async def test_root_reconnect_requires_provider_opt_in_before_suppressing_legacy
             version="test",
             frame_protocol_version=1,
             name="recovery-host",
-            recover_interrupted_sessions=True,
+            recover_interrupted_sessions=host_enabled,
         ),
         owner=None,
-        registered_with_managed_token=provider_enabled,
+        registered_with_managed_token=False,
     )
     assert store.replace_session_recovery(
         session_id, None, SessionRecovery(host_id, _RUNNER_ID, 100, phase="launching")
@@ -3044,13 +3045,13 @@ async def test_root_reconnect_requires_provider_opt_in_before_suppressing_legacy
     async with _reconnect_fires_connect_hook(
         stack.ap_app, stack.fake_pm, wait_for_recover=session_id
     ):
-        assert spy.call_args.kwargs["suppress_recovery_turn"] is provider_enabled
+        assert spy.call_args.kwargs["suppress_recovery_turn"] is host_enabled
         assert store.get_session_recovery(session_id) is not None
         from omnigent.server.routes._sessions import orchestration
 
         probe = orchestration._relay_turn_held_for_host
         assert probe is not None
-        assert await probe(_RUNNER_ID, session_id) is provider_enabled
+        assert await probe(_RUNNER_ID, session_id) is host_enabled
         for phase in ("stopped", "failed"):
             recovery = store.get_session_recovery(session_id)
             assert recovery is not None

@@ -141,7 +141,7 @@ def test_reconcile_is_conditional_and_marks_scheduled_run_incomplete(
     ],
 )
 @pytest.mark.parametrize("path", ["orphan", "offline"])
-async def test_interrupted_runner_bookkeeping_requires_recovery_opt_in(
+async def test_interruption_evidence_is_retained_independently_of_opt_in(
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
     enabled: bool,
@@ -157,10 +157,8 @@ async def test_interrupted_runner_bookkeeping_requires_recovery_opt_in(
     store.touch_runner_liveness([conv.runner_id], now_epoch() - RUNNER_LIVENESS_TTL_S - 1)
     conv = store.get_conversation(sid)
     assert conv is not None and conv.runner_id is not None
-    previous = (
-        SessionRecovery(host_id, conv.runner_id, now_epoch(), phase=phase)
-        if phase is not None
-        else None
+    previous = SessionRecovery(
+        host_id, conv.runner_id, now_epoch(), phase=phase or "active", response_id="turn"
     )
     if previous is not None:
         assert store.replace_session_recovery(sid, None, previous)
@@ -175,13 +173,24 @@ async def test_interrupted_runner_bookkeeping_requires_recovery_opt_in(
     )
     service = HostSessionRecoverer(
         store,
-        Mock(get=Mock(return_value=None)),
         Mock(
-            get_host=Mock(return_value=SimpleNamespace(deleted_at=None, sandbox_provider="test"))
+            get=Mock(
+                return_value=SimpleNamespace(
+                    owner="local", hello=SimpleNamespace(recover_interrupted_sessions=enabled)
+                )
+            )
+        ),
+        Mock(
+            get_host=Mock(
+                return_value=SimpleNamespace(
+                    deleted_at=None, sandbox_provider=None, user_id="local"
+                )
+            )
         ),
         Mock(),
         Mock(),
         sandbox_config=config,
+        deployment_gate=True,
     )
     publish_status = Mock()
     monkeypatch.setattr(helpers, "_publish_status", publish_status)
@@ -196,14 +205,15 @@ async def test_interrupted_runner_bookkeeping_requires_recovery_opt_in(
             [conv], error, store, host_session_recoverer=service
         )
     recovery = store.get_session_recovery(sid)
-    if enabled and previous is None:
+    if phase is None:
         assert recovery is not None
         assert (recovery.host_id, recovery.runner_id, recovery.phase) == (
             host_id,
             conv.runner_id,
             "pending",
         )
-        publish_status.assert_not_called()
+        if enabled:
+            publish_status.assert_not_called()
     else:
         assert recovery == previous
         current = store.get_conversation(sid)

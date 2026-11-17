@@ -13,7 +13,7 @@ import pytest
 
 from omnigent.db.utils import generate_agent_id
 from omnigent.entities import MessageData, NewConversationItem
-from omnigent.server.host_session_recovery import HostSessionRecoverer
+from omnigent.server.host_session_recovery import HostSessionRecoverer, record_turn
 from omnigent.server.managed_hosts import ManagedSandboxConfig, ManagedSandboxDeployment
 from omnigent.session_recovery import (
     RECOVERY_MAX_AGE_S,
@@ -39,12 +39,12 @@ def recovery(db_uri: str, monkeypatch: pytest.MonkeyPatch) -> Any:
         host_id=host_id,
         owner="owner",
         hello=SimpleNamespace(recover_interrupted_sessions=True),
-        registered_with_managed_token=True,
+        registered_with_managed_token=False,
     )
     hosts = Mock(get=lambda _: connection)
     host = SimpleNamespace(
         host_id=host_id,
-        sandbox_provider="test",
+        sandbox_provider=None,
         deleted_at=None,
         user_id="owner",
     )
@@ -96,8 +96,15 @@ def recovery(db_uri: str, monkeypatch: pytest.MonkeyPatch) -> Any:
     clock = [1000]
     monkeypatch.setattr("omnigent.server.host_session_recovery.now_epoch", lambda: clock[0])
     service = HostSessionRecoverer(
-        store, hosts, host_store, runners, initializer, sandbox_config=sandbox_config
+        store,
+        hosts,
+        host_store,
+        runners,
+        initializer,
+        sandbox_config=sandbox_config,
+        deployment_gate=True,
     )
+    record_turn(store, conv.id, "old", "turn-1", finished=False)
     return SimpleNamespace(
         service=service,
         store=store,
@@ -135,6 +142,7 @@ async def test_host_recovery_claim_is_shared_between_replicas(
     recovery: Any, custom_prompt: str | None
 ) -> None:
     if custom_prompt is not None:
+        recovery.host.sandbox_provider = "test"
         recovery.host_config["host"]["recovery_prompt"] = custom_prompt
     service = recovery.service
     other = HostSessionRecoverer(
@@ -144,6 +152,7 @@ async def test_host_recovery_claim_is_shared_between_replicas(
         service.runners,
         service.initializer,
         sandbox_config=recovery.sandbox_config,
+        deployment_gate=True,
     )
     await asyncio.gather(
         service.recover(recovery.connection, []), other.recover(recovery.connection, [])
@@ -175,6 +184,7 @@ async def test_host_recovery_claim_is_shared_between_replicas(
 )
 async def test_ineligible_session_is_not_restarted(recovery: Any, reason: str) -> None:
     if reason == "idle":
+        record_turn(recovery.store, recovery.conv.id, "old", "turn-1", finished=True)
         recovery.store.set_session_live_status(recovery.conv.id, "idle")
     elif reason == "approval":
         recovery.store.set_pending_elicitation_count(recovery.conv.id, 1)
@@ -197,60 +207,33 @@ async def test_ineligible_session_is_not_restarted(recovery: Any, reason: str) -
 @pytest.mark.parametrize(
     "reason",
     [
-        "disabled",
-        "missing_config",
-        "missing_host_config",
-        "missing_host_section",
-        "missing_opt_in",
+        "deployment_off",
+        "evaluator_failure",
         "host_opt_out",
-        "ordinary_host",
-        "string_true",
-        "integer_one",
-        "unknown_provider",
         "deleted_host",
         "missing_host",
         "unsupported_store",
+        "stale_connection",
     ],
 )
-async def test_admin_opt_in_gates_bookkeeping_and_continuation(recovery: Any, reason: str) -> None:
+async def test_host_and_deployment_gate_execution(recovery: Any, reason: str) -> None:
     service = recovery.service
-    if reason == "missing_config":
-        service = HostSessionRecoverer(
-            recovery.store, service.hosts, service.host_store, service.runners, service.initializer
-        )
-    elif reason == "missing_host_config":
-        recovery.host_config.clear()
-    elif reason == "missing_host_section":
-        recovery.host_config["host"] = None
-    elif reason == "missing_opt_in":
-        recovery.host_config["host"].clear()
+    if reason == "deployment_off":
+        service.deployment_gate = False
+    elif reason == "evaluator_failure":
+        service.deployment_gate = Mock(side_effect=RuntimeError("flag unavailable"))
     elif reason == "host_opt_out":
         recovery.connection.hello.recover_interrupted_sessions = False
-    elif reason == "ordinary_host":
-        recovery.connection.registered_with_managed_token = False
-    elif reason in {"disabled", "string_true", "integer_one"}:
-        recovery.host_config["host"]["recover_interrupted_sessions"] = {
-            "disabled": False,
-            "string_true": "true",
-            "integer_one": 1,
-        }[reason]
-    elif reason == "unknown_provider":
-        recovery.host.sandbox_provider = "unknown"
     elif reason == "deleted_host":
         recovery.host.deleted_at = 1000
     elif reason == "missing_host":
         service.host_store.get_host.return_value = None
+    elif reason == "stale_connection":
+        service.hosts.get = Mock(return_value=None)
     else:
         recovery.store.supports_session_recovery = False
-    if reason != "host_opt_out":
-        del recovery.connection.hello
-    recovery.store.replace_session_recovery = Mock(wraps=recovery.store.replace_session_recovery)
     assert not service.enabled(recovery.conv.host_id)
-    service.record_interruption(recovery.conv)
-    service.stop_recovery(recovery.conv)
     await service.recover(recovery.connection, [])
-    recovery.store.replace_session_recovery.assert_not_called()
-    assert recovery.store.get_session_recovery(recovery.conv.id) is None
     recovery.launch.assert_not_awaited()
     recovery.initializer.initialize.assert_not_awaited()
 
@@ -268,9 +251,7 @@ async def test_admin_opt_in_gates_bookkeeping_and_continuation(recovery: Any, re
 def test_invalid_custom_recovery_prompt_is_rejected(recovery: Any, prompt: object) -> None:
     recovery.host_config["host"]["recovery_prompt"] = prompt
     service = recovery.service
-    with pytest.raises(
-        ValueError, match=r"host\.recovery_prompt must contain 1 to 8000 characters"
-    ):
+    with pytest.raises(ValueError, match="recovery_prompt must contain 1 to 8000 characters"):
         HostSessionRecoverer(
             service.store,
             service.hosts,
@@ -278,10 +259,12 @@ def test_invalid_custom_recovery_prompt_is_rejected(recovery: Any, prompt: objec
             service.runners,
             service.initializer,
             sandbox_config=recovery.sandbox_config,
+            deployment_gate=True,
         )
 
 
 def test_custom_recovery_prompt_accepts_the_maximum_length(recovery: Any) -> None:
+    recovery.host.sandbox_provider = "test"
     prompt = "x" * 8000
     recovery.host_config["host"]["recovery_prompt"] = prompt
     service = recovery.service
@@ -292,15 +275,14 @@ def test_custom_recovery_prompt_accepts_the_maximum_length(recovery: Any) -> Non
         service.runners,
         service.initializer,
         sandbox_config=recovery.sandbox_config,
+        deployment_gate=True,
     )
     assert configured.prompt(recovery.conv.host_id) == f"{RECOVERY_NOTICE}\n{prompt}"
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("phase", ["pending", "stopped"])
-async def test_disabling_recovery_leaves_existing_intent_untouched(
-    recovery: Any, phase: str
-) -> None:
+async def test_offline_stop_and_opt_out_close_existing_intent(recovery: Any, phase: str) -> None:
     service = recovery.service
     if phase == "stopped":
         service.stop_recovery(recovery.conv)
@@ -308,14 +290,13 @@ async def test_disabling_recovery_leaves_existing_intent_untouched(
         service.record_interruption(recovery.conv)
     previous = recovery.store.get_session_recovery(recovery.conv.id)
     assert previous.phase == phase
-    recovery.host_config["host"]["recover_interrupted_sessions"] = False
+    recovery.connection.hello.recover_interrupted_sessions = False
     recovery.store.replace_session_recovery = Mock(wraps=recovery.store.replace_session_recovery)
     service.record_interruption(recovery.conv)
     service.stop_recovery(recovery.conv)
     service.stop_recovery(recovery.conv, only_pending=True)
     await service.recover(recovery.connection, [])
-    recovery.store.replace_session_recovery.assert_not_called()
-    assert recovery.store.get_session_recovery(recovery.conv.id) == previous
+    assert recovery.store.get_session_recovery(recovery.conv.id).phase == "stopped"
     recovery.launch.assert_not_awaited()
     recovery.initializer.initialize.assert_not_awaited()
 
@@ -335,7 +316,7 @@ async def test_user_intent_during_launch_prevents_continuation(
         elif action == "rebind":
             recovery.store.replace_runner_id(recovery.conv.id, "explicit")
         else:
-            recovery.host_config["host"]["recover_interrupted_sessions"] = False
+            recovery.connection.hello.recover_interrupted_sessions = False
 
     if stage == "launch":
         launch = recovery.launch.side_effect
@@ -387,6 +368,7 @@ async def test_retries_stop_after_three_failures_across_service_restarts(recover
             service.runners,
             service.initializer,
             sandbox_config=recovery.sandbox_config,
+            deployment_gate=True,
         )
         await service.recover(recovery.connection, [])
         state = recovery.store.get_session_recovery(recovery.conv.id)
@@ -427,12 +409,14 @@ def test_stop_survives_store_restart_and_fresh_user_input_reenables_recovery(
         service.runners,
         service.initializer,
         sandbox_config=recovery.sandbox_config,
+        deployment_gate=True,
     )
     restarted_service.record_interruption(recovery.conv)
     assert restarted.get_session_recovery(recovery.conv.id).phase == "stopped"
     user_input(restarted, recovery.conv.id)
     restarted_service.record_interruption(recovery.conv)
     assert restarted.get_session_recovery(recovery.conv.id) is None
+    record_turn(restarted, recovery.conv.id, "old", "turn-2", finished=False)
     restarted_service.record_interruption(restarted.get_conversation(recovery.conv.id))
     assert restarted.get_session_recovery(recovery.conv.id).phase == "pending"
 
@@ -510,7 +494,7 @@ async def test_persisted_running_session_does_not_receive_a_fresh_deadline(
     await recovery.service.recover(recovery.connection, [])
     state = recovery.store.get_session_recovery(recovery.conv.id)
     if age is None:
-        assert state is None
+        assert state.phase == "active"
     else:
         assert state.interrupted_at == recovery.clock[0] - age
         assert state.phase == ("failed" if age > RECOVERY_MAX_AGE_S else "submitted")
@@ -591,3 +575,123 @@ async def test_archive_then_unarchive_does_not_resume_old_work(recovery: Any) ->
     recovery.store.update_conversation(recovery.conv.id, archived=False)
     await recovery.service.recover(recovery.connection, [])
     recovery.launch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["active", "pending", "launching", "submitted"])
+@pytest.mark.parametrize("terminal", ["completed", "stop", "closed", "archive", "unidentified"])
+async def test_terminal_intent_prevents_resurrection_even_offline(
+    recovery: Any, phase: str, terminal: str
+) -> None:
+    store, conv = recovery.store, recovery.conv
+    state = store.get_session_recovery(conv.id)
+    store.replace_session_recovery(conv.id, state, replace(state, phase=phase))
+    recovery.service.hosts.get = Mock(return_value=None)
+    if terminal in {"completed", "unidentified"}:
+        record_turn(
+            store, conv.id, "old", "turn-1" if terminal == "completed" else None, finished=True
+        )
+    elif terminal == "stop":
+        recovery.service.stop_recovery(conv)
+    elif terminal == "closed":
+        store.set_labels(conv.id, {"omnigent.closed": "true"})
+        store.set_labels(conv.id, {"omnigent.closed": "false"})
+    else:
+        store.update_conversation(conv.id, archived=True)
+        store.update_conversation(conv.id, archived=False)
+    store.set_labels(conv.id, {"omnigent.last_task_error_code": "runner_interrupted"})
+    recovery.service.hosts.get = Mock(return_value=recovery.connection)
+    await recovery.service.recover(recovery.connection, [])
+    assert store.get_session_recovery(conv.id).phase == "stopped"
+    recovery.launch.assert_not_awaited()
+    recovery.initializer.initialize.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unwitnessed_running_status_and_old_error_are_not_turn_evidence(
+    recovery: Any,
+) -> None:
+    store, conv = recovery.store, recovery.conv
+    store.replace_session_recovery(conv.id, store.get_session_recovery(conv.id), None)
+    store.set_labels(conv.id, {"omnigent.last_task_error_code": "runner_interrupted"})
+    await recovery.service.recover(recovery.connection, [])
+    recovery.launch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_opt_out_then_reenable_does_not_revive_old_episode(recovery: Any) -> None:
+    recovery.service.record_interruption(recovery.conv)
+    recovery.connection.hello.recover_interrupted_sessions = False
+    await recovery.service.retire_disabled(recovery.connection)
+    recovery.connection.hello.recover_interrupted_sessions = True
+    await recovery.service.recover(recovery.connection, [])
+    recovery.launch.assert_not_awaited()
+    assert recovery.store.get_session_recovery(recovery.conv.id).phase == "stopped"
+
+
+def test_delayed_terminal_cannot_close_a_new_turn(recovery: Any) -> None:
+    store, conv = recovery.store, recovery.conv
+    user_input(store, conv.id)
+    record_turn(store, conv.id, "old", "turn-1", finished=True)
+    assert store.get_session_recovery(conv.id) is None
+    record_turn(store, conv.id, "old", "turn-2", finished=False)
+    record_turn(store, conv.id, "old", "turn-1", finished=True)
+    assert store.get_session_recovery(conv.id).response_id == "turn-2"
+    assert store.get_session_recovery(conv.id).phase == "active"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["claim", "launch", "routing"])
+async def test_completion_racing_recovery_prevents_continuation(recovery: Any, stage: str) -> None:
+    store, conv = recovery.store, recovery.conv
+
+    def finish() -> None:
+        current = store.get_conversation(conv.id)
+        record_turn(store, conv.id, current.runner_id, "turn-1", finished=True)
+
+    if stage == "claim":
+        claim = store.replace_session_recovery
+
+        def completed_claim(*args: Any, **kwargs: Any) -> bool:
+            store.replace_session_recovery = claim
+            finish()
+            return claim(*args, **kwargs)
+
+        store.replace_session_recovery = completed_claim
+    elif stage == "launch":
+        launch = recovery.launch.side_effect
+
+        async def completed_launch(*args: Any, **kwargs: Any) -> Any:
+            result = await launch(*args, **kwargs)
+            finish()
+            return result
+
+        recovery.launch.side_effect = completed_launch
+    else:
+        route = recovery.service.runners.client_for_existing_conversation
+
+        def completed_route(session_id: str) -> Any:
+            result = route(session_id)
+            finish()
+            return result
+
+        recovery.service.runners.client_for_existing_conversation = completed_route
+    await recovery.service.recover(recovery.connection, [])
+    recovery.initializer.initialize.assert_not_awaited()
+    assert store.get_session_recovery(conv.id).phase == "stopped"
+
+
+def test_embedded_default_is_off_and_server_prompt_is_generic(recovery: Any) -> None:
+    service = recovery.service
+    embedded = HostSessionRecoverer(
+        service.store,
+        service.hosts,
+        service.host_store,
+        service.runners,
+        service.initializer,
+        recovery_prompt="Check the checkpoint.",
+    )
+    assert not embedded.enabled(recovery.conv.host_id)
+    assert embedded.prompt(recovery.conv.host_id) == f"{RECOVERY_NOTICE}\nCheck the checkpoint."
+    embedded.deployment_gate = lambda: True
+    assert embedded.enabled(recovery.conv.host_id)

@@ -2398,7 +2398,7 @@ async def test_host_requests_recovery_without_blocking_tunnel(
     assert isinstance(hello, HostHelloFrame)
     hello.recover_interrupted_sessions = enabled
     await comm.send_input({"type": "websocket.receive", "text": encode_host_frame(hello)})
-    await asyncio.wait_for(_wait_registered(registry, _HOST_ID), timeout=budget(2))
+    await wait_for_tunnel_registration(comm, registry, _HOST_ID)
     request = {
         "type": "websocket.receive",
         "text": encode_host_frame(HostRecoverSessionsFrame(runners=["alive"])),

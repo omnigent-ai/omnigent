@@ -6570,6 +6570,7 @@ async def _launch_runner_on_host_impl(
     *,
     replace_move_claim: bool = False,
     recovery: SessionRecovery | None = None,
+    recovery_allowed: Callable[[], bool] | None = None,
 ) -> _HostLaunchAttempt:
     """
     Ask a host to spawn a runner for a session and capture the result.
@@ -6641,6 +6642,7 @@ async def _launch_runner_on_host_impl(
             host_conn,
             replace_move_claim=replace_move_claim,
             recovery=recovery,
+            recovery_allowed=recovery_allowed,
         )
         # Re-insert so the plain dict's insertion order is newest-last, then
         # evict from the front once past the cap.
@@ -6673,6 +6675,7 @@ async def _launch_runner_on_host_locked(
     *,
     replace_move_claim: bool = False,
     recovery: SessionRecovery | None = None,
+    recovery_allowed: Callable[[], bool] | None = None,
 ) -> _HostLaunchAttempt:
     """The launch round-trip proper; runs under the conversation's lock."""
     from dataclasses import replace
@@ -6687,7 +6690,9 @@ async def _launch_runner_on_host_locked(
         return _move_in_progress_attempt(conv.runner_id or "")
     await host_registry.admit_launch(host_conn, conv.id)
     if recovery is not None and (
-        await asyncio.to_thread(conversation_store.get_session_recovery, conv.id) != recovery
+        recovery_allowed is None
+        or not await asyncio.to_thread(recovery_allowed)
+        or await asyncio.to_thread(conversation_store.get_session_recovery, conv.id) != recovery
     ):
         return _HostLaunchAttempt(
             runner_id=conv.runner_id or "",
@@ -6727,17 +6732,19 @@ async def _launch_runner_on_host_locked(
             error="the session's host or runner changed before the runner could start",
         )
     if recovery:
+        rebound_recovery = replace(recovery, runner_id=new_runner_id)
         if not await asyncio.to_thread(
             conversation_store.replace_session_recovery,
             conv.id,
             recovery,
-            replace(recovery, runner_id=new_runner_id),
+            rebound_recovery,
         ):
             return _HostLaunchAttempt(
                 runner_id=new_runner_id,
                 error_code="recovery_cancelled",
                 error="Recovery was superseded before runner launch",
             )
+        recovery = rebound_recovery
     if bound_conv.runner_last_seen is not None:
         # The new token has not reached the host, so this stamp can only
         # belong to the previous runner. Clear it before launching.
@@ -6802,6 +6809,17 @@ async def _launch_runner_on_host_locked(
                 recovery=recovery is not None,
             )
         )
+        if recovery is not None and (
+            recovery_allowed is None
+            or not await asyncio.to_thread(recovery_allowed)
+            or await asyncio.to_thread(conversation_store.get_session_recovery, conv.id)
+            != recovery
+        ):
+            return _HostLaunchAttempt(
+                runner_id=new_runner_id,
+                error_code="recovery_cancelled",
+                error="Recovery was superseded before runner launch",
+            )
         for enqueue_attempt in range(2):
             launch_future: asyncio.Future[HostLaunchResult] = (
                 asyncio.get_running_loop().create_future()

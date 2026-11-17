@@ -1917,6 +1917,7 @@ def create_app(
     inbox_item_store: InboxItemStore | None = None,
     user_inbox: DeploymentGate | None = None,
     proactive_agent: DeploymentGate | None = None,
+    host_session_recovery: DeploymentGate = False,
     proactive_agent_settings_store: ProactiveAgentSettingsStore | None = None,
     session_mcp_selection: SessionMcpSelection | None = None,
 ) -> FastAPI:
@@ -2842,6 +2843,8 @@ def create_app(
             runner_router,
             runner_session_initializer,
             sandbox_config=sandbox_config,
+            deployment_gate=host_session_recovery,
+            recovery_prompt=(server_config or {}).get("recovery_prompt"),
         )
         if host_store is not None
         else None
@@ -5623,6 +5626,12 @@ def create_app(
             if startup_inputs is not None:
                 startup_inputs.host_changed(app, _host_id)
 
+        async def _on_host_connected(host_id: str, owner: str | None) -> None:
+            connection = host_registry.get(host_id)
+            if connection is not None:
+                await host_session_recoverer.retire_disabled(connection)
+            await _on_hosts_changed(host_id, owner)
+
         app.include_router(
             create_host_tunnel_router(
                 host_registry,
@@ -5631,7 +5640,7 @@ def create_app(
                 runner_exit_reports=runner_exit_reports,
                 on_runner_exited=_on_runner_exited,
                 on_session_recovery=host_session_recoverer.recover,
-                on_host_connect=_on_hosts_changed,
+                on_host_connect=_on_host_connected,
                 on_host_disconnect=_on_hosts_changed,
                 on_host_update=_on_hosts_changed,
                 harness_install=app.state.harness_install,

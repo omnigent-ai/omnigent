@@ -37,10 +37,11 @@ class SessionRecovery:
     host_id: str
     runner_id: str
     interrupted_at: int
-    phase: Literal["pending", "launching", "dispatching", "submitted", "stopped", "failed"] = (
-        "pending"
-    )
+    phase: Literal[
+        "active", "pending", "launching", "dispatching", "submitted", "stopped", "failed"
+    ] = "pending"
     attempts: int = 0
     attempt_id: str | None = None
     retry_at: int = 0
     launch_runner_id: str | None = None
+    response_id: str | None = None

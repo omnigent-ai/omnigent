@@ -1862,6 +1862,13 @@ class SqlAlchemyConversationStore(ConversationStore):
         stable_updates = dict(updates)
 
         def write(session: Session) -> None:
+            if stable_updates.get("omnigent.closed") == "true":
+                self._lock_conversation(session, conversation_id)
+                recovery = _read_session_recovery(session, conversation_id)
+                if recovery is not None:
+                    _write_session_recovery(
+                        session, conversation_id, replace(recovery, phase="stopped")
+                    )
             _upsert_labels(session, conversation_id, stable_updates, stamp)
 
         run_write_transaction(self._conv_session_immediate, "set_labels", write)
@@ -4915,6 +4922,12 @@ class SqlAlchemyConversationStore(ConversationStore):
                 row.archived = archived
                 ap_changed = True
             if label_updates:
+                if label_updates.get("omnigent.closed") == "true":
+                    recovery = _read_session_recovery(ap_sess, conversation_id)
+                    if recovery is not None:
+                        _write_session_recovery(
+                            ap_sess, conversation_id, replace(recovery, phase="stopped")
+                        )
                 _upsert_labels(ap_sess, conversation_id, label_updates, now)
                 ap_changed = True
             if ap_changed:

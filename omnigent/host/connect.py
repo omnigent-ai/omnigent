@@ -5844,7 +5844,7 @@ class HostProcess:
             await self._cancel_all_harness_logins()
 
     async def _session_recovery_loop(self, ws: websockets.asyncio.client.ClientConnection) -> None:
-        """Only opted-in hosts request recovery after provider restoration."""
+        """Only opted-in hosts request recovery after their local state is ready."""
         from omnigent.session_recovery import RECOVERY_RETRY_S
 
         if not self._recover_interrupted_sessions:

@@ -297,7 +297,19 @@ credential context; the default context is a no-op.
 
 ## Automatic continuation after a host restart
 
-Administrators can opt a provider in through the server's existing host configuration:
+A host opts in through its own `config.yaml`:
+
+```yaml
+host:
+  recover_interrupted_sessions: true
+```
+
+Restart the host process to apply the setting. It advertises this opt-in on its
+current authenticated connection and requests recovery every 30 seconds with its
+live runner IDs. No server-side host preference is stored. This works for ordinary
+machines as well as provider hosts; a stable host identity is required.
+
+For a fleet, distribute the same setting through the existing template:
 
 ```yaml
 sandbox:
@@ -305,35 +317,38 @@ sandbox:
   host_config:
     host:
       recover_interrupted_sessions: true
-      # Optional administrator instructions; the resume marker is added automatically.
-      recovery_prompt: >-
-        Continue the current task from its checkpoint. Check interrupted
-        operations before repeating them.
 ```
 
-Both the server's provider configuration and the host's hello must opt in.
-A host cannot enable this by advertising the capability alone. Omit the flag or
-set it to `false` to keep the existing manual continuation behavior, including
-for existing managed controllers. The optional prompt must be nonblank and at
-most 8,000 characters; omitting it uses the built-in continuation instructions.
+Provider membership and launch-token provenance do not grant recovery permission.
+Omitting the host flag, setting it to `false`, or using an older host keeps manual
+continuation. Existing controllers remain unchanged. Opt-out closes existing
+recovery episodes; re-enabling does not revive completed or stopped work.
 
-This is off by default and independent of `resume_stopped`. The provider must
-restore the workspace, credentials, and harness state **before starting the
-host**. Providers that restore files asynchronously must leave it disabled until
-that ordering is guaranteed. An opted-in host advertises the setting in its hello
-and sends `host.recover_sessions` with its live runner IDs every 30 seconds.
-Older hosts retain their existing behavior.
+Stock server entrypoints permit host opt-in. Embedded `create_app` integrations
+also need `host_session_recovery=True` or a live callable returning true; this
+permission defaults to false and evaluator errors deny recovery. A deployment
+can use this boundary for its own rollout or emergency disable policy.
 
-The server considers only authorized root sessions already bound to that managed
-host. It restarts lost runners for interrupted work and sends a hidden continuation
-prompt through the existing session initializer. Live runners, idle sessions,
-pending approvals, archived/closed sessions, Stop, and newer user input prevent
-automatic continuation. Missing workspace directories are refused, not recreated.
-The feature does not provision compute or call provider wake methods: the provider
-or infrastructure supervisor must bring the host back first.
+Administrators may set `recovery_prompt` in the server configuration. It must be
+nonblank and at most 8,000 characters; the server adds the resume marker. An
+existing provider's `host_config.host.recovery_prompt` overrides that default for
+its hosts, independently of admission. Neither a host frame nor an end user can
+supply these instructions. Without an override, the prompt asks the agent to
+continue the task and check interrupted operations before repeating them.
+
+The host must return with its workspace, credentials, and harness state restored.
+Keep recovery disabled when those files can still be restoring after registration.
+The server never provisions or wakes compute through this mechanism.
+
+Only root sessions with a durably witnessed unfinished turn are eligible. The
+server records the turn's response ID before admitting recovery. Completion,
+Stop, human-input waits, newer accepted input, archive/close, and changed bindings
+prevent continuation. A historical running status or disconnect error alone is
+insufficient; turns without reliable evidence or interruption age remain manual.
+Live runners are skipped and missing workspace directories are refused.
 
 Recovery intent uses private `omnigent.recovery.*` conversation labels: the host
-and runner bindings, expected launch runner, interruption time, phase, attempt
+and runner bindings, response ID, expected launch runner, interruption time, phase, attempt
 count and identity, and next retry time. These labels are hidden from normal label
 reads and forks and cannot be written through ordinary label APIs. No new table
 or ledger is needed.

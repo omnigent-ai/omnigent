@@ -5662,6 +5662,7 @@ async def test_malformed_native_failure_context_does_not_reject_status(
 
 async def test_post_external_session_status_carries_response_id(
     client: httpx.AsyncClient,
+    db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
@@ -5677,6 +5678,9 @@ async def test_post_external_session_status_carries_response_id(
     _capture_published(monkeypatch, published)
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"])
+    store = SqlAlchemyConversationStore(db_uri)
+    store.set_host_id(session["id"], "a" * 32, workspace="/workspace")
+    store.set_runner_id(session["id"], "turn-runner")
 
     resp = await client.post(
         f"/v1/sessions/{session['id']}/events",
@@ -5694,6 +5698,24 @@ async def test_post_external_session_status_carries_response_id(
     assert event["conversation_id"] == session["id"]
     assert event["status"] == "running"
     assert event["response_id"] == "codex_turn_123"
+
+    assert store.get_session_recovery(session["id"]).phase == "active"
+    for completed in (False, True):
+        resp = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={
+                "type": "external_session_status",
+                "data": {
+                    "status": "idle",
+                    "response_id": "codex_turn_123",
+                    "turn_completed": completed,
+                },
+            },
+        )
+        assert resp.status_code == 202, resp.text
+        assert store.get_session_recovery(session["id"]).phase == (
+            "stopped" if completed else "active"
+        )
 
 
 async def test_publish_status_keeps_failed_sticky_against_trailing_idle(

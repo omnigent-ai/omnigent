@@ -2780,6 +2780,17 @@ def register_events_routes(
             # A confirmed turn completion after a failure means a later turn
             # succeeded, so the earlier failure must not outlive it.
             turn_completed = status == "idle" and data.get("turn_completed") is True
+            from omnigent.server.host_session_recovery import record_turn
+
+            if status == "running" or status in {"failed", "waiting"} or turn_completed:
+                await asyncio.to_thread(
+                    record_turn,
+                    conversation_store,
+                    session_id,
+                    conv.runner_id,
+                    response_id,
+                    finished=status in {"failed", "waiting"} or turn_completed or bool(blocked_on),
+                )
             recovered_from_failure = (
                 turn_completed and _session_status_cache.get(session_id) == "failed"
             )

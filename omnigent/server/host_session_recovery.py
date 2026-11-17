@@ -10,6 +10,7 @@ from uuid import uuid4
 
 from omnigent.db.utils import now_epoch
 from omnigent.entities import Conversation
+from omnigent.server.feature_flags import DeploymentGate, deployment_gate_enabled
 from omnigent.server.schemas import ErrorDetail
 from omnigent.session_recovery import (
     MAX_RECOVERY_ATTEMPTS,
@@ -34,6 +35,48 @@ if TYPE_CHECKING:
 _logger = logging.getLogger(__name__)
 
 
+def record_turn(
+    store: ConversationStore,
+    session_id: str,
+    runner_id: str | None,
+    response_id: str | None,
+    *,
+    finished: bool,
+) -> None:
+    """Keep turn evidence under the input lock, independently of recovery admission."""
+    if not store.supports_session_recovery or not runner_id:
+        return
+    conv = store.get_conversation(session_id)
+    if (
+        conv is None
+        or not conv.host_id
+        or conv.runner_id != runner_id
+        or conv.parent_conversation_id is not None
+    ):
+        return
+    if not response_id:
+        if finished:
+            _stop_recovery(store, conv, only_pending=True)
+        return
+    previous = store.get_session_recovery(session_id)
+    if finished:
+        # An old turn's completion must not close newer accepted input.
+        if previous is None or previous.response_id != response_id:
+            return
+        state = replace(previous, phase="stopped")
+    elif previous is None:
+        state = SessionRecovery(
+            conv.host_id, runner_id, now_epoch(), phase="active", response_id=response_id
+        )
+    elif previous.phase in {"dispatching", "submitted"}:
+        state = replace(previous, phase="submitted", response_id=response_id)
+    else:
+        return
+    store.replace_session_recovery(
+        session_id, previous, state, expected_conversation=None if finished else conv
+    )
+
+
 def _record_interruption(
     store: ConversationStore, conv: Conversation, *, interrupted_at: int | None = None
 ) -> None:
@@ -46,24 +89,31 @@ def _record_interruption(
         or conv.parent_conversation_id is not None
         or not _restorable(conv)
         or conv.pending_elicitation_count
-        or not (
-            conv.live_status in {"running", "waiting"}
-            or conv.labels.get("omnigent.last_task_error_code")
-            in {"runner_disconnected", "runner_interrupted"}
+        or conv.live_status == "waiting"
+        or (
+            conv.live_status == "failed"
+            and conv.labels.get("omnigent.last_task_error_code")
+            not in {"runner_disconnected", "runner_interrupted"}
         )
     ):
         return
     previous = store.get_session_recovery(conv.id)
-    if previous is None:
+    if (
+        previous is None
+        or previous.host_id != conv.host_id
+        or previous.runner_id != conv.runner_id
+    ):
+        return
+    if previous.phase == "active":
         if interrupted_at is None:
             interrupted_at = (
                 conv.runner_last_seen
-                if conv.live_status in {"running", "waiting"}
+                if conv.live_status != "failed"
                 else store.get_session_interruption_time(conv.id)
             )
         if interrupted_at is None:
             return
-        recovery = SessionRecovery(conv.host_id, conv.runner_id, interrupted_at)
+        recovery = replace(previous, phase="pending", interrupted_at=interrupted_at)
     elif previous.phase == "submitted" and previous.runner_id == conv.runner_id:
         recovery = replace(previous, phase="pending", attempt_id=None)
     else:
@@ -84,7 +134,7 @@ def _stop_recovery(
         stopped = replace(
             previous or SessionRecovery(conv.host_id, conv.runner_id, now_epoch()), phase="stopped"
         )
-        if store.replace_session_recovery(conv.id, previous, stopped):
+        if store.replace_session_recovery(conv.id, previous, stopped, expected_conversation=conv):
             return
         # Stores without this optional contract must keep their normal Stop path.
         if store.get_session_recovery(conv.id) == previous:
@@ -102,6 +152,9 @@ class HostSessionRecoverer:
         runners: RunnerRouter,
         initializer: RunnerSessionInitializer,
         sandbox_config: ManagedSandboxDeployment | None = None,
+        *,
+        deployment_gate: DeploymentGate = False,
+        recovery_prompt: str | None = None,
     ) -> None:
         self.store = store
         self.hosts = hosts
@@ -109,57 +162,88 @@ class HostSessionRecoverer:
         self.runners = runners
         self.initializer = initializer
         self.sandbox_config = sandbox_config
+        self.deployment_gate = deployment_gate
+        self.recovery_prompt = recovery_prompt
+        self._validate_prompt(recovery_prompt)
         for config in sandbox_config.configs if sandbox_config is not None else ():
             settings = (config.host_config or {}).get("host", {})
             if not isinstance(settings, dict):
                 continue
             prompt = settings.get("recovery_prompt")
-            if prompt is not None and (
-                not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 8000
-            ):
-                raise ValueError("host.recovery_prompt must contain 1 to 8000 characters")
+            self._validate_prompt(prompt)
 
-    def prompt(self, host_id: str | None) -> str | None:
+    @staticmethod
+    def _validate_prompt(prompt: object) -> None:
+        if prompt is not None and (
+            not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 8000
+        ):
+            raise ValueError("recovery_prompt must contain 1 to 8000 characters")
+
+    def prompt(self, host_id: str | None) -> str:
         """Resolve administrator policy without waking or changing the host."""
-        from omnigent.server.sharing_settings import host_is_managed_sandbox
-
-        if not self.store.supports_session_recovery or self.sandbox_config is None or not host_id:
-            return None
-        host = self.host_store.get_host(host_id)
-        if host is None or host.deleted_at is not None or host.sandbox_provider is None:
-            return None
-        config = self.sandbox_config.for_provider(host.sandbox_provider)
-        if config is None:
-            return None
-        settings = (config.host_config or {}).get("host", {})
-        if (
-            not isinstance(settings, dict)
-            or settings.get("recover_interrupted_sessions") is not True
-        ):
-            return None
-        connection = self.hosts.get(host_id)
-        if connection is not None and (
-            not host_is_managed_sandbox(self.hosts, host_id)
-            or not connection.hello.recover_interrupted_sessions
-        ):
-            return None
-        custom = settings.get("recovery_prompt")
+        custom = self.recovery_prompt
+        host = self.host_store.get_host(host_id) if host_id else None
+        if host is not None and host.sandbox_provider and self.sandbox_config is not None:
+            config = self.sandbox_config.for_provider(host.sandbox_provider)
+            settings = (config.host_config or {}).get("host", {}) if config is not None else {}
+            if isinstance(settings, dict):
+                custom = settings.get("recovery_prompt", custom)
         return (
             f"{RECOVERY_NOTICE}\n{custom.strip()}" if isinstance(custom, str) else RECOVERY_PROMPT
         )
 
     def enabled(self, host_id: str | None) -> bool:
-        return self.prompt(host_id) is not None
+        if (
+            not self.store.supports_session_recovery
+            or not host_id
+            or not deployment_gate_enabled(self.deployment_gate, "host_session_recovery")
+        ):
+            return False
+        connection = self.hosts.get(host_id)
+        if connection is None or connection.hello.recover_interrupted_sessions is not True:
+            return False
+        host = self.host_store.get_host(host_id)
+        return host is not None and host.deleted_at is None and host.user_id == connection.owner
 
     def record_interruption(
         self, conv: Conversation, *, interrupted_at: int | None = None
     ) -> None:
-        if self.enabled(conv.host_id):
+        if self.store.supports_session_recovery:
             _record_interruption(self.store, conv, interrupted_at=interrupted_at)
 
     def stop_recovery(self, conv: Conversation, *, only_pending: bool = False) -> None:
-        if self.enabled(conv.host_id):
+        if self.store.supports_session_recovery:
             _stop_recovery(self.store, conv, only_pending=only_pending)
+
+    async def retire_disabled(self, connection: HostConnection) -> None:
+        """Opting out closes existing episodes without storing a host preference."""
+        host = await asyncio.to_thread(self.host_store.get_host, connection.host_id)
+        if (
+            not self.store.supports_session_recovery
+            or host is None
+            or host.user_id != connection.owner
+            or await asyncio.to_thread(self.enabled, connection.host_id)
+        ):
+            return
+        after = None
+        while self.hosts.get(connection.host_id) is connection:
+            ids = await asyncio.to_thread(
+                self.store.list_host_conversation_ids, connection.host_id, after=after
+            )
+            for session_id in ids:
+                if self.hosts.get(connection.host_id) is not connection:
+                    return
+                previous = await asyncio.to_thread(self.store.get_session_recovery, session_id)
+                if previous is not None and previous.phase not in {"stopped", "failed"}:
+                    await asyncio.to_thread(
+                        self.store.replace_session_recovery,
+                        session_id,
+                        previous,
+                        replace(previous, phase="stopped"),
+                    )
+            if len(ids) < 32:
+                return
+            after = ids[-1]
 
     async def recover(self, connection: HostConnection, live_runners: list[str]) -> None:
         host = await asyncio.to_thread(self.host_store.get_host, connection.host_id)
@@ -167,10 +251,10 @@ class HostSessionRecoverer:
             not await asyncio.to_thread(self.enabled, connection.host_id)
             or not connection.hello.recover_interrupted_sessions
             or host is None
-            or host.sandbox_provider is None
             or host.deleted_at is not None
             or host.user_id != connection.owner
         ):
+            await self.retire_disabled(connection)
             return
         after = None
         while self.hosts.get(connection.host_id) is connection:
@@ -197,7 +281,7 @@ class HostSessionRecoverer:
             _query_host_runner_status,
         )
 
-        if not connection.hello.recover_interrupted_sessions or not await asyncio.to_thread(
+        if self.hosts.get(connection.host_id) is not connection or not await asyncio.to_thread(
             self.enabled, connection.host_id
         ):
             return
@@ -208,6 +292,7 @@ class HostSessionRecoverer:
             or conv.parent_conversation_id is not None
             or not _restorable(conv)
             or conv.pending_elicitation_count
+            or conv.live_status == "waiting"
             or is_session_closed(conv.labels, conv.title)
         ):
             return
@@ -218,6 +303,8 @@ class HostSessionRecoverer:
             return
         recovery = await asyncio.to_thread(self.store.get_session_recovery, session_id)
         if recovery is not None:
+            if recovery.response_id is None:
+                return
             if recovery.host_id != connection.host_id:
                 return
             if recovery.runner_id != conv.runner_id:
@@ -247,7 +334,7 @@ class HostSessionRecoverer:
             return
         if online or conv.runner_id in live_runners or runner_seen_is_fresh(conv.runner_last_seen):
             return
-        if recovery is None:
+        if recovery is None or recovery.phase == "active":
             await asyncio.to_thread(self.record_interruption, conv)
             recovery = await asyncio.to_thread(self.store.get_session_recovery, session_id)
         if (
@@ -256,7 +343,7 @@ class HostSessionRecoverer:
             or recovery.runner_id != conv.runner_id
         ):
             return
-        if recovery.phase in {"failed", "stopped"}:
+        if recovery.phase in {"active", "failed", "stopped"} or recovery.response_id is None:
             return
         if conv.runner_id:
             status = await _query_host_runner_status(connection, self.hosts, conv.runner_id)
@@ -295,7 +382,15 @@ class HostSessionRecoverer:
                 # Reuse admission and binding tokens; do not call ensure_runner_connected,
                 # whose lazy wake path is allowed to mutate provider compute.
                 launch = await _launch_runner_on_host(
-                    conv, self.store, self.hosts, connection, recovery=attempt
+                    conv,
+                    self.store,
+                    self.hosts,
+                    connection,
+                    recovery=attempt,
+                    recovery_allowed=lambda: (
+                        self.hosts.get(connection.host_id) is connection
+                        and self.enabled(connection.host_id)
+                    ),
                 )
                 current = await asyncio.to_thread(self.store.get_session_recovery, session_id)
                 if current is None or current.attempt_id != attempt.attempt_id:
@@ -350,7 +445,7 @@ class HostSessionRecoverer:
         if (
             self.hosts.get(connection.host_id) is not connection
             or not connection.hello.recover_interrupted_sessions
-            or prompt is None
+            or not await asyncio.to_thread(self.enabled, connection.host_id)
             or attempt.runner_id != conv.runner_id
             or attempt.launch_runner_id != conv.runner_id
         ):
@@ -367,12 +462,13 @@ class HostSessionRecoverer:
         prompt = await asyncio.to_thread(self.prompt, connection.host_id)
         if (
             fresh is None
-            or prompt is None
+            or not await asyncio.to_thread(self.enabled, connection.host_id)
             or self.hosts.get(connection.host_id) is not connection
             or fresh.host_id != conv.host_id
             or fresh.runner_id != conv.runner_id
             or not _restorable(fresh)
             or fresh.pending_elicitation_count
+            or fresh.live_status == "waiting"
         ):
             return
         dispatch = replace(attempt, phase="dispatching", runner_id=conv.runner_id)

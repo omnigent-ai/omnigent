@@ -4911,13 +4911,14 @@ async def _mark_runner_sessions_offline_once(
         ):
             continue
         recovery = None
-        if host_session_recoverer is not None and await asyncio.to_thread(
-            host_session_recoverer.enabled, conv.host_id
-        ):
+        if host_session_recoverer is not None:
             await asyncio.to_thread(
                 host_session_recoverer.record_interruption, conv, interrupted_at=interrupted_at
             )
-            recovery = await asyncio.to_thread(conversation_store.get_session_recovery, conv.id)
+            if await asyncio.to_thread(host_session_recoverer.enabled, conv.host_id):
+                recovery = await asyncio.to_thread(
+                    conversation_store.get_session_recovery, conv.id
+                )
         decision_status = _session_status_cache.get(conv.id)
         binding_unavailable = False
         try:
@@ -10356,6 +10357,31 @@ async def _relay_runner_stream_once(
                             and evt_type not in _FENCE_EXEMPT_EVENT_TYPES
                         ):
                             continue
+
+                    from omnigent.server.host_session_recovery import record_turn
+
+                    turn_response = event.get("response")
+                    turn_response_id = (
+                        turn_response.get("id")
+                        if isinstance(turn_response, dict)
+                        else event.get("response_id")
+                    )
+                    terminal_turn = evt_type in _TERMINAL_RESPONSE_EVENT_TYPES
+                    status = event.get("status")
+                    blocked_turn = evt_type == "session.status" and (
+                        status in {"failed", "waiting"}
+                        or bool(event.get("blocked_on"))
+                        or (status == "idle" and event.get("turn_completed") is True)
+                    )
+                    if terminal_turn or blocked_turn or evt_type == "response.in_progress":
+                        await asyncio.to_thread(
+                            record_turn,
+                            conversation_store,
+                            session_id,
+                            runner_id,
+                            turn_response_id if isinstance(turn_response_id, str) else None,
+                            finished=terminal_turn or blocked_turn,
+                        )
 
                     if evt_type == "session.status":
                         status = event.get("status", "")

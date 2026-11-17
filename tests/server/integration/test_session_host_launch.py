@@ -4629,7 +4629,7 @@ async def test_relaunch_recovers_only_a_rejected_enqueue(
 
     async def launch() -> Any:
         return await sessions_module._launch_runner_on_host(
-            conv, store, registry, original, recovery=recovery
+            conv, store, registry, original, recovery=recovery, recovery_allowed=lambda: True
         )
 
     if scenario == "denied":

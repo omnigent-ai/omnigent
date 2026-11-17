@@ -179,10 +179,11 @@ the header menu), and each place is a separate entry point.
   which the server still lists the session's host offline (usually because the
   host came back under a new ID), with **Switch host** to move the session.
   States: reconnecting (spinner), reconnect failed (retry), host offline.
-- `host-recovery`: opted-in managed hosts request continuation after their
-  provider restores local state. Lost runners resume interrupted root tasks with
+- `host-recovery`: individually opted-in hosts request continuation after their
+  local state is ready. Lost runners resume witnessed interrupted root tasks with
   a hidden system-tagged prompt; Stop, newer input, approvals, and archive win.
-  Automatic launch retries are bounded and survive a server restart.
+  Completed turns stay stopped. Automatic launch retries are bounded and survive
+  a server restart. Embedded deployments stay off until their deployment gate allows it.
 - `workspace-recovery`: a missing-workspace error offers **Continue in another
   directory…**. Choose an existing host directory, optionally with a new git
   worktree of it, to fork the conversation into a new session; the original
@@ -1159,9 +1160,10 @@ plain `uv run pytest`, which starts a private server for the test.
   `tests/runner/test_suppress_recovery_turn.py`.
   Run with plain `uv run pytest`. The UI marker is covered by
   `web/src/components/blocks/SystemMessage.test.tsx`.
-  Live proof requires a managed sandbox whose provider restores files before
-  starting its opted-in host: interrupt an active task by restarting the sandbox,
-  then confirm completion in the same chat without sending another message.
+  Live proof uses an ordinary host or provider host with restored files and the
+  host opt-in enabled: restart it during an active task, then confirm completion
+  in the same chat without another message. Completed and stopped sessions must
+  receive neither a launch nor a continuation. Repeat with opt-in disabled.
   Keep native harness and provider lifecycle evidence separate from these tests.
 
 - **`message-recovery`, native binding races (own environment):**

@@ -12373,3 +12373,39 @@ async def test_mcp_activation_launch_frame_to_runner_environment(activation):
     assert (RUNNER_MCP_DISABLED_SERVERS_ACTIVE_HARNESSES_ENV_VAR in env) is (
         activation is not None
     )
+
+
+async def test_host_recovery_loop_uses_opt_in_and_current_inventory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.host.frames import HostRecoverSessionsFrame
+
+    host = _make_host_process()
+    sent = []
+    first, second = asyncio.Event(), asyncio.Event()
+    inventory = ["surviving"]
+
+    async def send(ws: object, payload: str) -> None:
+        sent.append(decode_host_frame(payload))
+        (first if len(sent) == 1 else second).set()
+
+    monkeypatch.setattr(host, "_send_text", send)
+    monkeypatch.setattr(host, "_alive_runner_ids", lambda: list(inventory))
+    monkeypatch.setattr("omnigent.session_recovery.RECOVERY_RETRY_S", 0)
+    host._recover_interrupted_sessions = False
+    await host._session_recovery_loop(None)
+    assert sent == []
+    host._recover_interrupted_sessions = True
+    task = asyncio.create_task(host._session_recovery_loop(None))
+    try:
+        await asyncio.wait_for(first.wait(), timeout=2)
+        inventory.clear()
+        await asyncio.wait_for(second.wait(), timeout=2)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        _cleanup_host(host)
+    assert all(isinstance(frame, HostRecoverSessionsFrame) for frame in sent)
+    assert sent[0].runners == ["surviving"]
+    assert sent[-1].runners == []

@@ -1191,3 +1191,34 @@ def test_failed_input_does_not_cancel_recovery(
             ],
         )
     assert store.get_session_recovery(conv.id) == intent
+
+
+def test_turn_completion_fences_recovery_in_the_input_database(
+    store: SqlAlchemyConversationStore,
+) -> None:
+    from omnigent.entities import MessageData, NewConversationItem
+    from omnigent.server.host_session_recovery import _record_interruption, record_turn
+
+    conv = store.create_conversation(host_id="a" * 32, workspace="/workspace", runner_id="runner")
+    store.set_session_live_status(conv.id, "running")
+    record_turn(store, conv.id, "runner", "first", finished=False)
+    snapshot = store.get_conversation(conv.id)
+    record_turn(store, conv.id, "runner", "first", finished=True)
+    _record_interruption(store, snapshot, interrupted_at=100)
+    assert store.get_session_recovery(conv.id).phase == "stopped"
+    store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                response_id="user",
+                type="message",
+                data=MessageData(
+                    role="user", content=[{"type": "input_text", "text": "New task"}]
+                ),
+            )
+        ],
+    )
+    record_turn(store, conv.id, "runner", "second", finished=False)
+    record_turn(store, conv.id, "runner", "first", finished=True)
+    assert store.get_session_recovery(conv.id).response_id == "second"
+    assert store.get_session_recovery(conv.id).phase == "active"
