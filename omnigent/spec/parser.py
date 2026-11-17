@@ -315,7 +315,6 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
     # Top-level ``tool_groups:`` opts out of framework-owned tool groups
     # that otherwise register on every agent; each group defaults to on.
     tool_groups = parse_tool_groups(raw.get("tool_groups"), spawn=spawn)
-    tool_groups_set = explicit_tool_groups(raw.get("tool_groups"))
     # Top-level ``agent_session_sharing:`` flag is the SOLE enabler of
     # the ``sys_session_share`` tool, independent of ``spawn`` /
     # ``tools.agents`` (and unrelated to server-API / CLI sharing).
@@ -361,7 +360,6 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
         timers=timers,
         spawn=spawn,
         tool_groups=tool_groups,
-        tool_groups_set=tool_groups_set,
         agent_session_sharing=agent_session_sharing,
     )
 
@@ -561,14 +559,6 @@ def parse_tool_groups(raw: object, *, spawn: bool) -> ToolGroupsConfig:
     groups = ToolGroupsConfig(**enabled)
     _reject_orphaned_agent_id_tools(groups, spawn=spawn)
     return groups
-
-
-def explicit_tool_groups(raw: object) -> frozenset[str]:
-    """Return the group names a ``tool_groups:`` block sets; empty when it is absent.
-
-    Call it after :func:`parse_tool_groups` has validated *raw*.
-    """
-    return frozenset(str(name) for name in raw) if isinstance(raw, dict) else frozenset()
 
 
 def _reject_orphaned_agent_id_tools(groups: ToolGroupsConfig, *, spawn: bool) -> None:

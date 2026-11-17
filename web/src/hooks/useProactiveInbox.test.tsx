@@ -23,15 +23,10 @@ vi.mock("@/lib/proactiveInbox", async (importActual) => ({
   updateSuggestion: vi.fn(),
 }));
 vi.mock("./useViewerId", () => ({ useViewerId: () => "alice" }));
-vi.mock("./useProactiveAgentSettings", () => ({
-  useProactiveAgentSettings: () => ({ settings: advisorOn ? { enabled: true } : undefined }),
-}));
 vi.mock("@/components/ui/toast", () => ({ showToast: vi.fn() }));
 
 let client: QueryClient;
-/** ``inbox_items_available``; ``undefined`` is a server that predates it. */
-let enabled: boolean | undefined = true;
-let advisorOn = false;
+let enabled = true;
 const wrapper = ({ children }: { children: ReactNode }) => (
   <QueryClientProvider client={client}>
     <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, inbox_items_available: enabled }}>
@@ -77,7 +72,6 @@ function deferred<T>() {
 beforeEach(() => {
   client = new QueryClient({ defaultOptions: { queries: { gcTime: Infinity, retry: false } } });
   enabled = true;
-  advisorOn = false;
   setOmnigentHostConfig({ serverIdentity: "server-a" });
   vi.mocked(listSuggestions)
     .mockReset()
@@ -91,25 +85,6 @@ afterEach(() => {
   client.clear();
   setOmnigentHostConfig({});
 });
-
-it.each([
-  { offered: true, advisor: false, lists: true },
-  { offered: false, advisor: true, lists: false },
-  // Older servers do not report agent items; there only Omni Advisor posts.
-  { offered: undefined, advisor: true, lists: true },
-  { offered: undefined, advisor: false, lists: false },
-])(
-  "lists suggestions where the server offers them ($offered), else where Omni Advisor is on ($advisor)",
-  async ({ offered, advisor, lists }) => {
-    enabled = offered;
-    advisorOn = advisor;
-    const { result } = renderHook(() => useProactiveInbox(true), { wrapper });
-
-    expect(result.current.enabled).toBe(lists);
-    if (lists) await waitFor(() => expect(result.current.items).toEqual([item]));
-    else expect(listSuggestions).not.toHaveBeenCalled();
-  },
-);
 
 it("stays off when the server does not offer suggestions to this caller", () => {
   enabled = false;

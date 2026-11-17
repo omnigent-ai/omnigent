@@ -1601,9 +1601,6 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
         an absent block changes nothing; a spec sets a group to
         ``false`` to drop tools it cannot use from the advertised
         payload. See :class:`ToolGroupsConfig` for the groups.
-    :param tool_groups_set: The ``tool_groups`` keys the spec itself sets,
-        e.g. ``frozenset({"browser"})``. A runner on a server that predates
-        default-on groups uses it to tell an explicit opt-in from a default.
     :param agent_session_sharing: Authority for the agent to share the
         session it is running in, via ``sys_session_share``. YAML key is
         ``agent_session_sharing:`` (top-level, like ``spawn:``). This
@@ -1666,7 +1663,6 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
     timers: bool = False
     spawn: bool = False
     tool_groups: ToolGroupsConfig = field(default_factory=ToolGroupsConfig)
-    tool_groups_set: frozenset[str] = field(default_factory=frozenset, compare=False)
     agent_session_sharing: SharePolicy = SharePolicy.NONE
     source_rel_dir: str | None = field(default=None, compare=False)
 

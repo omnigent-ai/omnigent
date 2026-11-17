@@ -16,11 +16,7 @@ from fastapi import (
 )
 from fastapi.responses import Response
 
-from omnigent.automations_availability import (
-    AGENT_INBOX_HEADER,
-    AUTOMATIONS_HEADER,
-    USER_INBOX_HEADER,
-)
+from omnigent.automations_availability import AUTOMATIONS_HEADER, USER_INBOX_HEADER
 from omnigent.errors import SESSION_AGENT_MISSING_MESSAGE, ErrorCode, OmnigentError
 from omnigent.host.identity import MANAGED_HOST_TOKEN_HEADER
 from omnigent.mcp_selection import MCP_SELECTION_HEADER, MCP_SELECTION_PREFIX, selected_mcp_spec
@@ -316,10 +312,7 @@ def register_agent_routes(
                     exc_info=True,
                 )
                 inbox_on = False
-            # Older runners read only the first header, and register the tools
-            # only for agents that opt in, which this server accepts too.
             selection_headers[USER_INBOX_HEADER] = "1" if inbox_on else "0"
-            selection_headers[AGENT_INBOX_HEADER] = "1" if inbox_on else "0"
         return Response(
             content=bundle_bytes,
             media_type="application/gzip",

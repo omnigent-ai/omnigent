@@ -90,7 +90,8 @@ vi.mock("@/hooks/useProactiveInbox", () => ({ useProactiveInbox: vi.fn() }));
 // or failed, which the page must not read as "no suggestions".
 const advisor = vi.hoisted(() => ({
   available: true,
-  settings: { enabled: true } as { enabled: boolean; agent_id?: string } | undefined,
+  settings: { enabled: true, agent_id: "agent_advisor" } as
+    { enabled: boolean; agent_id?: string } | undefined,
   failed: false,
   refetch: (() => {}) as () => void,
 }));
@@ -173,19 +174,13 @@ function commentInboxStub(overrides: Partial<CommentInbox> = {}): CommentInbox {
 function renderPage(
   queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } }),
   taskDetailsEnabled = false,
-  // A server that predates agent Inbox items does not report them.
-  serverPredatesAgentItems = false,
 ) {
   // Fresh client per render so cached queries never leak between tests. A
   // fresh element per render too: React skips an identical element object.
   const tree = () => (
     <QueryClientProvider client={queryClient}>
       <CapabilitiesProvider
-        info={{
-          ...FALLBACK_SERVER_INFO,
-          features: { automations_v2: taskDetailsEnabled },
-          inbox_items_available: serverPredatesAgentItems ? undefined : true,
-        }}
+        info={{ ...FALLBACK_SERVER_INFO, features: { automations_v2: taskDetailsEnabled } }}
       >
         <SidebarDataProvider>
           <MemoryRouter>
@@ -241,7 +236,7 @@ function proactiveInboxStub(overrides: Record<string, unknown> = {}) {
 
 beforeEach(() => {
   advisor.available = true;
-  advisor.settings = { enabled: true };
+  advisor.settings = { enabled: true, agent_id: "agent_advisor" };
   advisor.failed = false;
   advisor.refetch = vi.fn();
   window.localStorage.removeItem("omnigent:inbox-filter");
@@ -1941,13 +1936,6 @@ describe("agent suggestions", () => {
     expect(screen.queryByText("Loading inbox…")).toBeNull();
   });
 
-  it("waits on the Omni Advisor settings where the server predates agent items", () => {
-    advisor.settings = undefined;
-    stub({ items: [], enabled: false });
-    renderPage(undefined, false, true);
-    expect(screen.getByText("Loading inbox…")).toBeInTheDocument();
-  });
-
   it("keeps loading while the Omni Advisor settings are unknown", () => {
     window.localStorage.setItem("omnigent:inbox-filter", "advisor");
     advisor.settings = undefined;
@@ -1974,32 +1962,6 @@ describe("agent suggestions", () => {
     expect(screen.queryByText("Loading inbox…")).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Retry settings" }));
     expect(advisor.refetch).toHaveBeenCalledOnce();
-  });
-
-  it.each(["all", "unread"])(
-    "shows a settings load failure on %s where the server predates agent items",
-    (filter) => {
-      window.localStorage.setItem("omnigent:inbox-filter", filter);
-      advisor.settings = undefined;
-      advisor.failed = true;
-      stub({ items: [], enabled: false });
-      renderPage(undefined, false, true);
-
-      expect(screen.getByRole("alert")).toHaveTextContent("Couldn’t load Omni Advisor settings");
-      expect(screen.queryByText(/Nothing waiting on you|You’re all caught up/)).toBeNull();
-      fireEvent.click(screen.getByRole("button", { name: "Retry settings" }));
-      expect(advisor.refetch).toHaveBeenCalledOnce();
-    },
-  );
-
-  it("does not let a settings load failure hide other agents' items on a current server", () => {
-    advisor.settings = undefined;
-    advisor.failed = true;
-    stub({ items: [], enabled: true });
-    renderPage();
-
-    expect(screen.queryByText(/Couldn’t load Omni Advisor settings/)).toBeNull();
-    expect(screen.getByText("Nothing waiting on you")).toBeInTheDocument();
   });
 
   it("keeps showing suggestions when a settings refetch fails but the settings are cached", () => {

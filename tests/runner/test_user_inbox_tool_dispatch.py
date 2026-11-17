@@ -14,7 +14,7 @@ from omnigent.runner.tool_dispatch import (
     _USER_INBOX_TOOLS,
     execute_tool,
 )
-from omnigent.spec.parser import explicit_tool_groups, parse_tool_groups
+from omnigent.spec.parser import parse_tool_groups
 from omnigent.spec.types import AgentSpec, ToolGroupsConfig
 from omnigent.tools.manager import ToolManager
 
@@ -56,12 +56,6 @@ def test_tools_register_unless_the_spec_opts_out() -> None:
     assert not _USER_INBOX_TOOLS & _names(opted_out)
     assert parse_tool_groups({"user_inbox": False}, spawn=False).user_inbox is False
     assert parse_tool_groups(None, spawn=False).user_inbox is True
-    # The spec remembers which groups it set, for runners on older servers.
-    assert explicit_tool_groups({"user_inbox": True, "browser": False}) == {
-        "user_inbox",
-        "browser",
-    }
-    assert explicit_tool_groups(None) == frozenset()
     assert _USER_INBOX_TOOLS <= _ALL_LOCAL_TOOLS
     assert _USER_INBOX_TOOLS <= _NATIVE_RELAY_BUILTIN_TOOLS
 

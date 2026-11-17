@@ -251,12 +251,7 @@ export function InboxPage() {
     identityReady,
   } = useSidebarData();
   const navigate = useNavigate();
-  const serverInfo = useServerInfo();
-  const taskDetailsEnabled = isFeatureEnabled(serverInfo, "automations_v2");
-  // Older servers do not report agent Inbox items, so there suggestions load
-  // only once Omni Advisor's settings say it is on.
-  const legacyInboxServer =
-    serverInfo !== "loading" && serverInfo.inbox_items_available === undefined;
+  const taskDetailsEnabled = isFeatureEnabled(useServerInfo(), "automations_v2");
   const [storedFilter, setFilter] = useState<InboxFilter>(readInboxFilter);
   const {
     available: advisorAvailable,
@@ -279,9 +274,7 @@ export function InboxPage() {
   const filter: InboxFilter = storedFilter === "advisor" && !advisorTab ? "all" : storedFilter;
   const advisorOnly = filter === "advisor";
   const isAdvisorItem = (item: Suggestion) =>
-    // Servers that do not name the agent let only it post.
-    advisorSettings !== undefined &&
-    (advisorSettings.agent_id === undefined || item.agentId === advisorSettings.agent_id);
+    advisorSettings !== undefined && item.agentId === advisorSettings.agent_id;
   // The Unread tab pages through unread suggestions only, so an older unread
   // one is reachable behind newer read ones.
   const proactiveInbox = useProactiveInbox(
@@ -526,8 +519,7 @@ export function InboxPage() {
         snapshotQueries.some((q) => q.isLoading) ||
         commentInbox.isLoading)) ||
     (showUnread && automationInbox.isLoading) ||
-    (showSuggestions &&
-      (proactiveInbox.isLoading || ((advisorOnly || legacyInboxServer) && advisorSettingsPending)));
+    (showSuggestions && (proactiveInbox.isLoading || (advisorOnly && advisorSettingsPending)));
   const failedSnapshots = snapshotQueries.filter((q) => q.isError);
   const failedSessionCount = advisorOnly
     ? 0
@@ -1159,7 +1151,7 @@ export function InboxPage() {
         </div>
       )}
 
-      {(advisorOnly || legacyInboxServer) && advisorSettingsFailed && (
+      {advisorOnly && advisorSettingsFailed && (
         <div role="alert" className="mb-4 flex items-center gap-2 text-ui text-destructive">
           Couldn’t load {PROACTIVE_AGENT_DISPLAY_NAME} settings, so its suggestions are not shown.
           <Button
@@ -1211,7 +1203,7 @@ export function InboxPage() {
       {!assembling &&
         failedSessionCount === 0 &&
         !(showUnread && automationInbox.isError) &&
-        !((advisorOnly || legacyInboxServer) && advisorSettingsFailed) &&
+        !(advisorOnly && advisorSettingsFailed) &&
         !(showSuggestions && proactiveInbox.isError) &&
         visibleCount === 0 && (
           <div className="flex flex-col items-center gap-2 py-16 text-center">
