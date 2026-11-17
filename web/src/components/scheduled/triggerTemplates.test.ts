@@ -1325,9 +1325,16 @@ describe("renderTriggerPrompt", () => {
         "<slack-reply>\n:hourglass_flowing_sand: Omnigent is working on it...\n\nTrack progress: <https://omni.example.com/c/CONVERSATION_ID|Omni Session>\nSent with Omnigent\n</slack-reply>\nReply in the same thread";
       if (linkBack) {
         expect(worker).toContain(startReply);
+        // The runner fills in the link, so the worker looks its ID up only as a fallback.
+        expect(manager).toContain('session_id_placeholder "CONVERSATION_ID", and a message under');
+        expect(worker.split("Track progress:")[0]).not.toContain("CONVERSATION_ID");
+        expect(worker).toContain(
+          "If the link still ends with an uppercase placeholder word instead of a session ID",
+        );
       } else {
         expect(worker).not.toContain("Track progress:");
         expect(worker).toContain("Do not send an acknowledgement or a session link.");
+        expect(manager).not.toContain("session_id_placeholder");
       }
       expect(worker).toContain('ends with a line "Sent with Omnigent"');
       expect(worker).toContain(
@@ -1342,23 +1349,10 @@ describe("renderTriggerPrompt", () => {
     },
   );
 
-  it("has the runner fill in a Slack worker's link", () => {
-    const slackPrompt = (linkBack: boolean) =>
-      renderTriggerPrompt("slack", fields({ event: "posted", scope: "#support", linkBack }), CTX);
-    const prompt = slackPrompt(true);
-    const [manager, worker] = prompt.split("Instructions for each session:\n");
-    expect(manager).toContain('session_id_placeholder "CONVERSATION_ID", and a message under');
-    // The runner rewrites every CONVERSATION_ID in the message, so the worker's own text names none.
-    expect(worker.split("Track progress:")[0]).not.toContain("CONVERSATION_ID");
-    expect(worker).toContain(
-      "If the link still ends with an uppercase placeholder word instead of a session ID",
-    );
-    expect(slackPrompt(false)).not.toContain("session_id_placeholder");
-    expect(renderTriggerPrompt("jira", fields(), CTX)).not.toContain("session_id_placeholder");
-  });
-
   it("signs what it posts and stops when it can't reach the service", () => {
     const prompt = renderTriggerPrompt("jira", fields(), CTX);
+    // Only Slack workers post their own session link, so only they opt in to the fill-in.
+    expect(prompt).not.toContain("session_id_placeholder");
 
     // Link-backs and worker posts go out under the owner's account, so both are signed.
     expect(prompt).toContain(

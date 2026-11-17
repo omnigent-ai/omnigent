@@ -3905,11 +3905,15 @@ async def _execute_session_create(
             info = await server_client.get("/v1/info", timeout=30.0)
             info.raise_for_status()
             info_data = info.json()
+            advertised_max_chars = info_data.get("session_message_max_chars")
+            if isinstance(advertised_max_chars, int) and not isinstance(
+                advertised_max_chars, bool
+            ):
+                first_task_max_chars = min(advertised_max_chars, SESSION_MESSAGE_MAX_CHARS)
         if long_first_task:
             server_max_chars = info_data.get("session_message_max_chars")
             if not isinstance(server_max_chars, int) or isinstance(server_max_chars, bool):
                 server_max_chars = LEGACY_SESSION_MESSAGE_MAX_CHARS
-            first_task_max_chars = min(server_max_chars, SESSION_MESSAGE_MAX_CHARS)
             if len(str(message)) > server_max_chars:
                 return json.dumps(
                     {

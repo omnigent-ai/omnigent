@@ -882,25 +882,30 @@ async def test_long_first_task_needs_a_server_that_delivers_it(server_info, serv
 @pytest.mark.parametrize(
     ("placement", "placeholder", "filled"),
     [
-        # The runner sends a same_host message itself, so it can name the new ID.
+        # The runner sends same_host and host messages itself, so it can name the new ID.
         ("same_host", "CONVERSATION_ID", True),
+        ("host", "CONVERSATION_ID", True),
         # Without the argument, the text is never rewritten.
         ("same_host", None, False),
         # A managed message rides in the create body, before the ID exists.
         ("managed", "CONVERSATION_ID", False),
     ],
-    ids=["same_host-filled", "same_host-unset", "managed-unchanged"],
+    ids=["same_host-filled", "host-filled", "same_host-unset", "managed-unchanged"],
 )
 async def test_session_id_placeholder_is_filled_only_where_the_runner_sends_the_message(
     placement, placeholder, filled
 ):
     session_id = uuid4().hex
-    message = "Track progress: <https://omni.example.com/c/CONVERSATION_ID|Omni Session>"
+    # Every occurrence is filled, not just the first.
+    message = (
+        "Track progress: <https://omni.example.com/c/CONVERSATION_ID|Omni Session> "
+        "(CONVERSATION_ID)"
+    )
     posts = []
 
     def respond(request):
         if request.url.path == "/v1/info":
-            return httpx.Response(200, json={})
+            return httpx.Response(200, json={"scripted_sessions": True})
         posts.append(request)
         if request.url.path.endswith("/events"):
             return httpx.Response(202, json={"queued": True})
@@ -909,6 +914,8 @@ async def test_session_id_placeholder_is_filled_only_where_the_runner_sends_the_
         )
 
     arguments = {"agent_id": "worker", "placement": placement, "message": message}
+    if placement == "host":
+        arguments.update(host_id=uuid4().hex, workspace="/workspace")
     if placeholder is not None:
         arguments["session_id_placeholder"] = placeholder
     async with httpx.AsyncClient(
@@ -923,7 +930,7 @@ async def test_session_id_placeholder_is_filled_only_where_the_runner_sends_the_
             )
         )
 
-    if placement == "same_host":
+    if placement in ("same_host", "host"):
         sent = json.loads(posts[1].content)["data"]["message"]
         assert result["initial_message"] == {"queued": True}
     else:
@@ -933,10 +940,23 @@ async def test_session_id_placeholder_is_filled_only_where_the_runner_sends_the_
 
 
 @pytest.mark.asyncio
-async def test_session_id_placeholder_is_left_when_filling_it_would_exceed_the_limit():
+@pytest.mark.parametrize(
+    ("message_chars", "filled"),
+    [
+        # At the advertised limit, so a longer ID would push it over.
+        (32_000, False),
+        # At the legacy limit, so the server's limit isn't fetched; the ID would cross it.
+        (8_000, False),
+        # The filled message lands exactly on the legacy limit, which still fits.
+        (8_000 - (32 - len("CONVERSATION_ID")), True),
+    ],
+    ids=["over_advertised_limit", "over_legacy_limit", "fits_exactly"],
+)
+async def test_session_id_placeholder_is_left_when_filling_it_would_exceed_the_limit(
+    message_chars, filled
+):
     session_id = uuid4().hex
-    # Exactly at the server's limit, so filling in a longer ID would push it over.
-    message = "CONVERSATION_ID" + "x" * (32_000 - len("CONVERSATION_ID"))
+    message = "CONVERSATION_ID" + "x" * (message_chars - len("CONVERSATION_ID"))
     posts = []
 
     def respond(request):
@@ -968,9 +988,10 @@ async def test_session_id_placeholder_is_left_when_filling_it_would_exceed_the_l
             )
         )
 
-    # The task still arrives, with the placeholder the worker resolves itself.
+    # The task always arrives; unfilled, it keeps the placeholder the worker resolves itself.
     assert result["initial_message"] == {"queued": True}
-    assert json.loads(posts[1].content)["data"]["message"] == message
+    expected = message.replace("CONVERSATION_ID", session_id) if filled else message
+    assert json.loads(posts[1].content)["data"]["message"] == expected
 
 
 @pytest.mark.asyncio
