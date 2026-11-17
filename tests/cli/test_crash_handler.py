@@ -578,6 +578,26 @@ def test_issue_url_drops_body_when_command_alone_is_too_long(
         ("/home/example user", "file://localhost/home/example%20user/x", "~/x"),
         ("/home/example-user", "~example-user/x", "~/x"),
         ("/home/example-user", "%2Fhome%2Fexample-user%2Fx", "~%2Fx"),
+        (
+            "/home/example-user",
+            "file%3A%2F%2F%2Fhome%2Fexample-user%2Fprivate.txt",
+            "file%3A%2F%2F~%2Fprivate.txt",
+        ),
+        (
+            "C:\\Users\\example user",
+            "file%3A%2F%2F%2FC%3A%2FUsers%2Fexample%20user%2Fprivate.txt",
+            "file%3A%2F%2F%2F~%2Fprivate.txt",
+        ),
+        (
+            "/home/example-user",
+            "file%3a%2F%2f%2fhome%2Fexample-user%2fprivate.txt",
+            "file%3a%2F%2f~%2fprivate.txt",
+        ),
+        (
+            "/home/example-user",
+            "%2Fmnt%2Fhome%2Fexample-user%2Fx",
+            "%2Fmnt%2Fhome%2Fexample-user%2Fx",
+        ),
         # Privacy-first: siblings that share the home prefix are rewritten on purpose.
         ("/home/example-user", "/home/example-user-backup/x", "~-backup/x"),
         ("/home/example-user", "/home/example-user&backup/x", "~&backup/x"),
@@ -613,6 +633,10 @@ def test_issue_url_drops_body_when_command_alone_is_too_long(
         "localhost-file-url",
         "tilde-user",
         "percent-encoded-path",
+        "fully-encoded-file-uri",
+        "fully-encoded-windows-file-uri",
+        "mixed-case-hex-file-uri",
+        "encoded-mount-embedded",
         "hyphen-sibling",
         "ampersand-sibling",
         "parenthesis-sibling",
@@ -642,6 +666,43 @@ def test_issue_url_scrubs_encoded_windows_file_uri(
     assert body_included is True
     assert "example" not in urllib.parse.unquote_plus(url)
     assert "file:///~/private.txt" in _description_of(url)
+
+
+@pytest.mark.parametrize(
+    ("home_directory", "uri", "expected"),
+    [
+        (
+            "/home/example-user",
+            "file%3A%2F%2F%2Fhome%2Fexample-user%2Fprivate.txt",
+            "file%3A%2F%2F~%2Fprivate.txt",
+        ),
+        (
+            "C:\\Users\\example user",
+            "file%3A%2F%2F%2FC%3A%2FUsers%2Fexample%20user%2Fprivate.txt",
+            "file%3A%2F%2F%2F~%2Fprivate.txt",
+        ),
+        (
+            "/home/example-user",
+            "file%3a%2F%2f%2fhome%2Fexample-user%2fprivate.txt",
+            "file%3a%2F%2f~%2fprivate.txt",
+        ),
+    ],
+    ids=["fully-encoded", "fully-encoded-windows", "mixed-case-hex"],
+)
+def test_issue_url_scrubs_encoded_home_in_title_and_description(
+    data_dir: Path, monkeypatch: pytest.MonkeyPatch, home_directory: str, uri: str, expected: str
+) -> None:
+    """A percent-encoded file URI to the home directory is scrubbed in title and description."""
+    ch.install_crash_handler("omnigent", "omnigent-ai/omnigent")
+    monkeypatch.setattr(Path, "home", lambda: Path(home_directory))
+    exc = ImportError(f"cannot open {uri}")
+    tb_text = f'Traceback (most recent call last):\n  File "{uri}", line 1\nImportError: x\n'
+    url, body_included = ch._issue_url(exc, tb_text)
+    assert body_included is True
+    assert "example" not in urllib.parse.unquote_plus(url)
+    title = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)["title"][0]
+    assert expected in title
+    assert expected in _description_of(url)
 
 
 def test_issue_url_redacts_tokens_before_title_cutoff(
