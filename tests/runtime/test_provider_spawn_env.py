@@ -537,20 +537,13 @@ def test_locked_codex_gateway_requires_private_renewable_source_and_exact_route(
         ({"web_search": True, "disable_native_tools": False}, {}),
     ],
 )
-def test_codex_gateway_keeps_auth_for_ordinary_same_host_binding(
+def test_codex_gateway_without_proxy_retains_ordinary_auth(
     config_home: Path, settings: dict[str, object], tool_env: dict[str, str]
 ) -> None:
     _write_config(config_home, _openai_default_config())
-    binding = CredentialProxyEntry(
-        host="openai.example.com",
-        scheme="bearer",
-        source=CredentialSourceSpec(kind="env", env="PARENT_TOKEN"),
-        inject_env=["OTHER_TOKEN"],
-    )
     sandbox = OSEnvSandboxSpec(
         type="darwin_seatbelt",
         egress_rules=["POST openai.example.com/v1/responses"],
-        credential_proxy=CredentialProxySpec(entries=[binding]),
     )
     spec = _make_spec(harness="codex", os_env=OSEnvSpec(sandbox=sandbox))
     spec.executor.config.update(settings)
