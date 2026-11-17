@@ -1364,15 +1364,25 @@ def test_phone_composer_growth_keeps_the_bottom_through_a_scroll_before_remeasur
     # Until the overlay re-measures, a grown composer shortens the transcript's
     # viewport. A scroll event read in that window (in practice the growth pin's
     # own, a frame late) is not the reader leaving the bottom.
-    page.evaluate(
+    stale = page.evaluate(
         """() => {
           const ta = document.querySelector('textarea[aria-label="Message the agent"]');
           const form = ta.closest('form');
           const scroller = form.parentElement.querySelector('[role="log"] > div');
+          const surface = form.closest('[data-chat-surface]');
           form.style.minHeight = `${form.getBoundingClientRect().height + 40}px`;
+          const stale = {
+            overlayHeight: Math.round(parseFloat(
+              getComputedStyle(surface).getPropertyValue('--session-composer-height')) || 0),
+            distanceFromBottom: Math.round(
+              scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop),
+          };
           scroller.dispatchEvent(new Event('scroll'));
+          return stale;
         }"""
     )
+    assert stale["overlayHeight"] == pytest.approx(start["overlayHeight"], abs=TOLERANCE), stale
+    assert stale["distanceFromBottom"] > TOLERANCE, (start, stale)
     grown = settled_geometry(page)
     assert grown["overlayHeight"] == pytest.approx(start["overlayHeight"] + 40, abs=TOLERANCE)
     assert grown["distanceFromBottom"] <= TOLERANCE, (start, grown)

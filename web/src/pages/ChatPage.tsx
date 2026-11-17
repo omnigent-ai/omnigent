@@ -337,6 +337,7 @@ import { GoalDialog, CommandGoalDialog, GoalStatusPill, useGoalState } from "@/c
 import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { ConnectionIndicator } from "./ChatIndicators";
+import { nextTranscriptBottomPin, type TranscriptBottomPin } from "./transcriptBottomPin";
 import { Transcript } from "@/components/chat/Transcript";
 
 /** Server-info as consumers see it: the probe's result, or "loading". */
@@ -1846,18 +1847,12 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   useEffect(() => {
     const scrollEl = scroller?.el;
     if (!scrollEl) return;
-    let lastScrollTop = scrollEl.scrollTop;
+    // The growth pin's own scroll event can land before the overlay re-measures
+    // and read a viewport shortened by the pending growth; only upward movement escapes.
+    let pin: TranscriptBottomPin = { pinned: false, anchorScrollTop: scrollEl.scrollTop };
     const update = () => {
-      const { scrollTop } = scrollEl;
-      // Only an upward scroll leaves the bottom. A scroll event (often the growth
-      // pin's own, a frame later) can land after the composer grows but before
-      // its overlay re-measures, and that read sees a viewport shortened by the
-      // pending growth. The 1px covers the pin re-parking one pixel short of a
-      // maximum that shrank.
-      pinnedToBottomRef.current =
-        scrollEl.scrollHeight - scrollEl.clientHeight - scrollTop <= 1 ||
-        (pinnedToBottomRef.current && scrollTop >= lastScrollTop - 1);
-      lastScrollTop = scrollTop;
+      pin = nextTranscriptBottomPin(pin, scrollEl);
+      pinnedToBottomRef.current = pin.pinned;
     };
     update();
     scrollEl.addEventListener("scroll", update, { passive: true });
