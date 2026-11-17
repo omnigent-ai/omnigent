@@ -10358,8 +10358,6 @@ async def _relay_runner_stream_once(
                         ):
                             continue
 
-                    from omnigent.server.host_session_recovery import record_turn
-
                     turn_response = event.get("response")
                     turn_response_id = (
                         turn_response.get("id")
@@ -10375,7 +10373,7 @@ async def _relay_runner_stream_once(
                     )
                     if terminal_turn or blocked_turn or evt_type == "response.in_progress":
                         await asyncio.to_thread(
-                            record_turn,
+                            session_live_state.record_recovery_turn,
                             conversation_store,
                             session_id,
                             runner_id,

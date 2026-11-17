@@ -326,7 +326,9 @@ recovery episodes; re-enabling does not revive completed or stopped work.
 
 Stock server entrypoints permit host opt-in. Embedded `create_app` integrations
 also need `host_session_recovery=True` or a live callable returning true; this
-permission defaults to false and evaluator errors deny recovery. A deployment
+permission defaults to false; the default leaves recovery lifecycle hooks unwired.
+A configured live callable may return false to stop execution while retaining
+completion and Stop bookkeeping. Evaluator errors deny recovery. A deployment
 can use this boundary for its own rollout or emergency disable policy.
 
 Administrators may set `recovery_prompt` in the server configuration. It must be

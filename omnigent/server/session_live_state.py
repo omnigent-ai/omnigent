@@ -56,6 +56,7 @@ from omnigent.stores.conversation_store import (
 )
 
 if TYPE_CHECKING:
+    from omnigent.server.host_session_recovery import HostSessionRecoverer
     from omnigent.stores import ConversationStore
     from omnigent.stores.scheduled_task_store import ScheduledTaskStore
 
@@ -69,6 +70,7 @@ _logger = logging.getLogger(__name__)
 _KNOWN_LIVE_STATUSES: frozenset[str] = frozenset(SESSION_LIVE_STATUS)
 
 _store: ConversationStore | None = None
+_host_session_recoverer: HostSessionRecoverer | None = None
 # Scheduled-task store for the event-driven run-completion hook. Wired
 # alongside ``_store`` by :func:`configure`; ``None`` disables the hook (the
 # runner process and unit tests that never configure it are unaffected).
@@ -100,6 +102,8 @@ _last_liveness_stamp: dict[str, int] = {}
 def configure(
     store: ConversationStore | None,
     scheduled_task_store: ScheduledTaskStore | None = None,
+    *,
+    host_session_recoverer: HostSessionRecoverer | None = None,
 ) -> None:
     """
     Wire (or clear) the stores live-state writes go to.
@@ -109,9 +113,12 @@ def configure(
     :param scheduled_task_store: The server's scheduled-task store, enabling
         the event-driven run-completion hook
         (:func:`persist_scheduled_run_completion`); ``None`` disables it.
+    :param host_session_recoverer: Configured recovery integration; ``None`` keeps
+        recovery lifecycle writes disabled.
     """
-    global _store, _scheduled_task_store
+    global _store, _scheduled_task_store, _host_session_recoverer
     _store = store
+    _host_session_recoverer = host_session_recoverer
     _scheduled_task_store = scheduled_task_store
     _last_status.clear()
     _last_pending.clear()
@@ -121,6 +128,19 @@ def configure(
     with _child_activity_lock:
         _active_child_parents.clear()
         _active_child_counts.clear()
+
+
+def record_recovery_turn(
+    store: ConversationStore,
+    session_id: str,
+    runner_id: str | None,
+    response_id: str | None,
+    *,
+    finished: bool,
+) -> None:
+    """Persist lifecycle fences only for an explicitly configured recovery integration."""
+    if _host_session_recoverer is not None and _host_session_recoverer.store is store:
+        _host_session_recoverer.record_turn(session_id, runner_id, response_id, finished=finished)
 
 
 def _remove_active_child(session_id: str) -> None:

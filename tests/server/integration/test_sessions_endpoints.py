@@ -5660,8 +5660,11 @@ async def test_malformed_native_failure_context_does_not_reject_status(
     )
 
 
+@pytest.mark.parametrize("recovery_configured", [False, True])
 async def test_post_external_session_status_carries_response_id(
     client: httpx.AsyncClient,
+    app: FastAPI,
+    recovery_configured: bool,
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -5681,6 +5684,11 @@ async def test_post_external_session_status_carries_response_id(
     store = SqlAlchemyConversationStore(db_uri)
     store.set_host_id(session["id"], "a" * 32, workspace="/workspace")
     store.set_runner_id(session["id"], "turn-runner")
+    assert app.state.host_session_recoverer is None
+    if recovery_configured:
+        app.state.host_session_recoverer = HostSessionRecoverer(
+            store, Mock(), Mock(), Mock(), Mock(), deployment_gate=lambda: False
+        )
 
     resp = await client.post(
         f"/v1/sessions/{session['id']}/events",
@@ -5699,7 +5707,8 @@ async def test_post_external_session_status_carries_response_id(
     assert event["status"] == "running"
     assert event["response_id"] == "codex_turn_123"
 
-    assert store.get_session_recovery(session["id"]).phase == "active"
+    state = store.get_session_recovery(session["id"])
+    assert (state.phase if state else None) == ("active" if recovery_configured else None)
     for completed in (False, True):
         resp = await client.post(
             f"/v1/sessions/{session['id']}/events",
@@ -5713,9 +5722,9 @@ async def test_post_external_session_status_carries_response_id(
             },
         )
         assert resp.status_code == 202, resp.text
-        assert store.get_session_recovery(session["id"]).phase == (
-            "stopped" if completed else "active"
-        )
+        state = store.get_session_recovery(session["id"])
+        expected = ("stopped" if completed else "active") if recovery_configured else None
+        assert (state.phase if state else None) == expected
 
 
 async def test_publish_status_keeps_failed_sticky_against_trailing_idle(

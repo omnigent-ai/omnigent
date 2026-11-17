@@ -212,6 +212,11 @@ class HostSessionRecoverer:
         if self.store.supports_session_recovery:
             _record_interruption(self.store, conv, interrupted_at=interrupted_at)
 
+    def record_turn(
+        self, session_id: str, runner_id: str | None, response_id: str | None, *, finished: bool
+    ) -> None:
+        record_turn(self.store, session_id, runner_id, response_id, finished=finished)
+
     def stop_recovery(self, conv: Conversation, *, only_pending: bool = False) -> None:
         if self.store.supports_session_recovery:
             _stop_recovery(self.store, conv, only_pending=only_pending)

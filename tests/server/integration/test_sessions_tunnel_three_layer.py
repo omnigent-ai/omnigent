@@ -415,6 +415,7 @@ async def tunnel_three_layer_stack(
         artifact_store=artifact_store,
         agent_cache=agent_cache,
         host_store=HostStore(db_uri) if getattr(request, "param", False) else None,
+        host_session_recovery=getattr(request, "param", False) == "recovery",
     )
     set_runner_router(ap_app.state.runner_router)
 
@@ -2986,7 +2987,7 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
 
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("_isolated_session_status_cache")
-@pytest.mark.parametrize("tunnel_three_layer_stack", [True], indirect=True)
+@pytest.mark.parametrize("tunnel_three_layer_stack", ["recovery"], indirect=True)
 @pytest.mark.parametrize(
     "host_enabled",
     [pytest.param(False, id="legacy-fallback"), pytest.param(True, id="automatic-recovery")],

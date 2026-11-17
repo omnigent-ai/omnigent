@@ -2848,7 +2848,7 @@ def create_app(
             deployment_gate=host_session_recovery,
             recovery_prompt=(server_config or {}).get("recovery_prompt"),
         )
-        if host_store is not None
+        if host_store is not None and host_session_recovery is not False
         else None
     )
     app.state.host_session_recoverer = host_session_recoverer
@@ -3074,7 +3074,9 @@ def create_app(
     # scheduled-task store additionally enables the event-driven
     # run-completion hook (persist_scheduled_run_completion) fired from
     # _publish_status when a fired conversation's turn reaches terminal.
-    session_live_state.configure(conversation_store, scheduled_task_store)
+    session_live_state.configure(
+        conversation_store, scheduled_task_store, host_session_recoverer=host_session_recoverer
+    )
     # Extend a managed sandbox while its runner tunnel is live (the managed-path
     # caller for SandboxHostLauncher.keep_alive); no-op without a sandbox config.
     managed_host_keepalive.configure(conversation_store, host_store, sandbox_config)
@@ -5621,8 +5623,6 @@ def create_app(
         from omnigent.server.routes.skill_content import create_skill_content_router
         from omnigent.server.routes.skills import create_skills_router
 
-        assert host_session_recoverer is not None
-
         async def _on_hosts_changed(_host_id: str, owner: str | None) -> None:
             announce_hosts_changed(owner)
             if startup_inputs is not None:
@@ -5630,7 +5630,7 @@ def create_app(
 
         async def _on_host_connected(host_id: str, owner: str | None) -> None:
             connection = host_registry.get(host_id)
-            if connection is not None:
+            if connection is not None and host_session_recoverer is not None:
                 await host_session_recoverer.retire_disabled(connection)
             await _on_hosts_changed(host_id, owner)
 
@@ -5641,7 +5641,9 @@ def create_app(
                 auth_provider=auth_provider,
                 runner_exit_reports=runner_exit_reports,
                 on_runner_exited=_on_runner_exited,
-                on_session_recovery=host_session_recoverer.recover,
+                on_session_recovery=(
+                    host_session_recoverer.recover if host_session_recoverer is not None else None
+                ),
                 on_host_connect=_on_host_connected,
                 on_host_disconnect=_on_hosts_changed,
                 on_host_update=_on_hosts_changed,
