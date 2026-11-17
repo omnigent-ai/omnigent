@@ -54,17 +54,13 @@ def record_turn(
         or conv.parent_conversation_id is not None
     ):
         return
+    if finished:
+        _stop_recovery(store, conv, only_pending=True, response_id=response_id)
+        return
     if not response_id:
-        if finished:
-            _stop_recovery(store, conv, only_pending=True)
         return
     previous = store.get_session_recovery(session_id)
-    if finished:
-        # An old turn's completion must not close newer accepted input.
-        if previous is None or previous.response_id != response_id:
-            return
-        state = replace(previous, phase="stopped")
-    elif previous is None:
+    if previous is None:
         state = SessionRecovery(
             conv.host_id, runner_id, now_epoch(), phase="active", response_id=response_id
         )
@@ -72,9 +68,7 @@ def record_turn(
         state = replace(previous, phase="submitted", response_id=response_id)
     else:
         return
-    store.replace_session_recovery(
-        session_id, previous, state, expected_conversation=None if finished else conv
-    )
+    store.replace_session_recovery(session_id, previous, state, expected_conversation=conv)
 
 
 def _record_interruption(
@@ -123,23 +117,40 @@ def _record_interruption(
 
 
 def _stop_recovery(
-    store: ConversationStore, conv: Conversation, *, only_pending: bool = False
+    store: ConversationStore,
+    conv: Conversation,
+    *,
+    only_pending: bool = False,
+    response_id: str | None = None,
 ) -> None:
-    """Persist Stop before the process signal, including when its host is offline."""
+    """Fence one episode without superseding newly accepted input."""
     if conv.host_id is None or conv.runner_id is None:
         return
+    previous = store.get_session_recovery(conv.id)
+    if (previous is None and only_pending) or (
+        response_id is not None and (previous is None or previous.response_id != response_id)
+    ):
+        return
     while True:
-        previous = store.get_session_recovery(conv.id)
-        if previous is None and only_pending:
-            return
         stopped = replace(
             previous or SessionRecovery(conv.host_id, conv.runner_id, now_epoch()), phase="stopped"
         )
-        if store.replace_session_recovery(conv.id, previous, stopped, expected_conversation=conv):
+        # Accepted input clears the episode atomically; output must not defeat its fence.
+        if store.replace_session_recovery(
+            conv.id, previous, stopped, expected_conversation=conv if previous is None else None
+        ):
             return
         # Stores without this optional contract must keep their normal Stop path.
-        if store.get_session_recovery(conv.id) == previous:
+        current = store.get_session_recovery(conv.id)
+        if current is None or current == previous:
             return
+        if previous is None:
+            latest = store.get_conversation(conv.id)
+            if latest is None or latest.next_position != conv.next_position:
+                return
+        elif current.response_id != previous.response_id or current.host_id != previous.host_id:
+            return
+        previous = current
 
 
 class HostSessionRecoverer:

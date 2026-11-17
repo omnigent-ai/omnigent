@@ -396,9 +396,25 @@ async def test_unknown_submission_outcome_is_never_blindly_replayed(recovery: An
     recovery.initializer.initialize.assert_awaited_once()
 
 
+@pytest.mark.parametrize("concurrent_output", [False, True])
 def test_stop_survives_store_restart_and_fresh_user_input_reenables_recovery(
-    recovery: Any, db_uri: str
+    recovery: Any, db_uri: str, concurrent_output: bool
 ) -> None:
+    if concurrent_output:
+        recovery.store.append(
+            recovery.conv.id,
+            [
+                NewConversationItem(
+                    response_id="turn-1",
+                    type="message",
+                    data=MessageData(
+                        role="assistant",
+                        agent="recovery",
+                        content=[{"type": "output_text", "text": "Partial output"}],
+                    ),
+                )
+            ],
+        )
     recovery.service.stop_recovery(recovery.conv)
     restarted = SqlAlchemyConversationStore(db_uri)
     service = recovery.service
@@ -667,8 +683,36 @@ def test_delayed_terminal_cannot_close_a_new_turn(recovery: Any) -> None:
     assert store.get_session_recovery(conv.id).phase == "active"
 
 
+@pytest.mark.parametrize("terminal", ["stop", "completion"])
+@pytest.mark.parametrize("start_new_turn", [False, True])
+def test_new_input_racing_terminal_fence_is_preserved(
+    recovery: Any, terminal: str, start_new_turn: bool
+) -> None:
+    store, conv = recovery.store, recovery.conv
+    replace_recovery = store.replace_session_recovery
+
+    def accept_input_before_fence(*args: Any, **kwargs: Any) -> bool:
+        store.replace_session_recovery = replace_recovery
+        user_input(store, conv.id)
+        if start_new_turn:
+            record_turn(store, conv.id, "old", "turn-2", finished=False)
+        return replace_recovery(*args, **kwargs)
+
+    store.replace_session_recovery = accept_input_before_fence
+    if terminal == "stop":
+        recovery.service.stop_recovery(conv)
+    else:
+        record_turn(store, conv.id, "old", "turn-1", finished=True)
+    current = store.get_session_recovery(conv.id)
+    if start_new_turn:
+        assert current.response_id == "turn-2"
+        assert current.phase == "active"
+    else:
+        assert current is None
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize("stage", ["claim", "launch", "routing"])
+@pytest.mark.parametrize("stage", ["completion-write", "claim", "launch", "routing"])
 async def test_completion_racing_recovery_prevents_continuation(recovery: Any, stage: str) -> None:
     store, conv = recovery.store, recovery.conv
 
@@ -676,7 +720,18 @@ async def test_completion_racing_recovery_prevents_continuation(recovery: Any, s
         current = store.get_conversation(conv.id)
         record_turn(store, conv.id, current.runner_id, "turn-1", finished=True)
 
-    if stage == "claim":
+    if stage == "completion-write":
+        replace_recovery = store.replace_session_recovery
+
+        def interrupt_before_completion(*args: Any, **kwargs: Any) -> bool:
+            store.replace_session_recovery = replace_recovery
+            recovery.service.record_interruption(store.get_conversation(conv.id))
+            assert store.get_session_recovery(conv.id).phase == "pending"
+            return replace_recovery(*args, **kwargs)
+
+        store.replace_session_recovery = interrupt_before_completion
+        finish()
+    elif stage == "claim":
         claim = store.replace_session_recovery
 
         def completed_claim(*args: Any, **kwargs: Any) -> bool:
