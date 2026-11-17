@@ -81,6 +81,9 @@ describe("splitPullRequestRefs", () => {
     "docs/index.html#1234",
     "config/app.toml#1234",
     "src/app.js#12",
+    "src/index.mjs#1234",
+    "infra/main.tf#123",
+    "api/x.proto#12",
     "vercel/next.js#123",
   ])("leaves %j as text", (text) => {
     expect(splitPullRequestRefs(text)).toEqual([{ type: "text", value: text }]);

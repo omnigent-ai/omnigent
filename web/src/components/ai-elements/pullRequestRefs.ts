@@ -29,7 +29,7 @@ const GITHUB_REPO = /^[A-Za-z0-9._-]{1,100}$/;
 // `docs/setup.md#3` is a file path; an extensionless `src/foo#12` still links.
 // This also leaves dotted repos like `vercel/next.js#1` as text; a wrong link is worse than none.
 const FILE_EXTENSION =
-  /\.(md|mdx|py|ts|tsx|js|jsx|json|ya?ml|txt|sh|go|rs|java|scala|css|scss|less|html?|toml|xml|ini|cfg|lock|c|h|cpp|hpp|rb|kt|swift|sql|php|cs|vue|svelte)$/i;
+  /\.(md|mdx|py|ts|tsx|js|jsx|json|ya?ml|txt|sh|go|rs|java|scala|css|scss|less|html?|toml|xml|ini|cfg|lock|c|h|cpp|hpp|rb|kt|swift|sql|php|cs|vue|svelte|mjs|cjs|mts|cts|jsonc|tf|proto|ipynb|csv|svg|gradle|bzl|env)$/i;
 
 /** Repo for bare references when the session's repo is unknown; null leaves them as text. */
 const FALLBACK_PULL_REQUEST_REPO: string | null = null;
