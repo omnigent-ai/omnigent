@@ -30,6 +30,11 @@ const REMOTE_SOCKET_PATH =
 // A unary call the host answers only for a valid token, so a 200 proves the right host.
 const PROBE_PATH = "/omnigent.api.workspace.v1alpha1.WorkspaceService/ListDirectory";
 const PROBE_BODY = Buffer.from('{"pageSize":1}');
+// The host's answer to a refused token. Main gives it to the page instead of sending the
+// call to an unproven host, and the page renews its token.
+const REFUSED_BODY = Buffer.from(
+  '{"code":"unauthenticated","message":"the host refused the token"}',
+);
 
 /**
  * Whether `socketPath` is a workspace socket an Omnigent host made for this user.
@@ -118,26 +123,31 @@ function workspaceSocketRequest(request, routes = {}) {
       else if (status === 401) proof = "refused";
     } finally {
       // The connection may serve other hosts; it closes once idle, or now if it is gone.
-      if (!proof) dropForward();
+      if (proof !== true) dropForward();
     }
     return proof;
   };
   const forward = recorded
     ? forwards.localSocket(destination, socketPath)
     : routes.verifySshTarget(hostId, destination, proves).then((verdict) => {
-        // "refused": the host refused the token, so it answers the call, and the page renews it.
+        if (verdict === "refused") return null;
         if (!verdict) throw new Error("SSH alias not allowed or not verified for this host");
         return forwards.localSocket(destination, socketPath);
       });
-  return forward.then(({ socketPath: local, dropConnection, dropForward }) =>
-    send(local, methodPath, forwarded, body).catch((error) => {
+  return forward.then((reached) => {
+    if (!reached) {
+      const refusal = new Uint8Array(REFUSED_BODY);
+      return { status: 401, headers: { "content-type": "application/json" }, body: refusal };
+    }
+    const { socketPath: local, dropConnection, dropForward } = reached;
+    return send(local, methodPath, forwarded, body).catch((error) => {
       // A missing listener means the connection is gone. A reset means the remote socket
       // refused (a restarted host) or the master died; cancelling the forward tells which.
       if (error?.code === "ECONNREFUSED" || error?.code === "ENOENT") dropConnection();
       else if (error?.code === "ECONNRESET") dropForward();
       throw error;
-    }),
-  );
+    });
+  });
 }
 
 function send(socketPath, methodPath, forwarded, body) {

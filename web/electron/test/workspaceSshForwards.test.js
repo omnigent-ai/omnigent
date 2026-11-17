@@ -343,13 +343,14 @@ describe("an SSH alias the page suggests", { skip: !unix && "needs Unix sockets"
   let userAnswer;
   let clock;
   let paths;
-  let resetProbe;
+  let probeFault;
 
-  /** A host that accepts only `Bearer t`, and drops the probe when `resetProbe` is set. */
+  /** A host that accepts only `Bearer t`; `probeFault` drops the probe ("reset") or sets its status. */
   const host = (_remotePath, req, res) => {
     paths.push(req.url);
-    if (resetProbe && req.url === PROBE) return req.socket.destroy();
-    res.writeHead(req.headers.authorization === "Bearer t" ? 200 : 401);
+    if (req.url === PROBE && probeFault === "reset") return req.socket.destroy();
+    const status = req.headers.authorization === "Bearer t" ? 200 : 401;
+    res.writeHead(req.url === PROBE && probeFault ? probeFault : status);
     res.end();
   };
 
@@ -361,7 +362,7 @@ describe("an SSH alias the page suggests", { skip: !unix && "needs Unix sockets"
     userAnswer = async () => true;
     clock = 0;
     paths = [];
-    resetProbe = false;
+    probeFault = null;
     const checks = createSshTargetChecks({
       record: (...entry) => recorded.push(entry),
       now: () => clock,
@@ -448,21 +449,31 @@ describe("an SSH alias the page suggests", { skip: !unix && "needs Unix sockets"
     assert.equal(paths.filter((requestPath) => requestPath === PROBE).length, 2);
   });
 
-  it("lets the host answer a refused token, and probes again with the next one", async () => {
+  it("answers a refused token itself, without sending the call, and probes again with the next", async () => {
     const refusedRead = await suggest({ headers: { authorization: "Bearer other" } });
     assert.equal(refusedRead.status, 401, "the page sees the refusal and renews its token");
 
     assert.equal((await suggest()).status, 200);
-    assert.deepEqual(paths, [PROBE, METHOD, PROBE, METHOD]);
+    assert.deepEqual(paths, [PROBE, PROBE, METHOD], "the refused call never reaches the alias");
     assert.deepEqual(recorded, [[SERVER, "host-1", "my-box"]]);
     assert.equal(asked.length, 1);
-    assert.equal(ssh.sessions[0].cancelled.length, 0, "the forward works, so it is kept");
+  });
+
+  it("backs off from an alias whose host refuses a renewed token too", async () => {
+    const refusedToken = { headers: { authorization: "Bearer other" } };
+
+    assert.equal((await suggest(refusedToken)).status, 401);
+    await assert.rejects(suggest(refusedToken), /not verified/);
+    await assert.rejects(suggest(refusedToken), /not verified/);
+
+    assert.deepEqual(paths, [PROBE, PROBE], "no call reaches it, and the third read doesn't probe");
+    assert.deepEqual(recorded, []);
   });
 
   it("keeps another host's reads over the same connection when a probe fails", async () => {
     recorded.push([SERVER, "host-1", "my-box"]);
     await call(routes);
-    resetProbe = true;
+    probeFault = "reset";
 
     await assert.rejects(suggest({ hostId: "host-2", socketPath: GONE }), /not verified/);
 
@@ -471,24 +482,29 @@ describe("an SSH alias the page suggests", { skip: !unix && "needs Unix sockets"
     assert.equal(ssh.sessions[0].closed, false);
   });
 
-  it("cancels its forward and waits five minutes when the probe fails without an answer", async () => {
-    resetProbe = true;
+  for (const [fault, outcome] of [
+    ["reset", "fails without an answer"],
+    [503, "answers 503"],
+  ]) {
+    it(`cancels its forward and waits five minutes when the probe ${outcome}`, async () => {
+      probeFault = fault;
 
-    await assert.rejects(suggest(), /not verified/);
-    await assert.rejects(suggest(), /not verified/);
+      await assert.rejects(suggest(), /not verified/);
+      await assert.rejects(suggest(), /not verified/);
 
-    const [session] = ssh.sessions;
-    assert.deepEqual(recorded, []);
-    assert.equal(session.forwards.length, 1, "the second read doesn't try again");
-    assert.equal(session.cancelled.length, 1, "the failed forward is cancelled");
-    assert.equal(session.closed, false, "the connection may serve other hosts");
+      const [session] = ssh.sessions;
+      assert.deepEqual(recorded, []);
+      assert.equal(session.forwards.length, 1, "the second read doesn't try again");
+      assert.equal(session.cancelled.length, 1, "the failed forward is cancelled");
+      assert.equal(session.closed, false, "the connection may serve other hosts");
 
-    resetProbe = false;
-    clock += RETRY_MS + 1;
-    assert.equal((await suggest()).status, 200);
-    assert.equal(asked.length, 1, "an allowed alias isn't asked about again");
-    assert.deepEqual(recorded, [[SERVER, "host-1", "my-box"]]);
-  });
+      probeFault = null;
+      clock += RETRY_MS + 1;
+      assert.equal((await suggest()).status, 200);
+      assert.equal(asked.length, 1, "an allowed alias isn't asked about again");
+      assert.deepEqual(recorded, [[SERVER, "host-1", "my-box"]]);
+    });
+  }
 
   it("is ignored when the host already has a recorded destination", async () => {
     routes.sshDestination = () => "recorded-box";

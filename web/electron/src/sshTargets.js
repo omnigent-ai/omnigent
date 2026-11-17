@@ -34,16 +34,18 @@ function createSshTargetChecks(deps) {
   // Also kept here, so a record that fails to save isn't probed on every read.
   const proven = new Set();
   const failedUntil = new Map();
+  // Suggestions whose last probe the host refused; a second refusal counts as a failure.
+  const refused = new Set();
   const pending = new Map();
-  // One question at a time; later ones wait for it, then skip if their server was declined.
-  let questions = Promise.resolve();
+  // Each server's last question. Its next one waits for it, then skips if the server was declined.
+  const questions = new Map();
 
   function ask(serverUrl, approve) {
     // null: the question couldn't be shown, so nothing is remembered.
-    const answer = questions
+    const answer = (questions.get(serverUrl) ?? Promise.resolve())
       .then(() => (declined.has(serverUrl) ? false : approve()))
       .catch(() => null);
-    questions = answer;
+    questions.set(serverUrl, answer);
     return answer;
   }
 
@@ -57,10 +59,14 @@ function createSshTargetChecks(deps) {
       allowed.add(key);
     }
     const proof = await proves().catch(() => false);
-    // A refused token (one that expired during the question, say) is the page's to renew.
-    if (proof === "refused") return proof;
-    // Unreachable or not this host: the read goes through the server.
-    if (!proof) {
+    // A token refused once (it expired during the question, say) is the page's to renew.
+    if (proof === "refused" && !refused.has(key)) {
+      refused.add(key);
+      return proof;
+    }
+    refused.delete(key);
+    // Unreachable, not this host, or refusing renewed tokens too: the read goes through the server.
+    if (proof !== true) {
       failedUntil.set(key, now() + RETRY_MS);
       return false;
     }
@@ -76,9 +82,9 @@ function createSshTargetChecks(deps) {
   return {
     /**
      * Resolve true once the user allows `alias` and it proves to reach `hostId`
-     * (and is recorded), "refused" if the host there refused the call's token,
-     * else false. Concurrent checks of one suggestion share one attempt, and
-     * questions are asked one at a time.
+     * (and is recorded), "refused" the first time the host there refuses the
+     * call's token, else false. Concurrent checks of one suggestion share one
+     * attempt, and each server's questions are asked one at a time.
      *
      * @param {string} serverUrl
      * @param {string} hostId

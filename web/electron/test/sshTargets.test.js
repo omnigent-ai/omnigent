@@ -49,7 +49,7 @@ describe("createSshTargetChecks", () => {
     assert.equal(other.asked, 1, "only the other server is asked");
   });
 
-  it("asks queued questions in turn, skipping those for a server declined meanwhile", async () => {
+  it("asks each server's questions in turn, skipping the rest once it is declined", async () => {
     const checks = createSshTargetChecks({ record: () => {} });
     let decline;
     const first = counted(
@@ -69,22 +69,23 @@ describe("createSshTargetChecks", () => {
     await new Promise((resolve) => {
       setImmediate(resolve);
     });
-    assert.equal(otherServer.asked, 0, "the next question waits for the open one");
+    assert.equal(otherServer.asked, 1, "another server's question doesn't wait");
+    assert.equal(sameServer.asked, 0, "the same server's next question waits");
     decline();
 
     assert.deepEqual(await Promise.all(verdicts), [false, false, true]);
     assert.equal(sameServer.asked, 0);
-    assert.equal(otherServer.asked, 1);
   });
 
-  it("leaves a refused token to the page, and probes again on the next read", async () => {
+  it("leaves one refused token to the page, then backs off when the next is refused too", async () => {
     const checks = createSshTargetChecks({ record: () => {} });
     const steps = counted(() => true, "refused");
 
     assert.equal(await checks.verify(SERVER, "host-1", "my-box", steps), "refused");
-    assert.equal(await checks.verify(SERVER, "host-1", "my-box", steps), "refused");
+    assert.equal(await checks.verify(SERVER, "host-1", "my-box", steps), false);
+    assert.equal(await checks.verify(SERVER, "host-1", "my-box", steps), false);
     assert.equal(steps.asked, 1);
-    assert.equal(steps.probes, 2, "a refusal isn't held against the alias");
+    assert.equal(steps.probes, 2, "the back-off holds the third read");
   });
 
   it("asks again when the question couldn't be shown, but not after Not now", async () => {
