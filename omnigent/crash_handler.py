@@ -308,9 +308,18 @@ def _redact(text: str) -> str:
     return text
 
 
+def _quote_path_argument(arg: str) -> str:
+    """Quote home-path arguments while tokens can still span other arguments."""
+    with contextlib.suppress(Exception):
+        home = str(Path.home())
+        if home and home != os.sep and home in arg:
+            return shlex.quote(arg)
+    return arg
+
+
 def _command_line() -> str:
     try:
-        return _redact(shlex.join(sys.argv))
+        return _redact(" ".join(_quote_path_argument(arg) for arg in sys.argv))
     except Exception:  # noqa: BLE001  pragma: no cover
         return "(unavailable)"
 
@@ -488,7 +497,8 @@ def _scrub(text: str) -> str:
                 # A ``file://`` URL to the home directory is the one exception.
                 + r"(?:(?<![\w.\-~/\\])|(?<=(?<![\w.\-~/\\])file://))"
                 + home_pattern
-                + r"""(?=$|[/\\\s'"`)\]}>]|[.,;:!?]+(?=$|[\s'"`)\]}>]))"""
+                # Not followed by a name character, directly or after punctuation (``home)x``).
+                + r"""(?![\w+@~\-]|[.,;:!?)\]}>]+[\w+@~\-])"""
             )
 
             def redact_home(match: re.Match[str]) -> str:
