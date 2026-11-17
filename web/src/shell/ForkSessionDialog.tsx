@@ -965,7 +965,7 @@ function SupportedForkSessionForm({
   // Hosts for the picker — only for a coding source (a non-coding fork
   // never shows the host field). Reuse the source sandbox only when the server
   // advertises the shared-sandbox lifecycle that makes it safe.
-  const { data: hosts } = useHosts({
+  const { data: hosts, isLoading: hostsLoading } = useHosts({
     enabled: isCodingSource,
     sourceHostId: reusableSourceHostId,
   });
@@ -1154,8 +1154,6 @@ function SupportedForkSessionForm({
   // stranded. Only fills an empty slot, so an explicit pick always wins.
   useEffect(() => {
     if (!isCodingSource || sandboxSelected || selectedHostId !== null) return;
-    // An unloaded picker list is not "no host online"; a sandbox chosen now would stick.
-    if (hosts === undefined) return;
     // The source's provider and the offered providers decide a sandbox
     // source's default; a connected host chosen first would stick.
     if (sourceHostId && sourceHostLoading) return;
@@ -1163,7 +1161,11 @@ function SupportedForkSessionForm({
     if (managedSandboxesEnabled && sourceProviderRow !== undefined) {
       setSandboxSelected(true);
       setSandboxProvider(sourceProviderRow);
-    } else if (sourceHostId && sourceHostOnline) {
+      return;
+    }
+    // A loading picker list is not "no host online"; a sandbox chosen now would stick.
+    if (hostsLoading) return;
+    if (sourceHostId && sourceHostOnline) {
       setSelectedHostId(sourceHostId);
     } else if (onlineHosts.length > 0) {
       setSelectedHostId(onlineHosts[0].host_id);
@@ -1175,7 +1177,7 @@ function SupportedForkSessionForm({
     isCodingSource,
     sandboxSelected,
     selectedHostId,
-    hosts,
+    hostsLoading,
     sourceHostId,
     sourceHostOnline,
     sourceHostLoading,

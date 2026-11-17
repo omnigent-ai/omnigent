@@ -2497,6 +2497,36 @@ describe("ForkSessionDialog", () => {
       expect(screen.queryByTestId("fork-session-sandbox-hint")).not.toBeInTheDocument();
     });
 
+    it("still falls back to a sandbox when the hosts fail to load", async () => {
+      useHostsMock.mockImplementation(
+        () => ({ data: undefined, isLoading: false, isError: true }) as ReturnType<typeof useHosts>,
+      );
+      renderDialog({
+        ...CODING,
+        info: { managed_sandboxes_enabled: true, sandbox_provider: "modal" },
+      });
+
+      await act(async () => {});
+      expect(screen.getByTestId("fork-session-sandbox-hint")).toBeInTheDocument();
+    });
+
+    it("defaults a sandbox source to its provider without waiting for the picker's hosts", async () => {
+      const source = host({ sandbox_provider: "modal" });
+      useHostsMock.mockImplementation(
+        (options) =>
+          (options?.includeSandbox
+            ? { data: [source], isLoading: false }
+            : { data: undefined, isLoading: true }) as ReturnType<typeof useHosts>,
+      );
+      renderDialog({
+        ...CODING,
+        info: { managed_sandboxes_enabled: true, sandbox_provider: "modal" },
+      });
+
+      await act(async () => {});
+      expect(screen.getByTestId("fork-session-sandbox-hint")).toBeInTheDocument();
+    });
+
     it("keeps the same-provider default when server capabilities arrive after hosts", async () => {
       useSessionMock.mockReturnValue({
         session: { hostId: "host_1", labels: {} },
