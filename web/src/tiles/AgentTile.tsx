@@ -1,8 +1,9 @@
 // One agent in the Tile view. A live tile streams the session's conversation;
 // only the active tile has a composer. Cards show status without streaming.
 
-import { memo, type KeyboardEvent, type MouseEvent } from "react";
+import { memo, useId, useState, type KeyboardEvent, type MouseEvent } from "react";
 import {
+  ChevronDownIcon,
   ExternalLinkIcon,
   FolderIcon,
   GitBranchIcon,
@@ -15,10 +16,12 @@ import { RenderErrorBoundary } from "@/components/RenderErrorBoundary";
 import { SessionStateBadge } from "@/components/SessionStateBadge";
 import { Button } from "@/components/ui/button";
 import type { Conversation } from "@/hooks/useConversations";
-import { getSessionState, type SessionState } from "@/hooks/useSessionState";
+import { getSessionState } from "@/hooks/useSessionState";
 import { cn } from "@/lib/utils";
 import { conversationDisplayLabel } from "@/shell/sidebarNav";
 import { TileColorPicker } from "./TileColorPicker";
+import { TileDetails } from "./TileDetails";
+import { projectName, relativeAge, statusLabel } from "./tileSummary";
 import { TileResizeHandles } from "./TileResizeHandles";
 import { useTileColor } from "./tileColors";
 import type { TileResize } from "./TileGrid";
@@ -43,33 +46,6 @@ interface AgentTileProps {
   onPark?: (sessionId: string) => void;
 }
 
-function projectName(workspace: string | null | undefined): string | null {
-  const trimmed = workspace?.trim().replace(/\/+$/, "");
-  if (!trimmed) return null;
-  return trimmed.slice(trimmed.lastIndexOf("/") + 1) || trimmed;
-}
-
-function relativeAge(updatedAtSeconds: number, nowMs = Date.now()): string {
-  const minutes = Math.max(0, Math.round((nowMs - updatedAtSeconds * 1000) / 60000));
-  if (minutes < 1) return "now";
-  if (minutes < 60) return `${minutes}m ago`;
-  const hours = Math.round(minutes / 60);
-  if (hours < 48) return `${hours}h ago`;
-  return `${Math.round(hours / 24)}d ago`;
-}
-
-function statusLabel(state: SessionState | null, status: Conversation["status"]): string {
-  switch (state?.kind) {
-    case "awaiting":
-      return "Needs your response";
-    case "running":
-    case "starting":
-      return "Running";
-    default:
-      return status === "failed" ? "Failed" : "Idle";
-  }
-}
-
 function AgentTileComponent({
   conversation,
   active,
@@ -85,6 +61,8 @@ function AgentTileComponent({
 }: AgentTileProps) {
   const title = conversation.title || conversationDisplayLabel(conversation);
   const color = useTileColor(conversation.id);
+  const [detailsOpen, setDetailsOpen] = useState(false);
+  const detailsId = useId();
   const state = getSessionState(conversation);
   const waiting = needsYou(conversation);
   const project = projectName(conversation.workspace);
@@ -134,13 +112,31 @@ function AgentTileComponent({
         ) : (
           <span aria-hidden className="size-2 shrink-0 rounded-full bg-muted-foreground" />
         )}
-        <strong
-          title={title}
-          className="min-w-0 truncate text-sm font-semibold tracking-tight text-foreground"
+        <button
+          type="button"
+          data-testid="agent-tile-title"
+          aria-expanded={detailsOpen}
+          aria-controls={detailsOpen ? detailsId : undefined}
+          title={detailsOpen ? "Hide details" : "Show details"}
+          onClick={() => setDetailsOpen((open) => !open)}
+          className="flex min-w-0 cursor-pointer items-center gap-1 rounded-sm text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
         >
-          {title}
-        </strong>
-        <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground" title={subline}>
+          <strong className="min-w-0 truncate text-sm font-semibold tracking-tight text-foreground">
+            {title}
+          </strong>
+          <ChevronDownIcon
+            aria-hidden
+            className={cn(
+              "size-3.5 shrink-0 text-muted-foreground transition-transform",
+              detailsOpen && "rotate-180",
+            )}
+          />
+        </button>
+        <span
+          data-testid="agent-tile-subline"
+          className="min-w-0 flex-1 truncate text-xs text-muted-foreground"
+          title={subline}
+        >
           {subline}
         </span>
         {onToggleStar && (
@@ -177,6 +173,10 @@ function AgentTileComponent({
           <ExternalLinkIcon className="size-3.5" />
         </Button>
       </header>
+
+      {detailsOpen && (
+        <TileDetails id={detailsId} conversation={conversation} accent={color.solid} />
+      )}
 
       {showConversation ? (
         <div className="relative min-h-0 flex-1 overflow-hidden">

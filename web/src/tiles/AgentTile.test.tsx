@@ -13,6 +13,10 @@ vi.mock("@/components/chat/SideChatPane", () => ({
   ),
 }));
 
+vi.mock("./TileDetails", () => ({
+  TileDetails: ({ id }: { id: string }) => <div id={id} data-testid="tile-details" />,
+}));
+
 function conversation(overrides: Partial<Conversation> = {}): Conversation {
   return {
     id: "conv_1",
@@ -117,5 +121,19 @@ describe("AgentTile", () => {
   it("hides the star when the session can't be pinned on its own", () => {
     renderTile();
     expect(screen.queryByRole("button", { name: /star/i })).not.toBeInTheDocument();
+  });
+
+  it("opens details from the title without activating the tile", () => {
+    const { onActivate } = renderTile();
+    const title = screen.getByTestId("agent-tile-title");
+    expect(title).toHaveAttribute("aria-expanded", "false");
+
+    fireEvent.click(title);
+    expect(title).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByTestId("tile-details")).toBeInTheDocument();
+    expect(onActivate).not.toHaveBeenCalled();
+
+    fireEvent.click(title);
+    expect(screen.queryByTestId("tile-details")).not.toBeInTheDocument();
   });
 });

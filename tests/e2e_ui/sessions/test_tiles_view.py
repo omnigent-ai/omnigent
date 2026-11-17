@@ -90,8 +90,13 @@ def test_nav_toggle_opens_tiles_and_carries_the_active_agent(
     # The Tile view reads the sidebar's rows; the sidebar must still load.
     expect(page.get_by_text("Some sessions could not be loaded")).to_have_count(0)
 
-    # Click the tile's body, not a control, to make it the active agent.
-    _tile(page, session_b).locator("header strong").click()
+    # The title opens the tile's details without switching the active agent.
+    _tile(page, session_b).get_by_test_id("agent-tile-title").click()
+    expect(_tile(page, session_b).get_by_test_id("tile-details")).to_be_visible()
+    expect(_tile(page, session_a)).to_have_attribute("data-active", "true")
+
+    # Click the tile itself, not a control, to make it the active agent.
+    _tile(page, session_b).get_by_test_id("agent-tile-subline").click()
     expect(_tile(page, session_b)).to_have_attribute("data-active", "true")
     expect(page).to_have_url(f"{base_url}/tiles?active={session_b}")
 
