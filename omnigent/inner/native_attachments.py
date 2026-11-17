@@ -175,6 +175,21 @@ def uses_filesystem_delivery(filename: str | None, metadata: object) -> bool:
     return requires_filesystem(filename)
 
 
+def attachment_is_inlined(filename: str | None, metadata: object, *, native: bool = False) -> bool:
+    """
+    Whether an attachment's bytes go into the model prompt rather than a workspace file.
+
+    A native harness hands every attachment to its CLI as a file path; other
+    harnesses inline each upload unless it is delivered as a file.
+
+    :param filename: The stored filename, e.g. ``"chart.png"``.
+    :param metadata: The file's ``source_metadata`` or its content block.
+    :param native: The session runs a native (terminal) harness.
+    :returns: True when the payload is sent inline to the model.
+    """
+    return not native and not uses_filesystem_delivery(filename, metadata)
+
+
 def filesystem_attachment_capability(filenames: Iterable[str | None]) -> str:
     """
     Runtime capability needed to deliver these filesystem attachments.

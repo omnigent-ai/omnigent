@@ -2903,6 +2903,17 @@
             "title": "Code",
             "type": "string"
           },
+          "context_breakdown": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TurnContextBreakdown"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "For a request too long for the context window, the runner's estimate of what that request carried."
+          },
           "level": {
             "anyOf": [
               {
@@ -2987,6 +2998,17 @@
             "description": "Error code string, e.g. `\"server_error\"`, `\"invalid_input\"`.",
             "title": "Code",
             "type": "string"
+          },
+          "context_breakdown": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TurnContextBreakdown"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Estimated split of the request a failed turn attempted, so a \"prompt too long\" failure shows what overflowed; absent when the runner did not build one."
           },
           "message": {
             "description": "Human-readable error description. Always populated; older clients render this verbatim.",
@@ -8397,9 +8419,31 @@
             "title": "Bytes Per Token",
             "type": "integer"
           },
+          "failed_attempt": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TurnContextBreakdown"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The runner's breakdown of a later request that failed as too long for the context window; `None` otherwise."
+          },
           "history": {
             "$ref": "#/components/schemas/ContextBreakdownHistory",
             "description": "Live conversation history estimate."
+          },
+          "reported": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TurnContextBreakdown"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The runner's breakdown of the last completed turn's request; `None` when its harness does not report one. Preferred over the server-side estimates above where both exist."
           },
           "session_id": {
             "description": "The session, e.g. `\"conv_abc123\"`.",
@@ -9096,6 +9140,16 @@
           "code": {
             "title": "Code",
             "type": "string"
+          },
+          "context_breakdown": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TurnContextBreakdown"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "created_at": {
             "description": "Unix epoch seconds of creation.",
@@ -14239,6 +14293,92 @@
         "title": "TurnCompletedEvent",
         "type": "object"
       },
+      "TurnContextBreakdown": {
+        "description": "What one turn's request carried, split by source.\n\nFigures are estimated from the content the runner handed the harness\n(`method`); the provider-reported `context_tokens` stays the measured\ntotal. Content a harness adds itself (its own system prompt, project\ninstructions) is not included.",
+        "properties": {
+          "attachment_count": {
+            "default": 0,
+            "description": "Attachments sent inline, e.g. `2`.",
+            "format": "int64",
+            "minimum": 0.0,
+            "title": "Attachment Count",
+            "type": "integer"
+          },
+          "attachment_tokens": {
+            "default": 0,
+            "description": "Attachments sent inline, in every message.",
+            "format": "int64",
+            "minimum": 0.0,
+            "title": "Attachment Tokens",
+            "type": "integer"
+          },
+          "history_item_count": {
+            "default": 0,
+            "description": "Earlier messages and tool calls/results.",
+            "format": "int64",
+            "minimum": 0.0,
+            "title": "History Item Count",
+            "type": "integer"
+          },
+          "history_tokens": {
+            "default": 0,
+            "description": "Earlier messages and tool calls/results, without their attachments.",
+            "format": "int64",
+            "minimum": 0.0,
+            "title": "History Tokens",
+            "type": "integer"
+          },
+          "message_tokens": {
+            "default": 0,
+            "description": "The current message's text.",
+            "format": "int64",
+            "minimum": 0.0,
+            "title": "Message Tokens",
+            "type": "integer"
+          },
+          "method": {
+            "default": "content_size",
+            "description": "How the figures were derived, e.g. `\"content_size\"` (UTF-8 bytes per token, with a fixed estimate per image).",
+            "maxLength": 32,
+            "title": "Method",
+            "type": "string"
+          },
+          "system_tokens": {
+            "default": 0,
+            "description": "Composed instructions, e.g. `1200`.",
+            "format": "int64",
+            "minimum": 0.0,
+            "title": "System Tokens",
+            "type": "integer"
+          },
+          "tool_count": {
+            "default": 0,
+            "description": "Tools listed, e.g. `18`.",
+            "format": "int64",
+            "minimum": 0.0,
+            "title": "Tool Count",
+            "type": "integer"
+          },
+          "tool_tokens": {
+            "default": 0,
+            "description": "Tool schemas listed for the turn, e.g. `5400`.",
+            "format": "int64",
+            "minimum": 0.0,
+            "title": "Tool Tokens",
+            "type": "integer"
+          },
+          "unestimated_attachment_count": {
+            "default": 0,
+            "description": "Inline attachments with no reliable estimate (e.g. a PDF); their size is not in `attachment_tokens`.",
+            "format": "int64",
+            "minimum": 0.0,
+            "title": "Unestimated Attachment Count",
+            "type": "integer"
+          }
+        },
+        "title": "TurnContextBreakdown",
+        "type": "object"
+      },
       "TurnFailedEvent": {
         "description": "Emitted when a turn fails due to an LLM error, timeout, or crash.",
         "properties": {
@@ -15060,6 +15200,18 @@
             "format": "int64",
             "title": "Cache Read Input Tokens",
             "type": "integer"
+          },
+          "context_breakdown": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TurnContextBreakdown"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Estimated split of the request the runner sent for this turn (instructions, tools, history, attachments, current message); `None` when the harness does not report one."
           },
           "context_tokens": {
             "anyOf": [

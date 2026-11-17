@@ -130,6 +130,28 @@ def detect_request_size_overflow(message: str) -> RequestSizeOverflow | None:
         return None
 
 
+# Phrases a provider or harness uses when a request is too long for the window.
+CONTEXT_OVERFLOW_PHRASES = (
+    "context_length_exceeded",
+    "context window",
+    "maximum context length",
+    "prompt is too long",
+)
+
+
+def is_context_overflow_message(message: str) -> bool:
+    """
+    Whether a turn's error text says the request was too long for the model.
+
+    :param message: Error text, e.g. ``"prompt is too long: 210000 tokens"``.
+    :returns: ``True`` for a context-window phrase or a byte-cap rejection.
+    """
+    lowered = message.lower()
+    return any(phrase in lowered for phrase in CONTEXT_OVERFLOW_PHRASES) or (
+        detect_request_size_overflow(lowered) is not None
+    )
+
+
 def is_request_size_rejection(message: str) -> bool:
     """Whether *message* is a gateway rejection for a request body over its byte cap.
 

@@ -158,12 +158,22 @@ async def test_connection_error_preserves_a_valid_queued_failure() -> None:
 
 @pytest.mark.asyncio
 async def test_context_overflow_preserves_a_valid_queued_failure() -> None:
+    attempted = {"history_tokens": 4800, "history_item_count": 40, "message_tokens": 200}
     harness = _ScriptedHarnessClient(
         [
             _sse({"type": "response.created", "response": {"id": "resp_test"}}),
             _sse(
                 {
                     "type": "response.failed",
+                    "response": {
+                        "id": "resp_test",
+                        "status": "failed",
+                        "error": {
+                            "code": "context_length_exceeded",
+                            "message": "5000 tokens > 4096 maximum context length",
+                            "context_breakdown": attempted,
+                        },
+                    },
                     "error": {
                         "code": "context_length_exceeded",
                         "message": "5000 tokens > 4096 maximum context length",
@@ -179,6 +189,8 @@ async def test_context_overflow_preserves_a_valid_queued_failure() -> None:
     error = await _assert_failure_on_both_streams(app, source="llm")
     assert error["code"] == "context_length_exceeded"
     assert error["type"] == "_ContextWindowOverflow"
+    # The harness's estimate of the rejected request survives normalization.
+    assert error["context_breakdown"] == attempted
 
 
 @pytest.mark.asyncio

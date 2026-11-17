@@ -9,6 +9,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from omnigent.entities.context_breakdown import TurnContextBreakdown
 from omnigent.entities.scheduled_task import ScheduledRunLogContext
 from omnigent.inner.native_attachments import (
     UNRESOLVED_ATTACHMENT_MARKER_PATTERN,
@@ -547,6 +548,8 @@ class ErrorData(BaseModel):
     :param cause: Optional one or two sentences explaining why it failed.
     :param remediation: Optional concrete next step, e.g. the sign-in link
         and code; the card offers it as an action.
+    :param context_breakdown: For a request too long for the context window,
+        the runner's estimate of what that request carried.
     """
 
     source: Literal["llm", "execution", "tool", "harness"]
@@ -556,6 +559,7 @@ class ErrorData(BaseModel):
     title: str | None = None
     cause: str | None = None
     remediation: str | None = None
+    context_breakdown: TurnContextBreakdown | None = None
 
     @field_validator("code", "message")
     @classmethod

@@ -224,6 +224,8 @@ _INSTANCE_SCOPED_LABEL_KEYS = frozenset(
     {
         "omnigent.claude_native.bridge_id",
         "omnigent.codex_native.bridge_id",
+        "omnigent.context_breakdown",
+        "omnigent.context_breakdown_failed",
         "omnigent.last_context_tokens",
         "omnigent.last_context_window",
         "omnigent.startup",

@@ -71,7 +71,7 @@ from omnigent.harness_plugins import (
     model_env_keys,
     spawn_env_builders,
 )
-from omnigent.llms.errors import detect_request_size_overflow
+from omnigent.llms.errors import detect_request_size_overflow, is_context_overflow_message
 from omnigent.native.failure_telemetry import failure_log_attributes, normalize_failure_context
 from omnigent.native.input_diagnostics import input_attributes
 from omnigent.native.native_coding_agents import (
@@ -921,6 +921,8 @@ class _ContextWindowOverflow(Exception):
     :param detail_message: Original rejection text to surface verbatim in the
         error detail (e.g. a deployment byte-cap message carrying its byte
         sizes), kept instead of the token-count approximation when present.
+    :param context_breakdown: The harness's estimate of the rejected request,
+        e.g. ``{"history_tokens": 190000, ...}``, or ``None``.
     """
 
     def __init__(
@@ -929,19 +931,13 @@ class _ContextWindowOverflow(Exception):
         actual_tokens: int,
         *,
         detail_message: str | None = None,
+        context_breakdown: _JsonObject | None = None,
     ) -> None:
         self.max_tokens = max_tokens
         self.actual_tokens = actual_tokens
         self.detail_message = detail_message
+        self.context_breakdown = context_breakdown
         super().__init__(f"context window exceeded: {actual_tokens} > {max_tokens}")
-
-
-_CONTEXT_OVERFLOW_PATTERNS = (
-    "context_length_exceeded",
-    "context window",
-    "maximum context length",
-    "prompt is too long",
-)
 
 
 def _is_context_overflow_error(
@@ -970,7 +966,7 @@ def _is_context_overflow_error(
             size_overflow.approx_request_tokens,
             raw,
         )
-    if not any(pat in msg for pat in _CONTEXT_OVERFLOW_PATTERNS):
+    if not is_context_overflow_message(msg):
         return None
     actual_gt_max = re.search(r"(\d{4,})\D*>\D*(\d{4,})", msg)
     if actual_gt_max is not None:
@@ -982,6 +978,23 @@ def _is_context_overflow_error(
     if len(numbers) == 1:
         return int(numbers[0]), int(numbers[0]) + 1, None
     return 128000, 128001, None
+
+
+def _failed_event_context_breakdown(event: _JsonObject) -> _JsonObject | None:
+    """
+    The attempted-request breakdown a ``response.failed`` event carries, if any.
+
+    :param event: The parsed SSE event dict.
+    :returns: The ``error.context_breakdown`` object, or ``None``.
+    """
+    response = event.get("response")
+    for error in (
+        response.get("error") if isinstance(response, dict) else None,
+        event.get("error"),
+    ):
+        if isinstance(error, dict) and isinstance(error.get("context_breakdown"), dict):
+            return cast(_JsonObject, error["context_breakdown"])
+    return None
 
 
 def _response_failed_payload(
@@ -7132,6 +7145,7 @@ def create_runner_app(
                                         _max_tokens,
                                         _actual_tokens,
                                         detail_message=_ov_detail,
+                                        context_breakdown=_failed_event_context_breakdown(event),
                                     )
 
                                 _evt_type = event.get("type")
@@ -7522,7 +7536,7 @@ def create_runner_app(
                     _report_held_refusal()
                     return
                 _report_held_refusal()
-                _error = {
+                _error: dict[str, object] = {
                     "code": "context_length_exceeded",
                     "message": overflow.detail_message
                     or (
@@ -7531,6 +7545,8 @@ def create_runner_app(
                     ),
                     "type": "_ContextWindowOverflow",
                 }
+                if overflow.context_breakdown is not None:
+                    _error["context_breakdown"] = overflow.context_breakdown
                 _overflow_fail = _response_failed_payload(
                     _error,
                     source="llm",

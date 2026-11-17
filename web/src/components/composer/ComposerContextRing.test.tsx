@@ -49,6 +49,8 @@ const BREAKDOWN: SessionContextBreakdown = {
   historyPartial: false,
   summarizedPartial: false,
   bytesPerToken: 4,
+  reported: null,
+  failedAttempt: null,
 };
 
 afterEach(() => {
@@ -113,6 +115,30 @@ describe("ComposerContextRing", () => {
     expect(getSessionContextBreakdown).toHaveBeenCalledWith("conv_1", expect.anything());
     // The hover summary stays closed while its breakdown is open.
     expect(screen.queryByText("25% context used")).not.toBeInTheDocument();
+  });
+
+  it("opens the breakdown when asked from outside, e.g. by /context", async () => {
+    vi.mocked(getSessionContextBreakdown).mockResolvedValue(BREAKDOWN);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const ring = (openNonce: number) => (
+      <QueryClientProvider client={queryClient}>
+        <TooltipProvider>
+          <ComposerContextRing
+            contextWindow={200_000}
+            tokensUsed={50_000}
+            sessionId="conv_1"
+            openNonce={openNonce}
+          />
+        </TooltipProvider>
+      </QueryClientProvider>
+    );
+    const { rerender } = render(ring(0));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+
+    rerender(ring(1));
+
+    const dialog = await screen.findByRole("dialog", { name: "Context window breakdown" });
+    expect(await within(dialog).findByTestId("context-row-history")).toHaveTextContent("~40K");
   });
 
   it("refreshes an open breakdown when a turn finishes with the same total", async () => {

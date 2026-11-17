@@ -711,3 +711,107 @@ async def test_idle_ring_estimate_model_fallback(
     # window proves the estimate reached the host (the original crash
     # left the ring untouched because the task died before this call).
     assert host.ring_updates == [_RingUpdate(tokens=1_234, context_window=200_000)]
+
+
+# ---------------------------------------------------------------------------
+# Context breakdown from the server
+# ---------------------------------------------------------------------------
+
+
+class _BreakdownResponse:
+    """The slice of an ``httpx.Response`` the breakdown fetch reads."""
+
+    def __init__(self, status_code: int, body: object) -> None:
+        self.status_code = status_code
+        self._body = body
+
+    def json(self) -> object:
+        return self._body
+
+
+class _BreakdownHttp:
+    """Records requested URLs and answers each with one scripted response."""
+
+    def __init__(self, response: _BreakdownResponse) -> None:
+        self.response = response
+        self.urls: list[str] = []
+
+    async def get(self, url: str) -> _BreakdownResponse:
+        self.urls.append(url)
+        return self.response
+
+
+class _BreakdownClient:
+    """Stands in for the REPL's connected client: its HTTP session and base URL."""
+
+    def __init__(self, response: _BreakdownResponse) -> None:
+        self._http = _BreakdownHttp(response)
+        self._base_url = "http://omnigent.test"
+
+
+@pytest.mark.asyncio
+async def test_context_shows_the_runner_breakdown_and_a_failed_attempt() -> None:
+    """``/context`` lists what fills the window, preferring the runner's request."""
+    client = _BreakdownClient(
+        _BreakdownResponse(
+            200,
+            {
+                "session_id": "conv_abc123",
+                "system_prompt_tokens": 900,
+                "tools": {"mcp_servers": ["github"]},
+                "history": {"estimated_tokens": 4_000, "item_count": 6},
+                "bytes_per_token": 4,
+                "reported": {
+                    "system_tokens": 1_200,
+                    "tool_tokens": 5_400,
+                    "tool_count": 18,
+                    "history_tokens": 4_100,
+                    "history_item_count": 6,
+                    "message_tokens": 20,
+                },
+                "failed_attempt": {"history_tokens": 190_000, "history_item_count": 300},
+            },
+        )
+    )
+    host = CapturingHost()
+    host.tokens_used = 20_000  # type: ignore[attr-defined]  # read via getattr
+    session = _Session(context_window=200_000, session_id="conv_abc123")
+
+    await handle_slash_command(
+        "/context",
+        session,
+        client,  # type: ignore[arg-type]
+        host,
+        RichBlockFormatter(),  # type: ignore[arg-type]
+    )
+
+    assert client._http.urls == ["http://omnigent.test/v1/sessions/conv_abc123/context-breakdown"]
+    text = host.text
+    assert "What fills it" in text
+    # The runner's figures win over the server's spec estimate (900).
+    assert "~1,200" in text
+    assert "~900" not in text
+    assert "18 tools · MCP: github" in text
+    # Other is the measured total minus every itemized estimate.
+    assert "~9,280" in text
+    assert "~190,000 tokens attempted" in text
+
+
+@pytest.mark.asyncio
+async def test_context_keeps_the_usage_tree_without_a_breakdown_route() -> None:
+    """An older server without the route still gets the usage tree, and nothing more."""
+    client = _BreakdownClient(_BreakdownResponse(404, {"error": {"code": "not_found"}}))
+    host = CapturingHost()
+    host.tokens_used = 20_000  # type: ignore[attr-defined]  # read via getattr
+    session = _Session(context_window=200_000, session_id="conv_abc123")
+
+    await handle_slash_command(
+        "/context",
+        session,
+        client,  # type: ignore[arg-type]
+        host,
+        RichBlockFormatter(),  # type: ignore[arg-type]
+    )
+
+    assert "20.0k" in host.text
+    assert "What fills it" not in host.text

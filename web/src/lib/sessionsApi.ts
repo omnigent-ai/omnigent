@@ -1594,6 +1594,63 @@ export interface ContextBreakdownAttachment {
   estimatedTokens: number | null;
 }
 
+/**
+ * The runner's estimate of what one turn's request carried, by source. Every
+ * figure is a size-based estimate; the measured total stays on the session.
+ */
+export interface TurnContextBreakdown {
+  systemTokens: number;
+  toolTokens: number;
+  toolCount: number;
+  historyTokens: number;
+  historyItemCount: number;
+  attachmentTokens: number;
+  attachmentCount: number;
+  /** Inline attachments without a reliable estimate (e.g. a PDF). */
+  unestimatedAttachmentCount: number;
+  messageTokens: number;
+}
+
+/** Sum of a runner breakdown's itemized estimates. */
+export function turnBreakdownTotal(turn: TurnContextBreakdown): number {
+  return (
+    turn.systemTokens +
+    turn.toolTokens +
+    turn.historyTokens +
+    turn.attachmentTokens +
+    turn.messageTokens
+  );
+}
+
+interface TurnContextBreakdownWire {
+  system_tokens?: number;
+  tool_tokens?: number;
+  tool_count?: number;
+  history_tokens?: number;
+  history_item_count?: number;
+  attachment_tokens?: number;
+  attachment_count?: number;
+  unestimated_attachment_count?: number;
+  message_tokens?: number;
+}
+
+function turnBreakdownFromWire(
+  wire: TurnContextBreakdownWire | null | undefined,
+): TurnContextBreakdown | null {
+  if (wire == null) return null;
+  return {
+    systemTokens: wire.system_tokens ?? 0,
+    toolTokens: wire.tool_tokens ?? 0,
+    toolCount: wire.tool_count ?? 0,
+    historyTokens: wire.history_tokens ?? 0,
+    historyItemCount: wire.history_item_count ?? 0,
+    attachmentTokens: wire.attachment_tokens ?? 0,
+    attachmentCount: wire.attachment_count ?? 0,
+    unestimatedAttachmentCount: wire.unestimated_attachment_count ?? 0,
+    messageTokens: wire.message_tokens ?? 0,
+  };
+}
+
 /** Size-based estimates of what fills a session's context window. */
 export interface SessionContextBreakdown {
   /** Null when the server could not load the agent spec. */
@@ -1614,6 +1671,10 @@ export interface SessionContextBreakdown {
   summarizedPartial: boolean;
   /** Ratio behind the text estimates, e.g. 4. */
   bytesPerToken: number;
+  /** The runner's breakdown of the last completed turn; preferred where present. */
+  reported: TurnContextBreakdown | null;
+  /** The runner's breakdown of a later request rejected as too long. */
+  failedAttempt: TurnContextBreakdown | null;
 }
 
 interface ContextBreakdownAttachmentWire {
@@ -1640,6 +1701,8 @@ interface SessionContextBreakdownWire {
     summarized_partial?: boolean;
   };
   bytes_per_token?: number;
+  reported?: TurnContextBreakdownWire | null;
+  failed_attempt?: TurnContextBreakdownWire | null;
 }
 
 /** Estimate what fills a session's context window (system prompt, tools, attachments, history). */
@@ -1674,6 +1737,8 @@ export async function getSessionContextBreakdown(
     historyPartial: wire.history?.partial ?? false,
     summarizedPartial: wire.history?.summarized_partial ?? false,
     bytesPerToken: wire.bytes_per_token ?? 4,
+    reported: turnBreakdownFromWire(wire.reported),
+    failedAttempt: turnBreakdownFromWire(wire.failed_attempt),
   };
 }
 

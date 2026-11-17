@@ -5295,6 +5295,9 @@ class CodexExecutor(Executor):
     def supports_tool_calling(self) -> bool:
         return True
 
+    def sends_turn_request_to_model(self) -> bool:
+        return True
+
     def handles_tools_internally(self) -> bool:
         return True
 

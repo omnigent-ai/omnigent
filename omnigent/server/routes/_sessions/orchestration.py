@@ -161,6 +161,10 @@ from omnigent.server.bundles import (
     uploaded_agent_for,
     validate_agent_bundle,
 )
+from omnigent.server.context_breakdown import (
+    completed_turn_breakdown_labels,
+    failed_turn_breakdown_labels,
+)
 from omnigent.server.creation_logging import creation_metadata, creation_stage, session_created
 from omnigent.server.failed_status_diagnostics import failed_status_intake_attributes
 from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerExitReports
@@ -2441,6 +2445,11 @@ async def _persist_external_session_usage(
     label_updates: dict[str, str] = {}
     if raw_tokens is not None:
         label_updates[_LAST_CONTEXT_TOKENS_LABEL_KEY] = str(raw_tokens)
+        # The runner sees no request for a terminal harness, so a breakdown left
+        # by an earlier in-process turn no longer describes this total.
+        stale_breakdown = completed_turn_breakdown_labels({})
+        if conv is None or any(conv.labels.get(key) for key in stale_breakdown):
+            label_updates.update(stale_breakdown)
     if raw_window is not None:
         label_updates[_LAST_CONTEXT_WINDOW_LABEL_KEY] = str(raw_window)
     await asyncio.to_thread(
@@ -2515,6 +2524,8 @@ def _context_labels_from_turn_usage(
     Returns an empty dict when the turn reports no ``context_tokens`` (a native
     terminal harness reports its fill via ``external_session_usage`` instead),
     so this path stays in-process-only and never double-writes the labels.
+    The runner's per-turn ``context_breakdown`` rides along, so the breakdown
+    and the measured total always describe the same turn.
 
     :param resp_usage: The ``response.usage`` dict from a ``response.completed``
         event.
@@ -2524,7 +2535,10 @@ def _context_labels_from_turn_usage(
     context_tokens = resp_usage.get("context_tokens")
     if not isinstance(context_tokens, int) or context_tokens < 0:
         return {}
-    labels: dict[str, str] = {_LAST_CONTEXT_TOKENS_LABEL_KEY: str(context_tokens)}
+    labels: dict[str, str] = {
+        _LAST_CONTEXT_TOKENS_LABEL_KEY: str(context_tokens),
+        **completed_turn_breakdown_labels(resp_usage),
+    }
     model = resp_usage.get("model")
     if isinstance(model, str) and model:
         from omnigent.llms.context_window import get_model_context_window
@@ -10774,6 +10788,27 @@ async def _relay_runner_stream_once(
                                         session_id,
                                         _usage_conv,
                                     )
+
+                    if evt_type == "response.failed":
+                        # Keep what a "prompt too long" request attempted, for the
+                        # context breakdown; other failures leave the labels alone.
+                        _failed_resp = event.get("response")
+                        _failed_labels = failed_turn_breakdown_labels(
+                            (_failed_resp.get("error") if isinstance(_failed_resp, dict) else None)
+                            or event.get("error")
+                        )
+                        if _failed_labels:
+                            try:
+                                await asyncio.to_thread(
+                                    conversation_store.set_labels, session_id, _failed_labels
+                                )
+                            except Exception:  # noqa: BLE001 — diagnostic only; keep relaying
+                                _logger.warning(
+                                    "Relay: failed-attempt breakdown persist failed for %s",
+                                    session_id,
+                                    exc_info=True,
+                                    extra={"session_id": session_id},
+                                )
 
                     failed_response = event.get("response")
                     if (

@@ -6491,6 +6491,70 @@ async def _cmd_context(
             llm_model or agent_name,
         )
     _render_context_tree(agent_name, llm_model, message_tokens, context_window, host, fmt)
+    session_id = getattr(session, "session_id", None)
+    if isinstance(session_id, str):
+        breakdown = await _fetch_context_breakdown(client, session_id)
+        if breakdown is not None:
+            # A local message count is no measured total, so Other and Free are left out.
+            _render_context_breakdown(breakdown, live_tokens, context_window, host, fmt)
+
+
+async def _fetch_context_breakdown(
+    client: OmnigentClient, session_id: str
+) -> dict[str, object] | None:
+    """
+    Fetch what fills the session's context window, or ``None`` when unavailable.
+
+    Reuses the REPL client's authenticated HTTP session, as the version probe does.
+    An older server without the route, or any failure, yields ``None``.
+
+    :param client: The connected client.
+    :param session_id: The session, e.g. ``"conv_abc123"``.
+    :returns: The ``GET /v1/sessions/{id}/context-breakdown`` JSON, or ``None``.
+    """
+    from urllib.parse import quote
+
+    try:
+        resp = await client._http.get(
+            f"{client._base_url}/v1/sessions/{quote(session_id, safe='')}/context-breakdown"
+        )
+        if resp.status_code != 200:
+            return None
+        body = resp.json()
+    except Exception:  # noqa: BLE001 — REPL UI boundary: the usage tree already printed
+        return None
+    return body if isinstance(body, dict) else None
+
+
+def _render_context_breakdown(
+    breakdown: Mapping[str, object],
+    tokens_used: int | None,
+    context_window: int | None,
+    host: TerminalHost,
+    fmt: RichBlockFormatter,
+) -> None:
+    """
+    Print the breakdown rows below the context-usage tree.
+
+    :param breakdown: The context-breakdown response JSON.
+    :param tokens_used: The provider-measured total, or ``None`` when the tree
+        showed a local estimate.
+    :param context_window: The model's window, or ``None`` when unknown.
+    :param host: Terminal host to print to.
+    :param fmt: Formatter supplying REPL colour names.
+    """
+    from rich.markup import escape
+    from rich.text import Text
+
+    from omnigent.repl._context_breakdown import breakdown_body_lines
+
+    lines = breakdown_body_lines(breakdown, tokens_used=tokens_used, context_window=context_window)
+    body = "\n".join(escape(line) for line in lines)
+    host.output(
+        Text.from_markup(
+            f"  [{fmt.accent}]What fills it[/{fmt.accent}]\n[{fmt.muted}]{body}[/{fmt.muted}]"
+        )
+    )
 
 
 @_cmd("/cancel", "Cancel the current response")

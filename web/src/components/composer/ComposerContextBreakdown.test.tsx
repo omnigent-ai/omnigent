@@ -1,7 +1,7 @@
 import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 
-import type { SessionContextBreakdown } from "@/lib/sessionsApi";
+import type { SessionContextBreakdown, TurnContextBreakdown } from "@/lib/sessionsApi";
 import { ComposerContextBreakdown, itemizedEstimate } from "./ComposerContextBreakdown";
 
 function breakdown(overrides: Partial<SessionContextBreakdown> = {}): SessionContextBreakdown {
@@ -20,6 +20,23 @@ function breakdown(overrides: Partial<SessionContextBreakdown> = {}): SessionCon
     historyPartial: false,
     summarizedPartial: false,
     bytesPerToken: 4,
+    reported: null,
+    failedAttempt: null,
+    ...overrides,
+  };
+}
+
+function turn(overrides: Partial<TurnContextBreakdown> = {}): TurnContextBreakdown {
+  return {
+    systemTokens: 0,
+    toolTokens: 0,
+    toolCount: 0,
+    historyTokens: 0,
+    historyItemCount: 0,
+    attachmentTokens: 0,
+    attachmentCount: 0,
+    unestimatedAttachmentCount: 0,
+    messageTokens: 0,
     ...overrides,
   };
 }
@@ -149,5 +166,73 @@ describe("ComposerContextBreakdown", () => {
     renderBreakdown(undefined, "error");
     expect(screen.getByText("A breakdown isn't available for this session.")).toBeInTheDocument();
     expect(screen.getByText("20% used")).toBeInTheDocument();
+  });
+
+  it("prefers the runner's report of the request it sent", () => {
+    const reported = turn({
+      systemTokens: 3_000,
+      toolTokens: 5_400,
+      toolCount: 18,
+      historyTokens: 8_000,
+      historyItemCount: 6,
+      messageTokens: 100,
+    });
+    renderBreakdown(breakdown({ mcpServers: ["github"], reported }));
+
+    expect(screen.getByTestId("context-row-system-prompt")).toHaveTextContent("~3K");
+    const tools = screen.getByTestId("context-row-tools");
+    expect(tools).toHaveAttribute("data-source", "estimated");
+    expect(tools).toHaveTextContent("~5.4K");
+    expect(tools).toHaveTextContent("18 tools · MCP: github");
+    expect(screen.getByTestId("context-row-history")).toHaveTextContent("~8K");
+    expect(screen.getByTestId("context-row-message")).toHaveTextContent("~100");
+    expect(itemizedEstimate(breakdown({ reported }))).toBe(16_500);
+    // 20K measured minus the runner's 16.5K.
+    expect(screen.getByTestId("context-row-other")).toHaveTextContent("~3.5K");
+    expect(screen.queryByTestId("context-failed-attempt")).not.toBeInTheDocument();
+  });
+
+  it("shows what a request rejected as too long attempted", () => {
+    renderBreakdown(
+      breakdown({
+        failedAttempt: turn({ historyTokens: 190_000, historyItemCount: 300, toolTokens: 6_000 }),
+      }),
+    );
+
+    const attempt = screen.getByTestId("context-failed-attempt");
+    expect(attempt).toHaveTextContent("Last request was too long");
+    expect(attempt).toHaveTextContent("About 196K tokens attempted");
+    expect(attempt).toHaveTextContent("300 messages and tool calls");
+    // Empty categories are left out of the attempt.
+    expect(attempt).not.toHaveTextContent("Current message");
+  });
+
+  it("lists attachments under the runner's total without their own estimates", () => {
+    renderBreakdown(
+      breakdown({
+        reported: turn({ attachmentTokens: 1_600, attachmentCount: 1 }),
+        attachments: [
+          {
+            fileId: "file_1",
+            filename: "shot.png",
+            contentType: "image/png",
+            bytes: 2_048,
+            delivery: "inline",
+            estimatedTokens: 1_600,
+          },
+        ],
+      }),
+    );
+
+    expect(screen.getByTestId("context-row-attachments")).toHaveTextContent("~1.6K");
+    expect(screen.getByText("Sent inline")).toBeInTheDocument();
+  });
+
+  it("says when the estimates exceed the measured total", () => {
+    renderBreakdown(breakdown({ reported: turn({ historyTokens: 30_000 }) }));
+
+    const other = screen.getByTestId("context-row-other");
+    expect(other).toHaveTextContent("~0");
+    expect(other).toHaveTextContent("exceed the measured total");
   });
 });

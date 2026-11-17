@@ -15,7 +15,7 @@ from typing import Any, cast
 import httpx
 import pytest
 
-from omnigent.entities import Conversation
+from omnigent.entities import Conversation, ErrorData
 from omnigent.entities.scheduled_task import ScheduledRunLogContext
 from omnigent.scheduled_context import (
     SCHEDULED_RUN_HEADER,
@@ -608,9 +608,28 @@ def test_context_labels_from_turn_usage_shapes() -> None:
     negative = _context_labels_from_turn_usage({"context_tokens": -1, "model": "claude-sonnet-5"})
     assert negative == {}
 
-    # Numerator without a resolvable model → tokens only.
+    # Numerator without a resolvable model → tokens only; a turn without a
+    # runner breakdown clears any earlier one and any failed attempt.
     no_model = _context_labels_from_turn_usage({"context_tokens": 42})
-    assert no_model == {"omnigent.last_context_tokens": "42"}
+    assert no_model == {
+        "omnigent.last_context_tokens": "42",
+        "omnigent.context_breakdown": "",
+        "omnigent.context_breakdown_failed": "",
+    }
+
+    # The runner's per-turn breakdown is stored with the total it explains.
+    reported = _context_labels_from_turn_usage(
+        {"context_tokens": 42, "context_breakdown": {"history_tokens": 30, "tool_count": 2}}
+    )
+    assert json.loads(reported["omnigent.context_breakdown"]) == {
+        "history_tokens": 30,
+        "tool_count": 2,
+    }
+    # A malformed breakdown is dropped rather than stored.
+    malformed = _context_labels_from_turn_usage(
+        {"context_tokens": 42, "context_breakdown": {"history_tokens": -5}}
+    )
+    assert malformed["omnigent.context_breakdown"] == ""
 
 
 @pytest.mark.asyncio
@@ -642,6 +661,8 @@ async def test_relay_persists_context_window_labels_for_inprocess_turn(db_uri: s
     expected_window = get_model_context_window("claude-sonnet-5")
 
     response_id = "resp_ctx_ring_1"
+    reported = {"system_tokens": 1200, "tool_tokens": 5400, "tool_count": 18}
+    attempted = {"history_tokens": 190000, "history_item_count": 300}
     # The observed model (a full id, not a bare alias) is what the SDK reports.
     turn_events: list[dict[str, Any]] = [
         {"type": "response.in_progress", "response": {"id": response_id, "model": "jarvis"}},
@@ -656,6 +677,22 @@ async def test_relay_persists_context_window_labels_for_inprocess_turn(db_uri: s
                     "total_tokens": 1200,
                     "context_tokens": 45678,
                     "model": "claude-sonnet-5",
+                    "context_breakdown": reported,
+                },
+            },
+        },
+        # A later turn rejected as too long records what it attempted.
+        {"type": "response.in_progress", "response": {"id": "resp_ctx_ring_2", "model": "jarvis"}},
+        {
+            "type": "response.failed",
+            "source": "llm",
+            "response": {
+                "id": "resp_ctx_ring_2",
+                "status": "failed",
+                "error": {
+                    "code": "context_length_exceeded",
+                    "message": "Context window exceeded: 210000 tokens > 200000 max",
+                    "context_breakdown": attempted,
                 },
             },
         },
@@ -691,6 +728,35 @@ async def test_relay_persists_context_window_labels_for_inprocess_turn(db_uri: s
         assert refreshed is not None
         assert refreshed.labels.get("omnigent.last_context_tokens") == "45678"
         assert refreshed.labels.get("omnigent.last_context_window") == str(expected_window)
+        assert json.loads(refreshed.labels["omnigent.context_breakdown"]) == reported
+
+        # The overflow's attempted request is kept beside the last good turn's,
+        # and on the durable error item the transcript renders.
+        for _ in range(50):
+            event = await collector.next_event()
+            if event["type"] == "response.failed":
+                break
+        for _ in range(50):
+            refreshed = store.get_conversation(session_id)
+            assert refreshed is not None
+            if refreshed.labels.get("omnigent.context_breakdown_failed"):
+                break
+            await asyncio.sleep(0.02)
+        assert json.loads(refreshed.labels["omnigent.context_breakdown_failed"]) == attempted
+        assert json.loads(refreshed.labels["omnigent.context_breakdown"]) == reported
+        errors: list[Any] = []
+        for _ in range(50):
+            errors = [
+                item
+                for item in store.list_items(session_id, limit=20, order="desc").data
+                if isinstance(item.data, ErrorData)
+            ]
+            if errors:
+                break
+            await asyncio.sleep(0.02)
+        assert len(errors) == 1
+        assert errors[0].data.context_breakdown is not None
+        assert errors[0].data.context_breakdown.history_tokens == 190000
     finally:
         release.set()
         if collector is not None:

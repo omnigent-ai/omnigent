@@ -1,18 +1,23 @@
 """Estimate what fills a session's context window, for the web breakdown view.
 
 Every figure here is derived from content size (see
-:data:`~omnigent.llms.errors.APPROX_BYTES_PER_TOKEN`), not from a tokenizer:
-the provider-reported total on the session snapshot stays the measured value.
+:mod:`omnigent.runtime.context_breakdown`), not from a tokenizer: the
+provider-reported total on the session snapshot stays the measured value.
 """
 
 from __future__ import annotations
 
 import json
-from collections.abc import Callable, Iterable
+import logging
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from pydantic import ValidationError
+
+from omnigent.db.db_models import LABEL_VALUE_MAX_LEN
 from omnigent.entities import ConversationItem
+from omnigent.entities.context_breakdown import TurnContextBreakdown
 from omnigent.entities.conversation import (
     COMPACTION_SUMMARY_REPLAY_PROMPT,
     CompactionData,
@@ -26,11 +31,22 @@ from omnigent.entities.conversation import (
 from omnigent.entities.file import StoredFile
 from omnigent.errors import OmnigentError
 from omnigent.harness_aliases import is_native_harness
-from omnigent.inner.native_attachments import uses_filesystem_delivery
-from omnigent.llms.adapters._content import redact_binary_payloads
-from omnigent.llms.errors import APPROX_BYTES_PER_TOKEN
+from omnigent.inner.native_attachments import attachment_is_inlined
+from omnigent.llms.errors import (
+    APPROX_BYTES_PER_TOKEN,
+    CONTEXT_EXCEEDED_CODES,
+    is_context_overflow_message,
+)
 from omnigent.mcp_selection import selected_mcp_spec
-from omnigent.runtime.content_resolver import is_text_like_attachment
+from omnigent.runtime.context_breakdown import (
+    ATTACHMENT_BLOCK_TYPES,
+    IMAGE_TOKEN_ESTIMATE,
+    TEXT_BLOCK_TYPES,
+    estimate_attachment_tokens,
+    estimate_text_tokens,
+    estimate_without_binary,
+    inline_payload_bytes,
+)
 from omnigent.runtime.prompt import (
     build_instructions_nullable,
     build_native_startup_instructions,
@@ -44,15 +60,15 @@ from omnigent.server.schemas import (
 )
 from omnigent.spec.types import AgentSpec
 
-# Roughly one full-resolution image on current vision models; its token cost
-# does not follow its encoded size.
-IMAGE_TOKEN_ESTIMATE = 1_600
-
 # Most recent items read per breakdown, so a very long session stays cheap.
 MAX_SCANNED_ITEMS = 2_000
 
-_TEXT_BLOCK_TYPES = frozenset({"input_text", "output_text", "text", "refusal"})
-_ATTACHMENT_BLOCK_TYPES = frozenset({"input_image", "input_file"})
+# The runner's breakdown of the last completed turn's request.
+REPORTED_BREAKDOWN_LABEL_KEY = "omnigent.context_breakdown"
+# The runner's breakdown of a later request rejected as too long.
+FAILED_BREAKDOWN_LABEL_KEY = "omnigent.context_breakdown_failed"
+_logger = logging.getLogger(__name__)
+
 # Provider-shaped binary blocks, e.g. in a native harness's checkpoint messages.
 _PROVIDER_BINARY_BLOCK_TYPES = frozenset({"image", "document"})
 _THINKING_BLOCK_TYPES = frozenset({"thinking", "redacted_thinking"})
@@ -60,39 +76,9 @@ _THINKING_BLOCK_TYPES = frozenset({"thinking", "redacted_thinking"})
 _SNAPSHOT_ENVELOPE_KEYS = frozenset({"id", "forwarded_source_ids", "message_id", "status"})
 
 
-def estimate_text_tokens(text: str) -> int:
-    """
-    Estimate prompt tokens for *text* from its UTF-8 size.
-
-    :param text: Any prompt text, e.g. ``"Hello"``.
-    :returns: Estimated tokens, rounded up, e.g. ``2``.
-    """
-    return _bytes_to_tokens(len(text.encode("utf-8")))
-
-
-def _bytes_to_tokens(size: int) -> int:
-    """Estimated tokens for *size* bytes of text, rounded up."""
-    return -(-size // APPROX_BYTES_PER_TOKEN)
-
-
-def _estimate_without_binary(value: object) -> int:
-    """Estimate structured content, counting each embedded image as one image."""
-    images = 0
-
-    def drop_payload(media_type: str, _length: int) -> str:
-        nonlocal images
-        if media_type.startswith("image/"):
-            images += 1
-        return ""
-
-    stripped = redact_binary_payloads(value, drop_payload)
-    text = stripped if isinstance(stripped, str) else json.dumps(stripped, ensure_ascii=False)
-    return estimate_text_tokens(text) + images * IMAGE_TOKEN_ESTIMATE
-
-
 def _estimate_tool_output_tokens(output: str) -> int:
     """Estimate a tool result as it is replayed, with stored images reduced to placeholders."""
-    return _estimate_without_binary(dedupe_tool_output_images(output))
+    return estimate_without_binary(dedupe_tool_output_images(output))
 
 
 def estimate_system_prompt_tokens(spec: AgentSpec, harness: str | None) -> int:
@@ -181,21 +167,6 @@ def _block_payload(block: dict[str, Any]) -> object:
     return block.get("image_url") or block.get("file_data")
 
 
-def _inline_payload_bytes(block: dict[str, Any]) -> int | None:
-    """Decoded size of a block's inline base64 payload, if it carries one."""
-    for key in ("file_data", "image_url"):
-        payload = block.get(key)
-        if not isinstance(payload, str) or not payload or is_omitted_binary_payload(payload):
-            continue
-        if payload.startswith("data:"):
-            payload = payload.split(",", 1)[-1]
-        elif "://" in payload:
-            # A remote URL carries no payload of its own.
-            return None
-        return len(payload.rstrip("=")) * 3 // 4
-    return None
-
-
 def _attachment_ref(block: dict[str, Any]) -> _AttachmentRef:
     """Describe an ``input_image`` / ``input_file`` block."""
     file_id = block.get("file_id")
@@ -205,7 +176,7 @@ def _attachment_ref(block: dict[str, Any]) -> _AttachmentRef:
         file_id=file_id if isinstance(file_id, str) else None,
         filename=filename if isinstance(filename, str) else None,
         is_image=block.get("type") == "input_image",
-        inline_bytes=_inline_payload_bytes(block),
+        inline_bytes=inline_payload_bytes(block),
         has_data_uri=isinstance(payload, str) and payload.startswith("data:"),
         omitted=is_omitted_binary_payload(payload),
     )
@@ -238,7 +209,7 @@ def _snapshot_block_tokens(block: dict[str, Any]) -> tuple[int, _AttachmentRef |
             return (estimate_text_tokens(data) if isinstance(data, str) else 0), None
         return 0, _provider_block_ref(block)
     # Tool calls and results inside a transcript message.
-    return _estimate_without_binary(block), None
+    return estimate_without_binary(block), None
 
 
 def _content_tokens(
@@ -258,11 +229,11 @@ def _content_tokens(
         if not isinstance(block, dict):
             continue
         block_type = block.get("type")
-        if block_type in _TEXT_BLOCK_TYPES:
+        if block_type in TEXT_BLOCK_TYPES:
             text = block.get("text")
             if isinstance(text, str):
                 tokens += estimate_text_tokens(text)
-        elif block_type in _ATTACHMENT_BLOCK_TYPES:
+        elif block_type in ATTACHMENT_BLOCK_TYPES:
             attachments.append(_attachment_ref(block))
         elif snapshot:
             block_tokens, ref = _snapshot_block_tokens(block)
@@ -277,7 +248,7 @@ def _snapshot_entry_tokens(entry: dict[str, Any]) -> tuple[int, list[_Attachment
     if entry.get("type", "message") == "message" and "content" in entry:
         return _content_tokens(entry["content"], snapshot=True)
     payload = {key: value for key, value in entry.items() if key not in _SNAPSHOT_ENVELOPE_KEYS}
-    return _estimate_without_binary(payload), []
+    return estimate_without_binary(payload), []
 
 
 def _item_tokens(item: ConversationItem) -> tuple[int, list[_AttachmentRef]] | None:
@@ -298,8 +269,8 @@ def _item_tokens(item: ConversationItem) -> tuple[int, list[_AttachmentRef]] | N
         if native_item.get("type") == "image_generation_call" and "result" in native_item:
             # The generated image is stored as bare base64 under ``result``.
             rest = {key: value for key, value in native_item.items() if key != "result"}
-            return _estimate_without_binary(rest) + IMAGE_TOKEN_ESTIMATE, []
-        return _estimate_without_binary(native_item), []
+            return estimate_without_binary(rest) + IMAGE_TOKEN_ESTIMATE, []
+        return estimate_without_binary(native_item), []
     return None
 
 
@@ -451,13 +422,13 @@ def resolve_attachment(
                 bytes=size,
                 delivery="workspace" if ref.has_data_uri else "missing",
             )
-        tokens: int | None = None
-        if ref.is_image:
-            tokens = IMAGE_TOKEN_ESTIMATE
-        elif size is not None and is_text_like_attachment("", ref.filename):
-            tokens = _bytes_to_tokens(size)
         return ContextBreakdownAttachment(
-            filename=ref.filename, bytes=size, delivery="inline", estimated_tokens=tokens
+            filename=ref.filename,
+            bytes=size,
+            delivery="inline",
+            estimated_tokens=estimate_attachment_tokens(
+                is_image=ref.is_image, content_type=None, filename=ref.filename, size=size
+            ),
         )
     stored = lookup_file(ref.file_id)
     if stored is None:
@@ -466,7 +437,7 @@ def resolve_attachment(
         )
     filename = stored.filename or ref.filename
     content_type = stored.content_type
-    if native or uses_filesystem_delivery(filename, stored.source_metadata):
+    if not attachment_is_inlined(filename, stored.source_metadata, native=native):
         return ContextBreakdownAttachment(
             file_id=ref.file_id,
             filename=filename,
@@ -474,18 +445,18 @@ def resolve_attachment(
             bytes=stored.bytes,
             delivery="workspace",
         )
-    estimated: int | None = None
-    if ref.is_image or (content_type or "").startswith("image/"):
-        estimated = IMAGE_TOKEN_ESTIMATE
-    elif is_text_like_attachment(content_type or "", filename):
-        estimated = _bytes_to_tokens(stored.bytes)
     return ContextBreakdownAttachment(
         file_id=ref.file_id,
         filename=filename,
         content_type=content_type,
         bytes=stored.bytes,
         delivery="inline",
-        estimated_tokens=estimated,
+        estimated_tokens=estimate_attachment_tokens(
+            is_image=ref.is_image,
+            content_type=content_type,
+            filename=filename,
+            size=stored.bytes,
+        ),
     )
 
 
@@ -506,7 +477,8 @@ def build_context_breakdown(
     :param spec: The session's resolved agent spec, or ``None`` when it could
         not load (the prompt, skill and tool rows are then left empty).
     :param harness: The session's canonical harness, e.g. ``"claude-sdk"``.
-    :param labels: Session labels carrying per-session MCP selections.
+    :param labels: Session labels carrying per-session MCP selections and
+        the runner's reported breakdowns.
     :param items_newest_first: The session's items in descending position.
     :param lookup_file: Returns the session's stored file for an id, or ``None``.
     :param max_items: Items to read before marking the history partial.
@@ -521,6 +493,8 @@ def build_context_breakdown(
         history=history,
         attachments=[resolve_attachment(ref, lookup_file, native=native) for ref in refs],
         bytes_per_token=APPROX_BYTES_PER_TOKEN,
+        reported=parse_turn_breakdown(labels.get(REPORTED_BREAKDOWN_LABEL_KEY)),
+        failed_attempt=parse_turn_breakdown(labels.get(FAILED_BREAKDOWN_LABEL_KEY)),
     )
     if spec is not None:
         breakdown.system_prompt_tokens = estimate_system_prompt_tokens(spec, harness)
@@ -528,3 +502,91 @@ def build_context_breakdown(
         breakdown.skill_listing_tokens = estimate_skill_listing_tokens(spec)
         breakdown.tools = summarize_tools(spec, labels)
     return breakdown
+
+
+def parse_turn_breakdown(raw: object) -> TurnContextBreakdown | None:
+    """
+    Validate a runner-reported breakdown, from an event payload or a stored label.
+
+    :param raw: A JSON object, its serialized string, or anything else.
+    :returns: The breakdown, or ``None`` when absent or malformed.
+    """
+    if isinstance(raw, str):
+        if not raw:
+            return None
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            return None
+    if not isinstance(raw, Mapping):
+        return None
+    try:
+        return TurnContextBreakdown.model_validate(raw)
+    except ValidationError:
+        return None
+
+
+def _breakdown_label_value(raw: object) -> str:
+    """Serialize a reported breakdown for its label; ``""`` clears it when absent or too long."""
+    breakdown = parse_turn_breakdown(raw)
+    if breakdown is None:
+        return ""
+    value = breakdown.model_dump_json(exclude_defaults=True)
+    if len(value) > LABEL_VALUE_MAX_LEN:
+        _logger.debug("Reported context breakdown too long for its label (%d)", len(value))
+        return ""
+    return value
+
+
+def completed_turn_breakdown_labels(usage: Mapping[str, Any]) -> dict[str, str]:
+    """
+    Labels recording a completed turn's reported breakdown.
+
+    A completed turn replaces the previous report (an absent one clears it)
+    and supersedes any earlier failed attempt.
+
+    :param usage: The ``response.usage`` object of a ``response.completed`` event.
+    :returns: Label updates for both breakdown labels.
+    """
+    return {
+        REPORTED_BREAKDOWN_LABEL_KEY: _breakdown_label_value(usage.get("context_breakdown")),
+        FAILED_BREAKDOWN_LABEL_KEY: "",
+    }
+
+
+def overflow_breakdown(error: object) -> TurnContextBreakdown | None:
+    """
+    The attempted-request breakdown of a context-overflow failure.
+
+    An in-process harness can report an overflow under a generic code, so
+    its message is checked too.
+
+    :param error: A turn failure's ``error`` object, e.g.
+        ``{"code": "context_length_exceeded", "context_breakdown": {...}}``.
+    :returns: The breakdown when *error* is an overflow that carries one, else ``None``.
+    """
+    if not isinstance(error, Mapping) or "context_breakdown" not in error:
+        return None
+    code = error.get("code")
+    message = error.get("message")
+    if not (
+        (isinstance(code, str) and code in CONTEXT_EXCEEDED_CODES)
+        or (isinstance(message, str) and is_context_overflow_message(message))
+    ):
+        return None
+    return parse_turn_breakdown(error.get("context_breakdown"))
+
+
+def failed_turn_breakdown_labels(error: object) -> dict[str, str]:
+    """
+    Labels recording the attempted breakdown of a turn that overflowed the window.
+
+    :param error: The failed turn's ``error`` object.
+    :returns: The failed-attempt label update, or ``{}`` when the failure is
+        not an overflow with a breakdown.
+    """
+    breakdown = overflow_breakdown(error)
+    if breakdown is None:
+        return {}
+    value = _breakdown_label_value(breakdown.model_dump())
+    return {FAILED_BREAKDOWN_LABEL_KEY: value} if value else {}

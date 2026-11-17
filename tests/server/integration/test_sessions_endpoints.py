@@ -7158,6 +7158,7 @@ async def test_post_external_session_status_rejects_unknown_status(
 
 async def test_post_external_session_usage_publishes_session_usage(
     client: httpx.AsyncClient,
+    db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
@@ -7175,6 +7176,14 @@ async def test_post_external_session_usage_publishes_session_usage(
     _capture_published(monkeypatch, published)
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"])
+    # Breakdowns an earlier in-process turn reported no longer describe this total.
+    SqlAlchemyConversationStore(db_uri).set_labels(
+        session["id"],
+        {
+            "omnigent.context_breakdown": '{"history_tokens":30000}',
+            "omnigent.context_breakdown_failed": '{"history_tokens":990000}',
+        },
+    )
 
     resp = await client.post(
         f"/v1/sessions/{session['id']}/events",
@@ -7192,6 +7201,9 @@ async def test_post_external_session_usage_publishes_session_usage(
 
     snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
     assert snapshot["last_total_tokens"] == 44568
+    breakdown = (await client.get(f"/v1/sessions/{session['id']}/context-breakdown")).json()
+    assert breakdown["reported"] is None
+    assert breakdown["failed_attempt"] is None
 
 
 async def test_external_session_usage_broadcasts_parent_subtree_cost_not_own(

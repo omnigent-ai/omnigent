@@ -51,6 +51,7 @@ from fastapi import APIRouter, FastAPI, Request, Response, status
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
+from omnigent.entities.context_breakdown import TurnContextBreakdown
 from omnigent.errors import ErrorCode, HarnessTransportClosedError, OmnigentError
 from omnigent.inner.executor import (
     LiveMcpHarnessNotRunning,
@@ -69,6 +70,7 @@ from omnigent.server.schemas import (
     ElicitationRequestParams,
     ElicitationResolvedEvent,
     ElicitationResult,
+    ErrorDetail,
     FailedEvent,
     HarnessStreamEvent,
     HeartbeatEvent,
@@ -501,6 +503,9 @@ class TurnContext:
         # to populate the usage field on the response.completed SSE.
         # ``None`` when the inner executor does not report usage.
         self.provider_usage: dict[str, Any] | None = None
+        # Estimated split of the request this turn sent, set by the subclass
+        # before the model call; reported on the terminal event.
+        self.context_breakdown: TurnContextBreakdown | None = None
         # Idle-watchdog reset hook. ``_guarded_run_turn`` sets this to
         # push the per-turn idle deadline forward on each real progress
         # event so a long-but-active turn isn't killed mid-turn.
@@ -1037,8 +1042,6 @@ class HarnessApp:
             ideally matches one of the contract-recognized codes
             so AP-side retry decisions can act on it.
         """
-        from omnigent.server.schemas import ErrorDetail
-
         # P2.11: a turn-context desync (the inner generation outlived its turn)
         # carries the stable ``runner_turn_context_desync`` code. Surface it
         # verbatim — it is intentionally absent from AP's retryable-harness-
@@ -2105,13 +2108,18 @@ class HarnessApp:
                 # Authoritative per-turn cost reported by the harness (e.g. Copilot
                 # AI credits); preferred over the catalog estimate. None if absent.
                 cost_usd=u.get("cost_usd"),
+                context_breakdown=ctx.context_breakdown,
             )
+        error = None if exception is None else self._build_error_detail(exception)
+        if isinstance(error, ErrorDetail) and error.context_breakdown is None:
+            # A failed request reports what it attempted, e.g. for "prompt too long".
+            error.context_breakdown = ctx.context_breakdown
         response = ResponseObject(
             id=ctx.response_id,
             status=status_value,
             model=model,
             created_at=int(time.time()),
-            error=None if exception is None else self._build_error_detail(exception),
+            error=error,
             usage=usage,
         )
         terminal: ServerStreamEvent

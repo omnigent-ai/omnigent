@@ -18,6 +18,7 @@ from omnigent.inner.native_attachments import (
     UNRESOLVED_ATTACHMENT_MARKER_PATTERN,
     DataUri,
     attachment_cache_dir,
+    attachment_is_inlined,
     attachment_reference_line,
     codex_resize_metadata_path,
     filesystem_attachment_capability,
@@ -509,6 +510,24 @@ async def test_re_resolution_takes_the_filename_from_stored_metadata() -> None:
 def test_uses_filesystem_delivery(filename: str, metadata: object, expected: bool) -> None:
     """A recorded decision wins; without one the default extensions decide."""
     assert uses_filesystem_delivery(filename, metadata) is expected
+
+
+@pytest.mark.parametrize(
+    ("filename", "metadata", "native", "expected"),
+    [
+        ("chart.png", {}, False, True),
+        ("notes.txt", {"delivery": "inline"}, False, True),
+        ("trace.gz", {"delivery": "filesystem"}, False, False),
+        ("report.zip", None, False, False),
+        # A native harness hands every attachment to its CLI as a path.
+        ("chart.png", {"delivery": "inline"}, True, False),
+    ],
+)
+def test_attachment_is_inlined(
+    filename: str, metadata: object, native: bool, expected: bool
+) -> None:
+    """Only a non-native, inline-delivered upload reaches the prompt as bytes."""
+    assert attachment_is_inlined(filename, metadata, native=native) is expected
 
 
 @pytest.mark.parametrize(

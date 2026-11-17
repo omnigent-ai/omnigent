@@ -24,6 +24,7 @@ from typing import Any
 from fastapi import Response
 
 from omnigent.debug_logging import phase_scope
+from omnigent.entities.context_breakdown import TurnContextBreakdown
 from omnigent.errors import ElicitationDeclinedError, ErrorPhase
 from omnigent.harnesses.codex_native.shell_input import native_shell_authorization
 from omnigent.inner.executor import (
@@ -56,6 +57,7 @@ from omnigent.native.input_diagnostics import (
     log_input_event,
 )
 from omnigent.policies.types import FAIL_CLOSED_PHASES
+from omnigent.runtime.context_breakdown import build_turn_context_breakdown
 from omnigent.runtime.harnesses._scaffold import HarnessApp, PolicyVerdictPayload, TurnContext
 from omnigent.runtime.prompt import dedupe_tool_output_images
 from omnigent.runtime.tool_output import cap_tool_output
@@ -274,6 +276,10 @@ class ExecutorAdapter(HarnessApp):
         config = ExecutorConfig(model=request.model_override, extra=extra)
         tools = _normalize_tool_schemas(request.tools or [])
         system_prompt = request.instructions or ""
+        if executor.sends_turn_request_to_model():
+            ctx.context_breakdown = await asyncio.to_thread(
+                _turn_context_breakdown, request.input, system_prompt, tools, executor, messages
+            )
         # Install stable bridges once on first use — the SDK closure-captures them from the first
         # turn; per-turn rebinding would leave later tool calls dispatching into a dead ctx.
         if getattr(executor, "_tool_executor", None) is None:
@@ -1710,6 +1716,34 @@ def _extract_injection_content(
     if isinstance(content, str):
         return content
     return _join_text_blocks(content) if isinstance(content, list) else ""
+
+
+def _turn_context_breakdown(
+    input_value: str | list[dict[str, Any]],
+    system_prompt: str,
+    tools: list[dict[str, Any]],
+    executor: Executor,
+    messages: list[Message],
+) -> TurnContextBreakdown | None:
+    """
+    Estimate what this turn sends the executor; ``None`` if estimation fails.
+
+    An executor that keeps its own session still holds the tool calls it ran,
+    so history is sized with them even when they are not replayed to it.
+    """
+    try:
+        if not executor.replays_tool_history():
+            messages = _translate_input_to_messages(
+                input_value,
+                include_tool_history=True,
+                preserve_content_blocks=executor.preserves_message_content_blocks(),
+            )
+        return build_turn_context_breakdown(
+            system_prompt=system_prompt, tools=tools, messages=messages
+        )
+    except Exception:
+        _logger.debug("Context breakdown estimate failed", exc_info=True)
+        return None
 
 
 def _translate_input_to_messages(

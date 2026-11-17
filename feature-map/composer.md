@@ -248,7 +248,17 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   as a file path. History notes how many earlier items a compaction summary
   replaced. An open breakdown refreshes when a turn starts, when it ends, and
   when a later entry arrives. A server without the breakdown route still shows
-  the measured header.
+  the measured header. When the runner reports the request it sent (in-process
+  harnesses such as claude-sdk, openai-agents, pi or codex), those figures
+  replace the server's estimates: System prompt, Tool definitions (with a size
+  and tool count), Attachments, Conversation history and Current message, all
+  still labelled estimates; native terminal harnesses keep the server's
+  estimates. A later request rejected as too long for the window adds a "Last
+  request was too long" section with what it attempted; the next completed
+  turn that reports its usage clears it, as does a fork. `/context` opens the same breakdown when
+  the ring is shown (otherwise it prints the text summary), the REPL `/context`
+  prints it under its usage tree, and `omnigent session context --id <id>`
+  prints it in a terminal (`--json` for the raw response).
 - `review-context`: submitting an Agent comment in PR Changes attaches a chip
   to the session composer. Hover previews the comment, click reveals it in
   Changes, and X deletes the saved comment. Failed deletion retains the chip.
@@ -532,7 +542,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 
 **Context breakdown** (open a session with at least one finished turn): hover
 the context ring at the right end of the workspace bar above the composer for
-the measured summary, then click it to open the breakdown.
+the measured summary, then click it to open the breakdown. Typing `/context`
+in the composer opens the same breakdown. In a terminal, run `/context` in the
+REPL or `omnigent session context --id <session id>`.
 
 **Fork dialog** (Fork in the session header menu, or Fork from here on a
 message, with a native target): the same model, effort, and permission mode
@@ -591,6 +603,17 @@ Other connection providers alone do not enable the managed MCP picker.
   `web/src/components/composer/ComposerContextRing.test.tsx`; server
   estimates: `tests/server/test_context_breakdown.py`; read access:
   `tests/server/integration/test_sessions_permissions.py::test_context_breakdown_requires_read_access`.
+  Runner report: on a claude-sdk session, check that Tool definitions shows a
+  size and tool count and that `GET /v1/sessions/<id>/context-breakdown`
+  carries `reported`. For an overflow, script the mock model to reject a turn
+  as too long and check the "Last request was too long" section and
+  `failed_attempt`. Coverage: `tests/runtime/test_context_breakdown.py`,
+  `tests/runtime/harnesses/test_executor_adapter.py::test_executor_error_usage_reaches_response_failed`,
+  `tests/runner/test_failure_event_contract.py::test_context_overflow_preserves_a_valid_queued_failure`,
+  `tests/server/routes/test_sessions_runner_relay.py::test_relay_persists_context_window_labels_for_inprocess_turn`,
+  `tests/repl/test_context_command.py`, `tests/cli/test_session_context.py` and,
+  for `/context` in the composer,
+  `tests/browser_ui/chat/test_composer_context_breakdown.py`.
 - **`blocked-start`:** on a fresh new-session page with no working directory,
   enter a prompt or attach a file. Hover disabled Start, click it, then move
   away: its tooltip should stay visible. Check dismissal by outside click,

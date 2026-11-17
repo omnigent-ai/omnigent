@@ -415,6 +415,68 @@ async def test_executor_error_terminates_with_response_failed(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("sends_request", [True, False])
+async def test_turn_breakdown_only_for_executors_that_send_the_request(
+    sends_request: bool,
+) -> None:
+    """A native harness types into its own CLI, so its turn gets no breakdown."""
+    import asyncio
+
+    from omnigent.inner.executor import MockExecutor
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.schemas import CreateResponseRequest
+
+    class _Executor(MockExecutor):
+        def sends_turn_request_to_model(self) -> bool:
+            return sends_request
+
+    executor = _Executor()
+    executor.enqueue_response("done")
+    adapter = ExecutorAdapter(executor_factory=lambda: executor)
+    request = CreateResponseRequest(model="test-agent", input="x" * 40, instructions="i" * 80)
+    ctx = TurnContext(
+        response_id="resp_breakdown", event_queue=asyncio.Queue(), cancelled=asyncio.Event()
+    )
+
+    await adapter.run_turn(request, ctx)
+
+    if sends_request:
+        assert ctx.context_breakdown is not None
+        assert (ctx.context_breakdown.system_tokens, ctx.context_breakdown.message_tokens) == (
+            20,
+            10,
+        )
+    else:
+        assert ctx.context_breakdown is None
+
+
+def test_turn_breakdown_counts_tool_traffic_an_executor_keeps_itself() -> None:
+    """History includes tool calls even for an executor that is not replayed them."""
+    from omnigent.inner.executor import MockExecutor
+    from omnigent.runtime.harnesses._executor_adapter import (
+        _translate_input_to_messages,
+        _turn_context_breakdown,
+    )
+
+    history: list[dict[str, Any]] = [
+        {"type": "message", "role": "user", "content": "run it"},
+        {"type": "function_call", "call_id": "c1", "name": "shell", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "c1", "output": "o" * 4_000},
+        {"type": "message", "role": "user", "content": "and now?"},
+    ]
+    executor = MockExecutor()
+    assert not executor.replays_tool_history()
+    replayed = _translate_input_to_messages(history)
+
+    breakdown = _turn_context_breakdown(history, "", [], executor, replayed)
+
+    assert breakdown is not None
+    assert breakdown.history_item_count == 3
+    assert breakdown.history_tokens > 1_000
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("preserve_session", [False, True])
 @pytest.mark.parametrize("retryable", [False, True])
 async def test_executor_error_preserves_only_explicitly_reusable_sessions(
@@ -489,9 +551,8 @@ async def test_executor_error_usage_reaches_response_failed(
     conv_id = "conv_err_usage"
     client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
     events: list[_ParsedSSEEvent] = []
-    async with client.stream(
-        "POST", f"/v1/sessions/{conv_id}/events", json=_start_turn_body()
-    ) as response:
+    body = {**_start_turn_body(), "content": [{"type": "input_text", "text": "x" * 400}]}
+    async with client.stream("POST", f"/v1/sessions/{conv_id}/events", json=body) as response:
         async for event in _stream_iter(response):
             events.append(event)
 
@@ -503,7 +564,12 @@ async def test_executor_error_usage_reaches_response_failed(
     assert usage["input_tokens"] == 400
     # The failure is still a failure — the error detail must not be
     # displaced by the usage payload.
-    assert events[-1].data["response"]["error"] is not None
+    error = events[-1].data["response"]["error"]
+    assert error is not None
+    # The request the turn attempted is reported with the failure, sized from
+    # what the adapter handed the executor (400 bytes of message text).
+    assert error["context_breakdown"]["message_tokens"] == 100
+    assert usage["context_breakdown"] == error["context_breakdown"]
 
 
 async def test_provider_auth_required_survives_adapter_and_sse_envelope(

@@ -128,6 +128,7 @@ from omnigent.server.auth import (
     RESERVED_USER_PUBLIC,
     effective_admin,
 )
+from omnigent.server.context_breakdown import overflow_breakdown
 from omnigent.server.host_registry import (
     HostConnection,
     HostLaunchResult,
@@ -9053,6 +9054,8 @@ def _error_item_from_sse(
             title=_optional_error_text(raw_error.get("title")),
             cause=_optional_error_text(raw_error.get("cause")),
             remediation=_optional_error_text(raw_error.get("remediation")),
+            # What a "prompt too long" request attempted, so the card can show it.
+            context_breakdown=overflow_breakdown(raw_error),
         ),
     )
 

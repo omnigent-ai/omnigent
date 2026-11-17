@@ -29,9 +29,12 @@ from omnigent.runtime.prompt import (
     dedupe_tool_output_images,
 )
 from omnigent.server.context_breakdown import (
+    FAILED_BREAKDOWN_LABEL_KEY,
     IMAGE_TOKEN_ESTIMATE,
+    REPORTED_BREAKDOWN_LABEL_KEY,
     build_context_breakdown,
     estimate_text_tokens,
+    failed_turn_breakdown_labels,
     scan_history,
 )
 from omnigent.server.schemas import SessionContextBreakdown
@@ -553,3 +556,77 @@ def test_breakdown_lists_declared_servers_when_a_selection_label_is_malformed() 
     )
 
     assert breakdown.tools.mcp_servers == ["github", "slack"]
+
+
+def test_breakdown_returns_the_runner_reports_stored_on_the_session() -> None:
+    """The runner's last-turn report and a later overflow attempt ride on the response."""
+    labels = {
+        REPORTED_BREAKDOWN_LABEL_KEY: '{"system_tokens":1200,"tool_tokens":5400,"tool_count":18}',
+        **failed_turn_breakdown_labels(
+            {
+                "code": "context_length_exceeded",
+                "message": "Context window exceeded",
+                "context_breakdown": {"history_tokens": 190_000, "history_item_count": 300},
+            }
+        ),
+    }
+
+    breakdown = build_context_breakdown(
+        "conv_1",
+        spec=None,
+        harness="claude-sdk",
+        labels=labels,
+        items_newest_first=[],
+        lookup_file=lambda _file_id: None,
+    )
+
+    assert breakdown.reported is not None
+    assert (breakdown.reported.tool_tokens, breakdown.reported.tool_count) == (5400, 18)
+    assert breakdown.failed_attempt is not None
+    assert breakdown.failed_attempt.history_tokens == 190_000
+    assert breakdown.failed_attempt.total_tokens == 190_000
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        # Only an overflow records its attempt.
+        {"code": "rate_limit_exceeded", "message": "slow down", "context_breakdown": {}},
+        {"code": "context_length_exceeded", "message": "too long"},
+        {
+            "code": "context_length_exceeded",
+            "message": "x",
+            "context_breakdown": {"tool_count": -1},
+        },
+        None,
+    ],
+)
+def test_failed_attempt_labels_need_an_overflow_with_a_valid_breakdown(error: object) -> None:
+    assert failed_turn_breakdown_labels(error) == {}
+
+
+def test_breakdown_ignores_a_malformed_stored_report() -> None:
+    breakdown = build_context_breakdown(
+        "conv_1",
+        spec=None,
+        harness=None,
+        labels={REPORTED_BREAKDOWN_LABEL_KEY: "{not json", FAILED_BREAKDOWN_LABEL_KEY: ""},
+        items_newest_first=[],
+        lookup_file=lambda _file_id: None,
+    )
+
+    assert breakdown.reported is None
+    assert breakdown.failed_attempt is None
+
+
+def test_an_overflow_reported_under_a_generic_code_keeps_its_attempt() -> None:
+    """An in-process harness can surface "prompt is too long" as a plain runtime error."""
+    labels = failed_turn_breakdown_labels(
+        {
+            "code": "RuntimeError",
+            "message": "inner executor error: Prompt is too long: 210000 tokens > 200000",
+            "context_breakdown": {"history_tokens": 205_000},
+        }
+    )
+
+    assert json.loads(labels[FAILED_BREAKDOWN_LABEL_KEY]) == {"history_tokens": 205_000}

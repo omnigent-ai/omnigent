@@ -28,24 +28,34 @@ const RING_CIRCUMFERENCE = 2 * Math.PI * 5.5;
  * @param turnActive - Whether a turn is running. An open breakdown refreshes
  *   when a turn starts and ends, and when the transcript's newest entry changes
  *   between turns, since history can change while the measured total stays the same.
+ * @param openNonce - Opens the breakdown each time it changes to a new non-zero
+ *   value, e.g. from the `/context` command.
  */
 export function ComposerContextRing({
   contextWindow,
   tokensUsed,
   sessionId = null,
   turnActive = false,
+  openNonce = 0,
   className,
 }: {
   contextWindow: number | null;
   tokensUsed: number | null;
   sessionId?: string | null;
   turnActive?: boolean;
+  openNonce?: number;
   className?: string;
 }) {
   const [open, setOpen] = useState(false);
   const [tooltipOpen, setTooltipOpen] = useState(false);
   // The breakdown is session-local: a conversation switch starts closed.
   useEffect(() => setOpen(false), [sessionId]);
+  const appliedOpenNonce = useRef(openNonce);
+  useEffect(() => {
+    if (!openNonce || openNonce === appliedOpenNonce.current) return;
+    appliedOpenNonce.current = openNonce;
+    if (sessionId != null) setOpen(true);
+  }, [openNonce, sessionId]);
 
   if (contextWindow == null || contextWindow <= 0 || tokensUsed == null) return null;
 

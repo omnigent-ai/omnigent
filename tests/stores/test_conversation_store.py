@@ -6255,6 +6255,9 @@ def test_fork_conversation_drops_instance_scoped_labels(
             "omnigent.codex_native.bridge_id": source.id,
             "omnigent.last_context_tokens": "39903",
             "omnigent.last_context_window": "1000000",
+            # The runner's breakdowns describe the source's turns.
+            "omnigent.context_breakdown": '{"history_tokens":30000}',
+            "omnigent.context_breakdown_failed": '{"history_tokens":990000}',
             # The dangerous bypass opt-in must NOT ride into the fork.
             "omnigent.codex_native.bypass_sandbox": "1",
             # Creation origin belongs to the source, not the fork.
@@ -6883,12 +6886,18 @@ def test_instance_scoped_label_keys_match_harness_constants() -> None:
     """
     from omnigent.harnesses.claude_native.bridge import BRIDGE_ID_LABEL_KEY
     from omnigent.harnesses.codex_native.bridge import CODEX_NATIVE_BRIDGE_ID_LABEL_KEY
+    from omnigent.server.context_breakdown import (
+        FAILED_BREAKDOWN_LABEL_KEY,
+        REPORTED_BREAKDOWN_LABEL_KEY,
+    )
     from omnigent.stores.conversation_store import _INSTANCE_SCOPED_LABEL_KEYS
 
     # Each harness's canonical bridge-id key must be in the denylist; a
     # miss means a rename slipped past the store's hard-coded literal.
     assert BRIDGE_ID_LABEL_KEY in _INSTANCE_SCOPED_LABEL_KEYS
     assert CODEX_NATIVE_BRIDGE_ID_LABEL_KEY in _INSTANCE_SCOPED_LABEL_KEYS
+    assert REPORTED_BREAKDOWN_LABEL_KEY in _INSTANCE_SCOPED_LABEL_KEYS
+    assert FAILED_BREAKDOWN_LABEL_KEY in _INSTANCE_SCOPED_LABEL_KEYS
 
 
 def test_fork_only_dropped_label_keys_match_sandbox_repo_constant() -> None:

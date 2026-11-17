@@ -7547,9 +7547,41 @@ def session(ctx: click.Context) -> None:
       omnigent session export --id conv_abc123
       omnigent session export --id conv_abc123 --output transcript.jsonl
       omnigent session export --id conv_abc123 --server https://myserver.com
+      omnigent session context --id conv_abc123
     """
     if ctx.invoked_subcommand is None:
         click.echo(ctx.get_help())
+
+
+@contextlib.contextmanager
+def _session_api_client(server: str | None) -> Iterator[httpx.Client]:
+    """
+    An authenticated client for the sessions API of the resolved server.
+
+    :param server: ``--server`` value, or ``None`` for the configured or local server.
+    :returns: A context manager yielding the client, closed on exit.
+    """
+    import httpx
+
+    from omnigent.chat import _remote_headers
+
+    cfg = _load_effective_config()
+    resolved_server = _resolve_attach_server_url(server, cfg.get("server"))
+    if resolved_server is None:
+        startup = ensure_local_omnigent_server()
+        resolved_server = ServerUrl(startup.url)
+    base_url = resolved_server.api_base
+    with httpx.Client(
+        base_url=base_url,
+        headers=_remote_headers(
+            server_url=base_url,
+            host_id=None,
+            org_id=resolved_server.org_id,
+        ),
+        timeout=30.0,
+        trust_env=_trust_env_for(base_url),
+    ) as client:
+        yield client
 
 
 @session.command("export")
@@ -7591,29 +7623,9 @@ def session_export(session_id: str, output: str | None, server: str | None) -> N
       omnigent session export --id conv_abc123 --output my_session.jsonl
       omnigent session export --id conv_abc123 --server https://myserver.com
     """
-    import httpx
-
-    from omnigent.chat import _remote_headers
-
-    cfg = _load_effective_config()
-    resolved_server = _resolve_attach_server_url(server, cfg.get("server"))
-    if resolved_server is None:
-        startup = ensure_local_omnigent_server()
-        resolved_server = ServerUrl(startup.url)
-
-    base_url = resolved_server.api_base
     out_path = Path(output) if output else Path(f"{session_id}.jsonl")
 
-    with httpx.Client(
-        base_url=base_url,
-        headers=_remote_headers(
-            server_url=base_url,
-            host_id=None,
-            org_id=resolved_server.org_id,
-        ),
-        timeout=30.0,
-        trust_env=_trust_env_for(base_url),
-    ) as client:
+    with _session_api_client(server) as client:
         # Fetch session metadata (items fetched separately via pagination).
         resp = client.get(
             f"/v1/sessions/{session_id}",
@@ -7648,6 +7660,85 @@ def session_export(session_id: str, output: str | None, server: str | None) -> N
                 after = page.get("last_id")
 
     click.echo(f"Exported {n_items} item(s) from {session_id} to {out_path}")
+
+
+@session.command("context")
+@click.option(
+    "--id",
+    "session_id",
+    required=True,
+    metavar="SESSION_ID",
+    help="Session ID to inspect, e.g. conv_abc123.",
+)
+@click.option(
+    "--server",
+    default=None,
+    help=(
+        "Omnigent server URL. "
+        "Defaults to the configured server, or a local server already running."
+    ),
+)
+@click.option(
+    "--json",
+    "as_json",
+    is_flag=True,
+    default=False,
+    help="Emit the raw breakdown response as JSON instead of the table.",
+)
+def session_context(session_id: str, server: str | None, as_json: bool) -> None:
+    """Show what fills a session's context window.
+
+    Splits the last turn's measured total into system prompt, tool
+    definitions, attachments, conversation history and the current
+    message, as the web context ring does. Figures from the runner's
+    request are preferred; the rest are estimated from stored content. A
+    later request rejected as too long is listed with what it attempted.
+
+    \b
+    Examples:
+      omnigent session context --id conv_abc123
+      omnigent session context --id conv_abc123 --json
+    """
+    from urllib.parse import quote
+
+    from omnigent.repl._context_breakdown import format_context_breakdown
+
+    session_path = f"/v1/sessions/{quote(session_id, safe='')}"
+    with _session_api_client(server) as client:
+        resp = client.get(
+            session_path,
+            params={"include_items": "false", "include_liveness": "false"},
+        )
+        if resp.status_code == 404:
+            raise click.ClickException(f"Session {session_id!r} not found.")
+        if resp.is_error:
+            raise click.ClickException(
+                f"Could not read session {session_id!r} (HTTP {resp.status_code})."
+            )
+        session_data = resp.json()
+        breakdown_resp = client.get(f"{session_path}/context-breakdown")
+        if breakdown_resp.status_code == 404:
+            raise click.ClickException(
+                "This server does not report a context breakdown; upgrade it to use this command."
+            )
+        if breakdown_resp.is_error:
+            raise click.ClickException(
+                f"Could not read the context breakdown (HTTP {breakdown_resp.status_code})."
+            )
+        breakdown = breakdown_resp.json()
+
+    if as_json:
+        click.echo(json.dumps(breakdown, indent=2))
+        return
+    tokens_used = session_data.get("last_total_tokens")
+    context_window = session_data.get("context_window")
+    click.echo(
+        format_context_breakdown(
+            breakdown,
+            tokens_used=tokens_used if isinstance(tokens_used, int) else None,
+            context_window=context_window if isinstance(context_window, int) else None,
+        )
+    )
 
 
 # Fields on an exported item that belong to the store/envelope, not the typed
