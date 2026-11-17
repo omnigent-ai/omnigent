@@ -6912,19 +6912,264 @@ describe("Composer reply quotes", () => {
     expect(vi.mocked(props.onSend).mock.calls[1]?.[0]).toBe(text);
   });
 
-  it("sends slash-command-looking replies as part of the quoted message", () => {
+  it("opens the slash menu when / is typed with a reply quote attached", () => {
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    render(<Composer {...composerProps()} ref={ref} />);
+    act(() => textarea().focus());
+    fireEvent.change(textarea(), { target: { value: "/" } });
+    expect(screen.getByTestId("slash-menu-item-help")).toBeInTheDocument();
+    fireEvent.change(textarea(), { target: { value: "" } });
+
+    act(() => ref.current?.appendReplyQuote("Use AttributeBackFiller as the pattern"));
+    expect(screen.getByTestId("composer-reply-quote")).toBeInTheDocument();
+    fireEvent.change(textarea(), { target: { value: "/" } });
+    expect(textarea()).toHaveFocus();
+    expect(screen.getByTestId("slash-menu-item-help")).toBeInTheDocument();
+  });
+
+  it("keeps the slash menu closed in reply text before a quote", () => {
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    render(<Composer {...composerProps()} ref={ref} />);
+    act(() => textarea().focus());
+    act(() => ref.current?.appendReplyQuote("First quote"));
+    act(() => ref.current?.appendReplyQuote("Second quote"));
+    const earlier = screen.getByLabelText("Reply text before quote 2");
+    act(() => earlier.focus());
+    fireEvent.change(earlier, { target: { value: "/" } });
+    expect(earlier).toHaveValue("/");
+    expect(screen.queryByTestId("slash-menu-item-help")).toBeNull();
+  });
+
+  it.each(["/frobnicate", "constructor is wrong"])(
+    "sends a reply that is not a known command after its quote: %s",
+    (typed) => {
+      const ref = createRef<ComponentRef<typeof Composer>>();
+      const props = composerProps();
+      render(<Composer {...props} ref={ref} />);
+      act(() => ref.current?.appendReplyQuote("Explain it"));
+      fireEvent.change(textarea(), { target: { value: typed } });
+      expect(activeRow()).toBeNull();
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+      expect(props.onSend).toHaveBeenCalledWith(`> Explain it\n\n${typed}`, undefined, {
+        version: 1,
+        quotes: [{ before: "", text: "Explain it" }],
+        text: typed,
+      });
+    },
+  );
+
+  it("runs a built-in chosen after a reply quote and keeps the quote", () => {
     const ref = createRef<ComponentRef<typeof Composer>>();
     const props = composerProps();
     render(<Composer {...props} ref={ref} />);
     act(() => ref.current?.appendReplyQuote("Explain /help"));
     fireEvent.change(textarea(), { target: { value: "/help" } });
-    expect(activeRow()).toBeNull();
+    expect(activeRow()?.textContent).toContain("/help");
     fireEvent.keyDown(textarea(), { key: "Enter" });
-    expect(props.onSend).toHaveBeenCalledWith("> Explain /help\n\n/help", undefined, {
-      version: 1,
-      quotes: [{ before: "", text: "Explain /help" }],
-      text: "/help",
+
+    expect(screen.getByText(/\/help — Show available slash commands/)).toBeInTheDocument();
+    expect(props.onSend).not.toHaveBeenCalled();
+    expect(screen.getByTestId("composer-reply-quote")).toHaveTextContent("Explain /help");
+    expect(textarea()).toHaveValue("");
+  });
+
+  it.each(["/new", "/help", "/context"])(
+    "clears only a quoted %s's text when it is sent from an earlier field",
+    (command) => {
+      const ref = createRef<ComponentRef<typeof Composer>>();
+      const props = composerProps();
+      render(<Composer {...props} ref={ref} />);
+      fireEvent.change(textarea(), { target: { value: "My context" } });
+      act(() => ref.current?.appendReplyQuote("Use the filler pattern"));
+      fireEvent.change(textarea(), { target: { value: command } });
+      const earlier = screen.getByLabelText("Reply text before quote 1");
+      act(() => earlier.focus());
+      fireEvent.keyDown(earlier, { key: "Enter" });
+
+      expect(props.onSend).not.toHaveBeenCalled();
+      expect(props.onNewSession).toHaveBeenCalledTimes(command === "/new" ? 1 : 0);
+      expect(earlier).toHaveValue("My context");
+      expect(screen.getByTestId("composer-reply-quote")).toHaveTextContent(
+        "Use the filler pattern",
+      );
+      expect(textarea()).toHaveValue("");
+    },
+  );
+
+  it("invokes a skill chosen after a reply quote with the quote as context", () => {
+    setComposerState({
+      sessionHarness: "openai-agents",
+      skills: [{ name: "deslop", description: "Remove AI slop" }],
     });
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    const onSend = vi.fn();
+    const onSendSlashCommand = vi.fn();
+    render(<Composer {...composerProps({ onSend, onSendSlashCommand })} ref={ref} />);
+    fireEvent.change(textarea(), { target: { value: "Context first" } });
+    act(() => ref.current?.appendReplyQuote("Use the filler pattern"));
+    fireEvent.change(textarea(), { target: { value: "/des" } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    fireEvent.change(textarea(), { target: { value: `${textarea().value}tighten it` } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+
+    const replyDraft: StoredReplyDraft = {
+      version: 1,
+      quotes: [{ before: "Context first", text: "Use the filler pattern" }],
+      text: "/deslop tighten it",
+    };
+    expect(onSendSlashCommand).toHaveBeenCalledExactlyOnceWith(
+      "deslop",
+      "tighten it\n\nContext first\n\n> Use the filler pattern",
+      replyDraft,
+    );
+    expect(onSend).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("composer-reply-quote")).toBeNull();
+    expect(textarea()).toHaveValue("");
+
+    const text = serializeReplyDraft(replyDraft);
+    act(() =>
+      useChatStore.setState({
+        failedSendDraft: { conversationId: "conv_test", text, files: [], replyDraft },
+      }),
+    );
+    expect(screen.getByTestId("composer-reply-quote")).toHaveTextContent("Use the filler pattern");
+    expect(screen.getByLabelText("Reply text before quote 1")).toHaveValue("Context first");
+    expect(textarea()).toHaveValue("/deslop tighten it");
+    onSendSlashCommand.mockReturnValueOnce(false);
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(onSendSlashCommand).toHaveBeenLastCalledWith(...onSendSlashCommand.mock.calls[0]!);
+    expect(screen.getByTestId("composer-reply-quote")).toHaveTextContent("Use the filler pattern");
+    expect(textarea()).toHaveValue("/deslop tighten it");
+  });
+
+  it.each([false, true])(
+    "carries reply quotes into a side chat opened with /side (quote added while pending: %s)",
+    async (addQuoteWhilePending) => {
+      setComposerState({
+        sessionHarness: "openai-agents",
+        sideChatToOpen: null,
+        sideChatDrafts: {},
+      });
+      composerSessionSnapshot.sideChatAllowed = true;
+      let finishCreate = () => {};
+      vi.spyOn(sessionsApi, "createSideChat").mockImplementation(
+        () =>
+          new Promise((resolve) => {
+            finishCreate = () => resolve({ childSessionId: "conv_side" });
+          }),
+      );
+      const ref = createRef<ComponentRef<typeof Composer>>();
+      try {
+        renderWithTooltips(<Composer {...composerProps({ permissionLevel: 4 })} ref={ref} />);
+        act(() => ref.current?.appendReplyQuote("Use the filler pattern"));
+        fireEvent.change(textarea(), { target: { value: "/side why this one?" } });
+        fireEvent.keyDown(textarea(), { key: "Enter" });
+        if (addQuoteWhilePending) act(() => ref.current?.appendReplyQuote("A later quote"));
+        await act(async () => finishCreate());
+
+        expect(useChatStore.getState().sideChatDrafts).toEqual({
+          conv_side: "why this one?\n\n> Use the filler pattern",
+        });
+        const remaining = screen.queryAllByTestId("composer-reply-quote");
+        if (addQuoteWhilePending) {
+          expect(remaining).toHaveLength(2);
+          expect(remaining[1]).toHaveTextContent("A later quote");
+        } else {
+          expect(remaining).toHaveLength(0);
+          expect(textarea()).toHaveValue("");
+        }
+      } finally {
+        composerSessionSnapshot.sideChatAllowed = null;
+      }
+    },
+  );
+
+  it("keeps text typed while an unquoted /side is still opening", async () => {
+    setComposerState({ sessionHarness: "openai-agents", sideChatToOpen: null, sideChatDrafts: {} });
+    composerSessionSnapshot.sideChatAllowed = true;
+    let finishCreate = () => {};
+    vi.spyOn(sessionsApi, "createSideChat").mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          finishCreate = () => resolve({ childSessionId: "conv_side" });
+        }),
+    );
+    try {
+      renderWithTooltips(<Composer {...composerProps({ permissionLevel: 4 })} />);
+      fireEvent.change(textarea(), { target: { value: "/side why this one?" } });
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+      fireEvent.change(textarea(), { target: { value: "A new thought" } });
+      await act(async () => finishCreate());
+
+      expect(useChatStore.getState().sideChatDrafts).toEqual({ conv_side: "why this one?" });
+      expect(textarea()).toHaveValue("A new thought");
+    } finally {
+      composerSessionSnapshot.sideChatAllowed = null;
+    }
+  });
+
+  it("keeps a quoted /side draft when the side chat can't be created", async () => {
+    setComposerState({ sessionHarness: "openai-agents", sideChatToOpen: null, sideChatDrafts: {} });
+    composerSessionSnapshot.sideChatAllowed = true;
+    vi.spyOn(sessionsApi, "createSideChat").mockRejectedValue(new Error("fork failed"));
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    try {
+      renderWithTooltips(<Composer {...composerProps({ permissionLevel: 4 })} ref={ref} />);
+      act(() => ref.current?.appendReplyQuote("Use the filler pattern"));
+      fireEvent.change(textarea(), { target: { value: "/side why this one?" } });
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+      await act(async () => {});
+
+      expect(sessionsApi.createSideChat).toHaveBeenCalledOnce();
+      expect(useChatStore.getState().sideChatDrafts).toEqual({});
+      expect(screen.getByTestId("composer-reply-quote")).toHaveTextContent(
+        "Use the filler pattern",
+      );
+      expect(textarea()).toHaveValue("/side why this one?");
+    } finally {
+      composerSessionSnapshot.sideChatAllowed = null;
+    }
+  });
+
+  it.each([
+    ["a skill", "/deslop tighten it", "/deslop tighten it"],
+    ["a goal", "/GOAL\nship it", "/goal ship it"],
+  ])("leads a native session's quoted message with %s", (_kind, typed, command) => {
+    setComposerState({
+      sessionHarness: "claude-native",
+      skills: [{ name: "deslop", description: "Remove AI slop" }],
+    });
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    const props = composerProps({ isNativeWrapper: true, showGoalControl: true });
+    render(<Composer {...props} ref={ref} />);
+    act(() => ref.current?.appendReplyQuote("Use the filler pattern"));
+    fireEvent.change(textarea(), { target: { value: typed } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+
+    expect(props.onSend).toHaveBeenCalledExactlyOnceWith(
+      `${command}\n\n> Use the filler pattern`,
+      undefined,
+      { version: 1, quotes: [{ before: command, text: "Use the filler pattern" }], text: "" },
+    );
+  });
+
+  it("keeps a quoted command after the quote when the reply tags a file", () => {
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    const props = composerProps({ showGoalControl: true });
+    useChatStore.setState({ sessionHarness: "codex-native" });
+    render(<Composer {...props} ref={ref} />);
+    act(() =>
+      useChatStore.setState({
+        pendingComposerAttachments: [{ path: "src/example.ts", isDir: false }],
+      }),
+    );
+    act(() => ref.current?.appendReplyQuote("Actual card"));
+    fireEvent.change(textarea(), { target: { value: "/goal Fix CI" } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+
+    expect(vi.mocked(props.onSend).mock.calls[0]?.[0]).toBe(
+      "[Attached file: src/example.ts] \n\n> Actual card\n\n/goal Fix CI",
+    );
   });
 });
 

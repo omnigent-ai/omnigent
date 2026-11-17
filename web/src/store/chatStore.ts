@@ -3390,6 +3390,13 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       failSet((s) => ({
         pendingUserMessages: s.pendingUserMessages.filter((p) => p.tempId !== tempId),
       }));
+      // A quoted draft comes back only when the server refused it; an unanswered POST may have run.
+      const refused = err instanceof ApiError && err.code !== null;
+      if (opts?.replyDraft && refused && failTarget !== null) {
+        const replyDraft = opts.replyDraft;
+        const text = serializeReplyDraft(replyDraft);
+        failSet({ failedSendDraft: { conversationId: failTarget, text, files: [], replyDraft } });
+      }
       if (!alreadyStreaming) {
         finalizeActive(failSet, "failed", message, null);
         failSet({ status: "idle" });
