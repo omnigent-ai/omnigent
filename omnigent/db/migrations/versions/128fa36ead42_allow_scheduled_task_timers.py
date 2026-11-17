@@ -60,6 +60,9 @@ def _commit_cockroach_batch(connection: sa.Connection) -> None:
 
 def upgrade() -> None:
     """Accept timers in the kind check and index them by session."""
+    # CockroachDB can't drop a check added earlier in the same transaction, as one
+    # upgrade through 27d16059fab9 would, so publish the earlier revisions first.
+    _commit_cockroach_batch(op.get_bind())
     with op.batch_alter_table(_TABLE) as batch:
         # A distinct name lets CockroachDB replace the check in one transaction.
         batch.drop_constraint("ck_scheduled_tasks_kind", type_="check")
