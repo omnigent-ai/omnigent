@@ -412,27 +412,21 @@ def _description_of(url: str) -> str:
     return urllib.parse.parse_qs(urllib.parse.urlparse(url).query).get("description", [""])[0]
 
 
-def test_issue_url_truncates_huge_traceback_keeping_its_tail(data_dir: Path) -> None:
-    """A traceback too large for the URL keeps its final lines, not the whole body."""
+def test_issue_url_truncates_non_ascii_traceback(data_dir: Path) -> None:
+    """Non-ASCII content expands 6x under URL-encoding; the tail still fits."""
     ch.install_crash_handler("omnigent", "omnigent-ai/omnigent")
-    huge_tb = "X" * 30000 + "\nValueError: big crash\n"
-    url, body_included = ch._issue_url(_make_exc("big crash"), huge_tb)
+    frames = "".join(
+        f'  File "répertoire/modèle_{i}.py", line {i}, in échec\n' for i in range(120)
+    )
+    huge_non_ascii = "é" * 30000 + "\n" + frames + "ValueError: crash\n"
+    url, body_included = ch._issue_url(_make_exc("crash"), huge_non_ascii)
     assert len(url) <= ch._MAX_URL_LENGTH
     assert body_included is True
     body = _description_of(url)
     assert "truncated" in body
-    assert "ValueError: big crash" in body
-    assert body.count("X") < 30000
-
-
-def test_issue_url_truncates_non_ascii_traceback(data_dir: Path) -> None:
-    """Non-ASCII content expands 6x under URL-encoding; the tail still fits."""
-    ch.install_crash_handler("omnigent", "omnigent-ai/omnigent")
-    huge_non_ascii = "é" * 30000 + "\nValueError: crash\n"
-    url, body_included = ch._issue_url(_make_exc("crash"), huge_non_ascii)
-    assert len(url) <= ch._MAX_URL_LENGTH
-    assert body_included is True
-    assert "ValueError: crash" in _description_of(url)
+    traceback_body = body.split("**Traceback:**\n", 1)[1]
+    assert 'File "répertoire/modèle_119.py", line 119, in échec' in traceback_body
+    assert "ValueError: crash" in traceback_body
 
 
 def test_issue_url_prefills_tail_of_long_realistic_traceback(data_dir: Path) -> None:
@@ -446,6 +440,8 @@ def test_issue_url_prefills_tail_of_long_realistic_traceback(data_dir: Path) -> 
     )
     tb_text = (
         "Traceback (most recent call last):\n"
+        + "X" * 30000
+        + "\n"
         + frames
         + "ImportError: /lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.33' not found\n"
     )
@@ -454,8 +450,14 @@ def test_issue_url_prefills_tail_of_long_realistic_traceback(data_dir: Path) -> 
     assert len(url) <= ch._MAX_URL_LENGTH
     assert body_included is True
     body = _description_of(url)
-    assert "GLIBC_2.33" in body
-    assert "module_119.py" in body  # innermost frame survives the cut
+    assert "truncated" in body
+    assert body.count("X") < 30000
+    traceback_body = body.split("**Traceback:**\n", 1)[1]
+    assert (
+        "ImportError: /lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.33' not found"
+        in traceback_body
+    )
+    assert "module_119.py" in traceback_body
 
 
 def test_issue_url_drops_body_when_summary_alone_is_too_long(data_dir: Path) -> None:
@@ -468,19 +470,36 @@ def test_issue_url_drops_body_when_summary_alone_is_too_long(data_dir: Path) -> 
     assert "description=" not in url
 
 
-def test_issue_url_scrubs_home_directory_and_tokens(
+def test_issue_url_drops_body_when_command_alone_is_too_long(
     data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ch.install_crash_handler("omnigent", "omnigent-ai/omnigent")
+    monkeypatch.setattr(sys, "argv", ["omnigent", "run", "x" * 9000])
+    url, body_included = ch._issue_url(_make_exc("failure"), "ValueError: failure\n")
+    assert len(url) <= ch._MAX_URL_LENGTH
+    assert body_included is False
+    assert "description=" not in url
+    assert "ValueError" in urllib.parse.parse_qs(urllib.parse.urlparse(url).query)["title"][0]
+
+
+@pytest.mark.parametrize("prefix", ["", "." * 132], ids=["short", "crosses-title-cutoff"])
+def test_issue_url_scrubs_home_directory_and_tokens(
+    data_dir: Path, monkeypatch: pytest.MonkeyPatch, prefix: str
 ) -> None:
     """The title and body must not carry the user's home path or raw tokens."""
     ch.install_crash_handler("omnigent", "omnigent-ai/omnigent")
     monkeypatch.setenv("HOME", "/home/example-user")
-    exc = ImportError("cannot open /home/example-user/.config/app.toml with sk-abcdefghijklmnop")
+    token = "sk-abcdefghijklmnop"
+    exc = ImportError(f"{prefix}{token} cannot open /home/example-user/.config/app.toml")
     tb_text = 'Traceback (most recent call last):\n  File "/home/example-user/app.py", line 1\n'
     url, _ = ch._issue_url(exc, tb_text + "ImportError: cannot open\n")
     decoded_url = urllib.parse.unquote_plus(url)
     assert "example-user" not in decoded_url
     assert "~/app.py" in _description_of(url)
-    assert "sk-abcdefghijklmnop" not in decoded_url
+    assert token not in decoded_url
+    title = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)["title"][0]
+    assert token[:8] not in title
+    assert "sk-a***" in title
 
 
 def test_issue_url_redacts_multiline_bearer_before_truncation(data_dir: Path) -> None:
@@ -509,4 +528,4 @@ def test_issue_url_keeps_short_body_intact(data_dir: Path) -> None:
     assert body_included is True
     body = _description_of(url)
     assert "truncated" not in body
-    assert "ValueError: boom" in body
+    assert short_tb in body

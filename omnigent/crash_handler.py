@@ -486,15 +486,15 @@ def _issue_url(exc: BaseException, tb_text: str) -> tuple[str, bool]:
     OS are always prefilled. The Description holds the exception and the
     traceback; when the full traceback would exceed :data:`_MAX_URL_LENGTH`
     its leading frames are cut, so the exception line and innermost frames
-    survive. The Description is omitted only when the summary alone does
-    not fit (``body_included is False``).
+    survive. The Description is omitted when the exception summary and
+    command without a traceback do not fit (``body_included is False``).
 
     Field IDs (``version``, ``os``, ``description``) come from
     ``.github/ISSUE_TEMPLATE/bug_report.yml``; keep in sync if it changes.
     """
     # Scrub before cutting the tail, so a credential split across lines is caught whole.
     tb_text = _scrub(tb_text)
-    first_line = (str(exc).strip().splitlines() or [""])[0]
+    first_line = (_scrub(str(exc)).strip().splitlines() or [""])[0]
     title = _scrub(f"[Crash] {type(exc).__qualname__}: {first_line[:140]}")
     repo = _CONFIG["repo"]
     version = _CONFIG.get("version", "unknown")
