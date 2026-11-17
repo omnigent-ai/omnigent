@@ -54,6 +54,9 @@ from tests.e2e_ui.messages.test_native_claude_render_parity import (
     _wait_for_transcript_message,
     _wait_terminal_connected,
 )
+from tests.harnesses.claude_native._model_status_oracle import (
+    native_claude_wire_model as _native_claude_wire_model,
+)
 from tests.helpers.ui_configuration import validate_native_claude_mock_routing
 
 _EXPECTED_ROWS = [
@@ -1017,11 +1020,6 @@ _PINNED_CLAUDE_MODELS = {
     "sonnet": "claude-sonnet-4-20250514",
     "opus": "system.ai.claude-opus-4-8[1m]",
 }
-
-
-def _native_claude_wire_model(model: str) -> str:
-    # Claude's native-1M Opus 4.8 omits the public context suffix; private IDs stay literal.
-    return {"system.ai.claude-opus-4-8[1m]": "system.ai.claude-opus-4-8"}.get(model, model)
 
 
 @pytest.fixture

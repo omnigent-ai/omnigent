@@ -9,6 +9,11 @@ from omnigent.harnesses.claude_native import bridge
 from omnigent.harnesses.claude_native.status import sync_raw_status_context
 
 
+def native_claude_wire_model(model: str) -> str:
+    """Map the public native-1M spelling while keeping private model IDs literal."""
+    return {"system.ai.claude-opus-4-8[1m]": "system.ai.claude-opus-4-8"}.get(model, model)
+
+
 def _status_model_matches(bridge_dir: Path, expected: str) -> bool:
     try:
         raw = json.loads((bridge_dir / bridge.CONTEXT_RAW_FILE).read_text())
@@ -18,8 +23,5 @@ def _status_model_matches(bridge_dir: Path, expected: str) -> bool:
     if not isinstance(raw, dict) or not native_session or raw.get("session_id") != native_session:
         return False
     sync_raw_status_context(bridge_dir, None)
-    # Native-1M Opus 4.8 omits this public suffix; every other identity stays literal.
     actual = bridge.read_claude_status_model(bridge_dir)
-    return actual == expected or (
-        expected == "system.ai.claude-opus-4-8[1m]" and actual == "system.ai.claude-opus-4-8"
-    )
+    return actual in (expected, native_claude_wire_model(expected))
