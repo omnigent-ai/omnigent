@@ -187,6 +187,16 @@ describe("Settings source guard", () => {
     ).toEqual([]);
   }, 60_000);
 
+  it("finds an owner for every control the Harnesses section renders, each fix dialog opener's too", () => {
+    const section = path.join(WEB_ROOT, "src/pages/settings/SettingsHarnessesSection.tsx");
+    expect(
+      unexpectedViolations(
+        violationsFrom([{ file: section, name: "SettingsHarnessesSection" }]),
+        false,
+      ),
+    ).toEqual([]);
+  }, 60_000);
+
   it("finds an owner for every control the Harnesses grid renders", () => {
     // The grid's own components, walked as the page renders them; the detail page comes later.
     const section = path.join(WEB_ROOT, "src/pages/settings/SettingsHarnessesSection.tsx");
