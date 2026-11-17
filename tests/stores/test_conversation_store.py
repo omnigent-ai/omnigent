@@ -10672,6 +10672,9 @@ def test_move_sessions_between_nests(tmp_path, split_database, monkeypatch):
     )
     moved = store.create_conversation(
         conversation_id="2" * 32,
+        host_id="b" * 32,
+        runner_id="c" * 32,
+        workspace=str(tmp_path),
         labels={"omni_project": "Other", pinned_label_key("alice"): "234", "custom": "keep"},
     )
     store.set_session_nest(moved.id, source.id, user_id="alice")
@@ -10731,8 +10734,9 @@ def test_move_sessions_between_nests(tmp_path, split_database, monkeypatch):
 
 @pytest.mark.parametrize("detach", [False, True])
 @pytest.mark.parametrize("interleave", [False, True])
+@pytest.mark.parametrize("persistent", [False, True])
 def test_failed_split_database_nest_move_restores_membership(
-    tmp_path, monkeypatch, detach, interleave
+    tmp_path, monkeypatch, detach, interleave, persistent
 ):
     from omnigent.stores.conversation_store import (
         family_pinned_label_key,
@@ -10757,20 +10761,23 @@ def test_failed_split_database_nest_move_restores_membership(
     original = store._profile_label_session
     original_write = sqlalchemy_store.run_write_transaction
     failed = False
+    label_failure_active = not interleave
 
     @contextmanager
     def fail_labels(session, *, read_only=False):
         nonlocal failed
         with original(session, read_only=read_only) as labels_session:
             yield labels_session
-            if not read_only and not failed and not interleave:
+            if not read_only and label_failure_active and (persistent or not failed):
                 failed = True
                 raise RuntimeError("label transaction unavailable")
 
     def interleave_family_changes(session_maker, operation_name, callback, **kwargs):
+        nonlocal failed, label_failure_active
         if interleave and operation_name == "copy_session_nest_labels":
             store.set_conversation_project(source.id, "b" * 32)
             store.set_family_pin(source.id, "456", user_id="alice")
+            failed = label_failure_active = True
             raise RuntimeError("label transaction unavailable")
         return original_write(session_maker, operation_name, callback, **kwargs)
 
@@ -10782,6 +10789,14 @@ def test_failed_split_database_nest_move_restores_membership(
     saved = store.get_conversation(moved.id)
     assert saved.family_id == source.id
     assert saved.project_id == ("b" * 32 if interleave else None)
+    assert saved.labels[pinned_label_key("alice")] == "234"
+    if persistent:
+        assert saved.labels[family_pinned_label_key("alice")] == "123"
+        store = SqlAlchemyConversationStore(
+            f"sqlite:///{tmp_path / 'metadata.db'}", f"sqlite:///{tmp_path / 'messages.db'}"
+        )
+        store._repair_pending_nest_labels(moved.id)
+        saved = store.get_conversation(moved.id)
     assert saved.labels.get("omni_project") == (None if interleave else "Original")
     assert saved.labels[family_pinned_label_key("alice")] == ("456" if interleave else "123")
     assert saved.labels[pinned_label_key("alice")] == "234"
@@ -10790,3 +10805,97 @@ def test_failed_split_database_nest_move_restores_membership(
     assert saved.family_id == (None if detach else destination.id)
     assert saved.project_id == (("b" * 32 if interleave else None) if detach else "a" * 32)
     assert family_pinned_label_key("alice") not in saved.labels
+
+
+@pytest.mark.parametrize("split_database", [False, True])
+def test_sibling_admission_rechecks_a_stale_source(tmp_path, monkeypatch, split_database):
+    store = SqlAlchemyConversationStore(
+        f"sqlite:///{tmp_path / 'metadata.db'}",
+        f"sqlite:///{tmp_path / 'messages.db'}" if split_database else None,
+    )
+    source = store.create_conversation()
+    first = store.create_conversation()
+    second = store.create_conversation()
+    store.add_new_sibling(source.id, first.id, user_id="alice")
+    original = store.get_conversation
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            store, "get_conversation", lambda key: source if key == source.id else original(key)
+        )
+        store.add_new_sibling(source.id, second.id, user_id="alice")
+    assert {member.id for member in store.get_session_family(source.id)} == {
+        source.id,
+        first.id,
+        second.id,
+    }
+
+
+@pytest.mark.parametrize("fresh_family_id", [False, True])
+def test_legacy_split_database_finisher_preserves_initial_family_pin(
+    tmp_path, monkeypatch, fresh_family_id
+):
+    from omnigent.db.db_models import SqlConversationMetadata, current_workspace_id
+    from omnigent.stores.conversation_store import (
+        family_pinned_label_key,
+        pinned_label_key,
+        sqlalchemy_store,
+    )
+
+    store = SqlAlchemyConversationStore(
+        f"sqlite:///{tmp_path / 'metadata.db'}", f"sqlite:///{tmp_path / 'messages.db'}"
+    )
+    source = store.create_conversation(labels={"omni_project": "Planning"})
+    if fresh_family_id:
+        previous_peer = store.create_conversation()
+        store.add_new_sibling(source.id, previous_peer.id, user_id="alice")
+        store.set_session_nest(source.id, None, user_id="alice")
+    store.set_labels(source.id, {pinned_label_key("alice"): "123"})
+    created = store.create_conversation()
+    legacy_member = store.create_conversation()
+    original_write = sqlalchemy_store.run_write_transaction
+    interleaved = False
+
+    def interleave_legacy_finisher(session_maker, operation_name, callback, **kwargs):
+        nonlocal interleaved
+        if operation_name == "copy_sibling_labels" and not interleaved:
+            interleaved = True
+            family_id = store.get_conversation(source.id).family_id
+            with store._session_immediate("legacy_sibling_membership") as session:
+                store._lock_session_family(session, family_id)
+                source_meta = session.get(
+                    SqlConversationMetadata, (current_workspace_id(), source.id)
+                )
+                member_meta = session.get(
+                    SqlConversationMetadata, (current_workspace_id(), legacy_member.id)
+                )
+                member_meta.family_id = family_id
+                member_meta.project_id = source_meta.project_id
+            with store._session_immediate("legacy_sibling_labels") as session:
+                family_lock = store._lock_session_family(session, family_id)
+                initialize = family_lock.value == "pending_initial_labels"
+                assert initialize is not fresh_family_id
+                source_meta = session.get(
+                    SqlConversationMetadata, (current_workspace_id(), source.id)
+                )
+                with store._profile_label_session(session) as labels_session:
+                    store._copy_family_labels(
+                        labels_session,
+                        store._family_member_ids(session, family_id)
+                        if initialize
+                        else [legacy_member.id],
+                        label_source_id=family_id if initialize else source.id,
+                        promote_pin=initialize,
+                        project_id=source_meta.project_id,
+                        user_id="alice",
+                    )
+                family_lock.value = "{}"
+        return original_write(session_maker, operation_name, callback, **kwargs)
+
+    monkeypatch.setattr(sqlalchemy_store, "run_write_transaction", interleave_legacy_finisher)
+    store.add_new_sibling(source.id, created.id, user_id="alice")
+    assert interleaved
+    family = store.get_session_family(source.id)
+    assert {member.id for member in family} == {source.id, created.id, legacy_member.id}
+    assert all(member.labels[family_pinned_label_key("alice")] == "123" for member in family)
+    assert all(member.labels["omni_project"] == "Planning" for member in family)
+    assert pinned_label_key("alice") not in store.get_conversation(source.id).labels

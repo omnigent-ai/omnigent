@@ -2055,11 +2055,101 @@ class SqlAlchemyConversationStore(ConversationStore):
         return families
 
     def _new_family_id(self, source: Conversation) -> str:
-        if source.family_id is not None:
-            return source.family_id
         with self._session("choose_session_family") as session:
-            occupied = self._family_member_ids(session, source.id)
-        return uuid.uuid4().hex if occupied else source.id
+            current = session.execute(
+                select(
+                    SqlConversationMetadata.family_id,
+                    select(SqlConversationMetadata.id)
+                    .where(
+                        SqlConversationMetadata.workspace_id == current_workspace_id(),
+                        SqlConversationMetadata.family_id == source.id,
+                    )
+                    .correlate(None)
+                    .limit(1)
+                    .exists(),
+                ).where(
+                    SqlConversationMetadata.workspace_id == current_workspace_id(),
+                    SqlConversationMetadata.id == source.id,
+                )
+            ).one_or_none()
+        if current is None:
+            raise ConversationNotFoundError(source.id)
+        family_id, occupied = current
+        return family_id or (uuid.uuid4().hex if occupied else source.id)
+
+    def _begin_family_labels(
+        self, session: Session, family_lock: SqlPreference, source_id: str
+    ) -> None:
+        if source_id == family_lock.key:
+            family_lock.value = "pending_initial_labels"
+        else:
+            # Older finishers must leave initialization with a different source to new servers.
+            family_lock.value = "{}"
+            session.merge(
+                SqlPreference(
+                    workspace_id=current_workspace_id(),
+                    user_id="__session_family_initialization__",
+                    key=family_lock.key,
+                    value=source_id,
+                )
+            )
+
+    def _family_label_source(self, session: Session, family_lock: SqlPreference) -> str | None:
+        pending = session.get(
+            SqlPreference,
+            (current_workspace_id(), "__session_family_initialization__", family_lock.key),
+        )
+        if pending is not None:
+            return pending.value
+        if family_lock.value == "pending_initial_labels":
+            return family_lock.key
+        return json.loads(family_lock.value).get("initial_label_source")
+
+    def _complete_family_labels(self, session: Session, family_lock: SqlPreference) -> None:
+        pending = session.get(
+            SqlPreference,
+            (current_workspace_id(), "__session_family_initialization__", family_lock.key),
+        )
+        if pending is not None:
+            session.delete(pending)
+        family_lock.value = "{}"
+
+    def _repair_pending_nest_labels(self, session_id: str) -> None:
+        key = (current_workspace_id(), "__session_nest_repairs__", session_id)
+        with self._session("read_pending_nest_labels") as session:
+            pending = session.get(SqlPreference, key)
+            if pending is None:
+                return
+            expected = pending.value
+        repair = json.loads(expected)
+        family_id = repair["family_id"]
+
+        def write(session: Session) -> None:
+            self._lock_session_family(session, family_id)
+            pending = session.get(SqlPreference, key, with_for_update=True)
+            if pending is None or pending.value != expected:
+                return
+            target = session.get(
+                SqlConversationMetadata, (current_workspace_id(), session_id), with_for_update=True
+            )
+            if target is not None and target.family_id == family_id:
+                peers = self._family_member_ids(session, family_id)
+                peer_id = next((member_id for member_id in peers if member_id != session_id), None)
+                if peer_id is not None:
+                    peer = session.get(SqlConversationMetadata, (current_workspace_id(), peer_id))
+                    assert peer is not None
+                    with self._profile_label_session(session) as labels_session:
+                        self._copy_family_labels(
+                            labels_session,
+                            [session_id],
+                            label_source_id=peer_id,
+                            promote_pin=False,
+                            project_id=peer.project_id,
+                            user_id=repair["user_id"],
+                        )
+            session.delete(pending)
+
+        run_write_transaction(self._session_immediate, "repair_pending_nest_labels", write)
 
     def _copy_family_labels(
         self,
@@ -2165,7 +2255,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                         user_id=user_id,
                     )
             if self._conv_engine is not self._engine and source_meta.family_id is None:
-                family_lock.value = json.dumps({"initial_label_source": source_id})
+                self._begin_family_labels(session, family_lock, source_id)
             target_meta.project_id = source_meta.project_id
             source_meta.family_id = family_id
             target_meta.family_id = family_id
@@ -2183,11 +2273,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     raise OmnigentError(
                         "Sibling source is no longer available", code=ErrorCode.CONFLICT
                     )
-                initial_source = (
-                    family_id
-                    if family_lock.value == "pending_initial_labels"
-                    else json.loads(family_lock.value).get("initial_label_source")
-                )
+                initial_source = self._family_label_source(session, family_lock)
                 initialize_labels = initial_source is not None
                 with self._profile_label_session(session) as labels_session:
                     self._copy_family_labels(
@@ -2199,7 +2285,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                         user_id=user_id,
                     )
                 # Clear only after the separate label transaction commits.
-                family_lock.value = "{}"
+                self._complete_family_labels(session, family_lock)
 
             run_write_transaction(self._session_immediate, "copy_sibling_labels", finish_labels)
 
@@ -2211,6 +2297,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         if moved is None or (source_id is not None and source is None):
             raise ConversationNotFoundError(session_id if moved is None else source_id)
         session_id = moved.id
+        self._repair_pending_nest_labels(session_id)
         source_id = source.id if source is not None else None
         if source_id == session_id:
             return
@@ -2258,11 +2345,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     )
                 else:
                     assert family_lock is not None and family_id is not None
-                    initial_source = (
-                        family_id
-                        if family_lock.value == "pending_initial_labels"
-                        else json.loads(family_lock.value).get("initial_label_source")
-                    )
+                    initial_source = self._family_label_source(session, family_lock)
                     self._copy_family_labels(
                         labels_session,
                         self._family_member_ids(session, family_id)
@@ -2275,7 +2358,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     )
             labels_copied = True
             if family_lock is not None:
-                family_lock.value = "{}"
+                self._complete_family_labels(session, family_lock)
 
         def write(session: Session) -> None:
             target_meta, source_meta, family_lock = lock_members(session)
@@ -2318,7 +2401,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                         code=ErrorCode.INVALID_INPUT,
                     )
                 if source_meta.family_id is None:
-                    family_lock.value = json.dumps({"initial_label_source": source_id})
+                    self._begin_family_labels(session, family_lock, source_meta.id)
                 source_meta.family_id = family_id
                 target_meta.project_id = source_meta.project_id
             target_meta.family_id = family_id
@@ -2362,15 +2445,16 @@ class SqlAlchemyConversationStore(ConversationStore):
                                 )
                                 assert peer_meta is not None
                                 target_meta.project_id = peer_meta.project_id
-                                with self._profile_label_session(session) as labels_session:
-                                    self._copy_family_labels(
-                                        labels_session,
-                                        [session_id],
-                                        label_source_id=peer_id,
-                                        promote_pin=False,
-                                        project_id=peer_meta.project_id,
-                                        user_id=user_id,
+                                session.merge(
+                                    SqlPreference(
+                                        workspace_id=current_workspace_id(),
+                                        user_id="__session_nest_repairs__",
+                                        key=session_id,
+                                        value=json.dumps(
+                                            {"family_id": moved.family_id, "user_id": user_id}
+                                        ),
                                     )
+                                )
                         if (
                             source_meta is not None
                             and source is not None
@@ -2384,11 +2468,17 @@ class SqlAlchemyConversationStore(ConversationStore):
                             if not retained and source_meta.family_id == family_id:
                                 source_meta.family_id = None
                                 assert family_lock is not None
-                                family_lock.value = "{}"
+                                self._complete_family_labels(session, family_lock)
 
                     run_write_transaction(
                         self._session_immediate, "restore_session_nest", restore_membership
                     )
+                    try:
+                        self._repair_pending_nest_labels(session_id)
+                    except Exception:
+                        _logger.exception(
+                            "Nest label restoration remains pending for %s", session_id
+                        )
                 raise
 
     def set_family_pin(self, session_id: str, value: str, *, user_id: str | None) -> None:
