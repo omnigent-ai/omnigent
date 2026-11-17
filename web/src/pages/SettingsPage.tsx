@@ -1564,11 +1564,15 @@ function GithubIntegrationControl() {
 
   const returnTo = `${window.location.pathname}${window.location.search}`;
 
-  if (status === "loading") {
-    return <p className="text-sm text-muted-foreground">Checking…</p>;
-  }
-  if (status === null) {
-    return <p className="text-sm text-muted-foreground">GitHub status is unavailable.</p>;
+  if (status === "loading" || status === null) {
+    return (
+      <SettingsItem entry={GITHUB_CONNECTION_ENTRY}>
+        <SettingsEntryLabel entry={GITHUB_CONNECTION_ENTRY} labelClassName="text-sm" />
+        <p className="text-sm text-muted-foreground">
+          {status === "loading" ? "Checking…" : "GitHub status is unavailable."}
+        </p>
+      </SettingsItem>
+    );
   }
 
   return (
@@ -1757,11 +1761,15 @@ function DatabricksIntegrationControl() {
   if (status !== "loading" && status !== null && !status.enabled) {
     return null;
   }
-  if (status === "loading") {
-    return <p className="text-sm text-muted-foreground">Checking…</p>;
-  }
-  if (status === null) {
-    return <p className="text-sm text-muted-foreground">Databricks status is unavailable.</p>;
+  if (status === "loading" || status === null) {
+    return (
+      <SettingsItem entry={DATABRICKS_CONNECTION_ENTRY}>
+        <SettingsEntryLabel entry={DATABRICKS_CONNECTION_ENTRY} labelClassName="text-sm" />
+        <p className="text-sm text-muted-foreground">
+          {status === "loading" ? "Checking…" : "Databricks status is unavailable."}
+        </p>
+      </SettingsItem>
+    );
   }
 
   return (

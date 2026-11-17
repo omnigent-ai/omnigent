@@ -23,6 +23,8 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { Conversation } from "@/hooks/useConversations";
 import { BACKGROUND_SESSION_TITLES_STORAGE_KEY } from "@/lib/backgroundSessionTitlesPreferences";
 import { OPEN_SUBAGENTS_IN_PANEL_STORAGE_KEY } from "@/lib/subagentPanelPreferences";
+import { fetchDatabricksStatus } from "@/lib/databricksIntegration";
+import { fetchGithubStatus } from "@/lib/githubIntegration";
 import {
   useProjectFolderCollapse,
   useProjectFolderPageSize,
@@ -1882,6 +1884,33 @@ describe("SettingsPage", () => {
     expect(
       document.querySelector('[data-settings-control="databricks-connection:workspace"]'),
     ).not.toBeNull();
+  });
+
+  it("keeps the GitHub and Databricks rows on the page while their status is checking", () => {
+    mocks.enabledConnections = ["github", "databricks"];
+    renderPage("/settings/integrations");
+    for (const id of ["github-connection", "databricks-connection"]) {
+      expect(document.querySelector(`[data-settings-item="${id}"]`)).not.toBeNull();
+    }
+  });
+
+  it("keeps the integration rows on the page when their status can't be read", async () => {
+    mocks.enabledConnections = ["github", "databricks"];
+    vi.mocked(fetchGithubStatus).mockRejectedValueOnce(new Error("offline"));
+    vi.mocked(fetchDatabricksStatus).mockRejectedValueOnce(new Error("offline"));
+    renderPage("/settings/integrations");
+    expect(
+      await screen.findByText("GitHub status is unavailable.", { selector: "p" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("Databricks status is unavailable.", { selector: "p" }),
+    ).toBeInTheDocument();
+    expect(
+      document.querySelector('[data-settings-item="github-connection"]')?.textContent,
+    ).toContain("GitHub status is unavailable.");
+    expect(
+      document.querySelector('[data-settings-item="databricks-connection"]')?.textContent,
+    ).toContain("Databricks status is unavailable.");
   });
 
   it("lists archived sessions and unarchives on click", () => {
