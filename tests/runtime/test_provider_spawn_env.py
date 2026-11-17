@@ -523,6 +523,31 @@ def test_locked_codex_gateway_requires_private_renewable_source_and_exact_route(
         _build_codex_spawn_env(spec)
 
 
+def test_codex_binding_keeps_ordinary_auth_for_non_reserved_same_host_token() -> None:
+    binding = CredentialProxyEntry(
+        host="openai.example.com",
+        scheme="bearer",
+        source=CredentialSourceSpec(kind="env", env="PARENT_TOKEN"),
+        inject_env=["OTHER_TOKEN"],
+    )
+    sandbox = OSEnvSandboxSpec(
+        type="darwin_seatbelt",
+        egress_rules=["POST openai.example.com/v1/responses"],
+        credential_proxy=CredentialProxySpec(entries=[binding]),
+    )
+    spec = _make_spec(harness="codex", os_env=OSEnvSpec(sandbox=sandbox))
+    ordinary_env = {
+        "HARNESS_CODEX_GATEWAY_BASE_URL": "https://openai.example.com/v1",
+        "HARNESS_CODEX_GATEWAY_AUTH_COMMAND": "printf %s sk-oai-secret",
+    }
+    env = ordinary_env.copy()
+
+    _bind_codex_gateway_credential(env, spec)
+
+    assert env == ordinary_env
+    assert "HARNESS_CODEX_BROKERED_GATEWAY" not in env
+
+
 @pytest.mark.parametrize(
     ("settings", "tool_env"),
     [
