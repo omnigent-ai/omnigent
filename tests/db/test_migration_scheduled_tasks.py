@@ -1212,26 +1212,55 @@ def test_timer_kind_migration_round_trips(dispatch_migration_engine: Engine) -> 
         )
         conn.execute(tasks.insert().values(id=b"f" * 16, kind=3, state=4, **values))
         conn.execute(tasks.insert().values(id=b"a" * 16, kind=1, **values))
-    with pytest.raises(RuntimeError, match="Delete active or paused timer"):
-        migrate(down=True)
+    # An active or a paused timer holds the downgrade back.
+    for state in (1, 2):
+        with engine.begin() as conn:
+            conn.execute(tasks.update().where(tasks.c.id == b"t" * 16).values(state=state))
+        with pytest.raises(RuntimeError, match="Delete active or paused timer"):
+            migrate(down=True)
     with engine.begin() as conn:
         conn.execute(tasks.update().where(tasks.c.id == b"t" * 16).values(state=3))
     updates: list[str] = []
+    pages: list[str] = []
+    plans: list[str] = []
+    interrupt_at = [201]
 
-    def inspect_cleanup(conn, _cursor, statement, _parameters, _context, _executemany) -> None:
+    def inspect_cleanup(conn, cursor, statement, parameters, _context, _executemany) -> None:
         if statement.startswith("UPDATE scheduled_tasks"):
             updates.append(statement)
             if engine.dialect.name != "cockroachdb":
                 assert conn.get_execution_options().get("isolation_level") == "AUTOCOMMIT"
+            if engine.dialect.name == "sqlite" and not plans:
+                steps = cursor.connection.execute(f"EXPLAIN QUERY PLAN {statement}", parameters)
+                plans.append(" ".join(str(step) for step in steps.fetchall()))
+            if len(updates) in interrupt_at:
+                raise RuntimeError("interrupted")
         elif statement.startswith("SELECT scheduled_tasks.workspace_id, scheduled_tasks.id"):
+            pages.append(statement)
             assert "LIMIT" in statement
 
     sa.event.listen(engine, "before_cursor_execute", inspect_cleanup)
     try:
+        # Stopped at the second batch's first row, the first batch stays converted.
+        with pytest.raises(RuntimeError, match="interrupted"):
+            migrate(down=True)
+        with engine.connect() as conn:
+            version = conn.execute(sa.text("SELECT version_num FROM alembic_version"))
+            assert version.scalar_one() == _TIMER_KIND_REVISION
+            timers = sa.select(sa.func.count()).select_from(tasks).where(tasks.c.kind == 3)
+            assert conn.execute(timers).scalar_one() == 3
+        interrupt_at.clear()
+        updates.clear()
+        pages.clear()
         migrate(down=True)
     finally:
         sa.event.remove(engine, "before_cursor_execute", inspect_cleanup)
-    assert len(updates) == 2
+    # The retry converts the rest in one page, then finds none left.
+    assert (len(updates), len(pages)) == (3, 2)
+    if engine.dialect.name == "sqlite":
+        # Each update finds its row by primary key instead of scanning the remaining timers.
+        assert "id=?" in plans[0]
+        assert "ix_scheduled_tasks_kind_session" not in plans[0]
     assert "ix_scheduled_tasks_kind_session" not in {
         index["name"] for index in sa.inspect(engine).get_indexes("scheduled_tasks")
     }

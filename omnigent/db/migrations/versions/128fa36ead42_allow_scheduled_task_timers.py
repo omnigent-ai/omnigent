@@ -23,7 +23,8 @@ downgrade with a build that includes this migration (``OMNIGENT_DB_URL=<uri>
 alembic -c omnigent/db/alembic.ini downgrade f7c2d8a4b901``), and start the older
 build. The downgrade refuses while an active or paused timer remains. It turns
 finished and deleted timers into deleted automations, which cleanup purges, in
-batches that each commit, so an interrupted downgrade can be run again.
+batches that each commit, so a downgrade interrupted during that conversion can
+be run again.
 """
 
 from __future__ import annotations
@@ -99,19 +100,19 @@ def downgrade() -> None:
         )
         .limit(_CLEANUP_BATCH)
     )
-    key = sa.tuple_(tasks.c.workspace_id, tasks.c.id)
     page = connection.execute(finished).all()
     cockroach = connection.dialect.name == "cockroachdb"
     if page:
         # Each batch commits on its own; the revision moves only after the DDL below.
         with nullcontext() if cockroach else op.get_context().autocommit_block():
             while page:
-                connection.execute(
-                    tasks.update()
-                    .where(key.in_([(row.workspace_id, row.id) for row in page]))
-                    .where(tasks.c.kind == _TIMER)
-                    .values(kind=_AUTOMATION, state=_DELETED)
-                )
+                # A full primary key per row keeps each update a key lookup.
+                for row in page:
+                    connection.execute(
+                        tasks.update()
+                        .where(tasks.c.workspace_id == row.workspace_id, tasks.c.id == row.id)
+                        .values(kind=_AUTOMATION, state=_DELETED)
+                    )
                 _commit_cockroach_batch(connection)
                 page = connection.execute(finished).all()
     with op.batch_alter_table(_TABLE) as batch:
