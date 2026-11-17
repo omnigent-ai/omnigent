@@ -36,6 +36,7 @@ from omnigent.inner.executor import (
     ExecutorEvent,
     Message,
     MockExecutor,
+    NativeTurnAcceptance,
     ToolCallComplete,
     ToolCallRequest,
     ToolCallStatus,
@@ -115,7 +116,17 @@ def _build_text_only() -> Executor:
     :returns: A configured :class:`MockExecutor` instance.
     """
     executor = MockExecutor()
-    executor.enqueue_response("hello from mock")
+    raw_acceptance = os.environ.get("MOCK_EXECUTOR_NATIVE_ACCEPTANCE")
+    executor._turns.append(
+        [
+            TurnComplete(
+                response="hello from mock",
+                native_acceptance=NativeTurnAcceptance(**json.loads(raw_acceptance))
+                if raw_acceptance
+                else None,
+            )
+        ]
+    )
     return executor
 
 

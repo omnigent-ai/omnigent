@@ -14,14 +14,18 @@ import asyncio
 import time
 import uuid
 from collections.abc import Callable
+from dataclasses import asdict
 from typing import Any
 
 import pytest
 
 from omnigent.harnesses.claude_native import bridge as claude_native_bridge
+from omnigent.inner.executor import NativeTurnAcceptance
 from omnigent.runner import create_runner_app, subagent_work
 from omnigent.runner.tool_dispatch import execute_tool
 from tests.runner.conftest import (
+    _BlockingHarnessClient,
+    _drain_session_event_queue,
     _FakeProcessManager,
     _runner_client,
     _ScriptedHarnessClient,
@@ -73,19 +77,36 @@ async def _wait_until(condition: Callable[[], bool], message: str, timeout: floa
         await asyncio.sleep(0.02)
 
 
-def _turn_frames(response_id: str) -> list[str]:
+def _turn_frames(
+    response_id: str,
+    native_acceptance: NativeTurnAcceptance | dict[str, Any] | str | None = None,
+    *,
+    include_null_acceptance: bool = False,
+) -> list[str]:
+    completed: dict[str, Any] = {
+        "type": "response.completed",
+        "response": {"id": response_id, "status": "completed"},
+    }
+    if native_acceptance is not None or include_null_acceptance:
+        completed["native_acceptance"] = (
+            asdict(native_acceptance)
+            if isinstance(native_acceptance, NativeTurnAcceptance)
+            else native_acceptance
+        )
     return [
         _sse({"type": "response.created", "response": {"id": response_id}}),
-        _sse({"type": "response.completed", "response": {"id": response_id}}),
+        _sse(completed),
     ]
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "prompt_accepted", [False, True], ids=["unacknowledged-launch", "silent-codex"]
+    ("prompt_accepted", "delayed_previous_acceptance"),
+    [(False, False), (True, False), (True, True)],
+    ids=["unacknowledged-launch", "silent-codex", "silent-codex-after-stale-finalizer"],
 )
 async def test_reaped_native_launch_must_not_discard_childs_real_completion(
-    monkeypatch: pytest.MonkeyPatch, prompt_accepted: bool
+    monkeypatch: pytest.MonkeyPatch, prompt_accepted: bool, delayed_previous_acceptance: bool
 ) -> None:
     """A launch-reaped dispatch must still deliver the child's later completion.
 
@@ -100,10 +121,21 @@ async def test_reaped_native_launch_must_not_discard_childs_real_completion(
     budget_s = subagent_work._DEFAULT_SUBAGENT_LAUNCH_TIMEOUT_S
     parent_id = uuid.uuid4().hex
     child_id = uuid.uuid4().hex
+    child_agent_id = uuid.uuid4().hex
     inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
     server_client = _WakeRecordingServerClient(parent_id)
     turn_streamed = asyncio.Event()
-    harness = _ScriptedHarnessClient(_turn_frames("resp_wake"), stream_finished=turn_streamed)
+    native_acceptance = NativeTurnAcceptance(child_id, "thread_review", "codex_turn_review")
+    old_acceptance = NativeTurnAcceptance(child_id, "thread_review", "codex_turn_previous")
+    delivery_gate = asyncio.Event()
+    harness = (
+        _BlockingHarnessClient(_turn_frames("resp_previous", old_acceptance), delivery_gate)
+        if delayed_previous_acceptance
+        else _ScriptedHarnessClient(
+            _turn_frames("resp_wake", native_acceptance if prompt_accepted else None),
+            stream_finished=turn_streamed,
+        )
+    )
     app = create_runner_app(
         process_manager=_FakeProcessManager(harness),  # type: ignore[arg-type]
         server_client=server_client,  # type: ignore[arg-type]
@@ -117,6 +149,82 @@ async def test_reaped_native_launch_must_not_discard_childs_real_completion(
     )
 
     try:
+        if delayed_previous_acceptance:
+            async with _runner_client(app) as client:
+                resp = await client.post(
+                    f"/v1/sessions/{child_id}/events",
+                    json={
+                        "type": "message",
+                        "role": "user",
+                        "agent_id": child_agent_id,
+                        "model": "test-agent",
+                        "harness_override": "codex-native",
+                        "content": [{"type": "input_text", "text": "Previous review."}],
+                    },
+                )
+                assert resp.status_code == 202, resp.text
+                assert isinstance(harness, _BlockingHarnessClient)
+                await asyncio.wait_for(harness.post_seen.wait(), timeout=5.0)
+                assert child_id in subagent_work._pending_child_acceptances
+                resp = await client.post(
+                    f"/v1/sessions/{child_id}/events",
+                    json={
+                        "type": "external_session_status",
+                        "data": {
+                            "status": "idle",
+                            "turn_outcome": "completed",
+                            "response_id": old_acceptance.response_id,
+                            "output": "Previous report.",
+                        },
+                    },
+                )
+                assert resp.status_code == 204, resp.text
+                assert entry.status == "completed"
+                delivery_gate.set()
+                await _wait_until(
+                    lambda: child_id not in app.state.active_turns,
+                    "the previous delivery finalizer never ended",
+                )
+                assert child_id not in subagent_work._pending_child_acceptances
+                assert child_id not in subagent_work._children_accepted_turns
+                assert entry.awaiting_child_start_since is None
+                await _wait_until(
+                    lambda: any("finished (completed)" in n for n in server_client.wakes()),
+                    "the previous result never woke its parent",
+                )
+                previous_report = await execute_tool(
+                    tool_name="sys_read_inbox",
+                    arguments="{}",
+                    server_client=server_client,
+                    conversation_id=parent_id,
+                    session_inbox=inbox,
+                )
+                assert "Previous report." in previous_report
+                assert subagent_work.get_subagent_work(child_id) is None
+                assert server_client.label_patches == [
+                    {subagent_work.SUBAGENT_DELIVERED_ID_LABEL_KEY: entry.work_id}
+                ]
+                resp = await client.post(
+                    f"/v1/sessions/{parent_id}/events",
+                    json={
+                        "type": "message",
+                        "role": "user",
+                        "agent_id": uuid.uuid4().hex,
+                        "model": "test-agent",
+                        "harness": "openai-agents",
+                        "content": [
+                            {"type": "input_text", "text": "sub-agent finished (completed)"}
+                        ],
+                    },
+                )
+                assert resp.status_code == 202, resp.text
+                await _wait_until(
+                    lambda: parent_id not in app.state.active_turns,
+                    "the previous result's parent wake turn never ended",
+                )
+                harness._sse_frames = _turn_frames("resp_current", native_acceptance)
+                harness.post_seen.clear()
+        prior_receipts = server_client.label_patches[:]
         earliest_start = latest_start = entry.created_at
         if prompt_accepted:
             async with _runner_client(app) as client:
@@ -126,19 +234,38 @@ async def test_reaped_native_launch_must_not_discard_childs_real_completion(
                     json={
                         "type": "message",
                         "role": "user",
-                        "agent_id": uuid.uuid4().hex,
+                        "agent_id": child_agent_id,
                         "model": "test-agent",
                         "harness_override": "codex-native",
                         "content": [{"type": "input_text", "text": "Double-check the change."}],
                     },
                 )
                 assert resp.status_code == 202, resp.text
-                await asyncio.wait_for(turn_streamed.wait(), timeout=5.0)
+                await asyncio.wait_for(
+                    harness.post_seen.wait()
+                    if isinstance(harness, _BlockingHarnessClient)
+                    else turn_streamed.wait(),
+                    timeout=5.0,
+                )
                 await _wait_until(
                     lambda: child_id not in app.state.active_turns,
                     "the codex-native delivery turn never ended",
                 )
                 latest_start = time.time()
+                assert child_id not in subagent_work._pending_child_acceptances
+                if delayed_previous_acceptance:
+                    # The current acceptance precedes the parent's fresh registration.
+                    previous_work_id = entry.work_id
+                    entry = subagent_work.register_subagent_work(
+                        parent_session_id=parent_id,
+                        child_session_id=child_id,
+                        agent="codex-native",
+                        title="impl",
+                    )
+                    entry.status = "running"
+                    subagent_work.apply_child_start_evidence(entry)
+                    assert entry.work_id != previous_work_id
+                    assert entry.native_acceptance == native_acceptance
             assert harness.posted_bodies, "the brief never reached the codex-native harness"
             assert entry.status == "running"
             # Registration may predate acceptance; only acceptance starts this bound.
@@ -184,7 +311,7 @@ async def test_reaped_native_launch_must_not_discard_childs_real_completion(
             "real completion can no longer replace it"
         )
         assert entry.launch_timed_out
-        assert server_client.label_patches == [], (
+        assert server_client.label_patches == prior_receipts, (
             "draining the reaper's guess wrote a delivered receipt, so a runner "
             "restart would never recover the child's real result either"
         )
@@ -214,7 +341,13 @@ async def test_reaped_native_launch_must_not_discard_childs_real_completion(
                 # The silent child was only slow to report its turn starting.
                 resp = await client.post(
                     f"/v1/sessions/{child_id}/events",
-                    json={"type": "external_session_status", "data": {"status": "running"}},
+                    json={
+                        "type": "external_session_status",
+                        "data": {
+                            "status": "running",
+                            "response_id": native_acceptance.response_id,
+                        },
+                    },
                 )
                 assert resp.status_code == 204, resp.text
 
@@ -225,7 +358,15 @@ async def test_reaped_native_launch_must_not_discard_childs_real_completion(
                 f"/v1/sessions/{child_id}/events",
                 json={
                     "type": "external_session_status",
-                    "data": {"status": "idle", "output": final_report},
+                    "data": {
+                        "status": "idle",
+                        "output": final_report,
+                        **(
+                            {"response_id": native_acceptance.response_id}
+                            if prompt_accepted
+                            else {}
+                        ),
+                    },
                 },
             )
             assert resp.status_code == 204, resp.text
@@ -266,9 +407,11 @@ async def test_reaped_native_launch_must_not_discard_childs_real_completion(
             # is unregistered and its delivered receipt written.
             assert subagent_work.get_subagent_work(child_id) is None
             assert server_client.label_patches == [
-                {subagent_work.SUBAGENT_DELIVERED_ID_LABEL_KEY: entry.work_id}
+                *prior_receipts,
+                {subagent_work.SUBAGENT_DELIVERED_ID_LABEL_KEY: entry.work_id},
             ]
     finally:
+        delivery_gate.set()
         subagent_work.unregister_subagent_work_for_session(child_id)
         subagent_work._session_inboxes_ref.pop(parent_id, None)
         runner_app._session_event_queues_ref.pop(parent_id, None)
@@ -277,14 +420,33 @@ async def test_reaped_native_launch_must_not_discard_childs_real_completion(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("harness_name", "reported_status"),
-    [("claude-native", None), ("codex-native", "running"), ("codex-native", "waiting")],
-    ids=["claude-native-steer", "codex-native-reported-start", "codex-native-reported-approval"],
+    ("harness_name", "reported_status", "receipt_kind"),
+    [
+        ("claude-native", None, "missing"),
+        ("codex-native", "running", "valid"),
+        ("codex-native", "waiting", "valid"),
+        ("codex-native", None, "missing"),
+        ("codex-native", None, "explicit-null"),
+        ("codex-native", None, "malformed"),
+        ("codex-native", None, "other-session"),
+        ("codex-native", None, "missing-thread"),
+    ],
+    ids=[
+        "claude-native-steer",
+        "codex-native-reported-start",
+        "codex-native-reported-approval",
+        "legacy-codex",
+        "null-receipt-stream",
+        "malformed-receipt",
+        "other-session-receipt",
+        "missing-thread-receipt",
+    ],
 )
 async def test_native_prompt_delivery_takes_dispatch_out_of_launching(
     monkeypatch: pytest.MonkeyPatch,
     harness_name: str,
     reported_status: str | None,
+    receipt_kind: str,
 ) -> None:
     """The runner's own verified prompt delivery is the launch acknowledgment.
 
@@ -306,7 +468,24 @@ async def test_native_prompt_delivery_takes_dispatch_out_of_launching(
     child_id = uuid.uuid4().hex
     inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
     turn_streamed = asyncio.Event()
-    harness = _ScriptedHarnessClient(_turn_frames("resp_steer"), stream_finished=turn_streamed)
+    receipt = NativeTurnAcceptance(child_id, "thread_steer", "codex_turn_steer")
+    raw_receipt = (
+        None
+        if receipt_kind in ("missing", "explicit-null")
+        else "not-an-acceptance"
+        if receipt_kind == "malformed"
+        else {**asdict(receipt), "session_id": "conv_other"}
+        if receipt_kind == "other-session"
+        else {"session_id": child_id, "response_id": receipt.response_id}
+        if receipt_kind == "missing-thread"
+        else receipt
+    )
+    harness = _ScriptedHarnessClient(
+        _turn_frames(
+            "resp_steer", raw_receipt, include_null_acceptance=receipt_kind == "explicit-null"
+        ),
+        stream_finished=turn_streamed,
+    )
     app = create_runner_app(
         process_manager=_FakeProcessManager(harness),  # type: ignore[arg-type]
         server_client=NullServerClient(),  # type: ignore[arg-type]
@@ -324,8 +503,9 @@ async def test_native_prompt_delivery_takes_dispatch_out_of_launching(
             # The parent's follow-up: the runner injects it into the child's
             # native pane as a background turn that ends once the paste is
             # verifiably submitted.
+            streaming = receipt_kind == "explicit-null"
             resp = await client.post(
-                f"/v1/sessions/{child_id}/events",
+                f"/v1/sessions/{child_id}/events" + ("?stream=true" if streaming else ""),
                 json={
                     "type": "message",
                     "role": "user",
@@ -335,7 +515,9 @@ async def test_native_prompt_delivery_takes_dispatch_out_of_launching(
                     "content": [{"type": "input_text", "text": "status check"}],
                 },
             )
-            assert resp.status_code == 202, resp.text
+            assert resp.status_code == (200 if streaming else 202), resp.text
+            if streaming:
+                assert '"native_acceptance"' not in resp.text
             await asyncio.wait_for(turn_streamed.wait(), timeout=5.0)
             await _wait_until(
                 lambda: child_id not in app.state.active_turns,
@@ -344,7 +526,13 @@ async def test_native_prompt_delivery_takes_dispatch_out_of_launching(
             if reported_status is not None:
                 resp = await client.post(
                     f"/v1/sessions/{child_id}/events",
-                    json={"type": "external_session_status", "data": {"status": reported_status}},
+                    json={
+                        "type": "external_session_status",
+                        "data": {
+                            "status": reported_status,
+                            "response_id": receipt.response_id,
+                        },
+                    },
                 )
                 assert resp.status_code == 204, resp.text
 
@@ -363,6 +551,13 @@ async def test_native_prompt_delivery_takes_dispatch_out_of_launching(
         ), "the launch-liveness reaper failed a child that had already taken its prompt"
         assert entry.status == "running"
         assert inbox.empty()
+        assert entry.awaiting_child_start_since is None
+        assert child_id not in subagent_work._pending_child_acceptances
+        events = _drain_session_event_queue(runner_app._session_event_queues_ref.get(child_id))
+        completed = [event for event in events if event.get("type") == "response.completed"]
+        assert len(completed) == 1
+        assert completed[0]["response"]["id"] == "resp_steer"
+        assert "native_acceptance" not in completed[0]
     finally:
         subagent_work.unregister_subagent_work_for_session(child_id)
         subagent_work._session_inboxes_ref.pop(parent_id, None)

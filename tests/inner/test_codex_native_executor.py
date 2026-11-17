@@ -37,6 +37,7 @@ from omnigent.inner.executor import (
     ExecutorConfig,
     ExecutorError,
     InjectionDeliveryAmbiguous,
+    NativeTurnAcceptance,
     TurnComplete,
 )
 from omnigent.inner.native_attachments import attachment_cache_dir
@@ -1234,10 +1235,16 @@ def test_codex_delivery_records_input_and_accepted_native_turn(
         assert attrs["native_turn_id"] == ("turn_steered" if active_turn_id else "turn_1")
         assert attrs["outcome"] == "rpc_accepted"
         assert state.active_turn_id == attrs["native_turn_id"]
+        assert events[0].native_acceptance == NativeTurnAcceptance(
+            session_id=state.session_id,
+            thread_id=state.thread_id,
+            response_id=f"codex_{attrs['native_turn_id']}",
+        )
     else:
         assert attrs["native_turn_id"] is None
         assert attrs["outcome"] == "rpc_accepted_missing_turn_id"
         assert state.active_turn_id == active_turn_id
+        assert events[0].native_acceptance is None
     assert "private prompt" not in json.dumps(attrs)
 
 
@@ -3266,6 +3273,9 @@ def test_steer_ack_does_not_restore_a_turn_completed_meanwhile(
     events = _collect_turn_events(executor, "follow up")
 
     assert [type(event) for event in events] == [TurnComplete]
+    assert events[0].native_acceptance == NativeTurnAcceptance(
+        session_id="conv_123", thread_id="thread_123", response_id="codex_turn_a"
+    )
     state = read_bridge_state(tmp_path)
     assert state is not None
     assert state.active_turn_id is None

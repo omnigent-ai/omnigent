@@ -35,7 +35,7 @@ from tests.runner.conftest import (
 )
 
 # Reuse the proven runner-turn stubs from the sessions-native suite.
-from tests.runner.helpers import NullServerClient
+from tests.runner.helpers import NullServerClient, accept_subagent_turn
 
 PARENT_SESSION_ID = "conv_parent_orchestrator"
 CHILD_SESSION_ID = "conv_child_reviewer"
@@ -1209,7 +1209,12 @@ async def test_recovered_child_steered_after_restart_is_not_start_bounded(
 
     # What a codex-native steer's clean delivery end does to the reused entry.
     subagent_work.mark_subagent_work_started(CHILD_SESSION_ID)
-    subagent_work.arm_subagent_child_start_timeout(CHILD_SESSION_ID, now=entry.created_at)
+    accept_subagent_turn(
+        CHILD_SESSION_ID,
+        thread_id="thread_recovered",
+        response_id="codex_recovered",
+        now=entry.created_at,
+    )
 
     assert (
         subagent_work.reap_stalled_subagent_launches(now=entry.created_at + 900, timeout_s=180)

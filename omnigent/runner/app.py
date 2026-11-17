@@ -37,6 +37,7 @@ if TYPE_CHECKING:
 import httpx
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from pydantic import TypeAdapter, ValidationError
 
 from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
 from omnigent.debug_logging import (
@@ -71,6 +72,7 @@ from omnigent.harness_plugins import (
     model_env_keys,
     spawn_env_builders,
 )
+from omnigent.inner.executor import NativeTurnAcceptance
 from omnigent.llms.errors import detect_request_size_overflow
 from omnigent.native.failure_telemetry import failure_log_attributes, normalize_failure_context
 from omnigent.native.input_diagnostics import input_attributes
@@ -4632,6 +4634,8 @@ def create_runner_app(
         owner_response_id: str | None = None,
         sign_in_hold: bool = False,
         cancelled: bool = False,
+        native_acceptance: NativeTurnAcceptance | None = None,
+        acceptance_request: _subagent_work._ChildAcceptanceRequest | None = None,
     ) -> None:
         # Harness children record PRs without a server client; report them as the turn ends.
         pr_reports.notify(conv_id)
@@ -4754,7 +4758,9 @@ def create_runner_app(
             mark_subagent_work_started(conv_id)
             if _session_harness_name(conv_id) == _CODEX_NATIVE_HARNESS:
                 # Codex reports every turn start it begins; bound a child that never does.
-                arm_subagent_child_start_timeout(conv_id)
+                arm_subagent_child_start_timeout(
+                    conv_id, acceptance=native_acceptance, request=acceptance_request
+                )
         if inbox_recovery_checked:
             return
         try:
@@ -6879,6 +6885,7 @@ def create_runner_app(
 
             turn_input_identity = _input_identity(body)
             _response_id: str | None = None
+            _native_acceptance: NativeTurnAcceptance | None = None
 
             def _owns_live_turn() -> bool:
                 return _turn_bind_epoch.get(conv_id, 0) == stream_turn_epoch and (
@@ -7048,9 +7055,16 @@ def create_runner_app(
                     owner_response_id=_response_id,
                     sign_in_hold=holding,
                     cancelled=cancelled,
+                    native_acceptance=_native_acceptance,
+                    acceptance_request=acceptance_request,
                 )
                 return lifecycle_event
 
+            acceptance_request = (
+                _subagent_work.begin_subagent_child_acceptance(conv_id)
+                if _session_harness_name(conv_id) == _CODEX_NATIVE_HARNESS
+                else None
+            )
             try:
                 async with client.stream(
                     "POST",
@@ -7169,10 +7183,16 @@ def create_runner_app(
 
                             _defer_publish = False
                             if event is not None:
+                                has_native_acceptance = "native_acceptance" in event
+                                raw_native_acceptance = event.pop("native_acceptance", None)
+                                if has_native_acceptance and data_index is not None:
+                                    frame_lines[data_index] = f"data: {_json.dumps(event)}"
+                                    raw_sse_bytes = ("\n".join(frame_lines) + "\n\n").encode()
                                 if event.get("type") == "response.created":
                                     resp_obj = event.get("response") or {}
                                     _response_data = dict(resp_obj)
                                     _response_id = resp_obj.get("id")
+                                    _native_acceptance = None
                                     _terminal_response_type = None
                                     if _response_id and conv_id:
                                         _resp_to_conv[_response_id] = conv_id
@@ -7194,6 +7214,7 @@ def create_runner_app(
                                     "response.failed",
                                     "response.cancelled",
                                 }:
+                                    _native_acceptance = None
                                     terminal_response = event.get("response")
                                     _terminal_response_type = (
                                         _evt_type
@@ -7205,6 +7226,13 @@ def create_runner_app(
                                         == _evt_type.split(".")[1]
                                         else None
                                     )
+                                    if _terminal_response_type == "response.completed":
+                                        try:
+                                            _native_acceptance = TypeAdapter(
+                                                NativeTurnAcceptance
+                                            ).validate_python(raw_native_acceptance)
+                                        except ValidationError:
+                                            _native_acceptance = None
                                 if (
                                     _evt_type == "response.compaction.in_progress"
                                     and conv_id in _sdk_compact_inprogress
@@ -7707,6 +7735,9 @@ def create_runner_app(
                     # this stream; they drop the message and finalization reports it.
                     _report_held_refusal()
                 raise
+            finally:
+                if acceptance_request is not None:
+                    _subagent_work.finish_subagent_child_acceptance(acceptance_request)
 
         return StreamingResponse(
             proxy_stream(),
@@ -8140,9 +8171,19 @@ def create_runner_app(
                 _record_native_pane_status(conversation_id, status)
                 resource_registry.note_external_session_status(conversation_id, status)
                 if status in ("running", "waiting"):
-                    note_subagent_child_start_reported(conversation_id)
+                    note_subagent_child_start_reported(
+                        conversation_id,
+                        response_id=data.get("response_id")
+                        if isinstance(data, dict) and isinstance(data.get("response_id"), str)
+                        else None,
+                    )
                 elif status in ("idle", "failed"):
-                    note_subagent_child_turn_settled(conversation_id)
+                    note_subagent_child_turn_settled(
+                        conversation_id,
+                        response_id=data.get("response_id")
+                        if isinstance(data, dict) and isinstance(data.get("response_id"), str)
+                        else None,
+                    )
                 child_status = (
                     "idle" if terminal_status == "completed" else terminal_status or status
                 )

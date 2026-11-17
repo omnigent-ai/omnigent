@@ -117,7 +117,7 @@ from tests.runner.conftest import (
 from tests.runner.conftest import (
     _ScriptedHarnessClient as _RecoveryScriptedHarnessClient,
 )
-from tests.runner.helpers import NullServerClient
+from tests.runner.helpers import NullServerClient, accept_subagent_turn
 
 _TEST_HARNESS_NAME = "runner-test-default"
 _TEST_HARNESS_MODULE = "tests._fixtures.runner_test_harness"
@@ -2753,6 +2753,7 @@ async def test_runner_publishes_terminal_failed_when_harness_stream_fails(
         )
 
     statuses = [event.get("status") for event in events]
+    assert conv not in subagent_work._pending_child_acceptances
     # The turn must reach the parametrized terminal state. Without the fix,
     # the failed-stream cases regress in two distinct ways: codex-native
     # publishes only ["running"] (idle is suppressed, so the drain times out
@@ -13883,14 +13884,14 @@ async def test_named_send_adopts_busy_child_as_running_not_launching(
                 title="merge-task",
             )
             dispatch.status = "running"
-            subagent_work.arm_subagent_child_start_timeout(child_id)
+            accept_subagent_turn(child_id, thread_id="thread_busy", response_id="codex_busy")
             provisional = subagent_work.reap_stalled_subagent_launches(
                 now=time.time() + 7200.0, timeout_s=180.0
             )
             assert [entry.child_session_id for entry in provisional] == [child_id]
             assert dispatch.status == "failed"
         # The late report outlives any provisional failure and precedes adoption.
-        subagent_work.note_subagent_child_start_reported(child_id)
+        subagent_work.note_subagent_child_start_reported(child_id, response_id="codex_busy")
         output = await _run_named_continuation(parent_id, handler)
         work = subagent_work.get_subagent_work(child_id)
         assert work is not None
@@ -13898,7 +13899,7 @@ async def test_named_send_adopts_busy_child_as_running_not_launching(
         assert work.child_start_reported is True
         # The steer's own finished turn arms the launch bound; the start already reported
         # keeps it disarmed, so a steer into a running turn is never reaped.
-        subagent_work.arm_subagent_child_start_timeout(child_id)
+        accept_subagent_turn(child_id, thread_id="thread_busy", response_id="codex_busy")
         reaped = subagent_work.reap_stalled_subagent_launches(
             now=work.created_at + 7200.0, timeout_s=180.0
         )
@@ -13980,7 +13981,7 @@ async def test_named_send_registers_fresh_when_tracked_turn_already_ended(
     reaped: list[subagent_work._SubagentWorkEntry] = []
     # Codex accepts the new turn before the message POST returns to the parent, so the
     # acceptance lands while the stale entry is still the child's only record.
-    subagent_work.arm_subagent_child_start_timeout(child_id)
+    accept_subagent_turn(child_id, thread_id="thread_fresh", response_id="codex_fresh")
     try:
         output = await _run_named_continuation(parent_id, handler)
         work = subagent_work.get_subagent_work(child_id)
