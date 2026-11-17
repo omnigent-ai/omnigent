@@ -573,11 +573,11 @@ def _archive_scope_server(
 
     async def handler(request: httpx.Request) -> httpx.Response:
         path = request.url.path
+        requests.append((path, dict(request.url.params)))
         if path == "/v1/sessions/conv_caller/child_sessions":
             return httpx.Response(200, json={"data": []})
         if path == "/v1/sessions/conv_caller":
             return httpx.Response(200, json={"id": "conv_caller", "parent_session_id": None})
-        requests.append((path, dict(request.url.params)))
         if path == "/v1/info":
             return httpx.Response(
                 200, json={"session_list_scoped_archives": True} if scoped_archives else {}
@@ -701,12 +701,15 @@ async def test_sys_session_list_created_by_this_session_finds_workers_in_one_cal
         result = await _call_session(
             client, {"include_archived": True, "created_by_this_session": True}
         )
+        filtered_paths = [path for path, _ in requests]
         unfiltered_cursor = (await _call_session(client, {"limit": 1}))["page"]["next_cursor"]
         mismatched = await _call_session(
             client, {"created_by_this_session": True, "cursor": unfiltered_cursor}
         )
 
     assert result["sub_agents"] == []
+    assert "/v1/sessions/conv_caller/child_sessions" not in filtered_paths
+    assert "/v1/sessions/conv_caller" not in filtered_paths
     assert "page" not in result
     assert [row["session_id"] for row in result["sessions"]] == [
         f"conv_{index:04d}" for index in sorted(workers)
