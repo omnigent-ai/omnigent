@@ -75,7 +75,10 @@ function stubPinZoneRect(pinnedRows: number) {
 }
 
 function rowCenter(id: string) {
-  if (id === "__remove_nest__") return { clientX: 50, clientY: -35 };
+  if (id === "__remove_nest__") {
+    const rect = screen.getByTestId("sidebar-remove-from-nest").getBoundingClientRect();
+    return { clientX: rect.left + rect.width / 2, clientY: rect.top + rect.height / 2 };
+  }
   const rows = [...document.querySelectorAll("li[data-sidebar-session-id]")];
   const index = rows.findIndex((row) => row.getAttribute("data-sidebar-session-id") === id);
   return { clientX: 50, clientY: index * ROW_HEIGHT + ROW_HEIGHT / 2 };
@@ -90,10 +93,10 @@ async function dropOnto(
   expect(sources).toHaveLength(1);
   const source = sources[0];
   const start = rowCenter(sourceId);
-  const center = rowCenter(targetId);
-  const target = { ...center, clientY: center.clientY + offsetY };
   fireEvent.mouseDown(source, { button: 0, ...start });
   fireEvent.mouseMove(document, { clientX: start.clientX, clientY: start.clientY - 10 });
+  const center = rowCenter(targetId);
+  const target = { ...center, clientY: center.clientY + offsetY };
   await act(async () => {
     fireEvent.mouseMove(document, target);
   });
@@ -164,9 +167,23 @@ describe("moving sessions between nests by drag", () => {
   });
 
   it.each(["conv_a", "conv_b"])("detaches %s through the temporary drop target", async (source) => {
+    const rowRect = vi.mocked(Element.prototype.getBoundingClientRect).getMockImplementation()!;
+    vi.mocked(Element.prototype.getBoundingClientRect).mockImplementation(function (this: Element) {
+      if (this.matches('[data-testid="sidebar-remove-from-nest"]')) {
+        return rowRect.call(screen.getByRole("link", { name: "conv_d" }).closest("li")!);
+      }
+      return rowRect.call(this);
+    });
     renderNests();
     expect(screen.queryByTestId("sidebar-remove-from-nest")).toBeNull();
-    await dropOnto(source, "__remove_nest__", { expectTarget: false });
+    await dropOnto(source, "__remove_nest__", {
+      expectTarget: false,
+      whileOver: () => {
+        const target = screen.getByTestId("sidebar-remove-from-nest");
+        expect(screen.getByTestId("sidebar-conversation-list")).not.toContainElement(target);
+        expect(target.parentElement).toHaveClass("sticky", "top-0", "h-0");
+      },
+    });
     expect(mocks.moveToNest).toHaveBeenCalledExactlyOnceWith(
       { id: source, sourceId: null },
       expect.any(Object),

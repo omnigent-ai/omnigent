@@ -3546,10 +3546,12 @@ function ConversationList({
                 return source?.canManage !== false || target?.type === "session-grid";
               }),
             });
-            const nest = collisions.find((hit) =>
-              ["nest", "remove-from-nest"].includes(
-                hit.data?.droppableContainer.data.current?.type,
-              ),
+            const detach = collisions.find(
+              (hit) => hit.data?.droppableContainer.data.current?.type === "remove-from-nest",
+            );
+            if (detach) return [detach];
+            const nest = collisions.find(
+              (hit) => hit.data?.droppableContainer.data.current?.type === "nest",
             );
             if (nest) return [nest];
             // A row reorders; elsewhere, e.g. over another project's row, its folder files it.
@@ -3611,6 +3613,11 @@ function ConversationList({
         {activeDrag && <GridDropTargets sessionId={activeDrag.id} />}
         <RowEditHoldContext.Provider value={reportRowEditing}>
           <PinSavingContext.Provider value={pinWriting}>
+            {activeDrag?.canMoveNest && activeDrag.familyId && (
+              <div className="pointer-events-none sticky top-0 z-20 h-0">
+                <RemoveFromNestDropZone />
+              </div>
+            )}
             <div
               className="flex flex-col gap-6"
               data-testid="sidebar-conversation-list"
@@ -3630,7 +3637,6 @@ function ConversationList({
                 !grouped &&
                 activeDrag?.project != null &&
                 sections.sessions.length === 0 && <UngroupDropZone />}
-              {activeDrag?.canMoveNest && activeDrag.familyId && <RemoveFromNestDropZone />}
               {totalVisible === 0 && searchQuery && !sessionStatus && !importing ? (
                 <>
                   <p className="px-2 py-1 text-ui text-muted-foreground">{emptyMessage}</p>
@@ -3963,7 +3969,7 @@ function RemoveFromNestDropZone() {
       ref={setNodeRef}
       data-testid="sidebar-remove-from-nest"
       className={cn(
-        "rounded-md border border-dashed border-border px-2 py-1.5 text-sm text-muted-foreground",
+        "pointer-events-auto rounded-md border border-dashed border-border bg-card-solid px-2 py-1.5 text-sm text-muted-foreground",
         isOver && DROP_TARGET_HIGHLIGHT,
       )}
     >
