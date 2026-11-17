@@ -93,7 +93,8 @@ hydrateFromStorage();
 // first time a conversation is seen we copy its server `viewer_*` into the
 // mirror, then ignore later list values so an in-flight poll can't clobber a
 // local optimistic write. Cross-device changes after first load surface on a
-// reload (a deliberate Phase-1 scope: live merge is a follow-up).
+// reload (a deliberate Phase-1 scope: live merge is a follow-up). An explicit
+// mark also counts as seeded, so a list response already in flight can't undo it.
 const seeded = new Set<string>();
 
 // Until the first seed runs we don't know the server's baselines, so the
@@ -313,6 +314,7 @@ export function isConversationUnread(
  * the flag also survives a reload and shows on the user's other devices.
  */
 export function markConversationUnread(conversationId: string, updatedAt: number): void {
+  seeded.add(conversationId);
   explicitlyUnread.add(conversationId);
   lastSeenMap[conversationId] = updatedAt - 1;
   persistToStorage();
@@ -330,6 +332,7 @@ export function markConversationUnread(conversationId: string, updatedAt: number
  * exempt from the hydration gate.
  */
 export function markConversationRead(conversationId: string, updatedAt: number): void {
+  seeded.add(conversationId);
   const hadOverride = explicitlyUnread.delete(conversationId);
   const baseline = Math.max(nowSeconds(), updatedAt);
   const stored = lastSeenMap[conversationId];

@@ -419,14 +419,14 @@ or section, the header title becomes the input instead. Enter or blur
 saves; Escape cancels. The shortcut leaves terminals, code editors, and open
 menus or dialogs alone. It is listed in Keyboard shortcuts and Settings.
 
-**Unread shortcut:** in any open session you can see, press Cmd+Option+U on
-macOS or Ctrl+Alt+U elsewhere, including while writing a draft, to mark it
-unread; press it again to mark it read. A toast confirms which. The session's
-sidebar row shows the unread dot once its turn is idle, and leaving the session
-keeps it. The command palette's **Mark current session as unread** (or **as
-read**) action does the same. Like rename, the shortcut leaves terminals, code
-editors, and open menus or dialogs alone, and it is listed in Keyboard shortcuts
-and Settings.
+**Unread shortcut:** in any open top-level session you can see, press
+Cmd+Option+U on macOS or Ctrl+Alt+U elsewhere, including while writing a draft,
+to mark it unread; press it again to mark it read. A toast confirms which. The
+session's sidebar row shows the unread dot once its turn is idle, and leaving
+the session keeps it. The command palette's **Mark current session as unread**
+(or **as read**) action does the same. Like rename, the shortcut leaves
+terminals, code editors, and open menus or dialogs alone, and it is listed in
+Keyboard shortcuts and Settings.
 
 **Message actions:** fork through a specific assistant message, excluding later
 turns. The header's Fork action copies the whole session instead. In either

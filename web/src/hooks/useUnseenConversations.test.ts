@@ -324,6 +324,22 @@ describe("toggleConversationUnread", () => {
     expect(mod.isConversationUnseen("conv-1", 5_000, "idle")).toBe(false);
     expect(lastPutBody()).toEqual({ last_seen: 6_000, unread: false });
   });
+
+  it("keeps a toggle made before the first list response arrives", async () => {
+    const mod = await loadFresh();
+    vi.useFakeTimers({ now: 6_000_000 });
+    // The flag was restored from storage; the open session's snapshot loads first.
+    mod.markConversationUnread("conv-1", 5_000);
+    expect(mod.toggleConversationUnread("conv-1", 5_000)).toBe(false);
+
+    // The list request was already in flight and still carries the old flag.
+    mod.seedReadState([
+      { id: "conv-1", viewer_last_seen: 4_999, viewer_unread: true, updated_at: 5_000 },
+    ]);
+
+    expect(mod.isExplicitlyUnread("conv-1")).toBe(false);
+    expect(mod.isConversationUnseen("conv-1", 5_000, "idle")).toBe(false);
+  });
 });
 
 describe("clearUnreadOverride", () => {
