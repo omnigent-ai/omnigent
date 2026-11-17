@@ -1495,6 +1495,28 @@ describe("unsent composer state survives the pane moving", () => {
     renderPane(<SideChatPane childId={childId} fullSession gridComposer={{}} />);
     expect(screen.getByTestId("side-chat-input")).toHaveAttribute("rows", "1");
   });
+
+  it("gives Shift+Tab to a grid cell's permission cycle, and leaves a side chat's to the browser", () => {
+    const cyclePermissionMode = vi.fn(() => true);
+    const view = renderPane(
+      <SideChatPane childId={childId} fullSession gridComposer={{ cyclePermissionMode }} />,
+    );
+    const shiftTabInit = { key: "Tab", shiftKey: true };
+    expect(fireEvent.keyDown(screen.getByTestId("side-chat-input"), shiftTabInit)).toBe(false);
+    expect(cyclePermissionMode).toHaveBeenCalledOnce();
+    view.unmount();
+
+    cyclePermissionMode.mockReturnValueOnce(false);
+    const cell = renderPane(
+      <SideChatPane childId={childId} fullSession gridComposer={{ cyclePermissionMode }} />,
+    );
+    expect(fireEvent.keyDown(screen.getByTestId("side-chat-input"), shiftTabInit)).toBe(true);
+    cell.unmount();
+
+    renderPane(<SideChatPane childId={childId} />);
+    expect(fireEvent.keyDown(screen.getByTestId("side-chat-input"), shiftTabInit)).toBe(true);
+    expect(cyclePermissionMode).toHaveBeenCalledTimes(2);
+  });
 });
 
 describe("history a side chat copied from its parent", () => {

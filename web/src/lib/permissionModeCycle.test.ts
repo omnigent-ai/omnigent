@@ -6,6 +6,7 @@ import { DEVIN_NATIVE_PERMISSION_MODES } from "./nativeHarnessModes";
 import {
   isPermissionModeCycleKey,
   nextCycledPermissionMode,
+  nextPermissionModePress,
   permissionChip,
   permissionChipKind,
 } from "./permissionModeCycle";
@@ -106,6 +107,22 @@ describe("nextCycledPermissionMode", () => {
     ).toBe(null);
     expect(nextCycledPermissionMode([{ value: "default" }], "default")).toBe(null);
     expect(nextCycledPermissionMode([], "default")).toBe(null);
+  });
+});
+
+describe("nextPermissionModePress", () => {
+  const miss = { sessionId: "session-a", from: "default", past: "auto" };
+
+  it("continues past the mode a missed press tried, on the same session only", () => {
+    const options = CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES;
+    expect(nextPermissionModePress(options, "default", "session-a", miss)).toBe("acceptEdits");
+    expect(nextPermissionModePress(options, "default", "session-b", miss)).toBe("auto");
+    expect(nextPermissionModePress(options, "plan", "session-a", miss)).toBe("default");
+  });
+
+  it("retries the missed mode when it is the only one reachable", () => {
+    const options = [{ value: "default" }, { value: "auto" }];
+    expect(nextPermissionModePress(options, "default", "session-a", miss)).toBe("auto");
   });
 });
 

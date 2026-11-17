@@ -33,6 +33,7 @@ import { retrySession, updateSession } from "@/lib/sessionsApi";
 import { toast } from "sonner";
 import { revealFolderInFilesPanel } from "@/shell/FilesPanel";
 import { selectPullRequestInPanel } from "@/shell/PullRequestPanel";
+import { conversationRegistry } from "@/store/conversationRegistry";
 
 const queryClient = new QueryClient();
 const LINKED_PR = "https://github.com/example/app/pull/42";
@@ -155,14 +156,24 @@ vi.mock("@/components/chat/SideChatPane", () => ({
     gridComposer,
   }: {
     childId: string;
-    gridComposer?: { leading?: ReactNode; trailing?: ReactNode };
+    gridComposer?: {
+      leading?: ReactNode;
+      trailing?: ReactNode;
+      cyclePermissionMode?: () => boolean;
+    };
   }) => {
     const context = useContext(FileViewerContext)!;
     const terminal = useTerminalFirst();
     if (childId === fixture.failedChat) throw fixture.renderError;
     return (
       <>
-        <textarea aria-label="Message" disabled={fixture.composerDisabled} />
+        <textarea
+          aria-label="Message"
+          disabled={fixture.composerDisabled}
+          onKeyDown={(event) => {
+            if (event.key === "Tab" && event.shiftKey) gridComposer?.cyclePermissionMode?.();
+          }}
+        />
         <button type="button" onClick={() => terminal?.setView("terminal")}>
           Open terminal dialog
         </button>
@@ -408,6 +419,73 @@ it("opens chat-linked folders and PRs in that pane's workspace", () => {
   );
   expect(selectPullRequestInPanel).toHaveBeenCalledWith(queryClient, "second", LINKED_PR);
   expect(workspace).toHaveAttribute("data-tab", "github");
+});
+
+/** Renders the two-cell grid with both cells on claude-native sessions in "Manual" mode. */
+function renderClaudeCells() {
+  fixture.labels = { "omnigent.wrapper": "claude-code-native-ui" };
+  for (const id of ["first", "second"]) {
+    conversationRegistry.acquire(id).setState({ claudePermissionMode: "default" });
+  }
+  onTestFinished(() => conversationRegistry.clear());
+  vi.mocked(updateSession).mockClear();
+  return render(twoCellGrid());
+}
+
+/** Shift+Tab in the named cell's composer. */
+function pressShiftTab(cellName: string) {
+  return fireEvent.keyDown(
+    within(screen.getByRole("region", { name: cellName })).getByLabelText("Message"),
+    { key: "Tab", shiftKey: true },
+  );
+}
+
+it("steps only the Shift+Tab cell's session to its next mode, for its owner and while reachable", async () => {
+  const view = renderClaudeCells();
+  pressShiftTab("second");
+  await waitFor(() =>
+    expect(updateSession).toHaveBeenCalledWith("second", { claudePermissionMode: "auto" }),
+  );
+  expect(updateSession).toHaveBeenCalledTimes(1);
+
+  // The mocked PATCH cleared this cell's mode; restore it so only the gate can stop a press.
+  // Only the owner can switch modes.
+  conversationRegistry.acquire("second").setState({ claudePermissionMode: "default" });
+  fixture.permissionLevel = 2;
+  view.rerender(twoCellGrid());
+  pressShiftTab("second");
+  // Like the main composer, an unreachable session doesn't cycle.
+  conversationRegistry.acquire("second").setState({ claudePermissionMode: "default" });
+  fixture.permissionLevel = null;
+  fixture.livenessKind = "host_offline";
+  view.rerender(twoCellGrid());
+  pressShiftTab("second");
+  expect(updateSession).toHaveBeenCalledTimes(1);
+  view.unmount();
+});
+
+it("holds a cell's Shift+Tab while its switch is in flight", () => {
+  const view = renderClaudeCells();
+  vi.mocked(updateSession).mockReturnValueOnce(new Promise<never>(() => {}));
+  pressShiftTab("second");
+  pressShiftTab("second");
+  expect(updateSession).toHaveBeenCalledTimes(1);
+  view.unmount();
+});
+
+it("moves a cell past the mode its session refused on the next Shift+Tab", async () => {
+  const toastError = vi.spyOn(toast, "error").mockReturnValue("error");
+  const view = renderClaudeCells();
+  vi.mocked(updateSession).mockRejectedValueOnce(new Error("Runner unavailable"));
+  pressShiftTab("second");
+  await waitFor(() => expect(toastError).toHaveBeenCalledWith("Runner unavailable"));
+  pressShiftTab("second");
+  await waitFor(() =>
+    expect(updateSession).toHaveBeenLastCalledWith("second", {
+      claudePermissionMode: "acceptEdits",
+    }),
+  );
+  view.unmount();
 });
 
 it("keeps cell views, input, permissions and shortcut targets independent", async () => {
