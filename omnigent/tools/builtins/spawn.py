@@ -20,6 +20,7 @@ from omnigent.runtime.prompt import SUBAGENT_WAKE_NOTICE_SHAPE
 from omnigent.spec import AgentSpec
 from omnigent.stores import ConversationStore
 from omnigent.tools.base import Tool, ToolContext
+from omnigent.tools.builtins.session_message import SESSION_MESSAGE_MAX_CHARS
 from omnigent.util.session_lifecycle import (
     CLOSED_LABEL_KEY,
     CLOSED_LABEL_VALUE,
@@ -543,7 +544,8 @@ class SysSessionListTool(Tool):
             "the sessions you own (visibility 'mine', the default), each "
             "with status, runner connectivity and "
             "created_by_session_id (creation origin for independent workers). "
-            "Match that field to your session ID to find workers you created. "
+            "Match that field to your session ID to find workers you created, or "
+            "pass created_by_this_session true to list only those. "
             "Pass visibility 'shared' for sessions other users shared with you, "
             "or 'all' for both; those rows carry owner, so check it before "
             "treating a session as yours. "
@@ -604,6 +606,15 @@ class SysSessionListTool(Tool):
                                 "Optional: also list archived sessions in the "
                                 "global 'sessions' view; each row then carries "
                                 "'archived'. Defaults to false."
+                            ),
+                        },
+                        "created_by_this_session": {
+                            "type": "boolean",
+                            "description": (
+                                "Optional: list only sessions this session started "
+                                "(created_by_session_id is your session ID) in the "
+                                "global 'sessions' view, in one call where possible; "
+                                "sub_agents is then empty. Defaults to false."
                             ),
                         },
                         "limit": {
@@ -917,7 +928,8 @@ class SysSessionCreateTool(Tool):
       a fresh session-scoped agent.
 
     An optional ``message`` starts the session's first user turn;
-    an optional ``title`` labels the session.
+    an optional ``title`` labels the session. With ``agent_id``, an optional
+    ``workflow_id`` starts the session as a run of a saved workflow.
 
     Returns a handle ``{conversation_id, agent_id, title, status}``, plus
     ``project_id`` and ``project_name`` for an independent session. The session runs
@@ -969,7 +981,7 @@ class SysSessionCreateTool(Tool):
             "A project_name other than this session's project makes a standalone "
             "session there, not a nested agent. "
             "An independent worker's optional "
-            "first message must contain 1–8000 characters. "
+            f"first message must contain 1–{SESSION_MESSAGE_MAX_CHARS} characters. "
             "Independent sessions do not forward replies: "
             "read their status/history, and use sys_session_message for subsequent work. "
             "Returns {conversation_id, agent_id, title, status}, plus project_id "
@@ -1141,6 +1153,17 @@ class SysSessionCreateTool(Tool):
                                 "'approve-for-me' (agent_id only). Modes that skip "
                                 "approval, such as 'bypassPermissions' or 'full-access', "
                                 "are refused. Omit to use the agent's default."
+                            ),
+                        },
+                        "workflow_id": {
+                            "type": "string",
+                            "description": (
+                                "Optional ID of one of your saved workflows, from "
+                                "sys_workflow_list or sys_workflow_load (agent_id only). "
+                                "The session starts as a run of it, with the workflow's "
+                                "steps as its plan, and the workflow's page lists the run. "
+                                "Still give it a message asking it to run the workflow "
+                                "with the workflow skill."
                             ),
                         },
                     },

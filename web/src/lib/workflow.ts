@@ -6,6 +6,7 @@ import {
   splitTriggerPrompt,
   stripTriggerHeader,
 } from "@/components/scheduled/triggerTemplates";
+import { parseSavedWorkflowRun } from "@/lib/savedWorkflowRun";
 import type { WorkflowStep } from "@/lib/workflowGraphLayout";
 
 /** The framework skill that plans and runs a workflow (`/workflow <description>`). */
@@ -149,7 +150,7 @@ export function createWorkflowPrompt(name: string, description: string): string 
   return `Use the ${SAVE_WORKFLOW_SKILL} skill to create a workflow named "${name.trim()}" from this description, without doing the work:\n\n${description.trim()}`;
 }
 
-/** The planning chat proposes a graph; Save plan in the editor applies it. */
+/** The planning chat proposes a graph and its description; Save plan in the editor applies them. */
 export function editWorkflowPlanPrompt(workflow: {
   id: string;
   name: string;
@@ -162,6 +163,7 @@ export function editWorkflowPlanPrompt(workflow: {
     `Workflow description: ${workflow.description}`,
     "This is a planning conversation. Load the existing workflow with sys_workflow_load. Explore context if useful, but do not execute the workflow or make changes to the project.",
     "Use sys_journal_write_plan to publish the proposed steps, and write a new plan whenever I ask for revisions. Keep step IDs stable. Do not set workflow_id on this journal plan: this conversation is for planning, not an execution run.",
+    "Set description on every plan you publish: what the workflow does and what a run needs, written for the proposed steps. Save plan stores it as the workflow description, so keep the inputs and constraints from the current description that still apply.",
     "The workflow already exists. Do not call sys_workflow_save or create another workflow. I will use Save plan on the workflow page to apply the proposal.",
     hasSavedPlan
       ? "Read the saved plan and use it as the starting point. Ask what edits I want and wait for my answer before proposing or publishing changes. Preserve steps I haven't asked to change, and iterate with me on my requested edits."
@@ -185,12 +187,11 @@ export function runSavedWorkflowPrompt(
   return details.trim() ? `${request}\n\n${details.trim()}` : request;
 }
 
-// A savedWorkflowMessage without the plan review, as New automation stores it.
-const SAVED_WORKFLOW_RUN =
-  /^[/$]workflow Run the saved workflow "(.+)" \(ID ([0-9a-f]{32})\)\.(?:\n\n([\s\S]*))?$/;
-
 /**
  * Read back a {@link savedWorkflowMessage}, directly or inside a trigger prompt.
+ * Keep in sync with omnigent/server/scheduled/workflow_automations.py, which reads
+ * the prompt below a trigger header the same way to keep these automations off a
+ * reused session.
  *
  * @returns The workflow's ID and name and the run's details, or `null` for any other text.
  */
@@ -200,7 +201,15 @@ export function parseSavedWorkflowMessage(
   const instructions =
     decodeTriggerPrompt(text)?.instructions ??
     splitTriggerPrompt(stripTriggerHeader(text)).userPrompt;
-  const match = SAVED_WORKFLOW_RUN.exec(instructions.trim());
-  if (!match) return null;
-  return { id: match[2], name: match[1], details: (match[3] ?? "").trim() };
+  return parseSavedWorkflowRun(instructions);
+}
+
+/** The automations whose prompt runs the saved workflow *workflowId*, in list order. */
+export function automationsUsingWorkflow<T extends { prompt: string }>(
+  automations: readonly T[],
+  workflowId: string,
+): T[] {
+  return automations.filter(
+    (automation) => parseSavedWorkflowMessage(automation.prompt)?.id === workflowId,
+  );
 }

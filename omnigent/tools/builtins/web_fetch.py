@@ -253,6 +253,7 @@ def build_researcher_spec(parent_spec: AgentSpec) -> AgentSpec:
             agent_discovery=False,
             journal=False,
             projects=False,
+            user_inbox=False,
         ),
         os_env=child_os_env,
         instructions=_RESEARCHER_INSTRUCTIONS,

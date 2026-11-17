@@ -3477,10 +3477,13 @@ class WorkflowObject(WorkflowSummary):
 
     :param steps: The workflow's graph.
     :param planning_session_id: The conversation for proposing revisions, separate from runs.
+    :param description_source: The planning conversation's journal entry for the proposal
+        the description was saved from, until the description is written otherwise.
     """
 
     steps: list[WorkflowStep]
     planning_session_id: str | None = None
+    description_source: str | None = None
 
 
 class WorkflowList(BaseModel):
@@ -3523,11 +3526,24 @@ class WorkflowRunProgress(BaseModel):
     failed: int = 0
 
 
+class WorkflowRunStarter(BaseModel):
+    """
+    The session that started a workflow run.
+
+    :param session_id: That session's ID.
+    :param title: Its title; empty when it has none yet.
+    """
+
+    session_id: str
+    title: str
+
+
 class WorkflowRun(BaseModel):
     """
     One run of a saved workflow: a session that started it.
 
     :param id: The run's ID: that of the plan entry that started it.
+    :param workflow_id: The saved workflow the run follows.
     :param plan_graph_revision: Stable graph ID, or the earliest position of the
         unchanged legacy graph. ``None`` when authoritative context is unavailable.
     :param session_id: The session that ran it.
@@ -3542,9 +3558,25 @@ class WorkflowRun(BaseModel):
     :param steps: The latest plan's steps within this invocation.
     :param statuses: Each of those steps' newest status entry; a step with
         none yet is left out.
+    :param workflow_name: The workflow's name when it is the caller's own;
+        ``None`` for someone else's workflow or a deleted one.
+    :param started_by: The session that started it, when another session did
+        and the caller can read that session.
+    :param descendant_runs: The first page of the workflow runs below this one:
+        those of the sessions its session started while it was current, then
+        theirs, each right after the run that started it. Empty on the runs
+        listed here.
+    :param descendant_run_count: How many workflow runs are below this one, on
+        every page.
+    :param descendant_runs_cursor: Continues ``descendant_runs`` from
+        ``GET /v1/workflows/{workflow_id}/runs/{id}/descendant_runs``;
+        ``None`` when they are all here.
+    :param descendant_runs_active: Whether any run below this one, on any
+        page, is working or waiting for input.
     """
 
     id: str
+    workflow_id: str
     plan_graph_revision: str | int | None = None
     session_id: str
     title: str
@@ -3556,6 +3588,12 @@ class WorkflowRun(BaseModel):
     progress: WorkflowRunProgress
     steps: list[WorkflowStep] = Field(default_factory=list)
     statuses: list[SessionJournalEntry] = Field(default_factory=list)
+    workflow_name: str | None = None
+    started_by: WorkflowRunStarter | None = None
+    descendant_runs: list[WorkflowRun] = Field(default_factory=list)
+    descendant_run_count: int = 0
+    descendant_runs_cursor: str | None = None
+    descendant_runs_active: bool = False
 
 
 class WorkflowRunList(BaseModel):
@@ -3600,6 +3638,10 @@ class UpdateWorkflowRequest(BaseModel):
     :param name: A new name.
     :param description: A new description, subject to the same character and
         stored-byte limits as creation.
+    :param expected_description: Apply ``description`` only while the stored
+        description is still this text, so one written meanwhile stays.
+    :param description_source: The journal entry ID of the planning-chat proposal
+        ``description`` comes from; a description written without one clears it.
     :param steps: New steps, replacing the old ones.
     :param planning_session_id: The private owned session for iterating on the plan.
     """
@@ -3608,6 +3650,8 @@ class UpdateWorkflowRequest(BaseModel):
 
     name: str | None = None
     description: str | None = None
+    expected_description: str | None = None
+    description_source: str | None = None
     steps: list[WorkflowStep] | None = None
     planning_session_id: str | None = None
 

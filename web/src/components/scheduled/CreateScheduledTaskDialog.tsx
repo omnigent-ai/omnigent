@@ -12,6 +12,7 @@ import {
   FolderIcon,
   FolderOpenIcon,
   MonitorIcon,
+  PlugIcon,
   RefreshCwIcon,
   ShieldCheckIcon,
   TriangleAlertIcon,
@@ -52,11 +53,19 @@ import { ComposerConfigSections } from "@/components/composer/ComposerConfigSect
 import { ComposerAgentIcon } from "@/components/ComposerAgentIcon";
 import { ComposerHarnessTrigger } from "@/components/composer/ComposerControls";
 import { PickerSectionHeader } from "@/components/composer/HarnessMenuRow";
-import { TriggerTemplateFields } from "@/components/scheduled/TriggerTemplateFields";
+import {
+  TriggerTemplateFields,
+  type TriggerMcpService,
+} from "@/components/scheduled/TriggerTemplateFields";
 import { ModelEffortFields } from "@/components/scheduled/ModelEffortFields";
-import { WorkflowField } from "@/components/scheduled/WorkflowField";
+import {
+  WORKFLOW_DETAILS_LABEL,
+  WORKFLOW_DETAILS_PLACEHOLDER,
+  WorkflowField,
+} from "@/components/scheduled/WorkflowField";
 import { type SavedWorkflow, useSavedWorkflows } from "@/hooks/useSavedWorkflows";
 import { skillInvocationPrefix } from "@/lib/harnessSetup";
+import { parseSavedWorkflowRun } from "@/lib/savedWorkflowRun";
 import { parseSavedWorkflowMessage, savedWorkflowMessage } from "@/lib/workflow";
 import {
   TriggerWorkerHarnessField,
@@ -70,15 +79,21 @@ import {
   encodeTriggerPrompt,
   hasTriggerHeader,
   isTriggerPrompt,
+  promptMayRunSavedWorkflow,
   readTriggerWorkerPlacement,
+  readTriggerMessageMaxChars,
   readTriggerWorkerSettings,
   renderTriggerConfigPrompt,
+  renderTriggerPrompt,
   splitTriggerPrompt,
+  syncTriggerWorkflowId,
   TRIGGER_SOURCES,
   stripTriggerHeader,
   TRIGGER_TEMPLATES,
   triggerFieldsComplete,
+  triggerMessageBudget,
   triggerPromptSource,
+  triggerMcpService,
   triggerServiceName,
   triggerWorkerSettingsOf,
   updateTriggerWorkerSettings,
@@ -97,6 +112,9 @@ import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAge
 import { useHosts } from "@/hooks/useHosts";
 import { useHostWorktrees } from "@/hooks/useHostWorktrees";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { McpRegistryPicker } from "@/components/McpRegistry";
+import { useMcpRegistryCatalog, useRegistrySignIn } from "@/hooks/useMcpRegistry";
+import { withBasePath } from "@/lib/basePath";
 import { isBootFallbackInfo } from "@/lib/bootCapabilities";
 import { isFeatureEnabled, pickerCuration, sandboxOptionLabel } from "@/lib/capabilities";
 import { useCreateScheduledTask, useUpdateScheduledTask } from "@/hooks/useScheduledTasks";
@@ -139,11 +157,11 @@ import { useSession } from "@/hooks/useSession";
 import { claudePermissionModeFromSession } from "@/lib/claudePermissionMode";
 import { codexApprovalModeFromSession } from "@/lib/codexApprovalMode";
 import type { AutomationSourceSession } from "@/lib/automationFromSession";
+import { DEFAULT_AUTOMATION_PROJECT } from "@/lib/automationSessions";
 import type { Session } from "@/lib/types";
 
 const PROVIDER_DEFAULT = "provider-default";
 const PERMISSION_SELECT_DEFAULT = "__agent_default__";
-const DEFAULT_AUTOMATION_PROJECT = "Omnigent Automation";
 const AUTOMATION_CONTROL_TRIGGER_CLASS_NAME =
   "h-9! min-h-9! max-w-full justify-start gap-1.5 rounded-lg border border-input bg-transparent py-2 pr-2 pl-2.5 text-ui leading-5 font-normal md:min-h-9! [&_svg]:p-0! [&>svg:last-child]:ml-auto [&>svg:last-child]:text-muted-foreground [&>svg:last-child]:opacity-100 [&_[data-testid$='-agent-model-value']]:font-normal";
 const AUTOMATION_ADVANCED_CONTROL_TRIGGER_CLASS_NAME = `${AUTOMATION_CONTROL_TRIGGER_CLASS_NAME} border-transparent`;
@@ -254,6 +272,11 @@ export function CreateScheduledTaskDialog({
   const managedSandboxesEnabled = info !== "loading" && info.managed_sandboxes_enabled;
   // Older servers reject a task's project fields, so the picker needs the flag.
   const projectsSupported = info !== "loading" && info.scheduled_task_projects === true;
+  // Older servers reject a task's mcp_services, and without a registry there is nothing to pick.
+  const mcpRegistryEnabled =
+    info !== "loading" &&
+    info.scheduled_task_mcp_services === true &&
+    !!info.enabled_connections?.includes("mcp");
   const sandboxRepoCatalog =
     info !== "loading" && info.scheduled_task_sandbox_workspaces === true && info.sandbox_provider
       ? (info.sandbox_provider_capabilities?.[info.sandbox_provider]?.repo_catalog ?? [])
@@ -320,8 +343,11 @@ export function CreateScheduledTaskDialog({
 
   const [name, setName] = useState("");
   const [prompt, setPrompt] = useState("");
-  // A saved workflow for each run to follow; the instructions then hold the run's details.
+  // A saved workflow for each run to follow as saved, so the form hides the instructions.
   const [workflowChoice, setWorkflowChoice] = useState<SavedWorkflow | null>(null);
+  // The workflow an automation already saved instructions with; they stay editable while it's
+  // chosen, and saving them empty ends that.
+  const [detailsWorkflowId, setDetailsWorkflowId] = useState<string | null>(null);
   const savedWorkflows = useSavedWorkflows({ enabled: open });
   // The rendered template text around the instructions of an older trigger. Never shown.
   const [systemPrompt, setSystemPrompt] = useState<string | null>(null);
@@ -461,6 +487,7 @@ export function CreateScheduledTaskDialog({
     setAgentMenuOpen(false);
     setScheduleMenuOpen(false);
     setEndingMenuOpen(false);
+    setMcpMenuOpen(false);
     selectOpenCountRef.current = 0;
     nestedMenuOpenCountRef.current = 0;
     nestedMenuClosedAtRef.current = 0;
@@ -528,23 +555,15 @@ export function CreateScheduledTaskDialog({
   // Id of the existing project picked, captured at pick time so a later rename
   // can't redirect the save; null for a newly typed name.
   const [pickedProjectId, setPickedProjectId] = useState<string | null>(null);
-  const [sessionMode, setSessionMode] = useState<ScheduledTaskSessionMode>("new");
+  // The choice in Session continuity; a workflow can override it (see `sessionMode`).
+  const [pickedSessionMode, setSessionMode] = useState<ScheduledTaskSessionMode>("new");
   const [startNewSession, setStartNewSession] = useState(false);
+  const [mcpServices, setMcpServices] = useState<string[]>([]);
+  const [mcpAuthorizing, setMcpAuthorizing] = useState(false);
+  const [mcpMenuOpen, setMcpMenuOpen] = useState(false);
   const executionTarget: ScheduledTaskExecutionTarget = sandboxMode
     ? "managed_sandbox"
     : "connected_host";
-  // Agent, host, execution-target and repository changes clear the binding.
-  // Host directory edits stay locked: a symlink may resolve to the same directory.
-  const reusesExistingSession =
-    sessionMode === "continue" &&
-    editingTask !== null &&
-    editingTask.sessionId !== null &&
-    !startNewSession &&
-    !agentChanged &&
-    executionTarget === editingTask.executionTarget &&
-    (!sandboxMode || sandboxWorkspace === savedWorkspace) &&
-    baseBranch === (editingTask.baseBranch ?? null) &&
-    (hostId === "" || hostId === editingTask.hostId);
   // An active trigger template replaces the Prompt field; the saved prompt is
   // rendered from its fields. An edit shows the saved prompt unless the user
   // switches the trigger to another integration.
@@ -555,7 +574,8 @@ export function CreateScheduledTaskDialog({
     emptyTriggerFields("jira"),
   );
   // Like the model and effort overrides, this choice outlives switching trigger types.
-  const [triggerTaskSessionMode, setTriggerTaskSessionMode] =
+  // A workflow can override it (see `triggerTaskSessionMode`).
+  const [pickedTriggerTaskSessionMode, setTriggerTaskSessionMode] =
     useState<TriggerTaskSessionMode>("new");
   // Kept while a trigger edit watches another source, so switching back restores the saved trigger.
   const [sourceSwitch, setSourceSwitch] = useState<{
@@ -625,6 +645,7 @@ export function CreateScheduledTaskDialog({
               (savedRun && { id: savedRun.id, name: savedRun.name, description: "" }))
           : null,
       );
+      setDetailsWorkflowId(savedRun?.details ? savedRun.id : null);
       setPrompt(editingTriggerConfig ? "" : (savedRun?.details ?? parts.userPrompt));
       setSystemPrompt(parts.systemPrompt);
       setTimezone(editingTask?.timezone ?? localTimezone());
@@ -646,6 +667,7 @@ export function CreateScheduledTaskDialog({
         setPickedProjectId(null);
         setSessionMode(editingTask.sessionMode);
         setStartNewSession(false);
+        setMcpServices(editingTask.mcpServices);
         if (editingTriggerConfig !== null) {
           const {
             source,
@@ -686,6 +708,7 @@ export function CreateScheduledTaskDialog({
         setSandboxMode(false);
         setProjectChoice(null);
         setPickedProjectId(null);
+        setMcpServices([]);
       }
       setError(null);
     }
@@ -811,7 +834,8 @@ export function CreateScheduledTaskDialog({
     const updated = updateTriggerWorkerSettings(effectivePrompt, settings);
     if (updated === null) return;
     const parts = splitTriggerPrompt(updated);
-    setPrompt(withoutWorkflow(parts.userPrompt));
+    // A chosen workflow leaves the hidden draft out of the prompt, so keep the draft as typed.
+    if (showsInstructions) setPrompt(withoutWorkflow(parts.userPrompt));
     setSystemPrompt(parts.systemPrompt);
   }
 
@@ -1012,6 +1036,20 @@ export function CreateScheduledTaskDialog({
   // first ONLINE host so unconfigured agents show "needs setup" right away.
   const badgeHost =
     selectedHost ?? hostOptions.find((h) => h.status === "online") ?? hostOptions[0];
+  // Trigger messages fit what both the server and the pinned polling host deliver.
+  const savedMessageMaxChars =
+    editingTemplateTrigger && originalTargetSelected
+      ? readTriggerMessageMaxChars(editingTask.prompt)
+      : null;
+  const loadedMessageBudget = triggerMessageBudget(
+    // Until server info loads, a saved trigger keeps its limit; Save waits for it.
+    curationPending ? (savedMessageMaxChars ?? undefined) : info.session_message_max_chars,
+    sandboxMode ? "managed_sandbox" : selectedHost,
+    savedMessageMaxChars,
+  );
+  const messageBudget = curationPending
+    ? { ...loadedMessageBudget, upgradeHint: null }
+    : loadedMessageBudget;
 
   // A workspace is only valid with a host — mirror the server's pairing rule so
   // the user gets inline feedback instead of a 400. In sandbox mode there is no
@@ -1031,14 +1069,19 @@ export function CreateScheduledTaskDialog({
       : (trigger ?? sourceSwitch?.source ?? editingTriggerSource);
   // The polling session's state tracks the saved source's items, so a switch always resets it.
   const triggerSourceSwitched = sourceSwitch !== null;
-  const scheduleInvalid =
-    scheduleUnsupported ||
-    unsupportedByScheduler ||
-    validateSchedule(schedule, { allowPastEnd, sessionMode, subhourSupported, executionTarget }) !==
-      null;
   const workflowPrefix = skillInvocationPrefix(harnessSettings.harness);
+  // With a workflow, text typed before choosing it stays hidden and out of each run.
+  const keepsWorkflowDetails = workflowChoice !== null && workflowChoice.id === detailsWorkflowId;
+  const showsInstructions = workflowChoice === null || keepsWorkflowDetails;
   const withWorkflow = (text: string) =>
-    workflowChoice ? savedWorkflowMessage(workflowPrefix, workflowChoice, text, false) : text;
+    workflowChoice
+      ? savedWorkflowMessage(
+          workflowPrefix,
+          workflowChoice,
+          keepsWorkflowDetails ? text : "",
+          false,
+        )
+      : text;
   // The saved list's copy, once loaded, has the workflow's current name.
   const workflowShown =
     workflowChoice &&
@@ -1055,22 +1098,98 @@ export function CreateScheduledTaskDialog({
         onChange={setWorkflowChoice}
         onOpenChange={handleSelectOpenChange}
         locked={lockedWorkflow !== null}
+        runsAsSaved={!showsInstructions}
       />
     ) : null;
   const promptTriggerFields = {
     ...triggerFields,
     instructions: withWorkflow(triggerFields.instructions),
   };
+  // Whether each match's session can start as a run of the trigger's saved workflow.
+  const workflowIdSupported =
+    workflowsEnabled && info !== "loading" && info.session_create_workflow_id === true;
+  // The prompt when no trigger form is open: as typed, or an older trigger's instructions
+  // inside its saved template text, whose creation call follows the workflow they run.
+  const freeTextPrompt = syncTriggerWorkflowId(
+    combineTriggerPrompt(withWorkflow(prompt), systemPrompt),
+    workflowIdSupported,
+  );
+  const triggerComplete =
+    trigger !== null &&
+    triggerFieldsComplete(promptTriggerFields, trigger, messageBudget.instructionsMaxChars);
+  // Each run of a saved workflow gets its own new session, whether the workflow was
+  // picked or its message typed. Text is read as the server reads it; for a trigger, that
+  // is the prompt it would save with one task session, which its instructions can keep
+  // from splitting.
+  let runsSavedWorkflow: boolean;
+  if (trigger === null) {
+    runsSavedWorkflow = promptMayRunSavedWorkflow(freeTextPrompt);
+  } else if (triggerComplete) {
+    runsSavedWorkflow = promptMayRunSavedWorkflow(
+      renderTriggerPrompt(trigger, promptTriggerFields, {
+        placement: "same_host",
+        sessionLink,
+        taskSessionMode: "continue",
+      }),
+    );
+  } else {
+    runsSavedWorkflow = parseSavedWorkflowRun(promptTriggerFields.instructions) !== null;
+  }
+  // A trigger keeps its one polling session; only its matches start new ones.
+  const workflowNeedsNewSessions =
+    runsSavedWorkflow && trigger === null && !isTriggerPrompt(freeTextPrompt);
+  const sessionMode: ScheduledTaskSessionMode = workflowNeedsNewSessions
+    ? "new"
+    : pickedSessionMode;
+  const triggerTaskSessionMode: TriggerTaskSessionMode = runsSavedWorkflow
+    ? "new"
+    : pickedTriggerTaskSessionMode;
+  // A trigger edited as its prompt can't be rendered again, so it keeps its task session.
+  const workflowKeepsTaskSession =
+    trigger === null && runsSavedWorkflow && isTaskSessionTriggerPrompt(freeTextPrompt);
+  // What saving changes about an edited automation's session because of its workflow.
+  let workflowSessionNote: string | null = null;
+  if (workflowNeedsNewSessions && editingTask?.sessionMode === "continue") {
+    workflowSessionNote =
+      "A workflow runs in a new session each time, so saving switches this automation to a new session for each run.";
+  } else if (
+    isEdit &&
+    trigger !== null &&
+    runsSavedWorkflow &&
+    pickedTriggerTaskSessionMode === "continue"
+  ) {
+    workflowSessionNote =
+      "A workflow runs in a new session for each match, so saving stops sending matches to one task session.";
+  }
+  // Agent, host, execution-target and repository changes clear the binding.
+  // Host directory edits stay locked: a symlink may resolve to the same directory.
+  const reusesExistingSession =
+    sessionMode === "continue" &&
+    editingTask !== null &&
+    editingTask.sessionId !== null &&
+    !startNewSession &&
+    !agentChanged &&
+    executionTarget === editingTask.executionTarget &&
+    (!sandboxMode || sandboxWorkspace === savedWorkspace) &&
+    baseBranch === (editingTask.baseBranch ?? null) &&
+    (hostId === "" || hostId === editingTask.hostId);
+  const scheduleInvalid =
+    scheduleUnsupported ||
+    unsupportedByScheduler ||
+    validateSchedule(schedule, { allowPastEnd, sessionMode, subhourSupported, executionTarget }) !==
+      null;
   const triggerPromptContext = {
     sessionLink,
     pollingIntervalMinutes:
       schedule.preset === "custom" && schedule.customFreq === "minutely" ? schedule.interval : 60,
     taskSessionTitle: name,
+    messageMaxChars: messageBudget.messageMaxChars,
+    workflowIdSupported,
   };
   // An edit keeps the saved workers; a new trigger's workers run where the manager
   // runs (beside it on a connected host, or each in its own sandbox).
   const renderedTriggerConfig: TriggerConfig | null =
-    trigger !== null && triggerFieldsComplete(promptTriggerFields, trigger)
+    trigger !== null && triggerComplete
       ? {
           source: trigger,
           ...promptTriggerFields,
@@ -1093,10 +1212,7 @@ export function CreateScheduledTaskDialog({
   } else if (renderedTriggerConfig !== null) {
     renderedTriggerPrompt = renderTriggerConfigPrompt(renderedTriggerConfig, triggerPromptContext);
   }
-  const effectivePrompt =
-    trigger !== null
-      ? renderedTriggerPrompt
-      : combineTriggerPrompt(withWorkflow(prompt), systemPrompt);
+  const effectivePrompt = trigger !== null ? renderedTriggerPrompt : freeTextPrompt;
   const triggerMode =
     trigger !== null ||
     (sessionMode === "continue" && (editingTemplateTrigger || isTriggerPrompt(effectivePrompt)));
@@ -1286,6 +1402,82 @@ export function CreateScheduledTaskDialog({
   // Set across the whole submit, which may first find or create a project.
   const [submitting, setSubmitting] = useState(false);
   const mutationPending = submitting || createMutation.isPending || updateMutation.isPending;
+  // A trigger's saved worker settings hide the session controls, so its services stay as saved.
+  const mcpPickerShown = mcpRegistryEnabled && !editingWorkerSettings;
+  const mcpCatalog = useMcpRegistryCatalog(open && mcpPickerShown);
+  // A saved or remembered service the catalog no longer offers is not saved again.
+  const offeredMcpServices = mcpServices.filter((id) =>
+    mcpCatalog.services.some((service) => service.id === id),
+  );
+  const mcpNeedsSignIn = mcpCatalog.services.filter(
+    (service) => offeredMcpServices.includes(service.id) && !service.connected,
+  ).length;
+  // Runs start unattended, so every selected service must already be signed in.
+  const mcpBlockedReason =
+    !mcpPickerShown || reusesExistingSession || mcpServices.length === 0
+      ? null
+      : mcpCatalog.loading
+        ? "Loading MCP services…"
+        : mcpCatalog.error
+          ? "Could not load MCP services. Retry, or turn them off."
+          : mcpNeedsSignIn > 0
+            ? "Sign in to each selected MCP service, or turn it off."
+            : null;
+  const mcpServicesChanged =
+    editingTask === null
+      ? offeredMcpServices.length > 0
+      : !sameServices(offeredMcpServices, editingTask.mcpServices);
+  const toggleMcpService = (id: string, next: boolean) =>
+    setMcpServices((current) =>
+      next ? [...new Set([...current, id])] : current.filter((service) => service !== id),
+    );
+  const {
+    signIn: signInMcp,
+    authorizing: mcpSigningIn,
+    error: mcpSignInError,
+    clearError: clearMcpSignInError,
+    cancel: cancelMcpSignIn,
+  } = useRegistrySignIn(mcpCatalog.refresh);
+  // The dialog stays mounted between drafts, so a sign-in must not outlive its own.
+  useEffect(() => {
+    if (!open) cancelMcpSignIn();
+  }, [open, cancelMcpSignIn]);
+  // A trigger reads its source through that service's MCP, when the server offers one.
+  const triggerMcp =
+    mcpPickerShown && trigger !== null && !reusesExistingSession
+      ? triggerMcpService(trigger, mcpCatalog.services)
+      : undefined;
+  // The owner adds a trigger's service; picking or switching triggers never changes them.
+  const triggerMcpNote: TriggerMcpService | undefined =
+    triggerMcp === undefined
+      ? undefined
+      : {
+          title: triggerMcp.title,
+          selected: triggerMcp.connected && offeredMcpServices.includes(triggerMcp.id),
+          signingIn: mcpSigningIn === triggerMcp.id,
+          error: mcpSignInError?.id === triggerMcp.id ? mcpSignInError.message : null,
+          // A pasted token has no sign-in popup, so it is connected in settings.
+          settingsHref:
+            !triggerMcp.connected && triggerMcp.auth === "bearer"
+              ? withBasePath("/settings/mcp")
+              : undefined,
+          onAdd: () => {
+            clearMcpSignInError();
+            if (triggerMcp.connected) {
+              toggleMcpService(triggerMcp.id, true);
+              return;
+            }
+            // A Databricks service first asks for its workspace, which the menu collects.
+            if (triggerMcp.auth === "databricks") {
+              setAdvancedOpen(true);
+              setMcpMenuOpen(true);
+              return;
+            }
+            void signInMcp(triggerMcp).then(
+              (signedIn) => signedIn && toggleMcpService(triggerMcp.id, true),
+            );
+          },
+        };
   const canSubmit =
     !curationPending &&
     name.trim() !== "" &&
@@ -1297,8 +1489,12 @@ export function CreateScheduledTaskDialog({
     (isEdit || sandboxMode || hostId !== "") &&
     !workspaceWithoutHost &&
     !scheduleInvalid &&
+    !workflowKeepsTaskSession &&
     !pollingBlockedReason &&
     !(workerSettings !== null && workerHarnessSettings.blockedReason) &&
+    mcpBlockedReason === null &&
+    !mcpAuthorizing &&
+    mcpSigningIn === null &&
     !mutationPending;
   // Problems that disable Save but whose explanation or fix lives under Advanced settings.
   const advancedBlocksSubmit =
@@ -1310,7 +1506,8 @@ export function CreateScheduledTaskDialog({
       workspaceWithoutHost ||
       Boolean(pollingBlockedReason) ||
       (workerSettings !== null && Boolean(workerHarnessSettings.blockedReason)) ||
-      (!isEdit && agents !== undefined && effectiveAgentId === null));
+      (!isEdit && agents !== undefined && effectiveAgentId === null) ||
+      (mcpBlockedReason !== null && !mcpCatalog.loading));
   useEffect(() => {
     if (open && advancedBlocksSubmit) setAdvancedOpen(true);
   }, [open, advancedBlocksSubmit]);
@@ -1325,7 +1522,7 @@ export function CreateScheduledTaskDialog({
       triggerFields,
       schedule,
       timezone,
-      sessionMode,
+      sessionMode: pickedSessionMode,
     };
     const previousDefaultName =
       triggerType === "schedule" ? (initialName ?? "") : TRIGGER_TEMPLATES[triggerType].name;
@@ -1424,6 +1621,7 @@ export function CreateScheduledTaskDialog({
     setTrigger(null);
     setTriggerFields(emptyTriggerFields("jira"));
     setTriggerTaskSessionMode("new");
+    setMcpServices([]);
     setError(null);
     setScheduleUnsupported(false);
   }
@@ -1490,6 +1688,7 @@ export function CreateScheduledTaskDialog({
                   }
                 : {}),
               ...(supportsPermission ? { permissionMode: effectivePermission || null } : {}),
+              ...(mcpPickerShown && mcpServicesChanged ? { mcpServices: offeredMcpServices } : {}),
             };
         await updateMutation.mutateAsync({
           id: editingTask.id,
@@ -1525,6 +1724,7 @@ export function CreateScheduledTaskDialog({
           ...(supportsPermission && effectivePermission !== ""
             ? { permissionMode: effectivePermission }
             : {}),
+          ...(mcpPickerShown && mcpServicesChanged ? { mcpServices: offeredMcpServices } : {}),
         });
         onCreated?.(created);
       }
@@ -1802,42 +2002,78 @@ export function CreateScheduledTaskDialog({
                         taskSessionMode={triggerTaskSessionMode}
                         workflowField={workflowField}
                         instructionsAreDetails={workflowChoice !== null}
+                        hideInstructions={!showsInstructions}
+                        mcpService={triggerMcpNote}
+                        instructionsMaxChars={messageBudget.instructionsMaxChars}
+                        instructionsUpgradeHint={messageBudget.upgradeHint}
                       />
                     ) : (
                       <div ref={promptFieldsRef} className="flex flex-col gap-1.5">
-                        {workflowField && <div className="mb-3.5">{workflowField}</div>}
-                        <Textarea
-                          id="task-prompt"
-                          aria-label={
-                            startsFromSession || workflowChoice
-                              ? "Additional instructions"
-                              : "Instructions"
-                          }
-                          value={prompt}
-                          rows={5}
-                          placeholder={
-                            workflowChoice
-                              ? "Optional. Instructions to customize the workflow."
-                              : startsFromSession
-                                ? "Optional. For example: Use this week's data."
-                                : "What should the agent do each run?"
-                          }
-                          data-testid="task-prompt-input"
-                          componentId="tasks.scheduled.prompt"
-                          className="min-h-40 resize-y rounded-xl text-ui focus-visible:ring-0"
-                          onChange={(e) => setPrompt(e.target.value)}
-                        />
-                        {systemPrompt !== null &&
-                          splitTriggerPrompt(effectivePrompt).systemPrompt === null && (
-                            <p role="status" className="text-sm text-warning">
-                              {prompt.trim() === ""
-                                ? "Instructions can't be empty."
-                                : "These edits change the template structure. After saving, the full text will appear as one prompt."}
-                            </p>
-                          )}
+                        {workflowField && (
+                          <div className={showsInstructions ? "mb-3.5" : undefined}>
+                            {workflowField}
+                          </div>
+                        )}
+                        {showsInstructions && (
+                          <>
+                            {workflowChoice && (
+                              <Label htmlFor="task-prompt">{WORKFLOW_DETAILS_LABEL}</Label>
+                            )}
+                            <Textarea
+                              id="task-prompt"
+                              aria-label={
+                                workflowChoice
+                                  ? undefined
+                                  : startsFromSession
+                                    ? "Additional instructions"
+                                    : "Instructions"
+                              }
+                              value={prompt}
+                              rows={5}
+                              placeholder={
+                                workflowChoice
+                                  ? WORKFLOW_DETAILS_PLACEHOLDER
+                                  : startsFromSession
+                                    ? "Optional. For example: Use this week's data."
+                                    : "What should the agent do each run?"
+                              }
+                              data-testid="task-prompt-input"
+                              componentId="tasks.scheduled.prompt"
+                              className="min-h-40 resize-y rounded-xl text-ui focus-visible:ring-0"
+                              onChange={(e) => setPrompt(e.target.value)}
+                            />
+                            {systemPrompt !== null &&
+                              splitTriggerPrompt(effectivePrompt).systemPrompt === null && (
+                                <p role="status" className="text-sm text-warning">
+                                  {prompt.trim() === ""
+                                    ? "Instructions can't be empty."
+                                    : "These edits change the template structure. After saving, the full text will appear as one prompt."}
+                                </p>
+                              )}
+                          </>
+                        )}
                       </div>
                     )}
                   </div>
+                  {workflowKeepsTaskSession && (
+                    <p
+                      role="alert"
+                      className="text-sm text-warning sm:col-span-6"
+                      data-testid="task-workflow-task-session-note"
+                    >
+                      A workflow runs in a new session for each match, but this automation sends
+                      every match to one task session. Remove the workflow to save it.
+                    </p>
+                  )}
+                  {workflowSessionNote !== null && (
+                    <p
+                      role="status"
+                      className="text-sm text-muted-foreground sm:col-span-6"
+                      data-testid="task-workflow-session-note"
+                    >
+                      {workflowSessionNote}
+                    </p>
+                  )}
                   {hiddenTriggerScheduleNeedsReplacement && (
                     <div
                       className="flex items-center justify-between gap-3 rounded-lg bg-muted/50 px-3 py-2 text-ui"
@@ -1987,6 +2223,7 @@ export function CreateScheduledTaskDialog({
                         </SelectContent>
                       </Select>
                     )}
+
                     <Collapsible
                       open={advancedOpen}
                       onOpenChange={setAdvancedOpen}
@@ -2008,54 +2245,8 @@ export function CreateScheduledTaskDialog({
                           data-testid="task-top-level-controls"
                         >
                           {trigger !== null && editingTask === null && (
-                            <div
-                              className="flex min-h-9 items-center justify-between gap-4 py-px"
-                              data-testid="task-trigger-session-mode-field"
-                            >
-                              <span className="text-ui text-muted-foreground">
-                                Session continuity
-                              </span>
-                              <DropdownMenu>
-                                <DropdownMenuTrigger asChild>
-                                  <ComposerHarnessTrigger
-                                    label="Session continuity"
-                                    model={
-                                      triggerTaskSessionMode === "new"
-                                        ? "New session for each match"
-                                        : "One task session for all matches"
-                                    }
-                                    icon={<RefreshCwIcon className="size-4 shrink-0" />}
-                                    className={AUTOMATION_ADVANCED_CONTROL_TRIGGER_CLASS_NAME}
-                                    data-testid="task-trigger-session-mode"
-                                  />
-                                </DropdownMenuTrigger>
-                                <DropdownMenuContent align="end" className="min-w-64">
-                                  <DropdownMenuRadioGroup
-                                    value={triggerTaskSessionMode}
-                                    onValueChange={(value) =>
-                                      setTriggerTaskSessionMode(value as TriggerTaskSessionMode)
-                                    }
-                                  >
-                                    <DropdownMenuRadioItem value="new">
-                                      New session for each match
-                                    </DropdownMenuRadioItem>
-                                    <DropdownMenuRadioItem value="continue">
-                                      One task session for all matches
-                                    </DropdownMenuRadioItem>
-                                  </DropdownMenuRadioGroup>
-                                </DropdownMenuContent>
-                              </DropdownMenu>
-                            </div>
-                          )}
-                          {/* A trigger keeps one session: the mode switch stays hidden, but an edit can restart it. */}
-                          {sessionModesSupported &&
-                            (trigger === null || isEdit) &&
-                            !startsFromSession &&
-                            (!editingTemplateTrigger || editingTask?.sessionId) && (
-                              <div
-                                className="flex min-h-9 items-center justify-between gap-4 py-px"
-                                data-testid="task-session-mode-field"
-                              >
+                            <div className="py-px" data-testid="task-trigger-session-mode-field">
+                              <div className="flex min-h-9 items-center justify-between gap-4">
                                 <span className="text-ui text-muted-foreground">
                                   Session continuity
                                 </span>
@@ -2064,53 +2255,191 @@ export function CreateScheduledTaskDialog({
                                     <ComposerHarnessTrigger
                                       label="Session continuity"
                                       model={
-                                        sessionMode === "new"
-                                          ? "New session each run"
-                                          : "Continue one session"
+                                        triggerTaskSessionMode === "new"
+                                          ? "New session for each match"
+                                          : "One task session for all matches"
                                       }
                                       icon={<RefreshCwIcon className="size-4 shrink-0" />}
                                       className={AUTOMATION_ADVANCED_CONTROL_TRIGGER_CLASS_NAME}
-                                      data-testid="task-session-mode-trigger"
+                                      data-testid="task-trigger-session-mode"
                                     />
                                   </DropdownMenuTrigger>
                                   <DropdownMenuContent align="end" className="min-w-64">
-                                    {!editingTemplateTrigger && (
-                                      <DropdownMenuRadioGroup
-                                        value={sessionMode}
-                                        onValueChange={(value) =>
-                                          setSessionMode(value as ScheduledTaskSessionMode)
-                                        }
+                                    <DropdownMenuRadioGroup
+                                      value={triggerTaskSessionMode}
+                                      onValueChange={(value) =>
+                                        setTriggerTaskSessionMode(value as TriggerTaskSessionMode)
+                                      }
+                                    >
+                                      <DropdownMenuRadioItem value="new">
+                                        New session for each match
+                                      </DropdownMenuRadioItem>
+                                      <DropdownMenuRadioItem
+                                        value="continue"
+                                        disabled={runsSavedWorkflow}
                                       >
-                                        <DropdownMenuRadioItem value="new">
-                                          New session each run
-                                        </DropdownMenuRadioItem>
-                                        <DropdownMenuRadioItem value="continue">
-                                          Continue one session
-                                        </DropdownMenuRadioItem>
-                                      </DropdownMenuRadioGroup>
-                                    )}
-                                    {isEdit &&
-                                      sessionMode === "continue" &&
-                                      editingTask?.sessionId && (
-                                        <>
-                                          {!editingTemplateTrigger && <DropdownMenuSeparator />}
-                                          <DropdownMenuCheckboxItem
-                                            checked={startNewSession || triggerSourceSwitched}
-                                            disabled={triggerSourceSwitched}
-                                            onCheckedChange={(checked) =>
-                                              setStartNewSession(checked === true)
-                                            }
-                                            onSelect={(event) => event.preventDefault()}
-                                            data-testid="task-start-new-session"
-                                          >
-                                            Start a new session on the next run
-                                          </DropdownMenuCheckboxItem>
-                                        </>
-                                      )}
+                                        One task session for all matches
+                                      </DropdownMenuRadioItem>
+                                    </DropdownMenuRadioGroup>
                                   </DropdownMenuContent>
                                 </DropdownMenu>
                               </div>
+                              {runsSavedWorkflow && (
+                                <p
+                                  className="pb-2 text-sm text-muted-foreground"
+                                  data-testid="task-trigger-session-mode-workflow-note"
+                                >
+                                  A workflow runs in a new session for each match.
+                                </p>
+                              )}
+                            </div>
+                          )}
+                          {/* A trigger keeps one session: the mode switch stays hidden, but an edit can restart it. */}
+                          {sessionModesSupported &&
+                            (trigger === null || isEdit) &&
+                            !startsFromSession &&
+                            (!editingTemplateTrigger || editingTask?.sessionId) && (
+                              <div className="py-px" data-testid="task-session-mode-field">
+                                <div className="flex min-h-9 items-center justify-between gap-4">
+                                  <span className="text-ui text-muted-foreground">
+                                    Session continuity
+                                  </span>
+                                  <DropdownMenu>
+                                    <DropdownMenuTrigger asChild>
+                                      <ComposerHarnessTrigger
+                                        label="Session continuity"
+                                        model={
+                                          sessionMode === "new"
+                                            ? "New session each run"
+                                            : "Continue one session"
+                                        }
+                                        icon={<RefreshCwIcon className="size-4 shrink-0" />}
+                                        className={AUTOMATION_ADVANCED_CONTROL_TRIGGER_CLASS_NAME}
+                                        data-testid="task-session-mode-trigger"
+                                      />
+                                    </DropdownMenuTrigger>
+                                    <DropdownMenuContent align="end" className="min-w-64">
+                                      {!editingTemplateTrigger && (
+                                        <DropdownMenuRadioGroup
+                                          value={sessionMode}
+                                          onValueChange={(value) =>
+                                            setSessionMode(value as ScheduledTaskSessionMode)
+                                          }
+                                        >
+                                          <DropdownMenuRadioItem value="new">
+                                            New session each run
+                                          </DropdownMenuRadioItem>
+                                          <DropdownMenuRadioItem
+                                            value="continue"
+                                            disabled={workflowNeedsNewSessions}
+                                          >
+                                            Continue one session
+                                          </DropdownMenuRadioItem>
+                                        </DropdownMenuRadioGroup>
+                                      )}
+                                      {isEdit &&
+                                        sessionMode === "continue" &&
+                                        editingTask?.sessionId && (
+                                          <>
+                                            {!editingTemplateTrigger && <DropdownMenuSeparator />}
+                                            <DropdownMenuCheckboxItem
+                                              checked={startNewSession || triggerSourceSwitched}
+                                              disabled={triggerSourceSwitched}
+                                              onCheckedChange={(checked) =>
+                                                setStartNewSession(checked === true)
+                                              }
+                                              onSelect={(event) => event.preventDefault()}
+                                              data-testid="task-start-new-session"
+                                            >
+                                              Start a new session on the next run
+                                            </DropdownMenuCheckboxItem>
+                                          </>
+                                        )}
+                                    </DropdownMenuContent>
+                                  </DropdownMenu>
+                                </div>
+                                {workflowNeedsNewSessions && (
+                                  <p
+                                    className="pb-2 text-sm text-muted-foreground"
+                                    data-testid="task-session-mode-workflow-note"
+                                  >
+                                    A workflow runs in a new session each time.
+                                  </p>
+                                )}
+                              </div>
                             )}
+                          {mcpPickerShown && (
+                            <div className="py-px" data-testid="task-mcp-services-field">
+                              <div className="flex min-h-9 items-center justify-between gap-4">
+                                <span className="text-ui text-muted-foreground">MCP services</span>
+                                <Popover
+                                  open={mcpMenuOpen}
+                                  onOpenChange={(next) => !mcpAuthorizing && setMcpMenuOpen(next)}
+                                >
+                                  <PopoverTrigger asChild>
+                                    <ComposerHarnessTrigger
+                                      label="MCP services"
+                                      model={
+                                        reusesExistingSession
+                                          ? "Session's MCPs"
+                                          : offeredMcpServices.length === 0
+                                            ? "No MCPs"
+                                            : `MCPs · ${offeredMcpServices.length}`
+                                      }
+                                      icon={
+                                        <PlugIcon
+                                          className={`size-4 shrink-0${
+                                            mcpBlockedReason && !mcpCatalog.loading
+                                              ? " text-amber-600 dark:text-amber-500"
+                                              : ""
+                                          }`}
+                                        />
+                                      }
+                                      disabled={reusesExistingSession}
+                                      title={
+                                        reusesExistingSession
+                                          ? "The continued session keeps its MCP services"
+                                          : undefined
+                                      }
+                                      className={AUTOMATION_ADVANCED_CONTROL_TRIGGER_CLASS_NAME}
+                                      data-testid="task-mcp-services-trigger"
+                                    />
+                                  </PopoverTrigger>
+                                  <PopoverContent
+                                    align="end"
+                                    collisionPadding={12}
+                                    onPointerDownOutside={keepParentPopoverOpenForNestedMenu}
+                                    className="flex max-h-[var(--radix-popover-content-available-height)] w-72 max-w-[calc(100vw-2rem)] flex-col p-0"
+                                    data-testid="task-mcp-services-menu"
+                                  >
+                                    <div className="shrink-0 border-b border-border px-3 py-2.5">
+                                      <PickerSectionHeader>MCP services</PickerSectionHeader>
+                                      <p className="mt-0.5 text-xs text-muted-foreground">
+                                        Every run starts with these. Runs are unattended, so sign in
+                                        to each one now.
+                                      </p>
+                                    </div>
+                                    <McpRegistryPicker
+                                      attached={mcpServices}
+                                      onToggle={toggleMcpService}
+                                      busy={mutationPending}
+                                      onAuthorizingChange={setMcpAuthorizing}
+                                      catalog={mcpCatalog}
+                                    />
+                                  </PopoverContent>
+                                </Popover>
+                              </div>
+                              {mcpBlockedReason && !mcpCatalog.loading && (
+                                <p
+                                  role="alert"
+                                  data-testid="task-mcp-services-blocked"
+                                  className="pb-2 text-sm text-destructive"
+                                >
+                                  {mcpBlockedReason}
+                                </p>
+                              )}
+                            </div>
+                          )}
 
                           {!usesTriggerSchedule && (isEdit || fromSession !== null) && (
                             <div className="flex min-h-9 items-center justify-between gap-4 py-px">
@@ -2616,3 +2945,8 @@ const SANDBOX_HOST = "__sandbox__";
 // other dialogs (project settings) can reuse it without pulling this file's
 // module graph. Re-exported here to keep existing imports and tests stable.
 export { isBackdropOverlay, isInsidePopper, shouldGuardDialogDismiss };
+
+/** Whether two MCP service lists name the same services, in any order. */
+function sameServices(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((service) => right.includes(service));
+}

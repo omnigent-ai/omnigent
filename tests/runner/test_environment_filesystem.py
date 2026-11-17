@@ -1030,6 +1030,82 @@ async def test_download_returns_complete_file_past_read_cap(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    ("range_header", "start", "end"),
+    [
+        ("bytes=0-1", 0, 2),
+        ("bytes=65530-65545", 65530, 65546),
+        ("bytes=131072-", 131072, 153600),
+        ("bytes=-16", 153584, 153600),
+        ("bytes=153590-999999", 153590, 153600),
+        ("bytes=-999999", 0, 153600),
+    ],
+)
+async def test_download_serves_byte_range(
+    client: httpx.AsyncClient, workspace: Path, range_header: str, start: int, end: int
+) -> None:
+    payload = bytes(range(256)) * 600
+    (workspace / "recording.mp4").write_bytes(payload)
+    response = await client.get(
+        "/v1/sessions/conv_test/resources/environments/default/filesystem/recording.mp4",
+        params={"download": "true"},
+        headers={"Range": range_header},
+    )
+    assert response.status_code == 206
+    assert response.content == payload[start:end]
+    assert response.headers["content-length"] == str(end - start)
+    assert response.headers["content-range"] == f"bytes {start}-{end - 1}/{len(payload)}"
+    assert response.headers["accept-ranges"] == "bytes"
+    assert response.headers["content-type"] == "video/mp4"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("payload", "range_header"),
+    [(b"hello", "bytes=5-"), (b"hello", "bytes=10-20"), (b"", "bytes=0-"), (b"hello", "bytes=-0")],
+)
+async def test_download_rejects_unsatisfiable_byte_range(
+    client: httpx.AsyncClient, workspace: Path, payload: bytes, range_header: str
+) -> None:
+    (workspace / "recording.mp4").write_bytes(payload)
+    response = await client.get(
+        "/v1/sessions/conv_test/resources/environments/default/filesystem/recording.mp4",
+        params={"download": "true"},
+        headers={"Range": range_header},
+    )
+    assert response.status_code == 416
+    assert response.headers["content-range"] == f"bytes */{len(payload)}"
+    assert response.headers["accept-ranges"] == "bytes"
+    assert response.content == b""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {},
+        {"Range": "items=0-1"},
+        {"Range": "bytes=garbage"},
+        {"Range": "bytes=3-1"},
+        {"Range": "bytes=0-1,3-4"},
+        {"Range": "bytes=0-1", "If-Range": '"different-version"'},
+    ],
+)
+async def test_download_falls_back_to_complete_file(
+    client: httpx.AsyncClient, workspace: Path, headers: dict[str, str]
+) -> None:
+    response = await client.get(
+        "/v1/sessions/conv_test/resources/environments/default/filesystem/hello.txt",
+        params={"download": "true"},
+        headers=headers,
+    )
+    assert response.status_code == 200
+    assert response.content == (workspace / "hello.txt").read_bytes()
+    assert response.headers["accept-ranges"] == "bytes"
+    assert "content-range" not in response.headers
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     ("path", "status", "code"),
     [("src", 400, "invalid_path"), ("nope.bin", 404, "path_not_found")],
 )

@@ -7,6 +7,7 @@
 const fs = require("node:fs");
 const http = require("node:http");
 const path = require("node:path");
+const { suggestedAlias } = require("./sshTargets");
 
 // The host binds <temp dir>/omnigent-workspace-XXXX/workspace.sock, in a 0700 directory.
 const SOCKET_NAME = "workspace.sock";
@@ -22,6 +23,13 @@ const MAX_REQUEST_BYTES = 1024 * 1024;
 // The host caps a read at 10 MiB; this leaves room for framing.
 const MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
 const TIMEOUT_MS = 30_000;
+// A host's socket on another machine, which can't be checked from here. Only
+// characters `ssh -L` can carry, in the directory shape the host makes.
+const REMOTE_SOCKET_PATH =
+  /^(\/[A-Za-z0-9._-]+)*\/omnigent-workspace-[A-Za-z0-9_]+\/workspace\.sock$/;
+// A unary call the host answers only for a valid token, so a 200 proves the right host.
+const PROBE_PATH = "/omnigent.api.workspace.v1alpha1.WorkspaceService/ListDirectory";
+const PROBE_BODY = Buffer.from('{"pageSize":1}');
 
 /**
  * Whether `socketPath` is a workspace socket an Omnigent host made for this user.
@@ -55,14 +63,21 @@ function isWorkspaceSocket(socketPath) {
 /**
  * Send one workspace API call to a host's socket and buffer its response.
  *
- * @param {{socketPath: string, path: string, headers: Record<string, string>, body: Uint8Array}} request
+ * The socket is this machine's, or one on the host's machine reached over SSH
+ * through `forwards`: by the destination recorded for the host, or else by the
+ * alias the page suggests once the user allows it and `verifySshTarget` proves
+ * it reaches the host.
+ *
+ * @param {{hostId?: string, sshTarget?: string, socketPath: string, path: string, headers: Record<string, string>, body: Uint8Array}} request
+ * @param {{
+ *   sshDestination?: (hostId: string) => string | null,
+ *   verifySshTarget?: (hostId: string, alias: string, proves: () => Promise<boolean>) => Promise<boolean>,
+ *   forwards?: ReturnType<typeof import("./workspaceSshForwards").createWorkspaceSshForwards>,
+ * }} [routes]
  * @returns {Promise<{status: number, headers: Record<string, string>, body: Uint8Array}>}
  */
-function workspaceSocketRequest(request) {
-  const { socketPath, path: methodPath, headers, body } = request ?? {};
-  if (!isWorkspaceSocket(socketPath)) {
-    return Promise.reject(new Error("not a workspace socket on this machine"));
-  }
+function workspaceSocketRequest(request, routes = {}) {
+  const { hostId, sshTarget, socketPath, path: methodPath, headers, body } = request ?? {};
   if (typeof methodPath !== "string" || !METHOD_PATH.test(methodPath)) {
     return Promise.reject(new Error("not a workspace API method"));
   }
@@ -74,6 +89,55 @@ function workspaceSocketRequest(request) {
     const value = headers?.[name];
     if (typeof value === "string") forwarded[name] = value;
   }
+  if (isWorkspaceSocket(socketPath)) return send(socketPath, methodPath, forwarded, body);
+  const recorded = typeof hostId === "string" ? (routes.sshDestination?.(hostId) ?? null) : null;
+  const suggested =
+    !recorded && typeof hostId === "string" && routes.verifySshTarget
+      ? suggestedAlias(sshTarget)
+      : null;
+  const destination = recorded ?? suggested;
+  const { forwards } = routes;
+  const remotePathOk =
+    typeof socketPath === "string" &&
+    REMOTE_SOCKET_PATH.test(socketPath) &&
+    path.posix.normalize(socketPath) === socketPath;
+  if (!destination || !forwards || !remotePathOk) {
+    return Promise.reject(new Error("not a workspace socket on this machine"));
+  }
+  const proves = async () => {
+    const { socketPath: local, dropForward } = await forwards.localSocket(destination, socketPath);
+    const probe = {
+      "content-type": "application/json",
+      "content-length": String(PROBE_BODY.byteLength),
+      ...(forwarded.authorization ? { authorization: forwarded.authorization } : {}),
+    };
+    let ok = false;
+    try {
+      ok = (await send(local, PROBE_PATH, probe, PROBE_BODY)).status === 200;
+    } finally {
+      // The connection may serve other hosts; it closes once idle, or now if it is gone.
+      if (!ok) dropForward();
+    }
+    return ok;
+  };
+  const forward = recorded
+    ? forwards.localSocket(destination, socketPath)
+    : routes.verifySshTarget(hostId, destination, proves).then((ok) => {
+        if (!ok) throw new Error("SSH alias not allowed or not verified for this host");
+        return forwards.localSocket(destination, socketPath);
+      });
+  return forward.then(({ socketPath: local, dropConnection, dropForward }) =>
+    send(local, methodPath, forwarded, body).catch((error) => {
+      // A missing listener means the connection is gone. A reset means the remote socket
+      // refused (a restarted host) or the master died; cancelling the forward tells which.
+      if (error?.code === "ECONNREFUSED" || error?.code === "ENOENT") dropConnection();
+      else if (error?.code === "ECONNRESET") dropForward();
+      throw error;
+    }),
+  );
+}
+
+function send(socketPath, methodPath, forwarded, body) {
   return new Promise((resolve, reject) => {
     const outgoing = http.request(
       { socketPath, path: methodPath, method: "POST", headers: forwarded, timeout: TIMEOUT_MS },

@@ -95,6 +95,7 @@ import { ContentSearchPanel } from "./ContentSearchPanel";
 import { FileViewer } from "./FileViewer";
 import { ResponsiveViewerSlot } from "./ResponsiveViewerSlot";
 import { TasksPanel } from "./TasksPanel";
+import { SessionDescendantRuns } from "@/components/workflows/WorkflowRunRow";
 import { PullRequestPanel } from "./PullRequestPanel";
 import type { ChangedSort } from "./FlatFileList";
 import { SubagentsPanel } from "./SubagentsPanel";
@@ -2227,7 +2228,13 @@ function WorkspacePanelImpl({
             </RenderErrorBoundary>
           ) : scopeView === "tasks" && conversationId ? (
             <RenderErrorBoundary name="tasks" resetKey={conversationId}>
-              <TasksPanel conversationId={conversationId} active={open && !inert} />
+              <TasksPanel
+                conversationId={conversationId}
+                active={open && !inert}
+                renderWorkflowRuns={(workflowId) => (
+                  <SessionDescendantRuns sessionId={conversationId} workflowId={workflowId} />
+                )}
+              />
             </RenderErrorBoundary>
           ) : scopeView === "subagents" && rootSessionId ? (
             <SubagentPanelOpenerContext.Provider value={subagentPanelOpener ?? null}>

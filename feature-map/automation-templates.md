@@ -47,6 +47,10 @@ to customize.
   Instructions for the task session, and Advanced's summary shows One task session.
   The choice is saved in the prompt, survives switching integrations, and isn't
   offered on edit. Archiving the task session makes the next match start a new one.
+  With a workflow chosen, One task session is disabled and a note says each match
+  runs the workflow in a new session. Saving a workflow trigger that used one task
+  session from the trigger form switches it to a session for each match; one that
+  opens as its prompt text can't be saved until the workflow is removed.
 - `prompt-editing`: the rendered template prompt is never shown or editable; there is
   no System prompt, Preview prompt, or Edit as prompt. A trigger saves its form state
   as a one-line `<!-- omnigent-trigger v1 {...} -->` header above the rendered prompt.
@@ -187,6 +191,16 @@ to customize.
   **Start a new session for each match**. With `automations_v2` on a server
   supporting sub-hour schedules, use Repeat → Interval
   for a connected host or a continued sandbox session.
+- **MCP services:** when the server's MCP registry is on and `/v1/info` reports
+  `scheduled_task_mcp_services`, Advanced has an MCP services row that opens
+  the new-chat service list and its sign-in. A new automation starts with none,
+  and picking or switching triggers never changes them. A trigger whose
+  service is in the catalog shows "Uses <service> MCP" when it is selected,
+  otherwise a yellow "Add <service> MCP" button that signs in if needed (or
+  opens MCP settings for a pasted-token service) and selects it. Create stays
+  disabled, and Advanced opens, while a selected service needs sign-in or the
+  list can't load. An edit that keeps a continued session locks the row, since
+  that session keeps its services.
 - **Editing:** open Edit automation from a row menu or a task's detail page;
   the same workspace and sandbox Repository controls apply. Unrelated edits
   preserve a continued session when the repository is unchanged or a legacy
