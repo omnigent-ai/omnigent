@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -11,6 +12,7 @@ from pathlib import Path, PurePosixPath
 TESTS = "Tests and test support"
 CATEGORIES = (TESTS, "Documentation", "Dependencies and lockfiles", "Implementation / other")
 TEST_FIELD_COUNT = 5
+COMMENT_BYTE_LIMIT = 60000
 LINKED_ISSUE_BODY_LIMIT = 4096
 LINKED_ISSUES_QUERY = """query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) { pullRequest(number: $number) {
@@ -255,18 +257,149 @@ def compose_review(review: str, stats: dict) -> str:
         + escape_tests_table(sections["Tests"])
         + review[tests_start + len(sections["Tests"]) :]
     )
-    result = (
+    return (
         review[: summary.end()].rstrip()
         + "\n\n"
         + stats["markdown"]
         + "\n\n"
         + collapse_test_assessment(review[summary.end() :].lstrip())
     )
-    if len(result.encode("utf-8")) > 60000:
-        raise ValueError(
-            "Polly review exceeds the comment budget; refusing to truncate assessments."
+
+
+def split_review(review: str, byte_limit: int) -> list[str]:
+    """Partition without dropping text, preferring complete Markdown lines."""
+    if byte_limit < 4:
+        raise ValueError("Comment wrappers leave no room for review content.")
+    parts = []
+    while len(encoded := review.encode("utf-8")) > byte_limit:
+        boundary = byte_limit
+        while encoded[boundary] & 0xC0 == 0x80:
+            boundary -= 1
+        prefix = encoded[:boundary].decode("utf-8")
+        line_end = prefix.rfind("\n") + 1
+        end = line_end if line_end > len(prefix) // 2 else len(prefix)
+        parts.append(review[:end])
+        review = review[end:]
+    parts.append(review)
+    return parts
+
+
+def _markdown_context(text: str) -> tuple[str, str, str]:
+    """Reopen details, fenced code and table headers at a comment boundary."""
+    details = 0
+    fence = ""
+    fence_line = ""
+    table_header = ""
+    previous = ""
+    for line in text.splitlines():
+        if fence:
+            if re.fullmatch(rf" {{0,3}}{re.escape(fence[0])}{{{len(fence)},}}\s*", line):
+                fence = ""
+            continue
+        opening = re.match(r"^ {0,3}(`{3,}|~{3,})", line)
+        if opening:
+            fence, fence_line = opening[1], line
+            table_header = ""
+            continue
+        if line.strip() == "<details>":
+            details += 1
+        elif line.strip() == "</details>":
+            details = max(0, details - 1)
+        if line.lstrip().startswith("|"):
+            cells = split_table_row(line.strip().strip("|"))
+            if previous.lstrip().startswith("|") and all(
+                re.fullmatch(r"\s*:?-+:?\s*", cell) for cell in cells
+            ):
+                table_header = previous + "\n" + line + "\n"
+        else:
+            table_header = ""
+        previous = line
+    prefix = "<details>\n<summary>Review continued</summary>\n\n" * details
+    suffix = "\n\n</details>" * details
+    if fence:
+        prefix += fence_line + "\n"
+        suffix = "\n" + fence + "\n" + suffix
+        table_header = ""
+    return prefix, suffix, table_header
+
+
+def review_comments(review: str, *, head_sha: str, run_id: str, run_url: str) -> list[str]:
+    """Render all bounded comments before publishing any authoritative marker."""
+
+    def wrap(content: str, part: int, count: int) -> str:
+        marker = (
+            f"<!-- polly-reviewed-sha: {head_sha} -->"
+            if part == 1
+            else f"<!-- polly-review-part:{run_id}:{part}/{count} -->"
         )
-    return result
+        title = (
+            '## <img src="https://raw.githubusercontent.com/omnigent-ai/omnigent/main/'
+            'docs/images/omnigent-logo.svg" alt="" height="20" valign="middle" /> Polly AI Review'
+        )
+        note = ""
+        if count > 1:
+            title += f" (part {part}/{count})"
+            note = (
+                f"Review of `{head_sha}`. Read all {count} parts. "
+                "Continuations are posted before part 1; publication is complete only when "
+                "part 1 appears.\n\n"
+            )
+        return (
+            f"<!-- polly-review-bot -->\n{marker}\n<!-- polly-review-run:{run_id} -->\n"
+            f"{title}\n\n{note}{content}\n---\n"
+            f"<sub>Automated review by Polly · [workflow run]({run_url})</sub>\n"
+        )
+
+    single = wrap(review, 1, 1)
+    if len(single.encode("utf-8")) <= COMMENT_BYTE_LIMIT:
+        return [single]
+    byte_limit = COMMENT_BYTE_LIMIT
+    while True:
+        chunks = split_review(review, byte_limit)
+        comments = []
+        before = ""
+        for part, chunk in enumerate(chunks, 1):
+            prefix, _, table_header = _markdown_context(before)
+            before += chunk
+            _, suffix, _ = _markdown_context(before)
+            if chunk.startswith("|"):
+                prefix += table_header
+            comments.append(wrap(prefix + chunk + suffix, part, len(chunks)))
+        overflow = max(len(comment.encode("utf-8")) for comment in comments) - COMMENT_BYTE_LIMIT
+        if overflow <= 0:
+            return comments
+        byte_limit -= overflow
+
+
+def publish_review(review: Path, receipt: Path) -> None:
+    receipt.unlink(missing_ok=True)
+    comments = review_comments(
+        review.read_text(encoding="utf-8"),
+        head_sha=os.environ["HEAD_SHA"],
+        run_id=f"{os.environ['GITHUB_RUN_ID']}-{os.environ['GITHUB_RUN_ATTEMPT']}",
+        run_url=os.environ["RUN_URL"],
+    )
+    paths = []
+    for part, comment in enumerate(comments, 1):
+        path = review.with_name("comment.md" if part == 1 else f"comment-part-{part}.md")
+        path.write_text(comment, encoding="utf-8")
+        paths.append(path)
+    # Continuations cannot suppress a retry. Publish the reviewed-SHA marker last.
+    for path in [*paths[1:], paths[0]]:
+        subprocess.run(
+            [
+                "gh",
+                "pr",
+                "comment",
+                os.environ["PR_NUMBER"],
+                "--repo",
+                os.environ["REPO"],
+                "--body-file",
+                str(path),
+            ],
+            check=True,
+        )
+    receipt.write_text(os.environ["HEAD_SHA"] + "\n", encoding="utf-8")
 
 
 def linked_issues(pull_request: str) -> dict | None:
@@ -337,6 +470,11 @@ def main() -> None:
         review = Path(destination)
         result = compose_review(review.read_text(encoding="utf-8"), stats)
         review.write_text(result, encoding="utf-8")
+    elif mode == "publish":
+        try:
+            publish_review(Path(source), Path(destination))
+        except subprocess.CalledProcessError as error:
+            raise SystemExit(error.returncode) from error
     else:
         raise ValueError(f"Unknown command: {mode}")
 

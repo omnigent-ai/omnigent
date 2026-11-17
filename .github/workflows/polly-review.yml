@@ -984,26 +984,9 @@ jobs:
           RUN_URL: "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
         run: |
           set -euo pipefail
-
-          # Read the validated review as data, never as shell source.
-          {
-            echo "<!-- polly-review-bot -->"
-            echo "<!-- polly-reviewed-sha: ${HEAD_SHA} -->"
-            echo "<!-- polly-review-run:${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT} -->"
-            echo "## <img src=\"https://raw.githubusercontent.com/omnigent-ai/omnigent/main/docs/images/omnigent-logo.svg\" alt=\"\" height=\"20\" valign=\"middle\" /> Polly AI Review"
-            echo ""
-            cat /tmp/polly_review.txt
-            echo ""
-            echo "---"
-            echo "<sub>Automated review by Polly · [workflow run](${RUN_URL})</sub>"
-          } > /tmp/comment.md
-
-          # Post a fresh comment for every review run, so each trigger (push,
-          # `/review` comment, or maintainer approval) is visible in the thread
-          # and notifies watchers — no in-place upsert of a prior comment.
-          gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file /tmp/comment.md
-          printf '%s\n' "$HEAD_SHA" > /tmp/polly-completed-sha.txt
-          echo "Created new comment"
+          # Validate/scan the complete review first; publish bounded parts with
+          # the authoritative marker and completion receipt only after all parts.
+          python3 .github/scripts/polly-review-summary.py publish /tmp/polly_review.txt /tmp/polly-completed-sha.txt
 
       - name: Upload Polly completion receipt
         if: steps.publish.outcome == 'success'

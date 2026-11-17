@@ -115,7 +115,7 @@ def test_invalid_diff_fails_instead_of_claiming_zero_changes(tmp_path: Path) -> 
         _REVIEW.replace("tests/test_parser.py::test_empty", "another_test")
         + "\nMention only: tests/test_parser.py\n",
         _REVIEW.replace("### Scope", "### Other"),
-        _REVIEW + "x" * 60000,
+        _REVIEW.replace("tests/test_parser.py", "tests/test_unrelated.py") + "x" * 70000,
     ],
     ids=[
         "missing-summary",
@@ -130,14 +130,130 @@ def test_invalid_diff_fails_instead_of_claiming_zero_changes(tmp_path: Path) -> 
         "missing-table-header",
         "mentioned-without-assessment",
         "missing-scope",
-        "oversized",
+        "oversized-unassessed-file",
     ],
 )
-def test_incomplete_or_oversized_reviews_are_rejected(review: str) -> None:
+def test_incomplete_reviews_are_rejected_regardless_of_size(review: str) -> None:
     with pytest.raises(ValueError):
         _HELPERS["compose_review"](
             review, {"markdown": "Computed counts", "test_files": ["tests/test_parser.py"]}
         )
+
+
+def test_long_review_parts_preserve_all_assessments_and_markdown_context() -> None:
+    rows = "".join(
+        f"| tests/test_parser.py::test_case[{number}] | Empty input é🙂 | Unit | Keep | "
+        "Guards the regression without a second setup. |\n"
+        for number in range(1200)
+    )
+    review = _REVIEW.replace(
+        "| tests/test_parser.py::test_empty | Empty input | Unit | Keep |"
+        " Guards the regression. |\n",
+        rows,
+    )
+    composed = _HELPERS["compose_review"](
+        review, {"markdown": "Computed counts", "test_files": ["tests/test_parser.py"]}
+    )
+    chunks = _HELPERS["split_review"](composed, 58000)
+    comments = _HELPERS["review_comments"](
+        composed, head_sha="a" * 40, run_id="10-1", run_url="https://example.test/run"
+    )
+
+    assert "".join(chunks) == composed
+    assert len(comments) >= 3
+    assert all(len(comment.encode("utf-8")) <= 60000 for comment in comments)
+    assert all(comment.count("<details>") == comment.count("</details>") for comment in comments)
+    assert sum(comment.count("<!-- polly-reviewed-sha:") for comment in comments) == 1
+    assert "<!-- polly-reviewed-sha: " + "a" * 40 + " -->" in comments[0]
+    for row in rows.splitlines():
+        assert sum(comment.count(row) for comment in comments) == 1
+    for part, comment in enumerate(comments[1:], 2):
+        assert f"part {part}/{len(comments)}" in comment
+        assert (
+            "| Test / case | Behavior protected | Layer | Needed? | Action / rationale |"
+            in comment
+        )
+        assert "<!-- polly-reviewed-sha:" not in comment
+    assert "## Blocking issues\nNone." in comments[0]
+    assert "### Scope\nAll changes support the parser fix." in comments[-1]
+
+
+def test_unicode_and_wrapper_bytes_are_included_in_comment_limit() -> None:
+    review = "## Review\n```text\n" + "é🙂" * 24000 + "\n```\nFinal finding."
+    chunks = _HELPERS["split_review"](review, 58000)
+    comments = _HELPERS["review_comments"](
+        review,
+        head_sha="b" * 40,
+        run_id="10-1",
+        run_url="https://example.test/" + "r" * 1000,
+    )
+
+    assert "".join(chunks) == review
+    assert all(len(chunk.encode("utf-8")) <= 58000 for chunk in chunks)
+    assert all(len(comment.encode("utf-8")) <= 60000 for comment in comments)
+    assert all(comment.count("```text") == comment.count("\n```\n") for comment in comments)
+    assert sum(comment.count("é") for comment in comments) == 24000
+    assert sum(comment.count("🙂") for comment in comments) == 24000
+    assert "Final finding." in comments[-1]
+
+
+@pytest.mark.parametrize(
+    "failed_call", [0, 1, 2, None], ids=["first-part", "later-part", "primary", "success"]
+)
+def test_multipart_publication_is_retryable_and_completes_only_after_primary(
+    tmp_path: Path, failed_call: int | None
+) -> None:
+    review = tmp_path / "polly_review.txt"
+    review.write_text(_REVIEW + ("A preserved finding é🙂.\n" * 4500), encoding="utf-8")
+    receipt = tmp_path / "polly-completed-sha.txt"
+    receipt.write_text("stale receipt\n")
+    env = _fake_gh(
+        tmp_path,
+        "directory = pathlib.Path(sys.argv[0]).parent\n"
+        "assert not (directory / 'polly-completed-sha.txt').exists()\n"
+        "arguments = sys.argv[1:]\n"
+        "assert arguments[:5] == ['pr', 'comment', '1', '--repo', 'test/repo']\n"
+        "assert arguments[5] == '--body-file'\n"
+        "body = pathlib.Path(arguments[6]).read_text()\n"
+        "record = directory / 'calls.json'\n"
+        "calls = json.loads(record.read_text()) if record.exists() else []\n"
+        "calls.append(body)\n"
+        "record.write_text(json.dumps(calls))\n"
+        f"if len(calls) - 1 == {failed_call!r}: sys.exit(42)\n"
+        "published = directory / 'published.json'\n"
+        "bodies = json.loads(published.read_text()) if published.exists() else []\n"
+        "published.write_text(json.dumps(bodies + [body]))\n",
+    )
+    env.update(
+        HEAD_SHA="a" * 40,
+        GITHUB_RUN_ID="10",
+        GITHUB_RUN_ATTEMPT="1",
+        RUN_URL="https://example.test/run",
+        PR_NUMBER="1",
+        REPO="test/repo",
+    )
+    command = [sys.executable, str(_SCRIPT), "publish", str(review), str(receipt)]
+    result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=10)
+    calls = json.loads((tmp_path / "calls.json").read_text())
+    if failed_call is not None:
+        assert result.returncode == 42, result.stdout + result.stderr
+        assert len(calls) == failed_call + 1
+        assert not receipt.exists()
+        published = tmp_path / "published.json"
+        if published.exists():
+            assert all(
+                "<!-- polly-reviewed-sha:" not in body
+                for body in json.loads(published.read_text())
+            )
+        # A later ordinary attempt can publish every part; partial comments have no dedupe marker.
+        result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=10)
+        calls = json.loads((tmp_path / "calls.json").read_text())[failed_call + 1 :]
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert receipt.read_text() == "a" * 40 + "\n"
+    assert len(calls) == 3
+    assert all(f"part {part}/3" in body for part, body in zip([2, 3, 1], calls, strict=True))
+    assert all("<!-- polly-reviewed-sha:" not in body for body in calls[:-1])
+    assert "<!-- polly-reviewed-sha: " + "a" * 40 + " -->" in calls[-1]
 
 
 def test_pipes_inside_code_spans_do_not_split_test_rows() -> None:
@@ -417,7 +533,14 @@ def test_workflow_inserts_computed_summary_before_secret_scan_and_publication(
         "### Tests\n", "### Tests\n\n<details>\n<summary>Test-by-test assessment</summary>\n\n"
     ).replace("### Scope\n", "\n</details>\n\n### Scope\n")
     assert review.read_text() == expected
-    assert expected in (tmp_path / "comment.md").read_text()
+    assert (tmp_path / "comment.md").read_text() == (
+        "<!-- polly-review-bot -->\n<!-- polly-reviewed-sha: abc -->\n"
+        "<!-- polly-review-run:10-1 -->\n"
+        '## <img src="https://raw.githubusercontent.com/omnigent-ai/omnigent/main/'
+        'docs/images/omnigent-logo.svg" alt="" height="20" valign="middle" /> Polly AI Review\n\n'
+        + expected
+        + "\n---\n<sub>Automated review by Polly · [workflow run](https://example.test/run)</sub>\n"
+    )
 
     assert (tmp_path / "polly-completed-sha.txt").read_text().strip() == "abc"
     receipt = next(step for step in steps if step["name"] == "Upload Polly completion receipt")
