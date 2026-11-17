@@ -32,6 +32,10 @@ implements them separately, so a fix for one harness does not reach the others.
 - `pi-host-mcp`: managed Pi sessions (pi-native with an Omnigent provider, and the
   Pi gateway executor) also get the MCP servers configured for Claude Code, Codex
   and Cursor; the user's own `~/.pi/agent/mcp.json` entries win and it is not written.
+- `pi-claude-plugins`: with `OMNIGENT_FEATURES=pi_claude_plugins`, managed Pi sessions
+  (pi-native and the Pi gateway executor) load the skills, `/<plugin>:<command>`
+  prompts and Pi packages of the Claude Code plugins enabled for the user. Disabled
+  plugins stay out, and a path the user's Pi settings name or exclude is not added again.
 - `claude-managed-mcp-relay`: on a machine with Claude Code's enterprise
   `managed-mcp.json`, Claude Code refuses `--mcp-config`, so Claude native
   sessions (web-launched and `omnigent claude`) reach Omnigent's tools through
@@ -1207,6 +1211,14 @@ Cross-harness journeys:
   `{"name": {"enabled": false}}` there turns it off. `~/.pi/agent` stays unchanged.
   A server whose env or headers use `${VAR}` connects only when the runner gets
   that variable, for example through `OMNIGENT_RUNNER_ENV_PASSTHROUGH=VAR`.
+- **`pi-claude-plugins`:** run `tests/inner/test_pi_claude_plugins.py` and
+  `tests/e2e/omnigent/test_pi_claude_plugins_e2e.py` (real Pi, mock model). Manually,
+  start the instance with `OMNIGENT_FEATURES=pi_claude_plugins`, enable a marketplace
+  plugin with a skill and a command in Claude Code, then start `omnigent pi` with an
+  Omnigent provider. Run `/<plugin>:<command> focus`: the body expands with the
+  arguments. The skill is listed for the model and `/skill:<name>` works. Disable the
+  plugin in Claude Code and launch again: both are gone. `~/.pi/agent` stays unchanged.
+  Without the flag, nothing changes.
 - **`cleanup`:** no single cross-harness test. For each harness in scope, start
   a session, stop it (and separately cancel one during startup), then confirm
   no helper process from that session is still running.

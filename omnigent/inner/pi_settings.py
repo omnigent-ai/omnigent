@@ -146,7 +146,10 @@ def prepare_managed_pi_agent_dir(
     Linked resources are writable shared state; Pi may update MCP OAuth tokens.
     MCP servers the host configures for Claude Code, Codex, or Cursor are added
     through a managed ``mcp.json`` copy when the user's file lacks them (see
-    :func:`omnigent.inner.pi_mcp.sync_managed_pi_mcp_config`).
+    :func:`omnigent.inner.pi_mcp.sync_managed_pi_mcp_config`). When the
+    ``pi_claude_plugins`` feature is on, enabled Claude Code plugins add their
+    skills, commands and Pi packages (see
+    :func:`omnigent.inner.pi_claude_plugins.add_claude_plugin_resources`).
     Global context files (``AGENTS.md`` et al.) are linked so Pi applies them
     unless ``--no-context-files`` is set; ``SYSTEM.md``, ``APPEND_SYSTEM.md``
     and model credentials are not linked.
@@ -168,6 +171,9 @@ def prepare_managed_pi_agent_dir(
     settings = _relocate_resource_settings(
         _read_settings_file(agent_root / "settings.json"), agent_root, managed_dir.absolute()
     )
+    from omnigent.inner.pi_claude_plugins import add_claude_plugin_resources
+
+    settings = add_claude_plugin_resources(settings, managed_dir.absolute())
     if overlay:
         settings = _deep_merge_settings(settings, overlay)
 
