@@ -93,13 +93,31 @@ describe("runCli", () => {
   );
 
   it("kills the child when its signal aborts", { timeout: 10000 }, async () => {
+    const readyFile = path.join(os.tmpdir(), `runcli-ready-${process.pid}-${Date.now()}`);
     const controller = new AbortController();
-    const started = Date.now();
-    const pending = runCli(nodeScript("setTimeout(() => {}, 60000)"), [], {
-      signal: controller.signal,
+    const pending = runCli(
+      nodeScript(
+        'require("fs").writeFileSync(process.argv[1], "up"); setTimeout(() => {}, 60000);',
+      ),
+      [readyFile],
+      { signal: controller.signal },
+    );
+    await new Promise((resolve, reject) => {
+      const deadline = Date.now() + 5000;
+      const timer = setInterval(() => {
+        if (fs.existsSync(readyFile)) {
+          clearInterval(timer);
+          resolve();
+        } else if (Date.now() > deadline) {
+          clearInterval(timer);
+          reject(new Error("the child never started"));
+        }
+      }, 25);
     });
+    const started = Date.now();
     controller.abort();
     const res = await pending;
+    fs.rmSync(readyFile, { force: true });
     assert.notEqual(res.code, 0);
     assert.ok(Date.now() - started < 5000, "the abort ended the run before its 60s sleep");
   });

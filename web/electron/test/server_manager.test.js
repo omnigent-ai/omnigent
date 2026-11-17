@@ -150,6 +150,47 @@ describe("ensureServerAuth", () => {
     assert.match(res.error, /omnigent login https:\/\/app\.example\.com/);
   });
 
+  for (const [name, probe] of [
+    ["an authenticated server", { authed: true, reachable: true }],
+    ["an unreachable server", { authed: false, reachable: false }],
+    ["a server that needs sign-in", { authed: false, reachable: true }],
+  ]) {
+    it(`cancelled during the probe of ${name} neither succeeds nor starts a login`, async () => {
+      mock.method(cli, "isLoopbackServer", () => false);
+      let finishProbe;
+      mock.method(
+        cli,
+        "probeServerAuth",
+        () =>
+          new Promise((resolve) => {
+            finishProbe = () => resolve(probe);
+          }),
+      );
+      const login = mock.method(cli, "loginServer", async () => ({ ok: true }));
+      const onLogin = mock.fn();
+      const controller = new AbortController();
+
+      const pending = ensureServerAuth(CLI_PATH, SERVER, { onLogin, signal: controller.signal });
+      controller.abort();
+      finishProbe();
+
+      assert.deepEqual(await pending, { ok: false, canceled: true });
+      assert.equal(login.mock.callCount(), 0);
+      assert.equal(onLogin.mock.callCount(), 0);
+    });
+  }
+
+  it("is already cancelled on entry: nothing is probed", async () => {
+    const probe = mock.method(cli, "probeServerAuth", async () => ({ authed: true }));
+    const controller = new AbortController();
+    controller.abort();
+    assert.deepEqual(await ensureServerAuth(CLI_PATH, SERVER, { signal: controller.signal }), {
+      ok: false,
+      canceled: true,
+    });
+    assert.equal(probe.mock.callCount(), 0);
+  });
+
   it("stops the login when its signal aborts, and reports a cancel rather than a failure", async () => {
     mock.method(cli, "isLoopbackServer", () => false);
     mock.method(cli, "probeServerAuth", async () => ({ authed: false, reachable: true }));

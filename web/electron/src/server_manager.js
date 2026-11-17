@@ -334,8 +334,11 @@ async function disconnectHost(cliCommand, serverUrl) {
  * }>}
  */
 async function ensureServerAuth(cliCommand, serverUrl, { onLogin, loginTimeoutMs, signal } = {}) {
+  if (signal?.aborted) return { ok: false, canceled: true };
   if (cli.isLoopbackServer(serverUrl)) return { ok: true };
   const probe = await cli.probeServerAuth(serverUrl);
+  // Cancelled during the probe: neither report success nor start a login.
+  if (signal?.aborted) return { ok: false, canceled: true };
   const managedOmni = cli.cliCommandParts(cliCommand).prefixArgs[0] === "omni";
   // A legacy token can pass /v1/me but cannot supply the managed host's OAuth grant.
   // Skip unreachable servers so the connect attempt reports the connectivity error.

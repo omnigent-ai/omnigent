@@ -4715,7 +4715,7 @@ function registerIpc() {
     return { remote: internal && arca.resolveArcaPath() !== null, bundledCli: internal };
   });
 
-  // In-flight laptop sign-ins started from the setup page, per window, so Cancel can stop one.
+  // In-flight onboarding runner connects, per setup window, so Cancel can stop one.
   const runnerConnects = new Map();
   ipcMain.handle("omnigent:cancel-runner-connect", (event) => {
     if (!isSetupPageSender(event)) {
@@ -4735,9 +4735,32 @@ function registerIpc() {
     }
     if (runner !== "local" && runner !== "remote") throw new TypeError("unknown runner");
     if (typeof url !== "string") throw new TypeError("connect-runner requires a URL string");
-    const target = await resolveConnectTarget(url);
-    // Resolving can probe the network; don't start anything for a closed window.
-    if (event.sender.isDestroyed()) return { ok: false, canceled: true };
+    // One attempt per window: Cancel, a newer attempt, or closing the window stops it,
+    // wherever it is, and a stopped attempt never signs in or connects the host.
+    runnerConnects.get(event.sender)?.abort();
+    const controller = new AbortController();
+    runnerConnects.set(event.sender, controller);
+    const abortOnClose = () => controller.abort();
+    event.sender.once("destroyed", abortOnClose);
+    try {
+      return await connectRunnerAttempt(event, url, runner, controller.signal);
+    } finally {
+      event.sender.removeListener("destroyed", abortOnClose);
+      if (runnerConnects.get(event.sender) === controller) runnerConnects.delete(event.sender);
+    }
+  });
+
+  async function connectRunnerAttempt(event, url, runner, signal) {
+    const canceled = { ok: false, canceled: true };
+    let target;
+    try {
+      target = await resolveConnectTarget(url, { signal });
+    } catch (error) {
+      if (signal.aborted) return canceled;
+      throw error;
+    }
+    // Resolving can probe the network; don't start anything for a stopped attempt.
+    if (signal.aborted || event.sender.isDestroyed()) return canceled;
     const log = (line) => {
       try {
         event.sender.send("omnigent:runner-connect-log", { line });
@@ -4750,6 +4773,7 @@ function registerIpc() {
         return { ok: false, error: "A remote environment isn't available for this server." };
       }
       const result = await connectOnboardingArca(target, log, event.sender);
+      if (signal.aborted) return canceled;
       if (result.ok) rememberOnboardingRunner(target, runner);
       return result;
     }
@@ -4764,18 +4788,11 @@ function registerIpc() {
     }
     log(`$ ${omnigentCli.cliCommandParts(cliCommand).displayName} host --server ${target}`);
     log("Signing in to the server if needed…");
-    const controller = new AbortController();
-    runnerConnects.set(event.sender, controller);
-    let auth;
-    try {
-      auth = await serverManager.ensureServerAuth(cliCommand, target, {
-        onLogin: () => log("If a browser window opens, finish signing in there."),
-        signal: controller.signal,
-      });
-    } finally {
-      if (runnerConnects.get(event.sender) === controller) runnerConnects.delete(event.sender);
-    }
-    if (auth.canceled) return { ok: false, canceled: true };
+    const auth = await serverManager.ensureServerAuth(cliCommand, target, {
+      onLogin: () => log("If a browser window opens, finish signing in there."),
+      signal,
+    });
+    if (auth.canceled || signal.aborted) return canceled;
     if (!auth.ok) {
       return {
         ok: false,
@@ -4788,12 +4805,14 @@ function registerIpc() {
     log("Signed in. Connecting this laptop to the server…");
     const result = await serverManager.ensureHostConnected(cliCommand, target);
     broadcastHostStatus();
+    // The host connect itself can't be stopped, but a stopped attempt isn't recorded.
+    if (signal.aborted) return canceled;
     if (result.ok) {
       log("Connected this laptop.");
       rememberOnboardingRunner(target, runner);
     }
     return { ok: result.ok, error: result.error };
-  });
+  }
 
   ipcMain.handle("omnigent:copy-setup-text", (event, text) => {
     if (!isSetupPageSender(event)) {

@@ -225,16 +225,22 @@ describe("SetupTerminalStep", () => {
   });
 
   it("leaves the server connect's own Cancel alone", () => {
+    const onCancel = vi.fn();
+    const onCancelConnect = vi.fn();
     render(
       <SetupTerminalStep
         onRun={() => new Promise(() => {})}
         onBack={vi.fn()}
-        onCancel={vi.fn()}
-        onCancelConnect={vi.fn()}
+        onCancel={onCancel}
+        onCancelConnect={onCancelConnect}
         connection={{ phase: "connecting" }}
       />,
     );
-    expect(screen.getAllByRole("button", { name: /cancel/i })).toHaveLength(1);
+    const buttons = screen.getAllByRole("button", { name: /cancel/i });
+    expect(buttons).toHaveLength(1);
+    fireEvent.click(buttons[0]);
+    expect(onCancelConnect).toHaveBeenCalledOnce();
+    expect(onCancel).not.toHaveBeenCalled();
   });
 
   it("fires onBack from Back on the failure screen", async () => {

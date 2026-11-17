@@ -309,6 +309,7 @@ export function BridgeSetupApp() {
             const result = await setupBridge()?.connectRunner?.(url, runner);
             return {
               ok: result?.ok === true,
+              canceled: result?.canceled === true,
               error: result?.error,
               errorMessage: result?.errorMessage,
               errorAction: result?.errorAction,
@@ -319,7 +320,13 @@ export function BridgeSetupApp() {
         }
       : undefined,
     onCancelRunnerConnect: setupBridge()?.cancelRunnerConnect
-      ? async () => (await setupBridge()?.cancelRunnerConnect?.()) === true
+      ? async () => {
+          try {
+            return (await setupBridge()?.cancelRunnerConnect?.()) === true;
+          } catch {
+            return false;
+          }
+        }
       : undefined,
     onRunnerLog: setupBridge()?.onRunnerConnectLog
       ? (cb) => setupBridge()?.onRunnerConnectLog?.(cb) ?? (() => {})

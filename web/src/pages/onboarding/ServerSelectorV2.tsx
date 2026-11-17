@@ -45,6 +45,8 @@ export interface ConnectResult {
 /** Result of a setup operation; `error` remains the combined legacy message. */
 export interface SetupResult {
   ok: boolean;
+  /** The user cancelled; not a failure. */
+  canceled?: boolean;
   error?: string;
   errorMessage?: string;
   errorAction?: string;
@@ -345,12 +347,22 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
   };
   // Checked at run time (Retry re-checks): a picked local install that's up opens
   // that exact URL; one that's down starts like "Get started locally".
+  // Bumped per run and on Cancel, so a run the user cancelled can't go on to open the server.
+  const terminalRun = useRef(0);
+  const cancelTerminal = () => {
+    terminalRun.current += 1;
+    void setup.onCancelRunnerConnect?.();
+    setStep(terminalTarget.back);
+  };
   const runTerminal = async () => {
     setRemoteRunnerFailed(false);
+    const run = ++terminalRun.current;
+    const cancelled = { ok: false, error: "Cancelled." };
     const t = terminalTarget;
     if (t.kind === "connect" && t.runner && setup.onConnectRunner) {
       if (!confirmServer(t.url)) return { ok: false, error: "Connection cancelled." };
       const res = await setup.onConnectRunner(t.url, t.runner);
+      if (res.canceled || run !== terminalRun.current) return cancelled;
       if (!res.ok) {
         setRemoteRunnerFailed(t.runner === "remote");
         return res;
@@ -539,10 +551,7 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
               onRun={runTerminal}
               onSetupLog={terminalRunner ? setup.onRunnerLog : setup.onSetupLog}
               onBack={() => setStep(terminalTarget.back)}
-              onCancel={() => {
-                void setup.onCancelRunnerConnect?.();
-                setStep(terminalTarget.back);
-              }}
+              onCancel={terminalTarget.kind === "connect" ? cancelTerminal : undefined}
               onConnectAnyway={connectAnyway}
               runningLabel={terminalCopy.label}
               runningHint={terminalCopy.hint}
