@@ -175,7 +175,12 @@ function AgentTileComponent({
       </header>
 
       {detailsOpen && (
-        <TileDetails id={detailsId} conversation={conversation} accent={color.solid} />
+        <TileDetails
+          id={detailsId}
+          conversation={conversation}
+          title={title}
+          accent={color.solid}
+        />
       )}
 
       {showConversation ? (

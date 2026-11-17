@@ -1,16 +1,18 @@
 // A tile's details, opened from its title: what the agent is doing, where,
 // what it has cost, its latest reply and who it is. Fetches only while open.
 
-import type { ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { GitPullRequestIcon } from "lucide-react";
-import type { Conversation } from "@/hooks/useConversations";
+import { GitPullRequestIcon, PencilIcon } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { useRenameConversation, type Conversation } from "@/hooks/useConversations";
 import { useSession } from "@/hooks/useSession";
 import { getSessionState } from "@/hooks/useSessionState";
 import { formatSessionCostUsd, formatTokenCount } from "@/lib/formatCost";
 import { fetchLastAssistantText } from "@/lib/lastAssistantText";
 import { getSessionUsage } from "@/lib/sessionsApi";
 import { cn } from "@/lib/utils";
+import { HeaderTitleInput } from "@/shell/HeaderTitle";
 import { activityNotes, projectName, relativeAge, statusLabel, usageTotals } from "./tileSummary";
 
 const DETAILS_STALE_MS = 30_000;
@@ -53,13 +55,54 @@ function Row({ label, value, mono = false }: { label: string; value: ReactNode; 
   );
 }
 
+/** The session's title with the header's inline rename; sub-agents keep their name. */
+function TitleRow({ conversation, title }: { conversation: Conversation; title: string }) {
+  const rename = useRenameConversation();
+  const [editing, setEditing] = useState(false);
+  const canRename = !conversation.parent_session_id;
+  return (
+    <div className="flex min-w-0 items-center gap-2 text-xs">
+      <span className="shrink-0 text-muted-foreground">Title</span>
+      {editing ? (
+        <HeaderTitleInput
+          initialTitle={title}
+          pending={rename.isPending}
+          onCommit={(next) => {
+            const trimmed = next.trim();
+            if (trimmed && trimmed !== title)
+              rename.mutate({ id: conversation.id, title: trimmed });
+            setEditing(false);
+          }}
+          onCancel={() => setEditing(false)}
+        />
+      ) : (
+        <>
+          <span className="min-w-0 truncate text-foreground">{title}</span>
+          {canRename && (
+            <Button
+              variant="ghost"
+              size="icon-xs"
+              aria-label={`Rename ${title}`}
+              title="Rename"
+              onClick={() => setEditing(true)}
+            >
+              <PencilIcon className="size-3" />
+            </Button>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
 interface TileDetailsProps {
   id: string;
   conversation: Conversation;
+  title: string;
   accent: string;
 }
 
-export function TileDetails({ id, conversation, accent }: TileDetailsProps) {
+export function TileDetails({ id, conversation, title, accent }: TileDetailsProps) {
   const sessionId = conversation.id;
   const { session } = useSession(sessionId);
   const usage = useQuery({
@@ -148,6 +191,7 @@ export function TileDetails({ id, conversation, accent }: TileDetailsProps) {
       </DetailCard>
 
       <DetailCard title="Agent">
+        <TitleRow conversation={conversation} title={title} />
         <Row label="Name" value={conversation.agent_name ?? "Agent"} />
         {conversation.harness && <Row label="Harness" value={conversation.harness} />}
         {model && <Row label="Model" value={model} mono />}
