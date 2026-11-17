@@ -1504,6 +1504,20 @@ describe("renderTriggerPrompt", () => {
     },
   );
 
+  it.each(SOURCE_MODES)(
+    "loads a $source manager's tools in one search in $taskSessionMode mode",
+    ({ source, taskSessionMode }) => {
+      const prompt = renderTriggerPrompt(source, fields(), { ...CTX, taskSessionMode });
+
+      // One search, not one per tool, when the manager's tools load on demand.
+      expect(prompt).toContain(
+        "Each run:\n1. If your tools load on demand, load every tool this run needs in one tool search before your first call, naming them all:",
+      );
+      // The creation call stays the only sys_session_create the saved-prompt parser reads.
+      expect(readTriggerWorkerSettings(prompt)).not.toBeNull();
+    },
+  );
+
   it("signs what it posts and stops when it can't reach the service", () => {
     const prompt = renderTriggerPrompt("jira", fields(), CTX);
 
