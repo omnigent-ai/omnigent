@@ -93,12 +93,41 @@ def test_redact_strips_common_tokens(data_dir: Path) -> None:
 def test_command_line_redacts_tokens_in_argv(
     data_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    home = Path("/home/example-user")
+    monkeypatch.setattr(Path, "home", lambda: home)
+    tokens = [
+        "sk-" + "supersecret123456",
+        "dapi-" + "synthetic123456",
+        "xoxb-" + "synthetic123456",
+        "gh" + "p_" + "TEST" + "x" * 30,
+        "AIza" + "x" * 24,
+        "Bearer synthetic.jwt.payload",
+    ]
     monkeypatch.setattr(
-        sys, "argv", ["omnigent", "run", "a.yaml", "--api-key", "sk-supersecret123456"]
+        sys,
+        "argv",
+        [
+            "omnigent",
+            "run",
+            "a.yaml",
+            "--api-key",
+            tokens[0],
+            "--note",
+            f"{home}/x {' '.join(tokens)}",
+        ],
     )
     cmd = ch._command_line()
-    assert "sk-supersecret123456" not in cmd
-    assert "***" in cmd
+    assert all(token not in cmd for token in tokens)
+    assert "synthetic.jwt.payload" not in cmd
+    assert shlex.split(cmd) == [
+        "omnigent",
+        "run",
+        "a.yaml",
+        "--api-key",
+        "sk-s***",
+        "--note",
+        f"{home}/x sk-s*** dapi*** xoxb*** ghp_*** AIza*** Bear***",
+    ]
 
 
 # --------------------------------------------------------------------------- #
@@ -771,18 +800,46 @@ def test_command_line_keeps_sibling_argument_with_spaces(
     assert shlex.split(command) == ["omnigent", "run", argv[2], "~/project/file.py"]
 
 
+@pytest.mark.parametrize(
+    ("prefix", "local_prefix", "public_prefix"),
+    [
+        ("Authorization: Bearer", "Authorization: Bear***", "Authorization: Bear***"),
+        (
+            "/home/example-user/x Bearer",
+            "/home/example-user/x Bear***",
+            "~/x Bear***",
+        ),
+    ],
+    ids=["plain-prefix", "home-containing-prefix"],
+)
 def test_bearer_token_split_across_arguments_is_redacted(
-    data_dir: Path, monkeypatch: pytest.MonkeyPatch
+    data_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    prefix: str,
+    local_prefix: str,
+    public_prefix: str,
 ) -> None:
     """Quoting must not stop a bearer pattern from matching the token that follows it."""
     ch.install_crash_handler("omnigent", "omnigent-ai/omnigent")
-    monkeypatch.setattr(sys, "argv", ["example", "Authorization: Bearer", "synthetic.jwt.payload"])
-    url, body_included = ch._issue_url(
-        _make_exc("failure"), "Traceback (most recent call last):\nValueError\n"
-    )
+    home = Path("/home/example-user")
+    monkeypatch.setattr(Path, "home", lambda: home)
+    token = "example-token-value"
+    neighbors = [f"{home} backup/config.yaml", f"{home}/app.yaml", "--keep", "unchanged"]
+    monkeypatch.setattr(sys, "argv", ["omnigent", "--note", prefix, token, *neighbors])
+    exc = _make_exc("failure")
+    tb_text = "Traceback (most recent call last):\nValueError\n"
+    report = ch._build_report(exc, tb_text, source="test")
+    assert token not in report
+    assert tb_text in report
+    local_command = report.split("## Command\n\n```\n", 1)[1].split("\n```", 1)[0]
+    assert local_prefix in local_command
+    assert shlex.split(local_command)[-4:] == neighbors
+    url, body_included = ch._issue_url(exc, tb_text)
     assert body_included is True
-    assert "example Authorization: Bear***" in _description_of(url)
-    assert "synthetic.jwt.payload" not in urllib.parse.unquote_plus(url)
+    assert token not in urllib.parse.unquote_plus(url)
+    public_command = _description_of(url).split("**Command:**\n```\n", 1)[1].split("\n```", 1)[0]
+    assert public_prefix in public_command
+    assert shlex.split(public_command)[-4:] == [neighbors[0], "~/app.yaml", *neighbors[2:]]
 
 
 def test_issue_url_redacts_multiline_bearer_before_truncation(data_dir: Path) -> None:

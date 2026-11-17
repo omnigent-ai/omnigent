@@ -309,7 +309,7 @@ def _redact(text: str) -> str:
 
 
 def _quote_path_argument(arg: str) -> str:
-    """Quote home-path arguments while tokens can still span other arguments."""
+    """Quote home-path arguments so spaced sibling paths stay distinguishable."""
     with contextlib.suppress(Exception):
         home = str(Path.home())
         if home and home != os.sep and home in arg:
@@ -319,7 +319,23 @@ def _quote_path_argument(arg: str) -> str:
 
 def _command_line() -> str:
     try:
-        return _redact(" ".join(_quote_path_argument(arg) for arg in sys.argv))
+        args = list(sys.argv)
+        # Match before shell quoting, preserving argument boundaries when
+        # redacting credentials that span arguments.
+        for pat in _TOKEN_PATTERNS:
+            matches = list(pat.finditer(" ".join(args)))
+            offset = 0
+            for index, arg in enumerate(args):
+                end = offset + len(arg)
+                for match in reversed(matches):
+                    start = max(offset, match.start() + 4)
+                    stop = min(end, match.end())
+                    if start < stop:
+                        args[index] = (
+                            args[index][: start - offset] + "***" + args[index][stop - offset :]
+                        )
+                offset = end + 1
+        return " ".join(_quote_path_argument(arg) for arg in args)
     except Exception:  # noqa: BLE001  pragma: no cover
         return "(unavailable)"
 
