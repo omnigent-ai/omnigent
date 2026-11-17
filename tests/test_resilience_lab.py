@@ -386,8 +386,8 @@ def test_lab_diagnostic_failure_still_stops_all_labs(
 
 @pytest.mark.parametrize(
     "invalid_tail,churn",
-    [(False, "none"), (True, "none"), (False, "proxy"), (False, "discovery")],
-    ids=["valid-tail", "invalid-tail", "proxy-churn", "discovery-churn"],
+    [(False, "none"), (True, "none"), (False, "proxy"), (False, "discovery"), (False, "native")],
+    ids=["valid-tail", "invalid-tail", "proxy-churn", "discovery-churn", "native-bounds"],
 )
 def test_lab_diagnostics_bound_aggregate_history_and_session_snapshots(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, invalid_tail: bool, churn: str
@@ -424,6 +424,23 @@ def test_lab_diagnostics_bound_aggregate_history_and_session_snapshots(
     if churn == "proxy":
         for index in range(4097):
             lab.events.emit("proxy:host", "connect", conn=index, tag="runner.tunnel")
+    if churn == "native":
+        bridge = lab.root / "t" / "omnigent-123" / "claude-native" / ("c" * 32)
+        bridge.mkdir(parents=True)
+        for index in range(130):
+            launch_id = f"{index:032x}"
+            (bridge / f"lifecycle-{launch_id}.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "terminal_instance_id": "d" * 32,
+                        "launch_id": launch_id,
+                        "events": [
+                            {"event_name": "Stop", "recorded_at": hook} for hook in range(20)
+                        ],
+                    }
+                )
+            )
     project = Mock(wraps=lab_module._diagnostic_fields)
     monkeypatch.setattr(lab_module, "_diagnostic_fields", project)
     requests = []
@@ -459,6 +476,19 @@ def test_lab_diagnostics_bound_aggregate_history_and_session_snapshots(
     assert payload["discovery_events_omitted"] == (14 if churn == "discovery" else 0)
     assert payload["snapshot_budget_exhausted"] is False
     assert "private-invalid-status" not in raw
+    if churn == "native":
+        native = payload["native_lifecycle"]
+        assert native["candidates"] == 130
+        assert native["omitted"] == 2
+        assert native["rejected"] == 0
+        assert len(native["records"]) == 128
+        assert [record["launch_id"] for record in native["records"]] == [
+            f"{index:032x}" for index in range(128)
+        ]
+        for record in native["records"]:
+            assert record["events"] == [
+                {"event_name": "Stop", "recorded_at": hook} for hook in range(4, 20)
+            ]
 
 
 @pytest.mark.parametrize("snapshot_available", [True, False])
