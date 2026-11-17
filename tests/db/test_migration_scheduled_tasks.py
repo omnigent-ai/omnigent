@@ -1281,6 +1281,27 @@ def test_timer_kind_downgrade_requires_live_connection() -> None:
     assert "ALTER TABLE" not in config.output_buffer.getvalue()
 
 
+def test_standalone_timer_kind_migrations_record_their_revision(
+    dispatch_migration_engine: Engine,
+) -> None:
+    """``alembic`` run on its own opens its own connection; on CockroachDB the migration
+    also commits part way, and the revision it reaches must still persist."""
+    engine = dispatch_migration_engine
+    config = _build_alembic_config(engine.url.render_as_string(hide_password=False))
+
+    def revision() -> str:
+        with engine.connect() as conn:
+            return conn.execute(sa.text("SELECT version_num FROM alembic_version")).scalar_one()
+
+    command.upgrade(config, _TIMER_KIND_REVISION)
+    assert revision() == _TIMER_KIND_REVISION
+    command.downgrade(config, _TIMER_KIND_PREVIOUS)
+    assert revision() == _TIMER_KIND_PREVIOUS
+    assert "ix_scheduled_tasks_kind_session" not in {
+        index["name"] for index in sa.inspect(engine).get_indexes("scheduled_tasks")
+    }
+
+
 @pytest.mark.parametrize(
     "starting_revision",
     [_MCP_SERVICES_PREVIOUS, _MCP_SERVICES_REVISION, _COMMENT_ANCHOR_REVISION],

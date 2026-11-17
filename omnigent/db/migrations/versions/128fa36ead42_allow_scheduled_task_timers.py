@@ -18,7 +18,9 @@ older build keep working on the migrated schema, but an older build does not
 start on it: startup refuses a schema revision the build does not know.
 
 Rollback: turn ``durable_timers`` off and delete the remaining active or paused
-timers, which ``GET /v1/scheduled-tasks?kind=all`` lists. The application can
+timers. ``GET /v1/scheduled-tasks?kind=all`` lists the caller's own; across owners,
+``SELECT workspace_id, id, user_id FROM scheduled_tasks WHERE kind = 3 AND state
+IN (1, 2)`` finds them over the index. The application can
 then roll back to the build that added this revision, which reads timer rows but
 keeps no timers. To remove the schema as well, stop the servers, downgrade with
 that build (``OMNIGENT_DB_URL=<uri> alembic -c omnigent/db/alembic.ini downgrade
