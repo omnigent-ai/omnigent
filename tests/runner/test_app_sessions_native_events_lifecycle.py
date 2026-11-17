@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import sys
@@ -22,7 +23,10 @@ from omnigent.harnesses.claude_native.bridge import (
     bridge_dir_for_conversation_id,
 )
 from omnigent.harnesses.codex_native import bridge as codex_native_bridge
-from omnigent.harnesses.codex_native.side_chat import SideChatEffortUnavailable
+from omnigent.harnesses.codex_native.side_chat import (
+    SideChatEffortUnavailable,
+    SideChatValidationError,
+)
 from omnigent.harnesses.cursor_native import bridge as cursor_native_bridge
 from omnigent.harnesses.cursor_native import main as cursor_native
 from omnigent.harnesses.kiro_native import bridge as kiro_native_bridge
@@ -2772,7 +2776,8 @@ async def test_events_interrupt_codex_side_chat_leaves_parent_turn_running(
         (None, None, 400),
         ("", None, 400),
         (12, None, 400),
-        ("conv_side", ValueError("The session is not a side chat of this parent."), 400),
+        ("conv_side", SideChatValidationError("Internal validation detail"), 400),
+        ("conv_side", json.JSONDecodeError("Internal parser detail", "invalid", 0), 503),
         ("conv_side", RuntimeError("The forwarder is unavailable."), 503),
         ("conv_side", httpx.ConnectError("Connection lost"), 503),
     ],
@@ -2782,6 +2787,7 @@ async def test_events_interrupt_codex_side_chat_leaves_parent_turn_running(
         "empty-id",
         "invalid-id",
         "wrong-child",
+        "invalid-history",
         "unavailable",
         "disconnected",
     ],
@@ -2825,6 +2831,11 @@ async def test_events_resume_codex_side_chat_leaves_parent_turn_running(
     assert response.status_code == status, response.text
     if status == 200:
         assert response.json() == {"resumed": True}
+    elif isinstance(failure, SideChatValidationError):
+        assert response.json() == {
+            "error": "invalid_request",
+            "detail": "This session is not a side chat of the active Codex parent.",
+        }
     elif status == 503:
         assert response.json() == {
             "error": "codex_side_chat_unavailable",

@@ -745,6 +745,21 @@ async def _resume_codex_side_chat(
     """Restore a native side thread on its parent's authorized live runner."""
     from omnigent.harnesses.claude_native.bridge import url_component
 
+    live_runner_id = None
+    if (
+        conv.parent_conversation_id is not None
+        and conv.runner_id is not None
+        and not is_session_closed(conv.labels, conv.title)
+    ):
+        parent = await asyncio.to_thread(
+            conversation_store.get_conversation, conv.parent_conversation_id
+        )
+        if (
+            parent is not None
+            and parent.runner_id == conv.runner_id
+            and await _get_runner_client(parent.id, runner_router, conversation=parent) is not None
+        ):
+            live_runner_id = conv.runner_id
     runner_client, conv = await _recover_side_chat_runner_via_source(
         conv,
         app_state=request.app.state,
@@ -793,14 +808,30 @@ async def _resume_codex_side_chat(
             "The side chat could not reconnect to its runner. Try again.",
             code=ErrorCode.RUNNER_UNAVAILABLE,
         ) from exc
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    resumed = response.status_code == 200 and payload.get("resumed") is True
+    # Older runners send unknown controls to the subprocess path, which native chats bypass.
+    if (
+        live_runner_id is not None
+        and conv.runner_id == live_runner_id
+        and (
+            (response.status_code < 400 and "resumed" not in payload)
+            or (
+                response.status_code in (409, 503)
+                and payload.get("error") in ("no_live_harness", "no_harness")
+            )
+        )
+    ):
+        return conv
     if response.status_code >= 400:
         from omnigent.server.routes._sessions.orchestration import _codex_side_chat_runner_error
 
         raise _codex_side_chat_runner_error(response)
-    try:
-        resumed = response.status_code == 200 and response.json().get("resumed") is True
-    except (ValueError, AttributeError):
-        resumed = False
     if not resumed:
         raise OmnigentError(
             "This runner cannot resume side chats. Update the host and restart the session.",

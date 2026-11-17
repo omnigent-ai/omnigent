@@ -877,6 +877,12 @@ async def test_resume_side_chat_keeps_its_thread_and_saved_context(
                 },
             )
         assert request.url.path == "/v1/sessions/conv_side/items"
+        # Saved usage can advance during replay before the history fetch.
+        child["native_usage_baseline"] = {
+            "cumulative_input_tokens": 137,
+            "cumulative_output_tokens": 20,
+            "cumulative_cache_read_input_tokens": 30,
+        }
         if request.url.params.get("after") == "page-one":
             return httpx.Response(
                 200, json={"data": [message("side-second", 22)], "has_more": False}
@@ -949,11 +955,11 @@ async def test_resume_side_chat_keeps_its_thread_and_saved_context(
         assert len(usage) == 1
         assert usage[0]["type"] == "token_count"
         assert usage[0]["info"]["total_token_usage"] == {
-            "input_tokens": 130,
+            "input_tokens": 137,
             "cached_input_tokens": 30,
             "output_tokens": 20,
             "reasoning_output_tokens": 0,
-            "total_tokens": 150,
+            "total_tokens": 157,
         }
         assert all(value == 0 for value in usage[0]["info"]["last_token_usage"].values())
     else:
@@ -989,7 +995,7 @@ async def test_resume_side_chat_rejects_sessions_outside_its_parent(
             forwarder_state=fwd._CodexForwarderState(parent_session_id="conv_parent"),
         )
         try:
-            with pytest.raises(ValueError, match="not a side chat"):
+            with pytest.raises(side_chat.SideChatValidationError, match="not a side chat"):
                 await side_chat.resume_side_chat(tmp_path, "conv_side")
         finally:
             side_chat.unregister_side_chat_forwarder(tmp_path, codex_client)

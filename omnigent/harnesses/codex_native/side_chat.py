@@ -80,6 +80,10 @@ _logger = logging.getLogger(__name__)
 _JsonObject = dict[str, Any]
 
 
+class SideChatValidationError(ValueError):
+    """The requested session is not a side chat owned by the active parent."""
+
+
 class _SideChatForwarder(NamedTuple):
     codex_client: CodexAppServerClient
     ap_client: httpx.AsyncClient
@@ -138,11 +142,13 @@ async def resume_side_chat(bridge_dir: Path, child_session_id: str) -> None:
             or not isinstance(thread_id, str)
             or not thread_id
         ):
-            raise ValueError("This session is not a side chat of the active Codex parent.")
+            raise SideChatValidationError(
+                "This session is not a side chat of the active Codex parent."
+            )
         existing = active.state.session_for_child_thread(thread_id)
         if existing is not None:
             if existing != child_session_id:
-                raise ValueError("The Codex thread belongs to another side chat.")
+                raise SideChatValidationError("The Codex thread belongs to another side chat.")
             return
         # Map before resume can emit thread/started, so it cannot rotate the parent.
         active.state.note_child_thread(thread_id, child_session_id)
@@ -248,7 +254,12 @@ async def _rebuild_side_chat_rollout(
     if any(record.get("payload") == boundary["payload"] for record in records):
         return path
     restored = [records[0], *parent_records[1:], boundary, *records[1:]]
-    baseline = child.get("native_usage_baseline")
+    # Rebuilding history replays pending usage, so refresh its cumulative totals.
+    child_response = await active.ap_client.get(
+        f"/v1/sessions/{url_component(child['id'])}", params={"include_usage": "false"}
+    )
+    child_response.raise_for_status()
+    baseline = child_response.json().get("native_usage_baseline")
     if isinstance(baseline, dict):
         # Codex restores cumulative totals from this event before counting the next turn.
         empty_usage = {

@@ -129,46 +129,78 @@ async def test_side_chat_binding_unchanged_when_source_runner_unavailable(
     assert saved is not None and saved.runner_id == "runner-exited"
 
 
-@pytest.mark.parametrize("replacement_online", [True, False], ids=["replaced", "unavailable"])
+@pytest.mark.parametrize(
+    ("state", "status", "payload", "succeeds"),
+    [
+        ("replaced", 200, {"resumed": True}, True),
+        ("unavailable", 200, {"resumed": True}, False),
+        ("live", 200, {"queued": False}, True),
+        ("live", 409, {"error": "no_live_harness"}, True),
+        ("live", 503, {"error": "no_harness"}, True),
+        ("closed", 200, {"queued": False}, False),
+        ("closed", 409, {"error": "no_live_harness"}, False),
+        ("unbound", 503, {"error": "no_harness"}, False),
+        ("mismatched", 200, {"queued": False}, False),
+        ("advanced", 409, {"error": "no_live_harness"}, False),
+        ("offline", 503, {"error": "no_harness"}, False),
+        ("live", 503, {"error": "codex_side_chat_unavailable"}, False),
+        ("live", 200, {"resumed": False}, False),
+    ],
+)
 async def test_native_side_chat_resume_revalidates_runner_after_parent_initialization(
-    db_uri: str, monkeypatch: pytest.MonkeyPatch, replacement_online: bool
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    state: str,
+    status: int,
+    payload: dict[str, Any],
+    succeeds: bool,
 ) -> None:
     store = SqlAlchemyConversationStore(db_uri)
     source = store.create_conversation(runner_id="runner-first")
     side = store.create_conversation(
-        kind="sub_agent", parent_conversation_id=source.id, runner_id="runner-first"
+        kind="sub_agent",
+        parent_conversation_id=source.id,
+        runner_id=None if state == "unbound" else "runner-first",
     )
+    if state == "mismatched":
+        store.replace_runner_id(side.id, "runner-stale")
+    closed = state in ("replaced", "unavailable", "closed")
     store.set_labels(
         side.id,
         {
             "omnigent.wrapper": "codex-native-ui-subagent",
             "omnigent.codex_native.agent_nickname": "Side chat",
             "omnigent.codex_native.subagent_thread_id": "thread-side",
-            "omnigent.closed": "true",
+            **({"omnigent.closed": "true"} if closed else {}),
         },
     )
     side = store.get_conversation(side.id)
     assert side is not None
     first_runner = AsyncMock()
     next_runner = AsyncMock()
-    next_runner.post.return_value = httpx.Response(200, json={"resumed": True})
+    first_runner.post.return_value = next_runner.post.return_value = httpx.Response(
+        status, json=payload
+    )
     runners = {"runner-first": first_runner, "runner-next": next_runner}
 
     async def ensure(*, conv: Conversation, **_kwargs: object):
         current = store.get_conversation(conv.id)
         assert current is not None
-        if current.runner_id == "runner-next" and not replacement_online:
+        if current.runner_id == "runner-next" and state == "unavailable":
             return None, current
         return runners[current.runner_id], current
 
     async def client_for(session_id: str, *_args: object, **_kwargs: object):
+        if session_id == source.id and state == "offline":
+            return None
         current = store.get_conversation(session_id)
         assert current is not None
         return runners[current.runner_id]
 
     async def initialize_parent(**kwargs: object) -> None:
         assert kwargs["session_id"] == source.id
-        store.replace_runner_id(source.id, "runner-next")
+        if state in ("replaced", "unavailable", "advanced"):
+            store.replace_runner_id(source.id, "runner-next")
 
     monkeypatch.setattr(orchestration, "ensure_runner_connected", ensure)
     monkeypatch.setattr(sessions, "_get_runner_client", client_for)
@@ -181,21 +213,32 @@ async def test_native_side_chat_resume_revalidates_runner_after_parent_initializ
         "user_id": None,
         "permission_store": None,
     }
-    if replacement_online:
+    expected_runner_id = (
+        "runner-next" if state in ("replaced", "unavailable", "advanced") else "runner-first"
+    )
+    expected_runner = runners[expected_runner_id]
+    if succeeds:
         recovered = await routes_events._resume_codex_side_chat(**kwargs)
-        assert recovered.runner_id == "runner-next"
+        assert recovered.runner_id == expected_runner_id
         assert "omnigent.closed" not in recovered.labels
-        next_runner.post.assert_awaited_once_with(
-            f"/v1/sessions/{source.id}/events",
-            json={"type": "codex_side_chat_resume", "codex_side_session_id": side.id},
-        )
     else:
         with pytest.raises(OmnigentError) as raised:
             await routes_events._resume_codex_side_chat(**kwargs)
-        assert raised.value.code == ErrorCode.RUNNER_UNAVAILABLE
+        assert raised.value.code == (
+            ErrorCode.CONFLICT
+            if status == 409 and state != "unavailable"
+            else ErrorCode.RUNNER_UNAVAILABLE
+        )
+        assert (store.get_conversation(side.id).labels.get("omnigent.closed") == "true") == closed
+    if state == "unavailable":
         next_runner.post.assert_not_awaited()
-        assert store.get_conversation(side.id).labels["omnigent.closed"] == "true"
-    first_runner.post.assert_not_awaited()
+    else:
+        expected_runner.post.assert_awaited_once_with(
+            f"/v1/sessions/{source.id}/events",
+            json={"type": "codex_side_chat_resume", "codex_side_session_id": side.id},
+        )
+    other_runner = next_runner if expected_runner is first_runner else first_runner
+    other_runner.post.assert_not_awaited()
 
 
 class _AdvancingSource:

@@ -7822,12 +7822,22 @@ def create_runner_app(
             try:
                 bridge_dir = await _codex_native_bridge_dir_for_session(conversation_id)
                 await side_chat.resume_side_chat(bridge_dir, child_session_id)
-            except ValueError as exc:
+            except side_chat.SideChatValidationError:
                 return JSONResponse(
                     status_code=400,
-                    content={"error": "invalid_request", "detail": str(exc)},
+                    content={
+                        "error": "invalid_request",
+                        "detail": "This session is not a side chat of the active Codex parent.",
+                    },
                 )
-            except (RuntimeError, OSError, httpx.HTTPError, TimeoutError, WebSocketException):
+            except (
+                RuntimeError,
+                OSError,
+                httpx.HTTPError,
+                TimeoutError,
+                ValueError,
+                WebSocketException,
+            ):
                 _logger.warning(
                     "Codex side-chat resume failed: conv=%s child=%s",
                     conversation_id,
