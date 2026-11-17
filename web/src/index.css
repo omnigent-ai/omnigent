@@ -145,18 +145,18 @@
 
 /* Keep these non-inline: `@theme inline` bakes values into utilities and
  * bypasses the runtime typography mapping. Unitless line heights scale with
- * font size: 1.8 for body text and 1.4 for captions. */
+ * font size: 1.6 for interface and message text, and 1.3 for captions. */
 @theme {
   /* App-default interface/body text — every control, label, and menu item. */
   --font-weight-normal: 450;
   --text-ui: 1rem;
-  --text-ui--line-height: 1.8;
+  --text-ui--line-height: 1.6;
   --text-message: var(--text-ui);
-  --text-message--line-height: 1.8;
+  --text-message--line-height: var(--text-ui--line-height);
   /* Captions, descriptions, and sub/group titles stay 1px below body text
    * as the Appearance font size changes. */
   --text-sm: calc(var(--text-ui) - 1px);
-  --text-sm--line-height: 1.4;
+  --text-sm--line-height: 1.3;
   /* `text-xs` is retired in favour of `text-sm`. Aliased rather than left on
    * Tailwind's 0.75rem, which against the fixed 16px root is a hard 12px that
    * ignores the Appearance setting — the same trap the ramp test guards. Keeps
