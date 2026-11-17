@@ -23,6 +23,7 @@ import {
   sgrWheelReports,
   terminalTheme,
   terminalKeyEventPayload,
+  terminalLinkClickOpens,
   touchScrollPayload,
   type ConnectionState,
   wheelReportPayload,
@@ -148,6 +149,25 @@ describe("openTerminalLink", () => {
     openTerminalLink(new MouseEvent("click"), uri, () => false);
 
     expect(openSpy).not.toHaveBeenCalled();
+  });
+});
+
+describe("terminalLinkClickOpens", () => {
+  const plain = { metaKey: false, ctrlKey: false };
+  const command = { metaKey: true, ctrlKey: false };
+  const control = { metaKey: false, ctrlKey: true };
+
+  it.each([
+    ["a plain click without mouse tracking", plain, "none", null, true, true],
+    ["a plain click while the program tracks the mouse", plain, "any", "mouse", true, false],
+    ["a ⌘-click on macOS while tracking", command, "vt200", "mouse", true, true],
+    ["a Ctrl-click on macOS while tracking", control, "vt200", "mouse", true, false],
+    ["a Ctrl-click elsewhere while tracking", control, "drag", "mouse", false, true],
+    ["a ⌘-click elsewhere while tracking", command, "drag", "mouse", false, false],
+    ["a touch tap while tracking", plain, "any", "touch", false, true],
+    ["a pen tap while tracking", plain, "x10", "pen", true, true],
+  ] as const)("decides %s", (_name, event, mode, pointerType, isMac, opens) => {
+    expect(terminalLinkClickOpens(event, mode, pointerType, isMac)).toBe(opens);
   });
 });
 
@@ -768,6 +788,97 @@ describe("TerminalSession", () => {
     expect(term.options.linkHandler?.allowNonHttpProtocols).toBe(true);
     expect(term.options.linkHandler?.activate).toBeTypeOf("function");
     session.dispose();
+  });
+
+  describe("link gestures", () => {
+    const LINK = "https://docs.example.com/guide";
+
+    function termOf(session: TerminalSession): Terminal {
+      return (session as unknown as { term: Terminal }).term;
+    }
+
+    function write(term: Terminal, data: string): Promise<void> {
+      return new Promise((resolve) => {
+        term.write(data, resolve);
+      });
+    }
+
+    function activate(term: Terminal, init: MouseEventInit) {
+      term.options.linkHandler?.activate(new MouseEvent("mouseup", init), LINK, {
+        start: { x: 1, y: 1 },
+        end: { x: LINK.length, y: 1 },
+      });
+    }
+
+    it("opens on a plain click when the program does not track the mouse", () => {
+      const openSpy = vi.spyOn(window, "open").mockReturnValue(null);
+      const { session } = makeSession();
+
+      activate(termOf(session), {});
+
+      expect(openSpy).toHaveBeenCalledWith(LINK, "_blank", "noopener,noreferrer");
+      session.dispose();
+    });
+
+    it("leaves plain clicks to a mouse-tracking program and opens on Ctrl-click", async () => {
+      const openSpy = vi.spyOn(window, "open").mockReturnValue(null);
+      const { session } = makeSession();
+      const term = termOf(session);
+      await write(term, "\x1b[?1003h\x1b[?1006h");
+
+      activate(term, {});
+      expect(openSpy).not.toHaveBeenCalled();
+
+      activate(term, { ctrlKey: true });
+      expect(openSpy).toHaveBeenCalledExactlyOnceWith(LINK, "_blank", "noopener,noreferrer");
+      session.dispose();
+    });
+
+    it("opens on a touch tap while the program tracks the mouse", async () => {
+      const openSpy = vi.spyOn(window, "open").mockReturnValue(null);
+      const { session, container } = makeSession();
+      const term = termOf(session);
+      await write(term, "\x1b[?1000h");
+      const press = new Event("pointerdown", { bubbles: true });
+      Object.defineProperty(press, "pointerType", { value: "touch" });
+
+      container.querySelector(".xterm-screen")!.dispatchEvent(press);
+      activate(term, {});
+
+      expect(openSpy).toHaveBeenCalledOnce();
+      session.dispose();
+    });
+
+    it("keeps a Ctrl-click on a hovered link from the program's mouse reporting", async () => {
+      const { session } = makeSession();
+      const term = termOf(session);
+      const screen = term.element!.querySelector(".xterm-screen")!;
+      const reported = vi.fn();
+      term.element!.addEventListener("mousedown", reported);
+      const press = (init: MouseEventInit) => {
+        const event = new MouseEvent("mousedown", { bubbles: true, cancelable: true, ...init });
+        screen.dispatchEvent(event);
+        return event;
+      };
+      const range = { start: { x: 1, y: 1 }, end: { x: LINK.length, y: 1 } };
+
+      term.options.linkHandler?.hover?.(new MouseEvent("mousemove"), LINK, range);
+      press({ ctrlKey: true });
+      expect(reported).toHaveBeenCalledOnce();
+
+      await write(term, "\x1b[?1000h");
+      const linkPress = press({ ctrlKey: true });
+      expect(reported).toHaveBeenCalledOnce();
+      expect(linkPress.defaultPrevented).toBe(true);
+
+      press({});
+      expect(reported).toHaveBeenCalledTimes(2);
+
+      term.options.linkHandler?.leave?.(new MouseEvent("mousemove"), LINK, range);
+      press({ ctrlKey: true });
+      expect(reported).toHaveBeenCalledTimes(3);
+      session.dispose();
+    });
   });
 
   describe("pasteCommand", () => {

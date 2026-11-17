@@ -17,12 +17,13 @@ import { type FontWeight, type ITheme, Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import { withBasePath } from "@/lib/basePath";
 import { type CodeFont, codeFontFamilyForEditor, readCodeFont } from "@/lib/codeFontPreferences";
+import { hasCommandModifier } from "@/lib/hotkeys";
 import { parseHttpUrl } from "@/lib/openLinkInApp";
 import { terminalSurfaceColors } from "@/lib/terminalPalette";
 import { splitWorkspaceFileCitation } from "@/components/ai-elements/streamdown-security";
 import { resolveChatFilePath } from "@/hooks/useWorkspaceChangedFiles";
 import { CodexTerminalPalette, codexTerminalTheme } from "./CodexTerminalPalette";
-import { TerminalLinkProvider } from "./TerminalLinkProvider";
+import { type TerminalLinkHandler, TerminalLinkProvider } from "./TerminalLinkProvider";
 import { parseTmuxRepliesMessage, suppressRepliesTmuxSends } from "./TerminalQueryReplies";
 
 const TERMINAL_BOLD_WEIGHT_OFFSET = 300;
@@ -124,6 +125,21 @@ export function resolveTerminalWorkspaceFileLink(
   const path = resolveChatFilePath(citation.path, root, home)?.path ?? null;
   if (path === null || path.startsWith("/")) return null;
   return { path, line: citation.line, ...(citation.endLine ? { endLine: citation.endLine } : {}) };
+}
+
+/**
+ * Whether a click on a terminal link opens it. A program that tracks the mouse owns plain
+ * clicks, so only ⌘-click (macOS) or Ctrl-click opens there; touch and pen taps always open.
+ */
+export function terminalLinkClickOpens(
+  event: Pick<MouseEvent, "metaKey" | "ctrlKey">,
+  mouseTrackingMode: string,
+  pointerType: string | null,
+  isMac?: boolean,
+): boolean {
+  if (mouseTrackingMode === "none") return true;
+  if (pointerType === "touch" || pointerType === "pen") return true;
+  return hasCommandModifier(event, isMac);
 }
 
 export function openTerminalLink(
@@ -685,6 +701,10 @@ export class TerminalSession {
   private touchLastY = 0;
   /** Fractional touch lines carried across moves (see {@link touchScrollPayload}). */
   private touchPartialLines = 0;
+  /** Whether the pointer is over a detected or OSC 8 link. */
+  private linkHovered = false;
+  /** ``pointerType`` of the latest press, e.g. ``"mouse"`` or ``"touch"``. */
+  private lastPointerType: string | null = null;
 
   /**
    * Construct, attach to the DOM, and open the WebSocket.
@@ -725,8 +745,22 @@ export class TerminalSession {
     // construction; a mid-session change is applied live via setFont(). The
     // xterm.js defaults (15px, no theme) feel out of place inside the app
     // chrome, so an unset family falls back to the shared mono stack.
-    const activateLink = (event: MouseEvent, uri: string) =>
-      openTerminalLink(event, uri, onFileLink);
+    const linkHandler: TerminalLinkHandler = {
+      activate: (event, uri) => {
+        if (
+          !terminalLinkClickOpens(event, this.term.modes.mouseTrackingMode, this.lastPointerType)
+        ) {
+          return;
+        }
+        openTerminalLink(event, uri, onFileLink);
+      },
+      hover: () => {
+        this.linkHovered = true;
+      },
+      leave: () => {
+        this.linkHovered = false;
+      },
+    };
     this.term = new Terminal({
       ...terminalFontOptions(readCodeFont()),
       scrollback: 20000,
@@ -740,7 +774,7 @@ export class TerminalSession {
       // xterm ignores OSC 8 file:// links unless non-HTTP protocols are
       // enabled. openTerminalLink keeps activation safe by consuming local
       // workspace files and refusing every non-HTTP fallback.
-      linkHandler: { activate: activateLink, allowNonHttpProtocols: true },
+      linkHandler: { ...linkHandler, allowNonHttpProtocols: true },
     });
     // Control mode forwards raw pane output. Consume pane OSC 52 so clipboard
     // writes can only arrive through validated tmux `clipboard-write` frames.
@@ -749,7 +783,7 @@ export class TerminalSession {
     this.term.loadAddon(this.fit);
     // Turn bare URLs in terminal output into clickable links; xterm alone
     // renders them as plain text.
-    this.term.registerLinkProvider(new TerminalLinkProvider(this.term, activateLink));
+    this.term.registerLinkProvider(new TerminalLinkProvider(this.term, linkHandler));
     this.term.open(container);
     // Load the GPU renderer after open() (it needs the mounted canvas).
     // Falls back to the DOM renderer when WebGL is unavailable.
@@ -785,6 +819,27 @@ export class TerminalSession {
         this.onClipboardRequest?.(selection, event);
       },
       { capture: true, signal },
+    );
+
+    container.addEventListener(
+      "pointerdown",
+      (event) => {
+        this.lastPointerType = event.pointerType || null;
+      },
+      { capture: true, signal },
+    );
+    // Keep a link-opening ⌘/Ctrl-click from a mouse-tracking program, which would act on it or
+    // open the link again. The link provider listens on this element, so it still sees the press.
+    this.term.element?.querySelector<HTMLElement>(".xterm-screen")?.addEventListener(
+      "mousedown",
+      (event) => {
+        if (!this.linkHovered || this.term.modes.mouseTrackingMode === "none") return;
+        if (!hasCommandModifier(event)) return;
+        event.preventDefault();
+        event.stopPropagation();
+        this.term.focus();
+      },
+      { signal },
     );
 
     this.ws.addEventListener(

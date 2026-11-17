@@ -9,6 +9,10 @@ A URL longer than the pane is shown across two rows. When the printing program
 broke the line at the pane width itself (a CLI that word-wraps its output to the
 terminal size), the user sees the same two rows as a terminal soft wrap and a
 click must open the complete URL, not the first-row fragment.
+
+A program that tracks the mouse (a fullscreen TUI) owns plain clicks, so a link
+there opens only on the platform's command-click (⌘ on macOS, Ctrl elsewhere),
+and that click is not reported to the program.
 """
 
 from __future__ import annotations
@@ -17,7 +21,7 @@ import json
 import re
 
 import pytest
-from playwright.sync_api import Page, Route, expect
+from playwright.sync_api import Page, Route, WebSocket, expect
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 from tests.e2e_ui.conftest import open_right_rail
@@ -28,6 +32,10 @@ _WRAPPED_URL_HOST = "wrapped-link.example.com"
 _WRAPPED_URL = (
     f"https://{_WRAPPED_URL_HOST}/explore/connections/seg-path/seg-path/pagerduty-mcp?o=1#end"
 )
+_TRACKED_URL = f"https://{_WRAPPED_URL_HOST}/docs/mouse-tracking"
+# SGR mouse report: ESC [ < button ; column ; row, then M for a press.
+_SGR_PRESS = re.compile(r"\x1b\[<(\d+);\d+;\d+M")
+_SGR_MOTION_BIT = 32
 
 
 def _open_new_shell(page: Page) -> None:
@@ -59,6 +67,12 @@ def _print_url_at_terminal_origin(page: Page, url: str) -> None:
 def _print_url_folded_at_pane_width(page: Page, url: str) -> None:
     """Print *url* at row 1/column 1 with the program breaking the line at the pane width."""
     _run_at_terminal_origin(page, f"printf '%s\\n' '{url}' | fold -w \"$(tput cols)\"")
+
+
+def expect_terminal_link_hovered(page: Page) -> None:
+    """Wait until xterm reports the pointer over a detected link in the active terminal."""
+    terminal_view = page.get_by_test_id("terminal-view").last
+    expect(terminal_view.locator(".xterm-screen.xterm-cursor-pointer")).to_be_visible()
 
 
 def _terminal_row_point(page: Page, row: int = 1, rows: int = 1) -> tuple[float, float]:
@@ -96,6 +110,26 @@ def _record_pane_sizes(page: Page) -> list[list[tuple[int, int]]]:
 
     page.on("websocket", _on_ws)
     return panes
+
+
+def record_terminal_mouse_presses(page: Page) -> list[int]:
+    """Collect the button codes of SGR mouse presses the page sends to terminal sockets."""
+    presses: list[int] = []
+
+    def _on_frame(payload: str | bytes) -> None:
+        text = payload.decode("latin-1") if isinstance(payload, bytes) else payload
+        presses.extend(
+            int(match.group(1))
+            for match in _SGR_PRESS.finditer(text)
+            if not int(match.group(1)) & _SGR_MOTION_BIT
+        )
+
+    def _on_socket(socket: WebSocket) -> None:
+        if "/attach" in socket.url:
+            socket.on("framesent", _on_frame)
+
+    page.on("websocket", _on_socket)
+    return presses
 
 
 def _echo_destination(route: Route) -> None:
@@ -178,3 +212,51 @@ def test_program_broken_two_row_terminal_url_opens_full_destination(
             f"clicking row {row} of the two-row URL opened {popup.url!r} "
             f"instead of the complete URL {_WRAPPED_URL!r} (pane is {pane_cols} columns wide)"
         )
+
+
+def test_mouse_tracking_program_keeps_plain_clicks_and_command_click_opens_the_link(
+    request: pytest.FixtureRequest, terminal_session: tuple[str, str]
+) -> None:
+    """With mouse tracking on, a plain click reaches the program and a command-click opens.
+
+    ``cat`` runs after the program turns on SGR mouse tracking, so the reports the
+    browser sends for a click are echoed into the pane where they can be seen.
+    """
+    base_url, session_id = terminal_session
+    page: Page = request.getfixturevalue("page")
+    page.context.route(f"https://{_WRAPPED_URL_HOST}/**", _echo_destination)
+    presses = record_terminal_mouse_presses(page)
+
+    page.goto(f"{base_url}/c/{session_id}")
+    _open_new_shell(page)
+    _run_at_terminal_origin(page, f"printf '%s\\n\\033[?1000h\\033[?1006h' '{_TRACKED_URL}'; cat")
+    point = _terminal_row_point(page)
+    page.mouse.move(*point)
+    expect_terminal_link_hovered(page)
+
+    presses.clear()
+    try:
+        with page.expect_popup(timeout=2_000):
+            page.mouse.click(*point)
+    except PlaywrightTimeoutError:
+        pass
+    else:
+        raise AssertionError("a plain click opened the link while the program tracks the mouse")
+    assert presses and all(code & 3 == 0 for code in presses), (
+        f"the plain click never reached the program as a left-button press: {presses}"
+    )
+
+    presses.clear()
+    page.mouse.move(*point)
+    expect_terminal_link_hovered(page)
+    with page.expect_popup(timeout=5_000) as popup_info:
+        page.keyboard.down("ControlOrMeta")
+        page.mouse.click(*point)
+        page.keyboard.up("ControlOrMeta")
+    popup = popup_info.value
+    expect(
+        popup.get_by_role("heading", name="Destination opened from the terminal")
+    ).to_be_visible()
+    assert popup.url == _TRACKED_URL
+    page.wait_for_timeout(500)  # custom-lint: disable=sleep-then-assert -- no late press
+    assert presses == [], f"the command-click also reached the program: {presses}"
