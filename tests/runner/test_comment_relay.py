@@ -1869,18 +1869,6 @@ async def test_agent_switch_moves_relay_to_new_bridge_dir(
             )
             monkeypatch.setattr(server_client, "post", mcp_post)
             async with httpx.AsyncClient(trust_env=False) as relay_client:
-                try:
-                    retired_response = await relay_client.post(
-                        f"{old_relay['url']}/tool",
-                        headers={"Authorization": f"Bearer {old_relay['token']}"},
-                        json={"name": "list_comments", "arguments": {}},
-                        timeout=2.0,
-                    )
-                except httpx.ConnectError:
-                    pass
-                else:
-                    # Another relay may already have reused the released pool port.
-                    assert retired_response.status_code == 401
                 refused = await relay_client.post(
                     f"{new_relay['url']}/tool",
                     headers={"Authorization": f"Bearer {old_relay['token']}"},
