@@ -358,6 +358,8 @@ export interface Session {
    */
   backgroundAgents?: BackgroundTaskInfo[];
   createdAt: number;
+  /** Server time of the last persisted activity, when the response carries it. */
+  updatedAt?: number;
   /**
    * Human-readable session title, e.g. ``"researcher:auth"`` for a
    * sub-agent (the spawn tool seeds this) or a user-supplied string

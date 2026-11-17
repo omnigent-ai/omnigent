@@ -46,7 +46,11 @@ import { maybeOpenLinkInApp } from "@/lib/openLinkInApp";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import { writeWorkspacePanelDefault } from "@/lib/workspacePanelPreferences";
 import { writePinnedWorkspaceTabs } from "@/lib/workspaceTabPreferences";
-import { isExplicitlyUnread, resetReadStateForTests } from "@/hooks/useUnseenConversations";
+import {
+  isConversationUnseen,
+  isExplicitlyUnread,
+  resetReadStateForTests,
+} from "@/hooks/useUnseenConversations";
 
 const runnerHealthState = vi.hoisted(() => ({
   runnerOnline: undefined as boolean | undefined,
@@ -6887,15 +6891,30 @@ describe("mark-unread shortcut", () => {
 
   it("toggles a directly linked shared session that is not in the loaded sidebar rows", () => {
     resetReadStateForTests();
+    // The client clock lags the server's last update, so marking read must
+    // anchor on the session's update time rather than its creation time.
+    const now = vi.spyOn(Date, "now").mockReturnValue(5_000_000);
     mockConversations([]);
     useSessionMock.mockReturnValue({
-      session: sessionSnapshot({ id: "conv_linked", permissionLevel: 1 }),
+      session: sessionSnapshot({
+        id: "conv_linked",
+        permissionLevel: 1,
+        createdAt: 1_000,
+        updatedAt: 6_000,
+      }),
       isLoading: false,
       error: null,
     });
     renderShell("/c/conv_linked");
-    fireEvent.keyDown(window, { key: "u", code: "KeyU", ctrlKey: true, altKey: true });
+    const pressShortcut = () =>
+      fireEvent.keyDown(window, { key: "u", code: "KeyU", ctrlKey: true, altKey: true });
+    pressShortcut();
     expect(isExplicitlyUnread("conv_linked")).toBe(true);
+    expect(isConversationUnseen("conv_linked", 6_000, "idle")).toBe(true);
+    pressShortcut();
+    expect(isExplicitlyUnread("conv_linked")).toBe(false);
+    expect(isConversationUnseen("conv_linked", 6_000, "idle")).toBe(false);
+    now.mockRestore();
   });
 
   it("leaves a sub-agent session's read state alone", () => {

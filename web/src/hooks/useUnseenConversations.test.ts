@@ -326,19 +326,20 @@ describe("toggleConversationUnread", () => {
   });
 
   it("keeps a toggle made before the first list response arrives", async () => {
-    const mod = await loadFresh();
+    (await loadFresh()).markConversationUnread("conv-1", 5_000);
     vi.useFakeTimers({ now: 6_000_000 });
-    // The flag was restored from storage; the open session's snapshot loads first.
-    mod.markConversationUnread("conv-1", 5_000);
-    expect(mod.toggleConversationUnread("conv-1", 5_000)).toBe(false);
+    // After a reload the flag comes back from storage, unseeded, and the open
+    // session's snapshot loads before the first list page.
+    const reloaded = await reloadKeepingStorage();
+    expect(reloaded.toggleConversationUnread("conv-1", 5_000)).toBe(false);
 
     // The list request was already in flight and still carries the old flag.
-    mod.seedReadState([
+    reloaded.seedReadState([
       { id: "conv-1", viewer_last_seen: 4_999, viewer_unread: true, updated_at: 5_000 },
     ]);
 
-    expect(mod.isExplicitlyUnread("conv-1")).toBe(false);
-    expect(mod.isConversationUnseen("conv-1", 5_000, "idle")).toBe(false);
+    expect(reloaded.isExplicitlyUnread("conv-1")).toBe(false);
+    expect(reloaded.isConversationUnseen("conv-1", 5_000, "idle")).toBe(false);
   });
 });
 

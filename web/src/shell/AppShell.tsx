@@ -918,7 +918,8 @@ function AppShellImpl() {
   // including a shared one missing from the loaded sidebar rows.
   const readStateSnapshot = isKnownTopLevel && activeSessionMatchesRoute ? activeSession : null;
   const readStateId = activeConv?.id ?? readStateSnapshot?.id;
-  const readStateUpdatedAt = activeConv?.updated_at ?? readStateSnapshot?.createdAt;
+  const readStateUpdatedAt =
+    activeConv?.updated_at ?? readStateSnapshot?.updatedAt ?? readStateSnapshot?.createdAt;
   const readStateTarget = useMemo<ReadStateTarget | null>(
     () =>
       readStateId !== undefined && readStateUpdatedAt !== undefined

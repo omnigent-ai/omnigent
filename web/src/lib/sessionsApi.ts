@@ -161,6 +161,7 @@ interface SessionResponseWire {
    */
   background_agents?: BackgroundTaskInfo[] | null;
   created_at: number;
+  updated_at?: number | null;
   /**
    * Human-readable session title, e.g. ``"researcher:auth"`` for a
    * sub-agent or a user-supplied string for a top-level session.
@@ -380,6 +381,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     backgroundTasks: parseBackgroundTasks(wire.background_tasks),
     backgroundAgents: parseBackgroundTasks(wire.background_agents),
     createdAt: wire.created_at,
+    updatedAt: wire.updated_at ?? undefined,
     title: wire.title ?? null,
     labels: wire.labels,
     projectId: wire.project_id ?? null,

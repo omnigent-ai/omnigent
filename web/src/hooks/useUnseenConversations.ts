@@ -89,12 +89,9 @@ function persistToStorage(): void {
 
 hydrateFromStorage();
 
-// Sessions already seeded from the list. Seeding is once-per-session: the
-// first time a conversation is seen we copy its server `viewer_*` into the
-// mirror, then ignore later list values so an in-flight poll can't clobber a
-// local optimistic write. Cross-device changes after first load surface on a
-// reload (a deliberate Phase-1 scope: live merge is a follow-up). An explicit
-// mark also counts as seeded, so a list response already in flight can't undo it.
+// Sessions whose server `viewer_*` was copied in once, or that the user marked
+// explicitly; later list values are ignored so an in-flight poll can't clobber
+// a local write. Cross-device changes after first load surface on a reload.
 const seeded = new Set<string>();
 
 // Until the first seed runs we don't know the server's baselines, so the

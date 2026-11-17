@@ -73,6 +73,16 @@ function labelRow(text: string) {
   return screen.getByText((_content, el) => el?.tagName === "SPAN" && el.textContent === text);
 }
 
+/** The key caps shown beside the palette row labelled `label`. */
+function chordsFor(label: string) {
+  return Array.from(
+    screen
+      .getByText(label)
+      .closest("[cmdk-item]")!
+      .querySelectorAll<HTMLElement>('[data-slot="kbd"]'),
+  ).map((key) => key.textContent);
+}
+
 function renderPalette(
   overrides: Partial<ComponentProps<typeof CommandPalette>> = {},
   queryClient = new QueryClient(),
@@ -332,13 +342,6 @@ describe("CommandPalette — sessions", () => {
     expect(navigate).toHaveBeenCalledWith("/c/c99");
   });
   it("shows each action's chord beside its row, and hides the workspace chord on grid routes", () => {
-    const chordsFor = (label: string) =>
-      Array.from(
-        screen
-          .getByText(label)
-          .closest("[cmdk-item]")!
-          .querySelectorAll<HTMLElement>('[data-slot="kbd"]'),
-      ).map((key) => key.textContent);
     renderPalette();
     expect(chordsFor("Go to Settings")).toEqual([MOD_KEY, ALT_KEY, ","]);
     expect(chordsFor("Toggle conversations sidebar")).toEqual([MOD_KEY, ALT_KEY, "["]);
@@ -351,13 +354,6 @@ describe("CommandPalette — sessions", () => {
   });
 
   it("marks the open session unread, then offers to mark it read again", () => {
-    const chordsFor = (label: string) =>
-      Array.from(
-        screen
-          .getByText(label)
-          .closest("[cmdk-item]")!
-          .querySelectorAll<HTMLElement>('[data-slot="kbd"]'),
-      ).map((key) => key.textContent);
     renderPalette();
     expect(screen.queryByText("Mark current session as unread")).toBeNull();
     cleanup();

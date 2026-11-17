@@ -1339,6 +1339,7 @@ describe("getSession", () => {
         agent_id: "agent_xyz",
         status: "running",
         created_at: 1704067200,
+        updated_at: 1704067260,
         items: [],
         side_chat_parent_id: "conv_parent",
         side_chat_allowed: false,
@@ -1351,6 +1352,7 @@ describe("getSession", () => {
     expect(fetchMock.mock.calls[0][0]).toBe("/v1/sessions/conv_abc");
     expect(session.agentId).toBe("agent_xyz");
     expect(session.createdAt).toBe(1704067200);
+    expect(session.updatedAt).toBe(1704067260);
     expect(session.sideChatParentId).toBe("conv_parent");
     expect(session.sideChatAllowed).toBe(false);
   });
