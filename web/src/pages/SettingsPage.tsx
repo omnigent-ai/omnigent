@@ -92,7 +92,6 @@ import {
 } from "@/pages/settings/search/catalog/updates";
 import { SettingsEntryLabel, SettingsItem } from "@/pages/settings/search/SettingsItem";
 import {
-  type SettingsControlProps,
   settingsControlProps,
   settingsFileInputProps,
   settingsDescriptionId,
@@ -105,6 +104,7 @@ import {
 import {
   SettingsDataRegion,
   SettingsOwner,
+  useSettingsOwnership,
   settingsOverlayProps,
   settingsRowOverlayProps,
   settingsRuntimeChoiceProps,
@@ -1460,7 +1460,9 @@ function AppearanceSection() {
                 </DialogHeader>
                 <DialogFooter>
                   <DialogClose asChild>
-                    <Button variant="outline">Cancel</Button>
+                    <Button data-settings-dialog-action="Cancel" variant="outline">
+                      Cancel
+                    </Button>
                   </DialogClose>
                   <Button
                     variant="default"
@@ -1474,23 +1476,23 @@ function AppearanceSection() {
                 </DialogFooter>
               </DialogContent>
             </Dialog>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".json"
+              hidden
+              {...settingsFileInputProps(APPEARANCE_DATA_ENTRY, "chooseFile")}
+              data-testid="import-settings-file-input"
+              onChange={(e) => {
+                const file = e.target.files?.[0];
+                if (file) void handleImportFile(file);
+                e.target.value = "";
+              }}
+            />
           </SettingsItem>
         </SettingsGroup>
       </div>
 
-      <input
-        ref={fileInputRef}
-        type="file"
-        accept=".json"
-        className="hidden"
-        {...settingsFileInputProps(APPEARANCE_DATA_ENTRY, "chooseFile")}
-        data-testid="import-settings-file-input"
-        onChange={(e) => {
-          const file = e.target.files?.[0];
-          if (file) void handleImportFile(file);
-          e.target.value = "";
-        }}
-      />
       <Dialog open={isImportDialogOpen} onOpenChange={setIsImportDialogOpen}>
         <DialogContent {...settingsOverlayProps(APPEARANCE_DATA_ENTRY, "import")}>
           <DialogHeader>
@@ -1510,7 +1512,9 @@ function AppearanceSection() {
           )}
           <DialogFooter>
             <DialogClose asChild>
-              <Button variant="outline">Cancel</Button>
+              <Button data-settings-dialog-action="Cancel" variant="outline">
+                Cancel
+              </Button>
             </DialogClose>
             <Button
               variant="default"
@@ -2355,15 +2359,16 @@ function UiFontSizeControl() {
           "focus-within:border-ring focus-within:ring-3 focus-within:ring-ring/50",
         )}
       >
-        <StepperButton
-          control={settingsControlProps(UI_FONT_SIZE_ENTRY, "decrease")}
-          testId="ui-font-size-dec"
-          disabled={atMin}
-          onClick={() => commit(px - UI_FONT_SIZE_STEP)}
-          componentId="settings.appearance.ui_font_decrease"
-        >
-          <MinusIcon className="ui-icon" />
-        </StepperButton>
+        <SettingsOwner entry={UI_FONT_SIZE_ENTRY} part="decrease">
+          <StepperButton
+            testId="ui-font-size-dec"
+            disabled={atMin}
+            onClick={() => commit(px - UI_FONT_SIZE_STEP)}
+            componentId="settings.appearance.ui_font_decrease"
+          >
+            <MinusIcon className="ui-icon" />
+          </StepperButton>
+        </SettingsOwner>
         <div className="flex items-center border-x border-input px-2 tabular-nums">
           <input
             type="number"
@@ -2382,15 +2387,16 @@ function UiFontSizeControl() {
             }}
           />
         </div>
-        <StepperButton
-          control={settingsControlProps(UI_FONT_SIZE_ENTRY, "increase")}
-          testId="ui-font-size-inc"
-          disabled={atMax}
-          onClick={() => commit(px + UI_FONT_SIZE_STEP)}
-          componentId="settings.appearance.ui_font_increase"
-        >
-          <PlusIcon className="ui-icon" />
-        </StepperButton>
+        <SettingsOwner entry={UI_FONT_SIZE_ENTRY} part="increase">
+          <StepperButton
+            testId="ui-font-size-inc"
+            disabled={atMax}
+            onClick={() => commit(px + UI_FONT_SIZE_STEP)}
+            componentId="settings.appearance.ui_font_increase"
+          >
+            <PlusIcon className="ui-icon" />
+          </StepperButton>
+        </SettingsOwner>
       </div>
     </SettingsItem>
   );
@@ -2510,15 +2516,16 @@ function UiCodeFontSizeControl() {
           "focus-within:border-ring focus-within:ring-3 focus-within:ring-ring/50",
         )}
       >
-        <StepperButton
-          control={settingsControlProps(CODE_FONT_SIZE_ENTRY, "decrease")}
-          testId="code-font-size-dec"
-          disabled={atMin}
-          onClick={() => commit(px - CODE_FONT_SIZE_STEP)}
-          componentId="settings.appearance.code_font_decrease"
-        >
-          <MinusIcon className="ui-icon" />
-        </StepperButton>
+        <SettingsOwner entry={CODE_FONT_SIZE_ENTRY} part="decrease">
+          <StepperButton
+            testId="code-font-size-dec"
+            disabled={atMin}
+            onClick={() => commit(px - CODE_FONT_SIZE_STEP)}
+            componentId="settings.appearance.code_font_decrease"
+          >
+            <MinusIcon className="ui-icon" />
+          </StepperButton>
+        </SettingsOwner>
         <div className="flex items-center border-x border-input px-2 tabular-nums">
           <input
             type="number"
@@ -2537,15 +2544,16 @@ function UiCodeFontSizeControl() {
             }}
           />
         </div>
-        <StepperButton
-          control={settingsControlProps(CODE_FONT_SIZE_ENTRY, "increase")}
-          testId="code-font-size-inc"
-          disabled={atMax}
-          onClick={() => commit(px + CODE_FONT_SIZE_STEP)}
-          componentId="settings.appearance.code_font_increase"
-        >
-          <PlusIcon className="ui-icon" />
-        </StepperButton>
+        <SettingsOwner entry={CODE_FONT_SIZE_ENTRY} part="increase">
+          <StepperButton
+            testId="code-font-size-inc"
+            disabled={atMax}
+            onClick={() => commit(px + CODE_FONT_SIZE_STEP)}
+            componentId="settings.appearance.code_font_increase"
+          >
+            <PlusIcon className="ui-icon" />
+          </StepperButton>
+        </SettingsOwner>
       </div>
     </SettingsItem>
   );
@@ -2634,14 +2642,12 @@ function UiCodeFontWeightControl() {
 
 /** Flanking +/- segment of the font-size pill: square, ghost-hover, no border. */
 function StepperButton({
-  control,
   testId,
   disabled,
   onClick,
   componentId,
   children,
 }: {
-  control: SettingsControlProps;
   testId: string;
   disabled: boolean;
   onClick: () => void;
@@ -2649,10 +2655,11 @@ function StepperButton({
   children: ReactNode;
 }) {
   const { trackClick } = useOmnigentAnalytics();
+  const owned = useSettingsOwnership();
   return (
     <button
       type="button"
-      {...control}
+      {...owned.control()}
       data-testid={testId}
       disabled={disabled}
       onClick={() => {
