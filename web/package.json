@@ -73,6 +73,7 @@
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "cmdk": "^1.1.1",
+    "dom-accessibility-api": "^0.6.3",
     "emoji-mart": "^5.6.0",
     "katex": "catalog:",
     "lucide-react": "^1.57.0",

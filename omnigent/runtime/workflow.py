@@ -1588,6 +1588,24 @@ def _bind_codex_gateway_credential(env: dict[str, str], spec: AgentSpec) -> None
     env["HARNESS_CODEX_DISABLE_NATIVE_TOOLS"] = "true"
 
 
+def _apply_codex_tool_switches(env: dict[str, str], spec: AgentSpec) -> None:
+    """Apply the spec's Codex tool switches on every route.
+
+    The switches only restrict: ``web_search: true`` or
+    ``disable_native_tools: false`` never re-enables tools the operator disabled.
+    """
+    config = spec.executor.config
+    for key in ("web_search", "disable_native_tools"):
+        if config.get(key) is not None and not isinstance(config[key], bool):
+            raise OmnigentError(
+                f"executor.config.{key} must be a boolean", code=ErrorCode.INVALID_INPUT
+            )
+    if config.get("web_search") is False:
+        env["HARNESS_CODEX_ENABLE_WEB_SEARCH"] = "false"
+    if config.get("disable_native_tools") is True:
+        env["HARNESS_CODEX_DISABLE_NATIVE_TOOLS"] = "true"
+
+
 def _build_codex_spawn_env(
     spec: AgentSpec,
     *,
@@ -1623,6 +1641,7 @@ def _build_codex_spawn_env(
     # unchanged.
     provider = _resolve_provider_for_build(spec, harness_type="codex", for_launch=True)
     _apply_codex_provider_env(env, spec, provider)
+    _apply_codex_tool_switches(env, spec)
     # Skills bridge — same shape as the claude-sdk variant. Always
     # set so the harness wrap doesn't fall back to its ``"all"``
     # default and override an explicit ``skills: none`` spec.
