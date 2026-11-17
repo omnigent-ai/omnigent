@@ -280,8 +280,8 @@ it("shows each cell's session controls and targets that session's permission mod
   // Named from the cells' snapshots; neither session is on a loaded sidebar page.
   await waitFor(() => expect(document.title).toBe("first + second"));
   const second = within(screen.getByRole("region", { name: "second" }));
-  // Host and harness are read-only here; switch hosts and models full screen.
-  expect(second.getByText("Host for second (status only)")).toBeInTheDocument();
+  // The harness is read-only here; models are switched full screen.
+  expect(second.getByText("Host for second")).toBeInTheDocument();
   expect(second.getByTestId("grid-harness-status")).toHaveAccessibleName("Claude Code");
   fireEvent.pointerDown(second.getByRole("button", { name: "Permission mode: Manual" }), {
     button: 0,

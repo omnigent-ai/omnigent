@@ -376,6 +376,23 @@ describe("SwitchHostDialog", () => {
     expect(invalidate).toHaveBeenCalledWith({ queryKey: ["session-agent", "conv_1"] });
   });
 
+  it("stamps the runner launch on the session it moved, not the open conversation", async () => {
+    // A grid cell's switch runs while another conversation is on screen.
+    conversationRegistry.acquire("conv_open");
+    conversationRegistry.setActive("conv_open");
+    conversationRegistry.acquire("conv_1");
+    renderDialog();
+
+    const button = await screen.findByTestId("switch-host-button");
+    await waitFor(() => expect((button as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(button);
+
+    await waitFor(() =>
+      expect(conversationRegistry.peek("conv_1")!.getState().runnerLaunchedAt).not.toBeNull(),
+    );
+    expect(conversationRegistry.peek("conv_open")!.getState().runnerLaunchedAt).toBeNull();
+  });
+
   it("keeps the binding when stopping the old runner fails", async () => {
     stopSessionMock.mockRejectedValue(new Error("Old runner could not be stopped"));
     renderDialog();
