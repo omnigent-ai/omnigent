@@ -141,6 +141,7 @@ async def test_side_chat_binding_unchanged_when_source_runner_unavailable(
         ("closed", 422, {"detail": [{"type": "union_tag_invalid"}]}, False),
         ("unbound", 503, {"error": "no_harness"}, False),
         ("mismatched", 200, {"queued": False}, False),
+        ("reappeared", 200, {"queued": False}, False),
         ("advanced", 409, {"error": "no_live_harness"}, False),
         ("offline", 503, {"error": "no_harness"}, False),
         ("closed", 503, {"error": "codex_side_chat_unavailable"}, False),
@@ -190,9 +191,14 @@ async def test_native_side_chat_resume_revalidates_runner_after_parent_initializ
             return None, current
         return runners[current.runner_id], current
 
+    parent_probes = 0
+
     async def client_for(session_id: str, *_args: object, **_kwargs: object):
-        if session_id == source.id and state == "offline":
-            return None
+        nonlocal parent_probes
+        if session_id == source.id:
+            parent_probes += 1
+            if state == "offline" or (state == "reappeared" and parent_probes == 1):
+                return None
         current = store.get_conversation(session_id)
         assert current is not None
         return runners[current.runner_id]
@@ -231,7 +237,7 @@ async def test_native_side_chat_resume_revalidates_runner_after_parent_initializ
             if status == 409 and state != "unavailable"
             else ErrorCode.RUNNER_UNAVAILABLE
         )
-        assert (store.get_conversation(side.id).labels.get("omnigent.closed") == "true") == closed
+        assert store.get_conversation(side.id).labels.get("omnigent.closed") == "true"
     if state == "live":
         ensure_connected.assert_not_awaited()
         initialize.assert_not_awaited()
@@ -245,6 +251,17 @@ async def test_native_side_chat_resume_revalidates_runner_after_parent_initializ
         )
     other_runner = next_runner if expected_runner is first_runner else first_runner
     other_runner.post.assert_not_awaited()
+    if state == "mismatched":
+        first_runner.post.return_value = httpx.Response(200, json={"resumed": True})
+        kwargs["conv"] = store.get_conversation(side.id)
+        assert kwargs["conv"].runner_id == "runner-first"
+
+        recovered = await routes_events._resume_codex_side_chat(**kwargs)
+
+        assert recovered.runner_id == "runner-first"
+        assert "omnigent.closed" not in recovered.labels
+        assert first_runner.post.await_count == 2
+        assert first_runner.post.await_args == first_runner.post.await_args_list[0]
 
 
 class _AdvancingSource:
@@ -462,6 +479,9 @@ async def test_side_chat_recovery_gates_on_source_edit_access_at_the_routes(
         monkeypatch.setattr(
             auth_app.state.runner_router, "runner_owner", Mock(return_value=_OWNER)
         )
+        monkeypatch.setattr(
+            auth_app.state.runner_router, "host_is_on_another_replica", Mock(return_value=False)
+        )
         monkeypatch.setattr(sessions, "_get_runner_client", AsyncMock(return_value=runner))
         monkeypatch.setattr(routes_events, "_ensure_runner_relay_ready", AsyncMock())
 
@@ -491,6 +511,31 @@ async def test_side_chat_recovery_gates_on_source_edit_access_at_the_routes(
                 "codex_side_thread_id": "thread-side",
             },
         )
+        monkeypatch.setattr(routes_events, "_recover_retry_session", AsyncMock())
+        runner.post.return_value = httpx.Response(200, json={"resumed": True})
+        for event in (message, {"type": "retry_session", "data": {}}):
+            store.set_labels(side.id, {"omnigent.closed": "true"})
+            runner.post.reset_mock()
+
+            reopened = await auth_client.post(
+                f"/v1/sessions/{side.id}/events",
+                json=event,
+                headers={"X-Forwarded-Email": _OTHER},
+            )
+
+            assert reopened.status_code == 202, reopened.text
+            ensure.assert_not_awaited()
+            saved = store.get_conversation(side.id)
+            assert saved.runner_id == "runner-shared"
+            assert "omnigent.closed" not in saved.labels
+            forwarded = [call.kwargs["json"] for call in runner.post.await_args_list]
+            assert forwarded[0] == {
+                "type": "codex_side_chat_resume",
+                "codex_side_session_id": side.id,
+            }
+            assert len(forwarded) == (2 if event["type"] == "message" else 1)
+            if event["type"] == "message":
+                assert forwarded[1]["codex_side_thread_id"] == "thread-side"
 
 
 @pytest.mark.parametrize(

@@ -463,6 +463,8 @@ from omnigent.telemetry.events import TurnEndEvent as _TelTurnEndEvent
 from omnigent.telemetry.installation_id import get_installation_id as _get_installation_id
 from omnigent.telemetry.surface import CLIENT_SURFACE_LABEL_KEY, resolve_session_surface
 from omnigent.util.session_lifecycle import (
+    CLOSED_LABEL_KEY,
+    CLOSED_LABEL_VALUE,
     labels_with_closed_status,
     title_without_closed_marker,
 )
@@ -6098,12 +6100,13 @@ async def _recover_side_chat_runner_via_source(
     and rebinds the side chat atomically so concurrent rebindings are
     preserved. The caller must initialize the side chat on the returned
     runner. Recovery requires edit access to the source and, like an explicit
-    runner attach, ownership of the runner the side chat would use; a runner
-    owned by another user raises ``FORBIDDEN`` with that explanation.
+    runner attach, ownership when acquiring a runner. A native side chat may
+    reuse its existing live runner without acquiring it again.
     """
     source_id = _side_chat_source_id(side_chat)
     if source_id is None:
         return None, side_chat
+    native_side_chat = _is_codex_native_subagent(side_chat)
     source = await asyncio.to_thread(conversation_store.get_conversation, source_id)
     if source is None:
         return None, side_chat
@@ -6126,26 +6129,34 @@ async def _recover_side_chat_runner_via_source(
                 "side chat runner is connected to another server replica",
                 host_id=source.host_id,
             )
-        source_client, source = await ensure_runner_connected(
-            session_id=source_id,
-            conv=source,
-            app_state=app_state,
-            conversation_store=conversation_store,
-            runner_router=runner_router,
-            raise_host_refusal=raise_host_refusal,
-        )
+        source_client = None
+        if (
+            native_side_chat
+            and source.runner_id is not None
+            and source.runner_id == side_chat.runner_id
+        ):
+            source_client = await _get_runner_client(source_id, runner_router, conversation=source)
+        reuse_existing = source_client is not None
+        if not reuse_existing:
+            source_client, source = await ensure_runner_connected(
+                session_id=source_id,
+                conv=source,
+                app_state=app_state,
+                conversation_store=conversation_store,
+                runner_router=runner_router,
+                raise_host_refusal=raise_host_refusal,
+            )
         if source_client is None or source.runner_id is None:
             return None, side_chat
-        # A concurrent recovery may have advanced the source past the snapshot
-        # ensure_runner_connected returned. Retry against the fresh row so the
-        # side chat follows the source instead of binding a superseded runner.
+        # Revalidate after client resolution so a concurrent recovery cannot
+        # bind the side chat to a superseded source runner.
         live_source = await asyncio.to_thread(conversation_store.get_conversation, source_id)
         if live_source is None:
             return None, side_chat
         if live_source.runner_id != source.runner_id:
             source = live_source
             continue
-        if user_id is not None and runner_router is not None:
+        if not reuse_existing and user_id is not None and runner_router is not None:
             runner_owner = runner_router.runner_owner(source.runner_id)
             if runner_owner is not None and runner_owner != user_id:
                 _logger.info(
@@ -6159,6 +6170,13 @@ async def _recover_side_chat_runner_via_source(
                     "another user's runner.",
                     code=ErrorCode.FORBIDDEN,
                 )
+        if native_side_chat:
+            # A failed native resume must remain retryable after its binding changes.
+            await asyncio.to_thread(
+                conversation_store.set_labels,
+                side_chat.id,
+                {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE},
+            )
         if source.runner_id != side_chat.runner_id:
             try:
                 if side_chat.runner_id is None:
@@ -6199,6 +6217,11 @@ async def _recover_side_chat_runner_via_source(
                     source.runner_id,
                     extra={"session_id": side_chat.id},
                 )
+        if native_side_chat:
+            refreshed = await asyncio.to_thread(conversation_store.get_conversation, side_chat.id)
+            if refreshed is None:
+                return None, side_chat
+            side_chat = refreshed
         if side_chat.runner_id is None:
             return None, side_chat
         return (
