@@ -5704,6 +5704,7 @@ async def test_a_one_shot_timer_fires_on_the_minute_after_its_delay(
     ("case", "status", "message"),
     [
         ("feature-off", 404, "does not keep timers"),
+        ("no-source-session", 403, "require a source session"),
         ("another-sessions-runner", 403, "set by its own agent"),
         ("side-chat", 400, "side chat"),
         ("too-short", 400, "at least 600 seconds"),
@@ -5722,7 +5723,7 @@ async def test_only_a_sessions_own_runner_keeps_a_timer_the_server_can_keep(
         refused = await client.post(
             f"/v1/sessions/{session_id}/timers",
             json={"seconds": seconds, "repeat": True},
-            headers=_runner_headers(caller),
+            headers=_headers() if case == "no-source-session" else _runner_headers(caller),
         )
         assert refused.status_code == status, refused.text
         assert message in refused.json()["error"]["message"]
@@ -5730,6 +5731,37 @@ async def test_only_a_sessions_own_runner_keeps_a_timer_the_server_can_keep(
             info = (await client.get("/v1/info", headers=_headers())).json()
             assert info["scheduled_task_timers"] is False
     assert [task.kind for task in SqlAlchemyScheduledTaskStore(db_uri).list()] == []
+
+
+async def test_only_the_session_that_set_a_timer_cancels_it(
+    runtime_init: None, db_uri: str, tmp_path: Path
+) -> None:
+    app = _timer_app(db_uri, tmp_path)
+    session_id = _runner_session(db_uri)
+    other = _runner_session(db_uri)
+    async with _off_host_client(app) as client:
+        created = await client.post(
+            f"/v1/sessions/{session_id}/timers",
+            json={"seconds": 600, "repeat": True},
+            headers=_runner_headers(session_id),
+        )
+        assert created.status_code == 200, created.text
+        timer_id = created.json()["timer_id"]
+        # With no source session, from another session's runner, and under that session.
+        refused = [
+            await client.delete(
+                f"/v1/sessions/{session_id}/timers/{timer_id}", headers=_headers()
+            ),
+            await client.delete(
+                f"/v1/sessions/{session_id}/timers/{timer_id}", headers=_runner_headers(other)
+            ),
+            await client.delete(
+                f"/v1/sessions/{other}/timers/{timer_id}", headers=_runner_headers(other)
+            ),
+        ]
+    assert [response.status_code for response in refused] == [403, 403, 404]
+    [timer] = SqlAlchemyScheduledTaskStore(db_uri).list()
+    assert (timer.kind, timer.state) == ("timer", "active")
 
 
 async def test_a_session_keeps_at_most_ten_timers(

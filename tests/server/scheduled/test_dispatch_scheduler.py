@@ -2846,7 +2846,12 @@ async def test_a_repeating_timer_survives_a_restart_and_fires_once_each_time(
 
 
 @pytest.mark.parametrize(
-    ("late", "delivered"), [(60, True), (TIMER_LAST_FIRING_GRACE_SECONDS + 60, False)]
+    ("late", "delivered"),
+    [
+        (TIMER_LAST_FIRING_GRACE_SECONDS - 1, True),
+        (TIMER_LAST_FIRING_GRACE_SECONDS, True),
+        (TIMER_LAST_FIRING_GRACE_SECONDS + 1, False),
+    ],
 )
 async def test_a_timer_back_after_missed_firings_sends_its_last_only_within_the_grace(
     store, late: int, delivered: bool

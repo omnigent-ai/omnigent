@@ -209,7 +209,12 @@ def test_a_timer_continues_its_session_once_or_on_repeat(
         )
 
 
-def test_a_session_keeps_a_bounded_number_of_timers(store: SqlAlchemyScheduledTaskStore) -> None:
+def test_a_session_keeps_a_bounded_number_of_timers(
+    store: SqlAlchemyScheduledTaskStore, db_uri: str
+) -> None:
+    import sqlalchemy as sa
+
+    from omnigent.db.utils import get_or_create_engine
     from omnigent.stores.scheduled_task_store import (
         TIMERS_PER_SESSION,
         ScheduledTaskSessionTimerCapError,
@@ -232,7 +237,23 @@ def test_a_session_keeps_a_bounded_number_of_timers(store: SqlAlchemyScheduledTa
     keep("st_automation", kind="automation")
     # A cancelled timer makes room for another.
     store.delete(kept[0])
-    keep("st_timer_again")
+    engine = get_or_create_engine(db_uri)
+    plans: list[str] = []
+
+    def explain_count(conn, cursor, statement, parameters, _context, _executemany) -> None:
+        if conn.dialect.name == "sqlite" and statement.startswith("SELECT count(*)"):
+            steps = cursor.connection.execute(f"EXPLAIN QUERY PLAN {statement}", parameters)
+            plans.append(" ".join(str(step) for step in steps.fetchall()))
+
+    sa.event.listen(engine, "before_cursor_execute", explain_count)
+    try:
+        keep("st_timer_again")
+    finally:
+        sa.event.remove(engine, "before_cursor_execute", explain_count)
+    if engine.dialect.name == "sqlite":
+        # The count seeks the session's active timers, however long its timer history.
+        [plan] = plans
+        assert "ix_scheduled_tasks_kind_session (kind=? AND state=? AND workspace_id=?" in plan
 
 
 def test_racing_creates_for_a_sessions_last_timer_place_take_turns(

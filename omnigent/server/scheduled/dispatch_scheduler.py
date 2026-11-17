@@ -695,8 +695,9 @@ class PersistentTaskScheduler:
         ):
             return False
         # The cursor can name an earlier missed firing; nothing comes after now, so a
-        # firing after the grace window's start is the last one, and it isn't late.
-        if await self._next_occurrence(task, now - TIMER_LAST_FIRING_GRACE_SECONDS) is not None:
+        # firing at or after the grace window's start is the last one, and it isn't late.
+        cutoff = now - TIMER_LAST_FIRING_GRACE_SECONDS
+        if await self._next_occurrence(task, cutoff - 1) is not None:
             return False
         with workspace_scope(task.workspace_id):
             completed = await asyncio.to_thread(

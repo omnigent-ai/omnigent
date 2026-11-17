@@ -182,9 +182,7 @@ class ToolManager:
         # registration only cares about the gate — no
         # construction-time wiring.
         self._register_async_inbox_tools()
-        # Step 10: register sys_timer_set / sys_timer_cancel unless
-        # the spec sets ``timers: false``. Defaults on, like the
-        # inner stack's ``AgentDef.timers``.
+        # Step 10: register timer tools unless the spec opts out.
         # Firings ride the same ``async_work_complete`` drain path
         # as ``sys_call_async``, but with ``kind="timer"`` so they
         # don't block end-of-turn auto-collect.
