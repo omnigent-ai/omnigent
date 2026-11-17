@@ -1350,7 +1350,7 @@ describe("renderTriggerPrompt", () => {
     // The window opens 5 minutes before the previous run's end, for slow indexing;
     // the form discloses that an item created in that overlap can still count.
     expect(prompt).toContain(
-      "Note the current UTC time; it ends this run's window. Then search from 5 minutes before the check time, because new items can take a few minutes to appear.",
+      "Note the current UTC time: the \"Run time:\" line near the end of this message gives it, so don't check the clock unless that line is missing. It ends this run's window. Then search from 5 minutes before the check time, because new items can take a few minutes to appear.",
     );
     expect(prompt).toContain(
       'End with "Checked through: <time>" in ISO 8601 UTC: the time you noted before searching if you read every result and handled every match; otherwise the time the last ticket you handled (started or skipped) before you stopped was created, or the previous check time if you handled none',
