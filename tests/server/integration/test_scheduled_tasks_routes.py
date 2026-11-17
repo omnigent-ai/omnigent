@@ -5740,29 +5740,42 @@ async def test_recipients_read_an_automation_its_runs_and_their_steps(
     assert (await client.get(_read_urls(task_id)[0], headers=_CAROL)).status_code == 404
 
 
-async def test_a_reminder_is_neither_shared_nor_shown_to_recipients(
+async def test_a_shared_reminder_is_not_shown_to_recipients(
     workflows_client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     client = workflows_client
     task_id = await _create_task(client)
     assert (await _share(client, task_id, "bob@example.com")).status_code == 200
     get = SqlAlchemyScheduledTaskStore.get
+    get_many = SqlAlchemyScheduledTaskStore.get_many
 
-    def as_reminder(self: SqlAlchemyScheduledTaskStore, *args: Any, **kwargs: Any) -> Any:
-        task = get(self, *args, **kwargs)
+    def as_reminder(task: Any) -> Any:
         if task is None or task.id != task_id:
             return task
         return dataclasses.replace(task, kind="reminder")
 
-    monkeypatch.setattr(SqlAlchemyScheduledTaskStore, "get", as_reminder)
+    monkeypatch.setattr(
+        SqlAlchemyScheduledTaskStore,
+        "get",
+        lambda self, *args, **kwargs: as_reminder(get(self, *args, **kwargs)),
+    )
+    monkeypatch.setattr(
+        SqlAlchemyScheduledTaskStore,
+        "get_many",
+        lambda self, ids: {key: as_reminder(task) for key, task in get_many(self, ids).items()},
+    )
 
-    refused = await _share(client, task_id, "carol@example.com")
+    # Sharing a reminder still saves the grant, which gives no read access.
+    shared = await _share(client, task_id, "carol@example.com")
 
-    assert refused.status_code == 400, refused.text
-    assert _task_grantees(db_uri, task_id) == ["bob@example.com"]
-    # A grant made before it became a reminder gives no access.
-    for url in _read_urls(task_id):
-        assert (await client.get(url, headers=_BOB)).status_code == 404, url
+    assert shared.status_code == 200, shared.text
+    assert _task_grantees(db_uri, task_id) == ["bob@example.com", "carol@example.com"]
+    for headers in (_BOB, _CAROL):
+        for url in _read_urls(task_id):
+            assert (await client.get(url, headers=headers)).status_code == 404, url
+        listed = await client.get("/v1/scheduled-tasks/shared", headers=headers)
+        assert listed.status_code == 200, listed.text
+        assert listed.json()["scheduled_tasks"] == []
 
 
 async def test_a_deleted_automation_stays_hidden_from_a_grant_that_outlived_it(
