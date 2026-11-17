@@ -521,6 +521,15 @@ describe("browserViewRegistry — opened site for the Chrome cookie import", () 
     assert.equal(opened(tab), "https://workspace.example.com/start");
   });
 
+  it("matches an explicit open to the canonical URL Chromium starts", () => {
+    const tab = makeEventCapturingRegistry();
+    tab.registry.openOrNavigate("conv_1", "https://Workspace.example.com");
+    tab.emit("did-start-navigation", ...start("https://workspace.example.com/"));
+    tab.commit("https://idp.example.net/authorize");
+    tab.emit("did-navigate", {}, "https://idp.example.net/authorize");
+    assert.equal(opened(tab), "https://Workspace.example.com");
+  });
+
   it("keeps the opened site through page-driven redirects and sign-in steps", () => {
     const tab = signInRedirect();
     tab.emit(
@@ -576,17 +585,14 @@ describe("browserViewRegistry — opened site for the Chrome cookie import", () 
   it("keeps the earlier opened site when an explicit open never commits", () => {
     const endings = {
       "a download or empty response": (tab) => tab.emit("did-stop-loading"),
-      "a failed load": (tab) =>
-        tab.emit(
-          "did-fail-load",
-          {},
-          -105,
-          "ERR_NAME_NOT_RESOLVED",
-          "https://files.example.org/report.zip",
-          true,
-        ),
+      "a failed load": (tab, openUrl) =>
+        tab.emit("did-fail-load", {}, -105, "ERR_NAME_NOT_RESOLVED", openUrl, true),
       "a back step on the sign-in host": (tab) =>
         tab.emit("did-start-navigation", ...start("https://idp.example.net/authorize")),
+      "a popup loaded into the tab on the sign-in host": (tab) => {
+        tab.windowOpen("https://idp.example.net/help", "foreground-tab");
+        tab.emit("did-start-navigation", ...start("https://idp.example.net/help"));
+      },
       "a link click on the sign-in host": (tab) => {
         tab.emit("input-event", {}, { type: "mouseDown" });
         tab.emit(
@@ -595,13 +601,16 @@ describe("browserViewRegistry — opened site for the Chrome cookie import", () 
         );
       },
     };
-    for (const [name, end] of Object.entries(endings)) {
-      const tab = signInRedirect();
-      tab.registry.openOrNavigate("conv_1", "https://files.example.org/report.zip");
-      tab.emit("did-start-navigation", ...start("https://files.example.org/report.zip"));
-      end(tab);
-      tab.emit("did-navigate", {}, "https://idp.example.net/authorize");
-      assert.equal(opened(tab), "https://workspace.example.com/start", name);
+    const opens = ["https://files.example.org/report.zip", "https://idp.example.net/slow-download"];
+    for (const openUrl of opens) {
+      for (const [name, end] of Object.entries(endings)) {
+        const tab = signInRedirect();
+        tab.registry.openOrNavigate("conv_1", openUrl);
+        tab.emit("did-start-navigation", ...start(openUrl));
+        end(tab, openUrl);
+        tab.emit("did-navigate", {}, "https://idp.example.net/authorize");
+        assert.equal(opened(tab), "https://workspace.example.com/start", `${name}, ${openUrl}`);
+      }
     }
   });
 

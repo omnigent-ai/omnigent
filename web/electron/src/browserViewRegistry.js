@@ -363,10 +363,17 @@ function createBrowserViewRegistry({
     wc.on("did-start-navigation", (details, positionalUrl, isInPlace, isMainFrame) => {
       if ((details?.isMainFrame ?? isMainFrame) === false) return;
       if (details?.isSameDocument ?? isInPlace) return;
-      const targetHost = hostnameOf(details?.url ?? positionalUrl);
+      const targetUrl = details?.url ?? positionalUrl;
+      const targetHost = hostnameOf(targetUrl);
       const pending = entry.pendingOpenedSite;
-      if (pending && !details?.initiator && targetHost === hostnameOf(pending.url)) return;
-      // Any other main-frame load replaces the pending open before it commits.
+      // Only the open's own start repeats its URL; any other main-frame load replaces it.
+      if (
+        pending &&
+        !details?.initiator &&
+        canonicalUrlOf(targetUrl) === canonicalUrlOf(pending.url)
+      ) {
+        return;
+      }
       entry.pendingOpenedSite = null;
       const pageRedirect =
         Boolean(details?.initiator) &&
@@ -532,6 +539,10 @@ function createBrowserViewRegistry({
 
   function hostnameOf(url) {
     return URL.canParse(url) ? new URL(url).hostname : "";
+  }
+
+  function canonicalUrlOf(url) {
+    return URL.canParse(url) ? new URL(url).href : url;
   }
 
   // Resolve named hosts in the owning partition before any request is sent.
