@@ -150,26 +150,38 @@ def test_incomplete_reviews_are_rejected_regardless_of_size(review: str) -> None
         "oversized_field",
         "terminal_remainder",
         "adjacent_tables",
+        "oversized_nonassessment",
     ),
     [
-        (None, 0, "", False, "run", None, None, False),
-        ((20000, 45000, 20000), 0, "", False, "run", None, None, False),
-        ((3000,) * 30, 59194, "", False, "run", None, None, False),
-        (None, 0, "  ", False, "run", None, None, False),
-        ((70000,), 0, "", False, "run", None, None, False),
+        (None, 0, "", False, "run", None, None, False, False),
+        ((20000, 45000, 20000), 0, "", False, "run", None, None, False, False),
+        ((3000,) * 30, 59194, "", False, "run", None, None, False, False),
+        (None, 0, "  ", False, "run", None, None, False, False),
+        ((70000,), 0, "", False, "run", None, None, False, False),
         # Align an escaped pipe with the fully wrapped comment boundary.
-        (("y" * 69 + ("x" * 70 + r"\|") * 1100,), 0, "", False, "r" * 66, None, None, False),
-        (None, 0, "", True, "run", None, None, False),
-        (("Reason",), 0, "", False, "run", 0, None, False),
-        (("Reason",), 0, "", False, "run", 1, None, False),
-        (("Reason",), 0, "", False, "run", 2, None, False),
-        ((177655, "Tail."), 0, "", False, "run", None, " | \t", False),
-        ((177654, "Tail."), 0, "", False, "run", None, "| \t", False),
-        ((177653, "Tail."), 0, "", False, "run", None, " \t", False),
-        ((177652, "Tail."), 0, "", False, "run", None, "\t", False),
-        ((177651, "Tail."), 0, "", False, "run", None, "", False),
-        (("Reason." + " " * 135000 + "Tail.",), 0, "", False, "run", None, None, False),
-        (None, 0, "", False, "run", None, None, True),
+        (
+            ("y" * 69 + ("x" * 70 + r"\|") * 1100,),
+            0,
+            "",
+            False,
+            "r" * 66,
+            None,
+            None,
+            False,
+            False,
+        ),
+        (None, 0, "", True, "run", None, None, False, False),
+        (("Reason",), 0, "", False, "run", 0, None, False, False),
+        (("Reason",), 0, "", False, "run", 1, None, False, False),
+        (("Reason",), 0, "", False, "run", 2, None, False, False),
+        ((177655, "Tail."), 0, "", False, "run", None, " | \t", False, False),
+        ((177654, "Tail."), 0, "", False, "run", None, "| \t", False, False),
+        ((177653, "Tail."), 0, "", False, "run", None, " \t", False, False),
+        ((177652, "Tail."), 0, "", False, "run", None, "\t", False, False),
+        ((177651, "Tail."), 0, "", False, "run", None, "", False, False),
+        (("Reason." + " " * 135000 + "Tail.",), 0, "", False, "run", None, None, False, False),
+        (None, 0, "", False, "run", None, None, True, False),
+        (("Reason",), 0, "", False, "run", None, None, False, True),
     ],
     ids=[
         "many-rows",
@@ -189,6 +201,7 @@ def test_incomplete_reviews_are_rejected_regardless_of_size(review: str) -> None
         "terminal-before-newline",
         "interior-whitespace",
         "adjacent-tables",
+        "oversized-nonassessment",
     ],
 )
 def test_long_review_parts_preserve_all_assessments_and_markdown_context(
@@ -200,6 +213,7 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
     oversized_field: int | None,
     terminal_remainder: str | None,
     adjacent_tables: bool,
+    oversized_nonassessment: bool,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -230,6 +244,10 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
     if inline_details:
         review = review.replace("### Tests\n", "### Tests\n<details><summary>Logs</summary>\n\n")
         review = review.replace("### Scope\n", "</details>\n\n### Scope\n")
+    if oversized_nonassessment:
+        review = (
+            "| Finding | Details |\n| --- | --- |\n| Large | " + "x" * 130000 + " |\n\n" + review
+        )
     composed = _HELPERS["compose_review"](
         review, {"markdown": "Computed counts", "test_files": ["tests/test_parser.py"]}
     )
@@ -241,6 +259,7 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
         or terminal_remainder is not None
         or unrenderable_whitespace
         or adjacent_tables
+        or oversized_nonassessment
     ):
         review_path = tmp_path / "review.md"
         review_path.write_text(composed, encoding="utf-8")
@@ -259,19 +278,26 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
         monkeypatch.setattr(
             subprocess, "run", lambda argv, **kwargs: posts.append(Path(argv[-1]).read_text())
         )
-    if oversized_field is not None or unrenderable_whitespace:
+    if oversized_field is not None or unrenderable_whitespace or oversized_nonassessment:
         message = (
             "assessment fragments need all five populated fields"
             if unrenderable_whitespace
-            else "assessment fields exceed comment capacity"
+            else "comment capacity"
+            if oversized_nonassessment
+            else "table row cannot continue within comment capacity without five parsed fields"
         )
         if unrenderable_whitespace:
             assert _HELPERS["COMMENT_BYTE_LIMIT"] == 60000
-        with pytest.raises(ValueError, match=message):
+        with pytest.raises(ValueError, match=message) as error:
             _HELPERS["publish_review"](review_path, receipt)
         assert not posts
         assert not receipt.exists()
         assert not list(tmp_path.glob("comment*.md"))
+        if oversized_nonassessment:
+            assert str(error.value) == (
+                "Polly review table row cannot continue within comment capacity "
+                "without five parsed fields."
+            )
         return
 
     byte_limits = []

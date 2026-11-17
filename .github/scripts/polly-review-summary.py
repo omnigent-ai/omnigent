@@ -313,7 +313,10 @@ def split_review(review: str, byte_limit: int) -> list[str]:
 
 
 def _markdown_context(text: str, *, validate_assessments: bool = False) -> tuple[str, str, str]:
-    """Reopen Markdown context and optionally validate final assessment rows."""
+    """Reopen Markdown context and optionally validate final assessment rows.
+
+    Mid-row continuation requires five parsed fields; other widths fail closed.
+    """
     details = 0
     fence = ""
     fence_line = ""
@@ -365,7 +368,10 @@ def _markdown_context(text: str, *, validate_assessments: bool = False) -> tuple
         row = previous.strip()
         cells = split_table_row(row.strip("|"))
         if len(cells) != TEST_FIELD_COUNT:
-            raise ValueError("Polly review assessment fields exceed comment capacity.")
+            raise ValueError(
+                "Polly review table row cannot continue within comment capacity "
+                "without five parsed fields."
+            )
         if row.endswith("|") and not row.endswith(r"\|"):
             return prefix, suffix, table_header
         prefix += table_header + "|" + "|".join(cells[:-1]) + "| "
