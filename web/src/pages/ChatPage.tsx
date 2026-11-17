@@ -2506,6 +2506,8 @@ function ComposerImpl(
   // Bumped by "/permissions" on codex-native to open the approval-mode control
   // instead of sending the command, which would open Codex's popup in its terminal.
   const [permissionPickerOpenNonce, setPermissionPickerOpenNonce] = useState(0);
+  // Bumped by /context to open the context ring's breakdown.
+  const [contextBreakdownOpenNonce, setContextBreakdownOpenNonce] = useState(0);
   // Single send-telemetry point (see submit()). Emitting here rather than via
   // the Button's componentId covers Enter-key sends too — a textarea Enter never
   // submits the form, so it would otherwise bypass the Button entirely.
@@ -3566,6 +3568,20 @@ function ComposerImpl(
       case "/context": {
         const state = useChatStore.getState();
         const { contextWindow, llmModel, sessionModelOverride, tokensUsed, blocks } = state;
+        if (
+          !isMobile &&
+          conversationId &&
+          contextWindow != null &&
+          contextWindow > 0 &&
+          tokensUsed != null
+        ) {
+          // The ring is on screen: open the same breakdown it shows on click.
+          dirtyRef.current = true;
+          setValue("");
+          setCommandError(null);
+          setContextBreakdownOpenNonce((n) => n + 1);
+          return true;
+        }
         const lines: string[] = [];
         if (sessionModelOverride) lines.push(`Model: ${sessionModelOverride} (override)`);
         else if (llmModel) lines.push(`Model: ${llmModel}`);
@@ -4504,6 +4520,7 @@ function ComposerImpl(
                 tokensUsed={composerTokensUsed}
                 sessionId={conversationId}
                 turnActive={computeIsTurnActive(sessionStatus, isStreaming)}
+                openNonce={contextBreakdownOpenNonce}
               />
             </div>
           </ComposerWorkspaceBar>

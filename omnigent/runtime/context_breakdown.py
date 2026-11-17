@@ -7,10 +7,12 @@ not a tokenizer, so they are labelled estimates wherever they are shown.
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any
 
+from omnigent.entities.context_breakdown import TurnContextBreakdown
 from omnigent.entities.conversation import is_omitted_binary_payload
+from omnigent.inner.native_attachments import attachment_is_inlined
 from omnigent.llms.adapters._content import redact_binary_payloads
 from omnigent.llms.errors import APPROX_BYTES_PER_TOKEN
 from omnigent.runtime.content_resolver import is_text_like_attachment
@@ -101,3 +103,121 @@ def inline_payload_bytes(block: Mapping[str, Any]) -> int | None:
             return None
         return len(payload.rstrip("=")) * 3 // 4
     return None
+
+
+def _data_uri_media_type(block: Mapping[str, Any]) -> str | None:
+    """MIME type of a block's ``data:`` URI payload, e.g. ``"text/plain"``."""
+    for key in ("file_data", "image_url"):
+        payload = block.get(key)
+        if isinstance(payload, str) and payload.startswith("data:"):
+            return payload[5:].split(";", 1)[0].split(",", 1)[0] or None
+    return None
+
+
+class _ContentTally:
+    """Running totals for one category's text and the attachments it carries."""
+
+    def __init__(self) -> None:
+        self.tokens = 0
+        self.attachment_tokens = 0
+        self.attachment_count = 0
+        self.unestimated_attachment_count = 0
+
+    def add(self, content: object) -> None:
+        """Count a message's content: plain text, content blocks or a tool payload."""
+        if isinstance(content, str):
+            self.tokens += estimate_without_binary(content)
+            return
+        if not isinstance(content, list):
+            self.tokens += estimate_without_binary(content) if content else 0
+            return
+        for block in content:
+            if not isinstance(block, Mapping):
+                continue
+            block_type = block.get("type")
+            if block_type in TEXT_BLOCK_TYPES:
+                text = block.get("text")
+                if isinstance(text, str):
+                    self.tokens += estimate_text_tokens(text)
+            elif block_type in ATTACHMENT_BLOCK_TYPES:
+                self._add_attachment(block)
+            else:
+                self.tokens += estimate_without_binary(dict(block))
+
+    def _add_attachment(self, block: Mapping[str, Any]) -> None:
+        filename = block.get("filename")
+        name = filename if isinstance(filename, str) else None
+        size = inline_payload_bytes(block)
+        if size is None and not attachment_is_inlined(name, block):
+            # A workspace file reaches the model only as its path; bytes the
+            # block carries were inlined whatever its name.
+            return
+        self.attachment_count += 1
+        estimate = estimate_attachment_tokens(
+            is_image=block.get("type") == "input_image",
+            content_type=_data_uri_media_type(block),
+            filename=name,
+            size=size,
+        )
+        if estimate is None:
+            self.unestimated_attachment_count += 1
+        else:
+            self.attachment_tokens += estimate
+
+
+def build_turn_context_breakdown(
+    *,
+    system_prompt: str,
+    tools: Sequence[Mapping[str, Any]],
+    messages: Sequence[Mapping[str, Any]],
+    omitted_history: int = 0,
+) -> TurnContextBreakdown:
+    """
+    Estimate what one turn's request to the harness carries.
+
+    The last message is the current one when it is the user's; everything
+    before it is history. ``system``-role messages count as instructions.
+
+    :param system_prompt: The composed instructions sent with the turn.
+    :param tools: The tool schemas listed for the turn.
+    :param messages: The turn's messages, oldest first, e.g.
+        ``[{"role": "user", "content": "Hi"}]``.
+    :param omitted_history: Oldest history messages the harness's session
+        does not hold (a restarted session's trimmed replay), e.g. ``12``.
+    :returns: The per-category breakdown.
+    """
+    system = _ContentTally()
+    history = _ContentTally()
+    current = _ContentTally()
+    if system_prompt:
+        system.add(system_prompt)
+    history_count = 0
+    to_omit = max(omitted_history, 0)
+    omitted = 0
+    for index, message in enumerate(messages):
+        content = message.get("content")
+        role = message.get("role")
+        if role == "system":
+            system.add(content)
+        elif index == len(messages) - 1 and role == "user":
+            current.add(content)
+        elif omitted < to_omit:
+            omitted += 1
+        else:
+            history.add(content)
+            history_count += 1
+    tallies = (system, history, current)
+    return TurnContextBreakdown(
+        system_tokens=system.tokens,
+        tool_tokens=(
+            estimate_text_tokens(json.dumps(list(tools), ensure_ascii=False)) if tools else 0
+        ),
+        tool_count=len(tools),
+        history_tokens=history.tokens,
+        history_item_count=history_count,
+        omitted_history_count=omitted,
+        attachment_tokens=sum(tally.attachment_tokens for tally in tallies),
+        attachment_count=sum(tally.attachment_count for tally in tallies),
+        unestimated_attachment_count=sum(tally.unestimated_attachment_count for tally in tallies),
+        message_tokens=current.tokens,
+    )

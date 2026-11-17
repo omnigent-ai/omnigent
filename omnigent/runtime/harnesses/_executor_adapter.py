@@ -25,6 +25,7 @@ from typing import Any
 from fastapi import Response
 
 from omnigent.debug_logging import phase_scope
+from omnigent.entities.context_breakdown import TurnContextBreakdown
 from omnigent.errors import ElicitationDeclinedError, ErrorPhase
 from omnigent.harnesses.codex_native.shell_input import native_shell_authorization
 from omnigent.inner._subprocess_lifecycle import await_cleanup_task
@@ -58,6 +59,7 @@ from omnigent.native.input_diagnostics import (
     log_input_event,
 )
 from omnigent.policies.types import FAIL_CLOSED_PHASES
+from omnigent.runtime.context_breakdown import build_turn_context_breakdown
 from omnigent.runtime.harnesses._scaffold import HarnessApp, PolicyVerdictPayload, TurnContext
 from omnigent.runtime.prompt import dedupe_tool_output_images
 from omnigent.runtime.tool_output import cap_tool_output
@@ -295,6 +297,25 @@ class ExecutorAdapter(HarnessApp):
         config = ExecutorConfig(model=request.model_override, extra=extra)
         tools = _normalize_tool_schemas(request.tools or [])
         system_prompt = request.instructions or ""
+        if executor.sends_turn_request_to_model():
+            ctx.context_breakdown = await asyncio.to_thread(
+                _turn_context_breakdown, request.input, system_prompt, tools, executor, messages
+            )
+
+        async def _exclude_omitted_history() -> None:
+            """Re-estimate without the history a restarted session did not replay."""
+            omitted = executor.omitted_history_messages(self._session_key)
+            if omitted and ctx.context_breakdown is not None:
+                ctx.context_breakdown = await asyncio.to_thread(
+                    _turn_context_breakdown,
+                    request.input,
+                    system_prompt,
+                    tools,
+                    executor,
+                    messages,
+                    omitted,
+                )
+
         # Install stable bridges once on first use — the SDK closure-captures them from the first
         # turn; per-turn rebinding would leave later tool calls dispatching into a dead ctx.
         if getattr(executor, "_tool_executor", None) is None:
@@ -496,6 +517,9 @@ class ExecutorAdapter(HarnessApp):
 
                                 record_llm_usage(agent_span, event.usage)
                     # --- End tracing ---
+                    if isinstance(event, TurnComplete | ExecutorError):
+                        # The executor knows what it replayed only once it built its prompt.
+                        await _exclude_omitted_history()
                     self._translate_event(event, ctx)
                     if isinstance(event, TurnComplete):
                         log_input_event(
@@ -1813,6 +1837,39 @@ def _extract_injection_content(
     if isinstance(content, str):
         return content
     return _join_text_blocks(content) if isinstance(content, list) else ""
+
+
+def _turn_context_breakdown(
+    input_value: str | list[dict[str, Any]],
+    system_prompt: str,
+    tools: list[dict[str, Any]],
+    executor: Executor,
+    messages: list[Message],
+    omitted_history: int = 0,
+) -> TurnContextBreakdown | None:
+    """
+    Estimate what this turn sends the executor; ``None`` if estimation fails.
+
+    An executor that keeps its own session still holds the tool calls it ran,
+    so history is sized with them even when they are not replayed to it.
+    """
+    try:
+        if not executor.replays_tool_history():
+            messages = _translate_input_to_messages(
+                input_value,
+                include_tool_history=True,
+                preserve_content_blocks=executor.preserves_message_content_blocks(),
+                preserve_empty_initiating_message=executor.preserves_empty_initiating_message(),
+            )
+        return build_turn_context_breakdown(
+            system_prompt=system_prompt,
+            tools=tools,
+            messages=messages,
+            omitted_history=omitted_history,
+        )
+    except Exception:
+        _logger.debug("Context breakdown estimate failed", exc_info=True)
+        return None
 
 
 def _translate_input_to_messages(

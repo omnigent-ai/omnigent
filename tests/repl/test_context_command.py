@@ -711,3 +711,129 @@ async def test_idle_ring_estimate_model_fallback(
     # window proves the estimate reached the host (the original crash
     # left the ring untouched because the task died before this call).
     assert host.ring_updates == [_RingUpdate(tokens=1_234, context_window=200_000)]
+
+
+# ---------------------------------------------------------------------------
+# Context breakdown from the server
+# ---------------------------------------------------------------------------
+
+
+class _BreakdownResponse:
+    """The slice of an ``httpx.Response`` the breakdown fetch reads."""
+
+    def __init__(self, status_code: int, body: object) -> None:
+        self.status_code = status_code
+        self._body = body
+
+    def json(self) -> object:
+        return self._body
+
+
+class _BreakdownHttp:
+    """Records requested URLs and answers each with one scripted response."""
+
+    def __init__(self, response: _BreakdownResponse) -> None:
+        self.response = response
+        self.urls: list[str] = []
+
+    async def get(self, url: str) -> _BreakdownResponse:
+        self.urls.append(url)
+        return self.response
+
+
+class _BreakdownClient:
+    """Stands in for the REPL's connected client: its HTTP session and base URL."""
+
+    def __init__(self, response: _BreakdownResponse) -> None:
+        self._http = _BreakdownHttp(response)
+        self._base_url = "http://omnigent.test"
+
+
+def _row(kind: str, tokens: int | None, **fields: object) -> dict[str, object]:
+    return {
+        "kind": kind,
+        "tokens": tokens,
+        "source": "unknown" if tokens is None else "estimated",
+        "origin": "runner",
+        **fields,
+    }
+
+
+@pytest.mark.asyncio
+async def test_context_prints_the_rows_the_server_resolved() -> None:
+    """``/context`` lists the server's rows and any failed attempt, without recomputing."""
+    client = _BreakdownClient(
+        _BreakdownResponse(
+            200,
+            {
+                "session_id": "conv_abc123",
+                "measured": {"total_tokens": 20_000, "context_window": 200_000},
+                "categories": [
+                    _row("system_prompt", 1_200),
+                    _row("tools", 5_400, count=18, detail="18 tools · MCP: github"),
+                    _row("attachments", 1_600, count=1),
+                    _row("other", 9_280, origin="server"),
+                    _row("free", 180_000, origin="server", source="measured"),
+                    _row("future_kind", None, origin="server"),
+                ],
+                "attachments": [
+                    {"filename": "shot.png", "delivery": "inline", "estimated_tokens": 1_600},
+                    {"filename": "trace\x1b[31m.gz", "delivery": "workspace"},
+                ],
+                "bytes_per_token": 4,
+                "failed_attempt": {
+                    "total_tokens": 190_000,
+                    "categories": [_row("history", 190_000, detail="300 messages and tool calls")],
+                },
+            },
+        )
+    )
+    host = CapturingHost()
+    host.tokens_used = 20_000  # type: ignore[attr-defined]  # read via getattr
+    session = _Session(context_window=200_000, session_id="conv_abc123")
+
+    await handle_slash_command(
+        "/context",
+        session,
+        client,  # type: ignore[arg-type]
+        host,
+        RichBlockFormatter(),  # type: ignore[arg-type]
+    )
+
+    assert client._http.urls == ["http://omnigent.test/v1/sessions/conv_abc123/context-breakdown"]
+    lines = [line.split() for line in host.text.splitlines()]
+    assert "What fills it" in host.text
+    assert ["System", "prompt", "~1,200", "estimate"] in lines
+    assert ["Tool", "definitions", "~5,400", "estimate"] in lines
+    assert "18 tools · MCP: github" in host.text
+    assert ["Attachments", "(1)", "~1,600", "estimate"] in lines
+    assert ["shot.png", "~1,600", "estimate"] in lines
+    # A control sequence in a filename never reaches the terminal.
+    assert ["trace[31m.gz", "in", "workspace"] in lines
+    assert "\x1b" not in host.text
+    # The remainder and free space are the server's figures, printed as sent.
+    assert ["Other", "~9,280", "estimate"] in lines
+    assert ["Free", "space", "180,000", "measured"] in lines
+    assert ["future", "kind", "not", "measured"] in lines
+    assert "~190,000 tokens when the turn started" in host.text
+    assert ["Conversation", "history", "~190,000", "estimate"] in lines
+
+
+@pytest.mark.asyncio
+async def test_context_keeps_the_usage_tree_without_a_breakdown_route() -> None:
+    """An older server without the route still gets the usage tree, and nothing more."""
+    client = _BreakdownClient(_BreakdownResponse(404, {"error": {"code": "not_found"}}))
+    host = CapturingHost()
+    host.tokens_used = 20_000  # type: ignore[attr-defined]  # read via getattr
+    session = _Session(context_window=200_000, session_id="conv_abc123")
+
+    await handle_slash_command(
+        "/context",
+        session,
+        client,  # type: ignore[arg-type]
+        host,
+        RichBlockFormatter(),  # type: ignore[arg-type]
+    )
+
+    assert "20.0k" in host.text
+    assert "What fills it" not in host.text

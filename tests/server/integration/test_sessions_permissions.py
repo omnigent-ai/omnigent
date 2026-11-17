@@ -685,6 +685,34 @@ async def test_context_breakdown_requires_read_access(
     assert rows["other"]["tokens"] == 9000 - rows["system_prompt"]["tokens"] - 3
     assert rows["free"]["tokens"] == 191000
 
+    # A runner report stored for that measured turn replaces the server's rows,
+    # and a rejected request's attempt is listed beside them.
+    SqlAlchemyConversationStore(db_uri).merge_context_breakdown(
+        session_id,
+        {
+            "reported": {"tool_tokens": 5400, "tool_count": 18, "history_tokens": 2000},
+            "context_tokens": 9000,
+            "failed_attempt": {"history_tokens": 190000, "history_item_count": 300},
+        },
+    )
+    body = (await auth_client.get(path, headers={"X-Forwarded-Email": "user-b"})).json()
+    rows = {row["kind"]: row for row in body["categories"]}
+    assert (rows["tools"]["tokens"], rows["tools"]["origin"]) == (5400, "runner")
+    assert rows["other"]["tokens"] == 9000 - 5400 - 2000
+    assert body["failed_attempt"] == {
+        "total_tokens": 190000,
+        "categories": [
+            {
+                "kind": "history",
+                "tokens": 190000,
+                "source": "estimated",
+                "origin": "runner",
+                "count": 300,
+                "detail": "300 messages and tool calls",
+            }
+        ],
+    }
+
 
 async def test_edit_grant_blocked_from_stop_session_requires_owner(
     auth_client: httpx.AsyncClient,

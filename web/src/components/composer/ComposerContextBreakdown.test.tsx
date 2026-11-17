@@ -39,6 +39,7 @@ function breakdown(overrides: Partial<SessionContextBreakdown> = {}): SessionCon
     estimatesExceedMeasured: false,
     attachments: [],
     bytesPerToken: 4,
+    failedAttempt: null,
     ...overrides,
   };
 }
@@ -204,5 +205,43 @@ describe("ComposerContextBreakdown", () => {
     renderBreakdown(undefined, "error");
     expect(screen.getByText("A breakdown isn't available for this session.")).toBeInTheDocument();
     expect(screen.getByText("20% used")).toBeInTheDocument();
+  });
+
+  it("renders runner rows and a rejected request's rows as the server sent them", () => {
+    renderBreakdown(
+      breakdown({
+        categories: [
+          row("tools", 5_400, { origin: "runner", count: 18, detail: "18 tools · MCP: github" }),
+          row("message", 100, { origin: "runner" }),
+        ],
+        failedAttempt: {
+          totalTokens: 196_000,
+          categories: [
+            row("tools", 6_000, { origin: "runner", detail: "18 tools" }),
+            row("history", 190_000, {
+              origin: "runner",
+              detail: "300 messages and tool calls",
+            }),
+          ],
+        },
+      }),
+    );
+
+    const tools = screen.getByTestId("context-row-tools");
+    expect(tools).toHaveTextContent("~5.4K");
+    expect(tools).toHaveTextContent("18 tools · MCP: github");
+    expect(screen.getByTestId("context-row-message")).toHaveTextContent("Current message");
+    const attempt = screen.getByTestId("context-failed-attempt");
+    expect(attempt).toHaveTextContent("Last request was too long");
+    expect(attempt).toHaveTextContent("About 196K tokens when the turn started");
+    expect(attempt).toHaveTextContent("300 messages and tool calls");
+    // Only the rows the server sent for the attempt are listed.
+    expect(attempt).not.toHaveTextContent("Current message");
+  });
+
+  it("shows no rejected-request section without one", () => {
+    renderBreakdown(breakdown());
+
+    expect(screen.queryByTestId("context-failed-attempt")).not.toBeInTheDocument();
   });
 });

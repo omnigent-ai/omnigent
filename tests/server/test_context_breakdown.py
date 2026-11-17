@@ -33,6 +33,8 @@ from omnigent.runtime.prompt import (
 from omnigent.server.context_breakdown import (
     HistoryEstimate,
     build_context_breakdown,
+    completed_turn_updates,
+    failed_turn_updates,
     scan_history,
 )
 from omnigent.server.schemas import (
@@ -861,3 +863,216 @@ def test_breakdown_lists_declared_servers_when_a_selection_label_is_malformed() 
     )
 
     assert _category(breakdown, "tools").detail == "MCP: github, slack"
+
+
+_RUNNER_REPORT = {
+    "system_tokens": 1_200,
+    "tool_tokens": 5_400,
+    "tool_count": 18,
+    "history_tokens": 4_100,
+    "history_item_count": 6,
+    "attachment_tokens": 1_600,
+    "attachment_count": 2,
+    "unestimated_attachment_count": 1,
+    "message_tokens": 20,
+    "omitted_history_count": 12,
+}
+
+
+def _reported_breakdown(
+    document: dict[str, object], *, total_tokens: int | None = 20_000
+) -> SessionContextBreakdown:
+    return build_context_breakdown(
+        "conv_1",
+        spec=_spec(),
+        harness="claude-sdk",
+        labels={},
+        items_newest_first=[_user("msg_1", _text("a" * 4_000))],
+        lookup_file=lambda _file_id: None,
+        measured=(
+            None
+            if total_tokens is None
+            else ContextBreakdownMeasured(total_tokens=total_tokens, context_window=200_000)
+        ),
+        runner_report=document,
+    )
+
+
+def test_breakdown_prefers_the_runner_rows_for_the_measured_turn() -> None:
+    """The runner's request replaces the server's rows and feeds the remainder."""
+    document = completed_turn_updates(
+        {"context_tokens": 20_000, "context_breakdown": _RUNNER_REPORT}
+    )
+
+    breakdown = _reported_breakdown(document)
+
+    rows = [
+        (row.kind, row.tokens, row.origin, row.count, row.detail) for row in breakdown.categories
+    ]
+    assert rows[:5] == [
+        ("system_prompt", 1_200, "runner", None, "Instructions the runner sent on the last turn"),
+        ("tools", 5_400, "runner", 18, "18 tools · MCP: github, slack"),
+        (
+            "attachments",
+            1_600,
+            "runner",
+            2,
+            "Plus 1 sent without an estimate, counted in Other",
+        ),
+        (
+            "history",
+            4_100,
+            "runner",
+            6,
+            "6 messages and tool calls · 12 earlier omitted to fit the window after a restart",
+        ),
+        ("message", 20, "runner", None, None),
+    ]
+    other = _category(breakdown, "other")
+    # 20,000 measured minus the runner's 12,320; the tools row has a figure now.
+    assert (other.tokens, other.origin) == (7_680, "server")
+    assert other.detail == "Content the harness adds itself and the last reply"
+    assert breakdown.failed_attempt is None
+
+
+@pytest.mark.parametrize(
+    ("document", "total_tokens"),
+    [
+        # A later total from elsewhere (e.g. a native usage report) retires the report.
+        (
+            completed_turn_updates(
+                {"context_tokens": 20_000, "context_breakdown": _RUNNER_REPORT}
+            ),
+            21_000,
+        ),
+        (
+            completed_turn_updates(
+                {"context_tokens": 20_000, "context_breakdown": _RUNNER_REPORT}
+            ),
+            None,
+        ),
+        # A completed turn without a usable report clears it.
+        (completed_turn_updates({"context_tokens": 20_000}), 20_000),
+        (
+            completed_turn_updates(
+                {"context_tokens": 20_000, "context_breakdown": {"tool_count": -1}}
+            ),
+            20_000,
+        ),
+        ({"reported": "not an object", "context_tokens": 20_000}, 20_000),
+    ],
+)
+def test_breakdown_falls_back_to_server_rows_without_a_current_report(
+    document: dict[str, object], total_tokens: int | None
+) -> None:
+    breakdown = _reported_breakdown(document, total_tokens=total_tokens)
+
+    assert {row.origin for row in breakdown.categories} == {"server"}
+    assert _category(breakdown, "tools").tokens is None
+
+
+def test_breakdown_ignores_a_stored_report_for_a_native_harness() -> None:
+    """After an in-place switch to a native harness, the old harness's document is not shown."""
+    document = {
+        **completed_turn_updates({"context_tokens": 20_000, "context_breakdown": _RUNNER_REPORT}),
+        "failed_attempt": {"history_tokens": 190_000},
+    }
+    breakdown = build_context_breakdown(
+        "conv_1",
+        spec=_spec(),
+        harness="claude-native",
+        labels={},
+        items_newest_first=[],
+        lookup_file=lambda _file_id: None,
+        measured=ContextBreakdownMeasured(total_tokens=20_000, context_window=200_000),
+        runner_report=document,
+    )
+
+    assert {row.origin for row in breakdown.categories} == {"server"}
+    assert breakdown.failed_attempt is None
+
+
+def test_runner_attachments_row_counts_the_files_listed_under_it() -> None:
+    """The heading's count matches the per-file rows, which come from stored history."""
+    image = {"type": "input_image", "image_url": "data:image/png;base64,AAAA"}
+    breakdown = build_context_breakdown(
+        "conv_1",
+        spec=None,
+        harness="claude-sdk",
+        labels={},
+        items_newest_first=[_user("msg_1", image)],
+        lookup_file=lambda _file_id: None,
+        measured=ContextBreakdownMeasured(total_tokens=9_000, context_window=200_000),
+        runner_report=completed_turn_updates(
+            {"context_tokens": 9_000, "context_breakdown": {"history_tokens": 10}}
+        ),
+    )
+
+    row = _category(breakdown, "attachments")
+    assert (row.origin, row.count, row.tokens) == ("runner", 1, 0)
+    assert len(breakdown.attachments) == 1
+
+
+def test_completed_turn_updates_clear_a_failed_attempt_and_an_old_report() -> None:
+    # A turn that measured nothing still ends an earlier failed attempt.
+    assert set(completed_turn_updates({}).values()) == {None}
+    assert completed_turn_updates({"context_tokens": 5}) == {
+        "reported": None,
+        "context_tokens": None,
+        "failed_attempt": None,
+    }
+    assert completed_turn_updates(
+        {"context_tokens": 5, "context_breakdown": {"history_tokens": 3}}
+    ) == {"reported": {"history_tokens": 3}, "context_tokens": 5, "failed_attempt": None}
+
+
+def test_breakdown_lists_what_a_rejected_request_attempted() -> None:
+    """The failed attempt reuses the row shape, without empty rows, beside the live rows."""
+    document = failed_turn_updates(
+        {
+            "code": "RuntimeError",
+            "message": "inner executor error: Prompt is too long: 210000 tokens > 200000",
+            "context_breakdown": {
+                "tool_tokens": 6_000,
+                "tool_count": 18,
+                "history_tokens": 190_000,
+                "history_item_count": 300,
+            },
+        }
+    )
+
+    breakdown = _reported_breakdown(document)
+
+    attempt = breakdown.failed_attempt
+    assert attempt is not None
+    assert attempt.total_tokens == 196_000
+    assert [(row.kind, row.tokens, row.origin, row.detail) for row in attempt.categories] == [
+        ("tools", 6_000, "runner", "18 tools"),
+        ("history", 190_000, "runner", "300 messages and tool calls"),
+    ]
+    # The live rows stay the server's: the attempt is not the measured turn.
+    assert {row.origin for row in breakdown.categories} == {"server"}
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        # Only an overflow records its attempt.
+        {"code": "rate_limit_exceeded", "message": "slow down", "context_breakdown": {}},
+        {"code": "context_length_exceeded", "message": "too long"},
+        # A crash report that merely mentions the window is not an overflow.
+        {
+            "code": "RuntimeError",
+            "message": "CLI exited; stderr: resizing context window buffer",
+            "context_breakdown": {"history_tokens": 5},
+        },
+        {
+            "code": "context_length_exceeded",
+            "message": "x",
+            "context_breakdown": {"tool_count": -1},
+        },
+        None,
+    ],
+)
+def test_failed_turn_updates_need_an_overflow_with_a_valid_breakdown(error: object) -> None:
+    assert failed_turn_updates(error) == {}

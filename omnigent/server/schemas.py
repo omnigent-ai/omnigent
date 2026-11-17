@@ -41,6 +41,7 @@ from omnigent.entities import (
     SlashCommandData,
     TerminalCommandData,
 )
+from omnigent.entities.context_breakdown import TurnContextBreakdown
 from omnigent.entities.conversation import StartupInputOptions
 from omnigent.inner.native_attachments import reject_authored_framework_notices
 from omnigent.onboarding.sandboxes.profiles import SandboxProfileSummary
@@ -1079,6 +1080,9 @@ class Usage(BaseModel):
         it in preference to the catalog token-price estimate; ``None``
         when the harness doesn't report a cost (the common case, where
         cost is computed from token counts x catalog pricing).
+    :param context_breakdown: Estimated split of the request the runner sent
+        for this turn (instructions, tools, history, attachments, current
+        message); ``None`` when the harness does not report one.
     """
 
     input_tokens: int = 0
@@ -1090,6 +1094,7 @@ class Usage(BaseModel):
     cache_creation_input_tokens: int = 0
     model: str | None = None
     cost_usd: float | None = None
+    context_breakdown: TurnContextBreakdown | None = None
 
 
 class ErrorDetail(BaseModel):
@@ -1111,6 +1116,9 @@ class ErrorDetail(BaseModel):
     :param undelivered: ``True`` when the harness reports it never received the
         message this turn carried (it failed before delivery), so the sender's
         queued copy is the only record of it; absent otherwise.
+    :param context_breakdown: Estimated split of the request a failed turn
+        attempted, so a "prompt too long" failure shows what overflowed;
+        absent when the runner did not build one.
     """
 
     code: str
@@ -1119,6 +1127,7 @@ class ErrorDetail(BaseModel):
     cause: str | None = None
     remediation: str | None = None
     undelivered: bool | None = None
+    context_breakdown: TurnContextBreakdown | None = None
 
 
 class ErrorResponse(BaseModel):
@@ -3351,12 +3360,26 @@ class ContextBreakdownCategory(BaseModel):
     detail: str | None = None
 
 
+class ContextBreakdownFailedAttempt(BaseModel):
+    """
+    What a request rejected as too long for the context window carried.
+
+    :param total_tokens: Sum of the rows' estimates, e.g. ``208655``.
+    :param categories: The runner's rows for the rejected request, in
+        display order; categories without content are left out.
+    """
+
+    total_tokens: int
+    categories: list[ContextBreakdownCategory] = Field(default_factory=list)
+
+
 class SessionContextBreakdown(BaseModel):
     """
     Response for ``GET /v1/sessions/{session_id}/context-breakdown``.
 
-    One resolved view: the server picks each row's figure and computes the
-    remainder, so clients only render ``categories`` in order. Content a
+    One resolved view: the server picks each row's figure (the runner's
+    report of the request it sent where there is one, else its own estimate)
+    and computes the remainder, so clients only render ``categories`` in order. Content a
     harness adds itself (its own system prompt, tool schemas, project
     instructions) is only visible as part of the ``"other"`` row.
 
@@ -3369,6 +3392,8 @@ class SessionContextBreakdown(BaseModel):
         than the measured total, so they run high and ``"other"`` is ``0``.
     :param attachments: Attachments in the live history, oldest first.
     :param bytes_per_token: Ratio behind the text estimates, e.g. ``4``.
+    :param failed_attempt: What a later request that was rejected as too
+        long for the context window attempted; ``None`` otherwise.
     """
 
     session_id: str
@@ -3377,6 +3402,7 @@ class SessionContextBreakdown(BaseModel):
     estimates_exceed_measured: bool = False
     attachments: list[ContextBreakdownAttachment] = Field(default_factory=list)
     bytes_per_token: int
+    failed_attempt: ContextBreakdownFailedAttempt | None = None
 
 
 class ReadStatePutRequest(BaseModel):

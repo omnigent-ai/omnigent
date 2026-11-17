@@ -869,6 +869,22 @@ class Executor:
         """Whether the executor can pause and resume its own agent loop between turns."""
         return False
 
+    def sends_turn_request_to_model(self) -> bool:
+        """Whether a turn's instructions, tools and messages make up the model request.
+
+        Off by default: a native harness types the message into its own CLI,
+        which keeps its own context, so a breakdown of the turn would mislead.
+        """
+        return False
+
+    def omitted_history_messages(self, session_key: str) -> int:  # noqa: ARG002 — default; subclasses that trim override
+        """Oldest prior messages the session's model context does not hold.
+
+        Non-zero when a restarted session replayed only the newest history that
+        fit its budget, e.g. ``12``.
+        """
+        return 0
+
     def close_timeout(self) -> float:
         """Budget in seconds for background resource cleanup."""
         return 3.0
@@ -898,6 +914,9 @@ class MockExecutor(Executor):
         executor.enqueue_tool_call("sql_query", {"query": "SELECT 1"})
         executor.enqueue_response("Done.")
     """
+
+    def sends_turn_request_to_model(self) -> bool:
+        return True
 
     def __init__(self) -> None:
         self._turns: list[list[ExecutorEvent]] = []

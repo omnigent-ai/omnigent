@@ -19,10 +19,10 @@ from omnigent.entities import ConversationItem, MessageData
 from omnigent.inner.native_attachments import (
     DELIVERY_KEY,
     FilesystemAttachmentPolicy,
+    attachment_is_inlined,
     framework_notice_block,
     requires_filesystem,
     resize_dimensions,
-    uses_filesystem_delivery,
 )
 from omnigent.stores import ArtifactStore, FileStore
 
@@ -737,7 +737,7 @@ def extract_text_attachments(
         # decision, so an archive stored under a text MIME still reaches the
         # filesystem. It has no scannable text, but is announced by name so a
         # policy can refuse it.
-        if uses_filesystem_delivery(file_meta.filename, file_meta.source_metadata):
+        if not attachment_is_inlined(file_meta.filename, file_meta.source_metadata):
             attachments.append(
                 {
                     "filename": file_meta.filename or "",
@@ -946,7 +946,7 @@ def _resolve_file_id_block(
     # Types requiring filesystem tools never reach a model as bytes (a native
     # harness reads them off disk instead), so inlining one here would send
     # a payload the provider can't interpret. Fail with an actionable error.
-    if uses_filesystem_delivery(file_meta.filename, file_meta.source_metadata):
+    if not attachment_is_inlined(file_meta.filename, file_meta.source_metadata):
         if defer_filesystem_files:
             # The runner sets delivery from the stored record when it fetches the file.
             return {k: v for k, v in block.items() if k != DELIVERY_KEY}, None

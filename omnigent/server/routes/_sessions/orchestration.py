@@ -164,6 +164,10 @@ from omnigent.server.bundles import (
     uploaded_agent_for,
     validate_agent_bundle,
 )
+from omnigent.server.context_breakdown import (
+    completed_turn_updates,
+    failed_turn_updates,
+)
 from omnigent.server.creation_logging import creation_metadata, creation_stage, session_created
 from omnigent.server.failed_status_diagnostics import failed_status_intake_attributes
 from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerExitReports
@@ -2659,6 +2663,31 @@ async def _persist_external_session_usage(
     # top-level session (no ancestors). Threaded: it sums the tree per ancestor.
     await asyncio.to_thread(_publish_ancestor_subtree_costs, tree, session_id)
     return raw_tokens
+
+
+async def _relay_merge_context_breakdown(
+    conversation_store: ConversationStore,
+    session_id: str,
+    updates: dict[str, Any | None],  # type: ignore[explicit-any]  # stored JSON document
+) -> None:
+    """
+    Store a turn's runner breakdown updates; a failure is logged, not raised.
+
+    :param conversation_store: Store holding the session's breakdown document.
+    :param session_id: Session identifier, e.g. ``"conv_abc123"``.
+    :param updates: Keys to set or (with ``None``) remove; empty is a no-op.
+    """
+    if not updates:
+        return
+    try:
+        await asyncio.to_thread(conversation_store.merge_context_breakdown, session_id, updates)
+    except Exception:  # noqa: BLE001 — diagnostic data only; keep relaying the turn
+        _logger.warning(
+            "Relay: context breakdown persist failed for %s",
+            session_id,
+            exc_info=True,
+            extra={"session_id": session_id},
+        )
 
 
 def _context_labels_from_turn_usage(
@@ -11145,6 +11174,15 @@ async def _relay_runner_stream_once(
                                     session_id,
                                     _context_labels,
                                 )
+                            # The runner's breakdown of this turn's request is
+                            # stored with the total it explains; a completed turn
+                            # without one clears the previous report and any
+                            # earlier failed attempt.
+                            await _relay_merge_context_breakdown(
+                                conversation_store,
+                                session_id,
+                                completed_turn_updates(_resp_usage),
+                            )
                         if evt_type == "response.completed" or _resp_usage:
                             # Push the server-computed cost AND token breakdown
                             # to the web client's session indicator, rolled up
@@ -11211,6 +11249,23 @@ async def _relay_runner_stream_once(
                                         _usage_tree,
                                         session_id,
                                     )
+
+                    if evt_type == "response.failed":
+                        # Keep what a "prompt too long" request attempted, for the
+                        # context breakdown; other failures leave it alone.
+                        _failed_resp = event.get("response")
+                        await _relay_merge_context_breakdown(
+                            conversation_store,
+                            session_id,
+                            failed_turn_updates(
+                                (
+                                    _failed_resp.get("error")
+                                    if isinstance(_failed_resp, dict)
+                                    else None
+                                )
+                                or event.get("error")
+                            ),
+                        )
 
                     failed_response = event.get("response")
                     if (

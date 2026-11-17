@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import functools
 from collections.abc import Callable, Iterator
+from typing import Any
 
 from fastapi import APIRouter, Request
 
@@ -142,6 +143,19 @@ def register_context_routes(
 
         return lookup
 
+    def _runner_report(session_id: str) -> dict[str, Any] | None:
+        """The runner's stored report, or ``None`` when it cannot be read."""
+        try:
+            return conversation_store.get_context_breakdown(session_id)
+        except Exception:
+            # Same tolerance as the spec: fall back to the server's own rows.
+            _logger.debug(
+                "Context breakdown could not read the runner report for %s",
+                session_id,
+                exc_info=True,
+            )
+            return None
+
     def _build(conv: Conversation) -> SessionContextBreakdown:
         spec = _load_spec(conv)
         harness = conv.harness_override or (_spec_harness(spec) if spec is not None else None)
@@ -153,6 +167,7 @@ def register_context_routes(
             items_newest_first=_items_newest_first(conv.id),
             lookup_file=_file_lookup(conv.id),
             measured=_measured_usage(conv, spec, harness),
+            runner_report=_runner_report(conv.id),
         )
 
     @router.get(

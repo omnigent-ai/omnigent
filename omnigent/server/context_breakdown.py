@@ -7,12 +7,15 @@ provider-reported total stays the measured value the rows are relative to.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import PurePath
 from typing import Any
 
+from pydantic import ValidationError
+
 from omnigent.entities import ConversationItem
+from omnigent.entities.context_breakdown import TurnContextBreakdown
 from omnigent.entities.conversation import (
     COMPACTION_SUMMARY_REPLAY_PROMPT,
     CompactionData,
@@ -27,8 +30,12 @@ from omnigent.entities.file import StoredFile
 from omnigent.errors import OmnigentError
 from omnigent.harness_aliases import canonicalize_harness, is_native_harness
 from omnigent.harness_capabilities import InstructionDelivery
-from omnigent.inner.native_attachments import decode_data_uri, uses_filesystem_delivery
-from omnigent.llms.errors import APPROX_BYTES_PER_TOKEN
+from omnigent.inner.native_attachments import attachment_is_inlined, decode_data_uri
+from omnigent.llms.errors import (
+    APPROX_BYTES_PER_TOKEN,
+    CONTEXT_EXCEEDED_CODES,
+    is_context_overflow_message,
+)
 from omnigent.mcp_selection import selected_mcp_spec
 from omnigent.runtime.context_breakdown import (
     ATTACHMENT_BLOCK_TYPES,
@@ -43,6 +50,7 @@ from omnigent.runtime.prompt import compose_delivered_instructions, dedupe_tool_
 from omnigent.server.schemas import (
     ContextBreakdownAttachment,
     ContextBreakdownCategory,
+    ContextBreakdownFailedAttempt,
     ContextBreakdownMeasured,
     SessionContextBreakdown,
 )
@@ -449,7 +457,7 @@ def resolve_attachment(
         )
     filename = stored.filename or ref.filename
     content_type = stored.content_type
-    if native or uses_filesystem_delivery(filename, stored.source_metadata):
+    if not attachment_is_inlined(filename, stored.source_metadata, native=native):
         return ContextBreakdownAttachment(
             file_id=ref.file_id,
             filename=filename,
@@ -523,12 +531,17 @@ def _instruction_categories(
     return categories
 
 
+def _mcp_servers_detail(tools: ToolSources) -> str:
+    """``"MCP: github, linear"``."""
+    return f"MCP: {', '.join(tools.mcp_servers)}"
+
+
 def _tools_category(tools: ToolSources | None) -> ContextBreakdownCategory:
     """The tool-definitions row: sources are listed, schema size is not known here."""
     parts: list[str] = []
     if tools is not None:
         if tools.mcp_servers:
-            parts.append(f"MCP: {', '.join(tools.mcp_servers)}")
+            parts.append(_mcp_servers_detail(tools))
         if tools.builtin_tool_count:
             parts.append(_plural(tools.builtin_tool_count, "built-in tool"))
         if tools.local_tool_count:
@@ -561,10 +574,23 @@ def _attachments_category(
     )
 
 
+def _history_items(count: int) -> str:
+    """``"1 message or tool call"`` / ``"12 messages and tool calls"``."""
+    return f"{count} {'message or tool call' if count == 1 else 'messages and tool calls'}"
+
+
+def _summarized_detail(history: HistoryEstimate) -> str | None:
+    """``"3 earlier items replaced by a summary"``, or ``None`` without a compaction."""
+    if not history.summarized_item_count:
+        return None
+    at_least = "at least " if history.summarized_partial else ""
+    items = "item" if history.summarized_item_count == 1 else "items"
+    return f"{at_least}{history.summarized_item_count} earlier {items} replaced by a summary"
+
+
 def _history_category(history: HistoryEstimate, *, sized: bool) -> ContextBreakdownCategory:
     """The conversation-history row; unsized for a harness that keeps its own history."""
-    noun = "message or tool call" if history.item_count == 1 else "messages and tool calls"
-    count = f"{'At least ' if history.partial else ''}{history.item_count} {noun}"
+    count = f"{'At least ' if history.partial else ''}{_history_items(history.item_count)}"
     if not sized:
         return ContextBreakdownCategory(
             kind="history",
@@ -573,12 +599,8 @@ def _history_category(history: HistoryEstimate, *, sized: bool) -> ContextBreakd
             detail=f"{count} stored; this harness keeps its own history",
         )
     parts = [count]
-    if history.summarized_item_count:
-        at_least = "at least " if history.summarized_partial else ""
-        items = "item" if history.summarized_item_count == 1 else "items"
-        parts.append(
-            f"{at_least}{history.summarized_item_count} earlier {items} replaced by a summary"
-        )
+    if summarized := _summarized_detail(history):
+        parts.append(summarized)
     return ContextBreakdownCategory(
         kind="history",
         tokens=history.estimated_tokens,
@@ -586,6 +608,166 @@ def _history_category(history: HistoryEstimate, *, sized: bool) -> ContextBreakd
         count=history.item_count,
         detail=" · ".join(parts),
     )
+
+
+def _runner_categories(
+    reported: TurnContextBreakdown,
+    *,
+    tools: ToolSources | None = None,
+    history: HistoryEstimate | None = None,
+    listed_attachments: int = 0,
+    skip_empty: bool = False,
+) -> list[ContextBreakdownCategory]:
+    """
+    Rows from the request the runner sent, in display order.
+
+    :param reported: The runner's per-turn breakdown.
+    :param tools: The agent's declared tool sources, named beside the count.
+    :param history: The server's scan, for its compaction note.
+    :param listed_attachments: Attachments the response lists per file, so
+        their heading shows even when the runner inlined none.
+    :param skip_empty: Leave out rows without tokens, as a failed attempt does.
+    """
+    tool_parts = [_plural(reported.tool_count, "tool")]
+    if tools is not None and tools.mcp_servers:
+        tool_parts.append(_mcp_servers_detail(tools))
+    history_parts = [_history_items(reported.history_item_count)]
+    if reported.omitted_history_count:
+        history_parts.append(
+            f"{reported.omitted_history_count} earlier omitted to fit the window after a restart"
+        )
+    if history is not None and (summarized := _summarized_detail(history)):
+        history_parts.append(summarized)
+
+    def row(
+        kind: str, tokens: int, count: int | None = None, detail: str | None = None
+    ) -> ContextBreakdownCategory:
+        return ContextBreakdownCategory.model_validate(
+            {
+                "kind": kind,
+                "tokens": tokens,
+                "source": "estimated",
+                "origin": "runner",
+                "count": count,
+                "detail": detail,
+            }
+        )
+
+    rows = [
+        row(
+            "system_prompt",
+            reported.system_tokens,
+            # A failed attempt is not "the last turn"; its heading says what it is.
+            detail=None if skip_empty else "Instructions the runner sent on the last turn",
+        ),
+        row("tools", reported.tool_tokens, reported.tool_count, " · ".join(tool_parts)),
+    ]
+    if reported.attachment_count or listed_attachments:
+        unestimated = reported.unestimated_attachment_count
+        rows.append(
+            row(
+                "attachments",
+                reported.attachment_tokens,
+                # The files listed under the row come from stored history.
+                listed_attachments or reported.attachment_count,
+                f"Plus {unestimated} sent without an estimate, counted in Other"
+                if unestimated
+                else None,
+            )
+        )
+    rows.append(
+        row(
+            "history",
+            reported.history_tokens,
+            reported.history_item_count,
+            " · ".join(history_parts),
+        )
+    )
+    rows.append(row("message", reported.message_tokens))
+    if skip_empty:
+        return [category for category in rows if category.tokens]
+    return rows
+
+
+def parse_turn_breakdown(raw: object) -> TurnContextBreakdown | None:
+    """
+    Validate a runner-reported breakdown from an event payload or stored document.
+
+    :param raw: A JSON object, or anything else.
+    :returns: The breakdown, or ``None`` when absent or malformed.
+    """
+    if not isinstance(raw, Mapping):
+        return None
+    try:
+        return TurnContextBreakdown.model_validate(raw)
+    except ValidationError:
+        return None
+
+
+def overflow_breakdown(error: object) -> TurnContextBreakdown | None:
+    """
+    The attempted-request breakdown of a context-overflow failure.
+
+    An in-process harness can report an overflow under a generic code, so
+    its message is checked too, for the phrases only an overflow uses.
+
+    :param error: A turn failure's ``error`` object, e.g.
+        ``{"code": "context_length_exceeded", "context_breakdown": {...}}``.
+    :returns: The breakdown when *error* is an overflow that carries one, else ``None``.
+    """
+    if not isinstance(error, Mapping) or "context_breakdown" not in error:
+        return None
+    code = error.get("code")
+    message = error.get("message")
+    if not (
+        (isinstance(code, str) and code in CONTEXT_EXCEEDED_CODES)
+        or (isinstance(message, str) and is_context_overflow_message(message, specific_only=True))
+    ):
+        return None
+    return parse_turn_breakdown(error.get("context_breakdown"))
+
+
+# Keys of the stored per-session document (``ConversationStore.merge_context_breakdown``).
+_REPORTED_KEY = "reported"
+_REPORTED_TOTAL_KEY = "context_tokens"
+_FAILED_ATTEMPT_KEY = "failed_attempt"
+
+
+def completed_turn_updates(usage: Mapping[str, Any]) -> dict[str, Any | None]:
+    """
+    Stored-document updates for a completed turn.
+
+    The turn's report replaces the previous one (an absent or malformed one,
+    or a turn that measured nothing, clears it) and supersedes any earlier
+    failed attempt. The measured total is kept beside it so a later total
+    from elsewhere retires the report.
+
+    :param usage: The ``response.usage`` object of a ``response.completed`` event.
+    :returns: Updates for :meth:`ConversationStore.merge_context_breakdown`.
+    """
+    reported = parse_turn_breakdown(usage.get("context_breakdown"))
+    total = usage.get("context_tokens")
+    if reported is None or not isinstance(total, int) or isinstance(total, bool):
+        return {_REPORTED_KEY: None, _REPORTED_TOTAL_KEY: None, _FAILED_ATTEMPT_KEY: None}
+    return {
+        _REPORTED_KEY: reported.model_dump(exclude_defaults=True),
+        _REPORTED_TOTAL_KEY: total,
+        _FAILED_ATTEMPT_KEY: None,
+    }
+
+
+def failed_turn_updates(error: object) -> dict[str, Any | None]:
+    """
+    Stored-document updates for a turn that overflowed the context window.
+
+    :param error: The failed turn's ``error`` object.
+    :returns: The failed-attempt update, or ``{}`` when the failure is not an
+        overflow with a breakdown.
+    """
+    breakdown = overflow_breakdown(error)
+    if breakdown is None:
+        return {}
+    return {_FAILED_ATTEMPT_KEY: breakdown.model_dump(exclude_defaults=True)}
 
 
 # What the remainder row absorbs for each row that carries no figure of its own.
@@ -649,6 +831,7 @@ def build_context_breakdown(
     lookup_file: Callable[[str], StoredFile | None],
     measured: ContextBreakdownMeasured | None = None,
     tool_schemas: Sequence[dict[str, Any]] = (),
+    runner_report: Mapping[str, Any] | None = None,
     max_items: int = MAX_SCANNED_ITEMS,
 ) -> SessionContextBreakdown:
     """
@@ -665,6 +848,10 @@ def build_context_breakdown(
         has reported none (no remainder rows are then derived).
     :param tool_schemas: Tool schemas the instructions are composed with; the
         runner composes with none, so the default matches a real turn.
+    :param runner_report: The stored runner document
+        (:meth:`ConversationStore.get_context_breakdown`), or ``None``. Its
+        report replaces the server's rows only while it belongs to the
+        measured total.
     :param max_items: Items to read before marking the history partial.
     :returns: The resolved breakdown.
     """
@@ -674,12 +861,27 @@ def build_context_breakdown(
     )
     attachments = [resolve_attachment(ref, lookup_file, native=native) for ref in refs]
     sized_history = not native or canonicalize_harness(harness) in _SIZED_NATIVE_HISTORY_HARNESSES
-    categories = _instruction_categories(spec, harness, tool_schemas)
-    categories.append(_tools_category(summarize_tools(spec, labels) if spec else None))
-    attachments_category = _attachments_category(attachments)
-    if attachments_category is not None:
-        categories.append(attachments_category)
-    categories.append(_history_category(history, sized=sized_history))
+    tools = summarize_tools(spec, labels) if spec else None
+    # A native harness never reports; a document from before an in-place
+    # switch to one describes another harness's requests.
+    stored = {} if native else (runner_report or {})
+    reported = parse_turn_breakdown(stored.get(_REPORTED_KEY))
+    if (
+        reported is not None
+        and measured is not None
+        and stored.get(_REPORTED_TOTAL_KEY) == measured.total_tokens
+    ):
+        categories = _runner_categories(
+            reported, tools=tools, history=history, listed_attachments=len(attachments)
+        )
+    else:
+        categories = _instruction_categories(spec, harness, tool_schemas)
+        categories.append(_tools_category(tools))
+        attachments_category = _attachments_category(attachments)
+        if attachments_category is not None:
+            categories.append(attachments_category)
+        categories.append(_history_category(history, sized=sized_history))
+    attempt = parse_turn_breakdown(stored.get(_FAILED_ATTEMPT_KEY))
     exceeded = False
     if measured is not None:
         derived, exceeded = remainder_categories(categories, measured)
@@ -691,4 +893,12 @@ def build_context_breakdown(
         estimates_exceed_measured=exceeded,
         attachments=attachments,
         bytes_per_token=APPROX_BYTES_PER_TOKEN,
+        failed_attempt=(
+            ContextBreakdownFailedAttempt(
+                total_tokens=attempt.total_tokens,
+                categories=_runner_categories(attempt, skip_empty=True),
+            )
+            if attempt is not None
+            else None
+        ),
     )

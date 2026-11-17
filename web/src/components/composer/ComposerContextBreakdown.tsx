@@ -134,6 +134,38 @@ function categoryLabel(category: ContextBreakdownCategory): string {
   }
 }
 
+/** What a turn rejected as too long for the window started with, as the server resolved it. */
+function FailedAttempt({
+  attempt,
+}: {
+  attempt: NonNullable<SessionContextBreakdown["failedAttempt"]>;
+}) {
+  return (
+    <div
+      className="flex flex-col gap-1.5 border-t border-border pt-2"
+      data-testid="context-failed-attempt"
+    >
+      <div className="flex flex-col gap-0.5">
+        <span className="text-sm font-medium text-foreground">Last request was too long</span>
+        <span className="text-xs tabular-nums text-muted-foreground">
+          About {formatTokenCount(attempt.totalTokens)} tokens when the turn started, by source
+        </span>
+      </div>
+      <ul className="flex flex-col gap-1.5" aria-label="What the rejected request carried">
+        {attempt.categories.map((category) => (
+          <BreakdownRow
+            key={`${category.origin}-${category.kind}`}
+            label={categoryLabel(category)}
+            tokens={category.tokens}
+            source={category.source}
+            detail={category.detail}
+          />
+        ))}
+      </ul>
+    </div>
+  );
+}
+
 /**
  * Popover body splitting the context window into what fills it.
  *
@@ -190,6 +222,9 @@ export function ComposerContextBreakdown({
           ))}
         </ul>
       )}
+      {status === "success" && breakdown?.failedAttempt ? (
+        <FailedAttempt attempt={breakdown.failedAttempt} />
+      ) : null}
       <p className="text-[11px] text-muted-foreground">
         Estimates come from content size, about {breakdown?.bytesPerToken ?? 4} bytes per token.
       </p>

@@ -1732,6 +1732,8 @@ export interface SessionContextBreakdown {
   attachments: ContextBreakdownAttachment[];
   /** Ratio behind the text estimates, e.g. 4. */
   bytesPerToken: number;
+  /** What a later request rejected as too long for the window attempted. */
+  failedAttempt: { totalTokens: number; categories: ContextBreakdownCategory[] } | null;
 }
 
 interface ContextBreakdownAttachmentWire {
@@ -1758,6 +1760,18 @@ interface SessionContextBreakdownWire {
   estimates_exceed_measured?: boolean;
   attachments?: ContextBreakdownAttachmentWire[];
   bytes_per_token?: number;
+  failed_attempt?: { total_tokens: number; categories?: ContextBreakdownCategoryWire[] } | null;
+}
+
+function categoryFromWire(category: ContextBreakdownCategoryWire): ContextBreakdownCategory {
+  return {
+    kind: category.kind,
+    tokens: category.tokens ?? null,
+    source: category.source,
+    origin: category.origin ?? "server",
+    count: category.count ?? null,
+    detail: category.detail ?? null,
+  };
 }
 
 /** Fetch what fills a session's context window (system prompt, tools, attachments, history). */
@@ -1777,14 +1791,7 @@ export async function getSessionContextBreakdown(
           contextWindow: wire.measured.context_window ?? null,
         }
       : null,
-    categories: (wire.categories ?? []).map((category) => ({
-      kind: category.kind,
-      tokens: category.tokens ?? null,
-      source: category.source,
-      origin: category.origin ?? "server",
-      count: category.count ?? null,
-      detail: category.detail ?? null,
-    })),
+    categories: (wire.categories ?? []).map(categoryFromWire),
     estimatesExceedMeasured: wire.estimates_exceed_measured ?? false,
     attachments: (wire.attachments ?? []).map((attachment) => ({
       fileId: attachment.file_id ?? null,
@@ -1795,6 +1802,12 @@ export async function getSessionContextBreakdown(
       estimatedTokens: attachment.estimated_tokens ?? null,
     })),
     bytesPerToken: wire.bytes_per_token ?? 4,
+    failedAttempt: wire.failed_attempt
+      ? {
+          totalTokens: wire.failed_attempt.total_tokens,
+          categories: (wire.failed_attempt.categories ?? []).map(categoryFromWire),
+        }
+      : null,
   };
 }
 
