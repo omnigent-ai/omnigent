@@ -386,6 +386,11 @@ function chooseTriggerSessionMode(label: "New session for each match" | "One tas
   fireEvent.click(screen.getByRole("menuitemradio", { name: new RegExp(`^${label}`) }));
 }
 
+/** A trigger saves a polling schedule but never shows it ("Every N minutes" or "Hourly"). */
+function expectNoPollingInterval() {
+  expect(document.body).not.toHaveTextContent(/Every \d+ minutes|Hourly/);
+}
+
 function closeTopLevelPopovers() {
   for (const testId of ["task-schedule-trigger", "task-ending-trigger"]) {
     const trigger = screen.queryByTestId(testId);
@@ -3366,13 +3371,13 @@ describe("CreateScheduledTaskDialog session mode", () => {
         expect(screen.queryByTestId("task-schedule-trigger")).toBeNull();
         expect(screen.queryByTestId("custom-schedule-trigger")).toBeNull();
         expect(screen.queryByTestId("schedule-preset-trigger")).toBeNull();
-        expect(screen.queryByTestId("task-trigger-cadence")).toBeNull();
         expect(screen.queryByTestId("task-session-mode-trigger")).toBeNull();
         if (!supported) {
           expect(submit).toBeDisabled();
           fireEvent.click(screen.getByRole("button", { name: "Use supported schedule" }));
         }
         await waitFor(() => expect(submit).toBeEnabled());
+        expectNoPollingInterval();
         fireEvent.click(submit);
         await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
         expect(updateMutateAsync.mock.calls[0][0].input.rrule).toBe(
@@ -4136,7 +4141,7 @@ describe("CreateScheduledTaskDialog trigger template", () => {
       fillJira();
       expect(screen.queryByLabelText("Frequency")).not.toBeInTheDocument();
       expect(screen.queryByTestId("task-schedule-trigger")).not.toBeInTheDocument();
-      expect(screen.queryByTestId("task-trigger-cadence")).not.toBeInTheDocument();
+      expectNoPollingInterval();
       const prompt = await submittedPrompt();
       expect(prompt).toContain(
         `On the first run, use ${minutes > 60 ? `${minutes} minutes` : "one hour"} ago and nothing pending.`,
@@ -4157,13 +4162,13 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     );
     expect(sessionMode).toHaveTextContent("New session for each match");
     expect(screen.getByLabelText("Instructions for each session")).toHaveValue("Triage it.");
-    expect(screen.queryByTestId("task-trigger-cadence")).not.toBeInTheDocument();
+    expectNoPollingInterval();
     expect(screen.queryByTestId("task-schedule-trigger")).not.toBeInTheDocument();
 
     chooseTriggerSessionMode("One task session");
     expect(sessionMode).toHaveTextContent("One task session for all matches");
     expect(screen.getByLabelText("Instructions for the task session")).toHaveValue("Triage it.");
-    expect(screen.queryByTestId("task-trigger-cadence")).not.toBeInTheDocument();
+    expectNoPollingInterval();
     expect(screen.queryByTestId("task-schedule-trigger")).not.toBeInTheDocument();
     type("task-name-input", "Ticket triage");
 

@@ -232,19 +232,21 @@ it.each(["continue", "new"] as const)(
     renderRow(
       task({
         prompt: "This automation watches Slack and starts one Omnigent session",
+        rrule: "FREQ=MINUTELY;INTERVAL=10",
         sessionMode,
         nextRunAt: "2026-03-10T14:00:00Z",
       }),
     );
     fireEvent.pointerDown(screen.getByTestId("task-row-menu"), { button: 0 });
     expect(await screen.findByTestId("task-edit")).toBeInTheDocument();
+    const scheduleLine = screen.getByTestId("task-schedule-line");
     if (sessionMode === "continue") {
-      expect(screen.getByTestId("task-schedule-line")).toHaveTextContent(
-        "Runs when new items match",
-      );
+      expect(scheduleLine).toHaveTextContent("Runs when new items match");
+      expect(scheduleLine).not.toHaveTextContent("Every 10 minutes");
       expect(screen.queryByTestId("task-next-run")).not.toBeInTheDocument();
       expect(screen.queryByTestId("task-run-now")).not.toBeInTheDocument();
     } else {
+      expect(scheduleLine).toHaveTextContent("Every 10 minutes");
       expect(screen.getByTestId("task-next-run")).toBeInTheDocument();
       expect(screen.getByTestId("task-run-now")).toBeInTheDocument();
     }

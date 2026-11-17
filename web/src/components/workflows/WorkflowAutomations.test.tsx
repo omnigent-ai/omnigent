@@ -54,6 +54,7 @@ const ISSUE_TRIGGER = {
     },
     { placement: "same_host", sessionLink: "https://example.test/c/CONVERSATION_ID" },
   ),
+  rrule: "FREQ=MINUTELY;INTERVAL=10",
   state: "paused",
   session_mode: "continue",
   last_run_status: "failed",
@@ -103,9 +104,11 @@ describe("WorkflowAutomations", () => {
     expect(within(daily!).queryByText("Paused")).toBeNull();
     expect(within(trigger!).getByRole("link")).toHaveAttribute("href", "/tasks/issues");
     expect(within(trigger!).getByText("Paused")).toBeInTheDocument();
-    expect(within(trigger!).getByTestId("workflow-automation-schedule")).toHaveTextContent(
+    const triggerSchedule = within(trigger!).getByTestId("workflow-automation-schedule");
+    expect(triggerSchedule).toHaveTextContent(
       `Runs when new items match · Last run failed ${lastRun}`,
     );
+    expect(triggerSchedule).not.toHaveTextContent("Every 10 minutes");
     expect(within(trigger!).getByText(/^Last run failed/)).toHaveClass("text-status-red");
   });
 
