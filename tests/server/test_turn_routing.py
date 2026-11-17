@@ -580,6 +580,10 @@ class _FakeServerClient:
     items: list[dict[str, Any]] | None = None
     items_fail: bool = False
 
+    @property
+    def messages(self) -> list[tuple[str, dict[str, Any]]]:
+        return [post for post in self.posts if post[1].get("type") == "message"]
+
     async def post(self, url: str, *, json: dict[str, Any], timeout: float) -> _FakeResponse:
         del timeout
         self.posts.append((url, json))
@@ -1063,13 +1067,32 @@ async def test_replay_keeps_the_prompt_pending_when_the_model_actuator_is_not_tr
         idle=lambda _: True,
     )
 
-    assert client.posts == []
+    assert not client.messages
+    assert len(client.posts) == 1
+    assert client.posts[0][1]["type"] == "external_conversation_item"
     pending = turn_routing.read_pending_replay(tmp_path)
     assert pending is not None and pending.prompt == "hello"
 
 
+@pytest.mark.parametrize("notification_fails", [False, True])
+@pytest.mark.parametrize(
+    ("refusal", "unsupported"),
+    [
+        ("No exact picker choice", False),
+        (
+            "Session-only model switching requires Claude Code 2.1.323 or newer. "
+            "Update Claude Code and relaunch this terminal.",
+            True,
+        ),
+    ],
+    ids=["picker-refusal", "unsupported-cli"],
+)
 async def test_replay_refused_model_switch_can_be_explicitly_retried(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    refusal: str,
+    unsupported: bool,
+    notification_fails: bool,
 ) -> None:
     from omnigent.harnesses.claude_native.bridge import (
         ClaudeModelSwitchRefused,
@@ -1080,12 +1103,16 @@ async def test_replay_refused_model_switch_can_be_explicitly_retried(
     turn_routing.write_pending_replay(
         tmp_path, session_id="conv_1", prompt="hello", blocked_turn_id=None, model="private-model"
     )
-    client = _FakeServerClient()
+    pending_before = (tmp_path / turn_routing.PENDING_FILE).read_bytes()
+    client = _FakeServerClient(fail=notification_fails)
     refusing = True
+    attempts = 0
 
     def select(_bridge: Path, *, model: str, owned_draft: str | None) -> ClaudeModelSwitchResult:
+        nonlocal attempts
+        attempts += 1
         if refusing:
-            raise ClaudeModelSwitchRefused("No exact picker choice")
+            raise ClaudeModelSwitchRefused(refusal, unsupported=unsupported)
         return ClaudeModelSwitchResult(model, model, model, model, "native-session")
 
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge.inject_model_command", select)
@@ -1103,11 +1130,52 @@ async def test_replay_refused_model_switch_can_be_explicitly_retried(
         )
 
     await replay()
-    assert client.posts == []
-    assert turn_routing.read_pending_replay(tmp_path) is not None
+    assert attempts == 1
+    assert not client.messages
+    assert (tmp_path / turn_routing.PENDING_FILE).read_bytes() == pending_before
+    assert client.posts == [
+        (
+            "/v1/sessions/conv_1/events",
+            {
+                "type": "external_conversation_item",
+                "data": {
+                    "item_type": "error",
+                    "item_data": {
+                        "source": "harness",
+                        "code": "turn_routing_replay_pending",
+                        "level": "info",
+                        "title": "Your message is saved and has not been sent",
+                        "message": (
+                            "Smart Routing could not confirm the requested model. " + refusal
+                        ),
+                        "remediation": (
+                            "Resolve the model-switch refusal, then relaunch this session "
+                            "to retry the saved message. "
+                            "Do not resend it while it remains pending."
+                        ),
+                    },
+                },
+            },
+        )
+    ]
     refusing = False
+    client.fail = False
     await replay()
-    assert len(client.posts) == 1
+    assert attempts == 2
+    assert len(client.posts) == 2
+    assert client.messages == [
+        (
+            "/v1/sessions/conv_1/events",
+            {
+                "type": "message",
+                "data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hello"}],
+                },
+                "model_override": "private-model",
+            },
+        )
+    ]
     assert turn_routing.read_pending_replay(tmp_path) is None
 
 
@@ -1208,7 +1276,7 @@ async def test_replay_hold_does_not_authorize_delivery_without_a_fresh_receipt(
         timeout=2,
     )
     assert attempts == 2
-    assert not client.posts
+    assert not client.messages
     assert read_pending_replay(tmp_path) is not None
 
 
@@ -1382,7 +1450,7 @@ async def test_replay_hold_expires_without_sending_or_discarding_the_prompt(
             await asyncio.wait_for(replay, timeout=2)
     assert attempts == (2 if hold_s else 1)
     assert drained.is_set() is bool(hold_s)
-    assert not client.posts
+    assert not client.messages
     assert read_pending_replay(tmp_path) == pending_before
 
 
@@ -1472,7 +1540,7 @@ async def test_replay_requires_a_fresh_same_model_receipt(
     )
 
     assert checked == ["private-model"]
-    assert len(client.posts) == (1 if receipt_model == "private-model" else 0)
+    assert len(client.messages) == (1 if receipt_model == "private-model" else 0)
     assert (turn_routing.read_pending_replay(tmp_path) is None) is (
         receipt_model == "private-model"
     )

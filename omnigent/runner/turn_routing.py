@@ -1157,6 +1157,8 @@ async def _replay(
 ) -> None:
     """Run the replay handshake and deliver the prompt. See
     :func:`schedule_replay` for the ordering contract."""
+    from omnigent.harnesses.claude_native.model_switch import ClaudeModelSwitchRefused
+
     turn_cleared = idle if idle is not None else _settle_probe(bridge_dir, harness)
     # Our OWN marker: a fork or a ``/clear`` rotation can leave another
     # session's marker in this dir, and treating it as ours would replay a
@@ -1181,8 +1183,9 @@ async def _replay(
             blocked_turn_id,
             session_id,
         )
-    if (
-        await _apply_routed_model(
+    refusal_detail = ""
+    try:
+        applied = await _apply_routed_model(
             session_id,
             bridge_dir=bridge_dir,
             harness=harness,
@@ -1190,12 +1193,51 @@ async def _replay(
             blocked_prompt=prompt,
             blocked_turn_id=blocked_turn_id,
         )
-        is not True
-    ):
+    except ClaudeModelSwitchRefused as exc:
+        applied = False
+        refusal_detail = f" {exc}"
+    if applied is not True:
         _logger.warning(
             "route-turn: required model switch refused for session=%s; the prompt stays pending",
             session_id,
         )
+        if not turn_routing_marker_present(bridge_dir, session_id) or read_pending_replay(
+            bridge_dir
+        ) != PendingReplay(session_id, prompt, blocked_turn_id, model):
+            return
+        try:
+            resp = await server_client.post(
+                f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}/events",
+                json={
+                    "type": "external_conversation_item",
+                    "data": {
+                        "item_type": "error",
+                        "item_data": {
+                            "source": "harness",
+                            "code": "turn_routing_replay_pending",
+                            "level": "info",
+                            "title": "Your message is saved and has not been sent",
+                            "message": (
+                                "Smart Routing could not confirm the requested model."
+                                + refusal_detail
+                            ),
+                            "remediation": (
+                                "Resolve the model-switch refusal, then relaunch this session "
+                                "to retry the saved message. "
+                                "Do not resend it while it remains pending."
+                            ),
+                        },
+                    },
+                },
+                timeout=10.0,
+            )
+            resp.raise_for_status()
+        except Exception:
+            _logger.warning(
+                "route-turn: could not publish the pending replay notice for session=%s",
+                session_id,
+                exc_info=True,
+            )
         return
     if not await _deliver_prompt(
         session_id, prompt=prompt, server_client=server_client, model=model
@@ -1441,6 +1483,7 @@ async def _apply_routed_model(
     from omnigent.harnesses.claude_native.bridge import (
         CLAUDE_INPUT_HOLD_S,
         ClaudeComposerNotCleared,
+        ClaudeModelSwitchRefused,
         ClaudeModelSwitchResult,
         ClaudeTerminalDialog,
         ClaudeUserPromptPending,
@@ -1501,6 +1544,8 @@ async def _apply_routed_model(
                 return False
             await asyncio.sleep(min(REPLAY_POLL_S, remaining))
             continue
+        except ClaudeModelSwitchRefused:
+            raise
         except (RuntimeError, ValueError, OSError):
             _logger.warning(
                 "route-turn: could not confirm session=%s on %s; the prompt remains pending",
