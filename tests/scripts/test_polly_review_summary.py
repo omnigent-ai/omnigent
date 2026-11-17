@@ -141,13 +141,22 @@ def test_incomplete_reviews_are_rejected_regardless_of_size(review: str) -> None
 
 
 @pytest.mark.parametrize(
-    ("rationale_lengths", "preceding_paragraph_length", "row_indentation"),
+    (
+        "rationale_specs",
+        "preceding_paragraph_length",
+        "row_indentation",
+        "inline_details",
+        "run_path",
+    ),
     [
-        (None, 0, ""),
-        ((20000, 45000, 20000), 0, ""),
-        ((3000,) * 30, 59194, ""),
-        (None, 0, "  "),
-        ((70000,), 0, ""),
+        (None, 0, "", False, "run"),
+        ((20000, 45000, 20000), 0, "", False, "run"),
+        ((3000,) * 30, 59194, "", False, "run"),
+        (None, 0, "  ", False, "run"),
+        ((70000,), 0, "", False, "run"),
+        # Align an escaped pipe with the fully wrapped comment boundary.
+        (("y" * 69 + ("x" * 70 + r"\|") * 1100,), 0, "", False, "r" * 66),
+        (None, 0, "", True, "run"),
     ],
     ids=[
         "many-rows",
@@ -155,17 +164,21 @@ def test_incomplete_reviews_are_rejected_regardless_of_size(review: str) -> None
         "header-boundary",
         "indented-rows",
         "oversized-row",
+        "escaped-pipe-boundary",
+        "inline-details",
     ],
 )
 def test_long_review_parts_preserve_all_assessments_and_markdown_context(
-    rationale_lengths: tuple[int, ...] | None,
+    rationale_specs: tuple[int | str, ...] | None,
     preceding_paragraph_length: int,
     row_indentation: str,
+    inline_details: bool,
+    run_path: str,
 ) -> None:
     rationales = (
         ["Guards the regression without a second setup."] * 1200
-        if rationale_lengths is None
-        else ["x" * length for length in rationale_lengths]
+        if rationale_specs is None
+        else ["x" * spec if isinstance(spec, int) else spec for spec in rationale_specs]
     )
     rows = "".join(
         f"{row_indentation}| tests/test_parser.py::test_case[{number}] | "
@@ -181,12 +194,15 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
         review = review.replace(
             "### Tests\n", "### Tests\n" + "x" * preceding_paragraph_length + "\n\n"
         )
+    if inline_details:
+        review = review.replace("### Tests\n", "### Tests\n<details><summary>Logs</summary>\n\n")
+        review = review.replace("### Scope\n", "</details>\n\n### Scope\n")
     composed = _HELPERS["compose_review"](
         review, {"markdown": "Computed counts", "test_files": ["tests/test_parser.py"]}
     )
     chunks = _HELPERS["split_review"](composed, 58000)
     comments = _HELPERS["review_comments"](
-        composed, head_sha="a" * 40, run_id="10-1", run_url="https://example.test/run"
+        composed, head_sha="a" * 40, run_id="10-1", run_url=f"https://example.test/{run_path}"
     )
 
     assert "".join(chunks) == composed

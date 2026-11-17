@@ -291,6 +291,8 @@ def split_review(review: str, byte_limit: int) -> list[str]:
                 )
             ):
                 end = header_start
+        elif review[end - 1 : end + 1] == r"\|":
+            end -= 1
         parts.append(review[:end])
         review = review[end:]
     parts.append(review)
@@ -314,10 +316,9 @@ def _markdown_context(text: str) -> tuple[str, str, str]:
             fence, fence_line = opening[1], line
             table_header = ""
             continue
-        if line.strip() == "<details>":
-            details += 1
-        elif line.strip() == "</details>":
-            details = max(0, details - 1)
+        if line.lstrip().startswith(("<details>", "</details>")):
+            for tag in re.findall(r"</?details>", line):
+                details = max(0, details + (1 if tag == "<details>" else -1))
         if line.lstrip().startswith("|"):
             cells = split_table_row(line.strip().strip("|"))
             if previous.lstrip().startswith("|") and all(
@@ -378,10 +379,12 @@ def review_comments(review: str, *, head_sha: str, run_id: str, run_url: str) ->
         chunks = split_review(review, byte_limit)
         comments = []
         before = ""
+        context = ("", "", "")
         for part, chunk in enumerate(chunks, 1):
-            prefix, _, table_header = _markdown_context(before)
+            prefix, _, table_header = context
             before += chunk
-            _, suffix, _ = _markdown_context(before)
+            context = _markdown_context(before)
+            _, suffix, _ = context
             if chunk.lstrip().startswith("|"):
                 prefix += table_header
             comments.append(wrap(prefix + chunk + suffix, part, len(chunks)))
