@@ -274,6 +274,34 @@ describe("auditSettingsDom", () => {
     expect(audit(OWNED_ROW, [{ ...ACCENT, revealedBy: "fixture.sync" }])).toEqual([]);
   });
 
+  it("names a row with no label of its own by the heading before it, if that heading shows the label", () => {
+    const row = `<div data-settings-item="fixture.accent"><span>Other</span></div>`;
+    const notShown = 'fixture.accent: its row doesn\'t show "Accent"';
+    // Named by the nearest heading before the row, or by the heading its aria-labelledby names.
+    expect(audit(`<section><h2>Accent</h2>${row}</section>`, [ACCENT])).toEqual([]);
+    expect(
+      audit(
+        `<h2 id="accent-heading">Accent</h2><div data-settings-item="fixture.accent" aria-labelledby="accent-heading"><span>Other</span></div>`,
+        [ACCENT],
+      ),
+    ).toEqual([]);
+    // Not named by a heading showing the label: another heading, a nearer one, a heading after
+    // the row, text that isn't a heading, a labelledby on text, or a heading inside another row.
+    expect(audit(`<h2>Sync</h2>${row}`, [ACCENT])).toEqual([notShown]);
+    expect(audit(`<h2>Accent</h2><h3>Advanced</h3>${row}`, [ACCENT])).toEqual([notShown]);
+    expect(audit(`${row}<h2>Accent</h2>`, [ACCENT])).toEqual([notShown]);
+    expect(audit(`<p>Accent</p>${row}`, [ACCENT])).toEqual([notShown]);
+    expect(
+      audit(
+        `<span id="accent-label">Accent</span><div data-settings-item="fixture.accent" aria-labelledby="accent-label"><span>Other</span></div>`,
+        [ACCENT],
+      ),
+    ).toEqual([notShown]);
+    expect(
+      audit(`<div data-settings-item="fixture.sync"><h2>Accent</h2></div>${row}`, [ACCENT]),
+    ).toEqual([notShown]);
+  });
+
   describe("a part shown only in some states, or inside an overlay", () => {
     /** Sync, whose Reset shows while it's dirty or in conflict. */
     const STATEFUL: SettingsEntry = {

@@ -4,6 +4,8 @@
 // What's left out, and why, is listed below rather than skipped silently.
 
 import { writeRetentionDays } from "@/lib/retentionPreferences";
+import { EmbeddedProvider } from "@/lib/embedded";
+import { writeThemePalette } from "@/lib/themePalette";
 import { PROJECT_LABEL_KEY } from "@/lib/sessionListCache";
 import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
@@ -18,10 +20,12 @@ import { setOmnigentHostConfig } from "@/lib/host";
 import { SettingsPage } from "@/pages/SettingsPage";
 import type { SettingsSectionId } from "@/shell/settingsNav";
 import {
+  accessibleName,
   auditOpenedPortals,
   auditSettingsDomFindings,
   domAuditProblems,
   settingsCoverageProblems,
+  type SettingsDomFinding,
   type SettingsDomScenarioAudit,
 } from "@/test/settingsDomAudit";
 import { type SettingsRoute, settingsRouteTable } from "@/test/settingsPageRoutes";
@@ -37,6 +41,7 @@ import {
 
 import { SECTION_CATALOGS, SETTINGS_ENTRIES } from "./catalog";
 import type { SettingsEntry } from "./catalog/types";
+import { UNOWNED_CONTROLS } from "./settingsUnownedBaseline";
 import {
   HARNESS_CARD_ENTRIES,
   FIX_DIALOG_PARTS,
@@ -319,6 +324,8 @@ interface SettingsAuditScenario {
   scenario: string;
   /** Server info that differs from SERVER_INFO in this scenario. */
   info?: Partial<ServerInfo>;
+  /** Rendered inside a browser embed, which follows its host's appearance. */
+  embedded?: boolean;
   /** Defaults to the section's own page. */
   path?: string;
   /** Server answers that differ from ROUTES in this scenario. */
@@ -405,6 +412,13 @@ function service(id: string, title: string, auth: string, connected: boolean) {
     tools: ["search"],
     connect_provider: `mcp-${id}`,
   };
+}
+
+/** A button in one catalog row, by the row's entry id and the button's name. */
+function rowButton(entryId: string, name: string): HTMLElement {
+  const row = document.querySelector<HTMLElement>(`[data-settings-item="${CSS.escape(entryId)}"]`);
+  if (!row) throw new Error(`no row ${entryId}`);
+  return within(row).getByRole("button", { name });
 }
 
 /** A button of one service's card, by the service's title. */
@@ -856,16 +870,152 @@ const SCENARIOS: readonly SettingsAuditScenario[] = [
       },
     ],
   },
+  {
+    section: "appearance",
+    scenario: "web",
+    ready: ["Settings data"],
+    // Collapsing project sessions is on by default, so its page size shows.
+    states: { "project-folder-pagination": ["collapsed"] },
+    actions: [
+      {
+        name: "settings import dialog",
+        open: () => userEvent.click(screen.getByRole("button", { name: "Import" })),
+        witness: "Import settings",
+      },
+      {
+        name: "reset dialog",
+        open: () => userEvent.click(screen.getByRole("button", { name: "Reset to defaults" })),
+        witness: "Reset appearance?",
+      },
+      {
+        name: "agent picker list",
+        open: () => userEvent.click(rowButton("picker-visibility", "Edit")),
+        witness: { label: "Filter harnesses and agents" },
+      },
+    ],
+  },
+  {
+    section: "appearance",
+    scenario: "web › custom palette",
+    setup: () => writeThemePalette("custom"),
+    ready: ["Background tint"],
+    states: { "project-folder-pagination": ["collapsed"] },
+    actions: [
+      {
+        name: "accent picker",
+        open: () => userEvent.click(screen.getByRole("button", { name: /^Accent: / })),
+        witness: { label: "Accent hue" },
+      },
+      {
+        name: "background tint picker",
+        open: () => userEvent.click(screen.getByRole("button", { name: /^Background tint: / })),
+        witness: { label: "Background tint hue" },
+      },
+    ],
+  },
+  {
+    section: "appearance",
+    scenario: "web › agents failed to load",
+    routes: [{ url: "/v1/agents", status: 500, body: {} }],
+    ready: ["Couldn't load this server's harnesses and agents."],
+    states: { "picker-visibility": ["load failed"], "project-folder-pagination": ["collapsed"] },
+  },
+  {
+    section: "appearance",
+    scenario: "web › in a Databricks embed",
+    embedded: true,
+    setup: () =>
+      setOmnigentHostConfig({
+        themeSettingsUrl: "https://workspace.example.com/settings/appearance",
+      }),
+    ready: ["Databricks appearance settings"],
+    states: { "theme-mode": ["follows Databricks"], "project-folder-pagination": ["collapsed"] },
+  },
+  {
+    section: "members",
+    scenario: "web",
+    ready: ["alice"],
+    routes: [
+      {
+        method: "POST",
+        url: "/auth/invite",
+        body: {
+          token: "invite-token",
+          register_url: "https://omnigent.example.com/register/invite-token",
+          expires_at: 1_780_086_400,
+          is_admin: false,
+        },
+      },
+    ],
+    actions: [
+      {
+        name: "invite dialog",
+        open: () => userEvent.click(screen.getByRole("button", { name: "Invite member" })),
+        witness: "Create invite",
+        states: { "members-invite": ["choosing"] },
+      },
+      {
+        name: "invite created",
+        open: async () => {
+          await userEvent.click(screen.getByRole("button", { name: "Invite member" }));
+          await userEvent.click(await screen.findByRole("button", { name: "Create invite" }));
+        },
+        witness: "Send this URL to the new member",
+        states: { "members-invite": ["invite created"] },
+      },
+    ],
+  },
 ];
+/** The theme color picker's popover controls, which the source guard's baseline already counts. */
+const COLOR_PICKER = "src/components/theme/ThemeColorPicker.tsx › ThemeColorPicker";
+/**
+ * Those controls by section, tag and accessible name, each mapped to its baseline key. The picker's
+ * trigger is owned under the Settings page, so only the popover's controls can be unowned here.
+ */
+const COLOR_PICKER_CONTROLS: Readonly<Record<string, string>> = Object.fromEntries(
+  ["Accent", "Background tint"].flatMap((label) => [
+    [`appearance › button › Randomize ${label.toLowerCase()}`, `${COLOR_PICKER} › button`],
+    [`appearance › div › ${label} saturation and brightness`, `${COLOR_PICKER} › div`],
+    [`appearance › input › ${label} hue`, `${COLOR_PICKER} › input`],
+    [`appearance › input › ${label} hex value`, `${COLOR_PICKER} › input`],
+  ]),
+);
+
+/**
+ * Drops the unowned findings that the baseline accepts, as many as its count allows, from one
+ * audited snapshot: the page, or one portal open in it.
+ */
+function withoutBaselineControls(
+  section: SettingsSectionId,
+  findings: readonly SettingsDomFinding[],
+): SettingsDomFinding[] {
+  const used = new Map<string, number>();
+  return findings.filter((finding) => {
+    const { element } = finding;
+    if (finding.kind !== "unowned" || element === undefined) return true;
+    const key = `${section} › ${element.tagName.toLowerCase()} › ${accessibleName(element)}`;
+    const baseline = COLOR_PICKER_CONTROLS[key];
+    if (baseline === undefined) return true;
+    const count = (used.get(baseline) ?? 0) + 1;
+    used.set(baseline, count);
+    return count > (UNOWNED_CONTROLS[baseline]?.count ?? 0);
+  });
+}
+
 /** Renders the real page at `path` under its providers, kept mounted until the audit ends. */
-function renderSettingsPage(path: string, info: Partial<ServerInfo> = {}): QueryClient {
+function renderSettingsPage(
+  path: string,
+  info: Partial<ServerInfo> = {},
+  embedded = false,
+): QueryClient {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const settings = <SettingsPage />;
   render(
     <QueryClientProvider client={client}>
       <CapabilitiesProvider info={{ ...SERVER_INFO, ...info }}>
         <TooltipProvider>
           <MemoryRouter initialEntries={[path]}>
-            <SettingsPage />
+            {embedded ? <EmbeddedProvider>{settings}</EmbeddedProvider> : settings}
           </MemoryRouter>
         </TooltipProvider>
       </CapabilitiesProvider>
@@ -948,6 +1098,7 @@ async function auditScenario(
     section,
     scenario,
     info,
+    embedded,
     path = `/settings/${section}`,
     routes: changed = [],
     ready,
@@ -973,7 +1124,7 @@ async function auditScenario(
     setup?.();
     const routes = settingsRouteTable([...ROUTES, ...changed]);
     vi.stubGlobal("fetch", routes.fetch);
-    const client = renderSettingsPage(path, info);
+    const client = renderSettingsPage(path, info, embedded);
     for (const witness of ready) {
       // oxlint-disable-next-line no-await-in-loop -- each witness in turn
       await witnessed(witness).catch((error: unknown) => {
@@ -997,12 +1148,15 @@ async function auditScenario(
     audits.push({
       section,
       scenario,
-      findings: auditSettingsDomFindings({
-        roots: [document.body],
-        entries,
-        expected,
-        drivenStates,
-      }),
+      findings: withoutBaselineControls(
+        section,
+        auditSettingsDomFindings({
+          roots: [document.body],
+          entries,
+          expected,
+          drivenStates,
+        }),
+      ),
     });
     const withStates = (
       more: Readonly<Record<string, readonly string[]>> = {},
@@ -1041,14 +1195,17 @@ async function auditScenario(
           snapshots.push({ name: `${action.name} › ${step.name}`, states: step.states });
         }
         const snapshot = snapshots[snapshots.length - 1]!;
-        const findings = auditOpenedPortals({
-          roots: [document.body],
-          opened,
-          entries,
-          expected,
-          drivenStates: withStates(snapshot.states, action.leaves),
-          origins,
-        });
+        const findings = withoutBaselineControls(
+          section,
+          auditOpenedPortals({
+            roots: [document.body],
+            opened,
+            entries,
+            expected,
+            drivenStates: withStates(snapshot.states, action.leaves),
+            origins,
+          }),
+        );
         audits.push({ section, scenario: `${scenario} › ${snapshot.name}`, findings });
         observeRendered(entries, observedRows, observedParts);
       }
@@ -1103,15 +1260,12 @@ const ALL_AUDITS: ScenarioAudits = {
  * for coverage; putting one back is a deliberate change to this list.
  */
 const LEFT_OUT_SECTIONS: Partial<Record<SettingsSectionId, string>> = {
-  appearance:
-    "Settings data's row is named by its group heading, outside the row, and the color pickers hold unowned controls.",
   sharing:
-    "The mode row is named by its group heading, outside the row, and the tier help buttons have no owner.",
-  members: "The list row is named by the page heading, outside the row.",
+    "The scope radios' help buttons, About Managed hosts only and About All sessions, have no owner: no rule owns a choice's help button, and the source guard doesn't read the label component that draws it.",
   policies:
-    "The list row is named by the page heading, outside the row, and the add dialog's help buttons have no owner.",
+    'Its list\'s heading reads "Global Policies", not its catalog name, and the add dialog\'s parameter help buttons have no owner: a multi-select\'s field is named "Parameter values: …", which no rule matches.',
   import:
-    "The mode row is named by its group heading, outside the row, and the recent-count field is named differently from its catalog entry.",
+    'The mode row\'s visible label is "Import", not its catalog name "What to import", and the run button shares "Import".',
   cli: "Its row needs the desktop shell's CLI bridge.",
   updates: "Its rows need the desktop shell's update bridge.",
 };
