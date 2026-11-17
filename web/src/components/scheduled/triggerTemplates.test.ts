@@ -626,6 +626,26 @@ describe("Slack DM triggers", () => {
     expect(prompt).toContain("archives/<channel ID>/p<ts without its dot>");
   });
 
+  it("asks a privacy filter for author columns only when a condition names an author", () => {
+    const withAuthor = renderTriggerPrompt(
+      "slack",
+      slack({
+        scope: "eng-support",
+        scopeOperator: "is",
+        conditions: [{ field: "author", operator: "is", value: "Example Person" }],
+      }),
+      CTX,
+    );
+    const withoutAuthor = renderTriggerPrompt(
+      "slack",
+      slack({ scope: "eng-support", scopeOperator: "is" }),
+      CTX,
+    );
+
+    expect(withAuthor).toContain("adding one yes/no column per author ID the conditions name");
+    expect(withoutAuthor).not.toContain("yes/no column per author ID");
+  });
+
   it("leaves DM triggers' lookups unchanged", () => {
     const prompt = renderTriggerPrompt("slack", slack({ event: "dm", scope: "@alice" }), CTX);
 
