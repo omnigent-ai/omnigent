@@ -69,6 +69,73 @@ def _report() -> dict:
     return make_report(samples, _args(), "ui-revision", "test-chromium")
 
 
+@pytest.mark.parametrize("document_state", ["available", "closed", "timeout", "unavailable"])
+async def test_failed_screenshot_retains_error_and_document_state(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, document_state: str
+) -> None:
+    measurement_error = RuntimeError("measurement failed")
+    capture_error = RuntimeError("screenshot transport failed")
+    state_error = {
+        "timeout": TimeoutError("document state timed out"),
+        "unavailable": ui_run.PlaywrightError("document state unavailable"),
+    }.get(document_state)
+    state = {
+        "readyState": "interactive",
+        "viewport": {"width": 1440, "height": 900},
+        "documentElement": {"width": 1440, "height": 900},
+        "paints": [],
+        "observedAt": 15.0,
+    }
+    page = SimpleNamespace(
+        on=lambda *_args: None,
+        goto=AsyncMock(side_effect=measurement_error),
+        is_closed=lambda: document_state == "closed",
+        evaluate=AsyncMock(return_value=state, side_effect=state_error),
+    )
+    session = SimpleNamespace(send=AsyncMock(side_effect=[{}, {}, capture_error]))
+    context = SimpleNamespace(
+        new_page=AsyncMock(return_value=page),
+        new_cdp_session=AsyncMock(return_value=session),
+        close=AsyncMock(),
+    )
+    browser = SimpleNamespace(new_context=AsyncMock(return_value=context))
+    with pytest.raises(RuntimeError, match="measurement failed") as raised:
+        await ui_run.measure_scenario(
+            browser,
+            SimpleNamespace(base_url="http://example.test"),
+            "session",
+            "browser",
+            _args(),
+            tmp_path / "page-error",
+        )
+    assert raised.value is measurement_error
+    context.close.assert_awaited_once()
+    records = [
+        record for record in caplog.records if record.name == ui_run.__name__ and record.exc_info
+    ]
+    assert len(records) == 1
+    record = records[0]
+    assert record.exc_info[1] is capture_error
+    assert "Failure screenshot" in record.getMessage()
+    assert "page-error.failed.png" in record.getMessage()
+    states = [
+        entry
+        for entry in caplog.records
+        if "Document state after failed screenshot capture" in entry.getMessage()
+    ]
+    assert len(states) == 1
+    assert caplog.records.index(record) < caplog.records.index(states[0])
+    observed = states[0].args[1]
+    assert observed["page_closed"] == (document_state == "closed")
+    if document_state == "available":
+        assert observed["document"] == state
+    elif document_state == "closed":
+        page.evaluate.assert_not_awaited()
+    else:
+        assert str(state_error) in observed["state_error"]
+    assert session.send.await_args_list[-1].args == ("Page.captureScreenshot",)
+
+
 def test_ui_report_preserves_raw_samples_and_revision(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(schema, "git_branch", lambda: "driver-branch")
     report = _report()
