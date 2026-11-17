@@ -71,7 +71,7 @@ export function HeaderTitle({ conversationId, title }: { conversationId: string;
  * Japanese conversion) doesn't commit the rename, and a cancel flag so the
  * unmount blur doesn't re-commit after Escape.
  */
-function HeaderTitleInput({
+export function HeaderTitleInput({
   initialTitle,
   pending,
   onCommit,
