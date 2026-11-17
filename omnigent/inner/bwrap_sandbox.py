@@ -20,6 +20,8 @@ Default view inside the sandbox:
   ``/etc/pki``) bound read-only via ``--ro-bind-try``.
 - Fresh ``/proc`` (or a bind from vetted outer sandboxes; see
   :func:`_should_bind_host_proc`), ``/dev``, and ``/tmp``.
+- NVIDIA device nodes and driver sysfs entries when the host has them
+  (see :func:`_gpu_device_binds`).
 - Cwd bind-mounted read-only by default; explicit
   ``write_paths: ["."]`` flips it to read-write. Top-level
   dotfiles / dotdirs in cwd are tmpfs-masked unless their name is
@@ -221,6 +223,34 @@ def _detect_host_sandbox_backend() -> str | None:
         # the fresh-proc default rather than the proc-bind downgrade.
         _LOGGER.debug("lakebox marker probe failed for %s", _LAKEBOX_MARKER, exc_info=True)
     return None
+
+
+# libcuda reads these to confirm the driver is loaded; without them device
+# enumeration fails with error 304 even when the /dev nodes are present.
+_NVIDIA_SYSFS_DIRS = ("/sys/module/nvidia", "/sys/module/nvidia_uvm")
+
+
+def _gpu_device_binds(dev_root: Path = Path("/dev")) -> list[str]:
+    """
+    Expose NVIDIA GPUs to the helper on hosts that have them.
+
+    ``--dev /dev`` gives the sandbox a minimal ``/dev`` without the
+    ``/dev/nvidia*`` nodes, so CUDA reports "No CUDA GPUs are available".
+    Each node is ``--dev-bind``-ed back, plus the read-only driver sysfs
+    entries libcuda probes. Hosts without NVIDIA nodes get no extra mounts.
+
+    :param dev_root: Directory scanned for ``nvidia*`` nodes, e.g. ``/dev``.
+    :returns: bwrap arguments, empty when the host has no NVIDIA devices.
+    """
+    nodes = sorted(str(path) for path in dev_root.glob("nvidia*"))
+    if not nodes:
+        return []
+    args: list[str] = []
+    for node in nodes:
+        args += ["--dev-bind-try", node, node]
+    for path in _NVIDIA_SYSFS_DIRS:
+        args += ["--ro-bind-try", path, path]
+    return args
 
 
 def _should_bind_host_proc() -> bool:
@@ -492,6 +522,7 @@ class BwrapSandboxBackend(SandboxBackend):
             "--tmpfs",
             "/tmp",
         ]
+        bwrap_args += _gpu_device_binds()
 
         # Make sure argv[0] (the helper interpreter) is reachable inside
         # the sandbox even when it lives outside the default mounts —
