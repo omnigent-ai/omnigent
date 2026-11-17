@@ -18,8 +18,15 @@ the header menu), and each place is a separate entry point.
   session remains bound. The representative pins/moves the entire family; nested members have no pin
   action, and legacy individual pins keep their place inside the nest.
   Opening Add nested agent shows a draft row in the family until creation
-  replaces it; leaving the composer without submitting removes the draft. Existing
-  sessions cannot join a family; ordinary forks remain standalone and may reuse the source host.
+  replaces it; leaving the composer without submitting removes the draft.
+  Owners can move existing sessions into a nest or remove one member. Ordinary
+  forks remain standalone by default and may reuse the source host.
+- `nest-moves`: drag an owned session onto the middle of an existing nest row
+  to join it; row edges still reorder. While dragging a nest member, a temporary
+  **Remove from nest** target detaches that session. The existing **Move session**
+  submenu also lists searchable Projects and Nests, with **Remove from nest**
+  only for members. Joining inherits the nest's project and pin; leaving keeps
+  the project. History, permissions, compute and execution ancestry stay unchanged.
 
 - `session-grid`: with `grid_sessions_display_ui` (on by default), drag sidebar sessions into a
   conversation to split left/right or top/bottom with a hover preview. Up to four
@@ -388,6 +395,14 @@ the Pinned section, or drop an unpinned row onto a pinned row to pin it into
 that slot: the line marks whether it lands above or below the row. Release it
 just below the last pin to pin it at the bottom. Only standalone sessions and
 family representatives can be dragged to pin or reorder a pin.
+
+**Move into or out of a nest:** drag onto the middle of an existing nest row;
+the highlight and drag preview say which nest will receive the session. Drop
+near the top or bottom of the row to reorder instead. Dragging a nest member
+also reveals **Remove from nest** above the sidebar sections. For keyboard or
+touch use, open the row's kebab or right-click menu → **Move session**, then
+choose a nest or **Remove from nest**. The destination nest expands after a move.
+Removing the representative promotes the oldest remaining active member.
 
 **Custom order:** with `sidebar_grouping_ui` on (the default), drag one of your sessions onto
 another row in the same list, project or group and release it; a line like the
@@ -1372,6 +1387,9 @@ outside the checkout to retain recordings.
 The component tests in `web/src/shell/HeaderConversationMenu.test.tsx` and
 `web/src/components/KeyboardShortcutsDialog.test.tsx` cover Cmd/Ctrl+Alt+A and
 its discoverability.
+Nest move drag boundaries and detach targets have coverage in
+`web/src/shell/Sidebar.pinReorder.test.tsx`; desktop/mobile menu destinations
+and detach actions are covered by `web/src/shell/Sidebar.rowActions.test.tsx`.
 
 ## Gotchas
 

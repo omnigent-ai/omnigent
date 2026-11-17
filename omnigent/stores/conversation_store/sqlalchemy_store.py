@@ -126,6 +126,7 @@ from omnigent.stores.conversation_store import (
     SCHEDULED_TASK_PENDING_RUN_LABEL_PREFIX,
     SCHEDULED_TASK_RUN_LABEL_KEY,
     SIDE_CHAT_COPY_ID_PREFIX_LEN,
+    SIDE_CHAT_LABEL_KEY,
     ConversationAlreadyExistsError,
     ConversationNotFoundError,
     ConversationStore,
@@ -2053,50 +2054,66 @@ class SqlAlchemyConversationStore(ConversationStore):
             family.sort(key=lambda member: (member.created_at, member.id != family_id, member.id))
         return families
 
+    def _new_family_id(self, source: Conversation) -> str:
+        if source.family_id is not None:
+            return source.family_id
+        with self._session("choose_session_family") as session:
+            occupied = self._family_member_ids(session, source.id)
+        return uuid.uuid4().hex if occupied else source.id
+
+    def _copy_family_labels(
+        self,
+        labels_session: Session,
+        member_ids: list[str],
+        *,
+        label_source_id: str,
+        promote_pin: bool,
+        project_id: str | None,
+        user_id: str | None,
+    ) -> None:
+        pin_key = pinned_label_key(user_id)
+        family_pin_key = family_pinned_label_key(user_id)
+        source_labels = _fetch_labels(
+            labels_session, label_source_id, keys=(PROJECT_LABEL_KEY, pin_key, family_pin_key)
+        )
+        updates: dict[str, str] = {}
+        labels_session.execute(
+            delete(SqlConversationLabel).where(
+                SqlConversationLabel.workspace_id == current_workspace_id(),
+                SqlConversationLabel.conversation_id.in_(member_ids),
+                SqlConversationLabel.key == family_pin_key,
+            )
+        )
+        if project_id is None and PROJECT_LABEL_KEY in source_labels:
+            updates[PROJECT_LABEL_KEY] = source_labels[PROJECT_LABEL_KEY]
+        else:
+            labels_session.execute(
+                delete(SqlConversationLabel).where(
+                    SqlConversationLabel.workspace_id == current_workspace_id(),
+                    SqlConversationLabel.conversation_id.in_(member_ids),
+                    SqlConversationLabel.key == PROJECT_LABEL_KEY,
+                )
+            )
+        if promote_pin and pin_key in source_labels:
+            updates[family_pin_key] = source_labels[pin_key]
+            labels_session.execute(
+                delete(SqlConversationLabel).where(
+                    SqlConversationLabel.workspace_id == current_workspace_id(),
+                    SqlConversationLabel.conversation_id == label_source_id,
+                    SqlConversationLabel.key == pin_key,
+                )
+            )
+        elif family_pin_key in source_labels:
+            updates[family_pin_key] = source_labels[family_pin_key]
+        if updates:
+            for member_id in member_ids:
+                _upsert_prepared_labels(labels_session, member_id, updates, now_epoch())
+
     def add_new_sibling(self, source_id: str, session_id: str, *, user_id: str | None) -> None:
         source = self.get_conversation(source_id)
         if source is None:
             raise ConversationNotFoundError(source_id)
-        family_id = source.family_id or source.id
-        pin_key = pinned_label_key(user_id)
-        family_pin_key = family_pinned_label_key(user_id)
-
-        def copy_labels(
-            labels_session: Session,
-            member_ids: list[str],
-            *,
-            label_source_id: str,
-            promote_pin: bool,
-            project_id: str | None,
-        ) -> None:
-            source_labels = _fetch_labels(
-                labels_session, label_source_id, keys=(PROJECT_LABEL_KEY, pin_key, family_pin_key)
-            )
-            updates: dict[str, str] = {}
-            if project_id is None and PROJECT_LABEL_KEY in source_labels:
-                updates[PROJECT_LABEL_KEY] = source_labels[PROJECT_LABEL_KEY]
-            else:
-                labels_session.execute(
-                    delete(SqlConversationLabel).where(
-                        SqlConversationLabel.workspace_id == current_workspace_id(),
-                        SqlConversationLabel.conversation_id.in_(member_ids),
-                        SqlConversationLabel.key == PROJECT_LABEL_KEY,
-                    )
-                )
-            if promote_pin and pin_key in source_labels:
-                updates[family_pin_key] = source_labels[pin_key]
-                labels_session.execute(
-                    delete(SqlConversationLabel).where(
-                        SqlConversationLabel.workspace_id == current_workspace_id(),
-                        SqlConversationLabel.conversation_id == label_source_id,
-                        SqlConversationLabel.key == pin_key,
-                    )
-                )
-            elif family_pin_key in source_labels:
-                updates[family_pin_key] = source_labels[family_pin_key]
-            if updates:
-                for member_id in member_ids:
-                    _upsert_prepared_labels(labels_session, member_id, updates, now_epoch())
+        family_id = self._new_family_id(source)
 
         def write(session: Session) -> None:
             family_lock = self._lock_session_family(session, family_id)
@@ -2122,7 +2139,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     or source_row.parent_conversation_id is not None
                     or target_row.parent_conversation_id is not None
                     or target_meta.family_id is not None
-                    or (source_meta.family_id or source_id) != family_id
+                    or source_meta.family_id not in (None, family_id)
                 ):
                     raise OmnigentError(
                         "Sibling source is no longer available", code=ErrorCode.CONFLICT
@@ -2139,15 +2156,16 @@ class SqlAlchemyConversationStore(ConversationStore):
                         code=ErrorCode.INVALID_INPUT,
                     )
                 if self._conv_engine is self._engine:
-                    copy_labels(
+                    self._copy_family_labels(
                         labels_session,
                         [source_id, session_id],
                         label_source_id=source_id,
                         promote_pin=source_meta.family_id is None,
                         project_id=source_meta.project_id,
+                        user_id=user_id,
                     )
             if self._conv_engine is not self._engine and source_meta.family_id is None:
-                family_lock.value = "pending_initial_labels"
+                family_lock.value = json.dumps({"initial_label_source": source_id})
             target_meta.project_id = source_meta.project_id
             source_meta.family_id = family_id
             target_meta.family_id = family_id
@@ -2165,19 +2183,213 @@ class SqlAlchemyConversationStore(ConversationStore):
                     raise OmnigentError(
                         "Sibling source is no longer available", code=ErrorCode.CONFLICT
                     )
-                initialize_labels = family_lock.value == "pending_initial_labels"
+                initial_source = (
+                    family_id
+                    if family_lock.value == "pending_initial_labels"
+                    else json.loads(family_lock.value).get("initial_label_source")
+                )
+                initialize_labels = initial_source is not None
                 with self._profile_label_session(session) as labels_session:
-                    copy_labels(
+                    self._copy_family_labels(
                         labels_session,
                         members if initialize_labels else [session_id],
-                        label_source_id=family_id if initialize_labels else source_id,
+                        label_source_id=initial_source or source_id,
                         promote_pin=initialize_labels,
                         project_id=source_meta.project_id,
+                        user_id=user_id,
                     )
                 # Clear only after the separate label transaction commits.
                 family_lock.value = "{}"
 
             run_write_transaction(self._session_immediate, "copy_sibling_labels", finish_labels)
+
+    def set_session_nest(
+        self, session_id: str, source_id: str | None, *, user_id: str | None
+    ) -> None:
+        moved = self.get_conversation(session_id)
+        source = self.get_conversation(source_id) if source_id is not None else None
+        if moved is None or (source_id is not None and source is None):
+            raise ConversationNotFoundError(session_id if moved is None else source_id)
+        session_id = moved.id
+        source_id = source.id if source is not None else None
+        if source_id == session_id:
+            return
+        family_id = self._new_family_id(source) if source is not None else None
+        lock_ids = sorted(
+            {value for value in (session_id, source_id, moved.family_id, family_id) if value}
+        )
+
+        def lock_members(
+            session: Session,
+        ) -> tuple[SqlConversationMetadata, SqlConversationMetadata | None, SqlPreference | None]:
+            locks = {key: self._lock_session_family(session, key) for key in lock_ids}
+            metadata = {
+                key: session.get(
+                    SqlConversationMetadata, (current_workspace_id(), key), with_for_update=True
+                )
+                for key in sorted(value for value in {session_id, source_id} if value is not None)
+            }
+            target_meta = metadata[session_id]
+            source_meta = metadata.get(source_id) if source_id is not None else None
+            if target_meta is None or (source_id is not None and source_meta is None):
+                raise OmnigentError("Session is no longer available", code=ErrorCode.CONFLICT)
+            return (
+                target_meta,
+                source_meta,
+                locks.get(family_id) if family_id is not None else None,
+            )
+
+        labels_copied = False
+
+        def copy_labels(
+            session: Session,
+            source_meta: SqlConversationMetadata | None,
+            family_lock: SqlPreference | None,
+        ) -> None:
+            nonlocal labels_copied
+            with self._profile_label_session(session) as labels_session:
+                if source_meta is None:
+                    labels_session.execute(
+                        delete(SqlConversationLabel).where(
+                            SqlConversationLabel.workspace_id == current_workspace_id(),
+                            SqlConversationLabel.conversation_id == session_id,
+                            SqlConversationLabel.key == family_pinned_label_key(user_id),
+                        )
+                    )
+                else:
+                    assert family_lock is not None and family_id is not None
+                    initial_source = (
+                        family_id
+                        if family_lock.value == "pending_initial_labels"
+                        else json.loads(family_lock.value).get("initial_label_source")
+                    )
+                    self._copy_family_labels(
+                        labels_session,
+                        self._family_member_ids(session, family_id)
+                        if initial_source
+                        else [session_id],
+                        label_source_id=initial_source or source_meta.id,
+                        promote_pin=initial_source is not None,
+                        project_id=source_meta.project_id,
+                        user_id=user_id,
+                    )
+            labels_copied = True
+            if family_lock is not None:
+                family_lock.value = "{}"
+
+        def write(session: Session) -> None:
+            target_meta, source_meta, family_lock = lock_members(session)
+            if target_meta.family_id != moved.family_id or (
+                source_meta is not None
+                and source is not None
+                and source_meta.family_id != source.family_id
+            ):
+                raise OmnigentError(
+                    "Session family changed; retry the move", code=ErrorCode.CONFLICT
+                )
+            with self._profile_label_session(session, read_only=True) as labels_session:
+                for key in (session_id, source_id):
+                    if key is None:
+                        continue
+                    row = labels_session.get(
+                        SqlConversation, (current_workspace_id(), key), with_for_update=True
+                    )
+                    labels = _fetch_labels(labels_session, key, keys=(SIDE_CHAT_LABEL_KEY,))
+                    if (
+                        row is None
+                        or row.archived
+                        or row.parent_conversation_id is not None
+                        or labels.get(SIDE_CHAT_LABEL_KEY)
+                    ):
+                        raise OmnigentError(
+                            "Only active independent sessions can move between nests",
+                            code=ErrorCode.INVALID_INPUT,
+                        )
+            if source_meta is not None:
+                assert family_id is not None and family_lock is not None
+                members = self._family_member_ids(session, family_id)
+                if source_meta.family_id is None and members:
+                    raise OmnigentError(
+                        "Session family changed; retry the move", code=ErrorCode.CONFLICT
+                    )
+                if len(set(members) | {session_id, source_id}) > MAX_SESSION_FAMILY_MEMBERS:
+                    raise OmnigentError(
+                        f"A family supports up to {MAX_SESSION_FAMILY_MEMBERS} sessions",
+                        code=ErrorCode.INVALID_INPUT,
+                    )
+                if source_meta.family_id is None:
+                    family_lock.value = json.dumps({"initial_label_source": source_id})
+                source_meta.family_id = family_id
+                target_meta.project_id = source_meta.project_id
+            target_meta.family_id = family_id
+            session.flush()
+            if self._conv_engine is self._engine:
+                copy_labels(session, source_meta, family_lock)
+
+        run_write_transaction(self._session_immediate, "move_session_nest", write)
+        if self._conv_engine is not self._engine:
+            # shortcut: a crash between databases needs a retried move; add a journal for recovery.
+
+            def finish_labels(session: Session) -> None:
+                target_meta, source_meta, family_lock = lock_members(session)
+                if target_meta.family_id != family_id or (
+                    source_meta is not None and source_meta.family_id != family_id
+                ):
+                    raise OmnigentError(
+                        "Session family changed; retry the move", code=ErrorCode.CONFLICT
+                    )
+                copy_labels(session, source_meta, family_lock)
+
+            try:
+                run_write_transaction(
+                    self._session_immediate, "copy_session_nest_labels", finish_labels
+                )
+            except Exception:
+                if not labels_copied:
+
+                    def restore_membership(session: Session) -> None:
+                        target_meta, source_meta, family_lock = lock_members(session)
+                        if target_meta.family_id != family_id:
+                            return
+                        target_meta.family_id = moved.family_id
+                        target_meta.project_id = moved.project_id
+                        if moved.family_id is not None:
+                            peers = self._family_member_ids(session, moved.family_id)
+                            peer_id = next((key for key in peers if key != session_id), None)
+                            if peer_id is not None:
+                                peer_meta = session.get(
+                                    SqlConversationMetadata, (current_workspace_id(), peer_id)
+                                )
+                                assert peer_meta is not None
+                                target_meta.project_id = peer_meta.project_id
+                                with self._profile_label_session(session) as labels_session:
+                                    self._copy_family_labels(
+                                        labels_session,
+                                        [session_id],
+                                        label_source_id=peer_id,
+                                        promote_pin=False,
+                                        project_id=peer_meta.project_id,
+                                        user_id=user_id,
+                                    )
+                        if (
+                            source_meta is not None
+                            and source is not None
+                            and source.family_id is None
+                        ):
+                            assert family_id is not None
+                            retained = set(self._family_member_ids(session, family_id)) - {
+                                session_id,
+                                source_id,
+                            }
+                            if not retained and source_meta.family_id == family_id:
+                                source_meta.family_id = None
+                                assert family_lock is not None
+                                family_lock.value = "{}"
+
+                    run_write_transaction(
+                        self._session_immediate, "restore_session_nest", restore_membership
+                    )
+                raise
 
     def set_family_pin(self, session_id: str, value: str, *, user_id: str | None) -> None:
         value = _prepare_label_updates({PINNED_LABEL_KEY: value})[PINNED_LABEL_KEY]

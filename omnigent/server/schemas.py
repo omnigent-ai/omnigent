@@ -2797,6 +2797,14 @@ class UpdateSessionRequest(BaseModel):
 
     runner_id: str | None = None
     family_pinned: bool | None = None
+    nest_source_id: str | None = Field(
+        default=None,
+        min_length=1,
+        description=(
+            "Join the named session's nest, or null to detach; omit to leave unchanged. "
+            "Send separately from other changes."
+        ),
+    )
     title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
     labels: dict[str, str] | None = None
     reasoning_effort: str | None = None

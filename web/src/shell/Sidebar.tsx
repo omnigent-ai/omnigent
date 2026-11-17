@@ -33,7 +33,6 @@ import { InfiniteScrollSentinel, type AutoLoadBudget } from "@/components/Infini
 import {
   type ComponentType,
   type CSSProperties,
-  type KeyboardEvent,
   type MouseEvent,
   type ReactNode,
   type RefObject,
@@ -184,6 +183,7 @@ import {
   useProjects,
   useProjectSessions,
   useMoveToProject,
+  useMoveToNest,
   useDeleteProject,
   useRenameProject,
   useProjectConfig,
@@ -454,6 +454,8 @@ const PinOrderContext = createContext<{
 const RowEditHoldContext = createContext<(id: string, editing: boolean) => void>(() => {});
 // Moves a session into another row's slot in the Custom order (row menu Move up/down).
 const SessionReorderContext = createContext<(fromId: string, toId: string) => void>(() => {});
+const NestDestinationsContext = createContext<readonly Conversation[]>([]);
+const RevealNestContext = createContext<(sourceId: string | null) => void>(() => {});
 
 // Stable callback identity that always runs the latest `fn` — keeps the row
 // handlers from changing on every Sidebar render and defeating the row memo.
@@ -473,6 +475,8 @@ function SidebarRowDataProvider({
   serverInfo,
   onActivate,
   onReorder,
+  nestDestinations,
+  onRevealNest,
   children,
 }: {
   projectNamesById: Map<string, string>;
@@ -484,6 +488,8 @@ function SidebarRowDataProvider({
   serverInfo: ReturnType<typeof useServerInfo>;
   onActivate: (id: string, event: MouseEvent<HTMLAnchorElement>) => void;
   onReorder: (fromId: string, toId: string) => void;
+  nestDestinations: readonly Conversation[];
+  onRevealNest: (sourceId: string | null) => void;
   children: ReactNode;
 }) {
   return (
@@ -496,7 +502,11 @@ function SidebarRowDataProvider({
                 <ServerInfoContext.Provider value={serverInfo}>
                   <RowActivationContext.Provider value={onActivate}>
                     <SessionReorderContext.Provider value={onReorder}>
-                      {children}
+                      <NestDestinationsContext.Provider value={nestDestinations}>
+                        <RevealNestContext.Provider value={onRevealNest}>
+                          {children}
+                        </RevealNestContext.Provider>
+                      </NestDestinationsContext.Provider>
                     </SessionReorderContext.Provider>
                   </RowActivationContext.Provider>
                 </ServerInfoContext.Provider>
@@ -2940,6 +2950,8 @@ function ConversationList({
   // target — you can't file sessions there. The kebab "Move session" menu + the
   // pin button remain the keyboard-accessible session actions.
   const moveToProject = useMoveToProject();
+  const moveToNest = useMoveToNest();
+  const [overNest, setOverNest] = useState<string | null>(null);
   // The session currently being dragged (id + source project + pinned state), or
   // null. Set on drag start, cleared on end/cancel; drives the DragOverlay
   // preview and which drop zones light up (ungroup only for a filed session, pin
@@ -2949,6 +2961,8 @@ function ConversationList({
     label: string;
     project: string | null;
     isPinned: boolean;
+    familyId?: string;
+    canMoveNest: boolean;
   } | null>(null);
   // Mouse: a small drag threshold so a plain click still navigates / opens the
   // kebab. Touch: a press-and-hold delay so scrolling the list isn't hijacked
@@ -2994,12 +3008,21 @@ function ConversationList({
       return;
     }
     const data = event.active.data.current as
-      { label?: string; project?: string | null; isPinned?: boolean } | undefined;
+      | {
+          label?: string;
+          project?: string | null;
+          isPinned?: boolean;
+          familyId?: string;
+          canMoveNest?: boolean;
+        }
+      | undefined;
     setActiveDrag({
       id: String(event.active.id),
       label: data?.label ?? String(event.active.id),
       project: data?.project ?? null,
       isPinned: data?.isPinned ?? false,
+      familyId: data?.familyId,
+      canMoveNest: data?.canMoveNest === true,
     });
   }, []);
   const handleDragEnd = useCallback(
@@ -3016,6 +3039,7 @@ function ConversationList({
       const dragged = activeDrag;
       setActiveDrag(null);
       setOverPin(null);
+      setOverNest(null);
       if (!dragged) return;
       const gridTarget = event.over?.data.current as GridDropTarget | undefined;
       if (gridTarget?.type === "session-grid") {
@@ -3023,6 +3047,24 @@ function ConversationList({
         return;
       }
       const over = event.over?.data.current;
+      if (over?.type === "nest" || over?.type === "remove-from-nest") {
+        if (!dragged.canMoveNest || moveToNest.isPending) return;
+        const sourceId = over.type === "nest" ? (over.id as string) : null;
+        moveToNest.mutate(
+          { id: dragged.id, sourceId },
+          {
+            onSuccess: () => {
+              if (over.type === "nest") {
+                setCollapsedFamilies(
+                  (previous) => new Set([...previous].filter((id) => id !== over.familyId)),
+                );
+                if (over.project) expandProject(over.project as string);
+              }
+            },
+          },
+        );
+        return;
+      }
       if (over?.type === "session-order") {
         if (over.group === event.active.data.current?.reorderGroup)
           reorderSessions(dragged.id, over.id as string);
@@ -3095,6 +3137,7 @@ function ConversationList({
       activeDrag,
       grids,
       moveToProject,
+      moveToNest,
       expandProject,
       onTogglePinned,
       projects,
@@ -3428,6 +3471,32 @@ function ConversationList({
     sections.projectGroups.length +
     sections.projectGroups.reduce((sum, g) => sum + g.conversations.length, 0);
 
+  const nestDestinations = useMemo(
+    () =>
+      dedupeConversationsById([
+        ...allConversations,
+        ...[...folderConversations.values()].flatMap((folder) => folder.conversations),
+      ]).filter(
+        (row) =>
+          row.family?.representative_id === row.id &&
+          !row.archived &&
+          !row.provisional &&
+          isOwnedByViewer(row, viewerId),
+      ),
+    [allConversations, folderConversations, viewerId],
+  );
+  const revealNest = useStableCallback((sourceId: string | null) => {
+    const destination = nestDestinations.find((row) => row.id === sourceId);
+    if (!destination?.family) return;
+    setCollapsedFamilies(
+      (previous) => new Set([...previous].filter((id) => id !== destination.family!.id)),
+    );
+    const project = destination.project_id
+      ? projectNamesById.get(destination.project_id)
+      : destination.labels[PROJECT_LABEL_KEY];
+    if (project) expandProject(project);
+  });
+
   // Section structure comes from the muted micro-headers + whitespace
   // alone (Linear-style) — no icons or counts in the headers, no divider
   // rules between groups.
@@ -3442,6 +3511,8 @@ function ConversationList({
       serverInfo={serverInfo}
       onActivate={activateRow}
       onReorder={reorderSessions}
+      nestDestinations={nestDestinations}
+      onRevealNest={revealNest}
     >
       <DndContext
         sensors={sensors}
@@ -3456,12 +3527,33 @@ function ConversationList({
               ...args,
               droppableContainers: droppableContainers.filter((container) => {
                 const target = container.data.current;
+                if (target?.type === "nest") {
+                  const rect = args.droppableRects.get(container.id);
+                  const pointer = args.pointerCoordinates;
+                  return (
+                    source?.canMoveNest === true &&
+                    target.familyId !== source.familyId &&
+                    target.id !== args.active.id &&
+                    !!rect &&
+                    !!pointer &&
+                    pointer.y > rect.top + rect.height / 4 &&
+                    pointer.y < rect.bottom - rect.height / 4
+                  );
+                }
+                if (target?.type === "remove-from-nest")
+                  return source?.canMoveNest === true && !!source.familyId;
                 // Only rows in the dragged session's own list are reorder targets.
                 if (target?.type === "session-order")
                   return target.id !== args.active.id && target.group === source?.reorderGroup;
                 return source?.canManage !== false || target?.type === "session-grid";
               }),
             });
+            const nest = collisions.find((hit) =>
+              ["nest", "remove-from-nest"].includes(
+                hit.data?.droppableContainer.data.current?.type,
+              ),
+            );
+            if (nest) return [nest];
             // A row reorders; elsewhere, e.g. over another project's row, its folder files it.
             const row = collisions.find(
               (hit) => hit.data?.droppableContainer.data.current?.type === "session-order",
@@ -3507,11 +3599,13 @@ function ConversationList({
           const over = event.over?.data.current;
           setOverProject(over?.type === "project-order" ? (over.name as string) : null);
           setOverPin(over?.type === "pin-order" ? (over.id as string) : null);
+          setOverNest(over?.type === "nest" ? (over.label as string) : null);
         }}
         onDragMove={(event) => setPinBelow(event.collisions?.[0]?.data?.below === true)}
         onDragCancel={() => {
           setActiveDrag(null);
           setOverPin(null);
+          setOverNest(null);
           setDraggedProject(null);
           setOverProject(null);
         }}
@@ -3538,6 +3632,7 @@ function ConversationList({
                 !grouped &&
                 activeDrag?.project != null &&
                 sections.sessions.length === 0 && <UngroupDropZone />}
+              {activeDrag?.canMoveNest && activeDrag.familyId && <RemoveFromNestDropZone />}
               {totalVisible === 0 && searchQuery && !sessionStatus && !importing ? (
                 <>
                   <p className="px-2 py-1 text-ui text-muted-foreground">{emptyMessage}</p>
@@ -3845,6 +3940,11 @@ function ConversationList({
                 style={dragOrigin.current ? { maxWidth: "none" } : undefined}
               >
                 {draggedProject ?? activeDrag?.label}
+                {overNest && (
+                  <div className="truncate text-xs text-muted-foreground">
+                    Move into nest: {overNest}
+                  </div>
+                )}
               </div>
             ) : null}
           </DragOverlay>,
@@ -3855,12 +3955,26 @@ function ConversationList({
   );
 }
 
-/** Wraps the flat "Chats" section as an ungroup drop target: a filed session
-    released here is removed from its project (back to the flat list, where
-    unfiled sessions live). `active` gates the droppable so it only intercepts
-    drops while a filed session is being dragged — at rest it's an inert
-    wrapper. Outline-only highlight on drag-over (no background fill), matching
-    the project folders. */
+function RemoveFromNestDropZone() {
+  const { setNodeRef, isOver } = useDroppable({
+    id: "remove-from-nest",
+    data: { type: "remove-from-nest" },
+  });
+  return (
+    <div
+      ref={setNodeRef}
+      data-testid="sidebar-remove-from-nest"
+      className={cn(
+        "rounded-md border border-dashed border-border px-2 py-1.5 text-sm text-muted-foreground",
+        isOver && DROP_TARGET_HIGHLIGHT,
+      )}
+    >
+      Remove from nest
+    </div>
+  );
+}
+
+/** Filed sessions dropped on Chats return to the unfiled list. */
 function ChatsDropZone({ active, children }: { active: boolean; children: ReactNode }) {
   const { setNodeRef, isOver } = useDroppable({
     id: "chats-ungroup",
@@ -5023,6 +5137,10 @@ export function ConversationMenuItems({
   const info = useContext(ServerInfoContext);
   const atPinCap = useContext(PinCapacityContext);
   const pinSaving = useContext(PinSavingContext);
+  const moveToNest = useMoveToNest();
+  const revealNest = useContext(RevealNestContext);
+  const nestingEnabled = info !== "loading" && info.sibling_sessions === true;
+  const canMoveProject = !isIndentedSibling(conversation);
   const moveSession = useContext(SessionReorderContext);
   const grids = useGridSessions();
   const gridLayout = grids?.enabled
@@ -5068,6 +5186,25 @@ export function ConversationMenuItems({
     moveToProject.mutate({ id: conversation.id, project: "" });
   };
 
+  const movePicker = (
+    <SessionMovePickerMenu
+      components={C}
+      currentProject={currentProject}
+      onSelect={handleProjectSelect}
+      conversation={conversation}
+      canMoveProject={canMoveProject}
+      nestingEnabled={nestingEnabled && !isArchived}
+      nestSaving={moveToNest.isPending}
+      onNestSelect={(sourceId) => {
+        setMenuOpen(false);
+        moveToNest.mutate(
+          { id: conversation.id, sourceId },
+          { onSuccess: () => revealNest(sourceId) },
+        );
+      }}
+    />
+  );
+
   // Mobile project sub-view: replaces the entire menu body in place (the
   // "Back" row flips `view` without closing the menu or navigating). Reachable
   // only via the mobile project item below, which sits behind the same
@@ -5088,11 +5225,7 @@ export function ConversationMenuItems({
           Back
         </C.Item>
         <C.Separator />
-        <ProjectPickerMenu
-          components={C}
-          currentProject={currentProject}
-          onSelect={handleProjectSelect}
-        />
+        {movePicker}
       </>
     );
   }
@@ -5270,7 +5403,7 @@ export function ConversationMenuItems({
       {/* Projects are a My-sessions-only tool, so filing is owner-only — a
           shared session shows no project affordance. */}
       {isOwner &&
-        !isIndentedSibling(conversation) &&
+        (canMoveProject || (nestingEnabled && !isArchived)) &&
         (isMobile ? (
           // Mobile: no room for a side flyout, so this item swaps the menu
           // body to the project picker in place (see the `view === "projects"`
@@ -5286,7 +5419,7 @@ export function ConversationMenuItems({
             <FolderInputIcon className="size-3.5" />
             {/* "Add to project" until the session is filed, then "Move
                 session" to switch or remove it. */}
-            {currentProject ? "Move session" : "Add to project"}
+            {nestingEnabled || currentProject ? "Move session" : "Add to project"}
           </C.Item>
         ) : (
           <C.Sub>
@@ -5295,16 +5428,12 @@ export function ConversationMenuItems({
               className="mobile-touch-target whitespace-nowrap"
             >
               <FolderInputIcon className="size-3.5" />
-              {currentProject ? "Move session" : "Add to project"}
+              {nestingEnabled || currentProject ? "Move session" : "Add to project"}
             </C.SubTrigger>
             <C.SubContent className="min-w-56">
               {/* A native submenu flyout — no separate popover layer, so no
                   open/dismiss race with the parent menu. */}
-              <ProjectPickerMenu
-                components={C}
-                currentProject={currentProject}
-                onSelect={handleProjectSelect}
-              />
+              {movePicker}
             </C.SubContent>
           </C.Sub>
         ))}
@@ -6011,6 +6140,11 @@ function ConversationRowImpl({
 
   // Owners' live rows reorder; any row in the same list is a target.
   const canReorder = reorderGroup !== undefined && isOwner && !isArchived;
+  const canMoveNest =
+    serverInfo !== "loading" &&
+    serverInfo.sibling_sessions === true &&
+    isOwner &&
+    !conversation.parent_session_id;
   // Drag-and-drop: a row is grabbable when the viewer owns it (re-filing is
   // owner-only, like the Move-to-project kebab item), outside selection /
   // archive / rename modes. Dragging it onto a project folder files it there;
@@ -6030,11 +6164,13 @@ function ConversationRowImpl({
       isPinned,
       canManage: isOwner && !familyIndented && !isIndentedSibling(conversation),
       canMoveProject: !isIndentedSibling(conversation),
+      canMoveNest,
+      familyId: conversation.family?.id,
       reorderGroup: canReorder ? reorderGroup : undefined,
       reorderIndex,
     },
     disabled:
-      ((familyIndented || isIndentedSibling(conversation)) && !gridsEnabled) ||
+      ((familyIndented || isIndentedSibling(conversation)) && !gridsEnabled && !canMoveNest) ||
       (!isOwner && !gridsEnabled) ||
       selectionMode ||
       isArchived ||
@@ -6049,6 +6185,23 @@ function ConversationRowImpl({
     id: `session-order:${conversation.id}`,
     data: { type: "session-order", id: conversation.id, group: reorderGroup },
     disabled: reorderGroup === undefined || isEditing || isProvisionalRow,
+  });
+  const { setNodeRef: setNestNodeRef, isOver: isNestTarget } = useDroppable({
+    id: `nest:${conversation.id}`,
+    data: {
+      type: "nest",
+      id: conversation.id,
+      familyId: conversation.family?.id,
+      label,
+      project: currentProject,
+    },
+    disabled:
+      !canMoveNest ||
+      !conversation.family ||
+      isArchived ||
+      isEditing ||
+      isProvisionalRow ||
+      selectionMode,
   });
   // Like pins, a row dragged down lands below this one; one dragged up, above it.
   let reorderInsertion: "before" | "after" | undefined;
@@ -6079,8 +6232,9 @@ function ConversationRowImpl({
       setDragNodeRef(node);
       setPinOrderNodeRef(node);
       setSessionOrderNodeRef(node);
+      setNestNodeRef(node);
     },
-    [setDragNodeRef, setPinOrderNodeRef, setSessionOrderNodeRef],
+    [setDragNodeRef, setPinOrderNodeRef, setSessionOrderNodeRef, setNestNodeRef],
   );
   // Timestamps of the last two clicks this row received, for the dblclick
   // rename guard: the list can reorder between the two clicks of a
@@ -6352,7 +6506,13 @@ function ConversationRowImpl({
           dragListeners?.onTouchStart?.(event);
         }
       }}
-      className={cn("group relative", familyIndented && "ml-6", isDragging && "opacity-40")}
+      className={cn(
+        "group relative",
+        familyIndented && "ml-6",
+        isDragging && "opacity-40",
+        isNestTarget && DROP_TARGET_HIGHLIGHT,
+      )}
+      data-nest-drop-target={isNestTarget || undefined}
       data-sibling-session={familyIndented || undefined}
     >
       {familyIndented && <span aria-hidden="true" className={SIDEBAR_FAMILY_LINE} />}
@@ -7388,83 +7548,108 @@ function ProjectFolderMenu({
   );
 }
 
-// ── ProjectPickerMenu ─────────────────────────────────────────────────────────
-
-/**
- * Project picker rendered as the body of a {@link DropdownMenuSubContent}.
- *
- * Lives inside the kebab menu's submenu flyout rather than a separate popover —
- * that avoids the open/dismiss race that made a standalone popover flash open
- * and vanish. The search / new-project inputs stop key events from bubbling so
- * the menu's built-in typeahead and arrow-key navigation don't hijack typing.
- */
-function ProjectPickerMenu({
+/** Searchable destinations shared by desktop and mobile Move session menus. */
+function SessionMovePickerMenu({
   components: C,
   currentProject,
   onSelect,
+  conversation,
+  canMoveProject,
+  nestingEnabled,
+  nestSaving,
+  onNestSelect,
 }: {
   components: MenuComponents;
   currentProject: string | null;
   onSelect: (project: string) => void;
+  conversation: Conversation;
+  canMoveProject: boolean;
+  nestingEnabled: boolean;
+  nestSaving: boolean;
+  onNestSelect: (sourceId: string | null) => void;
 }) {
   const { data: projects = [] } = useProjects();
+  const nests = useContext(NestDestinationsContext);
   const [search, setSearch] = useState("");
-
   const trimmed = search.trim();
-  const filtered = projectsMatching(projects, search);
-  // Offer create only when the typed name isn't already an exact project.
-  const canCreate = canCreateProject(projects, search);
-  const currentProjectIcon = projects.find((p) => p.name === currentProject)?.icon;
-
-  // Keep keystrokes inside the inputs from reaching the menu's typeahead /
-  // navigation handlers (which would otherwise steal letters and arrows).
-  const swallowKeys = (e: KeyboardEvent<HTMLInputElement>) => e.stopPropagation();
+  const matchesSearch = (name: string) => name.toLowerCase().includes(trimmed.toLowerCase());
+  const filtered = canMoveProject ? projects.filter((project) => matchesSearch(project.name)) : [];
+  const filteredNests = nestingEnabled
+    ? nests.filter(
+        (row) =>
+          row.family?.id !== conversation.family?.id &&
+          matchesSearch(conversationDisplayLabel(row)),
+      )
+    : [];
+  const canCreate =
+    canMoveProject &&
+    trimmed.length > 0 &&
+    !projects.some((project) => project.name.toLowerCase() === trimmed.toLowerCase());
+  const currentProjectIcon = projects.find((project) => project.name === currentProject)?.icon;
 
   return (
     <>
-      {/* Combobox-style search: a leading magnifier inside a borderless input,
-          with a divider beneath separating it from the results. */}
       <div className="flex items-center gap-2 border-b px-2 py-1.5">
         <SearchIcon className="size-3.5 shrink-0 text-muted-foreground" />
         <input
           className="w-full bg-transparent text-sm outline-none placeholder:text-muted-foreground"
-          placeholder="Search or create project"
+          placeholder={nestingEnabled ? "Search destinations" : "Search or create project"}
           value={search}
-          onChange={(e) => setSearch(e.target.value)}
-          onKeyDown={swallowKeys}
+          onChange={(event) => setSearch(event.target.value)}
+          onKeyDown={(event) => event.stopPropagation()}
         />
       </div>
       <div className="max-h-48 overflow-y-auto">
-        {filtered.map((p) => (
+        {nestingEnabled && canMoveProject && filtered.length > 0 && (
+          <div className="px-2 py-1.5 text-xs text-muted-foreground">Projects</div>
+        )}
+        {filtered.map((project) => (
           <C.Item
-            key={p.name}
+            key={project.name}
             className="px-2 py-1"
-            textValue={p.name}
-            onSelect={() => onSelect(p.name)}
+            textValue={project.name}
+            onSelect={() => onSelect(project.name)}
           >
-            <ProjectRowIcon icon={p.icon} />
-            <span className="flex-1 truncate text-left">{p.name}</span>
-            {currentProject === p.name && (
+            <ProjectRowIcon icon={project.icon} />
+            <span className="flex-1 truncate text-left">{project.name}</span>
+            {currentProject === project.name && (
               <CheckMarkIcon className="size-3.5 shrink-0 text-primary" />
             )}
           </C.Item>
         ))}
-        {filtered.length === 0 && !canCreate && (
-          <p className="px-2 py-1.5 text-sm text-muted-foreground">No projects yet.</p>
+        {filteredNests.length > 0 && (
+          <div className="px-2 py-1.5 text-xs text-muted-foreground">Nests</div>
+        )}
+        {filteredNests.map((nest) => (
+          <C.Item
+            key={nest.id}
+            className="px-2 py-1"
+            textValue={conversationDisplayLabel(nest)}
+            disabled={nestSaving}
+            onSelect={() => onNestSelect(nest.id)}
+          >
+            <GitBranchIcon className="size-3.5 shrink-0 text-muted-foreground" />
+            <span className="flex-1 truncate text-left">{conversationDisplayLabel(nest)}</span>
+          </C.Item>
+        ))}
+        {filtered.length === 0 && filteredNests.length === 0 && !canCreate && (
+          <p className="px-2 py-1.5 text-sm text-muted-foreground">
+            {nestingEnabled ? "No matching destinations." : "No projects yet."}
+          </p>
         )}
       </div>
       {canCreate && (
         <div className="border-t pt-1">
           <C.Item className="px-2 py-1" onSelect={() => onSelect(trimmed)}>
             <PlusIcon className="size-3.5 shrink-0 text-muted-foreground" />
-            Create{" "}
+            {nestingEnabled ? "Create project" : "Create"}{" "}
             <span className="truncate rounded bg-muted px-1 py-0.5 font-mono text-[0.95em]">
               {trimmed}
             </span>
           </C.Item>
         </div>
       )}
-      {currentProject && (
+      {canMoveProject && currentProject && (
         <div className="border-t pt-1">
           <C.Item
             className="px-2 py-1"
@@ -7476,6 +7661,19 @@ function ProjectPickerMenu({
             <span className="rounded bg-muted px-1 py-0.5 font-mono text-[0.95em]">
               {currentProject}
             </span>
+          </C.Item>
+        </div>
+      )}
+      {nestingEnabled && conversation.family && (
+        <div className="border-t pt-1">
+          <C.Item
+            className="px-2 py-1"
+            textValue="Remove from nest"
+            disabled={nestSaving}
+            onSelect={() => onNestSelect(null)}
+          >
+            <GitBranchIcon className="size-3.5 shrink-0 text-muted-foreground" />
+            Remove from nest
           </C.Item>
         </div>
       )}

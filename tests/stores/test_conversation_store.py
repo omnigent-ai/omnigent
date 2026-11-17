@@ -10428,10 +10428,10 @@ async def test_sibling_family_lifecycle(tmp_path, split_database, user_id, monke
     assert store.get_conversation(replacement.id).project_id is None
     assert all(member.project_id == project_id for member in store.get_session_family(later.id))
     candidate = store.create_conversation()
-    with pytest.raises(OmnigentError, match="another family"):
-        store.add_new_sibling(replacement.id, candidate.id, user_id=user_id)
-    assert store.get_conversation(replacement.id).family_id is None
-    assert store.get_conversation(candidate.id).family_id is None
+    store.add_new_sibling(replacement.id, candidate.id, user_id=user_id)
+    replacement_family = store.get_conversation(replacement.id).family_id
+    assert replacement_family is not None and replacement_family != source.id
+    assert store.get_conversation(candidate.id).family_id == replacement_family
 
     another = store.create_conversation()
     another_sibling = store.create_conversation(labels={"omni_project": "Other project"})
@@ -10651,3 +10651,142 @@ def test_family_membership_is_independent_of_labels(conversation_store) -> None:
         source.id,
         sibling.id,
     }
+
+
+@pytest.mark.parametrize("split_database", [False, True])
+def test_move_sessions_between_nests(tmp_path, split_database, monkeypatch):
+    from omnigent.errors import OmnigentError
+    from omnigent.stores.conversation_store import (
+        SIDE_CHAT_LABEL_KEY,
+        family_pinned_label_key,
+        pinned_label_key,
+    )
+
+    store = SqlAlchemyConversationStore(
+        f"sqlite:///{tmp_path / 'metadata.db'}",
+        f"sqlite:///{tmp_path / 'messages.db'}" if split_database else None,
+    )
+    source = store.create_conversation(
+        conversation_id="1" * 32,
+        labels={"omni_project": "Planning", pinned_label_key("alice"): "123"},
+    )
+    moved = store.create_conversation(
+        conversation_id="2" * 32,
+        labels={"omni_project": "Other", pinned_label_key("alice"): "234", "custom": "keep"},
+    )
+    store.set_session_nest(moved.id, source.id, user_id="alice")
+    saved = store.get_conversation(moved.id)
+    assert saved.family_id == source.id
+    assert saved.labels["omni_project"] == "Planning"
+    assert saved.labels[family_pinned_label_key("alice")] == "123"
+    assert saved.labels[pinned_label_key("alice")] == "234"
+    assert saved.labels["custom"] == "keep"
+    assert (
+        saved.parent_conversation_id,
+        saved.root_conversation_id,
+        saved.runner_id,
+        saved.host_id,
+    ) == (moved.parent_conversation_id, moved.root_conversation_id, moved.runner_id, moved.host_id)
+    peer = store.create_conversation()
+    store.add_new_sibling(source.id, peer.id, user_id="alice")
+    other = store.create_conversation()
+    store.set_conversation_project(other.id, "a" * 32)
+    store.set_session_nest(moved.id, other.id, user_id="alice")
+    saved = store.get_conversation(moved.id)
+    assert saved.family_id == other.id and saved.project_id == "a" * 32
+    assert "omni_project" not in saved.labels
+    assert family_pinned_label_key("alice") not in saved.labels
+    assert saved.labels[pinned_label_key("alice")] == "234"
+    assert {member.id for member in store.get_session_family(source.id)} == {source.id, peer.id}
+    store.set_session_nest(moved.id, None, user_id="alice")
+    saved = store.get_conversation(moved.id)
+    assert saved.family_id is None and saved.project_id == "a" * 32
+    assert saved.labels[pinned_label_key("alice")] == "234"
+    store.set_session_nest(source.id, None, user_id="alice")
+    assert store.get_conversation(source.id).family_id is None
+    assert family_pinned_label_key("alice") not in store.get_conversation(source.id).labels
+    assert store.get_conversation(peer.id).family_id == source.id
+    candidate = store.create_conversation()
+    store.add_new_sibling(source.id, candidate.id, user_id="alice")
+    replacement_family = store.get_conversation(source.id).family_id
+    assert replacement_family is not None and replacement_family != source.id
+    assert store.get_conversation(candidate.id).family_id == replacement_family
+    assert store.get_conversation(peer.id).family_id == source.id
+
+    for settings in (
+        {"parent_conversation_id": source.id},
+        {"labels": {SIDE_CHAT_LABEL_KEY: "1"}},
+    ):
+        unavailable = store.create_conversation(**settings)
+        with pytest.raises(OmnigentError, match="independent"):
+            store.set_session_nest(unavailable.id, source.id, user_id="alice")
+        assert store.get_conversation(unavailable.id).family_id is None
+    monkeypatch.setattr(
+        "omnigent.stores.conversation_store.sqlalchemy_store.MAX_SESSION_FAMILY_MEMBERS", 2
+    )
+    with pytest.raises(OmnigentError, match="up to 2"):
+        store.set_session_nest(moved.id, source.id, user_id="alice")
+    assert store.get_conversation(moved.id).family_id is None
+
+
+@pytest.mark.parametrize("detach", [False, True])
+@pytest.mark.parametrize("interleave", [False, True])
+def test_failed_split_database_nest_move_restores_membership(
+    tmp_path, monkeypatch, detach, interleave
+):
+    from omnigent.stores.conversation_store import (
+        family_pinned_label_key,
+        pinned_label_key,
+        sqlalchemy_store,
+    )
+
+    store = SqlAlchemyConversationStore(
+        f"sqlite:///{tmp_path / 'metadata.db'}", f"sqlite:///{tmp_path / 'messages.db'}"
+    )
+    source = store.create_conversation(
+        conversation_id="1" * 32, labels={"omni_project": "Original"}
+    )
+    moved = store.create_conversation(conversation_id="2" * 32)
+    store.add_new_sibling(source.id, moved.id, user_id="alice")
+    store.set_family_pin(source.id, "123", user_id="alice")
+    store.set_labels(moved.id, {pinned_label_key("alice"): "234"})
+    destination = store.create_conversation(conversation_id="3" * 32)
+    peer = store.create_conversation()
+    store.add_new_sibling(destination.id, peer.id, user_id="alice")
+    store.set_conversation_project(destination.id, "a" * 32)
+    original = store._profile_label_session
+    original_write = sqlalchemy_store.run_write_transaction
+    failed = False
+
+    @contextmanager
+    def fail_labels(session, *, read_only=False):
+        nonlocal failed
+        with original(session, read_only=read_only) as labels_session:
+            yield labels_session
+            if not read_only and not failed and not interleave:
+                failed = True
+                raise RuntimeError("label transaction unavailable")
+
+    def interleave_family_changes(session_maker, operation_name, callback, **kwargs):
+        if interleave and operation_name == "copy_session_nest_labels":
+            store.set_conversation_project(source.id, "b" * 32)
+            store.set_family_pin(source.id, "456", user_id="alice")
+            raise RuntimeError("label transaction unavailable")
+        return original_write(session_maker, operation_name, callback, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(store, "_profile_label_session", fail_labels)
+        patch.setattr(sqlalchemy_store, "run_write_transaction", interleave_family_changes)
+        with pytest.raises(RuntimeError, match="label transaction unavailable"):
+            store.set_session_nest(moved.id, None if detach else destination.id, user_id="alice")
+    saved = store.get_conversation(moved.id)
+    assert saved.family_id == source.id
+    assert saved.project_id == ("b" * 32 if interleave else None)
+    assert saved.labels.get("omni_project") == (None if interleave else "Original")
+    assert saved.labels[family_pinned_label_key("alice")] == ("456" if interleave else "123")
+    assert saved.labels[pinned_label_key("alice")] == "234"
+    store.set_session_nest(moved.id, None if detach else destination.id, user_id="alice")
+    saved = store.get_conversation(moved.id)
+    assert saved.family_id == (None if detach else destination.id)
+    assert saved.project_id == (("b" * 32 if interleave else None) if detach else "a" * 32)
+    assert family_pinned_label_key("alice") not in saved.labels

@@ -2689,6 +2689,38 @@ export function useMoveToProject() {
   });
 }
 
+/** Move one session into a nest, or detach it when sourceId is null. */
+export function useMoveToNest() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ id, sourceId }: { id: string; sourceId: string | null }) => {
+      const response = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(id)}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ nest_source_id: sourceId }),
+      });
+      if (!response.ok) throw await apiErrorFromResponse(response);
+    },
+    onSuccess: () => {
+      // Moving one member can change both nests' representatives, projects and pins.
+      for (const queryKey of [
+        ["conversations"],
+        ["project-sessions"],
+        PINNED_CONVERSATIONS_KEY,
+        ["conversation-backfill"],
+        ["session"],
+        ["projects"],
+        ARCHIVED_PROJECT_NAMES_KEY,
+      ]) {
+        void queryClient.invalidateQueries({ queryKey });
+      }
+    },
+    onError: (error) => {
+      showToast(error instanceof Error ? error.message : "Couldn't move session.");
+    },
+  });
+}
+
 /**
  * Collect every session id filed under a project, paging through the
  * server-side `?project=` filter (archived included). Used by "Delete project"

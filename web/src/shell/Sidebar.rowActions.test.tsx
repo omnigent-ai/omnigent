@@ -65,6 +65,7 @@ const mocks = vi.hoisted(() => {
     projects: [] as string[],
     projectIcons: {} as Record<string, string | null | undefined>,
     moveToProject: { mutate: vi.fn() },
+    moveToNest: { mutate: vi.fn(), isPending: false },
     leave: { mutate: vi.fn(), isPending: false },
     // The signed-in viewer. Rows with no `owner` read as owned by them; a row
     // owned by someone else is the shared case Leave applies to.
@@ -125,6 +126,7 @@ vi.mock("@/hooks/useConversations", async () => {
       isFetchingNextPage: false,
     }),
     useMoveToProject: () => mocks.moveToProject,
+    useMoveToNest: () => mocks.moveToNest,
   };
 });
 
@@ -296,6 +298,7 @@ beforeEach(() => {
   mocks.rename.isSuccess = false;
   mocks.rename.isError = false;
   mocks.moveToProject.mutate.mockReset();
+  mocks.moveToNest.mutate.mockReset();
   mocks.leave.mutate.mockReset();
   mocks.projects = [];
   mocks.projectIcons = {};
@@ -1275,6 +1278,94 @@ describe("mobile in-place project picker", () => {
     // Radix SubTrigger advertises a submenu popup.
     expect(moveItem).toHaveAttribute("aria-haspopup", "menu");
     expect(screen.queryByTestId("project-picker-back")).toBeNull();
+  });
+});
+
+describe("Move session nest destinations", () => {
+  const family = { id: "nest", representative_id: "nest", pinned: false };
+  const destination = { ...CONV, id: "nest", title: "Research", family };
+  const openMove = async (mobile: boolean, id = CONV.id) => {
+    const row = screen
+      .getByRole("link", { name: id === CONV.id ? CONV.title! : "Research" })
+      .closest("li")!;
+    fireEvent.pointerDown(row.querySelector('[data-testid="conversation-actions"]')!, {
+      button: 0,
+    });
+    const move = screen.getByTestId("move-to-project");
+    expect(move).toHaveTextContent("Move session");
+    expect(screen.queryByRole("menuitem", { name: "Remove from nest" })).toBeNull();
+    if (mobile) fireEvent.click(move);
+    else {
+      move.focus();
+      fireEvent.keyDown(move, { key: "ArrowRight" });
+    }
+    await screen.findByPlaceholderText("Search destinations");
+  };
+
+  it.each([false, true])(
+    "moves into an existing nest inside Move session (mobile: %s)",
+    async (mobile) => {
+      mocks.isMobile = mobile;
+      mocks.projects = ["Planning"];
+      mockConversations([
+        CONV,
+        destination,
+        { ...CONV, id: "peer", title: "Peer", family },
+        { ...CONV, id: "standalone", title: "Other standalone" },
+        {
+          ...destination,
+          id: "shared",
+          title: "Shared nest",
+          owner: "other@example.com",
+          family: { ...family, id: "shared", representative_id: "shared" },
+        },
+      ]);
+      renderSidebar(undefined, serverInfo({ sibling_sessions: true }));
+      fireEvent.click(screen.getByRole("button", { name: "Collapse session family" }));
+      expect(screen.queryByRole("link", { name: "Peer" })).toBeNull();
+      mocks.moveToNest.mutate.mockImplementation((_variables, options) => options.onSuccess());
+      await openMove(mobile);
+      expect(screen.getByRole("menuitem", { name: "Planning" })).toBeInTheDocument();
+      expect(screen.queryByRole("menuitem", { name: "Peer" })).toBeNull();
+      expect(screen.queryByRole("menuitem", { name: "Other standalone" })).toBeNull();
+      expect(screen.queryByRole("menuitem", { name: "Shared nest" })).toBeNull();
+      fireEvent.change(screen.getByPlaceholderText("Search destinations"), {
+        target: { value: "research" },
+      });
+      expect(screen.queryByRole("menuitem", { name: "Planning" })).toBeNull();
+      fireEvent.click(screen.getByRole("menuitem", { name: "Research" }));
+      expect(mocks.moveToNest.mutate).toHaveBeenCalledExactlyOnceWith(
+        { id: CONV.id, sourceId: "nest" },
+        expect.any(Object),
+      );
+      expect(mocks.moveToProject.mutate).not.toHaveBeenCalled();
+      expect(screen.getByRole("link", { name: "Peer" })).toBeInTheDocument();
+    },
+  );
+
+  it.each([CONV.id, "nest"])("removes only %s from its nest through Move session", async (id) => {
+    mocks.isMobile = true;
+    mocks.projects = ["Planning"];
+    mockConversations([{ ...CONV, family }, destination]);
+    renderSidebar(undefined, serverInfo({ sibling_sessions: true }));
+    await openMove(true, id);
+    expect(screen.queryByRole("menuitem", { name: "Research" })).toBeNull();
+    if (id === CONV.id) expect(screen.queryByRole("menuitem", { name: "Planning" })).toBeNull();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Remove from nest" }));
+    expect(mocks.moveToNest.mutate).toHaveBeenCalledExactlyOnceWith(
+      { id, sourceId: null },
+      expect.any(Object),
+    );
+  });
+
+  it("keeps nest actions hidden when nested agents are disabled", () => {
+    mocks.isMobile = true;
+    mockConversations([CONV, destination]);
+    renderSidebar(undefined, serverInfo({ sibling_sessions: false }));
+    fireEvent.pointerDown(screen.getAllByTestId("conversation-actions")[0], { button: 0 });
+    fireEvent.click(screen.getByTestId("move-to-project"));
+    expect(screen.getByPlaceholderText("Search or create project")).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "Research" })).toBeNull();
   });
 });
 

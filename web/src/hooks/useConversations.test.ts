@@ -34,6 +34,7 @@ import {
   useRenameProject,
   useUpdateProjectConfig,
   useMoveToProject,
+  useMoveToNest,
   useRenameConversation,
   useStopAndDeleteConversation,
   useStopSession,
@@ -4577,4 +4578,57 @@ it("uses the configured API page size for archived initial loads and pagination"
   expect(calls[1].get("after")).toBe(first.last_id);
   unmount();
   client.clear();
+});
+
+describe("useMoveToNest", () => {
+  it.each([null, "target"])(
+    "PATCHes membership to %s and refreshes both nests' cached context",
+    async (sourceId) => {
+      fetchMock.mockResolvedValueOnce(mockResponse({ id: "session/one" }));
+      const client = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+      const invalidate = vi.spyOn(client, "invalidateQueries");
+      const wrapper = ({ children }: { children: ReactNode }) =>
+        createElement(QueryClientProvider, { client }, children);
+      const { result } = renderHook(() => useMoveToNest(), { wrapper });
+      await act(() => result.current.mutateAsync({ id: "session/one", sourceId }));
+      const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+      expect(url).toBe("/v1/sessions/session%2Fone");
+      expect(init.method).toBe("PATCH");
+      expect(JSON.parse(init.body as string)).toEqual({ nest_source_id: sourceId });
+      for (const queryKey of [
+        ["conversations"],
+        ["project-sessions"],
+        PINNED_CONVERSATIONS_KEY,
+        ["conversation-backfill"],
+        ["session"],
+        ["projects"],
+      ]) {
+        expect(invalidate).toHaveBeenCalledWith({ queryKey });
+      }
+    },
+  );
+
+  it("shows the server's rejection without changing cached membership", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({ error: { message: "Nest is full" } }, { ok: false, status: 400 }),
+    );
+    const client = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    const existing = { family: { id: "old" } };
+    client.setQueryData(["conversation-backfill", "session"], existing);
+    const invalidate = vi.spyOn(client, "invalidateQueries");
+    const toast = vi.fn();
+    window.addEventListener("omnigent:toast", toast);
+    onTestFinished(() => window.removeEventListener("omnigent:toast", toast));
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client }, children);
+    const { result } = renderHook(() => useMoveToNest(), { wrapper });
+    await act(async () => {
+      await expect(
+        result.current.mutateAsync({ id: "session", sourceId: "target" }),
+      ).rejects.toThrow("Nest is full");
+    });
+    expect(toast.mock.calls[0][0].detail.content).toBe("Nest is full");
+    expect(client.getQueryData(["conversation-backfill", "session"])).toEqual(existing);
+    expect(invalidate).not.toHaveBeenCalled();
+  });
 });

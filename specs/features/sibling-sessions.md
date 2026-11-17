@@ -31,14 +31,15 @@ The first seven items transcribe the whiteboard with the subsequent clarificatio
 3. Pinning the representative pins the family. Pinning another member creates
    an individual shortcut, temporarily removing it from the nest until unpinned.
    Family pins survive promotion and include future members; unpinning the family preserves individual pins.
-4. An indented member cannot move independently or detach from its family.
-   Custom ordering moves the whole family and preserves its position when the
+4. Owners can move an existing independent session into another nest or remove
+   one member from its nest. Custom ordering moves the whole family and preserves its position when the
    representative changes. Status grouping uses the highest-priority member status.
 5. Ordinary **Fork** creates a standalone session and can reuse the source's
-   ephemeral host. Neither an existing sibling nor an existing standalone
-   session can join another family. Membership is assigned only during creation.
+   ephemeral host. Existing standalone sessions and siblings can join another
+   nest afterward through drag-and-drop or the **Move session** submenu.
 6. The representative moves the whole family between projects, including
-   archived members. Menus, drag actions, bulk actions and the server enforce it.
+   archived members. Joining a nest moves only the selected session and inherits
+   the destination's project and family pin; leaving keeps its current project.
 7. Nested presentation for shared viewers is optional. Shared views remain flat.
 
 Additional requirements:
@@ -79,9 +80,12 @@ Additional requirements:
 
 Store membership in nullable `omnigent_conversation_metadata.family_id`, using
 the original source session ID as the durable family ID. A standalone session
-has no family ID, and execution parent/root links remain unchanged. Only sibling
-creation assigns membership; client labels and PATCH cannot change it. Ordinary
-forks start standalone. Per-user family pins retain their server-owned labels,
+has no family ID, and execution parent/root links remain unchanged. Sibling
+creation and the owner-only `nest_source_id` PATCH assign membership; generic
+labels cannot change it. A null source detaches one session, and a source ID
+joins that session's nest. Send this field alone to avoid partial metadata updates. Ordinary
+forks start standalone. A detached original source can form a new nest with a
+fresh family ID while its former peers retain the old ID. Per-user family pins retain their server-owned labels,
 which generic label writers cannot change and forks do not inherit.
 
 A family supports up to 100 retained members, including archived members. This

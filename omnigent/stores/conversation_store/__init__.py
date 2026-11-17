@@ -1617,6 +1617,12 @@ class ConversationStore(ABC):
         """Assign a freshly created session to its source's family before launch."""
         raise NotImplementedError
 
+    def set_session_nest(
+        self, session_id: str, source_id: str | None, *, user_id: str | None
+    ) -> None:
+        """Move an independent session into a source's nest, or detach it with None."""
+        raise NotImplementedError
+
     def get_session_family(self, session_id: str) -> list[Conversation]:
         """Return family members in stable creation order, including archived members."""
         raise NotImplementedError

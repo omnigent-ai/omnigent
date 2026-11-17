@@ -15,6 +15,7 @@ const mocks = vi.hoisted(() => ({
   filterHonored: true,
   pinFn: vi.fn(),
   reorderPins: vi.fn(),
+  moveToNest: vi.fn(),
 }));
 
 vi.mock("@/hooks/useConversations", async () => {
@@ -34,6 +35,7 @@ vi.mock("@/hooks/useConversations", async () => {
         mutationFn: (vars: unknown) => mocks.pinFn(vars),
       }),
     useReorderPinnedConversations: () => ({ mutate: mocks.reorderPins }),
+    useMoveToNest: () => ({ mutate: mocks.moveToNest, isPending: false }),
   };
 });
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
@@ -42,6 +44,7 @@ import { useConversations } from "@/hooks/useConversations";
 import { Toaster } from "@/components/ui/sonner";
 import { toast } from "sonner";
 import { PINNED_CONVERSATION_IDS_STORAGE_KEY } from "./sidebarNav";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 
 const ROW_HEIGHT = 30;
 
@@ -51,6 +54,8 @@ function stubRowRects() {
   return vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (
     this: Element,
   ) {
+    if (this.matches('[data-testid="sidebar-remove-from-nest"]'))
+      return new DOMRect(0, -50, 200, 30);
     const rows = [...document.querySelectorAll("li[data-sidebar-session-id]")];
     const index = rows.indexOf(this);
     if (index < 0) return new DOMRect(0, 0, 0, 0);
@@ -70,6 +75,7 @@ function stubPinZoneRect(pinnedRows: number) {
 }
 
 function rowCenter(id: string) {
+  if (id === "__remove_nest__") return { clientX: 50, clientY: -35 };
   const rows = [...document.querySelectorAll("li[data-sidebar-session-id]")];
   const index = rows.findIndex((row) => row.getAttribute("data-sidebar-session-id") === id);
   return { clientX: 50, clientY: index * ROW_HEIGHT + ROW_HEIGHT / 2 };
@@ -108,6 +114,86 @@ beforeEach(() => {
     conversationPage([conv("conv_c"), conv("conv_d")]),
   );
   stubRowRects();
+});
+
+describe("moving sessions between nests by drag", () => {
+  const destination = { id: "conv_d", representative_id: "conv_d", pinned: false };
+  const original = { id: "conv_a", representative_id: "conv_a", pinned: false };
+  const renderNests = () =>
+    renderSidebar({
+      info: {
+        ...FALLBACK_SERVER_INFO,
+        sibling_sessions: true,
+        features: { sidebar_grouping_ui: true },
+      },
+    });
+
+  beforeEach(() => {
+    mocks.pinned = [];
+    localStorage.setItem("omnigent:sidebar-view", JSON.stringify({ ordering: "created" }));
+    vi.mocked(useConversations).mockImplementation(() =>
+      conversationPage([
+        conv("conv_a", { family: original }),
+        conv("conv_b", { family: original }),
+        conv("conv_c"),
+        conv("conv_d", { family: destination }),
+        conv("conv_peer", { family: destination }),
+      ]),
+    );
+  });
+
+  it.each(["conv_c", "conv_b", "conv_a"])("moves only %s into the target nest", async (source) => {
+    renderNests();
+    await dropOnto(source, "conv_d", {
+      expectTarget: false,
+      whileOver: () => {
+        expect(screen.getByRole("link", { name: "conv_d" }).closest("li")).toHaveAttribute(
+          "data-nest-drop-target",
+          "true",
+        );
+        expect(screen.getByText("Move into nest: conv_d")).toBeInTheDocument();
+      },
+    });
+    expect(mocks.moveToNest).toHaveBeenCalledExactlyOnceWith(
+      { id: source, sourceId: "conv_d" },
+      expect.any(Object),
+    );
+    expect(mocks.pinFn).not.toHaveBeenCalled();
+    expect(mocks.reorderPins).not.toHaveBeenCalled();
+  });
+
+  it.each(["conv_a", "conv_b"])("detaches %s through the temporary drop target", async (source) => {
+    renderNests();
+    expect(screen.queryByTestId("sidebar-remove-from-nest")).toBeNull();
+    await dropOnto(source, "__remove_nest__", { expectTarget: false });
+    expect(mocks.moveToNest).toHaveBeenCalledExactlyOnceWith(
+      { id: source, sourceId: null },
+      expect.any(Object),
+    );
+    expect(screen.queryByTestId("sidebar-remove-from-nest")).toBeNull();
+  });
+
+  it("keeps reordering at the row edges and ignores moves within the same nest", async () => {
+    renderNests();
+    await dropOnto("conv_b", "conv_a", { expectTarget: false });
+    expect(mocks.moveToNest).not.toHaveBeenCalled();
+    await dropOnto("conv_c", "conv_d", {
+      expectTarget: false,
+      offsetY: ROW_HEIGHT / 3,
+      whileOver: () => expect(screen.getByTestId("session-order-insertion")).toBeInTheDocument(),
+    });
+    expect(mocks.moveToNest).not.toHaveBeenCalled();
+    expect(JSON.parse(localStorage.getItem("omnigent:sidebar-view")!)).toMatchObject({
+      ordering: "custom",
+    });
+  });
+
+  it("does not offer membership moves when nested agents are disabled", async () => {
+    renderSidebar({ features: { sidebar_grouping_ui: true } });
+    await dropOnto("conv_c", "conv_d", { expectTarget: false });
+    expect(mocks.moveToNest).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("sidebar-remove-from-nest")).toBeNull();
+  });
 });
 
 afterEach(async () => {

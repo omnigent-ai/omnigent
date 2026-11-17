@@ -3076,3 +3076,50 @@ async def test_explicit_host_endpoint_refuses_without_capability_or_source(
     )
     assert response.status_code == 403, response.text
     assert {session.id for session in store.list_conversations().data} == before
+
+
+async def test_owner_can_move_independent_sessions_between_nests(auth_client, peers, db_uri):
+    source, target, _ = peers
+    store = SqlAlchemyConversationStore(db_uri)
+    for extra in ({"project_id": ""}, {"labels": {"omni_project": "Other"}}):
+        refused = await auth_client.patch(
+            f"/v1/sessions/{target['id']}", json={"nest_source_id": source["id"], **extra}
+        )
+        assert refused.status_code == 400, refused.text
+        assert store.get_conversation(target["id"]).family_id is None
+    joined = await auth_client.patch(
+        f"/v1/sessions/{target['id']}", json={"nest_source_id": source["id"]}
+    )
+    assert joined.status_code == 200, joined.text
+    assert joined.json()["family"]["id"] == source["id"]
+    unchanged = await auth_client.patch(f"/v1/sessions/{target['id']}", json={"title": "Renamed"})
+    assert unchanged.status_code == 200, unchanged.text
+    assert unchanged.json()["family"]["id"] == source["id"]
+    other = await _create_session_as(auth_client, "", "bob")
+    refused = await auth_client.patch(
+        f"/v1/sessions/{target['id']}", json={"nest_source_id": other["id"]}
+    )
+    assert refused.status_code == 403, refused.text
+    assert store.get_conversation(target["id"]).family_id == source["id"]
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    permissions.grant("bob", target["id"], LEVEL_EDIT)
+    refused = await auth_client.patch(
+        f"/v1/sessions/{target['id']}",
+        json={"nest_source_id": None},
+        headers={"X-Forwarded-Email": "bob"},
+    )
+    assert refused.status_code == 403, refused.text
+    child = store.create_conversation(
+        agent_id=source["agent_id"], parent_conversation_id=source["id"]
+    )
+    refused = await auth_client.patch(
+        f"/v1/sessions/{child.id}", json={"nest_source_id": source["id"]}
+    )
+    assert refused.status_code == 400, refused.text
+    assert store.get_conversation(child.id).family_id is None
+    detached = await auth_client.patch(
+        f"/v1/sessions/{target['id']}", json={"nest_source_id": None}
+    )
+    assert detached.status_code == 200, detached.text
+    assert detached.json().get("family") is None
+    assert store.get_conversation(target["id"]).family_id is None
