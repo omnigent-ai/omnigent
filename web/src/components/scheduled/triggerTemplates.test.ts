@@ -604,6 +604,30 @@ describe("Slack DM triggers", () => {
     );
     expect(prompt).toContain("Watch: new Slack messages in #eng-support, C0123ABCD\n");
   });
+
+  it("saves a channel trigger's Slack lookups in its reply and reads each channel once", () => {
+    const prompt = renderTriggerPrompt(
+      "slack",
+      slack({ scope: "eng-support", scopeOperator: "is" }),
+      CTX,
+    );
+
+    // Later runs read the saved IDs from the previous reply instead of looking them up again.
+    expect(prompt).toContain(
+      "Your most recent reply's \"Slack IDs:\" line, when there is one, gives each channel's ID, the workspace URL",
+    );
+    expect(prompt).toContain('Above it, write a "Slack IDs:" line followed by one-line JSON');
+    expect(prompt).toContain("users.conversations");
+    expect(prompt).toContain("call conversations.history with the channel ID");
+    expect(prompt).toContain('pass "Output one JSON object per line for every message');
+    expect(prompt).toContain("archives/<channel ID>/p<ts without its dot>");
+  });
+
+  it("leaves DM triggers' lookups unchanged", () => {
+    const prompt = renderTriggerPrompt("slack", slack({ event: "dm", scope: "@alice" }), CTX);
+
+    expect(prompt).not.toContain("Slack IDs:");
+  });
 });
 
 describe("splitJqlOrderBy", () => {
@@ -1428,7 +1452,7 @@ describe("renderTriggerPrompt", () => {
       CTX,
     );
     expect(unfiltered).toContain("Watch: new Slack messages in #eng-support\n");
-    expect(unfiltered).toContain("Every top-level message counts.");
+    expect(unfiltered).toContain("Every other top-level message counts.");
   });
 
   it("renders the Linear search, reading every newest-first page before starting sessions", () => {
