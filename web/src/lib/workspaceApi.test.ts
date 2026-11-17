@@ -320,6 +320,27 @@ describe("readFileViaWorkspaceApi", () => {
 
     // Stops at the caller's limit and reports that more remain.
     expect((await listDirectoryViaWorkspaceApi("s-list", "src", 1))?.hasMore).toBe(true);
+    await expect(listDirectoryViaWorkspaceApi("s-list", "src", 0)).rejects.toThrow(RangeError);
+  });
+
+  it.each([
+    ["repeats its page token", 1, 2],
+    ["sends an empty page with a token", 0, 1],
+  ])("stops paging, and reports more, when the host %s", async (_case, entries, requests) => {
+    enable("workspace_api_server_access");
+    const page = create(ListDirectoryResponseSchema, {
+      entries: Array.from({ length: entries }, () => ({ name: "a.ts", path: "src/a.ts" })),
+      nextPageToken: "src/a.ts",
+    });
+    vi.mocked(authenticatedFetch).mockImplementation(
+      async () =>
+        new Response(toBinary(ListDirectoryResponseSchema, page), {
+          headers: { "content-type": "application/proto" },
+        }),
+    );
+
+    expect((await listDirectoryViaWorkspaceApi("s-list-stalled", "src", 1000))?.hasMore).toBe(true);
+    expect(authenticatedFetch).toHaveBeenCalledTimes(requests);
   });
 
   it("leaves a listing the host answers with an error to REST, and keeps the route for reads", async () => {
@@ -334,34 +355,49 @@ describe("readFileViaWorkspaceApi", () => {
     expect((await readFileViaWorkspaceApi("s-list-error", "notes.md"))?.content).toBe("héllo");
   });
 
-  it("starts a listing over on the next route when one fails part way", async () => {
-    enable("workspace_direct_access", "workspace_api_server_access");
-    const firstPage = create(ListDirectoryResponseSchema, {
-      entries: [{ name: "a.ts", path: "src/a.ts", type: EntryType.FILE }],
-      nextPageToken: "src/a.ts",
-    });
-    socket.mockResolvedValueOnce({
-      status: 200,
-      headers: { "content-type": "application/proto" },
-      body: toBinary(ListDirectoryResponseSchema, firstPage),
-    });
-    socket.mockRejectedValueOnce(new Error("the SSH connection closed"));
-    const serverTokens: string[] = [];
-    vi.mocked(authenticatedFetch).mockImplementation(async (input, init) => {
-      if (String(input).endsWith("/direct-access")) {
-        return Response.json({
-          host_id: "host-1",
-          socket_path: "/tmp/omnigent-workspace-x/workspace.sock",
-          token: "tok",
-          expires_at: Date.now() / 1000 + 300,
+  it.each([
+    ["answers", ["src/b.ts"]],
+    ["fails too", null],
+  ])(
+    "starts a listing over on the next route when one fails part way, and the server %s",
+    async (serverOutcome, expected) => {
+      enable("workspace_direct_access", "workspace_api_server_access");
+      const firstPage = create(ListDirectoryResponseSchema, {
+        entries: [{ name: "a.ts", path: "src/a.ts", type: EntryType.FILE }],
+        nextPageToken: "src/a.ts",
+      });
+      socket.mockResolvedValueOnce({
+        status: 200,
+        headers: { "content-type": "application/proto" },
+        body: toBinary(ListDirectoryResponseSchema, firstPage),
+      });
+      socket.mockRejectedValueOnce(new Error("the SSH connection closed"));
+      const serverTokens: string[] = [];
+      vi.mocked(authenticatedFetch).mockImplementation(async (input, init) => {
+        if (String(input).endsWith("/direct-access")) {
+          return Response.json({
+            host_id: "host-1",
+            socket_path: "/tmp/omnigent-workspace-x/workspace.sock",
+            token: "tok",
+            expires_at: Date.now() / 1000 + 300,
+          });
+        }
+        serverTokens.push(
+          fromBinary(ListDirectoryRequestSchema, init!.body as Uint8Array).pageToken,
+        );
+        if (!expected) return Response.json({ code: "internal", message: "down" }, { status: 500 });
+        const page = create(ListDirectoryResponseSchema, {
+          entries: [{ name: "b.ts", path: "src/b.ts", type: EntryType.FILE }],
         });
-      }
-      serverTokens.push(fromBinary(ListDirectoryRequestSchema, init!.body as Uint8Array).pageToken);
-      return Response.json({ code: "internal", message: "tunnel down" }, { status: 500 });
-    });
+        return new Response(toBinary(ListDirectoryResponseSchema, page), {
+          headers: { "content-type": "application/proto" },
+        });
+      });
 
-    expect(await listDirectoryViaWorkspaceApi("s-list-partial", "src", 1000)).toBeNull();
-    expect(socket).toHaveBeenCalledTimes(2);
-    expect(serverTokens).toEqual([""]);
-  });
+      const listed = await listDirectoryViaWorkspaceApi(`s-partial-${serverOutcome}`, "src", 1000);
+      expect(listed && listed.data.map((entry) => entry.path)).toEqual(expected);
+      expect(socket).toHaveBeenCalledTimes(2);
+      expect(serverTokens).toEqual([""]);
+    },
+  );
 });

@@ -267,7 +267,10 @@ async function listDirectory(
         modified_at: entry.modifyTime ? Number(entry.modifyTime.seconds) : null,
       });
     }
+    // A page that adds nothing, or repeats the token, would never end; report the rest as more.
+    const stalled = page.entries.length === 0 || page.nextPageToken === pageToken;
     pageToken = page.nextPageToken;
+    if (stalled) break;
   } while (pageToken && data.length < maxEntries);
   /* oxlint-enable no-await-in-loop */
   return { data, hasMore: pageToken !== "" };
@@ -313,7 +316,7 @@ async function viaWorkspaceApi<T>(
  *
  * :param sessionId: The session whose workspace to list.
  * :param path: Workspace-relative directory, ``""`` for the root.
- * :param maxEntries: Stop after this many entries, e.g. ``1000``.
+ * :param maxEntries: Stop after this many entries, e.g. ``1000``; must be positive.
  * :returns: The entries and whether more remain, or null when the caller
  *     should list through REST (see :func:`readFileViaWorkspaceApi`).
  */
@@ -323,6 +326,8 @@ export function listDirectoryViaWorkspaceApi(
   maxEntries: number,
   signal?: AbortSignal,
 ): Promise<{ data: ListedEntry[]; hasMore: boolean } | null> {
+  // The host reads a page size of 0 as its default, so a 0 limit would still return entries.
+  if (!(maxEntries > 0)) return Promise.reject(new RangeError("maxEntries must be positive"));
   return viaWorkspaceApi(
     sessionId,
     (client) => listDirectory(client, path, maxEntries, signal),
