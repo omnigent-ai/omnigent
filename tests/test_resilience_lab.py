@@ -523,6 +523,8 @@ def test_lab_diagnostics_project_records_and_upload_only_safe_file(
             {"wall": 10.0, "source": "stream", "status": "idle", "headers": private},
             {"wall": 11.0, "source": "stream", "status": "running"},
             {"wall": 12.0, "source": "snapshot", "status": "running", "runner_online": True},
+            {"wall": 12.5, "source": "stream", "status": "launching"},
+            {"wall": 13.0, "source": "stream", "status": private},
             {"wall": float("nan"), "source": private, "status": private},
         ],
     )
@@ -587,8 +589,13 @@ def test_lab_diagnostics_project_records_and_upload_only_safe_file(
     if snapshot_available:
         expected_snapshot.update(read_status="ok", status="running", runner_online=True)
     assert payload["sessions"] == [expected_snapshot]
-    assert [item["status"] for item in payload["observations"]] == ["idle", "running", "running"]
-    assert [item["wall"] for item in payload["observations"]] == [10.0, 11.0, 12.0]
+    assert [item["status"] for item in payload["observations"]] == [
+        "idle",
+        "running",
+        "running",
+        "launching",
+    ]
+    assert [item["wall"] for item in payload["observations"]] == [10.0, 11.0, 12.0, 12.5]
     assert payload["events"][1]["pid"] == 123
     assert payload["events"][2]["conn"] == 4
     assert payload["native_lifecycle"]["candidates"] == 1
@@ -629,6 +636,7 @@ def test_lab_diagnostics_project_records_and_upload_only_safe_file(
     "invalid",
     [
         "file-link",
+        "self-loop",
         "directory-link",
         "oversize",
         "malformed",
@@ -646,6 +654,13 @@ def test_lab_diagnostics_reject_outside_or_invalid_native_records(
     lab.config = LabConfig(root=lab.root)
     lab.events = EventLog()
     lab.events.emit("lab", "process_start", process="runner", pid=123)
+    session_id = "conv_" + "a" * 32
+    lab.events.emit(
+        "observer",
+        "timeline",
+        session_id=session_id,
+        observations=[{"wall": 1.0, "source": "stream", "status": "running"}],
+    )
     lab.observer = None
     bridge = lab.root / "t" / "omnigent-123" / "claude-native" / ("c" * 32)
     bridge.mkdir(parents=True)
@@ -663,6 +678,8 @@ def test_lab_diagnostics_reject_outside_or_invalid_native_records(
     source.write_text(json.dumps(value))
     if invalid == "file-link":
         path.symlink_to(source)
+    elif invalid == "self-loop":
+        path.symlink_to(path.name)
     elif invalid == "directory-link":
         bridge.rmdir()
         bridge.symlink_to(outside, target_is_directory=True)
@@ -680,9 +697,15 @@ def test_lab_diagnostics_reject_outside_or_invalid_native_records(
     lab.write_diagnostics(destination)
     payload = json.loads(destination.read_text())
     assert payload["events"][0]["pid"] == 123
+    assert payload["observations"] == [
+        {"wall": 1.0, "source": "stream", "status": "running", "session_id": session_id}
+    ]
     native = payload["native_lifecycle"]
     assert native["records"] == []
     assert native["rejected"] == native["candidates"]
+    if invalid == "self-loop":
+        assert native["candidates"] == 1
+        assert native["rejected"] == 1
     assert "private-invalid-json" not in destination.read_text()
     assert source.read_text() == json.dumps(value)
 

@@ -85,7 +85,7 @@ _DIAGNOSTIC_ID = re.compile(
     r"(?:(?:conv_)?[0-9a-f]{32}|[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})\Z"
 )
 _DIAGNOSTIC_ENUMS = {
-    "status": {"idle", "running", "waiting", "failed"},
+    "status": {"idle", "launching", "running", "waiting", "failed"},
     "source": {"stream", "snapshot", "startup", "resume", "clear", "compact"},
     "harness": {"claude", "codex"},
     "process": {"server", "host", "runner", "model"},
@@ -468,7 +468,11 @@ class Lab:
         selected = paths[:128]
         for path in selected:
             try:
-                if not path.resolve().is_relative_to(self._host_tmp) or path.is_symlink():
+                try:
+                    resolved = path.resolve()
+                except RuntimeError:
+                    continue
+                if not resolved.is_relative_to(self._host_tmp) or path.is_symlink():
                     continue
                 flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
                 fd = os.open(path, flags)
