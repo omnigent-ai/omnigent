@@ -8,8 +8,21 @@ import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
 import type { PullRequestInfo } from "@/hooks/usePullRequests";
+import { writeOpenLinksInApp } from "@/lib/linkOpenPreferences";
+import type * as NativeBridge from "@/lib/nativeBridge";
 import { FileViewerContext } from "@/shell/FileViewerContext";
 import { FilePathAwareMessageResponse } from "./ChatMarkdown";
+
+const nativeShell = vi.hoisted(() => ({ native: false }));
+
+vi.mock("@/lib/nativeBridge", async (importOriginal) => ({
+  ...(await importOriginal<typeof NativeBridge>()),
+  isNativeShell: () => nativeShell.native,
+}));
+
+vi.mock("@/lib/fetchSessionHostId", () => ({
+  fetchSessionHostId: vi.fn().mockResolvedValue("local-host"),
+}));
 
 const CONVERSATION_ID = "conv_1";
 const GITHUB_INFO_ROUTE = `/v1/sessions/${CONVERSATION_ID}/resources/github`;
@@ -52,13 +65,16 @@ afterEach(() => {
   cleanup();
   client.clear();
   vi.unstubAllGlobals();
+  nativeShell.native = false;
+  delete (window as { omnigentDesktop?: unknown }).omnigentDesktop;
+  window.localStorage.clear();
 });
 
 function githubInfo(overrides: Partial<PullRequestInfo> = {}): PullRequestInfo {
   return {
     object: "session.github.info",
     available: true,
-    repo: { name_with_owner: "acme/app" },
+    repo: { name_with_owner: "acme/app", host: "github.com" },
     ...overrides,
   };
 }
@@ -107,7 +123,7 @@ describe("pull request references in chat markdown", () => {
   });
 
   it("leaves a bare reference as text when the session's repo is unknown", () => {
-    seed(githubInfo({ repo: null }));
+    seed(githubInfo({ repo: { name_with_owner: null, host: "github.com" } }));
     renderMarkdown("See #4242 and acme/app#12");
     expect(hrefs()).toEqual(["https://github.com/acme/app/pull/12"]);
     expect(screen.getByText("#4242")).toBeVisible();
@@ -148,15 +164,13 @@ describe("pull request references in chat markdown", () => {
     expect(screen.getByText("#4242")).toBeVisible();
   });
 
-  it.each(["a/b?x", "../x", "javascript:alert(1)"])(
-    "keeps references as text for a malformed repo name %j",
-    (nameWithOwner) => {
-      seed(githubInfo({ repo: { name_with_owner: nameWithOwner } }));
-      renderMarkdown("See #4242");
-      expect(screen.queryByRole("link")).not.toBeInTheDocument();
-      expect(screen.getByText("#4242")).toBeVisible();
-    },
-  );
+  // pullRequestRefs.test.ts covers the other malformed names.
+  it("keeps references as text for a malformed repo name", () => {
+    seed(githubInfo({ repo: { name_with_owner: "javascript:alert(1)", host: "github.com" } }));
+    renderMarkdown("See #4242");
+    expect(screen.queryByRole("link")).not.toBeInTheDocument();
+    expect(screen.getByText("#4242")).toBeVisible();
+  });
 
   it("keeps references as text when the session's GitHub info fails to load", async () => {
     serveGithubInfo(() => new Response("boom", { status: 500 }));
@@ -186,7 +200,7 @@ describe("pull request references in chat markdown", () => {
     seed(githubInfo());
     client.setQueryData(
       ["github-info", "conv_child"],
-      githubInfo({ repo: { name_with_owner: "acme/lib" } }),
+      githubInfo({ repo: { name_with_owner: "acme/lib", host: "github.com" } }),
     );
     renderMarkdown("See #4242", true, (children) => (
       <ConversationScopeContext.Provider value="conv_child">
@@ -196,9 +210,51 @@ describe("pull request references in chat markdown", () => {
     expect(hrefs()).toEqual(["https://github.com/acme/lib/pull/4242"]);
   });
 
+  it("opens a side chat's link in the parent's in-app browser", async () => {
+    nativeShell.native = true;
+    const openOrNavigate = vi.fn().mockResolvedValue({ ok: true });
+    Object.assign(window, {
+      omnigentDesktop: { kind: "electron", browserOpenOrNavigate: openOrNavigate },
+    });
+    writeOpenLinksInApp(true);
+    seed(githubInfo());
+    client.setQueryData(
+      ["github-info", "conv_child"],
+      githubInfo({ repo: { name_with_owner: "acme/lib", host: "github.com" } }),
+    );
+    renderMarkdown("See #4242", true, (children) => (
+      <ConversationScopeContext.Provider value="conv_child">
+        {children}
+      </ConversationScopeContext.Provider>
+    ));
+
+    const link = screen.getByRole("link", { name: /#4242/ });
+    const event = new MouseEvent("click", { bubbles: true, cancelable: true, button: 0 });
+    link.dispatchEvent(event);
+    expect(event.defaultPrevented).toBe(true);
+    await vi.waitFor(() =>
+      expect(openOrNavigate).toHaveBeenCalledWith(
+        expect.stringMatching(new RegExp(`^browser-tab:${CONVERSATION_ID}:[^:]+$`)),
+        "https://github.com/acme/lib/pull/4242",
+        undefined,
+        expect.objectContaining({ agent: true }),
+      ),
+    );
+  });
+
   it("links nothing unless the caller opts in", () => {
     seed(githubInfo());
     renderMarkdown("See #4242", false);
+    expect(screen.queryByRole("link")).not.toBeInTheDocument();
+    cleanup();
+    render(
+      <QueryClientProvider client={client}>
+        <FileViewerContext.Provider value={FILE_VIEWER}>
+          <FilePathAwareMessageResponse>See #4242</FilePathAwareMessageResponse>
+        </FileViewerContext.Provider>
+      </QueryClientProvider>,
+    );
+    expect(screen.getByText(/#4242/)).toBeVisible();
     expect(screen.queryByRole("link")).not.toBeInTheDocument();
   });
 });

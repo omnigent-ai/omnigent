@@ -57,6 +57,8 @@ Additive fields:
 - ``auth``: a :class:`PullRequestAuth`; null when ``available`` is false.
 - ``capabilities``: :meth:`ProviderCapabilities.to_json`; null for an unsupported remote.
 - ``remote_host``: only with ``reason: "unsupported_remote"``.
+- ``repo.host``: the host of the repository's forge instance, e.g. ``"github.com"``;
+  omitted when the provider doesn't know it.
 - PR associations in ``prs`` carry ``provider``.
 - The dispatcher adds descriptor ``provider_display`` to info and associations.
 - ``checks`` may also count ``cancelled`` and ``skipped`` jobs, with matching ``runs``

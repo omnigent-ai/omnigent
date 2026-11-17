@@ -189,6 +189,49 @@ def test_github_info_no_pr(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     assert sum(c[:2] == ("pr", "view") for c in calls) == 1
 
 
+@pytest.mark.parametrize("host", ["github.com", "ghe.example.com"])
+def test_github_info_no_pr_reports_repo_host(
+    repo: Path, monkeypatch: pytest.MonkeyPatch, host: str
+) -> None:
+    """A reachable repo with no PR names its host; the provider also serves Enterprise."""
+
+    def fake_gh(
+        argv: Sequence[str], *, cwd: str, token: str | None = None
+    ) -> tuple[int, str, str]:
+        head = tuple(argv[:2])
+        if head == ("repo", "view"):
+            fields = argv[argv.index("--json") + 1].split(",")
+            view = {"nameWithOwner": "corp/app", "url": f"https://{host}/corp/app"}
+            return (0, json.dumps({k: v for k, v in view.items() if k in fields}), "")
+        if head == ("pr", "view"):
+            return (1, "", "no pull requests found for branch")
+        return (1, "", "no stub")
+
+    monkeypatch.setattr(github_resource, "_gh", fake_gh)
+    monkeypatch.setattr(github_resource.shutil, "which", lambda _name: "/usr/bin/gh")
+
+    info = github_info(str(repo))
+    assert info["pr"] is None
+    assert info["repo"] == {"name_with_owner": "corp/app", "host": host}
+
+
+def test_reference_info_without_gh_reports_repo_host(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A tracked PR names its host even when gh is missing and no PR loads."""
+    monkeypatch.setattr(github_resource.shutil, "which", lambda _name: None)
+    reference = PullRequestRef(
+        host="ghe.example.com",
+        repository="corp/app",
+        number=7,
+        url="https://ghe.example.com/corp/app/pull/7",
+    )
+
+    info = github_resource._reference_info(str(repo), reference)
+    assert info["pr"] is None
+    assert info["repo"] == {"name_with_owner": "corp/app", "host": "ghe.example.com"}
+
+
 def test_github_info_pr_via_commit_fork_fallback(
     repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -552,7 +595,7 @@ def test_github_info_skips_account_enumeration_on_happy_path(
 
     info = github_info(str(repo))
     assert info["pr"]["number"] == 42
-    assert info["repo"] == {"name_with_owner": "acme/repo"}  # derived from pr.url
+    assert info["repo"] == {"name_with_owner": "acme/repo", "host": "github.com"}  # from pr.url
     assert info["authenticated"] is True
     # The two per-poll network calls are gone on the happy path.
     assert not any(c[:4] == ("auth", "status", "--json", "hosts") for c in calls)

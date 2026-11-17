@@ -174,7 +174,7 @@ describe("UserBubble pull request references", () => {
     queryClient.setQueryData(["github-info", "conv_pr"], {
       object: "session.github.info",
       available: true,
-      repo: { name_with_owner: "acme/app" },
+      repo: { name_with_owner: "acme/app", host: "github.com" },
     });
     render(
       <QueryClientProvider client={queryClient}>

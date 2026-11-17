@@ -14,7 +14,7 @@ function info(overrides: Partial<PullRequestInfo> = {}): PullRequestInfo {
   return {
     object: "session.github.info",
     available: true,
-    repo: { name_with_owner: "acme/app" },
+    repo: { name_with_owner: "acme/app", host: "github.com" },
     ...overrides,
   };
 }
@@ -53,6 +53,7 @@ describe("splitPullRequestRefs", () => {
     ["PR #1234: done", ["#omnigent-pr-1234"]],
     ["omnigent-ai/omnigent#9882", ["#omnigent-pr-omnigent-ai/omnigent/9882"]],
     ["socketio/socket.io#7", ["#omnigent-pr-socketio/socket.io/7"]],
+    ["vercel/next.js#123", ["#omnigent-pr-vercel/next.js/123"]],
     // Accepted: an all-digit hex color reads the same as a PR number.
     ["#123456", ["#omnigent-pr-123456"]],
   ])("links %j", (text, hrefs) => {
@@ -77,6 +78,9 @@ describe("splitPullRequestRefs", () => {
     "#12345678901",
     "docs/setup.md#3",
     "src/foo.ts#12",
+    "styles/main.css#1234",
+    "docs/index.html#1234",
+    "config/app.toml#1234",
   ])("leaves %j as text", (text) => {
     expect(splitPullRequestRefs(text)).toEqual([{ type: "text", value: text }]);
   });
@@ -165,27 +169,77 @@ describe("gitHubPullRequestUrl", () => {
 });
 
 describe("sessionPullRequestRepo", () => {
-  it("uses the session's repo on GitHub, including hosts that predate providers", () => {
+  it("accepts the GitHub provider, and hosts that predate providers", () => {
     expect(sessionPullRequestRepo(info({ provider: "github" }), null)).toBe("acme/app");
-    expect(sessionPullRequestRepo(info(), null)).toBe("acme/app");
+    expect(sessionPullRequestRepo(info({ provider: undefined }), null)).toBe("acme/app");
+  });
+
+  it("links only when the repo or PR names github.com as its host", () => {
+    const corp = { name_with_owner: "corp/app" };
+    expect(sessionPullRequestRepo(info({ repo: { ...corp, host: "github.com" } }), null)).toBe(
+      "corp/app",
+    );
+    const githubPr = { url: "https://github.com/corp/app/pull/3" } as PullRequestInfo["pr"];
+    expect(sessionPullRequestRepo(info({ repo: corp, pr: githubPr }), null)).toBe("corp/app");
+    expect(
+      sessionPullRequestRepo(
+        info({ repo: corp, pr: null, selected_pr_url: "https://github.com/corp/app/pull/3" }),
+        null,
+      ),
+    ).toBe("corp/app");
+  });
+
+  it("leaves text when no host is reported, as from an older server", () => {
+    // The reachable-repo, no-PR payload of a server that predates `repo.host`.
+    const hostless = info({ provider: "github", repo: { name_with_owner: "corp/app" }, pr: null });
+    expect(sessionPullRequestRepo(hostless, "org/main")).toBeNull();
+    expect(pullRequestRefUrl({ repo: null, number: "4242" }, hostless)).toBeNull();
+    expect(pullRequestRefUrl({ repo: "o/r", number: "1" }, hostless)).toBeNull();
+    expect(sessionPullRequestRepo(undefined, "org/main")).toBeNull();
+  });
+
+  it("ignores signed-in accounts, which don't name the remote's host", () => {
+    const signedIn = info({
+      provider: "github",
+      repo: { name_with_owner: "corp/app" },
+      auth: {
+        authenticated: true,
+        hint: null,
+        cli: null,
+        accounts: [{ login: "me", active: true, state: "success", host: "github.com" }],
+        selected_account: "me",
+      },
+    });
+    expect(sessionPullRequestRepo(signedIn, "org/main")).toBeNull();
   });
 
   it("falls back only when the repo is unknown", () => {
-    expect(sessionPullRequestRepo(undefined, "org/main")).toBe("org/main");
-    expect(sessionPullRequestRepo(info({ repo: null, provider: "github" }), "org/main")).toBe(
-      "org/main",
-    );
-    expect(sessionPullRequestRepo(info({ repo: null }), null)).toBeNull();
-    expect(sessionPullRequestRepo(info({ repo: { name_with_owner: "a/b?x" } }), "org/main")).toBe(
-      null,
-    );
+    const unnamed = { name_with_owner: null, host: "github.com" };
+    expect(sessionPullRequestRepo(info({ repo: unnamed }), "org/main")).toBe("org/main");
+    expect(sessionPullRequestRepo(info({ repo: unnamed }), null)).toBeNull();
+    expect(
+      sessionPullRequestRepo(
+        info({ repo: { name_with_owner: "a/b?x", host: "github.com" } }),
+        "org/main",
+      ),
+    ).toBeNull();
   });
 
   it("links nothing for other providers or GitHub Enterprise", () => {
     expect(sessionPullRequestRepo(info({ provider: "gitlab" }), "org/main")).toBeNull();
     expect(sessionPullRequestRepo(info({ remote_host: "ghe.example.com" }), "org/main")).toBeNull();
+    const ghe = { name_with_owner: "acme/app", host: "ghe.example.com" };
+    expect(sessionPullRequestRepo(info({ repo: ghe }), "org/main")).toBeNull();
     const ghePr = { url: "https://ghe.example.com/acme/app/pull/3" } as PullRequestInfo["pr"];
     expect(sessionPullRequestRepo(info({ pr: ghePr }), "org/main")).toBeNull();
+    // A tracked Enterprise PR the host couldn't load (no gh) names only its URL.
+    const tracked = info({
+      repo: { name_with_owner: "acme/app" },
+      pr: null,
+      selected_pr_url: "https://ghe.example.com/acme/app/pull/3",
+    });
+    expect(sessionPullRequestRepo(tracked, "org/main")).toBeNull();
+    expect(pullRequestRefUrl({ repo: null, number: "4242" }, tracked)).toBeNull();
   });
 
   it("links nothing when no provider serves the workspace", () => {
@@ -198,36 +252,20 @@ describe("sessionPullRequestRepo", () => {
       provider: null,
     });
     expect(sessionPullRequestRepo(unsupported, "org/main")).toBeNull();
-    expect(sessionPullRequestRepo(info({ repo: null, provider: null }), "org/main")).toBeNull();
-    expect(
-      sessionPullRequestRepo(info({ repo: null, reason: "unsupported_remote" }), "org/main"),
-    ).toBeNull();
+    expect(sessionPullRequestRepo(info({ provider: null }), "org/main")).toBeNull();
+    expect(sessionPullRequestRepo(info({ reason: "unsupported_remote" }), "org/main")).toBeNull();
     const ref = { repo: "other/lib", number: "5" };
     expect(pullRequestRefUrl(ref, unsupported, null)).toBeNull();
-  });
-
-  it("links without a PR only when the session's account is on github.com", () => {
-    const signedIn = (host: string) =>
-      info({
-        provider: "github",
-        auth: {
-          authenticated: true,
-          hint: null,
-          cli: null,
-          accounts: [{ login: "me", active: true, state: "success", host }],
-          selected_account: "me",
-        },
-      });
-    expect(sessionPullRequestRepo(signedIn("ghe.example.com"), "org/main")).toBeNull();
-    expect(sessionPullRequestRepo(signedIn("github.com"), "org/main")).toBe("acme/app");
   });
 });
 
 describe("pullRequestRefUrl", () => {
-  it("links an explicit repo regardless of the session's, but not off GitHub", () => {
+  it("links an explicit repo regardless of the session's, but only on github.com", () => {
     const ref = { repo: "other/lib", number: "5" };
     expect(pullRequestRefUrl(ref, info(), null)).toBe("https://github.com/other/lib/pull/5");
-    expect(pullRequestRefUrl(ref, undefined, null)).toBe("https://github.com/other/lib/pull/5");
+    expect(pullRequestRefUrl(ref, undefined, null)).toBeNull();
     expect(pullRequestRefUrl(ref, info({ provider: "azure_devops" }), null)).toBeNull();
+    const ghe = { name_with_owner: "acme/app", host: "ghe.example.com" };
+    expect(pullRequestRefUrl(ref, info({ repo: ghe }), null)).toBeNull();
   });
 });

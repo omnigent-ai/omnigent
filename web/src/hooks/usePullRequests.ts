@@ -188,6 +188,9 @@ export interface PullRequest {
 
 export interface PullRequestRepo {
   name_with_owner: string | null;
+  /** Host of the repo's forge instance, e.g. "github.com"; absent from older hosts and
+   *  providers that don't report it. */
+  host?: string;
 }
 
 /** A `gh`-configured account — one option in the panel's account selector. */

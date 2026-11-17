@@ -7,7 +7,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ReactNode } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { RenderItem } from "@/lib/renderItems";
@@ -2886,7 +2886,11 @@ describe("BlockRenderer pull request references", () => {
     qc.setQueryData(["github-info", "conv_1"], {
       object: "session.github.info",
       available: true,
-      repo: { name_with_owner: "acme/app" },
+      repo: { name_with_owner: "acme/app", host: "github.com" },
+    });
+    // A description field renders as Markdown prose, the same renderer as assistant text.
+    const output = JSON.stringify({
+      description: "Merged in #5551234 after **review**.\n\nThen deployed.",
     });
     const items: RenderItem[] = [
       { kind: "text", itemId: "t1", text: "Landed in #4242.", final: true },
@@ -2900,9 +2904,9 @@ describe("BlockRenderer pull request references", () => {
           callId: "call_1",
           agentName: "test",
           executedBy: "server",
-          output: "Merged #5551234",
+          output,
         },
-        output: "Merged #5551234",
+        output,
         state: "output-available",
         startedAt: null,
         duration: undefined,
@@ -2921,6 +2925,10 @@ describe("BlockRenderer pull request references", () => {
       "href",
       "https://github.com/acme/app/pull/4242",
     );
-    expect(screen.queryByRole("link", { name: /#5551234/ })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByText("Read file"));
+    const prose = await screen.findByTestId("tool-prose-value");
+    expect(await within(prose).findByText("review")).toBeVisible();
+    expect(prose).toHaveTextContent("Merged in #5551234");
+    expect(within(prose).queryByRole("link")).not.toBeInTheDocument();
   });
 });

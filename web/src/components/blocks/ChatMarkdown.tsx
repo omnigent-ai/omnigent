@@ -547,11 +547,12 @@ function PullRequestRefLink({
   title,
   ...props
 }: React.ComponentPropsWithoutRef<"a"> & { pullRequestRef: PullRequestRef }) {
-  // A side chat inherits its parent's file viewer but may sit in another repo.
+  // A side chat inherits its parent's file viewer but may sit in another repo,
+  // so the repo comes from its own session while links open in the parent's
+  // browser, the one AppShell reveals.
   const scopedConversationId = useContext(ConversationScopeContext);
   const fileViewerConversationId = useFileViewerConversationId();
-  const conversationId = scopedConversationId ?? fileViewerConversationId;
-  const { data } = usePullRequestInfoSnapshot(conversationId);
+  const { data } = usePullRequestInfoSnapshot(scopedConversationId ?? fileViewerConversationId);
   const url = data ? pullRequestRefUrl(pullRequestRef, data) : null;
   if (!url) return <span className={className}>{children}</span>;
   return (
@@ -565,7 +566,7 @@ function PullRequestRefLink({
       data-streamdown="link"
       onClick={(event) => {
         props.onClick?.(event);
-        followLinkWithPopupFallback(event, url, conversationId);
+        followLinkWithPopupFallback(event, url, fileViewerConversationId);
       }}
     >
       <PullRequestLinkLabel>{children}</PullRequestLinkLabel>

@@ -27,7 +27,9 @@ const EXPLICIT_NUMBER = /^[1-9]\d{0,9}$/;
 const GITHUB_OWNER = /^[A-Za-z0-9][A-Za-z0-9-]{0,38}$/;
 const GITHUB_REPO = /^[A-Za-z0-9._-]{1,100}$/;
 // `docs/setup.md#3` is a file path; an extensionless `src/foo#12` still links.
-const FILE_EXTENSION = /\.(md|mdx|py|ts|tsx|js|jsx|json|ya?ml|txt|sh|go|rs|java|scala)$/i;
+// No `.js`: repos like `vercel/next.js` and `mrdoob/three.js` are named that way.
+const FILE_EXTENSION =
+  /\.(md|mdx|py|ts|tsx|jsx|json|ya?ml|txt|sh|go|rs|java|scala|css|scss|less|html?|toml|xml|ini|cfg|lock|c|h|cpp|hpp|rb|kt|swift|sql|php|cs|vue|svelte)$/i;
 
 /** Repo for bare references when the session's repo is unknown; null leaves them as text. */
 const FALLBACK_PULL_REQUEST_REPO: string | null = null;
@@ -141,23 +143,22 @@ function isGitHubSession(info: PullRequestInfo | undefined): boolean {
   if (info?.provider === null || info?.reason === "unsupported_remote") return false;
   if (typeof info?.provider === "string" && info.provider !== "github") return false;
   if (info?.remote_host && info.remote_host !== "github.com") return false;
-  if (info?.pr?.url) {
-    try {
-      return new URL(info.pr.url).hostname === "github.com";
-    } catch {
-      return false;
-    }
+  // The GitHub provider also serves Enterprise hosts, and a signed-in gh account
+  // names no remote, so only a host the repo or PR reports counts. Older servers
+  // that report neither leave references as text.
+  const hosts = [info?.repo?.host, urlHostname(info?.pr?.url), urlHostname(info?.selected_pr_url)];
+  const known = hosts.filter((host) => host !== undefined);
+  return known.length > 0 && known.every((host) => host === "github.com");
+}
+
+function urlHostname(url: string | null | undefined): string | undefined {
+  if (!url) return undefined;
+  try {
+    return new URL(url).hostname;
+  } catch {
+    // Present but unparseable: evidence against, not absence of evidence.
+    return "";
   }
-  // The GitHub provider also serves Enterprise hosts. Without a PR, the only
-  // host it reports is its accounts', and it lists those only when the repo is
-  // unreachable; a reachable repo with no PR names no host, so it links.
-  const accounts = info?.auth?.accounts ?? info?.accounts;
-  if (!accounts?.length) return true;
-  const selected = info?.auth?.selected_account ?? info?.selected_account;
-  const current = accounts.filter((account) =>
-    selected ? account.login === selected : account.active,
-  );
-  return current.length > 0 && current.every((account) => account.host === "github.com");
 }
 
 /** Where `ref` links in this session, or null when it should stay text. */
