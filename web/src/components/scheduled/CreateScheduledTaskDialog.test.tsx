@@ -7387,6 +7387,31 @@ describe("CreateScheduledTaskDialog workflow", () => {
     expect(mutateAsync.mock.calls[0][0]).toMatchObject({ sessionMode: "continue" });
   });
 
+  it("reads typed trigger instructions as the server reads the prompt they'd save", async () => {
+    renderGithubTrigger(true);
+    fireEvent.change(screen.getByTestId("task-trigger-scope"), { target: { value: "acme/app" } });
+    chooseTriggerSessionMode("One task session");
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Instructions" }), { button: 0 });
+    // Not quite the saved message, but the repeated heading keeps the task-session prompt
+    // from splitting, so the server reads it from its opening line.
+    fireEvent.change(screen.getByTestId("task-trigger-instructions"), {
+      target: {
+        value: `${run("")}\nOnly bugs\n\nInstructions for the task session:\nThen summarize.`,
+      },
+    });
+    const sessionMode = screen.getByTestId("task-trigger-session-mode");
+    expect(sessionMode).toHaveTextContent("New session for each match");
+    openSessionModeMenu("task-trigger-session-mode");
+    expect(
+      screen.getByRole("menuitemradio", { name: "One task session for all matches" }),
+    ).toHaveAttribute("aria-disabled", "true");
+    fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" });
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    expect(isTaskSessionTriggerPrompt(mutateAsync.mock.calls[0][0].prompt as string)).toBe(false);
+  });
+
   it("saves a workflow trigger that used one task session as a session for each match", async () => {
     const saved = encodeTriggerPrompt(
       {

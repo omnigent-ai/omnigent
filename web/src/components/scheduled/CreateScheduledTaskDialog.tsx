@@ -84,6 +84,7 @@ import {
   readTriggerMessageMaxChars,
   readTriggerWorkerSettings,
   renderTriggerConfigPrompt,
+  renderTriggerPrompt,
   splitTriggerPrompt,
   syncTriggerWorkflowId,
   TRIGGER_SOURCES,
@@ -1113,12 +1114,27 @@ export function CreateScheduledTaskDialog({
     combineTriggerPrompt(withWorkflow(prompt), systemPrompt),
     workflowIdSupported,
   );
+  const triggerComplete =
+    trigger !== null &&
+    triggerFieldsComplete(promptTriggerFields, trigger, messageBudget.instructionsMaxChars);
   // Each run of a saved workflow gets its own new session, whether the workflow was
-  // picked or its message typed; text is read as the server reads it.
-  const runsSavedWorkflow =
-    trigger !== null
-      ? parseSavedWorkflowRun(promptTriggerFields.instructions) !== null
-      : promptMayRunSavedWorkflow(freeTextPrompt);
+  // picked or its message typed. Text is read as the server reads it; for a trigger, that
+  // is the prompt it would save with one task session, which its instructions can keep
+  // from splitting.
+  let runsSavedWorkflow: boolean;
+  if (trigger === null) {
+    runsSavedWorkflow = promptMayRunSavedWorkflow(freeTextPrompt);
+  } else if (triggerComplete) {
+    runsSavedWorkflow = promptMayRunSavedWorkflow(
+      renderTriggerPrompt(trigger, promptTriggerFields, {
+        placement: "same_host",
+        sessionLink,
+        taskSessionMode: "continue",
+      }),
+    );
+  } else {
+    runsSavedWorkflow = parseSavedWorkflowRun(promptTriggerFields.instructions) !== null;
+  }
   // A trigger keeps its one polling session; only its matches start new ones.
   const workflowNeedsNewSessions =
     runsSavedWorkflow && trigger === null && !isTriggerPrompt(freeTextPrompt);
@@ -1173,8 +1189,7 @@ export function CreateScheduledTaskDialog({
   // An edit keeps the saved workers; a new trigger's workers run where the manager
   // runs (beside it on a connected host, or each in its own sandbox).
   const renderedTriggerConfig: TriggerConfig | null =
-    trigger !== null &&
-    triggerFieldsComplete(promptTriggerFields, trigger, messageBudget.instructionsMaxChars)
+    trigger !== null && triggerComplete
       ? {
           source: trigger,
           ...promptTriggerFields,
