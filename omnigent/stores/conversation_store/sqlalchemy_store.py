@@ -1287,7 +1287,11 @@ class SqlAlchemyConversationStore(ConversationStore):
                 insert_conversation,
             )
 
+            flushed_new_metadata = False
+
             def insert_metadata(meta_sess: Session) -> SqlConversationMetadata:
+                nonlocal flushed_new_metadata
+                flushed_new_metadata = False
                 lock_host_for_binding(meta_sess, host_id)
                 previous = (
                     meta_sess.get(SqlConversationMetadata, (current_workspace_id(), new_id))
@@ -1317,6 +1321,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                     side_chat_parent_id=side_chat_parent_id,
                 )
                 meta_sess.add(meta)
+                meta_sess.flush()
+                # A replacement's row stays for a retry under the same id to resume.
+                flushed_new_metadata = previous is None
                 return meta
 
             try:
@@ -1326,7 +1333,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     insert_metadata,
                 )
             except Exception:
-                self._discard_unbound_conversation(new_id)
+                self._discard_unbound_conversation(new_id, flushed_metadata=flushed_new_metadata)
                 raise
             return _to_conversation(row, meta, creation_labels)
         except IntegrityError as exc:
@@ -1357,8 +1364,37 @@ class SqlAlchemyConversationStore(ConversationStore):
                 ) from exc
             raise
 
-    def _discard_unbound_conversation(self, conversation_id: str) -> None:
-        """Undo an unpublished conversation when its metadata write failed."""
+    def _discard_unbound_conversation(
+        self,
+        conversation_id: str,
+        *,
+        flushed_metadata: bool = False,
+        agent_id: str | None = None,
+    ) -> None:
+        """Undo an unpublished conversation when its metadata write failed.
+
+        Rows flushed before a failed COMMIT may still have committed, so they go first.
+        """
+        if flushed_metadata:
+
+            def delete_flushed(session: Session) -> None:
+                session.execute(
+                    delete(SqlConversationMetadata).where(
+                        SqlConversationMetadata.workspace_id == current_workspace_id(),
+                        SqlConversationMetadata.id == conversation_id,
+                    )
+                )
+                if agent_id is not None:
+                    session.execute(
+                        delete(SqlAgent).where(
+                            SqlAgent.workspace_id == current_workspace_id(),
+                            SqlAgent.id == agent_id,
+                        )
+                    )
+
+            run_write_transaction(
+                self._session_immediate, "discard_unbound_conversation_metadata", delete_flushed
+            )
 
         def write(session: Session) -> bool:
             keys = list(
@@ -6155,9 +6191,13 @@ class SqlAlchemyConversationStore(ConversationStore):
             insert_ap,
         )
 
+        metadata_flushed = False
+
         def insert_metadata(
             session: Session,
         ) -> tuple[SqlConversationMetadata, SqlAgent]:
+            nonlocal metadata_flushed
+            metadata_flushed = False
             lock_host_for_binding(session, host_id)
             agent_row = _new_session_agent_row(
                 created_by=created_by,
@@ -6180,6 +6220,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
             session.add(agent_row)
             session.add(meta_row)
+            session.flush()
+            metadata_flushed = True
             return meta_row, agent_row
 
         try:
@@ -6189,7 +6231,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                 insert_metadata,
             )
         except Exception:
-            self._discard_unbound_conversation(conversation_id)
+            self._discard_unbound_conversation(
+                conversation_id, flushed_metadata=metadata_flushed, agent_id=agent_id
+            )
             raise
 
         return _created_session_from_rows(
