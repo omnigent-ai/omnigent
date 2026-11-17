@@ -2911,7 +2911,7 @@ async def _deliver_answer_to_stopped_session(
 
     The message path relaunches the runner; the card closes only after it accepts the message.
     :returns: The message path's acknowledgement (also for a later answer to the same question),
-        or ``None`` when out of scope. A second accept gets the first one's result or error.
+        or ``None`` when out of scope. An accept during a delivery gets that delivery's result.
     """
     elicitation_id = data.get("elicitation_id")
     if post_event is None or not isinstance(request, Request):
@@ -2923,7 +2923,7 @@ async def _deliver_answer_to_stopped_session(
     entry = pending_elicitations.lookup(elicitation_id, conversation_id=session_id)
     params = entry[1].get("params") if entry is not None else None
     record = _stopped_session_answers.get(key)
-    if record is not None and isinstance(params, dict):
+    if record is not None and record.delivery is None and isinstance(params, dict):
         fingerprint = _harness_elicitation_fingerprint_or_none(params)
         if fingerprint is None or fingerprint != record.fingerprint:
             # A new question under a reused id: the earlier recovery does not apply.
@@ -3020,16 +3020,21 @@ async def _run_stopped_session_delivery(
     finally:
         record.delivery = None
         if not delivery.done():
+            _logger.warning(
+                "Delivery of the answer to %s stopped before it finished",
+                elicitation_id,
+                extra={"session_id": session_id},
+            )
             delivery.set_exception(
                 OmnigentError(
-                    "The answer was not delivered. Answer the question again.",
+                    "The answer may not have been delivered. Answer the question again.",
                     code=ErrorCode.RUNNER_UNAVAILABLE,
                 )
             )
 
 
 def _prune_stopped_session_answers() -> None:
-    """Drop finished recoveries older than the longest hook wait (no such card is open)."""
+    """Drop records not delivering, started more than the longest hook wait ago."""
     cutoff = time.time() - _CLAUDE_NATIVE_PERMISSION_HOOK_TIMEOUT_S
     for key, record in list(_stopped_session_answers.items()):
         if record.started_at < cutoff and record.delivery is None:

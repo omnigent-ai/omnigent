@@ -5659,6 +5659,25 @@ async def _wait_for_dispatch_in_flight(session_id: str) -> None:
         await asyncio.sleep(0.01)
 
 
+async def _wait_for_follower(session_id: str, elicitation_id: str) -> None:
+    """Wait until a second request waits on the question's running delivery."""
+    from omnigent.server.routes._sessions import orchestration
+
+    deadline = time.monotonic() + budget(5.0)
+    while True:
+        record = orchestration._stopped_session_answers.get((session_id, elicitation_id))
+        # The delivery keeps one callback of its own; each waiting request adds one.
+        if (
+            record is not None
+            and record.delivery is not None
+            and len(record.delivery._callbacks) > 1
+        ):
+            return
+        if time.monotonic() > deadline:
+            raise AssertionError("the second answer never waited on the first one's delivery")
+        await asyncio.sleep(0.01)
+
+
 async def _resolve_answer(
     client: httpx.AsyncClient,
     session_id: str,
@@ -5763,10 +5782,7 @@ async def test_answer_with_a_live_runner_reaches_the_hook_and_sends_no_message(
     app: FastAPI,
     lookup: str,
 ) -> None:
-    """With the runner reachable, the answer goes to the waiting hook as before.
-
-    ``admission_error``: the runner is reachable, but execution admission fails for it.
-    """
+    """A reachable runner gets the answer through its hook, also when admission fails."""
     from omnigent.errors import ErrorCode
     from omnigent.runner.routing import RoutedRunner
     from omnigent.server.runtime_compatibility import RuntimeSupportError
@@ -5798,7 +5814,7 @@ async def test_answer_with_a_live_runner_reaches_the_hook_and_sends_no_message(
         await fake_runner.aclose()
 
     if lookup == "live":
-        # With admission failing, the old path's later approval forward still errors, as before.
+        # On admission_error the old path's later approval forward still errors, as before.
         assert response.status_code == 202, response.text
         assert response.json() == {"queued": False}
     decision = hook_response.json()["hookSpecificOutput"]["decision"]
@@ -5912,7 +5928,7 @@ async def test_two_answers_at_once_deliver_one_message(
         else:
             await _wait_for_dispatch_in_flight(session_id)
         second = asyncio.create_task(_resolve_answer(client, session_id, elicitation_id))
-        await asyncio.sleep(budget(0.1))
+        await _wait_for_follower(session_id, elicitation_id)
         assert not second.done(), "the second answer must wait for the first one's result"
         if case == "follower_sees_replacement":
             gate[1].set()
@@ -5943,6 +5959,59 @@ async def test_two_answers_at_once_deliver_one_message(
     assert not await _expect_no_launch(comm, budget_s=budget(0.2))
 
 
+async def test_two_answers_in_the_same_moment_deliver_one_message(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    app: FastAPI,
+) -> None:
+    """Two tabs that both pass the runner check before either starts still send one message."""
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+
+    comm, session_id, hook_task, elicitation_id = await _park_on_claude_session(client, app)
+    runner_posts: list[tuple[str, dict[str, Any]]] = []
+    fake_runner = _recording_runner(runner_posts)
+    set_runner_client(None)
+    _stage_relaunched_runner(monkeypatch, fake_runner)
+    release = asyncio.Event()
+    waiting = 0
+
+    async def _gated_no_runner(*args: Any, **kwargs: Any) -> httpx.AsyncClient | None:
+        nonlocal waiting
+        del args, kwargs
+        waiting += 1
+        await release.wait()
+        return None
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", _gated_no_runner)
+    answers = [
+        asyncio.create_task(_resolve_answer(client, session_id, elicitation_id)) for _ in range(2)
+    ]
+    launch: asyncio.Task[HostLaunchRunnerFrame] | None = None
+    try:
+        deadline = time.monotonic() + budget(5.0)
+        while waiting < 2:
+            assert time.monotonic() < deadline, "both answers must reach the runner check"
+            await asyncio.sleep(0.01)
+        release.set()
+        launch = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+        responses = await asyncio.wait_for(asyncio.gather(*answers), budget(10.0))
+    finally:
+        release.set()
+        for task in (*answers, launch, hook_task):
+            if task is not None:
+                task.cancel()
+        await asyncio.gather(
+            *(t for t in (*answers, launch, hook_task) if t is not None), return_exceptions=True
+        )
+        await fake_runner.aclose()
+
+    assert all(r.status_code < 300 and r.json().get("queued") is True for r in responses), [
+        r.text for r in responses
+    ]
+    assert len(_message_texts(runner_posts)) == 1, runner_posts
+
+
 async def test_a_cancelled_answer_can_be_answered_again(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -5965,7 +6034,7 @@ async def test_a_cancelled_answer_can_be_answered_again(
     try:
         await _wait_for_dispatch_in_flight(session_id)
         second = asyncio.create_task(_resolve_answer(client, session_id, elicitation_id))
-        await asyncio.sleep(budget(0.1))
+        await _wait_for_follower(session_id, elicitation_id)
         assert not second.done(), "the second answer must wait for the first one's result"
         first.cancel()
         await asyncio.gather(first, return_exceptions=True)
@@ -6024,7 +6093,7 @@ async def test_a_card_close_error_does_not_strand_the_answer(
     try:
         await _wait_for_dispatch_in_flight(session_id)
         second = asyncio.create_task(_resolve_answer(client, session_id, elicitation_id))
-        await asyncio.sleep(budget(0.1))
+        await _wait_for_follower(session_id, elicitation_id)
         launch = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
         leader, follower = await asyncio.wait_for(asyncio.gather(first, second), budget(10.0))
         retried = await asyncio.wait_for(
