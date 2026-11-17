@@ -31,7 +31,9 @@ def test_catalog_rows_render_for_every_native_picker(
     """The real chat page consumes runner-owned rows for every picker family."""
     chat = chat_session_contract
     chat.contract.json(f"/v1/sessions/{chat.session_id}/codex_goal", {"goal": None})
-    chat.contract.json(f"/v1/sessions/{chat.session_id}/claude_goal", {"goal": None, "available": True})
+    chat.contract.json(
+        f"/v1/sessions/{chat.session_id}/claude_goal", {"goal": None, "available": True}
+    )
     for harness in (
         "claude-native",
         "codex-native",

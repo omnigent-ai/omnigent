@@ -382,7 +382,9 @@ def test_long_model_and_permission_remain_single_row(
             "omnigent.claude_native.permission_mode": "bypassPermissions",
         }
     )
-    chat.contract.json(f"/v1/sessions/{chat.session_id}/claude_goal", {"goal": None, "available": True})
+    chat.contract.json(
+        f"/v1/sessions/{chat.session_id}/claude_goal", {"goal": None, "available": True}
+    )
     page.set_viewport_size({"width": width, "height": 900})
     page.goto(chat.url)
     label = page.get_by_test_id("composer-agent-config-value")
