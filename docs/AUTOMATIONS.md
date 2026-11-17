@@ -114,7 +114,7 @@ their existing authorization rules.
 
 **New automation** starts with **Trigger type: Schedule**. Choose **Jira**, **Slack**, **GitHub**, **Linear**, or **PagerDuty** in the same form to set up matching-item triggers (each option shows the service's logo); gallery templates preselect their integration. Choosing a type for the first time carries over your instructions. Switching back restores that type's draft until the dialog closes, including schedule settings and custom prompt edits. Integration choices require the same server capabilities as the template gallery. Existing automations keep their current editor.
 
-New automations default to the **Omnigent Automation** project, which is created or reused when you save. Choose another project or remove the selection to opt out. Run sessions and their workers inherit the project, keeping automated work together in the sidebar. Existing automations keep their selected project.
+New automations default to the **Automations** project, which is created or reused when you save. If you already have an **Omnigent Automation** project from an earlier version, new automations keep using it instead. Choose another project or remove the selection to opt out. Run sessions and their workers inherit the project, keeping automated work together in the sidebar. Existing automations keep their selected project.
 
 ## Schedules are RRULEs, not cron
 

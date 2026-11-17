@@ -60,9 +60,7 @@ def test_automation_sandbox_repository(
         )
         contract.json(
             "/v1/projects",
-            list_payload(
-                [{"id": "automation-project", "name": "Omnigent Automation", "icon": None}]
-            ),
+            list_payload([{"id": "automation-project", "name": "Automations", "icon": None}]),
         )
         tasks: list[dict[str, Any]] = []
         contract.json("/v1/scheduled-tasks", lambda _: {"scheduled_tasks": tasks})

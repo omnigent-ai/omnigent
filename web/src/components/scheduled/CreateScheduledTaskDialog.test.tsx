@@ -2808,9 +2808,24 @@ describe("CreateScheduledTaskDialog project", () => {
     resolveOrCreateProjectId.mockResolvedValueOnce("proj_automation");
     renderWithProjects();
     fillRequired();
-    expect(screen.getByTestId("task-project-trigger")).toHaveTextContent("Omnigent Automation");
+    expect(screen.getByTestId("task-project-trigger")).toHaveTextContent("Automations");
     expect(resolveOrCreateProjectId).not.toHaveBeenCalled();
     expect(await submitCreate()).toMatchObject({ projectId: "proj_automation" });
+    expect(resolveOrCreateProjectId).toHaveBeenCalledWith("Automations");
+  });
+
+  it("keeps defaulting to an existing folder that has the earlier default name", async () => {
+    projectsQuery.current = {
+      data: [...PROJECTS, { id: "proj_legacy", name: "Omnigent Automation", icon: null }],
+      isPending: false,
+      isSuccess: true,
+      isError: false,
+    };
+    resolveOrCreateProjectId.mockResolvedValueOnce("proj_legacy");
+    renderWithProjects();
+    fillRequired();
+    expect(screen.getByTestId("task-project-trigger")).toHaveTextContent("Omnigent Automation");
+    expect(await submitCreate()).toMatchObject({ projectId: "proj_legacy" });
     expect(resolveOrCreateProjectId).toHaveBeenCalledWith("Omnigent Automation");
   });
 
