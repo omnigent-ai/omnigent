@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import contextlib
 import copy
 import json
@@ -69,9 +70,14 @@ def _report() -> dict:
     return make_report(samples, _args(), "ui-revision", "test-chromium")
 
 
-@pytest.mark.parametrize("document_state", ["available", "closed", "timeout", "unavailable"])
+@pytest.mark.parametrize(
+    "document_state", ["available", "closed", "timeout", "unavailable", "deadline"]
+)
 async def test_failed_screenshot_retains_error_and_document_state(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture, document_state: str
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    document_state: str,
 ) -> None:
     measurement_error = RuntimeError("measurement failed")
     capture_error = RuntimeError("screenshot transport failed")
@@ -92,6 +98,18 @@ async def test_failed_screenshot_retains_error_and_document_state(
         is_closed=lambda: document_state == "closed",
         evaluate=AsyncMock(return_value=state, side_effect=state_error),
     )
+    if document_state == "deadline":
+        pending_document: asyncio.Future[None] = asyncio.Future()
+
+        async def evaluate_document(_expression: str) -> None:
+            await pending_document
+
+        def short_timeout(delay: float) -> asyncio.Timeout:
+            assert delay == 30
+            return asyncio.timeout(0.01)
+
+        page.evaluate.side_effect = evaluate_document
+        monkeypatch.setattr(ui_run, "asyncio", SimpleNamespace(timeout=short_timeout))
     session = SimpleNamespace(send=AsyncMock(side_effect=[{}, {}, capture_error]))
     context = SimpleNamespace(
         new_page=AsyncMock(return_value=page),
@@ -100,14 +118,15 @@ async def test_failed_screenshot_retains_error_and_document_state(
     )
     browser = SimpleNamespace(new_context=AsyncMock(return_value=context))
     with pytest.raises(RuntimeError, match="measurement failed") as raised:
-        await ui_run.measure_scenario(
-            browser,
-            SimpleNamespace(base_url="http://example.test"),
-            "session",
-            "browser",
-            _args(),
-            tmp_path / "page-error",
-        )
+        async with asyncio.timeout(2):
+            await ui_run.measure_scenario(
+                browser,
+                SimpleNamespace(base_url="http://example.test"),
+                "session",
+                "browser",
+                _args(),
+                tmp_path / "page-error",
+            )
     assert raised.value is measurement_error
     context.close.assert_awaited_once()
     records = [
@@ -131,6 +150,10 @@ async def test_failed_screenshot_retains_error_and_document_state(
         assert observed["document"] == state
     elif document_state == "closed":
         page.evaluate.assert_not_awaited()
+    elif document_state == "deadline":
+        page.evaluate.assert_awaited_once()
+        assert pending_document.cancelled()
+        assert observed["state_error"] == "TimeoutError()"
     else:
         assert str(state_error) in observed["state_error"]
     assert session.send.await_args_list[-1].args == ("Page.captureScreenshot",)
