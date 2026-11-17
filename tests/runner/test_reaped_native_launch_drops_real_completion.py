@@ -81,7 +81,12 @@ def _turn_frames(response_id: str) -> list[str]:
 
 
 @pytest.mark.asyncio
-async def test_reaped_native_launch_must_not_discard_childs_real_completion() -> None:
+@pytest.mark.parametrize(
+    "prompt_accepted", [False, True], ids=["unacknowledged-launch", "silent-codex"]
+)
+async def test_reaped_native_launch_must_not_discard_childs_real_completion(
+    monkeypatch: pytest.MonkeyPatch, prompt_accepted: bool
+) -> None:
     """A launch-reaped dispatch must still deliver the child's later completion.
 
     The reaper's ``failed`` is a guess with no terminal edge behind it (the
@@ -91,37 +96,73 @@ async def test_reaped_native_launch_must_not_discard_childs_real_completion() ->
     """
     from omnigent.runner import app as runner_app
 
+    monkeypatch.delenv("OMNIGENT_SUBAGENT_LAUNCH_TIMEOUT_S", raising=False)
+    budget_s = subagent_work._DEFAULT_SUBAGENT_LAUNCH_TIMEOUT_S
     parent_id = uuid.uuid4().hex
     child_id = uuid.uuid4().hex
     inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
     server_client = _WakeRecordingServerClient(parent_id)
+    turn_streamed = asyncio.Event()
+    harness = _ScriptedHarnessClient(_turn_frames("resp_wake"), stream_finished=turn_streamed)
     app = create_runner_app(
-        process_manager=_FakeProcessManager(_ScriptedHarnessClient(_turn_frames("resp_wake"))),  # type: ignore[arg-type]
+        process_manager=_FakeProcessManager(harness),  # type: ignore[arg-type]
         server_client=server_client,  # type: ignore[arg-type]
     )
     subagent_work._session_inboxes_ref[parent_id] = inbox
     entry = subagent_work.register_subagent_work(
         parent_session_id=parent_id,
         child_session_id=child_id,
-        agent="claude-native",
+        agent="codex-native" if prompt_accepted else "claude-native",
         title="impl",
     )
 
     try:
-        # The steered native turn relays no running edge, so the entry is still
-        # "launching" when the budget elapses: the reaper fails it, delivers
-        # that guess to the parent inbox and wakes the parent.
+        earliest_start = latest_start = entry.created_at
+        if prompt_accepted:
+            async with _runner_client(app) as client:
+                earliest_start = time.time()
+                resp = await client.post(
+                    f"/v1/sessions/{child_id}/events",
+                    json={
+                        "type": "message",
+                        "role": "user",
+                        "agent_id": uuid.uuid4().hex,
+                        "model": "test-agent",
+                        "harness_override": "codex-native",
+                        "content": [{"type": "input_text", "text": "Double-check the change."}],
+                    },
+                )
+                assert resp.status_code == 202, resp.text
+                await asyncio.wait_for(turn_streamed.wait(), timeout=5.0)
+                await _wait_until(
+                    lambda: child_id not in app.state.active_turns,
+                    "the codex-native delivery turn never ended",
+                )
+                latest_start = time.time()
+            assert harness.posted_bodies, "the brief never reached the codex-native harness"
+            assert entry.status == "running"
+            # Registration may predate acceptance; only acceptance starts this bound.
+            entry.created_at -= 600.0
+
+        assert (
+            subagent_work.reap_stalled_subagent_launches(
+                now=earliest_start + budget_s - 1.0,
+                mark_terminal=app.state.mark_subagent_terminal_and_wake,
+            )
+            == []
+        ), "the bound fired before its budget elapsed"
         reaped = subagent_work.reap_stalled_subagent_launches(
-            now=entry.created_at + 200.0,
-            timeout_s=180.0,
+            now=latest_start + budget_s,
             mark_terminal=app.state.mark_subagent_terminal_and_wake,
         )
         assert reaped == [entry]
         assert entry.status == "failed"
+        assert entry.launch_timed_out
         await _wait_until(
             lambda: any("finished (failed)" in notice for notice in server_client.wakes()),
             "the reaper's failure never woke the parent",
         )
+        assert not inbox.empty()
         # The parent reads the notice through the production drain, exactly as
         # its wake turn would.
         notice = await execute_tool(
@@ -131,7 +172,8 @@ async def test_reaped_native_launch_must_not_discard_childs_real_completion() ->
             conversation_id=parent_id,
             session_inbox=inbox,
         )
-        assert "no start acknowledgment" in notice, notice
+        failure = "reported no turn start" if prompt_accepted else "no start acknowledgment"
+        assert failure in notice, notice
         assert inbox.empty()
         # That failure is only the reaper's guess, so draining it must not
         # finalize the dispatch: the entry stays registered (still flagged) and
@@ -167,6 +209,14 @@ async def test_reaped_native_launch_must_not_discard_childs_real_completion() ->
                 "the parent's wake turn never ended",
             )
             wakes_before_completion = len(server_client.wakes())
+
+            if prompt_accepted:
+                # The silent child was only slow to report its turn starting.
+                resp = await client.post(
+                    f"/v1/sessions/{child_id}/events",
+                    json={"type": "external_session_status", "data": {"status": "running"}},
+                )
+                assert resp.status_code == 204, resp.text
 
             # The child genuinely finishes: its real Stop-hook completion edge
             # over the runner's HTTP event route.
@@ -219,7 +269,7 @@ async def test_reaped_native_launch_must_not_discard_childs_real_completion() ->
                 {subagent_work.SUBAGENT_DELIVERED_ID_LABEL_KEY: entry.work_id}
             ]
     finally:
-        subagent_work.unregister_subagent_work(child_id)
+        subagent_work.unregister_subagent_work_for_session(child_id)
         subagent_work._session_inboxes_ref.pop(parent_id, None)
         runner_app._session_event_queues_ref.pop(parent_id, None)
         runner_app._session_event_queues_ref.pop(child_id, None)
@@ -313,154 +363,6 @@ async def test_native_prompt_delivery_takes_dispatch_out_of_launching(
         ), "the launch-liveness reaper failed a child that had already taken its prompt"
         assert entry.status == "running"
         assert inbox.empty()
-    finally:
-        subagent_work.unregister_subagent_work_for_session(child_id)
-        subagent_work._session_inboxes_ref.pop(parent_id, None)
-        runner_app._session_event_queues_ref.pop(parent_id, None)
-        runner_app._session_event_queues_ref.pop(child_id, None)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("timeout_s", [None, 180.0], ids=["default-budget", "explicit-budget"])
-async def test_codex_native_silent_child_failure_yields_to_its_real_result(
-    monkeypatch: pytest.MonkeyPatch, timeout_s: float | None
-) -> None:
-    """Failing a codex-native child that reported no turn start is only a guess.
-
-    The bound starts when Codex accepts the prompt. Once it fires, the parent
-    reads the failure, but the child may simply have been slow to report: its
-    eventual result must replace the guess and wake the parent again.
-    """
-    from omnigent.runner import app as runner_app
-
-    monkeypatch.delenv("OMNIGENT_SUBAGENT_LAUNCH_TIMEOUT_S", raising=False)
-    budget_s = subagent_work._DEFAULT_SUBAGENT_LAUNCH_TIMEOUT_S if timeout_s is None else timeout_s
-    timeout_kwargs = {} if timeout_s is None else {"timeout_s": timeout_s}
-    parent_id = uuid.uuid4().hex
-    child_id = uuid.uuid4().hex
-    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
-    turn_streamed = asyncio.Event()
-    harness = _ScriptedHarnessClient(_turn_frames("resp_codex"), stream_finished=turn_streamed)
-    server_client = _WakeRecordingServerClient(parent_id)
-    app = create_runner_app(
-        process_manager=_FakeProcessManager(harness),  # type: ignore[arg-type]
-        server_client=server_client,  # type: ignore[arg-type]
-    )
-    subagent_work._session_inboxes_ref[parent_id] = inbox
-    entry = subagent_work.register_subagent_work(
-        parent_session_id=parent_id,
-        child_session_id=child_id,
-        agent="worker",
-        title="review-two",
-    )
-
-    try:
-        async with _runner_client(app) as client:
-            sent_at = time.time()
-            resp = await client.post(
-                f"/v1/sessions/{child_id}/events",
-                json={
-                    "type": "message",
-                    "role": "user",
-                    "agent_id": uuid.uuid4().hex,
-                    "model": "test-agent",
-                    "harness_override": "codex-native",
-                    "content": [{"type": "input_text", "text": "Double-check the change."}],
-                },
-            )
-            assert resp.status_code == 202, resp.text
-            await asyncio.wait_for(turn_streamed.wait(), timeout=5.0)
-            await _wait_until(
-                lambda: child_id not in app.state.active_turns,
-                "the codex-native delivery turn never ended",
-            )
-            accepted_by = time.time()
-            assert harness.posted_bodies, "the brief never reached the codex-native harness"
-            assert entry.status == "running"
-            # A dispatch registered long before acceptance must still get the full budget.
-            entry.created_at -= 600.0
-
-            assert (
-                subagent_work.reap_stalled_subagent_launches(
-                    now=sent_at + budget_s - 1.0,
-                    mark_terminal=app.state.mark_subagent_terminal_and_wake,
-                    **timeout_kwargs,
-                )
-                == []
-            ), "the bound fired before its budget elapsed after Codex accepted the prompt"
-            assert subagent_work.reap_stalled_subagent_launches(
-                now=accepted_by + budget_s,
-                mark_terminal=app.state.mark_subagent_terminal_and_wake,
-                **timeout_kwargs,
-            ) == [entry], (
-                f"work entry is {entry.status!r} past the budget after Codex accepted "
-                "the prompt and the child reported no turn start"
-            )
-            assert entry.status == "failed" and entry.launch_timed_out
-            await _wait_until(
-                lambda: any("finished (failed)" in n for n in server_client.wakes()),
-                "the silent codex-native child's failure never woke the parent",
-            )
-            assert not inbox.empty()
-            notice = await execute_tool(
-                tool_name="sys_read_inbox",
-                arguments="{}",
-                server_client=server_client,  # type: ignore[arg-type]
-                conversation_id=parent_id,
-                session_inbox=inbox,
-            )
-            assert "reported no turn start" in notice, notice
-            assert subagent_work.get_subagent_work(child_id) is entry
-            resp = await client.post(
-                f"/v1/sessions/{parent_id}/events",
-                json={
-                    "type": "message",
-                    "role": "user",
-                    "agent_id": uuid.uuid4().hex,
-                    "model": "test-agent",
-                    "harness": "openai-agents",
-                    "content": [{"type": "input_text", "text": "sub-agent finished (failed)"}],
-                },
-            )
-            assert resp.status_code == 202, resp.text
-            await _wait_until(
-                lambda: parent_id not in app.state.active_turns,
-                "the parent's wake turn never ended",
-            )
-            wakes_before = len(server_client.wakes())
-
-            # The child was only slow: it reports its turn, then its result.
-            resp = await client.post(
-                f"/v1/sessions/{child_id}/events",
-                json={"type": "external_session_status", "data": {"status": "running"}},
-            )
-            assert resp.status_code == 204, resp.text
-            final_report = "FINAL REPORT: the change is correct"
-            resp = await client.post(
-                f"/v1/sessions/{child_id}/events",
-                json={
-                    "type": "external_session_status",
-                    "data": {"status": "idle", "output": final_report},
-                },
-            )
-            assert resp.status_code == 204, resp.text
-            assert entry.status == "completed" and entry.output == final_report, (
-                f"work entry is {entry.status!r} with output {entry.output!r}: the "
-                "child's real result did not supersede the no-turn-start guess"
-            )
-            await _wait_until(
-                lambda: len(server_client.wakes()) > wakes_before,
-                "the parent was never woken for the real result",
-            )
-            report = await execute_tool(
-                tool_name="sys_read_inbox",
-                arguments="{}",
-                server_client=server_client,  # type: ignore[arg-type]
-                conversation_id=parent_id,
-                session_inbox=inbox,
-            )
-            assert final_report in report, report
-            assert subagent_work.get_subagent_work(child_id) is None
     finally:
         subagent_work.unregister_subagent_work_for_session(child_id)
         subagent_work._session_inboxes_ref.pop(parent_id, None)

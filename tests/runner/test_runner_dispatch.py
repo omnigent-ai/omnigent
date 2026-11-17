@@ -13835,8 +13835,14 @@ async def test_named_send_reused_in_flight_post_failure_keeps_tracking(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "provisional_failure",
+    [False, True],
+    ids=["already-running", "late-running-after-provisional-failure"],
+)
 async def test_named_send_adopts_busy_child_as_running_not_launching(
     monkeypatch: pytest.MonkeyPatch,
+    provisional_failure: bool,
 ) -> None:
     """A server-busy child with no local work entry is adopted as a running turn.
 
@@ -13866,12 +13872,29 @@ async def test_named_send_adopts_busy_child_as_running_not_launching(
         create_posts=create_posts,
         child_busy=True,
     )
-    # The busy child already reported running for its in-flight turn, before any entry existed.
-    subagent_work.note_subagent_child_start_reported(child_id)
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    subagent_work._session_inboxes_ref[parent_id] = inbox
     try:
+        if provisional_failure:
+            dispatch = subagent_work.register_subagent_work(
+                parent_session_id=parent_id,
+                child_session_id=child_id,
+                agent="claude",
+                title="merge-task",
+            )
+            dispatch.status = "running"
+            subagent_work.arm_subagent_child_start_timeout(child_id)
+            provisional = subagent_work.reap_stalled_subagent_launches(
+                now=time.time() + 7200.0, timeout_s=180.0
+            )
+            assert [entry.child_session_id for entry in provisional] == [child_id]
+            assert dispatch.status == "failed"
+        # The late report outlives any provisional failure and precedes adoption.
+        subagent_work.note_subagent_child_start_reported(child_id)
         output = await _run_named_continuation(parent_id, handler)
         work = subagent_work.get_subagent_work(child_id)
         assert work is not None
+        assert work.status == "running"
         assert work.child_start_reported is True
         # The steer's own finished turn arms the launch bound; the start already reported
         # keeps it disarmed, so a steer into a running turn is never reaped.
@@ -13896,6 +13919,11 @@ async def test_named_send_adopts_busy_child_as_running_not_launching(
     assert reaped == []
     assert work.status == "running"
     assert len(event_posts) == 1
+    if provisional_failure:
+        assert inbox.qsize() == 1
+        assert inbox.get_nowait()["status"] == "failed"
+    else:
+        assert inbox.empty()
 
 
 @pytest.mark.asyncio
@@ -14648,69 +14676,3 @@ async def test_eager_mcp_cache_keeps_named_child_scope_after_revision_change(mon
             assert response.status_code == 200, response.text
             assert "Worker instructions." in recording.posted_bodies[-1]["instructions"]
             assert "Root instructions." not in recording.posted_bodies[-1]["instructions"]
-
-
-@pytest.mark.asyncio
-async def test_named_send_keeps_a_late_running_report_across_a_provisional_failure(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A child that reported running after its provisional failure is not failed again.
-
-    The launch bound fails a silent dispatch provisionally. The child then reports
-    its turn running, and a steer adopts it. The active turn does not report running
-    again, so the steer's acceptance must not re-arm the bound, even past the budget.
-    """
-    from omnigent.runner import app as runner_app
-
-    parent_id, child_id = "conv_parent_late_running", "conv_child_late_running"
-    stamped: list[str] = []
-    event_posts: list[dict[str, Any]] = []
-    create_posts: list[int] = []
-
-    monkeypatch.setattr(runner_app, "get_session_agent_id", lambda _sid: "ag_parent")
-    monkeypatch.setattr(subagent_work, "register_child_session", lambda *a, **k: None)
-
-    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
-    subagent_work._session_inboxes_ref[parent_id] = inbox
-    dispatch = subagent_work.register_subagent_work(
-        parent_session_id=parent_id, child_session_id=child_id, agent="claude", title="merge-task"
-    )
-    dispatch.status = "running"
-    handler = _running_child_server_handler(
-        parent_id,
-        child_id,
-        stamped=stamped,
-        event_posts=event_posts,
-        create_posts=create_posts,
-        child_busy=True,
-    )
-    try:
-        # The dispatch's acceptance is armed, and the child stays silent past the budget.
-        subagent_work.arm_subagent_child_start_timeout(child_id)
-        provisional = subagent_work.reap_stalled_subagent_launches(
-            now=time.time() + 7200.0, timeout_s=180.0
-        )
-        assert [entry.child_session_id for entry in provisional] == [child_id]
-        assert dispatch.status == "failed"
-        # The child's turn then reports running, which must outlive the failed entry.
-        subagent_work.note_subagent_child_start_reported(child_id)
-
-        output = await _run_named_continuation(parent_id, handler)
-        steered = subagent_work.get_subagent_work(child_id)
-        assert steered is not None
-        assert steered.status == "running"
-        assert steered.child_start_reported is True
-        # The steered turn's acceptance arrives after the steer registered its entry.
-        subagent_work.arm_subagent_child_start_timeout(child_id)
-        reaped = subagent_work.reap_stalled_subagent_launches(
-            now=time.time() + 7200.0, timeout_s=180.0
-        )
-    finally:
-        subagent_work.unregister_subagent_work_for_session(child_id)
-        subagent_work._session_inboxes_ref.pop(parent_id, None)
-
-    assert json.loads(output)["status"] == "running"
-    assert reaped == []
-    # Only the provisional failure reached the parent; the steered turn was not failed.
-    assert inbox.qsize() == 1
-    assert inbox.get_nowait()["status"] == "failed"
