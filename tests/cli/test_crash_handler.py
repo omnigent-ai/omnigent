@@ -482,20 +482,44 @@ def test_issue_url_drops_body_when_command_alone_is_too_long(
     assert "ValueError" in urllib.parse.parse_qs(urllib.parse.urlparse(url).query)["title"][0]
 
 
-@pytest.mark.parametrize("prefix", ["", "." * 132], ids=["short", "crosses-title-cutoff"])
+@pytest.mark.parametrize(
+    ("prefix", "home_directory"),
+    [
+        ("", "/home/example-user"),
+        ("." * 132, "/home/example-user"),
+        ("", r"C:\Users\example-user"),
+    ],
+    ids=["short", "crosses-title-cutoff", "windows-home"],
+)
 def test_issue_url_scrubs_home_directory_and_tokens(
-    data_dir: Path, monkeypatch: pytest.MonkeyPatch, prefix: str
+    data_dir: Path, monkeypatch: pytest.MonkeyPatch, prefix: str, home_directory: str
 ) -> None:
     """The title and body must not carry the user's home path or raw tokens."""
     ch.install_crash_handler("omnigent", "omnigent-ai/omnigent")
-    monkeypatch.setenv("HOME", "/home/example-user")
+    home_path = Path(home_directory)
+    monkeypatch.setattr(Path, "home", lambda: home_path)
+    home = str(home_path)
     token = "sk-abcdefghijklmnop"
-    exc = ImportError(f"{prefix}{token} cannot open /home/example-user/.config/app.toml")
-    tb_text = 'Traceback (most recent call last):\n  File "/home/example-user/app.py", line 1\n'
+    exc = ImportError(f"{prefix}{token} cannot open {home}/.config/app.toml")
+    tb_text = (
+        "Traceback (most recent call last):\n"
+        f'  File "{home}/app.py", line 1\n'
+        f'  File "{home}\\native.py", line 2\n'
+        f'  File "{home}name/module.py", line 3\n'
+        f'  File "{home}.backup/module.py", line 4\n'
+        f"Home: \"{home}\" '{home}' `{home}` {home}\n"
+    )
     url, _ = ch._issue_url(exc, tb_text + "ImportError: cannot open\n")
     decoded_url = urllib.parse.unquote_plus(url)
-    assert "example-user" not in decoded_url
-    assert "~/app.py" in _description_of(url)
+    body = _description_of(url)
+    assert f"{home}/.config/app.toml" not in decoded_url
+    assert "cannot open ~/.config/app.toml" in body
+    assert 'File "~/app.py"' in body
+    assert 'File "~\\native.py"' in body
+    assert f'File "{home}name/module.py"' in body
+    assert f'File "{home}.backup/module.py"' in body
+    assert "Home: \"~\" '~' `~` ~\n" in body
+    assert ch._scrub(home) == "~"
     assert token not in decoded_url
     title = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)["title"][0]
     assert token[:8] not in title

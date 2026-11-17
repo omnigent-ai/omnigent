@@ -466,7 +466,7 @@ def _scrub(text: str) -> str:
     with contextlib.suppress(Exception):
         home = str(Path.home())
         if home and home != os.sep:
-            text = text.replace(home, "~")
+            text = re.sub(re.escape(home) + r"(?=$|[/\\\s'\"`])", "~", text)
     return text
 
 
