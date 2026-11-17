@@ -51,67 +51,14 @@ export const UNOWNED_CONTROLS: Readonly<Record<string, { count: number; reason: 
     count: 1,
     reason: "Skill content area's entry is picked at runtime, which the guard can't read.",
   },
-  "src/pages/settings/HarnessFixDialog.tsx › ChooseCredential › button": {
-    count: 1,
-    reason: "Credential choice card.",
-  },
-  "src/pages/settings/HarnessFixDialog.tsx › ChooseCredential › div": {
-    count: 1,
-    reason: "Credential choice card.",
-  },
-  "src/pages/settings/HarnessFixDialog.tsx › CommandRow › Button": {
-    count: 1,
-    reason: "Subscription command button in the fix dialog.",
-  },
-  "src/pages/settings/HarnessFixDialog.tsx › CopyButton › Button": {
-    count: 1,
-    reason: "Subscription command button in the fix dialog.",
-  },
-  "src/pages/settings/HarnessFixDialog.tsx › CredentialCard › button": {
-    count: 1,
-    reason: "Credential choice card.",
-  },
-  "src/pages/settings/HarnessFixDialog.tsx › DeviceCodeState › a": {
-    count: 1,
-    reason: "Open sign-in page link.",
-  },
-  "src/pages/settings/HarnessFixDialog.tsx › HarnessFixDialog › Button": {
-    count: 15,
-    reason:
-      "Fix dialog's own buttons; this run walks the dialog without its opener's owner, which the Harnesses section's run covers.",
-  },
-  "src/pages/settings/HarnessFixDialog.tsx › HarnessFixDialog › DialogContent": {
-    count: 1,
-    reason:
-      "Fix dialog's own buttons; this run walks the dialog without its opener's owner, which the Harnesses section's run covers.",
-  },
-  "src/pages/settings/HarnessFixDialog.tsx › SwitchAccountConfirm › input": {
-    count: 1,
-    reason:
-      "Fix dialog control; this run walks the dialog without its opener's owner, which the Harnesses section's run covers.",
-  },
   "src/pages/settings/SettingsHarnessesSection.tsx › CredentialCard › button": {
     count: 1,
-    reason: "Credential choice card.",
-  },
-  "src/shell/HarnessCredentialForm.tsx › AdoptRow › Button": {
-    count: 1,
     reason:
-      "Credential form control; this run walks the form without its fix dialog's owner, which the Harnesses section's run covers.",
-  },
-  "src/shell/HarnessCredentialForm.tsx › HarnessCredentialForm › Input": {
-    count: 3,
-    reason:
-      "Credential form control; this run walks the form without its fix dialog's owner, which the Harnesses section's run covers.",
+      "Credential card's button; its control is passed in as a prop, which the guard can't read.",
   },
   "src/shell/HarnessCredentialForm.tsx › HarnessCredentialForm › button": {
     count: 1,
     reason:
-      "Button that copies the subscription login command, named by the command; not a catalog part yet.",
-  },
-  "src/shell/HarnessCredentialForm.tsx › SaveButton › Button": {
-    count: 1,
-    reason:
-      "Credential form control; this run walks the form without its fix dialog's owner, which the Harnesses section's run covers.",
+      "Subscription sign-in's copy button, named by its command text; the fix dialog's owner doesn't name it, and it isn't a catalog part yet.",
   },
 };
