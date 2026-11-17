@@ -1,11 +1,12 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { ServerInfo, SharingMode } from "@/lib/capabilities";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { basenamedRouting, RoutingProvider } from "@/lib/routing";
-import { PermissionsModal } from "./PermissionsModal";
+import { PermissionsModal, type SharedAutomation } from "./PermissionsModal";
 import type * as SessionsApiModule from "@/lib/sessionsApi";
 
 vi.mock("@/hooks/useSharing", () => ({
@@ -17,6 +18,9 @@ vi.mock("@/lib/permissionsApi", async (importOriginal) => ({
   listPermissions: vi.fn(),
   grantPermission: vi.fn(),
   revokePermission: vi.fn(),
+  listAutomationPermissions: vi.fn(),
+  grantSharePermission: vi.fn(),
+  revokeSharePermission: vi.fn(),
 }));
 
 // The workspace-files toggle reads the session snapshot for its current state
@@ -59,6 +63,17 @@ import type { Session } from "@/lib/types";
 const listMock = vi.mocked(api.listPermissions);
 const grantMock = vi.mocked(api.grantPermission);
 const revokeMock = vi.mocked(api.revokePermission);
+const listAutomationMock = vi.mocked(api.listAutomationPermissions);
+const grantShareMock = vi.mocked(api.grantSharePermission);
+const revokeShareMock = vi.mocked(api.revokeSharePermission);
+
+/** A grants list as the API returns it, optionally naming a managing automation. */
+function grantList<T extends api.ShareGrant>(
+  permissions: T[],
+  managedByAutomation: api.ManagingAutomation | null = null,
+): api.GrantList<T> {
+  return { permissions, managedByAutomation };
+}
 const useSessionMock = vi.mocked(useSession);
 const updateSessionMock = vi.mocked(updateSession);
 
@@ -156,6 +171,9 @@ beforeEach(() => {
   listMock.mockReset();
   grantMock.mockReset();
   revokeMock.mockReset();
+  listAutomationMock.mockReset();
+  grantShareMock.mockReset();
+  revokeShareMock.mockReset();
   // Default: standalone (no host providers). Combobox/transform tests opt in.
   userSearchMock.mockReturnValue(undefined);
   transformLinkMock.mockReturnValue(undefined);
@@ -173,9 +191,9 @@ describe("PermissionsModal", () => {
   it.each(["General access", "New user permission", "Permission level for bob@example.com"])(
     "anchors the %s menu below the start of its trigger",
     async (label) => {
-      listMock.mockResolvedValue([
-        { user_id: "bob@example.com", conversation_id: "conv_abc", level: 2 },
-      ]);
+      listMock.mockResolvedValue(
+        grantList([{ user_id: "bob@example.com", conversation_id: "conv_abc", level: 2 }]),
+      );
 
       render(<PermissionsModal sessionId="conv_abc" open={true} onOpenChange={() => {}} />, {
         wrapper: createSharingWrapper("on"),
@@ -200,10 +218,12 @@ describe("PermissionsModal", () => {
   );
 
   it("fetches and displays grants when opened", async () => {
-    listMock.mockResolvedValue([
-      { user_id: "alice@example.com", conversation_id: "conv_abc", level: 3 },
-      { user_id: "bob@example.com", conversation_id: "conv_abc", level: 1 },
-    ]);
+    listMock.mockResolvedValue(
+      grantList([
+        { user_id: "alice@example.com", conversation_id: "conv_abc", level: 3 },
+        { user_id: "bob@example.com", conversation_id: "conv_abc", level: 1 },
+      ]),
+    );
 
     render(<PermissionsModal sessionId="conv_abc" open={true} onOpenChange={() => {}} />, {
       wrapper: createWrapper(),
@@ -217,7 +237,7 @@ describe("PermissionsModal", () => {
   });
 
   it("calls grantPermission with the form values on submit", async () => {
-    listMock.mockResolvedValue([]);
+    listMock.mockResolvedValue(grantList([]));
     grantMock.mockResolvedValue({ user_id: "carol", conversation_id: "conv_abc", level: 2 });
 
     render(<PermissionsModal sessionId="conv_abc" open={true} onOpenChange={() => {}} />, {
@@ -238,9 +258,9 @@ describe("PermissionsModal", () => {
   });
 
   it("calls revokePermission when the revoke button is clicked", async () => {
-    listMock.mockResolvedValue([
-      { user_id: "bob@example.com", conversation_id: "conv_abc", level: 1 },
-    ]);
+    listMock.mockResolvedValue(
+      grantList([{ user_id: "bob@example.com", conversation_id: "conv_abc", level: 1 }]),
+    );
     revokeMock.mockResolvedValue(undefined);
 
     render(<PermissionsModal sessionId="conv_abc" open={true} onOpenChange={() => {}} />, {
@@ -265,9 +285,9 @@ describe("PermissionsModal", () => {
         isLoading: false,
         error: null,
       });
-      listMock.mockResolvedValue([
-        { user_id: "bob@example.com", conversation_id: "conv_abc", level: 1 },
-      ]);
+      listMock.mockResolvedValue(
+        grantList([{ user_id: "bob@example.com", conversation_id: "conv_abc", level: 1 }]),
+      );
       grantMock.mockResolvedValue({
         user_id: "bob@example.com",
         conversation_id: "conv_abc",
@@ -315,10 +335,12 @@ describe("PermissionsModal", () => {
   );
 
   it("renders the owner as non-editable with no revoke control", async () => {
-    listMock.mockResolvedValue([
-      { user_id: "owner@example.com", conversation_id: "conv_abc", level: 4 },
-      { user_id: "bob@example.com", conversation_id: "conv_abc", level: 1 },
-    ]);
+    listMock.mockResolvedValue(
+      grantList([
+        { user_id: "owner@example.com", conversation_id: "conv_abc", level: 4 },
+        { user_id: "bob@example.com", conversation_id: "conv_abc", level: 1 },
+      ]),
+    );
 
     render(<PermissionsModal sessionId="conv_abc" open={true} onOpenChange={() => {}} />, {
       wrapper: createWrapper(),
@@ -335,7 +357,7 @@ describe("PermissionsModal", () => {
   });
 
   it("toggles public access via grant/revoke of __public__ sentinel", async () => {
-    listMock.mockResolvedValue([]);
+    listMock.mockResolvedValue(grantList([]));
     grantMock.mockResolvedValue({ user_id: "__public__", conversation_id: "conv_abc", level: 1 });
 
     render(<PermissionsModal sessionId="conv_abc" open={true} onOpenChange={() => {}} />, {
@@ -352,7 +374,7 @@ describe("PermissionsModal", () => {
   });
 
   it("displays server error messages from failed grant", async () => {
-    listMock.mockResolvedValue([]);
+    listMock.mockResolvedValue(grantList([]));
     let failGrant!: () => void;
     grantMock.mockReturnValue(
       new Promise((_resolve, reject) => {
@@ -384,11 +406,13 @@ describe("PermissionsModal", () => {
   // and not the per-row level select, regardless of the viewer (owners and
   // managers see the same modal).
   it("never offers Manage in any level dropdown", async () => {
-    listMock.mockResolvedValue([
-      { user_id: "owner@example.com", conversation_id: "conv_abc", level: 4 },
-      { user_id: "mallory@example.com", conversation_id: "conv_abc", level: 3 },
-      { user_id: "bob@example.com", conversation_id: "conv_abc", level: 1 },
-    ]);
+    listMock.mockResolvedValue(
+      grantList([
+        { user_id: "owner@example.com", conversation_id: "conv_abc", level: 4 },
+        { user_id: "mallory@example.com", conversation_id: "conv_abc", level: 3 },
+        { user_id: "bob@example.com", conversation_id: "conv_abc", level: 1 },
+      ]),
+    );
 
     render(<PermissionsModal sessionId="conv_abc" open={true} onOpenChange={() => {}} />, {
       wrapper: createWrapper(),
@@ -434,7 +458,7 @@ describe("PermissionsModal", () => {
   // sharing from the sidebar 3-dot menu always produced a link to whatever
   // conversation was currently open instead of the one being shared.
   it("copies a link to the shared conversation, not the currently open one", async () => {
-    listMock.mockResolvedValue([]);
+    listMock.mockResolvedValue(grantList([]));
     const writeText = vi.fn().mockResolvedValue(undefined);
     Object.assign(navigator, { clipboard: { writeText } });
     const originalLocation = window.location;
@@ -468,7 +492,7 @@ describe("PermissionsModal", () => {
   it("uses the host transformShareLink when one is installed", () => {
     // WHY: in the embed the host returns the full absolute URL; the modal must
     // defer to that transform instead of prepending window.location.origin.
-    listMock.mockResolvedValue([]);
+    listMock.mockResolvedValue(grantList([]));
     transformLinkMock.mockReturnValue((path: string) => `https://host.example.com/embed#${path}`);
     const writeText = vi.fn().mockResolvedValue(undefined);
     Object.assign(navigator, { clipboard: { writeText } });
@@ -495,7 +519,7 @@ describe("PermissionsModal", () => {
     ],
     ["is unavailable on an insecure origin", undefined],
   ])("copies the link and confirms when the async clipboard %s", async (_case, clipboard) => {
-    listMock.mockResolvedValue([]);
+    listMock.mockResolvedValue(grantList([]));
     const copiedText = vi.fn();
     Object.assign(navigator, { clipboard });
     Object.defineProperty(document, "execCommand", {
@@ -531,7 +555,7 @@ describe("PermissionsModal", () => {
   it.each([undefined, "report.html"])(
     "shows an error when the link cannot be copied (file: %s)",
     async (filePath) => {
-      listMock.mockResolvedValue([]);
+      listMock.mockResolvedValue(grantList([]));
       useSessionMock.mockReturnValue({
         session: sessionWith({ workspace: "/repo", shareWorkspaceFiles: true }),
         isLoading: false,
@@ -569,9 +593,9 @@ describe("PermissionsModal", () => {
   it("surfaces a server error from a failed revoke", async () => {
     // WHY: revoke failures (e.g. insufficient permission) must render the
     // server message via the onError path, mirroring the grant error path.
-    listMock.mockResolvedValue([
-      { user_id: "bob@example.com", conversation_id: "conv_abc", level: 1 },
-    ]);
+    listMock.mockResolvedValue(
+      grantList([{ user_id: "bob@example.com", conversation_id: "conv_abc", level: 1 }]),
+    );
     revokeMock.mockRejectedValue(new Error("cannot revoke last owner"));
 
     render(<PermissionsModal sessionId="conv_abc" open={true} onOpenChange={() => {}} />, {
@@ -593,9 +617,9 @@ describe("PermissionsModal", () => {
   // label that keeps the full id reachable via its title tooltip.
   describe("long user id rendering", () => {
     it("caps the grants section's grid min-content (min-w-0)", async () => {
-      listMock.mockResolvedValue([
-        { user_id: "bob@example.com", conversation_id: "conv_abc", level: 1 },
-      ]);
+      listMock.mockResolvedValue(
+        grantList([{ user_id: "bob@example.com", conversation_id: "conv_abc", level: 1 }]),
+      );
 
       render(<PermissionsModal sessionId="conv_abc" open={true} onOpenChange={() => {}} />, {
         wrapper: createWrapper(),
@@ -606,13 +630,15 @@ describe("PermissionsModal", () => {
     });
 
     it("renders a long email as a truncating label with the full id in its title", async () => {
-      listMock.mockResolvedValue([
-        {
-          user_id: "alice.a-very-long-local-part-that-overflows@example.com",
-          conversation_id: "conv_abc",
-          level: 1,
-        },
-      ]);
+      listMock.mockResolvedValue(
+        grantList([
+          {
+            user_id: "alice.a-very-long-local-part-that-overflows@example.com",
+            conversation_id: "conv_abc",
+            level: 1,
+          },
+        ]),
+      );
 
       render(<PermissionsModal sessionId="conv_abc" open={true} onOpenChange={() => {}} />, {
         wrapper: createWrapper(),
@@ -641,7 +667,7 @@ describe("PermissionsModal", () => {
   // from sm: up.
   describe("footer on a phone-width dialog", () => {
     it("keeps the footer stacked below sm instead of forcing one row", async () => {
-      listMock.mockResolvedValue([]);
+      listMock.mockResolvedValue(grantList([]));
 
       render(<PermissionsModal sessionId="conv_abc" open={true} onOpenChange={() => {}} />, {
         wrapper: createWrapper(),
@@ -671,7 +697,7 @@ describe("PermissionsModal", () => {
     });
 
     it("disables the combobox for a workspace that cannot be shared", async () => {
-      listMock.mockResolvedValue([]);
+      listMock.mockResolvedValue(grantList([]));
       render(
         <PermissionsModal
           sessionId="conv_abc"
@@ -689,7 +715,7 @@ describe("PermissionsModal", () => {
     });
 
     it("closes open suggestions when the workspace becomes unshareable", async () => {
-      listMock.mockResolvedValue([]);
+      listMock.mockResolvedValue(grantList([]));
       const { rerender } = render(
         <PermissionsModal
           sessionId="conv_abc"
@@ -717,7 +743,7 @@ describe("PermissionsModal", () => {
     });
 
     it("renders the field as a combobox and shows suggestions while typing", async () => {
-      listMock.mockResolvedValue([]);
+      listMock.mockResolvedValue(grantList([]));
       render(<PermissionsModal sessionId="conv_abc" open={true} onOpenChange={() => {}} />, {
         wrapper: createWrapper(),
       });
@@ -736,7 +762,7 @@ describe("PermissionsModal", () => {
     });
 
     it("commits a clicked suggestion into the input value", async () => {
-      listMock.mockResolvedValue([]);
+      listMock.mockResolvedValue(grantList([]));
       render(<PermissionsModal sessionId="conv_abc" open={true} onOpenChange={() => {}} />, {
         wrapper: createWrapper(),
       });
@@ -753,7 +779,7 @@ describe("PermissionsModal", () => {
     });
 
     it("shows an empty-state message when the searcher returns no matches", async () => {
-      listMock.mockResolvedValue([]);
+      listMock.mockResolvedValue(grantList([]));
       render(<PermissionsModal sessionId="conv_abc" open={true} onOpenChange={() => {}} />, {
         wrapper: createWrapper(),
       });
@@ -784,7 +810,7 @@ describe("PermissionsModal", () => {
     });
 
     it("on: renders the full controls with no disabled/read-only notice", async () => {
-      listMock.mockResolvedValue([]);
+      listMock.mockResolvedValue(grantList([]));
 
       render(<PermissionsModal sessionId="conv_abc" open={true} onOpenChange={() => {}} />, {
         wrapper: createSharingWrapper("on"),
@@ -802,7 +828,7 @@ describe("PermissionsModal", () => {
     });
 
     it("read_only: shows the read-only notice, keeps Grant, offers only Read", async () => {
-      listMock.mockResolvedValue([]);
+      listMock.mockResolvedValue(grantList([]));
 
       render(<PermissionsModal sessionId="conv_abc" open={true} onOpenChange={() => {}} />, {
         wrapper: createSharingWrapper("read_only"),
@@ -832,7 +858,7 @@ describe("PermissionsModal", () => {
     });
 
     it("restricted_read_only: presents the same read-only UI when the workspace is unknown", async () => {
-      listMock.mockResolvedValue([]);
+      listMock.mockResolvedValue(grantList([]));
 
       render(<PermissionsModal sessionId="conv_abc" open={true} onOpenChange={() => {}} />, {
         wrapper: createSharingWrapper("restricted_read_only"),
@@ -861,7 +887,7 @@ describe("PermissionsModal", () => {
 
   describe("workspace restrictions", () => {
     it("allows read-only grants in project directories", async () => {
-      listMock.mockResolvedValue([]);
+      listMock.mockResolvedValue(grantList([]));
       grantMock.mockResolvedValue({ conversation_id: "conv_abc", user_id: "bob", level: 1 });
       render(
         <PermissionsModal
@@ -881,7 +907,7 @@ describe("PermissionsModal", () => {
     it.each(["/home/alice", "/Users/bob", "/var/home/carol", "/root", "/", undefined])(
       "disables new grants and explains the restriction for workspace prop %s",
       async (workspace) => {
-        listMock.mockResolvedValue([]);
+        listMock.mockResolvedValue(grantList([]));
         const filePath = workspace === undefined ? "report.html" : undefined;
         useSessionMock.mockReturnValue({
           session: sessionWith({
@@ -927,7 +953,7 @@ describe("PermissionsModal", () => {
     );
 
     it("rejects a form submission once the workspace becomes unshareable", async () => {
-      listMock.mockResolvedValue([]);
+      listMock.mockResolvedValue(grantList([]));
       const { rerender } = render(
         <PermissionsModal
           sessionId="conv_abc"
@@ -960,7 +986,7 @@ describe("PermissionsModal", () => {
     it.each(["on", "read_only"] as const)(
       "does not block home directories in %s mode",
       async (mode) => {
-        listMock.mockResolvedValue([]);
+        listMock.mockResolvedValue(grantList([]));
         grantMock.mockResolvedValue({ conversation_id: "conv_abc", user_id: "bob", level: 1 });
         render(
           <PermissionsModal
@@ -983,11 +1009,13 @@ describe("PermissionsModal", () => {
     it.each([undefined, "report.html"])(
       "keeps existing user and public grants revocable for blocked workspaces (file: %s)",
       async (filePath) => {
-        listMock.mockResolvedValue([
-          { conversation_id: "conv_abc", user_id: "alice", level: 4 },
-          { conversation_id: "conv_abc", user_id: "bob", level: 2 },
-          { conversation_id: "conv_abc", user_id: "__public__", level: 1 },
-        ]);
+        listMock.mockResolvedValue(
+          grantList([
+            { conversation_id: "conv_abc", user_id: "alice", level: 4 },
+            { conversation_id: "conv_abc", user_id: "bob", level: 2 },
+            { conversation_id: "conv_abc", user_id: "__public__", level: 1 },
+          ]),
+        );
         revokeMock.mockResolvedValue(undefined);
         render(
           <PermissionsModal
@@ -1012,7 +1040,7 @@ describe("PermissionsModal", () => {
 
   describe("public access", () => {
     it("hides the Public access toggle when the server disables public sharing", async () => {
-      listMock.mockResolvedValue([]);
+      listMock.mockResolvedValue(grantList([]));
 
       render(<PermissionsModal sessionId="conv_abc" open={true} onOpenChange={() => {}} />, {
         wrapper: createInfoWrapper({ public_sharing_enabled: false }),
@@ -1026,7 +1054,7 @@ describe("PermissionsModal", () => {
     });
 
     it("shows the Public access toggle when public sharing is enabled", async () => {
-      listMock.mockResolvedValue([]);
+      listMock.mockResolvedValue(grantList([]));
 
       render(<PermissionsModal sessionId="conv_abc" open={true} onOpenChange={() => {}} />, {
         wrapper: createInfoWrapper({ public_sharing_enabled: true }),
@@ -1038,7 +1066,7 @@ describe("PermissionsModal", () => {
     });
 
     it("grants public Edit only when the server explicitly permits it", async () => {
-      listMock.mockResolvedValue([]);
+      listMock.mockResolvedValue(grantList([]));
       grantMock.mockResolvedValue({ user_id: "__public__", conversation_id: "conv_abc", level: 2 });
       render(<PermissionsModal sessionId="conv_abc" open onOpenChange={() => {}} />, {
         wrapper: createInfoWrapper({ public_sharing_max_level: "edit" }),
@@ -1050,7 +1078,7 @@ describe("PermissionsModal", () => {
     it.each([undefined, "read"] as const)(
       "offers only No access and Read for a %s ceiling",
       async (level) => {
-        listMock.mockResolvedValue([]);
+        listMock.mockResolvedValue(grantList([]));
         render(<PermissionsModal sessionId="conv_abc" open onOpenChange={() => {}} />, {
           wrapper: createInfoWrapper({ public_sharing_max_level: level }),
         });
@@ -1068,9 +1096,9 @@ describe("PermissionsModal", () => {
     );
 
     it("keeps an existing public grant revocable when public sharing is disabled", async () => {
-      listMock.mockResolvedValue([
-        { user_id: "__public__", conversation_id: "conv_abc", level: 2 },
-      ]);
+      listMock.mockResolvedValue(
+        grantList([{ user_id: "__public__", conversation_id: "conv_abc", level: 2 }]),
+      );
       revokeMock.mockResolvedValue(undefined);
       render(<PermissionsModal sessionId="conv_abc" open onOpenChange={() => {}} />, {
         wrapper: createInfoWrapper({ public_sharing_enabled: false }),
@@ -1090,7 +1118,7 @@ describe("PermissionsModal", () => {
     });
 
     it("leaves workspace files private when the file sharing dialog is only opened", async () => {
-      listMock.mockResolvedValue([]);
+      listMock.mockResolvedValue(grantList([]));
       useSessionMock.mockReturnValue({
         session: sessionWith({ workspace: "/repo", shareWorkspaceFiles: false }),
         isLoading: false,
@@ -1123,7 +1151,7 @@ describe("PermissionsModal", () => {
     ])(
       "enables workspace files only after a recipient grant succeeds (success: %s, already shared: %s)",
       async (succeeds, workspaceShared) => {
-        listMock.mockResolvedValue([]);
+        listMock.mockResolvedValue(grantList([]));
         useSessionMock.mockReturnValue({
           session: sessionWith({ workspace: "/repo", shareWorkspaceFiles: workspaceShared }),
           isLoading: false,
@@ -1187,7 +1215,9 @@ describe("PermissionsModal", () => {
     );
 
     it("enables file access for an existing viewer without changing the viewer's grant", async () => {
-      listMock.mockResolvedValue([{ user_id: "alice", conversation_id: "conv_abc", level: 1 }]);
+      listMock.mockResolvedValue(
+        grantList([{ user_id: "alice", conversation_id: "conv_abc", level: 1 }]),
+      );
       useSessionMock.mockReturnValue({
         session: sessionWith({ workspace: "/repo", shareWorkspaceFiles: false }),
         isLoading: false,
@@ -1218,7 +1248,7 @@ describe("PermissionsModal", () => {
     });
 
     it("reports that session access remains granted when workspace file sharing fails", async () => {
-      listMock.mockResolvedValue([]);
+      listMock.mockResolvedValue(grantList([]));
       useSessionMock.mockReturnValue({
         session: sessionWith({ workspace: "/repo", shareWorkspaceFiles: false }),
         isLoading: false,
@@ -1255,7 +1285,7 @@ describe("PermissionsModal", () => {
     it.each(["/repo", null])(
       "copies immediately and confirms after sharing workspace files (snapshot workspace: %s)",
       async (workspace) => {
-        listMock.mockResolvedValue([]);
+        listMock.mockResolvedValue(grantList([]));
         const queryClient = new QueryClient();
         const cached = sessionWith({
           workspace,
@@ -1316,7 +1346,7 @@ describe("PermissionsModal", () => {
     ])(
       "reports copy and preparation outcomes (copy succeeds: %s, preparation succeeds: %s)",
       async (copySucceeds, preparationSucceeds) => {
-        listMock.mockResolvedValue([]);
+        listMock.mockResolvedValue(grantList([]));
         useSessionMock.mockReturnValue({
           session: sessionWith({ workspace: "/repo", shareWorkspaceFiles: false }),
           isLoading: false,
@@ -1390,7 +1420,7 @@ describe("PermissionsModal", () => {
     it.each([true, false])(
       "shows the mobile QR code only after workspace preparation succeeds (success: %s)",
       async (succeeds) => {
-        listMock.mockResolvedValue([]);
+        listMock.mockResolvedValue(grantList([]));
         useSessionMock.mockReturnValue({
           session: sessionWith({ workspace: "/repo", shareWorkspaceFiles: false }),
           isLoading: false,
@@ -1435,7 +1465,7 @@ describe("PermissionsModal", () => {
     it.each([true, false])(
       "enables workspace files only after a general Read grant succeeds (success: %s)",
       async (succeeds) => {
-        listMock.mockResolvedValue([]);
+        listMock.mockResolvedValue(grantList([]));
         if (succeeds) {
           grantMock.mockResolvedValue({
             user_id: "__public__",
@@ -1481,10 +1511,12 @@ describe("PermissionsModal", () => {
     it.each([null, new Error("Could not load the session")])(
       "keeps grants revocable while file sharing waits for the session (error: %s)",
       async (sessionError) => {
-        listMock.mockResolvedValue([
-          { user_id: "bob", conversation_id: "conv_abc", level: 1 },
-          { user_id: "__public__", conversation_id: "conv_abc", level: 1 },
-        ]);
+        listMock.mockResolvedValue(
+          grantList([
+            { user_id: "bob", conversation_id: "conv_abc", level: 1 },
+            { user_id: "__public__", conversation_id: "conv_abc", level: 1 },
+          ]),
+        );
         revokeMock.mockResolvedValue(undefined);
         useSessionMock.mockReturnValue({
           session: null,
@@ -1520,7 +1552,7 @@ describe("PermissionsModal", () => {
     );
 
     it("explains session access and grants new recipients read access", async () => {
-      listMock.mockResolvedValue([]);
+      listMock.mockResolvedValue(grantList([]));
       grantMock.mockResolvedValue({ user_id: "carol", conversation_id: "conv_abc", level: 1 });
 
       render(
@@ -1558,10 +1590,10 @@ describe("PermissionsModal", () => {
       "preserves an existing level %i grant when sharing a file",
       async (level) => {
         listMock
-          .mockResolvedValueOnce([])
-          .mockResolvedValue([
-            { user_id: "alice@example.com", conversation_id: "conv_abc", level },
-          ]);
+          .mockResolvedValueOnce(grantList([]))
+          .mockResolvedValue(
+            grantList([{ user_id: "alice@example.com", conversation_id: "conv_abc", level }]),
+          );
 
         render(
           <PermissionsModal
@@ -1596,16 +1628,18 @@ describe("PermissionsModal", () => {
         const queryClient = new QueryClient({
           defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
         });
-        if (cached) queryClient.setQueryData(["permissions", "conv_abc"], []);
+        if (cached) queryClient.setQueryData(["permissions", "conv_abc"], grantList([]));
         let finishPermissions!: () => void;
         listMock.mockImplementation(
           () =>
             new Promise((resolve, reject) => {
               finishPermissions = () => {
                 if (succeeds) {
-                  resolve([
-                    { user_id: "alice@example.com", conversation_id: "conv_abc", level: 3 },
-                  ]);
+                  resolve(
+                    grantList([
+                      { user_id: "alice@example.com", conversation_id: "conv_abc", level: 3 },
+                    ]),
+                  );
                 } else {
                   reject(new Error("Could not refresh permissions"));
                 }
@@ -1650,7 +1684,7 @@ describe("PermissionsModal", () => {
     );
 
     it("copies an encoded fullscreen file link without current viewer parameters", async () => {
-      listMock.mockResolvedValue([]);
+      listMock.mockResolvedValue(grantList([]));
       const filePath = "artifacts/财务 report #1 & + %.html";
       const writeText = vi.fn().mockResolvedValue(undefined);
       Object.assign(navigator, { clipboard: { writeText } });
@@ -1689,7 +1723,7 @@ describe("PermissionsModal", () => {
     });
 
     it("rebases and transforms file links and preserves the file target in the app QR code", async () => {
-      listMock.mockResolvedValue([]);
+      listMock.mockResolvedValue(grantList([]));
       const filePath = "artifacts/report #1.html";
       const query = new URLSearchParams({ file: filePath, fullscreen: "1" }).toString();
       const transform = vi.fn((path: string) => `https://host.example.com:8443/embed#${path}`);
@@ -1748,7 +1782,7 @@ describe("PermissionsModal", () => {
     }
 
     it("encodes the omnigent:// deep link for the session from the server origin", async () => {
-      listMock.mockResolvedValue([]);
+      listMock.mockResolvedValue(grantList([]));
 
       await withLocation("https://app.example.com", async () => {
         render(<PermissionsModal sessionId="conv_abc" open={true} onOpenChange={() => {}} />, {
@@ -1766,7 +1800,7 @@ describe("PermissionsModal", () => {
 
     it("includes the port in the host when non-default", async () => {
       // Mirrors the deep-link convention: `omnigent://localhost:8000/c/<id>`.
-      listMock.mockResolvedValue([]);
+      listMock.mockResolvedValue(grantList([]));
 
       await withLocation("http://localhost:8000", async () => {
         render(<PermissionsModal sessionId="conv_abc" open={true} onOpenChange={() => {}} />, {
@@ -1783,7 +1817,7 @@ describe("PermissionsModal", () => {
     it("derives the host from the host transformShareLink in the embed", async () => {
       // In the embed the host transform returns the full absolute URL; the QR
       // must take its host from that URL, not window.location.origin.
-      listMock.mockResolvedValue([]);
+      listMock.mockResolvedValue(grantList([]));
       transformLinkMock.mockReturnValue((path: string) => `https://host.example.com/embed#${path}`);
 
       render(<PermissionsModal sessionId="conv_xyz" open={true} onOpenChange={() => {}} />, {
@@ -1799,7 +1833,7 @@ describe("PermissionsModal", () => {
 
   describe("workspace-files toggle", () => {
     it("is hidden for a session with no workspace", async () => {
-      listMock.mockResolvedValue([]);
+      listMock.mockResolvedValue(grantList([]));
       useSessionMock.mockReturnValue({
         session: sessionWith({ workspace: null }),
         isLoading: false,
@@ -1815,7 +1849,7 @@ describe("PermissionsModal", () => {
     });
 
     it("turns sharing on for a workspace session that isn't sharing yet", async () => {
-      listMock.mockResolvedValue([]);
+      listMock.mockResolvedValue(grantList([]));
       useSessionMock.mockReturnValue({
         session: sessionWith({ workspace: "/repo", shareWorkspaceFiles: false }),
         isLoading: false,
@@ -1837,7 +1871,7 @@ describe("PermissionsModal", () => {
     });
 
     it("turns sharing off when it is already on", async () => {
-      listMock.mockResolvedValue([]);
+      listMock.mockResolvedValue(grantList([]));
       useSessionMock.mockReturnValue({
         session: sessionWith({ workspace: "/repo", shareWorkspaceFiles: true }),
         isLoading: false,
@@ -1856,6 +1890,229 @@ describe("PermissionsModal", () => {
       await waitFor(() =>
         expect(updateSessionMock).toHaveBeenCalledWith("conv_abc", { shareWorkspaceFiles: false }),
       );
+    });
+  });
+
+  describe("sharing an automation", () => {
+    const automationTarget = { kind: "automation", id: "st_1" };
+
+    function renderAutomationDialog(overrides: Partial<SharedAutomation> = {}) {
+      const automation: SharedAutomation = {
+        id: "st_1",
+        name: "Nightly triage",
+        sessionMode: "new",
+        ...overrides,
+      };
+      render(<PermissionsModal automation={automation} open onOpenChange={() => {}} />, {
+        wrapper: createInfoWrapper({ scheduled_task_sharing: true }),
+      });
+    }
+
+    function grantee(userId: string, displayName = userId) {
+      return { user_id: userId, scheduled_task_id: "st_1", level: 1, display_name: displayName };
+    }
+
+    it("lists grantees by name with Read as the only level", async () => {
+      listAutomationMock.mockResolvedValue(
+        grantList([grantee("alice@example.com", "Alice Example"), grantee("team-b")]),
+      );
+
+      renderAutomationDialog();
+
+      expect(await screen.findByText("Alice Example")).toHaveAttribute(
+        "title",
+        "alice@example.com",
+      );
+      expect(screen.getByText("alice@example.com")).toBeInTheDocument();
+      expect(screen.getByText("team-b")).toBeInTheDocument();
+      expect(listAutomationMock).toHaveBeenCalledWith("st_1");
+      expect(listMock).not.toHaveBeenCalled();
+      // No level picker: both rows and the add form show a fixed Read.
+      expect(screen.queryAllByRole("combobox")).toHaveLength(0);
+      expect(screen.getAllByText("Read")).toHaveLength(3);
+    });
+
+    it("offers no public access, link or mobile sharing", async () => {
+      listAutomationMock.mockResolvedValue(grantList([]));
+
+      renderAutomationDialog();
+
+      expect(await screen.findByText("No grants yet.")).toBeInTheDocument();
+      expect(screen.getByRole("heading", { name: "Share this automation" })).toBeInTheDocument();
+      expect(screen.queryByText("General access")).toBeNull();
+      expect(screen.queryByRole("button", { name: /copy link/i })).toBeNull();
+      expect(screen.queryByRole("button", { name: /open in mobile app/i })).toBeNull();
+      expect(screen.getByRole("button", { name: "Done" })).toBeInTheDocument();
+    });
+
+    it("adds and removes grantees through the automation's endpoints", async () => {
+      listAutomationMock.mockResolvedValue(grantList([grantee("bob@example.com")]));
+      grantShareMock.mockResolvedValue(grantee("carol@example.com"));
+      revokeShareMock.mockResolvedValue(undefined);
+
+      renderAutomationDialog();
+
+      await screen.findByText("bob@example.com");
+      fireEvent.change(screen.getByPlaceholderText("alice@example.com"), {
+        target: { value: "carol@example.com" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: /grant/i }));
+      await waitFor(() =>
+        expect(grantShareMock).toHaveBeenCalledWith(automationTarget, "carol@example.com", 1),
+      );
+
+      const revokeButton = screen.getByRole("button", { name: /revoke/i });
+      await waitFor(() => expect(revokeButton).toBeEnabled());
+      fireEvent.click(revokeButton);
+      await waitFor(() =>
+        expect(revokeShareMock).toHaveBeenCalledWith(automationTarget, "bob@example.com"),
+      );
+      expect(grantMock).not.toHaveBeenCalled();
+      expect(revokeMock).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      "An automation's owner cannot be granted access to it",
+      "Sharing has been disabled for this Omnigent server",
+    ])("shows the server's refusal: %s", async (message) => {
+      listAutomationMock.mockResolvedValue(grantList([]));
+      grantShareMock.mockRejectedValue(new Error(message));
+
+      renderAutomationDialog();
+
+      await screen.findByText("No grants yet.");
+      fireEvent.change(screen.getByPlaceholderText("alice@example.com"), {
+        target: { value: "owner@example.com" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: /grant/i }));
+      expect(await screen.findByText(message)).toBeInTheDocument();
+    });
+
+    it.each([
+      ["new", false],
+      ["continue", true],
+    ] as const)(
+      "explains how a %s-session automation's sessions are shared",
+      async (sessionMode, replacesShares) => {
+        listAutomationMock.mockResolvedValue(grantList([]));
+
+        renderAutomationDialog({ sessionMode });
+
+        expect(
+          await screen.findByText(
+            "Each run's session is shared with the people below, with Read access.",
+          ),
+        ).toBeInTheDocument();
+        const replaced = screen.queryByText(/replaces the shares on the session it continues/);
+        expect(replaced !== null).toBe(replacesShares);
+        if (replaced) {
+          expect(replaced).toHaveTextContent("people added there by hand, even at Edit or Manage");
+          expect(replaced).toHaveTextContent("The owner and General access are kept.");
+        }
+      },
+    );
+  });
+
+  describe("a grants list that fails to load", () => {
+    it.each([
+      ["an automation", () => listAutomationMock],
+      ["a session", () => listMock],
+    ] as const)("shows the error for %s instead of an empty list", async (kind, mock) => {
+      mock().mockRejectedValue(new Error("Agents cannot view who this is shared with"));
+
+      render(
+        kind === "a session" ? (
+          <PermissionsModal sessionId="conv_abc" open onOpenChange={() => {}} />
+        ) : (
+          <PermissionsModal
+            automation={{ id: "st_1", name: "Nightly triage", sessionMode: "new" }}
+            open
+            onOpenChange={() => {}}
+          />
+        ),
+        { wrapper: createInfoWrapper({}) },
+      );
+
+      expect(await screen.findByRole("alert")).toHaveTextContent(
+        "Couldn't load who has access: Agents cannot view who this is shared with",
+      );
+      expect(screen.queryByText("No grants yet.")).toBeNull();
+    });
+  });
+
+  describe("a session an automation manages", () => {
+    const managed = { id: "st_1", name: "Nightly triage" };
+    const bob = { user_id: "bob@example.com", conversation_id: "conv_abc", level: 1 };
+
+    function sessionDialog(open: boolean, onOpenChange: (open: boolean) => void = () => {}) {
+      return (
+        <MemoryRouter>
+          <PermissionsModal sessionId="conv_abc" open={open} onOpenChange={onOpenChange} />
+        </MemoryRouter>
+      );
+    }
+
+    it("warns with the grants from one request and links to the automation's share dialog", async () => {
+      listMock.mockResolvedValue(grantList([bob], managed));
+      const onOpenChange = vi.fn();
+
+      // No automation-sharing capability: runs replace the shares regardless.
+      render(sessionDialog(true, onOpenChange), {
+        wrapper: createInfoWrapper({ features: { automations_v2: true } }),
+      });
+
+      await screen.findByText("bob@example.com");
+      const notice = screen.getByTestId("share-managed-by-automation");
+      expect(listMock).toHaveBeenCalledTimes(1);
+      expect(notice).toHaveTextContent("Sharing is managed by an automation");
+      expect(notice).toHaveTextContent(
+        "Shares added or removed here are replaced with the automation's list on each run of " +
+          "“Nightly triage” and whenever its sharing changes. General access isn't affected.",
+      );
+      // A warning only: the grants stay editable.
+      expect(screen.getByRole("button", { name: /grant/i })).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: /revoke/i })).toBeEnabled();
+
+      const link = within(notice).getByRole("link", { name: "Nightly triage" });
+      expect(link).toHaveAttribute("href", "/tasks/st_1?share=1");
+      fireEvent.click(link);
+      expect(onOpenChange).toHaveBeenCalledWith(false);
+    });
+
+    it("links to the automations list on a server without automation pages", async () => {
+      listMock.mockResolvedValue(grantList([], managed));
+
+      render(sessionDialog(true), { wrapper: createInfoWrapper({}) });
+
+      const notice = await screen.findByTestId("share-managed-by-automation");
+      expect(within(notice).getByRole("link", { name: "Nightly triage" })).toHaveAttribute(
+        "href",
+        "/tasks",
+      );
+    });
+
+    it("keeps the warning from the loaded list while closed and reopening", async () => {
+      listMock.mockResolvedValueOnce(grantList([bob], managed));
+      const view = render(sessionDialog(true), { wrapper: createInfoWrapper({}) });
+      await screen.findByTestId("share-managed-by-automation");
+
+      view.rerender(sessionDialog(false));
+      // The reopened dialog refetches; until then it shows the list it loaded.
+      listMock.mockReturnValue(new Promise(() => {}));
+      view.rerender(sessionDialog(true));
+
+      expect(await screen.findByTestId("share-managed-by-automation")).toBeInTheDocument();
+      expect(screen.getByText("bob@example.com")).toBeInTheDocument();
+      await waitFor(() => expect(listMock).toHaveBeenCalledTimes(2));
+    });
+
+    it("shows no warning when no automation manages the session", async () => {
+      listMock.mockResolvedValue(grantList([]));
+
+      render(sessionDialog(true), { wrapper: createInfoWrapper({}) });
+
+      await screen.findByText("No grants yet.");
+      expect(screen.queryByTestId("share-managed-by-automation")).toBeNull();
     });
   });
 });

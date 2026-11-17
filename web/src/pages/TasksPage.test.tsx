@@ -13,6 +13,7 @@ import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
 import { ScheduledTaskApiError, type ScheduledTask } from "@/lib/scheduledTasksApi";
 import { showToast } from "@/components/ui/toast";
+import { TooltipProvider } from "@/components/ui/tooltip";
 
 vi.mock("@/components/ui/toast", () => ({ showToast: vi.fn() }));
 
@@ -20,6 +21,7 @@ vi.mock("@/hooks/useViewerId", () => ({ useViewerId: vi.fn() }));
 
 vi.mock("@/hooks/useScheduledTasks", () => ({
   useScheduledTasks: vi.fn(),
+  useSharedScheduledTasks: vi.fn(),
   useUpdateScheduledTask: vi.fn(),
   useDeleteScheduledTask: vi.fn(),
   useRunScheduledTaskNow: vi.fn(),
@@ -77,6 +79,12 @@ vi.mock("@/components/scheduled/CreateScheduledTaskDialog", () => ({
     ) : null,
 }));
 
+// Stub the share dialog to a marker naming the automation it shares.
+vi.mock("@/components/PermissionsModal", () => ({
+  PermissionsModal: ({ automation, open }: { automation?: { id: string }; open: boolean }) =>
+    open ? <div data-testid="share-dialog-open" data-automation-id={automation?.id ?? ""} /> : null,
+}));
+
 function task(overrides: Partial<ScheduledTask> = {}): ScheduledTask {
   return {
     id: "st_1",
@@ -91,6 +99,7 @@ function task(overrides: Partial<ScheduledTask> = {}): ScheduledTask {
     modelOverride: null,
     reasoningEffort: null,
     permissionMode: null,
+    mcpServices: [],
     sessionMode: "new",
     sessionId: null,
     workspace: null,
@@ -122,8 +131,27 @@ function setTasks(
   } as unknown as ReturnType<typeof hooks.useScheduledTasks>);
 }
 
+const fetchNextSharedPage = vi.fn();
+
+function setSharedPages(
+  pages: { tasks: ScheduledTask[]; nextCursor: string | null }[] | undefined,
+  state: { isLoading?: boolean; isError?: boolean; isFetchingNextPage?: boolean } = {},
+) {
+  vi.mocked(hooks.useSharedScheduledTasks).mockReturnValue({
+    data: pages ? { pages, pageParams: pages.map(() => null) } : undefined,
+    isLoading: state.isLoading ?? false,
+    isError: state.isError ?? false,
+    hasNextPage: (pages?.at(-1)?.nextCursor ?? null) !== null,
+    isFetchingNextPage: state.isFetchingNextPage ?? false,
+    fetchNextPage: fetchNextSharedPage,
+    refetch: vi.fn(),
+  } as unknown as ReturnType<typeof hooks.useSharedScheduledTasks>);
+}
+
 const analytics = vi.fn();
 beforeEach(() => {
+  fetchNextSharedPage.mockReset();
+  setSharedPages(undefined);
   analytics.mockReset();
   setOmnigentHostConfig({ analytics });
   localStorage.clear();
@@ -167,17 +195,19 @@ function renderPage(
 ) {
   return render(
     <CapabilitiesProvider info={info}>
-      <MemoryRouter initialEntries={[`${basename}${path}`]}>
-        <RoutingProvider value={basenamedRouting(basename)}>
-          <Routes>
-            <Route path={`${basename}/tasks`} element={<TasksPage />} />
-            <Route
-              path={`${basename}/tasks/templates`}
-              element={<TasksPage key="templates" templatesOnly />}
-            />
-          </Routes>
-        </RoutingProvider>
-      </MemoryRouter>
+      <TooltipProvider>
+        <MemoryRouter initialEntries={[`${basename}${path}`]}>
+          <RoutingProvider value={basenamedRouting(basename)}>
+            <Routes>
+              <Route path={`${basename}/tasks`} element={<TasksPage />} />
+              <Route
+                path={`${basename}/tasks/templates`}
+                element={<TasksPage key="templates" templatesOnly />}
+              />
+            </Routes>
+          </RoutingProvider>
+        </MemoryRouter>
+      </TooltipProvider>
     </CapabilitiesProvider>,
   );
 }
@@ -747,6 +777,159 @@ describe("row actions", () => {
     fireEvent.pointerDown(screen.getByTestId("task-row-menu"), { button: 0 });
     fireEvent.click(screen.getByTestId("task-delete"));
     expect(deleteMutate).toHaveBeenCalledWith("st_1");
+  });
+});
+
+describe("sharing from the row menu", () => {
+  const SHARING_INFO = { ...TRIGGER_INFO, scheduled_task_sharing: true };
+
+  function openRowMenu(viewerId: string, info: typeof SERVER_INFO_OFFLINE_FALLBACK) {
+    vi.mocked(useViewerId).mockReturnValue(viewerId);
+    setTasks([task({ id: "st_share", ownerUserId: "alice@example.com" })]);
+    renderPage("/tasks", "", info);
+    // A known viewer gets the first-visit guide; dismiss it.
+    fireEvent.click(screen.getByRole("button", { name: "Maybe later" }));
+    fireEvent.pointerDown(screen.getByTestId("task-row-menu"), { button: 0 });
+  }
+
+  it("opens the share dialog for an automation the viewer owns", () => {
+    openRowMenu("alice@example.com", SHARING_INFO);
+    fireEvent.click(screen.getByTestId("task-share"));
+    expect(screen.getByTestId("share-dialog-open")).toHaveAttribute(
+      "data-automation-id",
+      "st_share",
+    );
+  });
+
+  it("disables Share while the server turns sharing off", () => {
+    openRowMenu("alice@example.com", { ...SHARING_INFO, sharing_mode: "off" });
+    const share = screen.getByTestId("task-share");
+    expect(share).toHaveAttribute("aria-disabled", "true");
+    fireEvent.click(share);
+    expect(screen.queryByTestId("share-dialog-open")).toBeNull();
+  });
+
+  it.each([
+    ["another user", "bob@example.com", SHARING_INFO],
+    ["a server that cannot share automations", "alice@example.com", TRIGGER_INFO],
+  ])("offers no Share to %s", (_label, viewerId, info) => {
+    openRowMenu(viewerId, info);
+    expect(screen.getByTestId("task-edit")).toBeInTheDocument();
+    expect(screen.queryByTestId("task-share")).toBeNull();
+  });
+});
+
+describe("automations shared with the viewer", () => {
+  const SHARING_INFO = {
+    ...TRIGGER_INFO,
+    scheduled_task_sharing: true,
+    scheduled_task_shared_with_me: true,
+  };
+  const shared = (overrides: Partial<ScheduledTask> = {}) =>
+    task({
+      id: "st_shared",
+      name: "Team digest",
+      ownerUserId: "alice@example.com",
+      viewerRole: "viewer",
+      ownerDisplayName: "Alice",
+      ...overrides,
+    });
+
+  function openSharedTab(info: typeof SERVER_INFO_OFFLINE_FALLBACK = SHARING_INFO) {
+    vi.mocked(useViewerId).mockReturnValue("bob@example.com");
+    setTasks([task({ id: "st_mine", name: "Mine", ownerUserId: "bob@example.com" })]);
+    renderPage("/tasks?view=shared", "", info);
+    // Without the tab the page falls back to the viewer's list, whose guide shows once.
+    const dismissGuide = screen.queryByRole("button", { name: "Maybe later" });
+    if (dismissGuide) fireEvent.click(dismissGuide);
+  }
+
+  it("lists them on their own tab, naming each owner", () => {
+    setSharedPages([{ tasks: [shared()], nextCursor: null }]);
+    openSharedTab();
+    expect(hooks.useSharedScheduledTasks).toHaveBeenLastCalledWith(true);
+    expect(screen.getByRole("tab", { name: "Shared with me" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    const list = screen.getByTestId("shared-tasks-list");
+    const row = within(list).getByTestId("scheduled-task-row");
+    expect(within(row).getByText("Team digest")).toBeInTheDocument();
+    expect(within(row).getByTestId("task-owner")).toHaveTextContent("Shared by Alice");
+    expect(within(list).queryByText("Mine")).toBeNull();
+  });
+
+  it("shows every action disabled with why, and takes none", () => {
+    setSharedPages([{ tasks: [shared()], nextCursor: null }]);
+    openSharedTab();
+    fireEvent.pointerDown(screen.getByTestId("task-row-menu"), { button: 0 });
+    for (const testId of [
+      "task-run-now",
+      "task-edit",
+      "task-share",
+      "task-pause-toggle",
+      "task-delete",
+    ]) {
+      const item = screen.getByTestId(testId);
+      expect(item).toHaveAttribute("aria-disabled", "true");
+      fireEvent.click(item);
+    }
+    expect(runNowMutate).not.toHaveBeenCalled();
+    expect(mutate).not.toHaveBeenCalled();
+    expect(deleteMutate).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("manual-dialog-open")).toBeNull();
+    expect(screen.queryByTestId("share-dialog-open")).toBeNull();
+  });
+
+  it("loads more on request, and past a page that came back empty", () => {
+    setSharedPages([{ tasks: [], nextCursor: "st_0" }]);
+    openSharedTab();
+    // Nothing to show yet, so the next page loads by itself.
+    expect(fetchNextSharedPage).toHaveBeenCalledTimes(1);
+    expect(screen.queryByTestId("shared-tasks-empty-state")).toBeNull();
+
+    fetchNextSharedPage.mockReset();
+    cleanup();
+    setSharedPages([{ tasks: [shared()], nextCursor: "st_shared" }]);
+    openSharedTab();
+    expect(fetchNextSharedPage).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByTestId("shared-tasks-show-more"));
+    expect(fetchNextSharedPage).toHaveBeenCalledTimes(1);
+  });
+
+  it("stops loading past an empty page once a page fails, until Retry", () => {
+    // An empty page with more to come, whose next page failed.
+    setSharedPages([{ tasks: [], nextCursor: "st_0" }], { isError: true });
+    openSharedTab();
+
+    expect(fetchNextSharedPage).not.toHaveBeenCalled();
+    expect(screen.getByTestId("shared-tasks-load-error")).toBeInTheDocument();
+  });
+
+  it("says when nothing is shared with the viewer", () => {
+    setSharedPages([{ tasks: [], nextCursor: null }]);
+    openSharedTab();
+    expect(screen.getByTestId("shared-tasks-empty-state")).toHaveTextContent(
+      "No automations are shared with you yet",
+    );
+  });
+
+  it.each([
+    ["a server that cannot share automations", TRIGGER_INFO],
+    ["a single-user server", { ...SHARING_INFO, single_user: true }],
+    [
+      "an older server that shares automations but cannot list them",
+      { ...TRIGGER_INFO, scheduled_task_sharing: true },
+    ],
+  ])("has no Shared with me tab on %s", (_label, info) => {
+    setSharedPages([{ tasks: [shared()], nextCursor: null }]);
+    openSharedTab(info);
+    expect(screen.queryByRole("tab", { name: "Shared with me" })).toBeNull();
+    expect(hooks.useSharedScheduledTasks).toHaveBeenLastCalledWith(false);
+    expect(screen.getByRole("tab", { name: "Your automations" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
   });
 });
 

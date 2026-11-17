@@ -2947,11 +2947,15 @@ async def _auto_create_pi_terminal(
             build_native_relay_tool_schemas,
             filter_workflow_tool_schemas,
         )
+        from omnigent.tools.browser_agent_tools import filter_native_relay_browser_tools
 
         spec_for_tools = _unwrap_resolved_spec(agent_spec)
-        pi_tools = filter_workflow_tool_schemas(
+        relay_tools = filter_workflow_tool_schemas(
             build_native_relay_tool_schemas(spec_for_tools),
             enabled=await server_workflows_enabled(server_client),
+        )
+        pi_tools = await filter_native_relay_browser_tools(
+            relay_tools, session_id=session_id, server_client=server_client
         )
     except Exception:  # tool registration is additive
         _logger.warning(

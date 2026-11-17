@@ -28,6 +28,7 @@ import mimetypes
 import os
 import re
 import tempfile
+import time
 import uuid
 import weakref
 from collections.abc import Awaitable, Callable, Mapping
@@ -77,6 +78,7 @@ from omnigent.runner.session_requests import remember_session_host
 from omnigent.runtime.mcp_tool_result import encode_mcp_image_result, native_image_payload
 from omnigent.tools import ToolManager
 from omnigent.tools.base import Tool, ToolContext
+from omnigent.tools.browser_agent_tools import ADVANCED_BROWSER_TOOL_NAMES
 from omnigent.tools.builtins._arguments import parse_json_object_arguments
 from omnigent.tools.builtins.async_inbox import (
     SysCallAsyncTool,
@@ -101,6 +103,8 @@ from omnigent.tools.builtins.scheduled_tasks import (
     resolve_reminder_time,
 )
 from omnigent.tools.builtins.session_message import (
+    LEGACY_SESSION_MESSAGE_MAX_CHARS,
+    SESSION_MESSAGE_MAX_CHARS,
     SysSessionMessageTool,
     peer_session_messaging_enabled,
 )
@@ -331,6 +335,7 @@ _TURN_ACTOR_LABEL = "omnigent.turn_actor"
 # via the JSON POST /v1/sessions create — same server-permission posture
 # as _execute_subagent_tool.
 _SESSION_CREATE_TOOLS = frozenset({"sys_session_create"})
+_SESSION_ID_PLACEHOLDER_MAX_CHARS = 64
 
 # Priority 5f.0: Session query tools — peek/list/close/get_info/share. The
 # runner has no in-process ConversationStore, so these read/mutate session
@@ -480,6 +485,9 @@ _SCHEDULED_TASK_TOOLS = frozenset(
 # Priority 5l.2: The session journal — the runner proxies the server's
 # /v1/sessions/{id}/journal routes (see omnigent/runner/journal_tools.py).
 _JOURNAL_TOOLS = JOURNAL_TOOL_NAMES
+# Priority 5l.2: Owner Inbox — the runner proxies /v1/inbox/items. Registered
+# only for agents that opt into ``tool_groups.user_inbox``.
+_USER_INBOX_TOOLS = frozenset({"sys_user_inbox_post", "sys_user_inbox_list"})
 
 # Priority 5m: Embedded-browser tools.
 # Runner dispatch POSTs a blocking action request to the server, which parks a
@@ -487,8 +495,8 @@ _JOURNAL_TOOLS = JOURNAL_TOOL_NAMES
 # Omnigent desktop renderer claims and executes the action, then POSTs the
 # result back. Execution lives HERE (not in Tool.invoke) because the browser
 # protocol needs the runner's ``server_client`` and ``ToolContext`` carries
-# none. See omnigent/tools/builtins/browser.py for the schema-only classes.
-_BROWSER_TOOLS = BROWSER_TOOL_NAMES
+# none. See omnigent/tools/builtins/browser.py and browser_agent_tools.py.
+_BROWSER_TOOLS = BROWSER_TOOL_NAMES | ADVANCED_BROWSER_TOOL_NAMES
 
 # Runner-side outer HTTP read timeout for a browser action POST. The read
 # budget (60s) MUST exceed the server-side browser-action await (30s) so the
@@ -536,6 +544,7 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     | _POLICY_TOOLS
     | _SCHEDULED_TASK_TOOLS
     | _JOURNAL_TOOLS
+    | _USER_INBOX_TOOLS
     | _TERMINAL_TOOLS
     # ``browser_*`` must ride the native relay: the Omnigent desktop app
     # runs native (claude/codex/pi) sessions, which ignore ``request.tools``
@@ -979,6 +988,7 @@ _ALL_LOCAL_TOOLS = (
     | _POLICY_TOOLS
     | _SCHEDULED_TASK_TOOLS
     | _JOURNAL_TOOLS
+    | _USER_INBOX_TOOLS
 )
 _PLACEHOLDER_CWDS = (None, "", ".", "./")
 
@@ -3709,7 +3719,8 @@ async def _execute_session_create(
 
     :param args: Parsed arguments; exactly one of ``agent_id`` /
         ``config_path`` required, ``title`` / ``message`` / ``model`` /
-        ``reasoning_effort`` optional in both modes.
+        ``reasoning_effort`` optional in both modes, ``workflow_id`` with
+        ``agent_id`` only.
     :param server_client: HTTP client pointed at the Omnigent server; ``None``
         returns an error string.
     :param conversation_id: The caller's session id — the forced parent;
@@ -3783,8 +3794,17 @@ async def _execute_session_create(
     if selection.get("sandbox_profile_revision") and not selection.get("sandbox_profile_id"):
         return json.dumps({"error": "sandbox_profile_revision requires sandbox_profile_id"})
     if placement != "child" and message is not None:
-        if not isinstance(message, str) or not message.strip() or len(message) > 8000:
-            return json.dumps({"error": "Provide an initial message of 1–8000 characters"})
+        if (
+            not isinstance(message, str)
+            or not message.strip()
+            or len(message) > SESSION_MESSAGE_MAX_CHARS
+        ):
+            return json.dumps(
+                {
+                    "error": "Provide an initial message of "
+                    f"1–{SESSION_MESSAGE_MAX_CHARS} characters"
+                }
+            )
     permission_mode = args.get("permission_mode")
     if permission_mode is not None:
         if not isinstance(permission_mode, str) or not permission_mode.strip():
@@ -3792,6 +3812,25 @@ async def _execute_session_create(
         if has_config_path:
             # A new agent's own config sets its permission mode.
             return json.dumps({"error": "permission_mode requires agent_id"})
+    workflow_id = args.get("workflow_id")
+    if workflow_id is not None:
+        if not isinstance(workflow_id, str) or not workflow_id.strip():
+            return json.dumps({"error": "workflow_id must be a nonempty string"})
+        if has_config_path:
+            # The bundled create doesn't copy a workflow's plan into the journal.
+            return json.dumps({"error": "workflow_id requires agent_id"})
+    session_id_placeholder = args.get("session_id_placeholder")
+    if session_id_placeholder is not None and (
+        not isinstance(session_id_placeholder, str)
+        or not session_id_placeholder.strip()
+        or len(session_id_placeholder) > _SESSION_ID_PLACEHOLDER_MAX_CHARS
+    ):
+        return json.dumps(
+            {
+                "error": "session_id_placeholder must be a nonempty string of at most "
+                f"{_SESSION_ID_PLACEHOLDER_MAX_CHARS} characters"
+            }
+        )
     if has_config_path:
         return await _session_create_from_config_path(
             str(config_path),
@@ -3810,6 +3849,8 @@ async def _execute_session_create(
         reasoning_effort=args.get("reasoning_effort"),
         permission_mode=permission_mode,
     )
+    if workflow_id is not None:
+        body["workflow_id"] = workflow_id
     headers: dict[str, str] = {}
     if placement != "child":
         from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
@@ -3844,15 +3885,42 @@ async def _execute_session_create(
             endpoint += "/host"
         host_id = None
         info_data: _JsonObject = {}
+        # Independent first tasks are delivered after creation, so check the server's
+        # limit first rather than leave a session without its task.
+        # The longest first task the server takes; filling in the session ID must stay under it.
+        first_task_max_chars = min(LEGACY_SESSION_MESSAGE_MAX_CHARS, SESSION_MESSAGE_MAX_CHARS)
+        long_first_task = (
+            placement in ("same_host", "host")
+            and isinstance(message, str)
+            and len(message) > LEGACY_SESSION_MESSAGE_MAX_CHARS
+        )
         if (
             placement in ("managed", "host")
+            or long_first_task
             or args.get("project_id") is not None
             or args.get("project_name") is not None
             or permission_mode is not None
+            or workflow_id is not None
         ):
             info = await server_client.get("/v1/info", timeout=30.0)
             info.raise_for_status()
             info_data = info.json()
+            advertised_max_chars = info_data.get("session_message_max_chars")
+            if isinstance(advertised_max_chars, int) and not isinstance(
+                advertised_max_chars, bool
+            ):
+                first_task_max_chars = min(advertised_max_chars, SESSION_MESSAGE_MAX_CHARS)
+        if long_first_task:
+            server_max_chars = info_data.get("session_message_max_chars")
+            if not isinstance(server_max_chars, int) or isinstance(server_max_chars, bool):
+                server_max_chars = LEGACY_SESSION_MESSAGE_MAX_CHARS
+            if len(str(message)) > server_max_chars:
+                return json.dumps(
+                    {
+                        "error": "This server accepts initial messages of up to "
+                        f"{server_max_chars} characters; no session was created"
+                    }
+                )
         if (placement == "host" or args.get("project_id") is not None) and info_data.get(
             "scripted_sessions"
         ) is not True:
@@ -3877,6 +3945,23 @@ async def _execute_session_create(
                     "no session was created. Omit permission_mode to use the agent's default."
                 }
             )
+        if workflow_id is not None:
+            features = info_data.get("features")
+            # With workflows off the server refuses the create as not found,
+            # which would read as a missing agent.
+            if not isinstance(features, dict) or features.get("workflows") is not True:
+                return json.dumps(
+                    {"error": "Workflows are disabled on this server; no session was created."}
+                )
+            # An older server ignores the field, so the session would start without the plan.
+            if info_data.get("session_create_workflow_id") is not True:
+                return json.dumps(
+                    {
+                        "error": "This Omnigent server can't start a session as a workflow "
+                        "run; no session was created. Omit workflow_id and ask the session "
+                        "to load the workflow itself."
+                    }
+                )
         if placement == "managed":
             if (
                 info_data.get("sibling_sessions") is True
@@ -3978,9 +4063,16 @@ async def _execute_session_create(
         if placement in ("same_host", "host") and args.get("message"):
             from omnigent.runner.session_message import execute_message_tool
 
+            # The runner sends this message itself, so it can name the new session's ID,
+            # unless that would push the task over the limit; the worker then looks it up.
+            initial_text = args["message"]
+            if session_id_placeholder is not None and isinstance(initial_text, str):
+                filled = initial_text.replace(session_id_placeholder, data["id"])
+                if len(filled) <= first_task_max_chars:
+                    initial_text = filled
             initial_message = json.loads(
                 await execute_message_tool(
-                    {"session_id": data["id"], "message": args["message"]},
+                    {"session_id": data["id"], "message": initial_text},
                     server_client,
                     conversation_id,
                 )
@@ -5151,7 +5243,9 @@ _SCHEDULED_TASK_UPDATE_FIELDS = (
     "state",
     "project_id",
 )
-_SCHEDULED_TASK_ID_RE = re.compile(r"^[0-9a-fA-F]{32}$")
+_SCHEDULED_TASK_UUID_RE = re.compile(r"^[0-9a-fA-F]{32}$")
+# IDs a deployment allocates in another form, limited to characters safe in one path segment.
+_SCHEDULED_TASK_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 # Optional fields an older server forbids, the ``/v1/info`` flag that admits
 # them, and how to retry without them.
 _SCHEDULED_TASK_GATED_FIELDS = (
@@ -5194,10 +5288,12 @@ async def _scheduled_task_session_fields_refusal(
 
 
 def _scheduled_task_url(task_id: object) -> str | None:
-    """Return a safe scheduled-task URL path for a canonical id."""
+    """Return a safe scheduled-task URL path for a task id, lowercasing a hex UUID."""
     if not isinstance(task_id, str) or not _SCHEDULED_TASK_ID_RE.fullmatch(task_id):
         return None
-    return f"/v1/scheduled-tasks/{task_id.lower()}"
+    if _SCHEDULED_TASK_UUID_RE.fullmatch(task_id):
+        task_id = task_id.lower()
+    return f"/v1/scheduled-tasks/{task_id}"
 
 
 async def _project_id_for_name(
@@ -5495,7 +5591,10 @@ async def _execute_scheduled_task_tool(
             task_url = _scheduled_task_url(task_id)
             if task_url is None:
                 return json.dumps(
-                    {"error": f"{tool_name} requires canonical 32-character hex scheduled_task_id"}
+                    {
+                        "error": f"{tool_name} requires a scheduled_task_id "
+                        "from sys_scheduled_task_list"
+                    }
                 )
             if tool_name == "sys_scheduled_task_delete":
                 resp = await server_client.delete(task_url, timeout=30.0)
@@ -5530,6 +5629,120 @@ async def _execute_scheduled_task_tool(
             {"error": f"server returned {resp.status_code}", "details": resp.text[:1000]}
         )
     return json.dumps(resp.json())
+
+
+# Item fields sys_user_inbox_list returns; the full body stays in the Inbox.
+_USER_INBOX_LIST_FIELDS = (
+    "id",
+    "created_at",
+    "kind",
+    "title",
+    "topic",
+    "links",
+    "status",
+    "resolution",
+    "resolution_action",
+    "feedback_text",
+    "expires_at",
+)
+_USER_INBOX_BODY_PREVIEW_CHARS = 300
+_USER_INBOX_LIST_PAGE = 100
+_USER_INBOX_LIST_MAX_PAGES = 3
+
+
+async def _execute_user_inbox_tool(
+    tool_name: str,
+    arguments: str,
+    *,
+    server_client: httpx.AsyncClient | None,
+    conversation_id: str | None,
+) -> str:
+    """
+    Runner-local handler for ``sys_user_inbox_post`` and ``sys_user_inbox_list``.
+
+    Proxies the server's ``/v1/inbox/items`` endpoints. Posts carry the
+    session as the orchestration source, which the server requires and
+    checks against this runner.
+
+    :param tool_name: ``"sys_user_inbox_post"`` or ``"sys_user_inbox_list"``.
+    :param arguments: JSON-encoded arguments string from the LLM.
+    :param server_client: HTTP client pointed at the Omnigent server; ``None``
+        returns an error string.
+    :param conversation_id: Session whose tool call is being dispatched.
+    :returns: Tool output JSON string.
+    """
+    from omnigent.tools.builtins.user_inbox import USER_INBOX_LIST_WINDOW_DAYS
+
+    if server_client is None:
+        return json.dumps({"error": f"{tool_name} requires server access"})
+    try:
+        args: _JsonObject = json.loads(arguments) if arguments.strip() else {}
+    except json.JSONDecodeError:
+        return json.dumps({"error": f"{tool_name}: malformed JSON arguments"})
+    if not isinstance(args, dict):
+        return json.dumps({"error": f"{tool_name}: arguments must be an object"})
+
+    def _server_error(resp: httpx.Response) -> str:
+        if resp.status_code == 404:
+            return json.dumps(
+                {
+                    "error": f"{tool_name}: this server does not support Inbox items "
+                    "(the proactive_agent feature is off or the server is older)"
+                }
+            )
+        return json.dumps(
+            {"error": f"server returned {resp.status_code}", "details": resp.text[:500]}
+        )
+
+    try:
+        if tool_name == "sys_user_inbox_post":
+            if conversation_id is None:
+                return json.dumps({"error": f"{tool_name} requires a session"})
+            resp = await server_client.post(
+                "/v1/inbox/items",
+                json=args,
+                headers={ORCHESTRATION_SOURCE_HEADER: conversation_id},
+                timeout=30.0,
+            )
+            if resp.status_code >= 400:
+                return _server_error(resp)
+            return json.dumps(resp.json())
+        created_after = int(time.time()) - USER_INBOX_LIST_WINDOW_DAYS * 86_400
+        items: list[_JsonObject] = []
+        cursor: str | None = None
+        for _ in range(_USER_INBOX_LIST_MAX_PAGES):
+            params: dict[str, str | int] = {
+                "created_after": created_after,
+                "limit": _USER_INBOX_LIST_PAGE,
+            }
+            if cursor is not None:
+                params["after"] = cursor
+            resp = await server_client.get("/v1/inbox/items", params=params, timeout=30.0)
+            if resp.status_code >= 400:
+                return _server_error(resp)
+            page = resp.json()
+            for item in page.get("data", []):
+                summary = {field: item.get(field) for field in _USER_INBOX_LIST_FIELDS}
+                summary["body_preview"] = str(item.get("body_md") or "")[
+                    :_USER_INBOX_BODY_PREVIEW_CHARS
+                ]
+                summary["action_labels"] = [
+                    action.get("label") for action in item.get("actions") or []
+                ]
+                items.append(summary)
+            cursor = page.get("next_cursor")
+            if not cursor:
+                break
+        return json.dumps(
+            {
+                "items": items,
+                "window_days": USER_INBOX_LIST_WINDOW_DAYS,
+                # More items exist than were read; the oldest are not listed.
+                "truncated": bool(cursor),
+            }
+        )
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": f"{tool_name} failed: {exc}"})
 
 
 @dataclass
@@ -7908,6 +8121,13 @@ async def execute_tool(
                 conversation_id=conversation_id,
                 call_id=call_id,
                 publish_event=publish_event,
+            )
+        elif tool_name in _USER_INBOX_TOOLS:
+            output = await _execute_user_inbox_tool(
+                tool_name,
+                arguments,
+                server_client=server_client,
+                conversation_id=conversation_id,
             )
         elif tool_name in _BROWSER_TOOLS:
             output = await _execute_browser_tool(

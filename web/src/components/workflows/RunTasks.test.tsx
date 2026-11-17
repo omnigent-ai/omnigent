@@ -11,9 +11,10 @@ import {
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { FullscreenIcon } from "@/components/ai-elements/MermaidBlock";
 import type * as SessionsApi from "@/lib/sessionsApi";
 
-import { RunPlanButton, useRunTaskMenus } from "./RunTasks";
+import { RunGraphButton, RunPlanButton, RunWorkflowButton, useRunTaskMenus } from "./RunTasks";
 
 const api = vi.hoisted(() => ({ interrupt: vi.fn(), sendUserMessage: vi.fn() }));
 vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
@@ -136,5 +137,33 @@ describe("RunPlanButton", () => {
     );
     expect(api.sendUserMessage.mock.calls[0]![1]).toContain("recursively");
     expect(api.interrupt).not.toHaveBeenCalled();
+  });
+});
+
+describe("RunWorkflowButton and RunGraphButton", () => {
+  afterEach(cleanup);
+
+  it("render the same box, placed as the row places them, with their own icons", () => {
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <MemoryRouter>
+          <RunWorkflowButton workflowId="wf_1" className="relative -my-1" />
+          <RunGraphButton runName="the run" className="relative -my-1" onClick={() => {}} />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    const workflowLink = screen.getByTestId("run-workflow-button");
+    const graphButton = screen.getByTestId("run-graph-button");
+    // A link beside a button: the same classes keep their boxes and icons level.
+    expect(workflowLink.tagName).toBe("A");
+    expect(graphButton.tagName).toBe("BUTTON");
+    expect(workflowLink.className).toBe(graphButton.className);
+    expect(workflowLink).toHaveAttribute("data-size", "icon-sm");
+    expect(graphButton).toHaveAttribute("data-size", "icon-sm");
+    expect(workflowLink).toHaveClass("-my-1", "items-center", "justify-center");
+    expect(workflowLink.querySelector("svg")).toHaveClass("lucide-workflow");
+    // The graph button keeps the diagrams' fullscreen glyph, unlike the workflow's boxes.
+    const { container: fullscreenGlyph } = render(<FullscreenIcon />);
+    expect(graphButton.innerHTML).toBe(fullscreenGlyph.innerHTML);
   });
 });

@@ -148,7 +148,6 @@ import {
 import { shouldQueueSend } from "@/lib/messageQueue";
 import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import { skillInvocationPrefix } from "@/lib/harnessSetup";
-import { DEVIN_NATIVE_PERMISSION_MODES } from "@/lib/nativeHarnessModes";
 import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import {
   composerInlineMentions,
@@ -348,17 +347,14 @@ import {
   type NativeModelPickerKind,
 } from "@/lib/composerCapabilities";
 
-import {
-  CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES,
-  claudePermissionModeLabel,
-  isClaudeNativeSession,
-} from "@/lib/claudePermissionMode";
-import {
-  CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS,
-  codexApprovalModeLabel,
-} from "@/lib/codexApprovalMode";
+import { isClaudeNativeSession } from "@/lib/claudePermissionMode";
 import { isCodexNativeSession } from "@/lib/codexPlanMode";
-import { isPermissionModeCycleKey, nextCycledPermissionMode } from "@/lib/permissionModeCycle";
+import {
+  isPermissionModeCycleKey,
+  nextCycledPermissionMode,
+  permissionChip,
+  type PermissionChipKind,
+} from "@/lib/permissionModeCycle";
 import { getCliServerUrl } from "@/lib/host";
 import { useOmnigentAnalytics } from "@/lib/analyticsEmit";
 import { GoalDialog, CommandGoalDialog, GoalStatusPill, useGoalState } from "@/components/goal";
@@ -380,6 +376,7 @@ import {
 import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { ConnectionIndicator } from "./ChatIndicators";
+import { nextTranscriptBottomPin, type TranscriptBottomPin } from "./transcriptBottomPin";
 import { Transcript } from "@/components/chat/Transcript";
 
 /** Server-info as consumers see it: the probe's result, or "loading". */
@@ -933,7 +930,9 @@ export function ChatPage() {
   );
   const sessionOwner = activeConv?.owner ?? directSessionOwner ?? null;
   const viewerOwnsSession = sessionOwner !== null && sessionOwner === viewerId;
-  const { data: ownerGrants } = usePermissions(viewerOwnsSession ? (sessionConvId ?? null) : null);
+  const { data: ownerGrants } = usePermissions(
+    viewerOwnsSession && sessionConvId ? { kind: "session", id: sessionConvId } : null,
+  );
   const isSessionShared = isSessionSharedWithOthers(sessionOwner, viewerId, ownerGrants);
 
   // The open session's derived liveness — the single signal the chat
@@ -1914,9 +1913,12 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   useEffect(() => {
     const scrollEl = scroller?.el;
     if (!scrollEl) return;
+    // The growth pin's own scroll event can land before the overlay re-measures
+    // and read a viewport shortened by the pending growth; only upward movement escapes.
+    let pin: TranscriptBottomPin = { pinned: false, anchorScrollTop: scrollEl.scrollTop };
     const update = () => {
-      pinnedToBottomRef.current =
-        scrollEl.scrollHeight - scrollEl.clientHeight - scrollEl.scrollTop <= 1;
+      pin = nextTranscriptBottomPin(pin, scrollEl);
+      pinnedToBottomRef.current = pin.pinned;
     };
     update();
     scrollEl.addEventListener("scroll", update, { passive: true });
@@ -2891,21 +2893,13 @@ function ComposerImpl(
   const openComposerGithubTab = useOpenGithubTab();
   // Devin shares this control but not Claude's vocabulary: its rungs are
   // normal / accept-edits / smart / dangerous, cycled in the TUI.
-  const devinPermissionControl = modelPickerKind === "devin";
-  const permissionOptions = showClaudePermissionMode
-    ? devinPermissionControl
-      ? DEVIN_NATIVE_PERMISSION_MODES
-      : CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES
-    : CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS;
-  const permissionLabel = showClaudePermissionMode
-    ? devinPermissionControl
-      ? (DEVIN_NATIVE_PERMISSION_MODES.find((m) => m.value === claudePermissionMode)?.label ??
-        claudePermissionMode)
-      : claudePermissionModeLabel(claudePermissionMode)
-    : codexApprovalModeLabel(codexApprovalMode);
-  const selectedPermissionMode = showClaudePermissionMode
-    ? claudePermissionMode
-    : codexApprovalMode;
+  let permissionKind: PermissionChipKind = "codex";
+  if (showClaudePermissionMode) permissionKind = modelPickerKind === "devin" ? "devin" : "claude";
+  const {
+    options: permissionOptions,
+    label: permissionLabel,
+    value: selectedPermissionMode,
+  } = permissionChip(permissionKind, claudePermissionMode, codexApprovalMode);
   const permissionControlInteractive =
     (showClaudePermissionMode || showCodexApprovalMode) &&
     !isReadOnly &&

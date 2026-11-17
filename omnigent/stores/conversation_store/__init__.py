@@ -196,6 +196,9 @@ SCHEDULED_TASK_ACTIVITY_LABEL_KEY = "omnigent.scheduled_task_activity"
 # Server-owned: marks the copy an automation starts each run from (its source
 # session). The value is the task id; runs never inherit it.
 SCHEDULED_TASK_SOURCE_LABEL_KEY = "omnigent.scheduled_task_source"
+# Server-owned: the automation whose run's session tree launched this independent or
+# sibling session, directly or through other launches. Forks drop it.
+SCHEDULED_TASK_LAUNCH_LABEL_KEY = "omnigent.scheduled_task_launch"
 
 # Compare-and-swap rounds swap_label tries before giving up on a contended label.
 _LABEL_SWAP_ATTEMPTS = 5
@@ -269,6 +272,8 @@ _FORK_ONLY_DROPPED_LABEL_KEYS = IMPORT_PROVENANCE_LABEL_KEYS | {
     ARCHIVED_AT_LABEL_KEY,
     # A fork of an automation's copy isn't what the automation runs from.
     SCHEDULED_TASK_SOURCE_LABEL_KEY,
+    # Nor is a fork of a session a run launched; the automation doesn't share it.
+    SCHEDULED_TASK_LAUNCH_LABEL_KEY,
     # Closing seals only that child (a stopped side chat, a closed sub-agent);
     # forking it is how the user continues it as a session of its own.
     CLOSED_LABEL_KEY,
@@ -399,6 +404,8 @@ class SessionActivity:
     :param runner_id: Bound runner, or ``None`` for an in-process session.
     :param archived: Whether the session is archived; ``None`` when the store
         doesn't report it.
+    :param current_run_id: The scheduled run the session is attributed to now,
+        e.g. ``"run_abc"``; ``None`` when unset or not reported.
     """
 
     updated_at: int
@@ -407,6 +414,7 @@ class SessionActivity:
     pending_elicitation_count: int | None = None
     runner_id: str | None = None
     archived: bool | None = None
+    current_run_id: str | None = None
 
 
 # Freshness window for ``omnigent_conversation_metadata.runner_last_seen``. The tunnel
@@ -777,8 +785,8 @@ class ConversationStore(ABC):
         """
         Return each session's last update time, live status and cost in one batch.
 
-        Reads activity and usage per id and no labels, so the cost is bounded by the
-        id count. Missing ids are omitted from the result.
+        Reads activity, usage and the current scheduled run label per id, so the
+        cost is bounded by the id count. Missing ids are omitted from the result.
 
         :param conversation_ids: Conversation ids, e.g. ``["conv_abc123"]``.
             Duplicates are tolerated; empty input returns ``{}`` without a query.

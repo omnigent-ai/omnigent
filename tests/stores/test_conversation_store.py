@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import re
 import threading
 import uuid
 from collections.abc import Callable, Iterator
@@ -37,7 +38,10 @@ from omnigent.session_import import (
     IMPORT_SOURCE_LABEL_KEY,
 )
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
-from omnigent.stores.conversation_store import ConversationUpdateResult
+from omnigent.stores.conversation_store import (
+    SCHEDULED_TASK_RUN_LABEL_KEY,
+    ConversationUpdateResult,
+)
 from omnigent.stores.conversation_store.activity_error import (
     LATEST_ACTIVITY_ERROR_LABEL_KEY,
     LATEST_ACTIVITY_ERROR_RESPONSE_LABEL_KEY,
@@ -220,10 +224,12 @@ def test_overlapping_run_attempts_preserve_the_last_sent_run(
 def test_fork_drops_the_automation_run_label(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
-    """A fork serves no automation run, so its journal entries are not the run's."""
+    """A fork serves no automation run, so its journal entries are not the run's,
+    and the automation doesn't share the sessions it launches."""
     from omnigent.stores.conversation_store import (
         SCHEDULED_TASK_ACTIVITY_LABEL_KEY,
         SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY,
+        SCHEDULED_TASK_LAUNCH_LABEL_KEY,
         SCHEDULED_TASK_PENDING_RUN_LABEL_PREFIX,
         SCHEDULED_TASK_RUN_LABEL_KEY,
     )
@@ -235,6 +241,7 @@ def test_fork_drops_the_automation_run_label(
             SCHEDULED_TASK_RUN_LABEL_KEY: "0123456789abcdef0123456789abcdef",
             SCHEDULED_TASK_ACTIVITY_LABEL_KEY: "older-run",
             SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY: "older-run",
+            SCHEDULED_TASK_LAUNCH_LABEL_KEY: "st_1",
         },
     )
     conversation_store.update_scheduled_run_label(source.id, "1" * 32, action="begin")
@@ -244,6 +251,7 @@ def test_fork_drops_the_automation_run_label(
     assert SCHEDULED_TASK_RUN_LABEL_KEY not in fork.labels
     assert SCHEDULED_TASK_ACTIVITY_LABEL_KEY not in fork.labels
     assert SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY not in fork.labels
+    assert SCHEDULED_TASK_LAUNCH_LABEL_KEY not in fork.labels
     assert not any(key.startswith(SCHEDULED_TASK_PENDING_RUN_LABEL_PREFIX) for key in fork.labels)
 
 
@@ -599,7 +607,9 @@ def test_get_session_activity(
     conversation_store.set_session_live_status(a.id, "waiting")
     conversation_store.set_runner_id(a.id, "runner_activity")
     conversation_store.set_pending_elicitation_count(a.id, 2)
-    conversation_store.set_labels(a.id, {"omnigent.ui": "terminal"})
+    conversation_store.set_labels(
+        a.id, {"omnigent.ui": "terminal", SCHEDULED_TASK_RUN_LABEL_KEY: "run_current"}
+    )
     conversation_store.set_session_usage(a.id, {"total_cost_usd": cost})
     child = conversation_store.create_conversation(
         kind="sub_agent", title="child", parent_conversation_id=a.id
@@ -621,8 +631,11 @@ def test_get_session_activity(
         event.remove(conversation_store._engine, "before_cursor_execute", record_query)
 
     reads = [statement for statement in statements if statement.startswith("select")]
-    assert len(reads) == 2
-    assert all("conversation_labels" not in statement for statement in reads)
+    # Only the current-run label is read, never the session's full label set.
+    assert len(reads) == 3
+    label_reads = [statement for statement in reads if "conversation_labels" in statement]
+    assert len(label_reads) == 1
+    assert re.search(r"\bkey\W* = ", label_reads[0])
 
     assert set(result) == {a.id, b.id, child.id}
     assert result[a.id].updated_at == conversation_store.get_conversation(a.id).updated_at  # type: ignore[union-attr]
@@ -637,6 +650,8 @@ def test_get_session_activity(
     assert result[b.id].total_cost_usd is None
     assert result[a.id].archived is False
     assert result[b.id].archived is True
+    assert result[a.id].current_run_id == "run_current"
+    assert result[b.id].current_run_id is None
     assert conversation_store.get_session_activity([]) == {}
 
 
