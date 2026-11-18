@@ -3383,7 +3383,7 @@ async def test_claude_callback_uses_selected_workspace_for_model_credentials(
     )
 
     assert json.loads(result) == {"content": "ok"}
-    assert resolve_access.call_args.kwargs["cwd"] == workspace
+    assert resolve_access.call_args.kwargs["cwd"] == str(workspace)
     assert create_environment.call_args.args[0].cwd == str(workspace)
     assert create_environment.call_args.kwargs["model_access"] is access
 

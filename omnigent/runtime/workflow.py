@@ -1470,7 +1470,7 @@ def claude_terminal_model_access(
     *,
     bundle_dir: Path | None = None,
     effective_harness: str | None = None,
-    cwd: Path | None = None,
+    cwd: str | Path | None = None,
 ) -> ClaudeModelAccess | None:
     """Derive automatic terminal model access from the owning Claude SDK session."""
     from omnigent.inner.claude_model_access import HELPER_ENV, resolve_claude_model_access
@@ -1488,7 +1488,9 @@ def claude_terminal_model_access(
         executor=replace(spec.executor, config={**spec.executor.config, "harness": "claude-sdk"}),
     )
     launch_env = _build_claude_sdk_spawn_env(spec)
-    cwd = cwd or _resolve_sandbox_cwd(spec.os_env.cwd if spec.os_env else None)
+    effective_cwd = _resolve_sandbox_cwd(
+        str(cwd) if cwd is not None else spec.os_env.cwd if spec.os_env else None
+    )
     profile = launch_env.get("HARNESS_CLAUDE_SDK_DATABRICKS_PROFILE")
     model_env = dict(os.environ)
     model_env.pop("ANTHROPIC_API_KEY", None)
@@ -1502,12 +1504,12 @@ def claude_terminal_model_access(
             )
         )
     else:
-        model_env.update(_claude_user_settings_env(str(cwd)))
+        model_env.update(_claude_user_settings_env(str(effective_cwd)))
     if helper := launch_env.get("HARNESS_CLAUDE_SDK_API_KEY_HELPER"):
         model_env[HELPER_ENV] = helper
     return resolve_claude_model_access(
         model_env,
-        cwd=cwd,
+        cwd=effective_cwd,
         databricks_profile=profile,
         source_env_names=frozenset(
             json.loads(launch_env.get("HARNESS_CLAUDE_SDK_CREDENTIAL_ENV_NAMES", "[]"))
