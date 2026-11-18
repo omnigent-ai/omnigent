@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -22,9 +23,11 @@ from tests.harnesses.claude_native.forwarder._support import (
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("hook_snapshot", ["normal", "slow", "missing"])
 async def test_subagent_output_item_before_idle_status_prevents_race(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    hook_snapshot: str,
 ) -> None:
     """The final reply is posted before the Stop idle edge, and idle posts once."""
     bridge_dir = tmp_path / "bridge"
@@ -88,6 +91,46 @@ async def test_subagent_output_item_before_idle_status_prevents_race(
 
     monkeypatch.setattr(forwarder, "_forward_available_items", mock_items)
 
+    snapshot_entered = asyncio.Event()
+    snapshot_released = threading.Event()
+    snapshot_finished = threading.Event()
+    loop = asyncio.get_running_loop()
+    snapshot_pending = False
+    original_prescan = forwarder._prescan_precompact_edges
+    original_stat = Path.stat
+    original_open = Path.open
+
+    async def prescan(*args: Any, **kwargs: Any) -> Any:
+        nonlocal snapshot_pending
+        result = await original_prescan(*args, **kwargs)
+        if hook_snapshot == "missing" and not stop_hook_injected:
+            (bridge_dir / forwarder._HOOKS_FILE).unlink()
+        snapshot_pending = True
+        return result
+
+    def hold_snapshot(path: Path) -> None:
+        if (
+            hook_snapshot == "slow"
+            and snapshot_pending
+            and path == bridge_dir / forwarder._HOOKS_FILE
+            and not snapshot_finished.is_set()
+        ):
+            loop.call_soon_threadsafe(snapshot_entered.set)
+            snapshot_released.wait(timeout=5.0)
+            snapshot_finished.set()
+
+    def stat(path: Path, *args: Any, **kwargs: Any) -> Any:
+        hold_snapshot(path)
+        return original_stat(path, *args, **kwargs)
+
+    def open_file(path: Path, *args: Any, **kwargs: Any) -> Any:
+        hold_snapshot(path)
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(forwarder, "_prescan_precompact_edges", prescan)
+    monkeypatch.setattr(Path, "stat", stat)
+    monkeypatch.setattr(Path, "open", open_file)
+
     def recording_handler(body: Any) -> dict[str, Any]:
         """Record POSTs."""
         request_bodies.append(body)
@@ -114,6 +157,11 @@ async def test_subagent_output_item_before_idle_status_prevents_race(
                 poll_interval_s=0.01,
             )
         )
+
+        if hook_snapshot == "slow":
+            await asyncio.wait_for(snapshot_entered.wait(), timeout=10.0)
+            assert not snapshot_finished.is_set(), "hook snapshot I/O blocked the event loop"
+            snapshot_released.set()
 
         # Wait for item + idle to appear.
         item_idx = None
@@ -157,6 +205,7 @@ async def test_subagent_output_item_before_idle_status_prevents_race(
         assert idle_count == 1, f"Expected 1 idle, got {idle_count}"
 
     finally:
+        snapshot_released.set()
         if not task.done():
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
