@@ -61,6 +61,7 @@ import {
 } from "@/lib/idleTransitions";
 import { isConversationUnseen, useUnseenTick } from "@/hooks/useUnseenConversations";
 import { conversationDisplayLabel } from "@/shell/sidebarNav";
+import { NEW_SESSION_COMPOSER_FOCUS_STATE } from "@/hooks/useNewSessionHotkey";
 
 const IDLE_BODY = "Agent finished and is ready for your input.";
 const ELICITATION_BODY = "Agent is asking for your input.";
@@ -187,8 +188,14 @@ export function useIdleNotifications(activeConversationId?: string): void {
   // Desktop shell only: native menu actions and same-server deep links send a
   // basename-less in-app path here, so route it with the same navigate used for
   // notification clicks. The router rebases it under the current mount.
+  // File > New Session sends "/"; land the caret in its composer like the hotkey.
   useEffect(() => {
-    return onOpenPath((path) => navigateRef.current(path));
+    return onOpenPath((path) =>
+      navigateRef.current(
+        path,
+        path === "/" ? { state: NEW_SESSION_COMPOSER_FOCUS_STATE } : undefined,
+      ),
+    );
   }, []);
 
   // Clear any deferred turn-end timers on unmount so a pending cue can't fire
