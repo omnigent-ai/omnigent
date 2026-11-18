@@ -1941,6 +1941,64 @@ describe("grid cell composer shares its session's draft", () => {
     });
   });
 
+  it("edits a queued cell quote card with its tag back as a token, and resends it unchanged", () => {
+    writeAlwaysSteer(false);
+    conversationRegistry.acquire(childId).setState({ sessionStatus: "running" });
+    const replyDraft: StoredReplyDraft = {
+      version: 1,
+      quotes: [{ before: "Ask @Fix CI", text: "Quoted line" }],
+      text: "Reply",
+    };
+    bridgedCell({
+      text: serializeReplyDraft(replyDraft),
+      files: [],
+      replyDraft,
+      mentions: { files: [], sessions: [sessionTag] },
+    });
+    fireEvent.click(screen.getByTestId("side-chat-send"));
+    const queued = useChatStore.getState().queuedMessages[0]!;
+
+    fireEvent.click(screen.getByRole("button", { name: "Edit queued message" }));
+    expect(screen.getByRole("textbox", { name: "Reply text before quote 1" })).toHaveValue(
+      "Ask @Fix CI",
+    );
+    expect(getSessionDraft(childId)?.mentions?.sessions).toEqual([
+      expect.objectContaining({ id: "sess_fix" }),
+    ]);
+    expect(useChatStore.getState().queuedMessages).toEqual([]);
+
+    act(() => conversationRegistry.acquire(childId).setState({ sessionStatus: "idle" }));
+    fireEvent.click(screen.getByTestId("side-chat-send"));
+    expect(send).toHaveBeenCalledExactlyOnceWith(queued.text, "agent_side", undefined, {
+      pinnedConversationId: childId,
+      replyDraft: queued.replyDraft,
+    });
+  });
+
+  it("posts a cell's /side command into its busy session, and queues other messages", () => {
+    writeAlwaysSteer(false);
+    conversationRegistry.acquire(childId).setState({ sessionStatus: "running" });
+    gridCell();
+    const input = screen.getByTestId("side-chat-input");
+    fireEvent.change(input, { target: { value: "/side Explain the failure" } });
+    fireEvent.click(screen.getByTestId("side-chat-send"));
+
+    expect(send).toHaveBeenCalledExactlyOnceWith(
+      "/side Explain the failure",
+      "agent_side",
+      undefined,
+      { pinnedConversationId: childId },
+    );
+    expect(useChatStore.getState().queuedMessages).toEqual([]);
+
+    fireEvent.change(input, { target: { value: "Explain the failure" } });
+    fireEvent.click(screen.getByTestId("side-chat-send"));
+    expect(send).toHaveBeenCalledOnce();
+    expect(useChatStore.getState().queuedMessages).toEqual([
+      expect.objectContaining({ text: "Explain the failure", conversationId: childId }),
+    ]);
+  });
+
   it("steers a cell's queued messages with Mod+Enter, as the full-screen composer does", () => {
     writeAlwaysSteer(false);
     conversationRegistry.acquire(childId).setState({ sessionStatus: "running" });

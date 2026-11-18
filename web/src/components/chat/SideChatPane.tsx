@@ -1147,7 +1147,7 @@ function SideChatComposer({
         useChatStore.getState().queuedMessages,
         readAlwaysSteer(),
         // A codex /side command posts now even mid-turn, as the full-screen composer does.
-        gridCell && usesNativeSideChatFork(harness) && isSideChatCommand(text.trim()),
+        gridCell && usesNativeSideChatFork(harness) && isSideChatCommand(message.trim()),
         holdsInitialDraft(child),
       )
     ) {
