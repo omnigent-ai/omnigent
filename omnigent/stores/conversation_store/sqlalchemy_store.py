@@ -2368,6 +2368,9 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         def write(session: Session) -> None:
             family_lock = self._lock_session_family(session, family_id)
+            self._repair_pending_family_labels(
+                session, family_id, user_id=user_id, initialize=False
+            )
             source_meta = session.get(
                 SqlConversationMetadata, (current_workspace_id(), source_id), with_for_update=True
             )

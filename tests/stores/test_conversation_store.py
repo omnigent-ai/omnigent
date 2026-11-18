@@ -10769,6 +10769,7 @@ def test_move_sessions_between_nests(tmp_path, split_database, monkeypatch):
         (False, "interrupted_initial_without_peers"),
         (False, "interrupted_initial_without_source"),
         (False, "interrupted_then_family_change"),
+        (False, "interrupted_then_sibling"),
     ],
 )
 def test_failed_split_database_nest_move_restores_membership(
@@ -10846,6 +10847,24 @@ def test_failed_split_database_nest_move_restores_membership(
             assert saved.family_id == source.id
             assert saved.labels[family_pinned_label_key("alice")] == "123"
     if interrupted:
+        sibling = None
+        if failure == "interrupted_then_sibling":
+            sibling = store.create_conversation(conversation_id="0" * 32)
+            failed_read_repair = False
+
+            @contextmanager
+            def fail_first_repair(session, *, read_only=False, operation=None):
+                nonlocal failed_read_repair
+                with original(session, read_only=read_only, operation=operation) as labels_session:
+                    yield labels_session
+                    if operation == "repair_pending_nest_labels" and not failed_read_repair:
+                        failed_read_repair = True
+                        raise RuntimeError("label transaction unavailable")
+
+            with monkeypatch.context() as patch:
+                patch.setattr(store, "_profile_label_session", fail_first_repair)
+                store.add_new_sibling(moved.id, sibling.id, user_id="alice")
+            assert failed_read_repair
         if failure == "interrupted_then_family_change":
             store.set_family_pin(destination.id, "789", user_id="alice")
             store.set_conversation_project(destination.id, "b" * 32)
@@ -10899,6 +10918,10 @@ def test_failed_split_database_nest_move_restores_membership(
         else:
             assert family_pinned_label_key("alice") not in saved.labels
             assert saved.project_id == (None if detach else "a" * 32)
+            if sibling is not None:
+                sibling_saved = store.get_conversation(sibling.id)
+                assert sibling_saved.family_id == destination.id
+                assert family_pinned_label_key("alice") not in sibling_saved.labels
         return
     if persistent:
         store = SqlAlchemyConversationStore(
