@@ -68,6 +68,14 @@ def _published_comments(review: str, review_path: Path, receipt: Path) -> list[s
     return [path.read_text(encoding="utf-8") for path in paths]
 
 
+def _multipart_content(comment: str) -> str:
+    _, marker, content = comment.partition("part 1 appears.\n\n")
+    assert marker
+    content, separator, footer = content.rpartition("\n\n---\n")
+    assert separator and footer.startswith("<sub>Automated review by Polly")
+    return content
+
+
 def test_metrics_use_real_patch_including_binary_rename_and_quoted_paths(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -971,6 +979,175 @@ def _check_identity_and_work(table_variant: str, monkeypatch: pytest.MonkeyPatch
                         fragments.append(_HELPERS["split_table_row"](line.strip().strip("|")))
             _assert_fragments(fragments, expected, expected_rationale)
     return
+
+
+@pytest.mark.parametrize(
+    ("form", "site", "boundary", "separated", "short"),
+    [
+        pytest.param(form, "rationale", boundary, False, False, id=f"{form}-{boundary}")
+        for form in ("link", "image", "autolink")
+        for boundary in ("label", "destination", "closing")
+    ]
+    + [
+        pytest.param(form, "rationale", "destination", True, False, id=f"{form}-separated")
+        for form in (
+            "link",
+            "image",
+            "autolink",
+            "email",
+            "bare-url",
+            "escaped",
+            "inline-code",
+            "inline-bare-code",
+        )
+    ]
+    + [
+        pytest.param(form, "prose", "destination", False, False, id=form)
+        for form in ("multiline-label", "multiline-image", "multiline-title", "multiline-code")
+    ]
+    + [
+        pytest.param("nested", "prose", "destination", True, False, id="nested-label-and-url"),
+        pytest.param("fence", "prose", "destination", False, False, id="fenced-literal"),
+        pytest.param("long-label", "prose", "destination", False, False, id="oversized-label"),
+        pytest.param("long-url", "prose", "destination", False, False, id="oversized-url"),
+    ]
+    + [
+        pytest.param(form, "prose", "destination", True, True, id=f"{form}-short")
+        for form in ("link", "image", "autolink", "multiline-label")
+    ],
+)
+def test_multipart_inline_destinations_keep_rendered_meaning(
+    form: str,
+    site: str,
+    boundary: str,
+    separated: bool,
+    short: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from markdown_it import MarkdownIt
+
+    destination = "https://example.test/proof"
+    construct = {
+        "link": f"[evidence]({destination})",
+        "image": f"![evidence]({destination})",
+        "autolink": f"<{destination}>",
+        "email": "<evidence@example.test>",
+        "bare-url": destination,
+        "escaped": rf"\[evidence]({destination})",
+        "inline-code": f"`[evidence]({destination})`",
+        "inline-bare-code": f"`literal {destination} code`",
+        "multiline-label": f"[evidence\nlabel]({destination})",
+        "multiline-image": f"![evidence\nlabel]({destination})",
+        "multiline-title": f'[evidence]({destination}\n "proof title")',
+        "multiline-code": f"`literal evidence\n[label]({destination})\nend`",
+        "nested": "[evidence [nested]](https://example.test/proof(a(b)c))",
+        "fence": f"```text\n[evidence]({destination})\n```\n\n",
+        "long-label": f"[{'e' * 70000}]({destination})",
+        "long-url": f"[evidence]({destination + 'u' * 70000})",
+    }[form]
+    metadata = {"head_sha": "a" * 40, "run_id": "10-1", "run_url": "https://example.test/run"}
+    summary = {"markdown": "Computed counts", "test_files": ["tests/test_parser.py"]}
+    base = _HELPERS["compose_review"](_REVIEW, summary)
+    if site == "rationale":
+        calibration = _HELPERS["compose_review"](
+            _REVIEW.replace("Guards the regression.", "x" * 130000), summary
+        )
+        row = next(
+            line
+            for comment in _HELPERS["review_comments"](calibration, **metadata)
+            for line in _multipart_content(comment).splitlines()
+            if line.lstrip().startswith("|") and "tests/test_parser.py::test_empty" in line
+        )
+        padding = _HELPERS["split_table_row"](row.strip().strip("|"))[-1].strip()
+        assert padding and set(padding) == {"x"}
+        capacity = len(padding)
+    else:
+        calibration = "x" * 130000 + "\n\n" + base
+        first = _multipart_content(_HELPERS["review_comments"](calibration, **metadata)[0])
+        assert first and set(first) == {"x"}
+        capacity = len(first)
+    offset = (
+        3
+        if boundary == "label"
+        else construct.index("example") + 3
+        if "example" in construct and boundary == "destination"
+        else len(construct) - 1
+    )
+    space = " " if separated else ""
+    body = construct if short else "x" * (capacity - offset - len(space)) + space + construct
+    if not short:
+        body += space + "y" * 70000
+    if form == "fence":
+        body = "x" * capacity + "\n\n" + construct + "y" * 70000
+    review = (
+        _HELPERS["compose_review"](_REVIEW.replace("Guards the regression.", body), summary)
+        if site == "rationale"
+        else body + "\n\n" + base
+    )
+    parser = MarkdownIt("commonmark").enable("table")
+    expected = _resolved_destinations(parser.parse(review))
+    if form in {
+        "bare-url",
+        "escaped",
+        "inline-code",
+        "inline-bare-code",
+        "multiline-code",
+        "fence",
+    }:
+        assert not expected
+    else:
+        assert len(expected) == 1
+    assert _HELPERS["COMMENT_BYTE_LIMIT"] == 60000
+    assert (len(review.encode("utf-8")) < 60000) == short
+    review_path, receipt, posts = _prepare_publication(
+        tmp_path, monkeypatch, head_sha=metadata["head_sha"], run_url=metadata["run_url"]
+    )
+    try:
+        comments = _published_comments(review, review_path, receipt)
+    except ValueError as error:
+        assert not short and not separated
+        assert "inline destination" in str(error) or str(error) == (
+            "Polly review table row cannot continue within comment capacity "
+            "without five parsed fields."
+        )
+        assert not posts and not receipt.exists()
+        assert not list(tmp_path.glob("comment*.md"))
+        return
+    assert bool(len(comments) == 1) == short
+    assert all(len(comment.encode("utf-8")) <= 60000 for comment in comments)
+    assert posts == [*comments[1:], comments[0]]
+    assert receipt.read_text() == metadata["head_sha"] + "\n"
+    actual = [
+        item
+        for comment in comments
+        for item in _resolved_destinations(parser.parse(comment))
+        if item[1] != metadata["run_url"]
+    ]
+    assert actual == expected, "Every destination must retain its independently rendered meaning"
+    assert [
+        child.content
+        for comment in comments
+        for token in parser.parse(review if short else _multipart_content(comment))
+        for child in token.children or []
+        if child.type == "code_inline"
+    ] == [
+        child.content
+        for token in parser.parse(review)
+        for child in token.children or []
+        if child.type == "code_inline"
+    ]
+    if form == "bare-url":
+        assert sum(construct in comment for comment in comments) == 1
+    if short:
+        assert review in comments[0]
+    if form == "fence":
+        assert [
+            token.content
+            for comment in comments
+            for token in parser.parse(comment)
+            if token.type == "fence"
+        ] == [f"[evidence]({destination})\n"]
 
 
 @pytest.mark.parametrize(
@@ -1936,11 +2113,8 @@ def test_multipart_keeps_literal_blocks_and_paragraph_dependencies_indivisible(
     )
     parser = MarkdownIt("commonmark").enable("table")
 
-    def content_of(comment: str) -> str:
-        return comment.split("part 1 appears.\n\n", 1)[1].rsplit("\n\n---\n", 1)[0]
-
     calibration = _HELPERS["review_comments"]("x" * 130000 + "\n\n" + composed, **metadata)
-    capacity = len(content_of(calibration[0]))
+    capacity = len(_multipart_content(calibration[0]))
     assert _HELPERS["COMMENT_BYTE_LIMIT"] == 60000
     amount = 130000 if form == "oversized" else 100
     prefix = ""
@@ -2057,7 +2231,7 @@ def test_multipart_keeps_literal_blocks_and_paragraph_dependencies_indivisible(
         assert len(comments) == 1
         assert comments[0].split("Polly AI Review\n\n", 1)[1].rsplit("\n---\n", 1)[0] == review
         return
-    fragments = [content_of(comment) for comment in comments]
+    fragments = [_multipart_content(comment) for comment in comments]
     assert len(comments) > 1
     assert "".join(fragments) == review
     rendered = [parser.parse(comment) for comment in comments]
@@ -2527,13 +2701,6 @@ def test_fence_continuations_preserve_literal_content_and_footer_context(
     if shape.startswith(("outside-", "invalid-info-", "closing-")):
         from markdown_it import MarkdownIt
 
-        def content_of(comment: str) -> str:
-            _, marker, content = comment.partition("part 1 appears.\n\n")
-            assert marker
-            content, separator, footer = content.rpartition("\n\n---\n")
-            assert separator and footer.startswith("<sub>Automated review by Polly")
-            return content
-
         metadata = {
             "head_sha": "a" * 40,
             "run_id": "10-1",
@@ -2553,7 +2720,9 @@ def test_fence_continuations_preserve_literal_content_and_footer_context(
                 )
                 capacity = max(
                     len(
-                        content_of(comment).removeprefix(opening).removesuffix("\n" + fence + "\n")
+                        _multipart_content(comment)
+                        .removeprefix(opening)
+                        .removesuffix("\n" + fence + "\n")
                     )
                     for comment in calibration
                 )
@@ -2635,7 +2804,7 @@ def test_fence_continuations_preserve_literal_content_and_footer_context(
                         "Needed?",
                         "Action / rationale",
                     ]
-                fragment = content_of(comment)
+                fragment = _multipart_content(comment)
                 if number and not remaining.startswith(fragment) and fragment.startswith(opening):
                     fragment = fragment[len(opening) :]
                 if not remaining.startswith(fragment):
@@ -2669,7 +2838,7 @@ def test_fence_continuations_preserve_literal_content_and_footer_context(
                 calibration = _HELPERS["review_comments"](
                     "x" * 130000 + "\n\n" + composed, **metadata
                 )
-                boundary = len(content_of(calibration[0]))
+                boundary = len(_multipart_content(calibration[0]))
                 invalidator = (
                     130000
                     if shape == "invalid-info-oversized"
@@ -2697,7 +2866,7 @@ def test_fence_continuations_preserve_literal_content_and_footer_context(
             )
         else:
             calibration = _HELPERS["review_comments"]("x" * 130000 + "\n\n" + composed, **metadata)
-            boundary = len(content_of(calibration[0]))
+            boundary = len(_multipart_content(calibration[0]))
             spaces = 200 if shape == "outside-whitespace" else 0
             prose = (
                 "x" * (boundary - spaces)
@@ -2772,7 +2941,7 @@ def test_fence_continuations_preserve_literal_content_and_footer_context(
                     "Action / rationale",
                 ]
             table_count += sum(token.type == "table_open" for token in tokens)
-            raw_fragments.append(content_of(comment))
+            raw_fragments.append(_multipart_content(comment))
         assert not shape.startswith("outside-oversized-")
         if shape.startswith("invalid-info-"):
             header, delimiter = _REVIEW.split("### Tests\n", 1)[1].splitlines()[:2]
@@ -2798,7 +2967,7 @@ def test_fence_continuations_preserve_literal_content_and_footer_context(
                 assert sum(comment.count(row) for comment in comments) == 1
         else:
             assert table_count == sum(token.type == "table_open" for token in original) == 1
-            assert "".join(content_of(comment) for comment in comments) == review
+            assert "".join(_multipart_content(comment) for comment in comments) == review
             row = next(line for line in _REVIEW.splitlines() if line.startswith("| tests/"))
             assert sum(comment.count(row) for comment in comments) == 1
         assert "".join(raw_fragments) == review

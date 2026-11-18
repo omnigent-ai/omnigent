@@ -418,6 +418,8 @@ def _markdown_context(
     indivisible; raw closing lines allow only space/tab and structural CR tails in
     multipart comments. Other raw HTML and unclosed literal blocks fail closed.
     Reference-definition-like lines outside fenced/raw blocks fail closed in multipart.
+    Destination-bearing words and inline-link blocks remain indivisible at cuts.
+    Ambiguous inline-code contexts with destinations fail closed.
     Inline-code formatting across fragments is not balanced.
     """
     details = 0
@@ -432,6 +434,8 @@ def _markdown_context(
     container_start = None
     container_blank = False
     inline_ambiguous = False
+    destination_start = None
+    destination_seen = False
     paragraph_start = indented_start = raw_start = None
     raw_end = None
     container_marker = re.compile(r">|[-+*](?=[ \t\r]|$)|[0-9]{1,9}[.)](?=[ \t\r]|$)")
@@ -494,6 +498,7 @@ def _markdown_context(
         line_start = offset
         offset += len(line) + 1
         if fence:
+            destination_start, destination_seen = None, False
             if re.fullmatch(rf" {{0,3}}{re.escape(fence[0])}{{{len(fence)},}}[ \t]*\r?", line):
                 protect_span(line_start, min(offset, len(text)), "fence delimiter")
                 fence = ""
@@ -526,6 +531,7 @@ def _markdown_context(
                 table_header = previous = ""
                 assessment_table = inline_ambiguous = False
         if raw_end is not None:
+            destination_start, destination_seen = None, False
             ending = raw_end.search(line)
             if ending:
                 if ending[0] == "--!>" and protected_spans is not None:
@@ -594,6 +600,7 @@ def _markdown_context(
                     "Polly review container fences are not supported in multipart comments."
                 )
             fence, fence_line = opening[1], line
+            destination_start, destination_seen = None, False
             inline_ambiguous = False
             protect_span(line_start, min(offset, len(text)), "fence delimiter")
             table_header = ""
@@ -643,6 +650,36 @@ def _markdown_context(
                 inline_ambiguous |= "`" in line[cursor:start]
                 cursor = end
             inline_ambiguous |= "`" in line[cursor:]
+
+            if not line.strip(" \t\r") or line.lstrip().startswith("|"):
+                destination_start, destination_seen = None, False
+            bracket = line.find("[")
+            if bracket >= 0 and destination_start is None:
+                while bracket and line[bracket - 1] in "\\!":
+                    bracket -= 1
+                destination_start = line_start + bracket
+            destination_seen |= "](" in line
+            if destination_seen and destination_start is not None:
+                closing = line.rfind(")")
+                if closing >= 0:
+                    protect_span(destination_start, line_start + closing + 1, "inline destination")
+            for start, end in code_spans:
+                literal = line[start:end]
+                if any(marker in literal for marker in ("[", "<", "://", "www.", "@")):
+                    protect_span(line_start + start, line_start + end, "inline destination code")
+            ambiguous_destination = False
+            for word in re.finditer(r"\S+", line):
+                value = word[0]
+                if (
+                    "://" in value
+                    or "www." in value
+                    or "@" in value
+                    or ("<" in value and ":" in value)
+                ):
+                    ambiguous_destination |= inline_ambiguous
+                    protect_span(
+                        line_start + word.start(), line_start + word.end(), "inline destination"
+                    )
 
             tags = visible_tags(disclosure_tag, line, line_start, literal_spans)
             if tags and (
@@ -704,6 +741,11 @@ def _markdown_context(
             ) or (table_header and "|" in line and not line.lstrip().startswith("|")):
                 raise ValueError(
                     "Polly review tables without leading pipes are not supported "
+                    "in multipart comments."
+                )
+            if ambiguous_destination:
+                raise ValueError(
+                    "Polly review ambiguous inline destinations are not supported "
                     "in multipart comments."
                 )
         if line.lstrip().startswith(("<details>", "</details>", "<summary>")):
