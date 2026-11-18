@@ -914,6 +914,7 @@ it("shows each cell's own model, not the active conversation's", () => {
   useChatStore.setState({ conversationId: "active", llmModel: "opus" });
   const view = renderClaudeCells();
   act(() => {
+    conversationRegistry.acquire("first").setState({ codexModelOptions: CELL_MODELS });
     conversationRegistry
       .acquire("second")
       .setState({ llmModel: "sonnet", codexModelOptions: CELL_MODELS });
@@ -923,7 +924,7 @@ it("shows each cell's own model, not the active conversation's", () => {
   ).toHaveTextContent("Sonnet");
   expect(
     within(screen.getByRole("region", { name: /^first/ })).getByTestId("composer-config-gear"),
-  ).not.toHaveTextContent("Opus");
+  ).not.toHaveTextContent(/opus/i);
   view.unmount();
 });
 
