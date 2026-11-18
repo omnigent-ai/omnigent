@@ -763,87 +763,6 @@ describe("WorkflowDetailPage", () => {
       );
     }
 
-    async function renderWith(newer: JournalEntry, stored: () => WorkflowDetail) {
-      const actual = await vi.importActual<typeof WorkflowHooks>("@/hooks/useWorkflow");
-      vi.mocked(useWorkflow).mockImplementation(actual.useWorkflow);
-      mockRuns([]);
-      vi.mocked(useSessionJournal).mockReturnValue({
-        entries: [saved, newer],
-        isLoading: false,
-        error: null,
-        hasOlder: false,
-        loadingOlder: false,
-        loadOlder: vi.fn(),
-        retry: vi.fn(),
-      });
-      vi.mocked(authenticatedFetch).mockImplementation(
-        async () => new Response(JSON.stringify(stored())),
-      );
-      renderPage();
-      await screen.findByTestId("workflow-detail-title");
-    }
-
-    it("edits the chosen description by hand, and keeps that edit over a newer proposal", async () => {
-      let stored: WorkflowDetail = {
-        ...WORKFLOW,
-        description: "Fixes one flaky test.",
-        description_source: "saved",
-        planning_session_id: "a".repeat(32),
-        updated_at: 200,
-      };
-      const newer = {
-        ...saved,
-        id: "newer",
-        position: 2,
-        created_at: 250,
-        content: { steps: WORKFLOW.steps, description: "Fixes flaky tests." },
-      };
-      await renderWith(newer, () => stored);
-      const patches: unknown[] = [];
-      vi.mocked(authenticatedFetch).mockImplementation(async (_path, options) => {
-        if (options?.method === "PATCH") {
-          // The editor writes the description alone, which clears its source on the server.
-          const body = JSON.parse(String(options.body));
-          patches.push(body);
-          stored = {
-            ...stored,
-            description: body.description,
-            description_source: null,
-            updated_at: 300,
-          };
-        }
-        return new Response(JSON.stringify(stored));
-      });
-      expect(proposed()).toBe("Fixes flaky tests.");
-      const editor = () => screen.getByRole("textbox", { name: "Workflow description" });
-
-      // The editor starts from the chosen description. Saved unedited, either offered wording
-      // stays a choice for Save plan instead of a write.
-      fireEvent.click(screen.getByRole("radio", { name: /^Use proposed/ }));
-      fireEvent.click(screen.getByRole("button", { name: "Edit description" }));
-      expect(editor()).toHaveValue("Fixes flaky tests.");
-      fireEvent.click(screen.getByRole("button", { name: "Save" }));
-      expect(screen.getByRole("radio", { name: /^Use proposed/ })).toBeChecked();
-      fireEvent.click(screen.getByRole("button", { name: "Edit description" }));
-      fireEvent.change(editor(), { target: { value: "Fixes one flaky test." } });
-      fireEvent.click(screen.getByRole("button", { name: "Save" }));
-      expect(screen.getByRole("radio", { name: /^Keep current/ })).toBeChecked();
-      expect(patches).toEqual([]);
-
-      fireEvent.click(screen.getByRole("button", { name: "Edit description" }));
-      fireEvent.change(editor(), { target: { value: "Fixes flaky tests, one at a time." } });
-      fireEvent.click(screen.getByRole("button", { name: "Save" }));
-      await waitFor(() => expect(description()).toBe("Fixes flaky tests, one at a time."));
-      expect(patches).toEqual([{ description: "Fixes flaky tests, one at a time." }]);
-      expect(screen.queryByRole("radiogroup")).toBeNull();
-      expect(screen.getByRole("status")).toHaveTextContent("Saved plan");
-      cleanup();
-      renderPage();
-      await screen.findByTestId("workflow-detail-title");
-      expect(description()).toBe("Fixes flaky tests, one at a time.");
-      expect(screen.getByRole("status")).toHaveTextContent("Saved plan");
-    });
-
     // Answers PATCH like the workflow store: a description applies only while the stored one is
     // still `expected_description`, and keeps the proposal it was saved with as its source.
     function serveLikeTheStore(initial: WorkflowDetail) {
@@ -887,9 +806,9 @@ describe("WorkflowDetailPage", () => {
       };
       vi.mocked(useSessionJournal).mockImplementation(() => journal);
       const server = serveLikeTheStore(initial);
-      renderPage();
+      const view = renderPage();
       await screen.findByTestId("workflow-detail-title");
-      return { journal, server };
+      return { journal, server, view };
     }
 
     const reload = async () => {
@@ -898,6 +817,72 @@ describe("WorkflowDetailPage", () => {
       await screen.findByTestId("workflow-detail-title");
       return view;
     };
+
+    it("edits the chosen description by hand, and keeps that edit over a newer proposal", async () => {
+      const newer = {
+        ...saved,
+        id: "newer",
+        position: 2,
+        created_at: 250,
+        content: { steps: WORKFLOW.steps, description: "Fixes flaky tests." },
+      };
+      const { journal, server, view } = await renderJournal([saved, newer], {
+        ...WORKFLOW,
+        description: "Fixes one flaky test.",
+        description_source: "saved",
+        planning_session_id: "a".repeat(32),
+        updated_at: 200,
+      });
+      expect(proposed()).toBe("Fixes flaky tests.");
+      const editor = () => screen.getByRole("textbox", { name: "Workflow description" });
+
+      // The editor starts from the chosen description. Saved unedited, either offered wording
+      // stays a choice for Save plan instead of a write.
+      fireEvent.click(screen.getByRole("radio", { name: /^Use proposed/ }));
+      fireEvent.click(screen.getByRole("button", { name: "Edit description" }));
+      expect(editor()).toHaveValue("Fixes flaky tests.");
+      fireEvent.click(screen.getByRole("button", { name: "Save" }));
+      expect(screen.getByRole("radio", { name: /^Use proposed/ })).toBeChecked();
+      fireEvent.click(screen.getByRole("button", { name: "Edit description" }));
+      fireEvent.change(editor(), { target: { value: "Fixes one flaky test." } });
+      fireEvent.click(screen.getByRole("button", { name: "Save" }));
+      expect(screen.getByRole("radio", { name: /^Keep current/ })).toBeChecked();
+      expect(server.patches).toEqual([]);
+
+      // Saved with the plan, the proposal's wording then gives way to a hand edit.
+      fireEvent.click(screen.getByRole("radio", { name: /^Use proposed/ }));
+      fireEvent.click(screen.getByRole("button", { name: "Save plan" }));
+      await waitFor(() => expect(description()).toBe("Fixes flaky tests."));
+      fireEvent.click(screen.getByRole("button", { name: "Edit description" }));
+      fireEvent.change(editor(), { target: { value: "Fixes flaky tests, one at a time." } });
+      fireEvent.click(screen.getByRole("button", { name: "Save" }));
+      await waitFor(() => expect(description()).toBe("Fixes flaky tests, one at a time."));
+      expect(server.patches.at(-1)).toEqual({ description: "Fixes flaky tests, one at a time." });
+      expect(screen.queryByRole("radiogroup")).toBeNull();
+      expect(screen.getByRole("status")).toHaveTextContent("Saved plan");
+
+      // A newer proposal repeating the wording chosen earlier is reviewed afresh, so Save plan
+      // keeps the hand edit and records that proposal.
+      journal.entries = [
+        saved,
+        newer,
+        { ...newer, id: "repeat", position: 3, created_at: server.stored.updated_at! + 1 },
+      ];
+      view.rerender(<WorkflowDetailPage />);
+      expect(proposed()).toBe("Fixes flaky tests.");
+      expect(screen.getByRole("radio", { name: /^Keep current/ })).toBeChecked();
+      fireEvent.click(screen.getByRole("button", { name: "Save plan" }));
+      await waitFor(() => expect(screen.queryByRole("radiogroup")).toBeNull());
+      expect(server.patches.at(-1)).toEqual({
+        steps: WORKFLOW.steps,
+        description: "Fixes flaky tests, one at a time.",
+        expected_description: "Fixes flaky tests, one at a time.",
+        description_source: "repeat",
+      });
+      await reload();
+      expect(description()).toBe("Fixes flaky tests, one at a time.");
+      expect(screen.getByRole("status")).toHaveTextContent("Saved plan");
+    });
 
     it("keeps the current description unless the proposal's is chosen, and records that", async () => {
       const declined = {
@@ -1024,7 +1009,7 @@ describe("WorkflowDetailPage", () => {
         created_at: 250,
         content: { steps: edited, description: "Fixes flaky tests." },
       };
-      await renderWith(newer, () => stored);
+      await renderJournal([saved, newer], stored);
       vi.mocked(authenticatedFetch).mockImplementation(async (_path, options) => {
         if (options?.method === "PATCH") {
           const body = JSON.parse(String(options.body));
