@@ -5035,6 +5035,10 @@ async def _execute_comment_tool(
         if status_filter is not None:
             all_comments = [c for c in all_comments if c.get("status") == status_filter]
         for comment in all_comments:
+            # Older servers omit reply_count and have no thread endpoint.
+            if not comment.get("reply_count"):
+                comment["replies"] = []
+                continue
             comment_id = _optional_string(comment.get("id"))
             if comment_id is None:
                 continue

@@ -2719,8 +2719,16 @@ def test_list_conversations_archive_toggle_round_trips(
 @pytest.mark.asyncio
 async def test_delete_conversation(
     conversation_store: SqlAlchemyConversationStore,
+    db_uri: str,
 ) -> None:
+    from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
+
     conv = conversation_store.create_conversation()
+    child = conversation_store.create_conversation(parent_conversation_id=conv.id)
+    comments = SqlAlchemyCommentStore(db_uri)
+    for session_id in (conv.id, child.id):
+        comment = comments.add(session_id, "file.py", "Question", 0, 1)
+        comments.add_reply(comment.id, session_id, "Answer")
     conversation_store.set_session_todos(
         conv.id, [{"content": "late", "status": "pending", "activeForm": "waiting"}]
     )
@@ -2737,6 +2745,12 @@ async def test_delete_conversation(
     assert await conversation_store.delete_conversation(conv.id) is True
     assert conversation_store.get_conversation(conv.id) is None
     assert conversation_store.list_items(conv.id).data == []
+    from sqlalchemy import func, select
+
+    from omnigent.db.db_models import SqlCommentReply
+
+    with conversation_store._session("assert_reply_cleanup") as session:
+        assert session.scalar(select(func.count()).select_from(SqlCommentReply)) == 0
     assert not conversation_store.set_session_todos(conv.id, [])
     assert await conversation_store.delete_conversation(conv.id) is False
 

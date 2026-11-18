@@ -62,7 +62,7 @@ async def test_runner_comment_reply_transport() -> None:
                     "next_cursor": None,
                 },
             )
-        return httpx.Response(200, json=[{"id": "2" * 32, "status": "draft"}])
+        return httpx.Response(200, json=[{"id": "2" * 32, "status": "draft", "reply_count": 21}])
 
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(respond), base_url="http://test"

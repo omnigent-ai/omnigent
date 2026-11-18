@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import dataclasses
+from typing import Literal
 
 COMMENT_ANCHOR_MAX_STORED_BYTES = 1_024
+CommentReplyAuthorKind = Literal["user", "agent"]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -41,7 +43,7 @@ class PullRequestCommentAnchor:
 class CommentReplySummary:
     """Latest reply metadata for a collapsed comment, with no plaintext body."""
 
-    author_kind: str
+    author_kind: CommentReplyAuthorKind
     created_by: str | None
     created_at: int
 
@@ -126,7 +128,7 @@ class CommentReply:
     id: str
     comment_id: str
     conversation_id: str
-    author_kind: str
+    author_kind: CommentReplyAuthorKind
     body: str
     created_by: str | None
     created_at: int

@@ -1907,6 +1907,10 @@
         "description": "One user or agent message in a comment thread; created_at is epoch \u00b5s.",
         "properties": {
           "author_kind": {
+            "enum": [
+              "user",
+              "agent"
+            ],
             "title": "Author Kind",
             "type": "string"
           },
@@ -1987,6 +1991,10 @@
         "description": "Latest reply metadata for a collapsed comment, with no plaintext body.",
         "properties": {
           "author_kind": {
+            "enum": [
+              "user",
+              "agent"
+            ],
             "title": "Author Kind",
             "type": "string"
           },

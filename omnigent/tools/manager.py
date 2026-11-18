@@ -398,7 +398,7 @@ class ToolManager:
                     "Available: web_search, web_read, web_fetch, "
                     "upload_file, list_files, download_file, "
                     "search_conversations, export_agent. "
-                    "Note: list_comments and update_comment are "
+                    "Note: list_comments, update_comment and reply_to_comment are "
                     "framework-owned and auto-registered; they cannot "
                     "be declared in the spec. "
                     "(Interactive shells now go through the "

@@ -51,6 +51,7 @@ def test_builtin_names_includes_framework_owned_tools() -> None:
     assert "web_fetch" in BUILTIN_NAMES
     assert "list_comments" in BUILTIN_NAMES
     assert "update_comment" in BUILTIN_NAMES
+    assert "reply_to_comment" in BUILTIN_NAMES
     assert "sys_list_models" in BUILTIN_NAMES
     assert "ui_open_file" in BUILTIN_NAMES
 
@@ -64,6 +65,7 @@ def test_instantiable_subset_excludes_framework_owned() -> None:
     assert "web_fetch" not in INSTANTIABLE_BUILTINS
     assert "list_comments" not in INSTANTIABLE_BUILTINS
     assert "update_comment" not in INSTANTIABLE_BUILTINS
+    assert "reply_to_comment" not in INSTANTIABLE_BUILTINS
     assert "ui_open_file" not in INSTANTIABLE_BUILTINS
 
 
@@ -86,6 +88,7 @@ def test_get_builtin_tool_returns_none_for_framework_owned() -> None:
     assert get_builtin_tool("web_fetch") is None
     assert get_builtin_tool("list_comments") is None
     assert get_builtin_tool("update_comment") is None
+    assert get_builtin_tool("reply_to_comment") is None
     assert get_builtin_tool("ui_open_file") is None
 
 
@@ -146,6 +149,7 @@ def test_builtin_names_size_matches_registry() -> None:
                 # ToolContext.conversation_id.
                 "list_comments",
                 "update_comment",
+                "reply_to_comment",
                 # sys_list_models / sys_advise_models: auto-registered
                 # by ToolManager alongside the sub-agent dispatch grant.
                 # sys_advise_models is only included when smart routing

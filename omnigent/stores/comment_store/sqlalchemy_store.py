@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from typing import cast
 
 from sqlalchemy import and_, delete, func, or_, select, tuple_
 from sqlalchemy.orm import Session
@@ -16,13 +17,19 @@ from omnigent.db.enum_codecs import (
     encode_comment_status,
 )
 from omnigent.db.utils import (
+    NamedManagedSessionMaker,
     get_or_create_engine,
     make_named_managed_session_maker,
     now_epoch_us,
     run_write_transaction,
 )
 from omnigent.entities import Comment, CommentsFingerprint
-from omnigent.entities.comment import CommentReply, CommentReplySummary, PullRequestCommentAnchor
+from omnigent.entities.comment import (
+    CommentReply,
+    CommentReplyAuthorKind,
+    CommentReplySummary,
+    PullRequestCommentAnchor,
+)
 from omnigent.stores.comment_store import (
     MAX_COMMENT_PAGE_SIZE,
     MAX_REPLIES_PER_COMMENT,
@@ -297,7 +304,10 @@ class SqlAlchemyCommentStore(CommentStore):
                 if reply is not None:
                     comment.reply_count = reply.reply_count
                     comment.last_reply = CommentReplySummary(
-                        author_kind=decode_comment_reply_author_kind(reply.author_kind),
+                        author_kind=cast(
+                            CommentReplyAuthorKind,
+                            decode_comment_reply_author_kind(reply.author_kind),
+                        ),
                         created_by=reply.created_by,
                         created_at=reply.created_at,
                     )
@@ -438,34 +448,7 @@ class SqlAlchemyCommentStore(CommentStore):
 
     def remove_conversation(self, conversation_id: str) -> None:
         """Delete all comments for a conversation. See base class for contract."""
-        # Each transaction deletes at most one bounded primary-key prefix page.
-        while True:
-
-            def remove_batch(session: Session) -> int:
-                scope = (
-                    SqlCommentReply.workspace_id == current_workspace_id(),
-                    SqlCommentReply.conversation_id == conversation_id,
-                )
-                keys = session.execute(
-                    select(SqlCommentReply.comment_id, SqlCommentReply.id)
-                    .where(*scope)
-                    .order_by(SqlCommentReply.comment_id, SqlCommentReply.id)
-                    .limit(MAX_COMMENT_PAGE_SIZE)
-                ).all()
-                if keys:
-                    session.execute(
-                        delete(SqlCommentReply).where(
-                            *scope,
-                            tuple_(SqlCommentReply.comment_id, SqlCommentReply.id).in_(keys),
-                        )
-                    )
-                return len(keys)
-
-            if (
-                run_write_transaction(self._session_immediate, "remove_reply_batch", remove_batch)
-                < MAX_COMMENT_PAGE_SIZE
-            ):
-                break
+        delete_conversation_replies(self._session_immediate, conversation_id)
         stmt = delete(SqlComment).where(
             SqlComment.workspace_id == current_workspace_id(),
             SqlComment.conversation_id == conversation_id,
@@ -483,8 +466,45 @@ def _reply_entity(row: SqlCommentReply) -> CommentReply:
         id=row.id,
         comment_id=row.comment_id,
         conversation_id=row.conversation_id,
-        author_kind=decode_comment_reply_author_kind(row.author_kind),
+        author_kind=cast(
+            CommentReplyAuthorKind, decode_comment_reply_author_kind(row.author_kind)
+        ),
         body=row.body,
         created_by=row.created_by,
         created_at=row.created_at,
     )
+
+
+def delete_conversation_replies(
+    session_maker: NamedManagedSessionMaker,
+    conversation_id: str,
+) -> None:
+    """Remove a conversation's replies in bounded primary-key prefix transactions."""
+    # Each transaction deletes at most one bounded primary-key prefix page.
+    while True:
+
+        def remove_batch(session: Session) -> int:
+            scope = (
+                SqlCommentReply.workspace_id == current_workspace_id(),
+                SqlCommentReply.conversation_id == conversation_id,
+            )
+            keys = session.execute(
+                select(SqlCommentReply.comment_id, SqlCommentReply.id)
+                .where(*scope)
+                .order_by(SqlCommentReply.comment_id, SqlCommentReply.id)
+                .limit(MAX_COMMENT_PAGE_SIZE)
+            ).all()
+            if keys:
+                session.execute(
+                    delete(SqlCommentReply).where(
+                        *scope,
+                        tuple_(SqlCommentReply.comment_id, SqlCommentReply.id).in_(keys),
+                    )
+                )
+            return len(keys)
+
+        if (
+            run_write_transaction(session_maker, "remove_reply_batch", remove_batch)
+            < MAX_COMMENT_PAGE_SIZE
+        ):
+            break

@@ -116,6 +116,11 @@ async def test_agent_reply_requires_matching_runner_origin(
     )
     assert response.status_code == 200, response.text
     assert response.json()["author_kind"] == "agent" and response.json()["created_by"] is None
+    listed = (await auth_client.get(f"/v1/sessions/{session_id}/comments", headers=user)).json()[0]
+    assert listed["reply_count"] == 1
+    assert listed["last_reply"] == {
+        key: response.json()[key] for key in ("author_kind", "created_by", "created_at")
+    }
     other = _seed_session_with_grants(db_uri, {OWNER: LEVEL_OWNER})
     conversations.set_runner_id(other, token_bound_runner_id(token))
     headers[ORCHESTRATION_SOURCE_HEADER] = other

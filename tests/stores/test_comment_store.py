@@ -1011,3 +1011,16 @@ def test_reply_scoping_and_cleanup(store: SqlAlchemyCommentStore) -> None:
     with workspace_scope(7):
         assert tenant_reply is not None
         assert store.get_reply(tenant_parent.id, conversation_id, tenant_reply.id) == tenant_reply
+
+
+def test_reply_body_limits_include_cipher_envelope(monkeypatch: pytest.MonkeyPatch) -> None:
+    from omnigent.stores.comment_store import validate_reply_body
+
+    class ExpandingCipher:
+        def encrypt(self, plaintext: bytes) -> tuple[dict[str, str], bytes]:
+            return {"algorithm": "example"}, plaintext + b"x" * 16_383
+
+    validate_reply_body("a" * 12_000)
+    monkeypatch.setattr("omnigent.db.envelope._cipher", ExpandingCipher())
+    with pytest.raises(ValueError, match=r"12,000.*encrypted storage limit"):
+        validate_reply_body("A short message")
