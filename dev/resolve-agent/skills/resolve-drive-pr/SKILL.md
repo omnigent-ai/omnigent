@@ -105,8 +105,8 @@ can land a fix depends on where its branch lives:
     is a bot indicator — the maintainer's approval still merges it.)
 
 Throughout, address the PR you're landing by its number `<pr>`. Continue until
-current CI and both independent reviews are settled; follow the workflow-provided review budget when present; otherwise there is no fixed
-review-round cap. After every push, request both Polly and OCR for the new head
+current CI and both independent reviews are settled; follow the workflow-provided review budget when present; otherwise the review loop's
+three-round cap applies. After every push, request both Polly and OCR for the new head
 (Step 4.3), including pushes for CI or conflict repairs. A fork takeover starts
 this loop on the replacement PR. If a concrete blocker or actual execution
 deadline prevents completion, leave a resumable checkpoint and report

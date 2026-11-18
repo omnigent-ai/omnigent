@@ -461,6 +461,7 @@ describe("header, prompt, configuration", () => {
     );
     expect(screen.getByTestId("task-detail-workspace")).toHaveTextContent("Host home directory");
     expect(screen.getByTestId("task-detail-timezone")).toHaveTextContent("UTC");
+    expect(screen.getByTestId("task-detail-cost-limit")).toHaveTextContent("No limit");
   });
 
   it("shows saved launch settings and the continued session configuration", () => {
@@ -477,6 +478,7 @@ describe("header, prompt, configuration", () => {
         workspace: "/work/inbox",
         projectId: "proj_1",
         timezone: "America/Los_Angeles",
+        maxCostUsd: 2.5,
       }),
     );
     renderPage();
@@ -490,6 +492,7 @@ describe("header, prompt, configuration", () => {
     expect(screen.getByTestId("task-detail-workspace")).toHaveTextContent("/work/inbox");
     expect(screen.getByTestId("task-detail-project")).toHaveTextContent("Inbox");
     expect(screen.getByTestId("task-detail-timezone")).toHaveTextContent("America/Los_Angeles");
+    expect(screen.getByTestId("task-detail-cost-limit")).toHaveTextContent("$2.50");
     expect(screen.getByText(/saved launch settings/)).toBeInTheDocument();
   });
 
