@@ -210,6 +210,13 @@ describe("useMessageDeepLink", () => {
       expect(scrollSpy).toHaveBeenCalledOnce();
       act(() => vi.advanceTimersByTime(SETTLE_MS));
       expect(useChatStore.getState().flashItemId).toBe("response_1");
+
+      if (notification === "mount only") {
+        await act(async () => {
+          root.append(document.createTextNode("later transcript update"));
+        });
+        expect(scrollSpy).toHaveBeenCalledOnce();
+      }
     },
   );
 
