@@ -246,8 +246,16 @@ function routeCapabilities(
       sessionId,
       async (client) => {
         const signal = AbortSignal.timeout(CAPABILITIES_TIMEOUT_MS);
-        const response = await client.getCapabilities({}, { signal });
-        return new Set(response.capabilities);
+        try {
+          const response = await client.getCapabilities({}, { signal });
+          return new Set(response.capabilities);
+        } catch (error) {
+          // A host without the capability query serves only the baseline methods.
+          if (error instanceof ConnectError && error.code === Code.Unimplemented) {
+            return new Set<string>();
+          }
+          throw error;
+        }
       },
       undefined,
       sshTarget,
@@ -377,7 +385,11 @@ async function viaWorkspaceApi<T>(
       if (code !== null && ANSWER_CODES.has(code)) return null;
       if (code !== null && TRANSIENT_CODES.has(code)) continue;
       // A restarted host refuses the old token; the next read gets a new one.
-      if (route === "direct" && code === Code.Unauthenticated) continue;
+      if (route === "direct" && code === Code.Unauthenticated) {
+        // A restarted host may serve other methods, so its capabilities are read again.
+        capabilities.delete(key);
+        continue;
+      }
       // The host listed a method it doesn't serve, e.g. one the server turned off.
       if (checked && code === Code.Unimplemented) {
         unsupportedUntil.set(unsupportedKey, Date.now() + ROUTE_RETRY_MS);
