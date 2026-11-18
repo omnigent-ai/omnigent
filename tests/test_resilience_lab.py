@@ -383,12 +383,22 @@ def test_lab_diagnostic_failure_still_stops_all_labs(
 
 
 @pytest.mark.parametrize(
-    "invalid_tail,churn",
-    [(False, "none"), (True, "none"), (False, "proxy"), (False, "discovery"), (False, "native")],
+    "invalid_tail,churn,events_omitted",
+    [
+        (False, "none", 0),
+        (True, "none", 0),
+        (False, "proxy", 14),
+        (False, "discovery", 14),
+        (False, "native", 0),
+    ],
     ids=["valid-tail", "invalid-tail", "proxy-churn", "discovery-churn", "native-bounds"],
 )
 def test_lab_diagnostics_bound_aggregate_history_and_session_snapshots(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, invalid_tail: bool, churn: str
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    invalid_tail: bool,
+    churn: str,
+    events_omitted: int,
 ) -> None:
     monkeypatch.setattr(
         lab_module, "time", SimpleNamespace(time=lambda: 123.0, monotonic=lambda: 0.0)
@@ -453,6 +463,7 @@ def test_lab_diagnostics_bound_aggregate_history_and_session_snapshots(
         lab.write_diagnostics(destination)
     raw = destination.read_text()
     payload = json.loads(raw)
+    assert payload["events_omitted"] == events_omitted
     if churn == "proxy":
         assert len(payload["events"]) == 4096
         assert [event["conn"] for event in payload["events"]] == list(range(1, 4097))
@@ -693,6 +704,20 @@ def test_lab_diagnostics_reject_outside_or_invalid_native_records(
         path.write_text(json.dumps({**value, "events": {}}))
     else:
         path.write_text(json.dumps({**value, "launch_id": "a" * 32}))
+    sibling_bridge = bridge.parent / ("e" * 32)
+    sibling_bridge.mkdir()
+    sibling_id = "f" * 32
+    (sibling_bridge / f"lifecycle-{sibling_id}.json").write_text(
+        json.dumps(
+            {
+                **value,
+                "launch_id": sibling_id,
+                "events": [
+                    {"event_name": "Stop", "recorded_at": 2.0, "payload": "private-invalid-json"}
+                ],
+            }
+        )
+    )
     destination = tmp_path / "pytest-base" / "resilience-diagnostics" / "lab-0.json"
     lab.write_diagnostics(destination)
     payload = json.loads(destination.read_text())
@@ -701,11 +726,17 @@ def test_lab_diagnostics_reject_outside_or_invalid_native_records(
         {"wall": 1.0, "source": "stream", "status": "running", "session_id": session_id}
     ]
     native = payload["native_lifecycle"]
-    assert native["records"] == []
-    assert native["rejected"] == native["candidates"]
-    if invalid == "self-loop":
-        assert native["candidates"] == 1
-        assert native["rejected"] == 1
+    assert native["records"] == [
+        {
+            "terminal_instance_id": "d" * 32,
+            "launch_id": sibling_id,
+            "events": [{"event_name": "Stop", "recorded_at": 2.0}],
+        }
+    ]
+    assert all(record["launch_id"] != launch_id for record in native["records"])
+    assert native["candidates"] == 2
+    assert native["rejected"] == 1
+    assert native["omitted"] == 0
     assert "private-invalid-json" not in destination.read_text()
     assert source.read_text() == json.dumps(value)
 

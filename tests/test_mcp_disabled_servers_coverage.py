@@ -48,7 +48,19 @@ def test_every_supported_executor_has_exactly_one_launch_hook():
     assert calls == Counter(dict.fromkeys(listed, 1))
 
 
-def test_native_failure_metadata_is_bounded_and_excludes_private_values(tmp_path):
+@pytest.mark.parametrize(
+    "file_state,expected_state",
+    [
+        ("ordinary", "parsed"),
+        ("at-limit", "parsed"),
+        ("oversize", "oversized"),
+        ("file-link", "symlink"),
+        ("malformed", "unreadable_or_invalid"),
+    ],
+)
+def test_native_failure_metadata_is_bounded_and_excludes_private_values(
+    tmp_path, file_state, expected_state
+):
     from tests.e2e.test_mcp_disabled_servers import _mcp_failure_metadata
 
     home = tmp_path / "home"
@@ -79,13 +91,37 @@ def test_native_failure_metadata_is_bounded_and_excludes_private_values(tmp_path
             }
         )
     )
+    for filename in ("tool_relay.json", "mcp_startup.json"):
+        path = bridge / filename
+        if file_state in {"at-limit", "oversize"}:
+            size = 524288 if file_state == "at-limit" else 524289
+            path.write_bytes(path.read_bytes().ljust(size, b" "))
+            assert path.stat().st_size == size
+        elif file_state == "file-link":
+            target = tmp_path / filename
+            path.rename(target)
+            path.symlink_to(target)
+        elif file_state == "malformed":
+            path.write_text(private)
     known = {
         "type": "namespace",
         "name": "mcp__omnigent",
         "namespace": "omnigent",
         "server_label": "on_fixture",
         "defer_loading": True,
-        "tools": [{"type": "function", "name": "sys_session_get_info", "description": private}],
+        "tools": [
+            {
+                "type": "function",
+                "name": "sys_session_get_info",
+                "description": private,
+                "tools": [
+                    {
+                        "name": "on_fixture",
+                        "tools": [{"name": private, "description": private}],
+                    }
+                ],
+            }
+        ],
     }
     unknown = {
         "type": private,
@@ -110,14 +146,38 @@ def test_native_failure_metadata_is_bounded_and_excludes_private_values(tmp_path
     assert (
         projected["entries"][0]["tools"]["entries"][0]["name"]["known"] == "sys_session_get_info"
     )
+    nested = projected["entries"][0]["tools"]["entries"][0]["tools"]
+    assert nested["count"] == 1
+    assert nested["entries"][0]["name"]["known"] == "on_fixture"
+    assert nested["entries"][0]["tools"] == {
+        "shape": "list",
+        "count": 1,
+        "entries": [],
+        "omitted": 1,
+    }
     assert projected["entries"][0]["deferred"]["defer_loading"] is True
     assert projected["entries"][1]["name"]["known"] is None
     assert all(row["tools"]["entries"] == [] for row in metadata["requests"][1:])
-    assert metadata["relay"]["state"] == "parsed"
-    assert metadata["relay"]["count"] == 130
-    assert metadata["relay"]["omitted"] == 2
-    assert metadata["relay"]["controls_in_inspected_prefix"]["sys_session_get_info"] is True
-    assert metadata["startup_observer_cache"]["servers"] == {"omnigent": "failed"}
+    assert metadata["relay"]["state"] == expected_state
+    assert metadata["startup_observer_cache"]["state"] == expected_state
+    assert (
+        metadata["startup_observer_cache"]["individual_success_not_implied_by_settlement"] is True
+    )
+    if expected_state == "parsed":
+        assert metadata["relay"]["count"] == 130
+        assert metadata["relay"]["omitted"] == 2
+        assert metadata["relay"]["controls_in_inspected_prefix"]["sys_session_get_info"] is True
+        assert metadata["startup_observer_cache"]["servers"] == {"omnigent": "failed"}
+    else:
+        assert metadata["relay"]["tools_shape"] == "NoneType"
+        assert metadata["relay"]["count"] is None
+        assert metadata["relay"]["omitted"] == 0
+        assert metadata["relay"]["controls_in_inspected_prefix"] == {
+            "sys_session_get_info": False,
+            "sys_session_create": False,
+            "sys_terminal_list": False,
+        }
+        assert metadata["startup_observer_cache"]["servers"] == {}
 
 
 @pytest.mark.parametrize("outcome", ["timeout", "post-success", "poll-error", "diagnostic-error"])
