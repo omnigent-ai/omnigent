@@ -19,10 +19,7 @@ export function McpRegistryConnections() {
     <div className="space-y-4">
       <div>
         <h3 className="text-sm font-medium">{MCP_SERVICES_ENTRY.label}</h3>
-        <p className="text-sm text-muted-foreground">
-          Connect once, then add these tools to any session. Your accounts are reused across
-          sessions on local machines, remote hosts, and sandboxes in this workspace.
-        </p>
+        <p className="text-sm text-muted-foreground">{MCP_SERVICES_ENTRY.description}</p>
       </div>
       {callbackFailed && (
         <p role="alert" className="text-sm text-destructive">

@@ -1830,6 +1830,13 @@ describe("SettingsPage", () => {
       document.querySelector('[data-settings-control="account-password:change"]'),
     ).not.toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Change password" }));
+    expect(screen.getByPlaceholderText("Current password")).toHaveAccessibleName(
+      "Current password",
+    );
+    expect(screen.getByPlaceholderText("New password")).toHaveAccessibleName("New password");
+    expect(screen.getByPlaceholderText("Confirm new password")).toHaveAccessibleName(
+      "Confirm new password",
+    );
     expect(
       document.querySelector('[data-settings-control="account-password:currentPassword"]'),
     ).not.toBeNull();
