@@ -331,6 +331,7 @@ def _markdown_context(
     Only canonical assessment rows require every field to be populated.
     Disclosure balancing supports lowercase <details>/</details> without attributes
     at the first nonblank position; <summary> may share an opening line.
+    Multipart preflight rejects container-prefixed fences outside active fences.
     Inline-code formatting across fragments is not balanced.
     """
     details = 0
@@ -340,6 +341,7 @@ def _markdown_context(
     assessment_table = False
     previous = ""
     offset = previous_start = 0
+    container_marker = re.compile(r">|[-+*](?=[ \t])|[0-9]{1,9}[.)](?=[ \t])")
 
     def protect_span(start: int, end: int, kind: str) -> None:
         if protected_spans is None:
@@ -381,6 +383,21 @@ def _markdown_context(
             elif protected_spans is not None:
                 protect_literals(line, line_start, fence)
             continue
+        if protected_spans is not None:
+            position = 0
+            container = False
+            while True:
+                while position < len(line) and line[position] in " \t":
+                    position += 1
+                marker = container_marker.match(line, position)
+                if marker is None:
+                    break
+                container = True
+                position = marker.end()
+            if container and line.startswith(("```", "~~~"), position):
+                raise ValueError(
+                    "Polly review container fences are not supported in multipart comments."
+                )
         opening = re.match(r"^ {0,3}(`{3,}|~{3,})", line)
         if opening and opening[1].startswith("`"):
             invalidating = line.find("`", opening.end())
