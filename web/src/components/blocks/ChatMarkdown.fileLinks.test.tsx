@@ -76,6 +76,20 @@ function dirListing(paths: string[]): Response {
 
 const WORKSPACE = "/home/u/ws";
 
+/** Lets every in-flight fetch reach React Query and re-render, so a negative assertion is final. */
+async function settleQueries(): Promise<void> {
+  for (let tick = 0; tick < 5; tick += 1) {
+    // Each tick must run after the previous one's re-render.
+    // oxlint-disable-next-line no-await-in-loop
+    await act(
+      () =>
+        new Promise<void>((resolve) => {
+          setTimeout(resolve, 0);
+        }),
+    );
+  }
+}
+
 // Module scope so the provider value is a constant (jsx-no-constructed-context-values);
 // `renderMarkdown` swaps the changed-file list and resets the spy per test.
 const openFile = vi.fn();
@@ -761,11 +775,16 @@ describe("links to folders", () => {
 
   it("keeps a trailing-slash inline-code path that names a file as plain code", async () => {
     fetchMock.mockResolvedValue(folderListing());
-    renderMarkdown("`experimental/data/summary.md/`", [], FOLDER_VIEWER);
+    renderMarkdown(
+      "`experimental/data/summary.md/` and `experimental/data/summary.md`",
+      [],
+      FOLDER_VIEWER,
+    );
 
-    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    // The sibling shares the parent listing, so once it links the listing has answered.
+    await screen.findByRole("button", { name: "experimental/data/summary.md" });
     expect(screen.getByText("experimental/data/summary.md/").tagName).toBe("CODE");
-    expect(screen.queryByRole("button")).toBeNull();
+    expect(screen.getAllByRole("button")).toHaveLength(1);
   });
 });
 
@@ -860,13 +879,20 @@ describe("file references beyond backticks and links", () => {
     });
   }
 
-  /** Answers searches with `found` and every directory listing with `listed`. */
-  function routeFetch(listed: string[], found: string[] = []): void {
-    fetchMock.mockImplementation(async (url: string) =>
-      url.includes("/search?")
-        ? listing(found.map((path) => ({ path })))
-        : listing(listed.map((path) => ({ path }))),
-    );
+  /**
+   * Answers searches with `found` and every directory listing with `listed`;
+   * `searchPages` overrides the answer to a search for one file name.
+   */
+  function routeFetch(
+    listed: string[],
+    found: string[] = [],
+    searchPages: Record<string, Response> = {},
+  ): void {
+    fetchMock.mockImplementation(async (url: string) => {
+      if (!url.includes("/search?")) return listing(listed.map((path) => ({ path })));
+      const name = new URL(url, "http://test").searchParams.get("q") ?? "";
+      return searchPages[name] ?? listing(found.map((path) => ({ path })));
+    });
   }
 
   it("links a bare prose path at its cited line, leaving the sentence punctuation", () => {
@@ -950,15 +976,70 @@ describe("file references beyond backticks and links", () => {
     expect(openFile).toHaveBeenCalledWith("accounts/Example/Predictive Optimization/notes.md");
   });
 
-  it("keeps a file name that several files share as plain code", async () => {
+  it.each([
+    ["several files share it", { has_more: false }, ["a/index.ts", "b/index.ts"]],
+    ["a cut-short search found one", { truncated: true, has_more: false }, ["a/index.ts"]],
+    ["a full page found one", { has_more: true }, ["a/index.ts"]],
+  ])("keeps a file name as plain code when %s", async (_label, page, paths) => {
+    const indexPage = jsonResponse({
+      object: "list",
+      data: paths.map((path) => ({ name: "index.ts", path, type: "file", bytes: 5 })),
+      ...page,
+    });
+    routeFetch([], ["omnigent/cli_auth.py"], { "index.ts": indexPage });
+    renderMarkdown("`index.ts:4` and `cli_auth.py:1`", [], FILE_VIEWER_WITH_SESSION);
+
+    await screen.findByRole("button", { name: "cli_auth.py:1" });
+    await settleQueries();
+    expect(screen.getByText("index.ts:4").tagName).toBe("CODE");
+    expect(screen.getAllByRole("button")).toHaveLength(1);
+  });
+
+  it("explains nothing for a markdown link to a file name several files share", async () => {
     routeFetch([], ["a/index.ts", "b/index.ts"]);
-    renderMarkdown("`index.ts:4`", [], FILE_VIEWER_WITH_SESSION);
+    renderMarkdown("[index](index.ts:4)", [], FILE_VIEWER_WITH_SESSION);
 
     await waitFor(() =>
       expect(fetchMock.mock.calls.some(([url]) => String(url).includes("/search?"))).toBe(true),
     );
-    expect(screen.getByText("index.ts:4").tagName).toBe("CODE");
-    expect(screen.queryByRole("button")).toBeNull();
+    await settleQueries();
+    expect(screen.queryByRole("button", { name: "index" })).toBeNull();
+    expect(toastMock).not.toHaveBeenCalled();
+  });
+
+  it("opens a literal a/ path that exists before its changed diff-prefix fallback", async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse({
+        object: "list",
+        data: [{ name: "notes.md", path: "a/notes.md", type: "file", bytes: 5 }],
+        has_more: false,
+      }),
+    );
+    renderMarkdown("`a/notes.md`", ["notes.md"], FILE_VIEWER_WITH_SESSION);
+
+    fireEvent.click(await screen.findByRole("button", { name: "a/notes.md" }));
+    expect(openFile).toHaveBeenCalledWith("a/notes.md");
+    expect(openFile).not.toHaveBeenCalledWith("notes.md");
+  });
+
+  it.each([
+    ["both exist", ["a.md"]],
+    ["the first is missing", []],
+  ])("links a later prose path when %s", async (_label, rootFiles) => {
+    fetchMock.mockImplementation(async (url: string) => {
+      if (url.includes("/filesystem?")) return listing(rootFiles.map((path) => ({ path })));
+      if (url.includes("/filesystem/docs?")) return listing([{ path: "docs/b.md" }]);
+      return listing([]);
+    });
+    renderMarkdown(`See ${WORKSPACE}/a.md and docs/b.md.`, [], FILE_VIEWER_WITH_SESSION);
+
+    fireEvent.click(await screen.findByRole("button", { name: "docs/b.md" }));
+    expect(openFile).toHaveBeenCalledWith("docs/b.md");
+    await settleQueries();
+    expect(screen.queryAllByRole("button", { name: `${WORKSPACE}/a.md` })).toHaveLength(
+      rootFiles.length,
+    );
+    expect(document.body).toHaveTextContent(`See ${WORKSPACE}/a.md and docs/b.md.`);
   });
 
   it("opens inline code at the lines cited in a note right after it", () => {
@@ -1008,7 +1089,16 @@ describe("a file written after an earlier mention", () => {
     // The user's request lists the root before the agent has written the file.
     fetchMock.mockResolvedValue(dirListing([]));
     const { rerender } = render(tree(["Create report.md and link it."]));
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    await waitFor(() =>
+      expect(client.getQueryState(["workspace-dir-listing", "conv_1", ""])?.status).toBe("success"),
+    );
+    // The agent's reply renders strictly after that listing was fetched.
+    await act(
+      () =>
+        new Promise<void>((resolve) => {
+          setTimeout(resolve, 5);
+        }),
+    );
 
     fetchMock.mockResolvedValue(
       jsonResponse({

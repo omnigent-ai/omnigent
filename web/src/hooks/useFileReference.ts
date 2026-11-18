@@ -1,15 +1,5 @@
-// Resolves a parsed file reference (see `lib/fileReferences`) against the
-// session's filesystem, so every chat surface links a path the same way and
-// only when it names something that exists.
-//
-// Each candidate is tried in order, the first that exists wins:
-//   1. the agent-changed files list (synchronous, and the only source for a
-//      deleted or not-yet-written file);
-//   2. the candidate itself, relative to the working folder, `~`-expanded, or
-//      absolute, checked against a cached listing of its parent directory;
-//   3. a workspace search for a file whose path ends in the candidate, for a
-//      path written relative to the repository root or a subfolder, used only
-//      when exactly one file matches.
+// Resolves a parsed file reference against the session's filesystem; it links
+// only once a candidate is found to exist.
 
 import { useEffect, useState } from "react";
 import { useQueries, useQuery } from "@tanstack/react-query";
@@ -133,46 +123,52 @@ export function useFileReference(
     resolution && resolution !== "pending" ? resolution.path : null,
   );
   // A folder can't be in the changed list, and an outside path is never a change.
-  const changedIndex = reference?.folderHint
-    ? -1
-    : resolvedPaths.findIndex((path) => !!path && !path.startsWith("/") && isChangedPath(path));
-  const checking = !!openFile && changedIndex < 0 && serveable !== false;
+  const changed = resolvedPaths.map(
+    (path) => !reference?.folderHint && !!path && !path.startsWith("/") && isChangedPath(path),
+  );
+  const firstChanged = changed.indexOf(true);
+  // Without a session nothing can be listed, so the changed list is the only evidence.
+  const checking = !!openFile && serveable !== false && !!conversationId;
 
+  // Only candidates tried before the first changed one need a listing.
   const listings = useQueries({
-    queries: resolvedPaths.map((path) =>
+    queries: resolvedPaths.map((path, index) =>
       workspaceDirListingQuery(
         conversationId,
         path === null ? null : workspaceParentDirectory(path),
-        checking,
+        checking && (firstChanged < 0 || index < firstChanged),
       ),
     ),
   });
 
   // Walk candidates in order: the first found wins, but only once every
   // earlier candidate is known to be missing, so a link never switches target.
-  let winner = changedIndex;
+  let winner = -1;
   let winnerKind: "file" | "folder" = "file";
   let undecided = false;
-  if (winner < 0) {
-    for (let index = 0; index < candidates.length; index += 1) {
-      const resolution = resolutions[index];
-      if (resolution === null) continue;
-      if (resolution === "pending") {
-        undecided = true;
-        break;
-      }
-      const query = listings[index];
-      let state = candidateState(query.isSuccess ? query.data : null, resolution.path);
-      if (state === "missing" && missIsOutdated(query, renderedAt)) state = "pending";
-      if (state === "pending") {
-        undecided = true;
-        break;
-      }
-      if (state === "missing") continue;
-      winner = index;
-      winnerKind = state;
+  for (let index = 0; index < candidates.length; index += 1) {
+    const resolution = resolutions[index];
+    if (resolution === null) continue;
+    if (resolution === "pending") {
+      undecided = true;
       break;
     }
+    if (changed[index]) {
+      winner = index;
+      break;
+    }
+    if (!checking) continue;
+    const query = listings[index];
+    let state = candidateState(query.isSuccess ? query.data : null, resolution.path);
+    if (state === "missing" && missIsOutdated(query, renderedAt)) state = "pending";
+    if (state === "pending") {
+      undecided = true;
+      break;
+    }
+    if (state === "missing") continue;
+    winner = index;
+    winnerKind = state;
+    break;
   }
   const anyResolved = resolvedPaths.some((path) => path !== null);
   const allMissing = winner < 0 && !undecided && anyResolved;
@@ -203,9 +199,11 @@ export function useFileReference(
           file.type !== "directory" &&
           searchTerms.some((term) => file.path === term || file.path.endsWith(`/${term}`)),
       );
-      if (matches.length === 1) searchMatch = matches[0].path;
-      // A cut-short search that found nothing hasn't proven absence.
-      else if (!matches.length && (result.truncated || missIsOutdated(search, renderedAt))) {
+      const complete = !result.truncated && !result.hasMore;
+      if (matches.length === 1 && complete) searchMatch = matches[0].path;
+      // Only a complete, fresh search that found nothing proves the file is missing;
+      // several matches are ambiguous, not missing.
+      else if (matches.length || !complete || missIsOutdated(search, renderedAt)) {
         searchPending = true;
       }
     }

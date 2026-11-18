@@ -1,17 +1,5 @@
-// Recognizes the ways Claude Code, Codex and other agents cite local files and
-// folders in their replies, so every chat surface can turn them into links.
-//
-// Shapes seen in real transcripts and agent system prompts:
-//   - markdown links to absolute or relative targets, with `:12`, `:12:5`,
-//     `#L12`, `#L12C5`, `#L12-L18` or `:12-18` positions, angle-bracketed when
-//     the path has spaces: `[My Report.md](</abs/My Project/My Report.md:3>)`
-//   - inline code: `src/app.ts:42`, `~/.config/x.json`, `cli.py:753-755`,
-//     `b/server/index.js#L10`, `docs/`, `/etc/hosts`, `../notes/log.txt`
-//   - bare prose: `see ~/ws/notes.md`, `edited src/app.ts:12.`, `README.md`
-//
-// This module only parses text. Whether a reference names a real file is
-// decided by `useFileReference`, which checks each candidate against the
-// session's filesystem; nothing links until that check finds it.
+// Parses the file and folder references agents write (markdown links, inline
+// code, prose) into candidate paths; `useFileReference` checks they exist.
 
 // ── Positions ────────────────────────────────────────────────────────────────
 
@@ -145,11 +133,15 @@ function fileUriPath(text: string): string | null {
     return null;
   }
   if (url.protocol !== "file:" || url.hostname || url.search) return null;
+  let path: string;
   try {
-    return decodeURIComponent(url.pathname) + url.hash;
+    path = decodeURIComponent(url.pathname);
   } catch {
     return null;
   }
+  // An encoded `#` or `:` belongs to the file name and must not read as a position.
+  if (/[?#]/.test(path) || splitFileCitation(path).hasPosition) return null;
+  return path + url.hash;
 }
 
 /**

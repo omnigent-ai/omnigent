@@ -74,6 +74,8 @@ describe("parseFileReference in inline code", () => {
     "docs/page.md?raw=1",
     "v1.2",
     "~",
+    "file:///home/u/ws/report.md%23L12",
+    "file:///home/u/ws/report.md%3A12",
   ])("rejects %s", (text) => {
     expect(parseFileReference(text, "code")).toBeNull();
   });

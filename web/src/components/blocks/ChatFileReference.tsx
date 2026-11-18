@@ -1,8 +1,5 @@
-// Renderers that turn file and folder references in chat markdown into links
-// opening the FileViewer (or the Files tree for a folder). Every surface parses
-// with `lib/fileReferences` and resolves with `useFileReference`, so an inline
-// code span, a markdown link, a bare prose path and a mention pill naming the
-// same file all behave the same way.
+// Renders file and folder references in chat markdown as links that open the
+// FileViewer, or the Files tree for a folder.
 
 import type React from "react";
 import { useMemo } from "react";
@@ -27,6 +24,7 @@ import {
 } from "@/hooks/useFileReference";
 import { copyText } from "@/lib/clipboard";
 import {
+  findProseFileReferences,
   mergeProseExtents,
   parseFileReference,
   shortFileCitationLabel,
@@ -144,10 +142,25 @@ export function ProseFileReference({
       merged?.candidateLengths.length === 1 &&
       (reference.hasDirectory || reference.citation.hasPosition),
   });
-  if (!resolved.open || !merged) return children;
-  const length =
-    resolved.candidateIndex >= 0 ? merged.candidateLengths[resolved.candidateIndex] : text.length;
+  if (!merged) return children;
+  // While a longer extent may still win, the tail can't be read on its own yet.
+  if (!resolved.open && resolved.status === "pending") return children;
+  // Unlinked, only the shortest extent is spent; the rest may hold other references.
+  const length = resolved.open
+    ? resolved.candidateIndex >= 0
+      ? merged.candidateLengths[resolved.candidateIndex]
+      : text.length
+    : Math.min(...merged.candidateLengths);
   const linked = text.slice(0, length);
+  const tail = <ProseText text={text.slice(length)} />;
+  if (!resolved.open) {
+    return (
+      <>
+        {linked}
+        {tail}
+      </>
+    );
+  }
   return (
     <>
       <FileLinkContextMenu path={resolved.copyPath}>
@@ -163,9 +176,35 @@ export function ProseFileReference({
           {linked}
         </a>
       </FileLinkContextMenu>
-      {text.slice(length)}
+      {tail}
     </>
   );
+}
+
+/** Prose left over after a reference, scanned again for references of its own. */
+function ProseText({ text }: { text: string }) {
+  const references = useMemo(() => findProseFileReferences(text), [text]);
+  const parts: React.ReactNode[] = [];
+  let cursor = 0;
+  for (const reference of references) {
+    const end = reference.extents[0].end;
+    parts.push(
+      text.slice(cursor, reference.start),
+      <ProseFileReference
+        key={reference.start}
+        {...{
+          [PROSE_FILE_REFERENCE_ENDS_ATTR]: reference.extents
+            .map((extent) => extent.end - reference.start)
+            .join(","),
+        }}
+      >
+        {text.slice(reference.start, end)}
+      </ProseFileReference>,
+    );
+    cursor = end;
+  }
+  parts.push(text.slice(cursor));
+  return parts;
 }
 
 /**
