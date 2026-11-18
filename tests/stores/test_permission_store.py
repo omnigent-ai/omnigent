@@ -10,13 +10,15 @@ SQLite file and tears it down automatically.
 
 from __future__ import annotations
 
+import re
 import uuid
 
 import pytest
-from sqlalchemy import event
+from sqlalchemy import event, insert
+from sqlalchemy.orm import Session
 
 from omnigent.db.account_authority import account_checks_scope
-from omnigent.db.db_models import workspace_scope
+from omnigent.db.db_models import SqlWorkflowShare, workspace_scope
 from omnigent.entities import ScheduledTaskPermission, SessionPermission, WorkflowPermission
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server import session_sharing
@@ -1984,6 +1986,58 @@ def test_delete_for_workflow_removes_only_that_workflows_grants(
     )
 
 
+def test_workflow_grant_cleanup_reads_only_the_batchs_grants(
+    store: SqlAlchemyPermissionStore,
+) -> None:
+    """A cleanup batch reads O(batch) grant rows however many other grants the workspace has."""
+    if store._engine.dialect.name != "postgresql":
+        pytest.skip("PostgreSQL execution-plan regression")
+    # Other workflows' grants sit on both sides of the deleted ones in key order.
+    deleting = [f"{index:032x}" for index in (20_000, 20_001)]
+    rows = [
+        {
+            "workspace_id": 0,
+            "workflow_id": f"{index:032x}",
+            "user_id": f"u{index % 97}",
+            "level": 1,
+        }
+        for index in range(1_000, 41_000)
+        if index not in (20_000, 20_001)
+    ] + [
+        {"workspace_id": 0, "workflow_id": workflow_id, "user_id": f"g{n:03d}", "level": 1}
+        for workflow_id in deleting
+        for n in range(80)
+    ]
+    with store._engine.begin() as connection:
+        connection.execute(insert(SqlWorkflowShare), rows)
+        connection.exec_driver_sql("ANALYZE workflow_shares")
+    plans: list[str] = []
+
+    def explain(conn, cursor, statement, parameters, context, executemany):
+        if statement.startswith("SELECT workflow_shares."):
+            explained = conn.exec_driver_sql("EXPLAIN ANALYZE " + statement, parameters)
+            plans.append("\n".join(row[0] for row in explained))
+
+    event.listen(store._engine, "before_cursor_execute", explain)
+    try:
+        with Session(store._engine) as session:
+            assert (
+                permission_module.delete_grants_on_workflows(session, deleting, batch_size=100)
+                == 100
+            )
+            session.rollback()
+    finally:
+        event.remove(store._engine, "before_cursor_execute", explain)
+    assert plans
+    for plan in plans:
+        # Rows each step actually read, and any a filter threw away.
+        examined = [int(n) for n in re.findall(r"actual time=[\d.]+\.\.[\d.]+ rows=(\d+)", plan)]
+        assert examined and max(examined) <= 100, plan
+        assert "Rows Removed by Filter" not in plan, plan
+    # One read per workflow: 80 grants, then the batch's last 20.
+    assert len(plans) == 2, plans
+
+
 @pytest.mark.parametrize(
     ("user_id", "level", "storable"),
     [
@@ -2100,6 +2154,7 @@ def test_store_without_workflow_grants_keeps_safe_defaults() -> None:
     assert minimal.resolve_workflow_access(["alice@example.com"], "flow") is None
     assert minimal.list_workflows_shared_with(["alice@example.com"]) == ([], None)
     assert minimal.delete_for_workflow("flow") == 0
+    assert minimal.deleted_accounts(["alice@example.com"]) == set()
 
 
 def test_direct_session_reads_default_to_the_stores_reads() -> None:

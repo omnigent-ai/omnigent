@@ -101,8 +101,10 @@ def readable_workflow(
     """The workflow the caller owns or that is shared with them, and their role.
 
     A grant through any of the caller's principals makes them a ``"viewer"``, who may
-    only read and run it. Unlike automations, a viewer's agents read it too: a run of a
-    shared workflow loads its description. Blocking: call off the loop.
+    only read and run it, while its owner's account is live: a deleted owner's
+    workflows stop being shared at once, though their cleanup runs later. Unlike
+    automations, a viewer's agents read it too: a run of a shared workflow loads its
+    description. Blocking: call off the loop.
 
     :param user_id: The caller, or ``None`` in single-user mode, where nothing is shared.
     :returns: ``(workflow, role)``, or ``None`` when the caller may not read it.
@@ -117,7 +119,11 @@ def readable_workflow(
     if permission_store.resolve_workflow_access(principals, workflow_id) is None:
         return None
     shared = store.get_many([workflow_id]).get(normalize_uuid(workflow_id) or workflow_id)
-    if shared is None or shared.user_id == user_id:
+    if (
+        shared is None
+        or shared.user_id == user_id
+        or permission_store.deleted_accounts([shared.user_id])
+    ):
         return None
     return shared, "viewer"
 
