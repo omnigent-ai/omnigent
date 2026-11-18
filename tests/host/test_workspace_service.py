@@ -4,8 +4,11 @@ The API must answer exactly what the REST file routes answer, because both
 read through :class:`WorkspaceReader`. Each parity test runs the real Connect
 client on both routes (the host's service directly, and the server forwarding
 over an in-memory host tunnel) and both browser-capable protocols, so neither
-a route nor a protocol can change an answer. The reader's own input matrix
-lives in ``tests/test_workspace_fs.py``.
+a route nor a protocol can change an answer. The ``helper`` cases answer through
+the host's workspace helper instead: ``$OMNIGENT_WORKSPACE_HELPER`` when it names
+a binary, else the fake in ``tests/_helpers/fake_workspace_helper.py``. The
+reader's own input matrix lives in ``tests/test_workspace_fs.py``; the helper's
+lifecycle, in ``test_workspace_helper.py``.
 """
 
 from __future__ import annotations
@@ -17,7 +20,7 @@ import signal
 import socket
 import stat
 import time
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -43,6 +46,7 @@ from omnigent.api.workspace.v1alpha1.workspace_pb2 import (
     ReadFileRequest,
     SearchFilesRequest,
     SearchTextRequest,
+    StatPathRequest,
 )
 from omnigent.host.frames import (
     CAP_WORKSPACE_API,
@@ -52,6 +56,7 @@ from omnigent.host.frames import (
     decode_host_frame,
     encode_host_frame,
 )
+from omnigent.host.workspace_helper.proxy import WorkspaceHelperProxy
 from omnigent.host.workspace_service import (
     WorkspaceService,
     serve_tunnel_call,
@@ -61,6 +66,7 @@ from omnigent.host.workspace_tokens import mint_token
 from omnigent.server.feature_flags import Feature, FeatureFlags
 from omnigent.server.host_registry import HostConnection, HostRegistry, deliver_workspace_reply
 from omnigent.workspace_fs import WorkspaceReader
+from tests._helpers.fake_workspace_helper import relax_helper_deadlines, write_fake_helper
 from tests._helpers.polling import poll_until_async
 from tests.server.routes.test_shell_permission_gate import _StubAgentStore, _StubConversationStore
 
@@ -103,6 +109,8 @@ def _server_app(
     flag: bool = True,
     side_chat: bool = False,
     remote_host: bool = False,
+    helper: WorkspaceHelperProxy | None = None,
+    content_search: bool = False,
 ) -> FastAPI:
     """The sessions API, with the session's host answering over an in-memory tunnel.
 
@@ -147,7 +155,8 @@ def _server_app(
         assert isinstance(call, HostWorkspaceCallFrame)
 
         async def answer() -> None:
-            async for reply in serve_tunnel_call(lambda ws: WorkspaceReader(Path(ws)), call):
+            reader_for = lambda ws: WorkspaceReader(Path(ws))  # noqa: E731
+            async for reply in serve_tunnel_call(reader_for, call, helper):
                 wire = decode_host_frame(encode_host_frame(reply))
                 assert isinstance(wire, HostWorkspaceReplyFrame)
                 deliver_workspace_reply(conn, wire)
@@ -176,7 +185,10 @@ def _server_app(
             lambda _host: WrongReplicaError("host is on another replica", host_id="host_ws"),
         )
     if flag:
-        app.state.feature_flags = FeatureFlags(frozenset({Feature.WORKSPACE_API_SERVER_ACCESS}))
+        features = {Feature.WORKSPACE_API_SERVER_ACCESS}
+        if content_search:
+            features.add(Feature.WORKSPACE_CONTENT_SEARCH)
+        app.state.feature_flags = FeatureFlags(frozenset(features))
     router = create_sessions_router(
         store,  # type: ignore[arg-type]
         _StubAgentStore(),  # type: ignore[arg-type]
@@ -189,27 +201,77 @@ def _server_app(
 ClientFor = Callable[[Path], WorkspaceServiceClient]
 
 
-@pytest.fixture(
-    params=[
-        ("host", ProtocolType.CONNECT),
-        ("host", ProtocolType.GRPC_WEB),
-        ("server", ProtocolType.CONNECT),
-        ("server", ProtocolType.GRPC_WEB),
-    ],
-    ids=["host-connect", "host-grpc-web", "server-connect", "server-grpc-web"],
-)
-def client_for(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> ClientFor:
-    """Return a client for one workspace on one route, over one protocol."""
-    route, protocol = request.param
+_PYTHON_ROUTES = {
+    "host-connect": ("host", ProtocolType.CONNECT, False),
+    "host-grpc-web": ("host", ProtocolType.GRPC_WEB, False),
+    "server-connect": ("server", ProtocolType.CONNECT, False),
+    "server-grpc-web": ("server", ProtocolType.GRPC_WEB, False),
+}
+_ROUTES = {
+    **_PYTHON_ROUTES,
+    "host-helper": ("host", ProtocolType.CONNECT, True),
+    "server-helper": ("server", ProtocolType.CONNECT, True),
+}
+
+
+async def _clients(
+    route: str,
+    protocol: ProtocolType,
+    through_helper: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    helper_directory: Callable[[], Path],
+) -> AsyncIterator[ClientFor]:
+    """Yield a factory of clients for one route, protocol and backend."""
+    helper: WorkspaceHelperProxy | None = None
+    if through_helper:
+        if os.name != "posix":
+            pytest.skip("the helper inherits a POSIX socket fd")
+        relax_helper_deadlines(monkeypatch)
+        binary = os.environ.get("OMNIGENT_WORKSPACE_HELPER") or str(
+            write_fake_helper(helper_directory())
+        )
+        helper = WorkspaceHelperProxy(binary)
+        # A helper that didn't start would leave the Python reader answering unnoticed.
+        assert "ListDirectory" in await helper.capabilities()
 
     def make(root: Path) -> WorkspaceServiceClient:
         if route == "server":
-            return _connect(_server_app(root, monkeypatch), _SERVER_BASE, protocol)
+            return _connect(_server_app(root, monkeypatch, helper=helper), _SERVER_BASE, protocol)
         reader = WorkspaceReader(root)
-        app = WorkspaceServiceASGIApplication(WorkspaceService(lambda _ctx: reader))
+        app = WorkspaceServiceASGIApplication(WorkspaceService(lambda _ctx: reader, helper))
         return _connect(app, "http://workspace.test", protocol)
 
-    return make
+    try:
+        yield make
+    finally:
+        if helper is not None:
+            await helper.close()
+
+
+@pytest.fixture(params=list(_ROUTES.values()), ids=list(_ROUTES))
+async def client_for(
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> AsyncIterator[ClientFor]:
+    """Return a client for one workspace on every route, protocol and backend."""
+    async for make in _clients(
+        *request.param, monkeypatch, lambda: tmp_path_factory.mktemp("helper")
+    ):
+        yield make
+
+
+@pytest.fixture(params=list(_PYTHON_ROUTES.values()), ids=list(_PYTHON_ROUTES))
+async def python_client_for(
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> AsyncIterator[ClientFor]:
+    """Like ``client_for``, for behavior of the host's own Python reader."""
+    async for make in _clients(
+        *request.param, monkeypatch, lambda: tmp_path_factory.mktemp("helper")
+    ):
+        yield make
 
 
 async def test_list_directory_matches_rest_listing_across_pages(
@@ -293,12 +355,12 @@ async def test_list_directory_resumes_after_the_cursor_entry_is_removed(
 
 
 async def test_read_file_flags_a_truncated_stream_like_rest(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, client_for: ClientFor
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, python_client_for: ClientFor
 ) -> None:
     """A cap that splits "é" keeps the text prefix, marked truncated, on every route."""
     monkeypatch.setattr("omnigent.workspace_fs._MAX_READ_BYTES", 2)
     reader = WorkspaceReader(_workspace(tmp_path))
-    client = client_for(tmp_path)
+    client = python_client_for(tmp_path)
 
     messages = [m async for m in client.read_file(ReadFileRequest(path="café.txt"))]
 
@@ -316,14 +378,24 @@ async def test_read_file_flags_a_truncated_stream_like_rest(
         ("read", "src", Code.NOT_FOUND),
         ("read", "../outside.txt", Code.INVALID_ARGUMENT),
         ("read", "", Code.INVALID_ARGUMENT),
+        ("read", "escape", Code.INVALID_ARGUMENT),
+        ("read", "fifo", Code.NOT_FOUND),
         ("list", "notes.md", Code.NOT_FOUND),
         ("list", "../", Code.INVALID_ARGUMENT),
+        ("list", "up", Code.INVALID_ARGUMENT),
     ],
 )
 async def test_errors_map_to_connect_codes(
     tmp_path: Path, client_for: ClientFor, call: str, path: str, code: Code
 ) -> None:
-    client = client_for(_workspace(tmp_path))
+    (tmp_path / "workspace").mkdir()
+    root = _workspace(tmp_path / "workspace")
+    (tmp_path / "outside.txt").write_text("secret")
+    # Symlinks leading out of the workspace, and a FIFO no read may block on.
+    (root / "escape").symlink_to("../outside.txt")
+    (root / "up").symlink_to("..")
+    os.mkfifo(root / "fifo")
+    client = client_for(root)
 
     with pytest.raises(ConnectError) as excinfo:
         if call == "read":
@@ -348,8 +420,10 @@ async def test_reader_for_refusal_reaches_the_client(
     assert excinfo.value.code == Code.PERMISSION_DENIED
 
 
-async def test_capabilities_list_the_served_methods(tmp_path: Path, client_for: ClientFor) -> None:
-    client = client_for(tmp_path)
+async def test_capabilities_list_the_served_methods(
+    tmp_path: Path, python_client_for: ClientFor
+) -> None:
+    client = python_client_for(tmp_path)
 
     response = await client.get_capabilities(GetCapabilitiesRequest())
 
@@ -357,10 +431,10 @@ async def test_capabilities_list_the_served_methods(tmp_path: Path, client_for: 
 
 
 async def test_methods_not_served_yet_answer_unimplemented(
-    tmp_path: Path, client_for: ClientFor
+    tmp_path: Path, python_client_for: ClientFor
 ) -> None:
     """A client that skips GetCapabilities still gets a code it can fall back on."""
-    client = client_for(tmp_path)
+    client = python_client_for(tmp_path)
 
     with pytest.raises(ConnectError) as unary:
         await client.search_files(SearchFilesRequest(query="main"))
@@ -406,6 +480,37 @@ async def test_server_route_serves_a_side_chat_from_its_source_session(
     page = await client.list_directory(ListDirectoryRequest())
 
     assert "notes.md" in {e.name for e in page.entries}
+
+
+@pytest.mark.skipif(os.name != "posix", reason="the helper inherits a POSIX socket fd")
+@pytest.mark.parametrize("content_search", [True, False], ids=["flag-on", "flag-off"])
+async def test_server_route_serves_text_search_only_with_its_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, content_search: bool
+) -> None:
+    """Every helper method reaches the host, except SearchText while its flag is off."""
+    (tmp_path / "workspace").mkdir()
+    root = _workspace(tmp_path / "workspace")
+    relax_helper_deadlines(monkeypatch)
+    helper = WorkspaceHelperProxy(str(write_fake_helper(tmp_path)))
+    try:
+        app = _server_app(root, monkeypatch, helper=helper, content_search=content_search)
+        client = _connect(app, _SERVER_BASE, ProtocolType.CONNECT)
+
+        capabilities = set((await client.get_capabilities(GetCapabilitiesRequest())).capabilities)
+        stat = await client.stat_path(StatPathRequest(path="notes.md"))
+        if content_search:
+            searched = [m async for m in client.search_text(SearchTextRequest(query="q"))]
+            assert searched[-1].done
+        else:
+            with pytest.raises(ConnectError) as refused:
+                [m async for m in client.search_text(SearchTextRequest(query="q"))]
+            assert refused.value.code == Code.UNIMPLEMENTED
+    finally:
+        await helper.close()
+
+    assert stat.entry.name == "workspace"
+    assert ("SearchText" in capabilities) is content_search
+    assert "StatPath" in capabilities
 
 
 async def test_server_route_readdresses_a_host_on_another_replica(

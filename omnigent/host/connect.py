@@ -252,6 +252,7 @@ from omnigent.util.tunnel_limits import (
 from omnigent.version import VERSION
 
 if TYPE_CHECKING:
+    from omnigent.host.workspace_helper.proxy import WorkspaceHelperProxy
     from omnigent.host.workspace_service import WorkspaceSocket
     from omnigent.workspace_fs import WorkspaceReader
 
@@ -1509,6 +1510,8 @@ class HostProcess:
         self._suspend_task: asyncio.Task[None] | None = None
         # The owner-only workspace API socket, when workspace_direct_access is on.
         self._workspace_socket: WorkspaceSocket | None = None
+        # The workspace helper both workspace API routes share; it starts on first use.
+        self._workspace_helper: WorkspaceHelperProxy | None = None
         # Set by _on_resume_from_suspend when it aborts a live tunnel after a
         # detected resume; read+cleared in run()'s reconnect handler to force a
         # prompt reconnect (skip the backoff).
@@ -3964,11 +3967,18 @@ class HostProcess:
         token for it; without one, every call is refused.
         """
         try:
+            from omnigent.host.workspace_helper.proxy import WorkspaceHelperProxy
             from omnigent.host.workspace_service import start_workspace_socket
         except ImportError:
             _logger.debug("No `omnigent[workspace-api]`; the workspace socket is off")
             return None
-        return await start_workspace_socket(self._workspace_reader, host_id=self._identity.host_id)
+        # The tunnel route uses the helper too, so it exists even if the socket can't bind.
+        self._workspace_helper = WorkspaceHelperProxy.from_environment()
+        return await start_workspace_socket(
+            self._workspace_reader,
+            host_id=self._identity.host_id,
+            helper=self._workspace_helper,
+        )
 
     def _workspace_reader(self, workspace: str) -> WorkspaceReader:
         """Return the cached reader for an existing workspace directory.
@@ -5439,6 +5449,9 @@ class HostProcess:
             if self._workspace_socket is not None:
                 await self._workspace_socket.stop()
                 self._workspace_socket = None
+            if self._workspace_helper is not None:
+                await self._workspace_helper.close()
+                self._workspace_helper = None
             if self._lifecycle_task is not None:
                 self._lifecycle_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -6309,7 +6322,9 @@ class HostProcess:
             from omnigent.host.workspace_service import serve_tunnel_call
 
             # Reply per message so a long ReadFile stays within the server's per-reply timeout.
-            async for reply in serve_tunnel_call(self._workspace_reader, frame):
+            async for reply in serve_tunnel_call(
+                self._workspace_reader, frame, self._workspace_helper
+            ):
                 await self._send_text(ws, self._encode_frame(reply))
         elif isinstance(frame, HostFsRequestFrame):
             # Git status and directory walks can block, so run the read

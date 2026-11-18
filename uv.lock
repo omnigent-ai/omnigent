@@ -3376,6 +3376,7 @@ databricks = [
     { name = "databricks-ai-bridge" },
     { name = "databricks-mcp" },
     { name = "databricks-sdk", extra = ["sandbox"] },
+    { name = "h2" },
     { name = "opentelemetry-distro" },
     { name = "psycopg", extra = ["binary"] },
     { name = "pymysql" },
@@ -3449,6 +3450,7 @@ vertex = [
 ]
 workspace-api = [
     { name = "connectrpc" },
+    { name = "h2" },
 ]
 
 [package.dev-dependencies]
@@ -3540,6 +3542,7 @@ requires-dist = [
     { name = "github-copilot-sdk", marker = "extra == 'copilot'", specifier = ">=1,<2" },
     { name = "google-antigravity", marker = "extra == 'antigravity'", specifier = ">=0.1,<1" },
     { name = "google-auth", marker = "extra == 'vertex'", specifier = ">=2.0,<3" },
+    { name = "h2", marker = "extra == 'workspace-api'", specifier = ">=4.1,<5" },
     { name = "hindsight-client", marker = "extra == 'hindsight'", specifier = ">=0.4.0" },
     { name = "httpx", specifier = ">=0.27,<1" },
     { name = "hvac", marker = "extra == 'vault'", specifier = ">=2,<3" },

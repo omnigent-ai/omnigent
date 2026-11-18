@@ -210,7 +210,8 @@ openshell = ["openshell>=0.1.0,<1"]
 # Workspace API server and client (omnigent/api/workspace/v1alpha1/workspace.proto)
 # for the desktop fast track. `databricks` includes it; other installs opt in,
 # since pyqwest builds from source with Rust where it has no wheel. Pre-1.0: pin minor.
-workspace-api = ["connectrpc>=0.13,<0.14"]
+# h2 carries the host's calls to the workspace helper over a private socket.
+workspace-api = ["connectrpc>=0.13,<0.14", "h2>=4.1,<5"]
 # On-demand Kubernetes runner Pod launcher (server-managed
 # `sandbox.provider: kubernetes`). The launcher module ships in the base
 # package and imports the official client lazily, so only users of the

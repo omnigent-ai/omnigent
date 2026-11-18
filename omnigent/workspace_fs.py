@@ -233,6 +233,11 @@ class WorkspaceReader:
         self._registry = create_filesystem_registry(self._root)
         self._registry.start()
 
+    @property
+    def root(self) -> Path:
+        """The workspace directory, resolved."""
+        return self._root
+
     # ── Path confinement ──────────────────────────────────────────
 
     def _resolve(self, path: str) -> Path:

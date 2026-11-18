@@ -3568,9 +3568,11 @@ async def test_installed_workspace_extra_starts_the_socket_without_a_host_flag(
     monkeypatch.delenv("OMNIGENT_FEATURES", raising=False)
     socket = object()
     started_for: list[str] = []
+    host = _make_host_process()
 
-    async def _start(_reader: object, *, host_id: str) -> object:
+    async def _start(_reader: object, *, host_id: str, helper: object) -> object:
         started_for.append(host_id)
+        assert helper is host._workspace_helper
         return socket
 
     monkeypatch.setitem(
@@ -3579,8 +3581,28 @@ async def test_installed_workspace_extra_starts_the_socket_without_a_host_flag(
         SimpleNamespace(start_workspace_socket=_start),
     )
 
-    assert await _make_host_process()._start_workspace_socket() is socket
+    assert await host._start_workspace_socket() is socket
     assert started_for == ["host_test_connect"]
+
+
+async def test_server_only_host_when_socket_fails_to_bind(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A socket that can't bind leaves the helper to the tunnel route, closed at shutdown."""
+    from omnigent.host.workspace_helper.proxy import WorkspaceHelperProxy
+
+    async def _start(_reader: object, *, host_id: str, helper: object) -> None:
+        return None
+
+    monkeypatch.setitem(
+        sys.modules,
+        "omnigent.host.workspace_service",
+        SimpleNamespace(start_workspace_socket=_start),
+    )
+    host = _make_host_process()
+
+    assert await host._start_workspace_socket() is None
+    assert isinstance(host._workspace_helper, WorkspaceHelperProxy)
 
 
 async def test_slow_capability_discovery_blocks_registration_and_frame_dispatch(

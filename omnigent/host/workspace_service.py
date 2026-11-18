@@ -1,10 +1,13 @@
 """The workspace API (``omnigent.api.workspace.v1alpha1``), served by the host.
 
 This is the API's single implementation: the desktop app's direct socket and
-the server's route both reach this service. It reads through
-:class:`~omnigent.workspace_fs.WorkspaceReader`, so its answers match the REST
-file routes. Which workspace a call reads comes from the caller-supplied
-``reader_for``, which resolves it from the call's credentials.
+the server's route both reach this service. It forwards to the host's
+workspace helper (:mod:`omnigent.host.workspace_helper`) the methods the
+helper serves, and reads ListDirectory and ReadFile through
+:class:`~omnigent.workspace_fs.WorkspaceReader` when there is no helper, so
+its answers match the REST file routes either way. Which workspace a call
+reads comes from the caller-supplied ``reader_for``, which resolves it from
+the call's credentials; the helper only ever sees that workspace.
 
 Mount it with the generated ASGI app::
 
@@ -24,8 +27,9 @@ import shutil
 import socket
 import tempfile
 from collections.abc import AsyncIterator, Callable
+from contextlib import aclosing
 from pathlib import Path
-from typing import ParamSpec, TypeVar
+from typing import ParamSpec, TypeVar, cast
 
 import uvicorn
 from connectrpc.code import Code
@@ -53,6 +57,15 @@ from omnigent.api.workspace.v1alpha1.workspace_pb2 import (
     ReadFileResponse,
 )
 from omnigent.host.frames import HostWorkspaceCallFrame, HostWorkspaceReplyFrame
+from omnigent.host.workspace_helper.process import HelperUnavailable
+from omnigent.host.workspace_helper.proxy import WorkspaceHelperProxy
+from omnigent.host.workspace_methods import (
+    BASELINE_METHODS,
+    CLIENT_FEATURES,
+    HELPER_METHODS,
+    WORKSPACE_METHODS,
+    WorkspaceMethod,
+)
 from omnigent.host.workspace_tokens import new_token_key, verify_token
 from omnigent.inner.async_utils import run_sync_on_thread
 from omnigent.util.uvicorn_server import NoSignalServer
@@ -92,17 +105,28 @@ class WorkspaceService(WorkspaceServiceMethods):
 
     :param reader_for: Returns the reader for the workspace a call may read.
         It must raise :class:`ConnectError` when the call isn't authorized.
+    :param helper: The host's workspace helper, or ``None`` to serve only
+        ListDirectory and ReadFile, from the reader.
     """
 
-    def __init__(self, reader_for: ReaderForCall) -> None:
+    def __init__(
+        self, reader_for: ReaderForCall, helper: WorkspaceHelperProxy | None = None
+    ) -> None:
         self._reader_for = reader_for
+        self._helper = helper
 
     async def get_capabilities(
         self,
         _request: GetCapabilitiesRequest,
-        _ctx: RequestContext[GetCapabilitiesRequest, GetCapabilitiesResponse] | None,
+        ctx: RequestContext[GetCapabilitiesRequest, GetCapabilitiesResponse] | None,
     ) -> GetCapabilitiesResponse:
-        return GetCapabilitiesResponse(capabilities=_CAPABILITIES)
+        names = list(_CAPABILITIES)
+        if self._helper is not None and self._helper.enabled:
+            # Only a caller that may read the workspace gets a helper started.
+            await _read(self._reader_for, ctx)
+            served = await self._helper.capabilities()
+            names += sorted((served & (HELPER_METHODS | CLIENT_FEATURES)) - set(names))
+        return GetCapabilitiesResponse(capabilities=names)
 
     async def list_directory(
         self,
@@ -112,6 +136,14 @@ class WorkspaceService(WorkspaceServiceMethods):
         if request.page_size < 0:
             raise ConnectError(Code.INVALID_ARGUMENT, "page_size must not be negative")
         reader = await _read(self._reader_for, ctx)
+        method = WORKSPACE_METHODS["ListDirectory"]
+        if await self._helper_serves(method):
+            try:
+                response = await self._forward_unary(method, reader, request)
+            except _HelperGone:
+                pass
+            else:
+                return cast("ListDirectoryResponse", response)
         page = await _read(
             reader.list_directory,
             request.path,
@@ -140,6 +172,20 @@ class WorkspaceService(WorkspaceServiceMethods):
         if not request.path:
             raise ConnectError(Code.INVALID_ARGUMENT, "path is required")
         reader = await _read(self._reader_for, ctx)
+        method = WORKSPACE_METHODS["ReadFile"]
+        if await self._helper_serves(method):
+            sent = False
+            try:
+                async for response in self._forward_stream(method, reader, request):
+                    sent = True
+                    yield cast("ReadFileResponse", response)
+                return
+            except _HelperGone:
+                # A read the helper started can't be finished by another reader.
+                if sent:
+                    raise ConnectError(
+                        Code.UNAVAILABLE, "The workspace helper stopped during the read"
+                    ) from None
         file = await _read(reader.read_file_bytes, request.path)
         yield ReadFileResponse(
             metadata=FileMetadata(
@@ -152,6 +198,89 @@ class WorkspaceService(WorkspaceServiceMethods):
         for start in range(0, len(file.data), _READ_CHUNK_BYTES):
             yield ReadFileResponse(data=file.data[start : start + _READ_CHUNK_BYTES])
 
+    async def _helper_serves(self, method: WorkspaceMethod) -> bool:
+        if self._helper is None or not self._helper.enabled:
+            return False
+        return method.name in await self._helper.capabilities()
+
+    async def _forward_unary(
+        self, method: WorkspaceMethod, reader: WorkspaceReader, request: Message
+    ) -> Message:
+        """Answer one call from the helper, in the caller's workspace."""
+        assert self._helper is not None
+        try:
+            async with self._helper.call(reader.root) as call:
+                return await getattr(call.client, method.python_name)(
+                    request, headers=call.headers
+                )
+        except HelperUnavailable as exc:
+            raise _HelperGone(str(exc)) from exc
+        except ConnectError as exc:
+            if exc.code == Code.UNAVAILABLE:
+                raise _HelperGone(exc.message) from exc
+            raise
+
+    async def _forward_stream(
+        self, method: WorkspaceMethod, reader: WorkspaceReader, request: Message
+    ) -> AsyncIterator[Message]:
+        """Stream one call's answers from the helper, leasing the workspace throughout."""
+        assert self._helper is not None
+        try:
+            async with self._helper.call(reader.root) as call:
+                responses = getattr(call.client, method.python_name)(request, headers=call.headers)
+                # Closing early resets the helper's stream instead of leaving it to the GC.
+                async with aclosing(responses) as stream:
+                    async for response in stream:
+                        yield response
+        except HelperUnavailable as exc:
+            raise _HelperGone(str(exc)) from exc
+        except ConnectError as exc:
+            if exc.code == Code.UNAVAILABLE:
+                raise _HelperGone(exc.message) from exc
+            raise
+
+
+class _HelperGone(ConnectError):
+    """No helper can answer now: it isn't running, or stopped during the call."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(Code.UNAVAILABLE, message)
+
+
+def _helper_forwarder(method: WorkspaceMethod) -> Callable[..., object]:
+    """A WorkspaceService method that only the helper serves."""
+    not_served = f"This host doesn't serve {method.name}"
+
+    if method.streaming:
+
+        async def forward_stream(
+            self: WorkspaceService, request: Message, ctx: RequestContext | None
+        ) -> AsyncIterator[Message]:
+            reader = await _read(self._reader_for, ctx)
+            if not await self._helper_serves(method):
+                raise ConnectError(Code.UNIMPLEMENTED, not_served)
+            async for response in self._forward_stream(method, reader, request):
+                yield response
+
+        forward_stream.__name__ = method.python_name
+        return forward_stream
+
+    async def forward(
+        self: WorkspaceService, request: Message, ctx: RequestContext | None
+    ) -> Message:
+        reader = await _read(self._reader_for, ctx)
+        if not await self._helper_serves(method):
+            raise ConnectError(Code.UNIMPLEMENTED, not_served)
+        return await self._forward_unary(method, reader, request)
+
+    forward.__name__ = method.python_name
+    return forward
+
+
+for _method in WORKSPACE_METHODS.values():
+    if _method.name in HELPER_METHODS - BASELINE_METHODS:
+        setattr(WorkspaceService, _method.python_name, _helper_forwarder(_method))
+
 
 def _reader_at(
     reader_for_workspace: Callable[[str], WorkspaceReader], workspace: str
@@ -163,29 +292,37 @@ def _reader_at(
     return reader_for_workspace(expanded)
 
 
-async def _call(service: WorkspaceService, method: str, request: bytes) -> AsyncIterator[Message]:
+async def _call(service: WorkspaceService, name: str, request: bytes) -> AsyncIterator[Message]:
     """Run one serialized call against ``service``, yielding its responses."""
-    if method == "GetCapabilities":
-        yield await service.get_capabilities(GetCapabilitiesRequest.FromString(request), None)
-    elif method == "ListDirectory":
-        yield await service.list_directory(ListDirectoryRequest.FromString(request), None)
-    elif method == "ReadFile":
-        async for response in service.read_file(ReadFileRequest.FromString(request), None):
-            yield response
+    method = WORKSPACE_METHODS.get(name)
+    if method is None:
+        raise ConnectError(Code.UNIMPLEMENTED, f"Unknown workspace method {name!r}")
+    handler = getattr(service, method.python_name)
+    message = method.request_type.FromString(request)
+    if method.streaming:
+        async with aclosing(handler(message, None)) as responses:
+            async for response in responses:
+                yield response
     else:
-        raise ConnectError(Code.UNIMPLEMENTED, f"Unknown workspace method {method!r}")
+        yield await handler(message, None)
 
 
 async def serve_tunnel_call(
-    reader_for_workspace: Callable[[str], WorkspaceReader], frame: HostWorkspaceCallFrame
+    reader_for_workspace: Callable[[str], WorkspaceReader],
+    frame: HostWorkspaceCallFrame,
+    helper: WorkspaceHelperProxy | None = None,
 ) -> AsyncIterator[HostWorkspaceReplyFrame]:
     """Answer a workspace call the server forwarded over the host tunnel.
 
     The server has already authorized the caller and chosen the workspace.
     Yields one reply per response message, then a final ``done`` reply that
     carries the error, if any.
+
+    :param helper: The host's workspace helper, shared with its socket.
     """
-    service = WorkspaceService(lambda _ctx: _reader_at(reader_for_workspace, frame.workspace))
+    service = WorkspaceService(
+        lambda _ctx: _reader_at(reader_for_workspace, frame.workspace), helper
+    )
     request_id = frame.request_id
     try:
         async for response in _call(service, frame.method, frame.request):
@@ -231,7 +368,10 @@ class WorkspaceSocket:
 
 
 async def start_workspace_socket(
-    reader_for_workspace: Callable[[str], WorkspaceReader], *, host_id: str
+    reader_for_workspace: Callable[[str], WorkspaceReader],
+    *,
+    host_id: str,
+    helper: WorkspaceHelperProxy | None = None,
 ) -> WorkspaceSocket | None:
     """Serve the workspace API on a fresh owner-only Unix socket.
 
@@ -241,6 +381,7 @@ async def start_workspace_socket(
     :param reader_for_workspace: Returns the reader for an existing workspace
         directory, e.g. the host's shared reader cache.
     :param host_id: This host's id, which tokens must name.
+    :param helper: The host's workspace helper, shared with its tunnel.
     :returns: The running socket, or ``None`` when it could not start. Direct
         access is an optimization, so the host carries on without it.
     """
@@ -278,7 +419,7 @@ async def start_workspace_socket(
         if directory is not None:
             shutil.rmtree(directory, ignore_errors=True)
         return None
-    app = WorkspaceServiceASGIApplication(WorkspaceService(reader_for))
+    app = WorkspaceServiceASGIApplication(WorkspaceService(reader_for, helper))
     config = uvicorn.Config(
         app, ws="none", lifespan="off", log_level="warning", access_log=False, log_config=None
     )

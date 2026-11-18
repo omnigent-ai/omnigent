@@ -28,7 +28,8 @@ answers such as "not found" go to REST, so callers keep the errors they expect.
 ## Methods a host serves
 
 `ListDirectory` and `ReadFile` came with the API, so every host that serves it
-has them. Before any other method (file and content search, Git comparisons)
+has them. The other methods come from the host's workspace helper (below), so a
+host serves them only when its helper does. Before any other method (file and content search, Git comparisons)
 the page asks the route's host with `GetCapabilities`, once per route every
 five minutes, shared by concurrent calls and never cancelled by one of them.
 A method or feature the host doesn't list goes straight to REST, or reads as
@@ -41,9 +42,42 @@ with the host's message instead.
 
 Go to File and Content search try the workspace API first and fall back to
 their REST routes. Content search is only asked for while the server's
-`workspace_content_search` flag is on. Neither route can stop a search on the
-host once it has started: a search the user abandons runs until it ends on
-its own.
+`workspace_content_search` flag is on; while it is off, the server route
+doesn't list `SearchText` and answers it `unimplemented`. A search the user
+abandons on a direct route stops in the helper once the host sees the caller
+leave. Through the server route it runs on the host until it ends on its own, because the server can't
+cancel a call it forwarded.
+
+## The workspace helper
+
+The host answers every method except `GetCapabilities` through the workspace
+helper, a native binary from the `omnigent-workspace-helper` package, when it
+has one. It starts the helper on the first call that needs it and stops it
+after ten idle minutes. Both routes share one helper per host, and the host
+keeps checking every call itself: the token or the server's authorization
+picks the workspace, and the helper only ever hears about that workspace.
+
+- **Methods.** `GetCapabilities` lists `ListDirectory`, `ReadFile`, and the
+  methods and client features the helper reports
+  (`omnigent/host/workspace_methods.py`). Names the helper reports for other
+  uses stay private.
+- **Fallback.** Without a helper, `ListDirectory` and `ReadFile` read through
+  the host's Python reader, and other methods answer `unimplemented`. The same
+  happens while a helper is restarting, except that a `ReadFile` that already
+  sent data fails with `unavailable` rather than mixing two readers' bytes.
+  Three failed starts in a row, or a helper that speaks another protocol
+  version, turn the helper off until the host restarts.
+- **Workspaces.** The host opens each workspace in the helper once and names it
+  in every call with the `omnigent-workspace-id` header. It keeps up to 16
+  open, closing the least recently used one that no call is reading. A
+  restarted helper starts with no open workspaces, so an id from an earlier
+  helper never reaches a new one.
+- **Cleanup.** Every stop (idle, crash, shutdown, a failed start) closes the
+  helper's workspaces, its connection and the process, each step within its
+  own one- or two-second bound, and reaps it.
+
+Set `OMNIGENT_WORKSPACE_HELPER` on the host to a binary's path to use that one,
+for example a local build, or to `off` for no helper.
 
 ## Turning it on
 
@@ -61,7 +95,8 @@ expires, up to five minutes later. Turn off `workspace_api_server_access` to
 stop the server workspace API route. Only `workspace_direct_access` governs
 direct-access tokens.
 
-`omnigent[workspace-api]` adds `connectrpc` and its HTTP client, `pyqwest`.
+`omnigent[workspace-api]` adds `connectrpc`, its HTTP client `pyqwest`, and
+`h2`, which the host speaks to its helper with.
 On Linux older than glibc 2.28, `pyqwest` has no prebuilt wheel and builds from
 source with Rust.
 
@@ -119,6 +154,10 @@ source with Rust.
   read goes through the server. An SSH agent's confirmation dialog, or a
   `ProxyCommand` that talks to the user, can still appear.
 - **Confined sessions** always use the REST routes, which apply their sandbox.
+- **The helper.** The host reaches it over one end of a socket pair it hands
+  the helper at start (`--connection-fd`). The connection has no path, so no
+  other process can call the helper. The helper runs as the host's user, in its
+  own process group, and exits when the host's end of its stdin closes.
 
 ## Checking it
 
@@ -137,6 +176,7 @@ source with Rust.
 | `not a workspace socket on this machine` in main's log | The host is on another machine, and it has no record and no SSH alias |
 | `SSH alias not allowed or not verified` in main's log | The user chose "Not now", or the alias didn't reach the host |
 | `ReadFile` answers `unimplemented` | The host lacks `omnigent[workspace-api]` or predates the workspace API |
+| Search falls back to REST | The host has no helper, or turned it off. Its log names why (`Workspace helper turned off …`). |
 
 ## Not covered yet
 
