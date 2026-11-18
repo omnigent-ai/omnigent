@@ -712,7 +712,7 @@ export function TaskCardDetails({
         </span>
         {menu}
       </span>
-      <span className="break-words font-medium">{item.step.name}</span>
+      <span className="font-medium">{item.step.name}</span>
       <span className="flex items-center gap-1.5">
         <StepGlyph state={item.state} number={number} />
         <span className={STATUS_LINE_COLORS[item.state]}>
@@ -723,7 +723,7 @@ export function TaskCardDetails({
         (full && detailIsGoal ? (
           <StepDescription text={shownDetail} />
         ) : (
-          <span className={cn("break-words text-muted-foreground", !full && "line-clamp-3")}>
+          <span className={cn("text-muted-foreground", !full && "line-clamp-3")}>
             {shownDetail}
           </span>
         ))}
@@ -877,7 +877,8 @@ export function ProgressStrip({
             <HoverCardContent
               side="bottom"
               sideOffset={8}
-              className="flex w-fit max-w-72 flex-col items-start gap-1 px-3 py-2 text-sm"
+              // break-words would let a long path or command set the text's width past the card.
+              className="flex w-fit max-w-72 flex-col items-start gap-1 wrap-anywhere px-3 py-2 text-sm"
               data-testid="tasks-progress-card"
             >
               <TaskCardDetails
