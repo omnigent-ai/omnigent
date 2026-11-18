@@ -34,6 +34,9 @@ from connectrpc.request import RequestContext
 from google.protobuf.message import Message
 from google.protobuf.timestamp_pb2 import Timestamp
 
+from omnigent.api.workspace.v1alpha1.workspace_connect import (
+    WorkspaceService as WorkspaceServiceMethods,
+)
 from omnigent.api.workspace.v1alpha1.workspace_connect import WorkspaceServiceASGIApplication
 from omnigent.api.workspace.v1alpha1.workspace_pb2 import (
     CONTENT_ENCODING_BINARY,
@@ -81,8 +84,11 @@ async def _read(fn: Callable[_Params, _T], *args: _Params.args, **kwargs: _Param
         raise ConnectError(_ERROR_CODES.get(exc.status, Code.INTERNAL), exc.message) from exc
 
 
-class WorkspaceService:
+class WorkspaceService(WorkspaceServiceMethods):
     """Implements ``WorkspaceService`` from ``workspace.proto``.
+
+    Methods it doesn't define answer UNIMPLEMENTED, and GetCapabilities
+    doesn't list them.
 
     :param reader_for: Returns the reader for the workspace a call may read.
         It must raise :class:`ConnectError` when the call isn't authorized.

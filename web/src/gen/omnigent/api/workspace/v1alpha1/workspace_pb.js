@@ -2,14 +2,20 @@
 // @generated from file omnigent/api/workspace/v1alpha1/workspace.proto (package omnigent.api.workspace.v1alpha1, syntax proto3)
 /* eslint-disable */
 
-// Workspace API: read a session's workspace files.
+// Workspace API: read, search and compare a session's workspace files.
 //
 // One implementation serves every route: directly from the desktop app over a
 // local socket, and through the server for every other client. Which session
 // and workspace a call reads comes from its credentials, never from a message.
-// Paths in messages are always relative to the workspace root.
 //
-// v1alpha1 may still change incompatibly.
+// Paths in messages are relative to the workspace root (search results: to
+// the request's `path`), use "/" separators, and are empty for the root. A
+// path that is absolute, contains "..", or resolves through symlinks outside
+// the root is refused with INVALID_ARGUMENT or PERMISSION_DENIED.
+//
+// Clients call GetCapabilities first and skip what a server doesn't list, so a
+// newer client works with an older server. v1alpha1 may still change
+// incompatibly, except that ListDirectory and ReadFile keep their wire shapes.
 
 import { enumDesc, fileDesc, messageDesc, serviceDesc, tsEnum } from "@bufbuild/protobuf/codegenv2";
 import { file_google_protobuf_timestamp } from "@bufbuild/protobuf/wkt";
@@ -18,7 +24,7 @@ import { file_google_protobuf_timestamp } from "@bufbuild/protobuf/wkt";
  * Describes the file omnigent/api/workspace/v1alpha1/workspace.proto.
  */
 export const file_omnigent_api_workspace_v1alpha1_workspace = /*@__PURE__*/
-  fileDesc("Ci9vbW5pZ2VudC9hcGkvd29ya3NwYWNlL3YxYWxwaGExL3dvcmtzcGFjZS5wcm90bxIfb21uaWdlbnQuYXBpLndvcmtzcGFjZS52MWFscGhhMSIYChZHZXRDYXBhYmlsaXRpZXNSZXF1ZXN0Ii8KF0dldENhcGFiaWxpdGllc1Jlc3BvbnNlEhQKDGNhcGFiaWxpdGllcxgBIAMoCSJLChRMaXN0RGlyZWN0b3J5UmVxdWVzdBIMCgRwYXRoGAEgASgJEhEKCXBhZ2Vfc2l6ZRgCIAEoBRISCgpwYWdlX3Rva2VuGAMgASgJImkKFUxpc3REaXJlY3RvcnlSZXNwb25zZRI3CgdlbnRyaWVzGAEgAygLMiYub21uaWdlbnQuYXBpLndvcmtzcGFjZS52MWFscGhhMS5FbnRyeRIXCg9uZXh0X3BhZ2VfdG9rZW4YAiABKAkiqgEKBUVudHJ5EgwKBG5hbWUYASABKAkSDAoEcGF0aBgCIAEoCRI4CgR0eXBlGAMgASgOMioub21uaWdlbnQuYXBpLndvcmtzcGFjZS52MWFscGhhMS5FbnRyeVR5cGUSEQoEc2l6ZRgEIAEoA0gAiAEBEi8KC21vZGlmeV90aW1lGAUgASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcEIHCgVfc2l6ZSIfCg9SZWFkRmlsZVJlcXVlc3QSDAoEcGF0aBgBIAEoCSJhChBSZWFkRmlsZVJlc3BvbnNlEj8KCG1ldGFkYXRhGAEgASgLMi0ub21uaWdlbnQuYXBpLndvcmtzcGFjZS52MWFscGhhMS5GaWxlTWV0YWRhdGESDAoEZGF0YRgCIAEoDCKJAQoMRmlsZU1ldGFkYXRhEgwKBHNpemUYASABKAMSEQoJdHJ1bmNhdGVkGAIgASgIEkIKCGVuY29kaW5nGAMgASgOMjAub21uaWdlbnQuYXBpLndvcmtzcGFjZS52MWFscGhhMS5Db250ZW50RW5jb2RpbmcSFAoMY29udGVudF90eXBlGAQgASgJKlYKCUVudHJ5VHlwZRIaChZFTlRSWV9UWVBFX1VOU1BFQ0lGSUVEEAASEwoPRU5UUllfVFlQRV9GSUxFEAESGAoURU5UUllfVFlQRV9ESVJFQ1RPUlkQAiprCg9Db250ZW50RW5jb2RpbmcSIAocQ09OVEVOVF9FTkNPRElOR19VTlNQRUNJRklFRBAAEhkKFUNPTlRFTlRfRU5DT0RJTkdfVVRGOBABEhsKF0NPTlRFTlRfRU5DT0RJTkdfQklOQVJZEAIylwMKEFdvcmtzcGFjZVNlcnZpY2USiQEKD0dldENhcGFiaWxpdGllcxI3Lm9tbmlnZW50LmFwaS53b3Jrc3BhY2UudjFhbHBoYTEuR2V0Q2FwYWJpbGl0aWVzUmVxdWVzdBo4Lm9tbmlnZW50LmFwaS53b3Jrc3BhY2UudjFhbHBoYTEuR2V0Q2FwYWJpbGl0aWVzUmVzcG9uc2UiA5ACARKDAQoNTGlzdERpcmVjdG9yeRI1Lm9tbmlnZW50LmFwaS53b3Jrc3BhY2UudjFhbHBoYTEuTGlzdERpcmVjdG9yeVJlcXVlc3QaNi5vbW5pZ2VudC5hcGkud29ya3NwYWNlLnYxYWxwaGExLkxpc3REaXJlY3RvcnlSZXNwb25zZSIDkAIBEnEKCFJlYWRGaWxlEjAub21uaWdlbnQuYXBpLndvcmtzcGFjZS52MWFscGhhMS5SZWFkRmlsZVJlcXVlc3QaMS5vbW5pZ2VudC5hcGkud29ya3NwYWNlLnYxYWxwaGExLlJlYWRGaWxlUmVzcG9uc2UwAWIGcHJvdG8z", [file_google_protobuf_timestamp]);
+  fileDesc("Ci9vbW5pZ2VudC9hcGkvd29ya3NwYWNlL3YxYWxwaGExL3dvcmtzcGFjZS5wcm90bxIfb21uaWdlbnQuYXBpLndvcmtzcGFjZS52MWFscGhhMSIYChZHZXRDYXBhYmlsaXRpZXNSZXF1ZXN0Ii8KF0dldENhcGFiaWxpdGllc1Jlc3BvbnNlEhQKDGNhcGFiaWxpdGllcxgBIAMoCSKMAQoUTGlzdERpcmVjdG9yeVJlcXVlc3QSDAoEcGF0aBgBIAEoCRIRCglwYWdlX3NpemUYAiABKAUSEgoKcGFnZV90b2tlbhgDIAEoCRIUCgxoaWRlX2lnbm9yZWQYBCABKAgSKQohY29sbGFwc2Vfc2luZ2xlX2NoaWxkX2RpcmVjdG9yaWVzGAUgASgIImkKFUxpc3REaXJlY3RvcnlSZXNwb25zZRI3CgdlbnRyaWVzGAEgAygLMiYub21uaWdlbnQuYXBpLndvcmtzcGFjZS52MWFscGhhMS5FbnRyeRIXCg9uZXh0X3BhZ2VfdG9rZW4YAiABKAki7AEKBUVudHJ5EgwKBG5hbWUYASABKAkSDAoEcGF0aBgCIAEoCRI4CgR0eXBlGAMgASgOMioub21uaWdlbnQuYXBpLndvcmtzcGFjZS52MWFscGhhMS5FbnRyeVR5cGUSEQoEc2l6ZRgEIAEoA0gAiAEBEi8KC21vZGlmeV90aW1lGAUgASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcBISCgppc19zeW1saW5rGAYgASgIEg8KB2lnbm9yZWQYByABKAgSGwoTbGVhZl9kaXJlY3RvcnlfcGF0aBgIIAEoCUIHCgVfc2l6ZSI2Cg9SZWFkRmlsZVJlcXVlc3QSDAoEcGF0aBgBIAEoCRIVCg1tYXhpbXVtX2J5dGVzGAIgASgEImEKEFJlYWRGaWxlUmVzcG9uc2USPwoIbWV0YWRhdGEYASABKAsyLS5vbW5pZ2VudC5hcGkud29ya3NwYWNlLnYxYWxwaGExLkZpbGVNZXRhZGF0YRIMCgRkYXRhGAIgASgMIroBCgxGaWxlTWV0YWRhdGESDAoEc2l6ZRgBIAEoAxIRCgl0cnVuY2F0ZWQYAiABKAgSQgoIZW5jb2RpbmcYAyABKA4yMC5vbW5pZ2VudC5hcGkud29ya3NwYWNlLnYxYWxwaGExLkNvbnRlbnRFbmNvZGluZxIUCgxjb250ZW50X3R5cGUYBCABKAkSLwoLbW9kaWZ5X3RpbWUYBSABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wIh8KD1N0YXRQYXRoUmVxdWVzdBIMCgRwYXRoGAEgASgJIkkKEFN0YXRQYXRoUmVzcG9uc2USNQoFZW50cnkYASABKAsyJi5vbW5pZ2VudC5hcGkud29ya3NwYWNlLnYxYWxwaGExLkVudHJ5IpcCChJTZWFyY2hGaWxlc1JlcXVlc3QSDQoFcXVlcnkYASABKAkSPQoEbW9kZRgCIAEoDjIvLm9tbmlnZW50LmFwaS53b3Jrc3BhY2UudjFhbHBoYTEuRmlsZVNlYXJjaE1vZGUSFwoPbWF4aW11bV9yZXN1bHRzGAMgASgNEgwKBHBhdGgYBCABKAkSDwoHaW5jbHVkZRgFIAMoCRIPCgdleGNsdWRlGAYgAygJEhcKD2luY2x1ZGVfaWdub3JlZBgHIAEoCBIbChNpbmNsdWRlX2RpcmVjdG9yaWVzGAggAygJEhsKE2V4Y2x1ZGVfZGlyZWN0b3JpZXMYCSADKAkSFwoPcmV0cnlfdW50cmFja2VkGAogASgIInEKEEZpbGVTZWFyY2hSZXN1bHQSNQoFZW50cnkYASABKAsyJi5vbW5pZ2VudC5hcGkud29ya3NwYWNlLnYxYWxwaGExLkVudHJ5Eg0KBXNjb3JlGAIgASgNEhcKD21hdGNoZWRfaW5kaWNlcxgDIAMoDSLQAQoTU2VhcmNoRmlsZXNSZXNwb25zZRJCCgdyZXN1bHRzGAEgAygLMjEub21uaWdlbnQuYXBpLndvcmtzcGFjZS52MWFscGhhMS5GaWxlU2VhcmNoUmVzdWx0EhEKCXRydW5jYXRlZBgCIAEoCBIVCg1pbmRleGVkX3BhdGhzGAMgASgEEhgKEGluZGV4X2luY29tcGxldGUYBCABKAgSEgoKcmVmcmVzaGluZxgFIAEoCBIdChV1bnRyYWNrZWRfdW5hdmFpbGFibGUYBiABKAgilgMKEVNlYXJjaFRleHRSZXF1ZXN0Eg0KBXF1ZXJ5GAEgASgJEhYKDmNhc2Vfc2Vuc2l0aXZlGAIgASgIEhoKEnJlZ3VsYXJfZXhwcmVzc2lvbhgDIAEoCBISCgp3aG9sZV93b3JkGAQgASgIEg8KB2luY2x1ZGUYBSABKAkSDwoHZXhjbHVkZRgGIAEoCRIXCg9tYXhpbXVtX3Jlc3VsdHMYByABKA0SFwoPaW5jbHVkZV9pZ25vcmVkGAggASgIEhsKE2luY2x1ZGVfZGlyZWN0b3JpZXMYCSADKAkSGwoTZXhjbHVkZV9kaXJlY3RvcmllcxgKIAMoCRI7CgVvcmRlchgLIAEoDjIsLm9tbmlnZW50LmFwaS53b3Jrc3BhY2UudjFhbHBoYTEuU2VhcmNoT3JkZXISFQoNZm9jdXNlZF9wYXRocxgMIAMoCRJICg9jaGFuZ2VkX2FnYWluc3QYDSABKA4yLy5vbW5pZ2VudC5hcGkud29ya3NwYWNlLnYxYWxwaGExLkNvbXBhcmlzb25LaW5kInMKD1RleHRTZWFyY2hNYXRjaBIMCgRwYXRoGAEgASgJEgwKBGxpbmUYAiABKAQSDgoGY29sdW1uGAMgASgNEgwKBHRleHQYBCABKAkSEwoLbWF0Y2hfc3RhcnQYBSABKA0SEQoJbWF0Y2hfZW5kGAYgASgNIokBChJTZWFyY2hUZXh0UmVzcG9uc2USQQoHbWF0Y2hlcxgBIAMoCzIwLm9tbmlnZW50LmFwaS53b3Jrc3BhY2UudjFhbHBoYTEuVGV4dFNlYXJjaE1hdGNoEgwKBGRvbmUYAiABKAgSEQoJdHJ1bmNhdGVkGAMgASgIEg8KB3dhcm5pbmcYBCABKAkieQoKQ29tcGFyaXNvbhI9CgRraW5kGAEgASgOMi8ub21uaWdlbnQuYXBpLndvcmtzcGFjZS52MWFscGhhMS5Db21wYXJpc29uS2luZBIVCg1iYXNlX3JldmlzaW9uGAIgASgJEhUKDWhlYWRfcmV2aXNpb24YAyABKAki0QEKFUNvbXBhcmlzb25VbmF2YWlsYWJsZRJDCgdwcm9ibGVtGAEgASgOMjIub21uaWdlbnQuYXBpLndvcmtzcGFjZS52MWFscGhhMS5Db21wYXJpc29uUHJvYmxlbRIRCglyZWZlcmVuY2UYAiABKAkSDwoHc2hhbGxvdxgDIAEoCBIOCgZkZXRhaWwYBCABKAkSPwoFZmllbGQYBSABKA4yMC5vbW5pZ2VudC5hcGkud29ya3NwYWNlLnYxYWxwaGExLkNvbXBhcmlzb25GaWVsZCLEAgoPV29ya2luZ0NvcHlCYXNlEj0KBGtpbmQYASABKA4yLy5vbW5pZ2VudC5hcGkud29ya3NwYWNlLnYxYWxwaGExLkNvbXBhcmlzb25LaW5kEgwKBGhlYWQYAiABKAkSDAoEYmFzZRgDIAEoCRIRCglyZWZlcmVuY2UYBCABKAkSGAoQcmVmZXJlbmNlX2NvbW1pdBgFIAEoCRJLCgt1bmF2YWlsYWJsZRgGIAEoCzI2Lm9tbmlnZW50LmFwaS53b3Jrc3BhY2UudjFhbHBoYTEuQ29tcGFyaXNvblVuYXZhaWxhYmxlEhIKCm1lcmdlX2Jhc2UYByABKAkSFAoMYmFzZV9kaXNwbGF5GAggASgJEhQKDGhlYWRfZGlzcGxheRgJIAEoCRIcChRoZWFkX2lzX3dvcmtpbmdfY29weRgKIAEoCCJgCh1SZXNvbHZlV29ya2luZ0NvcHlCYXNlUmVxdWVzdBI/Cgpjb21wYXJpc29uGAEgASgLMisub21uaWdlbnQuYXBpLndvcmtzcGFjZS52MWFscGhhMS5Db21wYXJpc29uImAKHlJlc29sdmVXb3JraW5nQ29weUJhc2VSZXNwb25zZRI+CgRiYXNlGAEgASgLMjAub21uaWdlbnQuYXBpLndvcmtzcGFjZS52MWFscGhhMS5Xb3JraW5nQ29weUJhc2Ui1AQKC0NoYW5nZWRGaWxlEgwKBHBhdGgYASABKAkSPQoGc3RhdHVzGAIgASgOMi0ub21uaWdlbnQuYXBpLndvcmtzcGFjZS52MWFscGhhMS5DaGFuZ2VTdGF0dXMSQAoJYmFzZV9raW5kGAMgASgOMi0ub21uaWdlbnQuYXBpLndvcmtzcGFjZS52MWFscGhhMS5HaXRFbnRyeUtpbmQSQwoMd29ya2luZ19raW5kGAQgASgOMi0ub21uaWdlbnQuYXBpLndvcmtzcGFjZS52MWFscGhhMS5HaXRFbnRyeUtpbmQSEwoLYmFzZV9vYmplY3QYBSABKAkSFgoJYmFzZV9zaXplGAYgASgESACIAQESGAoLbGluZXNfYWRkZWQYByABKARIAYgBARIaCg1saW5lc19yZW1vdmVkGAggASgESAKIAQESDgoGYmluYXJ5GAkgASgIEkQKB3Byb2JsZW0YCiABKA4yMy5vbW5pZ2VudC5hcGkud29ya3NwYWNlLnYxYWxwaGExLkNoYW5nZWRGaWxlUHJvYmxlbRJFCgd3b3JraW5nGAsgASgLMjQub21uaWdlbnQuYXBpLndvcmtzcGFjZS52MWFscGhhMS5Xb3JraW5nRmlsZU1ldGFkYXRhEkEKCWNvbW1pdHRlZBgMIAEoCzIuLm9tbmlnZW50LmFwaS53b3Jrc3BhY2UudjFhbHBoYTEuQ29tbWl0dGVkRmlsZUIMCgpfYmFzZV9zaXplQg4KDF9saW5lc19hZGRlZEIQCg5fbGluZXNfcmVtb3ZlZCI7Cg1Db21taXR0ZWRGaWxlEg4KBm9iamVjdBgBIAEoCRIRCgRzaXplGAIgASgESACIAQFCBwoFX3NpemUiewoTV29ya2luZ0ZpbGVNZXRhZGF0YRIMCgRzaXplGAEgASgEEhsKE21vZGlmaWVkX3VuaXhfbmFub3MYAiABKAMSGgoSY2hhbmdlZF91bml4X25hbm9zGAMgASgDEg0KBWlub2RlGAQgASgEEg4KBmRldmljZRgFIAEoBCJgCh1MaXN0V29ya2luZ0NvcHlDaGFuZ2VzUmVxdWVzdBI/Cgpjb21wYXJpc29uGAEgASgLMisub21uaWdlbnQuYXBpLndvcmtzcGFjZS52MWFscGhhMS5Db21wYXJpc29uIrwBCh5MaXN0V29ya2luZ0NvcHlDaGFuZ2VzUmVzcG9uc2USPgoEYmFzZRgBIAEoCzIwLm9tbmlnZW50LmFwaS53b3Jrc3BhY2UudjFhbHBoYTEuV29ya2luZ0NvcHlCYXNlEjsKBWZpbGVzGAIgAygLMiwub21uaWdlbnQuYXBpLndvcmtzcGFjZS52MWFscGhhMS5DaGFuZ2VkRmlsZRIdChV1bnJlcHJlc2VudGFibGVfbmFtZXMYAyABKA0iWgoTUmVhZEJhc2VGaWxlUmVxdWVzdBIOCgZjb21taXQYASABKAkSDAoEcGF0aBgCIAEoCRIOCgZvYmplY3QYAyABKAkSFQoNbWF4aW11bV9ieXRlcxgEIAEoBCJlChRSZWFkQmFzZUZpbGVSZXNwb25zZRI/CghtZXRhZGF0YRgBIAEoCzItLm9tbmlnZW50LmFwaS53b3Jrc3BhY2UudjFhbHBoYTEuRmlsZU1ldGFkYXRhEgwKBGRhdGEYAiABKAwiIwoTUmVhZExpbmtUZXh0UmVxdWVzdBIMCgRwYXRoGAEgASgJIiYKFFJlYWRMaW5rVGV4dFJlc3BvbnNlEg4KBnRhcmdldBgBIAEoDCIbChlMaXN0UmVwb3NpdG9yeVJlZnNSZXF1ZXN0IlkKGkxpc3RSZXBvc2l0b3J5UmVmc1Jlc3BvbnNlEgwKBHJlZnMYASADKAkSEQoJdHJ1bmNhdGVkGAIgASgIEhoKEmRlZmF1bHRfYnJhbmNoX3JlZhgDIAEoCSIxChhMaXN0QnJhbmNoQ29tbWl0c1JlcXVlc3QSFQoNYmFzZV9yZXZpc2lvbhgBIAEoCSJsCgxCcmFuY2hDb21taXQSDgoGb2JqZWN0GAEgASgJEg8KB3N1YmplY3QYAiABKAkSEwoLYXV0aG9yX25hbWUYAyABKAkSGAoQYXV0aG9yX3RpbWVfdW5peBgEIAEoAxIMCgRyb290GAUgASgIIq4BChlMaXN0QnJhbmNoQ29tbWl0c1Jlc3BvbnNlEj4KBGJhc2UYASABKAsyMC5vbW5pZ2VudC5hcGkud29ya3NwYWNlLnYxYWxwaGExLldvcmtpbmdDb3B5QmFzZRI+Cgdjb21taXRzGAIgAygLMi0ub21uaWdlbnQuYXBpLndvcmtzcGFjZS52MWFscGhhMS5CcmFuY2hDb21taXQSEQoJdHJ1bmNhdGVkGAMgASgIIiEKH1Jlc29sdmVSZXBvc2l0b3J5Q29udGV4dFJlcXVlc3QiSwoQUmVwb3NpdG9yeVJlbW90ZRIMCgRuYW1lGAEgASgJEgwKBGhvc3QYAiABKAkSDQoFb3duZXIYAyABKAkSDAoEcmVwbxgEIAEoCSJyCgpQdXNoVGFyZ2V0EhMKC3JlbW90ZV9uYW1lGAEgASgJEg4KBmJyYW5jaBgCIAEoCRIMCgRob3N0GAMgASgJEg0KBW93bmVyGAQgASgJEgwKBHJlcG8YBSABKAkSFAoMdHJhY2tpbmdfc2hhGAYgASgJIqwDCiBSZXNvbHZlUmVwb3NpdG9yeUNvbnRleHRSZXNwb25zZRJKCgdwcm9ibGVtGAEgASgOMjkub21uaWdlbnQuYXBpLndvcmtzcGFjZS52MWFscGhhMS5SZXBvc2l0b3J5Q29udGV4dFByb2JsZW0SDgoGYnJhbmNoGAIgASgJEhAKCGhlYWRfc2hhGAMgASgJEjkKBHB1c2gYBCABKAsyKy5vbW5pZ2VudC5hcGkud29ya3NwYWNlLnYxYWxwaGExLlB1c2hUYXJnZXQSSAoPcHVzaF91bnJlc29sdmVkGAUgASgOMi8ub21uaWdlbnQuYXBpLndvcmtzcGFjZS52MWFscGhhMS5QdXNoVW5yZXNvbHZlZBIUCgx1cHN0cmVhbV9yZWYYBiABKAkSQgoHcmVtb3RlcxgHIAMoCzIxLm9tbmlnZW50LmFwaS53b3Jrc3BhY2UudjFhbHBoYTEuUmVwb3NpdG9yeVJlbW90ZRIgChh1bnN1cHBvcnRlZF9yZW1vdGVfY291bnQYCCABKA0SGQoRdHJ1bmNhdGVkX3JlbW90ZXMYCSABKAgqVgoJRW50cnlUeXBlEhoKFkVOVFJZX1RZUEVfVU5TUEVDSUZJRUQQABITCg9FTlRSWV9UWVBFX0ZJTEUQARIYChRFTlRSWV9UWVBFX0RJUkVDVE9SWRACKmsKD0NvbnRlbnRFbmNvZGluZxIgChxDT05URU5UX0VOQ09ESU5HX1VOU1BFQ0lGSUVEEAASGQoVQ09OVEVOVF9FTkNPRElOR19VVEY4EAESGwoXQ09OVEVOVF9FTkNPRElOR19CSU5BUlkQAipuCg5GaWxlU2VhcmNoTW9kZRIgChxGSUxFX1NFQVJDSF9NT0RFX1VOU1BFQ0lGSUVEEAASGgoWRklMRV9TRUFSQ0hfTU9ERV9GVVpaWRABEh4KGkZJTEVfU0VBUkNIX01PREVfU1VCU1RSSU5HEAIqXQoLU2VhcmNoT3JkZXISHAoYU0VBUkNIX09SREVSX1VOU1BFQ0lGSUVEEAASFQoRU0VBUkNIX09SREVSX1dBTEsQARIZChVTRUFSQ0hfT1JERVJfUFJJT1JJVFkQAiqTAQoOQ29tcGFyaXNvbktpbmQSHwobQ09NUEFSSVNPTl9LSU5EX1VOU1BFQ0lGSUVEEAASHwobQ09NUEFSSVNPTl9LSU5EX0xBU1RfQ09NTUlUEAESIAocQ09NUEFSSVNPTl9LSU5EX0JSQU5DSF9QT0lOVBACEh0KGUNPTVBBUklTT05fS0lORF9SRVZJU0lPTlMQAyq9BQoRQ29tcGFyaXNvblByb2JsZW0SIgoeQ09NUEFSSVNPTl9QUk9CTEVNX1VOU1BFQ0lGSUVEEAASJwojQ09NUEFSSVNPTl9QUk9CTEVNX05PVF9BX1JFUE9TSVRPUlkQARIhCh1DT01QQVJJU09OX1BST0JMRU1fTk9fQ09NTUlUUxACEigKJENPTVBBUklTT05fUFJPQkxFTV9OT19ERUZBVUxUX0JSQU5DSBADEiYKIkNPTVBBUklTT05fUFJPQkxFTV9OT19CUkFOQ0hfUE9JTlQQBBIlCiFDT01QQVJJU09OX1BST0JMRU1fTUlTU0lOR19PQkpFQ1QQBRI0CjBDT01QQVJJU09OX1BST0JMRU1fUEFSVElBTF9DTE9ORV9ORUVEU19ORVdFUl9HSVQQBhIeChpDT01QQVJJU09OX1BST0JMRU1fVElNRU9VVBAHEiUKIUNPTVBBUklTT05fUFJPQkxFTV9UT09fTUFOWV9GSUxFUxAIEigKJENPTVBBUklTT05fUFJPQkxFTV9MSVNUSU5HX1RPT19MQVJHRRAJEiYKIkNPTVBBUklTT05fUFJPQkxFTV9HSVRfVU5BVkFJTEFCTEUQChIhCh1DT01QQVJJU09OX1BST0JMRU1fR0lUX0ZBSUxFRBALEiwKKENPTVBBUklTT05fUFJPQkxFTV9NVUxUSVBMRV9SRVBPU0lUT1JJRVMQDBInCiNDT01QQVJJU09OX1BST0JMRU1fSU5WQUxJRF9SRVZJU0lPThANEiUKIUNPTVBBUklTT05fUFJPQkxFTV9CQVNFX05PVF9GT1VORBAOEiUKIUNPTVBBUklTT05fUFJPQkxFTV9IRUFEX05PVF9GT1VORBAPEigKJENPTVBBUklTT05fUFJPQkxFTV9OT19DT01NT05fSElTVE9SWRAQKoQBCg9Db21wYXJpc29uRmllbGQSIAocQ09NUEFSSVNPTl9GSUVMRF9VTlNQRUNJRklFRBAAEhkKFUNPTVBBUklTT05fRklFTERfQkFTRRABEhkKFUNPTVBBUklTT05fRklFTERfSEVBRBACEhkKFUNPTVBBUklTT05fRklFTERfQk9USBADKrsBCgxDaGFuZ2VTdGF0dXMSHQoZQ0hBTkdFX1NUQVRVU19VTlNQRUNJRklFRBAAEhcKE0NIQU5HRV9TVEFUVVNfQURERUQQARIaChZDSEFOR0VfU1RBVFVTX01PRElGSUVEEAISGQoVQ0hBTkdFX1NUQVRVU19ERUxFVEVEEAMSHgoaQ0hBTkdFX1NUQVRVU19UWVBFX0NIQU5HRUQQBBIcChhDSEFOR0VfU1RBVFVTX0NPTkZMSUNURUQQBSqBAQoMR2l0RW50cnlLaW5kEh4KGkdJVF9FTlRSWV9LSU5EX1VOU1BFQ0lGSUVEEAASFwoTR0lUX0VOVFJZX0tJTkRfRklMRRABEhoKFkdJVF9FTlRSWV9LSU5EX1NZTUxJTksQAhIcChhHSVRfRU5UUllfS0lORF9TVUJNT0RVTEUQAyqGAQoSQ2hhbmdlZEZpbGVQcm9ibGVtEiQKIENIQU5HRURfRklMRV9QUk9CTEVNX1VOU1BFQ0lGSUVEEAASIQodQ0hBTkdFRF9GSUxFX1BST0JMRU1fRklMVEVSRUQQARInCiNDSEFOR0VEX0ZJTEVfUFJPQkxFTV9NSVNTSU5HX09CSkVDVBACKuECChhSZXBvc2l0b3J5Q29udGV4dFByb2JsZW0SKgomUkVQT1NJVE9SWV9DT05URVhUX1BST0JMRU1fVU5TUEVDSUZJRUQQABIvCitSRVBPU0lUT1JZX0NPTlRFWFRfUFJPQkxFTV9OT1RfQV9SRVBPU0lUT1JZEAESMQotUkVQT1NJVE9SWV9DT05URVhUX1BST0JMRU1fVU5TVVBQT1JURURfQ09ORklHEAISMgouUkVQT1NJVE9SWV9DT05URVhUX1BST0JMRU1fUkVQT1NJVE9SWV9DSEFOR0lORxADEiYKIlJFUE9TSVRPUllfQ09OVEVYVF9QUk9CTEVNX1RJTUVPVVQQBBIuCipSRVBPU0lUT1JZX0NPTlRFWFRfUFJPQkxFTV9HSVRfVU5BVkFJTEFCTEUQBRIpCiVSRVBPU0lUT1JZX0NPTlRFWFRfUFJPQkxFTV9HSVRfRkFJTEVEEAYqjgEKDlB1c2hVbnJlc29sdmVkEh8KG1BVU0hfVU5SRVNPTFZFRF9VTlNQRUNJRklFRBAAEhsKF1BVU0hfVU5SRVNPTFZFRF9SRUZTUEVDEAESHAoYUFVTSF9VTlJFU09MVkVEX1BVU0hfVVJMEAISIAocUFVTSF9VTlJFU09MVkVEX1BVU0hfREVGQVVMVBADMpcOChBXb3Jrc3BhY2VTZXJ2aWNlEokBCg9HZXRDYXBhYmlsaXRpZXMSNy5vbW5pZ2VudC5hcGkud29ya3NwYWNlLnYxYWxwaGExLkdldENhcGFiaWxpdGllc1JlcXVlc3QaOC5vbW5pZ2VudC5hcGkud29ya3NwYWNlLnYxYWxwaGExLkdldENhcGFiaWxpdGllc1Jlc3BvbnNlIgOQAgESgwEKDUxpc3REaXJlY3RvcnkSNS5vbW5pZ2VudC5hcGkud29ya3NwYWNlLnYxYWxwaGExLkxpc3REaXJlY3RvcnlSZXF1ZXN0GjYub21uaWdlbnQuYXBpLndvcmtzcGFjZS52MWFscGhhMS5MaXN0RGlyZWN0b3J5UmVzcG9uc2UiA5ACARJxCghSZWFkRmlsZRIwLm9tbmlnZW50LmFwaS53b3Jrc3BhY2UudjFhbHBoYTEuUmVhZEZpbGVSZXF1ZXN0GjEub21uaWdlbnQuYXBpLndvcmtzcGFjZS52MWFscGhhMS5SZWFkRmlsZVJlc3BvbnNlMAESdAoIU3RhdFBhdGgSMC5vbW5pZ2VudC5hcGkud29ya3NwYWNlLnYxYWxwaGExLlN0YXRQYXRoUmVxdWVzdBoxLm9tbmlnZW50LmFwaS53b3Jrc3BhY2UudjFhbHBoYTEuU3RhdFBhdGhSZXNwb25zZSIDkAIBEn0KC1NlYXJjaEZpbGVzEjMub21uaWdlbnQuYXBpLndvcmtzcGFjZS52MWFscGhhMS5TZWFyY2hGaWxlc1JlcXVlc3QaNC5vbW5pZ2VudC5hcGkud29ya3NwYWNlLnYxYWxwaGExLlNlYXJjaEZpbGVzUmVzcG9uc2UiA5ACARJ3CgpTZWFyY2hUZXh0EjIub21uaWdlbnQuYXBpLndvcmtzcGFjZS52MWFscGhhMS5TZWFyY2hUZXh0UmVxdWVzdBozLm9tbmlnZW50LmFwaS53b3Jrc3BhY2UudjFhbHBoYTEuU2VhcmNoVGV4dFJlc3BvbnNlMAESngEKFlJlc29sdmVXb3JraW5nQ29weUJhc2USPi5vbW5pZ2VudC5hcGkud29ya3NwYWNlLnYxYWxwaGExLlJlc29sdmVXb3JraW5nQ29weUJhc2VSZXF1ZXN0Gj8ub21uaWdlbnQuYXBpLndvcmtzcGFjZS52MWFscGhhMS5SZXNvbHZlV29ya2luZ0NvcHlCYXNlUmVzcG9uc2UiA5ACARKeAQoWTGlzdFdvcmtpbmdDb3B5Q2hhbmdlcxI+Lm9tbmlnZW50LmFwaS53b3Jrc3BhY2UudjFhbHBoYTEuTGlzdFdvcmtpbmdDb3B5Q2hhbmdlc1JlcXVlc3QaPy5vbW5pZ2VudC5hcGkud29ya3NwYWNlLnYxYWxwaGExLkxpc3RXb3JraW5nQ29weUNoYW5nZXNSZXNwb25zZSIDkAIBEn0KDFJlYWRCYXNlRmlsZRI0Lm9tbmlnZW50LmFwaS53b3Jrc3BhY2UudjFhbHBoYTEuUmVhZEJhc2VGaWxlUmVxdWVzdBo1Lm9tbmlnZW50LmFwaS53b3Jrc3BhY2UudjFhbHBoYTEuUmVhZEJhc2VGaWxlUmVzcG9uc2UwARKAAQoMUmVhZExpbmtUZXh0EjQub21uaWdlbnQuYXBpLndvcmtzcGFjZS52MWFscGhhMS5SZWFkTGlua1RleHRSZXF1ZXN0GjUub21uaWdlbnQuYXBpLndvcmtzcGFjZS52MWFscGhhMS5SZWFkTGlua1RleHRSZXNwb25zZSIDkAIBEpIBChJMaXN0UmVwb3NpdG9yeVJlZnMSOi5vbW5pZ2VudC5hcGkud29ya3NwYWNlLnYxYWxwaGExLkxpc3RSZXBvc2l0b3J5UmVmc1JlcXVlc3QaOy5vbW5pZ2VudC5hcGkud29ya3NwYWNlLnYxYWxwaGExLkxpc3RSZXBvc2l0b3J5UmVmc1Jlc3BvbnNlIgOQAgESjwEKEUxpc3RCcmFuY2hDb21taXRzEjkub21uaWdlbnQuYXBpLndvcmtzcGFjZS52MWFscGhhMS5MaXN0QnJhbmNoQ29tbWl0c1JlcXVlc3QaOi5vbW5pZ2VudC5hcGkud29ya3NwYWNlLnYxYWxwaGExLkxpc3RCcmFuY2hDb21taXRzUmVzcG9uc2UiA5ACARKkAQoYUmVzb2x2ZVJlcG9zaXRvcnlDb250ZXh0EkAub21uaWdlbnQuYXBpLndvcmtzcGFjZS52MWFscGhhMS5SZXNvbHZlUmVwb3NpdG9yeUNvbnRleHRSZXF1ZXN0GkEub21uaWdlbnQuYXBpLndvcmtzcGFjZS52MWFscGhhMS5SZXNvbHZlUmVwb3NpdG9yeUNvbnRleHRSZXNwb25zZSIDkAIBYgZwcm90bzM", [file_google_protobuf_timestamp]);
 
 /**
  * Describes the message omnigent.api.workspace.v1alpha1.GetCapabilitiesRequest.
@@ -77,6 +83,223 @@ export const FileMetadataSchema = /*@__PURE__*/
   messageDesc(file_omnigent_api_workspace_v1alpha1_workspace, 7);
 
 /**
+ * Describes the message omnigent.api.workspace.v1alpha1.StatPathRequest.
+ * Use `create(StatPathRequestSchema)` to create a new message.
+ */
+export const StatPathRequestSchema = /*@__PURE__*/
+  messageDesc(file_omnigent_api_workspace_v1alpha1_workspace, 8);
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.StatPathResponse.
+ * Use `create(StatPathResponseSchema)` to create a new message.
+ */
+export const StatPathResponseSchema = /*@__PURE__*/
+  messageDesc(file_omnigent_api_workspace_v1alpha1_workspace, 9);
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.SearchFilesRequest.
+ * Use `create(SearchFilesRequestSchema)` to create a new message.
+ */
+export const SearchFilesRequestSchema = /*@__PURE__*/
+  messageDesc(file_omnigent_api_workspace_v1alpha1_workspace, 10);
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.FileSearchResult.
+ * Use `create(FileSearchResultSchema)` to create a new message.
+ */
+export const FileSearchResultSchema = /*@__PURE__*/
+  messageDesc(file_omnigent_api_workspace_v1alpha1_workspace, 11);
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.SearchFilesResponse.
+ * Use `create(SearchFilesResponseSchema)` to create a new message.
+ */
+export const SearchFilesResponseSchema = /*@__PURE__*/
+  messageDesc(file_omnigent_api_workspace_v1alpha1_workspace, 12);
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.SearchTextRequest.
+ * Use `create(SearchTextRequestSchema)` to create a new message.
+ */
+export const SearchTextRequestSchema = /*@__PURE__*/
+  messageDesc(file_omnigent_api_workspace_v1alpha1_workspace, 13);
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.TextSearchMatch.
+ * Use `create(TextSearchMatchSchema)` to create a new message.
+ */
+export const TextSearchMatchSchema = /*@__PURE__*/
+  messageDesc(file_omnigent_api_workspace_v1alpha1_workspace, 14);
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.SearchTextResponse.
+ * Use `create(SearchTextResponseSchema)` to create a new message.
+ */
+export const SearchTextResponseSchema = /*@__PURE__*/
+  messageDesc(file_omnigent_api_workspace_v1alpha1_workspace, 15);
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.Comparison.
+ * Use `create(ComparisonSchema)` to create a new message.
+ */
+export const ComparisonSchema = /*@__PURE__*/
+  messageDesc(file_omnigent_api_workspace_v1alpha1_workspace, 16);
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.ComparisonUnavailable.
+ * Use `create(ComparisonUnavailableSchema)` to create a new message.
+ */
+export const ComparisonUnavailableSchema = /*@__PURE__*/
+  messageDesc(file_omnigent_api_workspace_v1alpha1_workspace, 17);
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.WorkingCopyBase.
+ * Use `create(WorkingCopyBaseSchema)` to create a new message.
+ */
+export const WorkingCopyBaseSchema = /*@__PURE__*/
+  messageDesc(file_omnigent_api_workspace_v1alpha1_workspace, 18);
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.ResolveWorkingCopyBaseRequest.
+ * Use `create(ResolveWorkingCopyBaseRequestSchema)` to create a new message.
+ */
+export const ResolveWorkingCopyBaseRequestSchema = /*@__PURE__*/
+  messageDesc(file_omnigent_api_workspace_v1alpha1_workspace, 19);
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.ResolveWorkingCopyBaseResponse.
+ * Use `create(ResolveWorkingCopyBaseResponseSchema)` to create a new message.
+ */
+export const ResolveWorkingCopyBaseResponseSchema = /*@__PURE__*/
+  messageDesc(file_omnigent_api_workspace_v1alpha1_workspace, 20);
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.ChangedFile.
+ * Use `create(ChangedFileSchema)` to create a new message.
+ */
+export const ChangedFileSchema = /*@__PURE__*/
+  messageDesc(file_omnigent_api_workspace_v1alpha1_workspace, 21);
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.CommittedFile.
+ * Use `create(CommittedFileSchema)` to create a new message.
+ */
+export const CommittedFileSchema = /*@__PURE__*/
+  messageDesc(file_omnigent_api_workspace_v1alpha1_workspace, 22);
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.WorkingFileMetadata.
+ * Use `create(WorkingFileMetadataSchema)` to create a new message.
+ */
+export const WorkingFileMetadataSchema = /*@__PURE__*/
+  messageDesc(file_omnigent_api_workspace_v1alpha1_workspace, 23);
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.ListWorkingCopyChangesRequest.
+ * Use `create(ListWorkingCopyChangesRequestSchema)` to create a new message.
+ */
+export const ListWorkingCopyChangesRequestSchema = /*@__PURE__*/
+  messageDesc(file_omnigent_api_workspace_v1alpha1_workspace, 24);
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.ListWorkingCopyChangesResponse.
+ * Use `create(ListWorkingCopyChangesResponseSchema)` to create a new message.
+ */
+export const ListWorkingCopyChangesResponseSchema = /*@__PURE__*/
+  messageDesc(file_omnigent_api_workspace_v1alpha1_workspace, 25);
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.ReadBaseFileRequest.
+ * Use `create(ReadBaseFileRequestSchema)` to create a new message.
+ */
+export const ReadBaseFileRequestSchema = /*@__PURE__*/
+  messageDesc(file_omnigent_api_workspace_v1alpha1_workspace, 26);
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.ReadBaseFileResponse.
+ * Use `create(ReadBaseFileResponseSchema)` to create a new message.
+ */
+export const ReadBaseFileResponseSchema = /*@__PURE__*/
+  messageDesc(file_omnigent_api_workspace_v1alpha1_workspace, 27);
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.ReadLinkTextRequest.
+ * Use `create(ReadLinkTextRequestSchema)` to create a new message.
+ */
+export const ReadLinkTextRequestSchema = /*@__PURE__*/
+  messageDesc(file_omnigent_api_workspace_v1alpha1_workspace, 28);
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.ReadLinkTextResponse.
+ * Use `create(ReadLinkTextResponseSchema)` to create a new message.
+ */
+export const ReadLinkTextResponseSchema = /*@__PURE__*/
+  messageDesc(file_omnigent_api_workspace_v1alpha1_workspace, 29);
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.ListRepositoryRefsRequest.
+ * Use `create(ListRepositoryRefsRequestSchema)` to create a new message.
+ */
+export const ListRepositoryRefsRequestSchema = /*@__PURE__*/
+  messageDesc(file_omnigent_api_workspace_v1alpha1_workspace, 30);
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.ListRepositoryRefsResponse.
+ * Use `create(ListRepositoryRefsResponseSchema)` to create a new message.
+ */
+export const ListRepositoryRefsResponseSchema = /*@__PURE__*/
+  messageDesc(file_omnigent_api_workspace_v1alpha1_workspace, 31);
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.ListBranchCommitsRequest.
+ * Use `create(ListBranchCommitsRequestSchema)` to create a new message.
+ */
+export const ListBranchCommitsRequestSchema = /*@__PURE__*/
+  messageDesc(file_omnigent_api_workspace_v1alpha1_workspace, 32);
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.BranchCommit.
+ * Use `create(BranchCommitSchema)` to create a new message.
+ */
+export const BranchCommitSchema = /*@__PURE__*/
+  messageDesc(file_omnigent_api_workspace_v1alpha1_workspace, 33);
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.ListBranchCommitsResponse.
+ * Use `create(ListBranchCommitsResponseSchema)` to create a new message.
+ */
+export const ListBranchCommitsResponseSchema = /*@__PURE__*/
+  messageDesc(file_omnigent_api_workspace_v1alpha1_workspace, 34);
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.ResolveRepositoryContextRequest.
+ * Use `create(ResolveRepositoryContextRequestSchema)` to create a new message.
+ */
+export const ResolveRepositoryContextRequestSchema = /*@__PURE__*/
+  messageDesc(file_omnigent_api_workspace_v1alpha1_workspace, 35);
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.RepositoryRemote.
+ * Use `create(RepositoryRemoteSchema)` to create a new message.
+ */
+export const RepositoryRemoteSchema = /*@__PURE__*/
+  messageDesc(file_omnigent_api_workspace_v1alpha1_workspace, 36);
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.PushTarget.
+ * Use `create(PushTargetSchema)` to create a new message.
+ */
+export const PushTargetSchema = /*@__PURE__*/
+  messageDesc(file_omnigent_api_workspace_v1alpha1_workspace, 37);
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.ResolveRepositoryContextResponse.
+ * Use `create(ResolveRepositoryContextResponseSchema)` to create a new message.
+ */
+export const ResolveRepositoryContextResponseSchema = /*@__PURE__*/
+  messageDesc(file_omnigent_api_workspace_v1alpha1_workspace, 38);
+
+/**
  * Describes the enum omnigent.api.workspace.v1alpha1.EntryType.
  */
 export const EntryTypeSchema = /*@__PURE__*/
@@ -99,6 +322,130 @@ export const ContentEncodingSchema = /*@__PURE__*/
  */
 export const ContentEncoding = /*@__PURE__*/
   tsEnum(ContentEncodingSchema);
+
+/**
+ * Describes the enum omnigent.api.workspace.v1alpha1.FileSearchMode.
+ */
+export const FileSearchModeSchema = /*@__PURE__*/
+  enumDesc(file_omnigent_api_workspace_v1alpha1_workspace, 2);
+
+/**
+ * @generated from enum omnigent.api.workspace.v1alpha1.FileSearchMode
+ */
+export const FileSearchMode = /*@__PURE__*/
+  tsEnum(FileSearchModeSchema);
+
+/**
+ * Describes the enum omnigent.api.workspace.v1alpha1.SearchOrder.
+ */
+export const SearchOrderSchema = /*@__PURE__*/
+  enumDesc(file_omnigent_api_workspace_v1alpha1_workspace, 3);
+
+/**
+ * @generated from enum omnigent.api.workspace.v1alpha1.SearchOrder
+ */
+export const SearchOrder = /*@__PURE__*/
+  tsEnum(SearchOrderSchema);
+
+/**
+ * Describes the enum omnigent.api.workspace.v1alpha1.ComparisonKind.
+ */
+export const ComparisonKindSchema = /*@__PURE__*/
+  enumDesc(file_omnigent_api_workspace_v1alpha1_workspace, 4);
+
+/**
+ * @generated from enum omnigent.api.workspace.v1alpha1.ComparisonKind
+ */
+export const ComparisonKind = /*@__PURE__*/
+  tsEnum(ComparisonKindSchema);
+
+/**
+ * Describes the enum omnigent.api.workspace.v1alpha1.ComparisonProblem.
+ */
+export const ComparisonProblemSchema = /*@__PURE__*/
+  enumDesc(file_omnigent_api_workspace_v1alpha1_workspace, 5);
+
+/**
+ * @generated from enum omnigent.api.workspace.v1alpha1.ComparisonProblem
+ */
+export const ComparisonProblem = /*@__PURE__*/
+  tsEnum(ComparisonProblemSchema);
+
+/**
+ * Describes the enum omnigent.api.workspace.v1alpha1.ComparisonField.
+ */
+export const ComparisonFieldSchema = /*@__PURE__*/
+  enumDesc(file_omnigent_api_workspace_v1alpha1_workspace, 6);
+
+/**
+ * Which requested revision a problem is about.
+ *
+ * @generated from enum omnigent.api.workspace.v1alpha1.ComparisonField
+ */
+export const ComparisonField = /*@__PURE__*/
+  tsEnum(ComparisonFieldSchema);
+
+/**
+ * Describes the enum omnigent.api.workspace.v1alpha1.ChangeStatus.
+ */
+export const ChangeStatusSchema = /*@__PURE__*/
+  enumDesc(file_omnigent_api_workspace_v1alpha1_workspace, 7);
+
+/**
+ * @generated from enum omnigent.api.workspace.v1alpha1.ChangeStatus
+ */
+export const ChangeStatus = /*@__PURE__*/
+  tsEnum(ChangeStatusSchema);
+
+/**
+ * Describes the enum omnigent.api.workspace.v1alpha1.GitEntryKind.
+ */
+export const GitEntryKindSchema = /*@__PURE__*/
+  enumDesc(file_omnigent_api_workspace_v1alpha1_workspace, 8);
+
+/**
+ * @generated from enum omnigent.api.workspace.v1alpha1.GitEntryKind
+ */
+export const GitEntryKind = /*@__PURE__*/
+  tsEnum(GitEntryKindSchema);
+
+/**
+ * Describes the enum omnigent.api.workspace.v1alpha1.ChangedFileProblem.
+ */
+export const ChangedFileProblemSchema = /*@__PURE__*/
+  enumDesc(file_omnigent_api_workspace_v1alpha1_workspace, 9);
+
+/**
+ * @generated from enum omnigent.api.workspace.v1alpha1.ChangedFileProblem
+ */
+export const ChangedFileProblem = /*@__PURE__*/
+  tsEnum(ChangedFileProblemSchema);
+
+/**
+ * Describes the enum omnigent.api.workspace.v1alpha1.RepositoryContextProblem.
+ */
+export const RepositoryContextProblemSchema = /*@__PURE__*/
+  enumDesc(file_omnigent_api_workspace_v1alpha1_workspace, 10);
+
+/**
+ * @generated from enum omnigent.api.workspace.v1alpha1.RepositoryContextProblem
+ */
+export const RepositoryContextProblem = /*@__PURE__*/
+  tsEnum(RepositoryContextProblemSchema);
+
+/**
+ * Describes the enum omnigent.api.workspace.v1alpha1.PushUnresolved.
+ */
+export const PushUnresolvedSchema = /*@__PURE__*/
+  enumDesc(file_omnigent_api_workspace_v1alpha1_workspace, 11);
+
+/**
+ * Why a branch that may push somewhere has no push target.
+ *
+ * @generated from enum omnigent.api.workspace.v1alpha1.PushUnresolved
+ */
+export const PushUnresolved = /*@__PURE__*/
+  tsEnum(PushUnresolvedSchema);
 
 /**
  * @generated from service omnigent.api.workspace.v1alpha1.WorkspaceService

@@ -1,0 +1,68 @@
+syntax = "proto3";
+
+// The workspace helper's control service, between a host and the helper it
+// starts. Never exposed to clients.
+//
+// The helper serves WorkspaceService (workspace.proto) and this service on a
+// private connection the host hands it at start. Each WorkspaceService call
+// names the workspace it reads in the `omnigent-workspace-id` request header,
+// with an id from OpenWorkspace; the host sets it from the caller's grant, so
+// a client can't choose another workspace.
+package omnigent.api.workspace.v1alpha1;
+
+service WorkspaceHelperService {
+  // The helper's build and what it serves.
+  rpc GetInfo(GetInfoRequest) returns (GetInfoResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+
+  // Opens a directory for WorkspaceService calls.
+  rpc OpenWorkspace(OpenWorkspaceRequest) returns (OpenWorkspaceResponse);
+
+  // Releases an opened workspace and what the helper keeps for it.
+  rpc CloseWorkspace(CloseWorkspaceRequest) returns (CloseWorkspaceResponse);
+}
+
+message GetInfoRequest {}
+
+message GetInfoResponse {
+  // Bumped only for incompatible changes; additions are capabilities.
+  uint32 protocol_version = 1;
+
+  // The release version, or "dev" for a local build.
+  string version = 2;
+
+  // The newest commit that changed the helper's sources, when known.
+  string commit = 3;
+
+  // As GetCapabilitiesResponse lists them: WorkspaceService method names and
+  // features, e.g. "SearchText" and "search_files.fuzzy".
+  repeated string capabilities = 4;
+}
+
+message OpenWorkspaceRequest {
+  // Absolute path of an existing directory.
+  string root = 1;
+
+  // Opened before any search asks: list only Git's tracked files, and leave a
+  // walk, outside Git or when Git fails, to the first search. Feature
+  // "open_workspace.ahead_of_search".
+  bool ahead_of_search = 2;
+}
+
+message OpenWorkspaceResponse {
+  // Pass in the `omnigent-workspace-id` header of WorkspaceService calls.
+  string workspace_id = 1;
+
+  // The root with symlinks resolved.
+  string root = 2;
+
+  // The enclosing Git repository's top level, or empty outside one.
+  string repository_root = 3;
+}
+
+message CloseWorkspaceRequest {
+  string workspace_id = 1;
+}
+
+message CloseWorkspaceResponse {}
