@@ -67,7 +67,12 @@ export interface FunctionCallItem extends BaseItem {
 export interface FunctionCallOutputItem extends BaseItem {
   type: "function_call_output";
   call_id: string;
+  /** The tool's result, or only its head when `output_truncated` is set. */
   output: string;
+  /** Set on `tool_output=preview` pages whose `output` is a prefix of the stored result. */
+  output_truncated?: boolean;
+  /** Character count of the stored result; sent with `output_truncated`. */
+  output_length?: number;
 }
 
 /**

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from typing import Any
 
 from fastapi import (
     APIRouter,
@@ -41,7 +42,9 @@ from omnigent.server.routes._auth_helpers import (
 from omnigent.server.routes._errors import (
     STALE_CURSOR_RESPONSE,
 )
+from omnigent.server.routes._errors import item_not_found as _item_not_found
 from omnigent.server.routes._errors import session_not_found as _session_not_found
+from omnigent.server.routes._gzip_route import GZipFileContentRoute
 from omnigent.server.routes._sessions.common import (
     _session_status_cache,
     get_server_runner_router,
@@ -57,12 +60,13 @@ from omnigent.server.schemas import (
     AgentCostList,
     ChildSessionList,
     PaginatedList,
+    SessionItem,
     SessionItemList,
     SideChatList,
     SideChatSummary,
 )
 from omnigent.stores import AgentStore, ConversationStore
-from omnigent.stores.conversation_store import runner_seen_is_fresh
+from omnigent.stores.conversation_store import PENDING_INPUT_RESPONSE_ID, runner_seen_is_fresh
 from omnigent.stores.permission_store import PermissionStore
 
 # ``?descendants=true`` depth: the default matches the CLI tree and the web
@@ -91,6 +95,41 @@ def _is_settle_candidate(conv: Conversation) -> bool:
     )
 
 
+# Characters of a tool output kept in a ``tool_output=preview`` page. The chat
+# transcript renders tool rows collapsed, so the preview only has to cover the
+# moment between expanding a row and the full item arriving — and it lets the
+# common short results (edit acks, small command output) skip that fetch.
+TOOL_OUTPUT_PREVIEW_CHARS = 400
+
+
+def project_tool_output_preview(
+    item: dict[str, Any], *, preview_chars: int = TOOL_OUTPUT_PREVIEW_CHARS
+) -> dict[str, Any]:
+    """
+    Replace a long tool output with its head plus length and truncation markers.
+
+    Items other than ``function_call_output``, and outputs that fit within
+    ``preview_chars``, are returned unchanged, so a client can treat an item
+    without ``output_truncated`` exactly as a full one.
+
+    :param item: One item in the ``to_api_dict`` shape.
+    :param preview_chars: Characters of ``output`` to keep, e.g. ``400``.
+    :returns: The same dict, or a copy whose ``output`` is the preview with
+        ``output_length`` (full character count) and ``output_truncated=True``.
+    """
+    if item.get("type") != "function_call_output":
+        return item
+    output = item.get("output")
+    if not isinstance(output, str) or len(output) <= preview_chars:
+        return item
+    return {
+        **item,
+        "output": output[:preview_chars],
+        "output_length": len(output),
+        "output_truncated": True,
+    }
+
+
 def register_items_routes(
     router: APIRouter,
     *,
@@ -101,6 +140,29 @@ def register_items_routes(
     liveness_lookup: Callable[[list[str]], dict[str, SessionLiveness]] | None = None,
 ) -> None:
     """Register the items routes on router."""
+
+    # Item reads carry tool output — often whole files — so a page is as large
+    # as the transcript it covers. They sit on their own router purely to
+    # attach GZipFileContentRoute, like the workspace-file reads; included
+    # into ``router`` at the end of this function.
+    item_read_router = APIRouter(route_class=GZipFileContentRoute)
+
+    async def _require_session_read(request: Request, session_id: str) -> None:
+        """
+        Authorize READ on the session, raising 404 when it does not exist.
+
+        :param request: Inbound HTTP request carrying the caller identity.
+        :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+        :raises OmnigentError: 403 without READ; 404 if no session exists.
+        """
+        user_id = _get_user_id(request, auth_provider)
+        access = await _require_access_and_level(
+            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        )
+        if access.conversation is None:
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if conv is None:
+                raise _session_not_found()
 
     async def _may_settle_children(
         user_id: str | None, parent: Conversation, displayed_level: int | None
@@ -170,7 +232,7 @@ def register_items_routes(
             may_settle=lambda _conv: True,
         )
 
-    @router.get(
+    @item_read_router.get(
         "/sessions/{session_id}/items",
         response_model=None,
         responses={200: {"model": SessionItemList}, **STALE_CURSOR_RESPONSE},
@@ -182,6 +244,7 @@ def register_items_routes(
         after: str | None = Query(default=None),
         before: str | None = Query(default=None),
         order: str = Query(default="asc", pattern="^(asc|desc)$"),
+        tool_output: str = Query(default="full", pattern="^(full|preview)$"),
         type: str | None = Query(default=None, pattern=_ITEM_TYPE_PATTERN),
     ) -> PaginatedList:
         """
@@ -200,20 +263,21 @@ def register_items_routes(
         :param before: Cursor — return items before this item ID.
         :param order: Sort order, ``"asc"`` (chronological,
             default) or ``"desc"``.
+        :param tool_output: ``"full"`` (default) returns every item as
+            stored. ``"preview"`` keeps only the first 400 characters
+            of each ``function_call_output`` and adds ``output_length``
+            and ``output_truncated=true`` to the items it shortened;
+            the full item stays available from
+            ``GET /sessions/{id}/items/{item_id}``. Tool output
+            dominates the bytes of a transcript page, so a preview page
+            costs a small fraction of a full one.
         :param type: Only items of this type, e.g. ``"message"``; ``None``
             lists every type. An unknown type is a 422.
         :returns: A page of flattened conversation items, documented as
             :class:`SessionItemList`.
         :raises OmnigentError: 404 if no session exists.
         """
-        user_id = _get_user_id(request, auth_provider)
-        access = await _require_access_and_level(
-            user_id, session_id, LEVEL_READ, permission_store, conversation_store
-        )
-        if access.conversation is None:
-            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-            if conv is None:
-                raise _session_not_found()
+        await _require_session_read(request, session_id)
         page = await asyncio.to_thread(
             conversation_store.list_items,
             session_id,
@@ -224,12 +288,48 @@ def register_items_routes(
             type=type,
         )
         data = [m.to_api_dict() for m in page.data]
+        if tool_output == "preview":
+            data = [project_tool_output_preview(item) for item in data]
         return PaginatedList(
             data=data,
             first_id=page.first_id,
             last_id=page.last_id,
             has_more=page.has_more,
         )
+
+    @item_read_router.get(
+        "/sessions/{session_id}/items/{item_id}",
+        response_model=None,
+        responses={
+            200: {"model": SessionItem, "description": "The item, flat as in the list route."}
+        },
+    )
+    async def get_session_item(
+        request: Request,
+        session_id: str,
+        item_id: str,
+    ) -> dict[str, Any]:
+        """
+        Return one committed item with its full payload.
+
+        Lets a client that listed items with ``tool_output=preview``
+        fetch a tool output in full when the reader expands it.
+
+        :param session_id: Session/conversation identifier,
+            e.g. ``"conv_abc123"``.
+        :param item_id: Item identifier from the list route,
+            e.g. ``"fco_abc123"``.
+        :returns: The item in the same flat shape as the list route.
+        :raises OmnigentError: 404 if no session exists, or the item is
+            not a committed item of this session.
+        """
+        await _require_session_read(request, session_id)
+        item = await asyncio.to_thread(conversation_store.get_item, session_id, item_id)
+        # Queued inputs live in the same table under a reserved response id;
+        # the list route hides them, so the point read does too.
+        if item is None or item.response_id == PENDING_INPUT_RESPONSE_ID:
+            raise _item_not_found()
+        return item.to_api_dict()
 
     # ── GET /sessions/{session_id}/agent_costs ───────────────────
 
@@ -559,3 +659,5 @@ def register_items_routes(
             last_id=ids[-1] if ids else None,
             has_more=has_more,
         )
+
+    router.include_router(item_read_router)

@@ -19,6 +19,7 @@ from omnigent.errors import SESSION_AGENT_MISSING_MESSAGE, ErrorCode, OmnigentEr
 from omnigent.server.schemas import ErrorResponse
 
 _SESSION_NOT_FOUND: str = "Session not found"
+_ITEM_NOT_FOUND: str = "Item not found"
 
 
 def agent_removed() -> OmnigentError:
@@ -44,6 +45,18 @@ def session_not_found() -> OmnigentError:
         ``"Session not found"`` and code :attr:`ErrorCode.NOT_FOUND`.
     """
     return OmnigentError(_SESSION_NOT_FOUND, code=ErrorCode.NOT_FOUND)
+
+
+def item_not_found() -> OmnigentError:
+    """Build the ``NOT_FOUND`` error for a conversation item that is not in the session.
+
+    Raised by the per-item read when the id is unknown, belongs to another
+    session, or names a queued (not yet committed) input.
+
+    :returns: A fresh :class:`OmnigentError` with message ``"Item not found"``
+        and code :attr:`ErrorCode.NOT_FOUND`.
+    """
+    return OmnigentError(_ITEM_NOT_FOUND, code=ErrorCode.NOT_FOUND)
 
 
 STALE_CURSOR_RESPONSE: dict[int | str, dict[str, Any]] = {

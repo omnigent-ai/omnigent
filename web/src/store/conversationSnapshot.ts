@@ -79,10 +79,22 @@ export async function fetchConversationSnapshot(
     withRetries(readSession),
     withRetries((attempt) =>
       withDeadline(
-        (signal) => fetchSessionItemsPage(id, { limit: INITIAL_WINDOW_ITEMS, signal }),
+        (signal) => fetchHistoryPage(id, { limit: INITIAL_WINDOW_ITEMS, signal }),
         attempt,
       ),
     ),
   ]);
   return { session, page };
+}
+
+/**
+ * Transcript hydration asks for lean tool output: tool rows render collapsed,
+ * so a result is fetched in full only when the reader expands it
+ * (`loadToolOutput`). Tool output is most of a history page's bytes.
+ */
+export function fetchHistoryPage(
+  sessionId: string,
+  options: { olderThan?: string; limit?: number; signal?: AbortSignal } = {},
+): Promise<SessionItemsPage> {
+  return fetchSessionItemsPage(sessionId, { ...options, toolOutput: "preview" });
 }

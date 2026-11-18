@@ -6,7 +6,13 @@
 // `blockStream.test.ts`.
 
 import { describe, expect, it } from "vitest";
-import type { AnyBlock, BlockContext, MessageContentBlock, ToolExecution } from "./blocks";
+import type {
+  AnyBlock,
+  BlockContext,
+  MessageContentBlock,
+  ToolExecution,
+  ToolResultBlock,
+} from "./blocks";
 import { BlockStream } from "./blockStream";
 import type { ConversationItem } from "./conversationItems";
 import type { StreamEvent } from "./events";
@@ -1572,6 +1578,40 @@ describe("buildBubbles — tool joining", () => {
     expect(t.itemId).toBe("fc_1");
     expect(t.startedAt).toBe(10);
     expect(t.duration).toBe(2.25);
+  });
+
+  it("tool item names its result item and the stored length of a lean-page preview", () => {
+    const toolItemFor = (result: Partial<ToolResultBlock>) => {
+      const blocks: AnyBlock[] = [
+        {
+          type: "tool_group",
+          ctx: ctx({ itemId: "fc_1", timestamp: 10 }),
+          executions: [mkExec("Read", "c1")],
+          iteration: 0,
+        },
+        {
+          type: "tool_result",
+          ctx: ctx({ itemId: "fco_1", timestamp: 12 }),
+          name: "Read",
+          callId: "c1",
+          agentName: "test",
+          output: "head",
+          ...result,
+        },
+      ];
+      const bubbles = buildBubbles(blocks, null);
+      return (bubbles[0] as Extract<Bubble, { kind: "assistant" }>).items[0] as Extract<
+        RenderItem,
+        { kind: "tool" }
+      >;
+    };
+    const preview = toolItemFor({ truncatedOutputLength: 4096 });
+    expect(preview.resultItemId).toBe("fco_1");
+    expect(preview.truncatedOutputLength).toBe(4096);
+    // A full result: the id is still known (nothing to fetch), no length.
+    const full = toolItemFor({});
+    expect(full.resultItemId).toBe("fco_1");
+    expect(full).not.toHaveProperty("truncatedOutputLength");
   });
 
   it("tool_group without matching result, lifecycle streaming → state input-available", () => {
