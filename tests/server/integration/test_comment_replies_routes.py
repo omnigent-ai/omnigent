@@ -72,6 +72,15 @@ async def test_reply_routes_permissions_and_pagination(
     assert len(response.json()["replies"]) == 100 and response.json()["next_cursor"] is None
     listed = (await auth_client.get(f"/v1/sessions/{session_id}/comments", headers=reader)).json()
     assert listed[0]["reply_count"] == 200
+    patched = await auth_client.patch(
+        f"/v1/sessions/{session_id}/comments/{comment.id}",
+        headers=editor,
+        json={"status": "addressed"},
+    )
+    assert patched.json()["reply_count"] == 200
+    assert patched.json()["last_reply"] == listed[0]["last_reply"]
+    descending = await auth_client.get(base, headers=reader, params={"order": "desc", "limit": 1})
+    assert descending.json()["replies"][0]["id"] == response.json()["replies"][-1]["id"]
     assert listed[0]["last_reply"] == {
         "author_kind": "user",
         "created_by": None,
@@ -111,6 +120,13 @@ async def test_agent_reply_requires_matching_runner_origin(
         ORCHESTRATION_SOURCE_HEADER: str(uuid.UUID(session_id)),
         RUNNER_TUNNEL_TOKEN_HEADER: token,
     }
+    assert (
+        await auth_client.post(
+            base + "/agent",
+            headers={**headers, "X-Forwarded-Email": EDITOR},
+            json={"body": "Non-owner spoof"},
+        )
+    ).status_code == 403
     response = await auth_client.post(
         base + "/agent", headers=headers, json={"body": "Agent answer"}
     )

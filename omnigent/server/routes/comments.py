@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import asdict
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Query, Request
 from pydantic import BaseModel, field_validator, model_validator
@@ -27,8 +27,8 @@ from omnigent.server.routes._auth_helpers import (
 from omnigent.server.routes._errors import session_not_found
 from omnigent.stores import ConversationStore
 from omnigent.stores.comment_store import (
+    AGENT_COMMENT_REPLY_WINDOW,
     MAX_COMMENT_PAGE_SIZE,
-    MAX_REPLIES_PER_COMMENT,
     CommentReplyLimitError,
     CommentStore,
     serialize_comment_anchor,
@@ -68,9 +68,16 @@ def _format_message(
                 lines.append(
                     f"  Answer in-thread with reply_to_comment(comment_id={c.id!r}, body=...)."
                 )
+                omitted = c.reply_count - len(thread)
+                if omitted > 0:
+                    lines.append(f"  ({omitted} earlier replies omitted; call list_comments)")
                 for reply in thread:
                     label = "Agent" if reply.author_kind == "agent" else "User"
-                    lines.append(f"  {label}: {reply.body}")
+                    if reply.created_by is not None:
+                        label += f" ({reply.created_by})"
+                    reply_lines = reply.body.splitlines()
+                    lines.append(f"  {label}: {reply_lines[0]}")
+                    lines.extend(f"    {line}" for line in reply_lines[1:])
 
     return "\n".join(lines)
 
@@ -93,7 +100,7 @@ class ReplyCursor(BaseModel):
 
 
 class CommentReplyPage(BaseModel):
-    """Oldest-first reply page."""
+    """Reply page in the requested order."""
 
     replies: list[CommentReply]
     next_cursor: ReplyCursor | None
@@ -410,7 +417,7 @@ def create_comments_router(
         await _require_session_access(user_id, session_id, LEVEL_EDIT)
         if permission_store is not None:
             await _require_comment_author(user_id, comment_id, session_id)
-        deleted = store.delete(comment_id, session_id)
+        deleted = await asyncio.to_thread(store.delete, comment_id, session_id)
         if deleted is None:
             raise OmnigentError("Comment not found", code=ErrorCode.NOT_FOUND)
         return {"deleted": True}
@@ -428,8 +435,9 @@ def create_comments_router(
         after_created_at: int | None = Query(None, ge=0),
         after_id: str | None = Query(None, pattern=r"^[0-9a-f]{32}$"),
         limit: int = Query(50, ge=1, le=100),
+        order: Literal["asc", "desc"] = Query("asc"),
     ) -> CommentReplyPage:
-        """Read an oldest-first thread page with LEVEL_READ access."""
+        """Read a thread page (oldest-first by default) with LEVEL_READ access."""
         await _require_session_access(get_user_id(request, auth_provider), session_id, LEVEL_READ)
         await _require_parent(comment_id, session_id)
         try:
@@ -440,6 +448,7 @@ def create_comments_router(
                 limit=limit,
                 after_created_at=after_created_at,
                 after_id=after_id,
+                order=order,
             )
         except ValueError as exc:
             raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
@@ -449,17 +458,14 @@ def create_comments_router(
         )
 
     async def _append_reply(
-        request: Request,
+        user_id: str | None,
         session_id: str,
         comment_id: str,
         body: AddCommentReplyRequest,
         *,
         agent: bool = False,
     ) -> CommentReply:
-        """Apply the same edit gate and storage validation for both writer transports."""
-        user_id = get_user_id(request, auth_provider)
-        await _require_session_access(user_id, session_id, LEVEL_EDIT)
-        await _require_parent(comment_id, session_id)
+        """Append after the caller has authorized its writer transport."""
         try:
             reply = await asyncio.to_thread(
                 store.add_reply,
@@ -485,7 +491,9 @@ def create_comments_router(
         body: AddCommentReplyRequest,
     ) -> CommentReply:
         """Append a user reply with LEVEL_EDIT access; a full thread returns 409."""
-        return await _append_reply(request, session_id, comment_id, body)
+        user_id = get_user_id(request, auth_provider)
+        await _require_session_access(user_id, session_id, LEVEL_EDIT)
+        return await _append_reply(user_id, session_id, comment_id, body)
 
     @router.post("/sessions/{session_id}/comments/{comment_id}/replies/agent")
     async def add_agent_comment_reply(
@@ -517,7 +525,7 @@ def create_comments_router(
             raise OmnigentError(
                 "Agents may reply only in their source session", code=ErrorCode.FORBIDDEN
             )
-        return await _append_reply(request, session_id, comment_id, body, agent=True)
+        return await _append_reply(user_id, session_id, comment_id, body, agent=True)
 
     @router.delete("/sessions/{session_id}/comments/{comment_id}/replies/{reply_id}")
     async def delete_comment_reply(
@@ -601,9 +609,10 @@ def create_comments_router(
         threads = await asyncio.to_thread(
             lambda: {
                 comment.id: store.recent_replies(
-                    comment.id, session_id, limit=MAX_REPLIES_PER_COMMENT
+                    comment.id, session_id, limit=AGENT_COMMENT_REPLY_WINDOW
                 )
                 for comment in to_send
+                if comment.reply_count > 0
             }
         )
         formatted = _format_message(to_send, threads)

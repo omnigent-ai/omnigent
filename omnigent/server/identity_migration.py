@@ -258,6 +258,7 @@ def remap_identities(
             for model, column in (
                 (SqlComment, SqlComment.created_by),
                 (SqlCommentReply, SqlCommentReply.created_by),
+                (SqlComment, SqlComment.last_reply_created_by),
                 (SqlPolicy, SqlPolicy.created_by),
             ):
                 result = cast(
@@ -265,7 +266,7 @@ def remap_identities(
                     session.execute(
                         update(model)
                         .where(model.workspace_id == current_workspace_id(), column == old_id)
-                        .values(created_by=new_id)
+                        .values({column: new_id})
                     ),
                 )
                 report._bump(model.__tablename__, result.rowcount or 0)

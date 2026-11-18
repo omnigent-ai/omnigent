@@ -171,6 +171,9 @@ def test_remap_repoints_comments_policies_tokens_hosts(db_uri: str) -> None:
     )
     assert reply is not None
     remap_identities(engine, {"alice": "alice@example.com"}, dry_run=False)
+    migrated = SqlAlchemyCommentStore(db_uri).get(reply.comment_id, reply.conversation_id)
+    assert migrated is not None and migrated.last_reply is not None
+    assert migrated.last_reply.created_by == "alice@example.com"
 
     with Session(engine) as s:
         assert (

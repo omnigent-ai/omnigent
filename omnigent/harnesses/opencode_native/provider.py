@@ -412,7 +412,8 @@ def build_opencode_omnigent_mcp_server(
 
     This is what makes opencode's model call the Omnigent builtin tools
     (``sys_session_*``, ``sys_agent_*``, ``load_skill``, ``web_fetch``,
-    ``list_comments``/``update_comment``, policy tools, …). opencode launches the
+    ``list_comments``/``update_comment``/``reply_to_comment``, policy tools, …).
+    opencode launches the
     SHARED ``omnigent.harnesses.claude_native.bridge serve-mcp`` as a ``{type:"local"}``
     stdio MCP server (the same relay codex/cursor/qwen use); ``serve-mcp`` reads
     the relay URL+token from ``tool_relay.json`` in *bridge_dir* (written by the

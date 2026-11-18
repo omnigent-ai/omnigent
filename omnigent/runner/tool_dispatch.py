@@ -77,6 +77,7 @@ from omnigent.runner.journal_tools import (
 from omnigent.runner.session_requests import remember_session_host
 from omnigent.runtime.mcp_tool_result import encode_mcp_image_result, native_image_payload
 from omnigent.spec.types import MEMORY_TOOL_NAMES
+from omnigent.stores.comment_store import AGENT_COMMENT_REPLY_WINDOW
 from omnigent.tools import ToolManager
 from omnigent.tools.base import Tool, ToolContext
 from omnigent.tools.browser_agent_tools import ADVANCED_BROWSER_TOOL_NAMES
@@ -5042,33 +5043,24 @@ async def _execute_comment_tool(
             comment_id = _optional_string(comment.get("id"))
             if comment_id is None:
                 continue
-            replies: list[_JsonObject] = []
-            cursor_params: dict[str, str | int] = {"limit": 100}
+            comment["replies"] = []
             try:
-                while True:
-                    response = await server_client.get(
-                        f"{base}/{_route_identifier(comment_id, 'Comment')}/replies",
-                        params=cursor_params,
-                        timeout=30.0,
+                response = await server_client.get(
+                    f"{base}/{_route_identifier(comment_id, 'Comment')}/replies",
+                    params={"order": "desc", "limit": AGENT_COMMENT_REPLY_WINDOW},
+                    timeout=30.0,
+                )
+                if response.status_code != 200:
+                    comment["replies_note"] = (
+                        f"Thread unavailable (HTTP {response.status_code}); retry list_comments."
                     )
-                    if response.status_code != 200:
-                        return json.dumps(
-                            {"error": f"list_comments replies returned {response.status_code}"}
-                        )
-                    page = response.json()
-                    replies.extend(page["replies"])
-                    cursor = page.get("next_cursor")
-                    if cursor is None:
-                        break
-                    cursor_params.update(
-                        after_created_at=cursor["created_at"], after_id=cursor["id"]
-                    )
+                    continue
                 comment["replies"] = [
                     {key: reply[key] for key in ("author_kind", "body", "created_at")}
-                    for reply in replies[-20:]
+                    for reply in reversed(response.json()["replies"])
                 ]
             except Exception as exc:  # noqa: BLE001
-                return json.dumps({"error": f"list_comments replies failed: {exc}"})
+                comment["replies_note"] = f"Thread unavailable: {exc}; retry list_comments."
         return json.dumps({"comments": all_comments})
 
     if tool_name == ReplyToCommentTool.name():
@@ -5084,7 +5076,9 @@ async def _execute_comment_tool(
                 timeout=30.0,
             )
             if response.status_code != 200:
-                return json.dumps({"error": f"reply_to_comment returned {response.status_code}"})
+                return json.dumps(
+                    {"error": f"reply_to_comment returned {response.status_code}: {response.text}"}
+                )
             return json.dumps({"reply": response.json()})
         except Exception as exc:  # noqa: BLE001
             return json.dumps({"error": f"reply_to_comment failed: {exc}"})

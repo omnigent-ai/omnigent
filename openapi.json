@@ -1960,7 +1960,7 @@
         "type": "object"
       },
       "CommentReplyPage": {
-        "description": "Oldest-first reply page.",
+        "description": "Reply page in the requested order.",
         "properties": {
           "next_cursor": {
             "anyOf": [
@@ -23947,7 +23947,7 @@
     },
     "/v1/sessions/{session_id}/comments/{comment_id}/replies": {
       "get": {
-        "description": "Read an oldest-first thread page with LEVEL_READ access.",
+        "description": "Read a thread page (oldest-first by default) with LEVEL_READ access.",
         "operationId": "list_comment_replies_v1_sessions__session_id__comments__comment_id__replies_get",
         "parameters": [
           {
@@ -24012,6 +24012,20 @@
               "minimum": 1,
               "title": "Limit",
               "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "order",
+            "required": false,
+            "schema": {
+              "default": "asc",
+              "enum": [
+                "asc",
+                "desc"
+              ],
+              "title": "Order",
+              "type": "string"
             }
           }
         ],

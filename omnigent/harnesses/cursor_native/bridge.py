@@ -46,6 +46,7 @@ _USAGE_HOOK_MODULE = "omnigent.harnesses.cursor_native.usage"
 _MCP_SERVER_NAME = "omnigent"
 _CURSOR_AUTO_APPROVE_TOOLS = [
     "list_comments",
+    "reply_to_comment",
     "sys_add_policy",
     "sys_agent_download",
     "sys_agent_get",

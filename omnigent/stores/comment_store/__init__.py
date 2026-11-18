@@ -3,6 +3,7 @@
 import json
 from abc import ABC, abstractmethod
 from dataclasses import asdict
+from typing import Literal
 
 from omnigent.db.compression import encode
 from omnigent.entities import Comment, CommentsFingerprint
@@ -13,6 +14,7 @@ from omnigent.entities.comment import (
 )
 
 MAX_COMMENT_PAGE_SIZE = 100
+AGENT_COMMENT_REPLY_WINDOW = 20
 
 
 def serialize_comment_anchor(anchor: PullRequestCommentAnchor | None) -> str | None:
@@ -204,6 +206,7 @@ class CommentStore(ABC):
         """
         ...
 
+    @abstractmethod
     def add_reply(
         self,
         comment_id: str,
@@ -216,13 +219,14 @@ class CommentStore(ABC):
         """Append atomically under the parent lock; None means no parent."""
         raise NotImplementedError
 
+    @abstractmethod
     def get_reply(
         self, comment_id: str, conversation_id: str, reply_id: str
     ) -> CommentReply | None:
         """Read a reply scoped to its conversation and parent comment."""
-        del comment_id, conversation_id, reply_id
-        return None
+        raise NotImplementedError
 
+    @abstractmethod
     def list_replies(
         self,
         comment_id: str,
@@ -231,22 +235,23 @@ class CommentStore(ABC):
         limit: int = 50,
         after_created_at: int | None = None,
         after_id: str | None = None,
+        order: Literal["asc", "desc"] = "asc",
     ) -> tuple[list[CommentReply], tuple[int, str] | None]:
-        """Return oldest-first messages and an exclusive (epoch µs, ID) cursor."""
-        del comment_id, conversation_id, limit, after_created_at, after_id
-        return [], None
+        """Return ordered messages and an exclusive (epoch µs, ID) cursor."""
+        raise NotImplementedError
 
+    @abstractmethod
     def recent_replies(
         self,
         comment_id: str,
         conversation_id: str,
         *,
-        limit: int = 20,
+        limit: int = AGENT_COMMENT_REPLY_WINDOW,
     ) -> list[CommentReply]:
         """Return the latest bounded messages in oldest-first order for agent context."""
-        del comment_id, conversation_id, limit
-        return []
+        raise NotImplementedError
 
+    @abstractmethod
     def delete_reply(
         self,
         comment_id: str,

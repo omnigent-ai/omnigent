@@ -57,7 +57,7 @@ async def test_runner_comment_reply_transport() -> None:
                 json={
                     "replies": [
                         {"author_kind": "agent", "body": f"Reply {index}", "created_at": index}
-                        for index in range(21)
+                        for index in range(20, 0, -1)
                     ],
                     "next_cursor": None,
                 },
@@ -79,5 +79,47 @@ async def test_runner_comment_reply_transport() -> None:
         listed = await _execute_comment_tool(
             "list_comments", "{}", conversation_id="1" * 32, server_client=client
         )
+        assert calls[-1].url.params == httpx.QueryParams({"order": "desc", "limit": "20"})
         replies = json.loads(listed)["comments"][0]["replies"]
         assert len(replies) == 20 and replies[0]["body"] == "Reply 1"
+
+
+@pytest.mark.asyncio
+async def test_runner_comment_context_degrades_per_thread() -> None:
+    calls = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        if request.method == "POST":
+            return httpx.Response(409, json={"detail": "A comment can have at most 200 replies"})
+        if request.url.path.endswith("/replies"):
+            return httpx.Response(503)
+        return httpx.Response(
+            200,
+            json=[
+                {"id": "2" * 32, "reply_count": 1},
+                {"id": "3" * 32, "reply_count": 0},
+            ],
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://test"
+    ) as client:
+        listed = json.loads(
+            await _execute_comment_tool(
+                "list_comments", "{}", conversation_id="1" * 32, server_client=client
+            )
+        )
+        assert len(calls) == 2
+        assert listed["comments"][0]["replies"] == []
+        assert "503" in listed["comments"][0]["replies_note"]
+        assert listed["comments"][1]["replies"] == []
+        error = json.loads(
+            await _execute_comment_tool(
+                "reply_to_comment",
+                json.dumps({"comment_id": "2" * 32, "body": "Answer"}),
+                conversation_id="1" * 32,
+                server_client=client,
+            )
+        )
+        assert "at most 200 replies" in error["error"]

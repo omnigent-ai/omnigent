@@ -29,6 +29,15 @@ class _InMemoryCommentStore(CommentStore):
         super().__init__(storage_location="memory://")
         self._comments: dict[str, Comment] = {}
 
+    def _unsupported_reply(self, *args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("This fake has no comment replies")
+
+    add_reply = _unsupported_reply
+    get_reply = _unsupported_reply
+    list_replies = _unsupported_reply
+    recent_replies = _unsupported_reply
+    delete_reply = _unsupported_reply
+
     def add(
         self,
         conversation_id: str,

@@ -6,6 +6,7 @@ import json
 from dataclasses import asdict
 from typing import Any
 
+from omnigent.stores.comment_store import AGENT_COMMENT_REPLY_WINDOW
 from omnigent.tools.base import Tool, ToolContext
 
 
@@ -121,7 +122,13 @@ class ListCommentsTool(Tool):
                     "body": reply.body,
                     "created_at": reply.created_at,
                 }
-                for reply in store.recent_replies(comment.id, ctx.conversation_id)
+                for reply in (
+                    store.recent_replies(
+                        comment.id, ctx.conversation_id, limit=AGENT_COMMENT_REPLY_WINDOW
+                    )
+                    if comment.reply_count
+                    else []
+                )
             ]
             result.append(entry)
         return json.dumps({"comments": result})

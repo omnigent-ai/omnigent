@@ -377,7 +377,15 @@ async def test_send_comments_includes_thread(
         "Please address the following review comments.\n\nFile: file.py\n"
         "• (offset 0–1): Why this way?"
     )
-    store.add_reply(parent.id, session_id, "Could you explain?", author_kind="user")
+    for index in range(19):
+        store.add_reply(parent.id, session_id, f"Old reply {index}")
+    store.add_reply(
+        parent.id,
+        session_id,
+        "Could you explain?\nSecond line",
+        author_kind="user",
+        created_by="a@example.test",
+    )
     store.add_reply(parent.id, session_id, "It preserves order", author_kind="agent")
     response = await client.post(
         f"/v1/sessions/{session_id}/comments/send", json={"comment_ids": [parent.id]}
@@ -385,5 +393,8 @@ async def test_send_comments_includes_thread(
     assert response.status_code == 200
     message = response.json()["formatted_message"]
     assert f"reply_to_comment(comment_id='{parent.id}'" in message
-    assert "User: Could you explain?" in message and "Agent: It preserves order" in message
-    assert message.index("User:") < message.index("Agent:")
+    assert "(1 earlier replies omitted; call list_comments)" in message
+    assert "Old reply 0\n" not in message
+    assert "User (a@example.test): Could you explain?\n    Second line" in message
+    assert "Agent: It preserves order" in message
+    assert message.index("User (a@example.test):") < message.index("Agent:")

@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import json
 import uuid
-from typing import cast
+from typing import Literal, cast
 
 from sqlalchemy import and_, delete, func, or_, select, tuple_
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session
 
 from omnigent.db.db_models import SqlComment, SqlCommentReply, current_workspace_id
@@ -31,6 +32,7 @@ from omnigent.entities.comment import (
     PullRequestCommentAnchor,
 )
 from omnigent.stores.comment_store import (
+    AGENT_COMMENT_REPLY_WINDOW,
     MAX_COMMENT_PAGE_SIZE,
     MAX_REPLIES_PER_COMMENT,
     CommentReplyLimitError,
@@ -58,6 +60,17 @@ def _to_entity(row: SqlComment) -> Comment:
         updated_at=row.updated_at,
         anchor_content=row.anchor_content,
         created_by=row.created_by,
+        reply_count=row.reply_count,
+        last_reply=CommentReplySummary(
+            author_kind=cast(
+                CommentReplyAuthorKind,
+                decode_comment_reply_author_kind(row.last_reply_author_kind),
+            ),
+            created_by=row.last_reply_created_by,
+            created_at=row.last_reply_created_at,
+        )
+        if row.last_reply_author_kind is not None and row.last_reply_created_at is not None
+        else None,
         anchor_metadata=PullRequestCommentAnchor(**json.loads(row.anchor_metadata))
         if row.anchor_metadata
         else None,
@@ -134,6 +147,7 @@ class SqlAlchemyCommentStore(CommentStore):
                 anchor_content=anchor_content,
                 created_by=created_by,
                 anchor_metadata=serialized_anchor,
+                reply_count=0,
             )
             session.add(row)
             return _to_entity(row)
@@ -157,7 +171,7 @@ class SqlAlchemyCommentStore(CommentStore):
         stmt = stmt.order_by(SqlComment.created_at, SqlComment.id)
         with self._session("list_comments") as session:
             rows = list(session.execute(stmt).scalars().all())
-            return self._with_reply_counts(session, conversation_id, [_to_entity(r) for r in rows])
+            return [_to_entity(r) for r in rows]
 
     def list_page(
         self,
@@ -181,9 +195,7 @@ class SqlAlchemyCommentStore(CommentStore):
             rows = list(session.execute(stmt).scalars().all())
             page = rows[:limit]
             next_cursor = page[-1].id if len(rows) > limit else None
-            return self._with_reply_counts(
-                session, conversation_id, [_to_entity(row) for row in page]
-            ), next_cursor
+            return [_to_entity(row) for row in page], next_cursor
 
     def update_comment(
         self,
@@ -194,18 +206,21 @@ class SqlAlchemyCommentStore(CommentStore):
         body: str | None = None,
     ) -> Comment | None:
         """Update a comment's fields, scoped to a conversation. See base class for contract."""
-        updated_at = now_epoch_us() if status is not None or body is not None else None
 
         def write(session: Session) -> Comment | None:
-            row = session.get(SqlComment, (current_workspace_id(), conversation_id, comment_id))
+            row = session.get(
+                SqlComment,
+                (current_workspace_id(), conversation_id, comment_id),
+                with_for_update=True,
+            )
             if row is None:
                 return None
             if status is not None:
                 row.status = encode_comment_status(status)
             if body is not None:
                 row.body = body
-            if updated_at is not None:
-                row.updated_at = updated_at
+            if status is not None or body is not None:
+                row.updated_at = max(now_epoch_us(), row.updated_at + 1)
             return _to_entity(row)
 
         return run_write_transaction(self._session_immediate, "update_comment", write)
@@ -263,56 +278,6 @@ class SqlAlchemyCommentStore(CommentStore):
             SqlCommentReply.comment_id == comment_id,
         )
 
-    def _with_reply_counts(
-        self,
-        session: Session,
-        conversation_id: str,
-        comments: list[Comment],
-    ) -> list[Comment]:
-        """Attach counts in bounded batches rather than querying each comment."""
-        for offset in range(0, len(comments), MAX_COMMENT_PAGE_SIZE):
-            batch = comments[offset : offset + MAX_COMMENT_PAGE_SIZE]
-            ranked = (
-                select(
-                    SqlCommentReply.comment_id,
-                    SqlCommentReply.author_kind,
-                    SqlCommentReply.created_by,
-                    SqlCommentReply.created_at,
-                    func.count()
-                    .over(partition_by=SqlCommentReply.comment_id)
-                    .label("reply_count"),
-                    func.row_number()
-                    .over(
-                        partition_by=SqlCommentReply.comment_id,
-                        order_by=(SqlCommentReply.created_at.desc(), SqlCommentReply.id.desc()),
-                    )
-                    .label("reply_rank"),
-                )
-                .where(
-                    SqlCommentReply.workspace_id == current_workspace_id(),
-                    SqlCommentReply.conversation_id == conversation_id,
-                    SqlCommentReply.comment_id.in_([comment.id for comment in batch]),
-                )
-                .subquery()
-            )
-            latest = {
-                row.comment_id: row
-                for row in session.execute(select(ranked).where(ranked.c.reply_rank == 1))
-            }
-            for comment in batch:
-                reply = latest.get(comment.id)
-                if reply is not None:
-                    comment.reply_count = reply.reply_count
-                    comment.last_reply = CommentReplySummary(
-                        author_kind=cast(
-                            CommentReplyAuthorKind,
-                            decode_comment_reply_author_kind(reply.author_kind),
-                        ),
-                        created_by=reply.created_by,
-                        created_at=reply.created_at,
-                    )
-        return comments
-
     def add_reply(
         self,
         comment_id: str,
@@ -338,15 +303,7 @@ class SqlAlchemyCommentStore(CommentStore):
             )
             if parent is None:
                 return None
-            # A locking read also avoids a stale MySQL repeatable-read snapshot.
-            existing = session.execute(
-                select(SqlCommentReply.id)
-                .where(*self._thread_scope(comment_id, conversation_id))
-                .order_by(SqlCommentReply.created_at, SqlCommentReply.id)
-                .limit(MAX_REPLIES_PER_COMMENT + 1)
-                .with_for_update()
-            ).all()
-            if len(existing) >= MAX_REPLIES_PER_COMMENT:
+            if parent.reply_count >= MAX_REPLIES_PER_COMMENT:
                 raise CommentReplyLimitError(
                     f"A comment can have at most {MAX_REPLIES_PER_COMMENT} replies"
                 )
@@ -363,6 +320,10 @@ class SqlAlchemyCommentStore(CommentStore):
             )
             session.add(row)
             parent.updated_at = created_at
+            parent.reply_count += 1
+            parent.last_reply_author_kind = author_code
+            parent.last_reply_created_by = created_by
+            parent.last_reply_created_at = created_at
             return _reply_entity(row)
 
         return run_write_transaction(self._session_immediate, "append_reply", write)
@@ -385,8 +346,11 @@ class SqlAlchemyCommentStore(CommentStore):
         limit: int = 50,
         after_created_at: int | None = None,
         after_id: str | None = None,
+        order: Literal["asc", "desc"] = "asc",
     ) -> tuple[list[CommentReply], tuple[int, str] | None]:
         """Page on the thread index, with ID breaking equal timestamp ties."""
+        if order not in ("asc", "desc"):
+            raise ValueError("order must be asc or desc")
         if not 1 <= limit <= 100:
             raise ValueError("limit must be between 1 and 100")
         if (after_created_at is None) != (after_id is None):
@@ -395,14 +359,23 @@ class SqlAlchemyCommentStore(CommentStore):
         if after_created_at is not None:
             stmt = stmt.where(
                 or_(
-                    SqlCommentReply.created_at > after_created_at,
+                    (SqlCommentReply.created_at > after_created_at)
+                    if order == "asc"
+                    else (SqlCommentReply.created_at < after_created_at),
                     and_(
                         SqlCommentReply.created_at == after_created_at,
-                        SqlCommentReply.id > after_id,
+                        (SqlCommentReply.id > after_id)
+                        if order == "asc"
+                        else (SqlCommentReply.id < after_id),
                     ),
                 )
             )
-        stmt = stmt.order_by(SqlCommentReply.created_at, SqlCommentReply.id).limit(limit + 1)
+        ordering = (
+            (SqlCommentReply.created_at, SqlCommentReply.id)
+            if order == "asc"
+            else (SqlCommentReply.created_at.desc(), SqlCommentReply.id.desc())
+        )
+        stmt = stmt.order_by(*ordering).limit(limit + 1)
         with self._session("page_replies") as session:
             rows = list(session.execute(stmt).scalars())
             page = rows[:limit]
@@ -410,7 +383,7 @@ class SqlAlchemyCommentStore(CommentStore):
             return [_reply_entity(row) for row in page], cursor
 
     def recent_replies(
-        self, comment_id: str, conversation_id: str, *, limit: int = 20
+        self, comment_id: str, conversation_id: str, *, limit: int = AGENT_COMMENT_REPLY_WINDOW
     ) -> list[CommentReply]:
         """Read the latest agent-context window and restore chronological order."""
         if not 1 <= limit <= MAX_REPLIES_PER_COMMENT:
@@ -441,6 +414,25 @@ class SqlAlchemyCommentStore(CommentStore):
             if row is None:
                 return False
             session.delete(row)
+            parent.reply_count -= 1
+            if row.created_at == parent.last_reply_created_at:
+                latest = session.execute(
+                    select(
+                        SqlCommentReply.author_kind,
+                        SqlCommentReply.created_by,
+                        SqlCommentReply.created_at,
+                    )
+                    .where(
+                        *self._thread_scope(comment_id, conversation_id),
+                        SqlCommentReply.id != reply_id,
+                    )
+                    .order_by(SqlCommentReply.created_at.desc(), SqlCommentReply.id.desc())
+                    .limit(1)
+                    .with_for_update()
+                ).first()
+                parent.last_reply_author_kind = latest.author_kind if latest else None
+                parent.last_reply_created_by = latest.created_by if latest else None
+                parent.last_reply_created_at = latest.created_at if latest else None
             parent.updated_at = max(now_epoch_us(), parent.updated_at + 1)
             return True
 
@@ -448,7 +440,6 @@ class SqlAlchemyCommentStore(CommentStore):
 
     def remove_conversation(self, conversation_id: str) -> None:
         """Delete all comments for a conversation. See base class for contract."""
-        delete_conversation_replies(self._session_immediate, conversation_id)
         stmt = delete(SqlComment).where(
             SqlComment.workspace_id == current_workspace_id(),
             SqlComment.conversation_id == conversation_id,
@@ -458,6 +449,7 @@ class SqlAlchemyCommentStore(CommentStore):
             session.execute(stmt)
 
         run_write_transaction(self._session_immediate, "delete_conversation_comments", write)
+        delete_conversation_replies(self._session_immediate, conversation_id)
 
 
 def _reply_entity(row: SqlCommentReply) -> CommentReply:
@@ -495,12 +487,17 @@ def delete_conversation_replies(
                 .limit(MAX_COMMENT_PAGE_SIZE)
             ).all()
             if keys:
-                session.execute(
-                    delete(SqlCommentReply).where(
-                        *scope,
-                        tuple_(SqlCommentReply.comment_id, SqlCommentReply.id).in_(keys),
-                    )
+                result = cast(
+                    CursorResult,
+                    session.execute(
+                        delete(SqlCommentReply).where(
+                            *scope,
+                            tuple_(SqlCommentReply.comment_id, SqlCommentReply.id).in_(keys),
+                        )
+                    ),
                 )
+                if result.rowcount == 0:
+                    return 0
             return len(keys)
 
         if (
