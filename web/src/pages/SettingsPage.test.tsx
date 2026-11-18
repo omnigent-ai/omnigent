@@ -31,6 +31,8 @@ import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/ses
 import * as host from "@/lib/host";
 import * as adminView from "@/lib/adminView";
 import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
+import { UPDATE_MODE_ENTRY } from "@/pages/settings/search/catalog/updates";
+import { settingsDescriptionId } from "@/pages/settings/search/settingsControl";
 import { UI_FONT_SIZE_MOBILE_QUERY } from "@/lib/uiFontPreferences";
 import {
   CODE_BLOCK_WORD_WRAP_STORAGE_KEY,
@@ -1670,6 +1672,12 @@ describe("SettingsPage", () => {
     for (const id of ["update-mode", "install-updates-on-quit", "check-for-updates"]) {
       expect(document.querySelector(`[data-settings-item="${id}"]`)).not.toBeNull();
     }
+    expect(document.getElementById(settingsDescriptionId(UPDATE_MODE_ENTRY))).toHaveTextContent(
+      UPDATE_MODE_ENTRY.description,
+    );
+    expect(
+      screen.getByRole("switch", { name: "Install downloaded updates on next quit" }),
+    ).toBeInTheDocument();
   });
 
   it("surfaces manual update-check failures in Settings", async () => {

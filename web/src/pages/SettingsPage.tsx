@@ -2792,7 +2792,13 @@ function UpdatesSection() {
                   id={settingsLabelId(UPDATE_MODE_ENTRY)}
                   className="text-ui font-normal md:font-medium"
                 >
-                  Update mode
+                  {UPDATE_MODE_ENTRY.label}
+                </span>
+                <span
+                  id={settingsDescriptionId(UPDATE_MODE_ENTRY)}
+                  className="text-sm text-muted-foreground"
+                >
+                  {UPDATE_MODE_ENTRY.description}
                 </span>
                 <Select
                   value={config.mode}
