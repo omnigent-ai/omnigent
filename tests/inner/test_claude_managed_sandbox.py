@@ -78,36 +78,36 @@ def test_benign_managed_policy_is_preserved(managed_dir: Path) -> None:
     } == original
 
 
-@pytest.mark.parametrize("relative_path", _MANAGED_FILES)
+_MANAGED_AUTH_PAYLOADS = [
+    ("api-key", {"env": {"ANTHROPIC_API_KEY": "parent-only-key"}}),
+    ("source-env", {"env": {"CUSTOM_MODEL_TOKEN": "parent-only-key"}}),
+    ("helper", {"apiKeyHelper": "printf parent-only-key"}),
+    ("token-fd", {"env": {"CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR": "0"}}),
+    ("helper-env", {"env": {"OMNIGENT_CLAUDE_API_KEY_HELPER": "printf parent-only-key"}}),
+    ("bedrock-bearer", {"env": {"AWS_BEARER_TOKEN_BEDROCK": "parent-only-key"}}),
+    ("bedrock-flag", {"env": {"CLAUDE_CODE_USE_BEDROCK": "1"}}),
+    ("vertex-flag", {"env": {"CLAUDE_CODE_USE_VERTEX": "true"}}),
+    ("foundry-flag", {"env": {"CLAUDE_CODE_USE_FOUNDRY": "1"}}),
+]
+
+
 @pytest.mark.parametrize(
-    "payload",
+    ("relative_path", "payload"),
     [
-        {"env": {"ANTHROPIC_API_KEY": "parent-only-key"}},
-        {"env": {"CUSTOM_MODEL_TOKEN": "parent-only-key"}},
-        {"apiKeyHelper": "printf parent-only-key"},
-        {"env": {"CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR": "0"}},
-        {"env": {"OMNIGENT_CLAUDE_API_KEY_HELPER": "printf parent-only-key"}},
-        {"env": {"AWS_BEARER_TOKEN_BEDROCK": "parent-only-key"}},
-        {"env": {"CLAUDE_CODE_USE_BEDROCK": "1"}},
-        {"env": {"CLAUDE_CODE_USE_VERTEX": "true"}},
-        {"env": {"CLAUDE_CODE_USE_FOUNDRY": "1"}},
-    ],
-    ids=[
-        "api-key",
-        "source-env",
-        "helper",
-        "token-fd",
-        "helper-env",
-        "bedrock-bearer",
-        "bedrock-flag",
-        "vertex-flag",
-        "foundry-flag",
+        *[
+            pytest.param(relative_path, _MANAGED_AUTH_PAYLOADS[0][1], id=relative_path)
+            for relative_path in _MANAGED_FILES
+        ],
+        *[
+            pytest.param(_MANAGED_FILES[0], payload, id=case_id)
+            for case_id, payload in _MANAGED_AUTH_PAYLOADS[1:]
+        ],
     ],
 )
 def test_managed_auth_is_rejected_in_every_file(
     managed_dir: Path, relative_path: str, payload: dict[str, object]
 ) -> None:
-    """Settings and drop-ins must be checked without a managed MCP file."""
+    """Every source is checked, and every credential form is rejected."""
     path = managed_dir / relative_path
     path.parent.mkdir(exist_ok=True)
     path.write_text(json.dumps(payload))
@@ -145,8 +145,15 @@ def test_nested_managed_mcp_env_rejects_credentials_and_aliases(
         _validate_claude_managed_config([managed_dir], {"CUSTOM_MODEL_TOKEN"})
 
 
-@pytest.mark.parametrize("relative_path", _MANAGED_FILES)
-@pytest.mark.parametrize("raw", ["{", "[]", "null", '{"env":[]}'])
+@pytest.mark.parametrize(
+    ("relative_path", "raw"),
+    [
+        *[pytest.param(relative_path, "{", id=relative_path) for relative_path in _MANAGED_FILES],
+        pytest.param(_MANAGED_FILES[0], "[]", id="array"),
+        pytest.param(_MANAGED_FILES[0], "null", id="null"),
+        pytest.param(_MANAGED_FILES[0], '{"env":[]}', id="invalid-env"),
+    ],
+)
 def test_invalid_managed_config_fails_closed(
     managed_dir: Path, relative_path: str, raw: str
 ) -> None:

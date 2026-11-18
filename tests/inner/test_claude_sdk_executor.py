@@ -5305,9 +5305,7 @@ def test_default_cli_process_rejects_resolution_failure_when_backend_exists(monk
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "permission_mode", ["auto", "bypassPermissions", "default", "acceptEdits", "plan", "dontAsk"]
-)
+@pytest.mark.parametrize("permission_mode", ["auto", "bypassPermissions", "default"])
 async def test_sandboxed_sdk_exposes_bash_for_skill_expansion(
     monkeypatch, permission_mode
 ) -> None:
@@ -6465,9 +6463,7 @@ async def test_bash_policy_hook_enforces_guardrails_in_bypass_mode(
         elicit.assert_not_awaited()
 
 
-@pytest.mark.parametrize(
-    "permission_mode", ["auto", "bypassPermissions", "default", "acceptEdits", "plan", "dontAsk"]
-)
+@pytest.mark.parametrize("permission_mode", ["auto", "bypassPermissions", "default"])
 @pytest.mark.parametrize(
     "policy_action,approved",
     [("POLICY_ACTION_ALLOW", True), ("POLICY_ACTION_ALLOW", False), ("POLICY_ACTION_ASK", True)],

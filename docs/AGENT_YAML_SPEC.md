@@ -560,15 +560,17 @@ The CLI, sandboxed session terminals, and `sys_os_*` shell environments get this
 model relay automatically, including when `allow_network: false`. They can make
 inference requests using the placeholder; skills therefore have the session's inference
 capability. Real model tokens and auth commands stay in the trusted parent. The
-CLI uses private HOME/config/scratch directories. Host Claude state and credential
-files are excluded; conflicting filesystem grants stop startup. macOS also denies
-Keychain service access. Bundled skills remain available; host Claude state and
-plugins are not imported into the private home. Only bundled skills and their
-supporting files are copied into a separate plugin directory. Keep the original
-agent bundle, including its credential-bearing `config.yaml` and MCP configuration,
-outside the sandbox workspace and read/write grants; conflicting layouts fail
-before execution. Omnigent's Python runtime and framework installation must also
-remain outside sandbox-writable paths.
+CLI, sandboxed session terminals, and `sys_os_*` shell environments use private
+HOME/config/scratch directories. Home-relative Git, package-manager, and shell
+configuration may therefore be unavailable in all three. Host Claude state and
+credential files are excluded; conflicting filesystem grants stop startup. macOS
+also denies Keychain service access. Bundled skills remain available; host Claude
+state and plugins are not imported into the private home. Only bundled skills
+and their supporting files are copied into a separate plugin directory. Keep
+the original agent bundle, including its credential-bearing `config.yaml` and
+MCP configuration, outside the sandbox workspace and read/write grants;
+conflicting layouts fail before execution. Omnigent's Python runtime and
+framework installation must also remain outside sandbox-writable paths.
 
 Direct networking is disabled for these contained launches, including policies
 that previously enabled it with `allow_network: true`. Additional ordinary
