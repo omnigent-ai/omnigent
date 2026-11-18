@@ -135,26 +135,26 @@ export function CommentThread({
                   <span className="ml-auto shrink-0 text-[10px] text-muted-foreground">
                     {formatCommentTime(reply.created_at / 1_000_000, now)}
                   </span>
+                  {canEdit && ownReply(reply) && (
+                    <button
+                      type="button"
+                      aria-label="Delete reply"
+                      disabled={deleteReply.isPending}
+                      className="shrink-0 text-[11px] text-muted-foreground opacity-0 hover:text-destructive group-hover/reply:opacity-100 group-focus-within/reply:opacity-100"
+                      onClick={() => {
+                        setError(null);
+                        deleteReply.mutate(reply.id, {
+                          onError: (failure) => setError(failure.message),
+                        });
+                      }}
+                    >
+                      Delete
+                    </button>
+                  )}
                 </div>
                 <p className="mt-0.5 whitespace-pre-wrap break-words text-sm leading-relaxed">
                   {reply.body}
                 </p>
-                {canEdit && ownReply(reply) && (
-                  <button
-                    type="button"
-                    aria-label="Delete reply"
-                    disabled={deleteReply.isPending}
-                    className="text-[11px] text-muted-foreground opacity-0 hover:text-destructive focus-visible:opacity-100 group-hover/reply:opacity-100"
-                    onClick={() => {
-                      setError(null);
-                      deleteReply.mutate(reply.id, {
-                        onError: (failure) => setError(failure.message),
-                      });
-                    }}
-                  >
-                    Delete
-                  </button>
-                )}
               </div>
             </div>
           ))}
