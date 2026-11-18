@@ -1,6 +1,6 @@
 // The page the desktop design tools name in their requests: the one the view has loaded,
-// never an address still being typed in the bar.
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+// never an address still being typed in the bar. And design mode, offered while they can't load.
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type * as NativeBridge from "@/lib/nativeBridge";
 import { BrowserPane } from "./BrowserPane";
@@ -12,14 +12,57 @@ vi.mock("@/lib/nativeBridge", async (importOriginal) => ({
   isIOSShell: () => false,
   getDesktopFeatures: async () => null,
 }));
-// The tools themselves, reduced to the page they were handed.
-vi.mock("@/components/BrowserPane/designTools/LazyDesktopDesignTools", () => ({
-  hasDesktopDesignTools: () => true,
-  useHasDesktopDesignTools: () => true,
-  DesktopDesignTools: ({ url }: { url: string }) => <output aria-label="Tools' page">{url}</output>,
-}));
+// The tools themselves, reduced to the page they were handed, and whether they can load.
+const toolsState = vi.hoisted(() => ({ available: true, listeners: new Set<() => void>() }));
+vi.mock("@/components/BrowserPane/designTools/LazyDesktopDesignTools", async () => {
+  const { useSyncExternalStore } = await import("react");
+  const subscribe = (listener: () => void) => {
+    toolsState.listeners.add(listener);
+    return () => void toolsState.listeners.delete(listener);
+  };
+  return {
+    hasDesktopDesignTools: () => toolsState.available,
+    useHasDesktopDesignTools: () => useSyncExternalStore(subscribe, () => toolsState.available),
+    DesktopDesignTools: ({ url }: { url: string }) => (
+      <output aria-label="Tools' page">{url}</output>
+    ),
+  };
+});
+
+function setToolsAvailable(available: boolean) {
+  toolsState.available = available;
+  for (const listener of [...toolsState.listeners]) listener();
+}
+
+/** A shell with one view, its url-changed listener handed to `onUrl`. */
+function installBridge(overrides: Record<string, unknown> = {}) {
+  const unsubscribe = () => {};
+  const bridge = {
+    browserHasView: vi.fn().mockResolvedValue({ exists: true, url: "https://a.example/" }),
+    onBrowserViewCreated: () => unsubscribe,
+    onBrowserHostActiveChanged: () => unsubscribe,
+    onBrowserViewClosed: () => unsubscribe,
+    onBrowserUrlChanged: () => unsubscribe,
+    onBrowserNavState: () => unsubscribe,
+    browserSetActive: vi.fn().mockResolvedValue({ ok: true }),
+    browserResize: vi.fn().mockResolvedValue({ ok: true }),
+    browserEnableDesignMode: vi.fn().mockResolvedValue({ ok: true }),
+    browserDisableDesignMode: vi.fn().mockResolvedValue({ ok: true }),
+    ...overrides,
+  };
+  (window as unknown as { omnigentDesktop?: unknown }).omnigentDesktop = bridge;
+  vi.stubGlobal(
+    "ResizeObserver",
+    class {
+      observe() {}
+      disconnect() {}
+    },
+  );
+  return bridge;
+}
 
 afterEach(() => {
+  toolsState.available = true;
   cleanup();
   vi.unstubAllGlobals();
   delete (window as unknown as { omnigentDesktop?: unknown }).omnigentDesktop;
@@ -68,5 +111,41 @@ describe("BrowserPane's design tools", () => {
     // The view closed: a new one names no page until it has loaded one.
     act(() => viewClosed({ conversationId: "conv_url", reason: null }));
     expect(tools).toBeEmptyDOMElement();
+  });
+
+  it("name a page the view moved to before its first look at the view answered", async () => {
+    let urlChanged: (payload: { conversationId: string; url: string }) => void = () => {};
+    let answer: (value: { exists: boolean; url: string }) => void = () => {};
+    installBridge({
+      browserHasView: () =>
+        new Promise((resolve) => {
+          answer = resolve;
+        }),
+      onBrowserUrlChanged: (callback: typeof urlChanged) => {
+        urlChanged = callback;
+        return () => {};
+      },
+    });
+    render(<BrowserPane conversationId="conv_race" />);
+    const page = await screen.findByLabelText("Tools' page");
+    act(() => urlChanged({ conversationId: "conv_race", url: "https://new.example/" }));
+    await act(async () => answer({ exists: true, url: "https://old.example/" }));
+    expect(page).toHaveTextContent("https://new.example/");
+    expect(screen.getByRole("textbox", { name: "Address bar" })).toHaveValue(
+      "https://new.example/",
+    );
+  });
+
+  it("turn design mode's picker off when they load after it was turned on in their place", async () => {
+    toolsState.available = false;
+    const bridge = installBridge();
+    render(<BrowserPane conversationId="conv_back" />);
+    const enter = await screen.findByRole("button", { name: "Enter design mode" });
+    await waitFor(() => expect(enter).toBeEnabled());
+    fireEvent.click(enter);
+    expect(bridge.browserEnableDesignMode).toHaveBeenCalledWith("conv_back");
+    act(() => setToolsAvailable(true));
+    expect(bridge.browserDisableDesignMode).toHaveBeenCalledWith("conv_back");
+    expect(screen.queryByRole("button", { name: /design mode/i })).toBeNull();
   });
 });

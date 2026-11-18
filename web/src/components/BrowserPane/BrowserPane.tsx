@@ -208,6 +208,8 @@ export function BrowserPane({
   // Ref (not state): read synchronously in the url-changed listener; a
   // stale-closure state read would race.
   const urlEditingRef = useRef(false);
+  // Counts url-changed events, so an older view probe can't overwrite a newer URL.
+  const urlEventsRef = useRef(0);
   const submitSequenceRef = useRef(0);
   useEffect(
     () => () => {
@@ -247,13 +249,15 @@ export function BrowserPane({
     if (!bridge) return;
     let cancelled = false;
     let viewChanged = false;
+    const urlEvents = urlEventsRef.current;
 
     // A newer lifecycle event takes precedence over this asynchronous snapshot.
     void bridge.browserHasView?.(conversationId).then((r) => {
       if (!cancelled && !viewChanged && r?.exists) {
         setHasView(true);
-        if (r.url) setPageUrl(r.url);
-        if (!urlEditingRef.current && r.url) setCurrentUrl(r.url);
+        const url = urlEventsRef.current === urlEvents ? r.url : undefined;
+        if (url) setPageUrl(url);
+        if (!urlEditingRef.current && url) setCurrentUrl(url);
         setCanGoBack(!!r.canGoBack);
         setCanGoForward(!!r.canGoForward);
       }
@@ -288,6 +292,7 @@ export function BrowserPane({
     if (!bridge) return;
     const unsubUrl = bridge.onBrowserUrlChanged?.((payload) => {
       if (payload.conversationId !== conversationId) return;
+      urlEventsRef.current += 1;
       setPageUrl(payload.url);
       if (urlEditingRef.current) return;
       setCurrentUrl(payload.url);
@@ -502,6 +507,14 @@ export function BrowserPane({
       setDesignMode(false);
     }
   }, [hasView, active, designMode]);
+
+  // The tools loading late (their chunk retried) replace design mode: turn its picker off.
+  useEffect(() => {
+    if (!hasDesignTools || !designMode) return;
+    designModeRef.current = false;
+    void getBridge()?.browserDisableDesignMode?.(conversationId);
+    setDesignMode(false);
+  }, [hasDesignTools, designMode, conversationId]);
 
   // Measure the placeholder and push bounds to the main process. These are
   // renderer CSS pixels; the main process converts to WebContentsView DIPs

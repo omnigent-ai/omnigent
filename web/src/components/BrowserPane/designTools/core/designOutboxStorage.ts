@@ -2,7 +2,7 @@
 // Each names its server, user and browser tab: a tab takes back its own, and another tab's
 // only once Web Locks show that tab is gone (adopting under one lock across windows).
 import { getBasePath } from "@/lib/basePath";
-import type { DesignRequest, DesignRequestStatus } from "./designOutbox";
+import type { DesignRequest, DesignRequestStatus, DesignTool } from "./designOutbox";
 import { DESIGN_OUTBOX_DATABASE, noteSavedDesignRequests } from "./designOutboxPresence";
 
 const STORE = "requests";
@@ -22,6 +22,7 @@ export interface SavedRequest {
   tabId: string;
   conversationId: string;
   label: string;
+  tool?: DesignTool;
   text: string;
   files: SavedFile[];
   status: Exclude<DesignRequestStatus, "sent">;
@@ -197,6 +198,7 @@ export async function saveRequest(request: DesignRequest, userId: string): Promi
     tabId: request.tabId,
     conversationId: request.conversationId,
     label: request.label,
+    ...(request.tool ? { tool: request.tool } : {}),
     text: request.text,
     files: await filesOf(request),
     status: request.status,

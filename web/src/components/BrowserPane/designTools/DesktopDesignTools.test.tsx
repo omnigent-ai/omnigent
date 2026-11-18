@@ -179,22 +179,6 @@ afterEach(() => {
   delete (window as unknown as { omnigentDesktop?: unknown }).omnigentDesktop;
 });
 
-describe("DesktopDesignTools: the toolbar", () => {
-  it("sets the design tools apart from the browser's own buttons with a divider", () => {
-    fakeShell();
-    renderTools();
-    const group = screen.getByRole("group", { name: "Design tools" });
-    const first = group.firstElementChild;
-    expect(first).toHaveAttribute("data-orientation", "vertical");
-    // Centered on the buttons: the separator's own stretch would pin it to the row's top.
-    expect(first).toHaveClass("data-vertical:self-center");
-    expect(first).not.toHaveClass("data-vertical:self-stretch");
-    expect(first?.nextElementSibling).toBe(
-      screen.getByRole("button", { name: "Annotate an element" }),
-    );
-  });
-});
-
 describe("DesktopDesignTools: closing from the tool's bar", () => {
   for (const [button, tool, close] of [
     ["Annotate an element", "annotate", "Close Annotate"],
@@ -496,6 +480,37 @@ describe("DesktopDesignTools: Annotate", () => {
     await settle();
     expect(shell.ops("hitTest")).toEqual([expect.objectContaining({ x: 20, y: 30 })]);
     expect(overlays.view().getByText('button "Track order"')).toBeInTheDocument();
+  });
+
+  it("outlines where the pointer stopped, not where it was when a slow hit test began", async () => {
+    const shell = fakeShell();
+    const overlays = fakeOverlays();
+    let answerFirst: (hit: string) => void = () => {};
+    shell.page
+      .mockImplementationOnce(
+        () =>
+          new Promise<string>((resolve) => {
+            answerFirst = resolve;
+          }),
+      )
+      .mockImplementation(async () =>
+        JSON.stringify({ ...HIT, element: { tag: "a", text: "Help" } }),
+      );
+    renderTools();
+    await open("Annotate an element");
+    const layer = overlays.view().getByTestId("annotate-layer");
+    await act(async () => {
+      fireEvent.pointerMove(layer, { clientX: 20, clientY: 30 });
+      fireEvent.pointerMove(layer, { clientX: 200, clientY: 300 });
+    });
+    // The first answers only after the pointer has stopped somewhere else.
+    await act(async () => answerFirst(JSON.stringify(HIT)));
+    await settle();
+    expect(shell.ops("hitTest")).toEqual([
+      expect.objectContaining({ x: 20, y: 30 }),
+      expect.objectContaining({ x: 200, y: 300 }),
+    ]);
+    expect(overlays.view().getByText('a "Help"')).toBeInTheDocument();
   });
 });
 

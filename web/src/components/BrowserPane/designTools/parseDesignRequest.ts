@@ -37,11 +37,17 @@ function clip(text: string, limit: number): string {
  */
 export function clipDesignRequest(request: DesignRequest, limit: number): DesignRequest {
   const words = clip(request.request, limit);
+  const { elementText, ariaLabel, ...rest } = request;
   const left = Math.max(limit - [...words].length, 0);
+  if (elementText === undefined || [...elementText].length <= left) {
+    return { ...request, request: words };
+  }
   return {
-    ...request,
+    ...rest,
     request: words,
-    ...(request.elementText !== undefined ? { elementText: clip(request.elementText, left) } : {}),
+    // A cut text ends in "…"; a label matching the whole text stays hidden, as unclipped.
+    elementText: `${clip(elementText, Math.max(left - 1, 0))}…`,
+    ...(ariaLabel !== undefined && ariaLabel !== elementText ? { ariaLabel } : {}),
   };
 }
 

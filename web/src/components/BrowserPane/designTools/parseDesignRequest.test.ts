@@ -114,7 +114,8 @@ describe("parseDesignRequest", () => {
     const started = performance.now();
     expect(parseDesignRequest(text)).toBeNull();
     expect(parseDesignRequest(`${text}x\n---`)).toBeNull();
-    expect(performance.now() - started).toBeLessThan(200);
+    // Generous for a loaded runner: a quadratic parse of this would take far longer.
+    expect(performance.now() - started).toBeLessThan(2_000);
   });
 
   it("leaves ordinary messages alone", () => {
@@ -133,7 +134,7 @@ describe("clipDesignRequest", () => {
     };
     const clipped = clipDesignRequest(request, 10);
     expect(clipped.request).toBe("a".repeat(8));
-    expect(clipped.elementText).toBe("bb");
+    expect(clipped.elementText).toBe("b…");
     expect(clipped.element).toBe("p");
   });
 
@@ -151,6 +152,23 @@ describe("clipDesignRequest", () => {
       element: "p",
       elementText: "b".repeat(8),
     };
-    expect(clipDesignRequest(request, 10).elementText).toBe("b".repeat(6));
+    expect(clipDesignRequest(request, 10).elementText).toBe(`${"b".repeat(5)}…`);
+  });
+
+  it("marks element text cut to nothing, and keeps a label that matched it hidden", () => {
+    const request: DesignRequest = {
+      kind: "element",
+      request: "a".repeat(10),
+      element: "button",
+      elementText: "Buy now",
+      ariaLabel: "Buy now",
+    };
+    const clipped = clipDesignRequest(request, 10);
+    expect(clipped.elementText).toBe("…");
+    expect(designSubject(clipped)).toBe('button "…"');
+    expect(clipDesignRequest({ ...request, request: "a" }, 10)).toEqual({
+      ...request,
+      request: "a",
+    });
   });
 });

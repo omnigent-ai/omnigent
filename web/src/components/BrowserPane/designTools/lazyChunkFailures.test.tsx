@@ -11,18 +11,23 @@ vi.mock("./DesignRequestMessage", () => ({
   },
 }));
 // The strip's chunk can't load until the network comes back.
-const strip = vi.hoisted(() => ({ broken: true, loads: 0 }));
+const strip = vi.hoisted(() => ({ broken: true, failsFor: "" }));
 vi.mock("./DesignOutboxStrip", () => ({
   get DesignOutboxStrip() {
-    strip.loads += 1;
-    if (!strip.broken) return () => <p>Design requests</p>;
+    if (!strip.broken) {
+      return ({ conversationId }: { conversationId: string }) => {
+        if (conversationId === strip.failsFor) throw new Error("The strip broke");
+        return <p>Design requests</p>;
+      };
+    }
     throw new TypeError(
       "Failed to fetch dynamically imported module: /assets/DesignOutboxStrip.js",
     );
   },
 }));
 import { DesignRequestBody } from "./LazyDesignRequestMessage";
-import { DesignOutboxStrip, STRIP_RETRY_MAX_MS, STRIP_RETRY_MS } from "./LazyDesignOutboxStrip";
+import { DesignOutboxStrip } from "./LazyDesignOutboxStrip";
+import { CHUNK_RETRY_MS } from "./retryingChunk";
 import { setDesignRequestSessions } from "./core/designOutboxPresence";
 
 /** The app's boundary above: what reaches it would replace the app. */
@@ -53,11 +58,11 @@ it("shows a design message's own words when its card can't load", async () => {
   expect(screen.queryByText("The app failed")).toBeNull();
 });
 
-it("leaves the composer as it was when the outbox strip can't load, and tries again less often", async () => {
+it("leaves the composer as it was when the outbox strip can't load, and shows it once it does", async () => {
   vi.useFakeTimers();
   try {
     setDesignRequestSessions(["conv_1"]);
-    render(
+    const view = render(
       <AppBoundary>
         <p>Composer</p>
         <DesignOutboxStrip conversationId="conv_1" />
@@ -66,27 +71,32 @@ it("leaves the composer as it was when the outbox strip can't load, and tries ag
     await act(() => vi.advanceTimersByTimeAsync(20));
     expect(screen.getByText("Composer")).toBeTruthy();
     expect(screen.queryByText("The app failed")).toBeNull();
-    // Each try that fails waits twice as long for the next, up to a cap.
-    const loads = () => strip.loads;
-    strip.loads = 0;
-    let waitMs = STRIP_RETRY_MS;
-    for (let tries = 1; tries <= 8; tries += 1) {
-      // oxlint-disable-next-line no-await-in-loop -- one wait at a time
-      await act(() => vi.advanceTimersByTimeAsync(waitMs - 1));
-      expect(loads()).toBe(tries - 1);
-      // oxlint-disable-next-line no-await-in-loop -- one wait at a time
-      await act(() => vi.advanceTimersByTimeAsync(1));
-      expect(loads()).toBe(tries);
-      waitMs = Math.min(waitMs * 2, STRIP_RETRY_MAX_MS);
-    }
-    expect(waitMs).toBe(STRIP_RETRY_MAX_MS);
-    // The chunk loads again, and the mounted strip tries it again on its own.
+    // The chunk loads again, and the mounted strip shows it.
     strip.broken = false;
-    await act(() => vi.advanceTimersByTimeAsync(STRIP_RETRY_MAX_MS));
-    await act(() => vi.advanceTimersByTimeAsync(20));
+    await act(() => vi.advanceTimersByTimeAsync(CHUNK_RETRY_MS));
+    expect(screen.getByText("Design requests")).toBeTruthy();
+    // A render failure hides it, until the conversation changes.
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    setDesignRequestSessions(["conv_1", "conv_2", "conv_3"]);
+    strip.failsFor = "conv_2";
+    view.rerender(
+      <AppBoundary>
+        <p>Composer</p>
+        <DesignOutboxStrip conversationId="conv_2" />
+      </AppBoundary>,
+    );
+    expect(screen.queryByText("Design requests")).toBeNull();
+    expect(screen.getByText("Composer")).toBeTruthy();
+    view.rerender(
+      <AppBoundary>
+        <p>Composer</p>
+        <DesignOutboxStrip conversationId="conv_3" />
+      </AppBoundary>,
+    );
     expect(screen.getByText("Design requests")).toBeTruthy();
   } finally {
     setDesignRequestSessions([]);
+    vi.restoreAllMocks();
     vi.useRealTimers();
   }
 });

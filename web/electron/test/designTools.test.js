@@ -4,6 +4,7 @@
 
 const assert = require("node:assert/strict");
 const { EventEmitter } = require("node:events");
+const path = require("node:path");
 const { afterEach, beforeEach, describe, it } = require("node:test");
 const { JSDOM } = require("jsdom");
 
@@ -247,7 +248,7 @@ describe("design tools: the overlay", () => {
     const decision = t.windowOpen();
     assert.equal(decision.action, "allow");
     assert.deepEqual(decision.overrideBrowserWindowOptions.webPreferences, {
-      preload: "",
+      preload: path.join(__dirname, "..", "src", "popup_preload.js"),
       sandbox: true,
       contextIsolation: true,
       nodeIntegration: false,
@@ -442,6 +443,16 @@ describe("design tools: the overlay", () => {
     }
   });
 
+  it("keeps a replaced overlay's keys in the app until the next overlay takes them", () => {
+    const t = openTool();
+    const overlay = t.open();
+    overlay.webContents.focusedNow = true;
+    t.start();
+    assert.equal(overlay.webContents.isDestroyed(), true);
+    assert.equal(t.webContents.focused, 0);
+    assert.equal(t.host.webContents.focused, 1);
+  });
+
   it("ends the opening, telling the app, when the overlay goes", () => {
     const t = openTool();
     const overlay = t.open();
@@ -532,6 +543,16 @@ describe("design tools: the overlay", () => {
     assert.equal(t.sent.at(-1).reason, "gone");
     assert.doesNotThrow(() => c.mock.timers.tick(1000));
   });
+
+  it("ends a notice whose page crashes", () => {
+    const t = openTool();
+    const overlay = t.open({ input: false });
+    t.webContents.emit("render-process-gone", {}, { reason: "crashed" });
+    assert.equal(t.tools.isOpen(t.entry), false);
+    assert.equal(overlay.webContents.isDestroyed(), true);
+    assert.equal(t.sent.at(-1).reason, "gone");
+    assert.equal(t.webContents.listenerCount("render-process-gone"), 0);
+  });
 });
 
 describe("design tools: a new page ends the tool", () => {
@@ -587,6 +608,16 @@ describe("design tools: a new page ends the tool", () => {
         ends,
       );
       assert.equal(overlay.webContents.isDestroyed(), ends);
+    });
+  }
+
+  for (const event of ["render-process-gone", "destroyed"]) {
+    it(`says the page went, not that it changed, on ${event}`, () => {
+      const t = openTool();
+      t.open();
+      t.webContents.emit(event, {}, { reason: "crashed" });
+      assert.equal(t.tools.isOpen(t.entry), false);
+      assert.equal(t.sent.at(-1).reason, "gone");
     });
   }
 });

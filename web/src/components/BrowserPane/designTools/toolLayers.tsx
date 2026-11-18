@@ -109,14 +109,26 @@ export function AnnotateLayer({ tabId, rect, onNotice }: LayerProps) {
   const { picked, request } = useTabTools(tabId);
   const session = useToolSession(tabId, onNotice, true);
   const hovering = useRef(false);
+  const nextPoint = useRef<{ x: number; y: number } | null>(null);
   const [hover, setHover] = useState<Hit | null>(null);
 
+  // One hit test at a time, each at the latest point the pointer moved to.
   const updateHover = async (event: ReactPointerEvent<HTMLDivElement>) => {
-    if (picked || hovering.current || !session || !rect) return;
+    if (picked || !session || !rect) return;
+    nextPoint.current = { x: event.clientX - rect.left, y: event.clientY - rect.top };
+    if (hovering.current) return;
     hovering.current = true;
-    const hit = await hitAt(session, event.clientX - rect.left, event.clientY - rect.top);
-    hovering.current = false;
-    if (!session.isEnded) setHover(hit);
+    try {
+      while (nextPoint.current && !session.isEnded) {
+        const { x, y } = nextPoint.current;
+        nextPoint.current = null;
+        // oxlint-disable-next-line no-await-in-loop -- one hit test at a time
+        const hit = await hitAt(session, x, y);
+        if (!session.isEnded) setHover(hit);
+      }
+    } finally {
+      hovering.current = false;
+    }
   };
   const pick = (event: React.MouseEvent<HTMLDivElement>) => {
     if (session && rect)

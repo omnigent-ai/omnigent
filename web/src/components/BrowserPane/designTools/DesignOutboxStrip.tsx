@@ -7,7 +7,6 @@ import {
   PencilLineIcon,
   RotateCwIcon,
   XIcon,
-  type LucideIcon,
 } from "lucide-react";
 import { useShallow } from "zustand/react/shallow";
 import { Button } from "@/components/ui/button";
@@ -22,11 +21,6 @@ import {
 const ACTION_BUTTON_CLASS =
   "shrink-0 text-muted-foreground transition-colors hover:text-foreground focus-visible:text-foreground max-md:size-11";
 
-const TOOL_ICONS: [prefix: string, icon: LucideIcon][] = [
-  ["Annotate", MousePointerClickIcon],
-  ["Draw", PencilLineIcon],
-];
-
 function stateText(request: DesignRequest): string {
   if (request.error) return request.error;
   if (request.status === "waiting") return "Waiting for the agent";
@@ -35,8 +29,7 @@ function stateText(request: DesignRequest): string {
 
 function OutboxRow({ request }: { request: DesignRequest }) {
   const stuck = request.status === "failed" || request.status === "denied";
-  const ToolIcon =
-    TOOL_ICONS.find(([prefix]) => request.label.startsWith(prefix))?.[1] ?? PencilLineIcon;
+  const ToolIcon = request.tool === "annotate" ? MousePointerClickIcon : PencilLineIcon;
   return (
     <div role="listitem" className="flex min-w-0 items-center gap-1 py-0.5 text-foreground text-sm">
       <ToolIcon className="mx-1 size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
@@ -65,7 +58,6 @@ function OutboxRow({ request }: { request: DesignRequest }) {
           <span className={stuck ? "min-w-0 break-words" : "truncate"}>{stateText(request)}</span>
         </span>
       </div>
-      {/* Not while it's sending: it may be reaching the agent right now. */}
       {request.status === "failed" && (
         <Button
           componentId="browserDesignTools.outbox.retry"
@@ -80,6 +72,7 @@ function OutboxRow({ request }: { request: DesignRequest }) {
           <RotateCwIcon className="size-3.5" aria-hidden="true" />
         </Button>
       )}
+      {/* Not while it's sending: it may be reaching the agent right now. */}
       {request.status !== "sending" && (
         <Button
           componentId="browserDesignTools.outbox.remove"

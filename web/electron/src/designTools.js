@@ -5,7 +5,11 @@
 "use strict";
 
 const { randomUUID } = require("node:crypto");
+const path = require("node:path");
 const { hitTestScript } = require("./designToolsPage.mjs");
+
+/** An empty preload, so an overlay never inherits the shell's bridges. */
+const NO_BRIDGE_PRELOAD = path.join(__dirname, "popup_preload.js");
 
 // Its own isolated world id: one that collides with another isolated world (an extension's,
 // say) would share that world's globals with it.
@@ -70,35 +74,36 @@ function navigation(details, isInPlace, isMainFrame) {
 }
 
 /**
- * Call `onGone` once when the page starts loading a new document in its main frame,
- * navigates within it, crashes or is destroyed: what ends an open tool.
+ * Call `onGone` once when the page starts loading a new document in its main frame or
+ * navigates within it (`"navigated"`), or crashes or is destroyed (`"gone"`).
  */
 function watchPage(webContents, onGone) {
   let gone = false;
-  const fire = () => {
+  const fire = (reason) => {
     if (gone) return;
     gone = true;
     detach();
-    onGone();
+    onGone(reason);
   };
+  const navigated = () => fire("navigated");
   const listeners = [
     [
       "did-start-navigation",
       (details, _url, isInPlace, isMainFrame) => {
         const { mainFrame, sameDocument } = navigation(details, isInPlace, isMainFrame);
-        if (mainFrame && !sameDocument) fire();
+        if (mainFrame && !sameDocument) navigated();
       },
     ],
     [
       "did-navigate-in-page",
       (details, _url, isMainFrame) => {
-        if (navigation(details, undefined, isMainFrame).mainFrame) fire();
+        if (navigation(details, undefined, isMainFrame).mainFrame) navigated();
       },
     ],
     // A document that started loading before the tool opened ends it once it commits.
-    ["did-navigate", fire],
-    ["render-process-gone", fire],
-    ["destroyed", fire],
+    ["did-navigate", navigated],
+    ["render-process-gone", () => fire("gone")],
+    ["destroyed", () => fire("gone")],
   ];
   function detach() {
     for (const [name, listener] of listeners) {
@@ -348,7 +353,7 @@ function createDesignTools({
       overrideBrowserWindowOptions: {
         webPreferences: {
           // The app's document, but none of the shell's bridges.
-          preload: "",
+          preload: NO_BRIDGE_PRELOAD,
           sandbox: true,
           contextIsolation: true,
           nodeIntegration: false,
@@ -423,7 +428,8 @@ function createDesignTools({
    * is the app renderer's webContents, whose reload or end ends the opening.
    */
   function start(viewId, entry, args, app) {
-    endSession(entry);
+    // The app keeps the keys until the new overlay takes them.
+    endSession(entry, undefined, { toPage: false });
     const id = randomUUID();
     /** @type {DesignToolsSession} */
     const session = {
@@ -452,10 +458,13 @@ function createDesignTools({
     // A tool belongs to the page it opened on; a notice isn't the page's, but ends with it.
     const page =
       session.mode === "tool"
-        ? watchPage(entry.view.webContents, () => session.ended("navigated"))
+        ? watchPage(entry.view.webContents, (reason) => session.ended(reason))
         : null;
     const destroyed = () => session.ended("gone");
-    if (!page) entry.view.webContents.on?.("destroyed", destroyed);
+    if (!page) {
+      entry.view.webContents.on?.("destroyed", destroyed);
+      entry.view.webContents.on?.("render-process-gone", destroyed);
+    }
     const bounds = () => fit(session);
     entry.view.on?.("bounds-changed", bounds);
     // DevTools opening or closing in the page's view moves the page's part of it.
@@ -483,6 +492,7 @@ function createDesignTools({
       entry.view.webContents.removeListener?.("devtools-opened", devTools);
       entry.view.webContents.removeListener?.("devtools-closed", devTools);
       entry.view.webContents.removeListener?.("destroyed", destroyed);
+      entry.view.webContents.removeListener?.("render-process-gone", destroyed);
     };
     views.set(entry, session);
     sessions.set(id, session);

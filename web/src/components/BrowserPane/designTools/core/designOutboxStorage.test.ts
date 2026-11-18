@@ -336,19 +336,21 @@ describe("design outbox storage", () => {
     const [waiting, sending, failed] = ["waiting", "sending", "failed"].map((id) =>
       useDesignOutbox.getState().requests.find((request) => request.id === id),
     );
-    expect(waiting).toMatchObject({ status: "failed", error: expect.stringContaining("Retry") });
+    // One saved waiting may have gone too: the reload can beat saving that it was sending.
+    for (const request of [waiting, sending]) {
+      expect(request).toMatchObject({
+        status: "failed",
+        error: expect.stringContaining("may have reached the agent"),
+        delivery: "unknown",
+      });
+    }
     expect(await waiting!.files[0]!.text()).toBe("png bytes");
-    expect(sending).toMatchObject({
-      status: "failed",
-      error: expect.stringContaining("may have reached the agent"),
-    });
     // A refused one stays refused (it never reached the agent); the others may have.
     expect(failed).toMatchObject({
       status: "failed",
       error: "Couldn't send: x",
       delivery: "refused",
     });
-    expect(sending).toMatchObject({ delivery: "unknown" });
   });
 
   it("brings back only the signed-in user's requests, once it's known who that is", async () => {

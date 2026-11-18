@@ -30,6 +30,7 @@ import {
 } from "./designOutboxStorage";
 
 export type DesignRequestStatus = "waiting" | "sending" | "sent" | "failed" | "denied";
+export type DesignTool = "annotate" | "draw";
 
 export interface DesignRequest {
   /** The message's stable id: every attempt posts under it. */
@@ -38,6 +39,8 @@ export interface DesignRequest {
   conversationId: string;
   /** What the tool sent, for the outbox's list ("Annotate: button …"). */
   label: string;
+  /** The tool that made it. */
+  tool?: DesignTool;
   text: string;
   files: readonly File[];
   status: DesignRequestStatus;
@@ -76,9 +79,10 @@ const RESTORE_RETRY_MAX_MS = 300_000;
 const DENIED = "A policy blocked this request, so it wasn't sent.";
 // Brought back after a reload: never sent on its own (the user said Send on an earlier
 // page, and may have changed their mind, or sent it from another tab), so it needs a Retry.
-const RESTORED_WAITING = "Brought back after the app reloaded. Retry to send it.";
-const RESTORED_SENDING =
-  "The app reloaded while this was sending, so it may have reached the agent. " +
+// A reload can land after the send but before its "sending" was saved, so a request saved
+// as waiting may have gone too.
+const RESTORED =
+  "The app reloaded before this was confirmed sent, so it may have reached the agent. " +
   "Look in the chat: if it isn't there, Retry sends it.";
 // The server's refusal when the session's host is offline promises a resend the chat box
 // makes for its own messages; the outbox doesn't, so it says what to do instead.
@@ -289,18 +293,26 @@ function schedule(): void {
 export interface NewDesignRequest {
   tabId: string;
   label: string;
+  tool?: DesignTool;
   text: string;
   files?: readonly File[];
 }
 
 /** Hand a request to the outbox; returns its id. */
-export function queueDesignRequest({ tabId, label, text, files = [] }: NewDesignRequest): string {
+export function queueDesignRequest({
+  tabId,
+  label,
+  tool,
+  text,
+  files = [],
+}: NewDesignRequest): string {
   const id = randomUUID().replace(/-/g, "");
   const request: DesignRequest = {
     id,
     tabId,
     conversationId: browserViewOwnerId(tabId),
     label,
+    ...(tool ? { tool } : {}),
     text,
     files,
     status: "waiting",
@@ -523,6 +535,7 @@ export async function restoreSavedDesignRequests(): Promise<void> {
       tabId: record.tabId,
       conversationId: record.conversationId,
       label: record.label,
+      ...(record.tool ? { tool: record.tool } : {}),
       text: record.text,
       files: savedFilesOf(record),
       // Another page may have sent it since: it says to look in the chat first.
@@ -536,8 +549,9 @@ export async function restoreSavedDesignRequests(): Promise<void> {
 
 /** A restored request's status: one saved waiting or sending is failed, for the user to retry. */
 function restoredStatus(record: SavedRequest): Pick<DesignRequest, "status" | "error"> {
-  if (record.status === "waiting") return { status: "failed", error: RESTORED_WAITING };
-  if (record.status === "sending") return { status: "failed", error: RESTORED_SENDING };
+  if (record.status === "waiting" || record.status === "sending") {
+    return { status: "failed", error: RESTORED };
+  }
   return { status: record.status, error: record.error };
 }
 

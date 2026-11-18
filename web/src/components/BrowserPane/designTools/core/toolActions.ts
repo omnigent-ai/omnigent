@@ -113,6 +113,7 @@ export async function sendAnnotation(session: ToolSession): Promise<string | nul
   queueDesignRequest({
     tabId: session.tabId,
     label: `Annotate ${elementTag(picked.element)}`,
+    tool: "annotate",
     // Without one, the block ends by saying so (its fields can't hold a line break).
     text: files.length > 0 ? prompt : prompt.replace(/\n---$/, `\n${NO_SCREENSHOT_LINE}\n---`),
     ...(files.length > 0 ? { files } : {}),
@@ -153,6 +154,7 @@ export async function sendDrawing(session: ToolSession, url: string): Promise<st
   queueDesignRequest({
     tabId: session.tabId,
     label: `Draw: ${note.trim() || marks(shapes.length)}`,
+    tool: "draw",
     text: buildDrawPrompt(note, url),
     files: [file],
   });

@@ -66,40 +66,26 @@ it("says the tools are missing once their chunk can't load, so the pane offers d
   expect(hasDesktopDesignTools()).toBe(false);
 });
 
-it("tries the tools' chunk again less often each time, and offers the tools once it loads", async () => {
+it("offers the tools once a later try loads their chunk", async () => {
   vi.useFakeTimers();
   try {
-    const chunk = { broken: true, loads: 0 };
+    const chunk = { broken: true };
     vi.doMock("./DesktopDesignTools", () => ({
       get DesktopDesignTools() {
-        chunk.loads += 1;
         if (!chunk.broken) return () => <p>The tools</p>;
         throw new TypeError("Failed to fetch dynamically imported module");
       },
     }));
-    const { DesktopDesignTools, TOOLS_RETRY_MAX_MS, TOOLS_RETRY_MS, useHasDesktopDesignTools } =
+    const { DesktopDesignTools, useHasDesktopDesignTools } =
       await import("./LazyDesktopDesignTools");
+    const { CHUNK_RETRY_MS } = await import("./retryingChunk");
     const has = renderHook(() => useHasDesktopDesignTools());
     render(<DesktopDesignTools viewId="conv_1" hasView url="" container={createRef()} />);
     await act(() => vi.advanceTimersByTimeAsync(0));
     expect(has.result.current).toBe(false);
-    // Each failed try waits twice as long for the next, up to a cap.
-    chunk.loads = 0;
-    let waitMs = TOOLS_RETRY_MS;
-    for (let tries = 1; tries <= 8; tries += 1) {
-      // oxlint-disable-next-line no-await-in-loop -- one wait at a time
-      await act(() => vi.advanceTimersByTimeAsync(waitMs - 1));
-      expect(chunk.loads).toBe(tries - 1);
-      // oxlint-disable-next-line no-await-in-loop -- one wait at a time
-      await act(() => vi.advanceTimersByTimeAsync(1));
-      expect(chunk.loads).toBe(tries);
-      waitMs = Math.min(waitMs * 2, TOOLS_RETRY_MAX_MS);
-    }
-    expect(waitMs).toBe(TOOLS_RETRY_MAX_MS);
     // The chunk loads again: the pane has the tools, not design mode.
     chunk.broken = false;
-    await act(() => vi.advanceTimersByTimeAsync(TOOLS_RETRY_MAX_MS));
-    await act(() => vi.advanceTimersByTimeAsync(20));
+    await act(() => vi.advanceTimersByTimeAsync(CHUNK_RETRY_MS));
     expect(has.result.current).toBe(true);
     expect(screen.getByText("The tools")).toBeTruthy();
   } finally {
