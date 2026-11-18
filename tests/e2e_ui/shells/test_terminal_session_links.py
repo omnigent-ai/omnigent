@@ -243,7 +243,7 @@ def test_mouse_tracking_program_keeps_plain_clicks_and_command_click_opens_the_l
     else:
         raise AssertionError("a plain click opened the link while the program tracks the mouse")
     assert [(code & 3, phase) for code, phase in reports] == [(0, "M"), (0, "m")], (
-        f"the plain click did not reach the program as a left press and release: {reports}"
+        f"the plain click was not sent to the program as a left press and release: {reports}"
     )
 
     reports.clear()
@@ -259,4 +259,4 @@ def test_mouse_tracking_program_keeps_plain_clicks_and_command_click_opens_the_l
     ).to_be_visible()
     assert popup.url == _TRACKED_URL
     page.wait_for_timeout(500)  # custom-lint: disable=sleep-then-assert -- no late press
-    assert reports == [], f"the command-click also reached the program: {reports}"
+    assert reports == [], f"the command-click was also sent to the program: {reports}"

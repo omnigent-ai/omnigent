@@ -18,10 +18,11 @@ reattach when the session moves to another host.
 - `user-shell`: open a shell, type into it, and close it.
 - `scrollback`: scroll back with the mouse wheel (including programs that track
   the mouse), by touch on phones, and by keyboard.
-- `links`: clicking a URL or OSC 8 link opens it in a new tab. While a program
-  tracks the mouse (fullscreen Claude Code, vim with mouse), plain clicks go to
-  the program and ⌘-click (macOS) or Ctrl-click opens the link without reaching
-  it. Touch and pen taps always open.
+- `links`: clicking an external URL or OSC 8 link opens it in a new tab, and a
+  same-origin session link navigates in the app. While a program tracks the
+  mouse (fullscreen Claude Code, vim with mouse), plain clicks go to the program
+  and ⌘-click (macOS) or Ctrl-click opens the link without reaching it. Touch
+  and pen taps always open.
 - `reconnect`: after the terminal connection drops, the terminal shows that it
   is reconnecting and then reattaches without user action.
 - `host-switch-reattach`: after "Switch host…", both the terminal strip and the
@@ -155,6 +156,14 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
 - **`scrollback`, keyboard:** no e2e coverage. In a Codex terminal with more
   output than fits, press Page Up and expect older output; then check that the
   Codex terminal's other keys still behave as before.
+- **`links`:** `tests/e2e_ui/shells/test_terminal_session_links.py` covers
+  plain-click opening, in-app session links, and a mouse-tracking program that
+  keeps plain clicks while ⌘/Ctrl-click opens.
+  `tests/e2e_ui/messages/test_native_claude_terminal_links.py` drives real Claude
+  Code with the mock model. Its fullscreen journey is skipped unless
+  `CLAUDE_CODE_NO_FLICKER=1` is exported, and the runner that launches Claude
+  Code needs the variable too. Touch and pen taps have only web unit coverage
+  in `web/src/components/blocks/TerminalSession.test.ts`.
 - **`reconnect`:**
   `tests/e2e_ui/shells/test_terminal_bridge_reconnect.py::test_embedded_terminal_reconnects_after_transport_close`
 - **`host-switch-reattach`:**
