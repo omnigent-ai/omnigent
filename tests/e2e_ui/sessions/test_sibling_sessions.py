@@ -223,6 +223,8 @@ async def _drive(rig: ManagedReplicas) -> None:
                     assert not restored.get("family")
                     family = (await client.get(f"{rig.a}/v1/sessions/{source_id}")).json()
                     assert family["family"]["representative_id"] == source_id
+                    # Return to the survivor the delete steps below message.
+                    await page.goto(f"{rig.ui}/c/{sibling_id}")
                     # Delete through the UI and prove the same-host sibling can still work.
                     row = page.locator(f'li[data-sidebar-session-id="{source_id}"]')
                     await row.hover()
