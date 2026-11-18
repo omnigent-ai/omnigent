@@ -356,7 +356,7 @@ async def _drive(rig: ManagedReplicas) -> None:
                     # Pinning an expanded folder's family removes every row from that folder.
                     project_header = page.get_by_role("button", name="Sibling demo", exact=True)
                     if await project_header.get_attribute("aria-expanded") == "false":
-                        await project_header.click()
+                        await project_header.locator("[data-section-toggle]").first.click()
                     project_section = project_header.locator("xpath=ancestor::section[1]")
                     member_selector = f'li[data-sidebar-session-id="{fresh_id}"]'
                     member_row = project_section.locator(member_selector)
@@ -456,7 +456,7 @@ async def _drive(rig: ManagedReplicas) -> None:
                         await phone.get_by_role("button", name="Open sidebar", exact=True).click()
                         project = phone.get_by_role("button", name="Sibling demo", exact=True)
                         if await project.get_attribute("aria-expanded") == "false":
-                            await project.click()
+                            await project.locator("[data-section-toggle]").first.click()
                         row = phone.locator(f'li[data-sidebar-session-id="{fresh_id}"]').first
                         await row.scroll_into_view_if_needed()
                         box = await row.bounding_box()
