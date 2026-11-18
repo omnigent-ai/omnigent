@@ -207,13 +207,17 @@ vi.mock("@/components/ui/select", async () => {
   }) => {
     const kids = Children.toArray(children);
     const trigger = kids.find((c) => isValidElement(c) && c.type === SelectTrigger);
-    const testId =
+    const triggerProps: Record<string, unknown> =
       isValidElement(trigger) && trigger.props && typeof trigger.props === "object"
-        ? (trigger.props as Record<string, unknown>)["data-testid"]
-        : undefined;
+        ? (trigger.props as Record<string, unknown>)
+        : {};
+    const stringProp = (name: string) =>
+      typeof triggerProps[name] === "string" ? triggerProps[name] : undefined;
     return (
       <select
-        data-testid={typeof testId === "string" ? testId : undefined}
+        data-testid={stringProp("data-testid")}
+        aria-label={stringProp("aria-label")}
+        aria-labelledby={stringProp("aria-labelledby")}
         value={value}
         disabled={disabled}
         onChange={(e) => onValueChange(e.target.value)}
@@ -1808,9 +1812,14 @@ describe("SettingsPage", () => {
     expect(
       document.querySelector('[data-settings-control="archived-sessions:select"]'),
     ).not.toBeNull();
+    expect(
+      screen.getByRole("combobox", { name: "Mark archived sessions as expired after" }),
+    ).toBeInTheDocument();
     const row = screen.getByTestId("archived-row");
     expect(row.querySelector('[data-settings-row-action="delete"]')).not.toBeNull();
     expect(row.querySelector('[data-settings-row-action="unarchive"]')).not.toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Select" }));
+    expect(screen.getByRole("button", { name: "Exit selection mode" })).toBeInTheDocument();
   });
 
   it("lists archived sessions and unarchives on click", () => {
