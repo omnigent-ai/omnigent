@@ -2845,6 +2845,7 @@ def register_core_routes(
                 conversation_store=conversation_store,
                 liveness_lookup=liveness_lookup,
                 host_store=getattr(request.app.state, "host_store", None),
+                host_session_recoverer=getattr(request.app.state, "host_session_recoverer", None),
                 # Only an owner's read may settle a row.
                 may_settle=lambda conv, perms=perms_by_conv: (
                     permission_store is None
@@ -4021,6 +4022,9 @@ def register_core_routes(
             # claims the session meanwhile keeps its claim.
             if body.runner_id == "":
                 try:
+                    recoverer = getattr(request.app.state, "host_session_recoverer", None)
+                    if recoverer is not None:
+                        await asyncio.to_thread(recoverer.stop_recovery, conv, only_pending=True)
                     if profile_catalog is not None:
                         await asyncio.to_thread(
                             profile_catalog.reassign_runner,
@@ -4098,6 +4102,9 @@ def register_core_routes(
                             host_id=runner_hosts[0] if len(runner_hosts) == 1 else None,
                             host_type="external",
                         )
+                    recoverer = getattr(request.app.state, "host_session_recoverer", None)
+                    if recoverer is not None and runner_id != conv.runner_id:
+                        await asyncio.to_thread(recoverer.stop_recovery, conv, only_pending=True)
                     handled = profile_catalog is not None and await asyncio.to_thread(
                         profile_catalog.reassign_runner,
                         conv,
@@ -4683,6 +4690,7 @@ def register_core_routes(
                 delete_worktree=body.delete_worktree,
                 host_store=getattr(request.app.state, "host_store", None),
                 sandbox_config=getattr(request.app.state, "sandbox_config", None),
+                host_session_recoverer=getattr(request.app.state, "host_session_recoverer", None),
                 after_turn=normalize_uuid(request.headers.get(ORCHESTRATION_SOURCE_HEADER))
                 == lifecycle_id,
             )
