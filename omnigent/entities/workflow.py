@@ -44,7 +44,8 @@ class Workflow:
     :param steps: The saved steps in the journal plan's format; empty for a draft.
     :param planning_session_id: The owner's conversation for iterating on the plan.
     :param description_source: The journal entry ID of the planning-chat proposal
-        Save plan took the description from; ``None`` once it's written otherwise.
+        Save plan took the description from or kept it over; ``None`` once it's
+        written otherwise.
     """
 
     id: str

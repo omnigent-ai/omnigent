@@ -57,6 +57,7 @@ class Feature(StrEnum):
     PROACTIVE_AGENT = "proactive_agent"
     USER_INBOX = "user_inbox"
     MEMORY = "memory"
+    QUICK_PICK_PALETTE = "quick_pick_palette"
 
 
 @dataclass(frozen=True)
@@ -311,6 +312,12 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         # Clients probe inbox_items_available in GET /v1/info.
         frontend_visible=False,
         default_enabled=True,
+    ),
+    FeatureDefinition(
+        feature=Feature.QUICK_PICK_PALETTE,
+        description="Run the ⌘K command palette on the fuzzy-matching QuickPick list",
+        owner="web",
+        review_by_release="0.24.0",
     ),
 )
 
