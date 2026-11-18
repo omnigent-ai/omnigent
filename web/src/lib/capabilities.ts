@@ -71,6 +71,7 @@ export type FeatureKey =
   | "session_orchestration"
   | "workflows"
   | "session_overview"
+  | "project_kanban"
   | "project_repository_creation"
   | "workspace_direct_access"
   | "workspace_api_server_access";

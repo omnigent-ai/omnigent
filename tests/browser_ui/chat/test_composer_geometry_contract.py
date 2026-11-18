@@ -162,7 +162,7 @@ def test_landing_and_live_cards_share_the_geometry_contract(
     for surface in ("landing", "live"):
         _surface(page, chat, surface, viewport)
         card_locator = page.locator("[data-composer-card]")
-        if viewport["width"] < 768:
+        if viewport["width"] < 1181:
             expect(card_locator).to_have_attribute("data-mobile-composer", "collapsed")
         card = box(card_locator)
         container = box(card_locator.locator(".."))
@@ -172,7 +172,8 @@ def test_landing_and_live_cards_share_the_geometry_contract(
         assert_within_viewport(box(_submit(page, surface)), viewport["width"])
         assert document_width(page) <= viewport["width"]
         submit = box(_submit(page, surface))
-        if touch or viewport["width"] < 768:
+        mobile_layout = viewport["width"] < 1181
+        if mobile_layout:
             assert submit["width"] >= 44 and submit["height"] >= 44
         else:
             assert submit["height"] < 44
@@ -185,7 +186,7 @@ def test_landing_and_live_cards_share_the_geometry_contract(
         expect(menu).to_be_visible()
         _settle_menu(menu)
         assert_within_viewport(box(menu), viewport["width"])
-        if touch:
+        if mobile_layout:
             for row in menu.get_by_role("menuitem").all():
                 bounds = box(row)
                 assert bounds["width"] >= 44 and bounds["height"] >= 44
@@ -1198,7 +1199,6 @@ def test_composer_growth_reflows_without_covering_output(
     composer.click()
     touch_baseline = settled_geometry(page)
     assert_clearance(touch_baseline, "native touch baseline")
-    # Keep touch input emulated while measuring: ending it resizes touch-sized targets.
     with native_touch_emulation(page) as touch_session:
         touch = scroll_with_native_touch(page, touch_session)
         assert touch["settledDistance"] > 100, touch
@@ -1492,7 +1492,8 @@ def test_scrollbar_thumb_drags_by_touch(
 ) -> None:
     chat = chat_session_contract
     seed_long_transcript(chat, 30, paragraphs=6)
-    open_live(page, chat, {"width": 800, "height": 1280})
+    # Desktop layout: the mobile composer overlays the thumb parked at the bottom.
+    open_live(page, chat, {"width": 1200, "height": 1280})
     tag_scroller(page)
     expect(page.get_by_test_id("transcript-scrollbar-thumb")).to_be_visible()
     bottom = park_at_bottom(page)

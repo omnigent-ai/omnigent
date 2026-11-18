@@ -103,9 +103,7 @@ export function SettingsCustomAgentsSection() {
     return (
       <SettingsItem entry={CUSTOM_AGENT_CREATE_ENTRY} className="@container">
         {back}
-        <h1 className="settings-page-title mb-6 text-2xl font-medium">
-          {CUSTOM_AGENT_CREATE_ENTRY.label}
-        </h1>
+        <h1 className="mb-6 text-2xl font-medium">{CUSTOM_AGENT_CREATE_ENTRY.label}</h1>
         <CreateAgentForm
           settingsEntry={CUSTOM_AGENT_CREATE_ENTRY}
           submitLabel={CUSTOM_AGENT_CREATE_ENTRY.parts.submit}
@@ -153,7 +151,7 @@ export function SettingsCustomAgentsSection() {
           />
         ) : (
           <>
-            <h1 className="settings-page-title mb-6 text-2xl font-medium">Custom agent</h1>
+            <h1 className="mb-6 text-2xl font-medium">Custom agent</h1>
             <p className="text-ui text-muted-foreground">
               {detail.isPending
                 ? "Loading agent…"
@@ -166,7 +164,7 @@ export function SettingsCustomAgentsSection() {
   }
   return (
     <SettingsItem entry={CUSTOM_AGENTS_LIST_ENTRY} className="@container">
-      <h1 className="settings-page-title pb-6 text-2xl font-medium">Custom agents</h1>
+      <h1 className="pb-6 text-2xl font-medium">Custom agents</h1>
       <div className="mb-6 flex items-center gap-2">
         <div className="flex h-8 min-w-0 flex-1 items-center gap-2 rounded-lg border border-border px-2.5">
           <SearchIcon className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
@@ -312,7 +310,7 @@ export function SettingsCustomAgentsSection() {
 function UnsupportedServer() {
   return (
     <div>
-      <h1 className="settings-page-title mb-6 text-2xl font-medium">Custom agents</h1>
+      <h1 className="mb-6 text-2xl font-medium">Custom agents</h1>
       <p role="alert" className="text-ui text-muted-foreground">
         Custom agents settings is unavailable on this server. Update the server and reload to enable
         it.
@@ -408,9 +406,7 @@ function AgentDetail({
         <>
           <BackButton label="Custom agents" to={BASE} componentId="settings.custom_agents.back" />
           <div className="flex items-start justify-between gap-4">
-            <h1 className="settings-page-title min-w-0 break-words text-2xl font-medium">
-              {agent.name}
-            </h1>
+            <h1 className="min-w-0 break-words text-2xl font-medium">{agent.name}</h1>
             {owned === true && (
               <Button
                 {...settingsControlProps(CUSTOM_AGENT_DETAIL_ENTRY, "delete")}

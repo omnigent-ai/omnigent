@@ -10,8 +10,6 @@ import {
 import { toast } from "sonner";
 import { useIdentityReady, useViewerId } from "@/hooks/useViewerId";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
-import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
-import { isAndroidShell, isIOSShell } from "@/lib/nativeBridge";
 import { getOmnigentServerIdentity } from "@/lib/host";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled } from "@/lib/capabilities";
@@ -56,9 +54,7 @@ export function GridSessionsProvider({ children }: { children: ReactNode }) {
 }
 
 function EnabledGridSessionsProvider({ children }: { children: ReactNode }) {
-  const mobileViewport = useIsMobileViewport();
-  const coarsePointer = useIsCoarsePointer();
-  const desktop = !mobileViewport && !coarsePointer && !isIOSShell() && !isAndroidShell();
+  const desktop = !useIsMobileViewport();
   const viewerId = useViewerId();
   const identityReady = useIdentityReady();
   const { conversationId: routeConversationId, gridId } = useParams<{

@@ -23,6 +23,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { Conversation } from "@/hooks/useConversations";
 import { BACKGROUND_SESSION_TITLES_STORAGE_KEY } from "@/lib/backgroundSessionTitlesPreferences";
 import { OPEN_SUBAGENTS_IN_PANEL_STORAGE_KEY } from "@/lib/subagentPanelPreferences";
+import { PROJECT_KANBAN_BOARD_STORAGE_KEY } from "@/lib/projectKanbanPreferences";
 import { fetchDatabricksStatus } from "@/lib/databricksIntegration";
 import { fetchGithubStatus } from "@/lib/githubIntegration";
 import {
@@ -68,6 +69,7 @@ const mocks = vi.hoisted(() => ({
   adminViewSupported: true as boolean | undefined,
   bootFallback: false,
   sessionTitleInstructions: false,
+  projectKanban: false,
   nestedAgents: false,
   advisorAvailable: false,
   authenticatedFetch: vi.fn(),
@@ -109,6 +111,7 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
           archive_worktree_cleanup: mocks.archiveWorktreeCleanup,
           session_title_instructions: mocks.sessionTitleInstructions,
           proactive_agent_available: mocks.advisorAvailable,
+          features: { project_kanban: mocks.projectKanban },
         },
 }));
 vi.mock("@/lib/githubIntegration", () => ({
@@ -327,6 +330,7 @@ beforeEach(() => {
   mocks.adminViewSupported = true;
   mocks.bootFallback = false;
   mocks.sessionTitleInstructions = false;
+  mocks.projectKanban = false;
   mocks.nestedAgents = false;
   mocks.advisorAvailable = false;
   mocks.authenticatedFetch.mockReset();
@@ -565,6 +569,26 @@ describe("SettingsPage", () => {
     ).toBeInTheDocument();
   });
 
+  it("offers the kanban board switch under Composer only when the server has the board", () => {
+    renderPage("/settings/general");
+    expect(screen.queryByTestId("settings-group-projects")).toBeNull();
+    cleanup();
+
+    mocks.projectKanban = true;
+    renderPage("/settings/general");
+    const projects = screen.getByTestId("settings-group-projects");
+    expect(screen.getByTestId("settings-group-composer").nextElementSibling).toBe(projects);
+    const toggle = within(projects).getByRole("switch", { name: "Kanban board views" });
+    expect(toggle).toBeChecked();
+
+    fireEvent.click(toggle);
+    expect(toggle).not.toBeChecked();
+    expect(localStorage.getItem(PROJECT_KANBAN_BOARD_STORAGE_KEY)).toBe("false");
+    fireEvent.click(toggle);
+    expect(toggle).toBeChecked();
+    expect(localStorage.getItem(PROJECT_KANBAN_BOARD_STORAGE_KEY)).toBeNull();
+  });
+
   it("renders session auto-rename enabled by default", async () => {
     renderPage("/settings/general");
 
@@ -729,7 +753,7 @@ describe("SettingsPage", () => {
   it("renders the Appearance section and applies a theme on card click", () => {
     renderPage("/settings/appearance");
     const heading = screen.getByRole("heading", { name: "Appearance" });
-    expect(heading).toHaveClass("settings-page-title", "font-medium");
+    expect(heading).toHaveClass("font-medium");
     expect(heading).not.toHaveClass("font-semibold");
     expect(heading.closest("section")?.parentElement).toHaveClass("max-w-4xl", "px-4", "md:px-8");
     expect(screen.getByRole("button", { name: "About Interface font size" })).toHaveClass(
