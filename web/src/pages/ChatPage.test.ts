@@ -37,6 +37,7 @@ import {
   shouldShowAuthorBadge,
   shouldShowWorkingIndicator,
   MAX_WARM_TERMINAL_SURFACES,
+  pruneWarmTerminalSurfaces,
   shouldMountTerminalSurface,
   shouldShowTerminalSurface,
   updateWarmTerminalSurfaces,
@@ -268,6 +269,20 @@ describe("Warm terminal-surface LRU", () => {
     // every session ever visited.
     expect(warmed.map((e) => e.conversationId)).toEqual(ids.slice(1));
     expect(warmed).toHaveLength(MAX_WARM_TERMINAL_SURFACES);
+  });
+
+  it("drops a session the predicate rejects, e.g. one deleted or archived", () => {
+    const warm = [
+      { conversationId: "conv_a", readOnly: false },
+      { conversationId: "conv_b", readOnly: true },
+      { conversationId: "conv_c", readOnly: false },
+    ];
+    expect(pruneWarmTerminalSurfaces(warm, (id) => id !== "conv_b")).toEqual([
+      { conversationId: "conv_a", readOnly: false },
+      { conversationId: "conv_c", readOnly: false },
+    ]);
+    // Nothing removed: the same array comes back, so no re-render.
+    expect(pruneWarmTerminalSurfaces(warm, () => true)).toBe(warm);
   });
 
   it("refreshes the readOnly snapshot for the re-inserted session only", () => {

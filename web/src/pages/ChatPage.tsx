@@ -6,7 +6,7 @@ import {
   useEditSentMessage,
   type SentMessage,
 } from "@/components/chat/editSentMessage";
-import { useLoadedConversations } from "@/hooks/useSidebarData";
+import { useLoadedConversations, useSidebarData } from "@/hooks/useSidebarData";
 import { useConversationRedirect } from "@/hooks/useConversationRedirect";
 import { MAIN_CANVAS_ID } from "@/canvas/canvasLayout";
 import { CANVAS_QUERY_PARAM, canvasLocation, isCanvasPathname } from "@/canvas/canvasNavigation";
@@ -1726,8 +1726,8 @@ export interface WarmTerminalEntry {
  * How many sessions' terminal surfaces stay warm at once (the active one
  * included). Each warm surface holds a WebSocket + a runner-side
  * tmux control client, a WebGL context (browsers cap those per page; losing
- * one falls back to xterm's DOM renderer), and keeps parsing any output
- * its TUI streams while hidden — so the cache is bounded rather than
+ * one falls back to xterm's DOM renderer), an xterm buffer, and keeps parsing
+ * any output its TUI streams while hidden — so the cache is bounded rather than
  * unbounded, but sized to cover a working set of sessions, not just a
  * pair. Idle shells cost ~nothing in the background; the practical
  * ceiling is many simultaneously *busy* TUIs.
@@ -1748,6 +1748,20 @@ export function updateWarmTerminalSurfaces(
 ): WarmTerminalEntry[] {
   const rest = prev.filter((e) => e.conversationId !== conversationId);
   return [...rest, { conversationId, readOnly }].slice(-MAX_WARM_TERMINAL_SURFACES);
+}
+
+/**
+ * Drop the warm entries *isKept* rejects (sessions the sidebar no longer
+ * lists, i.e. deleted or archived). Returns *prev* itself when nothing is
+ * dropped so the state update is a no-op. Pure — exported for direct unit
+ * testing.
+ */
+export function pruneWarmTerminalSurfaces(
+  prev: WarmTerminalEntry[],
+  isKept: (conversationId: string) => boolean,
+): WarmTerminalEntry[] {
+  const kept = prev.filter((e) => isKept(e.conversationId));
+  return kept.length === prev.length ? prev : kept;
 }
 
 interface WarmTerminalSurfacesProps {
@@ -1805,6 +1819,21 @@ function WarmTerminalSurfaces({
     if (!mountTerminal || !conversationId) return;
     setWarmTerminals((prev) => updateWarmTerminalSurfaces(prev, conversationId, terminalReadOnly));
   }, [mountTerminal, conversationId, terminalReadOnly]);
+  // Release the surface of a session the sidebar no longer lists (deleted or
+  // archived). Skipped while the list has more pages: an unloaded session is
+  // still live. The active session and temp ids (not listed until promoted)
+  // are never dropped here.
+  const { loadedData, all } = useSidebarData();
+  useEffect(() => {
+    if (!loadedData || all.hasNextPage) return;
+    const listed = new Set(loadedData.pages.flatMap((p) => p.data.map((c) => c.id)));
+    setWarmTerminals((prev) =>
+      pruneWarmTerminalSurfaces(
+        prev,
+        (id) => id === conversationId || isTempConvId(id) || listed.has(id),
+      ),
+    );
+  }, [loadedData, all.hasNextPage, conversationId]);
   // Render from warmTerminals only: the effect adds the active session after
   // the first paint, so xterm (a lazy chunk) never loads on the initial render.
   // Returning to an already-warm session is still same-commit.
