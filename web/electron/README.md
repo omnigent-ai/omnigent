@@ -652,7 +652,7 @@ including the address bar, chat links, and agent actions, enforces this policy.
 **Pieces:**
 
 - `src/browserViewRegistry.js` — a per-**conversation** `Map` of
-  `WebContentsView`s (cap 10). `setActive` attaches one view to the host window
+  `WebContentsView`s (cap 20). `setActive` attaches one view to the host window
   and **detaches (does not destroy)** the previous one, so a background
   conversation's page keeps running when the user switches away; views are
   destroyed only on explicit close or window teardown. Each child view keeps
@@ -972,12 +972,11 @@ install production desktop updates. `build:mac:release` retains
 cross-platform publishing and update-feed checklist, see [the desktop release
 runbook](RELEASING.md).
 
-macOS apps, including unpackaged development, default to V2 onboarding only when the managed preference
-`databricksInternalFeaturesEnabled` is `true`, for both new and existing profiles.
-Other users and Windows/Linux keep the legacy
-default. The setup-page switch still persists an explicit choice on every
-platform, and `OMNIGENT_SERVER_SELECTOR_V2=1` forces V2 regardless of the saved
-choice. A saved server still reconnects on launch.
+macOS apps, including unpackaged development, default to V2 onboarding for both
+new and existing profiles. Windows/Linux keep the legacy default. The setup-page
+switch still persists an explicit choice on every platform, and
+`OMNIGENT_SERVER_SELECTOR_V2=1` forces V2 regardless of the saved choice. A
+saved server still reconnects on launch.
 
 Unpackaged `pnpm start` / `just electron-dev` runs inside Electron's own macOS
 bundle, but reads local preferences from `ai.omnigent.desktop-dev` explicitly

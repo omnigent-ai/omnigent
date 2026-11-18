@@ -45,6 +45,10 @@ vi.mock("@/hooks/useSessionMentionEntries", () => ({
 // ComposerStatusLine's PR link reads GitHub info via a TanStack query; stub it
 // (default: no PR) so these tests don't need a QueryClientProvider, matching
 // the workspace-files stub above.
+// Run a workflow lists saved workflows from a TanStack query; none here.
+vi.mock("@/hooks/useSavedWorkflows", () => ({
+  useSavedWorkflows: () => ({ workflows: [], refresh: () => {} }),
+}));
 vi.mock("@/hooks/usePullRequests", () => ({
   usePullRequestInfo: () => usePullRequestInfoMock(),
 }));
@@ -415,11 +419,11 @@ describe("Composer status line (branch + context ring)", () => {
   it.each([true, false])(
     "places host and model controls beside overflow only on mobile (%s)",
     (mobile) => {
-      const mediaQuery = window.matchMedia("(max-width: 767.98px)");
+      const mediaQuery = window.matchMedia("(max-width: 1180.98px)");
       vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
         ...mediaQuery,
         media: query,
-        matches: mobile && query === "(max-width: 767.98px)",
+        matches: mobile && query === "(max-width: 1180.98px)",
       }));
       bindHost("mac-laptop");
       useSessionHostOnlineMock.mockReturnValue(false);

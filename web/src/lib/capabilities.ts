@@ -68,9 +68,13 @@ export type FeatureKey =
   | "automations_v2"
   | "splittable_terminal_view_ui"
   | "sidebar_windowed_rows"
+  | "session_orchestration"
+  | "workflows"
   | "session_overview"
+  | "project_kanban"
   | "project_repository_creation"
-  | "session_orchestration";
+  | "workspace_direct_access"
+  | "workspace_api_server_access";
 
 /** Deployment-wide release-feature values advertised by the server. */
 export type FeatureValues = Record<string, boolean>;
@@ -265,12 +269,20 @@ export interface ServerInfo {
    * Session control there. Fails to ``false``.
    */
   scheduled_task_session_modes?: boolean;
+  /** Scheduled tasks accept `mcp_services`; older servers reject it. */
+  scheduled_task_mcp_services?: boolean;
   /**
    * True when a session create (and so ``sys_session_create``) accepts
    * ``permission_mode``. Older servers ignore the field, so trigger templates
    * write a worker mode only here. Fails to ``false``.
    */
   session_create_permission_modes?: boolean;
+  /**
+   * True when a session create (and so ``sys_session_create``) accepts
+   * ``workflow_id``. Runners refuse the field on older servers, so trigger
+   * templates start workers as workflow runs only here. Fails to ``false``.
+   */
+  session_create_workflow_id?: boolean;
   /**
    * True when a scheduled task can start every run from a copy of an existing
    * session (``source_session_id``). Gates the session menu's "Create
@@ -283,6 +295,11 @@ export interface ServerInfo {
   scheduled_task_trigger_headers?: boolean;
   /** Server default for new trigger templates, from 10 to 240 minutes. */
   automation_trigger_poll_minutes?: number;
+  /**
+   * Longest session message the server delivers, e.g. 32000. Older servers
+   * omit it and deliver at most 8,000 characters.
+   */
+  session_message_max_chars?: number;
   /** Sandbox automations accept a repository URL as their workspace. */
   scheduled_task_sandbox_workspaces?: boolean;
   /**
@@ -327,6 +344,16 @@ export interface ServerInfo {
   /** Session comments preserve PR revision and line anchors; absent on older servers. */
   comment_anchor_metadata?: boolean;
   /**
+   * True when the server keeps session journals (``/v1/sessions/{id}/journal`` and
+   * ``session.journal.appended``), which the Tasks tab shows; absent on older servers (off).
+   */
+  session_journal?: boolean;
+  /**
+   * True when the server keeps each user's saved workflows (``/v1/workflows``), which
+   * Run a workflow offers; absent on older servers (off).
+   */
+  workflows?: boolean;
+  /**
    * True when the server stores each user's session title instructions
    * (``/v1/settings/session-title-instructions``); absent on older servers (off).
    */
@@ -340,6 +367,28 @@ export interface ServerInfo {
   scheduled_task_projects?: boolean;
   /** Latest sessionless automation failures can be listed for Inbox. */
   scheduled_task_inbox?: boolean;
+  /**
+   * Owners can share automations (``/v1/scheduled-tasks/{id}/permissions``);
+   * absent on older servers (off).
+   */
+  scheduled_task_sharing?: boolean;
+  /** Agents can post items to this caller's Inbox (``/v1/inbox/items``). */
+  inbox_items_available?: boolean;
+  /**
+   * Automations shared with the viewer can be listed (``/v1/scheduled-tasks/shared``);
+   * absent on older servers (off), including some that advertise sharing.
+   */
+  scheduled_task_shared_with_me?: boolean;
+  /**
+   * True when `GET /v1/scheduled-tasks/{id}/run-pull-requests` lists each run's PRs;
+   * absent on older servers (off), including ones that store session PRs.
+   */
+  scheduled_task_run_pull_requests?: boolean;
+  /**
+   * The deployment offers the proactive agent (Omni Advisor) to this caller;
+   * whether it is on for them is at ``GET /v1/proactive-agent/settings``.
+   */
+  proactive_agent_available?: boolean;
   /** Scheduled permissions support native harnesses beyond Claude Code. */
   scheduled_task_harness_settings?: boolean;
   /** Automations accept modes that skip approval; older servers may reject them. */
@@ -485,6 +534,8 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   session_search_scope: false,
   scheduled_task_session_modes: false,
   session_create_permission_modes: false,
+  session_create_workflow_id: false,
+  scheduled_task_mcp_services: false,
   scheduled_task_source_sessions: false,
   scheduled_task_subhour: false,
   scheduled_task_trigger_headers: false,
@@ -536,6 +587,14 @@ export function sandboxProfilesEnabled(info: ServerInfo | "loading"): boolean {
     isFeatureEnabled(info, "sandbox_profiles") &&
     info !== "loading" &&
     info.managed_sandboxes_enabled
+  );
+}
+
+/** Whether the Admin > General page has a setting to show: nested agents or Omni Advisor. */
+export function adminGeneralSettingsAvailable(info: ServerInfo | "loading"): boolean {
+  return (
+    info !== "loading" &&
+    (info.sibling_sessions === true || info.proactive_agent_available === true)
   );
 }
 
@@ -665,9 +724,17 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           session_search_scope: data.session_search_scope === true,
           scheduled_task_session_modes: data.scheduled_task_session_modes === true,
           session_create_permission_modes: data.session_create_permission_modes === true,
+          session_create_workflow_id: data.session_create_workflow_id === true,
+          scheduled_task_mcp_services: data.scheduled_task_mcp_services === true,
           scheduled_task_source_sessions: data.scheduled_task_source_sessions === true,
           scheduled_task_subhour: data.scheduled_task_subhour === true,
           scheduled_task_trigger_headers: data.scheduled_task_trigger_headers === true,
+          session_message_max_chars:
+            typeof data.session_message_max_chars === "number" &&
+            Number.isInteger(data.session_message_max_chars) &&
+            data.session_message_max_chars > 0
+              ? data.session_message_max_chars
+              : undefined,
           automation_trigger_poll_minutes:
             typeof data.automation_trigger_poll_minutes === "number" &&
             Number.isInteger(data.automation_trigger_poll_minutes) &&
@@ -688,12 +755,19 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           session_claude_sdk_clear: data.session_claude_sdk_clear === true,
           session_rewind: data.session_rewind === true,
           session_pull_requests: data.session_pull_requests === true,
+          session_journal: data.session_journal === true,
+          workflows: data.workflows === true,
           session_title_instructions: data.session_title_instructions === true,
           admin_view: data.admin_view === true,
           comment_anchor_metadata: data.comment_anchor_metadata === true,
           filesystem_attachments: parseFilesystemAttachments(data.filesystem_attachments),
           scheduled_task_projects: data.scheduled_task_projects === true,
           scheduled_task_inbox: data.scheduled_task_inbox === true,
+          scheduled_task_sharing: data.scheduled_task_sharing === true,
+          inbox_items_available: data.inbox_items_available === true,
+          scheduled_task_shared_with_me: data.scheduled_task_shared_with_me === true,
+          scheduled_task_run_pull_requests: data.scheduled_task_run_pull_requests === true,
+          proactive_agent_available: data.proactive_agent_available === true,
           scheduled_task_harness_settings: data.scheduled_task_harness_settings === true,
           scheduled_task_approval_skipping_modes:
             data.scheduled_task_approval_skipping_modes === true,
@@ -735,6 +809,14 @@ export function getCachedServerInfo(): ServerInfo | null {
  */
 export function isSingleUserMode(info: ServerInfo | "loading"): boolean {
   return info !== "loading" && info.single_user;
+}
+
+/** Why Share controls are disabled while the server turns sharing off. */
+export const SHARING_OFF_REASON = "Sharing has been disabled for this Omnigent server.";
+
+/** Whether the server turns sharing off; `false` while the probe loads (fail open). */
+export function isSharingOff(info: ServerInfo | "loading"): boolean {
+  return info !== "loading" && info.sharing_mode === "off";
 }
 
 /**

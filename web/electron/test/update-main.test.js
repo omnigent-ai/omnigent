@@ -252,7 +252,7 @@ function loadMainHarness({
   // into the menu, the IPC surface, and the before-quit install handoff.
   const source =
     fs.readFileSync(mainPath, "utf8") +
-    '\nmodule.exports.testApi = { buildMenu, registerIpc, windows, updater, setQuitTimeouts: (o) => { if (typeof (o && o.cleanup) === "number") quitCleanupTimeoutMs = o.cleanup; if (typeof (o && o.installFallback) === "number") quitInstallFallbackMs = o.installFallback; } }';
+    '\nmodule.exports.testApi = { buildMenu, registerIpc, windows, updater, workspaceSshForwards, setQuitTimeouts:(o) => { if (typeof (o && o.cleanup) === "number") quitCleanupTimeoutMs = o.cleanup; if (typeof (o && o.installFallback) === "number") quitInstallFallbackMs = o.installFallback; } }';
 
   const module = { exports: {} };
   const sandbox = {
@@ -1495,6 +1495,13 @@ describe("auto-update main-process wiring", () => {
     const harness = loadMainHarness({ settings: { update_mode: "manual" } });
     t.after(harness.cleanup);
     harness.api.setQuitTimeouts({ cleanup: 10 });
+    // Forced exits skip will-quit, so SSH teardown must have run before any app.exit.
+    const { closeAll } = harness.api.workspaceSshForwards;
+    const exitCountsAtTeardown = [];
+    harness.api.workspaceSshForwards.closeAll = () => {
+      exitCountsAtTeardown.push(harness.calls.appExit);
+      closeAll();
+    };
 
     harness.appEvents.get("before-quit")({ preventDefault: () => {} });
     await flushPromises();
@@ -1509,6 +1516,7 @@ describe("auto-update main-process wiring", () => {
       setTimeout(resolve, 30);
     });
     assert.equal(harness.calls.appExit, 1);
+    assert.deepEqual(exitCountsAtTeardown, [0]);
   });
 
   it("cancels the normal quit fallback once quit is reached", async (t) => {

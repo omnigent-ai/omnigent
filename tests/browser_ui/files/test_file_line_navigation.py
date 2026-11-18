@@ -938,7 +938,7 @@ def test_markdown_comment_draft_survives_responsive_layouts(
         # Let CSS hide the old layout before React receives the new viewport.
         page.add_init_script("""
             const matchMedia = window.matchMedia.bind(window);
-            const query = '(max-width: 767.98px)';
+            const query = '(max-width: 1180.98px)';
             const media = matchMedia(query);
             let matches = media.matches;
             const deferred = new EventTarget();

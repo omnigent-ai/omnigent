@@ -130,14 +130,18 @@ def _delivered(pending: ConversationItem) -> NewConversationItem:
         ([_error(), _text("Back online.")], ""),
         ([_text("Working."), _error()], "error"),
         ([_text("Working."), _disconnect()], "disconnected"),
-        ([_error(), _disconnect()], "disconnected"),
+        ([_error(), _disconnect()], "error"),
+        ([_error(), _disconnect(response_id="r2")], "disconnected"),
+        # Recovery ends the exception: a later disconnect in that response counts.
+        ([_error(), _text("Back online."), _disconnect()], "disconnected"),
         ([_disconnect(), _text("Back online.")], ""),
         ([_error(), _info_error()], "error"),
         ([_text("Working."), _info_error()], ""),
     ],
 )
 def test_fold_rule(batch: list[NewConversationItem], expected: str | None) -> None:
-    assert fold_activity_error(batch) == expected
+    summary = fold_activity_error(batch)
+    assert (summary.value if summary is not None else None) == expected
 
 
 def test_pending_input_never_decides() -> None:
@@ -146,7 +150,8 @@ def test_pending_input_never_decides() -> None:
         response_id=PENDING_INPUT_RESPONSE_ID,
         data=ErrorData(source="execution", code="rate_limit_exceeded", message="x"),
     )
-    assert fold_activity_error([_text("ok"), pending_error]) == ""
+    summary = fold_activity_error([_text("ok"), pending_error])
+    assert summary is not None and summary.value == ""
 
 
 # ── Maintenance on append ──────────────────────────────────────
@@ -244,12 +249,13 @@ def test_unchanged_value_writes_nothing(conversation_store: SqlAlchemyConversati
     conversation_store.append(conv.id, [_error()])
 
     with _count_label_writes(conversation_store) as writes:
-        conversation_store.append(conv.id, [_error(response_id="r2")])
+        conversation_store.append(conv.id, [_error()])
         assert writes == []
         conversation_store.append(conv.id, [_user("again", response_id="r2")])
         assert writes == []
         conversation_store.append(conv.id, [_text("Back.", response_id="r3")])
-        assert len(writes) == 1
+        # Both labels change; MySQL's generic upsert writes each separately.
+        assert writes
     assert _label(conversation_store, conv.id) == ""
 
 
@@ -309,4 +315,36 @@ def test_concurrent_appends_to_one_session_keep_a_consistent_label(
 
     history = conversation_store.list_items(conv.id, limit=100).data
     assert len(history) == 61
-    assert _label(conversation_store, conv.id) == (fold_activity_error(history) or "")
+    summary = fold_activity_error(history)
+    assert summary is not None
+    assert _label(conversation_store, conv.id) == summary.value
+
+
+@pytest.mark.parametrize("split_append", [False, True])
+@pytest.mark.parametrize("native_text", [False, True])
+def test_same_response_disconnect_preserves_genuine_fault(
+    conversation_store: SqlAlchemyConversationStore, split_append: bool, native_text: bool
+) -> None:
+    conv = conversation_store.create_conversation()
+    fault = _text("API Error: Overloaded") if native_text else _error()
+    if split_append:
+        conversation_store.append(conv.id, [fault])
+        conversation_store.append(conv.id, [_disconnect()])
+    else:
+        conversation_store.append(conv.id, [fault, _disconnect()])
+    assert _label(conversation_store, conv.id) == "error"
+    conversation_store.append(conv.id, [_text("Recovered", response_id="r2")])
+    assert _label(conversation_store, conv.id) == ""
+
+
+def test_newer_fault_moves_the_response_boundary(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A repeat fault keeps the value but must still record its own response."""
+    conv = conversation_store.create_conversation()
+    conversation_store.append(conv.id, [_error()])
+    conversation_store.append(conv.id, [_error(response_id="r2")])
+    conversation_store.append(conv.id, [_disconnect("r2")])
+    assert _label(conversation_store, conv.id) == "error"
+    conversation_store.append(conv.id, [_disconnect("r3")])
+    assert _label(conversation_store, conv.id) == "disconnected"

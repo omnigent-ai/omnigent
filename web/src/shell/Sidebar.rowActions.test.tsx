@@ -77,7 +77,8 @@ const mocks = vi.hoisted(() => {
 // Mock the mobile-viewport hook — jsdom doesn't evaluate media queries, so
 // drive it explicitly. Defaults to desktop (false); the mobile flyout test
 // flips `mocks.isMobile` for the duration of that case.
-vi.mock("@/hooks/useIsMobileViewport", () => ({
+vi.mock(import("@/hooks/useIsMobileViewport"), async (importOriginal) => ({
+  ...(await importOriginal()),
   useIsMobileViewport: () => mocks.isMobile,
 }));
 
@@ -390,30 +391,23 @@ describe("quick pin/unpin hover button", () => {
     expect(iconSelector.querySelector("svg")).toHaveClass("text-primary");
   });
 
-  it("keeps the Projects group-header actions visible without hover, hover-revealed on desktop", () => {
+  it("keeps the Projects group-header actions visible on mobile, hover-revealed on desktop", () => {
     // The "New project" (+) button is the only way to create a project, so its
-    // group-header wrapper must stay visible wherever hover is unavailable —
-    // phones AND touch tablets at `md`+ widths — rather than fade out like the
-    // desktop-only session-header controls. jsdom doesn't evaluate media
-    // queries, so assert the responsive classes: base `flex` (shown at every
-    // breakpoint) with the fade + hover/focus reveals gated on hover
-    // capability, not just the `md` width.
+    // group-header wrapper must stay visible in the mobile layout. jsdom doesn't
+    // evaluate media queries, so assert the responsive classes: base `flex`
+    // (shown at every breakpoint) with the fade + hover/focus reveals from `md`.
     mocks.projects = ["Sprint 42"];
     renderSidebar();
 
     const wrapper = screen.getByTestId("new-project").closest(".transition-opacity");
     expect(wrapper).not.toBeNull();
-    // Visible without hover: base display is `flex`, never `hidden`, and the
-    // fade is not applied by viewport width alone.
     expect(wrapper).toHaveClass("flex");
     expect(wrapper).not.toHaveClass("hidden");
-    expect(wrapper).not.toHaveClass("md:opacity-0");
-    // Hover-capable desktop: fades out until the header is hovered / focused /
-    // a menu opens.
+    // Desktop: fades out until the header is hovered / focused / a menu opens.
     expect(wrapper).toHaveClass(
-      "[@media((hover:hover)_and_(pointer:fine))]:md:opacity-0",
-      "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:opacity-100",
-      "[@media((hover:hover)_and_(pointer:fine))]:md:has-[:focus-visible]:opacity-100",
+      "md:opacity-0",
+      "md:group-hover/header:opacity-100",
+      "md:has-[:focus-visible]:opacity-100",
     );
   });
 

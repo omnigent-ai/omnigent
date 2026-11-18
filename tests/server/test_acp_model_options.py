@@ -351,6 +351,7 @@ def _acp_cache() -> MagicMock:
         name="worker",
         executor=ExecutorSpec(type="omnigent", config={"harness": "acp:synthetic"}),
     )
+    cache.load_spec.return_value = cache.load.return_value.spec
     return cache
 
 
@@ -364,7 +365,7 @@ def test_resolve_harness_is_acp_reuses_prefetched_agent() -> None:
             _conv(agent_id="agent_1"), store, agent=_agent_row("agent_1")
         )
     store.get.assert_not_called()
-    assert cache.load.call_args.args[:2] == ("agent_1", "b://acp")
+    assert cache.load_spec.call_args.args[:2] == ("agent_1", "b://acp")
 
 
 def test_resolve_harness_ignores_prefetched_agent_of_another_conversation() -> None:

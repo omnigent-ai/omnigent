@@ -45,6 +45,8 @@ from omnigent.runner.git_providers import (
     PinnedRevisionFacet,
     ProviderCapabilities,
     PullRequestFacet,
+    PullRequestStatus,
+    PullRequestStatusFacet,
     ReviewerRef,
     ReviewThreadsFacet,
     local_git,
@@ -362,6 +364,8 @@ def _session_prs_with_titles(
     facets = _title_facets(root, entries)
     now = time.time()
     titles: dict[str, str | None] = {}
+    # States looked up during this request, which the server stores as of its request.
+    statuses: dict[str, PullRequestStatus] = {}
     timed_out_urls: set[str] = set()
     pending: list[SessionPullRequest] = []
     for entry in entries:
@@ -384,25 +388,35 @@ def _session_prs_with_titles(
     pending.sort(key=lambda entry: entry.title_checked_at)
     deadline = min(request_deadline, time.monotonic() + _PR_TITLE_LOOKUP_SECONDS)
 
-    def fetch_title(entry: SessionPullRequest) -> tuple[str, str | None, bool] | None:
+    def fetch_title(
+        entry: SessionPullRequest,
+    ) -> tuple[str, str | None, bool, PullRequestStatus | None] | None:
         if time.monotonic() >= deadline:
             return None
+        facet = facets[entry.provider]
         try:
-            title, timed_out = facets[entry.provider].pr_title(root, entry, deadline)
+            # The same request a title lookup makes also carries the state, when the
+            # provider can return both.
+            if isinstance(facet, PullRequestStatusFacet):
+                status, timed_out = facet.pr_status(root, entry, deadline)
+                return entry.url, status.title if status else None, timed_out, status
+            title, timed_out = facet.pr_title(root, entry, deadline)
         except Exception:  # keep the existing cache when an optional lookup fails
             _logger.warning("Git provider %s failed in pr_title", entry.provider, exc_info=True)
             return None
-        return entry.url, title, timed_out
+        return entry.url, title, timed_out, None
 
     may_cache = time.monotonic() < request_deadline
     if pending and time.monotonic() < deadline:
         with ThreadPoolExecutor(max_workers=min(4, len(pending))) as executor:
             for result in executor.map(fetch_title, pending):
                 if result is not None:
-                    url, title, timed_out = result
+                    url, title, timed_out, status = result
                     titles[url] = title
                     if timed_out:
                         timed_out_urls.add(url)
+                    if status is not None and status.state is not None:
+                        statuses[url] = status
     if titles and may_cache:
         try:
             registry.update_titles(titles, timestamp=now, timed_out_urls=timed_out_urls)
@@ -414,6 +428,11 @@ def _session_prs_with_titles(
             **entry.model_dump(),
             "title": titles.get(entry.url) or entry.title,
             "provider_display": provider_display(entry.provider),
+            **(
+                {"state": status.state, "is_draft": status.is_draft}
+                if (status := statuses.get(entry.url)) is not None
+                else {}
+            ),
         }
         for entry in entries
     ]

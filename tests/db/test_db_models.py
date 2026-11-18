@@ -32,6 +32,7 @@ from omnigent.db.db_models import (
     SqlSessionPermission,
     SqlUser,
     SqlUserDailyCost,
+    SqlWorkflow,
 )
 from omnigent.db.enum_codecs import (
     encode_account_token_kind,
@@ -1044,3 +1045,42 @@ class TestSqlUserDailyCost:
         with managed() as session:
             rows = session.query(SqlUserDailyCost).filter_by(user_id="u1").all()
             assert len(rows) == 2
+
+
+# ── SqlWorkflow ───────────────────────────────────────
+
+
+class TestSqlWorkflow:
+    @pytest.mark.parametrize(("column_name", "limit"), [("description", 2000), ("plan", 16_383)])
+    def test_user_content_writes_enforce_the_column_stored_limit(
+        self, column_name: str, limit: int
+    ) -> None:
+        table = SqlWorkflow.__table__
+        assert table.c[column_name].type.max_bytes == limit
+        plan = b'{"steps":[{"id":"build","name":"Build","goal":null,"depends_on":[]}]}'
+        engine = sa.create_engine("sqlite://")
+        try:
+            table.create(engine)
+            with engine.begin() as connection:
+                connection.execute(
+                    table.insert().values(
+                        workspace_id=0,
+                        id="0123456789abcdef0123456789abcdef",
+                        user_id="alice@example.com",
+                        name="nightly-build",
+                        description=b"Build and test main every night.",
+                        plan=plan,
+                        created_at=1_762_534_860,
+                        updated_at=1_762_534_860,
+                    )
+                )
+                assert connection.execute(sa.select(table.c.plan)).scalar_one() == plan
+            # The column bounds the encoded bytes, including any encryption envelope.
+            oversized = b"x" * (limit + 1)
+            with (
+                pytest.raises(StatementError, match="stored value exceeds"),
+                engine.begin() as connection,
+            ):
+                connection.execute(table.update().values({column_name: oversized}))
+        finally:
+            engine.dispose()

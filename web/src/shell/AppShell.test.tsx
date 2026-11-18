@@ -142,7 +142,7 @@ vi.mock("@/hooks/useAgents", () => ({
 }));
 
 vi.mock("./Sidebar", () => ({
-  isMobileViewport: () => !window.matchMedia("(min-width: 768px)").matches,
+  isMobileViewport: () => !window.matchMedia("(min-width: 1181px)").matches,
   // Reflect the open/peek props so tests can assert sidebar collapse/expand and
   // whether it is peeking (a floating hover card rather than a docked panel).
   // Rendered as aside.conversations-sidebar like the real one, so the
@@ -2227,7 +2227,7 @@ describe("Workspace rail maximize", () => {
     const baseMatchMedia = window.matchMedia;
     const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query: string) => ({
       ...baseMatchMedia(query),
-      matches: query === "(min-width: 768px)" ? viewport === "desktop" : false,
+      matches: query === "(min-width: 1181px)" ? viewport === "desktop" : false,
     }));
     onTestFinished(() => matchMedia.mockRestore());
     mockConversations([]);
@@ -2409,8 +2409,8 @@ describe("Sidebar across the md breakpoint", () => {
     let width = initialWidth;
     const listeners = new Map<string, Set<EventListenerOrEventListenerObject>>();
     const matches = (query: string) => {
-      if (query === "(min-width: 768px)") return width >= 768;
-      if (query === "(max-width: 767.98px)") return width < 768;
+      if (query === "(min-width: 1181px)") return width >= 1181;
+      if (query === "(max-width: 1180.98px)") return width < 1181;
       return false;
     };
     const baseMatchMedia = window.matchMedia;
@@ -3122,61 +3122,130 @@ describe("Session overview", () => {
     if (workspace === "open") await waitFor(() => expect(railOpenState()).toBe("open"));
   }
 
-  const overview = () => screen.queryByRole("complementary", { name: "Session overview" });
+  const docked = () => screen.queryByRole("complementary", { name: "Session overview" });
+  const popover = () => screen.queryByRole("dialog", { name: "Session overview" });
 
   it("adds nothing with the flag off", async () => {
     setWideViewport(true);
     await renderOverviewShell(false, "collapsed");
 
     expect(screen.queryByTestId("header-session-cost")).toBeNull();
-    expect(overview()).toBeNull();
+    expect(docked()).toBeNull();
   });
 
-  it("docks beside chat in a wide window and keeps each placement's choice", async () => {
+  it("docks beside the right-panel toggle and keeps each placement's choice", async () => {
     setWideViewport(true);
     await renderOverviewShell(true, "collapsed");
     const chip = () => screen.getByTestId("header-session-cost");
+    const header = document.querySelector<HTMLElement>("header.chat-header")!;
 
-    expect(chip()).toHaveAttribute("aria-pressed", "true");
-    expect(overview()).toBeInTheDocument();
-    expect(screen.getByRole("main")).not.toContainElement(overview());
+    const headerButtons = within(header).getAllByRole("button");
+    expect(headerButtons.at(-2)).toBe(chip());
+    expect(headerButtons.at(-1)).toHaveAccessibleName("Expand right panel");
+    expect(chip()).toHaveAttribute("aria-expanded", "true");
+    expect(docked()).toBeInTheDocument();
+    expect(screen.getByRole("main")).not.toContainElement(docked());
     fireEvent.click(chip());
-    expect(chip()).toHaveAttribute("aria-pressed", "false");
-    expect(overview()).toBeNull();
+    expect(chip()).toHaveAttribute("aria-expanded", "false");
+    expect(docked()).toBeNull();
 
-    // The open workspace switches to the overlay, which starts hidden.
+    // The open workspace switches to the popover, which starts hidden.
     fireEvent.click(screen.getByRole("button", { name: "Expand right panel" }));
     await waitFor(() => expect(railOpenState()).toBe("open"));
-    expect(overview()).toBeNull();
+    expect(popover()).toBeNull();
     fireEvent.click(chip());
-    expect(screen.getByRole("main")).toContainElement(overview());
+    expect(popover()).toBeInTheDocument();
+    expect(docked()).toBeNull();
 
     // Collapsing it docks again, keeping the docked card hidden.
     fireEvent.click(screen.getByRole("button", { name: "Collapse right panel" }));
     await waitFor(() => expect(railOpenState()).toBe("closed"));
-    expect(chip()).toHaveAttribute("aria-pressed", "false");
-    expect(overview()).toBeNull();
+    expect(chip()).toHaveAttribute("aria-expanded", "false");
+    expect(docked()).toBeNull();
+    expect(popover()).toBeNull();
+
+    // A reload keeps the hand-closed card closed, and reopening it is remembered too.
+    cleanup();
+    await renderOverviewShell(true, "collapsed");
+    expect(docked()).toBeNull();
+    fireEvent.click(chip());
+    expect(docked()).toBeInTheDocument();
+    cleanup();
+    await renderOverviewShell(true, "collapsed");
+    expect(docked()).toBeInTheDocument();
+  });
+
+  it("toggles the docked card when its choice can't be stored", async () => {
+    setWideViewport(true);
+    const key = "omnigent:session-overview-docked";
+    localStorage.setItem(key, "closed");
+    // Fail only this key's writes and removals; the shell stores other preferences too.
+    for (const method of ["setItem", "removeItem"] as const) {
+      const original = Storage.prototype[method];
+      const failing = vi.spyOn(Storage.prototype, method).mockImplementation(function (
+        this: Storage,
+        ...args: [string, string]
+      ) {
+        if (args[0] === key) throw new DOMException("Storage is full", "QuotaExceededError");
+        return original.apply(this, args);
+      });
+      onTestFinished(() => failing.mockRestore());
+    }
+    await renderOverviewShell(true, "collapsed");
+    const chip = () => screen.getByTestId("header-session-cost");
+
+    expect(docked()).toBeNull();
+    fireEvent.click(chip());
+    expect(docked()).toBeInTheDocument();
+    fireEvent.click(within(docked()!).getByRole("button", { name: "Hide session overview" }));
+    expect(docked()).toBeNull();
+    expect(localStorage.getItem(key)).toBe("closed");
   });
 
   it.each([
     ["a narrow window", false, "collapsed"],
     ["an open workspace", true, "open"],
-  ] as const)("starts hidden with %s and opens over chat", async (_, wide, workspace) => {
+  ] as const)("starts hidden with %s and opens as a popover", async (_, wide, workspace) => {
     setWideViewport(wide);
     await renderOverviewShell(true, workspace);
 
-    const toggle = screen.getByTestId("header-session-cost");
-    expect(toggle).toHaveAttribute("aria-pressed", "false");
-    expect(overview()).toBeNull();
-    fireEvent.click(toggle);
-    expect(toggle).toHaveAttribute("aria-pressed", "true");
-    expect(screen.getByRole("main")).toContainElement(overview());
-    fireEvent.click(screen.getByRole("button", { name: "Hide session overview" }));
-    expect(overview()).toBeNull();
+    const chip = screen.getByTestId("header-session-cost");
+    expect(chip).toHaveAttribute("aria-expanded", "false");
+    expect(popover()).toBeNull();
+    fireEvent.click(chip);
+    expect(chip).toHaveAttribute("aria-expanded", "true");
+    expect(popover()).toBeInTheDocument();
+    expect(docked()).toBeNull();
+    fireEvent.click(within(popover()!).getByRole("button", { name: "Hide session overview" }));
+    expect(popover()).toBeNull();
+    expect(chip).toHaveAttribute("aria-expanded", "false");
   });
 });
 
 describe("Right workspace card visibility", () => {
+  it.each([true, false, undefined])(
+    "preserves a pinned Tasks tab with native to-dos on workflows=%s",
+    (workflows) => {
+      mockConversations([{ id: "conv_tasks", permission_level: null }]);
+      useChatStore.setState({
+        todos: [{ content: "Only item", status: "pending", activeForm: "" }],
+      });
+      onTestFinished(() => useChatStore.setState({ todos: [] }));
+      writePinnedWorkspaceTabs(["files", "tasks"]);
+      writeSessionWorkspaceState("conv_tasks", { open: true, rightRailTab: "tasks" });
+
+      renderShell(
+        "/c/conv_tasks",
+        serverInfo({
+          session_journal: false,
+          features: workflows === undefined ? {} : { workflows },
+        }),
+      );
+
+      expect(screen.getByRole("tab", { name: "Tasks" })).toHaveAttribute("aria-selected", "true");
+    },
+  );
+
   it.each([true, false])(
     "waits for capabilities before validating restored search (enabled=%s)",
     async (enabled) => {
@@ -5873,7 +5942,7 @@ describe("AppShell clone/fork action", () => {
     const baseMatchMedia = window.matchMedia;
     const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query: string) => ({
       ...baseMatchMedia(query),
-      matches: query === "(min-width: 768px)",
+      matches: query === "(min-width: 1181px)",
     }));
     onTestFinished(() => matchMedia.mockRestore());
     const parent = sessionSnapshot({ id: "conv_parent", title: "Parent title" });
@@ -6746,7 +6815,7 @@ describe("shell command drafts", () => {
       const matchMedia = window.matchMedia;
       const viewport = vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
         ...matchMedia(query),
-        matches: query === "(min-width: 768px)" ? !mobile : matchMedia(query).matches,
+        matches: query === "(min-width: 1181px)" ? !mobile : matchMedia(query).matches,
       }));
       onTestFinished(() => viewport.mockRestore());
       const terminals: TerminalInfo[] = [];

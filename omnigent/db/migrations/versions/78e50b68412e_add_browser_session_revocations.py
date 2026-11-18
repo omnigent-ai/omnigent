@@ -1,7 +1,7 @@
 """add browser_session_revocations table
 
 Revision ID: 78e50b68412e
-Revises: 27d16059fab9
+Revises: ffeec66eadb5
 Create Date: 2026-09-27 00:00:00.000000
 
 Adds ``browser_session_revocations``: one row per browser session (``sid``)
@@ -36,7 +36,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "78e50b68412e"
-down_revision: str | None = "27d16059fab9"
+down_revision: str | None = "ffeec66eadb5"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

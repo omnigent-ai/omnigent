@@ -114,6 +114,14 @@ const FORMATTERS: Record<string, ArgFormatter> = {
     const id = asString(args.timer_id);
     return id === null ? verbOnly("Cancel timer") : { verb: "Cancel timer:", body: id };
   },
+  sys_reminder_set: (args) => {
+    const at = asString(args.at);
+    if (at !== null) return { verb: "Set reminder:", body: at };
+    const seconds = asNumber(args.delay_seconds);
+    return seconds === null
+      ? verbOnly("Set reminder")
+      : { verb: "Set reminder:", body: `in ${seconds}s` };
+  },
 
   // Terminal multiplexer.
   sys_terminal_launch: (args) => terminalTitle("Launch terminal", args),
