@@ -72,6 +72,94 @@ HOST_SANDBOX_BACKEND_ENV = "OMNIGENT_HOST_SANDBOX_BACKEND"
 _SPAWN_WRAP_BACKENDS = frozenset({"linux_bwrap", "darwin_seatbelt"})
 
 _EDITABLE_PTH_IMPORT = re.compile(r"import (__editable__[A-Za-z0-9_]+_finder); \1\.install\(\)\Z")
+# Setuptools 84.2.0 generates this import hook in editable installs. Keep the executable
+# portion fixed; only the root mappings and finder name vary per install.
+_SETUPTOOLS_EDITABLE_FINDER_TEMPLATE = """from __future__ import annotations
+import sys
+from importlib.machinery import ModuleSpec, PathFinder
+from importlib.machinery import all_suffixes as module_suffixes
+from importlib.util import spec_from_file_location
+from itertools import chain
+from pathlib import Path
+
+MAPPING: dict[str, str] = {mapping!r}
+NAMESPACES: dict[str, list[str]] = {namespaces!r}
+PATH_PLACEHOLDER = {name!r} + ".__path_hook__"
+
+
+class _EditableFinder:  # MetaPathFinder
+    @classmethod
+    def find_spec(cls, fullname: str, path=None, target=None) -> ModuleSpec | None:  # type: ignore
+        # Top-level packages and modules (we know these exist in the FS)
+        if fullname in MAPPING:
+            pkg_path = MAPPING[fullname]
+            return cls._find_spec(fullname, Path(pkg_path))
+
+        # Handle immediate children modules (required for namespaces to work)
+        # To avoid problems with case sensitivity in the file system we delegate
+        # to the importlib.machinery implementation.
+        parent, _, child = fullname.rpartition(".")
+        if parent and parent in MAPPING:
+            return PathFinder.find_spec(fullname, path=[MAPPING[parent]])
+
+        # Other levels of nesting should be handled automatically by importlib
+        # using the parent path.
+        return None
+
+    @classmethod
+    def _find_spec(cls, fullname: str, candidate_path: Path) -> ModuleSpec | None:
+        init = candidate_path / "__init__.py"
+        candidates = (candidate_path.with_suffix(x) for x in module_suffixes())
+        for candidate in chain([init], candidates):
+            if candidate.exists():
+                return spec_from_file_location(fullname, candidate)
+        return None
+
+
+class _EditableNamespaceFinder:  # PathEntryFinder
+    @classmethod
+    def _path_hook(cls, path) -> type[_EditableNamespaceFinder]:
+        if path == PATH_PLACEHOLDER:
+            return cls
+        raise ImportError
+
+    @classmethod
+    def _paths(cls, fullname: str) -> list[str]:
+        paths = NAMESPACES[fullname]
+        if not paths and fullname in MAPPING:
+            paths = [MAPPING[fullname]]
+        # Always add placeholder, for 2 reasons:
+        # 1. __path__ cannot be empty for the spec to be considered namespace.
+        # 2. In the case of nested namespaces, we need to force
+        #    import machinery to query _EditableNamespaceFinder again.
+        return [*paths, PATH_PLACEHOLDER]
+
+    @classmethod
+    def find_spec(cls, fullname: str, target=None) -> ModuleSpec | None:  # type: ignore
+        if fullname in NAMESPACES:
+            spec = ModuleSpec(fullname, None, is_package=True)
+            spec.submodule_search_locations = cls._paths(fullname)
+            return spec
+        return None
+
+    @classmethod
+    def find_module(cls, _fullname) -> None:
+        return None
+
+
+def install():
+    if not any(finder == _EditableFinder for finder in sys.meta_path):
+        sys.meta_path.append(_EditableFinder)
+
+    if not NAMESPACES:
+        return
+
+    if not any(hook == _EditableNamespaceFinder._path_hook for hook in sys.path_hooks):
+        # PathEntryFinder is needed to create NamespaceSpec without private APIS
+        sys.path_hooks.append(_EditableNamespaceFinder._path_hook)
+    if PATH_PLACEHOLDER not in sys.path:
+        sys.path.append(PATH_PLACEHOLDER)  # Used just to trigger the path hook
+"""
 _STARTUP_HOOK_ENV_VARS = ("COVERAGE_PROCESS_START", "COVERAGE_PROCESS_CONFIG")
 _MAX_TRUSTED_RUNTIME_ENTRIES = 250_000
 
@@ -1597,19 +1685,7 @@ def _trusted_pth_import_roots(pth: Path, line: str) -> set[Path]:
             raise ValueError("missing editable finder roots")
         if not isinstance(finder_name, str):
             raise ValueError("missing editable finder name")
-        template_path = pth.parent / "setuptools" / "command" / "editable_wheel.py"
-        template_tree = ast.parse(template_path.read_text(encoding="utf-8"))
-        template = next(
-            ast.literal_eval(statement.value)
-            for statement in template_tree.body
-            if isinstance(statement, ast.Assign)
-            and any(
-                isinstance(target, ast.Name) and target.id == "_FINDER_TEMPLATE"
-                for target in statement.targets
-            )
-        )
-        if not isinstance(template, str):
-            raise ValueError("invalid editable finder template")
+        template = _SETUPTOOLS_EDITABLE_FINDER_TEMPLATE
         expected = ast.parse(
             template.format(name=finder_name, mapping=mapping, namespaces=namespaces)
         )

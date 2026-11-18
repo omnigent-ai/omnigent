@@ -615,24 +615,23 @@ def test_isolated_pth_roots_follow_cpython_venv_config_layout(
     assert venv_site in roots
 
 
-def test_editable_finder_must_match_installed_template(tmp_path: Path) -> None:
+def test_editable_finder_uses_bundled_template_without_setuptools(tmp_path: Path) -> None:
     site_dir = tmp_path / "site-packages"
-    template_path = site_dir / "setuptools" / "command" / "editable_wheel.py"
-    template_path.parent.mkdir(parents=True)
-    template = (
-        "MAPPING = {mapping!r}\n"
-        "NAMESPACES = {namespaces!r}\n"
-        "PATH_PLACEHOLDER = {name!r} + '.__path_hook__'\n"
-        "def install():\n    pass\n"
-    )
-    template_path.write_text(f"_FINDER_TEMPLATE = {template!r}\n")
+    site_dir.mkdir()
     finder = site_dir / "__editable___sample_finder.py"
     finder.write_text(
-        template.format(name="__editable__.sample.finder", mapping={}, namespaces={})
+        sb._SETUPTOOLS_EDITABLE_FINDER_TEMPLATE.format(
+            name="__editable__.sample.finder",
+            mapping={"sample": str(tmp_path / "package")},
+            namespaces={"sample.assets": [str(tmp_path / "assets")]},
+        )
     )
     pth = site_dir / "__editable__.sample.pth"
     line = "import __editable___sample_finder; __editable___sample_finder.install()"
-    assert sb._trusted_pth_import_roots(pth, line) == set()
+    assert sb._trusted_pth_import_roots(pth, line) == {
+        tmp_path / "package",
+        tmp_path / "assets",
+    }
 
     finder.write_text(finder.read_text() + "import pathlib; pathlib.Path('/tmp/marker').touch()\n")
     with pytest.raises(OSError, match=r"unsupported \.pth editable finder"):

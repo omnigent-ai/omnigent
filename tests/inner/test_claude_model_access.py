@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 import ssl
 import sys
 import time
@@ -1241,6 +1242,18 @@ def auth_runtime(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path,
     if sys.platform == "linux":
         interpreter.unlink()
         interpreter.symlink_to(f"python{sys.version_info.major}.{sys.version_info.minor}")
+        # CI's base Python can be world-writable; the venv metadata needs a trusted copy.
+        base_executable = tmp_path / "trusted-base-python"
+        shutil.copy2(sys._base_executable, base_executable)
+        base_executable.chmod(0o500)
+        config = runtime / "pyvenv.cfg"
+        config.write_text(
+            "\n".join(
+                f"executable = {base_executable}" if line.startswith("executable = ") else line
+                for line in config.read_text().splitlines()
+            )
+            + "\n"
+        )
     packages = (
         runtime
         / "lib"
