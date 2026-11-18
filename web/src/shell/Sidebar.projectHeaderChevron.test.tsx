@@ -170,11 +170,11 @@ describe("project folder header icon/chevron", () => {
       "mr-2",
       "border",
       "border-dashed",
-      "text-left",
       "px-0",
       "pb-2",
       "md:pb-2",
     );
+    expect(empty).not.toHaveClass("text-left");
     const message = empty.querySelector("p")!;
     expect(message).not.toHaveClass("text-ui");
     const body = message.querySelector("span")!;

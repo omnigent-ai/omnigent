@@ -165,7 +165,6 @@ describe("sidebar Stop session item", () => {
     // switch there before opening its kebab.
     mockConversations([{ ...HOST_SPAWNED, owner: "other@example.com" }]);
     renderSidebar();
-    // Shared rows only list under the Shared filter.
     selectSessionFilter("shared");
     openKebab();
     const item = screen.getByTestId("stop-conversation");

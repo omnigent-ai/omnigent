@@ -799,7 +799,6 @@ describe("double-click to rename", () => {
     // before reaching for the row.
     mockConversations([{ ...CONV, owner: "other@example.com" }]);
     renderSidebar();
-    // Shared rows only list under the Shared filter.
     selectSessionFilter("shared");
 
     fireEvent.dblClick(screen.getByRole("link", { name: /My Session/ }));

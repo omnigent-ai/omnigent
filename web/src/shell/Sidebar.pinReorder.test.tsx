@@ -67,7 +67,7 @@ function stubRowRects() {
   });
 }
 
-// Pinned zone extends 12px below the last pin, over conv_d (the dragged row, never a target).
+// Pinned zone extends 12px below the last pin, over the dragged row (never a target).
 function stubPinZoneRect(pinnedRows: number) {
   const rowRect = vi.mocked(Element.prototype.getBoundingClientRect).getMockImplementation()!;
   vi.mocked(Element.prototype.getBoundingClientRect).mockImplementation(function (this: Element) {

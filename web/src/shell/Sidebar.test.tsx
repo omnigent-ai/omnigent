@@ -703,10 +703,12 @@ describe("Sidebar session list", () => {
     // Archived swaps folders to archived members; Shared hides Projects.
     if (view !== "all") expect(screen.queryByText("filed-session")).toBeNull();
     else expect(screen.getByText("filed-session")).toBe(filed);
-    // Shared hides Projects, so the filter moves to the Shared list it shows.
-    if (view !== "shared") expect(screen.getByTestId("session-filter")).toBe(filter);
     const listTitle = view === "shared" ? "Shared with me" : "Sessions";
     const sessions = screen.getByRole("button", { name: listTitle }).closest("section")!;
+    // Shared hides Projects, so the filter moves to the Shared list it shows.
+    if (view === "shared")
+      expect(within(sessions).getByTestId("session-filter")).toBeInTheDocument();
+    else expect(screen.getByTestId("session-filter")).toBe(filter);
     expect(within(sessions).getByRole("status")).toHaveTextContent(
       state === "loading" ? "Loading…" : /could not be loaded|Failed to load/,
     );
@@ -1398,7 +1400,6 @@ describe("Sidebar session list", () => {
     const filterSessions = within(projectsSection).getByRole("button", {
       name: "Group, sort, and filter sessions",
     });
-    // The filter never fades.
     expect(filterSessions.closest('[class*="md:opacity-0"]')).toBeNull();
 
     fireEvent.click(selectSessions);
