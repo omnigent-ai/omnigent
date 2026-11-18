@@ -9,7 +9,11 @@ import { Link, useSearchParams } from "@/lib/routing";
 import { cn } from "@/lib/utils";
 import { mcpServerDisplayName } from "@/lib/mcpServerName";
 import { Button } from "@/components/ui/button";
-import type { InventoryHarnessDetailEntry } from "./search/catalog/harnesses";
+import {
+  INVENTORY_COUNT_SEPARATOR,
+  INVENTORY_KIND_LABELS,
+  type InventoryHarnessDetailEntry,
+} from "./search/catalog/harnesses";
 import { settingsControlProps } from "./search/settingsControl";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import type { Host } from "@/hooks/useHosts";
@@ -33,9 +37,9 @@ type CatalogKind = "mcps" | "skills" | "plugins";
 const DETAILED_HARNESSES: ReadonlySet<InventoryHarness> = new Set(["claude", "codex", "cursor"]);
 
 const KINDS: { id: CatalogKind; label: string; noun: string }[] = [
-  { id: "mcps", label: "MCP servers", noun: "MCP servers" },
-  { id: "skills", label: "Skills", noun: "skills" },
-  { id: "plugins", label: "Plugins", noun: "plugins" },
+  { id: "mcps", label: INVENTORY_KIND_LABELS.mcps, noun: "MCP servers" },
+  { id: "skills", label: INVENTORY_KIND_LABELS.skills, noun: "skills" },
+  { id: "plugins", label: INVENTORY_KIND_LABELS.plugins, noun: "plugins" },
 ];
 
 /** "← label" row above a page title: a link when `to` is set, else a button. */
@@ -223,7 +227,7 @@ export function HarnessCatalog({
               className="flex-none"
               data-testid={`harness-tab-${k.id}`}
             >
-              {loading ? k.label : `${k.label} · ${own[k.id].length}`}
+              {loading ? k.label : `${k.label}${INVENTORY_COUNT_SEPARATOR}${own[k.id].length}`}
             </TabsTrigger>
           ))}
           <TabsTrigger value="settings" className="flex-none" data-testid="harness-tab-settings">

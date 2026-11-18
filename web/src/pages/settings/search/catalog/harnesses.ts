@@ -131,7 +131,21 @@ export function harnessInventoryPage(
   };
 }
 
-const INVENTORY_KINDS = ["MCP servers", "Skills", "Plugins"] as const;
+/** The names of an inventory page's tabs, which the page shows as they are. */
+export const INVENTORY_KIND_LABELS = {
+  mcps: "MCP servers",
+  skills: "Skills",
+  plugins: "Plugins",
+} as const;
+
+/** Between a tab's name and its count, such as "Skills · 2". */
+export const INVENTORY_COUNT_SEPARATOR = " · ";
+
+const INVENTORY_KINDS = [
+  INVENTORY_KIND_LABELS.mcps,
+  INVENTORY_KIND_LABELS.skills,
+  INVENTORY_KIND_LABELS.plugins,
+] as const;
 
 /**
  * Each harness's own page, named by its title. Its setup warning's button is "Set up", or, by
@@ -143,12 +157,15 @@ export const HARNESS_DETAIL_ENTRIES = settingsEntryFamily({
   members: NATIVE_HARNESS_IDS,
   build: (harness): HarnessDetailEntry => {
     const name = harnessName(harness);
+    const hasInventory = inventoryFamilyOf(harness) !== undefined;
     const page = {
       id: `harness-${harness}-detail`,
       section: "harnesses" as const,
       harness,
       label: name,
-      description: `${name} on a machine: its MCP servers, skills and plugins, and its setup.`,
+      description: hasInventory
+        ? `${name} on a machine: its MCP servers, skills and plugins, and its setup.`
+        : `${name} on a machine, and how to set it up.`,
       keywords: ["harness", "agent", "setup"],
       parts: { fixAction: "Set up" },
       nameAlternatives: {
@@ -161,7 +178,7 @@ export const HARNESS_DETAIL_ENTRIES = settingsEntryFamily({
       },
       presence: { fixAction: { states: ["needs setup"] } },
     };
-    if (inventoryFamilyOf(harness) === undefined) return settingsEntry(page);
+    if (!hasInventory) return settingsEntry(page);
     return settingsEntry({
       ...page,
       parts: { fixAction: "Set up", tab: `${name} view` },
@@ -169,7 +186,10 @@ export const HARNESS_DETAIL_ENTRIES = settingsEntryFamily({
       // While the inventory loads, a tab shows its plain name; once loaded, its count.
       choiceTemplates: {
         tab: Object.fromEntries(
-          INVENTORY_KINDS.map((kind) => [kind, { before: `${kind} · `, count: true }]),
+          INVENTORY_KINDS.map((kind) => [
+            kind,
+            { before: `${kind}${INVENTORY_COUNT_SEPARATOR}`, count: true },
+          ]),
         ),
       },
       presence: { ...page.presence, tab: { states: ["lists its inventory"] } },

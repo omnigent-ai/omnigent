@@ -565,7 +565,7 @@ describe("Harness page catalog rows", () => {
     expect(tabList).toHaveAttribute("data-settings-control", "harness-claude-native-detail:tab");
   });
 
-  it("names the setup warning's fix and the credential card's action by their key", () => {
+  it("names the setup warning's fix by its key, inside the harness row", () => {
     hosts = [{ ...ONLINE, configured_harnesses: { "codex-native": "binary-missing" } }];
     renderHarnesses("codex-native");
 
@@ -586,10 +586,14 @@ describe("Harness page catalog rows", () => {
     hosts = [ONLINE];
     renderHarnesses("codex-native");
 
-    expect(screen.getByRole("button", { name: "Reconfigure" })).toHaveAttribute(
+    const reconfigure = screen.getByRole("button", { name: "Reconfigure" });
+    expect(reconfigure).toHaveAttribute(
       "data-settings-control",
       "harness-codex-native-credential:credentialAction",
     );
+    expect(
+      document.querySelector('[data-settings-item="harness-codex-native-credential"]'),
+    ).toContainElement(reconfigure);
   });
 });
 
