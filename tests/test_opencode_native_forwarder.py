@@ -1336,7 +1336,7 @@ async def test_permission_reply_failure_is_surfaced(turn_state: str) -> None:
         if turn_state == "next_step":
             await fwd.handle_event(_step_started("msg_2"))
         elif turn_state == "interrupted_flushing":
-            await flush_started.wait()
+            await asyncio.wait_for(flush_started.wait(), timeout=5)
         elif turn_state in {"interrupted", "replacement"}:
             await fwd.handle_event(_event("session.execution.interrupted", reason="user"))
             if turn_state == "replacement":
