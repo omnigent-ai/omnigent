@@ -17,6 +17,9 @@ class TestKiroReadinessEvidence(unittest.TestCase):
         async def pending(_private):
             await asyncio.sleep(0)
 
+        async def wrapper(inner, _private):
+            await inner
+
         outputs = []
         for private in ("synthetic-private-a", "synthetic-private-雪🚀"):
             known = FunctionType(
@@ -31,12 +34,20 @@ class TestKiroReadinessEvidence(unittest.TestCase):
                 globals(),
             )(_private=private)
             unknown = FunctionType(
-                pending.__code__.replace(co_filename=private, co_name=private), globals()
-            )(_private=private)
+                wrapper.__code__.replace(co_filename=private, co_name=private), globals()
+            )(known, _private=private)
             try:
                 output = delivery._kiro_readiness_evidence([known, unknown, object()])
                 self.assertNotIn("synthetic-private", output)
                 outputs.append(output)
+                unknown.send(None)
+                self.assertIs(unknown.cr_await, known)
+                nested_output = delivery._kiro_readiness_evidence([unknown])
+                self.assertNotIn("synthetic-private", nested_output)
+                self.assertEqual(
+                    [row["phase"] for row in json.loads(nested_output)["phases"]],
+                    ["session-snapshot-route"],
+                )
             finally:
                 known.close()
                 unknown.close()

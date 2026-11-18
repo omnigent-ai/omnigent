@@ -70,6 +70,8 @@ def test_budget_evidence_is_independent_of_private_content() -> None:
     assert evidence["parent_at_cost_check"]["pending_elicitations_count"] == 1
     assert evidence["child_at_discovery"]["pending_elicitations_count"] == 3
     assert evidence["child_at_discovery"]["busy"] is True
+    assert evidence["requests"][0]["items"][0]["role"] == "assistant"
+    assert evidence["requests"][0]["items"][0]["type"] == "function_call"
     assert evidence["requests"][0]["items"][0]["name"] == "exec_command"
     unknown = evidence["requests"][0]["items"][1]
     assert all(unknown[key] == "other" for key in ("role", "type", "name"))
@@ -146,6 +148,8 @@ def test_budget_evidence_keeps_recent_structure_within_ascii_bound(
         assert request["item_count"] == item_count
         assert request["items_omitted"] == item_count - len(item_indices)
         assert [item["item_index"] for item in request["items"]] == item_indices
+        assert all(item["role"] == "developer" for item in request["items"])
+        assert all(item["type"] == "function_call_output" for item in request["items"])
         assert all(item["name"] == "mcp__omnigent.sys_session_send" for item in request["items"])
 
 
