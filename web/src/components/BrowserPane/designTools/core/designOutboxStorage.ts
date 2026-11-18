@@ -103,9 +103,19 @@ function takeTabLock(): Promise<void> {
 }
 
 /** Run `task` while no other window adopts (one at a time across windows). */
-function exclusively<T>(task: () => Promise<T>): Promise<T> {
+async function exclusively<T>(task: () => Promise<T>): Promise<T> {
   if (!hasLocks()) return task();
-  return navigator.locks.request(ADOPT_LOCK + thisServer(), task) as Promise<T>;
+  let ran = false;
+  try {
+    return (await navigator.locks.request(ADOPT_LOCK + thisServer(), () => {
+      ran = true;
+      return task();
+    })) as T;
+  } catch (error) {
+    // The lock refused, not the task failing: run it as without Web Locks.
+    if (ran) throw error;
+    return task();
+  }
 }
 
 /** Tabs open on this server now (they hold their lock). */
@@ -227,10 +237,13 @@ export async function deleteRequest(id: string): Promise<void> {
   await noteCount();
 }
 
+/** How long an unsent request stays saved: anyone's older ones go, on a shared machine too. */
+export const SAVED_REQUEST_TTL_MS = 7 * 24 * 60 * 60_000;
+
 /**
  * The saved requests of `userId` on this server this tab may take back: its own, and those
- * of tabs now closed, except those of `held` (this page's own, still live). None is
- * dropped here: a saved request goes only once it's sent or removed.
+ * of tabs now closed, except those of `held` (this page's own, still live). Otherwise a
+ * saved request goes only once it's sent or removed, or past SAVED_REQUEST_TTL_MS.
  */
 export function adoptSavedRequests(
   userId: string,
@@ -247,7 +260,12 @@ export function adoptSavedRequests(
     // Claimed in the read's own callback, so it's the same transaction.
     reading.onsuccess = () => {
       const all = reading.result as SavedRequest[];
+      const expired = Date.now() - SAVED_REQUEST_TTL_MS;
       for (const record of all.sort((a, b) => a.savedAt - b.savedAt)) {
+        if (record.savedAt < expired && !(record.page === tab && held.has(record.id))) {
+          objects.delete(record.id);
+          continue;
+        }
         if (record.userId !== userId || record.server !== server || !free(record.page)) continue;
         if (record.page === tab && held.has(record.id)) continue;
         const mine = { ...record, page: tab };

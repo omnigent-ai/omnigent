@@ -187,6 +187,9 @@ async function send(request: DesignRequest, agentId: string): Promise<void> {
       markSent(request);
     } else {
       update(request.id, { status: "failed", slow: false, error: STALLED, delivery: "unknown" });
+      // Its POST may still land: the session's next request waits as if this one was sent.
+      turns.set(request.conversationId, { postedAt: Date.now(), sawBusy: false });
+      setTimeout(schedule, TURN_START_MS + 1);
       // Stopping it settles the chat store's send, so the session takes its next message.
       controller.abort();
     }

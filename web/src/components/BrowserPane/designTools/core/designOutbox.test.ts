@@ -206,6 +206,9 @@ describe("design outbox", () => {
     });
     // Its send is stopped, which settles it in the chat store and frees the session.
     expect(send.mock.calls[0]![3]?.signal?.aborted).toBe(true);
+    // Its POST may still land and start a turn: the next waits as if it had been sent.
+    expect(statusOf(next)).toBe("waiting");
+    await vi.advanceTimersByTimeAsync(TURN_START_MS + 1);
     expect(statusOf(next)).toBe("sent");
     // Its POST answering at last is news that it arrived.
     answer();
@@ -274,7 +277,7 @@ describe("design outbox", () => {
     await vi.advanceTimersByTimeAsync(STALLED_SEND_MS);
     expect(statusOf(id)).toBe("failed");
     retryDesignRequest(id);
-    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(TURN_START_MS + 1);
     expect(signals.map((signal) => signal?.aborted)).toEqual([true, false]);
     expect(statusOf(id)).toBe("sent");
   });

@@ -41,6 +41,7 @@ import { noteSavedDesignRequests } from "./designOutboxPresence";
 import {
   deleteRequest,
   resetDesignOutboxStorage,
+  SAVED_REQUEST_TTL_MS,
   saveRequest,
   thisServer,
   thisTab,
@@ -458,6 +459,32 @@ describe("design outbox storage", () => {
     await vi.waitFor(async () => expect(await savedIds()).toEqual([id]));
     await designOutboxSaved();
     expect(unloadAsks()).toBe(false);
+  });
+
+  it("drops anyone's request saved longer ago than it's kept, and keeps the rest", async () => {
+    const old = Date.now() - SAVED_REQUEST_TTL_MS - 1;
+    await putRecord(record({ id: "bobs_old", userId: "bob", savedAt: old }));
+    await putRecord(record({ id: "alices_old", savedAt: old }));
+    await putRecord(record({ id: "bobs", userId: "bob" }));
+    await putRecord(record({ id: "alices" }));
+    await restoreSavedDesignRequests();
+    expect(ids()).toEqual(["alices"]);
+    expect(await savedIds()).toEqual(["alices", "bobs"]);
+  });
+
+  it("restores without the adopt lock when the browser refuses it", async () => {
+    installLocks();
+    const { request } = navigator.locks;
+    Object.defineProperty(navigator.locks, "request", {
+      configurable: true,
+      value: (...args: Parameters<typeof request>) =>
+        typeof args[1] === "function"
+          ? Promise.reject(new DOMException("Locks are unavailable", "SecurityError"))
+          : request(...args),
+    });
+    await putRecord(record({ id: "saved" }));
+    await restoreSavedDesignRequests();
+    expect(ids()).toEqual(["saved"]);
   });
 
   it("still saves when the browser refuses this tab's lock", async () => {

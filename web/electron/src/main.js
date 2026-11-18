@@ -3040,7 +3040,8 @@ function createWindow(targetUrl, opts = {}) {
   // and the opener's localStorage — opens as a hardened child window.
   // Conditions in popupPolicy.js; hardening in hardenOauthPopup.
   win.webContents.setWindowOpenHandler(({ url, disposition, features, frameName }) => {
-    // A Browser design tool's overlay, which only the app's own opening can open.
+    // A design tool's overlay: allowed only as about:blank, from the opening's owner, under
+    // the unclaimed frame name designTools.start issued. Null for any other open.
     const designOverlay = sharedDesignTools().windowOpen(win, { url, frameName });
     if (designOverlay) return designOverlay;
     const origin = pinnedOrigin(win);

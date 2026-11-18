@@ -405,6 +405,10 @@ function createDesignTools({
       let focused = false;
       try {
         focused = session.overlay.webContents.isFocused?.() === true;
+      } catch {
+        /* destroyed */
+      }
+      try {
         host.contentView.removeChildView(session.overlay);
       } catch {
         /* window torn down */
@@ -529,7 +533,7 @@ function createDesignTools({
   async function handle(entry, args) {
     const session = views.get(entry);
     const op = args?.op;
-    if (!session || typeof args.session !== "string" || args.session !== session.id) {
+    if (!session || typeof args?.session !== "string" || args.session !== session.id) {
       return { ok: false, error: NOT_OPEN };
     }
     // A notice outlives its page's navigations, so it can't read or scroll the next document.
@@ -560,6 +564,7 @@ function createDesignTools({
         // The wheel turned over the tool: it scrolls what's under it, as the wheel would.
         const { x, y, dx, dy } = args;
         if (![x, y, dx, dy].every(isFiniteNumber)) return invalid();
+        if (!live(webContents)) return { ok: false, error: NOT_OPEN };
         const zoom = zoomOf(entry);
         // With its modifiers, so Ctrl+wheel still zooms the page.
         const modifiers = asModifiers(args.modifiers);
