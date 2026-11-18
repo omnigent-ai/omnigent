@@ -200,7 +200,16 @@ def _steps_schema(description: str) -> dict[str, Any]:
                     "type": "string",
                     "description": "A short name, e.g. 'Profile the endpoint'.",
                 },
-                "goal": {"type": "string", "description": "What done means for this step."},
+                "goal": {
+                    "type": "string",
+                    "description": (
+                        "The step's description, in Markdown written for a person first: "
+                        "'**Inputs:**' (what it reads, and from where), '**What it does:**' "
+                        "(a few short bullets) and '**Outputs:**' (what it produces, which is "
+                        "what done means), then '**Details:**' with the exact commands, paths "
+                        "and flags the work needs. Separate the parts with blank lines."
+                    ),
+                },
                 "depends_on": {
                     "type": "array",
                     "items": {"type": "string", "pattern": _STEP_ID_PATTERN},

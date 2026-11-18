@@ -93,6 +93,7 @@ from omnigent.entities import (
     MessageData,
     NewConversationItem,
     PagedList,
+    SlashCommandData,
     parse_item_data,
 )
 from omnigent.errors import ErrorCode, OmnigentError, StaleCursorError
@@ -3379,8 +3380,15 @@ class SqlAlchemyConversationStore(ConversationStore):
         # Postgres text column never sees a NUL (tool output can embed one, e.g.
         # reading a binary file), which would abort the whole INSERT.
         recovery_candidates: dict[int, NewConversationItem] = {}
+        input_candidates: set[int] = set()
         interruption_notices: set[int] = set()
         for index, item in enumerate(items):
+            if (
+                isinstance(item.data, MessageData)
+                and item.data.role == "user"
+                and (not item.data.is_meta or item.data.user_authored)
+            ) or (isinstance(item.data, SlashCommandData) and item.data.kind == "skill"):
+                input_candidates.add(index)
             if isinstance(item.data, MessageData) and not item.data.user_authored:
                 from omnigent.inner.executor import is_interruption_marker
 
@@ -3501,11 +3509,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                     ]
 
             has_new_input = any(
-                item.stable_id not in existing_by_id
-                and isinstance(item.data, MessageData)
-                and item.data.role == "user"
-                and not item.data.is_meta
-                for item in items
+                index in input_candidates and item.stable_id not in existing_by_id
+                for index, item in enumerate(items)
             )
             recovery = _read_session_recovery(session, conversation_id) if has_new_input else None
             append_rows = []
@@ -3521,16 +3526,30 @@ class SqlAlchemyConversationStore(ConversationStore):
                         item = recovery_candidates[index]
                         prepared = {**prepared, "data": recovery_encoded[index]}
                     elif (
-                        isinstance(item.data, MessageData)
-                        and item.data.role == "user"
-                        and not item.data.is_meta
-                        and recovery is not None
+                        recovery is not None
+                        and index in input_candidates
                         and index not in interruption_notices
-                        and (item.data.user_authored or item.response_id != recovery.response_id)
+                        and (
+                            not isinstance(item.data, MessageData)
+                            or item.data.user_authored
+                            or item.response_id != recovery.response_id
+                        )
                     ):
                         # A native turn's delayed input echo must retain its lifecycle fence.
-                        _write_session_recovery(session, conversation_id, None)
-                        recovery = None
+                        recovery = (
+                            SessionRecovery(
+                                recovery.host_id,
+                                recovery.runner_id,
+                                recovery.interrupted_at,
+                                phase="active",
+                                response_id=item.response_id,
+                            )
+                            if isinstance(item.data, MessageData)
+                            and not item.data.user_authored
+                            and item.response_id == recovery.next_response_id
+                            else None
+                        )
+                        _write_session_recovery(session, conversation_id, recovery)
                     if item.stable_id is not None:
                         seen_stable_ids.add(item.stable_id)
                 append_rows.append((item, prepared, search))
