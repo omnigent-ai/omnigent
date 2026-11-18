@@ -154,20 +154,44 @@ class TestKiroReadinessTimeout(unittest.IsolatedAsyncioTestCase):
 
     async def test_external_cancellation_is_preserved_and_observer_cancelled(self) -> None:
         entered = asyncio.Event()
+        timeout = asyncio.timeout(60)
+        loop = asyncio.get_running_loop()
+        call_at = loop.call_at
+        scheduled: list[asyncio.TimerHandle] = []
+
+        def record_handle(*args, **kwargs):
+            handle = call_at(*args, **kwargs)
+            scheduled.append(handle)
+            return handle
 
         async def subject():
-            async with delivery._kiro_readiness_timeout(asyncio.timeout(0.02)):
+            async with delivery._kiro_readiness_timeout(timeout):
                 entered.set()
                 await asyncio.Event().wait()
 
-        with patch.object(delivery, "_kiro_readiness_evidence") as observe:
+        with (
+            patch.object(delivery, "_kiro_readiness_evidence") as observe,
+            patch.object(loop, "call_at", side_effect=record_handle),
+        ):
             task = asyncio.create_task(subject())
-            await entered.wait()
-            task.cancel()
-            with self.assertRaises(asyncio.CancelledError):
-                await task
-            await asyncio.sleep(0.03)
-            observe.assert_not_called()
+            try:
+                await entered.wait()
+                self.assertEqual(len(scheduled), 2)
+                observer = scheduled[0]
+                self.assertFalse(observer.cancelled())
+                task.cancel("synthetic-external-cancel")
+                with self.assertRaises(asyncio.CancelledError) as caught:
+                    await task
+                self.assertEqual(caught.exception.args, ("synthetic-external-cancel",))
+                self.assertTrue(task.cancelled())
+                self.assertTrue(observer.cancelled())
+                self.assertFalse(timeout.expired())
+                observe.assert_not_called()
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                for handle in scheduled:
+                    handle.cancel()
 
     async def test_observation_failure_cannot_replace_original_timeout(self) -> None:
         with patch.object(
