@@ -553,6 +553,50 @@ describe("Harnesses grid catalog rows", () => {
   });
 });
 
+describe("Harness page catalog rows", () => {
+  it("names an inventory page's tab list, and keeps its row around the header", () => {
+    hosts = [ONLINE];
+    renderHarnesses("claude-native");
+
+    const detailRow = document.querySelector('[data-settings-item="harness-claude-native-detail"]');
+    expect(detailRow).toContainElement(screen.getByRole("heading", { name: "Claude Code" }));
+    const tabList = screen.getByRole("tablist", { name: "Claude Code view" });
+    expect(detailRow).toContainElement(tabList);
+    expect(tabList).toHaveAttribute("data-settings-control", "harness-claude-native-detail:tab");
+  });
+
+  it("names the setup warning's fix by its key, inside the harness row", () => {
+    hosts = [{ ...ONLINE, configured_harnesses: { "codex-native": "binary-missing" } }];
+    renderHarnesses("codex-native");
+
+    const install = screen.getByRole("button", { name: "Install" });
+    expect(install).toHaveAttribute(
+      "data-settings-control",
+      "harness-codex-native-detail:fixAction",
+    );
+    expect(
+      document.querySelector('[data-settings-item="harness-codex-native-detail"]'),
+    ).toContainElement(install);
+    expect(
+      document.querySelector('[data-settings-item="harness-codex-native-credential"]'),
+    ).toBeTruthy();
+  });
+
+  it("names the credential card's action, Reconfigure, by its own control", () => {
+    hosts = [ONLINE];
+    renderHarnesses("codex-native");
+
+    const reconfigure = screen.getByRole("button", { name: "Reconfigure" });
+    expect(reconfigure).toHaveAttribute(
+      "data-settings-control",
+      "harness-codex-native-credential:credentialAction",
+    );
+    expect(
+      document.querySelector('[data-settings-item="harness-codex-native-credential"]'),
+    ).toContainElement(reconfigure);
+  });
+});
+
 describe("Harness card navigation", () => {
   const selected = (name: string) =>
     screen.getByRole("tab", { name }).getAttribute("aria-selected");
