@@ -705,6 +705,8 @@ export class TerminalSession {
   private linkHovered = false;
   /** ``pointerType`` of the latest press, e.g. ``"mouse"`` or ``"touch"``. */
   private lastPointerType: string | null = null;
+  /** Whether the latest screen press opens a link; activation reuses it so press and release agree. */
+  private linkPressOpens: boolean | null = null;
 
   /**
    * Construct, attach to the DOM, and open the WebSocket.
@@ -747,12 +749,11 @@ export class TerminalSession {
     // chrome, so an unset family falls back to the shared mono stack.
     const linkHandler: TerminalLinkHandler = {
       activate: (event, uri) => {
-        if (
-          !terminalLinkClickOpens(event, this.term.modes.mouseTrackingMode, this.lastPointerType)
-        ) {
-          return;
-        }
-        openTerminalLink(event, uri, onFileLink);
+        const opens =
+          this.linkPressOpens ??
+          terminalLinkClickOpens(event, this.term.modes.mouseTrackingMode, this.lastPointerType);
+        this.linkPressOpens = null;
+        if (opens) openTerminalLink(event, uri, onFileLink);
       },
       hover: () => {
         this.linkHovered = true;
@@ -834,8 +835,8 @@ export class TerminalSession {
       "mousedown",
       (event) => {
         const mode = this.term.modes.mouseTrackingMode;
-        if (!this.linkHovered || mode === "none") return;
-        if (!terminalLinkClickOpens(event, mode, this.lastPointerType)) return;
+        this.linkPressOpens = terminalLinkClickOpens(event, mode, this.lastPointerType);
+        if (!this.linkHovered || mode === "none" || !this.linkPressOpens) return;
         event.preventDefault();
         event.stopPropagation();
         this.term.focus();

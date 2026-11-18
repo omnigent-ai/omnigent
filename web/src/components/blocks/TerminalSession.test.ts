@@ -885,6 +885,29 @@ describe("TerminalSession", () => {
       expect(reported).toHaveBeenCalledTimes(3);
       session.dispose();
     });
+
+    it("decides opening from the press when the modifier changes before release", async () => {
+      const openSpy = vi.spyOn(window, "open").mockReturnValue(null);
+      const { session } = makeSession();
+      const term = termOf(session);
+      const screen = term.element!.querySelector(".xterm-screen")!;
+      const reported = vi.fn();
+      term.element!.addEventListener("mousedown", reported);
+      const range = { start: { x: 1, y: 1 }, end: { x: LINK.length, y: 1 } };
+      term.options.linkHandler?.hover?.(new MouseEvent("mousemove"), LINK, range);
+      await write(term, "\x1b[?1000h");
+
+      screen.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, ctrlKey: true }));
+      activate(term, {});
+      expect(reported).not.toHaveBeenCalled();
+      expect(openSpy).toHaveBeenCalledOnce();
+
+      screen.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+      activate(term, { ctrlKey: true });
+      expect(reported).toHaveBeenCalledOnce();
+      expect(openSpy).toHaveBeenCalledOnce();
+      session.dispose();
+    });
   });
 
   describe("pasteCommand", () => {
