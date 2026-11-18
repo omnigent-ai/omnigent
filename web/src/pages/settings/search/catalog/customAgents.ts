@@ -53,7 +53,6 @@ export const CUSTOM_AGENT_CREATE_ENTRY = settingsEntry({
     harness: { runtimeChoices: {} },
   },
   focus: "name",
-  // Its own page, reached from the list's Create.
   revealedBy: "custom-agents-list",
 });
 

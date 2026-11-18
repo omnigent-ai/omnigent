@@ -236,15 +236,13 @@ export function CreateAgentDialog({
   );
 }
 
-/** Settings saves persist the agent and keep the draft available on failure. */
 /**
  * The Settings row a create form renders in, which names its top-level fields and buttons. The
  * shell's dialog passes none and keeps its own names.
  */
-type CreateAgentFieldPart =
-  "name" | "description" | "harness" | "model" | "instructions" | "addServer" | "cancel" | "submit";
-
 type CreateAgentSettingsEntry = typeof CUSTOM_AGENT_CREATE_ENTRY;
+
+type CreateAgentFieldPart = keyof CreateAgentSettingsEntry["parts"];
 
 function settingsFieldProps(
   entry: CreateAgentSettingsEntry | undefined,
@@ -253,6 +251,7 @@ function settingsFieldProps(
   return entry ? settingsControlProps(entry, part) : {};
 }
 
+/** Settings saves persist the agent and keep the draft available on failure. */
 export function CreateAgentForm({
   onCreate,
   onCancel,
