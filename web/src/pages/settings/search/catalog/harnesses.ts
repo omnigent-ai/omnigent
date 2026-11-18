@@ -11,7 +11,7 @@ export const NATIVE_HARNESS_IDS: readonly NativeHarnessId[] = NATIVE_CODING_AGEN
 );
 
 // One line per harness, keyed by native id. The server's harness list carries no descriptions.
-export const HARNESS_DESCRIPTIONS: Readonly<Record<string, string>> = {
+export const HARNESS_DESCRIPTIONS: Readonly<Record<NativeHarnessId, string>> = {
   "claude-native": "Anthropic’s agent for coding and development workflows.",
   "codex-native": "OpenAI’s coding agent for building features and fixing bugs.",
   "opencode-native": "An open-source coding agent for terminal, IDE, and desktop.",
@@ -57,7 +57,7 @@ export const HARNESS_CARD_ENTRIES = settingsEntryFamily({
       id: `harness-${harness}`,
       section: "harnesses",
       label: name,
-      description: HARNESS_DESCRIPTIONS[harness] ?? "",
+      description: HARNESS_DESCRIPTIONS[harness],
       keywords: ["harness", "agent"],
       parts: {
         open: name,

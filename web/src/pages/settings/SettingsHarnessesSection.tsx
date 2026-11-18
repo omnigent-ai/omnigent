@@ -627,7 +627,8 @@ function HarnessCard({
     <SettingsItem entry={card} className="grid">
       {opensDetail ? (
         <Link
-          // Named by its content, as before; the id only lets search find the link.
+          // Named by the harness, as its declared part is; the id lets search find the link.
+          aria-label={card.label}
           data-settings-control={settingsControlId(card, "open")}
           to={`/settings/harnesses/${entry.harness}${status.ready ? "" : "?tab=settings"}`}
           // Only cards that open a details page get the hover, so it reads as clickable.

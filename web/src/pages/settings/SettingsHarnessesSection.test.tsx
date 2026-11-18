@@ -541,8 +541,7 @@ describe("Harnesses grid catalog rows", () => {
       "data-settings-control",
       "harness-claude-native:open",
     );
-    // The link keeps the name its content gives it: no name of its own is added.
-    expect(card("claude-native")).not.toHaveAttribute("aria-label");
+    expect(card("claude-native")).toHaveAccessibleName("Claude Code");
     expect(screen.getByRole("button", { name: "Claude Code settings" })).toHaveAttribute(
       "data-settings-control",
       "harness-claude-native:settings",
