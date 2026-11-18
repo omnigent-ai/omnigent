@@ -11,6 +11,7 @@ import stat
 import subprocess
 import sys
 import venv
+from importlib.machinery import EXTENSION_SUFFIXES
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -193,16 +194,17 @@ def test_launcher_rejects_alias_and_intermediate_interpreter_hops(
         sb.create_exec_launcher("/bin/true", policy)
 
 
-@pytest.mark.parametrize("trusted_source", ["package", "framework"])
+@pytest.mark.parametrize("trusted_source", ["package", "framework", "native", "root_package"])
 @pytest.mark.parametrize("grant_kind", ["write_roots", "write_files"])
 def test_launcher_rejects_writable_hardlink_to_startup_import(
     runtime_layout: SimpleNamespace, tmp_path: Path, trusted_source: str, grant_kind: str
 ) -> None:
-    startup = (
-        runtime_layout.packages / "startup_module.py"
-        if trusted_source == "package"
-        else runtime_layout.framework / "uuid.py"
-    )
+    startup = {
+        "package": runtime_layout.packages / "startup_module.py",
+        "framework": runtime_layout.framework / "uuid.py",
+        "native": runtime_layout.framework / f"uuid{EXTENSION_SUFFIXES[0]}",
+        "root_package": runtime_layout.framework / "shadow" / "__init__.py",
+    }[trusted_source]
     startup.parent.mkdir(parents=True)
     startup.write_text("value = 'trusted'\n")
     original_identity = (startup.stat().st_dev, startup.stat().st_ino)
@@ -233,6 +235,23 @@ def test_launcher_allows_unrelated_hardlinks(
 
     policy = _policy()
     policy.write_roots = [workspace]
+    Path(sb.create_exec_launcher("/bin/true", policy)).unlink()
+
+
+def test_launcher_allows_unrelated_frontend_hardlink_outside_grants(
+    runtime_layout: SimpleNamespace, tmp_path: Path
+) -> None:
+    frontend = runtime_layout.framework / "web" / "node_modules" / "package" / "index.js"
+    frontend.parent.mkdir(parents=True)
+    frontend.write_text("export const value = 1;\n")
+    external = tmp_path / "external"
+    external.mkdir()
+    os.link(frontend, external / "index.js")
+    workspace = tmp_path / "contained"
+    workspace.mkdir()
+    policy = _policy()
+    policy.write_roots = [workspace]
+
     Path(sb.create_exec_launcher("/bin/true", policy)).unlink()
 
 

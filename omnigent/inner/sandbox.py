@@ -22,6 +22,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Mapping, MutableMapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, replace
+from importlib.machinery import all_suffixes
 from pathlib import Path
 from typing import Protocol, cast
 
@@ -70,6 +71,7 @@ HOST_SANDBOX_BACKEND_ENV = "OMNIGENT_HOST_SANDBOX_BACKEND"
 # work ``activate_sandbox`` does. ``none`` is a no-op backend so it
 # doesn't need a wrap.
 _SPAWN_WRAP_BACKENDS = frozenset({"linux_bwrap", "darwin_seatbelt"})
+_IMPORT_SUFFIXES = tuple(all_suffixes())
 
 _EDITABLE_PTH_IMPORT = re.compile(r"import (__editable__[A-Za-z0-9_]+_finder); \1\.install\(\)\Z")
 # Setuptools 84.2.0 generates this import hook in editable installs. Keep the executable
@@ -1996,6 +1998,33 @@ def _validate_trusted_hardlink_aliases(
                         )
 
 
+def _project_import_inode_roots(root: Path) -> tuple[set[Path], set[Path]]:
+    """Find files under an editable root that Python can import before containment."""
+    entries: set[Path] = set()
+    trees = {root / "omnigent", root / "__pycache__"}
+    try:
+        children = list(root.iterdir())
+    except FileNotFoundError:
+        return entries, trees
+    except OSError as exc:
+        raise OSError(f"Cannot validate sandbox launcher import root: {root}") from exc
+    for child in children:
+        if child.name in {"omnigent", "__pycache__"}:
+            continue
+        if any(
+            child.name.endswith(suffix) and child.name[: -len(suffix)].isidentifier()
+            for suffix in _IMPORT_SUFFIXES
+        ):
+            entries.add(child)
+        elif (
+            child.name.isidentifier()
+            and child.is_dir()
+            and any((child / f"__init__{suffix}").exists() for suffix in _IMPORT_SUFFIXES)
+        ):
+            trees.add(child)
+    return entries, trees
+
+
 def _validate_launcher_runtime(sandbox: SandboxPolicy) -> None:
     """Reject writes to code or startup configuration used before containment."""
     if not sandbox.active or sandbox.backend_type not in _SPAWN_WRAP_BACKENDS:
@@ -2009,8 +2038,12 @@ def _validate_launcher_runtime(sandbox: SandboxPolicy) -> None:
         Path(sys.exec_prefix),
         Path(sys.base_exec_prefix),
     }
-    entries.add(_project_root())
-    trees = {Path(__file__).absolute().parents[2], _project_root()}
+    project_root = _project_root()
+    project_roots = _launcher_path_variants(project_root) | _launcher_path_variants(
+        Path(__file__).absolute().parents[2]
+    )
+    entries.add(project_root)
+    trees = set(project_roots)
     for prefix in list(entries):
         entries.add(prefix / "pyvenv.cfg")
         trees.update(prefix / name for name in ("lib", "lib64", "Lib", "DLLs"))
@@ -2034,7 +2067,14 @@ def _validate_launcher_runtime(sandbox: SandboxPolicy) -> None:
     trusted_trees = {variant for path in trees for variant in _launcher_path_variants(path)}
     # Reject mutable interpreter/site files before running the startup probe.
     _validate_launcher_write_grants(sandbox, trusted_entries, trusted_trees)
-    _validate_trusted_hardlink_aliases(sandbox, trusted_entries, trusted_trees)
+    import_entries, import_trees = _project_import_inode_roots(project_root)
+    inode_entries = trusted_entries | {
+        variant for path in import_entries for variant in _launcher_path_variants(path)
+    }
+    inode_trees = (trusted_trees - project_roots) | {
+        variant for path in import_trees for variant in _launcher_path_variants(path)
+    }
+    _validate_trusted_hardlink_aliases(sandbox, inode_entries, inode_trees)
     # The parent may add workspaces to sys.path. Only isolated startup roots,
     # including .pth additions, are imported by the launcher before containment.
     isolated_trees = {
@@ -2043,7 +2083,7 @@ def _validate_launcher_runtime(sandbox: SandboxPolicy) -> None:
         for variant in _launcher_path_variants(path)
     }
     _validate_launcher_write_grants(sandbox, set(), isolated_trees)
-    _validate_trusted_hardlink_aliases(sandbox, set(), isolated_trees)
+    _validate_trusted_hardlink_aliases(sandbox, set(), isolated_trees - project_roots)
 
 
 def create_exec_launcher(
