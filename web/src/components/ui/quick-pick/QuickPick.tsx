@@ -47,8 +47,8 @@ export interface QuickPickProps<Value> {
   inputEnd?: ReactNode;
   autoFocus?: boolean;
   /**
-   * A row the caller wants active, such as the last row before ones still loading;
-   * the user's next move replaces it and is reported through `onActiveIdChange`.
+   * A row the caller wants active, such as the last row before ones still loading.
+   * It stays active while set, so clear it in `onActiveIdChange` once the user moves.
    */
   activeId?: string | null;
   onActiveIdChange?: (id: string) => void;

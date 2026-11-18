@@ -63,7 +63,8 @@ describe("QuickPickCommandPalette", () => {
     fireEvent.change(input, { target: { value: "gts" } });
     const actions = within(screen.getByRole("group", { name: "Actions" })).getAllByRole("option");
     expect(actions[0].textContent).toContain("Go to Settings");
-    expect(actions[0].querySelectorAll("mark").length).toBeGreaterThan(0);
+    const marked = [...actions[0].querySelectorAll("mark")].map((mark) => mark.textContent);
+    expect(marked.join("").toLowerCase()).toBe("gts");
   });
 
   it("moves between groups with Alt+Arrow and runs the action with Enter", () => {
@@ -76,5 +77,6 @@ describe("QuickPickCommandPalette", () => {
     );
     fireEvent.keyDown(input, { key: "Enter" });
     expect(onOpenChange).toHaveBeenCalledWith(false);
+    expect(navigate).toHaveBeenCalledWith("/");
   });
 });

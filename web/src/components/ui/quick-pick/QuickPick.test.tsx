@@ -267,10 +267,16 @@ describe("QuickPick pointer and query picks", () => {
 describe("QuickPick caller-chosen active row", () => {
   it("activates the caller's row until the user moves, then reports the move", () => {
     const onActiveIdChange = vi.fn();
-    const { input } = renderPicker({ activeId: "open-settings", onActiveIdChange });
+    const { input, rerender, onAccept } = renderPicker({
+      activeId: "open-settings",
+      onActiveIdChange,
+    });
     expect(activeOption(input)?.textContent).toContain("Open settings");
     fireEvent.pointerMove(screen.getByRole("option", { name: /New session/ }));
     expect(onActiveIdChange).toHaveBeenCalledWith("new-session");
+    // The caller clears its row once told about the move, and the moved row stays active.
+    rerender(<Harness onAccept={onAccept} activeId={null} onActiveIdChange={onActiveIdChange} />);
+    expect(activeOption(input)?.textContent).toContain("New session");
   });
 });
 

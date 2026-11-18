@@ -5,6 +5,7 @@ import type { Conversation } from "@/hooks/useConversations";
 import type { ComponentProps, ReactNode } from "react";
 
 import { ALT_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
+import * as commandPaletteModule from "./CommandPalette";
 import { CommandPalette } from "./CommandPalette";
 
 const navigate = vi.fn();
@@ -508,7 +509,7 @@ describe("CommandPalette — sessions", () => {
   });
 
   // The QuickPick palette aligns them with a blank icon slot; its own test covers that.
-  it.skipIf(CommandPalette.name === "QuickPickCommandPalette")(
+  it.skipIf("QUICK_PICK_PALETTE" in commandPaletteModule)(
     "indents session rows so their label aligns with the icon-prefixed actions",
     () => {
       setSessions([conv("c1", "Fix the parser")]);

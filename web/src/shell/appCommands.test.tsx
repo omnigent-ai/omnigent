@@ -1,5 +1,5 @@
 import { renderHook } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const navigate = vi.fn();
 vi.mock("@/lib/routing", () => ({ useNavigate: () => navigate }));
@@ -27,6 +27,8 @@ describe("useAppCommands", () => {
       "Toggle workspace sidebar",
     ]);
   });
+
+  beforeEach(() => navigate.mockReset());
 
   it("navigates for the Go to commands", () => {
     const byId = new Map(commands().map((command) => [command.id, command]));

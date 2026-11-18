@@ -7,7 +7,7 @@ import type * as CommandPaletteModule from "./CommandPalette";
 vi.mock("./CommandPalette", async (importOriginal) => {
   const actual = await importOriginal<typeof CommandPaletteModule>();
   const { QuickPickCommandPalette } = await import("./QuickPickCommandPalette");
-  return { ...actual, CommandPalette: QuickPickCommandPalette };
+  return { ...actual, CommandPalette: QuickPickCommandPalette, QUICK_PICK_PALETTE: true };
 });
 
 await import("./CommandPalette.test");
