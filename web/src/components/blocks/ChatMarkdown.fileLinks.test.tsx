@@ -11,7 +11,7 @@
 // Both should instead open the FileViewer, exactly as an inline-code path does.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FileViewerContext } from "@/shell/FileViewerContext";
 import { mentionPillMarkdown } from "@/lib/mentionPills";
@@ -1021,7 +1021,8 @@ describe("a file written after an earlier mention", () => {
       tree(["Create report.md and link it.", `Done: [report.md](file://${WORKSPACE}/report.md)`]),
     );
 
-    fireEvent.click(await screen.findByRole("button", { name: "report.md" }));
+    const done = screen.getByText(/^Done:/);
+    fireEvent.click(await within(done).findByRole("button", { name: "report.md" }));
     expect(openFile).toHaveBeenCalledWith("report.md");
     expect(toastMock).not.toHaveBeenCalled();
   });
