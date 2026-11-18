@@ -1037,20 +1037,32 @@ class SqlAlchemyPermissionStore(PermissionStore):
             return _to_account(row) if row is not None and row.deleted_at is None else None
 
     def deleted_accounts(self, user_ids: Sequence[str]) -> set[str]:
-        """Read the tombstones among *user_ids* by primary key. See base class."""
+        """Return the given IDs a deleted account's key matches. See base class.
+
+        Compared in SQL, one primary-key probe each in a single statement, so a
+        spelling the key's collation equates with a deleted account counts, as it
+        would at login, and comes back as given.
+        """
         wanted = sorted(set(user_ids))
         if not wanted:
             return set()
-        with self._session("read_deleted_accounts") as session:
-            return set(
-                session.execute(
-                    select(SqlUser.id).where(
+        probes = [
+            case(
+                (
+                    exists().where(
                         SqlUser.workspace_id == current_workspace_id(),
-                        SqlUser.id.in_(wanted),
+                        SqlUser.id == user_id,
                         SqlUser.deleted_at.is_not(None),
-                    )
-                ).scalars()
+                    ),
+                    literal(True),
+                ),
+                else_=literal(False),
             )
+            for user_id in wanted
+        ]
+        with self._session("read_deleted_accounts") as session:
+            deleted = session.execute(select(*probes)).one()
+        return {user_id for user_id, gone in zip(wanted, deleted, strict=True) if gone}
 
     def user_exists(self, user_id: str) -> bool:
         """Check for a user row. See base class for contract."""

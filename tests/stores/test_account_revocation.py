@@ -633,6 +633,11 @@ def test_deleted_accounts_names_only_tombstoned_users(db_uri):
     # "carol" has no account row, as an identity an SSO proxy supplies may not.
     assert permissions.deleted_accounts(["alice", "bob", "carol", "alice"]) == {"alice"}
     assert permissions.deleted_accounts([]) == set()
+    # MySQL's key folds case and accents, so a spelling it equates is deleted too,
+    # and comes back as given, which is how a workflow may store its owner.
+    variants = ["ALICE", "alíce"]
+    expected = set(variants) if permissions._engine.dialect.name == "mysql" else set()
+    assert permissions.deleted_accounts([*variants, "bob"]) == expected
     accounts.create_user_with_password("alice", "replacement-hash")
     assert permissions.deleted_accounts(["alice"]) == set()
 
