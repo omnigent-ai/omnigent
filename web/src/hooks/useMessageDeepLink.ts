@@ -66,7 +66,7 @@ export function useMessageDeepLink(
   const flashUserMessage = useChatStore((s) => s.flashUserMessage);
   const appliedKeyRef = useRef<string | null>(null);
 
-  useEffect(() => {
+  useEffect((): void | (() => void) => {
     if (!conversationId || !messageId) {
       appliedKeyRef.current = null;
       return;
@@ -75,13 +75,22 @@ export function useMessageDeepLink(
     if (appliedKeyRef.current === key) return;
     if (!ready || showTerminal || loadingConversation || loadingMoreHistory) return;
 
-    if (findMessageElement(messageId, root)) {
+    const scrollIfMounted = () => {
+      if (!findMessageElement(messageId, root)) return false;
       appliedKeyRef.current = key;
       scrollToMessage(messageId, flashUserMessage, undefined, root);
-      return;
+      return true;
+    };
+    if (scrollIfMounted()) return;
+    if (ensureMessageVisible?.(messageId)) {
+      if (scrollIfMounted()) return;
+      // A prepend can mount the target without changing the virtual range indices.
+      const observer = new MutationObserver(() => {
+        if (scrollIfMounted()) observer.disconnect();
+      });
+      observer.observe(root, { childList: true, subtree: true });
+      return () => observer.disconnect();
     }
-    // Geometry publishes a new range after this scroll mounts the target.
-    if (ensureMessageVisible?.(messageId)) return;
     if (hasMoreHistory) {
       void useChatStore.getState().loadMoreHistory();
       return;

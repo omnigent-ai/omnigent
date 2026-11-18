@@ -7374,7 +7374,9 @@ def create_runner_app(
                                     if (
                                         not _is_spec_local
                                         and not is_mcp
-                                        and not should_dispatch_locally(tool_name)
+                                        and not should_dispatch_locally(
+                                            tool_name, _spec_for_dispatch_hint
+                                        )
                                     ):
                                         (
                                             _spec_for_dispatch_hint_entry,
@@ -7392,7 +7394,9 @@ def create_runner_app(
                                         tool_name,
                                         dispatch=dispatch,
                                         is_mcp=is_mcp,
-                                        is_runner_builtin=should_dispatch_locally(tool_name),
+                                        is_runner_builtin=should_dispatch_locally(
+                                            tool_name, _spec_for_dispatch_hint
+                                        ),
                                         is_spec_local=_is_spec_local,
                                     )
                                     if _should_dispatch and _response_id:
