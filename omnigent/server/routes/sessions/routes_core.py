@@ -108,6 +108,13 @@ from omnigent.server.feature_flags import Feature
 from omnigent.server.host_registry import HostLaunchResult, HostRegistry, RunnerExitReports
 from omnigent.server.openapi_request_bodies import SESSION_CREATE_OPENAPI_EXTRA
 from omnigent.server.permissions import check_session_access
+from omnigent.server.proactive_agent import (
+    finish_provisioning as finish_proactive_provisioning,
+)
+from omnigent.server.proactive_agent import reject_proactive_agent_id
+from omnigent.server.proactive_agent import (
+    start_provisioning as start_proactive_provisioning,
+)
 from omnigent.server.routes._auth_helpers import SessionAccess
 from omnigent.server.routes._auth_helpers import (
     get_permission_level as _get_permission_level,
@@ -1454,6 +1461,18 @@ def register_core_routes(
             database creation fails.
         """
         user_id = _require_user(request, auth_provider)
+        # Provision the caller's proactive task alongside the create; it never fails it.
+        provisioning = start_proactive_provisioning(request, user_id)
+        try:
+            return await _create_session(request, user_id)
+        finally:
+            await finish_proactive_provisioning(provisioning)
+
+    async def _create_session(
+        request: Request,
+        user_id: str | None,
+    ) -> SessionResponse | CreatedSessionResponse:
+        """Create a session for *user_id*; see :func:`create_session`."""
         content_type = request.headers.get("content-type", "").split(";", 1)[0].lower()
         if (
             content_type == "multipart/form-data"
@@ -1508,6 +1527,7 @@ def register_core_routes(
             # message survives in each entry's `msg`.
             raise HTTPException(status_code=422, detail=exc.errors(include_context=False)) from exc
 
+        reject_proactive_agent_id(body.agent_id)
         explicit_host = request.url.path.endswith("/sessions/orchestrated/host")
         if explicit_host and (
             body.host_type != "external" or not body.host_id or not body.workspace
@@ -1680,7 +1700,7 @@ def register_core_routes(
             created_by_scheduled_task_id=(
                 source.labels.get(SCHEDULED_TASK_ORIGIN_LABEL_KEY) if source is not None else None
             ),
-            created_by_labels=source.labels if source is not None else None,
+            created_by=source,
             launched_by_scheduled_task_id=(
                 launching_task.id if launching_task is not None else None
             ),
@@ -4925,6 +4945,9 @@ def register_core_routes(
                     code=ErrorCode.INVALID_INPUT,
                 )
 
+        # The fork keeps the source's agent unless the body names another, so
+        # check the agent the fork would actually bind.
+        reject_proactive_agent_id(body.agent_id if body.agent_id is not None else source.agent_id)
         source_agent = await asyncio.to_thread(agent_store.get, source.agent_id)
         target_agent_id = body.agent_id
         switching_agent = target_agent_id is not None and target_agent_id != source.agent_id
@@ -4960,7 +4983,12 @@ def register_core_routes(
             cache = agent_cache or get_agent_cache()
             try:
                 target_spec = (
-                    await asyncio.to_thread(cache.load, base_agent.id, base_agent.bundle_location)
+                    await asyncio.to_thread(
+                        cache.load,
+                        base_agent.id,
+                        base_agent.bundle_location,
+                        expand_env=base_agent.operator_authored,
+                    )
                 ).spec
             except (KeyError, AttributeError, ValueError, ImportError, OSError) as exc:
                 raise OmnigentError(

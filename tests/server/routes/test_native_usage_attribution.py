@@ -10,7 +10,11 @@ double-counted the shared baseline once the active model changed).
 
 from __future__ import annotations
 
+import dataclasses
 import json
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass
 
 import pytest
 
@@ -495,6 +499,18 @@ def _conversation_point_reads(statements: list[str]) -> list[str]:
     return matches
 
 
+def _conversation_tree_scans(statements: list[str]) -> list[str]:
+    """Filter captured SQL to page loads of one spawn tree."""
+    matches: list[str] = []
+    for raw in statements:
+        normalized = " ".join(raw.split())
+        if "FROM conversations" not in normalized or " WHERE " not in normalized:
+            continue
+        if "root_conversation_id = " in normalized.split(" WHERE ", 1)[1]:
+            matches.append(normalized)
+    return matches
+
+
 @pytest.mark.asyncio
 async def test_flush_with_stale_row_keeps_monotonic_clamp(db_uri: str) -> None:
     """A stale caller-held row must not weaken the forged-low-report clamp.
@@ -581,7 +597,194 @@ async def test_flush_with_supplied_row_skips_tree_root_rereads(db_uri: str) -> N
         f"flush issued {len(point_reads)} conversation point reads (expected "
         f"1: the persist's fresh clamp baseline); statements={point_reads}"
     )
+    # The subtree roll-up and the ancestor publish share one tree load; on a
+    # large spawn tree each load pages the whole tree.
+    tree_scans = _conversation_tree_scans(statements)
+    assert len(tree_scans) == 1, (
+        f"flush loaded the spawn tree {len(tree_scans)} times (expected 1); "
+        f"statements={tree_scans}"
+    )
     assert _usage(store, conv.id)["total_cost_usd"] == pytest.approx(3.0)
+
+
+@dataclass
+class _UsageTree:
+    """root -> {mid -> leaf -> grandchild, sibling}; each node holds known spend."""
+
+    root: str
+    mid: str
+    sibling: str
+    leaf: str
+    grandchild: str
+
+
+def _seed_usage_tree(store: SqlAlchemyConversationStore) -> _UsageTree:
+    root = store.create_conversation(title="root", agent_id=_AGENT_ID)
+    mid = store.create_conversation(kind="sub_agent", parent_conversation_id=root.id)
+    sibling = store.create_conversation(kind="sub_agent", parent_conversation_id=root.id)
+    leaf = store.create_conversation(kind="sub_agent", parent_conversation_id=mid.id)
+    grandchild = store.create_conversation(kind="sub_agent", parent_conversation_id=leaf.id)
+    # Powers of two give every subtree a unique total, so summing the wrong
+    # subtree (sibling included, grandchild dropped) changes the number.
+    for conv, cost, tokens in (
+        (root, 1.0, 10),
+        (mid, 2.0, 20),
+        (sibling, 8.0, 80),
+        (leaf, 4.0, 40),
+        (grandchild, 16.0, 160),
+    ):
+        store.set_session_usage(
+            conv.id,
+            {
+                "total_cost_usd": cost,
+                "input_tokens": tokens,
+                "by_model": {"m1": {"input_tokens": tokens, "total_cost_usd": cost}},
+            },
+        )
+    return _UsageTree(root.id, mid.id, sibling.id, leaf.id, grandchild.id)
+
+
+class _UsageRecorder:
+    """Stands in for ``session_stream``, keeping only ``session.usage`` events."""
+
+    def __init__(self) -> None:
+        self.events: list[dict] = []
+
+    def publish(self, session_id: str, event: dict) -> None:
+        if event.get("type") == "session.usage":
+            assert event["conversation_id"] == session_id
+            self.events.append(event)
+
+
+@pytest.fixture
+def usage_events(monkeypatch: pytest.MonkeyPatch) -> list[dict]:
+    from omnigent.server.routes import sessions as sessions_facade
+
+    recorder = _UsageRecorder()
+    # Orchestration reaches ``session_stream`` through the facade at call time.
+    monkeypatch.setattr(sessions_facade, "session_stream", recorder)
+    return recorder.events
+
+
+@contextmanager
+def _captured_sql(db_uri: str) -> Iterator[list[str]]:
+    from sqlalchemy import event as sa_event
+
+    from omnigent.db.utils import _engine_cache
+
+    engine = _engine_cache[db_uri]
+    statements: list[str] = []
+
+    def _on_exec(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    sa_event.listen(engine, "before_cursor_execute", _on_exec)
+    try:
+        yield statements
+    finally:
+        sa_event.remove(engine, "before_cursor_execute", _on_exec)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("caller_row", "expected_tree_scans"),
+    [
+        pytest.param("fresh", 1, id="fresh-row"),
+        pytest.param("absent", 1, id="no-row"),
+        # The row predates a re-parent and claims the child is top-level, so its
+        # root hint names a tree the child is not in: the verified load
+        # re-resolves the root, and the ancestors must come from the fresh tree.
+        pytest.param("stale-top-level", 2, id="stale-row-claims-top-level"),
+    ],
+)
+async def test_child_flush_publishes_every_ancestor_from_one_tree_load(
+    db_uri: str,
+    usage_events: list[dict],
+    caller_row: str,
+    expected_tree_scans: int,
+) -> None:
+    """A sub-agent's flush re-publishes each ancestor's subtree from its own tree read."""
+    from omnigent.server.routes._sessions.orchestration import (
+        _persist_external_session_usage,
+    )
+    from omnigent.server.schemas import SessionEventInput
+
+    store = SqlAlchemyConversationStore(db_uri)
+    tree = _seed_usage_tree(store)
+    row = store.get_conversation(tree.leaf)
+    assert row is not None
+    conv_arg = {
+        "fresh": row,
+        "absent": None,
+        "stale-top-level": dataclasses.replace(
+            row, root_conversation_id=row.id, parent_conversation_id=None
+        ),
+    }[caller_row]
+
+    with _captured_sql(db_uri) as statements:
+        await _persist_external_session_usage(
+            tree.leaf,
+            SessionEventInput(
+                type="external_session_usage",
+                data={"context_tokens": 1234, "cumulative_cost_usd": 4.5, "model": "m1"},
+            ),
+            store,
+            conv_arg,
+        )
+
+    tree_scans = _conversation_tree_scans(statements)
+    assert len(tree_scans) == expected_tree_scans, tree_scans
+    # leaf = 4.5 + grandchild 16; mid adds 2; root adds 1 + sibling 8. The
+    # sibling gets no event, and context_tokens rides only on the leaf's own.
+    assert [(e["conversation_id"], e["total_cost_usd"]) for e in usage_events] == [
+        (tree.leaf, 20.5),
+        (tree.mid, 22.5),
+        (tree.root, 31.5),
+    ]
+    assert [e.get("context_tokens") for e in usage_events] == [1234, None, None]
+    assert [e["usage_by_model"]["m1"]["input_tokens"] for e in usage_events] == [200, 220, 310]
+
+
+@pytest.mark.asyncio
+async def test_relay_turn_completion_publishes_every_ancestor_from_one_tree_load(
+    db_uri: str,
+    usage_events: list[dict],
+) -> None:
+    """A relayed ``response.completed`` rolls usage up its ancestors from one tree read."""
+    import httpx
+
+    from omnigent.server.routes._sessions.orchestration import _relay_runner_stream_once
+
+    store = SqlAlchemyConversationStore(db_uri)
+    tree = _seed_usage_tree(store)
+    events = [
+        {"type": "response.in_progress", "response": {"id": "turn-1", "model": "m1"}},
+        {
+            "type": "response.completed",
+            "response": {
+                "id": "turn-1",
+                "usage": {"input_tokens": 100, "output_tokens": 0, "cost_usd": 0.5, "model": "m1"},
+            },
+        },
+    ]
+    body = "".join(f"data: {json.dumps(event)}\n\n" for event in events) + "data: [DONE]\n\n"
+    # Only the runner is faked; event handling and the store stay real.
+    transport = httpx.MockTransport(lambda request: httpx.Response(200, text=body))
+
+    with _captured_sql(db_uri) as statements:
+        async with httpx.AsyncClient(
+            base_url="http://runner.example", transport=transport
+        ) as runner:
+            await _relay_runner_stream_once(tree.leaf, runner, store)
+
+    tree_scans = _conversation_tree_scans(statements)
+    assert len(tree_scans) == 1, tree_scans
+    assert [(e["conversation_id"], e["total_cost_usd"]) for e in usage_events] == [
+        (tree.leaf, 20.5),
+        (tree.mid, 22.5),
+        (tree.root, 31.5),
+    ]
+    assert [e["usage_by_model"]["m1"]["input_tokens"] for e in usage_events] == [300, 320, 410]
 
 
 @pytest.mark.asyncio

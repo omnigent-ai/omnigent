@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import AsyncIterator, Iterable
 from contextlib import asynccontextmanager
+from itertools import islice
 from pathlib import Path
-from types import SimpleNamespace
+from types import CoroutineType, GeneratorType, SimpleNamespace
 
 import httpx
 import pytest
@@ -22,6 +24,112 @@ from tests.test_kiro_native_permissions import (
 )
 
 pytestmark = pytest.mark.asyncio
+
+_KIRO_READINESS_CODES = {
+    (str(Path(__file__).resolve().parents[3] / path), name): (path, phase)
+    for path, name, phase in (
+        (
+            "tests/server/integration/test_kiro_permission_delivery.py",
+            "parent_delivery",
+            "parent-delivery-poll",
+        ),
+        (
+            "omnigent/server/routes/sessions/routes_core.py",
+            "get_session",
+            "session-snapshot-route",
+        ),
+        (
+            "omnigent/server/routes/_sessions/orchestration.py",
+            "_get_session_snapshot",
+            "session-snapshot-build",
+        ),
+        (
+            "omnigent/server/routes/sessions/routes_hooks.py",
+            "native_permission_request_hook",
+            "permission-hook",
+        ),
+        (
+            "omnigent/server/routes/_sessions/orchestration.py",
+            "_publish_and_wait_for_harness_elicitation",
+            "permission-delivery",
+        ),
+    )
+}
+
+
+def _kiro_readiness_evidence(coroutines: Iterable[object]) -> str:
+    phases: set[tuple[str, str, int]] = set()
+    scanned = 0
+    depth_limited = rows_limited = False
+    for current in islice(coroutines, 32):
+        scanned += 1
+        for _ in range(48):
+            if isinstance(current, CoroutineType):
+                code, frame = current.cr_code, current.cr_frame
+                following = current.cr_await
+            elif isinstance(current, GeneratorType):
+                code, frame = current.gi_code, current.gi_frame
+                following = current.gi_yieldfrom
+            else:
+                break
+            known = _KIRO_READINESS_CODES.get((code.co_filename, code.co_name))
+            if known is not None and frame is not None:
+                path, phase = known
+                row = (phase, path, frame.f_lineno if 0 < frame.f_lineno < 1_000_000 else 0)
+                if row not in phases:
+                    if len(phases) < 8:
+                        phases.add(row)
+                    else:
+                        rows_limited = True
+            current = following
+        else:
+            depth_limited = depth_limited or isinstance(current, (CoroutineType, GeneratorType))
+    evidence = {
+        "diagnostic": "kiro-readiness-before-cancellation",
+        "coroutines_scanned": scanned,
+        "coroutine_limit_reached": scanned == 32,
+        "await_depth_limit_reached": depth_limited,
+        "phase_limit_reached": rows_limited,
+        "phases": [
+            {"phase": phase, "path": path, "line": line} for phase, path, line in sorted(phases)
+        ],
+    }
+    encoded = json.dumps(evidence, ensure_ascii=True)
+    while len(encoded) > 4096:
+        evidence["phases"].pop()
+        evidence["phase_limit_reached"] = True
+        encoded = json.dumps(evidence, ensure_ascii=True)
+    return encoded
+
+
+@asynccontextmanager
+async def _kiro_readiness_timeout(timeout: asyncio.Timeout) -> AsyncIterator[None]:
+    evidence = '{"diagnostic":"kiro-readiness-not-sampled"}'
+
+    def observe() -> None:
+        nonlocal evidence
+        try:
+            evidence = _kiro_readiness_evidence(task.get_coro() for task in asyncio.all_tasks())
+        except Exception:
+            evidence = '{"diagnostic":"kiro-readiness-observation-unavailable"}'
+
+    loop = asyncio.get_running_loop()
+    deadline = timeout.when()
+    observer = None
+    if deadline is not None:
+        # Sample once before timeout cancellation unwinds the inner ASGI tasks.
+        lead = min(0.05, max(0, deadline - loop.time()) / 10)
+        observer = loop.call_at(deadline - lead, observe)
+    try:
+        async with timeout:
+            yield
+    except TimeoutError as error:
+        if timeout.expired():
+            error.add_note(evidence)
+        raise
+    finally:
+        if observer is not None:
+            observer.cancel()
 
 
 async def _wait_for_state(elicitation_id: str, state: str) -> None:
@@ -303,7 +411,7 @@ async def test_kiro_child_delivery_stays_pending_in_parent_until_receipt(
     hook = asyncio.create_task(client.post(hook_url, json=payload))
 
     async def parent_delivery(state: str) -> dict:
-        async with asyncio.timeout(5):
+        async with _kiro_readiness_timeout(asyncio.timeout(5)):
             while True:
                 snapshot = (await client.get(f"/v1/sessions/{parent}")).json()
                 entries = snapshot["pending_elicitations"]

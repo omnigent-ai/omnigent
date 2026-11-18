@@ -294,3 +294,14 @@ export function canShareAutomation(
     ownerUserId === viewerId
   );
 }
+
+/**
+ * Whether the server lists the automations shared with the viewer: it serves
+ * `/v1/scheduled-tasks/shared` and has other users. Older servers that share
+ * automations lack that route.
+ */
+export function sharedAutomationsListed(info: ServerInfo | "loading"): boolean {
+  return (
+    info !== "loading" && info.scheduled_task_shared_with_me === true && !isSingleUserMode(info)
+  );
+}

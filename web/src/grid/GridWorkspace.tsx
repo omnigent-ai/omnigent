@@ -29,6 +29,8 @@ import {
 } from "lucide-react";
 import { CanvasWorkspace } from "@/canvas/CanvasWorkspace";
 import { usePaneCycleHotkey } from "@/hooks/usePaneCycleHotkey";
+import { useQueries } from "@tanstack/react-query";
+import { sessionQueryOptions } from "@/hooks/useSession";
 import { useLoadedConversations } from "@/hooks/useSidebarData";
 import { useSidebarToggleHotkeys } from "@/hooks/useSidebarToggleHotkeys";
 import { Link, useParams } from "@/lib/routing";
@@ -68,12 +70,16 @@ export function GridSidebar({ onNavigate }: { onNavigate?: MouseEventHandler<HTM
   return <SavedGridSidebar onNavigate={onNavigate} />;
 }
 
-function SavedGridSidebar({ onNavigate }: { onNavigate?: MouseEventHandler<HTMLAnchorElement> }) {
-  const grids = useGridSessions()!;
+function useSessionTitles() {
   const { data } = useLoadedConversations();
-  const titles = new Map(
+  return new Map(
     data?.pages.flatMap((page) => page.data.map((session) => [session.id, session.title] as const)),
   );
+}
+
+function SavedGridSidebar({ onNavigate }: { onNavigate?: MouseEventHandler<HTMLAnchorElement> }) {
+  const grids = useGridSessions()!;
+  const titles = useSessionTitles();
   return (
     <section aria-label="Grids" className="mb-6">
       <div className="px-2 pb-2 text-xs font-medium text-muted-foreground">Grids</div>
@@ -82,12 +88,7 @@ function SavedGridSidebar({ onNavigate }: { onNavigate?: MouseEventHandler<HTMLA
           <GridSidebarRow
             key={grid.id}
             grid={grid}
-            title={
-              grid.name ||
-              gridSessionIds(grid.layout)
-                .map((id) => titles.get(id) || "Session")
-                .join(" + ")
-            }
+            title={gridTitle(grid, titles)}
             onNavigate={onNavigate}
           />
         ))}
@@ -193,6 +194,24 @@ export function RearrangeableGrid({
   const { layout } = grid;
   const sessionIds = gridSessionIds(layout);
   const { selectedSessionId: activeSessionId, selectSession } = useGridSessions()!;
+  // The cells' own snapshots also name sessions the sidebar hasn't loaded (sub-agents, older pages).
+  const cellTitles = useQueries({
+    queries: sessionIds.map((id) => sessionQueryOptions(id)),
+    combine: (results) => results.map((result) => result.data?.title),
+  });
+  const titles = useSessionTitles();
+  sessionIds.forEach((id, index) => {
+    if (cellTitles[index]) titles.set(id, cellTitles[index]);
+  });
+  const title = gridTitle(grid, titles);
+  useEffect(() => {
+    // Leaving the grid restores the title the page had before it.
+    const previous = document.title;
+    document.title = title;
+    return () => {
+      document.title = previous;
+    };
+  }, [title]);
   const workspaceKey = `grid:${grid.id}`;
   const [workspace, setWorkspace] = useState(() => {
     const saved = readSessionWorkspaceState(workspaceKey);
@@ -326,9 +345,15 @@ export function RearrangeableGrid({
           ref={(node) => {
             node?.toggleAttribute("inert", maximized);
           }}
-          className="flex min-h-0 min-w-0 flex-1 flex-col pt-[var(--mac-titlebar-height,0px)]"
+          className="flex min-h-0 min-w-0 flex-1 flex-col"
         >
-          <header className="flex h-12 shrink-0 items-center gap-2 px-4 py-3">
+          {/* Shares the macOS title-bar strip, like the chat header. */}
+          <header
+            className={cn(
+              "flex h-12 shrink-0 items-center gap-2 px-4 py-3",
+              onOpenSidebar && "traffic-light-clearance",
+            )}
+          >
             {onOpenSidebar && (
               <SidebarOpenButton
                 size="icon-sm"
@@ -337,7 +362,7 @@ export function RearrangeableGrid({
               />
             )}
             <Grid2X2Icon className="size-4 shrink-0" />
-            <h1 className="truncate text-ui">{gridTitle(grid)}</h1>
+            <h1 className="truncate text-ui">{title}</h1>
             <span className="flex-1" />
             <Button
               variant="ghost"

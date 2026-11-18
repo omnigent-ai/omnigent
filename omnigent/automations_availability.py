@@ -9,7 +9,7 @@ from omnigent.spec.types import AgentSpec
 # Sent on the runner's bundle download because the gate is per caller while the
 # runner caches one parsed spec per bundle.
 AUTOMATIONS_HEADER = "X-Omnigent-Automations"
-# Same, for the Inbox tools of the proactive agent.
+# Same, for the owner-Inbox tools; runners keep them only when it is "1".
 USER_INBOX_HEADER = "X-Omnigent-User-Inbox"
 
 

@@ -15,6 +15,7 @@ import {
   getScheduledTask,
   listScheduledTaskRuns,
   listScheduledTasks,
+  listSharedScheduledTasks,
   listAutomationFailures,
   runScheduledTaskNow,
   updateScheduledTask,
@@ -125,11 +126,59 @@ describe("listScheduledTasks", () => {
 });
 
 describe("getScheduledTask", () => {
+  it.each([undefined, null, 2.5])("reads the saved cost limit (%s)", async (maxCostUsd) => {
+    fetchMock.mockResolvedValueOnce(mockResponse({ ...TASK_WIRE, max_cost_usd: maxCostUsd }));
+    expect((await getScheduledTask("st_1")).maxCostUsd).toBe(maxCostUsd ?? null);
+  });
+
   it("GETs /v1/scheduled-tasks/{id} and encodes the id", async () => {
     fetchMock.mockResolvedValueOnce(mockResponse(TASK_WIRE));
     const task = await getScheduledTask("st 1");
     expect(fetchMock.mock.calls[0][0]).toBe("/v1/scheduled-tasks/st%201");
     expect(task.id).toBe("st_1");
+    // Older servers return only the caller's own tasks.
+    expect(task).toMatchObject({ viewerRole: "owner", ownerDisplayName: null });
+  });
+
+  it("names the owner of a task shared with the caller", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({ ...TASK_WIRE, viewer_role: "viewer", owner_display_name: "Alice" }),
+    );
+    expect(await getScheduledTask("st_1")).toMatchObject({
+      viewerRole: "viewer",
+      ownerUserId: "alice",
+      ownerDisplayName: "Alice",
+    });
+  });
+});
+
+describe("listSharedScheduledTasks", () => {
+  it("requests bounded pages and keeps a cursor after a short page", async () => {
+    const shared = { ...TASK_WIRE, viewer_role: "viewer", owner_display_name: "Alice" };
+    fetchMock.mockResolvedValueOnce(mockResponse({ scheduled_tasks: [], next_cursor: "st_0" }));
+    expect(await listSharedScheduledTasks(null)).toEqual({ tasks: [], nextCursor: "st_0" });
+    expect(fetchMock.mock.calls[0][0]).toBe("/v1/scheduled-tasks/shared?limit=50");
+
+    fetchMock.mockResolvedValueOnce(mockResponse({ scheduled_tasks: [shared], next_cursor: null }));
+    const page = await listSharedScheduledTasks("st_0");
+    expect(fetchMock.mock.calls[1][0]).toBe("/v1/scheduled-tasks/shared?limit=50&after=st_0");
+    expect(page.nextCursor).toBeNull();
+    expect(page.tasks.map((task) => [task.id, task.viewerRole, task.ownerDisplayName])).toEqual([
+      ["st_1", "viewer", "Alice"],
+    ]);
+  });
+
+  it("throws the server's error", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse(
+        { error: { code: "forbidden", message: "Agents cannot list" } },
+        { ok: false, status: 403 },
+      ),
+    );
+    await expect(listSharedScheduledTasks(null)).rejects.toMatchObject({
+      status: 403,
+      code: "forbidden",
+    });
   });
 });
 
@@ -210,6 +259,20 @@ describe("listScheduledTaskRuns", () => {
 });
 
 describe("createScheduledTask", () => {
+  it.each([undefined, null, 2.5])("sends a cost limit only when set (%s)", async (maxCostUsd) => {
+    fetchMock.mockResolvedValueOnce(mockResponse(TASK_WIRE));
+    await createScheduledTask({
+      name: "Nightly review",
+      prompt: "Review new issues",
+      rrule: "FREQ=DAILY",
+      agentId: "ag_1",
+      maxCostUsd,
+    });
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    if (maxCostUsd == null) expect(body).not.toHaveProperty("max_cost_usd");
+    else expect(body.max_cost_usd).toBe(maxCostUsd);
+  });
+
   it("POSTs required fields and omits unset optionals", async () => {
     fetchMock.mockResolvedValueOnce(mockResponse(TASK_WIRE));
     await createScheduledTask({
@@ -324,6 +387,17 @@ describe("createScheduledTask", () => {
 });
 
 describe("updateScheduledTask", () => {
+  it.each([undefined, null, 2.5])(
+    "preserves, clears, or sets the cost limit (%s)",
+    async (maxCostUsd) => {
+      fetchMock.mockResolvedValueOnce(mockResponse(TASK_WIRE));
+      await updateScheduledTask("st_1", { maxCostUsd });
+      expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual(
+        maxCostUsd === undefined ? {} : { max_cost_usd: maxCostUsd },
+      );
+    },
+  );
+
   it("PATCHes only the fields present in the input", async () => {
     fetchMock.mockResolvedValueOnce(mockResponse({ ...TASK_WIRE, state: "paused" }));
     const updated = await updateScheduledTask("st_1", { state: "paused" });

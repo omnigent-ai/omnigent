@@ -23,6 +23,7 @@ from typing import Any
 from omnigent.entities.session_journal import (
     JOURNAL_KINDS,
     NOTE_BODY_MAX_BYTES,
+    PLAN_DESCRIPTION_MAX_CHARS,
     PLAN_MAX_STEPS,
     PLAN_NAME_MAX_CHARS,
     STEP_ID_MAX_CHARS,
@@ -166,6 +167,16 @@ class SysJournalWritePlanTool(Tool):
                     "description": (
                         "Only on the plan that starts a run of a saved workflow: its ID, "
                         "from sys_workflow_load."
+                    ),
+                },
+                "description": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": PLAN_DESCRIPTION_MAX_CHARS,
+                    "description": (
+                        "Only in a workflow page's planning chat: the workflow's description "
+                        "for this proposal, what it does and what a run needs. Save plan "
+                        "stores it with the steps."
                     ),
                 },
             },
@@ -321,7 +332,10 @@ class SysWorkflowRequestInputTool(Tool):
             "with your first question, puts the questions in the user's Inbox with your "
             "options as buttons (they can also write their own answer), and returns the "
             "answers. Then write the task's next status: started to resume it, done for an "
-            "approval given, failed for one refused. Ask everything you need in one call. "
+            "approval given, failed for one refused. If they haven't answered within a few "
+            "minutes it returns still_open: finish the work that doesn't depend on the answer, "
+            "then end your turn; their answer arrives later as a message. Ask everything you "
+            "need in one call. "
             "In an unattended automation or its workers, this tool and needs_input are "
             "refused. Resolve within the user's authorization and record the choice. Write "
             "failed for a remaining blocker only with the same evidence; continue independent "
