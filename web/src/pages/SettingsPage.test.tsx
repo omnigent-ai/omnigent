@@ -23,6 +23,8 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { Conversation } from "@/hooks/useConversations";
 import { BACKGROUND_SESSION_TITLES_STORAGE_KEY } from "@/lib/backgroundSessionTitlesPreferences";
 import { OPEN_SUBAGENTS_IN_PANEL_STORAGE_KEY } from "@/lib/subagentPanelPreferences";
+import { fetchDatabricksStatus } from "@/lib/databricksIntegration";
+import { fetchGithubStatus } from "@/lib/githubIntegration";
 import {
   useProjectFolderCollapse,
   useProjectFolderPageSize,
@@ -56,6 +58,7 @@ const mocks = vi.hoisted(() => ({
   accountsEnabled: true,
   importSessionsPanel: vi.fn(() => null),
   enabledConnections: [] as string[],
+  archiveWorktreeCleanup: false,
   // login_url: non-null for any sign-in mode (accounts OR OIDC), null in
   // header mode. Gates the Account section.
   loginUrl: "/login" as string | null,
@@ -103,9 +106,25 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
           admin_view: mocks.adminViewSupported,
           sibling_sessions: mocks.nestedAgents,
           enabled_connections: mocks.enabledConnections,
+          archive_worktree_cleanup: mocks.archiveWorktreeCleanup,
           session_title_instructions: mocks.sessionTitleInstructions,
           proactive_agent_available: mocks.advisorAvailable,
         },
+}));
+vi.mock("@/lib/githubIntegration", () => ({
+  fetchGithubStatus: vi.fn(async () => ({ connected: false, login: null, install_url: null })),
+  beginGithubConnect: vi.fn(),
+  disconnectGithub: vi.fn(),
+}));
+vi.mock("@/lib/databricksIntegration", () => ({
+  fetchDatabricksStatus: vi.fn(async () => ({
+    enabled: true,
+    connected: false,
+    workspace_host: null,
+    databricks_user: null,
+  })),
+  beginDatabricksConnect: vi.fn(),
+  disconnectDatabricks: vi.fn(),
 }));
 vi.mock("@/components/SessionTitleInstructionsControl", () => ({
   SessionTitleInstructionsControl: () => <div data-testid="mock-session-title-instructions" />,
@@ -313,6 +332,7 @@ beforeEach(() => {
   mocks.authenticatedFetch.mockReset();
   mocks.importSessionsPanel.mockClear();
   mocks.enabledConnections = [];
+  mocks.archiveWorktreeCleanup = false;
   mocks.loginUrl = "/login";
   mocks.me = { id: "alice", is_admin: false };
   mocks.effectiveAdmin = undefined;
@@ -1843,6 +1863,82 @@ describe("SettingsPage", () => {
     expect(
       document.querySelector('[data-settings-control="account-password:submit"]'),
     ).not.toBeNull();
+  });
+
+  it("renders the Git rows from their Settings catalog entries", () => {
+    renderPage("/settings/git");
+    for (const id of ["always-use-worktree", "default-base-branch"]) {
+      expect(document.querySelector(`[data-settings-item="${id}"]`)).not.toBeNull();
+    }
+    expect(
+      document
+        .querySelector('[data-settings-control="default-base-branch:"]')
+        ?.getAttribute("aria-labelledby"),
+    ).toBe("settings-default-base-branch-label");
+    expect(
+      screen.getByRole("switch", { name: "Always use a random worktree" }),
+    ).toHaveAccessibleDescription(
+      "Use a fresh, randomly named worktree for new sessions in Git workspaces. Project settings override this default.",
+    );
+    expect(screen.getByRole("textbox", { name: "Default base branch" })).toBeInTheDocument();
+  });
+
+  it("renders the delete-worktrees row only when the server enables worktree cleanup", () => {
+    renderPage("/settings/git");
+    expect(document.querySelector('[data-settings-item="delete-worktrees-on-archive"]')).toBeNull();
+
+    cleanup();
+    mocks.archiveWorktreeCleanup = true;
+    renderPage("/settings/git");
+    expect(
+      document.querySelector('[data-settings-item="delete-worktrees-on-archive"]'),
+    ).not.toBeNull();
+    expect(
+      document
+        .querySelector('[data-settings-control="delete-worktrees-on-archive:"]')
+        ?.getAttribute("aria-labelledby"),
+    ).toBe("settings-delete-worktrees-on-archive-label");
+  });
+
+  it("renders the Sandbox Integrations rows from their Settings catalog entries", async () => {
+    mocks.enabledConnections = ["github", "databricks"];
+    renderPage("/settings/integrations");
+    expect(await screen.findByTestId("github-connect")).toBeInTheDocument();
+    expect(await screen.findByTestId("databricks-workspace")).toBeInTheDocument();
+    for (const id of ["github-connection", "databricks-connection"]) {
+      expect(document.querySelector(`[data-settings-item="${id}"]`)).not.toBeNull();
+    }
+    expect(
+      document.querySelector('[data-settings-control="databricks-connection:workspace"]'),
+    ).not.toBeNull();
+    expect(screen.getByRole("textbox", { name: "Databricks workspace host" })).toBeInTheDocument();
+  });
+
+  it("keeps the GitHub and Databricks rows on the page while their status is checking", () => {
+    mocks.enabledConnections = ["github", "databricks"];
+    renderPage("/settings/integrations");
+    for (const id of ["github-connection", "databricks-connection"]) {
+      expect(document.querySelector(`[data-settings-item="${id}"]`)).not.toBeNull();
+    }
+  });
+
+  it("keeps the integration rows on the page when their status can't be read", async () => {
+    mocks.enabledConnections = ["github", "databricks"];
+    vi.mocked(fetchGithubStatus).mockRejectedValueOnce(new Error("offline"));
+    vi.mocked(fetchDatabricksStatus).mockRejectedValueOnce(new Error("offline"));
+    renderPage("/settings/integrations");
+    expect(
+      await screen.findByText("GitHub status is unavailable.", { selector: "p" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("Databricks status is unavailable.", { selector: "p" }),
+    ).toBeInTheDocument();
+    expect(
+      document.querySelector('[data-settings-item="github-connection"]')?.textContent,
+    ).toContain("GitHub status is unavailable.");
+    expect(
+      document.querySelector('[data-settings-item="databricks-connection"]')?.textContent,
+    ).toContain("Databricks status is unavailable.");
   });
 
   it("lists archived sessions and unarchives on click", () => {
