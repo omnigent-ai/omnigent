@@ -107,6 +107,7 @@ import {
 } from "@/lib/outgoingComposerMessage";
 import {
   composerInlineMentions,
+  mergeTaggedDrafts,
   presentTaggedMentions,
   recallFileMentions,
   recallSessionMentions,
@@ -144,15 +145,23 @@ function recallGridDraft(
   quoteBefores: readonly string[] = [],
 ): { text: string; quoteBefores: string[]; mentions: TaggedMentions | undefined } {
   const sessions = recallSessionMentions(text, quoteBefores);
-  const files = recallFileMentions(
-    sessions.main,
-    sessions.sessions.map((session) => session.token!),
-  );
-  const tagged = files.files.length > 0 || sessions.sessions.length > 0;
+  const sessionTokens = sessions.sessions.map((session) => session.token!);
+  // One tag list across the segments, so a file named in two of them keeps one token.
+  let mentions: TaggedMentions = { files: [], sessions: sessions.sessions };
+  const segments = [sessions.main, ...sessions.others].map((segment) => {
+    const files = recallFileMentions(segment, sessionTokens);
+    const merged = mergeTaggedDrafts(mentions, {
+      text: files.text,
+      mentions: { files: files.files, sessions: [] },
+    });
+    mentions = merged.mentions!;
+    return merged.text;
+  });
+  const tagged = mentions.files.length > 0 || mentions.sessions.length > 0;
   return {
-    text: files.text,
-    quoteBefores: sessions.others,
-    mentions: tagged ? { files: files.files, sessions: sessions.sessions } : undefined,
+    text: segments[0]!,
+    quoteBefores: segments.slice(1),
+    mentions: tagged ? mentions : undefined,
   };
 }
 

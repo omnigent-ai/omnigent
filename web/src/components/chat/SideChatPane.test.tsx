@@ -1941,30 +1941,31 @@ describe("grid cell composer shares its session's draft", () => {
     });
   });
 
-  it("edits a queued cell quote card with its tag back as a token, and resends it unchanged", () => {
+  it("edits a queued cell quote card with its tags back as tokens, and resends it unchanged", () => {
     writeAlwaysSteer(false);
     conversationRegistry.acquire(childId).setState({ sessionStatus: "running" });
     const replyDraft: StoredReplyDraft = {
       version: 1,
-      quotes: [{ before: "Ask @Fix CI", text: "Quoted line" }],
+      quotes: [{ before: "Check @src/app.ts, ask @Fix CI", text: "Quoted line" }],
       text: "Reply",
     };
     bridgedCell({
       text: serializeReplyDraft(replyDraft),
       files: [],
       replyDraft,
-      mentions: { files: [], sessions: [sessionTag] },
+      mentions: { files: [fileTag], sessions: [sessionTag] },
     });
     fireEvent.click(screen.getByTestId("side-chat-send"));
     const queued = useChatStore.getState().queuedMessages[0]!;
 
     fireEvent.click(screen.getByRole("button", { name: "Edit queued message" }));
     expect(screen.getByRole("textbox", { name: "Reply text before quote 1" })).toHaveValue(
-      "Ask @Fix CI",
+      "Check @src/app.ts, ask @Fix CI",
     );
-    expect(getSessionDraft(childId)?.mentions?.sessions).toEqual([
-      expect.objectContaining({ id: "sess_fix" }),
-    ]);
+    expect(getSessionDraft(childId)?.mentions).toEqual({
+      files: [expect.objectContaining({ path: "src/app.ts", token: "@src/app.ts" })],
+      sessions: [expect.objectContaining({ id: "sess_fix" })],
+    });
     expect(useChatStore.getState().queuedMessages).toEqual([]);
 
     act(() => conversationRegistry.acquire(childId).setState({ sessionStatus: "idle" }));
@@ -2031,7 +2032,11 @@ describe("grid cell composer shares its session's draft", () => {
 
   it("offers Send, not Interrupt, for a cell's draft while its session works", () => {
     writeAlwaysSteer(false);
-    conversationRegistry.acquire(childId).setState({ sessionStatus: "running" });
+    // An observed streaming response makes the interrupt ready, so Escape would reach it.
+    conversationRegistry.acquire(childId).setState({
+      sessionStatus: "running",
+      activeResponse: { responseId: "codex_turn_side", state: "streaming", error: null },
+    });
     gridCell();
     const input = screen.getByTestId("side-chat-input");
 
@@ -2043,7 +2048,7 @@ describe("grid cell composer shares its session's draft", () => {
     expect(input).toHaveValue("Keep going");
 
     fireEvent.change(input, { target: { value: "" } });
-    expect(screen.getByRole("button", { name: "Interrupt session" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Interrupt session" })).toBeEnabled();
   });
 
   it("leaves a side chat alone when its session has a shared draft", () => {
