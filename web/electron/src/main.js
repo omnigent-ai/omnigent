@@ -1635,8 +1635,8 @@ function broadcastHostStatus() {
 
 /**
  * True for a regular shell window. A panel (see createWindow's `role`) is tracked too, but
- * main-window fallbacks, deep links, placement and the Dock skip it. Menu items that act on
- * the focused window still act on a focused panel.
+ * `activeWindow()` (and every command that targets through it), deep links, placement and the
+ * Dock skip it. Only code that reads `BrowserWindow.getFocusedWindow()` itself sees a panel.
  *
  * @param {BrowserWindow | null | undefined} win
  */

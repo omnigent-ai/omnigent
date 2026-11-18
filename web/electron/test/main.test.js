@@ -3686,6 +3686,36 @@ describe("CLI deep-link handoff", () => {
   }
 });
 
+describe("deep links with a panel open", () => {
+  it("open in the server's main window, not a focused panel of that server", async () => {
+    const h = loadNavigationHarness({
+      serverUrl: "http://localhost:6767/",
+      deepLinks: { ...require("../src/deepLink"), acceptCliDeepLink: async () => true },
+    });
+    const panelSends = [];
+    const panel = {
+      isDestroyed: () => false,
+      webContents: {
+        getURL: () => "http://localhost:6767/compose/floating",
+        send: (channel) => panelSends.push(channel),
+      },
+    };
+    // The panel comes first in the window map and has focus.
+    const mainState = h.api.windows.get(h.win);
+    h.api.windows.delete(h.win);
+    h.api.windows.set(panel, { ...mainState, role: "panel" });
+    h.api.windows.set(h.win, mainState);
+    h.electron.BrowserWindow.getFocusedWindow = () => panel;
+    await h.api.handleDeepLink("omnigent://localhost:6767/");
+    assert.deepEqual(
+      h.calls.progress.filter(({ channel }) => channel === "omnigent:open-path"),
+      [{ channel: "omnigent:open-path", data: "/" }],
+    );
+    assert.deepEqual(panelSends, []);
+    h.api.disposeAuth();
+  });
+});
+
 describe("deep-link ingestion wiring (src/main.js)", () => {
   it("registers open-url with preventDefault + enqueueDeepLink as live code", () => {
     assert.match(
