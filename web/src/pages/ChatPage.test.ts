@@ -1505,7 +1505,17 @@ describe("composer /clear and /rewind gating", () => {
 });
 
 describe("buildSlashCommandMap", () => {
-  const gatedOffByDefault = ["/btw", "/side", "/mcp", "/clear", "/permissions", "/rewind", "/goal"];
+  const gatedOffByDefault = [
+    "/btw",
+    "/side",
+    "/mcp",
+    "/clear",
+    "/permissions",
+    "/rewind",
+    "/goal",
+    "/reload-skills",
+    "/reload-plugins",
+  ];
 
   it("returns the built-ins unchanged when no skills are loaded", () => {
     const map = buildSlashCommandMap([], true, true);
@@ -1535,6 +1545,29 @@ describe("buildSlashCommandMap", () => {
     expect(buildSlashCommandMap([], true, true, true, false, true)["/side"]).toBe(
       BUILTIN_SLASH_COMMANDS["/side"],
     );
+  });
+
+  it("includes the reload commands only when showReload is true (claude-native)", () => {
+    const reloadNames = ["/reload-skills", "/reload-plugins"];
+    const withReload = buildSlashCommandMap(
+      [],
+      true,
+      true,
+      true,
+      false,
+      false,
+      "/",
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+    );
+    const withoutReload = buildSlashCommandMap([], true, true);
+    for (const name of reloadNames) expect(withoutReload[name]).toBeUndefined();
+    for (const name of reloadNames) expect(withReload[name]).toBe(BUILTIN_SLASH_COMMANDS[name]);
   });
 
   it("includes /clear only when showClear is true (native terminals)", () => {

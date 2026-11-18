@@ -34,6 +34,9 @@ export const BUILTIN_SLASH_COMMANDS: Record<string, string> = {
   "/effort": "Set reasoning effort: /effort low | medium | high | default",
   "/model": "Switch the model for this session: /model <name>",
   "/mcp": "Show MCP servers enabled for this session",
+  "/reload-skills": "Pick up skills added or changed on disk during this session",
+  "/reload-plugins":
+    "Activate pending plugin changes in the current session: /reload-plugins [--force]",
   "/permissions": "Change the approval mode for this session",
   "/goal": "View or set the goal for this session",
   "/new": "Start a blank session in the same project",

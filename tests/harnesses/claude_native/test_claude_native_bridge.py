@@ -71,6 +71,7 @@ from omnigent.harnesses.claude_native.bridge import (
     read_seen_claude_session_ids,
     read_transcript_items_from_offset,
     read_transcript_items_since,
+    read_transcript_items_since_with_position,
     read_transcript_path,
     record_hook_event,
     start_tool_relay,
@@ -1846,6 +1847,133 @@ def test_read_transcript_items_since_flags_compact_noop(tmp_path: Path, stdout: 
     )
     record_items = [item for record in byte_result.record_items for item in record.items]
     assert record_items == byte_result.items
+
+
+def _reload_command_records(name: str, arguments: str, stdout: str) -> list[dict[str, Any]]:
+    """The caveat, echo, and stdout records Claude Code writes for a reload command."""
+    return [
+        {
+            "type": "user",
+            "uuid": f"{name}-caveat",
+            "isMeta": True,
+            "message": {
+                "role": "user",
+                "content": "<local-command-caveat>Caveat</local-command-caveat>",
+            },
+        },
+        {
+            "type": "user",
+            "uuid": f"{name}-cmd",
+            "message": {
+                "role": "user",
+                "content": (
+                    f"<command-name>/{name}</command-name>\n"
+                    f"            <command-message>{name}</command-message>\n"
+                    f"            <command-args>{arguments}</command-args>"
+                ),
+            },
+        },
+        {
+            "type": "system",
+            "subtype": "local_command",
+            "uuid": f"{name}-stdout",
+            "isMeta": False,
+            "content": f"<local-command-stdout>{stdout}</local-command-stdout>",
+        },
+    ]
+
+
+@pytest.mark.parametrize(
+    ("name", "arguments", "stdout"),
+    [
+        ("reload-skills", "", "Reloaded skills: 13 skills available (1 added)"),
+        ("reload-plugins", "--force", "Reloaded: 0 plugins · 0 skills · 6 agents · 0 hooks"),
+    ],
+)
+def test_read_transcript_items_shows_reload_command_with_its_output(
+    tmp_path: Path, name: str, arguments: str, stdout: str
+) -> None:
+    transcript_path = tmp_path / "session.jsonl"
+    records = _reload_command_records(name, arguments, stdout)
+    transcript_path.write_text("".join(json.dumps(record) + "\n" for record in records))
+
+    _cursor, _response_id, items = read_transcript_items_since(
+        transcript_path, 0, agent_name="claude-native-ui"
+    )
+    byte_result = read_transcript_items_from_offset(
+        transcript_path, 0, start_line=0, agent_name="claude-native-ui"
+    )
+
+    expected = {"kind": "command", "name": name, "arguments": arguments, "output": stdout}
+    for parsed in (items, byte_result.items):
+        assert [item.item_type for item in parsed] == ["slash_command"]
+        assert {key: parsed[0].data[key] for key in expected} == expected
+    assert [item for record in byte_result.record_items for item in record.items] == (
+        byte_result.items
+    )
+
+
+@pytest.mark.parametrize("first_reader", ["line_cursor", "byte_offset"])
+def test_live_read_waits_for_a_reload_result_written_after_the_echo(
+    tmp_path: Path, first_reader: str
+) -> None:
+    transcript_path = tmp_path / "session.jsonl"
+    caveat, echo, stdout = _reload_command_records("reload-skills", "", "Reloaded skills: 1")
+    transcript_path.write_text(json.dumps(caveat) + "\n" + json.dumps(echo) + "\n")
+    echo_offset = len(json.dumps(caveat)) + 1
+    first = (
+        read_transcript_items_since_with_position(
+            transcript_path, 0, agent_name="claude-native-ui", defer_reload_echo=True
+        )
+        if first_reader == "line_cursor"
+        else read_transcript_items_from_offset(
+            transcript_path, 0, start_line=0, agent_name="claude-native-ui", defer_reload_echo=True
+        )
+    )
+    with transcript_path.open("a") as transcript:
+        transcript.write(json.dumps(stdout) + "\n")
+    second = read_transcript_items_from_offset(
+        transcript_path,
+        first.byte_offset,
+        start_line=first.line_cursor,
+        agent_name="claude-native-ui",
+        defer_reload_echo=True,
+    )
+
+    assert (first.items, first.byte_offset, first.line_cursor) == ([], echo_offset, 1)
+    assert [(item.data["name"], item.data.get("output")) for item in second.items] == [
+        ("reload-skills", "Reloaded skills: 1")
+    ]
+    assert second.byte_offset == transcript_path.stat().st_size
+
+
+def test_live_read_shows_a_reload_echo_whose_result_never_arrives(tmp_path: Path) -> None:
+    transcript_path = tmp_path / "session.jsonl"
+    caveat, echo, _stdout = _reload_command_records("reload-plugins", "", "unused")
+    transcript_path.write_text(json.dumps(caveat) + "\n" + json.dumps(echo) + "\n")
+    written_long_ago = time.time() - 60
+    os.utime(transcript_path, (written_long_ago, written_long_ago))
+
+    result = read_transcript_items_from_offset(
+        transcript_path, 0, start_line=0, agent_name="claude-native-ui", defer_reload_echo=True
+    )
+
+    assert [item.data["name"] for item in result.items] == ["reload-plugins"]
+    assert "output" not in result.items[0].data
+    assert result.byte_offset == transcript_path.stat().st_size
+
+
+def test_live_read_does_not_defer_other_command_echoes(tmp_path: Path) -> None:
+    transcript_path = tmp_path / "session.jsonl"
+    caveat, echo, _stdout = _reload_command_records("effort", "high", "unused")
+    transcript_path.write_text(json.dumps(caveat) + "\n" + json.dumps(echo) + "\n")
+
+    result = read_transcript_items_from_offset(
+        transcript_path, 0, start_line=0, agent_name="claude-native-ui", defer_reload_echo=True
+    )
+
+    assert [item.data["name"] for item in result.items] == ["effort"]
+    assert result.byte_offset == transcript_path.stat().st_size
 
 
 def test_read_transcript_items_since_keeps_real_bash_local_command(tmp_path: Path) -> None:
@@ -5462,6 +5590,8 @@ def test_paste_file_is_removed_when_payload_write_fails(
         ("/branch", "/branch"),
         ("/fork", "/fork"),
         ("/my-skill some args", "/my-skill some args"),
+        ("/reload-skills", "/reload-skills"),
+        ("/reload-plugins --force", "/reload-plugins --force"),
     ],
 )
 def test_escape_unsupported_slash_command(content: str, expected: str) -> None:
@@ -5640,9 +5770,20 @@ def _run_unknown_command_injection(
     return loaded_payloads
 
 
+@pytest.mark.parametrize(
+    ("content", "reject_name"),
+    [
+        ("/not-a-real-skill hello world", "not-a-real-skill"),
+        # Claude Code builds without the reload commands reject them the same way.
+        ("/reload-skills", "reload-skills"),
+        ("/reload-plugins --force", "reload-plugins"),
+    ],
+)
 def test_unknown_command_rejection_redelivers_escaped(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    content: str,
+    reject_name: str,
 ) -> None:
     """
     A message rejected as "Unknown command" is re-delivered escaped.
@@ -5656,15 +5797,15 @@ def test_unknown_command_rejection_redelivers_escaped(
     payloads = _run_unknown_command_injection(
         tmp_path,
         monkeypatch,
-        content="/not-a-real-skill hello world",
-        reject_name="not-a-real-skill",
+        content=content,
+        reject_name=reject_name,
     )
     assert len(payloads) == 2, (
         f"Expected the rejected message to be pasted twice (raw, then escaped); "
         f"got {len(payloads)} paste(s)."
     )
-    assert payloads[0].startswith(b"/not-a-real-skill")
-    assert payloads[1].startswith(b" /not-a-real-skill hello world")
+    assert payloads[0].startswith(f"/{reject_name}".encode())
+    assert payloads[1].startswith(f" {content}".encode())
 
 
 def test_unknown_name_accepted_as_skill_is_not_redelivered(

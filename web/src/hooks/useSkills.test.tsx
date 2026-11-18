@@ -2,7 +2,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { useState, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, expectTypeOf, it, vi } from "vitest";
-import { useSkills, type SkillsTarget } from "./useSkills";
+import { skillsQueryKey, useSkills, type SkillsTarget } from "./useSkills";
 
 const fetchMock = vi.fn();
 const target = { hostId: "host", harness: "claude-native", path: "/repo" };
@@ -105,10 +105,12 @@ describe("useSkills", () => {
   });
 
   it.each([{ target: null }, { target, enabled: false }])(
-    "does not discover with an unavailable or disabled target: %j",
+    "does not discover or reload with an unavailable or disabled target: %j",
     async (options) => {
       const { result } = renderHook(() => useSkills(options), { wrapper });
-      await act(async () => {});
+      await act(async () => {
+        await result.current.reload();
+      });
       expect(result.current.skillsStatus).toBe("unavailable");
       expect(fetchMock).not.toHaveBeenCalled();
     },
@@ -270,6 +272,165 @@ describe("useSkills", () => {
       expect(fetchMock).toHaveBeenCalledTimes("sessionId" in discoveryTarget ? 3 : 2);
     },
   );
+
+  it("reloads with a host rescan and replaces the cached catalog", async () => {
+    const added = [...skills, { name: "added", description: "Added on disk" }];
+    fetchMock.mockResolvedValueOnce(response());
+    const { result } = renderHook(() => useSkills({ target: { sessionId: "session-a" } }), {
+      wrapper,
+    });
+    await waitFor(() => expect(result.current.skills).toEqual(skills));
+    fetchMock.mockResolvedValueOnce(response(added));
+    await act(async () => {
+      await result.current.reload();
+    });
+    await waitFor(() => expect(result.current.skills).toEqual(added));
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls[1][0]).toBe("/v1/skills?session_id=session-a&refresh=true");
+  });
+
+  const renderWithClient = (sessionTarget: SkillsTarget) => {
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false, refetchOnWindowFocus: false } },
+    });
+    const view = renderHook(() => useSkills({ target: sessionTarget }), {
+      wrapper: ({ children }: { children: ReactNode }) => (
+        <QueryClientProvider client={client}>{children}</QueryClientProvider>
+      ),
+    });
+    return { client, ...view };
+  };
+
+  it("keeps the loaded catalog, and its age, when a rescan fails", async () => {
+    fetchMock.mockResolvedValueOnce(response());
+    const sessionTarget = { sessionId: "session-a" };
+    const { client, result } = renderWithClient(sessionTarget);
+    await waitFor(() => expect(result.current.skills).toEqual(skills));
+    const loadedAt = client.getQueryState(skillsQueryKey(sessionTarget))?.dataUpdatedAt;
+    fetchMock.mockResolvedValueOnce(response([], 502));
+    await act(async () => {
+      await expect(result.current.reload()).rejects.toThrow();
+    });
+    expect(result.current.skills).toEqual(skills);
+    expect(result.current.skillsStatus).toBe("ready");
+    expect(client.getQueryState(skillsQueryKey(sessionTarget))?.dataUpdatedAt).toBe(loadedAt);
+  });
+
+  it("rescans again when an invalidation replaces the rescan with a cached read", async () => {
+    const added = [...skills, { name: "added", description: "Added on disk" }];
+    fetchMock.mockResolvedValueOnce(response());
+    const { client, result } = renderWithClient({ sessionId: "session-a" });
+    await waitFor(() => expect(result.current.skills).toEqual(skills));
+    fetchMock
+      .mockImplementationOnce(() => new Promise<Response>(() => {}))
+      .mockResolvedValueOnce(response())
+      .mockResolvedValueOnce(response(added));
+    let reloading!: Promise<void>;
+    act(() => {
+      reloading = result.current.reload();
+    });
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    await act(async () => {
+      await client.invalidateQueries({ queryKey: ["skills", "session-a"] });
+      await reloading;
+    });
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      "/v1/skills?session_id=session-a",
+      "/v1/skills?session_id=session-a&refresh=true",
+      "/v1/skills?session_id=session-a",
+      "/v1/skills?session_id=session-a&refresh=true",
+    ]);
+    await waitFor(() => expect(result.current.skills).toEqual(added));
+  });
+
+  it("reports a rescan that invalidations replaced twice", async () => {
+    fetchMock.mockResolvedValueOnce(response());
+    const { client, result } = renderWithClient({ sessionId: "session-a" });
+    await waitFor(() => expect(result.current.skills).toEqual(skills));
+    fetchMock
+      .mockImplementationOnce(() => new Promise<Response>(() => {}))
+      .mockResolvedValueOnce(response())
+      .mockImplementationOnce(() => new Promise<Response>(() => {}))
+      .mockResolvedValueOnce(response());
+    let reloading!: Promise<void>;
+    act(() => {
+      reloading = result.current.reload();
+    });
+    const outcome = expect(reloading).rejects.toThrow("replaced by a cached read");
+    const invalidate = () => client.invalidateQueries({ queryKey: ["skills", "session-a"] });
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    await act(invalidate);
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(4));
+    await act(invalidate);
+    await outcome;
+  });
+
+  it("runs overlapping reloads one after another", async () => {
+    const added = [...skills, { name: "added", description: "Added on disk" }];
+    fetchMock.mockResolvedValueOnce(response());
+    const { result } = renderWithClient({ sessionId: "session-a" });
+    await waitFor(() => expect(result.current.skills).toEqual(skills));
+    let finishFirst!: (value: Response) => void;
+    fetchMock
+      .mockImplementationOnce(
+        () =>
+          new Promise<Response>((done) => {
+            finishFirst = done;
+          }),
+      )
+      .mockResolvedValueOnce(response(added));
+    let first!: Promise<void>;
+    act(() => {
+      first = result.current.reload();
+    });
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    let second!: Promise<void>;
+    act(() => {
+      second = result.current.reload();
+    });
+    await act(async () => {
+      finishFirst(response());
+      await Promise.all([first, second]);
+    });
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      "/v1/skills?session_id=session-a",
+      "/v1/skills?session_id=session-a&refresh=true",
+      "/v1/skills?session_id=session-a&refresh=true",
+    ]);
+    await waitFor(() => expect(result.current.skills).toEqual(added));
+  });
+
+  it("lets a scheduled refetch share an in-flight reload instead of racing it", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const added = [...skills, { name: "added", description: "Added on disk" }];
+    fetchMock.mockResolvedValueOnce(response());
+    const { result } = renderHook(() => useSkills({ target: { sessionId: "session-a" } }), {
+      wrapper,
+    });
+    await waitFor(() => expect(result.current.skills).toEqual(skills));
+    let finishRescan!: (value: Response) => void;
+    fetchMock.mockImplementationOnce(
+      () =>
+        new Promise<Response>((done) => {
+          finishRescan = done;
+        }),
+    );
+    let reloading!: Promise<void>;
+    act(() => {
+      reloading = result.current.reload();
+    });
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(60_000);
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    await act(async () => {
+      finishRescan(response(added));
+      await reloading;
+    });
+    await waitFor(() => expect(result.current.skills).toEqual(added));
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
 
   it("rejects malformed catalogs", async () => {
     fetchMock.mockResolvedValue(new Response(JSON.stringify({})));

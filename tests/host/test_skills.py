@@ -294,6 +294,20 @@ def test_host_cache_expires_and_keys_by_directory_and_agent_version(
     assert fetch.call_count == 4
 
 
+def test_refresh_rescans_within_the_ttl_and_updates_the_cache(tmp_path: Path) -> None:
+    discovery = HostSkillDiscovery(lambda _: pytest.fail("No bundle expected"))
+    frame = HostSkillsFrame("request", "claude", str(tmp_path))
+    assert discovery.discover(frame, tmp_path) == []
+    directory = tmp_path / ".claude" / "skills" / "added"
+    directory.mkdir(parents=True)
+    (directory / "SKILL.md").write_text(_skill("added"))
+    assert discovery.discover(frame, tmp_path) == []
+    refreshed = discovery.discover(replace(frame, refresh=True), tmp_path)
+    assert [skill["name"] for skill in refreshed] == ["added"]
+    # Ordinary requests now get the refreshed catalog from the cache.
+    assert discovery.discover(frame, tmp_path) == refreshed
+
+
 def test_failed_or_changed_bundle_is_not_cached(tmp_path: Path) -> None:
     fetch = Mock(
         side_effect=[

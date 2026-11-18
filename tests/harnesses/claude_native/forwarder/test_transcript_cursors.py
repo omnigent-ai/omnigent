@@ -1474,3 +1474,27 @@ def test_validated_transcript_state_preserves_seen_source_ids_on_stale_reset(
     assert "session=conv_replaced" in caplog.text
     assert str(tmp_path / "bridge") not in caplog.text
     assert str(transcript_path) not in caplog.text
+
+
+def test_live_transcript_reads_wait_for_a_reload_result(tmp_path: Path) -> None:
+    """The forwarder's poll leaves a just-written reload echo for the next read."""
+    transcript_path = tmp_path / "session.jsonl"
+    echo = {
+        "type": "user",
+        "uuid": "reload-echo",
+        "message": {
+            "role": "user",
+            "content": "<command-name>/reload-skills</command-name><command-args></command-args>",
+        },
+    }
+    transcript_path.write_text(json.dumps(echo) + "\n", encoding="utf-8")
+    state = forwarder.TranscriptForwardState(
+        transcript_path=transcript_path,
+        line_cursor=0,
+        byte_offset=0,
+        cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(transcript_path, 0),
+    )
+
+    result = forwarder._read_transcript_items_for_state(state, "claude-native-ui", None)
+
+    assert (result.items, result.byte_offset) == ([], 0)

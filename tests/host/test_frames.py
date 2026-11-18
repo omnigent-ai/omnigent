@@ -222,6 +222,7 @@ def test_import_local_frames_round_trip() -> None:
             agent_version="2",
             sub_agent_name="child",
         ),
+        HostSkillsFrame(request_id="reload", harness="claude", path="/workspace", refresh=True),
         HostSkillsResultFrame(request_id="session", status="ok", session_id="conv"),
         HostSkillsResultFrame(request_id="filtered", status="ok", agent_id="agent"),
         HostSkillsResultFrame(request_id="req_skills", status="ok"),
@@ -241,6 +242,16 @@ def test_import_local_frames_round_trip() -> None:
 )
 def test_skills_frames_round_trip(frame: HostSkillsFrame | HostSkillsResultFrame) -> None:
     assert decode_host_frame(encode_host_frame(frame)) == frame
+
+
+def test_skills_request_from_an_older_server_uses_the_cache() -> None:
+    frame = decode_host_frame(
+        json.dumps(
+            {"kind": "host.skills", "request_id": "r", "harness": "claude", "path": "/workspace"}
+        )
+    )
+    assert isinstance(frame, HostSkillsFrame)
+    assert frame.refresh is False
 
 
 def test_skills_result_from_an_older_host_is_a_complete_catalog() -> None:

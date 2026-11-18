@@ -4,11 +4,9 @@
 //
 //   skill   — plugin/Skill invocations (``/dev-productivity:simplify``,
 //             ``/oncall``). Wand icon in brand pink, prefix "Skill".
-//   command — surfaced CLI built-ins (``/effort``, ``/clear``,
-//             ``/compact``, ``/model``, ``/ultrareview``). Command
-//             icon (⌘ glyph) in slate, prefix "Command". These change
-//             conversation state (effort level, context reset,
-//             compaction, model swap), so a web observer needs them.
+//   command — surfaced CLI built-ins that change conversation state
+//             (the surfaced and reload command sets in the claude-native bridge).
+//             Command icon (⌘ glyph) in slate, prefix "Command".
 
 import { ChevronRightIcon, CommandIcon, WandSparklesIcon, type LucideIcon } from "lucide-react";
 import { useMemo } from "react";

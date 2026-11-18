@@ -61,6 +61,7 @@ class HostSkillDiscovery:
 
         Sources a provider could not read are reported through ``warnings``.
         Such incomplete catalogs are cached only briefly, so a retry rescans soon.
+        A ``refresh`` frame rescans and replaces the cached catalog.
         """
         key = (
             str(root),
@@ -76,7 +77,7 @@ class HostSkillDiscovery:
         )
         with self._lock:
             cached = self._cache.get(key)
-            if cached is not None and cached[0] > time.monotonic():
+            if not frame.refresh and cached is not None and cached[0] > time.monotonic():
                 self._cache.move_to_end(key)
                 if warnings is not None:
                     warnings.extend(cached[2])

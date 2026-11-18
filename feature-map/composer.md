@@ -206,6 +206,18 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   attachment that could not be restored (a warning asks the user to attach it
   again, including missing files and failed server lookups; failed downloads
   name the affected files).
+- `reload-commands`: in Claude Code native sessions, `/reload-skills` and
+  `/reload-plugins [--force]` run in the session's Claude Code process, which
+  keeps running. The chat shows a **Command** card whose Output is Claude Code's
+  result line. Each time the live stream reports that Claude Code ran one,
+  including a reload that waited in the queue, the host's skill catalog is
+  rescanned so the `/` menu lists the new skills; a run while the Terminal view
+  is open rescans when the chat composer returns, and cards loaded with history
+  do not rescan. Other harnesses do not offer them; a typed command is sent as
+  text. States: unexpected arguments (error under the composer), a Claude Code
+  build without the command (re-sent as plain text), no result written within
+  a few seconds (card without Output), a failed rescan (toast; the menu keeps
+  its previous skills).
 - `session-mcp-status`: selecting `/mcp` in a started session replaces the slash
   suggestions with the MCP servers enabled for that session and links to harness
   Settings with the session’s host preselected. Host-native entries are limited
@@ -436,6 +448,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   type `/rew` and click **/rewind**, or type `/rewind` and press Enter, then
   pick a prompt (search, or **Load older prompts** in a long session). The new
   chat opens with that prompt, and its attachments, in the composer.
+- In a Claude Code native session, type `/reload` and click **/reload-skills**
+  or **/reload-plugins**, or type either command (`/reload-plugins --force` is
+  accepted) and press Enter. Expand the **Command** card to read the result.
 
 **Desktop browser pointer** (open a session in the desktop app):
 
@@ -842,6 +857,18 @@ Other connection providers alone do not enable the managed MCP picker.
   with an attachment. Each `/clear` moves the view to an empty chat on the
   same machine, and the original chat ends with a notice linking to it. The
   capability gate is also in `web/src/pages/ChatPage.composer.test.tsx`.
+- **`reload-commands`:**
+  `tests/e2e_ui/chat/test_claude_native_reload_commands.py` picks each command
+  from the `/reload` menu in a real Claude Code native session on the mock LLM,
+  after adding a skill or installing a plugin mid-session, then runs the new
+  skill and checks that the Claude process and earlier context survived.
+  Typed commands, argument errors, the harness gate and the rescan after each
+  run are in `web/src/pages/ChatPage.composer.test.tsx` and
+  `web/src/store/reloadCommandRuns.test.ts`; the Command
+  card's Output, including a result written after the echo was read, in
+  `tests/harnesses/claude_native/test_claude_native_bridge.py`. Manually, add a
+  skill under the workspace's `.claude/skills` during a native session, run
+  `/reload-skills` from Chat, and pick the new skill from the `/` menu.
 - **`slash-menu`:**
   `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_tracks_real_focus_and_wrapping_keyboard_navigation`,
   `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_shows_full_skill_description`,

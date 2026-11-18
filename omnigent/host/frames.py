@@ -1399,6 +1399,8 @@ class HostSkillsFrame:
     sub_agent_name: str | None = None
     skills_filter: str | list[str] = "all"
     workflows_enabled: bool = False
+    # Rescan disk instead of serving the host's cached catalog.
+    refresh: bool = False
 
 
 @dataclass
@@ -2320,6 +2322,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "sub_agent_name": frame.sub_agent_name,
                 "skills_filter": frame.skills_filter,
                 "workflows_enabled": frame.workflows_enabled,
+                "refresh": frame.refresh,
             }
         )
     if isinstance(frame, HostSkillsResultFrame):
@@ -2904,6 +2907,7 @@ def _decode_known_host_frame(
                 sub_agent_name=_optional_nullable_str(msg, "sub_agent_name"),
                 skills_filter=skills_filter,
                 workflows_enabled=msg.get("workflows_enabled") is True,
+                refresh=msg.get("refresh") is True,
             )
         case HostFrameKind.SKILLS_RESULT:
             return _decode_skills_result(msg)

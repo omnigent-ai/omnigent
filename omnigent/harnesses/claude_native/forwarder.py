@@ -5837,6 +5837,7 @@ def _read_transcript_items_for_state(
             settled_response_id=settled_response_id,
             pending_settled_response_id=pending_settled_response_id,
             pending_settled_at=pending_settled_at,
+            defer_reload_echo=True,
         )
     return read_transcript_items_from_offset(
         state.transcript_path,
@@ -5847,6 +5848,7 @@ def _read_transcript_items_for_state(
         settled_response_id=settled_response_id,
         pending_settled_response_id=pending_settled_response_id,
         pending_settled_at=pending_settled_at,
+        defer_reload_echo=True,
     )
 
 
