@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { MOBILE_BREAKPOINT_PX as MD_BREAKPOINT } from "@/hooks/useIsMobileViewport";
 import {
   readPanelSizePreference,
   writePanelSizePreference,
@@ -7,8 +8,6 @@ import {
 
 const MIN_WIDTH_PX = 320;
 const MAX_WIDTH_RATIO = 0.8; // 80% of viewport
-/** Tailwind `md` breakpoint — must track the value in tailwind.config. */
-const MD_BREAKPOINT = 768;
 
 /** Clamp a width value to the allowed range for the current viewport. */
 function clampWidth(w: number, minPx = MIN_WIDTH_PX): number {

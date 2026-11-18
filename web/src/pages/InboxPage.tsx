@@ -1286,9 +1286,7 @@ function InboxCard({
       data-expanded={expanded}
       className={cn(
         "overflow-hidden border border-border transition-[border-radius]",
-        expanded
-          ? "rounded-2xl bg-card shadow-[0_12px_20px_-20px_rgba(0,0,0,0.14),0_20px_28px_-28px_rgba(0,0,0,0.1)]"
-          : "rounded-xl bg-transparent",
+        expanded ? "rounded-2xl bg-card shadow-lg" : "rounded-xl bg-transparent",
       )}
     >
       <button

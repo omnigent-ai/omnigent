@@ -653,11 +653,11 @@ describe("Composer growth layout", () => {
   });
 
   it("publishes mobile overlay height only when it changes and clears it on unmount", () => {
-    const mediaQuery = window.matchMedia("(max-width: 767.98px)");
+    const mediaQuery = window.matchMedia("(max-width: 951.98px)");
     vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
       ...mediaQuery,
       media: query,
-      matches: query === "(max-width: 767.98px)",
+      matches: query === "(max-width: 951.98px)",
     }));
     let height = 48;
     const getRect = HTMLElement.prototype.getBoundingClientRect;
@@ -4098,11 +4098,11 @@ describe("Composer background tasks", () => {
   it.each([false, true])(
     "keeps a running monitor reachable after foreground work ends (mobile=%s)",
     (mobile) => {
-      const mediaQuery = window.matchMedia("(max-width: 767.98px)");
+      const mediaQuery = window.matchMedia("(max-width: 951.98px)");
       const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
         ...mediaQuery,
         media: query,
-        matches: mobile && query === "(max-width: 767.98px)",
+        matches: mobile && query === "(max-width: 951.98px)",
       }));
       onTestFinished(() => matchMedia.mockRestore());
       useChatStore.setState({

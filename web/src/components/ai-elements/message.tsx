@@ -117,7 +117,8 @@ export const MessageAction = ({
       type="button"
       variant={variant}
       className={cn(
-        "mobile-touch-target mobile-app:[&_svg]:size-5!",
+        // Full-height touch targets, narrowed so a row of actions sits closer together.
+        "mobile-touch-target mobile-app:min-w-8! mobile-app:[&_svg]:size-4!",
         "text-muted-foreground hover:text-foreground",
         className,
       )}

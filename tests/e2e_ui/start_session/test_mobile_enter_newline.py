@@ -11,7 +11,7 @@ The observable failure (reproduced on the running build at the time of filing,
 commit d2556dff):
 
   1. Open the new-session screen (``/``) in a mobile-viewport browser context
-     (``is_mobile: True``, ``has_touch: True``, viewport width < 768 px).
+     (``is_mobile: True``, ``has_touch: True``, viewport width < 952 px).
   2. Pick a non-terminal agent (polly / any YAML agent — the composer is
      mounted; terminal agents launch into xterm.js immediately so the web
      composer is never shown).
@@ -29,7 +29,7 @@ avoid the pytest-playwright/asyncio loop incompatibility, with the same
 ``page.route`` stubs for ``/v1/hosts``, ``/v1/agents``, and
 ``POST /v1/sessions``.  The test uses a ``new_context`` (not bare ``new_page``)
 with the iPhone 13 device descriptor so the SPA's ``(pointer: coarse)`` /
-``(max-width: 767.98px)`` guards resolve correctly; video is recorded via the
+``(max-width: 951.98px)`` guards resolve correctly; video is recorded via the
 context so a ``--video on`` pass captures the failing state.
 """
 
@@ -128,7 +128,7 @@ async def _drive_mobile_enter_newline(base_url: str, session_id: str) -> None:
     async with async_playwright() as pw:
         # iPhone 13 device descriptor: is_mobile=True, has_touch=True,
         # viewport 390×664 (below Tailwind's md breakpoint at 768px).
-        # ``(pointer: coarse)`` and ``(max-width: 767.98px)`` both fire, so the
+        # ``(pointer: coarse)`` and ``(max-width: 951.98px)`` both fire, so the
         # SPA's mobile guard — when present — correctly suppresses Enter-to-send.
         # Use Chromium (available in CI); the SPA's media-query guards are
         # browser-agnostic. Strip ``default_browser_type`` — it's metadata for

@@ -464,7 +464,7 @@ def test_background_task_popover_stays_interactive_and_within_viewport(
     _background_status(chat, 1, [_MONITOR_TASK])
 
     def activate(control: Locator) -> None:
-        if width < 768:
+        if width < 952:
             control.tap()
         else:
             control.click()

@@ -4327,14 +4327,15 @@ describe("NewChatLandingScreen", () => {
     expect(tooltip).not.toHaveTextContent("Status:");
   });
 
-  it("uses a home-specific focus shadow without a resting shadow or focus border", () => {
+  it("uses one hover and focus shadow without a resting shadow or focus border", () => {
     renderLanding();
 
     const composer = screen.getByTestId("new-chat-landing-composer");
     expect(composer).toHaveClass(
       "composer-reference-surface",
       "border",
-      "has-[textarea:focus]:shadow-[var(--composer-shadow-focus)]",
+      "hover:shadow-[var(--composer-shadow)]",
+      "has-[textarea:focus]:shadow-[var(--composer-shadow)]",
     );
     expect(composer).not.toHaveClass("bg-card", "dark:bg-card-solid");
     expect(composer).not.toHaveClass("shadow-[var(--composer-shadow)]");
@@ -10272,7 +10273,7 @@ describe("NewChatLandingScreen attachments", () => {
     fireEvent.dragOver(composer, { dataTransfer: fileDrag() });
     expect(screen.getByText("Drop files here")).toBeTruthy();
     expect(composer).toHaveClass("ring-2", "ring-ring", "ring-inset");
-    expect(composer).toHaveClass("has-[textarea:focus]:shadow-[var(--composer-shadow-focus)]");
+    expect(composer).toHaveClass("has-[textarea:focus]:shadow-[var(--composer-shadow)]");
     // Dropping a file attaches it (chip proves it reached state) and clears
     // the overlay.
     const file = new File(["hello"], "dropped.txt", { type: "text/plain" });

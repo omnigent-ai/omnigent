@@ -28,7 +28,7 @@ import {
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { Link } from "@/lib/routing";
 import { cn } from "@/lib/utils";
-import { MobileHeaderButton } from "./MobileHeaderButton";
+import { MobileHeaderButton, MobileHeaderButtonGroup } from "./MobileHeaderButton";
 
 /**
  * Navigation, Search, Settings, and sidebar-toggle controls from the header row.
@@ -93,11 +93,11 @@ export function SidebarHeaderActions({
   const { canGoBack, canGoForward } = useHistoryNavigationAvailability();
   const hasNavigationHistory = canGoBack || canGoForward;
 
-  return (
-    <div className="flex items-center gap-1" data-testid="sidebar-header-actions">
+  const toggleAndSearch = (
+    <>
       <Tooltip>
         <TooltipTrigger asChild>
-          <Button
+          <MobileHeaderButton
             type="button"
             variant="ghost"
             size="icon-xs"
@@ -120,11 +120,11 @@ export function SidebarHeaderActions({
             is open; panel-left-open as "bring it back" once it is collapsed or
             merely peeking. */}
             {expanded ? (
-              <PanelRightOpenIcon className="size-4" />
+              <PanelRightOpenIcon className="size-4 max-md:size-5" />
             ) : (
-              <PanelLeftOpenIcon className="size-4" />
+              <PanelLeftOpenIcon className="size-4 max-md:size-5" />
             )}
-          </Button>
+          </MobileHeaderButton>
         </TooltipTrigger>
         <TooltipContent side="bottom" shortcut={sidebarToggleShortcutKeys()}>
           <span>{expanded ? "Collapse sidebar" : "Open sidebar"}</span>
@@ -134,6 +134,21 @@ export function SidebarHeaderActions({
         <SidebarSettingsButton onSettingsClick={onSettingsClick} className="max-md:hidden" />
       )}
       {showSearch && <SidebarSearchButton onOpenSearch={onOpenSearch} />}
+    </>
+  );
+
+  return (
+    <div className="flex items-center gap-1" data-testid="sidebar-header-actions">
+      {/* With the toggle shown on mobile, it and Search share one glass pill like the page header's. */}
+      {showMobileToggle ? (
+        <MobileHeaderButtonGroup
+          className={cn("flex items-center gap-1 max-md:gap-0", SIDEBAR_GLASS_CONTROL)}
+        >
+          {toggleAndSearch}
+        </MobileHeaderButtonGroup>
+      ) : (
+        toggleAndSearch
+      )}
       <div
         className={cn("flex items-center gap-1 max-md:hidden", !hasNavigationHistory && "hidden")}
         data-testid="history-navigation-buttons"
@@ -181,11 +196,20 @@ export function SidebarHeaderActions({
   );
 }
 
-/** Shared sizing for the mobile icon-only Search and Settings actions. */
-const SIDEBAR_FLOAT_BUTTON =
-  "size-6 text-muted-foreground hover:text-foreground max-md:size-11 max-md:rounded-full max-md:border-none max-md:p-0 max-md:text-foreground max-md:shadow-none max-md:[--icon-container-default:20px]";
+/**
+ * Sidebar glass controls take the page header's 20px icons over the sidebar's 16px glyphs,
+ * and keep their outline but drop the shadow over the drawer's own glass.
+ */
+const SIDEBAR_GLASS_CONTROL =
+  "[--omni-glass-drop-shadow:0_0_#0000] [--sidebar-icon-size-mobile:20px]";
 
-const SIDEBAR_FLOAT_ICON = "size-4 max-md:size-[22px]";
+/** Shared sizing for the mobile icon-only Search and Settings actions. */
+const SIDEBAR_FLOAT_BUTTON = cn(
+  "size-6 text-muted-foreground hover:text-foreground max-md:size-11 max-md:rounded-full max-md:border-none max-md:p-0 max-md:shadow-none max-md:[--icon-container-default:20px]",
+  SIDEBAR_GLASS_CONTROL,
+);
+
+const SIDEBAR_FLOAT_ICON = "size-4 max-md:size-5";
 
 /**
  * Search (command palette) icon button.

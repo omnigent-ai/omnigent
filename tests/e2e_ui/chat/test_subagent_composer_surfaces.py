@@ -37,7 +37,7 @@ def test_subagent_composer_masks_overlap(
     tray = page.get_by_test_id("composer-subagent-tray")
     bar = page.get_by_test_id("composer-workspace-controls")
     expect(tray).to_be_visible(timeout=30_000)
-    if width < 768:
+    if width < 952:
         expect(bar).to_have_count(0)
         card = page.locator("[data-composer-card]")
         expect(card.locator(".omni-glass-surface")).to_be_visible()

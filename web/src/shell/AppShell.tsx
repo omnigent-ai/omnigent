@@ -45,7 +45,7 @@ import { AgentInfoContent, agentHasInfo } from "@/components/AgentInfo";
 import { useIdleNotifications } from "@/hooks/useIdleNotifications";
 import { useSeedReadState } from "@/hooks/useUnseenConversations";
 import { useIOSViewportLock } from "@/hooks/useIOSViewportLock";
-import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { DESKTOP_VIEWPORT_QUERY, useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { readFilesPanelPreferences, writeFilesPanelPreferences } from "@/lib/filesPanelPreferences";
 import { useOptimisticTitle } from "@/lib/optimisticTitles";
 import { derivePermissionLevel, isOwnerLevel } from "@/lib/permissionsApi";
@@ -121,6 +121,7 @@ import {
 } from "@/lib/nativeCodingAgents";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled, isSingleUserMode, SHARING_OFF_REASON } from "@/lib/capabilities";
+import { useProjectKanbanEnabled } from "@/lib/projectKanbanPreferences";
 import { isCurrentServerLocal } from "@/lib/serverOrigin";
 import { holdsInitialDraft, isTempConvId, useChatStore } from "@/store/chatStore";
 import { useSessionTasksActions } from "@/store/sessionTasksActions";
@@ -135,11 +136,7 @@ import {
 import { useResizableInlinePanel } from "@/hooks/useResizableInlinePanel";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { ChatHeader } from "./ChatHeader";
-import {
-  ProjectBoardSearch,
-  ProjectHomeTitle,
-  ProjectNewSessionButton,
-} from "@/projectHome/ProjectHomeHeader";
+import { ProjectHomeHeaderActions, ProjectHomeTitle } from "@/projectHome/ProjectHomeHeader";
 import { projectNameFromHomePath } from "@/projectHome/projectHomeNavigation";
 import { MobileHeaderControlsProvider } from "./MobileHeaderControlsSlot";
 import { CREATED_BY_SESSION_LABEL_KEY } from "./CreatedBySession";
@@ -855,10 +852,9 @@ function AppShellImpl() {
     isChildSession && activeSession?.parentSessionId
       ? `/c/${activeSession.parentSessionId}`
       : undefined;
+  const projectKanban = useProjectKanbanEnabled();
   const projectHomeName =
-    extensionId === undefined && isFeatureEnabled(serverInfo, "project_kanban")
-      ? projectNameFromHomePath(location.pathname)
-      : null;
+    extensionId === undefined && projectKanban ? projectNameFromHomePath(location.pathname) : null;
   // Positive "this is a top-level session" signal for the top-level-only
   // actions (Share/Clone). Gating those on ``!isChildSession`` flickered:
   // while the snapshot loads ``activeSession`` is null, so ``isChildSession``
@@ -3187,10 +3183,7 @@ function AppShellImpl() {
                     }
                     pageActions={
                       projectHomeName !== null ? (
-                        <>
-                          <ProjectBoardSearch />
-                          <ProjectNewSessionButton projectName={projectHomeName} />
-                        </>
+                        <ProjectHomeHeaderActions projectName={projectHomeName} />
                       ) : undefined
                     }
                     boundAgent={boundAgent}
@@ -3527,11 +3520,10 @@ function AppShellImpl() {
 
 /**
  * Initial sidebar open state — open on desktop, closed on mobile. SSR-
- * safe (returns false when window is undefined). The threshold (`md`)
- * matches Tailwind's default 768px, used in the Sidebar's responsive
- * classes.
+ * safe (returns false when window is undefined). The threshold is
+ * Tailwind's `md` breakpoint, used in the Sidebar's responsive classes.
  */
 function initialSidebarOpen(): boolean {
   if (typeof window === "undefined") return false;
-  return window.matchMedia("(min-width: 768px)").matches;
+  return window.matchMedia(DESKTOP_VIEWPORT_QUERY).matches;
 }

@@ -78,7 +78,7 @@ def test_composer_input_font_setting_and_alignment(
 ) -> None:
     """Landing, command backdrops and interleaved replies share the chosen typography."""
     base_url, session_id = seeded_session
-    mobile = width < 768
+    mobile = width < 952
     page.set_viewport_size({"width": width, "height": 844})
     page.add_init_script(f"localStorage.setItem('omnigent:ui-font-size', '{font_size}')")
     if native:

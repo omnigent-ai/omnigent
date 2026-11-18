@@ -23,6 +23,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { Conversation } from "@/hooks/useConversations";
 import { BACKGROUND_SESSION_TITLES_STORAGE_KEY } from "@/lib/backgroundSessionTitlesPreferences";
 import { OPEN_SUBAGENTS_IN_PANEL_STORAGE_KEY } from "@/lib/subagentPanelPreferences";
+import { PROJECT_KANBAN_BOARD_STORAGE_KEY } from "@/lib/projectKanbanPreferences";
 import {
   useProjectFolderCollapse,
   useProjectFolderPageSize,
@@ -58,6 +59,7 @@ const mocks = vi.hoisted(() => ({
   adminViewSupported: true as boolean | undefined,
   bootFallback: false,
   sessionTitleInstructions: false,
+  projectKanban: false,
   nestedAgents: false,
   advisorAvailable: false,
   authenticatedFetch: vi.fn(),
@@ -98,6 +100,7 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
           enabled_connections: mocks.enabledConnections,
           session_title_instructions: mocks.sessionTitleInstructions,
           proactive_agent_available: mocks.advisorAvailable,
+          features: { project_kanban: mocks.projectKanban },
         },
 }));
 vi.mock("@/components/SessionTitleInstructionsControl", () => ({
@@ -297,6 +300,7 @@ beforeEach(() => {
   mocks.adminViewSupported = true;
   mocks.bootFallback = false;
   mocks.sessionTitleInstructions = false;
+  mocks.projectKanban = false;
   mocks.nestedAgents = false;
   mocks.advisorAvailable = false;
   mocks.authenticatedFetch.mockReset();
@@ -532,6 +536,26 @@ describe("SettingsPage", () => {
     expect(
       await screen.findByRole("switch", { name: "Show Omnigent from anywhere" }),
     ).toBeInTheDocument();
+  });
+
+  it("offers the kanban board switch under Composer only when the server has the board", () => {
+    renderPage("/settings/general");
+    expect(screen.queryByTestId("settings-group-projects")).toBeNull();
+    cleanup();
+
+    mocks.projectKanban = true;
+    renderPage("/settings/general");
+    const projects = screen.getByTestId("settings-group-projects");
+    expect(screen.getByTestId("settings-group-composer").nextElementSibling).toBe(projects);
+    const toggle = within(projects).getByRole("switch", { name: "Kanban board views" });
+    expect(toggle).toBeChecked();
+
+    fireEvent.click(toggle);
+    expect(toggle).not.toBeChecked();
+    expect(localStorage.getItem(PROJECT_KANBAN_BOARD_STORAGE_KEY)).toBe("false");
+    fireEvent.click(toggle);
+    expect(toggle).toBeChecked();
+    expect(localStorage.getItem(PROJECT_KANBAN_BOARD_STORAGE_KEY)).toBeNull();
   });
 
   it("renders session auto-rename enabled by default", async () => {

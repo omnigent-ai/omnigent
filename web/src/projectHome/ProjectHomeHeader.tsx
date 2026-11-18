@@ -22,7 +22,11 @@ import {
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useProjectConfig, useProjects } from "@/hooks/useConversations";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
-import { Link, useNavigate } from "@/lib/routing";
+import { useNavigate } from "@/lib/routing";
+import { cn } from "@/lib/utils";
+import { MobileHeaderButton } from "@/shell/MobileHeaderButton";
+import { MOBILE_GLASS_SURFACE } from "@/shell/mobileGlass";
+import { SessionMenuHeader } from "@/shell/SessionMenuHeader";
 import { useProjectFolderMenu } from "@/shell/Sidebar";
 import { projectHomePath } from "./projectHomeNavigation";
 
@@ -48,11 +52,22 @@ export const useProjectBoardSearchStore = create<ProjectBoardSearchState>((set) 
   setQuery: (query) => set({ query }),
 }));
 
-/** The project home's header title: its editable icon tile and name. */
-export function ProjectHomeTitle({ projectName }: { projectName: string }) {
+function useProjectHomeConfig(projectName: string) {
   const { data: projects, isLoading: projectsLoading } = useProjects();
   const projectId = projects?.find((project) => project.name === projectName)?.id ?? null;
   const { data: config } = useProjectConfig(projectId);
+  return { projectId, config, projectsLoading };
+}
+
+/**
+ * The project home's header title: its editable icon tile and name, with the
+ * project actions beside it. Phones have no room for it, so they keep the name
+ * for screen readers only; their actions sit in the header's right-hand group.
+ */
+export function ProjectHomeTitle({ projectName }: { projectName: string }) {
+  const isMobile = useIsMobileViewport();
+  const { projectId, config, projectsLoading } = useProjectHomeConfig(projectName);
+  if (isMobile) return <h1 className="sr-only">{projectName}</h1>;
   return (
     <div className="flex min-w-0 items-center gap-3">
       <ProjectLandingIcon
@@ -65,71 +80,94 @@ export function ProjectHomeTitle({ projectName }: { projectName: string }) {
         small
       />
       <h1 className="min-w-0 truncate text-xl font-medium text-foreground">{projectName}</h1>
-      <ProjectHomeActions projectName={projectName} projectId={projectId} icon={config?.icon} />
+      <ProjectHomeActions projectName={projectName} />
     </div>
   );
 }
 
+/** The header's right-hand actions; phones add the project actions as the session page's icon buttons. */
+export function ProjectHomeHeaderActions({ projectName }: { projectName: string }) {
+  const isMobile = useIsMobileViewport();
+  return (
+    <>
+      <ProjectBoardSearch />
+      <ProjectNewSessionButton projectName={projectName} />
+      {isMobile && <ProjectHomeActions projectName={projectName} />}
+    </>
+  );
+}
+
 /** Project settings, plus an overflow menu to rename or delete the project. */
-function ProjectHomeActions({
-  projectName,
-  projectId,
-  icon,
-}: {
-  projectName: string;
-  projectId: string | null;
-  icon: string | undefined;
-}) {
+function ProjectHomeActions({ projectName }: { projectName: string }) {
+  const isMobile = useIsMobileViewport();
   const navigate = useNavigate();
+  const { projectId, config } = useProjectHomeConfig(projectName);
   const { actions, dialogs } = useProjectFolderMenu(
     projectName,
     projectId,
-    icon,
+    config?.icon,
     (_oldName, newName) => navigate(projectHomePath(newName), { replace: true }),
     () => navigate("/", { replace: true }),
   );
+  const buttonClass = cn("text-muted-foreground", isMobile && "mobile-touch-target");
+  const iconClass = isMobile ? "size-5" : undefined;
+  const itemClass = cn("mobile-touch-target", isMobile && "gap-2.5 px-2.5 py-2");
   return (
-    <div className="flex shrink-0 items-center gap-0.5">
+    <div className={isMobile ? "contents" : "flex shrink-0 items-center gap-0.5"}>
       <Tooltip>
         <TooltipTrigger asChild>
-          <Button
+          <MobileHeaderButton
             type="button"
             variant="ghost"
             size="icon-sm"
             aria-label="Project settings"
             data-testid="project-home-settings"
-            className="text-muted-foreground"
+            className={buttonClass}
             onClick={actions.openSettings}
           >
-            <Settings2Icon />
-          </Button>
+            <Settings2Icon className={iconClass} />
+          </MobileHeaderButton>
         </TooltipTrigger>
         <TooltipContent side="bottom">Project settings</TooltipContent>
       </Tooltip>
-      <DropdownMenu onOpenChange={(open) => (open ? actions.onMenuOpen() : actions.onMenuClose())}>
+      {/* Non-modal on phones, as in the session header: a modal menu leaves itself the only touch target. */}
+      <DropdownMenu
+        modal={!isMobile}
+        onOpenChange={(open) => (open ? actions.onMenuOpen() : actions.onMenuClose())}
+      >
         <DropdownMenuTrigger asChild>
-          <Button
+          <MobileHeaderButton
             type="button"
             variant="ghost"
             size="icon-sm"
             aria-label={`Project actions for ${projectName}`}
             data-testid="project-home-actions"
-            className="text-muted-foreground"
+            className={buttonClass}
           >
-            <MoreHorizontalIcon />
-          </Button>
+            <MoreHorizontalIcon className={iconClass} />
+          </MobileHeaderButton>
         </DropdownMenuTrigger>
         <DropdownMenuContent
-          align="start"
-          className="min-w-40"
+          align={isMobile ? "end" : "start"}
+          collisionPadding={isMobile ? 16 : undefined}
+          className={cn(
+            "min-w-40",
+            MOBILE_GLASS_SURFACE,
+            isMobile && "w-[calc(100vw-2rem)] max-w-[calc(100vw-2rem)]",
+          )}
           onCloseAutoFocus={actions.onCloseAutoFocus}
         >
-          <DropdownMenuItem onSelect={actions.openRename}>
+          {isMobile && <SessionMenuHeader title={projectName} />}
+          <DropdownMenuItem className={itemClass} onSelect={actions.openRename}>
             <PencilIcon className="size-3.5" />
             Rename project
           </DropdownMenuItem>
           <DropdownMenuSeparator />
-          <DropdownMenuItem variant="destructive" onSelect={actions.openDelete}>
+          <DropdownMenuItem
+            className={itemClass}
+            variant="destructive"
+            onSelect={actions.openDelete}
+          >
             <Trash2Icon className="size-3.5" />
             Delete project
           </DropdownMenuItem>
@@ -189,19 +227,21 @@ export function ProjectBoardSearch() {
  */
 export function ProjectNewSessionButton({ projectName }: { projectName: string }) {
   const isMobile = useIsMobileViewport();
+  const navigate = useNavigate();
   const open = useProjectComposerStore((state) => state.open);
   const setOpen = useProjectComposerStore((state) => state.setOpen);
-  const label = (
-    <>
-      <MessageCirclePlusIcon />
-      New session
-    </>
-  );
   if (isMobile) {
+    // A button, not a link: the phone header's button group hides itself when it holds no button.
     return (
-      <Button asChild data-testid="project-new-session-button">
-        <Link to={`/?project=${encodeURIComponent(projectName)}`}>{label}</Link>
-      </Button>
+      <MobileHeaderButton
+        type="button"
+        aria-label="New session"
+        data-testid="project-new-session-button"
+        className="mobile-touch-target text-muted-foreground"
+        onClick={() => navigate(`/?project=${encodeURIComponent(projectName)}`)}
+      >
+        <MessageCirclePlusIcon className="size-5" />
+      </MobileHeaderButton>
     );
   }
   return (
@@ -210,7 +250,8 @@ export function ProjectNewSessionButton({ projectName }: { projectName: string }
       data-testid="project-new-session-button"
       onClick={() => setOpen(!open)}
     >
-      {label}
+      <MessageCirclePlusIcon />
+      New session
     </Button>
   );
 }

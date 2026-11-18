@@ -13,6 +13,8 @@ import { CircleAlertIcon } from "lucide-react";
 
 export interface SessionStateBadgeProps {
   state: SessionState;
+  /** In the sidebar, the tag takes the row highlight's color instead of clashing with it. */
+  inSidebar?: boolean;
 }
 
 interface Visual {
@@ -30,7 +32,7 @@ function awaitingTooltip(count: number, terminalReason: string | undefined): str
   return count === 1 ? "1 approval prompt waiting" : `${count} approval prompts waiting`;
 }
 
-function describe(state: SessionState): Visual {
+function describe(state: SessionState, inSidebar: boolean): Visual {
   switch (state.kind) {
     case "awaiting": {
       const tooltip = awaitingTooltip(state.count, state.terminalReason);
@@ -42,7 +44,16 @@ function describe(state: SessionState): Visual {
         ariaLabel: tooltip,
         tooltip,
         render: () => (
-          <Badge className="border-transparent bg-brand-accent/15 text-brand-accent">{label}</Badge>
+          <Badge
+            className={cn(
+              "border-transparent",
+              inSidebar
+                ? "bg-[var(--sidebar-active)] text-[var(--sidebar-active-foreground)]"
+                : "bg-warning/15 text-warning",
+            )}
+          >
+            {label}
+          </Badge>
         ),
       };
     }
@@ -100,8 +111,8 @@ function Dot({ tone }: { tone: string }) {
   return <span aria-hidden className={cn("size-1.5 shrink-0 rounded-full", tone)} />;
 }
 
-export function SessionStateBadge({ state }: SessionStateBadgeProps) {
-  const visual = describe(state);
+export function SessionStateBadge({ state, inSidebar = false }: SessionStateBadgeProps) {
+  const visual = describe(state, inSidebar);
   return (
     <Tooltip>
       <TooltipTrigger asChild>

@@ -625,7 +625,7 @@ def test_grid_mobile_entry_points(
             "Emulation.setTouchEmulationEnabled", {"enabled": True}
         )
     assert page.evaluate("matchMedia('(pointer: coarse)').matches") == touch
-    desktop = width >= 768 and not touch
+    desktop = width >= 952 and not touch
     with ExitStack() as stack:
         sessions = [
             stack.enter_context(
@@ -649,13 +649,13 @@ def test_grid_mobile_entry_points(
             [s.session_id for s in sessions],
         )
         page.reload()
-        if width < 768:
+        if width < 952:
             page.get_by_role("button", name="Open sidebar", exact=True).click()
         row = page.locator(f'aside [data-sidebar-session-id="{sessions[1].session_id}"]')
         expect(row).to_be_visible()
         expect(page.get_by_role("region", name="Grids")).to_have_count(int(desktop))
         expect(page.locator("[data-grid-session]")).to_have_count(int(desktop))
-        if width < 768:
+        if width < 952:
             row.click(button="right")
         else:
             row.get_by_test_id("conversation-actions").click()

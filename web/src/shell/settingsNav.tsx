@@ -16,6 +16,7 @@ import {
   GitBranchIcon,
   KeyboardIcon,
   PaletteIcon,
+  PanelRightOpenIcon,
   PlugIcon,
   SettingsIcon,
   Share2Icon,
@@ -254,9 +255,12 @@ export function useTrackSettingsReturn(): void {
  */
 export function SettingsSidebarBody({
   onNavClick,
+  onCollapse,
   harnessesOffered = true,
 }: {
   onNavClick: (e: React.MouseEvent<HTMLAnchorElement>) => void;
+  /** Shown while the menu docks beside the page, which leaves no strip to tap away. */
+  onCollapse?: () => void;
   /** False when the deployment curated out every harness, which drops Harnesses. */
   harnessesOffered?: boolean;
 }) {
@@ -289,7 +293,7 @@ export function SettingsSidebarBody({
       home sidebar's header row gets: with the sidebar now starting at the
       window's top edge on the macOS shell, this Back row would otherwise sit
       underneath the window controls (see index.css). Inert elsewhere. */}
-      <div className="settings-sidebar-header px-3 pt-3">
+      <div className="settings-sidebar-header flex items-center justify-between px-3 pt-3">
         <Button
           asChild
           variant="ghost"
@@ -300,7 +304,7 @@ export function SettingsSidebarBody({
         >
           {/* Returns to wherever the user was before entering settings (the
           conversation they were viewing, or home) — see settingsReturnPath.
-          No onNavClick here: on mobile the sidebar is a full-screen overlay.
+          No onNavClick here: on mobile the sidebar is an overlay.
           Leaving /settings swaps the sidebar back to the conversation list —
           but we keep the overlay OPEN so mobile lands on that list rather than
           closing onto the content behind it. On desktop onNavClick is a no-op
@@ -310,6 +314,18 @@ export function SettingsSidebarBody({
             Back
           </Link>
         </Button>
+        {onCollapse && (
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-xs"
+            aria-label="Close sidebar"
+            onClick={onCollapse}
+            className="size-6 text-muted-foreground hover:text-foreground"
+          >
+            <PanelRightOpenIcon className="size-4" />
+          </Button>
+        )}
       </div>
       <nav className="flex flex-1 flex-col gap-4 overflow-y-auto px-3 py-3">
         {groups.map((group) => (

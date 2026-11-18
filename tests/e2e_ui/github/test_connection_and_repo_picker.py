@@ -67,13 +67,13 @@ def test_github_connection_controls(
         re.compile(r"/v1/connections/github/(status|connect|disconnect)(?:\?|$)"), connection
     )
     page.goto(f"{base_url}/settings/integrations")
-    if width < 768:
+    if width < 952:
         expect(page.locator("aside[aria-label='Conversations']")).to_have_attribute(
             "aria-hidden", "true"
         )
     page.get_by_role("button", name="Connect GitHub", exact=True).click()
     expect(page.get_by_role("status")).to_contain_text("GitHub account connected.")
-    if width < 768:
+    if width < 952:
         expect(page.locator("aside[aria-label='Conversations']")).to_have_attribute(
             "aria-hidden", "true"
         )
@@ -88,7 +88,7 @@ def test_github_connection_controls(
     assert state["disconnects"] == 1
     page.screenshot(path=tmp_path / "github-disconnected.png", animations="disabled")
     page.goto(f"{base_url}/settings/integrations?github=error")
-    if width < 768:
+    if width < 952:
         expect(page.locator("aside[aria-label='Conversations']")).to_have_attribute(
             "aria-hidden", "true"
         )

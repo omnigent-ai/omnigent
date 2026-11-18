@@ -178,13 +178,11 @@ import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover
 import {
   type Conversation,
   type PinnedConversationsResult,
-  useArchiveConversation,
   useBulkArchiveConversations,
   useBulkDeleteConversations,
   useBulkMoveToProject,
   useProjects,
   useProjectSessions,
-  useLeaveSession,
   useMoveToProject,
   useDeleteProject,
   useRenameProject,
@@ -196,8 +194,6 @@ import {
   useReorderPinnedConversations,
   setConversationPinned,
   useRenameConversation,
-  useStopAndDeleteConversation,
-  useStopSession,
   useAutomationsEnabled,
 } from "@/hooks/useConversations";
 import { fetchConversationById, useOpenSessionRow } from "@/hooks/useOpenSessionRow";
@@ -206,13 +202,14 @@ import { useHosts, type Host } from "@/hooks/useHosts";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled, isSingleUserMode, SHARING_OFF_REASON } from "@/lib/capabilities";
+import { useProjectKanbanEnabled } from "@/lib/projectKanbanPreferences";
 import { useBranding } from "@/lib/branding";
 import { relativeTime } from "@/lib/relativeTime";
 import { showToast } from "@/components/ui/toast";
 import { showArchiveUndoToast } from "./archiveUndoToast";
 import { unpinWithUndo } from "./unpinUndoToast";
 import { useArchivePrompt } from "./ArchivePrompt";
-import { PermissionsModal } from "@/components/PermissionsModal";
+import { useSessionActions } from "./useSessionActions";
 import { ProjectSettingsDialog } from "./ProjectSettingsDialog";
 import { ProjectRowIcon } from "./ProjectPicker";
 import { EmojiPicker } from "@/components/ProjectIconPicker";
@@ -240,7 +237,7 @@ import {
 import { collectUnreadInboxItems } from "@/lib/inbox";
 import { cn } from "@/lib/utils";
 import { useOmnigentAnalytics } from "@/lib/analytics";
-import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { DESKTOP_VIEWPORT_QUERY, useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import {
   isSideBySideSidebarViewport,
   useIsSideBySideSidebarViewport,
@@ -331,12 +328,7 @@ import {
   SessionUpdatedLabel,
   useSessionBranch,
 } from "./sessionRowMeta";
-import { ForkSessionDialog } from "./ForkSessionDialog";
-import { CreateAutomationFromSessionDialog } from "@/components/scheduled/CreateAutomationFromSessionDialog";
-import {
-  AutomationSourceDeleteNotice,
-  AutomationSourcesDeleteNotice,
-} from "@/components/scheduled/AutomationSourceDeleteNotice";
+import { AutomationSourcesDeleteNotice } from "@/components/scheduled/AutomationSourceDeleteNotice";
 import {
   canCreateAutomationFromSession,
   automationDeletedWith,
@@ -346,6 +338,7 @@ import { SessionActionMenuItem } from "@/components/SessionActionMenuItem";
 import { useSessionActionRestrictions } from "@/hooks/useSessionActionRestrictions";
 import {
   SIDEBAR_ROW,
+  SIDEBAR_ROW_MOBILE_INSET,
   SIDEBAR_HOVER_HIGHLIGHT,
   SIDEBAR_ACTIVE_HIGHLIGHT,
   SIDEBAR_GRID_MEMBER_HIGHLIGHT,
@@ -619,10 +612,9 @@ function useActiveNavItem(): {
   const isUsagePage = !isExtensionRoute && leaf === "usage";
   const activeExtensionPageId =
     resolveExtensionPageFromPath(extensions, location.pathname)?.page.id ?? null;
+  const projectKanban = useProjectKanbanEnabled();
   const projectHomeName =
-    !isExtensionRoute && isFeatureEnabled(serverInfo, "project_kanban")
-      ? projectNameFromHomePath(location.pathname)
-      : null;
+    !isExtensionRoute && projectKanban ? projectNameFromHomePath(location.pathname) : null;
   const isNewSessionRoute =
     activeConversationId == null &&
     projectHomeName == null &&
@@ -956,7 +948,7 @@ function SidebarImpl({
     projectHomeName,
   } = useActiveNavItem();
   const navigate = useNavigate();
-  const projectKanban = isFeatureEnabled(serverInfo, "project_kanban");
+  const projectKanban = useProjectKanbanEnabled();
   const openProjectHome = useStableCallback((projectName: string) => {
     if (projectName !== projectHomeName) navigate(projectHomePath(projectName));
     if (isMobileViewport() && !isSideBySideSidebarViewport()) onClose();
@@ -1065,10 +1057,10 @@ function SidebarImpl({
   const [openSwipeProgress, setOpenSwipeProgress] = useState<number | null>(null);
   const mobileLayout = useIsMobileViewport();
   // A wide phone (unfolded foldable, landscape) docks the open sidebar beside
-  // the chat instead of over it. Settings keeps its full-bleed drawer.
-  const sideBySide = useIsSideBySideSidebarViewport() && !inSettings;
-  const closeSwipeEnabled = open && mobileLayout && !inSettings && dragProgress == null;
-  const openSwipeEnabled = !open && !peek && mobileLayout && !inSettings && dragProgress == null;
+  // the chat instead of over it.
+  const sideBySide = useIsSideBySideSidebarViewport();
+  const closeSwipeEnabled = open && mobileLayout && dragProgress == null;
+  const openSwipeEnabled = !open && !peek && mobileLayout && dragProgress == null;
   useSidebarSwipeToOpen({
     enabled: openSwipeEnabled,
     drawerRef,
@@ -1113,7 +1105,7 @@ function SidebarImpl({
   // on the header toggle moves focus itself), and on iOS its soft keyboard then
   // stays up over the drawer. Drop focus held outside the drawer so it goes down.
   // Only on opening: narrowing the window with the sidebar open keeps focus.
-  const overlayOpen = open && mobileLayout && !sideBySide && !inSettings;
+  const overlayOpen = open && mobileLayout && !sideBySide;
   const wasOpenRef = useRef(open);
   useLayoutEffect(() => {
     const opened = open && !wasOpenRef.current;
@@ -1210,7 +1202,7 @@ function SidebarImpl({
       pill) and renders after the sidebar, so a same-z peer that ever takes
       pointer events would win the tie inside the exposed strip and swallow the
       dismiss. Strictly between chat chrome and the drawer's z-50. */}
-      {!inSettings && !sideBySide && (
+      {!sideBySide && (
         <button
           type="button"
           ref={scrimRef}
@@ -1263,10 +1255,7 @@ function SidebarImpl({
           // most of the phone but stops short of the right edge so the chat stays
           // visible (and tappable through the scrim) behind it.
           "fixed inset-0 z-50",
-          // The settings nav takes the sidebar over and its "Back" row is the
-          // only way out, so there the drawer stays full-bleed (and gets no
-          // dismiss scrim) rather than offering a tap that strands the user.
-          !inSettings && !sideBySide && "max-md:right-14",
+          !sideBySide && "max-md:right-14",
           // Mobile only: animate the slide so the iOS edge-swipe settles
           // smoothly on release. Suppressed inline while a drag is live (the
           // overlay must track the finger 1:1). Scoped to transform so it can't
@@ -1349,6 +1338,7 @@ function SidebarImpl({
         {inSettings ? (
           <SettingsSidebarBody
             onNavClick={onNavClick}
+            onCollapse={sideBySide ? onClose : undefined}
             harnessesOffered={curatedOutHarnesses.size < NATIVE_CODING_AGENTS.length}
           />
         ) : (
@@ -1382,7 +1372,7 @@ function SidebarImpl({
                     src={omnigentWordmark}
                     alt="Omnigent"
                     data-testid="sidebar-wordmark"
-                    className="h-[15px] w-auto shrink-0 translate-y-px dark:invert"
+                    className="h-[15px] w-auto shrink-0 translate-y-px max-md:h-5 dark:invert"
                   />
                 )}
               </Link>
@@ -1408,7 +1398,13 @@ function SidebarImpl({
               />
             </div>
 
-            <div className="flex flex-col gap-px px-2 pt-2 pb-0" data-testid="sidebar-primary-nav">
+            <div
+              className={cn(
+                "flex flex-col gap-px px-2 pt-2 pb-0 max-md:pt-0",
+                SIDEBAR_ROW_MOBILE_INSET,
+              )}
+              data-testid="sidebar-primary-nav"
+            >
               {/* "New session" routes to the home composer ("/"), which now owns
             session creation end-to-end (host/workspace/worktree chips +
             send). Rendered as a Link so cmd/middle-click opens it in a new
@@ -1605,6 +1601,7 @@ function SidebarImpl({
                 }}
                 className={cn(
                   "relative flex-1 overflow-y-auto px-2 pt-4 pb-3",
+                  SIDEBAR_ROW_MOBILE_INSET,
                   // Reserve the gutter even when the list fits, so neither the thumb
                   // nor a section collapsing out of overflow reflows the rows.
                   "[scrollbar-gutter:stable] [scrollbar-width:thin] [&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-track]:bg-transparent",
@@ -2139,7 +2136,7 @@ function ProjectShowMoreRow({
               isDotMarker(marker) && SESSION_STATE_DOT_SLOT_CLASS,
             )}
           >
-            <SessionStateBadge state={marker} />
+            <SessionStateBadge state={marker} inSidebar />
           </span>
         )}
       </button>
@@ -3630,12 +3627,7 @@ function ConversationList({
                             homeActive={projectHomeName === group.name}
                             onToggleCollapsed={() => toggleProjectExpanded(group.name)}
                             onActivate={
-                              onOpenProjectHome
-                                ? () => {
-                                    expandProject(group.name);
-                                    onOpenProjectHome(group.name);
-                                  }
-                                : undefined
+                              onOpenProjectHome ? () => onOpenProjectHome(group.name) : undefined
                             }
                             collapsedFamilies={collapsedFamilies}
                             onToggleFamily={toggleFamily}
@@ -4012,7 +4004,7 @@ function SectionHeader({
       className={cn(
         headerDrag &&
           !headerDrag.attributes["aria-disabled"] &&
-          "cursor-grab active:cursor-grabbing",
+          cn("cursor-pointer active:cursor-grab", headerDrag.isDragging && "cursor-grab"),
         headerDrag?.isDragging && "opacity-40",
         contextMenu && "select-none [-webkit-touch-callout:none]",
         icon
@@ -4027,7 +4019,7 @@ function SectionHeader({
                 "pr-8 [@media((hover:hover)_and_(pointer:fine))]:pr-14 [@media((hover:hover)_and_(pointer:fine))]:md:pr-2 [@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:pr-14 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]:focus-within]/header:pr-14 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:pr-14",
             )
           : cn(
-              "group flex h-7 w-full items-center gap-1 border-0 pr-0 pl-2 text-left text-sm font-normal text-muted-foreground transition-colors hover:text-foreground",
+              "group flex h-7 w-full items-center gap-1 border-0 pr-0 pl-2 text-left text-sm font-normal text-muted-foreground transition-colors hover:text-foreground max-md:pl-4",
               (hasAction || hasPersistentAction) && "mobile-touch-target",
             ),
         status && "w-auto min-w-0 max-w-1/2 shrink-0",
@@ -4041,7 +4033,7 @@ function SectionHeader({
         // icon and shows the trailing chevron below.
         <span
           data-section-toggle
-          className="relative flex size-4 shrink-0 items-center justify-center"
+          className="relative flex size-4 shrink-0 cursor-default items-center justify-center"
         >
           <span className="flex md:transition-opacity md:group-hover:opacity-0 md:group-focus-visible:opacity-0">
             {icon}
@@ -4063,7 +4055,7 @@ function SectionHeader({
       <ChevronRightIcon
         data-section-toggle
         className={cn(
-          "size-3.5 shrink-0 transition-[transform,opacity]",
+          "size-3.5 shrink-0 cursor-default transition-[transform,opacity]",
           !collapsed && "rotate-90",
           icon
             ? "md:hidden"
@@ -4094,7 +4086,7 @@ function SectionHeader({
             hasAction && cn(markerFade, actionFocusFade),
           )}
         >
-          <SessionStateBadge state={marker} />
+          <SessionStateBadge state={marker} inSidebar />
         </span>
       )}
     </button>
@@ -4887,12 +4879,13 @@ const NO_DESKTOP_COMMANDS: ReadonlySet<DesktopCommand> = new Set();
  * same primitive family (roving focus / keyboard nav), so the items can't simply
  * be shared as elements — they're rendered through the injected `components` set.
  */
-function ConversationMenuItems({
-  components: C,
+export function ConversationMenuItems({
+  components: C = dropdownBundle,
+  kanbanCard = false,
   conversation,
-  sessionShortcuts,
+  sessionShortcuts = NO_DESKTOP_COMMANDS,
   onNavigate,
-  isPinned,
+  isPinned = false,
   isArchived,
   isOwner,
   sharingOff,
@@ -4917,12 +4910,15 @@ function ConversationMenuItems({
   runArchive,
   reorder,
 }: {
-  components: MenuComponents;
+  /** The menu family to render items from; the kebab's dropdown by default. */
+  components?: MenuComponents;
+  /** On a kanban card, only actions that change the board: no nested agent, grid, pin, share or automation. */
+  kanbanCard?: boolean;
   conversation: Conversation;
   /** Session menu commands whose chords to list (the open session's row only). */
-  sessionShortcuts: ReadonlySet<DesktopCommand>;
+  sessionShortcuts?: ReadonlySet<DesktopCommand>;
   onNavigate?: (event: MouseEvent<HTMLAnchorElement>) => void;
-  isPinned: boolean;
+  isPinned?: boolean;
   isArchived: boolean;
   isOwner: boolean;
   // Server-wide sharing kill switch (OMNIGENT_SHARING_MODE=off): disables the
@@ -4936,7 +4932,7 @@ function ConversationMenuItems({
   // unread dot (the active thread and running sessions included).
   canMarkUnread: boolean;
   currentProject: string | null;
-  onTogglePinned: (conversationId: string) => void;
+  onTogglePinned?: (conversationId: string) => void;
   onMarkUnread: () => void;
   onMarkRead: () => void;
   onProjectAssigned?: (projectName: string) => void;
@@ -5036,7 +5032,7 @@ function ConversationMenuItems({
 
   return (
     <>
-      {isOwner && !isArchived && info !== "loading" && info.sibling_sessions && (
+      {!kanbanCard && isOwner && !isArchived && info !== "loading" && info.sibling_sessions && (
         <>
           <C.Item asChild data-testid="add-sibling-session">
             <Link to={`/?sibling=${encodeURIComponent(conversation.id)}`} onClick={onNavigate}>
@@ -5047,7 +5043,7 @@ function ConversationMenuItems({
           <C.Separator />
         </>
       )}
-      {!isArchived && gridOptions.length > 0 && (
+      {!kanbanCard && !isArchived && gridOptions.length > 0 && (
         <C.Sub>
           <C.SubTrigger className="mobile-touch-target">Open in grid</C.SubTrigger>
           <C.SubContent>
@@ -5065,7 +5061,7 @@ function ConversationMenuItems({
       )}
       {/* Desktop pins from the hover button unless Settings hides it; archived
           rows omit Pin (archive outranks pin). */}
-      {!isArchived && !isIndentedSibling(conversation) && (
+      {onTogglePinned && !kanbanCard && !isArchived && !isIndentedSibling(conversation) && (
         <C.Item
           data-testid="pin-conversation"
           disabled={pinSaving || (!isPinned && atPinCap)}
@@ -5078,7 +5074,8 @@ function ConversationMenuItems({
       )}
       {/* Single-user mode has no other users to share with — omit the item
           entirely rather than showing it disabled. */}
-      {!isSingleUser &&
+      {!kanbanCard &&
+        !isSingleUser &&
         (isOwner && !sharingOff ? (
           <C.Item
             className="mobile-touch-target"
@@ -5174,7 +5171,7 @@ function ConversationMenuItems({
           Mark as read
         </C.Item>
       )}
-      {canCreateAutomation && (
+      {!kanbanCard && canCreateAutomation && (
         <C.Item
           className="mobile-touch-target"
           data-testid="create-automation-from-session"
@@ -5744,19 +5741,10 @@ function ConversationRowImpl({
     if (!isActive || !row || isRowFullyVisible(row)) return;
     row.scrollIntoView({ behavior: "smooth", block: "center" });
   }, [isActive]);
-  const queryClient = useQueryClient();
   const rename = useRenameConversation();
-  const del = useStopAndDeleteConversation();
-  const archive = useArchiveConversation();
-  const archivePrompt = useArchivePrompt();
   // Settings → Appearance can keep Pin and Archive in the menus only.
   const showQuickActions = useSessionRowQuickActions();
-  const leave = useLeaveSession();
   const moveToProject = useMoveToProject();
-  // The kebab's user-facing "Stop session" action. Archiving does NOT go
-  // through here — the server stops the session itself once the archived
-  // flag commits, so a hidden session never keeps a runner alive.
-  const stopSession = useStopSession();
   const isArchived = conversation.archived === true;
   const [isEditing, setIsEditing] = useState(false);
   // Hold the list's sort order while this row's rename input is open — the
@@ -5773,17 +5761,9 @@ function ConversationRowImpl({
     reportRowEditing(conversation.id, true);
     return () => reportRowEditing(conversation.id, false);
   }, [isEditing, conversation.id, reportRowEditing]);
-  const [deleteOpen, setDeleteOpen] = useState(false);
-  const [stopOpen, setStopOpen] = useState(false);
   // The kebab menu is controlled so the project submenu can close the whole
   // menu after a pick (a plain click inside the submenu wouldn't otherwise).
   const [menuOpen, setMenuOpen] = useState(false);
-  // Opt-in "delete local branch" checkbox (worktree sessions only).
-  const [deleteBranch, setDeleteBranch] = useState(false);
-  const [shareOpen, setShareOpen] = useState(false);
-  const [forkOpen, setForkOpen] = useState(false);
-  const [automationOpen, setAutomationOpen] = useState(false);
-  const [leaveOpen, setLeaveOpen] = useState(false);
   const gitBranch = conversation.git_branch ?? null;
   // Every row action gates on ownership alone — the sidebar carries no
   // effective-permission level, so rename/share/move/drag are owner-only and
@@ -5805,9 +5785,6 @@ function ConversationRowImpl({
     conversation,
     isOwner,
   });
-  // Deleting a session an automation runs from deletes the automation first.
-  const automationSourceOf = automationDeletedWith(serverInfo, conversation);
-  const deleteSourceAutomations = useDeleteSourceAutomations();
   // Single-user mode has no other users to share with, so the Share item is
   // hidden entirely (not just disabled) — mirrors the header Share button.
   const isSingleUser = isSingleUserMode(serverInfo);
@@ -5864,6 +5841,24 @@ function ConversationRowImpl({
   }, [conversation.title, pendingTitle, rename.isSuccess, rename.isError]);
 
   const label = pendingTitle ?? conversationDisplayLabel(conversation);
+  const {
+    setShareOpen,
+    setForkOpen,
+    setAutomationOpen,
+    setStopOpen,
+    setDeleteOpen,
+    setLeaveOpen,
+    runArchive,
+    runUnarchive,
+    dialogs: actionDialogs,
+  } = useSessionActions({
+    conversation,
+    label,
+    viewerId,
+    serverInfo,
+    onLeave: isActive ? () => navigate("/", { replace: true }) : undefined,
+    componentIdPrefix: "sidebar.conversation",
+  });
   // Subscribed so the just-recorded optimistic label flips the row
   // immediately instead of at the next conversations poll.
   const optimisticTitle = useOptimisticTitle(conversation.id);
@@ -6046,98 +6041,6 @@ function ConversationRowImpl({
     );
   }
 
-  function confirmDelete() {
-    // Fire-and-forget: close the dialog and drop the row immediately so the
-    // user isn't blocked on the (potentially slow) DELETE — server-side
-    // teardown can take seconds. The mutation removes the row from the
-    // cached lists optimistically, which unmounts this component, so
-    // anything that must happen on delete either runs here or lives in the
-    // hook (a mutate-level callback would never fire).
-    setDeleteOpen(false);
-    setDeleteBranch(false);
-    if (automationSourceOf !== null) {
-      void deleteWithAutomation(automationSourceOf, gitBranch !== null && deleteBranch);
-      return;
-    }
-    // Viewing the session being deleted? Leave now, so the chat surface
-    // doesn't sit on an id that's about to 404.
-    if (isActive) navigate("/", { replace: true });
-    del.mutate({ id: conversation.id, deleteBranch: gitBranch !== null && deleteBranch });
-  }
-
-  // "Delete both": the automation first, so no run starts from a missing session.
-  async function deleteWithAutomation(taskId: string, deleteLocalBranch: boolean) {
-    if (!(await deleteSourceAutomations([taskId], [conversation.id]))) {
-      showToast("Couldn't delete the automation, so the session was kept");
-      return;
-    }
-    del.mutate({ id: conversation.id, deleteBranch: deleteLocalBranch });
-  }
-
-  function runArchive() {
-    if (isArchived) {
-      runUnarchive();
-      return;
-    }
-    archivePrompt.requestArchive([conversation], (deleteWorktreeIds) =>
-      archiveNow(deleteWorktreeIds.has(conversation.id)),
-    );
-  }
-
-  function archiveNow(deleteWorktree: boolean) {
-    // The archive PATCH sends only the flag: the server stops the session (and
-    // tears down a host-spawned runner) in the background once it's committed.
-    // A client stop too would race that one against the same runner, and the
-    // loser gets a 503 from the already-killed pane.
-    //
-    // The row leaves the sidebar optimistically (useArchiveConversation flips
-    // the cached `archived` flag in onMutate; the list filters archived rows
-    // out client-side), so this component unmounts on the next frame. Leaving
-    // the archived session's chat surface therefore has to happen HERE,
-    // synchronously — not in an onSuccess callback that fires a round-trip
-    // later with a stale `isActive`, which used to jump the user off whatever
-    // session they'd switched to meanwhile. Mirrors confirmDelete.
-    if (isActive) navigate("/", { replace: true });
-    archive.mutate({ id: conversation.id, archived: true, deleteWorktree });
-    // Offer an Undo (and point at where the session went) — fire NOW, not in a
-    // mutate onSuccess: the optimistic overlay unmounts this row on the next
-    // frame, and per-call mutate callbacks don't fire once their observer
-    // unmounts. A failed archive reconciles the row back with its own error
-    // toast. The toast is driven imperatively (module state + app-level
-    // Toaster), so it survives this row unmounting.
-    showArchiveUndoToast(queryClient, [conversation], navigate);
-  }
-
-  function runUnarchive() {
-    const nextArchived = !isArchived;
-    archive.mutate({ id: conversation.id, archived: nextArchived });
-  }
-
-  function confirmLeave() {
-    // Leave is a self-revoke, so it needs the viewer's own id. The menu item is
-    // gated on the row NOT being owned by the viewer, which is only decidable
-    // once the id has resolved — so this is non-null wherever it's reachable.
-    if (viewerId === null) return;
-    // Close immediately — the row drops out of the list on success, so there's
-    // nothing left to show progress against. A failure surfaces as a toast
-    // (the row is still there to retry from).
-    setLeaveOpen(false);
-    leave.mutate(
-      { id: conversation.id, viewerId },
-      {
-        onSuccess: () => {
-          // The session 404s for this user now, so don't leave them staring at
-          // its chat surface. Mirrors delete/archive's post-mutation navigate.
-          if (isActive) navigate("/", { replace: true });
-        },
-        onError: (err) => {
-          const detail = err instanceof Error && err.message ? `: ${err.message}` : "";
-          showToast(`Couldn't leave the session${detail}`);
-        },
-      },
-    );
-  }
-
   // Shared by the kebab dropdown and the right-click context menu so the two
   // menus render identical items. `setMenuOpen` is supplied per-call (the
   // controlled kebab passes the real setter; the uncontrolled context menu a
@@ -6287,14 +6190,6 @@ function ConversationRowImpl({
             e.stopPropagation();
             onToggleSelected(conversation.id, e.shiftKey);
             return;
-          }
-          // Opening a family's parent also expands or collapses its nested sessions.
-          if (
-            familyExpanded !== undefined &&
-            e.button === 0 &&
-            !(e.metaKey || e.ctrlKey || e.shiftKey || e.altKey)
-          ) {
-            onToggleFamily?.();
           }
           activateRow(conversation.id, e);
           onClick(e);
@@ -6506,7 +6401,7 @@ function ConversationRowImpl({
           )}
         >
           {sessionState !== null ? (
-            <SessionStateBadge state={sessionState} />
+            <SessionStateBadge state={sessionState} inSidebar />
           ) : (
             <span
               role="img"
@@ -6718,201 +6613,7 @@ function ConversationRowImpl({
       {shortcutSlot !== undefined && (
         <SessionShortcutHint slot={shortcutSlot} overlayTop={overlayTop} />
       )}
-      {/* Mount only while open — one per row, its hook tree + JSX would
-          otherwise run closed on every row re-render. */}
-      {shareOpen && (
-        <PermissionsModal
-          sessionId={conversation.id}
-          open={shareOpen}
-          onOpenChange={setShareOpen}
-        />
-      )}
-      {forkOpen && (
-        <ForkSessionDialog
-          sourceSessionId={conversation.id}
-          sourceTitle={conversation.title}
-          sourceWorkspace={conversation.workspace}
-          sourceHostId={conversation.host_id}
-          sourceGitBranch={conversation.git_branch}
-          open
-          onOpenChange={setForkOpen}
-        />
-      )}
-      {automationOpen && (
-        <CreateAutomationFromSessionDialog
-          conversation={conversation}
-          open
-          onOpenChange={setAutomationOpen}
-        />
-      )}
-      <Dialog
-        open={deleteOpen}
-        onOpenChange={(open) => {
-          setDeleteOpen(open);
-          // Reset the checkbox on close so it doesn't carry over.
-          if (!open) setDeleteBranch(false);
-        }}
-      >
-        {/* Body only while open — see the share modal above. */}
-        {deleteOpen && (
-          <DialogContent
-            // Don't trigger the surrounding Link when the modal opens
-            // — the dialog content is a portal, but defensively belt-
-            // and-braces the click path.
-            onClick={(e) => e.stopPropagation()}
-          >
-            <DialogHeader>
-              <DialogTitle>
-                {automationSourceOf !== null ? "Delete session and automation?" : "Delete session?"}
-              </DialogTitle>
-              <DialogDescription>
-                <span className="font-medium break-all">{label}</span> and all of its history will
-                be removed. This cannot be undone.
-              </DialogDescription>
-            </DialogHeader>
-            {automationSourceOf !== null && (
-              <AutomationSourceDeleteNotice
-                taskId={automationSourceOf}
-                onNavigate={() => {
-                  setDeleteOpen(false);
-                  setDeleteBranch(false);
-                }}
-              />
-            )}
-            {gitBranch !== null && (
-              <div className="flex flex-col gap-2 rounded-md border border-destructive/40 bg-destructive/5 p-3">
-                <p className="text-sm text-muted-foreground">
-                  Optionally clean up the git worktree. These actions are{" "}
-                  <span className="font-semibold text-destructive">irreversible</span>.
-                </p>
-                <label className="flex cursor-pointer items-start gap-2 text-ui">
-                  <input
-                    type="checkbox"
-                    data-testid="delete-branch-checkbox"
-                    checked={deleteBranch}
-                    onChange={(e) => setDeleteBranch(e.target.checked)}
-                    className="mt-0.5 size-4 shrink-0 accent-destructive"
-                  />
-                  <GitBranchIcon className="mt-0.5 size-3.5 shrink-0 text-muted-foreground" />
-                  <span className="min-w-0">
-                    Delete local branch{" "}
-                    <code className="break-all rounded bg-muted px-1 py-0.5 text-sm">
-                      {gitBranch}
-                    </code>
-                  </span>
-                </label>
-              </div>
-            )}
-            {/* Drop the default footer divider + muted bar so the actions
-              blend into the dialog body (same background). */}
-            <DialogFooter className="border-t-0 bg-transparent">
-              <Button
-                type="button"
-                variant="ghost"
-                onClick={() => setDeleteOpen(false)}
-                disabled={del.isPending}
-              >
-                Cancel
-              </Button>
-              <Button
-                type="button"
-                variant="destructive"
-                onClick={confirmDelete}
-                disabled={del.isPending}
-                componentId="sidebar.conversation.delete"
-              >
-                {automationSourceOf !== null ? "Delete both" : "Delete"}
-              </Button>
-            </DialogFooter>
-          </DialogContent>
-        )}
-      </Dialog>
-      {archivePrompt.dialog}
-      <Dialog open={leaveOpen} onOpenChange={setLeaveOpen}>
-        {leaveOpen && (
-          <DialogContent
-            // Keep dialog clicks off the surrounding Link (same defensive
-            // handling as the delete dialog above).
-            onClick={(e) => e.stopPropagation()}
-          >
-            <DialogHeader>
-              <DialogTitle>Leave session?</DialogTitle>
-              <DialogDescription>
-                <span className="font-medium break-all">{label}</span> will be removed from your
-                sidebar. Nothing is deleted — the session and its history stay with its owner, who
-                can share it with you again.
-              </DialogDescription>
-            </DialogHeader>
-            <DialogFooter className="border-t-0 bg-transparent">
-              <Button
-                type="button"
-                variant="ghost"
-                onClick={() => setLeaveOpen(false)}
-                disabled={leave.isPending}
-              >
-                Cancel
-              </Button>
-              <Button
-                type="button"
-                variant="destructive"
-                data-testid="confirm-leave-conversation"
-                onClick={confirmLeave}
-                disabled={leave.isPending}
-                componentId="sidebar.conversation.leave"
-              >
-                Leave
-              </Button>
-            </DialogFooter>
-          </DialogContent>
-        )}
-      </Dialog>
-      {/* The stale-error reset lives on the kebab item's onSelect (the only
-          open path) — onOpenChange only fires for Radix-initiated closes. */}
-      <Dialog open={stopOpen} onOpenChange={setStopOpen}>
-        {stopOpen && (
-          <DialogContent
-            // Keep dialog clicks off the surrounding Link (same defensive
-            // handling as the delete dialog above).
-            onClick={(e) => e.stopPropagation()}
-          >
-            <DialogHeader>
-              <DialogTitle>Stop session?</DialogTitle>
-              <DialogDescription>
-                This terminates the running session for <span className="font-medium">{label}</span>
-                {conversation.host_id
-                  ? " and stops its runner, including side chats running on it."
-                  : "."}{" "}
-                Conversation histories are kept.
-              </DialogDescription>
-            </DialogHeader>
-            <DialogFooter>
-              <Button type="button" variant="ghost" onClick={() => setStopOpen(false)}>
-                Cancel
-              </Button>
-              <Button
-                type="button"
-                variant="destructive"
-                data-testid="stop-session-confirm"
-                onClick={() => {
-                  // Close now and stop in the background — keeping the modal open
-                  // for the whole kill blocks the rest of the sidebar. A failure
-                  // surfaces as a toast since the dialog is already gone.
-                  setStopOpen(false);
-                  stopSession.mutate(conversation.id, {
-                    onError: (err) => {
-                      const detail = err instanceof Error && err.message ? `: ${err.message}` : "";
-                      showToast(`Couldn't stop the session${detail}`);
-                    },
-                  });
-                }}
-                componentId="sidebar.conversation.stop"
-              >
-                Stop session
-              </Button>
-            </DialogFooter>
-          </DialogContent>
-        )}
-      </Dialog>
+      {actionDialogs}
     </li>
   );
 }
@@ -8237,8 +7938,8 @@ function BulkActionBar({
 }
 
 /**
- * Returns true on mobile viewports (below the `md` breakpoint of
- * 768px). Used to gate the auto-close-on-navigation behavior — on
+ * Returns true on mobile viewports (below the `md` breakpoint). Used to
+ * gate the auto-close-on-navigation behavior — on
  * mobile the sidebar is a full-screen overlay so dismissing on action
  * is what reveals the destination; on desktop the sidebar pushes content
  * aside and staying open is more useful.
@@ -8247,7 +7948,7 @@ function BulkActionBar({
  */
 export function isMobileViewport(): boolean {
   if (typeof window === "undefined") return false;
-  return !window.matchMedia("(min-width: 768px)").matches;
+  return !window.matchMedia(DESKTOP_VIEWPORT_QUERY).matches;
 }
 
 // Default collapse state: every section (Pinned / Projects / Chats / Shared)

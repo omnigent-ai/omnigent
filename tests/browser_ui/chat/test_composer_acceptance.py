@@ -72,7 +72,7 @@ def test_pr_context_and_background_tasks_share_workspace_bar(
     chat = chat_session_contract
     session_id = chat.session_id
     page.add_init_script("localStorage.setItem('omnigent:default-workspace-panel', 'open')")
-    is_mobile = viewport_width < 768
+    is_mobile = viewport_width < 952
     chat.contract.json("/v1/sessions/acceptance-child/child_sessions", {"data": []})
     chat.contract.json(
         f"/v1/sessions/{session_id}/resources/environments/default",
@@ -387,7 +387,7 @@ def test_long_model_and_permission_remain_single_row(
     label = page.get_by_test_id("composer-agent-config-value")
     expect(label).to_contain_text("Opus 4.8 1M", timeout=30_000)
     permission = page.get_by_test_id("composer-permission-chip")
-    if width < 768:
+    if width < 952:
         page.get_by_label("Message the agent").focus()
     expect(permission).to_be_visible()
     if width == 3200:

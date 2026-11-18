@@ -1101,6 +1101,30 @@ describe("Sidebar session list", () => {
     );
   });
 
+  it("docks the settings menu beside the page on a wide phone, collapsing from its header", () => {
+    const mediaQuery = window.matchMedia("(max-width: 951.98px)");
+    const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
+      ...mediaQuery,
+      media: query,
+      matches: query.includes("pointer: coarse") || query === "(max-width: 951.98px)",
+    }));
+    try {
+      mockConversations(THREE_TYPE_CONVERSATIONS);
+      const onClose = vi.fn();
+      renderSidebar(true, "/settings", undefined, undefined, [], onClose);
+
+      expect(screen.getByRole("complementary", { name: "Conversations" })).toHaveClass(
+        "max-md:w-80",
+      );
+      fireEvent.click(screen.getByTestId("settings-nav-appearance"));
+      expect(onClose).not.toHaveBeenCalled();
+      fireEvent.click(screen.getByRole("button", { name: "Close sidebar" }));
+      expect(onClose).toHaveBeenCalledOnce();
+    } finally {
+      matchMedia.mockRestore();
+    }
+  });
+
   it("keeps navigation controls in the header and moves Settings to the footer", async () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
     renderSidebar();
@@ -2513,7 +2537,7 @@ describe("Sidebar sections", () => {
     );
   });
 
-  it("toggles the family when its parent row is clicked", () => {
+  it("opens a family parent without toggling it; only its icon button toggles", () => {
     const family = { id: "family", representative_id: "conv_parent", pinned: false };
     mockConversations([
       conv("conv_parent", "Claude Code", { updated_at: 2, family }),
@@ -2523,13 +2547,14 @@ describe("Sidebar sections", () => {
     const parent = screen.getByRole("link", { name: /conv_parent/ });
 
     fireEvent.click(parent);
-    expect(screen.queryByText("conv_nested")).toBeNull();
-    expect(screen.getByRole("button", { name: "Expand session family" })).toBeInTheDocument();
+    expect(screen.getByText("conv_nested")).toBeInTheDocument();
 
-    fireEvent.click(parent, { metaKey: true });
+    fireEvent.click(screen.getByRole("button", { name: "Collapse session family" }));
     expect(screen.queryByText("conv_nested")).toBeNull();
-
     fireEvent.click(parent);
+    expect(screen.queryByText("conv_nested")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Expand session family" }));
     expect(screen.getByText("conv_nested")).toBeInTheDocument();
   });
 });
@@ -4021,11 +4046,11 @@ describe("Sidebar move-to-project action", () => {
 
 describe("Sidebar mobile overlay background", () => {
   it("uses shared glass with an overridable background for the mobile overlay", () => {
-    const mediaQuery = window.matchMedia("(max-width: 767.98px)");
+    const mediaQuery = window.matchMedia("(max-width: 951.98px)");
     const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
       ...mediaQuery,
       media: query,
-      matches: query === "(max-width: 767.98px)",
+      matches: query === "(max-width: 951.98px)",
     }));
     try {
       mockConversations(THREE_TYPE_CONVERSATIONS);
@@ -4638,11 +4663,11 @@ describe("Sidebar view options", () => {
   });
 
   it("opens view submenus in place of the main menu on a mobile viewport", () => {
-    const mediaQuery = window.matchMedia("(max-width: 767.98px)");
+    const mediaQuery = window.matchMedia("(max-width: 951.98px)");
     const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
       ...mediaQuery,
       media: query,
-      matches: query === "(max-width: 767.98px)",
+      matches: query === "(max-width: 951.98px)",
     }));
     try {
       mockConversations([conv("conv_idle", "Codex", { status: "idle" })]);

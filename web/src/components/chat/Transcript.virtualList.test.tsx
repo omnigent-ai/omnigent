@@ -306,11 +306,11 @@ it("keeps every action row hover-only when the final message is from the user", 
 
 it("toggles mobile message actions on tap and shows the latest assistant's actions by default", async () => {
   const user = userEvent.setup();
-  const mediaQuery = window.matchMedia("(max-width: 767.98px)");
+  const mediaQuery = window.matchMedia("(max-width: 951.98px)");
   const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
     ...mediaQuery,
     media: query,
-    matches: query === "(max-width: 767.98px)",
+    matches: query === "(max-width: 951.98px)",
   }));
   try {
     const olderReply = {

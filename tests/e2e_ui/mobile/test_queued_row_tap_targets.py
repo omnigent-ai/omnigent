@@ -79,7 +79,7 @@ def test_queued_row_controls_meet_mobile_tap_target(
         composer = page.get_by_label("Message the agent")
         expect(composer).to_be_visible(timeout=30_000)
         # Prove the mobile layout branch is actually in effect.
-        assert page.evaluate("matchMedia('(max-width: 767.98px)').matches")
+        assert page.evaluate("matchMedia('(max-width: 951.98px)').matches")
 
         send = page.get_by_role("button", name="Send", exact=True)
 

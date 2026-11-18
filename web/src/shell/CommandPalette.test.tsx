@@ -571,7 +571,7 @@ describe("CommandPalette — input", () => {
 });
 
 describe("CommandPalette — mobile full-screen sheet", () => {
-  // useIsMobileViewport reads window.matchMedia("(max-width: 767.98px)").matches.
+  // useIsMobileViewport reads window.matchMedia("(max-width: 951.98px)").matches.
   // The global test-setup stubs matchMedia to always report false (desktop);
   // flip it here so the palette renders its keyboard-safe mobile layout.
   function setMobile(isMobile: boolean) {

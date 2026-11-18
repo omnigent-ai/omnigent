@@ -15,6 +15,7 @@
 // resizes are also persisted so a full page reload restores the width.
 
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { MOBILE_BREAKPOINT_PX as MD_BREAKPOINT } from "@/hooks/useIsMobileViewport";
 import { readPanelSizePreference, writePanelSizePreference } from "@/lib/panelSizePreferences";
 
 const DEFAULT_WIDTH_PX = 240; // matches the previous fixed `md:w-60`
@@ -22,8 +23,6 @@ const MIN_WIDTH_PX = 200;
 const MAX_WIDTH_PX = 640;
 /** Keep at least this much room for the code/diff viewer beside the panel. */
 const MIN_VIEWER_PX = 240;
-/** Tailwind `md` breakpoint — must track the value in tailwind.config. */
-const MD_BREAKPOINT = 768;
 
 // ---------------------------------------------------------------------------
 // Module-level width store (shared across panel remounts within a session)

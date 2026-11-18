@@ -162,7 +162,7 @@ def test_landing_and_live_cards_share_the_geometry_contract(
     for surface in ("landing", "live"):
         _surface(page, chat, surface, viewport)
         card_locator = page.locator("[data-composer-card]")
-        if viewport["width"] < 768:
+        if viewport["width"] < 952:
             expect(card_locator).to_have_attribute("data-mobile-composer", "collapsed")
         card = box(card_locator)
         container = box(card_locator.locator(".."))
@@ -172,7 +172,7 @@ def test_landing_and_live_cards_share_the_geometry_contract(
         assert_within_viewport(box(_submit(page, surface)), viewport["width"])
         assert document_width(page) <= viewport["width"]
         submit = box(_submit(page, surface))
-        if touch or viewport["width"] < 768:
+        if touch or viewport["width"] < 952:
             assert submit["width"] >= 44 and submit["height"] >= 44
         else:
             assert submit["height"] < 44

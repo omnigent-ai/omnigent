@@ -116,7 +116,7 @@ def test_session_list_shows_import_in_progress(
 
     def leave_settings() -> None:
         if mobile:
-            page.get_by_role("button", name="Back to settings menu", exact=True).click()
+            page.get_by_role("button", name="Open settings menu", exact=True).click()
         page.get_by_role("link", name="Back", exact=True).click()
         if mobile and aside.get_attribute("aria-hidden") == "true":
             page.get_by_role("button", name="Open sidebar", exact=True).click()

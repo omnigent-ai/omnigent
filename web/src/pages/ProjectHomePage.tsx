@@ -80,8 +80,8 @@ export function ProjectHomePage() {
         className="overflow-hidden"
         maxWidthClassName="max-w-none"
         contentClassName="flex h-full"
-        // Clears the taller header the project title gets.
-        extraTop="4rem"
+        // Clears the taller header the project title gets on desktop.
+        extraTop={isMobile ? "0.75rem" : "4rem"}
         extraBottom="0px"
       >
         <ProjectKanbanBoard
@@ -89,6 +89,7 @@ export function ProjectHomePage() {
           searchQuery={searchQuery}
           quickViewHref={isMobile ? undefined : projectSessionPanelSearch}
           selectedSessionId={panelSessionId}
+          onCloseQuickView={closePanel}
           overlayClearance={composerOpen ? "10rem" : undefined}
         />
         {panelSessionId !== null && (
@@ -118,7 +119,8 @@ export function ProjectHomePage() {
         >
           <div
             data-testid="project-floating-composer"
-            className="pointer-events-auto w-full max-w-3xl [filter:drop-shadow(var(--shadow-dialog))]"
+            // drop-shadow() takes no spread, so this can't use the spread-based shadow tokens.
+            className="project-floating-composer pointer-events-auto w-full max-w-3xl [filter:drop-shadow(0_16px_48px_rgb(var(--ui-shadow-neutral-rgb)/0.2))]"
             onKeyDown={closeComposerOnEscape}
           >
             <NewChatLandingScreen

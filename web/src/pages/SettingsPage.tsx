@@ -134,6 +134,7 @@ import {
 } from "@/lib/identity";
 import { isAdminViewEnabled, setAdminViewEnabled } from "@/lib/adminView";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isFeatureEnabled } from "@/lib/capabilities";
 import { isBootFallbackInfo } from "@/lib/bootCapabilities";
 import { useOmnigentAnalytics, useOmnigentPageView } from "@/lib/analytics";
 import {
@@ -256,6 +257,10 @@ import {
   readOpenSubagentsInPanel,
   writeOpenSubagentsInPanel,
 } from "@/lib/subagentPanelPreferences";
+import {
+  useProjectKanbanBoardPreference,
+  writeProjectKanbanBoard,
+} from "@/lib/projectKanbanPreferences";
 import {
   readSubmitWithModEnter,
   writeSubmitWithModEnter,
@@ -1857,6 +1862,33 @@ function ComposerSendShortcutControl() {
   );
 }
 
+/** On by default: clicking a project opens its sessions board. */
+function ProjectKanbanBoardControl() {
+  const enabled = useProjectKanbanBoardPreference();
+  const labelId = useId();
+  const descriptionId = useId();
+  return (
+    <div className="flex items-start justify-between gap-6">
+      <SettingsLabel
+        label="Kanban board views"
+        labelId={labelId}
+        descriptionId={descriptionId}
+        className="flex-1"
+        description="Monitor a project's agents in one view and respond the moment one needs you."
+      />
+      <Switch
+        aria-labelledby={labelId}
+        aria-describedby={descriptionId}
+        checked={enabled}
+        onCheckedChange={writeProjectKanbanBoard}
+        data-testid="project-kanban-board-toggle"
+        className="mt-0.5 shrink-0"
+        componentId="settings.general.project_kanban_board"
+      />
+    </div>
+  );
+}
+
 /**
  * Where a plain click on a web link in chat content opens — desktop shells
  * with the embedded browser only. Off keeps the current behavior (the
@@ -2090,6 +2122,11 @@ function GeneralSection() {
             <AlwaysSteerControl />
           </div>
         </SettingsGroup>
+        {isFeatureEnabled(info, "project_kanban") && (
+          <SettingsGroup title="Projects" testId="settings-group-projects">
+            <ProjectKanbanBoardControl />
+          </SettingsGroup>
+        )}
         <SettingsGroup title="Sessions" testId="settings-group-sessions">
           <BackgroundSessionTitlesControl />
           {titleInstructions && (

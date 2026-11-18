@@ -419,11 +419,11 @@ describe("Composer status line (branch + context ring)", () => {
   it.each([true, false])(
     "places host and model controls beside overflow only on mobile (%s)",
     (mobile) => {
-      const mediaQuery = window.matchMedia("(max-width: 767.98px)");
+      const mediaQuery = window.matchMedia("(max-width: 951.98px)");
       vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
         ...mediaQuery,
         media: query,
-        matches: mobile && query === "(max-width: 767.98px)",
+        matches: mobile && query === "(max-width: 951.98px)",
       }));
       bindHost("mac-laptop");
       useSessionHostOnlineMock.mockReturnValue(false);

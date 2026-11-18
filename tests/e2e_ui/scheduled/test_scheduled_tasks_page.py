@@ -223,7 +223,7 @@ def test_automations_introduction_first_visit(
 ) -> None:
     """Walk through first-visit onboarding and keep it dismissed after a reload."""
     page.set_viewport_size(viewport)
-    if viewport["width"] < 768:
+    if viewport["width"] < 952:
         page.goto(f"{live_server}/tasks")
     else:
         page.goto(live_server)

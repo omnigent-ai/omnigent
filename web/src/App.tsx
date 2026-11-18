@@ -7,8 +7,9 @@ import { PageLoading } from "@/components/PageLoading";
 import { Spinner } from "@/components/ui/spinner";
 import { ChunkLoadErrorBoundary } from "@/components/ChunkLoadErrorBoundary";
 import { RenderErrorBoundary } from "@/components/RenderErrorBoundary";
-import { Outlet, useLocation, useNavigate } from "@/lib/routing";
+import { Outlet, useLocation, useNavigate, useParams } from "@/lib/routing";
 import { isFeatureEnabled, type FeatureKey } from "@/lib/capabilities";
+import { useProjectKanbanBoardPreference } from "@/lib/projectKanbanPreferences";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { AppShell } from "@/shell/AppShell";
 import { ExtensionPageRoute } from "@/extensions/ExtensionPageRoute";
@@ -95,6 +96,17 @@ function FeatureGatedPage({ feature, children }: { feature: FeatureKey; children
     );
   }
   return isFeatureEnabled(info, feature) ? children : <NotFoundPage />;
+}
+
+// With the board turned off in Settings, a project link opens that project's composer.
+function ProjectHomeRoute() {
+  const boardEnabled = useProjectKanbanBoardPreference();
+  const { projectName = "" } = useParams<{ projectName: string }>();
+  const navigate = useNavigate();
+  useEffect(() => {
+    if (!boardEnabled) navigate(`/?project=${encodeURIComponent(projectName)}`, { replace: true });
+  }, [boardEnabled, navigate, projectName]);
+  return boardEnabled ? <ProjectHomePage /> : null;
 }
 
 function AppRedirect({ to }: { to: string }) {
@@ -206,7 +218,7 @@ function AppRoutes({ basename }: AppProps) {
             path={`${prefix}/projects/:projectName`}
             element={
               <FeatureGatedPage feature="project_kanban">
-                <ProjectHomePage />
+                <ProjectHomeRoute />
               </FeatureGatedPage>
             }
           />

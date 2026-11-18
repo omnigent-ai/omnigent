@@ -1,5 +1,6 @@
 import { renderSidebar as renderSidebarAt } from "@/test/sidebarTestHelpers";
 import { conversationPage } from "@/test/sidebarMockHelpers";
+import { PROJECT_KANBAN_BOARD_STORAGE_KEY } from "@/lib/projectKanbanPreferences";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
@@ -210,26 +211,44 @@ describe("project folder header icon/chevron", () => {
   });
 });
 
-it("opens the project home from the row and collapses it only from the chevron", () => {
+it("opens the project home from the row and expands or collapses it only from the chevron", () => {
   localStorage.clear();
   renderSidebarAt({ features: { project_kanban: true } });
   const header = headerButton("My Project");
   const title = within(header).getByText("My Project");
+  const chevron = header.querySelector("[data-section-toggle]")!;
   expect(header).toHaveAttribute("aria-expanded", "false");
 
   fireEvent.click(title);
-  expect(header).toHaveAttribute("aria-expanded", "true");
+  expect(header).toHaveAttribute("aria-expanded", "false");
   expect(header).toHaveAttribute("aria-current", "page");
   expect(screen.getByTestId("new-chat-button")).not.toHaveClass("bg-[var(--sidebar-active)]");
+
+  fireEvent.click(chevron);
+  expect(header).toHaveAttribute("aria-expanded", "true");
   expect(
     within(header.closest("section")!).queryByRole("link", { name: /^New session$/ }),
   ).toBeNull();
+  fireEvent.click(title);
+  expect(header).toHaveAttribute("aria-expanded", "true");
+  fireEvent.click(chevron);
+  expect(header).toHaveAttribute("aria-expanded", "false");
+  expect(header).toHaveAttribute("aria-current", "page");
+});
+
+it("keeps the project row a collapse toggle when the board is turned off in Settings", () => {
+  localStorage.clear();
+  localStorage.setItem(PROJECT_KANBAN_BOARD_STORAGE_KEY, "false");
+  renderSidebarAt({ features: { project_kanban: true } });
+  const header = headerButton("My Project");
+  const title = within(header).getByText("My Project");
 
   fireEvent.click(title);
   expect(header).toHaveAttribute("aria-expanded", "true");
-  fireEvent.click(header.querySelector("[data-section-toggle]")!);
+  expect(header).not.toHaveAttribute("aria-current");
+  fireEvent.click(title);
   expect(header).toHaveAttribute("aria-expanded", "false");
-  expect(header).toHaveAttribute("aria-current", "page");
+  localStorage.clear();
 });
 
 it("opens New project without toggling the Projects header", () => {

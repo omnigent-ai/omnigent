@@ -312,7 +312,7 @@ def test_composer_pr_link_opens_github_tab(
 ) -> None:
     """Aligned, grouped metadata uses caption text and opens the appropriate GitHub surface."""
     base_url, session_id = seeded_session
-    is_mobile = viewport_width < 768
+    is_mobile = viewport_width < 952
     workspace = "/workspace/demo-app"
     branch = "feature/pr-link"
 

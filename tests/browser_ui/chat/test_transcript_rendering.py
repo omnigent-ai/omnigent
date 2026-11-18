@@ -154,7 +154,7 @@ def test_message_font_size_survives_rotation_and_reload(
         ]
     )
     viewports = (
-        [(390, 844), (844, 390), (390, 844)] if touch else [(767, 844), (768, 844), (1280, 844)]
+        [(390, 844), (844, 390), (390, 844)] if touch else [(951, 844), (952, 844), (1280, 844)]
     )
     page.set_viewport_size({"width": viewports[0][0], "height": viewports[0][1]})
     page.goto(chat.url)
@@ -174,7 +174,7 @@ def test_message_font_size_survives_rotation_and_reload(
             if reload:
                 page.reload()
             assert page.evaluate("matchMedia('(pointer: coarse)').matches") is touch
-            interface_px = saved_size if saved_size is not None else (15 if width < 768 else 14)
+            interface_px = saved_size if saved_size is not None else (15 if width < 952 else 14)
             message_px = interface_px
             for element in prose:
                 expect(element).to_have_css("font-size", f"{message_px}px")
@@ -214,7 +214,7 @@ def test_large_message_fallback_keeps_message_font_size(
         for scope in ('[data-role="user"]', '[data-testid="assistant-text-section"]'):
             fallback = page.locator(f"{scope} .whitespace-pre-wrap.break-all")
             expect(fallback).to_contain_text("VISIBLE_FALLBACK_TAIL")
-            expected_px = (15 if width < 768 else 14) if touch else 13
+            expected_px = (15 if width < 952 else 14) if touch else 13
             expect(fallback).to_have_css("font-size", f"{expected_px}px")
 
 

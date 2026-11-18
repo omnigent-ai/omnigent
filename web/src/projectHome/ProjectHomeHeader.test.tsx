@@ -5,6 +5,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import type * as ConversationsModule from "@/hooks/useConversations";
 import {
   ProjectBoardSearch,
+  ProjectHomeHeaderActions,
   ProjectHomeTitle,
   ProjectNewSessionButton,
   useProjectBoardSearchStore,
@@ -47,7 +48,8 @@ vi.mock("@/shell/Sidebar", () => ({
 }));
 
 function LocationProbe() {
-  return <output data-testid="location">{useLocation().pathname}</output>;
+  const location = useLocation();
+  return <output data-testid="location">{location.pathname + location.search}</output>;
 }
 
 function renderButton() {
@@ -111,6 +113,28 @@ describe("ProjectHomeTitle", () => {
     act(() => onDeleted());
     expect(screen.getByTestId("location")).toHaveTextContent(/^\/$/);
   });
+
+  it("hides the title and moves the project actions beside New session on phones", () => {
+    mocks.isMobile = true;
+    render(
+      <MemoryRouter initialEntries={["/projects/Payments"]}>
+        <TooltipProvider>
+          <header>
+            <ProjectHomeTitle projectName="Payments" />
+          </header>
+          <nav aria-label="Header actions">
+            <ProjectHomeHeaderActions projectName="Payments" />
+          </nav>
+        </TooltipProvider>
+      </MemoryRouter>,
+    );
+    expect(screen.getByRole("heading", { name: "Payments" })).toHaveClass("sr-only");
+    expect(screen.getByRole("banner").querySelectorAll("button")).toHaveLength(0);
+    const actions = screen.getByRole("navigation", { name: "Header actions" });
+    expect(
+      [...actions.querySelectorAll("button")].map((button) => button.getAttribute("aria-label")),
+    ).toEqual(["New session", "Project settings", "Project actions for Payments"]);
+  });
 });
 
 describe("ProjectBoardSearch", () => {
@@ -145,12 +169,15 @@ describe("ProjectNewSessionButton", () => {
     expect(useProjectComposerStore.getState().open).toBe(false);
   });
 
-  it("links phones to the full-screen project composer", () => {
+  it("sends phones to the full-screen project composer", () => {
     mocks.isMobile = true;
-    renderButton();
-    expect(screen.getByRole("link", { name: "New session" })).toHaveAttribute(
-      "href",
-      "/?project=Payments",
+    render(
+      <MemoryRouter initialEntries={["/projects/Payments"]}>
+        <ProjectNewSessionButton projectName="Payments" />
+        <LocationProbe />
+      </MemoryRouter>,
     );
+    fireEvent.click(screen.getByRole("button", { name: "New session" }));
+    expect(screen.getByTestId("location")).toHaveTextContent(/^\/\?project=Payments$/);
   });
 });

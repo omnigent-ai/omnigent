@@ -75,12 +75,12 @@ def test_canvas_controls_clear_the_macos_titlebar(
     expand = page.get_by_role("button", name="Open sidebar", exact=True)
     expect(expand).to_have_count(1)
     expect(page.get_by_role("navigation", name="Collapsed sidebar")).to_have_count(0)
-    for control in (expand, heading) if width < 768 else (heading,):
+    for control in (expand, heading) if width < 952 else (heading,):
         bounds = control.bounding_box()
         assert bounds is not None and bounds["y"] >= titlebar_bottom, (
             f"Canvas control overlaps the native titlebar: {bounds}, bottom={titlebar_bottom}"
         )
-    if width >= 768:
+    if width >= 952:
         expect(
             page.locator(".electron-sidebar-header-actions").get_by_role(
                 "button", name="Open sidebar", exact=True
@@ -90,7 +90,7 @@ def test_canvas_controls_clear_the_macos_titlebar(
         assert bounds and bounds["y"] + bounds["height"] <= titlebar_bottom
     expand.click()
     expect(page.get_by_test_id("canvas-nav")).to_be_visible()
-    if width < 768:
+    if width < 952:
         page.get_by_test_id("sidebar-scrim").click(position={"x": width - 28, "y": 100})
     else:
         page.locator(".electron-sidebar-header-actions").get_by_role(
@@ -108,7 +108,7 @@ def test_canvas_controls_clear_the_macos_titlebar(
     expect(expand).to_have_count(1)
     expand.click()
     expect(page.get_by_test_id("canvas-nav")).to_be_visible()
-    if width < 768:
+    if width < 952:
         page.get_by_test_id("sidebar-scrim").click(position={"x": width - 28, "y": 100})
     else:
         page.locator(".electron-sidebar-header-actions").get_by_role(
@@ -270,7 +270,7 @@ def test_canvas_stays_visible_when_workspace_opens(
     assert board.evaluate("element => element.isConnected")
 
 
-@pytest.mark.parametrize("width", [390, 767])
+@pytest.mark.parametrize("width", [390, 951])
 def test_canvas_deep_link_and_mobile_return_keep_the_project(
     page: Page,
     canvas_project: tuple[str, str, str, str],

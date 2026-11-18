@@ -54,7 +54,7 @@ def touch_project_page(
     project = f"Project {uuid.uuid4().hex[:6]}"
     context = browser.new_context(
         has_touch=True,
-        viewport={"width": 767, "height": 720},
+        viewport={"width": 951, "height": 720},
     )
     try:
         page = context.new_page()

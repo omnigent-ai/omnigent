@@ -145,7 +145,7 @@ interface ChatHeaderProps {
   sidebarOpen: boolean;
   /** Open the left sidebar. */
   onOpenSidebar: (peek?: boolean) => void;
-  /** Render the mobile settings-menu return affordance and fade. */
+  /** Render the mobile settings-menu toggle and fade. */
   settingsMode?: boolean;
   /** Whether the active session is a sub-agent (appends its identity). */
   isChildSession: boolean;
@@ -599,8 +599,8 @@ export function ChatHeader({
         // Mobile keeps only the individual glass button surfaces.
         "chat-header absolute inset-x-0 top-0 z-30 flex h-[76px] md:h-12 items-center justify-between px-4 py-4 md:py-3 md:right-[var(--workspace-panel-offset,0px)]",
         (conversationId || hasPageTitle) && !isMobile && "session-header-glass",
-        // A page title gets a taller header, with room above it for hover toolbars.
-        hasPageTitle && "h-26 pt-8 pb-0 md:h-26 md:pt-8 md:pb-0",
+        // On desktop a page title gets a taller header, with room above it for hover toolbars.
+        hasPageTitle && "md:h-26 md:pt-8 md:pb-0",
         // Pages scroll under the header without a background, so only its controls take clicks.
         !conversationId && "pointer-events-none *:pointer-events-auto",
         settingsMode && "settings-mobile-header",

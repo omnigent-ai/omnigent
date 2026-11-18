@@ -430,7 +430,7 @@ def test_project_menu_is_visible_without_hover(
             touch.keyboard.press("Escape")
             shortcut.click()
         expect(touch).to_have_url(f"{base_url}/?project={project.replace(' ', '%20')}")
-        if viewport["width"] < 768:
+        if viewport["width"] < 952:
             expect(touch.get_by_role("button", name="Open sidebar", exact=True)).to_be_visible()
     finally:
         context.close()

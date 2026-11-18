@@ -1,6 +1,10 @@
 /** Shared row geometry for the home and Settings sidebars. */
 export const SIDEBAR_ROW =
   "sidebar-row sidebar-compact-text h-auto min-h-0 gap-2 rounded-[var(--radius-otto-button)] px-2 py-1.5 md:py-1";
+// On a list container, gives mobile rows 8px more inset inside their highlight.
+// A transparent border the highlight paints under adds to each row's own padding.
+export const SIDEBAR_ROW_MOBILE_INSET =
+  "max-md:[&_.sidebar-row]:border-x-8 max-md:[&_.sidebar-row]:border-transparent max-md:[&_.sidebar-row]:bg-clip-border";
 
 // Match the Settings sidebar's ghost-button hover treatment across every home
 // sidebar row.
@@ -22,6 +26,6 @@ export const SIDEBAR_GRID_MEMBER_HIGHLIGHT =
 // The focused grid pane's row adds an inset ring on top.
 export const SIDEBAR_GRID_SELECTED_RING = "ring-1 ring-inset ring-brand-accent/50";
 // Nested rows join into one line under the parent icon, inset 4px from the parent
-// row and the last nested row.
+// row and the last nested row. Mobile follows the icon past SIDEBAR_ROW_MOBILE_INSET.
 export const SIDEBAR_FAMILY_LINE =
-  "pointer-events-none absolute -top-px bottom-0 -left-[7.5px] w-px bg-muted-foreground/40 [li:not([data-sibling-session]+li)>&]:top-[3px] [li:not(:has(+li[data-sibling-session]))>&]:bottom-1";
+  "pointer-events-none absolute -top-px bottom-0 -left-[7.5px] max-md:left-[0.5px] w-px bg-muted-foreground/40 [li:not([data-sibling-session]+li)>&]:top-[3px] [li:not(:has(+li[data-sibling-session]))>&]:bottom-1";

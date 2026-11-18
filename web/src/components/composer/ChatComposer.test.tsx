@@ -372,7 +372,7 @@ describe("ChatComposer", () => {
   describe("mobile expansion", () => {
     beforeEach(() => {
       vi.stubGlobal("matchMedia", (query: string) => ({
-        matches: query === "(max-width: 767.98px)",
+        matches: query === "(max-width: 951.98px)",
         addEventListener: vi.fn(),
         removeEventListener: vi.fn(),
       }));
