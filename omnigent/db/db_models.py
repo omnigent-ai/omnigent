@@ -2053,7 +2053,8 @@ class SqlWorkflow(OmnigentBase):
     ``session_journal_entries.workflow_id``. Workflows have no versions: an edit
     rewrites the row, and each run's journal keeps the plan it ran.
 
-    :param id: UUID of the workflow, in the session ID's format (bare hex).
+    :param id: The workflow's ID from the store's allocator, in the session ID's format
+        (bare hex); by default a UUID4.
     :param user_id: The owning user, or the reserved ``local`` user in single-user mode.
     :param name: One line, e.g. ``"nightly-build"``; a run's plan takes this name.
     :param description: What the workflow is for; a run gives it to the agent as

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import random
 import string
 from collections.abc import Sequence
@@ -291,6 +292,58 @@ def test_invalid_or_oversized_workflows_are_refused(store: WorkflowStore) -> Non
     with pytest.raises(InvalidWorkflowError, match=f"limit is {MAX_STORED_VALUE_BYTES}"):
         store.create(user_id=ALICE, name="big", description="d", steps=steps)
     assert store.list_page(user_id=ALICE, limit=10) == ([], False)
+
+
+class _AllocatingWorkflows(WorkflowStore):
+    """A deployment's store that allocates workflow IDs and is told which go unused."""
+
+    def __init__(self, storage_location: str, *, release_error: Exception | None = None) -> None:
+        super().__init__(storage_location)
+        self.allocated: list[tuple[str | None, str]] = []
+        self.released: list[str] = []
+        self._release_error = release_error
+
+    def allocate_workflow_id(self, *, user_id: str | None, name: str) -> str:
+        self.allocated.append((user_id, name))
+        return f"{len(self.allocated):032x}"
+
+    def release_workflow_id(self, workflow_id: str) -> None:
+        self.released.append(workflow_id)
+        if self._release_error is not None:
+            raise self._release_error
+
+
+@pytest.mark.parametrize("user_id", [ALICE, None])
+def test_a_workflow_is_saved_under_the_id_its_store_allocates(
+    db_uri: str, user_id: str | None
+) -> None:
+    store = _AllocatingWorkflows(db_uri)
+    saved = store.create(user_id=user_id, name=" nightly \n build ", description="d", steps=STEPS)
+    assert saved.id == f"{1:032x}"
+    # The allocator sees the name as it is saved.
+    assert store.allocated == [(user_id, "nightly build")]
+    assert store.get(saved.id, user_id=user_id) == saved
+    assert store.released == []
+
+
+@pytest.mark.parametrize("release_error", [None, RuntimeError("the folder service is down")])
+def test_a_failed_save_releases_its_id_and_an_invalid_one_allocates_none(
+    db_uri: str, release_error: Exception | None, caplog: pytest.LogCaptureFixture
+) -> None:
+    store = _AllocatingWorkflows(db_uri, release_error=release_error)
+    deploy = _save(store, "deploy")
+    with caplog.at_level(logging.ERROR, logger="omnigent.stores.workflow_store"):
+        # The name conflict, not the release, reaches the caller.
+        with pytest.raises(WorkflowNameTakenError):
+            _save(store, "deploy")
+    assert store.released == [f"{2:032x}"]
+    assert ("could not release the unused workflow ID" in caplog.text) is (
+        release_error is not None
+    )
+    with pytest.raises(InvalidWorkflowError):
+        store.create(user_id=ALICE, name="x", description=" ", steps=STEPS)
+    assert len(store.allocated) == 2
+    assert store.list_page(user_id=ALICE, limit=10) == ([deploy], False)
 
 
 def test_a_workflow_deletes_once_and_only_for_its_owner(store: WorkflowStore) -> None:
