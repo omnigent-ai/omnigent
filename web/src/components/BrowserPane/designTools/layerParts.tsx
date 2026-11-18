@@ -58,21 +58,27 @@ export function prepareMarksCanvas(
 const CARD_WIDTH = 320;
 const CARD_HEIGHT = 120;
 const CARD_GAP = 10;
+const CARD_MARGIN = 8;
 
-/** Where the request card goes: beside the picked element, never over it. */
+/** Where the request card goes, and how wide: beside the picked element, inside the frame. */
 export function cardPosition(
   element: CssRect,
   frame: { width: number; height: number },
-): { left: number; top: number } {
-  const clampX = (x: number) => Math.min(Math.max(8, x), frame.width - CARD_WIDTH - 8);
-  const clampY = (y: number) => Math.min(Math.max(8, y), frame.height - CARD_HEIGHT - 8);
+): { left: number; top: number; width: number } {
+  // Narrower than usual in a narrow frame, so all of it stays on the page.
+  const width = Math.max(0, Math.min(CARD_WIDTH, frame.width - 2 * CARD_MARGIN));
+  const clampX = (x: number) =>
+    Math.max(CARD_MARGIN, Math.min(x, frame.width - width - CARD_MARGIN));
+  const clampY = (y: number) =>
+    Math.max(CARD_MARGIN, Math.min(y, frame.height - CARD_HEIGHT - CARD_MARGIN));
   const below = element.y + element.height + CARD_GAP;
   const above = element.y - CARD_GAP - CARD_HEIGHT;
-  if (below + CARD_HEIGHT <= frame.height) return { left: clampX(element.x), top: below };
-  if (above >= 0) return { left: clampX(element.x), top: above };
+  if (below + CARD_HEIGHT <= frame.height) return { left: clampX(element.x), top: below, width };
+  if (above >= 0) return { left: clampX(element.x), top: above, width };
   const right = element.x + element.width + CARD_GAP;
-  const left = right + CARD_WIDTH <= frame.width ? right : element.x - CARD_GAP - CARD_WIDTH;
-  return { left: Math.max(8, left), top: clampY(element.y) };
+  const fitsRight = right + width <= frame.width - CARD_MARGIN;
+  const left = fitsRight ? right : element.x - CARD_GAP - width;
+  return { left: clampX(left), top: clampY(element.y), width };
 }
 
 export function ToolButton({

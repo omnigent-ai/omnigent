@@ -10,6 +10,7 @@ describe("cardPosition", () => {
     expect(cardPosition({ x: 20, y: 40, width: 100, height: 20 }, frame)).toEqual({
       left: 20,
       top: 70,
+      width: 320,
     });
   });
 
@@ -17,6 +18,7 @@ describe("cardPosition", () => {
     expect(cardPosition({ x: 20, y: 520, width: 100, height: 20 }, frame)).toEqual({
       left: 20,
       top: 390,
+      width: 320,
     });
   });
 
@@ -24,13 +26,29 @@ describe("cardPosition", () => {
     expect(cardPosition({ x: 20, y: 0, width: 100, height: 600 }, frame)).toEqual({
       left: 130,
       top: 8,
+      width: 320,
     });
     // No room to its right: to its left, at least 8px in.
     const right = cardPosition({ x: 600, y: 0, width: 190, height: 600 }, frame);
-    expect(right).toEqual({ left: 270, top: 8 });
+    expect(right).toEqual({ left: 270, top: 8, width: 320 });
   });
 
   it("keeps it inside the page's right edge", () => {
     expect(cardPosition({ x: 700, y: 40, width: 50, height: 20 }, frame).left).toBe(472);
+  });
+
+  it("narrows it to fit a narrow frame, wherever it goes", () => {
+    const narrow = { width: 260, height: 600 };
+    for (const element of [
+      { x: 20, y: 40, width: 100, height: 20 }, // under
+      { x: 200, y: 520, width: 40, height: 20 }, // over, near the right edge
+      { x: 20, y: 0, width: 100, height: 600 }, // beside, no room right
+      { x: 140, y: 0, width: 100, height: 600 }, // beside, no room left
+    ]) {
+      const card = cardPosition(element, narrow);
+      expect(card.width).toBe(244);
+      expect(card.left).toBeGreaterThanOrEqual(8);
+      expect(card.left + card.width).toBeLessThanOrEqual(narrow.width - 8);
+    }
   });
 });

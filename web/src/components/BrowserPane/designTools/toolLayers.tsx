@@ -159,7 +159,7 @@ export function AnnotateLayer({ tabId, rect, onNotice }: LayerProps) {
       {!picked && <PickHint rect={rect} onClose={() => closeTool(tabId)} />}
       {picked && card && (
         <RequestCard
-          style={{ left: rect.left + card.left, top: rect.top + card.top }}
+          style={{ left: rect.left + card.left, top: rect.top + card.top, width: card.width }}
           sendDisabled={sendCommand.blocked !== undefined}
           onCancel={() => closeTool(tabId)}
           onSubmit={() => runCommand(sendCommand)}

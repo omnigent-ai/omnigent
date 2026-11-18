@@ -438,11 +438,13 @@ function createDesignTools({
     // Nothing in an app that reloaded or went will stop this opening, so it ends at once,
     // and keys meant for the tool don't go on to the page.
     const owner = watchOwner(app.owner, () => endSession(entry, id, { toPage: false }));
-    // A tool belongs to the page it opened on; a notice isn't the page's.
+    // A tool belongs to the page it opened on; a notice isn't the page's, but ends with it.
     const page =
       session.mode === "tool"
         ? watchPage(entry.view.webContents, () => session.ended("navigated"))
         : null;
+    const destroyed = () => session.ended("gone");
+    if (!page) entry.view.webContents.on?.("destroyed", destroyed);
     const bounds = () => fit(session);
     entry.view.on?.("bounds-changed", bounds);
     // DevTools opening or closing in the page's view moves the page's part of it.
@@ -451,8 +453,14 @@ function createDesignTools({
     entry.view.webContents.on?.("devtools-closed", devTools);
     // A zoom set on the page while it's open: its overlay follows.
     const zoomWatch = setInterval(() => {
-      if (zoomMoved(session)) fit(session);
-      void remeasure(session);
+      // A page destroyed under it ends it; its getters throw once it's gone.
+      if (!live(entry.view.webContents)) return void session.ended("gone");
+      try {
+        if (zoomMoved(session)) fit(session);
+      } catch {
+        /* destroyed */
+      }
+      remeasure(session).catch(() => {});
     }, zoomCheckMs);
     zoomWatch.unref?.();
     void remeasure(session);
@@ -463,6 +471,7 @@ function createDesignTools({
       entry.view.removeListener?.("bounds-changed", bounds);
       entry.view.webContents.removeListener?.("devtools-opened", devTools);
       entry.view.webContents.removeListener?.("devtools-closed", devTools);
+      entry.view.webContents.removeListener?.("destroyed", destroyed);
     };
     views.set(entry, session);
     sessions.set(id, session);

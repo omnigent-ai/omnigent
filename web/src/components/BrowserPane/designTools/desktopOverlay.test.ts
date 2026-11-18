@@ -74,7 +74,7 @@ describe("DesignOverlay", () => {
     expect(windows.opened.map((opened) => opened.frame)).toEqual(["f2"]);
   });
 
-  it("sends a request waiting for its opening to the start that comes after a stop", async () => {
+  it("holds a request made while its opening starts, then sends it in that opening's name", async () => {
     const { bridge, next } = heldBridge();
     const overlay = new DesignOverlay(bridge, "view_1", frames().open);
     overlay.start(true);

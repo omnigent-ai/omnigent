@@ -1,20 +1,12 @@
 import { lazy, Suspense, type ComponentType } from "react";
 import { RenderErrorBoundary } from "@/components/RenderErrorBoundary";
-import type { DesignRequestCardProps } from "./DesignRequestMessage";
-import { designSubject, NO_SCREENSHOT_NOTE } from "./parseDesignRequest";
+import { DesignRequestContent, type DesignRequestCardProps } from "./DesignRequestContent";
 
 /** The card's content without its chunk: the words, and what they were about. */
-function PlainCard({ request, words }: DesignRequestCardProps) {
+function PlainCard(props: DesignRequestCardProps) {
   return (
     <div className="flex min-w-0 flex-col gap-1">
-      {request.request &&
-        (words ?? <p className="whitespace-pre-wrap break-words">{request.request}</p>)}
-      <span className="min-w-0 break-words text-muted-foreground text-sm [overflow-wrap:anywhere]">
-        {designSubject(request)}
-      </span>
-      {request.noScreenshot && (
-        <span className="text-muted-foreground text-xs">{NO_SCREENSHOT_NOTE}</span>
-      )}
+      <DesignRequestContent {...props} />
     </div>
   );
 }

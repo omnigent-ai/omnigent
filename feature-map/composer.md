@@ -317,8 +317,11 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 - `host-offline-hold`: a message sent to a native session whose host is offline
   waits in the queue as "Waiting for host", ahead of other queued messages, and
   sends once the host reconnects; no failed turn is recorded.
-- `browser-pointer-queue`: desktop Design-mode instructions follow the same queue
-  and always-steer preference, keeping their element screenshots.
+- `browser-pointer-queue`: desktop Design-mode instructions (older shells) follow
+  the same queue and always-steer preference, keeping their element screenshots.
+  Annotate/Draw requests skip the queue: they wait in their own outbox, saved in
+  the browser, send once the session is idle, and show Retry/Remove above the
+  composer.
 - `pi-compact`: `/compact` follows the normal queue/Always steer preference.
   Send now interrupts the turn and compacts. During compaction, queued messages
   wait in the web queue; immediate sends are retained by the Pi integration.
@@ -1055,6 +1058,9 @@ node --test e2e/desktop_dictation_availability.e2e.js`): no mic against a
   Repeat in a fresh session with Always steer on: both entry points send while
   busy and the pointer popup says "Sent to agent." If older messages are already
   queued, new pointer instructions must join them even with Always steer on.
+  With Annotate or Draw instead, the request waits above the composer while the
+  turn runs and sends once it ends; after a reload it comes back for Retry or
+  Remove.
 - **`pi-compact`:** in a Pi session, start a long turn, type `/comp`, press Tab,
   then Enter. With Always steer off, confirm `/compact` queues; use Send now to
   interrupt and compact. With Always steer on and an empty queue, Enter should

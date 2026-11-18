@@ -39,12 +39,13 @@ async function eventually(done, ms = 1000) {
 }
 
 // Main's own timers don't keep the process alive: this does, so a test awaiting one
-// isn't ended before it fires.
+// isn't ended before it fires (with the real timers, which a test may mock).
+const { setInterval: keepAlive, clearInterval: letGo } = globalThis;
 let alive;
 beforeEach(() => {
-  alive = setInterval(() => {}, 1000);
+  alive = keepAlive(() => {}, 1000);
 });
-afterEach(() => clearInterval(alive));
+afterEach(() => letGo(alive));
 
 /** A page's view: its isolated world is a JSDOM window. */
 function fakePage({ zoom = 1, bounds = { x: 100, y: 50, width: 800, height: 600 } } = {}) {
@@ -444,7 +445,8 @@ describe("design tools: the overlay", () => {
     assert.equal(contents.isDestroyed(), true);
   });
 
-  it("gives a notice an overlay of its own size, over the page's bottom, without the keys", async () => {
+  it("gives a notice an overlay of its own size, over the page's bottom, without the keys", async (c) => {
+    c.mock.timers.enable({ apis: ["setInterval"] });
     const t = openTool({ zoom: 2 });
     const overlay = t.open({ input: false });
     // Not shown until the app has measured the notice in it.
@@ -457,6 +459,41 @@ describe("design tools: the overlay", () => {
     // A notice isn't the page's: it stays across a navigation.
     t.webContents.emit("did-start-navigation", { isMainFrame: true, isSameDocument: false });
     assert.equal(t.tools.isOpen(t.entry), true);
+    c.mock.timers.tick(250);
+    assert.equal(t.tools.isOpen(t.entry), true);
+    // Its page destroyed: it ends then, and its zoom check never asks the gone page.
+    t.webContents.isDestroyed = () => true;
+    t.webContents.getZoomFactor = () => {
+      throw new Error("Object has been destroyed");
+    };
+    t.webContents.emit("destroyed");
+    assert.equal(t.tools.isOpen(t.entry), false);
+    assert.equal(overlay.webContents.isDestroyed(), true);
+    assert.deepEqual(t.sent.at(-1), {
+      channel: "browser-design-tools-event",
+      viewId: "view-1",
+      type: "ended",
+      session: t.session,
+      reason: "gone",
+    });
+    assert.doesNotThrow(() => c.mock.timers.tick(1000));
+  });
+
+  it("ends a notice whose page its zoom check finds destroyed, without asking it", async (c) => {
+    c.mock.timers.enable({ apis: ["setInterval"] });
+    const t = openTool();
+    const overlay = t.open({ input: false });
+    await t.ask("fit", { notice: { width: 100, height: 30 } });
+    // Gone without its "destroyed" reaching main.
+    t.webContents.isDestroyed = () => true;
+    t.webContents.getZoomFactor = () => {
+      throw new Error("Object has been destroyed");
+    };
+    assert.doesNotThrow(() => c.mock.timers.tick(250));
+    assert.equal(t.tools.isOpen(t.entry), false);
+    assert.equal(overlay.webContents.isDestroyed(), true);
+    assert.equal(t.sent.at(-1).reason, "gone");
+    assert.doesNotThrow(() => c.mock.timers.tick(1000));
   });
 });
 
@@ -730,17 +767,26 @@ describe("design tools: capture", () => {
   it("refuses a capture the page zoomed during, whether it was measuring or painting", async () => {
     const t = openTool();
     t.open();
+    // DevTools docked: the capture measures the page's area first, and that's held.
+    t.webContents.isDevToolsOpened = () => true;
     const release = t.webContents.holdNext();
     const measuring = t.ask("capture", { rect: { x: 10, y: 20, width: 50, height: 30 } });
+    await tick();
+    assert.equal(t.webContents.codes.filter((code) => code.includes("innerHeight")).length, 1);
     t.webContents.zoom = 2;
     release();
     assert.deepEqual(await measuring, { ok: false, error: "the page's zoom changed" });
+    // The overlay at the new zoom; the page zooms back while it paints.
+    await t.ask("fit");
     const paint = t.webContents.capturePage;
+    let painted = 0;
     t.webContents.capturePage = async (rect) => {
+      painted += 1;
       t.webContents.zoom = 1;
       return paint(rect);
     };
     assert.deepEqual(await t.ask("capture"), { ok: false, error: "the page's zoom changed" });
+    assert.equal(painted, 1);
   });
 
   it("fails a capture the page never paints", async () => {

@@ -367,12 +367,33 @@ const saving = new Map<string, string>();
 // again, so a removed request can't come back (and send itself) on the next page.
 const deleting = new Map<string, "pending" | "failed">();
 
+let deleteTimer: ReturnType<typeof setTimeout> | null = null;
+let deleteRetryMs = RESTORE_RETRY_MS;
+
 function forgetSaved(id: string): void {
   deleting.set(id, "pending");
   void write(() => deleteRequest(id)).then((ok) => {
-    if (ok) deleting.delete(id);
-    else deleting.set(id, "failed");
+    if (!ok) {
+      deleting.set(id, "failed");
+      retryDeletes();
+      return;
+    }
+    deleting.delete(id);
+    if (![...deleting.values()].includes("failed")) deleteRetryMs = RESTORE_RETRY_MS;
   });
+}
+
+/** Try failed deletes again on their own, less often each time (as restoring does). */
+function retryDeletes(): void {
+  if (deleteTimer !== null) return;
+  deleteTimer = setTimeout(() => {
+    deleteTimer = null;
+    deleteRetryMs = Math.min(deleteRetryMs * 2, RESTORE_RETRY_MAX_MS);
+    const present = new Set(useDesignOutbox.getState().requests.map((request) => request.id));
+    for (const [id, state] of deleting) {
+      if (state === "failed" && !present.has(id)) forgetSaved(id);
+    }
+  }, deleteRetryMs);
 }
 let writes: Promise<void> = Promise.resolve();
 
@@ -554,4 +575,7 @@ export function resetDesignOutbox(): void {
   savedAs.clear();
   saving.clear();
   deleting.clear();
+  if (deleteTimer !== null) clearTimeout(deleteTimer);
+  deleteTimer = null;
+  deleteRetryMs = RESTORE_RETRY_MS;
 }

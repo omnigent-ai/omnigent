@@ -198,9 +198,10 @@ describe("design outbox storage", () => {
   });
 
   it("keeps trying to delete a removed request's saved copy, so it can't come back", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     const id = queueDesignRequest({ tabId: TAB, label: "Annotate", text: "Green" });
     await designOutboxSaved();
-    const failOnce = vi.spyOn(IDBObjectStore.prototype, "delete").mockImplementationOnce(() => {
+    const busy = vi.spyOn(IDBObjectStore.prototype, "delete").mockImplementation(() => {
       throw new Error("Storage is busy");
     });
     forget(id);
@@ -209,12 +210,19 @@ describe("design outbox storage", () => {
     expect(await savedIds()).toEqual([id]);
     // The delete is still owed, so leaving asks first.
     expect(unloadAsks()).toBe(true);
-    failOnce.mockRestore();
-    // The next change tries again.
-    const other = queueDesignRequest({ tabId: TAB, label: "Annotate", text: "Blue" });
+    // It's tried again on its own, with nothing else in the outbox: still busy the first time.
+    await vi.advanceTimersByTimeAsync(RESTORE_RETRY_MS);
     await designOutboxSaved();
+    expect(busy).toHaveBeenCalledTimes(2);
+    busy.mockRestore();
+    // The next try waits twice as long.
+    await vi.advanceTimersByTimeAsync(RESTORE_RETRY_MS);
     await designOutboxSaved();
-    expect(await savedIds()).toEqual([other]);
+    expect(await savedIds()).toEqual([id]);
+    await vi.advanceTimersByTimeAsync(RESTORE_RETRY_MS);
+    await designOutboxSaved();
+    expect(await savedIds()).toEqual([]);
+    expect(useDesignOutbox.getState().requests).toEqual([]);
     expect(unloadAsks()).toBe(false);
   });
 

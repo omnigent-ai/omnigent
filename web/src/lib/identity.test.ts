@@ -288,6 +288,51 @@ describe("getCurrentUserId", () => {
   });
 });
 
+describe("fetchSignedInUserId", () => {
+  it("asks the server each time, past the cached user", async () => {
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({ user_id: "alice" }));
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({ user_id: "bob" }));
+    const { fetchSignedInUserId, getCurrentUserId, resolveIdentity } = await import("./identity");
+    await resolveIdentity();
+
+    expect(await fetchSignedInUserId()).toBe("bob");
+    expect(getCurrentUserId()).toBe("alice");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls[1][0]).toBe("/v1/me");
+  });
+
+  it("answers null when signed out", async () => {
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({}, { ok: false, status: 401 }));
+    const { fetchSignedInUserId } = await import("./identity");
+
+    expect(await fetchSignedInUserId()).toBeNull();
+  });
+
+  it.each<[string, () => void]>([
+    ["a network error", () => fetchMock.mockRejectedValueOnce(new Error("network"))],
+    [
+      "a gateway 503",
+      () => fetchMock.mockResolvedValueOnce(mockJsonResponse({}, { ok: false, status: 503 })),
+    ],
+    [
+      "a 200 whose body cannot be parsed",
+      () =>
+        fetchMock.mockResolvedValueOnce({
+          ok: true,
+          status: 200,
+          json: async () => {
+            throw new SyntaxError("Unexpected end of JSON input");
+          },
+        } as unknown as Response),
+    ],
+  ])("answers undefined (can't say) after %s", async (_label, failOnce) => {
+    failOnce();
+    const { fetchSignedInUserId } = await import("./identity");
+
+    expect(await fetchSignedInUserId()).toBeUndefined();
+  });
+});
+
 describe("resolveIdentity base-path login redirect", () => {
   let originalLocation: Location;
 
