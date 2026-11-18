@@ -1,4 +1,5 @@
 import { create, fromBinary, toBinary, type MessageInitShape } from "@bufbuild/protobuf";
+import { Code, ConnectError } from "@connectrpc/connect";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   ContentEncoding,
@@ -16,6 +17,7 @@ import {
   ListWorkingCopyChangesRequestSchema,
   ListWorkingCopyChangesResponseSchema,
   ReadBaseFileResponseSchema,
+  ResolveWorkingCopyBaseResponseSchema,
 } from "@/gen/omnigent/api/workspace/v1alpha1/workspace_pb";
 import { getCachedServerInfo, type ServerInfo } from "@/lib/capabilities";
 import { authenticatedFetch } from "@/lib/identity";
@@ -23,9 +25,11 @@ import { workspaceSocketBridge, type WorkspaceSocketResponse } from "@/lib/nativ
 import {
   listDirectoryViaWorkspaceApi,
   readFileViaWorkspaceApi,
+  listBranchCommitsViaWorkspaceApi,
   listWorkingCopyChangesViaWorkspaceApi,
   readBaseFileViaWorkspaceApi,
   resolveRepositoryContextViaWorkspaceApi,
+  resolveWorkingCopyBaseViaWorkspaceApi,
   searchFilesViaWorkspaceApi,
   searchTextViaWorkspaceApi,
 } from "./workspaceApi";
@@ -617,6 +621,27 @@ describe("searchFilesViaWorkspaceApi", () => {
     expect(grantRequests()).toBe(1);
   });
 
+  it.each(["not_found", "invalid_argument"])(
+    "keeps a socket's grant when it answers %s",
+    async (code) => {
+      enable("workspace_direct_access");
+      serve(() => {
+        throw new Error("the server route is off");
+      });
+      // A stream's error arrives in its end message.
+      socket.mockImplementation(async () =>
+        fromSocket(frames([], { error: { code, message: code } })),
+      );
+
+      expect(await readFileViaWorkspaceApi(`s-answers-${code}`, "missing.md")).toBeNull();
+      expect(await readFileViaWorkspaceApi(`s-answers-${code}`, "missing.md")).toBeNull();
+
+      // An answer: the same grant serves the next read on the same route.
+      expect(socket).toHaveBeenCalledTimes(2);
+      expect(grantRequests()).toBe(1);
+    },
+  );
+
   it("tries a refused method again once its back-off ends", async () => {
     enable("workspace_direct_access");
     serve(() => {
@@ -858,16 +883,22 @@ describe("searchTextViaWorkspaceApi", () => {
     });
   });
 
-  it("leaves a stream that ends without its last message to REST", async () => {
+  it("leaves a stream that ends without its last message to REST, then stops asking", async () => {
     enable("workspace_api_server_access", "workspace_content_search");
     serveMethods({
       GetCapabilities: () =>
         new Response(capabilitiesBody("SearchText"), { headers: PROTO_HEADERS }),
       SearchText: () =>
         new Response(textMatches({ matches: [match(1)] }), { headers: CONNECT_HEADERS }),
+      ReadFile: () => new Response(textFile(), { headers: CONNECT_HEADERS }),
     });
 
     expect(await searchTextViaWorkspaceApi("s-text-cut", "needle", TEXT_OPTIONS)).toBeNull();
+    expect(await searchTextViaWorkspaceApi("s-text-cut", "needle", TEXT_OPTIONS)).toBeNull();
+
+    // Only the method backs off: the route still reads files.
+    expect(methodCalls("SearchText")).toHaveLength(1);
+    expect((await readFileViaWorkspaceApi("s-text-cut", "notes.md"))?.content).toBe("héllo");
   });
 
   it("leaves the search to REST while content search is off", async () => {
@@ -952,6 +983,68 @@ describe("Git comparisons through the workspace API", () => {
 
     expect(await resolveRepositoryContextViaWorkspaceApi("s-git-old")).toBeNull();
     expect(methodCalls("ResolveRepositoryContext")).toHaveLength(0);
+  });
+
+  it("resolves a comparison's base, and stops asking a host that answers without one", async () => {
+    enable("workspace_api_server_access");
+    let sendsBase = true;
+    serveMethods({
+      GetCapabilities: () =>
+        new Response(capabilitiesBody("ResolveWorkingCopyBase"), { headers: PROTO_HEADERS }),
+      ResolveWorkingCopyBase: () => {
+        const response = create(ResolveWorkingCopyBaseResponseSchema, {
+          base: sendsBase ? { kind: ComparisonKind.LAST_COMMIT, base: "a".repeat(40) } : undefined,
+        });
+        return new Response(toBinary(ResolveWorkingCopyBaseResponseSchema, response), {
+          headers: PROTO_HEADERS,
+        });
+      },
+      ReadFile: () => new Response(textFile(), { headers: CONNECT_HEADERS }),
+    });
+    const lastCommit = { kind: ComparisonKind.LAST_COMMIT };
+
+    expect(await resolveWorkingCopyBaseViaWorkspaceApi("s-git-base", lastCommit)).toMatchObject({
+      base: "a".repeat(40),
+    });
+    sendsBase = false;
+    expect(await resolveWorkingCopyBaseViaWorkspaceApi("s-git-base", lastCommit)).toBeNull();
+    expect(await resolveWorkingCopyBaseViaWorkspaceApi("s-git-base", lastCommit)).toBeNull();
+
+    // An unusable answer backs off that method alone.
+    expect(methodCalls("ResolveWorkingCopyBase")).toHaveLength(2);
+    expect((await readFileViaWorkspaceApi("s-git-base", "notes.md"))?.content).toBe("héllo");
+  });
+
+  it("hands the host's refusal of a Git request to the caller, keeping the route", async () => {
+    enable("workspace_api_server_access");
+    serveMethods({
+      GetCapabilities: () =>
+        new Response(capabilitiesBody("ListBranchCommits", "ReadBaseFile"), {
+          headers: PROTO_HEADERS,
+        }),
+      ListBranchCommits: () =>
+        Response.json({ code: "not_found", message: "No revision 'gone'" }, { status: 404 }),
+      // The base moved since the changes were listed.
+      ReadBaseFile: () =>
+        new Response(
+          frames([], { error: { code: "failed_precondition", message: "The blob changed" } }),
+          { headers: CONNECT_HEADERS },
+        ),
+      ReadFile: () => new Response(textFile(), { headers: CONNECT_HEADERS }),
+    });
+    const file = { commit: "b".repeat(40), path: "src/a.ts", object: "c".repeat(40) };
+
+    const commits = listBranchCommitsViaWorkspaceApi("s-git-refused", "gone");
+    await expect(commits).rejects.toThrow("No revision 'gone'");
+    await expect(commits).rejects.toMatchObject({ code: Code.NotFound });
+    const base = readBaseFileViaWorkspaceApi("s-git-refused", file);
+    await expect(base).rejects.toBeInstanceOf(ConnectError);
+    await expect(base).rejects.toMatchObject({ code: Code.FailedPrecondition });
+
+    // Answers, not failures: the route keeps serving reads and asks again.
+    expect((await readFileViaWorkspaceApi("s-git-refused", "notes.md"))?.content).toBe("héllo");
+    await expect(readBaseFileViaWorkspaceApi("s-git-refused", file)).rejects.toThrow();
+    expect(methodCalls("ReadBaseFile")).toHaveLength(2);
   });
 });
 
