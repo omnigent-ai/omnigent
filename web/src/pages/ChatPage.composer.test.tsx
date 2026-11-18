@@ -7279,9 +7279,11 @@ describe("Composer workflow entry point", () => {
       skills: [],
       sessionStatus: "running",
     });
-    const fetchMessage = vi
-      .spyOn(globalThis, "fetch")
-      .mockResolvedValue(new Response(JSON.stringify({ error: "boom" }), { status: 500 }));
+    const fetchMessage = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ error: { message: "The session is offline." } }), {
+        status: 503,
+      }),
+    );
     const error = vi.spyOn(toast, "error");
     onTestFinished(() => {
       fetchMessage.mockRestore();
@@ -7292,7 +7294,8 @@ describe("Composer workflow entry point", () => {
 
     act(() => useSessionTasksActions.getState().stopWork.conv_test?.());
     expect(usePlanStops.getState().requests.conv_test).toMatchObject({ sent: false });
-    await waitFor(() => expect(error).toHaveBeenCalledOnce());
+    await waitFor(() => expect(error).toHaveBeenCalledWith("The session is offline."));
+    expect(error).toHaveBeenCalledOnce();
     expect(usePlanStops.getState().requests.conv_test).toBeUndefined();
   });
 

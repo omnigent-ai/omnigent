@@ -17,10 +17,10 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { formatMessageTimestamp } from "@/lib/relativeTime";
 import type { AnyBlock } from "@/lib/blocks";
 import type { JournalEntry, StepProgress } from "@/lib/sessionJournal";
-import { continuePlanMessage, stopPlanMessage } from "@/lib/workflow";
+import { stopPlanMessage } from "@/lib/workflow";
 import type { ConversationState } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
-import { trackPlanStop, usePlanStops } from "@/store/planStops";
+import { type MessageReceipt, trackPlanStop, usePlanStops } from "@/store/planStops";
 import {
   openTasksTab,
   registerContinuePlan,
@@ -776,21 +776,21 @@ describe("TasksPanel", () => {
 
     /** Registers the composer's Stop, whose message the session takes once `deliver` settles. */
     function registerTrackedStop() {
-      let deliver!: (taken: boolean) => void;
+      let deliver!: (receipt: MessageReceipt | null) => void;
       const withdraw = registerStopWork(
         "conv",
         () =>
           void trackPlanStop(
             "conv",
             () =>
-              new Promise<boolean>((resolve) => {
+              new Promise<MessageReceipt | null>((resolve) => {
                 deliver = resolve;
               }),
           ),
       );
       onTestFinished(() => act(withdraw));
       onTestFinished(() => usePlanStops.setState({ requests: {}, settledStops: {} }));
-      return (taken: boolean) => act(async () => deliver(taken));
+      return (taken: boolean) => act(async () => deliver(taken ? {} : null));
     }
 
     beforeEach(() => {
@@ -799,7 +799,7 @@ describe("TasksPanel", () => {
       onTestFinished(() => act(withdrawContinue));
     });
 
-    it("shows Stopping… until the agent stops working, then Continue", async () => {
+    it("shows Stopping… until the agent and its background work stop, then Continue", async () => {
       const deliver = registerTrackedStop();
       setSession({ sessionStatus: "running" });
       renderPanel();
@@ -814,7 +814,10 @@ describe("TasksPanel", () => {
       await deliver(true);
       expect(screen.getByTestId("plan-stopping")).toBeInTheDocument();
 
-      setSession({ sessionStatus: "idle" });
+      // The agent's turn ends while its background work still runs.
+      setSession({ sessionStatus: "idle", backgroundTaskCount: 1 });
+      expect(screen.getByTestId("plan-stopping")).toBeInTheDocument();
+      setSession({ backgroundTaskCount: 0 });
       expect(screen.queryByTestId("plan-stopping")).toBeNull();
       expect(screen.getByTestId("plan-continue")).toBeInTheDocument();
       expect(screen.getByTestId("tasks-paused")).toHaveTextContent("Stopped");
@@ -830,42 +833,6 @@ describe("TasksPanel", () => {
       await deliver(false);
       expect(screen.queryByTestId("plan-stopping")).toBeNull();
       expect(screen.getByTestId("plan-stop")).toBeEnabled();
-    });
-
-    it("keeps Stopping… while background work outlives the agent's turn", async () => {
-      const deliver = registerTrackedStop();
-      setSession({ sessionStatus: "running" });
-      renderPanel();
-      fireEvent.click(screen.getByTestId("plan-stop"));
-      await deliver(true);
-
-      setSession({ sessionStatus: "idle", backgroundTaskCount: 1 });
-      expect(screen.getByTestId("plan-stopping")).toBeInTheDocument();
-      setSession({ backgroundTaskCount: 0 });
-      expect(screen.queryByTestId("plan-stopping")).toBeNull();
-      expect(screen.getByTestId("plan-continue")).toBeInTheDocument();
-    });
-
-    it("shows Stop once the transcript shows a request after the stop message, as from another tab", async () => {
-      const deliver = registerTrackedStop();
-      setSession({ sessionStatus: "running" });
-      renderPanel();
-      fireEvent.click(screen.getByTestId("plan-stop"));
-      await deliver(true);
-      setSession({ blocks: [userMessage("stop", stopPlanMessage(null))] });
-      expect(screen.getByTestId("plan-stopping")).toBeInTheDocument();
-
-      // Background work keeps the session working while another tab continues the run.
-      setSession({
-        sessionStatus: "idle",
-        backgroundTaskCount: 1,
-        blocks: [
-          userMessage("stop", stopPlanMessage(null)),
-          userMessage("go", continuePlanMessage(null)),
-        ],
-      });
-      expect(screen.queryByTestId("plan-stopping")).toBeNull();
-      expect(screen.getByTestId("plan-stop")).toBeInTheDocument();
     });
 
     it("reads a Stop from the transcript after a reload, through the workers' reports", () => {

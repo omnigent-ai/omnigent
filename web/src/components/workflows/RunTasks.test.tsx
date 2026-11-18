@@ -152,6 +152,43 @@ describe("RunPlanButton", () => {
     rerender({ stopping: true });
     expect(result.current?.(running)).toBeUndefined();
   });
+
+  it("keeps a run's Stop when a task's message sent before it lands after it", async () => {
+    let landRetry!: () => void;
+    api.sendUserMessage
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            landRetry = () => resolve({ queued: true });
+          }),
+      )
+      .mockResolvedValue({ queued: true });
+    const client = new QueryClient();
+    const { result } = renderHook(() => useRunTaskMenus("sess_1", [], "plan_1"), {
+      wrapper: ({ children }) => (
+        <QueryClientProvider client={client}>
+          <MemoryRouter>{children}</MemoryRouter>
+        </QueryClientProvider>
+      ),
+    });
+    const task: StepProgress = {
+      step: { id: "review", name: "Review changes", goal: null, depends_on: [] },
+      state: "failed",
+      status: null,
+      startedAt: 1,
+      native: false,
+      activeForm: null,
+    };
+    act(() => result.current?.(task)?.onSelect());
+    await waitFor(() => expect(api.sendUserMessage).toHaveBeenCalledTimes(1));
+    await act(async () => result.current?.({ ...task, state: "running" })?.onSelect());
+    await waitFor(() =>
+      expect(usePlanStops.getState().requests.sess_1).toMatchObject({ sent: true }),
+    );
+
+    await act(async () => landRetry());
+    expect(usePlanStops.getState().requests.sess_1).toMatchObject({ sent: true });
+  });
 });
 
 describe("RunWorkflowButton and RunGraphButton", () => {

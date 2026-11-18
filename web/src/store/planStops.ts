@@ -11,10 +11,16 @@ export interface PlanStopRequest {
   /** Tells this Stop from a later one, across its updates. */
   id: number;
   sent: boolean;
-  /** The stop message the transcript last showed when this Stop began, which isn't this Stop's. */
-  earlierStop: string | null;
-  /** Whether the transcript has since shown a newer stop message as the latest request. */
-  seen?: boolean;
+  /** The conversation item the stop message became, once known. */
+  itemId?: string;
+  /** A native session's pending input for the stop message, which names its item later. */
+  pendingId?: string;
+}
+
+/** The session's receipt for a message: its item, or a native session's pending input. */
+export interface MessageReceipt {
+  itemId?: string;
+  pendingId?: string;
 }
 
 /** A send the composer shows before the agent takes it; `posted` once the session accepted it. */
@@ -40,11 +46,17 @@ interface PlanStopsState {
  */
 export const usePlanStops = create<PlanStopsState>(() => ({ requests: {}, settledStops: {} }));
 
-// Only a session's latest stop message can stand in for a Stop; a few cover sends that cross.
-const SETTLED_STOPS_KEPT = 8;
+// Only a session's latest stop messages matter; a few cover sends that cross.
+const RECENT_KEPT = 8;
 
 let nextRequestId = 1;
 const watcherCounts = new Map<string, number>();
+/** Per session, the items recent native receipts named, by pending input. */
+const receiptItems = new Map<string, Map<string, string>>();
+/** Per session, pending inputs of Stops a later request ended before their items were known. */
+const supersededPendingStops = new Map<string, Set<string>>();
+/** Stops a later request ended while their messages were still on the way. */
+const supersededSendingStops = new Set<number>();
 
 function messageText(content: readonly MessageContentBlock[]): string {
   return content
@@ -89,6 +101,12 @@ export function latestStopRequest(
   return latest.stableKey ?? latest.ctx.itemId ?? "";
 }
 
+/** Whether the transcript shows another request from the user after the item *itemId*. */
+export function hasRequestAfter(blocks: readonly AnyBlock[], itemId: string): boolean {
+  const index = blocks.findLastIndex((block) => block.ctx.itemId === itemId);
+  return index !== -1 && blocks.slice(index + 1).some(isUserRequest);
+}
+
 /** The stop message the streamed transcript holds as its latest request, if any. */
 function committedStopMessage(sessionId: string): string | null {
   const entry = conversationRegistry.peek(sessionId);
@@ -120,36 +138,78 @@ function retireStopMessage(sessionId: string, stopMessage: string): void {
     return {
       settledStops: {
         ...state.settledStops,
-        [sessionId]: [...settled, stopMessage].slice(-SETTLED_STOPS_KEPT),
+        [sessionId]: [...settled, stopMessage].slice(-RECENT_KEPT),
       },
     };
   });
+}
+
+/** Retire a superseded Stop's own message, now or once a native receipt names it. */
+function retireOwnStopMessage(sessionId: string, receipt: MessageReceipt): void {
+  const itemId =
+    receipt.itemId ?? (receipt.pendingId && receiptItems.get(sessionId)?.get(receipt.pendingId));
+  if (itemId) retireStopMessage(sessionId, itemId);
+  else if (receipt.pendingId) {
+    const pending = supersededPendingStops.get(sessionId) ?? new Set<string>();
+    supersededPendingStops.set(sessionId, pending.add(receipt.pendingId));
+  }
 }
 
 /**
  * Show *sessionId*'s run as stopping while *send* delivers the Stop, then until
  * the run stops. A Stop the session doesn't take restores the Stop control.
  *
- * @param send Delivers the stop message, resolving to whether the session took it.
+ * @param send Delivers the stop message, resolving to the session's receipt,
+ *   or null when the session didn't take it.
  */
 export async function trackPlanStop(
   sessionId: string,
-  send: () => Promise<boolean>,
+  send: () => Promise<MessageReceipt | null>,
 ): Promise<void> {
-  const sending: PlanStopRequest = {
-    id: nextRequestId++,
-    sent: false,
-    earlierStop: committedStopMessage(sessionId),
-  };
+  const sending: PlanStopRequest = { id: nextRequestId++, sent: false };
   replaceRequest(sessionId, currentRequest(sessionId), sending);
-  let taken = false;
+  let receipt: MessageReceipt | null = null;
   try {
-    taken = await send();
+    receipt = await send();
   } finally {
     const current = currentRequest(sessionId);
-    if (current?.id === sending.id) {
-      replaceRequest(sessionId, current, taken ? { ...current, sent: true } : undefined);
+    if (supersededSendingStops.delete(sending.id)) {
+      if (receipt) retireOwnStopMessage(sessionId, receipt);
+    } else if (current?.id === sending.id) {
+      const itemId =
+        receipt?.itemId ??
+        (receipt?.pendingId ? receiptItems.get(sessionId)?.get(receipt.pendingId) : undefined);
+      replaceRequest(
+        sessionId,
+        current,
+        receipt
+          ? {
+              ...current,
+              sent: true,
+              ...(itemId ? { itemId } : {}),
+              ...(receipt.pendingId ? { pendingId: receipt.pendingId } : {}),
+            }
+          : undefined,
+      );
     }
+  }
+}
+
+/**
+ * A native session's receipt: its pending input *pendingId* became the item
+ * *itemId*, which places a Stop's message in the transcript.
+ */
+export function notePlanStopReceipt(sessionId: string, pendingId: string, itemId: string): void {
+  const items = receiptItems.get(sessionId) ?? new Map<string, string>();
+  items.set(pendingId, itemId);
+  for (const oldest of [...items.keys()].slice(0, -RECENT_KEPT)) items.delete(oldest);
+  receiptItems.set(sessionId, items);
+  if (supersededPendingStops.get(sessionId)?.delete(pendingId)) {
+    retireStopMessage(sessionId, itemId);
+  }
+  const request = currentRequest(sessionId);
+  if (request?.pendingId === pendingId && request.itemId === undefined) {
+    replaceRequest(sessionId, request, { ...request, itemId });
   }
 }
 
@@ -158,25 +218,25 @@ export function endPlanStop(sessionId: string, request: PlanStopRequest): void {
   replaceRequest(sessionId, request, undefined);
 }
 
-/** The transcript shows a stop message newer than *request* began with, so a later request ends it. */
-export function notePlanStopSeen(sessionId: string, request: PlanStopRequest): void {
-  if (!request.seen) replaceRequest(sessionId, request, { ...request, seen: true });
-}
-
 /**
  * Note the Stop in progress, and the stop message the transcript shows, as the
  * user sends *sessionId* another message.
  *
- * @returns Ends both once the session takes the message. A Stop asked for
- *   after the message was sent isn't affected.
+ * @returns Ends both once the session takes the message, along with that
+ *   Stop's own message when it arrives later. A Stop asked for after the
+ *   message was sent isn't affected.
  */
 export function supersedePlanStop(sessionId: string | null): () => void {
   if (sessionId === null) return () => undefined;
   const superseded = currentRequest(sessionId);
   const stopMessage = committedStopMessage(sessionId);
   return () => {
-    if (superseded) endPlanStop(sessionId, superseded);
     if (stopMessage !== null) retireStopMessage(sessionId, stopMessage);
+    const request = currentRequest(sessionId);
+    if (superseded === undefined || request?.id !== superseded.id) return;
+    if (request.sent) retireOwnStopMessage(sessionId, request);
+    else supersededSendingStops.add(request.id);
+    endPlanStop(sessionId, request);
   };
 }
 

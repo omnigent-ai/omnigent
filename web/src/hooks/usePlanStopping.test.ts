@@ -5,7 +5,10 @@ import type { AnyBlock } from "@/lib/blocks";
 import { continuePlanMessage, stopPlanMessage } from "@/lib/workflow";
 import { conversationRegistry } from "@/store/conversationRegistry";
 import {
+  hasRequestAfter,
   latestStopRequest,
+  type MessageReceipt,
+  notePlanStopReceipt,
   supersedePlanStop,
   trackPlanStop,
   usePlanStops,
@@ -42,32 +45,33 @@ function pendingSend(tempId: string, text: string, posted?: boolean) {
   };
 }
 
-const STOP = userMessage("stop", stopPlanMessage(null));
+const stopMessage = (itemId: string) => userMessage(itemId, stopPlanMessage(null));
+const STOP = stopMessage("stop");
 const CONTINUE = userMessage("go", continuePlanMessage(null));
 
 /** A stop whose message is still on its way, and how to settle it. */
 function sendStop() {
-  let settle!: (taken: boolean) => void;
+  let settle!: (receipt: MessageReceipt | null) => void;
   let fail!: (error: Error) => void;
   let tracked!: Promise<void>;
   act(() => {
     tracked = trackPlanStop(
       SESSION,
       () =>
-        new Promise<boolean>((resolve, reject) => {
+        new Promise<MessageReceipt | null>((resolve, reject) => {
           settle = resolve;
           fail = reject;
         }),
     );
   });
-  const settleWith = (taken: boolean) =>
+  const settleWith = (receipt: MessageReceipt | null) =>
     act(async () => {
-      settle(taken);
+      settle(receipt);
       await tracked;
     });
   return {
-    take: () => settleWith(true),
-    refuse: () => settleWith(false),
+    take: (receipt: MessageReceipt = {}) => settleWith(receipt),
+    refuse: () => settleWith(null),
     fail: (error: Error) =>
       act(async () => {
         fail(error);
@@ -87,6 +91,12 @@ function transcript() {
   return conversationRegistry.acquire(SESSION);
 }
 
+/** A follow-up the session accepts, sent outside the chat, as a run row's Retry is. */
+function sendFollowUp() {
+  const accept = supersedePlanStop(SESSION);
+  return () => act(accept);
+}
+
 afterEach(() => {
   cleanup();
   conversationRegistry.clear();
@@ -101,7 +111,7 @@ describe("usePlanStopping", () => {
 
     const stop = sendStop();
     expect(result.current).toBe(true);
-    await stop.take();
+    await stop.take({ itemId: "stop" });
     act(() => entry.setState({ blocks: [STOP] }));
     expect(result.current).toBe(true);
 
@@ -131,87 +141,86 @@ describe("usePlanStopping", () => {
   it("ends once the session takes a message sent after the Stop, even mid-send", async () => {
     const { result } = renderStopping(true);
 
-    const stop = sendStop();
-    await stop.take();
-    act(() => supersedePlanStop(SESSION)());
+    await sendStop().take();
+    await sendFollowUp()();
     expect(result.current).toBe(false);
 
     // Continue lands while the Stop is still on its way; the Stop doesn't come back.
     const late = sendStop();
-    const endStop = supersedePlanStop(SESSION);
-    act(endStop);
+    await sendFollowUp()();
     await late.take();
     expect(result.current).toBe(false);
   });
 
   it("keeps stopping when a message sent before a Stop lands after it", async () => {
     const { result } = renderStopping(true);
-    const endNoStop = supersedePlanStop(SESSION);
+    const acceptEarlier = sendFollowUp();
     await sendStop().take();
-    act(endNoStop);
+    await acceptEarlier();
     expect(result.current).toBe(true);
 
     // Stop A, then a follow-up, then Stop B: the follow-up only ends A.
-    const endStopA = supersedePlanStop(SESSION);
+    const acceptAfterA = sendFollowUp();
     await sendStop().take();
-    act(endStopA);
+    await acceptAfterA();
     expect(result.current).toBe(true);
     expect(usePlanStops.getState().requests[SESSION]).toMatchObject({ sent: true });
   });
 
-  it("keeps a Stop that began after a follow-up the transcript shows later", async () => {
+  it("keeps Stop B through Stop A's and an earlier follow-up's items arriving later", async () => {
     const entry = transcript();
     const { result } = renderStopping(true);
-    await sendStop().take();
-    act(() => entry.setState({ blocks: [STOP] }));
-    // A follow-up the session accepts ends Stop A; its transcript item comes later.
-    const endStopA = supersedePlanStop(SESSION);
-    act(endStopA);
-    const followUp = pendingSend("pend_1", "Keep the logs", true);
-    act(() => entry.setState({ pendingUserMessages: [followUp] }));
+    // Stop A and a follow-up are accepted before either item arrives.
+    await sendStop().take({ itemId: "stop_a" });
+    await sendFollowUp()();
     expect(result.current).toBe(false);
+    await sendStop().take({ itemId: "stop_b" });
+    expect(result.current).toBe(true);
 
-    // Stop B, while the transcript still ends in A.
-    await sendStop().take();
-    expect(result.current).toBe(true);
     const logs = userMessage("logs", "Keep the logs");
-    act(() => entry.setState({ blocks: [STOP, logs], pendingUserMessages: [] }));
+    act(() => entry.setState({ blocks: [stopMessage("stop_a")] }));
     expect(result.current).toBe(true);
-    // B's own message, then a later request.
-    const stopB = userMessage("stop_b", stopPlanMessage(null));
-    act(() => entry.setState({ blocks: [STOP, logs, stopB] }));
+    act(() => entry.setState({ blocks: [stopMessage("stop_a"), logs] }));
     expect(result.current).toBe(true);
-    act(() => entry.setState({ blocks: [STOP, logs, stopB, CONTINUE] }));
+    act(() => entry.setState({ blocks: [stopMessage("stop_a"), logs, stopMessage("stop_b")] }));
+    expect(result.current).toBe(true);
+    act(() =>
+      entry.setState({ blocks: [stopMessage("stop_a"), logs, stopMessage("stop_b"), CONTINUE] }),
+    );
     expect(result.current).toBe(false);
   });
 
-  it("ends a transcript's Stop once the session accepts a follow-up sent outside the chat", () => {
+  it("keeps a Stop that began while the transcript ended in an older stop message", async () => {
     const entry = transcript();
     entry.setState({ blocks: [STOP] });
     const { result } = renderStopping(true);
-    expect(result.current).toBe(true);
-
-    // A run row's Retry: no pending bubble, and its item comes later.
-    const endStop = supersedePlanStop(SESSION);
-    act(endStop);
+    // A composer follow-up the session accepted; its item comes later.
+    const accept = supersedePlanStop(SESSION);
+    act(() => {
+      accept();
+      entry.setState({ pendingUserMessages: [pendingSend("pend_1", "Keep the logs", true)] });
+    });
     expect(result.current).toBe(false);
+
+    await sendStop().take({ itemId: "stop_b" });
+    act(() =>
+      entry.setState({
+        blocks: [STOP, userMessage("logs", "Keep the logs")],
+        pendingUserMessages: [],
+      }),
+    );
+    expect(result.current).toBe(true);
   });
 
-  it("ends when the transcript shows a later request after the stop message, as from another tab", async () => {
+  it("ends when the transcript shows a request after the Stop's own message, as from another tab", async () => {
     const entry = transcript();
     const { result } = renderStopping(true);
-    // The delivery names no item, as a native session's doesn't.
-    await sendStop().take();
-    act(() => entry.setState({ blocks: [STOP] }));
+    await sendStop().take({ itemId: "stop" });
     act(() =>
       entry.setState({
         blocks: [STOP, userMessage("report", "[Message from session 9b8b]\nStopped my shells.")],
       }),
     );
-    expect(result.current).toBe(true);
-
-    // A transcript with no requests, as once its stream closes, isn't a later request.
-    act(() => entry.setState({ blocks: [] }));
     expect(result.current).toBe(true);
 
     // Background work keeps the session working throughout.
@@ -220,10 +229,47 @@ describe("usePlanStopping", () => {
     expect(usePlanStops.getState().requests[SESSION]).toBeUndefined();
   });
 
+  it("places a native Stop's message by the receipt its pending input gets", async () => {
+    const entry = transcript();
+    const { result } = renderStopping(true);
+    await sendStop().take({ pendingId: "pending_stop" });
+    act(() => entry.setState({ blocks: [STOP, CONTINUE] }));
+    // Until the receipt names its item, the transcript can't place the Stop.
+    expect(result.current).toBe(true);
+    act(() => notePlanStopReceipt(SESSION, "pending_stop", "stop"));
+    expect(result.current).toBe(false);
+
+    // A receipt that arrives before the delivery's response counts too.
+    act(() => {
+      entry.setState({ blocks: [] });
+      notePlanStopReceipt(SESSION, "pending_again", "again");
+    });
+    await sendStop().take({ pendingId: "pending_again" });
+    expect(usePlanStops.getState().requests[SESSION]).toMatchObject({ itemId: "again" });
+  });
+
+  it("doesn't take a Stop's own message for a stop once a follow-up ended it", async () => {
+    const entry = transcript();
+    const { result } = renderStopping(true);
+    await sendStop().take({ itemId: "stop_b" });
+    await sendFollowUp()();
+    act(() => entry.setState({ blocks: [stopMessage("stop_b")] }));
+    expect(result.current).toBe(false);
+
+    // A native Stop's message, once its receipt names it.
+    await sendStop().take({ pendingId: "pending_c" });
+    await sendFollowUp()();
+    act(() => {
+      notePlanStopReceipt(SESSION, "pending_c", "stop_c");
+      entry.setState({ blocks: [stopMessage("stop_b"), stopMessage("stop_c")] });
+    });
+    expect(result.current).toBe(false);
+  });
+
   it("follows the order the session took requests in, not when their sends were accepted", async () => {
     const entry = transcript();
     const { result } = renderStopping(true);
-    await sendStop().take();
+    await sendStop().take({ itemId: "stop" });
     act(() => entry.setState({ blocks: [STOP] }));
 
     // A follow-up sent before the Stop is accepted after it.
@@ -244,7 +290,7 @@ describe("usePlanStopping", () => {
   it("drops the Stop once no surface watches the session, which can't see it stop", async () => {
     const first = renderStopping(true);
     const second = renderStopping(true);
-    await sendStop().take();
+    await sendStop().take({ itemId: "stop" });
     first.unmount();
     expect(second.result.current).toBe(true);
     expect(usePlanStops.getState().requests[SESSION]).toMatchObject({ sent: true });
@@ -267,8 +313,19 @@ describe("usePlanStopping", () => {
     expect(result.current).toBe(false);
 
     // A new Stop is its own.
-    act(() => entry.setState({ blocks: [STOP, userMessage("again", stopPlanMessage(null))] }));
+    act(() => entry.setState({ blocks: [STOP, stopMessage("again")] }));
     expect(result.current).toBe(true);
+  });
+
+  it("ends a transcript's Stop once the session accepts a follow-up sent outside the chat", async () => {
+    const entry = transcript();
+    entry.setState({ blocks: [STOP] });
+    const { result } = renderStopping(true);
+    expect(result.current).toBe(true);
+
+    // A run row's Retry: no pending bubble, and its item comes later.
+    await sendFollowUp()();
+    expect(result.current).toBe(false);
   });
 
   it.each([
@@ -322,5 +379,24 @@ describe("latestStopRequest", () => {
       latestStopRequest([CONTINUE], [pendingSend("pend_2", stopPlanMessage(null), true)]),
     ).toBe("pend_2");
     expect(latestStopRequest([], [])).toBeUndefined();
+  });
+});
+
+describe("hasRequestAfter", () => {
+  it("finds a request from the user after the item, not a notice or a report", () => {
+    expect(hasRequestAfter([STOP], "stop")).toBe(false);
+    expect(hasRequestAfter([], "stop")).toBe(false);
+    expect(
+      hasRequestAfter(
+        [
+          STOP,
+          userMessage("notice", "[System: timer t1 fired]"),
+          userMessage("report", "[Message from session 9b8b]\nDone."),
+        ],
+        "stop",
+      ),
+    ).toBe(false);
+    expect(hasRequestAfter([STOP, slashCommand("cmd", "workflow")], "stop")).toBe(true);
+    expect(hasRequestAfter([CONTINUE, STOP], "stop")).toBe(false);
   });
 });

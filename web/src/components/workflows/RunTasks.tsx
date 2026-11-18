@@ -43,12 +43,13 @@ function useRunSession(sessionId: string, refreshKeys: RunRefreshKeys, runId: st
       setPending(false);
     }
   };
-  // Resolves to whether the session took the message.
+  // Resolves to the session's receipt, or null when it didn't take the message.
   const deliver = async (text: string) => {
-    if (!runId) return false;
+    if (!runId) return null;
     const result = await sendUserMessage(sessionId, text, runId);
-    if (result.denied) toast.error("A policy blocked the message.");
-    return !result.denied;
+    if (!result.denied) return result;
+    toast.error("A policy blocked the message.");
+    return null;
   };
   // Any other message the session takes ends the Stop in progress when it was sent.
   const post = async (text: string) => {

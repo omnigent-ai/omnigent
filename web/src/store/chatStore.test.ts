@@ -44,7 +44,7 @@ import {
 } from "@/lib/sessionsApi";
 import { SSE_STALL_TIMEOUT_MS } from "@/lib/sse";
 import { serializeReplyDraft, type StoredReplyDraft } from "@/lib/replyDraft";
-import { continuePlanMessage } from "@/lib/workflow";
+import { continuePlanMessage, stopPlanMessage } from "@/lib/workflow";
 import { trackPlanStop, usePlanStops } from "@/store/planStops";
 import {
   clearUnsentSends,
@@ -3638,7 +3638,7 @@ describe("chatStore — send (first-send ordering)", () => {
       abortController: new AbortController(),
       pendingUserMessages: [],
     });
-    await trackPlanStop("conv_existing", async () => true);
+    await trackPlanStop("conv_existing", async () => ({}));
     fetchMock.mockImplementation((input, init) => {
       if (String(input).endsWith("/v1/sessions/conv_existing/events")) {
         return mockResponse({ error: "boom" }, { ok: false, status: 500 });
@@ -3653,6 +3653,29 @@ describe("chatStore — send (first-send ordering)", () => {
     fetchMock.mockImplementation(defaultFetchHandler);
     await useChatStore.getState().send(continuePlanMessage(null), "agent_xyz");
     expect(usePlanStops.getState().requests.conv_existing).toBeUndefined();
+  });
+
+  it("places a native Stop's message once the session's receipt names its item", async () => {
+    onTestFinished(() => usePlanStops.setState({ requests: {}, settledStops: {} }));
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+      pendingUserMessages: [],
+    });
+    await trackPlanStop("conv_existing", async () => ({ pendingId: "pending_stop" }));
+    expect(usePlanStops.getState().requests.conv_existing).not.toHaveProperty("itemId");
+
+    handleSessionEvent({
+      type: "session_input_consumed",
+      itemId: "item_stop",
+      itemType: "message",
+      clearedPendingId: "pending_stop",
+      data: { role: "user", content: [{ type: "input_text", text: stopPlanMessage(null) }] },
+    });
+    expect(usePlanStops.getState().requests.conv_existing).toMatchObject({
+      sent: true,
+      itemId: "item_stop",
+    });
   });
 
   it("keeps a plan's Stop when a message sent before it lands after it", async () => {
@@ -3674,7 +3697,7 @@ describe("chatStore — send (first-send ordering)", () => {
 
     const sending = useChatStore.getState().send("Keep the logs", "agent_xyz");
     await vi.waitFor(() => expect(landMessage).toBeDefined());
-    await trackPlanStop("conv_existing", async () => true);
+    await trackPlanStop("conv_existing", async () => ({}));
     landMessage!();
     await sending;
     expect(usePlanStops.getState().requests.conv_existing).toMatchObject({ sent: true });
@@ -5596,7 +5619,7 @@ describe("chatStore — sendSlashCommand", () => {
       conversationId: "conv_existing",
       abortController: new AbortController(),
     });
-    await trackPlanStop("conv_existing", async () => true);
+    await trackPlanStop("conv_existing", async () => ({}));
     fetchMock.mockImplementation((input, init) => {
       if (String(input).endsWith("/v1/sessions/conv_existing/events")) {
         return mockResponse({ error: "boom" }, { ok: false, status: 500 });

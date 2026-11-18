@@ -116,7 +116,7 @@ import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSe
 import { applyJournalEntry } from "@/hooks/useSessionJournal";
 import { isFirstPlan } from "@/lib/sessionJournal";
 import { showTasksTabBesideChat } from "@/store/sessionTasksActions";
-import { supersedePlanStop } from "@/store/planStops";
+import { notePlanStopReceipt, supersedePlanStop } from "@/store/planStops";
 import { noteSessionStreamClosed, noteSessionStreamOpen } from "@/lib/sessionStreamSignals";
 import { invalidateAgentCosts } from "@/hooks/useAgentCosts";
 import { sessionItemsQueryKey } from "@/hooks/useSessionItems";
@@ -9308,6 +9308,10 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
     }
     case "session_input_consumed": {
       applyToConversation({ startupPending: false });
+      // A native Stop's receipt places its message in the transcript.
+      if (sourceConversationId && event.clearedPendingId) {
+        notePlanStopReceipt(sourceConversationId, event.clearedPendingId, event.itemId);
+      }
       // A retry from another client may have delivered an undelivered message: clear
       // it now when the receipt names it (native ones do), and re-read either way,
       // superseding any failure read still in flight from before the delivery.
