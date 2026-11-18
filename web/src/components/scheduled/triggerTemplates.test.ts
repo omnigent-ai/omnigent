@@ -1520,6 +1520,10 @@ describe("renderTriggerPrompt", () => {
       expect(prompt).toContain(
         "Each run:\n1. If your tools load on demand, load every tool this run needs in one tool search before your first call, naming them all:",
       );
+      // Loading get_info up front avoids a second search for a blank worker agent's ID.
+      expect(prompt).toContain(
+        "each sys_session tool the steps below use, and sys_session_get_info, which returns your session and agent IDs.",
+      );
       // The creation call stays the only sys_session_create the saved-prompt parser reads.
       expect(readTriggerWorkerSettings(prompt)).not.toBeNull();
     },
