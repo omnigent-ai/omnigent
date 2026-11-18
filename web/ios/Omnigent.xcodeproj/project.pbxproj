@@ -31,6 +31,7 @@
 		B1000000000000000000000E /* AppIcon.icon in Resources */ = {isa = PBXBuildFile; fileRef = A1000000000000000000000E /* AppIcon.icon */; };
 		B10000000000000000000013 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000013 /* PrivacyInfo.xcprivacy */; };
 		B20000000000000000000001 /* ServerURLTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000001 /* ServerURLTests.swift */; };
+		B20000000000000000000108 /* WelcomeBlobBackgroundTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000108 /* WelcomeBlobBackgroundTests.swift */; };
 		B20000000000000000000002 /* SettingsStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000002 /* SettingsStoreTests.swift */; };
 		B20000000000000000000008 /* WorkspaceChromeScriptTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000008 /* WorkspaceChromeScriptTests.swift */; };
 		B20000000000000000000003 /* WorkspaceURLExpanderTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000003 /* WorkspaceURLExpanderTests.swift */; };
@@ -124,6 +125,7 @@
 		A10000000000000000000013 /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; lastKnownFileType = text.xml; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
 		A10000000000000000000018 /* OidcLoginManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OidcLoginManager.swift; sourceTree = "<group>"; };
 		A20000000000000000000001 /* ServerURLTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerURLTests.swift; sourceTree = "<group>"; };
+		A20000000000000000000108 /* WelcomeBlobBackgroundTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WelcomeBlobBackgroundTests.swift; sourceTree = "<group>"; };
 		A20000000000000000000002 /* SettingsStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsStoreTests.swift; sourceTree = "<group>"; };
 		A20000000000000000000003 /* WorkspaceURLExpanderTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceURLExpanderTests.swift; sourceTree = "<group>"; };
 		A20000000000000000000004 /* DeepLinkTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeepLinkTests.swift; sourceTree = "<group>"; };
@@ -274,6 +276,7 @@
 			isa = PBXGroup;
 			children = (
 				A20000000000000000000001 /* ServerURLTests.swift */,
+				A20000000000000000000108 /* WelcomeBlobBackgroundTests.swift */,
 				A20000000000000000000002 /* SettingsStoreTests.swift */,
 				A20000000000000000000003 /* WorkspaceURLExpanderTests.swift */,
 				A20000000000000000000004 /* DeepLinkTests.swift */,
@@ -498,6 +501,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				B20000000000000000000001 /* ServerURLTests.swift in Sources */,
+				B20000000000000000000108 /* WelcomeBlobBackgroundTests.swift in Sources */,
 				B20000000000000000000002 /* SettingsStoreTests.swift in Sources */,
 				B20000000000000000000003 /* WorkspaceURLExpanderTests.swift in Sources */,
 				B20000000000000000000004 /* DeepLinkTests.swift in Sources */,

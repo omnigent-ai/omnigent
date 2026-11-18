@@ -14,6 +14,7 @@ struct ConnectView: View {
   @State private var infoLink: InfoLink?
   @FocusState private var isFieldFocused: Bool
   @Environment(\.accessibilityReduceMotion) private var reduceMotion
+  @Environment(\.verticalSizeClass) private var verticalSizeClass
 
   init(prefill: String?, error: String?, onConnect: @escaping (URL) -> Void) {
     self.prefill = prefill
@@ -28,7 +29,7 @@ struct ConnectView: View {
       let topInset = proxy.safeAreaInsets.top
       VStack(spacing: 0) {
         heroBand(topInset: topInset)
-          .frame(height: topInset + (isFieldFocused ? collapsedBandHeight : expandedBandHeight))
+          .frame(height: topInset + (isBandCollapsed ? collapsedBandHeight : expandedBandHeight))
           .contentShape(Rectangle())
           .onTapGesture { isFieldFocused = false }
 
@@ -41,7 +42,7 @@ struct ConnectView: View {
         }
         .scrollDismissesKeyboard(.interactively)
       }
-      .ignoresSafeArea(.container, edges: .top)
+      .ignoresSafeArea(.container, edges: [.top, .horizontal])
       .animation(
         reduceMotion ? nil : .timingCurve(0.22, 1, 0.36, 1, duration: 0.5), value: isFieldFocused)
     }
@@ -68,7 +69,7 @@ struct ConnectView: View {
           .scaledToFit()
           .frame(width: 56, height: 56)
           .padding(.top, topInset + (expandedBandHeight - 56) / 2)
-          .opacity(isFieldFocused ? 0 : 1)
+          .opacity(isBandCollapsed ? 0 : 1)
           .accessibilityHidden(true)
       }
       .clipped()
@@ -77,6 +78,11 @@ struct ConnectView: View {
           stops: [.init(color: .black, location: 0.7), .init(color: .clear, location: 1)],
           startPoint: .top, endPoint: .bottom)
       )
+  }
+
+  // Landscape iPhones lack the height for the full band, so it stays collapsed there.
+  private var isBandCollapsed: Bool {
+    isFieldFocused || verticalSizeClass == .compact
   }
 
   private var form: some View {

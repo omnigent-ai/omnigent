@@ -79,7 +79,7 @@ struct WelcomeBlobBackground: View {
   private static let darkBase = Color(red: 0.051, green: 0.051, blue: 0.059)
 }
 
-private struct WelcomeBlob: Identifiable {
+struct WelcomeBlob: Identifiable {
   struct Pose {
     var dx: CGFloat
     var dy: CGFloat
