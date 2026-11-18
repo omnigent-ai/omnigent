@@ -66,7 +66,8 @@ def test_move_session_into_project_regroups_sidebar_row(
         submenu = page.get_by_test_id("move-to-project")
         expect(submenu).to_be_visible()
         submenu.hover()
-        page.get_by_role("menuitem", name="Project", exact=True).hover()
+        if submenu.inner_text() == "Move session":
+            page.get_by_role("menuitem", name="Project", exact=True).hover()
         target = page.get_by_role("menuitem", name=project_name)
         expect(target).to_be_visible()
         target.click()
