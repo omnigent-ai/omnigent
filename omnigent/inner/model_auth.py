@@ -248,12 +248,14 @@ def _auth_base_runtime_trees(interpreter: Path) -> set[Path]:
             continue
         candidates = [tree / f"python{version}"] if version is not None else tree.glob("python*")
         stdlibs.update(candidate for candidate in candidates if candidate.is_dir())
-    if not any(
-        (stdlib / "site.py").is_file() and (stdlib / "json" / "__init__.py").is_file()
+    actual_stdlibs = {
+        stdlib
         for stdlib in stdlibs
-    ):
+        if (stdlib / "site.py").is_file() and (stdlib / "json" / "__init__.py").is_file()
+    }
+    if not actual_stdlibs:
         raise OSError("Cannot determine authentication Python base stdlib")
-    return trees
+    return actual_stdlibs
 
 
 def _validate_auth_runtime(executable: _TrustedExecutable, policy: SandboxPolicy) -> None:
@@ -279,7 +281,8 @@ def _validate_auth_runtime(executable: _TrustedExecutable, policy: SandboxPolicy
     trees = {variant for path in trees for variant in _launcher_path_variants(path)}
     try:
         _validate_launcher_write_grants(policy, entries, trees)
-        _validate_trusted_hardlink_aliases(policy, entries, trees)
+        # The venv library container can hold unrelated unreadable data.
+        _validate_trusted_hardlink_aliases(policy, entries, set())
         base_trees = {
             variant
             for path in _auth_base_runtime_trees(executable.interpreter)

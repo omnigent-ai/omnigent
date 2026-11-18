@@ -467,6 +467,9 @@ def test_launcher_allows_child_workspace_under_system_prefix(
     runtime_layout: SimpleNamespace, grant_kind: str
 ) -> None:
     layout = runtime_layout
+    unrelated = layout.system / "lib" / "ssl" / "private"
+    unrelated.mkdir(parents=True)
+    unrelated.chmod(0)
     policy = _policy()
     # A broad system prefix is a protected entry, not an all-descendants ban.
     setattr(
@@ -474,8 +477,11 @@ def test_launcher_allows_child_workspace_under_system_prefix(
         grant_kind,
         [layout.system / "workspace" / ".venv", layout.system / "library-project"],
     )
-    path = sb.create_exec_launcher("/bin/true", policy)
-    Path(path).unlink()
+    try:
+        path = sb.create_exec_launcher("/bin/true", policy)
+        Path(path).unlink()
+    finally:
+        unrelated.chmod(0o700)
 
 
 @pytest.mark.parametrize("backend,active", [("none", False), ("linux_bwrap", False)])

@@ -2044,6 +2044,8 @@ def _validate_launcher_runtime(sandbox: SandboxPolicy) -> None:
     )
     entries.add(project_root)
     trees = set(project_roots)
+    # Broad paths reject ancestor write grants; scan only code Python may load.
+    startup_trees: set[Path] = set()
     for prefix in list(entries):
         entries.add(prefix / "pyvenv.cfg")
         trees.update(prefix / name for name in ("lib", "lib64", "Lib", "DLLs"))
@@ -2054,14 +2056,24 @@ def _validate_launcher_runtime(sandbox: SandboxPolicy) -> None:
         trees.add(executable.parent.parent / "lib")
 
     paths = sysconfig.get_paths()
-    trees.update(Path(paths[key]) for key in ("stdlib", "platstdlib", "purelib", "platlib"))
-    trees.update(Path(path) for path in site.getsitepackages())
+    startup_trees.update(
+        Path(paths[key]) for key in ("stdlib", "platstdlib", "purelib", "platlib")
+    )
+    startup_trees.update(Path(path) for path in site.getsitepackages())
+    python_library_name = Path(paths["stdlib"]).name
+    for executable in _launcher_path_variants(Path(sys.executable)):
+        runtime_root = executable.parent.parent
+        startup_trees.update(
+            runtime_root / library / python_library_name / "site-packages"
+            for library in ("lib", "lib64")
+        )
     # copy_on_write imports _proc (and psutil) before the spawn-time wrap.
     dependency = importlib.util.find_spec("psutil")
     if dependency is None or dependency.origin is None:
         raise OSError("Cannot validate sandbox launcher runtime: psutil has no import path")
     entries.add(Path(dependency.origin))
-    trees.update(Path(path) for path in dependency.submodule_search_locations or [])
+    startup_trees.update(Path(path) for path in dependency.submodule_search_locations or [])
+    trees.update(startup_trees)
 
     trusted_entries = {variant for path in entries for variant in _launcher_path_variants(path)}
     trusted_trees = {variant for path in trees for variant in _launcher_path_variants(path)}
@@ -2071,9 +2083,9 @@ def _validate_launcher_runtime(sandbox: SandboxPolicy) -> None:
     inode_entries = trusted_entries | {
         variant for path in import_entries for variant in _launcher_path_variants(path)
     }
-    inode_trees = (trusted_trees - project_roots) | {
-        variant for path in import_trees for variant in _launcher_path_variants(path)
-    }
+    inode_trees = {
+        variant for path in startup_trees for variant in _launcher_path_variants(path)
+    } | {variant for path in import_trees for variant in _launcher_path_variants(path)}
     _validate_trusted_hardlink_aliases(sandbox, inode_entries, inode_trees)
     # The parent may add workspaces to sys.path. Only isolated startup roots,
     # including .pth additions, are imported by the launcher before containment.

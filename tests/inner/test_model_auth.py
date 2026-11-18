@@ -136,6 +136,16 @@ def test_auth_runtime_rejects_copied_interpreter_base_stdlib_alias_before_probe(
         _validate_auth_runtime(pinned, policy)
     probe.assert_not_called()
 
+    alias.unlink()
+    unrelated = base_bin.parent / "lib" / "ssl" / "private"
+    unrelated.mkdir(parents=True)
+    unrelated.chmod(0)
+    monkeypatch.setattr(sandbox, "_isolated_launcher_import_roots", lambda _python: ())
+    try:
+        _validate_auth_runtime(pinned, policy)
+    finally:
+        unrelated.chmod(0o700)
+
 
 def test_auth_base_runtime_accepts_venv_without_optional_version(tmp_path: Path) -> None:
     base_bin = tmp_path / "base" / "bin"
@@ -149,7 +159,8 @@ def test_auth_base_runtime_accepts_venv_without_optional_version(tmp_path: Path)
     interpreter.write_bytes(b"\x7fELF-disposable-runtime")
     (interpreter.parent.parent / "pyvenv.cfg").write_text(f"home = {base_bin}\n")
 
-    assert base_bin.parent / "lib" in _auth_base_runtime_trees(interpreter)
+    roots = _auth_base_runtime_trees(interpreter)
+    assert roots and all(path.name == stdlib.name and path.samefile(stdlib) for path in roots)
 
 
 @pytest.mark.parametrize(
