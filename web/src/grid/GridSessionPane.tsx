@@ -12,7 +12,6 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useDraggable, useDroppable } from "@dnd-kit/core";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled } from "@/lib/capabilities";
-import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 import { Maximize2Icon, XIcon } from "lucide-react";
 import { SideChatPane } from "@/components/chat/SideChatPane";
@@ -43,10 +42,8 @@ import {
   nativeCodingAgentForHarness,
   nativeCodingAgentForSubagentWrapper,
 } from "@/lib/nativeCodingAgents";
-import { permissionChip, permissionChipKind } from "@/lib/permissionModeCycle";
 import { isOwnerLevel } from "@/lib/permissionsApi";
 import type { Session } from "@/lib/types";
-import { useChatStore } from "@/store/chatStore";
 import { retrySession } from "@/lib/sessionsApi";
 import { readTranscriptViewDefault } from "@/lib/transcriptViewPreferences";
 import { MainTerminalView } from "@/shell/MainTerminalView";
@@ -77,6 +74,7 @@ import { revealFolderInFilesPanel } from "@/shell/FilesPanel";
 import { selectPullRequestInPanel } from "@/shell/PullRequestPanel";
 import { citedFilePosition } from "@/shell/filePositionState";
 import { useGridSessions } from "./GridSessionsContext";
+import { useGridPermissionControl, type GridPermissionControl } from "./useGridPermissionControl";
 
 export type GridWorkspacePanelProps = Pick<
   ComponentProps<typeof WorkspacePanel>,
@@ -141,6 +139,8 @@ export function GridSessionPane({
     turnActive: state.status === "streaming",
     launchedAt: state.runnerLaunchedAt,
   });
+  const unreachable = liveness.kind === "host_offline" || liveness.kind === "local_stranded";
+  const permission = useGridPermissionControl(session, permissionLevel, unreachable);
   const wrapper = session?.labels?.["omnigent.wrapper"];
   const terminalFirst = session?.labels?.["omnigent.ui"] === "terminal";
   const rootSessionId = useRootSessionId(sessionId, session?.parentSessionId);
@@ -458,16 +458,11 @@ export function GridSessionPane({
                       <>
                         {/* Status only; switching hosts stays in the full-screen view. */}
                         <HostBadge sessionId={sessionId} appearance="composer" readOnly />
-                        <GridPermissionPicker
-                          session={session}
-                          permissionLevel={permissionLevel}
-                          unreachable={
-                            liveness.kind === "host_offline" || liveness.kind === "local_stranded"
-                          }
-                        />
+                        <GridPermissionPicker permission={permission} />
                       </>
                     ),
                     trailing: session && <GridHarnessStatus session={session} />,
+                    cyclePermissionMode: permission.cycle,
                   }}
                 />
               </RenderErrorBoundary>
@@ -604,43 +599,21 @@ export function GridSessionPane({
 }
 
 /** The cell session's permission mode; its owner can switch it as in the main composer. */
-function GridPermissionPicker({
-  session,
-  permissionLevel,
-  unreachable,
-}: {
-  session: Session;
-  permissionLevel: number | null;
-  /** Its host is offline and a message can't wake it, as in the main composer. */
-  unreachable: boolean;
-}) {
-  const state = useConversationEntryState(session.id);
-  const [busy, setBusy] = useState(false);
-  const kind = permissionChipKind(session);
-  if (kind === null) return null;
-  const chip = permissionChip(kind, state.claudePermissionMode, state.codexApprovalMode);
-  const owner = isOwnerLevel(permissionLevel);
+function GridPermissionPicker({ permission }: { permission: GridPermissionControl }) {
+  const { chip } = permission;
+  if (chip === null) return null;
   return (
     <ComposerPermissionPicker
       label="Permission mode"
       value={chip.label || "Permission mode"}
-      harness={state.sessionHarness}
+      harness={permission.harness}
       selectedValue={chip.value}
       options={chip.options}
-      disabled={!owner || unreachable || busy}
-      disabledReason={owner ? undefined : "Only the session owner can change the permission mode"}
-      onSelect={(mode) => {
-        const store = useChatStore.getState();
-        setBusy(true);
-        (kind === "codex"
-          ? store.setCodexApprovalMode(mode, session.id)
-          : store.setClaudePermissionMode(mode, session.id)
-        )
-          .catch((error: unknown) =>
-            toast.error(error instanceof Error ? error.message : "Unable to change permissions"),
-          )
-          .finally(() => setBusy(false));
-      }}
+      disabled={!permission.owner || permission.unreachable || permission.busy}
+      disabledReason={
+        permission.owner ? undefined : "Only the session owner can change the permission mode"
+      }
+      onSelect={permission.select}
     />
   );
 }

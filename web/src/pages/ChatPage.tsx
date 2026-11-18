@@ -321,6 +321,7 @@ import { isCodexNativeSession } from "@/lib/codexPlanMode";
 import {
   isPermissionModeCycleKey,
   nextCycledPermissionMode,
+  nextPermissionModePress,
   permissionChip,
   type PermissionChipKind,
 } from "@/lib/permissionModeCycle";
@@ -2924,14 +2925,12 @@ function ComposerImpl(
     // Read the store, not the render: a change may have landed since the last render.
     const selected = currentPermissionMode();
     if (!isSwitchableMode(selected)) return false;
-    const cursor = cycleCursorRef.current;
-    const resume = cursor?.sessionId === sessionId && cursor.from === selected ? cursor.past : null;
-    const resumed =
-      resume === null
-        ? null
-        : nextCycledPermissionMode(permissionOptions, resume, new Set([selected]));
-    // With nothing else to move to, retry the failed mode.
-    const next = resumed ?? nextCycledPermissionMode(permissionOptions, selected);
+    const next = nextPermissionModePress(
+      permissionOptions,
+      selected,
+      sessionId,
+      cycleCursorRef.current,
+    );
     if (next === null) return false;
     void changePermission(next).then((landed) => {
       if (!landed && useChatStore.getState().conversationId === sessionId)
