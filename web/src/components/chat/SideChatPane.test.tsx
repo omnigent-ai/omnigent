@@ -2032,7 +2032,7 @@ describe("grid cell composer shares its session's draft", () => {
 
   it("offers Send, not Interrupt, for a cell's draft while its session works", () => {
     writeAlwaysSteer(false);
-    // An observed streaming response makes the interrupt ready, so Escape would reach it.
+    // The streaming response makes Interrupt ready; a grid cell's Escape never interrupts.
     conversationRegistry.acquire(childId).setState({
       sessionStatus: "running",
       activeResponse: { responseId: "codex_turn_side", state: "streaming", error: null },
@@ -2048,6 +2048,8 @@ describe("grid cell composer shares its session's draft", () => {
     expect(input).toHaveValue("Keep going");
 
     fireEvent.change(input, { target: { value: "" } });
+    fireEvent.keyDown(input, { key: "Escape" });
+    expect(sessionsApi.interrupt).not.toHaveBeenCalled();
     expect(screen.getByRole("button", { name: "Interrupt session" })).toBeEnabled();
   });
 
