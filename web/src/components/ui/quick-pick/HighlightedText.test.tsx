@@ -64,17 +64,17 @@ describe("HighlightedText", () => {
       { start: 5, end: 99 },
       { start: 40, end: 50 },
     ]);
-    expect(found.map((mark) => mark.textContent)).toEqual(["abc", "d", "f"]);
+    expect(found.map((mark) => mark.textContent)).toEqual(["abcd", "f"]);
     expect(container.textContent).toBe("abcdef");
   });
 
   it("keeps surrogate pairs and combining marks whole when ranges cover them", () => {
-    const text = "🚀 café";
+    const text = "🚀 cafe\u0301";
     const { container, marks: found } = marks(text, [
       { start: 0, end: 2 },
       { start: 3, end: 8 },
     ]);
-    expect(found.map((mark) => mark.textContent)).toEqual(["🚀", "café"]);
+    expect(found.map((mark) => mark.textContent)).toEqual(["🚀", "cafe\u0301"]);
     expect(container.textContent).toBe(text);
   });
 });

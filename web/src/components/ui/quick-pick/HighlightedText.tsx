@@ -2,7 +2,7 @@ import type { ReactNode } from "react";
 
 import { cn } from "@/lib/utils";
 
-import { type MatchRange, wordCoalescedRanges } from "./match";
+import { type MatchRange, mergeRanges, wordCoalescedRanges } from "./match";
 
 /**
  * How matched text stands out:
@@ -18,7 +18,7 @@ const HIGHLIGHT_CLASS: Record<MatchHighlight, string> = {
     "font-bold text-foreground underline decoration-muted-foreground decoration-1 underline-offset-[3px]",
 };
 
-/** `text` with each matched range marked; ranges are sorted, disjoint UTF-16 offsets. */
+/** `text` with each matched range marked. Ranges are UTF-16 offsets and should not split a surrogate pair. */
 export function HighlightedText({
   text,
   ranges,
@@ -30,7 +30,8 @@ export function HighlightedText({
 }) {
   if (ranges.length === 0) return text;
   // The underline reads as words; the default highlight stays on the exact characters.
-  const marked = highlight === "underline" ? wordCoalescedRanges(text, ranges) : ranges;
+  const marked =
+    highlight === "underline" ? wordCoalescedRanges(text, ranges) : mergeRanges(ranges);
   const parts: ReactNode[] = [];
   let cursor = 0;
   for (const range of marked) {

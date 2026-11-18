@@ -547,10 +547,11 @@ export function occurrenceRanges(query: string, text: string): MatchRange[] {
   const target = foldText(text);
   const ranges: MatchRange[] = [];
   for (const token of tokenizeQuery(query)) {
+    // Step one character at a time so overlapping occurrences all count.
     let first = contiguousStart(token, target.values);
     while (first !== -1) {
       ranges.push(sourceRange(target, first, first + token.length - 1));
-      first = contiguousStart(token, target.values, first + token.length);
+      first = contiguousStart(token, target.values, first + 1);
     }
   }
   return mergeRanges(ranges);

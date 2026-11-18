@@ -366,9 +366,9 @@ describe("occurrenceRanges", () => {
     ]);
   });
 
-  it("merges overlapping tokens and steps past each occurrence", () => {
+  it("merges overlapping tokens and counts overlapping occurrences", () => {
     expect(occurrenceRanges("ab bc", "abc")).toEqual([{ start: 0, end: 3 }]);
-    expect(occurrenceRanges("aa", "aaaaa")).toEqual([{ start: 0, end: 4 }]);
+    expect(occurrenceRanges("aa", "aaaaa")).toEqual([{ start: 0, end: 5 }]);
   });
 
   it("reports UTF-16 offsets past astral and decomposed characters", () => {
