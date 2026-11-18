@@ -132,17 +132,14 @@ async def _runner(
     bundle: Path,
     *,
     override: str | None = None,
+    omit_harness: bool = False,
 ) -> AsyncIterator[tuple[httpx.AsyncClient, TerminalRegistry, SessionResourceRegistry]]:
     async def snapshot(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/v1/sessions/conv_test"
-        return httpx.Response(
-            200,
-            json={
-                "id": "conv_test",
-                "agent_id": "agent_test",
-                "harness_override": override,
-            },
-        )
+        body = {"id": "conv_test", "agent_id": "agent_test"}
+        if not omit_harness:
+            body["harness"] = override if override is not None else spec.executor.harness_kind
+        return httpx.Response(200, json=body)
 
     async def resolve(agent_id: str, session_id: str) -> ResolvedSpec:
         assert (agent_id, session_id) == ("agent_test", "conv_test")
@@ -343,16 +340,24 @@ async def test_rest_terminal_cold_harness_override_keeps_bundle_and_credentials_
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("override", [None, "auto", "codex"])
+@pytest.mark.parametrize(
+    ("override", "omit_harness"),
+    [(None, False), (None, True), ("auto", False), ("codex", False)],
+)
 async def test_rest_terminal_effective_harness_controls_model_access(
     tmp_path: Path,
     processes: _TerminalProcesses,
     provider: None,
     bundle: Path,
     override: str | None,
+    omit_harness: bool,
 ) -> None:
     spec = _agent(tmp_path / "workspace")
-    async with _runner(spec, bundle, override=override) as (client, _, _resources):
+    async with _runner(spec, bundle, override=override, omit_harness=omit_harness) as (
+        client,
+        _,
+        _resources,
+    ):
         response = await client.post(
             "/v1/sessions/conv_test/resources/terminals",
             json={"terminal": "shell", "session_key": "main"},
@@ -438,14 +443,21 @@ async def test_rest_terminal_without_os_env_keeps_unsandboxed_default(
 
 
 @pytest.mark.asyncio
-async def test_rest_terminal_own_policy_rejects_original_bundle_grants(
+@pytest.mark.parametrize(
+    ("declared_harness", "effective_harness", "rejects"),
+    [("codex", "claude-sdk", True), ("claude-sdk", "codex", False)],
+)
+async def test_rest_terminal_own_policy_follows_effective_harness_for_bundle_grants(
     tmp_path: Path,
     processes: _TerminalProcesses,
     provider: None,
     bundle: Path,
+    declared_harness: str,
+    effective_harness: str,
+    rejects: bool,
 ) -> None:
     workspace = tmp_path / "workspace"
-    spec = _agent(workspace, harness="codex")
+    spec = _agent(workspace, harness=declared_harness)
     terminal_env = OSEnvSpec(
         type="caller_process",
         cwd=str(workspace),
@@ -454,21 +466,29 @@ async def test_rest_terminal_own_policy_rejects_original_bundle_grants(
     assert terminal_env.sandbox is not None
     terminal_env.sandbox.read_paths = [str(bundle)]
     spec.terminals = {"shell": TerminalEnvSpec(command="bash", os_env=terminal_env)}
-    # The SDK policy is safe; only this terminal's independent policy exposes the bundle.
+    # The terminal's independent policy exposes the credential-bearing bundle.
     assert spec.os_env is not None and spec.os_env.sandbox is not None
     assert spec.os_env.sandbox.read_paths == []
-    async with _runner(spec, bundle, override="claude-sdk") as (client, terminals, resources):
+    async with _runner(spec, bundle, override=effective_harness) as (client, terminals, resources):
         response = await client.post(
             "/v1/sessions/conv_test/resources/terminals",
             json={"terminal": "shell", "session_key": "main"},
         )
-        assert response.status_code == 500, response.text
-        assert response.json()["error"]["code"] == "terminal_launch_failed"
-        assert not processes.launched
-        assert len(processes.created) == len(processes.closed) == 1
-        assert terminals.list_for_conversation("conv_test") == []
-        assert not resources._terminal_lifecycles
-        assert "literal-bundle-secret" not in response.text
+        if rejects:
+            assert response.status_code == 500, response.text
+            assert response.json()["error"]["code"] == "terminal_launch_failed"
+            assert not processes.launched
+            assert len(processes.created) == len(processes.closed) == 1
+            assert terminals.list_for_conversation("conv_test") == []
+            assert not resources._terminal_lifecycles
+            assert "literal-bundle-secret" not in response.text
+        else:
+            assert response.status_code == 200, response.text
+            instance = terminals.get("conv_test", "shell", "main")
+            assert instance is not None and instance.model_access is None
+            assert instance.sandbox_policy is not None
+            assert bundle in instance.sandbox_policy.read_roots
+            assert len(processes.launched) == 1
 
 
 @pytest.mark.asyncio

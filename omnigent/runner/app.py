@@ -720,8 +720,8 @@ class _SessionSnapshot:
         a rebuilt work entry so wake suppression keyed on the child's
         ownership survives a reconnect / restart. ``None`` when unlabelled /
         the fetch failed.
-    :param harness_override: Stored session routing choice, retained for
-        resource launches before the first turn after reconnect.
+    :param harness: Server-reported effective harness, or the initialization
+        envelope's override, for resource launches after reconnect.
     """
 
     ok: bool
@@ -733,7 +733,7 @@ class _SessionSnapshot:
     parent_session_id: str | None = None
     agent_name: str | None = None
     wrapper_label: str | None = None
-    harness_override: str | None = None
+    harness: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2655,7 +2655,7 @@ def create_runner_app(
             parent_session_id: str | None = None
             agent_name: str | None = None
             wrapper_label: str | None = None
-            harness_override: str | None = None
+            harness: str | None = None
             try:
                 resp = await server_client.get(
                     f"/v1/sessions/{session_id}", params=_SESSION_METADATA_PARAMS
@@ -2680,9 +2680,9 @@ def create_runner_app(
                     if isinstance(raw_agent_name, str) and raw_agent_name:
                         agent_name = raw_agent_name
                     wrapper_label = wrapper_label_from_labels(body.get("labels"))
-                    raw_harness = body.get("harness_override")
+                    raw_harness = body.get("harness")
                     if isinstance(raw_harness, str) and raw_harness != "auto":
-                        harness_override = raw_harness
+                        harness = raw_harness
             except Exception:  # noqa: BLE001 — best-effort; created_at falls back to wall time
                 pass
             snapshot = _SessionSnapshot(
@@ -2695,7 +2695,7 @@ def create_runner_app(
                 parent_session_id=parent_session_id,
                 agent_name=agent_name,
                 wrapper_label=wrapper_label,
-                harness_override=harness_override,
+                harness=harness,
             )
             if snapshot.ok and snapshot.agent_id is not None:
                 if _session_cache_generation_is_current(session_id, generation):
@@ -2787,7 +2787,7 @@ def create_runner_app(
             sub_agent_name=envelope.sub_agent_name,
             parent_session_id=snapshot.parent_session_id,
             wrapper_label=wrapper_label_from_labels(snapshot.labels),
-            harness_override=snapshot.harness_override,
+            harness=snapshot.harness_override,
         )
         _session_start_cache[session_id] = float(snapshot.created_at)
         _session_workspace_cache[session_id] = snapshot.workspace
@@ -4285,7 +4285,7 @@ def create_runner_app(
         # the parent inbox (the native path that owes it never ran).
         snapshot = _session_snapshot_cache.get(conv_id)
         override = _session_harness_overrides.get(conv_id) or (
-            snapshot.harness_override if snapshot is not None else None
+            snapshot.harness if snapshot is not None else None
         )
         if override and override != "auto":
             return canonicalize_harness(override) or override
