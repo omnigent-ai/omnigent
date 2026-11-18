@@ -317,6 +317,41 @@ def _reference_info(root: str, reference: PullRequestRef) -> dict[str, Any]:
         }
 
 
+def _summary_info(
+    root: str,
+    reference: PullRequestRef,
+    entries: list[SessionPullRequest],
+    request_deadline: float,
+) -> dict[str, Any]:
+    """The tracked GitHub PRs' states alone, for the server's lists.
+
+    Carries no ``prs`` or ``tracking_available``, so the server keeps its tracked
+    list as is. ``pr`` is ``None`` when GitHub could not say, and the server then
+    keeps the state it has; ``pr_states`` holds the other PRs GitHub could read.
+    """
+    # github_pr_state imports github_resource, which imports this module at load time.
+    from omnigent.runner import github_pr_state
+
+    selected = github_pr_state.reference_state(root, reference)
+    states: list[dict[str, Any]] = []
+    for entry in entries:
+        if entry.url == reference.url:
+            continue
+        if time.monotonic() >= request_deadline:
+            break  # The rest keep their stored states until the next refresh.
+        state = github_pr_state.reference_state(root, entry)
+        if state is not None:
+            states.append(state)
+    return {
+        "object": "session.github.info",
+        "available": True,
+        "provider": reference.provider,
+        "selected_pr_url": reference.url,
+        "pr": selected,
+        "pr_states": states,
+    }
+
+
 def _discovery_info(root: str, resolution: ProviderResolution) -> dict[str, Any]:
     try:
         return _workspace_info(root, resolution)
@@ -546,6 +581,7 @@ def pr_info(
     *,
     session_id: str | None = None,
     pr_url: str | None = None,
+    summary: bool = False,
 ) -> dict[str, Any]:
     """Read the selected session PR and discover untracked providers from all remotes.
 
@@ -553,6 +589,10 @@ def pr_info(
     :param session_id: Session whose tracked PRs to list; ``None`` reads only
         the workspace branch's PR.
     :param pr_url: The selected PR, which must be tracked by the session.
+    :param summary: Read only the tracked GitHub
+        PRs' states, draft flags and titles, skipping discovery and the tracked
+        PRs' list. Sessions tracking no PR, or a PR on another provider, get the
+        full read.
     :returns: A ``session.github.info`` payload.
     """
     if session_id is None:
@@ -569,6 +609,12 @@ def pr_info(
     reference = (
         _selected_pr(session_id, default_url) if default_url else entries[0] if entries else None
     )
+    if (
+        summary
+        and reference is not None
+        and all(entry.provider == "github" for entry in [reference, *entries])
+    ):
+        return _summary_info(root, reference, entries, request_deadline)
     tracked_providers = {entry.provider for entry in entries}
     if reference is not None:
         tracked_providers.add(reference.provider)

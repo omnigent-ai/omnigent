@@ -518,6 +518,23 @@ export function computePullRequestPollInterval(
   return pr.checks.pending > 0 || pr.checks.total === 0 ? PULL_REQUEST_POLL_MS : false;
 }
 
+/**
+ * The panel's poll. A session whose PRs the
+ * server tracks polls every 10 s in the states
+ * {@link computePullRequestPollInterval} polls. An open PR whose checks
+ * settled still gets pushes, reviews and merges from outside the session, so
+ * it keeps polling at the list cadence; only a merged or closed PR rests.
+ * Each poll is a full PR read with checks, reviews and comments.
+ */
+export function computePanelPullRequestPollInterval(
+  info: PullRequestInfo | undefined,
+): number | false {
+  const interval = computePullRequestPollInterval(info);
+  if (!info?.tracking_available) return interval;
+  if (interval !== false) return 10_000;
+  return info.pr?.state === "OPEN" ? PULL_REQUEST_LIST_POLL_MS : false;
+}
+
 /** Poll linked PRs until all known states are terminal; unknown states keep refreshing. */
 export function computeLinkedPullRequestPollInterval(
   info: Pick<PullRequestInfo, "pr" | "prs"> | undefined,
@@ -556,7 +573,7 @@ function pullRequestInfoQueryOptions(
           const info = query.state.data;
           if (options.poll === "linked") return computeLinkedPullRequestPollInterval(info);
           if (options.poll === "list") return computePullRequestPollInterval(info, true);
-          return info?.tracking_available ? 10_000 : computePullRequestPollInterval(info);
+          return computePanelPullRequestPollInterval(info);
         }
       : false,
     refetchIntervalInBackground: false,

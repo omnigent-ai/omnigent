@@ -716,15 +716,24 @@ class WorkspaceReader:
     # the git provider's CLI or API (``gh`` for GitHub).
 
     def github_info(
-        self, session_id: str | None = None, pr_url: str | None = None
+        self,
+        session_id: str | None = None,
+        pr_url: str | None = None,
+        *,
+        summary: bool = False,
     ) -> _WorkspacePayload:
-        """PR context for an explicit session PR or the workspace branch."""
+        """PR context for an explicit session PR or the workspace branch.
+
+        :param summary: Read only the selected PR's
+            state, draft flag and title.
+        """
         return cast(
             "_WorkspacePayload",
             pr_resource.pr_info(
                 str(self._root),
                 session_id=session_id,
                 pr_url=pr_url,
+                summary=summary,
             ),
         )
 
