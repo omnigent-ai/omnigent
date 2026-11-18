@@ -15,12 +15,12 @@ import yaml
 
 from omnigent.errors import OmnigentError
 from omnigent.inner import terminal as terminal_module
-from omnigent.inner.datamodel import OSEnvSpec
+from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.sandbox import SandboxPolicy
 from omnigent.inner.terminal import TerminalInstance
 from omnigent.runtime import workflow
 from omnigent.spec import load
-from omnigent.spec.types import AgentSpec, ApiKeyAuth
+from omnigent.spec.types import AgentSpec, ApiKeyAuth, ExecutorSpec
 
 
 @pytest.fixture
@@ -275,8 +275,10 @@ def test_terminal_model_access_uses_parent_settings_only_without_explicit_gatewa
         )
         spec = load(bundle)
     spec.os_env = OSEnvSpec(cwd=str(tmp_path / "workspace"))
-    read_settings = Mock(wraps=claude_sdk_executor._claude_user_settings_env)
-    monkeypatch.setattr(claude_sdk_executor, "_claude_user_settings_env", read_settings)
+    read_settings = Mock(wraps=claude_sdk_executor._claude_user_settings_env_with_sources)
+    monkeypatch.setattr(
+        claude_sdk_executor, "_claude_user_settings_env_with_sources", read_settings
+    )
 
     access = workflow.claude_terminal_model_access(spec)
     assert access is not None
@@ -292,3 +294,65 @@ def test_terminal_model_access_uses_parent_settings_only_without_explicit_gatewa
     access.worker_environment(env, tmp_path / "worker-home")
     assert env["ANTHROPIC_AUTH_TOKEN"] == access.placeholder
     assert "parent-only-settings-token" not in env.values()
+
+
+@pytest.mark.parametrize("entrypoint", ["sdk", "terminal"])
+def test_redirected_user_settings_source_is_rejected_before_launch(
+    tmp_path: Path,
+    isolated_auth: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entrypoint: str,
+) -> None:
+    from omnigent.inner import claude_sdk_executor as claude
+
+    workspace = tmp_path / "selected-workspace"
+    original = workspace / "claude-config"
+    original.mkdir(parents=True)
+    redirected = tmp_path / "redirected-config"
+    redirected.mkdir()
+    daemon = tmp_path / "daemon"
+    daemon.mkdir()
+    monkeypatch.chdir(daemon)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "claude-config")
+    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    (original / "settings.json").write_text(
+        json.dumps(
+            {
+                "env": {
+                    "ANTHROPIC_AUTH_TOKEN": "parent-only-settings-token",
+                    "CLAUDE_CONFIG_DIR": str(redirected),
+                }
+            }
+        )
+    )
+    policy = SandboxPolicy("linux_bwrap", True, [workspace], [workspace], [], False)
+    spec = AgentSpec(
+        spec_version=1,
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+        os_env=OSEnvSpec(
+            cwd=str(tmp_path / "configured-workspace"),
+            sandbox=OSEnvSandboxSpec(type="linux_bwrap"),
+        ),
+    )
+    if entrypoint == "terminal":
+        access = workflow.claude_terminal_model_access(spec, cwd=workspace)
+        assert access is not None
+        assert access.credential() == "parent-only-settings-token"
+        with pytest.raises(ValueError, match="sandbox-writable paths"):
+            access.protect_sources(policy, workspace)
+        assert original in access.source_paths
+        assert original / "settings.json" in access.source_paths
+    else:
+        no_launch = Mock(side_effect=AssertionError("worker startup must not begin"))
+        monkeypatch.setattr(claude, "_find_system_claude", lambda: "/bin/claude")
+        monkeypatch.setattr(claude, "resolve_sandbox", lambda *_: policy)
+        monkeypatch.setattr(claude, "get_backend", no_launch)
+        monkeypatch.setattr(claude, "create_private_tmpdir", no_launch)
+        with pytest.raises(ValueError, match="sandbox-writable paths"):
+            claude.ClaudeSDKExecutor(
+                cwd=str(workspace),
+                os_env=spec.os_env,
+                bundle_dir=tmp_path / "bundle",
+            )
+        no_launch.assert_not_called()

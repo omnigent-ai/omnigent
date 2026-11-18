@@ -583,14 +583,35 @@ def read_claude_user_settings(cwd: str | None = None) -> dict[str, object] | Non
     :returns: The settings object, or ``None`` when the file is missing,
         unreadable, or not an object.
     """
+    settings, _ = read_claude_user_settings_with_sources(cwd)
+    return settings
+
+
+def read_claude_user_settings_with_sources(
+    cwd: str | None = None,
+) -> tuple[dict[str, object] | None, tuple[Path, ...]]:
+    """Read user settings and retain the directory and file actually selected."""
     configured = os.environ.get("CLAUDE_CONFIG_DIR")
     config_dir = Path(configured) if configured else Path.home() / ".claude"
-    settings_path = Path(cwd or "") / config_dir / "settings.json"
+    settings_path = Path(os.path.abspath(Path(cwd or "") / config_dir / "settings.json"))
     try:
-        payload = json.loads(settings_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    return payload if isinstance(payload, dict) else None
+        resolved_path = settings_path.resolve(strict=True)
+        payload = json.loads(resolved_path.read_text(encoding="utf-8"))
+    except (OSError, RuntimeError, ValueError):
+        return None, ()
+    if not isinstance(payload, dict):
+        return None, ()
+    sources = tuple(
+        dict.fromkeys(
+            (
+                settings_path.parent.absolute(),
+                settings_path.absolute(),
+                resolved_path.parent,
+                resolved_path,
+            )
+        )
+    )
+    return payload, sources
 
 
 def claude_managed_gateway_routes(paths: tuple[Path, ...] | None = None) -> str | None:

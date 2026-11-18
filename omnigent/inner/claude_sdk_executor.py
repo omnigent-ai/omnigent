@@ -1813,7 +1813,7 @@ def _claude_user_settings_env(cwd: str | None = None) -> dict[str, str]:
     """Read the ``env`` block of Claude Code's user ``settings.json``.
 
     The file is located by
-    :func:`omnigent.onboarding.ambient.read_claude_user_settings`.
+    :func:`omnigent.onboarding.ambient.read_claude_user_settings_with_sources`.
 
     :param cwd: The CLI's working directory, e.g. ``"/home/user/repo"``;
         ``None`` means this process's working directory.
@@ -1821,15 +1821,28 @@ def _claude_user_settings_env(cwd: str | None = None) -> dict[str, str]:
         ``{"ANTHROPIC_BEDROCK_BASE_URL": "https://gateway.example"}``; empty
         when the file is missing, unreadable, or has no ``env`` object.
     """
-    from omnigent.onboarding.ambient import read_claude_user_settings
+    env, _ = _claude_user_settings_env_with_sources(cwd)
+    return env
 
-    settings = read_claude_user_settings(cwd)
+
+def _claude_user_settings_env_with_sources(
+    cwd: str | None = None,
+) -> tuple[dict[str, str], tuple[pathlib.Path, ...]]:
+    """Keep the settings file provenance separate from its environment values."""
+    from omnigent.onboarding.ambient import read_claude_user_settings_with_sources
+
+    settings, sources = read_claude_user_settings_with_sources(cwd)
     env = settings.get("env") if settings is not None else None
     if not isinstance(env, dict):
-        return {}
-    return {
-        key: value for key, value in env.items() if isinstance(key, str) and isinstance(value, str)
-    }
+        return {}, sources
+    return (
+        {
+            key: value
+            for key, value in env.items()
+            if isinstance(key, str) and isinstance(value, str)
+        },
+        sources,
+    )
 
 
 def _resolve_gateway_env(
@@ -2052,6 +2065,7 @@ def prepare_claude_cli_path(
     request_body_transform: RequestBodyTransform | None = None,
     model_access: ClaudeModelAccess | None = None,
     databricks_profile: str | None = None,
+    user_settings_source_paths: tuple[pathlib.Path, ...] = (),
 ) -> PreparedClaudeCli:
     """Contain the whole Claude CLI when the agent requires a sandbox.
 
@@ -2063,6 +2077,7 @@ def prepare_claude_cli_path(
         binary, or ``None`` when no CLI is available.
     :param spec: The agent's ``os_env`` spec.  Only ``caller_process`` specs
         with a compatible sandbox are eligible for wrapping.
+    :param user_settings_source_paths: Original user settings paths read by the parent.
     :returns: A :class:`PreparedClaudeCli` naming the effective CLI path and
         whether native tools should be enabled.
     """
@@ -2099,12 +2114,19 @@ def prepare_claude_cli_path(
             isinstance(name, str) for name in credential_env_names
         ):
             raise ValueError("invalid Claude credential environment metadata")
-        model_access = model_access or resolve_claude_model_access(
-            parent_env,
-            cwd=cwd,
-            databricks_profile=databricks_profile,
-            source_env_names=frozenset(credential_env_names),
-        )
+        if model_access is None:
+            model_access = resolve_claude_model_access(
+                parent_env,
+                cwd=cwd,
+                databricks_profile=databricks_profile,
+                source_paths=user_settings_source_paths,
+                source_env_names=frozenset(credential_env_names),
+            )
+        elif user_settings_source_paths:
+            model_access = replace(
+                model_access,
+                source_paths=(*model_access.source_paths, *user_settings_source_paths),
+            )
         model_access = model_access.with_bundle_sources(bundle_dir)
         sandbox = model_access.protect_sources(sandbox, cwd)
     else:
@@ -2677,11 +2699,15 @@ class ClaudeSDKExecutor(Executor):
         if self._cli_path:
             if self._os_env_spec is not None:
                 effective_cwd = _resolve_sandbox_cwd(self._cwd or self._os_env_spec.cwd)
+                user_settings_source_paths: tuple[pathlib.Path, ...] = ()
                 if not self._gateway and (
                     self._os_env_spec.sandbox is None or self._os_env_spec.sandbox.type != "none"
                 ):
+                    settings_env, user_settings_source_paths = (
+                        _claude_user_settings_env_with_sources(str(effective_cwd))
+                    )
                     self._extra_env = {
-                        **_claude_user_settings_env(str(effective_cwd)),
+                        **settings_env,
                         **self._extra_env,
                     }
                 prepared = prepare_claude_cli_path(
@@ -2691,6 +2717,7 @@ class ClaudeSDKExecutor(Executor):
                     bundle_dir=self._bundle_dir,
                     agent_name=self._agent_name,
                     databricks_profile=self._databricks_profile if self._gateway else None,
+                    user_settings_source_paths=user_settings_source_paths,
                     request_body_transform=gateway_body_transform(
                         self._extra_env["ANTHROPIC_BASE_URL"]
                     )
