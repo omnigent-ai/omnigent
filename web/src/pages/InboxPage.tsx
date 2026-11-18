@@ -35,9 +35,9 @@
  * today", …). Only the newest approval starts expanded; manual toggles are
  * keyed by item, so they stick as new items arrive. Tabs narrow the list
  * to "Unread" (comments + unread sessions) or "Awaiting response"
- * (approvals); the pick persists per device. Beside the tabs, bulk actions
- * mark the current tab's loaded items read (Done sessions only, or all
- * with Undo) or decline its awaiting prompts after a confirmation.
+ * (approvals); the pick persists per device. A menu beside the tabs holds
+ * bulk actions: mark the current tab's loaded items read (Done sessions only,
+ * or all, with Undo) or decline its awaiting prompts after a confirmation.
  *
  * Deliberately NOT here: dismissing approvals and mentions — neither
  * exists as a server concept. Resolving (or the prompt timing out) is
@@ -50,18 +50,18 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled } from "@/lib/capabilities";
 import type { Query } from "@tanstack/react-query";
 import type { Session } from "@/lib/types";
-import { useEffect, useId, useRef, useState, type ReactNode } from "react";
+import { useEffect, useId, useRef, useState, type ComponentProps, type ReactNode } from "react";
 import { useQueries, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import {
   AlertTriangleIcon,
   ArrowRightIcon,
   ArrowUpIcon,
-  CheckCheckIcon,
   CheckIcon,
   ChevronDownIcon,
   CircleAlertIcon,
   CircleCheckIcon,
+  EllipsisVerticalIcon,
   HandIcon,
   InboxIcon,
   LightbulbIcon,
@@ -90,6 +90,7 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuLabel,
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
@@ -124,7 +125,7 @@ import {
   writeInboxFilter,
   type InboxFilter,
 } from "@/lib/inboxFilterPreferences";
-import { clearAskUserQuestionDraft } from "@/lib/askUserQuestionDrafts";
+import { clearAskUserQuestionDraft, useAskUserQuestionDraftIds } from "@/lib/askUserQuestionDrafts";
 import {
   isComposerAltNewlineKey,
   isComposerSendKey,
@@ -328,6 +329,7 @@ export function InboxPage() {
   // Keyed by session id at page level: a collapsed card unmounts its body,
   // and the draft must survive the toggle.
   const [replyDrafts, setReplyDrafts] = useState<Record<string, string>>({});
+  const questionDraftIds = useAskUserQuestionDraftIds();
   const [replyStatuses, setReplyStatuses] = useState<Record<string, ReplyStatus>>({});
   // ⌘K's Reply asks this session's reply field for focus once its card is expanded.
   const [replyFocus, setReplyFocus] = useState<{ sessionId: string; request: number } | null>(null);
@@ -717,19 +719,14 @@ export function InboxPage() {
   const allReadIncludes = [hasErrorTargets && "errors", visibleComments.length > 0 && "comments"]
     .filter(Boolean)
     .join(" and ");
-  const bulkHint = [
-    showApprovals
-      ? "Keeps awaiting responses, errors, and comments."
-      : "Keeps errors and comments.",
-    (hasNextPage || (showUnread && automationInbox.hasNextPage)) && "Loaded items only.",
-  ]
-    .filter(Boolean)
-    .join(" ");
+  const bulkLoadedOnly = hasNextPage || (showUnread && automationInbox.hasNextPage);
   // A native prompt mid-delivery already carries a decision; its card only offers a retry.
+  // A question with unsent answers stays for the user to finish.
   const declinable = visibleApprovals.filter(
     (item) =>
       liveVerdict(item) === undefined &&
-      (item.elicitation.nativeDelivery?.state ?? "ready") === "ready",
+      (item.elicitation.nativeDelivery?.state ?? "ready") === "ready" &&
+      !questionDraftIds.has(item.elicitation.elicitationId),
   );
 
   // Clears exactly these items; Undo restores them and nothing that arrived since.
@@ -1363,11 +1360,13 @@ export function InboxPage() {
           </TabsList>
         </Tabs>
         <InboxBulkActions
+          showRead={showUnread}
           doneCount={doneTargets.length}
           allCount={allReadCount}
           allIncludes={allReadIncludes}
-          hint={bulkHint}
+          showDecline={showApprovals}
           declineCount={declinable.length}
+          loadedOnly={bulkLoadedOnly}
           onMarkDoneRead={() => markEntriesRead(doneTargets, [], [])}
           onMarkAllRead={() => markEntriesRead(bulkUnread, visibleComments, visibleAutomations)}
           onDecline={() => setDeclineTargets(declinable)}
@@ -1545,6 +1544,7 @@ export function InboxPage() {
               </DialogTitle>
               <DialogDescription>
                 Each agent is told you declined. This can’t be undone.
+                {hasNextPage && " Only loaded items are included."}
               </DialogDescription>
             </DialogHeader>
             <ul className="flex flex-col gap-1 text-ui">
@@ -1604,99 +1604,102 @@ export function describeDeclineResult(declined: number, total: number): string {
 }
 
 /**
- * The tab row's bulk actions, each counting the loaded items it acts on. The
- * primary marks Done sessions read and keeps what needs attention; the menu
- * holds the wider actions. Without a primary, the others show as plain buttons.
+ * The tab row's bulk actions in one overflow menu, each counting the loaded
+ * items it acts on. Mark-read items keep their places, disabled when empty, so
+ * a repeated click never lands on the wider action.
  */
 function InboxBulkActions({
+  showRead,
   doneCount,
   allCount,
   allIncludes,
-  hint,
+  showDecline,
   declineCount,
+  loadedOnly,
   onMarkDoneRead,
   onMarkAllRead,
   onDecline,
 }: {
+  /** The tab lists sessions, comments and automation failures. */
+  showRead: boolean;
   doneCount: number;
   allCount: number;
-  /** What "Mark all" adds beyond the primary, e.g. "errors and comments". */
+  /** What the wider read action adds beyond Done, e.g. "errors and comments". */
   allIncludes: string;
-  hint: string;
+  /** The tab lists awaiting responses. */
+  showDecline: boolean;
   declineCount: number;
+  /** More items exist than are loaded, so the counts cover only part of the tab. */
+  loadedOnly: boolean;
   onMarkDoneRead: () => void;
   onMarkAllRead: () => void;
   onDecline: () => void;
 }) {
-  const showMarkAll = allCount > doneCount;
-  const markAllLabel = `Mark all ${allCount} as read`;
-  const declineLabel = `Decline ${declineCount} ${awaitingNoun(declineCount)}…`;
-  if (doneCount === 0) {
-    return (
-      <div className="ml-auto flex flex-wrap items-center gap-2">
-        {showMarkAll && (
-          <Button
-            variant="outline"
-            size="sm"
-            title={`Includes ${allIncludes}.`}
-            onClick={onMarkAllRead}
-            componentId="inbox.bulk.mark_all_read"
-          >
-            <CheckCheckIcon />
-            {markAllLabel}
-          </Button>
-        )}
-        {declineCount > 0 && (
-          <Button variant="outline" size="sm" onClick={onDecline} componentId="inbox.bulk.decline">
-            {declineLabel}
-          </Button>
-        )}
-      </div>
-    );
-  }
-  const hasMenu = showMarkAll || declineCount > 0;
+  const { trackClick } = useOmnigentAnalytics();
+  const showReadItems = showRead && allCount > 0;
+  const showDeclineItem = showDecline && declineCount > 0;
+  if (!showReadItems && !showDeclineItem) return null;
+  const extraCount = allCount - doneCount;
+  const select = (componentId: string, action: () => void) => () => {
+    trackClick(componentId, "button");
+    action();
+  };
   return (
     <DropdownMenu>
-      <div role="group" aria-label="Bulk actions" className="ml-auto inline-flex shrink-0">
+      <DropdownMenuTrigger asChild>
         <Button
-          variant="outline"
-          size="sm"
-          title={hint}
-          className={cn(hasMenu && "rounded-r-none border-r-0")}
-          onClick={onMarkDoneRead}
-          componentId="inbox.bulk.mark_done_read"
+          variant="ghost"
+          size="icon-sm"
+          aria-label="Inbox bulk actions"
+          title="Inbox bulk actions"
+          className="ml-auto shrink-0 mobile-touch-target"
+          componentId="inbox.bulk.menu"
         >
-          <CheckCheckIcon />
-          Mark {doneCount} as read
+          <EllipsisVerticalIcon />
         </Button>
-        {hasMenu && (
-          <DropdownMenuTrigger asChild>
-            <Button
-              variant="outline"
-              size="icon-sm"
-              className="w-7 rounded-l-none"
-              aria-label="More bulk actions"
-            >
-              <ChevronDownIcon />
-            </Button>
-          </DropdownMenuTrigger>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="max-w-72">
+        {loadedOnly && <DropdownMenuLabel>Loaded items only</DropdownMenuLabel>}
+        {showReadItems && (
+          <BulkMenuItem
+            label={doneCount > 0 ? `Mark ${doneCount} Done as read` : "Mark Done as read"}
+            detail={doneCount > 0 ? "Keeps errors and comments" : "No Done sessions loaded"}
+            disabled={doneCount === 0}
+            onSelect={select("inbox.bulk.mark_done_read", onMarkDoneRead)}
+          />
         )}
-      </div>
-      <DropdownMenuContent align="end">
-        {showMarkAll && (
-          <DropdownMenuItem onSelect={onMarkAllRead} className="flex-col items-start gap-0">
-            <span>{markAllLabel}</span>
-            <span className="text-sm text-muted-foreground">Includes {allIncludes}</span>
-          </DropdownMenuItem>
+        {showReadItems && extraCount > 0 && (
+          <BulkMenuItem
+            label={`Mark ${allCount} as read`}
+            detail={`Includes ${allIncludes}`}
+            onSelect={select("inbox.bulk.mark_all_read", onMarkAllRead)}
+          />
         )}
-        {showMarkAll && declineCount > 0 && <DropdownMenuSeparator />}
-        {declineCount > 0 && (
-          <DropdownMenuItem variant="destructive" onSelect={onDecline}>
-            {declineLabel}
-          </DropdownMenuItem>
+        {showReadItems && showDeclineItem && <DropdownMenuSeparator />}
+        {showDeclineItem && (
+          <BulkMenuItem
+            variant="destructive"
+            label={`Decline ${declineCount} ${awaitingNoun(declineCount)}…`}
+            detail="Can’t be undone"
+            onSelect={select("inbox.bulk.decline", onDecline)}
+          />
         )}
       </DropdownMenuContent>
     </DropdownMenu>
+  );
+}
+
+/** A bulk menu item: what it does, then what it covers. */
+function BulkMenuItem({
+  label,
+  detail,
+  ...props
+}: { label: string; detail: string } & ComponentProps<typeof DropdownMenuItem>) {
+  return (
+    <DropdownMenuItem className="mobile-touch-target flex-col items-start gap-0" {...props}>
+      <span>{label}</span>
+      <span className="text-sm text-muted-foreground">{detail}</span>
+    </DropdownMenuItem>
   );
 }
 
