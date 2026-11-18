@@ -518,8 +518,8 @@ def arm_subagent_child_start_timeout(
 ) -> None:
     """Bound an authoritative accepted native turn, never a settled or unidentified receipt.
 
-    Missing identity retains legacy indefinite waiting. The generic response ID
-    remains the caller's request-ownership guard, independently of native identity.
+    Missing identity cannot arm a deadline or erase unresolved evidence. The generic
+    response ID remains the request-ownership guard, independently of native identity.
     """
     if (
         request is None
@@ -528,18 +528,19 @@ def arm_subagent_child_start_timeout(
     ):
         return
     entry = _subagent_work_by_child.get(child_session_id)
+    if request.unidentified_settlement:
+        _children_accepted_turns.pop(child_session_id, None)
+        if entry is not None:
+            entry.awaiting_child_start_since = None
+            entry.native_acceptance = None
+        return
     if (
         acceptance is None
         or acceptance.session_id != child_session_id
         or not acceptance.thread_id
         or not acceptance.response_id.startswith("codex_")
         or acceptance.response_id == "codex_"
-        or request.unidentified_settlement
     ):
-        _children_accepted_turns.pop(child_session_id, None)
-        if entry is not None:
-            entry.awaiting_child_start_since = None
-            entry.native_acceptance = None
         return
     if acceptance.response_id in request.settled_response_ids:
         return

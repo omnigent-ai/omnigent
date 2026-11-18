@@ -563,6 +563,22 @@ def _drive_steer_lifecycle(
                     request=steer_request,
                     now=_STEER_ACCEPTED_AT,
                 )
+            elif event in ("accept_receiptless", "accept_malformed", "accept_other_session"):
+                if steer_request is None:
+                    steer_request = subagent_work.begin_subagent_child_acceptance(child_id)
+                acceptance = {
+                    "accept_receiptless": None,
+                    "accept_malformed": NativeTurnAcceptance(child_id, "", current_response_id),
+                    "accept_other_session": NativeTurnAcceptance(
+                        "conv_other_child", "thread_lifecycle", current_response_id
+                    ),
+                }[event]
+                subagent_work.arm_subagent_child_start_timeout(
+                    child_id,
+                    acceptance=acceptance,
+                    request=steer_request,
+                    now=_PREVIOUS_ACCEPTED_AT + 100.0,
+                )
             elif event == "drain_old":
                 accepted_at = subagent_work._children_accepted_turns.get(child_id)
                 subagent_work.unregister_subagent_work(
@@ -719,6 +735,48 @@ def _drive_steer_lifecycle(
             "codex_previous",
             _PREVIOUS_ACCEPTED_AT,
             id="events16-1000.0",
+        ),
+        pytest.param(
+            ["accept_prev", "accept_receiptless", "register"],
+            "codex_previous",
+            "codex_steer",
+            _PREVIOUS_ACCEPTED_AT,
+            id="receiptless-followup-before-registration",
+        ),
+        pytest.param(
+            ["register", "accept_prev", "accept_receiptless"],
+            "codex_previous",
+            "codex_steer",
+            _PREVIOUS_ACCEPTED_AT,
+            id="receiptless-followup-after-registration",
+        ),
+        pytest.param(
+            ["accept_prev", "accept_malformed", "register"],
+            "codex_previous",
+            "codex_steer",
+            _PREVIOUS_ACCEPTED_AT,
+            id="malformed-followup-before-registration",
+        ),
+        pytest.param(
+            ["register", "accept_prev", "accept_malformed"],
+            "codex_previous",
+            "codex_steer",
+            _PREVIOUS_ACCEPTED_AT,
+            id="malformed-followup-after-registration",
+        ),
+        pytest.param(
+            ["accept_prev", "accept_other_session", "register"],
+            "codex_previous",
+            "codex_steer",
+            _PREVIOUS_ACCEPTED_AT,
+            id="wrong-session-followup-before-registration",
+        ),
+        pytest.param(
+            ["register", "accept_prev", "accept_other_session"],
+            "codex_previous",
+            "codex_steer",
+            _PREVIOUS_ACCEPTED_AT,
+            id="wrong-session-followup-after-registration",
         ),
         pytest.param(
             ["begin_steer", "settle_unidentified", "accept_steer", "register"],

@@ -14002,9 +14002,11 @@ async def test_named_send_adopts_busy_child_as_running_not_launching(
         assert inbox.empty()
 
 
+@pytest.mark.parametrize("drain_during_post", [False, True])
 @pytest.mark.asyncio
 async def test_named_send_registers_fresh_when_tracked_turn_already_ended(
     monkeypatch: pytest.MonkeyPatch,
+    drain_during_post: bool,
 ) -> None:
     """The busy→ended race registers a fresh entry, not the drained one.
 
@@ -14045,7 +14047,11 @@ async def test_named_send_registers_fresh_when_tracked_turn_already_ended(
     )
 
     async def handler(request: httpx.Request) -> httpx.Response:
-        if request.method == "POST" and request.url.path == f"/v1/sessions/{child_id}/events":
+        if (
+            drain_during_post
+            and request.method == "POST"
+            and request.url.path == f"/v1/sessions/{child_id}/events"
+        ):
             # An inbox drain consumes the stale result while the steer's POST is in flight.
             subagent_work.unregister_subagent_work(
                 child_id, work_id=stale_work_id, remember_drained_delivery=True
@@ -14065,6 +14071,10 @@ async def test_named_send_registers_fresh_when_tracked_turn_already_ended(
         # acceptance recorded before registration must start its launch bound.
         assert work.child_start_reported is False
         assert work.awaiting_child_start_since is not None
+        assert work.native_acceptance is not None
+        assert work.native_acceptance.session_id == child_id
+        assert work.native_acceptance.thread_id == "thread_fresh"
+        assert work.native_acceptance.response_id == "codex_fresh"
         assert work.delivered is False
         subagent_work._session_inboxes_ref[parent_id] = inbox
         reaped = subagent_work.reap_stalled_subagent_launches(
