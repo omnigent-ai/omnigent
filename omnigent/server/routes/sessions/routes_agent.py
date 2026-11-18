@@ -20,7 +20,9 @@ from omnigent.automations_availability import AUTOMATIONS_HEADER, USER_INBOX_HEA
 from omnigent.errors import SESSION_AGENT_MISSING_MESSAGE, ErrorCode, OmnigentError
 from omnigent.host.identity import MANAGED_HOST_TOKEN_HEADER
 from omnigent.mcp_selection import MCP_SELECTION_HEADER, MCP_SELECTION_PREFIX, selected_mcp_spec
+from omnigent.memory_availability import MEMORY_HEADER, MEMORY_SEARCH_HEADER
 from omnigent.native.native_coding_agents import native_coding_agent_for_agent_name
+from omnigent.policies.registry import LOCAL_SINGLE_USER_HEADER, POLICY_MODULES_HEADER
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
@@ -38,6 +40,7 @@ from omnigent.server.auth import (
     LEVEL_READ,
     RESERVED_USER_LOCAL,
     AuthProvider,
+    local_single_user_enabled,
 )
 from omnigent.server.bundles import bundle_location, redacted_agent_bundle, validate_agent_bundle
 from omnigent.server.feature_flags import Feature, FeatureFlags
@@ -290,10 +293,10 @@ def register_agent_routes(
         automations_available = getattr(request.app.state, "automations_available", None)
         if automations_available is not None:
             selection_headers[AUTOMATIONS_HEADER] = "1" if automations_available() else "0"
-        inbox_enabled_for = getattr(request.app.state, "proactive_agent_enabled_for", None)
+        inbox_enabled_for = getattr(request.app.state, "inbox_items_enabled_for", None)
         if inbox_enabled_for is not None:
-            # Evaluate the caller's deployment gate with the root owner's settings;
-            # a failing settings read turns the optional Inbox tools off.
+            # Evaluate the caller's deployment gate for the root owner's Inbox;
+            # a failing check turns the Inbox tools off.
             try:
                 owner = (
                     await asyncio.to_thread(
@@ -313,6 +316,14 @@ def register_agent_routes(
                 )
                 inbox_on = False
             selection_headers[USER_INBOX_HEADER] = "1" if inbox_on else "0"
+        memory_available = getattr(request.app.state, "memory_available", None)
+        selection_headers[MEMORY_HEADER] = (
+            "1" if memory_available is not None and memory_available() else "0"
+        )
+        memory_search_available = getattr(request.app.state, "memory_search_available", None)
+        selection_headers[MEMORY_SEARCH_HEADER] = (
+            "1" if memory_search_available is not None and memory_search_available() else "0"
+        )
         return Response(
             content=bundle_bytes,
             media_type="application/gzip",
@@ -329,6 +340,12 @@ def register_agent_routes(
                 # agents may. The runner fails safe (treats a
                 # missing header as session-scoped → no expansion).
                 "X-Agent-Session-Scoped": "false" if agent.operator_authored else "true",
+                # Handler authority for the runner: the server's configured policy modules,
+                # and whether this is a local single-user server (the runner skips the check).
+                POLICY_MODULES_HEADER: json.dumps(
+                    getattr(request.app.state, "policy_modules", [])
+                ),
+                LOCAL_SINGLE_USER_HEADER: "1" if local_single_user_enabled() else "0",
             },
         )
 

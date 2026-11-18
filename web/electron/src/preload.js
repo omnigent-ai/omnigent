@@ -265,9 +265,11 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
     : {
         /**
          * Send one workspace API call to a session host's socket, named by the
-         * server with a token: on this machine, or over SSH for a host this
-         * desktop connected that way. Resolves `{ status, headers, body }`.
-         * @param {{hostId: string, socketPath: string, path: string, headers: Record<string, string>, body: Uint8Array}} request
+         * server with a token: on this machine, or over SSH. `sshTarget` is an
+         * alias main may ask the user to allow, then try and record, if the
+         * host has none yet.
+         * Resolves `{ status, headers, body }`.
+         * @param {{hostId: string, sshTarget?: string, socketPath: string, path: string, headers: Record<string, string>, body: Uint8Array}} request
          */
         workspaceSocketRequest: (request) =>
           ipcRenderer.invoke("omnigent:workspace-socket-request", request),
@@ -690,6 +692,8 @@ contextBridge.exposeInMainWorld("omnigentSetup", {
    *  `{ok, error?}`; output streams via onRunnerConnectLog.
    *  @param {string} url @param {"local"|"remote"} runner */
   connectRunner: (url, runner) => ipcRenderer.invoke("omnigent:connect-runner", url, runner),
+  /** Stop the in-flight connectRunner sign-in. Resolves whether one was running. */
+  cancelRunnerConnect: () => ipcRenderer.invoke("omnigent:cancel-runner-connect"),
   /** Subscribe to connectRunner output. Returns an unsubscribe function.
    *  @param {(line: string) => void} callback */
   onRunnerConnectLog: (callback) => {

@@ -1,7 +1,17 @@
 // The Tasks tab: where the session's tasks stand, one row each. Tasks are a
 // plan's steps, or the agent's own task list when the session has no plan.
 
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import {
+  Fragment,
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import {
   CheckIcon,
   ChevronRightIcon,
@@ -16,6 +26,7 @@ import {
   XIcon,
 } from "lucide-react";
 import { SessionActionMenuItem } from "@/components/SessionActionMenuItem";
+import { FullscreenIcon } from "@/components/ai-elements/MermaidBlock";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -68,6 +79,13 @@ import { PlanRunButton } from "@/shell/PlanRunButton";
 import { useSessionTasksActions } from "@/store/sessionTasksActions";
 
 const NO_ENTRIES: JournalEntry[] = [];
+
+// React Flow loads only once a plan opens on its graph.
+const WorkflowGraphOverlay = lazy(() =>
+  import("@/components/workflows/WorkflowStepsGraph").then((module) => ({
+    default: module.WorkflowGraphOverlay,
+  })),
+);
 
 export const STATE_LABELS: Record<StepState, string> = {
   waiting: "Not started",
@@ -942,6 +960,7 @@ function TasksHeader({
   onContinuePlan,
   menuActionFor,
   onStop,
+  onOpenGraph,
 }: {
   plan: JournalEntry | null;
   /** The saved workflow the plan came from, or null. */
@@ -958,6 +977,8 @@ function TasksHeader({
   menuActionFor: (item: StepProgress) => TaskMenuAction | undefined;
   /** Stops the agent; offered only while it works. */
   onStop?: () => void;
+  /** Opens the plan on its graph; absent without a plan, which says what waits on what. */
+  onOpenGraph?: () => void;
 }) {
   const tally = planTally(progress);
   const updatedAt = Math.max(
@@ -1021,6 +1042,19 @@ function TasksHeader({
                     onClick={onContinuePlan}
                   />
                 )
+              )}
+              {onOpenGraph && (
+                <Button
+                  variant="ghost"
+                  size="icon-xs"
+                  aria-label="View the plan on the graph"
+                  title="View the plan on the graph"
+                  className="shrink-0 self-center text-muted-foreground"
+                  data-testid="tasks-plan-graph"
+                  onClick={onOpenGraph}
+                >
+                  <FullscreenIcon />
+                </Button>
               )}
               {onSaveWorkflow && (
                 <DropdownMenu>
@@ -1152,12 +1186,19 @@ export function TasksPanel({
   active,
   onStartWorkflow,
   onShowInChat,
+  renderWorkflowRuns,
 }: {
   conversationId: string;
   active: boolean;
   onStartWorkflow?: () => void;
   /** Called before a task's click scrolls the chat to it, e.g. to close a phone's drawer. */
   onShowInChat?: () => void;
+  /**
+   * The workflow runs below the session's run of its plan's workflow, shown
+   * after the tasks while the panel is active. Passed in because those rows
+   * are built from this panel's parts.
+   */
+  renderWorkflowRuns?: (workflowId: string) => ReactNode;
 }) {
   const tasks = useSessionTasks(conversationId, active);
   const { journal, plan, progress } = tasks;
@@ -1168,6 +1209,7 @@ export function TasksPanel({
   const stopActiveWork = tasks.sessionWorking ? stopWork : undefined;
   const continuePlan = useSessionTasksActions((state) => state.continuePlan[conversationId]);
   const entries = tasks.journalSupported ? journal.entries : NO_ENTRIES;
+  const workflowId = planWorkflowId(entries);
   const names = new Map(progress.map((item) => [item.step.id, item.step.name]));
   const empty = progress.length === 0;
   const showPlan = !tasks.loading && !journal.error && progress.length > 0;
@@ -1196,10 +1238,19 @@ export function TasksPanel({
     // The rail or drawer may still be opening; its rows mount by the next frame.
     requestAnimationFrame(() => jumpToStep(taskToShow.stepId));
   }, [active, showPlan, taskToShow, conversationId, jumpToStep]);
+  const [graphOpen, setGraphOpen] = useState(false);
+  // The panel stays mounted across sessions, so a switch closes the graph rather than hiding it.
+  const [graphConversationId, setGraphConversationId] = useState(conversationId);
+  if (graphConversationId !== conversationId) {
+    setGraphConversationId(conversationId);
+    setGraphOpen(false);
+  }
   const location = useLocation();
   const navigate = useNavigate();
   const showInChat = useCallback(
     (markerId: string) => {
+      // The graph covers the chat it scrolls.
+      setGraphOpen(false);
       onShowInChat?.();
       const pathname = `/c/${encodeURIComponent(conversationId)}`;
       const search = messageDeepLinkParams(new URLSearchParams(location.search), markerId);
@@ -1298,7 +1349,7 @@ export function TasksPanel({
           <>
             <TasksHeader
               plan={plan}
-              workflowId={planWorkflowId(entries)}
+              workflowId={workflowId}
               progress={progress}
               paused={tasks.paused}
               stuck={stuck}
@@ -1313,6 +1364,7 @@ export function TasksPanel({
                   ? undefined
                   : stopActiveWork
               }
+              onOpenGraph={plan ? () => setGraphOpen(true) : undefined}
             />
             <TaskList
               progress={progress}
@@ -1323,6 +1375,18 @@ export function TasksPanel({
               menuActionFor={menuActionFor}
               nativeMarkerIds={nativeMarkerIds}
             />
+            {active && workflowId && renderWorkflowRuns?.(workflowId)}
+            {plan && graphOpen && (
+              <Suspense fallback={null}>
+                <WorkflowGraphOverlay
+                  title={planName(plan) ?? "Tasks"}
+                  steps={progress.map((item) => item.step)}
+                  progress={progress}
+                  menuActionFor={menuActionFor}
+                  onClose={() => setGraphOpen(false)}
+                />
+              </Suspense>
+            )}
           </>
         )}
       </div>

@@ -259,10 +259,12 @@ summary. No private configuration is stored. Host affinity uses the existing
 conversation `host_id`. Capable controllers remain authoritative for sandbox
 assignments; a missing sandbox can be replaced from its bound session's reference.
 Ordinary hosts skip
-profile discovery entirely. Legacy host recovery reads at most 201 session IDs
-through the existing host index and rejects histories over 200 before reading
-profile references. Each reference read uses only the seven canonical label keys.
-Enable controller assignment lookup for large histories or orphan recovery.
+profile discovery entirely. Legacy host recovery reads session IDs through the
+existing host index in pages of 500 and reads each page's profile references in
+one query using only the seven canonical label keys. It rejects histories over
+10,000 sessions; start a new session on overflow. A controller lookup that
+returns the sandbox's assignment skips this scan. Enable controller assignment
+lookup for orphan recovery.
 Runner-only adoption reads host IDs through the existing runner index in one
 statement snapshot, so concurrent rotation cannot hide a host between pages.
 This read has a separate safety budget of 10,000 currently attached sessions
