@@ -6970,12 +6970,15 @@ describe("Composer side-chat entry points", () => {
   afterEach(() => {
     cleanup();
     composerSessionSnapshot.sideChatAllowed = null;
+    setOmnigentHostConfig({});
     vi.restoreAllMocks();
   });
 
   it.each(["success", "failure"])(
     "ignores repeated /side submissions until creation settles (%s)",
     async (outcome) => {
+      const analytics = vi.fn();
+      setOmnigentHostConfig({ analytics });
       let finishCreation!: () => void;
       const creation = new Promise<{ childSessionId: string }>((resolve, reject) => {
         finishCreation = () => {
@@ -6998,6 +7001,9 @@ describe("Composer side-chat entry points", () => {
       });
 
       expect(createSideChat).toHaveBeenCalledExactlyOnceWith("conv_test");
+      expect(
+        analytics.mock.calls.filter(([event]) => event.componentId === "chat.composer.send"),
+      ).toHaveLength(1);
       expect(textarea()).toHaveValue("/side question");
       expect(useChatStore.getState().sideChatToOpen).toBeNull();
       await act(async () => finishCreation());
@@ -7026,6 +7032,45 @@ describe("Composer side-chat entry points", () => {
       expect(textarea()).toHaveValue("");
     },
   );
+
+  it("keeps pending /side creations independent across conversation switches", async () => {
+    clearSessionDrafts();
+    const finishCreation = new Map<string, () => void>();
+    const createSideChat = vi.spyOn(sessionsApi, "createSideChat").mockImplementation(
+      (sourceId) =>
+        new Promise((resolve) => {
+          finishCreation.set(sourceId, () => resolve({ childSessionId: `side_${sourceId}` }));
+        }),
+    );
+    renderWithTooltips(<Composer {...composerProps()} />);
+    fireEvent.change(textarea(), { target: { value: "/side first question" } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+
+    act(() => useChatStore.setState({ conversationId: "conv_other" }));
+    fireEvent.change(textarea(), { target: { value: "/side second question" } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(createSideChat.mock.calls.map(([sourceId]) => sourceId)).toEqual([
+      "conv_test",
+      "conv_other",
+    ]);
+
+    act(() => useChatStore.setState({ conversationId: "conv_test" }));
+    expect(textarea()).toHaveValue("/side first question");
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(createSideChat).toHaveBeenCalledTimes(2);
+    await act(async () => finishCreation.get("conv_test")!());
+
+    act(() => useChatStore.setState({ conversationId: "conv_other" }));
+    expect(textarea()).toHaveValue("/side second question");
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(createSideChat).toHaveBeenCalledTimes(2);
+    await act(async () => finishCreation.get("conv_other")!());
+    expect(textarea()).toHaveValue("");
+    expect(useChatStore.getState().sideChatToOpen).toEqual({
+      childId: "side_conv_other",
+      parentId: "conv_other",
+    });
+  });
 
   // An admin has owner level, but only the root session's owner starts side chats.
   it.each([
