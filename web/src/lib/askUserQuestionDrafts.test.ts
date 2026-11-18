@@ -1,3 +1,4 @@
+import { act, renderHook } from "@testing-library/react";
 import { beforeEach, describe, expect, it } from "vitest";
 import { parseAskUserQuestionPreview, type ClaudeQuestion } from "./askUserQuestion";
 import {
@@ -6,6 +7,7 @@ import {
   clearAskUserQuestionDraft,
   getAskUserQuestionDraft,
   saveAskUserQuestionDraft,
+  useAskUserQuestionDraftIds,
 } from "./askUserQuestionDrafts";
 
 const questions: ClaudeQuestion[] = [
@@ -70,5 +72,25 @@ describe("askUserQuestionDrafts", () => {
     expect(getAskUserQuestionDraft("elic_0", signature)).toEqual(draft);
     expect(getAskUserQuestionDraft("elic_2", signature)).toEqual(draft);
     expect(getAskUserQuestionDraft("elic_20", signature)).toEqual(draft);
+  });
+
+  it("lists prompts with drafts, changing only when one is added or dropped", () => {
+    const { result } = renderHook(() => useAskUserQuestionDraftIds());
+    expect(result.current.has("elic_1")).toBe(false);
+
+    act(() => saveAskUserQuestionDraft("elic_1", signature, draft));
+    const withDraft = result.current;
+    expect(withDraft.has("elic_1")).toBe(true);
+
+    act(() =>
+      saveAskUserQuestionDraft("elic_1", signature, {
+        ...draft,
+        customInputs: { "Pick a region": "us-east" },
+      }),
+    );
+    expect(result.current).toBe(withDraft);
+
+    act(() => clearAskUserQuestionDraft("elic_1"));
+    expect(result.current.has("elic_1")).toBe(false);
   });
 });

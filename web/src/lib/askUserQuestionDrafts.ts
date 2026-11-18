@@ -1,3 +1,4 @@
+import { useSyncExternalStore } from "react";
 import type { ClaudeQuestion } from "./askUserQuestion";
 
 /** Unsent answers on a pending AskUserQuestion card. */
@@ -12,6 +13,32 @@ const MAX_DRAFTS = 20;
 
 // In memory only, so typed answers never reach browser storage.
 const drafts = new Map<string, { signature: string; draft: AskUserQuestionDraft }>();
+
+// Prompts holding a draft; replaced only when one is added or dropped, not on each edit.
+let draftIds: ReadonlySet<string> = new Set();
+const listeners = new Set<() => void>();
+
+function syncDraftIds(): void {
+  if (draftIds.size === drafts.size && [...drafts.keys()].every((id) => draftIds.has(id))) return;
+  draftIds = new Set(drafts.keys());
+  listeners.forEach((listener) => listener());
+}
+
+function subscribe(listener: () => void): () => void {
+  listeners.add(listener);
+  return () => {
+    listeners.delete(listener);
+  };
+}
+
+function getDraftIds(): ReadonlySet<string> {
+  return draftIds;
+}
+
+/** Ids of prompts with unsent answers, so bulk actions can leave them alone. */
+export function useAskUserQuestionDraftIds(): ReadonlySet<string> {
+  return useSyncExternalStore(subscribe, getDraftIds, getDraftIds);
+}
 
 /**
  * Identity of a question list for draft matching: only the fields a draft's
@@ -50,6 +77,7 @@ export function saveAskUserQuestionDraft(
   drafts.delete(elicitationId);
   drafts.set(elicitationId, { signature, draft });
   if (drafts.size > MAX_DRAFTS) drafts.delete(drafts.keys().next().value as string);
+  syncDraftIds();
 }
 
 /**
@@ -59,5 +87,6 @@ export function saveAskUserQuestionDraft(
 export function clearAskUserQuestionDraft(elicitationId: string, signature?: string): void {
   if (signature === undefined || drafts.get(elicitationId)?.signature === signature) {
     drafts.delete(elicitationId);
+    syncDraftIds();
   }
 }
