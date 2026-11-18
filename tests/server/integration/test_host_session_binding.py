@@ -3701,11 +3701,13 @@ async def test_managed_launch_wait_follows_a_rebound_runner(
 
     session_id = "5d0c2c39a3f44f4c9d6d3b8f0e2a7c11"
     first = "runner_token_first"
-    monkeypatch.setattr(sessions_module, "_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", 0.6)
+    monkeypatch.setattr(sessions_module, "_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", 1.0)
     monkeypatch.setattr(helpers, "_MANAGED_RUNNER_REBIND_POLL_S", 0.05)
     monkeypatch.setattr(sessions_module, "_publish_sandbox_status", lambda *_args, **_kwargs: None)
-    registry = _ConnectingTunnelRegistry(connects=rebind_to, connect_after_s=0.4)
-    store = _RebindingConversationStore(session_id, first, rebind_to, after_s=0.2)
+    # The replacement connects after the first runner's deadline, so the
+    # launch succeeds only if the rebound runner gets a connect window of its own.
+    registry = _ConnectingTunnelRegistry(connects=rebind_to, connect_after_s=1.5)
+    store = _RebindingConversationStore(session_id, first, rebind_to, after_s=0.6)
     tracker = ManagedLaunchTracker()
     tracker.begin(session_id)
 
