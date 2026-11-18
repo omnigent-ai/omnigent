@@ -483,7 +483,7 @@ describe("WorkflowDetailPage", () => {
     expect(useChatStore.getState().sideChatComposers[planner]).toBeUndefined();
   });
 
-  it("saves a proposal's description with its steps, but not over a later edit", async () => {
+  it("saves a chosen proposal's description with its steps, but not over a later edit", async () => {
     const actual = await vi.importActual<typeof WorkflowHooks>("@/hooks/useWorkflow");
     vi.mocked(useWorkflow).mockImplementation(actual.useWorkflow);
     mockRuns([]);
@@ -538,6 +538,7 @@ describe("WorkflowDetailPage", () => {
       retry: vi.fn(),
     }));
     const description = () => screen.getByTestId("workflow-detail-description").textContent;
+    const proposed = () => screen.getByTestId("workflow-detail-proposed-description").textContent;
     const saveAndReload = async () => {
       fireEvent.click(screen.getByRole("button", { name: "Save plan" }));
       await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent("Saved plan"));
@@ -547,9 +548,11 @@ describe("WorkflowDetailPage", () => {
     };
     renderPage();
 
-    // The draft's description gives way to the proposal's until it saves with the steps.
+    // The draft's description stays beside the proposal's until that is chosen.
     await screen.findByTestId("workflow-detail-title");
-    expect(description()).toBe(WORKFLOW.description);
+    expect(description()).toBe("Pull the board's open tickets and group them");
+    expect(proposed()).toBe(WORKFLOW.description);
+    fireEvent.click(screen.getByRole("radio", { name: /^Use proposed/ }));
     await saveAndReload();
     // Each new description names the one it replaces, so the server keeps a newer one.
     expect(patches).toEqual([
@@ -561,6 +564,7 @@ describe("WorkflowDetailPage", () => {
       },
     ]);
     expect(description()).toBe(WORKFLOW.description);
+    expect(screen.queryByRole("radiogroup")).toBeNull();
     expect(screen.getByRole("status")).toHaveTextContent("Saved plan");
 
     // A newer proposal can revise the description alone.
@@ -575,8 +579,9 @@ describe("WorkflowDetailPage", () => {
     cleanup();
     renderPage();
     await screen.findByTestId("workflow-detail-title");
-    expect(description()).toBe("Fixes one flaky test.");
+    expect(proposed()).toBe("Fixes one flaky test.");
     expect(screen.getByRole("status")).toHaveTextContent("Unsaved changes");
+    fireEvent.click(screen.getByRole("radio", { name: /^Use proposed/ }));
     await saveAndReload();
     expect(patches[1]).toEqual({
       steps: WORKFLOW.steps,
@@ -678,6 +683,7 @@ describe("WorkflowDetailPage", () => {
 
     // The agent revises only the description while the first proposal's save is in flight,
     // and that save lands after the revision was written.
+    fireEvent.click(screen.getByRole("radio", { name: /^Use proposed/ }));
     fireEvent.click(screen.getByRole("button", { name: "Save plan" }));
     await waitFor(() => expect(patches).toHaveLength(1));
     journal.entries = [
@@ -695,14 +701,19 @@ describe("WorkflowDetailPage", () => {
 
     await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent("Unsaved changes"));
     const description = () => screen.getByTestId("workflow-detail-description").textContent;
-    expect(description()).toBe("Fixes flaky tests.");
+    const proposed = () => screen.getByTestId("workflow-detail-proposed-description").textContent;
+    // Choosing one proposal's wording doesn't choose a different, newer one.
+    expect(description()).toBe("Fixes one flaky test.");
+    expect(proposed()).toBe("Fixes flaky tests.");
+    expect(screen.getByRole("radio", { name: /^Keep current/ })).toBeChecked();
 
     // Reopened, the page still tells the newer proposal from the one it saved.
     cleanup();
     renderPage();
     await screen.findByTestId("workflow-detail-title");
     expect(screen.getByRole("status")).toHaveTextContent("Unsaved changes");
-    expect(description()).toBe("Fixes flaky tests.");
+    expect(proposed()).toBe("Fixes flaky tests.");
+    fireEvent.click(screen.getByRole("radio", { name: /^Use proposed/ }));
     fireEvent.click(screen.getByRole("button", { name: "Save plan" }));
     await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent("Saved plan"));
     expect(patches.map((patch) => patch.description)).toEqual([
@@ -735,6 +746,7 @@ describe("WorkflowDetailPage", () => {
       { id: "report", name: "Report", goal: null, depends_on: [] },
     ];
     const description = () => screen.getByTestId("workflow-detail-description").textContent;
+    const proposed = () => screen.getByTestId("workflow-detail-proposed-description").textContent;
 
     // The server's answers to where an entry sits in the journal.
     const placedAfter = (position: number) =>
@@ -751,34 +763,62 @@ describe("WorkflowDetailPage", () => {
       );
     }
 
-    async function renderWith(newer: JournalEntry, stored: () => WorkflowDetail) {
+    // Answers PATCH like the workflow store: a description applies only while the stored one is
+    // still `expected_description`, and keeps the proposal it was saved with as its source.
+    function serveLikeTheStore(initial: WorkflowDetail) {
+      const server = { stored: initial, patches: [] as Record<string, unknown>[] };
+      vi.mocked(authenticatedFetch).mockImplementation(async (_path, options) => {
+        if (options?.method === "PATCH") {
+          const body = JSON.parse(String(options.body));
+          server.patches.push(body);
+          const { stored } = server;
+          const describes =
+            body.description !== undefined &&
+            (body.expected_description === undefined ||
+              body.expected_description === stored.description);
+          server.stored = {
+            ...stored,
+            steps: body.steps ?? stored.steps,
+            description: describes ? body.description : stored.description,
+            description_source: describes
+              ? (body.description_source ?? null)
+              : stored.description_source,
+            updated_at: (stored.updated_at ?? 0) + 100,
+          };
+        }
+        return new Response(JSON.stringify(server.stored));
+      });
+      return server;
+    }
+
+    async function renderJournal(entries: JournalEntry[], initial: WorkflowDetail) {
       const actual = await vi.importActual<typeof WorkflowHooks>("@/hooks/useWorkflow");
       vi.mocked(useWorkflow).mockImplementation(actual.useWorkflow);
       mockRuns([]);
-      vi.mocked(useSessionJournal).mockReturnValue({
-        entries: [saved, newer],
+      const journal = {
+        entries,
         isLoading: false,
         error: null,
         hasOlder: false,
         loadingOlder: false,
         loadOlder: vi.fn(),
         retry: vi.fn(),
-      });
-      vi.mocked(authenticatedFetch).mockImplementation(
-        async () => new Response(JSON.stringify(stored())),
-      );
-      renderPage();
+      };
+      vi.mocked(useSessionJournal).mockImplementation(() => journal);
+      const server = serveLikeTheStore(initial);
+      const view = renderPage();
       await screen.findByTestId("workflow-detail-title");
+      return { journal, server, view };
     }
 
-    it("keeps that wording when the user restores it by hand over a newer proposal", async () => {
-      let stored: WorkflowDetail = {
-        ...WORKFLOW,
-        description: "Fixes one flaky test.",
-        description_source: "saved",
-        planning_session_id: "a".repeat(32),
-        updated_at: 200,
-      };
+    const reload = async () => {
+      cleanup();
+      const view = renderPage();
+      await screen.findByTestId("workflow-detail-title");
+      return view;
+    };
+
+    it("edits the chosen description by hand, and keeps that edit over a newer proposal", async () => {
       const newer = {
         ...saved,
         id: "newer",
@@ -786,35 +826,173 @@ describe("WorkflowDetailPage", () => {
         created_at: 250,
         content: { steps: WORKFLOW.steps, description: "Fixes flaky tests." },
       };
-      await renderWith(newer, () => stored);
-      vi.mocked(authenticatedFetch).mockImplementation(async (_path, options) => {
-        if (options?.method === "PATCH") {
-          // The editor writes the description alone, which clears its source on the server.
-          const body = JSON.parse(String(options.body));
-          stored = {
-            ...stored,
-            description: body.description,
-            description_source: null,
-            updated_at: 300,
-          };
-        }
-        return new Response(JSON.stringify(stored));
+      const { journal, server, view } = await renderJournal([saved, newer], {
+        ...WORKFLOW,
+        description: "Fixes one flaky test.",
+        description_source: "saved",
+        planning_session_id: "a".repeat(32),
+        updated_at: 200,
       });
-      expect(description()).toBe("Fixes flaky tests.");
+      expect(proposed()).toBe("Fixes flaky tests.");
+      const editor = () => screen.getByRole("textbox", { name: "Workflow description" });
 
+      // The editor starts from the chosen description. Saved unedited, either offered wording
+      // stays a choice for Save plan instead of a write.
+      fireEvent.click(screen.getByRole("radio", { name: /^Use proposed/ }));
       fireEvent.click(screen.getByRole("button", { name: "Edit description" }));
-      fireEvent.change(screen.getByRole("textbox", { name: "Workflow description" }), {
-        target: { value: "Fixes one flaky test." },
-      });
+      expect(editor()).toHaveValue("Fixes flaky tests.");
       fireEvent.click(screen.getByRole("button", { name: "Save" }));
-      await waitFor(() => expect(description()).toBe("Fixes one flaky test."));
+      expect(screen.getByRole("radio", { name: /^Use proposed/ })).toBeChecked();
+      fireEvent.click(screen.getByRole("button", { name: "Edit description" }));
+      fireEvent.change(editor(), { target: { value: "Fixes one flaky test." } });
+      fireEvent.click(screen.getByRole("button", { name: "Save" }));
+      expect(screen.getByRole("radio", { name: /^Keep current/ })).toBeChecked();
+      expect(server.patches).toEqual([]);
+
+      // Saved with the plan, the proposal's wording then gives way to a hand edit.
+      fireEvent.click(screen.getByRole("radio", { name: /^Use proposed/ }));
+      fireEvent.click(screen.getByRole("button", { name: "Save plan" }));
+      await waitFor(() => expect(description()).toBe("Fixes flaky tests."));
+      fireEvent.click(screen.getByRole("button", { name: "Edit description" }));
+      fireEvent.change(editor(), { target: { value: "Fixes flaky tests, one at a time." } });
+      fireEvent.click(screen.getByRole("button", { name: "Save" }));
+      await waitFor(() => expect(description()).toBe("Fixes flaky tests, one at a time."));
+      expect(server.patches.at(-1)).toEqual({ description: "Fixes flaky tests, one at a time." });
+      expect(screen.queryByRole("radiogroup")).toBeNull();
       expect(screen.getByRole("status")).toHaveTextContent("Saved plan");
-      cleanup();
-      renderPage();
-      await screen.findByTestId("workflow-detail-title");
-      expect(description()).toBe("Fixes one flaky test.");
+
+      // A newer proposal repeating the wording chosen earlier is reviewed afresh, so Save plan
+      // keeps the hand edit and records that proposal.
+      journal.entries = [
+        saved,
+        newer,
+        { ...newer, id: "repeat", position: 3, created_at: server.stored.updated_at! + 1 },
+      ];
+      view.rerender(<WorkflowDetailPage />);
+      expect(proposed()).toBe("Fixes flaky tests.");
+      expect(screen.getByRole("radio", { name: /^Keep current/ })).toBeChecked();
+      fireEvent.click(screen.getByRole("button", { name: "Save plan" }));
+      await waitFor(() => expect(screen.queryByRole("radiogroup")).toBeNull());
+      expect(server.patches.at(-1)).toEqual({
+        steps: WORKFLOW.steps,
+        description: "Fixes flaky tests, one at a time.",
+        expected_description: "Fixes flaky tests, one at a time.",
+        description_source: "repeat",
+      });
+      await reload();
+      expect(description()).toBe("Fixes flaky tests, one at a time.");
       expect(screen.getByRole("status")).toHaveTextContent("Saved plan");
     });
+
+    it("keeps the current description unless the proposal's is chosen, and records that", async () => {
+      const declined = {
+        ...saved,
+        id: "declined",
+        position: 2,
+        created_at: 250,
+        content: { steps: edited, description: "Fixes flaky tests." },
+      };
+      const { journal, server } = await renderJournal([saved, declined], {
+        ...WORKFLOW,
+        description: "Fixes one flaky test.",
+        description_source: "saved",
+        planning_session_id: "a".repeat(32),
+        updated_at: 200,
+      });
+      expect(description()).toBe("Fixes one flaky test.");
+      expect(proposed()).toBe("Fixes flaky tests.");
+      expect(screen.getByRole("radio", { name: /^Keep current/ })).toBeChecked();
+      expect(screen.getByRole("radio", { name: /^Use proposed/ })).not.toBeChecked();
+
+      // Keeping it saves the steps and names the declined proposal, so it isn't offered again.
+      fireEvent.click(screen.getByRole("button", { name: "Save plan" }));
+      await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent("Saved plan"));
+      expect(server.patches).toEqual([
+        {
+          steps: edited,
+          description: "Fixes one flaky test.",
+          expected_description: "Fixes one flaky test.",
+          description_source: "declined",
+        },
+      ]);
+      expect(description()).toBe("Fixes one flaky test.");
+      expect(screen.queryByRole("radiogroup")).toBeNull();
+      await reload();
+      expect(description()).toBe("Fixes one flaky test.");
+      expect(screen.queryByRole("radiogroup")).toBeNull();
+      expect(screen.getByRole("status")).toHaveTextContent("Saved plan");
+
+      // A newer proposal is offered, and its description saves once chosen.
+      const newer = {
+        ...declined,
+        id: "newer",
+        position: 3,
+        created_at: 350,
+        content: { steps: edited, description: "Finds and fixes flaky tests." },
+      };
+      journal.entries = [saved, declined, newer];
+      const view = await reload();
+      expect(proposed()).toBe("Finds and fixes flaky tests.");
+      expect(screen.getByRole("radio", { name: /^Keep current/ })).toBeChecked();
+      fireEvent.click(screen.getByRole("radio", { name: /^Use proposed/ }));
+      // Each proposal is chosen afresh, even one repeating the chosen wording.
+      journal.entries = [saved, declined, newer, { ...newer, id: "newest", position: 4 }];
+      view.rerender(<WorkflowDetailPage />);
+      expect(screen.getByRole("radio", { name: /^Keep current/ })).toBeChecked();
+      fireEvent.click(screen.getByRole("radio", { name: /^Use proposed/ }));
+      fireEvent.click(screen.getByRole("button", { name: "Save plan" }));
+      await waitFor(() => expect(description()).toBe("Finds and fixes flaky tests."));
+      expect(server.patches[1]).toEqual({
+        steps: edited,
+        description: "Finds and fixes flaky tests.",
+        expected_description: "Fixes one flaky test.",
+        description_source: "newest",
+      });
+      expect(screen.queryByRole("radiogroup")).toBeNull();
+      expect(screen.getByRole("status")).toHaveTextContent("Saved plan");
+    });
+
+    it.each(["Keep current", "Use proposed"])(
+      "saves the steps but keeps a description another client saved meanwhile (%s)",
+      async (choice) => {
+        const newer = {
+          ...saved,
+          id: "newer",
+          position: 2,
+          created_at: 250,
+          content: { steps: edited, description: "Fixes flaky tests." },
+        };
+        const { server } = await renderJournal([saved, newer], {
+          ...WORKFLOW,
+          description: "Fixes one flaky test.",
+          description_source: "saved",
+          planning_session_id: "a".repeat(32),
+          updated_at: 200,
+        });
+        // Another client's edit after this page loaded clears the stored source.
+        server.stored = {
+          ...server.stored,
+          description: "Edited elsewhere.",
+          description_source: null,
+          updated_at: 300,
+        };
+
+        fireEvent.click(screen.getByRole("radio", { name: new RegExp(`^${choice}`) }));
+        fireEvent.click(screen.getByRole("button", { name: "Save plan" }));
+        await waitFor(() => expect(description()).toBe("Edited elsewhere."));
+        expect(server.patches).toEqual([
+          {
+            steps: edited,
+            description: choice === "Keep current" ? "Fixes one flaky test." : "Fixes flaky tests.",
+            expected_description: "Fixes one flaky test.",
+            description_source: "newer",
+          },
+        ]);
+        expect(server.stored.steps).toEqual(edited);
+        expect(screen.queryByRole("radiogroup")).toBeNull();
+        expect(screen.getByRole("status")).toHaveTextContent("Saved plan");
+      },
+    );
 
     it("leaves the workflow runnable when an older server saves only the steps", async () => {
       // An older server returns no description source and refuses the conditional fields.
@@ -831,7 +1009,7 @@ describe("WorkflowDetailPage", () => {
         created_at: 250,
         content: { steps: edited, description: "Fixes flaky tests." },
       };
-      await renderWith(newer, () => stored);
+      await renderJournal([saved, newer], stored);
       vi.mocked(authenticatedFetch).mockImplementation(async (_path, options) => {
         if (options?.method === "PATCH") {
           const body = JSON.parse(String(options.body));
@@ -901,6 +1079,8 @@ describe("WorkflowDetailPage", () => {
       vi.mocked(useSessionJournal).mockImplementation(() => journal);
       const { rerender } = renderPage();
       await screen.findByTestId("workflow-detail-title");
+      // Its unchanged description leaves nothing to choose.
+      expect(screen.queryByRole("radiogroup")).toBeNull();
 
       fireEvent.click(screen.getByRole("button", { name: "Save plan" }));
       await waitFor(() => expect(patches).toHaveLength(1));
@@ -918,7 +1098,7 @@ describe("WorkflowDetailPage", () => {
       await act(async () => releaseSave());
 
       await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent("Unsaved changes"));
-      expect(description()).toBe("Fixes flaky tests.");
+      expect(proposed()).toBe("Fixes flaky tests.");
       expect(patches[0]).toMatchObject({
         description: "Fixes one flaky test.",
         description_source: "first",
@@ -954,7 +1134,7 @@ describe("WorkflowDetailPage", () => {
       serve(() => stored, notInJournal);
       renderPage();
       await screen.findByTestId("workflow-detail-title");
-      await waitFor(() => expect(description()).toBe("Fixes flaky tests."));
+      await waitFor(() => expect(proposed()).toBe("Fixes flaky tests."));
       expect(screen.getByRole("status")).toHaveTextContent("Unsaved changes");
     });
 
@@ -994,7 +1174,7 @@ describe("WorkflowDetailPage", () => {
       vi.mocked(useSessionJournal).mockReturnValue(page(true));
       renderPage();
       await screen.findByTestId("workflow-detail-title");
-      await waitFor(() => expect(description()).toBe("Fixes flaky tests."));
+      await waitFor(() => expect(proposed()).toBe("Fixes flaky tests."));
       expect(screen.getByRole("status")).toHaveTextContent("Unsaved changes");
 
       // A source the journal doesn't hold came from another planning chat: the workflow's

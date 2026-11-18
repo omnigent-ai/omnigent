@@ -113,6 +113,11 @@ is specified." Separate required inputs from optional overrides, and name
 any authorization needed for external actions. The running agent should
 look up missing details and apply documented defaults before asking.
 
+When the workflow already has a description, as in a planning chat, keep
+the user's wording and structure rather than rewriting it into the form
+above. Change only what the plan makes inaccurate, add only what a run needs
+that it leaves out, and publish it unchanged when it still fits.
+
 ## Save
 
 - When asked to create or save a workflow, save it with `sys_workflow_save`

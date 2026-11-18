@@ -168,7 +168,8 @@ describe("editWorkflowPlanPrompt", () => {
     expect(prompt).toContain("wait for my answer before proposing or publishing changes");
     expect(prompt).toContain("Preserve steps I haven't asked to change");
     expect(prompt).toContain("Set description on every plan you publish");
-    expect(prompt).toContain("Save plan stores it as the workflow description");
+    expect(prompt).toContain("Keep the current description's wording");
+    expect(prompt).toContain("repeat it unchanged when it still fits");
     expect(prompt).not.toContain("Draft a useful first proposal now");
   });
 

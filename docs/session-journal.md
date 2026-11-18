@@ -206,11 +206,14 @@ confirmation. An explicit request to draft, review or try it before saving
 still controls that order. Creating a workflow does not run its steps.
 In the workflow page's planning chat, the agent publishes proposals only;
 **Save plan** applies them to the workflow that already exists. Each proposal
-carries a description written for its steps, which the page shows until you
-save and Save plan stores with them. A proposal replaces the description only
-if it is newer than where that description came from: the proposal it was
-saved from, or else the workflow's last change. A description another client
-saved after the page loaded stays.
+carries a description for its steps, in the current description's wording
+where that still fits. When a proposal changes the description, the page shows
+the current and proposed descriptions side by side, and Save plan keeps the
+current one unless you choose the proposal's. Either way it records the
+proposal, so a declined description isn't offered again. A proposal's
+description is offered only if it is newer than where the description came
+from: the proposal it was saved from or kept over, or else the workflow's last
+change. A description another client saved after the page loaded stays.
 
 Authoring reads the referenced SOPs, runbooks and relevant linked procedures
 before proposing execution steps. The plan carries forward their actions,
@@ -438,9 +441,9 @@ it ran.
 - `PATCH /v1/workflows/{id}`: any of `name`, `description` and `steps`; fields
   left out keep their values. With `expected_description`, the new description
   applies only while the stored one is still that text. `description_source`
-  names the planning-chat proposal the description comes from; the workflow
-  returns it until the description is written without one or another planning
-  chat is attached.
+  names the planning-chat proposal the description was saved from or kept
+  over; the workflow returns it until the description is written without one or
+  another planning chat is attached.
 - `DELETE /v1/workflows/{id}`: deletes it.
 
 Workflows live in `workflows`, keyed by workspace and ID, with encoded JSON
