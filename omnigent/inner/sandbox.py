@@ -1756,7 +1756,9 @@ def _launcher_path_variants(path: Path) -> set[Path]:
     raise OSError(f"Cannot validate sandbox launcher symlink chain: {path}")
 
 
-def _isolated_launcher_import_roots(interpreter: str) -> tuple[Path, ...]:
+def _isolated_launcher_import_roots(
+    interpreter: str, *, sandbox: SandboxPolicy | None = None
+) -> tuple[Path, ...]:
     """Read isolated startup paths without executing site or its .pth hooks."""
     program = """
 import json, site, sys
@@ -1812,6 +1814,10 @@ print(json.dumps({
             if not site_dir.is_dir():
                 continue
             for pth in sorted(site_dir.glob("*.pth")):
+                if sandbox is not None:
+                    _validate_trusted_hardlink_aliases(
+                        sandbox, _launcher_path_variants(pth), set()
+                    )
                 for line in pth.read_text(encoding="utf-8").splitlines():
                     if not line or line.startswith("#"):
                         continue
@@ -1821,7 +1827,9 @@ print(json.dumps({
                     roots.add(site_dir / line.strip())
         return tuple(sorted(roots))
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
-        if isinstance(exc, OSError) and "unsupported .pth" in str(exc):
+        if isinstance(exc, OSError) and (
+            "unsupported .pth" in str(exc) or "mutable hard-link alias" in str(exc)
+        ):
             raise
         raise OSError("Cannot validate sandbox launcher isolated startup imports") from None
 
@@ -2091,7 +2099,7 @@ def _validate_launcher_runtime(sandbox: SandboxPolicy) -> None:
     # including .pth additions, are imported by the launcher before containment.
     isolated_trees = {
         variant
-        for path in _isolated_launcher_import_roots(sys.executable)
+        for path in _isolated_launcher_import_roots(sys.executable, sandbox=sandbox)
         for variant in _launcher_path_variants(path)
     }
     _validate_launcher_write_grants(sandbox, set(), isolated_trees)

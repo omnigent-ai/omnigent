@@ -292,7 +292,7 @@ def _validate_auth_runtime(executable: _TrustedExecutable, policy: SandboxPolicy
         _validate_trusted_hardlink_aliases(policy, set(), base_trees)
         # The liveness supervisor also starts Python in the trusted parent.
         _validate_launcher_runtime(policy)
-        roots = _isolated_launcher_import_roots(str(executable.interpreter))
+        roots = _isolated_launcher_import_roots(str(executable.interpreter), sandbox=policy)
         import_trees = {variant for root in roots for variant in _launcher_path_variants(root)}
         _validate_launcher_write_grants(policy, set(), import_trees)
         _validate_trusted_hardlink_aliases(policy, set(), import_trees)
