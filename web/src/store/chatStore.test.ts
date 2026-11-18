@@ -415,6 +415,7 @@ function defaultFetchHandler(input: RequestInfo | URL, init?: RequestInit): Resp
           subagent_routing_override?: "on" | "off" | null;
           collaboration_mode?: string;
           approval_mode?: string;
+          permission_mode?: string;
         })
       : {};
     const labels = { ...(sessionLabels.get(sessionId) ?? {}) };
@@ -440,6 +441,10 @@ function defaultFetchHandler(input: RequestInfo | URL, init?: RequestInit): Resp
     }
     if ("approval_mode" in body && typeof body.approval_mode === "string") {
       labels["omnigent.codex_native.approval_mode"] = body.approval_mode;
+      sessionLabels.set(sessionId, labels);
+    }
+    if ("permission_mode" in body && typeof body.permission_mode === "string") {
+      labels["omnigent.claude_native.permission_mode"] = body.permission_mode;
       sessionLabels.set(sessionId, labels);
     }
     return mockResponse({
@@ -794,10 +799,13 @@ describe("chatStore — lazy subtree usage", () => {
     expect(useChatStore.getState().blocks).toHaveLength(1);
     expect(useChatStore.getState().sessionCostUsd).toBeNull();
     expect(useChatStore.getState().sessionUsageByModel).toBeNull();
+    // Unknown while the read runs is loading, not unavailable.
+    expect(useChatStore.getState().sessionUsageLoading).toBe(true);
 
     finishUsage(usage("conv_usage", 3.5));
     await tick();
 
+    expect(useChatStore.getState().sessionUsageLoading).toBe(false);
     expect(useChatStore.getState().sessionCostUsd).toBe(3.5);
     expect(useChatStore.getState().sessionUsageByModel).toEqual({
       "model-a": {
@@ -866,6 +874,7 @@ describe("chatStore — lazy subtree usage", () => {
     expect(useChatStore.getState().conversationLoadError).toBeNull();
     expect(useChatStore.getState().sessionCostUsd).toBeNull();
     expect(useChatStore.getState().sessionUsageByModel).toBeNull();
+    expect(useChatStore.getState().sessionUsageLoading).toBe(false);
     expect(readUsage).toHaveBeenCalledOnce();
   });
 
@@ -1068,12 +1077,20 @@ describe("chatStore — lazy subtree usage", () => {
       await useChatStore.getState().switchTo("conv_usage");
       await drainAsync();
       expect(useChatStore.getState().sessionCostUsd).toBe(3.5);
+      await vi.advanceTimersByTimeAsync(2_000);
+      client.setQueryData(["agent_costs", "conv_usage"], new Map());
+      client.setQueryData(["agent_costs", "conv_unsupported"], null);
 
       await advanceReconcileInterval();
+      await vi.advanceTimersByTimeAsync(2_000);
 
       expect(streamOpenCount()).toBe(1);
       expect(readUsage).toHaveBeenCalledTimes(2);
       expect(useChatStore.getState().sessionCostUsd).toBe(8);
+      // A total recovered outside the live stream still refreshes per-agent costs,
+      // except from a server that has no breakdown.
+      expect(client.getQueryState(["agent_costs", "conv_usage"])?.isInvalidated).toBe(true);
+      expect(client.getQueryState(["agent_costs", "conv_unsupported"])?.isInvalidated).toBe(false);
       expect(useChatStore.getState().sessionUsageByModel?.["model-a"]).toMatchObject({
         inputTokens: 500,
         totalCostUsd: 8,
@@ -1096,6 +1113,8 @@ describe("chatStore — lazy subtree usage", () => {
 
       await advanceReconcileInterval();
       expect(readUsage).toHaveBeenCalledTimes(2);
+      // A background re-read keeps the settled answer instead of loading again.
+      expect(useChatStore.getState().sessionUsageLoading).toBe(false);
       handleSessionEvent({
         type: "session_status",
         conversationId: "conv_usage",
@@ -1261,6 +1280,22 @@ describe("chatStore — switchTo", () => {
     await tick();
     await tick();
     expect(useChatStore.getState().blocks).toHaveLength(1);
+  });
+
+  it("stamps a background session's runner launch without touching the open conversation", async () => {
+    seedSession("conv_cell", []);
+    seedSession("conv_open", []);
+    await useChatStore.getState().switchTo("conv_cell");
+    await useChatStore.getState().switchTo("conv_open");
+
+    useChatStore.getState().markRunnerLaunched("conv_cell");
+
+    expect(conversationRegistry.peek("conv_cell")!.getState().runnerLaunchedAt).toEqual(
+      expect.any(Number),
+    );
+    expect(conversationRegistry.peek("conv_open")!.getState().runnerLaunchedAt).toBeNull();
+    expect(useChatStore.getState().conversationId).toBe("conv_open");
+    expect(useChatStore.getState().runnerLaunchedAt).toBeNull();
   });
 
   it("scopes the background-task pill state to the active conversation", async () => {
@@ -7754,6 +7789,194 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
     });
   });
 
+  describe("rewindToPrompt", () => {
+    function answerRewind(response: Response): () => RequestInit | undefined {
+      let sent: RequestInit | undefined;
+      const base = fetchMock.getMockImplementation()!;
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        if (String(input).endsWith("/v1/sessions/conv_old/rewind")) {
+          sent = init;
+          return Promise.resolve(response.clone());
+        }
+        return base(input, init);
+      });
+      return () => sent;
+    }
+
+    it.each([false, true])(
+      "restores the rewound prompt and warns if incomplete: %s",
+      async (incomplete) => {
+        onTestFinished(() => clearSessionDrafts());
+        useChatStore.setState({ conversationId: "conv_old", redirectToConversationId: null });
+        const sent = answerRewind(
+          Response.json({
+            session_id: "conv_new",
+            prompt: "Add parser tests",
+            attachments_incomplete: incomplete,
+          }),
+        );
+        const warning = vi.spyOn(toast, "warning");
+        onTestFinished(() => warning.mockRestore());
+
+        await useChatStore.getState().rewindToPrompt("msg_second");
+
+        if (incomplete) {
+          expect(warning).toHaveBeenCalledExactlyOnceWith(
+            "Some attachments couldn't be restored. Attach them again before sending.",
+          );
+        } else {
+          expect(warning).not.toHaveBeenCalled();
+        }
+        expect(JSON.parse(String(sent()?.body))).toEqual({ item_id: "msg_second" });
+        expect(getSessionDraft("conv_new")?.text).toBe("Add parser tests");
+        expect(useChatStore.getState().redirectToConversationId).toBe("conv_new");
+        expect(useChatStore.getState().rewindPrefill).toEqual({
+          conversationId: "conv_new",
+          text: "Add parser tests",
+          files: [],
+        });
+      },
+    );
+
+    it("stays put when the user switched away before the rewind was acknowledged", async () => {
+      onTestFinished(() => {
+        clearSessionDrafts();
+        useChatStore.setState({ rewindPrefill: null });
+      });
+      useChatStore.setState({ conversationId: "conv_old", redirectToConversationId: null });
+      let acknowledge = () => {};
+      const answered = new Promise<void>((resolve) => {
+        acknowledge = resolve;
+      });
+      const base = fetchMock.getMockImplementation()!;
+      fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+        if (String(input).endsWith("/v1/sessions/conv_old/rewind")) {
+          await answered;
+          return Response.json({ session_id: "conv_new", prompt: "Add parser tests" });
+        }
+        return base(input, init);
+      });
+
+      const rewinding = useChatStore.getState().rewindToPrompt("msg_second");
+      useChatStore.setState({ conversationId: "conv_other" });
+      acknowledge();
+      await rewinding;
+
+      expect(useChatStore.getState().redirectToConversationId).toBeNull();
+      // The new session still opens with the prompt when the user goes there.
+      expect(getSessionDraft("conv_new")?.text).toBe("Add parser tests");
+    });
+
+    it("restores the prompt's attachments as the new session's own files", async () => {
+      onTestFinished(() => {
+        clearSessionDrafts();
+        useChatStore.setState({ rewindPrefill: null });
+      });
+      useChatStore.setState({ conversationId: "conv_old", redirectToConversationId: null });
+      answerRewind(
+        Response.json({
+          session_id: "conv_new",
+          prompt: "",
+          attachments: [
+            { type: "input_image", file_id: "file_fork_png", filename: "diagram.png" },
+            // Carried inline (e.g. imported), with no stored file to copy.
+            {
+              type: "input_image",
+              file_id: null,
+              image_url: "data:image/png;base64,cGFzdGVk",
+              filename: "pasted.png",
+            },
+            {
+              type: "input_file",
+              file_id: null,
+              file_data: "data:application/pdf;base64,JVBERi0=",
+              filename: "spec.pdf",
+            },
+            {
+              type: "input_file",
+              file_id: null,
+              file_data: "data:text/plain;charset=utf-8;base64,aW5saW5l",
+              filename: "inline.txt",
+            },
+            { type: "input_file", file_id: "file_fork_gone", filename: "gone.txt" },
+            { type: "input_file", file_id: "file_fork_txt", filename: "notes.txt" },
+          ],
+        }),
+      );
+      const contents: Record<string, Response> = {
+        file_fork_png: new Response("png", { headers: { "Content-Type": "image/png" } }),
+        file_fork_gone: Response.json({ error: { code: "not_found" } }, { status: 404 }),
+        file_fork_txt: new Response("notes", { headers: { "Content-Type": "text/plain" } }),
+      };
+      const uploads: string[] = [];
+      const posted: unknown[] = [];
+      const rewindFetch = fetchMock.getMockImplementation()!;
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const fileId = url.match(
+          /\/v1\/sessions\/conv_new\/resources\/files\/(\w+)\/content$/,
+        )?.[1];
+        if (fileId) return Promise.resolve(contents[fileId]!);
+        if (url.endsWith("/resources/files")) {
+          uploads.push(url);
+          return mockResponse({
+            id: `file_uploaded_${uploads.length}`,
+            name: "inline",
+            metadata: { filename: "inline", bytes: 6, created_at: 0 },
+          });
+        }
+        if (url.endsWith("/v1/sessions/conv_new/events") && init?.method === "POST")
+          posted.push(JSON.parse(String(init.body)));
+        return rewindFetch(input, init);
+      });
+
+      const warning = vi.spyOn(toast, "warning");
+      onTestFinished(() => warning.mockRestore());
+
+      await useChatStore.getState().rewindToPrompt("msg_second");
+
+      expect(warning).toHaveBeenCalledExactlyOnceWith(
+        "Couldn't restore gone.txt to the composer. Attach again to send.",
+      );
+      const files = getSessionDraft("conv_new")?.files ?? [];
+      expect(files.map((file) => [file.name, file.type])).toEqual([
+        ["diagram.png", "image/png"],
+        ["pasted.png", "image/png"],
+        ["spec.pdf", "application/pdf"],
+        ["inline.txt", "text/plain"],
+        ["notes.txt", "text/plain"],
+      ]);
+      expect(await files[1]!.text()).toBe("pasted");
+      expect(await files[2]!.text()).toBe("%PDF-");
+      expect(await files[3]!.text()).toBe("inline");
+      expect(await files[4]!.text()).toBe("notes");
+      expect(useChatStore.getState().rewindPrefill?.files).toEqual(files);
+
+      // Sending them reuses the new session's copies instead of uploading
+      // again; only the inline image and documents, which had no copy, are uploaded.
+      useChatStore.setState({ conversationId: "conv_new", abortController: new AbortController() });
+      await useChatStore.getState().send("", "agent_xyz", files);
+      expect(uploads).toEqual(Array(3).fill("/v1/sessions/conv_new/resources/files"));
+      expect(JSON.stringify(posted)).toContain('"file_id":"file_fork_png"');
+      for (const uploaded of ["file_uploaded_1", "file_uploaded_2", "file_uploaded_3"])
+        expect(JSON.stringify(posted)).toContain(`"file_id":"${uploaded}"`);
+      expect(JSON.stringify(posted)).toContain('"file_id":"file_fork_txt"');
+    });
+
+    it("leaves the view in place when the server refuses", async () => {
+      useChatStore.setState({ conversationId: "conv_old", redirectToConversationId: null });
+      answerRewind(
+        Response.json(
+          { error: { code: "invalid_input", message: "Stop the current turn first." } },
+          { status: 400 },
+        ),
+      );
+
+      await expect(useChatStore.getState().rewindToPrompt("msg_second")).rejects.toThrow();
+      expect(useChatStore.getState().redirectToConversationId).toBeNull();
+    });
+  });
+
   describe("session.status", () => {
     it("updates sessionStatus from the event", () => {
       const event: SessionStatusEvent = {
@@ -13221,6 +13444,114 @@ describe("chatStore — session configuration scope", () => {
     expect(sessionLabels.get("conv_approval_failure")).not.toHaveProperty(
       "omnigent.codex_native.approval_mode",
     );
+  });
+
+  it.each([
+    {
+      wrapper: "codex-native-ui",
+      setter: "setCodexApprovalMode",
+      field: "codexApprovalMode",
+      key: "approval_mode",
+      mode: "approve-for-me",
+    },
+    {
+      wrapper: "claude-code-native-ui",
+      setter: "setClaudePermissionMode",
+      field: "claudePermissionMode",
+      key: "permission_mode",
+      mode: "auto",
+    },
+  ] as const)(
+    "switches a background session's $field without touching the active one",
+    async ({ wrapper, setter, field, key, mode }) => {
+      const cellId = `conv_${key}_cell`;
+      const activeId = `conv_${key}_active`;
+      for (const id of [cellId, activeId]) {
+        seedSession(id, []);
+        withSnapshot(id, { labels: { "omnigent.wrapper": wrapper } });
+      }
+      await useChatStore.getState().switchTo(cellId);
+      await useChatStore.getState().switchTo(activeId);
+      const cell = () => conversationRegistry.peek(cellId)!.getState();
+      fetchMock.mockClear();
+
+      await useChatStore.getState()[setter](mode, cellId);
+
+      expect(patchCallsFor(cellId)).toEqual([{ [key]: mode }]);
+      expect(patchCallsFor(activeId)).toEqual([]);
+      expect(cell()[field]).toBe(mode);
+      expect(useChatStore.getState()[field]).toBe("");
+
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const path = (typeof input === "string" ? input : input.toString()).split("?")[0]!;
+        if (path === `/v1/sessions/${cellId}` && init?.method === "PATCH")
+          return mockResponse(
+            { error: { code: "runner_unavailable" } },
+            { ok: false, status: 503 },
+          );
+        return defaultFetchHandler(input, init);
+      });
+      await expect(useChatStore.getState()[setter]("default", cellId)).rejects.toThrow();
+
+      // The rejected switch rolls back only the targeted session.
+      expect(cell()[field]).toBe(mode);
+      expect(useChatStore.getState()[field]).toBe("");
+    },
+  );
+
+  it("changes a background session's model, effort and routing, leaving the active one", async () => {
+    const cellId = "conv_settings_cell";
+    const activeId = "conv_settings_active";
+    for (const id of [cellId, activeId]) {
+      seedSession(id, []);
+      sessionLabels.set(id, { "omnigent.wrapper": "claude-code-native-ui" });
+    }
+    // Echo a model pick like the real server ("default" clears it), so turning
+    // routing on must clear the pinned model.
+    fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const response = defaultFetchHandler(input, init);
+      const patch: Record<string, unknown> =
+        init?.method === "PATCH" ? JSON.parse(String(init.body)) : {};
+      if (!("model_override" in patch)) return response;
+      const model = patch.model_override === "default" ? null : patch.model_override;
+      return mockResponse({ ...(await response.json()), model_override: model });
+    });
+    await useChatStore.getState().switchTo(cellId);
+    await useChatStore.getState().switchTo(activeId);
+    useChatStore.setState({ sessionModelOverride: null, sessionReasoningEffort: "low" });
+    const cell = () => conversationRegistry.peek(cellId)!.getState();
+    fetchMock.mockClear();
+
+    await useChatStore.getState().setModel("sonnet", { sessionId: cellId });
+    expect(cell().sessionModelOverride).toBe("sonnet");
+    await useChatStore.getState().setEffort("high", cellId);
+    await useChatStore.getState().setCostControlMode("on", cellId);
+
+    expect(patchCallsFor(cellId)).toEqual([
+      { model_override: "sonnet" },
+      { reasoning_effort: "high" },
+      { cost_control_mode_override: "on", model_override: "default" },
+    ]);
+    expect(patchCallsFor(activeId)).toEqual([]);
+    expect(cell()).toMatchObject({
+      sessionModelOverride: null,
+      sessionReasoningEffort: "high",
+      costControlModeOverride: "on",
+    });
+    expect(useChatStore.getState()).toMatchObject({
+      conversationId: activeId,
+      sessionModelOverride: null,
+      sessionReasoningEffort: "low",
+      costControlModeOverride: null,
+    });
+  });
+
+  it("leaves a session that isn't loaded alone", async () => {
+    const store = useChatStore.getState();
+    await store.setModel("sonnet", { sessionId: "conv_not_loaded" });
+    await store.setEffort("high", "conv_not_loaded");
+    await store.setCostControlMode("on", "conv_not_loaded");
+    expect(patchCallsFor("conv_not_loaded")).toEqual([]);
   });
 
   it("hydrates server-side model and effort without PATCHing", async () => {
@@ -19420,6 +19751,22 @@ describe("chatStore — elicitations across stream drops and re-publishes", () =
     });
   }
 
+  function codexCommandReqFrame(id: string, command: string, prefix: string[]): string {
+    return sse("response.elicitation_request", {
+      elicitation_id: id,
+      params: {
+        mode: "form",
+        message: `Codex wants to run ${command}`,
+        phase: "codex_command_approval",
+        policy_name: "codex_native_command_approval",
+        content_preview: "",
+        command,
+        execpolicy_amendment: prefix,
+        approval_request_fingerprint: command,
+      },
+    });
+  }
+
   function elicitationCards(): ElicitationBlock[] {
     return useChatStore
       .getState()
@@ -19746,6 +20093,37 @@ describe("chatStore — elicitations across stream drops and re-publishes", () =
 
     await abortLoop(sinks, controller, loop);
   });
+
+  it.each(["pending", "auto_resolved", "responded"] as const)(
+    "replaces a reused Codex command card with the current request (%s)",
+    async (priorStatus) => {
+      seedSession("conv_codex_reuse", []);
+      const { sinks, controller, loop } = await openLoop("conv_codex_reuse");
+
+      sinks[0]!.push(codexCommandReqFrame("elic_reused", "python -m pytest", ["python", "-m"]));
+      await drainAsync();
+      if (priorStatus === "auto_resolved") {
+        sinks[0]!.push(sse("response.elicitation_resolved", { elicitation_id: "elic_reused" }));
+        await drainAsync();
+      } else if (priorStatus === "responded") {
+        await useChatStore.getState().submitApproval("elic_reused", "accept");
+      }
+
+      sinks[0]!.push(codexCommandReqFrame("elic_reused", "sh -c new-command", ["sh", "-c"]));
+      await drainAsync();
+
+      const cards = elicitationCards();
+      expect(cards).toHaveLength(1);
+      expect(cards[0]!.status).toBe("pending");
+      expect(cards[0]!.codexCommand).toMatchObject({
+        command: "sh -c new-command",
+        execPolicyAmendment: ["sh", "-c"],
+        requestFingerprint: "sh -c new-command",
+      });
+
+      await abortLoop(sinks, controller, loop);
+    },
+  );
 
   it("does not clobber an in-flight user verdict with a re-publish", async () => {
     seedSession("conv_verdict", []);

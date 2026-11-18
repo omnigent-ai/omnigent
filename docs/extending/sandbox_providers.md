@@ -256,7 +256,12 @@ The server's keepalive calls a provider's `keep_alive` while the sandbox's
 runner reports agent work, and for the runner idle timeout
 (`host_config.runner.idle_timeout_s`, one hour by default) afterwards, so a
 sandbox stays warm about as long as an idle runner stays alive. Viewing a session
-does not count as work. After renewal stops, the provider's own idle or expiry
+does not count as work. Waiting on a human (an unanswered dialog or permission
+request) counts as work for at most `OMNIGENT_RUNNER_HUMAN_WAIT_HOLD_S` seconds per
+wait (one day by default; `0` removes the limit), measured from the runner's first
+active-work check that observes the wait. Messages queued behind a wait that runs
+out are reported as not sent; a server too old to record that keeps the wait open
+instead. After renewal stops, the provider's own idle or expiry
 behavior applies. For `agent_sandbox`, `sandbox.keep_warm_s` sets that runner
 idle timeout, and expiry suspends compute while retaining storage. Other
 providers have different lifetime behavior, so enabling managed sandboxes alone

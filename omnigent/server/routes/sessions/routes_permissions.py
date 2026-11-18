@@ -53,6 +53,7 @@ from omnigent.server.routes._sessions.common import (
 from omnigent.server.routes._sessions.helpers import (
     _announce_session_added,
 )
+from omnigent.server.routes.scheduled_task_permissions import automation_managing_session
 from omnigent.server.schemas import (
     AgentObject,
     GrantPermissionRequest,
@@ -70,12 +71,19 @@ from omnigent.spec.types import (
     PolicySpec,
 )
 from omnigent.stores import AgentStore, ConversationStore
-from omnigent.stores.permission_store import PermissionStore
+from omnigent.stores.permission_store import MAX_GRANTS_PAGE_SIZE, PermissionStore
+
+
+class _ManagingAutomation(TypedDict):
+    id: str
+    name: str
 
 
 class _PermissionListResponse(TypedDict):
     permissions: list[PermissionObject]
     next_cursor: str | None
+    # The caller's automation that overwrites this session's sharing on each run.
+    managed_by_automation: _ManagingAutomation | None
 
 
 def _session_workspace(conversation_store: ConversationStore, session_id: str) -> str | None:
@@ -108,7 +116,8 @@ def register_permissions_routes(
         """Grant or update a permission on a session.
 
         Requires manage-level access. Upserts the grant — can
-        upgrade or downgrade an existing level. Auto-creates the
+        upgrade or downgrade an existing level unless ``ensure_minimum``
+        preserves stronger access. Auto-creates the
         grantee user if they don't exist yet.
 
         :param request: The incoming FastAPI request (for auth).
@@ -154,12 +163,16 @@ def register_permissions_routes(
                 )
             await asyncio.to_thread(permission_store.ensure_user, body.user_id)
             perm = await asyncio.to_thread(
-                permission_store.grant, body.user_id, session_id, body.level
+                permission_store.grant,
+                body.user_id,
+                session_id,
+                body.level,
+                ensure_minimum=body.ensure_minimum,
             )
         # Push the now-shared session to the GRANTEE's open tabs so it
         # appears in their sidebar without a list poll.
         _announce_session_added(body.user_id, session_id)
-        add_audit_attrs(target_user_id=body.user_id, level=body.level)
+        add_audit_attrs(target_user_id=body.user_id, level=perm.level)
         return PermissionObject(
             user_id=perm.user_id,
             conversation_id=perm.conversation_id,
@@ -279,7 +292,9 @@ def register_permissions_routes(
         await _require_access(
             user_id, session_id, LEVEL_READ, permission_store, conversation_store
         )
-        return {"owner": _get_session_owner_id(session_id, permission_store)}
+        return {
+            "owner": await asyncio.to_thread(_get_session_owner_id, session_id, permission_store)
+        }
 
     @router.get(
         "/sessions/{session_id}/permissions",
@@ -288,19 +303,22 @@ def register_permissions_routes(
     async def list_permissions(
         request: Request,
         session_id: str,
-        limit: int = Query(default=100, ge=1, le=1000),
+        limit: int = Query(default=100, ge=1, le=MAX_GRANTS_PAGE_SIZE),
         after: str | None = Query(default=None, description="Cursor: user_id to start after"),
     ) -> _PermissionListResponse:
         """List permission grants on a session with cursor pagination.
 
-        Requires manage-level access.
+        Requires manage-level access. ``managed_by_automation`` names the caller's
+        shared continue-session automation that syncs this session's sharing on each
+        run, overwriting changes made here.
 
         :param request: The incoming FastAPI request (for auth).
         :param session_id: Session to list grants for,
             e.g. ``"conv_abc123"``.
         :param limit: Max grants to return (1–1000, default 100).
         :param after: Cursor — user_id to start after (exclusive).
-        :returns: ``{"permissions": [...], "next_cursor": str|null}``.
+        :returns: ``{"permissions": [...], "next_cursor": str|null,
+            "managed_by_automation": {"id": str, "name": str}|null}``.
         :raises OmnigentError: 404 if no session or no access.
         """
         user_id = _require_user(request, auth_provider)
@@ -315,6 +333,23 @@ def register_permissions_routes(
         grants, next_cursor = await asyncio.to_thread(
             permission_store.list_for_session, session_id, limit=limit, after_user_id=after
         )
+        state = request.app.state
+        try:
+            managing = await automation_managing_session(
+                session_id,
+                user_id,
+                conversation_store=conversation_store,
+                scheduled_task_store=(
+                    getattr(state, "scheduled_task_store", None)
+                    if getattr(state, "automations_available", lambda: False)()
+                    else None
+                ),
+                permission_store=permission_store,
+            )
+        except Exception:
+            # The marker only informs the share dialog; the grants list must still load.
+            _logger.exception("could not find the automation managing session %s", session_id)
+            managing = None
         return {
             "permissions": [
                 PermissionObject(
@@ -325,6 +360,9 @@ def register_permissions_routes(
                 for g in grants
             ],
             "next_cursor": next_cursor,
+            "managed_by_automation": (
+                {"id": managing.id, "name": managing.name} if managing is not None else None
+            ),
         }
 
 

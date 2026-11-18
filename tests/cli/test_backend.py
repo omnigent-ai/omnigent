@@ -50,6 +50,7 @@ from omnigent.cli import (
     cli as cli_group,
 )
 from omnigent.host.local_server import LocalServerStartup
+from omnigent.telemetry.request_headers import client_user_agent
 
 
 @pytest.fixture(autouse=True)
@@ -3487,7 +3488,10 @@ def test_databricks_preflight_silent_sdk_refresh_skips_login(
 
     cli._ensure_databricks_server_auth(_HOST_DATABRICKS_SERVER, non_interactive=True)
 
-    assert requests[1]["headers"] == {"Authorization": "Bearer fresh-token"}
+    assert requests[1]["headers"] == {
+        "Authorization": "Bearer fresh-token",
+        "User-Agent": client_user_agent(),
+    }
     assert requests[1]["params"] == {"o": "123"}
     assert stored == [(_HOST_DATABRICKS_SERVER, "https://example.databricks.com", "123")]
 
@@ -3556,7 +3560,10 @@ def test_databricks_preflight_uses_cli_workspace_id_for_workspace_mount(
 
     cli._ensure_databricks_server_auth(server, non_interactive=True)
 
-    assert requests[1]["headers"] == {"Authorization": "Bearer fresh-token"}
+    assert requests[1]["headers"] == {
+        "Authorization": "Bearer fresh-token",
+        "User-Agent": client_user_agent(),
+    }
     assert requests[1]["params"] == {"o": "4242424242424242"}
     assert stored == [(server, "https://example.databricks.com", "4242424242424242")]
 
@@ -3868,7 +3875,7 @@ def test_databricks_preflight_rejected_credential_recovers_via_sdk_refresh(
     monkeypatch.setattr(httpx, "get", _get)
     monkeypatch.setattr(
         "omnigent.cli_auth.load_databricks_workspace_host",
-        lambda server: "https://example.databricks.com",
+        lambda server: "https://workspace.example.test",
     )
     monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda server: None)
     from omnigent.inner.databricks_executor import _databrickscfg_fingerprint
@@ -3878,6 +3885,7 @@ def test_databricks_preflight_rejected_credential_recovers_via_sdk_refresh(
         current_token=lambda: "fresh-token",
         profile_name=None,
         resolved_config_file=_databrickscfg_fingerprint(),
+        resolved_workspace_host="https://workspace.example.test",
     )
     monkeypatch.setattr(
         cli,
@@ -3899,7 +3907,7 @@ def test_databricks_preflight_rejected_credential_recovers_via_sdk_refresh(
 
     cli._ensure_databricks_server_auth(_HOST_DATABRICKS_SERVER, non_interactive=True)
 
-    assert stored == [(_HOST_DATABRICKS_SERVER, "https://example.databricks.com")]
+    assert stored == [(_HOST_DATABRICKS_SERVER, "https://workspace.example.test")]
     shared = chat._shared_token_source(_HOST_DATABRICKS_SERVER)
     assert shared is not refused, (
         "clients built after the refused probe would reuse the refused credential"

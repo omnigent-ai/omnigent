@@ -201,6 +201,31 @@ async def test_create_and_get_roundtrips_config(project_client: httpx.AsyncClien
     assert fetched["config"] == cfg
 
 
+@pytest.mark.parametrize(
+    "repository",
+    [
+        {"url": "https://git.example.com/team/app.git", "branch": "main"},
+        # A legacy bare string, and a null, are stored as-is; the composer ignores them.
+        "https://git.example.com/team/app.git",
+        None,
+    ],
+    ids=["object", "legacy-string", "null"],
+)
+async def test_repository_config_is_stored_opaquely(
+    project_client: httpx.AsyncClient, repository: object
+) -> None:
+    """The saved repository round-trips through create, get and rename untouched."""
+    config = {"agent_id": "187b7cb7ac30abf4debfaa578d052ec6", "repository": repository}
+    created = (
+        await project_client.post("/v1/projects", json={"name": "Repo", "config": config})
+    ).json()
+    assert created["config"] == config
+    fetched = (await project_client.get(f"/v1/projects/{created['id']}")).json()
+    assert fetched["config"] == config
+    renamed = await project_client.patch(f"/v1/projects/{created['id']}", json={"name": "Renamed"})
+    assert renamed.json()["config"] == config
+
+
 async def test_patch_replaces_config(project_client: httpx.AsyncClient) -> None:
     """PATCH with a new config replaces the stored one and stamps updated_at."""
     created = (

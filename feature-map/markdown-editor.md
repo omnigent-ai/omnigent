@@ -27,6 +27,9 @@ and the recording protocol for comparing revisions.
 - `changes`: select an existing changed Markdown file, then exit diff to edit it.
   Deleted files stay in diff; select another file to continue editing.
 - `direct-link`: open a session URL with a selected Markdown file.
+- Desktop with `workspace_direct_access` on, for a host on another machine:
+  the first file opened may ask, in a native dialog, to read that host's files
+  over SSH. "Not now" keeps reading through the server.
 - `chat-link`: follow a Markdown file link in a message; a line citation opens
   Source at that line, rather than the rich editor, and a range (`:12-18`,
   `#L12-L18`) highlights every cited line. Right-clicking or long-pressing the

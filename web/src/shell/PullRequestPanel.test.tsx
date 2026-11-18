@@ -236,6 +236,7 @@ import {
 
 import {
   PullRequestPanel,
+  selectPullRequestInPanel,
   derivePullRequestPanelState,
   LARGE_DIFF_THRESHOLD,
 } from "./PullRequestPanel";
@@ -1078,13 +1079,11 @@ describe("PullRequestPanel", () => {
       expect(
         labels.compareDocumentPosition(checks) & Node.DOCUMENT_POSITION_FOLLOWING,
       ).toBeTruthy();
-      // Reviewers and labels share one row, split by a vertical divider, above a divider.
+      // Reviewers and labels share one row, the labels column bordering the reviewers,
+      // above a divider.
       const row = reviewers.parentElement!.parentElement!;
       expect(row).toContainElement(labels);
-      expect(row.querySelector('[data-slot="separator"]')).toHaveAttribute(
-        "data-orientation",
-        "vertical",
-      );
+      expect(labels.parentElement).toHaveClass("border-l");
       expect(row.nextElementSibling).toHaveAttribute("data-slot", "separator");
     });
 
@@ -2806,6 +2805,46 @@ describe("derivePullRequestPanelState", () => {
 });
 
 describe("session PR selection", () => {
+  it.each([false, true])(
+    "selects a previewed PR in a mounted panel (active: %s)",
+    async (active) => {
+      Object.assign(state.info!.data!, {
+        tracking_available: true,
+        prs: [
+          {
+            ...OTHER_PR,
+            url: state.info!.data!.pr!.url,
+            number: 6000,
+          },
+          OTHER_PR,
+        ],
+      });
+      const { client, rerender } = renderPanel(false, active);
+      expect(await screen.findByRole("list", { name: "Pull requests" })).toBeVisible();
+
+      act(() => selectPullRequestInPanel(client, "conv_1", OTHER_PR.url));
+
+      expect(await screen.findByRole("tab", { name: "Summary" })).toHaveAttribute(
+        "aria-selected",
+        "true",
+      );
+      expect(screen.queryByRole("list", { name: "Pull requests" })).toBeNull();
+      expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", {
+        poll: active,
+        prUrl: OTHER_PR.url,
+      });
+
+      rerender(<div />);
+      selectPullRequestInPanel(client, "conv_1", state.info!.data!.pr!.url);
+      rerender(<PullRequestPanel conversationId="conv_1" active={active} />);
+      expect(screen.getByRole("tab", { name: "Summary" })).toHaveAttribute("aria-selected", "true");
+      expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", {
+        poll: active,
+        prUrl: state.info!.data!.pr!.url,
+      });
+    },
+  );
+
   it.each([false, true])("opens a single PR directly (stored list: %s)", async (stored) => {
     const url = state.info!.data!.pr!.url;
     const association: PullRequestAssociation = {

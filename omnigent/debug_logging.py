@@ -499,7 +499,13 @@ def _probe_workspace_id(api_base: str) -> str | None:
         return _probed_workspace_ids[api_base]
     workspace_id: str | None = None
     try:
-        resp = httpx.get(f"{api_base}/v1/me", timeout=_WORKSPACE_ID_PROBE_TIMEOUT_S)
+        from omnigent.telemetry.request_headers import client_identity_headers
+
+        resp = httpx.get(
+            f"{api_base}/v1/me",
+            headers=client_identity_headers(),
+            timeout=_WORKSPACE_ID_PROBE_TIMEOUT_S,
+        )
         header = _clean(resp.headers.get("x-databricks-org-id"))
         workspace_id = header if header and header.isdecimal() else None
     except httpx.HTTPError:

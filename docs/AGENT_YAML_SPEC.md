@@ -136,6 +136,35 @@ executor:
     api_key: ${GEMINI_API_KEY}     # or ANTIGRAVITY_API_KEY
 ```
 
+### Codex tool switches
+
+With `harness: codex`, `web_search: false` turns off Codex's built-in web
+search and `disable_native_tools: true` turns off its native shell tools, so
+shell commands use Omnigent tools and policies. For a directory bundle using
+`config.yaml`, place them in `executor.config`:
+
+```yaml
+spec_version: 1
+name: codex-worker
+executor:
+  type: omnigent
+  config:
+    harness: codex
+    web_search: false
+    disable_native_tools: true
+```
+
+The switches accept YAML booleans; omitting either switch or setting it to YAML
+`null` leaves it unset and preserves operator restrictions. Boolean settings
+apply on every Codex route, including ChatGPT login, API-key providers and brokered
+gateways. They only restrict tools: `web_search: true` and
+`disable_native_tools: false` do not re-enable tools that the runner's operator
+turned off. Locked profiles still require `web_search: false` and
+`disable_native_tools: true`, and `broker_gateway` rejects `null`.
+
+Upgrade runners before relying on these restrictions on ordinary routes. Older
+runners ignore the spec's tool switches on those routes.
+
 ### Pi context files
 
 With `harness: pi` or `pi-native`, Pi automatically appends context files such
@@ -635,6 +664,20 @@ to share one policy across `sys_os_*` and terminals, and how to set up network
 egress rules, see the `sandbox:` examples below and the sandbox source under
 `omnigent/inner/`.
 
+Runner-local `sys_os_read`, `sys_os_write` and `sys_os_edit` calls reuse a helper
+within a session when the environment spec, sandbox mounts and inherited
+environment values remain unchanged.
+Calls configured with `sandbox.credential_proxy` use a disposable environment for
+each runner-local tool invocation. Credential sources resolve at helper startup;
+snapshot and change-tracking reads share that helper with the requested operation.
+A safe retry can start a replacement and resolve the sources again. The next tool
+invocation starts a fresh helper, so these calls retain helper startup cost.
+A `sys_os_shell` call retires that tool helper before returning, including on
+success: shell descendants may outlive the command. The next tool call starts a
+fresh helper. Shell calls therefore still incur helper startup cost; warm shell
+reuse needs a complete per-request process lifetime boundary. This tool lease
+policy does not change shared copy-on-write environments or forked environments.
+
 ### Secretless credential proxy
 
 `sandbox.credential_proxy` lets sandboxed tools authenticate to external hosts
@@ -744,6 +787,78 @@ credential storage outside sandbox write grants. Locked Codex profiles must set
 `web_search: false` and `disable_native_tools: true` so their shell and file
 operations use Omnigent tools and policies. Missing or unsafe settings prevent
 launch.
+
+### Named TCP egress from a sandbox
+
+For runnable CLI checks on macOS and Linux, see the
+[local Python HTTP listener and public SSH examples](../examples/tcp-egress/README.md).
+
+`sandbox.tcp_egress` permits a sandbox to open an opaque TCP stream to one
+named, exact host and port without giving it general network access. The
+parent resolves DNS on each connection, checks **every** returned address
+against the route's policy, and dials a pinned address. The sandbox cannot
+choose the dialed IP or port. This setting supplies **no credentials** and
+does not verify the server's identity: configure TLS or host-key verification
+in the client.
+
+```yaml
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: auto # linux_bwrap or darwin_seatbelt
+    allow_network: false
+    tcp_egress:
+      - name: analytics_db
+        host: db.internal.example
+        port: 5432
+        allowed_cidrs: [10.42.0.0/16]
+      - name: git_host
+        host: github.com
+        port: 22
+terminals:
+  shell:
+    command: bash
+    os_env: inherit
+```
+
+Upgrade the server, host, and session runner to builds with TCP egress support
+before using this field. The server requires both connected runtimes to advertise
+the `tcp_egress` capability and rejects older builds before launch or initialization,
+including routes in sub-agents and terminal environments. Updating only the server
+is insufficient. Keep `allow_network: false` explicit so an older server and runner
+that ignore `tcp_egress` still deny direct networking.
+
+The parent resolves DNS on every connection. A public DNS name that resolves
+to a private address is **denied by default**; permit the smallest relevant
+private CIDR explicitly with `allowed_cidrs`. **Every** A/AAAA answer must
+match the CIDRs when specified; a mixed public/private answer is denied unless
+every address is explicitly allowed. The chosen IP is pinned for the dial,
+so a later DNS change cannot redirect an established connection.
+Loopback, link-local, metadata, cloud control addresses, and mixed
+allowed/blocked DNS answers remain denied. The broker permits up to eight
+concurrent streams per sandbox. Each stream has a 30-minute lifetime, a
+five-minute idle limit, and a 2 GiB total-transfer limit; the connector exits
+nonzero if the broker closes it early. A peer that stops reading for ten
+seconds also closes the stream, even if the idle limit has not elapsed.
+A sandbox cannot configure
+`tcp_egress` and HTTP `egress_rules` together: even a different DNS name
+could lead to the same HTTP endpoint and bypass method/path restrictions.
+Opaque routes on ports 80/443 are also rejected. Clients
+that support a stdin/stdout proxy can run
+`omnigent-egress-connect analytics_db` from `sys_os_shell` or an inherited
+sandboxed terminal. For example, OpenSSH can use
+`ssh -o 'ProxyCommand=omnigent-egress-connect git_host' git@github.com`
+with the `git_host` route above, a separately available SSH credential, and
+its own pinned host key. A
+plain `psql -h db.internal.example` cannot use this connector directly;
+PostgreSQL client wiring and secretless credentials require the separate
+PostgreSQL capability. Native Codex workers and sandbox backends other than
+`linux_bwrap` and `darwin_seatbelt` reject `tcp_egress` rather than silently
+discarding the route. Native launchers that have not started a TCP broker
+also fail at spawn rather than retaining direct network access. Git SSH
+bindings can coexist with named TCP routes;
+HTTP `egress_rules` cannot coexist until an explicit overlap policy exists.
 
 ### Git over SSH from a sandbox
 
@@ -1066,18 +1181,42 @@ byte-bounded provider counts every advertised tool against its limit.
 ```yaml
 tool_groups:
   browser: false          # browser_navigate / _snapshot / _click / _type / _screenshot
-  scheduled_tasks: false  # sys_scheduled_task_create / _list / _update / _delete
+  scheduled_tasks: false  # sys_scheduled_task_create / _list / _update / _delete, sys_reminder_set
   comments: false         # list_comments / update_comment
   policies: false         # sys_add_policy / sys_policy_registry
   agent_discovery: false  # sys_agent_get / sys_agent_download / sys_agent_list
+  journal: false          # sys_journal_read / _write_plan / _write_status / _write_note, sys_workflow_request_input / _save / _load / _list
   projects: false         # sys_project_* / sys_session_update
+  user_inbox: false       # sys_user_inbox_post / sys_user_inbox_list
+  memory: false           # memory_search / _get / _list / _write / _delete
 ```
 
 Every group defaults to `true`, so omitting the block changes nothing. Values
 must be booleans and group names must match exactly; a typo fails the load
-rather than silently leaving the group registered. Disabling `browser` also
-drops the embedded-browser guidance from the composed system prompt. The block
-is read the same way from a `config.yaml` bundle and a single-file agent YAML.
+rather than silently leaving the group registered. The `journal` group also
+requires the server's `workflows` feature flag, which defaults off; enable it
+with `OMNIGENT_FEATURES=workflows` on the server. The `user_inbox` group, which
+posts to and reads the session owner's Inbox, requires the server's `user_inbox`
+feature flag, which defaults on; turn it off with `OMNIGENT_FEATURES=-user_inbox`.
+Disabling `browser` also
+drops the embedded-browser guidance from the composed system prompt, and
+disabling `journal` also drops the `/workflow` and `/save-workflow` skills (see
+[Session journal](session-journal.md)). The block is read the same way from a
+`config.yaml` bundle and a single-file agent YAML.
+
+The `memory` group is the long-term memory tools. It applies only when the server
+has memory turned on (`OMNIGENT_FEATURES=memory`); otherwise no agent gets them,
+whatever the spec says. The tools persist across sessions, harnesses, models and
+forks, and belong to the signed-in user: the server decides whose memory it is,
+never the agent. They are refused in a session shared with anyone who can add
+input. Two kinds of spec get `memory: false` by default, and setting `memory: true`
+on them is an error:
+
+- Specs that still declare the deprecated `hindsight_*` builtins, with a warning.
+  Configure Hindsight as the server's memory backend instead with
+  `omnigent server --memory-backend hindsight`.
+- Specs with their own local tool or MCP server named like a memory tool, which
+  keep that tool. See [MEMORY.md](MEMORY.md).
 
 `agent_discovery: false` is rejected while `spawn: true` or the
 `scheduled_tasks` group is on: `sys_session_create` and

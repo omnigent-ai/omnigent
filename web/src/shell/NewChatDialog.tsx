@@ -27,6 +27,7 @@ import {
 import { useNavigate, useReplaceSearchParams, useSearchParams } from "@/lib/routing";
 import { MAIN_CANVAS_ID } from "@/canvas/canvasLayout";
 import { CANVAS_QUERY_PARAM, canvasLocation } from "@/canvas/canvasNavigation";
+import { projectHomePath } from "@/projectHome/projectHomeNavigation";
 import { MobileHeaderControlPortal } from "./MobileHeaderControlsSlot";
 import { OmniGlassSurface } from "@/components/OmniGlassSurface";
 import {
@@ -38,6 +39,14 @@ import {
   ComposerMenuTooltip,
 } from "@/components/composer/ComposerControls";
 import { ComposerAddMenu } from "@/components/composer/ComposerAddMenu";
+import { WorkflowDialog } from "@/components/composer/WorkflowDialog";
+import { type SavedWorkflow, useSavedWorkflows } from "@/hooks/useSavedWorkflows";
+import {
+  filterWorkflowSkills,
+  offersWorkflow,
+  savedWorkflowMessage,
+  workflowMessage,
+} from "@/lib/workflow";
 import {
   COMPOSER_HARNESS_MENU_SIZE,
   HarnessMenuNavigationLabel,
@@ -121,7 +130,9 @@ import { MenuItem } from "@/components/ui/menu-item";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { authenticatedFetch, getCurrentUserId, resolveIdentity } from "@/lib/identity";
 import { backgroundSessionTitlesRequestHeaders } from "@/lib/backgroundSessionTitlesPreferences";
+import { timezoneRequestHeaders } from "@/lib/timezones";
 import { composerContextToLabels } from "@/lib/composerContextAdapters";
+import { managedSandboxHostId } from "@/lib/managedSandboxHost";
 import { randomUUID } from "@/lib/randomUUID";
 import { sessionRoutingHostId, setSessionHost } from "@/lib/sessionHost";
 import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
@@ -191,7 +202,6 @@ import {
 } from "@/store/chatStore";
 import { markSessionCreated } from "@/store/interactionTelemetry";
 import { appendPromptHistoryEntry } from "@/hooks/usePromptHistory";
-import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { MODEL_PICKER_KEYS, useModelPickerHotkey } from "@/hooks/useModelPickerHotkey";
 import { CliCommandBlock, renderTextWithInlineCode } from "./CliCommandBlock";
@@ -208,11 +218,12 @@ import {
   initialPrefillState,
   prefillDone,
   projectPrefillStep,
+  projectRepository,
   withProjectLaunchDefaults,
   type ProjectPrefillConfig,
   type ProjectPrefillState,
 } from "./projectPrefill";
-import { getCliServerUrl, getOmnigentHostConfig } from "@/lib/host";
+import { getCliServerUrl, getOmnigentHostConfig, getOmnigentServerIdentity } from "@/lib/host";
 import { quoteShellArgument } from "@/lib/shell";
 import { readLastAgentId, writeLastAgentId } from "@/lib/agentPreferences";
 import {
@@ -2109,6 +2120,8 @@ export function AgentHarnessPicker({
 // Drafts survive navigation within this page load, with one slot per source.
 // Successful creation clears only its slot; a page refresh starts clean.
 interface LandingDraft {
+  /** Parked at prompt-link consumption: the composer keeps it in step with edits. */
+  fromLink?: boolean;
   mcpRegistryServices: string[];
   // `?project=` context the draft was composed under ("" = plain visit).
   // A draft restored under a DIFFERENT project only brings back its text and
@@ -2163,6 +2176,113 @@ function writeLandingDraft(state: LandingDraftState, draft: LandingDraft | null)
 // design, which would otherwise leak between tests).
 export function resetLandingDraft(): void {
   landingDrafts.clear();
+  submittedKeptPromptIds.clear();
+}
+
+// An embedding host can remount or reload the page right after the composer
+// strips `?prompt=`, and a remount renders before the old composer parks its
+// draft, so the consumed prompt is parked at once and kept briefly here.
+const LINKED_PROMPT_TTL_MS = 60_000;
+
+// Kept prompts whose create is in flight in this document: another composer
+// must not restore them, but a failed create hands them back (and a reload
+// starts with an empty set, so recovery still works).
+const submittedKeptPromptIds = new Set<string>();
+
+interface KeptLinkedPrompt {
+  /** Identifies this consumption; `at` only drives expiry. */
+  id: string;
+  text: string;
+  at: number;
+}
+
+// Scoped to the server and composer (sibling partition); nothing is kept
+// without a server identity. A known viewer mismatch drops it, but identity
+// resolves after first render, so an unknown viewer is not tied to it.
+function linkedPromptStorageKey(siblingSourceId: string | null): string | null {
+  const server = getOmnigentServerIdentity();
+  return server === null
+    ? null
+    : `omnigent:linked-prompt:${JSON.stringify([server, siblingSourceId])}`;
+}
+
+function keepLinkedPrompt(siblingSourceId: string | null, text: string): KeptLinkedPrompt | null {
+  const key = linkedPromptStorageKey(siblingSourceId);
+  if (key === null) return null;
+  const kept = {
+    id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`,
+    text,
+    at: Date.now(),
+  };
+  try {
+    sessionStorage.setItem(key, JSON.stringify({ ...kept, user: getCurrentUserId() }));
+  } catch {
+    // Nothing was kept for this prompt, and an older one must not outlive it.
+    try {
+      sessionStorage.removeItem(key);
+    } catch {
+      // Storage is unusable; only the reload case is lost.
+    }
+    return null;
+  }
+  return kept;
+}
+
+function parseKeptLinkedPrompt(raw: string | null): (KeptLinkedPrompt & { user?: unknown }) | null {
+  if (raw === null) return null;
+  const kept: unknown = JSON.parse(raw);
+  return typeof kept === "object" &&
+    kept !== null &&
+    "id" in kept &&
+    "text" in kept &&
+    "at" in kept &&
+    typeof kept.id === "string" &&
+    typeof kept.text === "string" &&
+    typeof kept.at === "number"
+    ? { id: kept.id, text: kept.text, at: kept.at, user: "user" in kept ? kept.user : undefined }
+    : null;
+}
+
+function readKeptLinkedPrompt(siblingSourceId: string | null): KeptLinkedPrompt | null {
+  const key = linkedPromptStorageKey(siblingSourceId);
+  if (key === null) return null;
+  try {
+    const raw = sessionStorage.getItem(key);
+    if (raw === null) return null;
+    const kept = parseKeptLinkedPrompt(raw);
+    const viewer = getCurrentUserId();
+    if (
+      kept !== null &&
+      kept.text.trim() !== "" &&
+      Date.now() - kept.at < LINKED_PROMPT_TTL_MS &&
+      !(viewer !== null && typeof kept.user === "string" && kept.user !== viewer)
+    ) {
+      if (submittedKeptPromptIds.has(kept.id)) return null;
+      return { id: kept.id, text: kept.text, at: kept.at };
+    }
+    sessionStorage.removeItem(key);
+  } catch {
+    // Unreadable storage means there is nothing to restore.
+  }
+  return null;
+}
+
+/** Forget the kept prompt; with `owned`, only if it is still that record. */
+function forgetKeptLinkedPrompt(
+  siblingSourceId: string | null,
+  owned: KeptLinkedPrompt | null,
+): void {
+  const key = linkedPromptStorageKey(siblingSourceId);
+  if (key === null) return;
+  try {
+    if (owned !== null) {
+      const stored = parseKeptLinkedPrompt(sessionStorage.getItem(key));
+      if (stored === null || stored.id !== owned.id) return;
+    }
+    sessionStorage.removeItem(key);
+  } catch {
+    // Nothing was kept.
+  }
 }
 
 function NewChatWorkspaceControls({
@@ -2177,7 +2297,7 @@ function NewChatWorkspaceControls({
   return (
     <fieldset
       disabled={disabled}
-      className="new-chat-workspace-controls relative isolate z-30 min-w-0 max-w-full self-center rounded-[20px]"
+      className="new-chat-workspace-controls relative isolate z-30 min-w-0 max-w-full self-center rounded-[20px] [--omni-glass-drop-shadow:0_0_#0000]"
     >
       <OmniGlassSurface borderRadius={20} className="-z-10" />
       {children}
@@ -2185,7 +2305,14 @@ function NewChatWorkspaceControls({
   );
 }
 
-export function NewChatLandingScreen() {
+/**
+ * `projectName` scopes the composer to a project, as `?project=` does, for the
+ * project home's floating composer; `onSessionStarted` hides it after a start.
+ */
+export function NewChatLandingScreen({
+  projectName,
+  onSessionStarted,
+}: { projectName?: string; onSessionStarted?: () => void } = {}) {
   const [params] = useSearchParams();
   const navigate = useNavigate();
   const siblingSourceId = params.get("sibling");
@@ -2228,6 +2355,8 @@ export function NewChatLandingScreen() {
       key={siblingSourceId ?? "standalone"}
       siblingSourceId={siblingSourceId}
       siblingSource={source.data}
+      projectHomeName={projectName}
+      onSessionStarted={onSessionStarted}
     />
   );
 }
@@ -2235,9 +2364,13 @@ export function NewChatLandingScreen() {
 function NewChatLandingContent({
   siblingSourceId,
   siblingSource,
+  projectHomeName,
+  onSessionStarted,
 }: {
   siblingSourceId: string | null;
   siblingSource?: Awaited<ReturnType<typeof getSessionSlim>>;
+  projectHomeName?: string;
+  onSessionStarted?: () => void;
 }) {
   const [draftState] = useState(() => {
     const state = landingDrafts.get(siblingSourceId) ?? { draft: null, revision: 0 };
@@ -2255,8 +2388,7 @@ function NewChatLandingContent({
   const [handoff] = useState(() => peekNewSessionHandoff(handoffToken));
   const queryClient = useQueryClient();
   const isMobileViewport = useIsMobileViewport();
-  const isCoarsePointer = useIsCoarsePointer();
-  const preventsKeyboardSubmit = isMobileViewport || isCoarsePointer;
+  const preventsKeyboardSubmit = isMobileViewport;
   const [submitWithModEnter] = useState(() => readSubmitWithModEnter());
   // Single send-telemetry point (see handleCreate). Emitting there rather than
   // via the Start button's componentId covers Enter-key sends too, which never
@@ -2266,9 +2398,11 @@ function NewChatLandingContent({
   const poweredBy = usePoweredBy();
   const serverUrl = getCliServerUrl();
 
-  // Project driving this visit, when the sidebar's per-project "new session"
-  // pencil landed here with a `?project=` query param. Empty otherwise.
-  const projectParam = searchParams.get("project") ?? "";
+  // Project driving this visit: the project home's, or the `?project=` param the
+  // sidebar's per-project "new session" button lands with. Empty otherwise.
+  const projectParam = projectHomeName ?? searchParams.get("project") ?? "";
+  // The project home keeps its board in view, so starting a session stays put.
+  const onProjectHome = projectHomeName !== undefined;
   const [cacheUser, setCacheUser] = useState(getCurrentUserId);
   useEffect(() => {
     if (cacheUser !== null) return;
@@ -2352,6 +2486,8 @@ function NewChatLandingContent({
           useWorktree: c.use_worktree,
           model: c.model,
           effort: c.effort,
+          sandboxProvider: c.sandbox_provider,
+          repository: projectRepository(c.repository),
         }
       : {};
     return withProjectLaunchDefaults(stored, projectLaunch);
@@ -2484,12 +2620,35 @@ function NewChatLandingContent({
           autoSeededBranch: "",
         };
 
+  // Restore from storage only without a parked draft. A parked draft with the
+  // same text takes over cleanup of the kept copy; a different one (e.g. a
+  // failed create's recovered text) supersedes it.
+  const [keptLinkedPrompt] = useState(() =>
+    handoff === null && !linkedPrompt?.trim() ? readKeptLinkedPrompt(siblingSourceId) : null,
+  );
+  const restoresKeptLinkedPrompt = keptLinkedPrompt !== null && landingDraft === null;
+  const [ownsKeptLinkedPrompt] = useState(
+    () => restoresKeptLinkedPrompt || landingDraft?.message === keptLinkedPrompt?.text,
+  );
+  const keptLinkedRef = useRef<KeptLinkedPrompt | null>(
+    ownsKeptLinkedPrompt ? keptLinkedPrompt : null,
+  );
+  const submittedLinkedPromptRef = useRef<KeptLinkedPrompt | null>(null);
+  // A prompt restored from storage joins the same lifecycle as a consumed link.
+  const syncsParkedDraftRef = useRef(landingDraft?.fromLink === true || restoresKeptLinkedPrompt);
+  useEffect(() => {
+    if (keptLinkedPrompt !== null && !ownsKeptLinkedPrompt) {
+      forgetKeptLinkedPrompt(siblingSourceId, keptLinkedPrompt);
+    }
+  }, [keptLinkedPrompt, ownsKeptLinkedPrompt, siblingSourceId]);
   // A handoff or prompt link replaces the parked draft's text, and with it the
   // tags that text's tokens pointed at.
-  const restoresDraftText = handoff === null && !linkedPrompt?.trim();
+  const restoresDraftText = handoff === null && !linkedPrompt?.trim() && !restoresKeptLinkedPrompt;
   const [message, setMessage] = useState<string>(() => {
     if (handoff !== null) return handoff.text;
-    return linkedPrompt?.trim() ? linkedPrompt : (restoredDraft?.message ?? "");
+    if (linkedPrompt?.trim()) return linkedPrompt;
+    if (restoresKeptLinkedPrompt) return keptLinkedPrompt?.text ?? "";
+    return restoredDraft?.message ?? "";
   });
   // Filled in once the mention browser below owns the tags.
   const clearTaggedMentionsRef = useRef<() => void>(() => {});
@@ -2498,6 +2657,19 @@ function NewChatLandingContent({
     if (linkedPrompt?.trim()) {
       setMessage(linkedPrompt);
       clearTaggedMentionsRef.current();
+      // The link's text is literal, so the parked copy carries none of the old tags.
+      writeLandingDraft(draftState, {
+        ...draftRef.current,
+        message: linkedPrompt,
+        mentions: undefined,
+        fromLink: true,
+      });
+      syncsParkedDraftRef.current = true;
+      keptLinkedRef.current = keepLinkedPrompt(siblingSourceId, linkedPrompt);
+    } else if (handoff !== null) {
+      // The handoff replaced the draft, so a prompt kept for this composer is stale.
+      keptLinkedRef.current = null;
+      forgetKeptLinkedPrompt(siblingSourceId, null);
     }
     // Consume the link once so returning to the composer preserves edits.
     const remaining = new URLSearchParams(searchParams);
@@ -2505,7 +2677,30 @@ function NewChatLandingContent({
     remaining.delete(NEW_SESSION_HANDOFF_PARAM);
     forgetNewSessionHandoff(handoffToken);
     replaceSearchParams(remaining);
-  }, [linkedPrompt, handoffToken, searchParams, replaceSearchParams]);
+  }, [
+    linkedPrompt,
+    handoffToken,
+    handoff,
+    searchParams,
+    replaceSearchParams,
+    draftState,
+    siblingSourceId,
+  ]);
+  // Once the user acts on the prompt, a reload must not bring the link's text
+  // back over their work. Any change to the text counts (typing, dictation,
+  // slash completion, clearing).
+  useEffect(() => {
+    const kept = keptLinkedRef.current;
+    if (kept === null || message === kept.text) return;
+    keptLinkedRef.current = null;
+    forgetKeptLinkedPrompt(siblingSourceId, kept);
+  }, [message, siblingSourceId]);
+  // A draft parked at link consumption is the only copy a same-commit remount can
+  // read, so it follows every edit; a submitted draft stays spent.
+  useEffect(() => {
+    if (!syncsParkedDraftRef.current || submittedRef.current) return;
+    writeLandingDraft(draftState, { ...draftRef.current, fromLink: true });
+  }, [message, draftState]);
   const [checkingDbcert, setCheckingDbcert] = useState(false);
   const [mcpAuthorizing, setMcpAuthorizing] = useState(false);
   // Composer text captured when voice dictation starts, so Esc can revert to it.
@@ -3600,6 +3795,12 @@ function NewChatLandingContent({
         : codexEffortLevelsForModel(models, model),
     [sandboxSessionCatalog, previewHarness],
   );
+  // With no sandbox catalog for the harness, a bare launch runs the harness's own default.
+  const sandboxUsesHarnessDefault =
+    sandboxSelected &&
+    info !== "loading" &&
+    !sandboxCatalogError &&
+    (!sandboxPreviewEnabled || sandboxModels.data?.status === "unconfigured");
   const claudeModelOptions = useMemo(
     () =>
       sandboxSelected
@@ -4157,6 +4358,9 @@ function NewChatLandingContent({
     setCostControlMode(null);
     rememberPickerOptions(selectedNativeHarness, { model: modelUid, effort: "", routing: "off" });
   };
+  // Smart Routing owns the model while it is on, so the menu keeps
+  // "Models unavailable" and offers no harness Default row.
+  const sandboxOffersHarnessDefault = sandboxUsesHarnessDefault && !routingOn;
   const modelSection: ComposerConfigSection | undefined =
     sandboxHasModelCatalog ||
     supportsModelPicker ||
@@ -4181,18 +4385,20 @@ function NewChatLandingContent({
               {pickerModelsLoading && pickerModelOptions.length === 0 && (
                 <div className="px-2 py-1 text-xs text-muted-foreground">Loading models…</div>
               )}
-              {!pickerModelsLoading && pickerModelOptions.length === 0 && (
-                <div className="whitespace-normal px-2 py-1 text-xs text-muted-foreground">
-                  {pickerModelsError?.message ?? "Models unavailable"}
-                </div>
-              )}
+              {!pickerModelsLoading &&
+                pickerModelOptions.length === 0 &&
+                !sandboxOffersHarnessDefault && (
+                  <div className="whitespace-normal px-2 py-1 text-xs text-muted-foreground">
+                    {pickerModelsError?.message ?? "Models unavailable"}
+                  </div>
+                )}
             </>
           ),
           choices: [
             // Default can't launch once the provider rules the harness out.
             ...((sandboxDefaultModelsEnabled && !sandboxSelectedUnsupported) ||
             (!sandboxInferenceConfigured &&
-              pickerModelOptions.length > 0 &&
+              (pickerModelOptions.length > 0 || sandboxOffersHarnessDefault) &&
               !pickerModelOptions.some((option) => option.isDefault))
               ? [
                   {
@@ -5041,7 +5247,16 @@ function NewChatLandingContent({
     const { writes } = step;
     if (writes.selectSandbox) {
       setSandboxSelected(true);
-      setSandboxProvider(defaultSandboxProvider());
+      // A stored provider the server no longer offers falls back to the default.
+      const storedProvider = writes.sandboxProvider;
+      setSandboxProvider(
+        storedProvider !== undefined && sandboxProviderRows.includes(storedProvider)
+          ? storedProvider
+          : defaultSandboxProvider(),
+      );
+    }
+    if (writes.sandboxRepos !== undefined) {
+      setSandboxRepoSelections(writes.sandboxRepos);
     }
     if (writes.hostId !== undefined) setSelectedHostId((cur) => cur ?? writes.hostId!);
     if (writes.agentId !== undefined) {
@@ -5083,6 +5298,7 @@ function NewChatLandingContent({
     prefillConfig,
     projectLaunch,
     defaultSandboxProvider,
+    sandboxProviderRows,
   ]);
 
   // Nested agents reuse their source checkout unless a new worktree is explicitly chosen.
@@ -5200,14 +5416,32 @@ function NewChatLandingContent({
     enabled: canDiscoverHostSkills,
     starting: (!sandboxSelected || arcletSkills) && (hostsLoading || agentsLoading),
   });
+  const workflowsEnabled = isFeatureEnabled(info, "workflows");
   const availableSkills = useMemo(
-    () => (skillsStatus === "ready" ? hostSkills : (selectedAgent?.skills ?? [])),
-    [skillsStatus, hostSkills, selectedAgent?.skills],
+    () =>
+      filterWorkflowSkills(
+        skillsStatus === "ready" ? hostSkills : (selectedAgent?.skills ?? []),
+        workflowsEnabled,
+      ),
+    [skillsStatus, hostSkills, selectedAgent?.skills, workflowsEnabled],
   );
 
   // Pre-session suggestions contain skills; built-ins such as /model need a live session.
   const [inputFocused, setInputFocused] = useState(false);
   const skillPrefix = skillInvocationPrefix(skillsHarness);
+  const canStartWorkflow = offersWorkflow(availableSkills);
+  const savedWorkflows = useSavedWorkflows({ enabled: canStartWorkflow });
+  const [workflowDialogOpen, setWorkflowDialogOpen] = useState(false);
+  // Run a workflow starts from the draft, or from text typed in the saved-workflow search.
+  const [workflowDialogDescription, setWorkflowDialogDescription] = useState<string | null>(null);
+  const [savedWorkflowToRun, setSavedWorkflowToRun] = useState<SavedWorkflow | null>(null);
+  const openWorkflowDialog = (description?: string, savedWorkflow: SavedWorkflow | null = null) => {
+    setWorkflowDialogDescription(description || null);
+    setSavedWorkflowToRun(savedWorkflow);
+    setWorkflowDialogOpen(true);
+  };
+  // A workflow from the dialog becomes the first message, then starts the session.
+  const [workflowToSend, setWorkflowToSend] = useState<string | null>(null);
   const skillCommands = useMemo(
     () =>
       Object.fromEntries(
@@ -5877,6 +6111,10 @@ function NewChatLandingContent({
   // dropped it on the strength of the submit.
   function returnDraftToUser(temporaryConversationId?: string) {
     submittedRef.current = false;
+    if (submittedLinkedPromptRef.current !== null) {
+      submittedKeptPromptIds.delete(submittedLinkedPromptRef.current.id);
+      submittedLinkedPromptRef.current = null;
+    }
     submittedDraftRevisionRef.current = null;
     removeNestedSessionDraft(queryClient, nestedProvisional.id);
     if (siblingSource && onScreenRef.current) {
@@ -5903,6 +6141,9 @@ function NewChatLandingContent({
   }
 
   async function handleCreate() {
+    // Captured before any await: a newer prompt link can replace the kept record
+    // while an earlier submit is still waiting on a pre-create check.
+    const submittedLinkedPrompt = keptLinkedRef.current;
     // Mirror the Send button's disabled condition (canSubmit) so the Enter-key
     // and form-submit paths that call this directly can't create a session with
     // a blank message, host, agent, or workspace.
@@ -5995,8 +6236,12 @@ function NewChatLandingContent({
         if (needsDbcert) return;
       }
       // Spend the draft only once provisioning starts, after the laptop credential check.
+      // A composer remounted in this commit would otherwise restore the submitted text.
+      if (draftState.draft !== null) writeLandingDraft(draftState, null);
       submittedDraftRevisionRef.current = draftState.revision;
       submittedRef.current = true;
+      submittedLinkedPromptRef.current = submittedLinkedPrompt;
+      if (submittedLinkedPrompt !== null) submittedKeptPromptIds.add(submittedLinkedPrompt.id);
       if (siblingSource) updateNestedSessionDraft(queryClient, nestedProvisional.id);
       trackClick("new_chat.start_session", "button");
       if (sandboxRepoSelections.length > 0) {
@@ -6196,7 +6441,7 @@ function NewChatLandingContent({
         const metadata: Parameters<typeof createBundledSession>[1] = { labels: createLabels };
         if (siblingSourceId) metadata.sibling_source_id = siblingSourceId;
         if (sandboxSelected) {
-          // Multipart creates allocate their host server-side; they cannot reserve a host ID.
+          // Bundle creates send no host id until the server's multipart host_id is deployed.
           metadata.host_type = "managed";
           metadata.workspaces = composeSandboxWorkspaces(sandboxRepoSelections);
           if (sandboxProvider !== null) metadata.sandbox_provider = sandboxProvider;
@@ -6282,7 +6527,9 @@ function NewChatLandingContent({
             // real host (null for a sandbox create).
             hostId: sandboxSelected ? null : selectedHostId,
           });
-          if (localConv !== null) navigate(sessionLocation(localConv.tempConvId));
+          if (localConv !== null && !onProjectHome) {
+            navigate(sessionLocation(localConv.tempConvId));
+          }
         } catch {
           /* non-fatal: the response still opens the server session */
         }
@@ -6290,6 +6537,7 @@ function NewChatLandingContent({
         const matchOwnCreate = (item: SessionListWireItem) =>
           item.parent_session_id == null &&
           item.labels?.[CLIENT_CREATE_TOKEN_LABEL] === createToken;
+        const managedHostId = sandboxSelected ? await managedSandboxHostId(info) : undefined;
         const createPayload = JSON.stringify({
           ...(siblingSourceId ? { sibling_source_id: siblingSourceId } : {}),
           ...(serverOwnsInitialInput ? { initial_input: initialInput } : {}),
@@ -6322,9 +6570,7 @@ function NewChatLandingContent({
                   : {}),
                 // The new sandbox host's id, in the server's minted shape;
                 // keys the create and the session's requests until it binds.
-                ...(info !== "loading" && info.request_managed_sandbox_host_id
-                  ? { host_id: randomUUID().replace(/-/g, "") }
-                  : {}),
+                ...(managedHostId ? { host_id: managedHostId } : {}),
                 ...(sandboxPreviewEnabled && sandboxModels.data?.configuration_revision
                   ? {
                       inference_configuration_revision: sandboxModels.data.configuration_revision,
@@ -6404,6 +6650,7 @@ function NewChatLandingContent({
           headers: {
             ...(createForm === null ? { "Content-Type": "application/json" } : {}),
             ...backgroundSessionTitlesRequestHeaders(),
+            ...timezoneRequestHeaders(),
           },
           body: createForm ?? createPayload,
         });
@@ -6584,6 +6831,11 @@ function NewChatLandingContent({
       appendPromptHistoryEntry(initialPrompt, data.id);
       // The session was created — drop any draft a detour back to this
       // screen stashed, so the next visit starts clean.
+      if (submittedLinkedPrompt !== null) {
+        if (keptLinkedRef.current === submittedLinkedPrompt) keptLinkedRef.current = null;
+        forgetKeptLinkedPrompt(siblingSourceId, submittedLinkedPrompt);
+        submittedKeptPromptIds.delete(submittedLinkedPrompt.id);
+      }
       if (submittedDraftRevisionRef.current === draftState.revision) {
         writeLandingDraft(draftState, null);
       }
@@ -6615,10 +6867,16 @@ function NewChatLandingContent({
         void queryClient.refetchQueries({ queryKey: ["conversations"] });
         if (!serverOwnsInitialInput)
           setPendingInitialPrompt(data.id, { text: initialPrompt, skill, files });
-        if (onScreenRef.current && window.location.href === createLocation) {
+        // Only the full chat delivers a pending prompt, so the project home hands off to it.
+        if (
+          (!onProjectHome || !serverOwnsInitialInput) &&
+          onScreenRef.current &&
+          window.location.href === createLocation
+        ) {
           navigate(sessionLocation(data.id));
         }
       }
+      if (onProjectHome && onScreenRef.current) onSessionStarted?.();
     } catch {
       if (siblingSource && createdSessionId) {
         const stillViewing = localConv
@@ -6654,6 +6912,14 @@ function NewChatLandingContent({
       }
     }
   }
+
+  const handleCreateRef = useRef(handleCreate);
+  handleCreateRef.current = handleCreate;
+  useEffect(() => {
+    if (workflowToSend === null || message !== workflowToSend) return;
+    setWorkflowToSend(null);
+    void handleCreateRef.current();
+  }, [workflowToSend, message]);
 
   const placeholderText = siblingSourceId
     ? "What should this agent work on?"
@@ -7148,69 +7414,83 @@ function NewChatLandingContent({
   );
 
   return (
-    // Desktop keeps the centered composition; mobile docks the composer.
+    // Desktop keeps the centered composition; mobile docks the composer. The
+    // project home floats just the composer over its board.
     <div
       ref={setLandingSurface}
-      className="relative flex min-h-0 flex-1 items-stretch justify-center md:items-center md:pb-24"
+      className={cn(
+        "relative flex",
+        !onProjectHome && "min-h-0 flex-1 items-stretch justify-center md:items-center md:pb-24",
+      )}
       data-testid="new-chat-landing"
     >
       {/* Padding lives inside the 800px cap, so the composer surface reaches
           its shared 48rem column (800 − 32 = 768px) on desktop. px-4 (16px
           gutters) keeps the composer from feeling cramped against the
           viewport edges on phones. */}
-      <div className="flex min-h-0 w-full max-w-[800px] flex-col items-center px-4 pt-8 pb-[max(16px,env(safe-area-inset-bottom))] md:pb-16 md:select-none">
-        {/* On phones the heading yields its height first, so a long draft cannot
-            push Send below the keyboard. */}
-        <div className="mb-6 flex w-full flex-1 flex-col items-center justify-center gap-3.5 max-md:min-h-0 max-md:overflow-hidden md:flex-none">
-          {siblingSourceId ? (
-            <div aria-hidden="true" className="flex h-16 shrink-0 items-center">
-              <span className="flex size-14 items-center justify-center rounded-xl bg-tag-pink">
-                <PlusIcon className="size-6 text-brand-accent" />
-              </span>
-            </div>
-          ) : selectedProject ? (
-            // Landing inside a project: swap Otto's eyes for the project's
-            // icon — the default pink folder, or a chosen emoji — and name the
-            // project. Sized to Otto's h-16 box so the centered composer doesn't
-            // shift when toggling between the two landings.
-            <ProjectLandingIcon
-              projectId={configProjectId}
-              projectName={selectedProject}
-              config={storedProjectConfig}
-              // Gate editing until the config resolves: the PATCH replaces the
-              // whole blob, so a write before the name→id and config have loaded
-              // would wipe the project's other defaults. A label-only folder
-              // (`configProjectId === null`) has no first-class config to lose.
-              configReady={
-                !projectListLoading &&
-                (configProjectId === null || storedProjectConfig !== undefined)
-              }
-            />
-          ) : (
-            <BrandLogo variant="eyes" className="h-14 w-auto shrink-0" />
-          )}
-          {siblingSourceId || isMobileViewport || selectedProject || heading ? (
-            <h1 className="min-w-0 break-words text-center text-[28px] md:text-[2.15em] font-normal tracking-[-0.05em] text-foreground line-clamp-2 sm:text-left">
-              {siblingSourceId
-                ? "Add nested agent"
-                : isMobileViewport
-                  ? "Start a new session in"
-                  : selectedProject || heading}
-            </h1>
-          ) : null}
-          {siblingSourceId && (
-            <p
-              className="max-w-full break-words text-center text-sm text-muted-foreground line-clamp-2"
-              data-testid="sibling-composer-context"
-            >
-              A new conversation alongside{" "}
-              <span className="font-medium text-foreground">
-                {siblingSource?.title?.trim() || "Untitled"}
-              </span>
-            </p>
-          )}
-          {isMobileViewport && workspaceControls}
-        </div>
+      <div
+        className={cn(
+          "flex min-h-0 w-full flex-col md:select-none",
+          !onProjectHome &&
+            "max-w-[800px] items-center px-4 pt-8 pb-[max(16px,env(safe-area-inset-bottom))] md:pb-16",
+        )}
+      >
+        {onProjectHome ? (
+          isMobileViewport && workspaceControls
+        ) : (
+          /* On phones the heading yields its height first, so a long draft cannot
+            push Send below the keyboard. */
+          <div className="mb-6 flex w-full flex-1 flex-col items-center justify-center gap-3.5 max-md:min-h-0 max-md:overflow-hidden md:flex-none">
+            {siblingSourceId ? (
+              <div aria-hidden="true" className="flex h-16 shrink-0 items-center">
+                <span className="flex size-14 items-center justify-center rounded-xl bg-tag-pink">
+                  <PlusIcon className="size-6 text-brand-accent" />
+                </span>
+              </div>
+            ) : selectedProject ? (
+              // Landing inside a project: swap Otto's eyes for the project's
+              // icon — the default pink folder, or a chosen emoji — and name the
+              // project. Sized to Otto's h-16 box so the centered composer doesn't
+              // shift when toggling between the two landings.
+              <ProjectLandingIcon
+                projectId={configProjectId}
+                projectName={selectedProject}
+                config={storedProjectConfig}
+                // Gate editing until the config resolves: the PATCH replaces the
+                // whole blob, so a write before the name→id and config have loaded
+                // would wipe the project's other defaults. A label-only folder
+                // (`configProjectId === null`) has no first-class config to lose.
+                configReady={
+                  !projectListLoading &&
+                  (configProjectId === null || storedProjectConfig !== undefined)
+                }
+              />
+            ) : (
+              <BrandLogo variant="eyes" className="h-14 w-auto shrink-0" />
+            )}
+            {siblingSourceId || isMobileViewport || selectedProject || heading ? (
+              <h1 className="min-w-0 break-words text-center text-[28px] md:text-[2.15em] font-normal tracking-[-0.05em] text-foreground line-clamp-2 sm:text-left">
+                {siblingSourceId
+                  ? "Add nested agent"
+                  : isMobileViewport
+                    ? "Start a new session in"
+                    : selectedProject || heading}
+              </h1>
+            ) : null}
+            {siblingSourceId && (
+              <p
+                className="max-w-full break-words text-center text-sm text-muted-foreground line-clamp-2"
+                data-testid="sibling-composer-context"
+              >
+                A new conversation alongside{" "}
+                <span className="font-medium text-foreground">
+                  {siblingSource?.title?.trim() || "Untitled"}
+                </span>
+              </p>
+            )}
+            {isMobileViewport && workspaceControls}
+          </div>
+        )}
         {/* Drop cue, spanning the landing surface. */}
         {isDragActive && landingSurface ? <FileDropOverlay container={landingSurface} /> : null}
         <fieldset
@@ -7412,12 +7692,46 @@ function NewChatLandingContent({
                         }
                         projects={projectList ?? []}
                         onProjectSelect={(name) => {
-                          const params = new URLSearchParams(searchParams);
-                          params.set("project", name);
-                          navigate(`/?${params.toString()}`);
+                          if (projectHomeName !== undefined) {
+                            navigate(projectHomePath(name));
+                          } else {
+                            const params = new URLSearchParams(searchParams);
+                            params.set("project", name);
+                            navigate(`/?${params.toString()}`);
+                          }
                           requestAnimationFrame(() => textareaRef.current?.focus());
                         }}
+                        onWorkflow={canStartWorkflow ? openWorkflowDialog : undefined}
+                        savedWorkflows={savedWorkflows.workflows}
+                        workflowPagination={savedWorkflows.pagination}
+                        onRunSavedWorkflow={
+                          canStartWorkflow
+                            ? (workflow) => openWorkflowDialog(undefined, workflow)
+                            : undefined
+                        }
+                        onOpen={savedWorkflows.refresh}
                       />
+                      {canStartWorkflow && (
+                        <WorkflowDialog
+                          open={workflowDialogOpen}
+                          onOpenChange={setWorkflowDialogOpen}
+                          // The draft becomes the description, since the workflow replaces it.
+                          initialDescription={workflowDialogDescription ?? message}
+                          savedWorkflow={savedWorkflowToRun}
+                          onRunWorkflow={({ description, reviewPlanFirst, savedWorkflow }) => {
+                            const text = savedWorkflow
+                              ? savedWorkflowMessage(
+                                  skillPrefix,
+                                  savedWorkflow,
+                                  description,
+                                  reviewPlanFirst,
+                                )
+                              : workflowMessage(skillPrefix, description, reviewPlanFirst);
+                            setMessage(text);
+                            setWorkflowToSend(text);
+                          }}
+                        />
+                      )}
                     </div>
                     {/* Host chip */}
                     <MobileHeaderControlPortal sessionId={null}>
@@ -8178,7 +8492,7 @@ function NewChatLandingContent({
             ? async (bundle) => {
                 const installed = await installAgentBundle(bundle);
                 try {
-                  const mine = await queryClient.fetchQuery({
+                  const { agents: mine } = await queryClient.fetchQuery({
                     queryKey: USER_AGENTS_QUERY_KEY,
                     queryFn: fetchUserAgents,
                     staleTime: 0,

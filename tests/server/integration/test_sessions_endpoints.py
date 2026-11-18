@@ -31,6 +31,7 @@ from starlette.datastructures import Headers
 
 from omnigent.entities import (
     USER_SESSION_TITLE_MAX_CHARS,
+    FunctionCallData,
     MessageData,
     NewConversationItem,
 )
@@ -136,7 +137,11 @@ def _route_to_runner(monkeypatch: pytest.MonkeyPatch, runner: httpx.AsyncClient)
     """Route sessions to this client while checking the prefetched conversation identity."""
 
     async def resolve(
-        session_id: str, runner_router: object, *, conversation: Any = None
+        session_id: str,
+        runner_router: object,
+        *,
+        conversation: Any = None,
+        for_control: bool = False,
     ) -> httpx.AsyncClient:
         assert conversation is None or conversation.id == session_id
         return runner
@@ -2892,6 +2897,9 @@ async def test_skill_slash_command_persists_visible_item_and_hidden_meta_message
             # No renderer subscribes to the session stream in this test,
             # so the turn is stamped headless (browser tools stripped).
             "browser_renderer_available": False,
+            # The advanced browser tools switch was off at creation.
+            "browser_agent_tools": False,
+            "browser_trusted_input": False,
             # The forwarded message is the meta item; its store id lets the
             # runner dedup it on a cold-cache history reload.
             "persisted_item_id": meta["id"],
@@ -4910,6 +4918,62 @@ async def test_list_session_items_pagination(
     assert len(page["data"]) <= 1
 
 
+async def test_list_session_items_filters_by_item_type(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """``type`` keeps only items of that type, across pages; an unknown type is a 422."""
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    SqlAlchemyConversationStore(db_uri).append(
+        session["id"],
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_1",
+                data=MessageData(role="user", content=[{"type": "input_text", "text": "hi"}]),
+            ),
+            NewConversationItem(
+                type="function_call",
+                response_id="resp_1",
+                data=FunctionCallData(
+                    agent="test-agent", name="search", arguments="{}", call_id="call_1"
+                ),
+            ),
+            NewConversationItem(
+                type="message",
+                response_id="resp_2",
+                data=MessageData(role="user", content=[{"type": "input_text", "text": "again"}]),
+            ),
+        ],
+    )
+    items_url = f"/v1/sessions/{session['id']}/items"
+
+    by_type = {
+        item_type: [
+            item["type"]
+            for item in (await client.get(items_url, params={"type": item_type})).json()["data"]
+        ]
+        for item_type in ("message", "function_call")
+    }
+    # The cursor of a filtered page continues with the next item of that type.
+    first = (await client.get(items_url, params={"type": "message", "limit": 1})).json()
+    second = (
+        await client.get(
+            items_url, params={"type": "message", "limit": 1, "after": first["last_id"]}
+        )
+    ).json()
+    bogus = await client.get(items_url, params={"type": "bogus"})
+
+    assert by_type == {"message": ["message", "message"], "function_call": ["function_call"]}
+    pages = [
+        ([item["content"][0]["text"] for item in page["data"]], page["has_more"])
+        for page in (first, second)
+    ]
+    assert pages == [(["hi"], True), (["again"], False)]
+    assert bogus.status_code == 422, bogus.text
+
+
 async def test_list_session_items_404_for_nonexistent(
     client: httpx.AsyncClient,
 ) -> None:
@@ -5105,6 +5169,52 @@ async def test_post_external_assistant_message_persists_and_streams(
     assert all(session_id == session["id"] for session_id, _ in published)
     assert published[0][1]["item"]["id"] == ack["item_id"]
     assert published[0][1]["item"]["model"] == "claude-native-ui"
+
+
+async def test_post_external_assistant_message_rejects_over_length_response_id(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    A response_id longer than the ``String(64)`` column is a 400, not a 500.
+
+    An over-length id used to pass the non-empty check and fail the insert,
+    which the transcript forwarders retry as a transient server error. The
+    route must reject it as invalid input before persisting anything, while
+    an id exactly at the limit still round-trips.
+    """
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    rejected = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_assistant_message",
+            "data": {
+                "agent": "claude-native-ui",
+                "text": "too long",
+                "response_id": "r" * 65,
+            },
+        },
+    )
+    assert rejected.status_code == 400, rejected.text
+    assert "response_id" in rejected.text
+    assert (await client.get(f"/v1/sessions/{session['id']}")).json()["items"] == []
+
+    at_limit = "r" * 64
+    accepted = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_assistant_message",
+            "data": {
+                "agent": "claude-native-ui",
+                "text": "fits",
+                "response_id": at_limit,
+            },
+        },
+    )
+    assert accepted.status_code == 202, accepted.text
+    items = (await client.get(f"/v1/sessions/{session['id']}")).json()["items"]
+    assert [item["response_id"] for item in items] == [at_limit]
 
 
 async def test_post_external_conversation_item_persists_and_streams_visible_items(
@@ -8974,15 +9084,15 @@ async def test_post_external_model_options_populates_picker_and_publishes(
     assert snapshot["model_options"][1]["displayName"] == "anthropic-claude-opus-4-1"
 
 
-async def test_post_external_model_options_empty_evicts_cache(
+async def test_post_external_model_options_empty_hides_picker(
     client: httpx.AsyncClient,
 ) -> None:
     """
     An empty ``data.models`` clears any prior pushed catalog; a non-list 400s.
 
-    Empty means "no catalog to show" — the entry is evicted so the picker
-    hides rather than serving a stale list. A malformed (non-list) payload
-    fails loud at the boundary.
+    Empty means "no catalog to show" — cache that authoritative result so
+    host recovery cannot restore a stale list. A malformed (non-list)
+    payload fails loud at the boundary.
     """
     from omnigent.server.routes import sessions as _mod
 
@@ -9006,7 +9116,9 @@ async def test_post_external_model_options_empty_evicts_cache(
         json={"type": "external_model_options", "data": {"models": []}},
     )
     assert cleared.status_code == 202, cleared.text
-    assert session["id"] not in _mod._pushed_model_options_cache
+    assert _mod._pushed_model_options_cache[session["id"]] == []
+    snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    assert snapshot["model_options"] == []
 
     bad = await client.post(
         f"/v1/sessions/{session['id']}/events",
@@ -10017,12 +10129,22 @@ async def test_post_external_session_todos_publishes_session_todos(
     assert resp.status_code == 202, resp.text
     assert resp.json() == {"queued": False}
 
-    # Exactly one session.todos event must be published; no extra events.
-    assert [ev["type"] for _, ev in published] == ["session.todos"]
-    assert published[0][0] == session["id"]
+    # One chat marker each for the task that completed and the one that
+    # started, then exactly one session.todos event.
+    assert [ev["type"] for _, ev in published] == [
+        "response.output_item.done",
+        "response.output_item.done",
+        "session.todos",
+    ]
+    markers = [ev["item"]["resource"] for _, ev in published[:2]]
+    assert [(m["name"], m["status"]) for m in markers] == [
+        ("Write tests", "done"),
+        ("Fix the bug", "started"),
+    ]
+    assert {session_id for session_id, _ in published} == {session["id"]}
     # The full todos list is forwarded verbatim to subscribers.
-    assert published[0][1]["todos"] == todos
-    assert published[0][1]["conversation_id"] == session["id"]
+    assert published[2][1]["todos"] == todos
+    assert published[2][1]["conversation_id"] == session["id"]
 
 
 async def test_post_external_session_todos_updates_snapshot(
@@ -10369,6 +10491,59 @@ async def test_post_external_conversation_item_auto_assigns_response_id(
         "auto-assigned response_id must be a non-empty string"
     )
     assert published[0][1]["type"] == "session.input.consumed"
+
+
+async def test_post_external_conversation_item_rejects_over_length_response_id(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    A response_id longer than the ``String(64)`` column is a 400, not a 500.
+
+    An over-length id used to pass the non-empty check and fail the insert,
+    which the native forwarders retry as a transient server error and, for a
+    source-keyed item, loop on forever. The route must reject it as invalid
+    input before persisting anything, while an id exactly at the limit still
+    round-trips.
+    """
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    rejected = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "message",
+                "response_id": "r" * 65,
+                "item_data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "too long"}],
+                },
+            },
+        },
+    )
+    assert rejected.status_code == 400, rejected.text
+    assert "response_id" in rejected.text
+    assert (await client.get(f"/v1/sessions/{session['id']}")).json()["items"] == []
+
+    at_limit = "r" * 64
+    accepted = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "message",
+                "response_id": at_limit,
+                "item_data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "fits"}],
+                },
+            },
+        },
+    )
+    assert accepted.status_code == 202, accepted.text
+    items = (await client.get(f"/v1/sessions/{session['id']}")).json()["items"]
+    assert [item["response_id"] for item in items] == [at_limit]
 
 
 async def test_external_user_message_seeds_title_on_claude_native_session(
@@ -10999,6 +11174,7 @@ async def test_interrupt_forward_failure_lifts_stop_fence(
         runner_router: object,
         *,
         conversation: Any = None,
+        for_control: bool = False,
     ) -> httpx.AsyncClient | None:
         """Resolve every session to the failing fake runner (or to none)."""
         assert conversation is None or conversation.id == session_id
@@ -11164,6 +11340,7 @@ async def test_codex_side_chat_message_drives_parent_thread_without_child_init(
     )
     assert child_response.status_code == 202, child_response.text
     child_id = child_response.json()["child_session_id"]
+    SqlAlchemyConversationStore(db_uri).replace_runner_id(parent["id"], "native-runner")
     SqlAlchemyConversationStore(db_uri).replace_runner_id(child_id, "native-runner")
     forwarded: list[tuple[str, dict[str, Any]]] = []
 
@@ -11344,6 +11521,7 @@ async def test_interrupt_forward_failure_keeps_queued_native_messages_pending(
         runner_router: object,
         *,
         conversation: Any = None,
+        for_control: bool = False,
     ) -> httpx.AsyncClient | None:
         """Resolve every session to the failing fake runner (or to none)."""
         del session_id, runner_router, conversation
@@ -12952,8 +13130,10 @@ async def test_external_codex_subagent_start_mints_child_session(
     )
 
 
+@pytest.mark.parametrize("parent_item_id", ["parent-before", ""])
 async def test_external_codex_subagent_start_is_idempotent_and_upserts_labels(
     client: httpx.AsyncClient,
+    parent_item_id: str,
 ) -> None:
     """
     Re-registering the same Codex child thread returns the existing child
@@ -13000,11 +13180,19 @@ async def test_external_codex_subagent_start_is_idempotent_and_upserts_labels(
                 "parent_thread_id": "thread_parent",
                 "agent_nickname": "Euclid",
                 "agent_role": "explorer",
+                "parent_item_id": parent_item_id,
             },
         },
     )
     assert second.status_code == 202, second.text
     child_id_second = second.json()["child_session_id"]
+    replay = await client.post(
+        f"/v1/sessions/{parent['id']}/events",
+        json={"type": "external_codex_subagent_start", "data": {"thread_id": "thread_child_beta"}},
+    )
+    assert replay.status_code == 202, replay.text
+    child = (await client.get(f"/v1/sessions/{child_id_second}")).json()
+    assert child["labels"]["omnigent.codex_native.side_chat_parent_item_id"] == parent_item_id
 
     # Must return the same child id — no duplicate row minted.
     assert child_id_first == child_id_second, (

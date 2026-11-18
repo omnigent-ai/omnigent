@@ -47,7 +47,10 @@ from omnigent.onboarding.sandboxes.profiles import SandboxProfileSummary
 
 # ── Shared ──────────────────────────────────────────────────────
 
-McpRegistryServiceId = Annotated[str, Field(pattern=r"^[a-z][a-z0-9_-]{0,39}$")]
+MCP_REGISTRY_SERVICE_ID_PATTERN = r"^[a-z][a-z0-9_-]{0,39}$"
+# Most registry services one session (or automation) can select.
+MAX_MCP_REGISTRY_SERVICES = 40
+McpRegistryServiceId = Annotated[str, Field(pattern=MCP_REGISTRY_SERVICE_ID_PATTERN)]
 
 
 class PaginatedList(BaseModel):
@@ -1474,6 +1477,8 @@ class SessionEventInput(BaseModel):
         tools are fixed at start time.
     :param created_by: Optional internal attribution actor for runner-
         originated events that are triggered by a prior human turn.
+    :param workflow_run_id: Optional plan-entry ID limiting a user message to
+        that workflow run. A superseded run is rejected with HTTP 409.
     """
 
     type: str
@@ -1484,6 +1489,7 @@ class SessionEventInput(BaseModel):
     model_override: str | None = None
     tools: list[dict[str, Any]] | None = None
     created_by: str | None = None
+    workflow_run_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
 
     @field_validator("data")
     @classmethod
@@ -1622,6 +1628,8 @@ class _SessionCreateRequestBase(_SandboxProfileSelection):
         e.g. ``"ag_abc123"``. Must match a registered agent.
     :param initial_items: Initial queued events/inputs, typically a
         single user ``"message"``.
+    :param workflow_id: Saved workflow to copy into the session journal before
+        any initial input runs. Requires an owned workflow with a saved plan.
     :param title: Optional human-readable title for the session,
         e.g. ``"debugging auth flow"``.
     :param labels: Initial guardrails labels to set on the session.
@@ -1660,7 +1668,7 @@ class _SessionCreateRequestBase(_SandboxProfileSelection):
         registers the host under it and records it in the
         ``omnigent.sandbox.requested_host_id`` label, since the
         session's ``host_id`` stays null until the host binds. ``None``
-        lets the server mint one. JSON creates only, and not with
+        lets the server mint one. Not with
         ``parent_session_id`` (a child runs on its parent's host). An id
         naming an existing host, or sharing its ``managed-<first 8 hex>``
         name with one of the caller's hosts, fails with ``409``.
@@ -1774,7 +1782,10 @@ class _SessionCreateRequestBase(_SandboxProfileSelection):
     project_id: str | None = None
     initial_items: list[SessionEventInput] = Field(default_factory=list)
     initial_input: SessionStartupInput | None = None
-    mcp_registry_services: list[McpRegistryServiceId] = Field(default_factory=list, max_length=40)
+    workflow_id: str | None = None
+    mcp_registry_services: list[McpRegistryServiceId] = Field(
+        default_factory=list, max_length=MAX_MCP_REGISTRY_SERVICES
+    )
     title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
     labels: dict[str, str] = Field(default_factory=dict)
     sibling_source_id: str | None = None
@@ -1988,7 +1999,9 @@ class SessionCreateMetadata(_SandboxProfileSelection):
         binding token, writes the expected runner_id to the session
         row, and sends a ``host.launch_runner`` frame to the host.
         ``None`` for CLI-initiated sessions where the caller
-        manages runner spawning.
+        manages runner spawning. With ``host_type: "managed"`` it
+        instead names the NEW sandbox host (32 lowercase hex, as on
+        the JSON create) and is moved to ``requested_host_id``.
     :param workspace: Absolute path on the host where the runner
         should start, e.g. ``"/Users/corey/universe/src/foo"``.
         Required when ``host_id`` is set; validated against the
@@ -2023,7 +2036,9 @@ class SessionCreateMetadata(_SandboxProfileSelection):
 
     inference_configuration_revision: str | None = None
 
-    mcp_registry_services: list[McpRegistryServiceId] = Field(default_factory=list, max_length=40)
+    mcp_registry_services: list[McpRegistryServiceId] = Field(
+        default_factory=list, max_length=MAX_MCP_REGISTRY_SERVICES
+    )
 
     title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
     project_id: str | None = None
@@ -2031,6 +2046,8 @@ class SessionCreateMetadata(_SandboxProfileSelection):
     reasoning_effort: str | None = None
     model_override: str | None = None
     host_id: str | None = None
+    # A managed create's ``host_id``, moved here at validation (mirrors SessionCreateRequest).
+    requested_host_id: SkipJsonSchema[str | None] = None
     workspace: str | None = None
     workspaces: list[str] | None = None
     git: SessionGitOptions | None = None
@@ -2049,6 +2066,23 @@ class SessionCreateMetadata(_SandboxProfileSelection):
         if self.initial_input is not None and self.host_type != "managed":
             raise ValueError("initial_input requires host_type=managed")
         return self
+
+    @model_validator(mode="before")
+    @classmethod
+    def _move_managed_host_id(cls, data: Any) -> Any:
+        """
+        Move a managed create's ``host_id`` into ``requested_host_id``.
+
+        :param data: The raw metadata object.
+        :returns: The metadata, with a managed ``host_id`` moved.
+        """
+        if (
+            isinstance(data, dict)
+            and data.get("host_type") == "managed"
+            and data.get("host_id") is not None
+        ):
+            return {**data, "host_id": None, "requested_host_id": data["host_id"]}
+        return data
 
     @model_validator(mode="after")
     def _check_managed_bundle_fields(self) -> SessionCreateMetadata:
@@ -2076,10 +2110,16 @@ class SessionCreateMetadata(_SandboxProfileSelection):
         from omnigent.server.managed_hosts import is_repo_workspace, parse_repo_workspace
 
         if self.host_type == "managed":
-            if self.host_id is not None:
+            if self.requested_host_id is not None and not _MANAGED_HOST_ID_RE.fullmatch(
+                self.requested_host_id
+            ):
                 raise ValueError(
-                    "host_type 'managed' lets the server provision the host; "
-                    "host_id must not be set"
+                    "host_type 'managed' takes a host_id of 32 lowercase hex characters"
+                )
+            if self.requested_host_id is not None and self.parent_session_id is not None:
+                raise ValueError(
+                    "host_id does not apply to a managed child session; "
+                    "it runs on its parent's host"
                 )
             if self.git is not None:
                 raise ValueError("git worktrees require an existing external host")
@@ -2102,6 +2142,8 @@ class SessionCreateMetadata(_SandboxProfileSelection):
                         f"(optionally '#<branch>') in each workspace: {exc}"
                     ) from exc
             return self
+        if self.requested_host_id is not None:
+            raise ValueError("requested_host_id only applies to host_type 'managed'")
         if self.sandbox_provider is not None:
             raise ValueError(
                 "sandbox_provider only applies to host_type 'managed' — "
@@ -2193,8 +2235,7 @@ class SandboxStatus(BaseModel):
         has none) → ``starting`` (starting the in-sandbox host) →
         ``connecting`` (launching the agent runner) → ``ready`` /
         ``failed``.
-    :param provider: Sandbox provider being launched, e.g. ``"arclet"``,
-        or ``None`` when unknown.
+    :param provider: Sandbox provider being launched, or ``None`` when unknown.
     :param details: What the user needs to do when
         ``stage == "action_required"``, e.g. ``"Sign in on your laptop."``.
         ``None`` otherwise.
@@ -2458,9 +2499,9 @@ class SessionResponse(BaseModel):
         them with a separate ``GET /v1/sessions/{id}`` using
         ``include_usage=true``, ``include_items=false``,
         ``include_liveness=false``, and ``refresh_state=false``.
-    :param native_usage_baseline: Pi's own cumulative token baseline, excluding
-        descendants. Available even when display usage aggregation is skipped;
-        ``None`` for other harnesses or older servers.
+    :param native_usage_baseline: Own cumulative token baseline for Pi and Codex
+        side chats, excluding descendants. Available even when display usage
+        aggregation is skipped; ``None`` for other harnesses or older servers.
     :param last_task_error: Error details from the most recently
         failed task. Only present when ``status == "failed"`` and
         the task stored an error. Lets clients display the failure
@@ -2872,6 +2913,22 @@ class CodexGoalResponse(BaseModel):
     goal: CodexGoalObject | None
 
 
+class CodexGoalReadResponse(CodexGoalResponse):
+    """Goal read with explicit availability from the native backend.
+
+    :param available: Whether the backend confirmed the goal, including its
+        absence. An unavailable read must not replace the caller's snapshot.
+    """
+
+    available: Annotated[bool, Strict()]
+
+    @model_validator(mode="after")
+    def _validate_unavailable_goal(self) -> Self:
+        if not self.available and self.goal is not None:
+            raise ValueError("An unavailable goal read cannot contain a goal")
+        return self
+
+
 class SetCodexGoalRequest(BaseModel):
     """
     Request body for ``PUT /v1/sessions/{id}/codex_goal``.
@@ -3120,9 +3177,7 @@ class SessionManagedHostRequest(BaseModel):
         provision (one of the server's ``sandbox_providers``); ``None``
         takes the server's first.
     :param host_id: Id for the new sandbox host, 32 lowercase hex
-        characters, sent only when ``GET /v1/info`` reports
-        ``request_managed_sandbox_host_id``; ``None`` lets the server
-        mint one.
+        characters; ``None`` lets the server mint one.
     :param workspace: Git repository URL (optionally ``#<branch>``) cloned
         into the sandbox as the session's working directory, e.g.
         ``"https://github.com/org/repo#main"``; ``None`` gives the session
@@ -3147,6 +3202,66 @@ class SessionManagedHostRequest(BaseModel):
             self.host_id, [self.workspace] if self.workspace is not None else []
         )
         return self
+
+
+class SessionRewindRequest(BaseModel):
+    """
+    Request body for ``POST /v1/sessions/{session_id}/rewind``.
+
+    :param item_id: The session's user prompt to rewind to, e.g.
+        ``"msg_abc123"``. The new session keeps only the history before it.
+    """
+
+    item_id: str = Field(min_length=1, max_length=256)
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class SessionRewindAttachment(BaseModel):
+    """
+    A file the chosen ``/rewind`` prompt attached, as the rewound session holds it.
+
+    Exactly one of *file_id*, *image_url* and *file_data* is set.
+
+    :param type: The prompt's content block type, ``"input_file"`` or
+        ``"input_image"``.
+    :param file_id: The rewound session's copy of the file, e.g. ``"file_abc"``;
+        read it from ``/v1/sessions/{session_id}/resources/files/{file_id}``.
+    :param image_url: An image the prompt carried inline instead of as a stored
+        file, as a ``data:image/...`` URI (e.g. from a session imported from
+        another harness); the client uploads it on send like any attachment.
+    :param file_data: A document the prompt carried inline instead of as a
+        stored file, as a base64 ``data:`` URI, e.g.
+        ``"data:application/pdf;base64,..."``; uploaded on send like
+        *image_url*.
+    :param filename: The attachment's name, e.g. ``"diagram.png"``.
+    """
+
+    type: Literal["input_file", "input_image"]
+    file_id: str | None = None
+    image_url: str | None = None
+    file_data: str | None = None
+    filename: str
+
+
+class SessionRewindResponse(BaseModel):
+    """
+    Result of ``POST /v1/sessions/{session_id}/rewind``.
+
+    :param session_id: The rewound session that continues the work, e.g.
+        ``"conv_new"``. The source session gets a notice linking to it.
+    :param prompt: Text of the chosen prompt, for the client to put back in
+        the composer, e.g. ``"Add a test for the parser"``.
+    :param attachments: The prompt's attachments, in prompt order, for the
+        client to put back in the composer; empty when it had none.
+    :param attachments_incomplete: Some attachments could not be restored;
+        warn the user to attach them again before sending.
+    """
+
+    session_id: str
+    prompt: str
+    attachments: list[SessionRewindAttachment] = Field(default_factory=list)
+    attachments_incomplete: bool = False
 
 
 class ReadStatePutRequest(BaseModel):
@@ -3257,6 +3372,357 @@ class SessionPullRequestList(BaseModel):
     last_id: str | None = None
     has_more: bool = False
     synced: bool = False
+
+
+JournalEntryKind = Literal["status", "note", "dispatch", "dispatch_result", "plan", "plan_status"]
+
+
+class SessionJournalAuthor(BaseModel):
+    """
+    Who wrote a journal entry, derived from its kind and, for plans, its source.
+
+    :param type: ``"agent"`` for the session's agent, ``"omnigent"`` for
+        entries Omnigent writes.
+    """
+
+    type: Literal["agent", "omnigent"]
+
+
+class SessionJournalEntry(BaseModel):
+    """
+    One entry of a session's journal.
+
+    :param id: Entry ID, a bare 32-character hex UUID.
+    :param position: The entry's place in the journal: 0, 1, 2, …
+    :param created_at: Unix epoch seconds when it was appended.
+    :param scheduled_task_run_id: The automation run the session was serving,
+        or ``None``.
+    :param step: The plan step it is about, e.g. ``"propose"``, or ``None``.
+    :param kind: The entry kind; ``content`` holds its fields.
+    :param content: e.g. ``{"status": "done", "text": "PR merged"}`` for a
+        status, ``{"body": "…"}`` for a note, or ``{"version": 2, "source":
+        "agent", "steps": [...]}`` for a plan.
+    :param workflow_id: The saved workflow the entry was written under, or
+        ``None``: set on the plan that starts a run of it, and on the statuses
+        and notes written while that plan is current.
+    """
+
+    id: str
+    position: int
+    created_at: int
+    scheduled_task_run_id: str | None = None
+    step: str | None = None
+    author: SessionJournalAuthor
+    kind: JournalEntryKind
+    content: dict[str, Any]
+    workflow_id: str | None = None
+
+
+class SessionJournalPage(BaseModel):
+    """
+    One page of a session's journal, for ``GET /v1/sessions/{id}/journal``.
+    """
+
+    object: Literal["list"] = "list"
+    data: list[SessionJournalEntry] = Field(default_factory=list)
+    first_id: str | None = None
+    last_id: str | None = None
+    has_more: bool = False
+
+
+class WorkflowStep(BaseModel):
+    """
+    One step of a saved workflow, in the journal plan's step format.
+
+    :param id: Stable step ID, e.g. ``"build"``: lowercase letters, digits,
+        ``-`` and ``_``, starting with a letter or digit; at most 64 characters.
+    :param name: One line of at most 80 characters, e.g. ``"Build"``.
+    :param goal: What the step achieves, at most 300 characters, or ``None``.
+    :param depends_on: IDs of the steps that must be done before it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    name: str
+    goal: str | None = None
+    depends_on: list[str] = Field(default_factory=list)
+
+
+class WorkflowSummary(BaseModel):
+    """
+    A saved workflow as a list page returns it, without its steps.
+
+    :param id: Workflow ID, a bare 32-character hex UUID.
+    :param object: Discriminator; always ``"workflow"``.
+    :param name: One line, unique among the owner's workflows.
+    :param description: What the workflow is for.
+    :param created_at: Unix epoch seconds when it was saved.
+    :param updated_at: Unix epoch seconds of the last write.
+    :param is_draft: Derived from whether the saved plan has no steps.
+    """
+
+    id: str
+    object: Literal["workflow"] = "workflow"
+    name: str
+    description: str
+    created_at: int
+    updated_at: int
+    is_draft: bool = False
+
+
+class WorkflowObject(WorkflowSummary):
+    """
+    A saved workflow with its steps, the plan a run copies into a journal.
+
+    :param steps: The workflow's graph.
+    :param planning_session_id: The conversation for proposing revisions, separate from runs.
+    :param description_source: The planning conversation's journal entry for the proposal
+        the description was saved from, until the description is written otherwise.
+    """
+
+    steps: list[WorkflowStep]
+    planning_session_id: str | None = None
+    description_source: str | None = None
+
+
+class WorkflowList(BaseModel):
+    """
+    One page of the caller's workflows by name, for ``GET /v1/workflows``.
+
+    :param object: Discriminator; always ``"list"``.
+    :param data: The page's workflows, without their steps.
+    :param first_id: The page's first workflow ID, or ``None`` when empty.
+    :param last_id: The page's last workflow ID, retained for older clients.
+    :param next_cursor: Pass it as ``after`` for the next page. Retains the name
+        boundary if that workflow is renamed or deleted; ``None`` on the last page.
+    :param has_more: Whether another page follows.
+    """
+
+    object: Literal["list"] = "list"
+    data: list[WorkflowSummary] = Field(default_factory=list)
+    first_id: str | None = None
+    last_id: str | None = None
+    next_cursor: str | None = None
+    has_more: bool = False
+
+
+class WorkflowRunProgress(BaseModel):
+    """
+    Where a run's latest plan stands within its invocation, counted by each
+    step's newest status.
+
+    :param total: Steps in that plan, e.g. ``5``.
+    :param started: Steps in progress.
+    :param done: Steps done.
+    :param needs_input: Steps waiting for the user.
+    :param failed: Steps that failed.
+    """
+
+    total: int
+    started: int = 0
+    done: int = 0
+    needs_input: int = 0
+    failed: int = 0
+
+
+class WorkflowRunStarter(BaseModel):
+    """
+    The session that started a workflow run.
+
+    :param session_id: That session's ID.
+    :param title: Its title; empty when it has none yet.
+    """
+
+    session_id: str
+    title: str
+
+
+class WorkflowRun(BaseModel):
+    """
+    One run of a saved workflow: a session that started it.
+
+    :param id: The run's ID: that of the plan entry that started it.
+    :param workflow_id: The saved workflow the run follows.
+    :param plan_graph_revision: Stable graph ID, or the earliest position of the
+        unchanged legacy graph. ``None`` when authoritative context is unavailable.
+    :param session_id: The session that ran it.
+    :param title: The session's title; empty when it has none yet.
+    :param started_at: Unix epoch seconds when the run's plan was written.
+    :param is_current: Whether this is the session's current run, which can take actions.
+    :param session_status: The session's status, ``"idle"``, ``"running"`` or
+        ``"failed"``, including active direct sub-agents.
+    :param background_work_running: Whether background work outlives the session's turn.
+    :param archived: Whether the session is archived.
+    :param progress: Where the run's steps stand.
+    :param steps: The latest plan's steps within this invocation.
+    :param statuses: Each of those steps' newest status entry; a step with
+        none yet is left out.
+    :param workflow_name: The workflow's name when it is the caller's own;
+        ``None`` for someone else's workflow or a deleted one.
+    :param started_by: The session that started it, when another session did
+        and the caller can read that session.
+    :param descendant_runs: The first page of the workflow runs below this one:
+        those of the sessions its session started while it was current, then
+        theirs, each right after the run that started it. Empty on the runs
+        listed here.
+    :param descendant_run_count: How many workflow runs are below this one, on
+        every page.
+    :param descendant_runs_cursor: Continues ``descendant_runs`` from
+        ``GET /v1/workflows/{workflow_id}/runs/{id}/descendant_runs``;
+        ``None`` when they are all here.
+    :param descendant_runs_active: Whether any run below this one, on any
+        page, is working or waiting for input.
+    """
+
+    id: str
+    workflow_id: str
+    plan_graph_revision: str | int | None = None
+    session_id: str
+    title: str
+    started_at: int
+    is_current: bool = False
+    session_status: Literal["idle", "running", "failed"]
+    background_work_running: bool = False
+    archived: bool = False
+    progress: WorkflowRunProgress
+    steps: list[WorkflowStep] = Field(default_factory=list)
+    statuses: list[SessionJournalEntry] = Field(default_factory=list)
+    workflow_name: str | None = None
+    started_by: WorkflowRunStarter | None = None
+    descendant_runs: list[WorkflowRun] = Field(default_factory=list)
+    descendant_run_count: int = 0
+    descendant_runs_cursor: str | None = None
+    descendant_runs_active: bool = False
+
+
+class WorkflowRunList(BaseModel):
+    """
+    One page of a saved workflow's runs, newest first, for
+    ``GET /v1/workflows/{id}/runs``.
+
+    :param object: Discriminator; always ``"list"``.
+    :param data: The page's runs in sessions the caller can read.
+    :param next_cursor: Pass it as ``before`` for the next page; ``None`` on
+        the last page.
+    """
+
+    object: Literal["list"] = "list"
+    data: list[WorkflowRun] = Field(default_factory=list)
+    next_cursor: str | None = None
+
+
+class CreateWorkflowRequest(BaseModel):
+    """
+    Request body for ``POST /v1/workflows``.
+
+    :param name: One line of at most 80 characters, unique among the caller's
+        workflows.
+    :param description: What the workflow is for, at most 2,000 characters and
+        2,000 stored bytes after compression and the deployment's storage envelope.
+    :param steps: Empty or omitted to create a draft. Otherwise a graph with unique
+        step IDs, dependencies inside it, no cycles, and at most 100 steps.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    description: str
+    steps: list[WorkflowStep] = Field(default_factory=list)
+
+
+class UpdateWorkflowRequest(BaseModel):
+    """
+    Request body for ``PATCH /v1/workflows/{workflow_id}``; ``None`` keeps a field.
+
+    :param name: A new name.
+    :param description: A new description, subject to the same character and
+        stored-byte limits as creation.
+    :param expected_description: Apply ``description`` only while the stored
+        description is still this text, so one written meanwhile stays.
+    :param description_source: The journal entry ID of the planning-chat proposal
+        ``description`` comes from; a description written without one clears it.
+    :param steps: New steps, replacing the old ones.
+    :param planning_session_id: The private owned session for iterating on the plan.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str | None = None
+    description: str | None = None
+    expected_description: str | None = None
+    description_source: str | None = None
+    steps: list[WorkflowStep] | None = None
+    planning_session_id: str | None = None
+
+
+class WorkflowDeleted(BaseModel):
+    """
+    Response for ``DELETE /v1/workflows/{workflow_id}``.
+
+    :param id: The deleted workflow's ID.
+    :param object: Discriminator; always ``"workflow.deleted"``.
+    :param deleted: Always ``True``.
+    """
+
+    id: str
+    object: Literal["workflow.deleted"] = "workflow.deleted"
+    deleted: Literal[True] = True
+
+
+class SessionJournalAppendRequest(BaseModel):
+    """
+    Body of ``POST /v1/sessions/{id}/journal``, sent by the session's runner.
+
+    :param kind: The kind the agent writes.
+    :param content: The kind's fields, e.g. ``{"status": "done", "text": "PR merged"}``.
+    :param step: The plan step the entry is about.
+    :param idempotency_key: Names the write, e.g. ``"tool:<tool call ID>"``; a
+        retry with the same key returns the first attempt's entry.
+    :param workflow_id: The saved workflow associated with a plan.
+    :param start_run: False when saving the current plan as a workflow, preserving
+        its progress; True when invoking a saved workflow again.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["status", "note", "plan"]
+    content: dict[str, Any]
+    step: str | None = None
+    idempotency_key: str = Field(min_length=1, max_length=128)
+    workflow_id: str | None = None
+    start_run: bool = True
+
+
+class SessionJournalInputRequest(BaseModel):
+    """
+    Body of ``POST /v1/sessions/{id}/journal/input-requests``, sent by the session's runner.
+
+    :param step: The task in the current plan that waits for the answer, e.g. ``"deploy"``.
+    :param questions: 1 to 3 questions, each with a ``question``, a short
+        ``header``, 2 to 4 ``options`` (``label``, optional ``description``) and
+        an optional ``recommended`` option label.
+    :param idempotency_key: Names the request, e.g. ``"tool:<tool call ID>"``; a
+        retry with the same key reuses the first attempt's status and question.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    step: str
+    questions: list[dict[str, Any]]
+    idempotency_key: str = Field(min_length=1, max_length=128)
+
+
+class SessionJournalInputRequested(BaseModel):
+    """
+    Response of ``POST /v1/sessions/{id}/journal/input-requests``.
+
+    :param entry: The task's ``needs_input`` status.
+    :param elicitation_id: The question's elicitation; the runner waits for its answer.
+    """
+
+    entry: SessionJournalEntry
+    elicitation_id: str
 
 
 class SessionListItem(BaseModel):
@@ -3438,6 +3904,34 @@ class SessionList(BaseModel):
     last_id: str | None = None
     has_more: bool = False
     page_boundary: SessionPageBoundary | None = None
+
+
+class AgentCost(BaseModel):
+    """
+    Display cost of one agent in a session tree.
+
+    :param id: Session id, e.g. ``"conv_child123"``.
+    :param cost_usd: Priced USD cost of this agent including its sub-agents
+        (the same total its own session reports), or ``None`` when nothing
+        in that subtree is priced.
+    :param estimated_cost_usd: When ``cost_usd`` is ``None``, an ancestor
+        harness's transcript estimate for this agent, which that ancestor's
+        total already includes; otherwise ``None``.
+    """
+
+    id: str
+    cost_usd: float | None = None
+    estimated_cost_usd: float | None = None
+
+
+class AgentCostList(BaseModel):
+    """A page of costs for a session and its descendants; ``data`` lists ``AgentCost``."""
+
+    object: Literal["list"] = "list"
+    data: list[AgentCost] = Field(default_factory=list)
+    first_id: str | None = None
+    last_id: str | None = None
+    has_more: bool = False
 
 
 class ChildSessionList(BaseModel):
@@ -3751,10 +4245,12 @@ class GrantPermissionRequest(BaseModel):
         access subject to the server's public permission ceiling.
     :param level: Numeric permission level: ``1`` = read,
         ``2`` = edit, ``3`` = manage.
+    :param ensure_minimum: Preserve a stronger existing grant atomically.
     """
 
     user_id: str
     level: int = Field(ge=1, le=3)
+    ensure_minimum: bool = False
 
 
 class PermissionObject(BaseModel):
@@ -4264,8 +4760,7 @@ class SessionSandboxStatusEvent(_SSEEventBase):
     :param stage: The launch stage just entered, e.g.
         ``"provisioning"`` — see :class:`SandboxStatus` for the full
         pipeline order.
-    :param provider: Sandbox provider being launched, e.g. ``"arclet"``,
-        or ``None`` when unknown.
+    :param provider: Sandbox provider being launched, or ``None`` when unknown.
     :param details: What the user needs to do when
         ``stage == "action_required"``, e.g. ``"Sign in on your laptop."``.
         ``None`` otherwise.
@@ -4522,7 +5017,7 @@ class SessionCreatedEvent(_SSEEventBase):
 
 
 # Why a session's work moved to another session (``session.superseded``).
-SupersessionReason = Literal["clear"]
+SupersessionReason = Literal["clear", "rewind"]
 
 
 class SessionSupersededEvent(_SSEEventBase):
@@ -4554,9 +5049,8 @@ class SessionSupersededEvent(_SSEEventBase):
         event rides the stream of, e.g. ``"conv_old"``.
     :param target_conversation_id: The conversation to follow to, e.g.
         ``"conv_new"``.
-    :param reason: Why the session was superseded. Currently always
-        ``"clear"`` (a Claude Code ``/clear``); kept as a field so the
-        client can branch on future supersession causes.
+    :param reason: Why the session was superseded: ``"clear"`` (a
+        ``/clear``) or ``"rewind"`` (a ``/rewind`` onto a truncated fork).
     """
 
     type: Literal["session.superseded"]
@@ -5465,6 +5959,23 @@ class SessionChildSessionUpdatedEvent(_SSEEventBase):
     child: dict[str, Any]
 
 
+class SessionJournalAppendedEvent(_SSEEventBase):
+    """
+    An entry was appended to the session's journal.
+
+    Transient: the journal itself is the source of truth, and a client that
+    reconnects catches up with ``GET …/journal?order=asc&after=<last entry ID>``.
+
+    :param type: Always ``"session.journal.appended"``.
+    :param conversation_id: The session whose journal grew.
+    :param entry: The new entry.
+    """
+
+    type: Literal["session.journal.appended"]
+    conversation_id: str
+    entry: SessionJournalEntry
+
+
 class SessionChangedFilesInvalidatedEvent(_SSEEventBase):
     """
     The session's changed-files list may have changed — refetch it.
@@ -5609,6 +6120,7 @@ ServerStreamEvent = Annotated[
     | SessionResourceCreatedEvent
     | SessionResourceDeletedEvent
     | SessionChildSessionUpdatedEvent
+    | SessionJournalAppendedEvent
     | SessionChangedFilesInvalidatedEvent
     | SessionTerminalActivityEvent
     # ── Transient (SSE-only) — incremental token deltas ────────

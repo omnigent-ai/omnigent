@@ -39,6 +39,7 @@ from omnigent.util.server_url import ServerUrl, is_workspace_hosted_url
 
 if TYPE_CHECKING:
     import httpx
+    from omnigent_client import OmnigentClient
 
     from omnigent.runner.transports.ws_tunnel.event_delivery import RunnerEventDispatcher
 
@@ -493,9 +494,12 @@ def _refresh_locked(server_url: str, normalized: str, timeout: float) -> str | N
     import httpx
 
     try:
+        from omnigent.telemetry.request_headers import client_identity_headers
+
         resp = httpx.post(
             f"{normalized}/oauth/token",
             data={"grant_type": "refresh_token", "refresh_token": refresh_token},
+            headers=client_identity_headers(),
             timeout=timeout,
         )
     except httpx.HTTPError as exc:
@@ -734,8 +738,12 @@ def databricks_request_headers(
     httpx ``Auth`` that mints per request, or the managed-host token header)
     omits the token and still gets routing.
 
-    Both values are omitted when absent, so single-workspace and
-    local-unauthenticated callers get ``{}`` and are unaffected.
+    Both routing values are omitted when absent, so single-workspace and
+    local-unauthenticated callers get only the identity headers.
+
+    Always sets ``User-Agent`` to this component's identity, e.g.
+    ``omnigent-runner/0.22.0 python-httpx/0.28.1`` (see
+    :func:`~omnigent.telemetry.request_headers.client_user_agent`).
 
     Also folds in this machine's telemetry installation ID (omitted when
     telemetry is opted out of), so a server-side emitter can attribute an event
@@ -762,16 +770,19 @@ def databricks_request_headers(
     :param org_id: An explicit workspace selector captured from the current
         server URL. When omitted, the selector from the stored login record is
         used. An explicit value wins over stored state.
-    :returns: A header dict carrying ``Authorization``, ``X-Databricks-Org-Id``,
-        ``X-Databricks-Omnigent-Slice-Key``, ``X-Omnigent-Installation-Id``,
-        and/or the configured extra headers as available, possibly empty.
+    :returns: A header dict carrying ``User-Agent`` plus ``Authorization``,
+        ``X-Databricks-Org-Id``, ``X-Databricks-Omnigent-Slice-Key``,
+        ``X-Omnigent-Installation-Id``, and/or the configured extra headers as
+        available.
     """
-    from omnigent.telemetry.request_headers import telemetry_request_headers
+    from omnigent.telemetry.request_headers import (
+        client_identity_headers,
+        pop_client_user_agent,
+        telemetry_request_headers,
+    )
 
-    # This machine's installation ID, so a server-side telemetry emitter can
-    # name the machine an event came from without a lookup. Empty when
-    # telemetry is opted out of.
-    headers: dict[str, str] = telemetry_request_headers()
+    # Include component identity and, when telemetry is enabled, installation identity.
+    headers: dict[str, str] = {**client_identity_headers(), **telemetry_request_headers()}
     if bearer_token:
         headers["Authorization"] = f"Bearer {bearer_token}"
     org_id = org_id or load_databricks_org_id(server_url)
@@ -815,6 +826,9 @@ def databricks_request_headers(
     # Opaque dev/test extra headers (request-routing selectors); no-op in prod
     # (env unset).
     headers.update(_databricks_extra_headers())
+    # The component UA wins over a configured User-Agent in any casing, as on the
+    # WebSocket handshake, so exactly one identity is sent.
+    headers["User-Agent"] = pop_client_user_agent(headers)
     return headers
 
 
@@ -879,18 +893,20 @@ def open_server_client(
     import httpx
     from omnigent_client._http import is_loopback_url
 
-    pinned = {
-        **(headers or {}),
-        **databricks_request_headers(server_url, bearer_token=bearer_token, host_id=host_id),
-    }
-    kwargs: dict[str, Any] = {}
-    from omnigent.session_host import route_known_session_request
+    # httpx.Headers is case-insensitive: a caller's "user-agent" is replaced, not duplicated.
+    pinned = httpx.Headers(headers or {})
+    pinned.update(
+        databricks_request_headers(server_url, bearer_token=bearer_token, host_id=host_id)
+    )
+    from omnigent.session_host import SessionRoutingTransport, route_known_session_request
 
-    kwargs["event_hooks"] = {"request": [route_known_session_request]}
+    trust_env = not is_loopback_url(server_url)
+    kwargs: dict[str, Any] = {
+        "event_hooks": {"request": [route_known_session_request]},
+        "transport": SessionRoutingTransport(transport=transport, trust_env=trust_env),
+    }
     if timeout is not _TIMEOUT_UNSET:
         kwargs["timeout"] = timeout
-    if transport is not None:
-        kwargs["transport"] = transport
     if event_dispatcher is not None:
         from omnigent.runner.transports.ws_tunnel.event_delivery import TunnelEventClient
 
@@ -900,7 +916,7 @@ def open_server_client(
             headers=pinned,
             auth=auth,
             follow_redirects=follow_redirects,
-            trust_env=not is_loopback_url(server_url),
+            trust_env=trust_env,
             **kwargs,
         )
     return httpx.AsyncClient(
@@ -909,9 +925,46 @@ def open_server_client(
         auth=auth,
         follow_redirects=follow_redirects,
         # A proxy cannot reach a loopback server, so local targets bypass it.
-        trust_env=not is_loopback_url(server_url),
+        trust_env=trust_env,
         **kwargs,
     )
+
+
+def open_sdk_client(
+    server_url: str,
+    *,
+    headers: dict[str, str] | None = None,
+    auth: httpx.Auth | None = None,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> OmnigentClient:
+    """Open the Python SDK client to an Omnigent server, routed like :func:`open_server_client`.
+
+    Session requests go through :class:`~omnigent.session_host.SessionRoutingTransport`,
+    so each reaches its session's host and recovers once from a ``wrong_replica``
+    refusal. Every request carries :func:`databricks_request_headers`, so a client
+    without *auth* still sends the default routing key and any configured selectors.
+
+    :param server_url: The server base URL, e.g.
+        ``"https://workspace.example.com/api/2.0/omnigent"``.
+    :param headers: Headers sent on every request, e.g. the client ``User-Agent``.
+        Merged under the routing headers, so routing wins a collision.
+    :param auth: Optional per-request ``httpx.Auth``, e.g. the CLI's token refresher.
+    :param transport: The network transport the routing wraps; ``None`` uses the
+        default. Tests pass an ``httpx.MockTransport``.
+    :returns: An :class:`omnigent_client.OmnigentClient`, to use as an async context manager.
+    """
+    import httpx
+    from omnigent_client import OmnigentClient
+    from omnigent_client._http import is_loopback_url
+
+    from omnigent.session_host import SessionRoutingTransport
+
+    pinned = httpx.Headers(headers or {})
+    pinned.update(databricks_request_headers(server_url))
+    routing = SessionRoutingTransport(
+        transport=transport, trust_env=not is_loopback_url(server_url)
+    )
+    return OmnigentClient(base_url=server_url, headers=dict(pinned), auth=auth, transport=routing)
 
 
 def clear_token(server_url: str) -> None:

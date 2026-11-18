@@ -132,7 +132,7 @@ export function retryListFetch(failureCount: number, error: unknown): boolean {
  * mutations that actually change archived membership or a project label
  * invalidate this key explicitly instead.
  */
-const ARCHIVED_PROJECT_NAMES_KEY = ["archived-project-names"] as const;
+export const ARCHIVED_PROJECT_NAMES_KEY = ["archived-project-names"] as const;
 
 export type SessionSortBy = "updated_at" | "created_at";
 /** `?search_scope=`: `title` and `content` are disjoint groups of one search. */
@@ -256,6 +256,8 @@ export interface Conversation {
   provisional?: boolean;
   /** Client-only composer destination before a nested draft is submitted. */
   nested_draft_source_id?: string;
+  /** Client-only project whose new-session composer this ghost row reopens. */
+  project_draft_name?: string;
   /**
    * Total review comments (any status) on this session. Together with
    * `comments_updated_at` it forms a change fingerprint: an add or edit

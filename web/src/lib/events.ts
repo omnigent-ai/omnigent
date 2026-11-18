@@ -1,5 +1,6 @@
 import type { AssistantMessagePhase } from "./conversationItems";
 import type { NativePermissionDelivery } from "./nativePermissionDelivery";
+import type { JournalEntry } from "./sessionJournal";
 // Mirrors sdks/python-client/omnigent_client/_events.py.
 //
 // Hand-ported. When _events.py changes, update this file and the
@@ -222,6 +223,8 @@ export interface ElicitationRequest {
    * PermissionRequest for non-AskUserQuestion tools).
    */
   askUserQuestion?: Record<string, unknown> | null;
+  /** Producer-supplied extra (workflow questions only): the ID of the plan step the question is about. */
+  journalStep?: string;
   /**
    * Producer-supplied extra (claude-native only): the FULL
    * ``ExitPlanMode`` tool_input, untruncated — present when the
@@ -249,6 +252,7 @@ export interface ElicitationRequest {
     cwd: string | null;
     reason: string | null;
     execPolicyAmendment: string[] | null;
+    requestFingerprint?: string | null;
   } | null;
   /**
    * Producer-supplied extra (claude-native edit-tool prompts only):
@@ -911,6 +915,17 @@ export interface SessionChildSessionUpdatedEvent {
 }
 
 /**
+ * `session.journal.appended` — an entry was appended to the session's journal.
+ * Transient: a client that reconnects catches up from the REST journal.
+ */
+export interface SessionJournalAppendedEvent {
+  type: "session_journal_appended";
+  conversationId: string;
+  /** The new entry, shaped like a `GET …/journal` entry. */
+  entry: JournalEntry;
+}
+
+/**
  * `session.changed_files.invalidated` — the session's changed-files list
  * may have changed; the consumer should refetch it. Coarse signal (no
  * per-file payload).
@@ -967,9 +982,8 @@ export interface SessionPresenceEvent {
  * `session.superseded` — this conversation was superseded and the client
  * should follow to `targetConversationId`.
  *
- * Emitted when a Claude `/clear` rotates a session away: the old
- * conversation keeps its history but the live terminal moves to a fresh
- * conversation. A client actively viewing the old conversation
+ * Emitted when `/clear` or `/rewind` moves a session's work to another
+ * conversation; the old one keeps its history. A client actively viewing the old conversation
  * auto-redirects. Live-only (no SSE replay): a client connecting after
  * the rotation instead renders the persisted notice message appended to
  * the old conversation.
@@ -980,8 +994,8 @@ export interface SessionSupersededEvent {
   conversationId: string;
   /** The conversation id to redirect to. */
   targetConversationId: string;
-  /** Why the session was superseded. Currently always `"clear"`. */
-  reason: "clear";
+  /** Why the session was superseded. */
+  reason: "clear" | "rewind";
 }
 
 /**
@@ -1078,6 +1092,7 @@ export type StreamEvent =
   | SessionResourceCreatedEvent
   | SessionResourceDeletedEvent
   | SessionChildSessionUpdatedEvent
+  | SessionJournalAppendedEvent
   | SessionChangedFilesInvalidatedEvent
   | SessionTerminalActivityEvent
   | SessionModelOptionsEvent
