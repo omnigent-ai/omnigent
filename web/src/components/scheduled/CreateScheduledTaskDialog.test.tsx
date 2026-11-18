@@ -5502,8 +5502,10 @@ describe("editing template prompts", () => {
       ).map((context) => ({ workerReady, ...context })),
     ),
   )(
-    "validates worker placement $placement after poller target change=$change (worker ready: $workerReady)",
+    "validates saved worker placement $placement after poller target change=$change (worker ready: $workerReady)",
     async ({ workerReady, change, placement }) => {
+      // Moving the poller from a sandbox to a host moves its workers with it.
+      const savedPlacement = change === "host" ? "same_host" : placement;
       vi.mocked(sandboxModelsHook.useSandboxModelOptions).mockImplementation(
         (_provider, _harness, agentId) =>
           ({
@@ -5560,13 +5562,13 @@ describe("editing template prompts", () => {
         fireEvent.click(await screen.findByRole("option", { name: "laptop" }));
         expect(screen.queryByText(/Polling session cannot start:/)).not.toBeInTheDocument();
       }
-      if (workerReady || (change !== "none" && placement === "same_host")) {
+      if (workerReady || (change !== "none" && savedPlacement === "same_host")) {
         expect(submit).toBeEnabled();
         fireEvent.click(submit);
         await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
         const input = updateMutateAsync.mock.calls[0][0].input;
         expect(readTriggerWorkerSettings(input.prompt)?.agentId).toBe("ag_claude_native");
-        expect(input.prompt).toContain(`placement "${placement}"`);
+        expect(input.prompt).toContain(`placement "${savedPlacement}"`);
         expect(input).not.toHaveProperty("agentId");
         expect(input).not.toHaveProperty("sessionId");
       } else {
@@ -5579,6 +5581,50 @@ describe("editing template prompts", () => {
       }
     },
   );
+
+  it("restores the saved worker placement when the poller target moves back", async () => {
+    vi.mocked(sandboxModelsHook.useSandboxModelOptions).mockReturnValue({
+      data: { models: [], configured: false, status: "ready" },
+    } as unknown as ReturnType<typeof sandboxModelsHook.useSandboxModelOptions>);
+    render(
+      <CapabilitiesProvider
+        info={{
+          ...SERVER_INFO_OFFLINE_FALLBACK,
+          features: { automations_v2: true },
+          managed_sandboxes_enabled: true,
+          sandbox_provider: "modal",
+          sandbox_provider_capabilities: { modal: { default_models: true } },
+        }}
+      >
+        <CreateScheduledTaskDialog
+          open
+          onOpenChange={vi.fn()}
+          editingTask={scheduledTask({
+            prompt: original.replace('placement "same_host"', 'placement "managed"'),
+            executionTarget: "managed_sandbox",
+            hostId: null,
+            sessionMode: "continue",
+            sessionId: "poller",
+          })}
+        />
+      </CapabilitiesProvider>,
+    );
+    fireEvent.keyDown(screen.getByTestId("task-host-trigger"), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: "laptop" }));
+    // A worker edit while on the host must not keep the host's placement.
+    fireEvent.keyDown(screen.getByTestId("task-worker-agent-trigger"), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: "Claude Code" }));
+    fireEvent.keyDown(screen.getByTestId("task-host-trigger"), { key: "Enter" });
+    fireEvent.click(await screen.findByTestId("task-host-sandbox-option"));
+    const submit = screen.getByTestId("create-scheduled-task-submit");
+    await waitFor(() => expect(submit).toBeEnabled());
+    fireEvent.click(submit);
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    const input = updateMutateAsync.mock.calls[0][0].input;
+    expect(readTriggerWorkerSettings(input.prompt)?.agentId).toBe("ag_claude_native");
+    expect(input.prompt).toContain('placement "managed"');
+    expect(input).not.toHaveProperty("executionTarget");
+  });
 
   it("saves a customized creation call unchanged without offering worker controls", async () => {
     const customized = original.replace(

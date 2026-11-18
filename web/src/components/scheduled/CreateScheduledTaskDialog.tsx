@@ -96,6 +96,7 @@ import {
   triggerMcpService,
   triggerServiceName,
   triggerWorkerSettingsOf,
+  updateTriggerWorkerPlacement,
   updateTriggerWorkerSettings,
   type TriggerConfig,
   type TriggerFields,
@@ -831,7 +832,8 @@ export function CreateScheduledTaskDialog({
       setSwitchedWorkerSettings(settings);
       return;
     }
-    const updated = updateTriggerWorkerSettings(effectivePrompt, settings);
+    // Edit the authored prompt, so a later revert of the target restores its placement.
+    const updated = updateTriggerWorkerSettings(syncedFreeTextPrompt, settings);
     if (updated === null) return;
     const parts = splitTriggerPrompt(updated);
     // A chosen workflow leaves the hidden draft out of the prompt, so keep the draft as typed.
@@ -847,13 +849,23 @@ export function CreateScheduledTaskDialog({
         ? switchedWorkerSettings
         : readTriggerWorkerSettings(combineTriggerPrompt(prompt, systemPrompt));
   }
-  let workerPlacement: WorkerPlacement | null = null;
+  // Moving the poller between a sandbox and a connected host moves its workers with it.
+  const targetWorkerPlacement: WorkerPlacement | null =
+    editingTask !== null && executionTarget !== editingTask.executionTarget
+      ? sandboxMode
+        ? "managed"
+        : "same_host"
+      : null;
+  // The placement as saved or edited; state keeps it, and only the target override changes it.
+  let authoredWorkerPlacement: WorkerPlacement | null = null;
   if (editingWorkerSettings) {
-    workerPlacement =
+    authoredWorkerPlacement =
       trigger !== null
         ? switchedWorkerPlacement
         : readTriggerWorkerPlacement(combineTriggerPrompt(prompt, systemPrompt));
   }
+  const workerPlacement =
+    authoredWorkerPlacement === null ? null : (targetWorkerPlacement ?? authoredWorkerPlacement);
   const workerSandboxMode = workerPlacement === "managed" || sandboxMode;
   const workerAgent = agents?.find(
     (agent) =>
@@ -1110,10 +1122,14 @@ export function CreateScheduledTaskDialog({
     workflowsEnabled && info !== "loading" && info.session_create_workflow_id === true;
   // The prompt when no trigger form is open: as typed, or an older trigger's instructions
   // inside its saved template text, whose creation call follows the workflow they run.
-  const freeTextPrompt = syncTriggerWorkflowId(
+  const syncedFreeTextPrompt = syncTriggerWorkflowId(
     combineTriggerPrompt(withWorkflow(prompt), systemPrompt),
     workflowIdSupported,
   );
+  const freeTextPrompt =
+    targetWorkerPlacement === null
+      ? syncedFreeTextPrompt
+      : updateTriggerWorkerPlacement(syncedFreeTextPrompt, targetWorkerPlacement);
   const triggerComplete =
     trigger !== null &&
     triggerFieldsComplete(promptTriggerFields, trigger, messageBudget.instructionsMaxChars);
@@ -1577,7 +1593,9 @@ export function CreateScheduledTaskDialog({
     }
     // Fall back to the saved workers if the prompt editor's creation call no longer parses.
     setSwitchedWorkerSettings(workerSettings ?? savedWorkerSettings);
-    setSwitchedWorkerPlacement(workerSettings !== null ? workerPlacement : savedWorkerPlacement);
+    setSwitchedWorkerPlacement(
+      workerSettings !== null ? authoredWorkerPlacement : savedWorkerPlacement,
+    );
     if (next === editingTriggerSource) {
       setStartNewSession(saved.savedStartNewSession);
       setSourceSwitch(null);
