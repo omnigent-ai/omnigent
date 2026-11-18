@@ -37,7 +37,7 @@ function clip(text: string, limit: number): string {
  */
 export function clipDesignRequest(request: DesignRequest, limit: number): DesignRequest {
   const words = clip(request.request, limit);
-  const left = Math.max(limit - words.length, 0);
+  const left = Math.max(limit - [...words].length, 0);
   return {
     ...request,
     request: words,

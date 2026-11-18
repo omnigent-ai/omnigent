@@ -7,17 +7,18 @@
 const { randomUUID } = require("node:crypto");
 const { hitTestScript } = require("./designToolsPage.mjs");
 
-// The isolated world the tools' page scripts run in.
+// Its own isolated world id: one that collides with another isolated world (an extension's,
+// say) would share that world's globals with it.
 const DESIGN_TOOLS_WORLD_ID = 1789;
 
-// The overlay's frame name: this, then the opening's id.
+// windowOpen only treats an open whose frame name starts with this as an overlay's.
 const FRAME_PREFIX = "omnigent-design-tools:";
 
 const NOT_OPEN = "the design tool isn't open on this page";
 const ZOOM_CHANGED = "the page's zoom changed";
 const NO_ANSWER = "the page didn't answer";
 const OFF_SCREEN = "nothing to capture there";
-// How long a page operation may take to answer.
+// Long enough for a busy page; a hung page mustn't stall the tool.
 const OP_TIMEOUT_MS = 5000;
 // How often an open tool checks that its overlay is still at the page's zoom (nothing
 // reports a zoom set on the page itself).
@@ -40,6 +41,7 @@ const NOTICE_GAP = 4;
  *           while DevTools are docked there, in its CSS pixels; else null.
  * @property {boolean} claimed  Its overlay was asked for (it can be only once).
  * @property {boolean} [measuring]  Its page area is being measured.
+ * @property {boolean} [refocus]  Its tool's overlay held the keys when its page left the window.
  * @property {() => void} detach
  * @property {(reason: string) => void} ended  End it, telling the app why.
  */
@@ -292,6 +294,9 @@ function createDesignTools({
     // Just above the page, below whatever is above it (the reconnect overlay, prompts).
     contentView.addChildView(overlay, index + 1);
     fit(session);
+    if (!session.refocus) return;
+    session.refocus = false;
+    if (session.mode === "tool" && live(overlay.webContents)) overlay.webContents.focus();
   }
 
   /**
@@ -391,11 +396,17 @@ function createDesignTools({
   function viewDetached(host, view) {
     for (const session of sessions.values()) {
       if (session.host !== host || session.entry.view !== view || !session.overlay) continue;
+      let focused = false;
       try {
+        focused = session.overlay.webContents.isFocused?.() === true;
         host.contentView.removeChildView(session.overlay);
       } catch {
         /* window torn down */
       }
+      // Hidden, it mustn't take what's typed: the app has the keys until it's back.
+      if (!focused) continue;
+      session.refocus = true;
+      if (!host.isDestroyed?.() && live(host.webContents)) host.webContents.focus();
     }
   }
 
@@ -510,6 +521,8 @@ function createDesignTools({
     if (!session || typeof args.session !== "string" || args.session !== session.id) {
       return { ok: false, error: NOT_OPEN };
     }
+    // A notice outlives its page's navigations, so it can't read or scroll the next document.
+    if (session.mode === "notice" && op !== "fit") return { ok: false, error: NOT_OPEN };
     const webContents = entry.view.webContents;
     // Measured at the overlay's old zoom: the overlay follows the page's, and the app asks again.
     if (POSITIONED_OPS.has(op) && zoomMoved(session)) {
@@ -628,6 +641,11 @@ function sharedDesignTools() {
   return shared;
 }
 
+/** Whether `entry`'s page holds the keys: the page itself, or its open tool's overlay. */
+function isBrowserViewFocused(entry) {
+  return !!entry?.view.webContents.isFocused() || sharedDesignTools().overlayFocused(entry);
+}
+
 /**
  * The `omnigent:browser-design-tools` channel: `start`, `stop`, and the open tool's
  * requests, for a view in the sender's window. `gateRegistry` is browserIpc's trust gate.
@@ -673,6 +691,7 @@ module.exports = {
   DESIGN_TOOLS_WORLD_ID,
   FRAME_PREFIX,
   createDesignTools,
+  isBrowserViewFocused,
   registerDesignToolsIpc,
   sharedDesignTools,
 };

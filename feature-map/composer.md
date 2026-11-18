@@ -453,9 +453,11 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 
 **Desktop browser pointer** (open a session in the desktop app):
 
-- Choose **+ → Browser** to open a Browser soft tab, navigate to a page, enable
-  Design mode, and click an element. Type an instruction in the floating popup
-  and use Send or Enter.
+- Choose **+ → Browser** to open a Browser soft tab and navigate to a page. Use
+  Annotate to click an element and type an instruction, or Draw to mark up the
+  page and add a note, then send. Where they're unavailable (older shells),
+  enable Design mode instead, click an element, type an instruction in the
+  floating popup, and use Send or Enter.
 - Change Settings → Always steer (on by default) to choose whether
   busy-session follow-ups queue or send immediately. Existing queued messages
   retain FIFO ordering.

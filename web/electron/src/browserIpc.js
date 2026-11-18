@@ -21,7 +21,7 @@ const {
 } = require("./agentDeadline");
 const { routedGate, viewElsewhere } = require("./browserTabs");
 const { buildDesignModeScript } = require("./designModeScript");
-const { registerDesignToolsIpc, sharedDesignTools } = require("./designTools");
+const { isBrowserViewFocused, registerDesignToolsIpc } = require("./designTools");
 
 const { SESSION_HOST_PROTOCOL } = require("./hostIdentity");
 
@@ -590,11 +590,7 @@ function registerBrowserIpc({
     const viewId = g.registry.activeConversationId();
     if (viewId === null) return null;
     try {
-      // The design tools' overlay over the page takes its keys while a tool is open.
-      const entry = g.registry.get(viewId);
-      return entry?.view.webContents.isFocused() || sharedDesignTools().overlayFocused(entry)
-        ? viewId
-        : null;
+      return isBrowserViewFocused(g.registry.get(viewId)) ? viewId : null;
     } catch {
       return null;
     }

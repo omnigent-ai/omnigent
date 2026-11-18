@@ -1,4 +1,4 @@
-import { renderHook, render, screen, waitFor } from "@testing-library/react";
+import { act, renderHook, render, screen, waitFor } from "@testing-library/react";
 import { Component, createRef, type ReactNode } from "react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 
@@ -66,7 +66,48 @@ it("says the tools are missing once their chunk can't load, so the pane offers d
   expect(hasDesktopDesignTools()).toBe(false);
 });
 
-it("says the tools are missing once they fail after loading, so the pane offers design mode", async () => {
+it("tries the tools' chunk again less often each time, and offers the tools once it loads", async () => {
+  vi.useFakeTimers();
+  try {
+    const chunk = { broken: true, loads: 0 };
+    vi.doMock("./DesktopDesignTools", () => ({
+      get DesktopDesignTools() {
+        chunk.loads += 1;
+        if (!chunk.broken) return () => <p>The tools</p>;
+        throw new TypeError("Failed to fetch dynamically imported module");
+      },
+    }));
+    const { DesktopDesignTools, TOOLS_RETRY_MAX_MS, TOOLS_RETRY_MS, useHasDesktopDesignTools } =
+      await import("./LazyDesktopDesignTools");
+    const has = renderHook(() => useHasDesktopDesignTools());
+    render(<DesktopDesignTools viewId="conv_1" hasView url="" container={createRef()} />);
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    expect(has.result.current).toBe(false);
+    // Each failed try waits twice as long for the next, up to a cap.
+    chunk.loads = 0;
+    let waitMs = TOOLS_RETRY_MS;
+    for (let tries = 1; tries <= 8; tries += 1) {
+      // oxlint-disable-next-line no-await-in-loop -- one wait at a time
+      await act(() => vi.advanceTimersByTimeAsync(waitMs - 1));
+      expect(chunk.loads).toBe(tries - 1);
+      // oxlint-disable-next-line no-await-in-loop -- one wait at a time
+      await act(() => vi.advanceTimersByTimeAsync(1));
+      expect(chunk.loads).toBe(tries);
+      waitMs = Math.min(waitMs * 2, TOOLS_RETRY_MAX_MS);
+    }
+    expect(waitMs).toBe(TOOLS_RETRY_MAX_MS);
+    // The chunk loads again: the pane has the tools, not design mode.
+    chunk.broken = false;
+    await act(() => vi.advanceTimersByTimeAsync(TOOLS_RETRY_MAX_MS));
+    await act(() => vi.advanceTimersByTimeAsync(20));
+    expect(has.result.current).toBe(true);
+    expect(screen.getByText("The tools")).toBeTruthy();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it("says the tools are missing for good once they fail after loading", async () => {
   vi.spyOn(console, "error").mockImplementation(() => {});
   vi.doMock("./DesktopDesignTools", () => ({
     DesktopDesignTools: () => {
@@ -84,4 +125,12 @@ it("says the tools are missing once they fail after loading, so the pane offers 
   );
   await waitFor(() => expect(has.result.current).toBe(false));
   expect(screen.queryByText("The app failed")).toBeNull();
+  // A failure while running isn't a chunk to try again: no later try brings them back.
+  vi.useFakeTimers();
+  try {
+    await act(() => vi.advanceTimersByTimeAsync(60_000));
+    expect(has.result.current).toBe(false);
+  } finally {
+    vi.useRealTimers();
+  }
 });

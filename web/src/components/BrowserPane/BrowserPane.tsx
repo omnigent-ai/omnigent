@@ -268,6 +268,7 @@ export function BrowserPane({
       if (payload.conversationId !== conversationId) return;
       viewChanged = true;
       setHasView(false);
+      setPageUrl("");
       setCanGoBack(false);
       setCanGoForward(false);
     });

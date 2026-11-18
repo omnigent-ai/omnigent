@@ -166,22 +166,25 @@ async function bytesOf(file: File): Promise<ArrayBuffer> {
   });
 }
 
-// A request's text and files never change, so its files are read once.
+// A request's text and files never change, so its files are read once (once it works).
 const savedFiles = new Map<string, Promise<SavedFile[]>>();
 
 function filesOf(request: DesignRequest): Promise<SavedFile[]> {
-  let files = savedFiles.get(request.id);
-  if (!files) {
-    files = Promise.all(
-      request.files.map(async (file) => ({
-        name: file.name,
-        type: file.type,
-        lastModified: file.lastModified,
-        bytes: await bytesOf(file),
-      })),
-    );
-    savedFiles.set(request.id, files);
-  }
+  const cached = savedFiles.get(request.id);
+  if (cached) return cached;
+  const files = Promise.all(
+    request.files.map(async (file) => ({
+      name: file.name,
+      type: file.type,
+      lastModified: file.lastModified,
+      bytes: await bytesOf(file),
+    })),
+  );
+  savedFiles.set(request.id, files);
+  // A failed read isn't kept, so the next save reads again.
+  files.catch(() => {
+    if (savedFiles.get(request.id) === files) savedFiles.delete(request.id);
+  });
   return files;
 }
 

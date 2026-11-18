@@ -297,6 +297,30 @@ describe("design tools: the overlay", () => {
     assert.equal(overlay.visible, true);
   });
 
+  it("gives its keys to the app while its page is out of the window, and takes them back", () => {
+    const t = openTool();
+    const overlay = t.open();
+    const switchAway = () => {
+      t.host.contentView.removeChildView(t.view);
+      t.tools.viewDetached(t.host, t.view);
+    };
+    const switchBack = () => {
+      t.host.contentView.addChildView(t.view);
+      t.tools.viewAttached(t.host, t.view);
+    };
+    switchAway();
+    assert.equal(t.host.webContents.focused, 1);
+    overlay.webContents.focusedNow = false; // the app has them now
+    switchBack();
+    assert.equal(overlay.webContents.isFocused(), true);
+    // Without the keys when its page left, it doesn't take them coming back.
+    overlay.webContents.focusedNow = false;
+    switchAway();
+    switchBack();
+    assert.equal(overlay.webContents.isFocused(), false);
+    assert.equal(t.host.webContents.focused, 1);
+  });
+
   it("covers only the page's part of its view while DevTools are docked there", async () => {
     const t = openTool({ zoom: 2 });
     const overlay = t.open();
@@ -459,6 +483,19 @@ describe("design tools: the overlay", () => {
     // A notice isn't the page's: it stays across a navigation.
     t.webContents.emit("did-start-navigation", { isMainFrame: true, isSameDocument: false });
     assert.equal(t.tools.isOpen(t.entry), true);
+    // So it can't capture, read or scroll the page, only lay itself out.
+    const refused = { ok: false, error: "the design tool isn't open on this page" };
+    assert.deepEqual(
+      await Promise.all([
+        t.ask("capture", {}),
+        t.ask("hitTest", { x: 1, y: 1 }),
+        t.ask("scroll", { x: 1, y: 1, dx: 0, dy: 10 }),
+      ]),
+      [refused, refused, refused],
+    );
+    assert.equal(t.webContents.captured, undefined);
+    assert.deepEqual(t.webContents.inputs, []);
+    assert.deepEqual(await t.ask("fit", { notice: { width: 100, height: 30 } }), { ok: true });
     c.mock.timers.tick(250);
     assert.equal(t.tools.isOpen(t.entry), true);
     // Its page destroyed: it ends then, and its zoom check never asks the gone page.

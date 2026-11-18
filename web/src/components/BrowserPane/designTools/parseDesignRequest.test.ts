@@ -143,4 +143,14 @@ describe("clipDesignRequest", () => {
     const request: DesignRequest = { kind: "element", request: wide.repeat(3) };
     expect(clipDesignRequest(request, 2).request).toBe(wide.repeat(2));
   });
+
+  it("counts an emoji in the request as one character of the budget", () => {
+    const request: DesignRequest = {
+      kind: "element",
+      request: "😀".repeat(4),
+      element: "p",
+      elementText: "b".repeat(8),
+    };
+    expect(clipDesignRequest(request, 10).elementText).toBe("b".repeat(6));
+  });
 });

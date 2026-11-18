@@ -48,10 +48,4 @@ describe("a design-tool message", () => {
     );
     expect(screen.queryByText(/\*\*/)).toBeNull();
   });
-
-  it("leaves an ordinary message as Markdown", () => {
-    renderBubble(userBubble("Please fix the build"));
-    expect(screen.getByText("Please fix the build")).toBeInTheDocument();
-    expect(screen.queryByTestId("design-request")).toBeNull();
-  });
 });

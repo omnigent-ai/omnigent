@@ -4,15 +4,31 @@ import { DesignRequestBody } from "./LazyDesignRequestMessage";
 import { NO_SCREENSHOT_NOTE } from "./parseDesignRequest";
 
 describe("DesignRequestBody", () => {
-  it("shows the request and its subject while the card's chunk loads", async () => {
+  it("shows the request, its subject and a missing screenshot's note while the card's chunk loads", async () => {
     // A fresh module, whose card hasn't loaded for an earlier test.
     vi.resetModules();
     const { DesignRequestBody: FreshBody } = await import("./LazyDesignRequestMessage");
-    render(<FreshBody request={{ kind: "element", request: "Make it red", element: "p#blurb" }} />);
+    const { rerender } = render(
+      <FreshBody
+        request={{
+          kind: "element",
+          request: "Make it red",
+          element: "p#blurb",
+          noScreenshot: true,
+        }}
+      />,
+    );
+    expect(screen.queryByTestId("design-request")).toBeNull();
     expect(screen.getByText("Make it red")).toBeInTheDocument();
     expect(screen.getByText("p#blurb")).toBeInTheDocument();
-    expect(screen.queryByTestId("design-request")).toBeNull();
-    expect(await screen.findByTestId("design-request")).toHaveTextContent("p#blurb");
+    expect(screen.getByText(NO_SCREENSHOT_NOTE)).toBeInTheDocument();
+    const card = await screen.findByTestId("design-request");
+    expect(card).toHaveTextContent("p#blurb");
+    expect(card).toHaveTextContent(NO_SCREENSHOT_NOTE);
+    rerender(
+      <FreshBody request={{ kind: "element", request: "Make it red", element: "p#blurb" }} />,
+    );
+    expect(screen.queryByText(NO_SCREENSHOT_NOTE)).toBeNull();
   });
 
   it("shows the request and what it was about", async () => {
@@ -35,18 +51,6 @@ describe("DesignRequestBody", () => {
     await screen.findByTestId("design-request");
     expect(screen.getByText("Drawing on localhost:5173")).toBeInTheDocument();
     expect(screen.getByText("Bigger heading")).toBeInTheDocument();
-  });
-
-  it("notes a request the agent got without its screenshot, before and after the chunk", async () => {
-    const { rerender } = render(
-      <DesignRequestBody
-        request={{ kind: "element", request: "Red", element: "p", noScreenshot: true }}
-      />,
-    );
-    expect(screen.getByText(NO_SCREENSHOT_NOTE)).toBeInTheDocument();
-    expect(await screen.findByTestId("design-request")).toHaveTextContent(NO_SCREENSHOT_NOTE);
-    rerender(<DesignRequestBody request={{ kind: "element", request: "Red", element: "p" }} />);
-    expect(screen.queryByText(NO_SCREENSHOT_NOTE)).toBeNull();
   });
 
   it("shows the words as the chat renders them, and a long subject in full", async () => {

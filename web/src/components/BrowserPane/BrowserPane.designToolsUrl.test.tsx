@@ -28,12 +28,16 @@ afterEach(() => {
 describe("BrowserPane's design tools", () => {
   it("name the page the view loaded, not what's typed in the address bar", async () => {
     let urlChanged: (payload: { conversationId: string; url: string }) => void = () => {};
+    let viewClosed: (payload: { conversationId: string; reason: string | null }) => void = () => {};
     const unsubscribe = () => {};
     (window as unknown as { omnigentDesktop?: unknown }).omnigentDesktop = {
       browserHasView: vi.fn().mockResolvedValue({ exists: true, url: "https://a.example/" }),
       onBrowserViewCreated: () => unsubscribe,
       onBrowserHostActiveChanged: () => unsubscribe,
-      onBrowserViewClosed: () => unsubscribe,
+      onBrowserViewClosed: (callback: typeof viewClosed) => {
+        viewClosed = callback;
+        return unsubscribe;
+      },
       onBrowserUrlChanged: (callback: typeof urlChanged) => {
         urlChanged = callback;
         return unsubscribe;
@@ -61,5 +65,8 @@ describe("BrowserPane's design tools", () => {
     act(() => urlChanged({ conversationId: "conv_url", url: "https://c.example/" }));
     expect(tools).toHaveTextContent("https://c.example/");
     expect(bar).toHaveValue("https://b.example/");
+    // The view closed: a new one names no page until it has loaded one.
+    act(() => viewClosed({ conversationId: "conv_url", reason: null }));
+    expect(tools).toBeEmptyDOMElement();
   });
 });

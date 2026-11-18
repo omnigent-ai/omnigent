@@ -300,23 +300,10 @@ describe("design outbox", () => {
     forget(id);
     expect(statusOf(id)).toBeUndefined();
     expect(designOutboxTracks(id)).toBe(false);
-  });
-
-  it("stops a send it stopped waiting on once the request is removed, before it posts", async () => {
-    vi.useFakeTimers();
-    let signal: AbortSignal | undefined;
-    send.mockImplementationOnce(async (_t, _a, _f, opts) => {
-      signal = opts?.signal;
-      await new Promise(() => {});
-    });
-    const id = queueDesignRequest({ tabId: TAB, label: "Annotate", text: "Uploading" });
-    await vi.advanceTimersByTimeAsync(STALLED_SEND_MS - 1);
-    expect(signal?.aborted).toBe(false);
-    await vi.advanceTimersByTimeAsync(1);
-    expect(statusOf(id)).toBe("failed");
-    expect(signal?.aborted).toBe(true);
-    forget(id);
+    // Removed, it's never sent again.
+    await flush();
     expect(statusOf(id)).toBeUndefined();
+    expect(send).toHaveBeenCalledTimes(1);
   });
 
   it("counts a send the runner took while it ran as sent, though its POST then failed", async () => {

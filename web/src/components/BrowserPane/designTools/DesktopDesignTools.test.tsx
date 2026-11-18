@@ -22,7 +22,7 @@ import { isEscapeOwnerOpen } from "@/lib/hotkeys";
 import { NOTICE_MS } from "./layerParts";
 import { DesktopDesignTools } from "./DesktopDesignTools";
 import type { DesignToolsEvent } from "./desktopBridge";
-import { resetDesignOutbox } from "./core/designOutbox";
+import { resetDesignOutbox, useDesignOutbox } from "./core/designOutbox";
 import { resetDesignTools, tabTools } from "./core/designToolsStore";
 
 const VIEW = "conv_1";
@@ -321,6 +321,49 @@ describe("DesktopDesignTools: the overlay", () => {
       }),
     );
   });
+
+  for (const [name, end] of [
+    [
+      "main ends a notice's opening",
+      (shell: ReturnType<typeof fakeShell>) =>
+        shell.emit({ type: "ended", session: "open_2", reason: "gone" }),
+    ],
+    [
+      "a notice's overlay goes",
+      async (_shell: ReturnType<typeof fakeShell>, overlays: ReturnType<typeof fakeOverlays>) => {
+        await act(async () => {
+          overlays.opened.at(-1)!.win.dispatchEvent(new Event("pagehide"));
+        });
+      },
+    ],
+  ] as const) {
+    it(`shows the next notice afresh once ${name}`, async () => {
+      const shell = fakeShell();
+      const overlays = fakeOverlays();
+      renderTools();
+      await open("Annotate an element");
+      await shell.emit({ type: "ended", reason: "navigated" });
+      await settle();
+      expect(shell.ops("start")).toHaveLength(2);
+      await end(shell, overlays);
+      await settle();
+      // One of this tab's requests is sent: its notice opens an overlay of its own.
+      const request = {
+        id: "request_1",
+        tabId: VIEW,
+        conversationId: VIEW,
+        label: "Annotate",
+        text: "Make it green",
+        files: [],
+        status: "sending",
+      } as const;
+      act(() => useDesignOutbox.setState({ requests: [request] }));
+      act(() => useDesignOutbox.setState({ requests: [{ ...request, status: "sent" }] }));
+      await settle();
+      expect(shell.ops("start")).toHaveLength(3);
+      expect(overlays.view().getByRole("status")).toHaveTextContent("Sent to agent.");
+    });
+  }
 
   it("ignores an older opening's end once another has opened", async () => {
     const shell = fakeShell();

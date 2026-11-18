@@ -222,11 +222,18 @@ export function DesktopDesignTools({
       if (event.viewId !== viewId || event.type !== "ended") return;
       // An older opening's end does nothing to the one open now.
       if (!overlay.ended(event.session)) return;
-      if (tabTools(viewId).tool === null) return;
+      // A notice's opening ended: it goes too, so the next notice opens afresh.
+      if (tabTools(viewId).tool === null) {
+        setNotice(null);
+        return;
+      }
       closeTool(viewId);
       if (event.reason === "navigated") setNotice(PAGE_CHANGED);
     });
-    const stopLost = overlay.onLost(() => closeTool(viewId));
+    const stopLost = overlay.onLost(() => {
+      if (tabTools(viewId).tool === null) setNotice(null);
+      else closeTool(viewId);
+    });
     return () => {
       stopEvents();
       stopLost();

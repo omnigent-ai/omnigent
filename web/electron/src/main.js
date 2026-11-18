@@ -81,7 +81,7 @@ const { createBrowserViewRegistry } = require("./browserViewRegistry");
 const { registerBrowserTabsIpc } = require("./browserTabs");
 const { createBrowserViewBoundsController } = require("./browserViewBounds");
 const { goBack, goForward, registerBrowserIpc } = require("./browserIpc");
-const { sharedDesignTools } = require("./designTools");
+const { isBrowserViewFocused, sharedDesignTools } = require("./designTools");
 const { arcaTarget, createArcaIdentityStore, isArcaAgentContext } = require("./arcaIdentity");
 const { createHostThisMachineChecker, SESSION_HOST_PROTOCOL } = require("./hostIdentity");
 const { isDeveloperModeEnabled } = require("./developer_mode");
@@ -6198,7 +6198,7 @@ function sendDesktopCommand(win, command, extra = {}) {
 
 /**
  * The embedded browser view (by view ID) holding keyboard focus in `win`, or
- * null. Only the attached view can hold focus, so checking it is enough.
+ * null. Only the attached view (or its design tool's overlay) can hold focus.
  *
  * @param {BrowserWindow} win
  * @returns {string | null}
@@ -6208,10 +6208,7 @@ function focusedBrowserViewId(win) {
   const viewId = registry?.activeConversationId() ?? null;
   if (viewId === null) return null;
   try {
-    const entry = registry.get(viewId);
-    return entry?.view.webContents.isFocused() || sharedDesignTools().overlayFocused(entry)
-      ? viewId
-      : null;
+    return isBrowserViewFocused(registry.get(viewId)) ? viewId : null;
   } catch {
     return null;
   }

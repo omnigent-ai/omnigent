@@ -181,6 +181,26 @@ describe("design outbox storage", () => {
     expect(unloadAsks()).toBe(false);
   });
 
+  it("reads a request's screenshot again after a failed read, so a later save keeps it", async () => {
+    const shot = new File(["png bytes"], "shot.png", { type: "image/png" });
+    const read = vi
+      .spyOn(shot, "arrayBuffer")
+      .mockRejectedValueOnce(new Error("Couldn't read the file"));
+    const id = queueDesignRequest({ tabId: TAB, label: "Draw", text: "Note", files: [shot] });
+    await designOutboxSaved();
+    expect(await records()).toEqual([]);
+    expect(unloadAsks()).toBe(true);
+    // The next change saves it again, reading the screenshot afresh.
+    const other = queueDesignRequest({ tabId: TAB, label: "Annotate", text: "Small" });
+    await designOutboxSaved();
+    await designOutboxSaved();
+    expect(read).toHaveBeenCalledTimes(2);
+    expect(await savedIds()).toEqual([id, other].sort());
+    const saved = (await records()).find((entry) => entry.id === id);
+    expect(new TextDecoder().decode(saved!.files[0]!.bytes)).toBe("png bytes");
+    expect(unloadAsks()).toBe(false);
+  });
+
   it("doesn't count a save whose transaction aborted after the write (a full disk)", async () => {
     const put = IDBObjectStore.prototype.put;
     vi.spyOn(IDBObjectStore.prototype, "put").mockImplementationOnce(function (
