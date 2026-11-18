@@ -9,17 +9,29 @@ that run against both palettes (``CommandPalette.quickPick.test.tsx``).
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 from playwright.sync_api import Page, expect
 
-from tests._helpers.compat import compat_server_cwd, server_executable, server_pythonpath
+from tests._helpers.compat import (
+    COMPAT_SERVER_VERSION_ENV,
+    compat_server_cwd,
+    compat_server_python,
+    meets_min_server_version,
+    server_executable,
+    server_pythonpath,
+)
 from tests._helpers.live_server import isolated_local_server
 from tests.e2e_ui.conftest import _BUILD_OUTPUT, _REPO_ROOT
 
 _PALETTE_INPUT = "command-palette-input"
+# "Go to Settings" navigates to /settings, which redirects to the general section.
+_SETTINGS_URL_SUFFIX = "/settings/general"
+# First release whose server recognizes the quick_pick_palette feature name.
+_FLAG_MIN_SERVER_VERSION = "0.23.0"
 
 
 def _palette_server(directory: Path, features: str) -> Iterator[str]:
@@ -40,6 +52,11 @@ def _palette_server(directory: Path, features: str) -> Iterator[str]:
 @pytest.fixture(scope="module")
 def quick_pick_server(built_spa: None, tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
     """A server with ``OMNIGENT_FEATURES=quick_pick_palette``."""
+    compat_version = os.environ.get(COMPAT_SERVER_VERSION_ENV) or "0"
+    if compat_server_python() is not None and not meets_min_server_version(
+        compat_version, _FLAG_MIN_SERVER_VERSION
+    ):
+        pytest.skip(f"pinned server {compat_version} predates the quick_pick_palette flag")
     yield from _palette_server(tmp_path_factory.mktemp("quick_pick_on"), "quick_pick_palette")
 
 
@@ -54,6 +71,7 @@ def default_palette_server(
 def test_flag_off_keeps_the_current_palette(page: Page, default_palette_server: str) -> None:
     """Without the flag, ⌘K opens the cmdk palette and runs an action as before."""
     page.goto(f"{default_palette_server}/")
+    expect(page.get_by_role("heading", name="What should we build?")).to_be_visible(timeout=30_000)
     page.keyboard.press("ControlOrMeta+k")
     palette_input = page.get_by_test_id(_PALETTE_INPUT)
     expect(palette_input).to_be_focused(timeout=10_000)
@@ -63,12 +81,13 @@ def test_flag_off_keeps_the_current_palette(page: Page, default_palette_server: 
 
     palette_input.fill("settings")
     page.keyboard.press("Enter")
-    expect(page).to_have_url(f"{default_palette_server}/settings", timeout=10_000)
+    expect(page).to_have_url(f"{default_palette_server}{_SETTINGS_URL_SUFFIX}", timeout=10_000)
 
 
 def test_flag_on_runs_the_quick_pick_palette(page: Page, quick_pick_server: str) -> None:
     """With the flag, ⌘K opens QuickPick; initials, Escape and Enter work."""
     page.goto(f"{quick_pick_server}/")
+    expect(page.get_by_role("heading", name="What should we build?")).to_be_visible(timeout=30_000)
     page.keyboard.press("ControlOrMeta+k")
     palette_input = page.get_by_role("combobox", name="Command palette")
     expect(palette_input).to_be_focused(timeout=10_000)
@@ -96,5 +115,5 @@ def test_flag_on_runs_the_quick_pick_palette(page: Page, quick_pick_server: str)
     # Enter runs the top match and closes the palette.
     palette_input.fill("settings")
     page.keyboard.press("Enter")
-    expect(page).to_have_url(f"{quick_pick_server}/settings", timeout=10_000)
+    expect(page).to_have_url(f"{quick_pick_server}{_SETTINGS_URL_SUFFIX}", timeout=10_000)
     expect(page.get_by_test_id(_PALETTE_INPUT)).to_have_count(0)
