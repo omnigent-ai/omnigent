@@ -12,6 +12,12 @@ const page = { run: vi.fn<(name: string) => Promise<string>>() };
 const designPage: DesignPage = {
   hitTest: (x) => page.run(`hit ${x}`),
   scroll: () => page.run("scroll"),
+  liveEditPick: () => page.run("pick"),
+  liveEditPreview: () => page.run("preview"),
+  liveEditRestore: () => page.run("restore"),
+  liveEditSettle: () => page.run("settle"),
+  liveEditForget: () => page.run("forget"),
+  liveEditDiscard: () => page.run("discard"),
 };
 /** An operation the page answers as `name`. */
 const op =

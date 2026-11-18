@@ -1,6 +1,7 @@
 // One scope per opening of a design tool, owning its async work: it starts when the store
 // opens a tool and ends when the store closes or replaces it. Ending it removes its
-// listeners and refuses its late results; its page operations run in one ordered queue.
+// listeners and refuses its late results; its page operations run in one ordered queue,
+// and those it asked for at its end (cleanup) still run, after everything before them.
 import { designPlatform, type DesignPage, type PageOp } from "./designPlatform";
 import {
   begin as beginPhase,
@@ -28,15 +29,19 @@ export const isSessionEnded = (error: unknown) => error instanceof SessionEnded;
 export class ToolSession {
   readonly tabId: string;
   readonly id: number;
+  /** Names this session's state in the page, so another session's cleanup can't touch it. */
+  readonly scope: string;
   private ended = false;
   private tail: Promise<unknown> = Promise.resolve();
   private pageReady: Promise<DesignPage | string> | null = null;
   private readonly cleanup = new Set<() => void>();
+  private readonly endOps: (() => PageOp | null)[] = [];
 
   /** `after`: the tab's previous session's page work, which this one's follows. */
   constructor(tabId: string, id: number, after: Promise<unknown> = Promise.resolve()) {
     this.tabId = tabId;
     this.id = id;
+    this.scope = `s${id}_${Math.random().toString(36).slice(2, 10)}`;
     this.tail = after.catch(() => undefined);
   }
 
@@ -44,7 +49,7 @@ export class ToolSession {
     return this.ended;
   }
 
-  /** Once everything this session asked of the page is done. */
+  /** Once everything this session asked of the page is done (its end's too, once ended). */
   get drained(): Promise<unknown> {
     return this.tail;
   }
@@ -84,6 +89,11 @@ export class ToolSession {
     });
     this.tail = next.catch(() => undefined);
     return next;
+  }
+
+  /** Do `build()`'s op in the page when the session ends, after what's queued (null skips it). */
+  atEnd(build: () => PageOp | null): void {
+    if (!this.ended) this.endOps.push(build);
   }
 
   // ── The drafts ───────────────────────────────────────────
@@ -128,13 +138,45 @@ export class ToolSession {
     return stop;
   }
 
-  /** End the session: stop its listeners and drop its late results. */
+  /** End the session: stop its listeners, drop its late results and run its end ops. */
   end(): void {
     if (this.ended) return;
     this.ended = true;
     for (const stop of [...this.cleanup]) stop();
     this.cleanup.clear();
+    // Built now, from the state then; run once the queue gets to them, if the page was used.
+    const ops = this.endOps
+      .splice(0)
+      .map((build) => build())
+      .filter((op): op is PageOp => op !== null);
+    if (ops.length === 0 || this.pageReady === null) return;
+    const ready = this.pageReady;
+    const { tabId } = this;
+    this.tail = this.tail.then(async () => {
+      const page = await ready.catch(() => "gone");
+      if (typeof page === "string") return;
+      for (const op of ops) {
+        const attempt = () => Promise.resolve().then(() => op(page));
+        // Asked once more if it fails; the tab hears when that fails too.
+        // oxlint-disable-next-line no-await-in-loop -- in order, after the session's own
+        const ok = await attempt()
+          .catch(attempt)
+          .then(
+            () => true,
+            () => false,
+          );
+        if (!ok) for (const listener of [...endFailures]) listener(tabId);
+      }
+    });
   }
+}
+
+const endFailures = new Set<(tabId: string) => void>();
+
+/** Hear of a session's end op the page didn't take (asked twice), by tab. */
+export function onEndFailed(listener: (tabId: string) => void): () => void {
+  endFailures.add(listener);
+  return () => endFailures.delete(listener);
 }
 
 // Every tab's live session, kept in step with the store. A tab's sessions do their page

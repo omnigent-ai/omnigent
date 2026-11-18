@@ -849,6 +849,7 @@ function registerBrowserIpc({
     }
   });
 
+  // Annotate, Draw and Live Edit on a view (designTools.js).
   registerDesignToolsIpc({ ipcMain, gateRegistry });
 
   // ── Design mode (point-and-prompt) ───────────────────────────────────────

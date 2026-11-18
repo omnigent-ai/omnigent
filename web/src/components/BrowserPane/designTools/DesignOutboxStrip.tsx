@@ -6,7 +6,9 @@ import {
   MousePointerClickIcon,
   PencilLineIcon,
   RotateCwIcon,
+  TypeIcon,
   XIcon,
+  type LucideIcon,
 } from "lucide-react";
 import { useShallow } from "zustand/react/shallow";
 import { Button } from "@/components/ui/button";
@@ -17,7 +19,14 @@ import {
   unsettled,
   useDesignOutbox,
   type DesignRequest,
+  type DesignTool,
 } from "./core/designOutbox";
+
+const TOOL_ICONS: Record<DesignTool, LucideIcon> = {
+  annotate: MousePointerClickIcon,
+  draw: PencilLineIcon,
+  edit: TypeIcon,
+};
 
 const ACTION_BUTTON_CLASS =
   "shrink-0 text-muted-foreground transition-colors hover:text-foreground focus-visible:text-foreground max-md:size-11";
@@ -30,7 +39,7 @@ function stateText(request: DesignRequest): string {
 
 function OutboxRow({ request }: { request: DesignRequest }) {
   const stuck = request.status === "failed" || request.status === "denied";
-  const ToolIcon = request.tool === "annotate" ? MousePointerClickIcon : PencilLineIcon;
+  const ToolIcon = request.tool ? TOOL_ICONS[request.tool] : PencilLineIcon;
   return (
     <div role="listitem" className="flex min-w-0 items-center gap-1 py-0.5 text-foreground text-sm">
       <ToolIcon className="mx-1 size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />

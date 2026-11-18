@@ -248,13 +248,21 @@ export class DesignOverlay {
     };
   }
 
-  /** One of main's page operations for the open tool (`hitTest`, `scroll`, `capture`). */
+  /** One of main's page operations for the open tool (`hitTest`, `capture`, Live Edit's...). */
   async request(op: string, args: Record<string, unknown> = {}): Promise<Answer> {
     const session = await this.opened();
     if (!session) throw new Error(NOT_OPEN);
     const answer = await this.call(op, { session, ...args });
     if (!answer.ok) throw new Error(answer.error ?? "The page didn't answer.");
     return answer;
+  }
+
+  /**
+   * End Live Edit scope `scope`, even once the overlay has closed: the page shows `texts`
+   * and keeps them; with null it only forgets; with `restore` it puts the page back first.
+   */
+  endLiveEdit(scope: string, texts: [number, string][] | null, restore = false): Promise<Answer> {
+    return this.call("liveEditEnd", restore ? { scope, texts: null, restore } : { scope, texts });
   }
 }
 

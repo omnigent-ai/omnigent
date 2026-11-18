@@ -46,6 +46,12 @@ const answer = async (done: string) => {
 const designPage: DesignPage = {
   hitTest: (x, y) => answer(`hit ${x},${y}`),
   scroll: () => answer("scroll"),
+  liveEditPick: () => answer("pick"),
+  liveEditPreview: () => answer("preview"),
+  liveEditRestore: () => answer("restore"),
+  liveEditSettle: () => answer("settle"),
+  liveEditForget: () => answer("forget"),
+  liveEditDiscard: () => answer("discard"),
 };
 const platform: DesignPlatform = {
   page: async () => designPage,

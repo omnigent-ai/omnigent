@@ -1,7 +1,7 @@
-// Design tools for the desktop app's Browser pane: Annotate and Draw. The page is a native
-// view that paints over the app, so while a tool is open its layers render into an overlay
-// document main stacks just above the page (desktopOverlay.ts), which takes the user's input.
-import { MousePointerClickIcon, PencilLineIcon } from "lucide-react";
+// Design tools for the desktop app's Browser pane: Annotate, Draw and Live Edit. The page
+// is a native view that paints over the app, so while a tool is open its layers render into
+// an overlay document main stacks just above the page (desktopOverlay.ts), taking the input.
+import { MousePointerClickIcon, PencilLineIcon, TypeIcon } from "lucide-react";
 import {
   useCallback,
   useEffect,
@@ -15,13 +15,14 @@ import {
 import { createPortal } from "react-dom";
 import { Separator } from "@/components/ui/separator";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
-import { closeTool, tabTools, toggleTool, useTabTools } from "./core/designToolsStore";
+import { closeTool, editDrafts, tabTools, toggleTool, useTabTools } from "./core/designToolsStore";
 import { desktopDesignTools } from "./desktopBridge";
 import { setTabDesignPlatform } from "./core/designPlatform";
 import { desktopDesignPlatform } from "./desktopDesignPlatform";
 import { DesignOverlay, type OverlayDocument } from "./desktopOverlay";
 import { Notice, NOTICE_MS, ToolButton, useShownRef, type LayerRect } from "./layerParts";
 import { useOutboxNotices } from "./outboxNotices";
+import { LiveEditLayer } from "./liveEditLayer";
 import { AnnotateLayer, DrawLayer } from "./toolLayers";
 
 const PAGE_CHANGED = "The page changed, so the tool closed.";
@@ -256,14 +257,15 @@ export function DesktopDesignTools({
     if (overlay && width !== undefined && height !== undefined && mode === "tool") overlay.fit();
   }, [overlay, width, height, mode]);
 
-  // Esc closes the tool from the overlay, where the keys go while the user works in it, or
-  // from its own toolbar button; Escape elsewhere in the app belongs to what has focus.
+  // Esc closes the tool (Live Edit's open editor first) from the overlay, where the keys go
+  // while the user works in it, or from its own toolbar button; elsewhere it's the app's.
   const escape = useCallback(
     (event: KeyboardEvent) => {
       // An input method's Escape cancels its candidate, not the tool.
       if (event.key !== "Escape" || event.defaultPrevented) return;
       if (isImeCompositionKeyEvent({ nativeEvent: event })) return;
-      closeTool(viewId);
+      if (tabTools(viewId).editing !== null) editDrafts(viewId, { editing: null });
+      else closeTool(viewId);
     },
     [viewId],
   );
@@ -309,6 +311,14 @@ export function DesktopDesignTools({
         onClick={() => toggleTool(viewId, "draw")}
         onEscape={() => closeTool(viewId)}
       />
+      <ToolButton
+        label="Live Edit text"
+        icon={TypeIcon}
+        active={tool === "edit"}
+        disabled={!usable}
+        onClick={() => toggleTool(viewId, "edit")}
+        onEscape={() => closeTool(viewId)}
+      />
       {unplaced && (
         <span
           role="status"
@@ -326,6 +336,7 @@ export function DesktopDesignTools({
             <>
               {tool === "annotate" && <AnnotateLayer key={session} {...layer} />}
               {tool === "draw" && <DrawLayer key={session} {...layer} />}
+              {tool === "edit" && <LiveEditLayer key={session} {...layer} />}
               {notice && <Notice rect={rect}>{notice}</Notice>}
             </>
           ) : (

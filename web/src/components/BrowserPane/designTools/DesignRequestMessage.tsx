@@ -1,7 +1,7 @@
-// A design-tool message's body in the chat, as a compact card: what was asked and what it
-// was about. It renders inside the ordinary user bubble; desktop design mode sends the same
-// format, so its messages get the card too.
-import { MousePointerClickIcon, PencilLineIcon, type LucideIcon } from "lucide-react";
+// A design-tool message's body in the chat, as a compact card: what was asked (or Live
+// Edit's changes, before and after) and what it was about, inside the ordinary user bubble.
+// Desktop design mode sends the same format, so its messages get the card too.
+import { MousePointerClickIcon, PencilLineIcon, TypeIcon, type LucideIcon } from "lucide-react";
 import { RenderErrorBoundary } from "@/components/RenderErrorBoundary";
 import { DesignRequestContent, type DesignRequestCardProps } from "./DesignRequestContent";
 import type { DesignRequest } from "./parseDesignRequest";
@@ -9,6 +9,7 @@ import type { DesignRequest } from "./parseDesignRequest";
 const KIND_ICONS: Record<DesignRequest["kind"], LucideIcon> = {
   element: MousePointerClickIcon,
   drawing: PencilLineIcon,
+  edits: TypeIcon,
 };
 
 /** A design-tool message's text, compact: the request and its subject. */

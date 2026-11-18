@@ -2,11 +2,18 @@
 // block) so the chat can show it as a compact card instead of raw Markdown. What the agent
 // receives is unchanged.
 
-export type DesignRequestKind = "element" | "drawing";
+export type DesignRequestKind = "element" | "drawing" | "edits";
+
+/** One of Live Edit's text changes, as its message names it. */
+export interface DesignRequestEdit {
+  element: string;
+  before: string;
+  after: string;
+}
 
 export interface DesignRequest {
   kind: DesignRequestKind;
-  /** What the user typed. */
+  /** What the user typed (Live Edit's is fixed copy, which its card doesn't show). */
   request: string;
   /** The picked element, e.g. `p#blurb`; element requests only. */
   element?: string;
@@ -21,6 +28,10 @@ export interface DesignRequest {
   page?: string;
   /** The block says no screenshot was attached; element requests only. */
   noScreenshot?: boolean;
+  /** Live Edit's changes; a collapsed card keeps only the first ones. */
+  edits?: DesignRequestEdit[];
+  /** How many changes the message has in all, when `edits` holds fewer. */
+  editCount?: number;
 }
 
 /** `text`, at most `limit` code points of it. */
@@ -32,23 +43,41 @@ function clip(text: string, limit: number): string {
 }
 
 /**
- * `request` as a collapsed message shows it: at most `limit` characters of its words and
- * element text in all, so the card's size is bounded however much the message carries.
+ * `request` as a collapsed message shows it: at most `limit` characters of its words,
+ * element text and edits in all (later edits dropped), so the card's size stays bounded.
  */
 export function clipDesignRequest(request: DesignRequest, limit: number): DesignRequest {
+  const length = (text: string) => [...text].length;
   const words = clip(request.request, limit);
   const { elementText, ariaLabel, ...rest } = request;
-  const left = Math.max(limit - [...words].length, 0);
-  if (elementText === undefined || [...elementText].length <= left) {
-    return { ...request, request: words };
-  }
-  return {
-    ...rest,
-    request: words,
+  let left = Math.max(limit - length(words), 0);
+  const clipped: DesignRequest = { ...rest, request: words };
+  if (elementText !== undefined && length(elementText) > left) {
     // A cut text ends in "…"; a label matching the whole text stays hidden, as unclipped.
-    elementText: `${clip(elementText, Math.max(left - 1, 0))}…`,
-    ...(ariaLabel !== undefined && ariaLabel !== elementText ? { ariaLabel } : {}),
-  };
+    clipped.elementText = `${clip(elementText, Math.max(left - 1, 0))}…`;
+    if (ariaLabel !== undefined && ariaLabel !== elementText) clipped.ariaLabel = ariaLabel;
+    left = 0;
+  } else {
+    if (elementText !== undefined) clipped.elementText = elementText;
+    if (ariaLabel !== undefined) clipped.ariaLabel = ariaLabel;
+    left -= elementText === undefined ? 0 : length(elementText);
+  }
+  if (request.edits) {
+    // Live Edit's changes share what's left, in order, until it runs out.
+    const take = (text: string) => {
+      const kept = clip(text, left);
+      left -= length(kept);
+      return kept;
+    };
+    const edits: DesignRequestEdit[] = [];
+    for (const edit of request.edits) {
+      if (left <= 0) break;
+      edits.push({ element: edit.element, before: take(edit.before), after: take(edit.after) });
+    }
+    clipped.edits = edits;
+    clipped.editCount = request.editCount ?? request.edits.length;
+  }
+  return clipped;
 }
 
 /** A card's note when the agent got the request without its screenshot. */
@@ -57,6 +86,11 @@ export const NO_SCREENSHOT_NOTE = "Sent without a screenshot (it couldn't be tak
 /** What a design request was about, as one line: the element and its text, or the page. */
 export function designSubject(request: DesignRequest): string {
   if (request.kind === "drawing") return request.page ? `Drawing on ${request.page}` : "Drawing";
+  if (request.kind === "edits") {
+    const total = request.editCount ?? request.edits?.length ?? 0;
+    const count = `${total} ${total === 1 ? "edit" : "edits"}`;
+    return request.page ? `${count} on ${request.page}` : count;
+  }
   const parts = [request.component ? `<${request.component}>` : "", request.element ?? "element"];
   if (request.elementText) parts.push(`"${request.elementText}"`);
   // An icon-only control is told apart by its accessible name.
@@ -72,6 +106,9 @@ const OPENING = "\n\n---\n[Design Mode — ";
 const CLOSING = "\n---";
 const ELEMENT_HEADER = "modify this element in the browser preview";
 const DRAWING_HEADER = "marked-up screenshot of the browser preview";
+const EDITS_HEADER = "live text edits in the browser preview";
+// One of Live Edit's lines: `1. <h1>#title: "Old" → "New"`, its texts JSON strings.
+const EDIT_LINE = /^\d+\. (.+?): (".*") → (".*")$/;
 // An HTML tag as the picker reports it (lowercase); anything else is a component's name.
 const TAG = /^[a-z][a-z0-9-]*$/;
 
@@ -126,6 +163,33 @@ function drawingRequest(request: string, lines: string[]): DesignRequest | null 
   return { kind: "drawing", request, page: shownPage(page) };
 }
 
+/** A JSON string from an edit line, or the line's text as it is. */
+function parseQuoted(value: string): string {
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return typeof parsed === "string" ? parsed : value;
+  } catch {
+    return value;
+  }
+}
+
+function editsRequest(request: string, lines: string[]): DesignRequest | null {
+  const page = field(lines, "Page");
+  if (page === undefined) return null;
+  const edits = lines.flatMap((line) => {
+    const edit = line.match(EDIT_LINE);
+    if (!edit) return [];
+    return [
+      {
+        element: edit[1]!.replace(/^<|>/g, ""),
+        before: parseQuoted(edit[2]!),
+        after: parseQuoted(edit[3]!),
+      },
+    ];
+  });
+  return { kind: "edits", request, page: shownPage(page), edits };
+}
+
 /**
  * The design request a message carries, or null when it's an ordinary message. Only the
  * block a tool appends at the very end counts, so one the user quoted above stays words.
@@ -143,5 +207,6 @@ export function parseDesignRequest(text: string): DesignRequest | null {
   const request = message.slice(0, start).trim();
   if (header === ELEMENT_HEADER) return elementRequest(request, lines);
   if (header === DRAWING_HEADER) return drawingRequest(request, lines);
+  if (header === EDITS_HEADER) return editsRequest(request, lines);
   return null;
 }
