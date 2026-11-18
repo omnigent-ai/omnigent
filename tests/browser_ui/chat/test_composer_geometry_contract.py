@@ -1492,7 +1492,8 @@ def test_scrollbar_thumb_drags_by_touch(
 ) -> None:
     chat = chat_session_contract
     seed_long_transcript(chat, 30, paragraphs=6)
-    open_live(page, chat, {"width": 800, "height": 1280})
+    # Desktop layout: the mobile composer overlays the thumb parked at the bottom.
+    open_live(page, chat, {"width": 1200, "height": 1280})
     tag_scroller(page)
     expect(page.get_by_test_id("transcript-scrollbar-thumb")).to_be_visible()
     bottom = park_at_bottom(page)

@@ -160,8 +160,17 @@ async def _drive(rig: ManagedReplicas) -> None:
                         .get_by_text("Research the API", exact=True)
                         .bounding_box()
                     )
+                    representative_box, sibling_box = [
+                        await page.locator(
+                            f'li[data-sidebar-session-id="{row_id}"]'
+                        ).bounding_box()
+                        for row_id in (source_id, sibling_id)
+                    ]
                     assert representative_label and sibling_label
-                    assert sibling_label["x"] >= representative_label["x"] + 16
+                    assert representative_box and sibling_box
+                    # The nested row steps in; its title lines up with the representative's.
+                    assert sibling_box["x"] >= representative_box["x"] + 16
+                    assert sibling_label["x"] == representative_label["x"]
                     await page.screenshot(path=str(evidence / "siblings-two-sandboxes.png"))
                     representative = page.locator(f'li[data-sidebar-session-id="{source_id}"]')
                     await page.mouse.move(1200, 900)
