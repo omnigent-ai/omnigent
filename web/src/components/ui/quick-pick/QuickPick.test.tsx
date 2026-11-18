@@ -92,6 +92,14 @@ describe("QuickPick accessibility", () => {
 });
 
 describe("QuickPick rows", () => {
+  it("keeps an option's ID when rows above it change", () => {
+    const { input } = renderPicker();
+    const openSettingsId = screen.getByRole("option", { name: /Open settings/ }).id;
+    fireEvent.change(input, { target: { value: "ope" } });
+    expect(optionNames()).toEqual(["Open settings"]);
+    expect(screen.getByRole("option", { name: /Open settings/ }).id).toBe(openSettingsId);
+  });
+
   it("ranks client rows, highlights the match, and shows shortcut caps", () => {
     const { input } = renderPicker();
     fireEvent.change(input, { target: { value: "sett" } });

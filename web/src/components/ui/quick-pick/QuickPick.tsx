@@ -82,7 +82,8 @@ export function QuickPick<Value>({
 }: QuickPickProps<Value>) {
   const baseId = useId();
   const listId = `${baseId}-list`;
-  const optionId = (index: number) => `${baseId}-option-${index}`;
+  // Keyed by the row, not its position, so an option keeps its ID when results above it change.
+  const optionId = (row: QuickPickRow<Value>) => `${baseId}-option-${encodeURIComponent(row.key)}`;
 
   const rows = useMemo(() => buildQuickPickRows({ segments, query }), [segments, query]);
   const sections = useMemo(() => sectionsOf(rows), [rows]);
@@ -122,7 +123,7 @@ export function QuickPick<Value>({
     return (
       <div
         key={row.key}
-        id={optionId(index)}
+        id={optionId(row)}
         role="option"
         aria-selected={isActive}
         aria-disabled={disabled || undefined}
@@ -196,7 +197,7 @@ export function QuickPick<Value>({
           aria-expanded
           aria-controls={listId}
           aria-autocomplete="list"
-          aria-activedescendant={activeIndex === -1 ? undefined : optionId(activeIndex)}
+          aria-activedescendant={activeRow === null ? undefined : optionId(activeRow)}
           autoFocus={autoFocus}
           autoComplete="off"
           autoCorrect="off"
