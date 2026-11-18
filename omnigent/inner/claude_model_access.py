@@ -223,6 +223,21 @@ class ClaudeAuthRequired(ProviderAuthRequired):
         super().__init__("Claude model authentication is unavailable; sign in again and retry.")
 
 
+def validate_claude_sandbox_backend(policy: SandboxPolicy) -> None:
+    """Require an active backend that enforces filesystem and network isolation."""
+    if not policy.active:
+        raise ValueError(
+            "Sandboxed Claude requires an active sandbox policy; "
+            f"sandbox backend {policy.backend_type!r} is inactive."
+        )
+    if policy.backend_type not in ("linux_bwrap", "darwin_seatbelt"):
+        raise ValueError(
+            "Sandboxed Claude requires filesystem and network isolation; "
+            f"sandbox backend {policy.backend_type!r} is unsupported. "
+            "Use linux_bwrap or darwin_seatbelt."
+        )
+
+
 class _CredentialResolver:
     """Parent-only resolver shared by equal callback access and the running relay."""
 
@@ -331,6 +346,8 @@ class ClaudeModelAccess:
 
     def protect_sources(self, policy: SandboxPolicy, cwd: Path) -> SandboxPolicy:
         """Reject credential sources reachable through any sandbox grant."""
+        validate_claude_sandbox_backend(policy)
+
         from omnigent.onboarding.ambient import claude_code_managed_mcp_paths
 
         managed_dirs = []
@@ -365,7 +382,10 @@ class ClaudeModelAccess:
                     for candidate in (grant.absolute(), grant.resolve())
                     for source in sources
                 ):
-                    raise ValueError("protected credential paths must stay outside sandbox grants")
+                    raise ValueError(
+                        "protected credential paths must stay outside sandbox grants: "
+                        f"source {str(path)!r} conflicts with grant {str(grant)!r}"
+                    )
             protect_credential_source(
                 CredentialSourceSpec(kind="file", path=str(path)), policy, cwd=cwd
             )

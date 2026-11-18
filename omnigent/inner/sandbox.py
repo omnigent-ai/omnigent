@@ -665,10 +665,23 @@ def protect_credential_source(
     )
     for component in (path, *path.parents):
         for candidate in (component.absolute(), component.resolve()):
-            if any(candidate.is_relative_to(root) for root in roots) or candidate in files:
-                raise ValueError("refresh source must stay outside sandbox-writable paths")
-            if any(candidate.is_relative_to(root) for root in read_roots):
-                raise ValueError("refresh source must stay outside sandbox-readable paths")
+            writable_grant = next(
+                (root for root in roots if candidate.is_relative_to(root)),
+                candidate if candidate in files else None,
+            )
+            if writable_grant is not None:
+                raise ValueError(
+                    "refresh source must stay outside sandbox-writable paths: "
+                    f"source {str(path)!r} conflicts with grant {str(writable_grant)!r}"
+                )
+            readable_grant = next(
+                (root for root in read_roots if candidate.is_relative_to(root)), None
+            )
+            if readable_grant is not None:
+                raise ValueError(
+                    "refresh source must stay outside sandbox-readable paths: "
+                    f"source {str(path)!r} conflicts with grant {str(readable_grant)!r}"
+                )
     if path.exists() and not path.is_dir() and path.stat().st_nlink != 1:
         raise ValueError("refresh source must not be hard-linked")
     canonical = path.resolve()
@@ -1205,8 +1218,8 @@ def run_launcher(
         inside the sandbox, e.g. ``"/usr/bin/python3"``.
     :param argv: Arguments passed to *target_path* (the launcher's own
         ``sys.argv[1:]``).
-    :param env_overrides: Sanitized per-launch values applied after environment
-        pruning. These must contain placeholders rather than host credentials.
+    :param env_overrides: Complete sanitized launch environment applied after
+        pruning. Model credential values must be placeholders.
     :returns: The target process's exit code.
     :raises ValueError: If *encoded_sandbox* does not decode to a dict.
     """
@@ -1579,8 +1592,9 @@ def create_exec_launcher(
 
     :param target_path: The real binary the launcher ultimately spawns.
     :param sandbox: Policy baked into the launcher and applied before the spawn.
-    :param env_overrides: Snapshot of sanitized per-launch values, stored only
-        in the private script. Supply placeholders only, never host credentials.
+    :param env_overrides: Complete sanitized launch environment snapshot, retained
+        in the owner-only script until caller cleanup. Model credential values
+        must be placeholders; ordinary paths, flags, and settings are preserved.
     :returns: Path to the launcher script; the caller owns deleting it.
     :raises OSError: If the interpreter cannot be named or write grants could
         poison the launcher's trusted runtime before containment.

@@ -1331,6 +1331,13 @@ class _RelayConsents:
         """Remember that the gate approved ``tool_name`` with ``arguments``."""
         self._approved.append((tool_name, self._key(arguments), time.monotonic()))
 
+    def discard(self, tool_name: str) -> None:
+        """Forget this key's approvals and prune expired entries."""
+        now = time.monotonic()
+        self._approved = [
+            item for item in self._approved if item[0] != tool_name and now - item[2] < self.TTL_S
+        ]
+
     def consume(self, tool_name: str, arguments: Mapping[str, object]) -> bool:
         """Use up one approval for this exact call; ``False`` when there is none."""
         now = time.monotonic()
@@ -3576,6 +3583,79 @@ class ClaudeSDKExecutor(Executor):
         hooks["PreToolUse"] = entries
         options.hooks = hooks
 
+    def _install_bash_policy_hook(
+        self,
+        sdk: _ClaudeSDK,
+        options: Any,  # type: ignore[explicit-any]  # ClaudeAgentOptions
+    ) -> None:
+        """Enforce Bash policies even when Claude skips permission prompts."""
+        from omnigent.native.native_policy_hook import (
+            evaluation_response_to_hook_output,
+            fail_closed_hook_output,
+        )
+
+        hook_matcher = getattr(sdk, "HookMatcher", None)
+        if hook_matcher is None:
+            raise RuntimeError("Native Bash requires SDK PreToolUse hook support")
+        consents = _RelayConsents()
+        evaluated = _RelayConsents()
+
+        async def gate_bash(payload: object, tool_use_id: str | None, _context: object) -> object:
+            agent_id = payload.get("agent_id") if isinstance(payload, dict) else None
+            key = json.dumps((agent_id, tool_use_id))
+            consents.discard(key)
+            evaluated.discard(key)
+            if not isinstance(payload, dict) or not isinstance(payload.get("tool_input"), dict):
+                return fail_closed_hook_output("PreToolUse", "Invalid Bash tool input")
+            try:
+                result = await self._evaluate_tool_call_policy("Bash", payload["tool_input"])
+            except Exception:
+                logger.exception("Bash policy hook failed; denying the call")
+                return fail_closed_hook_output("PreToolUse")
+            if getattr(result, "behavior", None) == "deny":
+                return evaluation_response_to_hook_output(
+                    "PreToolUse",
+                    {"result": "POLICY_ACTION_DENY", "reason": getattr(result, "message", "")},
+                )
+            if tool_use_id:
+                evaluated.record(key, payload["tool_input"])
+                if getattr(result, "behavior", None) == "allow":
+                    consents.record(key, payload["tool_input"])
+            # Policy approval must leave Claude's own permission rules in force.
+            return {}
+
+        hooks = dict(getattr(options, "hooks", None) or {})
+        entries = list(hooks.get("PreToolUse") or [])
+        entries.append(
+            hook_matcher(
+                matcher="Bash", timeout=self._ASK_QUESTION_HOOK_TIMEOUT_S, hooks=[gate_bash]
+            )
+        )
+        hooks["PreToolUse"] = entries
+        options.hooks = hooks
+
+        permission_gate = getattr(options, "can_use_tool", None)
+        if permission_gate is not None:
+
+            async def can_use_tool(
+                tool_name: str, tool_input: ToolArgs, perm_ctx: object
+            ) -> object:
+                if tool_name == "Bash":
+                    tool_use_id = getattr(perm_ctx, "tool_use_id", None)
+                    key = json.dumps((getattr(perm_ctx, "agent_id", None), tool_use_id))
+                    # Another hook can rewrite input after our policy evaluation.
+                    if tool_use_id and evaluated.consume(key, tool_input):
+                        if consents.consume(key, tool_input):
+                            from claude_agent_sdk import PermissionResultAllow
+
+                            return PermissionResultAllow()
+                        return await self._can_use_tool_for_permission(
+                            tool_name, tool_input, perm_ctx
+                        )
+                return await permission_gate(tool_name, tool_input, perm_ctx)
+
+            options.can_use_tool = can_use_tool
+
     async def _can_use_tool_for_permission(
         self,
         tool_name: str,
@@ -3585,10 +3665,9 @@ class ClaudeSDKExecutor(Executor):
         """
         Route a Claude SDK permission request through the Omnigent elicitation system.
 
-        Installed as ``options.can_use_tool`` when ``permission_mode`` is
-        not ``"bypassPermissions"`` and an elicitation handler has been wired
-        in by :class:`omnigent.runtime.harnesses._executor_adapter.ExecutorAdapter`.
-        Called by the SDK before each tool invocation.
+        Called when Claude requests permission. Bypass mode or an absent
+        elicitation handler allows without prompting. Bash reaches this
+        method directly because its PreToolUse hook already evaluated policy.
 
         :param tool_name: Name of the tool Claude wants to call,
             e.g. ``"Bash"``.
@@ -3611,12 +3690,7 @@ class ClaudeSDKExecutor(Executor):
             tool_name,
             tool_use_id,
         )
-        if self._elicitation_handler is None:
-            # No handler installed — grant by default. This branch is
-            # unreachable in normal operation (run_turn only sets
-            # can_use_tool when _elicitation_handler is not None), but
-            # is included for safety if the SDK ever calls the callback
-            # after the handler was cleared.
+        if self._permission_mode == "bypassPermissions" or self._elicitation_handler is None:
             return PermissionResultAllow()
         allowed = await self._elicitation_handler(tool_name, tool_input)
         if allowed:
@@ -3729,13 +3803,11 @@ class ClaudeSDKExecutor(Executor):
 
         Composes two independent gates, in order:
 
-        1. **TOOL_CALL policy** (always, when a ``_policy_evaluator`` is
+        1. **TOOL_CALL policy** (when a ``_policy_evaluator`` is
            wired): a hard DENY short-circuits to
-           :class:`~claude_agent_sdk.PermissionResultDeny`. This runs in
-           EVERY permission mode — including ``bypassPermissions`` — so
-           connector-native MCP tools can't slip past policy. ALLOW /
-           no-match falls through with no human interaction, preserving
-           ``bypassPermissions`` ergonomics for un-gated tools.
+           :class:`~claude_agent_sdk.PermissionResultDeny`. Claude only calls
+           this callback for permission prompts; native Bash uses a separate
+           PreToolUse policy hook to cover calls Claude approves automatically.
         2. **Human-consent elicitation** (only when the permission mode is
            NOT ``bypassPermissions`` and an elicitation handler is wired):
            the pre-existing per-tool approval prompt. Under
@@ -3748,16 +3820,10 @@ class ClaudeSDKExecutor(Executor):
         :param perm_ctx: :class:`claude_agent_sdk.ToolPermissionContext`.
         :returns: A :class:`~claude_agent_sdk.PermissionResult`.
         """
-        from claude_agent_sdk import PermissionResultAllow
-
         policy_result = await self._evaluate_tool_call_policy(tool_name, tool_input)
         if policy_result is not None:
             # Hard DENY from policy — block before execution.
             return policy_result
-        # Policy allowed (or no policy gate). Under bypassPermissions we
-        # never prompt; otherwise defer to the elicitation gate.
-        if self._permission_mode == "bypassPermissions" or self._elicitation_handler is None:
-            return PermissionResultAllow()
         return await self._can_use_tool_for_permission(tool_name, tool_input, perm_ctx)
 
     async def run_turn(
@@ -3989,8 +4055,6 @@ class ClaudeSDKExecutor(Executor):
         base_tools: list[str] = self._base_tools(sdk)
         if self._prepared_cli is not None and self._prepared_cli.sandboxed:
             base_tools.append("Bash")
-            if self._permission_mode in _OMNIGENT_TOOLS_PREAPPROVED_MODES:
-                allowed_tools.append("Bash")
         # Bundle skills are exposed via the SDK's plugin mechanism.
         # The bundle's ``<bundle>/skills/<dir>/SKILL.md`` files are
         # discovered as plugin skills (no ``.claude/`` prefix needed
@@ -4076,23 +4140,8 @@ class ClaudeSDKExecutor(Executor):
             options.model = model
         if self._cwd:
             options.cwd = self._cwd
-        # Install the unified can_use_tool gate. It runs the TOOL_CALL
-        # policy evaluation in EVERY permission mode — including
-        # ``bypassPermissions`` — so connector-native MCP tools
-        # (``mcp__github__*``, ``mcp__atlassian__*``) that execute inside
-        # the CLI subprocess are evaluated against Omnigent TOOL_CALL
-        # policy before they run, instead of bypassing policy entirely.
-        #
-        # The gate is no-friction when nothing matches: a policy ALLOW /
-        # no-match returns allow with no human prompt, so
-        # ``bypassPermissions`` ergonomics are preserved for un-gated
-        # tools. The human-consent elicitation half of the gate still only
-        # fires for non-bypass modes (see ``_can_use_tool_gate``).
-        #
-        # Install whenever EITHER a policy evaluator OR an elicitation
-        # handler is wired. Previously this only installed for non-bypass
-        # modes, which is why default ``claude-sdk`` sessions (which
-        # default to ``bypassPermissions``) had no per-tool TOOL_CALL gate.
+        # The permission callback only handles calls Claude would prompt for.
+        # Bash also needs PreToolUse policy enforcement in every mode.
         if (
             getattr(self, "_policy_evaluator", None) is not None
             or self._elicitation_handler is not None
@@ -4102,6 +4151,8 @@ class ClaudeSDKExecutor(Executor):
         self._install_subagent_router_hook(sdk, options, model)
         self._install_framework_context_hook(sdk, options, session_key)
         self._install_ask_user_question_hook(sdk, options)
+        if "Bash" in base_tools:
+            self._install_bash_policy_hook(sdk, options)
 
         # Log the full configuration for debugging
         logger.info(

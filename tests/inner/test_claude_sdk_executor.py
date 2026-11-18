@@ -5219,7 +5219,14 @@ def test_prepare_claude_cli_path_wrap_failure_prevents_launch(monkeypatch) -> No
 
 
 @pytest.mark.asyncio
-async def test_sandboxed_sdk_exposes_bash_for_skill_expansion(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    "permission_mode", ["auto", "bypassPermissions", "default", "acceptEdits", "plan", "dontAsk"]
+)
+async def test_sandboxed_sdk_exposes_bash_for_skill_expansion(
+    monkeypatch, permission_mode
+) -> None:
+    from claude_agent_sdk import HookMatcher as SdkHookMatcher
+
     from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor, PreparedClaudeCli
     from omnigent.inner.datamodel import OSEnvSpec
 
@@ -5231,11 +5238,13 @@ async def test_sandboxed_sdk_exposes_bash_for_skill_expansion(monkeypatch) -> No
 
     class _FakeSDK(_sdk_types(), _SDKTools):
         ResultMessage = _ResultMessage
+        HookMatcher = SdkHookMatcher
 
         class ClaudeSDKClient(_SDKClient):
             def __init__(self, options):
                 captured_options["tools"] = options.tools
                 captured_options["allowed_tools"] = options.allowed_tools
+                captured_options["hooks"] = options.hooks
 
             async def query(self, prompt, session_id="default"):
                 pass
@@ -5250,17 +5259,23 @@ async def test_sandboxed_sdk_exposes_bash_for_skill_expansion(monkeypatch) -> No
         "omnigent.inner.claude_sdk_executor.prepare_claude_cli_path",
         lambda *args, **kwargs: PreparedClaudeCli("/bin/wrapped", True, sandboxed=True),
     )
-    executor = ClaudeSDKExecutor(os_env=OSEnvSpec())
+    executor = ClaudeSDKExecutor(os_env=OSEnvSpec(), permission_mode=permission_mode)
     monkeypatch.setattr("omnigent.inner.claude_sdk_executor._ensure_sdk", lambda: _FakeSDK)
     try:
         events = [
             event
             async for event in executor.run_turn(
-                [{"role": "user", "content": "hi", "session_id": "sandboxed-skill"}], [], ""
+                [{"role": "user", "content": "hi", "session_id": "sandboxed-skill"}],
+                [{"name": "sys_ping", "description": "Ping", "parameters": {"type": "object"}}],
+                "",
             )
         ]
         assert captured_options["tools"] == ["Skill", "ToolSearch", "Bash"]
-        assert "Bash" in captured_options["allowed_tools"]
+        expected_allowed = (
+            ["mcp__omnigent__sys_ping"] if permission_mode in ("auto", "bypassPermissions") else []
+        )
+        assert captured_options["allowed_tools"] == expected_allowed
+        assert any(m.matcher == "Bash" for m in captured_options["hooks"]["PreToolUse"])
         assert isinstance(events[-1], TurnComplete)
     finally:
         await executor.close()
@@ -6309,6 +6324,243 @@ async def test_result_message_usage_none_yields_turn_complete_without_usage() ->
 # ---------------------------------------------------------------------------
 # Tests: pre-execution TOOL_CALL policy gate (can_use_tool)
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "permission_mode", ["auto", "bypassPermissions", "default", "acceptEdits", "plan", "dontAsk"]
+)
+@pytest.mark.parametrize(
+    "action,approval,denied",
+    [
+        ("POLICY_ACTION_ALLOW", None, False),
+        ("POLICY_ACTION_UNSPECIFIED", None, False),
+        ("POLICY_ACTION_DENY", None, True),
+        ("POLICY_ACTION_ASK", True, False),
+        ("POLICY_ACTION_ASK", False, True),
+        ("POLICY_ACTION_ASK", None, True),
+        ("unexpected", None, True),
+    ],
+)
+async def test_bash_policy_hook_enforces_guardrails_in_every_mode(
+    permission_mode, action, approval, denied
+) -> None:
+    import claude_agent_sdk as sdk
+
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+    executor = ClaudeSDKExecutor(permission_mode=permission_mode)
+    executor._policy_evaluator = AsyncMock(
+        return_value=SimpleNamespace(action=action, reason="shell policy")
+    )
+    elicit = AsyncMock(return_value=approval)
+    if approval is not None:
+        executor._elicitation_handler = elicit
+    skill_hook = sdk.HookMatcher(matcher="Skill", hooks=[])
+    options = sdk.ClaudeAgentOptions(hooks={"PreToolUse": [skill_hook]})
+    executor._install_bash_policy_hook(sdk, options)
+    assert options.hooks["PreToolUse"][0] is skill_hook
+    bash_hook = options.hooks["PreToolUse"][-1]
+    assert bash_hook.matcher == "Bash"
+    assert bash_hook.timeout == executor._ASK_QUESTION_HOOK_TIMEOUT_S
+
+    arguments = {"command": "printf permitted"}
+    # Invoke the hook without can_use_tool: auto/bypass may never request permission.
+    output = await bash_hook.hooks[0]({"tool_input": arguments}, "bash-call", {})
+
+    executor._policy_evaluator.assert_awaited_once_with(
+        "PHASE_TOOL_CALL", {"name": "Bash", "arguments": arguments}
+    )
+    if denied:
+        assert output["hookSpecificOutput"]["permissionDecision"] == "deny"
+        assert output["hookSpecificOutput"]["permissionDecisionReason"]
+    else:
+        # An allow decision here would override Claude's own permission gate.
+        assert output == {}
+    if action == "POLICY_ACTION_ASK" and approval is not None:
+        elicit.assert_awaited_once_with("Bash", arguments)
+    else:
+        elicit.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "permission_mode", ["auto", "bypassPermissions", "default", "acceptEdits", "plan", "dontAsk"]
+)
+@pytest.mark.parametrize(
+    "policy_action,approved",
+    [("POLICY_ACTION_ALLOW", True), ("POLICY_ACTION_ALLOW", False), ("POLICY_ACTION_ASK", True)],
+)
+async def test_bash_policy_hook_preserves_permission_callback_without_double_evaluation(
+    permission_mode, policy_action, approved
+) -> None:
+    import claude_agent_sdk as sdk
+
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+    executor = ClaudeSDKExecutor(permission_mode=permission_mode)
+    executor._policy_evaluator = AsyncMock(
+        return_value=SimpleNamespace(action=policy_action, reason="shell policy")
+    )
+    executor._elicitation_handler = AsyncMock(return_value=approved)
+    options = sdk.ClaudeAgentOptions(can_use_tool=executor._can_use_tool_gate)
+    executor._install_bash_policy_hook(sdk, options)
+    arguments = {"command": "printf permitted"}
+    output = await options.hooks["PreToolUse"][0].hooks[0](
+        {"tool_input": arguments}, "bash-call", {}
+    )
+    assert output == {}
+
+    # Only simulate this callback when Claude asks, after PreToolUse has run.
+    result = await options.can_use_tool(
+        "Bash", arguments, SimpleNamespace(tool_use_id="bash-call")
+    )
+    assert result.behavior == (
+        "allow" if approved or permission_mode == "bypassPermissions" else "deny"
+    )
+    executor._policy_evaluator.assert_awaited_once()
+    if permission_mode == "bypassPermissions" and policy_action != "POLICY_ACTION_ASK":
+        executor._elicitation_handler.assert_not_awaited()
+    else:
+        executor._elicitation_handler.assert_awaited_once_with("Bash", arguments)
+
+    # Other tools retain the original gate, including the Omnigent dispatch exemption.
+    await options.can_use_tool("mcp__omnigent__sys_ping", {}, None)
+    executor._policy_evaluator.assert_awaited_once()
+    await options.can_use_tool("mcp__example__write", {}, None)
+    assert executor._policy_evaluator.await_args.args == (
+        "PHASE_TOOL_CALL",
+        {"name": "mcp__example__write", "arguments": {}},
+    )
+    executor._policy_evaluator.return_value = SimpleNamespace(
+        action="POLICY_ACTION_DENY", reason="connector writes blocked"
+    )
+    executor._elicitation_handler.reset_mock()
+    denied = await options.can_use_tool("mcp__example__write", {}, None)
+    assert denied.behavior == "deny"
+    assert denied.message == "connector writes blocked"
+    executor._elicitation_handler.assert_not_awaited()
+
+
+@pytest.mark.parametrize("permission_mode", ["auto", "default"])
+@pytest.mark.parametrize(
+    "mismatch", ["call-id", "arguments", "replayed", "missing-id", "agent-id", "reused-id"]
+)
+async def test_bash_ask_consent_only_approves_the_exact_invocation(
+    permission_mode, mismatch
+) -> None:
+    import claude_agent_sdk as sdk
+
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+    executor = ClaudeSDKExecutor(permission_mode=permission_mode)
+    executor._policy_evaluator = AsyncMock(
+        return_value=SimpleNamespace(action="POLICY_ACTION_ASK", reason="shell policy")
+    )
+    executor._elicitation_handler = AsyncMock(side_effect=[True, False])
+    options = sdk.ClaudeAgentOptions(can_use_tool=executor._can_use_tool_gate)
+    executor._install_bash_policy_hook(sdk, options)
+    arguments = {"command": "printf permitted"}
+    tool_use_id = None if mismatch == "missing-id" else "bash-call"
+    output = await options.hooks["PreToolUse"][0].hooks[0](
+        {"tool_input": arguments, "agent_id": "agent-a"}, tool_use_id, {}
+    )
+    assert output == {}
+    context = SimpleNamespace(
+        tool_use_id="other-call" if mismatch == "call-id" else "bash-call",
+        agent_id="agent-b" if mismatch == "agent-id" else "agent-a",
+    )
+    if mismatch in ("agent-id", "reused-id"):
+        executor._policy_evaluator.return_value = SimpleNamespace(action="POLICY_ACTION_ALLOW")
+        # Interleave another agent's same ID, or reuse an unused approval in a later message.
+        output = await options.hooks["PreToolUse"][0].hooks[0](
+            {"tool_input": arguments, "agent_id": context.agent_id}, "bash-call", {}
+        )
+        assert output == {}
+    if mismatch == "replayed":
+        approved = await options.can_use_tool("Bash", arguments, context)
+        assert approved.behavior == "allow"
+    if mismatch == "arguments":
+        arguments = {"command": "printf changed"}
+    result = await options.can_use_tool("Bash", arguments, context)
+    assert result.behavior == "deny"
+    assert executor._elicitation_handler.await_count == 2
+    assert executor._policy_evaluator.await_count == 2
+    if mismatch == "agent-id":
+        # Agent B's hook must not discard agent A's pending approval or evaluation.
+        approved = await options.can_use_tool(
+            "Bash", arguments, SimpleNamespace(tool_use_id="bash-call", agent_id="agent-a")
+        )
+        assert approved.behavior == "allow"
+        assert executor._elicitation_handler.await_count == 2
+        assert executor._policy_evaluator.await_count == 2
+
+
+@pytest.mark.parametrize("permission_mode", ["auto", "bypassPermissions"])
+@pytest.mark.parametrize("changed_input", [True, False], ids=["rewritten-input", "missing-hook"])
+async def test_bash_permission_callback_rechecks_policy_without_exact_hook_evaluation(
+    permission_mode, changed_input
+) -> None:
+    import claude_agent_sdk as sdk
+
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+    executor = ClaudeSDKExecutor(permission_mode=permission_mode)
+    executor._policy_evaluator = AsyncMock(
+        return_value=SimpleNamespace(action="POLICY_ACTION_ALLOW")
+    )
+    executor._elicitation_handler = AsyncMock(return_value=True)
+    options = sdk.ClaudeAgentOptions(can_use_tool=executor._can_use_tool_gate)
+    executor._install_bash_policy_hook(sdk, options)
+    if changed_input:
+        output = await options.hooks["PreToolUse"][0].hooks[0](
+            {"tool_input": {"command": "printf permitted"}, "agent_id": "agent-a"}, "bash-call", {}
+        )
+        assert output == {}
+    executor._policy_evaluator.return_value = SimpleNamespace(
+        action="POLICY_ACTION_DENY", reason="rewritten shell blocked"
+    )
+    arguments = {"command": "printf changed"}
+    result = await options.can_use_tool(
+        "Bash", arguments, SimpleNamespace(tool_use_id="bash-call", agent_id="agent-a")
+    )
+    assert result.behavior == "deny"
+    assert result.message == "rewritten shell blocked"
+    assert executor._policy_evaluator.await_args.args == (
+        "PHASE_TOOL_CALL",
+        {"name": "Bash", "arguments": arguments},
+    )
+    assert executor._policy_evaluator.await_count == (2 if changed_input else 1)
+    executor._elicitation_handler.assert_not_awaited()
+
+
+@pytest.mark.parametrize("failure", ["payload", "arguments", "policy", "elicitation"])
+async def test_bash_policy_hook_fails_closed(failure) -> None:
+    import claude_agent_sdk as sdk
+
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+    executor = ClaudeSDKExecutor(permission_mode="bypassPermissions")
+    executor._policy_evaluator = AsyncMock(
+        return_value=SimpleNamespace(action="POLICY_ACTION_ASK", reason="shell policy"),
+        side_effect=RuntimeError("policy unavailable") if failure == "policy" else None,
+    )
+    executor._elicitation_handler = AsyncMock(side_effect=RuntimeError("approval unavailable"))
+    options = sdk.ClaudeAgentOptions()
+    executor._install_bash_policy_hook(sdk, options)
+    payload = (
+        "invalid" if failure == "payload" else {"tool_input": [] if failure == "arguments" else {}}
+    )
+    output = await options.hooks["PreToolUse"][0].hooks[0](payload, None, {})
+    assert output["hookSpecificOutput"]["permissionDecision"] == "deny"
+    if failure in ("payload", "arguments"):
+        executor._policy_evaluator.assert_not_awaited()
+
+
+def test_native_bash_requires_hook_support() -> None:
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+    executor = ClaudeSDKExecutor()
+    with pytest.raises(RuntimeError, match="Native Bash requires SDK PreToolUse hook support"):
+        executor._install_bash_policy_hook(SimpleNamespace(), SimpleNamespace())
 
 
 class TestToolCallPolicyGate(unittest.TestCase):
@@ -7433,6 +7685,7 @@ def _make_recovery_fake_sdk():
     from claude_agent_sdk.types import (
         ClaudeAgentOptions as SDKClaudeAgentOptions,
     )
+    from claude_agent_sdk.types import HookMatcher as SDKHookMatcher
     from claude_agent_sdk.types import ResultMessage as SDKResultMessage
     from claude_agent_sdk.types import StreamEvent as SDKStreamEvent
 
@@ -7458,6 +7711,7 @@ def _make_recovery_fake_sdk():
         StreamEvent = SDKStreamEvent
         ResultMessage = SDKResultMessage
         ClaudeAgentOptions = SDKClaudeAgentOptions
+        HookMatcher = SDKHookMatcher
         created_clients = []
 
         class ClaudeSDKClient:

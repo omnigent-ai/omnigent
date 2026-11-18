@@ -81,8 +81,18 @@ effects and the tool result in the following API request. Public CLI cases run
 spec loading, server, runner, DNS, TLS, and relay code, without transport
 monkeypatches in those subprocesses.
 
-On macOS, the containment probes use Seatbelt. A separate Keychain canary test
-proves the parent can retrieve a synthetic secret while a contained child cannot.
+On macOS, the containment probes use Seatbelt. The login-Keychain test adds a
+synthetic item under a unique account and service in the user's default Keychain
+and deletes that item afterward. This uses the same generic-password API as
+Claude without sharing its credential service or querying real credentials. It proves the
+parent can retrieve the item and look up `com.apple.SecurityServer`, while the
+contained child can do neither. The opt-in real-CLI hook test repeats those
+checks from a `SessionStart` hook for both CLI binaries. The OS callback test
+separately checks a temporary file Keychain through the real shell callback.
+Seatbelt still allows other Mach service lookups for macOS runtime compatibility;
+the credential boundary specifically denies `com.apple.SecurityServer` and
+service names matching `securityd`, `secd`, or `keychain`. It does not claim to
+isolate every macOS IPC service.
 The networking probes also start from policies with networking enabled, so they
 verify that installing the relay removes direct network access.
 

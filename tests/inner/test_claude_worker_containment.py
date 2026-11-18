@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
@@ -830,6 +831,92 @@ def test_real_cli_bash_tool_round_trip_and_inline_skill_finish(
         prepared.close()
 
 
+@pytest.mark.parametrize(
+    "permission_mode,policy_action,approved",
+    [
+        ("bypassPermissions", "POLICY_ACTION_DENY", False),
+        ("auto", "POLICY_ACTION_DENY", False),
+        ("bypassPermissions", "POLICY_ACTION_ALLOW", True),
+        ("auto", "POLICY_ACTION_ASK", True),
+    ],
+    ids=["bypass-deny", "auto-deny", "bypass-allow", "auto-ask-approved"],
+)
+async def test_sdk_real_cli_bash_policy_runs_before_execution(
+    real_claude_cli: str,
+    real_worker_spec: OSEnvSpec,
+    cli_model_server,
+    monkeypatch: pytest.MonkeyPatch,
+    permission_mode: str,
+    policy_action: str,
+    approved: bool,
+) -> None:
+    from omnigent.inner.executor import ExecutorConfig, ExecutorError, TurnComplete
+    from omnigent.runtime.harnesses._scaffold import PolicyVerdictPayload
+
+    requests, replies = cli_model_server
+    workspace = Path(real_worker_spec.cwd)
+    marker = workspace / "bash-policy-marker"
+    arguments = {"command": "printf BASH_POLICY_OK > bash-policy-marker; printf BASH_POLICY_OK"}
+    replies.append(
+        [{"type": "tool_use", "id": "toolu_bash_policy", "name": "Bash", "input": arguments}]
+    )
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://model.test")
+    monkeypatch.setattr(claude, "_find_system_claude", lambda: real_claude_cli)
+    executor = claude.ClaudeSDKExecutor(
+        os_env=real_worker_spec,
+        model="claude-sonnet-4-6",
+        permission_mode=permission_mode,
+        api_key_helper="printf %s parent-only-cli-secret",
+        skills_filter="none",
+    )
+    tool_calls = []
+
+    async def evaluate(phase, data):
+        if phase == "PHASE_TOOL_CALL":
+            assert not marker.exists(), "Bash executed before its policy hook"
+            tool_calls.append(data)
+            return PolicyVerdictPayload(action=policy_action, reason="shell policy")
+        return PolicyVerdictPayload(action="POLICY_ACTION_ALLOW")
+
+    async def approve(tool_name, tool_input):
+        assert not marker.exists(), "Bash executed before approval"
+        assert (tool_name, tool_input) == ("Bash", arguments)
+        return approved
+
+    executor._policy_evaluator = evaluate
+    executor._elicitation_handler = AsyncMock(side_effect=approve)
+    permission_callback = AsyncMock(wraps=executor._can_use_tool_for_permission)
+    monkeypatch.setattr(executor, "_can_use_tool_for_permission", permission_callback)
+    try:
+        events = [
+            event
+            async for event in executor.run_turn(
+                [{"role": "user", "content": "Run the Bash probe.", "session_id": "bash-policy"}],
+                [],
+                "Execute the requested tool and report its result.",
+                ExecutorConfig(extra={"max_tokens": 1000, "max_turns": 3}),
+            )
+        ]
+        assert not [event for event in events if isinstance(event, ExecutorError)], events
+        assert any(isinstance(event, TurnComplete) for event in events)
+        assert tool_calls == [{"name": "Bash", "arguments": arguments}]
+        assert marker.exists() is approved
+        if approved:
+            assert marker.read_text() == "BASH_POLICY_OK"
+            _assert_tool_result(requests, "toolu_bash_policy", "BASH_POLICY_OK")
+        else:
+            assert "shell policy" in json.dumps(requests[-1]["body"])
+        if policy_action == "POLICY_ACTION_ASK":
+            executor._elicitation_handler.assert_awaited_once_with("Bash", arguments)
+        elif policy_action == "POLICY_ACTION_DENY" or permission_mode == "bypassPermissions":
+            executor._elicitation_handler.assert_not_awaited()
+        if permission_mode == "bypassPermissions":
+            # The CLI never asks permission in bypass; policy must run in PreToolUse.
+            permission_callback.assert_not_awaited()
+    finally:
+        await executor.close()
+
+
 async def test_sdk_real_cli_keeps_working_across_turns(
     real_claude_cli: str,
     real_worker_spec: OSEnvSpec,
@@ -1320,34 +1407,29 @@ def test_each_cli_execution_path_inherits_the_sandbox(
         prepared.close()
 
 
-@pytest.mark.skipif(sys.platform != "darwin", reason="macOS Keychain IPC")
-def test_contained_child_cannot_retrieve_keychain_canary(
-    real_worker_spec: OSEnvSpec,
+@pytest.fixture
+def login_keychain_probe(
     tmp_path: Path,
     request: pytest.FixtureRequest,
-) -> None:
-    """A readable Keychain service must still be unreachable through securityd."""
-    keychain = str(tmp_path / "canary.keychain-db")
-    password = "synthetic-keychain-password"
-    subprocess.run(
-        ["/usr/bin/security", "create-keychain", "-p", password, keychain],
-        capture_output=True,
-        check=True,
-        timeout=10,
-    )
-    request.addfinalizer(
-        lambda: subprocess.run(
-            ["/usr/bin/security", "delete-keychain", keychain], capture_output=True, timeout=10
+) -> tuple[str, Path]:
+    # A unique service avoids colliding with concurrent Claude credential lookups.
+    account = f"omnigent-containment-probe-{uuid.uuid4().hex}"
+    service = f"{account}-credentials"
+    keychain = (
+        subprocess.check_output(
+            ["/usr/bin/security", "default-keychain", "-d", "user"], text=True, timeout=10
         )
+        .strip()
+        .strip('"')
     )
     subprocess.run(
         [
             "/usr/bin/security",
             "add-generic-password",
             "-a",
-            "probe",
+            account,
             "-s",
-            "omnigent-containment-probe",
+            service,
             "-w",
             "keychain-canary",
             keychain,
@@ -1356,27 +1438,66 @@ def test_contained_child_cannot_retrieve_keychain_canary(
         check=True,
         timeout=10,
     )
+    request.addfinalizer(
+        lambda: subprocess.run(
+            [
+                "/usr/bin/security",
+                "delete-generic-password",
+                "-a",
+                account,
+                "-s",
+                service,
+                keychain,
+            ],
+            capture_output=True,
+            check=True,
+            timeout=10,
+        )
+    )
     retrieve = [
         "/usr/bin/security",
         "find-generic-password",
         "-a",
-        "probe",
+        account,
         "-s",
-        "omnigent-containment-probe",
+        service,
         "-w",
         keychain,
     ]
     parent = subprocess.run(retrieve, capture_output=True, text=True, check=True, timeout=10)
     assert parent.stdout.strip() == "keychain-canary"
+    lookup = (
+        "import ctypes; lib = ctypes.CDLL('/usr/lib/libSystem.B.dylib'); "
+        "port = ctypes.c_uint(); "
+        "lookup = lib.bootstrap_look_up(ctypes.c_uint.in_dll(lib, 'bootstrap_port').value, "
+        "b'com.apple.SecurityServer', ctypes.byref(port)); "
+    )
+    parent_lookup = subprocess.check_output(
+        [sys.executable, "-c", lookup + "print(lookup)"], text=True, timeout=10
+    )
+    assert int(parent_lookup) == 0
+    report = tmp_path / "workspace" / "keychain-report.json"
+    code = (
+        "import json, pathlib, subprocess; "
+        + lookup
+        + f"r = subprocess.run({retrieve!r}, capture_output=True, text=True, timeout=5); "
+        + "result = {'code': r.returncode, 'stdout': r.stdout, "
+        "'stderr': r.stderr, 'lookup': lookup}; "
+        + f"pathlib.Path({str(report)!r}).write_text(json.dumps(result))"
+    )
+    return code, report
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS Keychain IPC")
+def test_contained_child_cannot_retrieve_keychain_canary(
+    real_worker_spec: OSEnvSpec, login_keychain_probe: tuple[str, Path]
+) -> None:
+    """Deny the default login Keychain and its IPC service, even when the parent can read."""
+    code, report = login_keychain_probe
     env = {"PATH": os.environ["PATH"], "ANTHROPIC_API_KEY": "synthetic"}
     prepared = claude.prepare_claude_cli_path(sys.executable, real_worker_spec, worker_env=env)
     try:
-        code = (
-            "import json, subprocess; "
-            f"r = subprocess.run({retrieve!r}, capture_output=True, text=True, timeout=5); "
-            "print(json.dumps({'code': r.returncode, 'stdout': r.stdout, 'stderr': r.stderr}))"
-        )
-        child = subprocess.run(
+        subprocess.run(
             [prepared.cli_path, "-c", code],
             cwd=real_worker_spec.cwd,
             env=env,
@@ -1385,8 +1506,60 @@ def test_contained_child_cannot_retrieve_keychain_canary(
             check=True,
             timeout=15,
         )
-        result = json.loads(child.stdout)
+        result = json.loads(report.read_text())
         assert result["code"] != 0
+        assert result["lookup"] != 0
         assert "keychain-canary" not in result["stdout"] + result["stderr"]
+    finally:
+        prepared.close()
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS Keychain IPC")
+def test_real_cli_hook_cannot_retrieve_login_keychain_canary(
+    real_claude_cli: str,
+    real_worker_spec: OSEnvSpec,
+    cli_model_server,
+    login_keychain_probe: tuple[str, Path],
+) -> None:
+    code, report = login_keychain_probe
+    env = {
+        "PATH": os.environ["PATH"],
+        "ANTHROPIC_API_KEY": "parent-only-cli-secret",
+        "ANTHROPIC_BASE_URL": "https://model.test",
+    }
+    prepared = claude.prepare_claude_cli_path(real_claude_cli, real_worker_spec, worker_env=env)
+    args = _cli_args("Return the marker.", bare=False)
+    args[args.index("--settings") + 1] = json.dumps(
+        {
+            "hooks": {
+                "SessionStart": [
+                    {
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": shlex.join([sys.executable, "-c", code]),
+                            }
+                        ]
+                    }
+                ]
+            }
+        }
+    )
+    try:
+        child = subprocess.run(
+            [prepared.cli_path, *args],
+            cwd=real_worker_spec.cwd,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=40,
+        )
+        assert child.returncode == 0, child.stdout + "\n" + child.stderr
+        assert json.loads(child.stdout)["result"] == "CLI_E2E_OK"
+        result = json.loads(report.read_text())
+        assert result["code"] != 0
+        assert result["lookup"] != 0
+        assert "keychain-canary" not in result["stdout"] + result["stderr"]
+        assert cli_model_server[0]
     finally:
         prepared.close()

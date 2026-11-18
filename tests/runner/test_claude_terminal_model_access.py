@@ -1,7 +1,9 @@
-"""Exercise Claude terminal authority through the runner's REST launch route."""
+"""Exercise Claude terminal authority through REST and terminal tools."""
 
 from __future__ import annotations
 
+import asyncio
+import json
 import shutil
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -24,6 +26,8 @@ from omnigent.runtime import workflow
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.terminals import registry as registry_mod
 from omnigent.terminals.registry import TerminalRegistry
+from omnigent.tools.base import ToolContext
+from omnigent.tools.builtins.sys_terminal import SysTerminalLaunchTool
 
 
 @dataclass
@@ -173,6 +177,124 @@ def bundle(tmp_path: Path) -> Path:
     (root / "skills").mkdir()
     (root / "skills" / "SKILL.md").write_text("# Public skill\n")
     return root
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("harness", "sandbox_type", "inherited", "override_none", "rejects"),
+    [
+        ("claude-sdk", "linux_bwrap", True, False, True),
+        ("claude-sdk", None, False, False, True),
+        ("claude", None, True, False, True),
+        ("claude-sdk", "none", False, False, False),
+        ("claude-sdk", "linux_bwrap", True, True, False),
+        ("claude-native", None, True, False, False),
+        ("codex-native", None, True, False, False),
+        ("openai-agents", "linux_bwrap", False, False, False),
+    ],
+    ids=[
+        "sdk-inherited-sandbox",
+        "sdk-own-implicit-sandbox",
+        "sdk-alias-inherited-implicit-sandbox",
+        "sdk-explicit-optout",
+        "sdk-call-optout",
+        "claude-native-default",
+        "codex-native-default",
+        "other-harness-explicit-sandbox",
+    ],
+)
+async def test_terminal_tool_without_resolver_rejects_only_sdk_containment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    processes: _TerminalProcesses,
+    harness: str,
+    sandbox_type: str | None,
+    inherited: bool,
+    override_none: bool,
+    rejects: bool,
+) -> None:
+    workspace = tmp_path / "workspace"
+    spec = _agent(workspace, harness=harness)
+    environment = OSEnvSpec(
+        cwd=str(workspace),
+        sandbox=OSEnvSandboxSpec(type=sandbox_type) if sandbox_type is not None else None,
+        fork=rejects,
+    )
+    spec.os_env = environment if inherited else None
+    spec.terminals = {
+        "shell": TerminalEnvSpec(
+            command="bash",
+            os_env="inherit" if inherited else environment,
+            allow_sandbox_override=override_none,
+        )
+    }
+    resolve_access = Mock(return_value=None)
+    monkeypatch.setattr(workflow, "claude_terminal_model_access", resolve_access)
+    terminals = TerminalRegistry()
+    tool = SysTerminalLaunchTool(spec=spec, registry=terminals)
+    context = ToolContext(task_id="task", agent_id="agent", conversation_id="conv_test")
+    arguments = {"terminal": "shell", "session": "main"}
+    if override_none:
+        arguments["sandbox"] = "none"
+    try:
+        result = json.loads(await asyncio.to_thread(tool.invoke, json.dumps(arguments), context))
+        if rejects:
+            assert result == {
+                "error": (
+                    "launch failed: Claude SDK terminals require a session model-access resolver"
+                )
+            }
+            assert not processes.created  # Reject before allocating or copying a fork.
+            assert not processes.launched
+            assert terminals.list_for_conversation("conv_test") == []
+        else:
+            assert result["status"] == "launched"
+            instance = terminals.get("conv_test", "shell", "main")
+            assert instance is not None and instance.model_access is None
+            assert (instance.sandbox_policy is not None) == (
+                sandbox_type == "linux_bwrap" and not override_none
+            )
+            repeated = json.loads(
+                await asyncio.to_thread(tool.invoke, json.dumps(arguments), context)
+            )
+            assert repeated["status"] == "already_running"
+            assert len(processes.launched) == 1
+        resolve_access.assert_not_called()
+    finally:
+        await terminals.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("harness", "override"), [("codex", "claude-sdk"), ("claude-sdk", "claude-native")]
+)
+async def test_terminal_tool_session_resolver_controls_harness_and_bundle(
+    tmp_path: Path,
+    processes: _TerminalProcesses,
+    provider: None,
+    bundle: Path,
+    harness: str,
+    override: str,
+) -> None:
+    spec = _agent(tmp_path / "workspace", harness=harness)
+    assert spec.os_env is not None
+    spec.os_env.sandbox = None
+    async with _runner(spec, bundle, override=override) as (_, terminals, _resources):
+        tool = SysTerminalLaunchTool(spec=spec, registry=terminals)
+        context = ToolContext(task_id="task", agent_id="agent", conversation_id="conv_test")
+        result = json.loads(
+            await asyncio.to_thread(
+                tool.invoke, json.dumps({"terminal": "shell", "session": "main"}), context
+            )
+        )
+        assert result["status"] == "launched"
+        instance = terminals.get("conv_test", "shell", "main")
+        assert instance is not None
+        assert (instance.model_access is not None) == (override == "claude-sdk")
+        assert (instance.sandbox_policy is not None) == (override == "claude-sdk")
+        if instance.model_access is not None:
+            assert bundle.resolve() in instance.model_access.source_paths
+        assert len(processes.launched) == 1
 
 
 @pytest.mark.asyncio

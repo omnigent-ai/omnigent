@@ -447,9 +447,16 @@ async def test_shared_callback_environment_is_protected_before_execution(
     environment.close.assert_not_called()
 
 
-@pytest.mark.parametrize("fork", [False, True])
+@pytest.mark.parametrize(
+    "fork,active",
+    [
+        pytest.param(False, True, id="False"),
+        pytest.param(True, True, id="True"),
+        pytest.param(False, False, id="inactive"),
+    ],
+)
 async def test_callback_rejects_bundle_credentials_before_execution(
-    callback_session, monkeypatch: pytest.MonkeyPatch, fork: bool
+    callback_session, monkeypatch: pytest.MonkeyPatch, fork: bool, active: bool
 ) -> None:
     spec, workspace, bundle, _ = callback_session
     spec.os_env.fork = fork
@@ -457,7 +464,7 @@ async def test_callback_rejects_bundle_credentials_before_execution(
     monkeypatch.setattr(
         os_module,
         "resolve_sandbox",
-        lambda spec, cwd: SandboxPolicy("linux_bwrap", True, [bundle], [cwd], [], False),
+        lambda spec, cwd: SandboxPolicy("linux_bwrap", active, [bundle], [cwd], [], False),
     )
     copy = Mock(side_effect=AssertionError("must reject before copying credentials"))
     spawn = Mock(side_effect=AssertionError("must reject before executing payload"))
@@ -470,7 +477,8 @@ async def test_callback_rejects_bundle_credentials_before_execution(
         runner_workspace=workspace,
         local_tool_workdir=bundle,
     )
-    assert "outside sandbox" in json.loads(result)["error"]
+    expected_error = "outside sandbox" if active else "active sandbox policy"
+    assert expected_error in json.loads(result)["error"]
     copy.assert_not_called()
     spawn.assert_not_called()
 

@@ -474,8 +474,6 @@ class _HelperProcessClient:
 
     def isolate_model_credentials(self, access: ClaudeModelAccess) -> SandboxPolicy:
         with self._lock:
-            if not self.sandbox.active:
-                return self.sandbox
             protected = access.protect_sources(self.sandbox, self.cwd)
             # Callbacks re-derive equal access; keep the running relay's placeholder.
             if self._model_access != access:

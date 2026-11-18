@@ -328,8 +328,50 @@ def test_credentials_inside_granted_workspace_are_rejected(tmp_path: Path) -> No
     source.write_text("private")
     access = ClaudeModelAccess("https://model.test", "authorization", lambda: "secret", (source,))
     policy = SandboxPolicy("linux_bwrap", True, [tmp_path], [tmp_path], [], False)
-    with pytest.raises(ValueError, match="outside sandbox"):
+    with pytest.raises(ValueError, match="outside sandbox") as error:
         access.protect_sources(policy, tmp_path)
+    assert repr(str(source)) in str(error.value)
+    assert repr(str(tmp_path.resolve())) in str(error.value)
+
+
+@pytest.mark.parametrize(
+    "backend_type,active",
+    [
+        pytest.param("linux_bwrap", True, id="linux_bwrap"),
+        pytest.param("darwin_seatbelt", True, id="darwin_seatbelt"),
+        pytest.param("windows_jobobject", True, id="windows_jobobject"),
+        pytest.param("unknown", True, id="unknown"),
+        pytest.param("linux_bwrap", False, id="inactive"),
+    ],
+)
+def test_model_access_requires_backend_isolation_even_without_file_sources(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, backend_type: str, active: bool
+) -> None:
+    from omnigent.inner import claude_model_access as module
+
+    credentials = Mock(return_value="parent-only-key")
+    access = ClaudeModelAccess("https://model.test", "authorization", credentials)
+    policy = SandboxPolicy(backend_type, active, [], [tmp_path], [], False)
+    discover = Mock(return_value=())
+    monkeypatch.setattr("omnigent.onboarding.ambient.claude_code_managed_mcp_paths", discover)
+    monkeypatch.setattr(module, "_claude_managed_preferences_paths", lambda: ())
+
+    # Environment-only credentials still require filesystem and network isolation.
+    if active and backend_type in ("linux_bwrap", "darwin_seatbelt"):
+        protected = access.protect_sources(policy, tmp_path)
+        assert protected.backend_type == backend_type
+        assert protected.credential_source_paths == []
+    else:
+        expected_error = (
+            "requires filesystem and network isolation" if active else "active sandbox policy"
+        )
+        with pytest.raises(ValueError, match=expected_error) as error:
+            access.protect_sources(policy, tmp_path)
+        assert backend_type in str(error.value)
+        discover.assert_not_called()
+
+    credentials.assert_not_called()
+    assert policy.credential_source_paths is None
 
 
 def test_static_helper_never_executes_a_shell(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -350,8 +392,10 @@ def test_custom_provider_config_cannot_be_granted_to_the_worker(tmp_path: Path) 
         {"ANTHROPIC_API_KEY": "parent-only", "OMNIGENT_CONFIG_HOME": str(tmp_path)}
     )
     policy = SandboxPolicy("linux_bwrap", True, [tmp_path], [], [], False)
-    with pytest.raises(ValueError, match="outside sandbox-readable paths"):
+    with pytest.raises(ValueError, match="outside sandbox-readable paths") as error:
         access.protect_sources(policy, tmp_path)
+    assert repr(str(config)) in str(error.value)
+    assert repr(str(tmp_path.resolve())) in str(error.value)
 
 
 @pytest.mark.parametrize("custom_home", [False, True])
@@ -451,9 +495,11 @@ def test_bundle_directory_symlink_targets_cannot_be_granted(
     else:
         cwd = target
 
-    with pytest.raises(ValueError, match="outside sandbox"):
+    with pytest.raises(ValueError, match="outside sandbox") as error:
         access.protect_sources(policy, cwd)
 
+    assert repr(str(alias)) in str(error.value)
+    assert repr(str(target)) in str(error.value)
     assert alias in access.source_paths
 
 

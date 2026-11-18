@@ -492,9 +492,17 @@ hooks, and plugin subprocesses. Both system-installed and SDK-bundled CLIs use
 the same launcher. A sandbox resolution or launch failure stops startup;
 `OMNIGENT_CLAUDE_SDK_NO_SANDBOX` cannot bypass a requested sandbox. Bash is
 available in the contained CLI so skills can execute their shell commands.
+Native Bash calls pass an Omnigent `PreToolUse` policy gate even when Claude's
+permission mode approves tools automatically; Claude's own permission rules
+remain in force.
 Claude's own Bash sandbox is separate from this outer process boundary.
+Containment requires `linux_bwrap` or `darwin_seatbelt`. Windows
+`windows_jobobject` provides process containment without filesystem or network
+isolation and is rejected for sandboxed Claude SDK launches and callbacks.
 Omitting `os_env` or selecting `sandbox.type: none` does not request this
 boundary; skills, hooks, and local MCP commands can then run uncontained.
+Setting `OMNIGENT_CLAUDE_SDK_NO_SANDBOX` while requesting a sandbox raises a
+startup error; use an explicit `sandbox.type: none` to opt out.
 
 Model access is automatic; no model egress rule is needed:
 
@@ -533,7 +541,8 @@ outside the sandbox workspace and read/write grants; conflicting layouts fail
 before execution. Omnigent's Python runtime and framework installation must also
 remain outside sandbox-writable paths.
 
-Direct networking is disabled for these contained launches. Additional ordinary
+Direct networking is disabled for these contained launches, including policies
+that previously enabled it with `allow_network: true`. Additional ordinary
 HTTP(S) access requires `egress_rules`; those requests do not receive the model
 credential. API-key providers, explicit Anthropic bearer/OAuth tokens, and host
 Claude OAuth credentials are supported. Host OAuth credentials are reread from
