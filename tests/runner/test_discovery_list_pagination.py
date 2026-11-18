@@ -666,11 +666,11 @@ def _archive_scope_server(
 
     async def handler(request: httpx.Request) -> httpx.Response:
         path = request.url.path
+        requests.append((path, dict(request.url.params)))
         if path == "/v1/sessions/conv_caller/child_sessions":
             return httpx.Response(200, json={"data": []})
         if path == "/v1/sessions/conv_caller":
             return httpx.Response(200, json={"id": "conv_caller", "parent_session_id": None})
-        requests.append((path, dict(request.url.params)))
         if path == "/v1/info":
             return httpx.Response(
                 200, json={"session_list_scoped_archives": True} if scoped_archives else {}
@@ -764,6 +764,95 @@ async def test_sys_session_list_include_archived_lists_archived_rows_on_every_pa
     ] == [(listing, "true"), (listing, "true"), ("mine", None), (shared_listing, "true")]
     # Only an older server needs the caller's identity.
     assert ("/v1/me" in [path for path, _ in requests]) is not scoped_archives
+
+
+def _worker_rows(total: int, worker_indexes: set[int]) -> list[dict[str, object]]:
+    """The caller's sessions, newest first; only *worker_indexes* were started by it."""
+    rows = [_scope_row(index, _VIEWER, archived=index % 2 == 0) for index in range(total)]
+    for index, row in enumerate(rows):
+        if index not in worker_indexes:
+            row["labels"] = {"omnigent.created_by_session_id": "conv_other_manager"}
+    return rows
+
+
+@pytest.mark.asyncio
+async def test_sys_session_list_created_by_this_session_finds_workers_in_one_call() -> None:
+    """Workers scattered across many sessions come back from one call, archived included.
+
+    The runner pages the server in large pages and keeps the caller's own rows, so
+    the model doesn't follow a cursor through every session it owns. The named
+    sub-agent view isn't needed to find workers and isn't read.
+    """
+    workers = {3, 1_400, 2_999}
+    rows = _worker_rows(3_000, workers)
+    requests: list[tuple[str, dict[str, str]]] = []
+    handler = _archive_scope_server(rows, requests, scoped_archives=True)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server"
+    ) as client:
+        result = await _call_session(
+            client, {"include_archived": True, "created_by_this_session": True}
+        )
+        filtered_paths = [path for path, _ in requests]
+        unfiltered_cursor = (await _call_session(client, {"limit": 1}))["page"]["next_cursor"]
+        mismatched = await _call_session(
+            client, {"created_by_this_session": True, "cursor": unfiltered_cursor}
+        )
+
+    assert result["sub_agents"] == []
+    assert "/v1/sessions/conv_caller/child_sessions" not in filtered_paths
+    assert "/v1/sessions/conv_caller" not in filtered_paths
+    assert "page" not in result
+    assert [row["session_id"] for row in result["sessions"]] == [
+        f"conv_{index:04d}" for index in sorted(workers)
+    ]
+    assert {row["archived"] for row in result["sessions"]} == {True, False}
+    listing_limits = [params["limit"] for path, params in requests if path == "/v1/sessions"]
+    assert listing_limits[:3] == ["1000", "1000", "1000"]
+    # A cursor minted without the filter can't continue a filtered listing.
+    assert mismatched == {"error": "sys_session_list: cursor uses different filter arguments"}
+
+
+@pytest.mark.asyncio
+async def test_sys_session_list_created_by_this_session_stops_at_the_scan_limit() -> None:
+    """A huge account gets a cursor after the scan limit, and continuing finds the rest."""
+    scan_limit = tool_dispatch._CREATED_SESSIONS_SCAN_LIMIT
+    rows = _worker_rows(scan_limit + 10, {scan_limit + 5})
+    requests: list[tuple[str, dict[str, str]]] = []
+    handler = _archive_scope_server(rows, requests, scoped_archives=True)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server"
+    ) as client:
+        arguments: dict[str, object] = {"include_archived": True, "created_by_this_session": True}
+        first = await _call_session(client, arguments)
+        second = await _call_session(client, {**arguments, "cursor": first["page"]["next_cursor"]})
+
+    assert first["sessions"] == []
+    assert first["page"]["has_more"] == {"sessions": True}
+    assert len([path for path, _ in requests if path == "/v1/sessions"]) == (
+        scan_limit // tool_dispatch._AGENT_LIST_PAGE_LIMIT + 1
+    )
+    assert [row["session_id"] for row in second["sessions"]] == [f"conv_{scan_limit + 5:04d}"]
+
+
+@pytest.mark.asyncio
+async def test_sys_session_list_created_by_this_session_reports_a_failed_read() -> None:
+    """A listing failure is never reported as "no workers", which would start a duplicate."""
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions":
+            return httpx.Response(503, json={"error": "unavailable"})
+        raise AssertionError(f"unexpected path {request.url.path}")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server"
+    ) as client:
+        result = await _call_session(client, {"created_by_this_session": True})
+
+    assert result["sessions"] == []
+    assert result["page"]["has_more"] == {"sessions": True}
 
 
 @pytest.mark.asyncio

@@ -3,7 +3,7 @@
  * Drafts become runnable when the user saves the agent's proposed plan.
  */
 
-import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import {
   ChevronDownIcon,
   ChevronLeftIcon,
@@ -29,17 +29,8 @@ import {
   type WorkflowSessionRequest,
   WorkflowSessionDialog,
 } from "@/components/workflows/WorkflowSessionDialog";
-import {
-  RunGraphButton,
-  RunPlanButton,
-  RunTimeline,
-  useRunTaskMenus,
-} from "@/components/workflows/RunTasks";
-import { planRunControl } from "@/shell/PlanRunButton";
-import {
-  WorkflowGraphOverlay,
-  WorkflowStepsGraph,
-} from "@/components/workflows/WorkflowStepsGraph";
+import { WorkflowRunRow } from "@/components/workflows/WorkflowRunRow";
+import { WorkflowStepsGraph } from "@/components/workflows/WorkflowStepsGraph";
 import { useNow } from "@/hooks/useNow";
 import {
   useWorkflow,
@@ -48,8 +39,7 @@ import {
   useSaveWorkflowPlan,
   WorkflowNotFoundError,
 } from "@/hooks/useWorkflow";
-import { useSessionJournal } from "@/hooks/useSessionJournal";
-import { useSessionWorking } from "@/hooks/useSessionWorking";
+import { useJournalEntryPosition, useSessionJournal } from "@/hooks/useSessionJournal";
 import { useAutomationsEnabled } from "@/hooks/useConversations";
 import { useSession } from "@/hooks/useSession";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
@@ -58,18 +48,9 @@ import { automationPagePath } from "@/lib/automationFromSession";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { Link, useNavigate, useParams } from "@/lib/routing";
-import { formatRunTimestamp } from "@/lib/scheduleText";
 import { cn } from "@/lib/utils";
-import { currentPlan, planDescription, planSteps, type StepState } from "@/lib/sessionJournal";
+import { currentPlan, planDescription, planSteps } from "@/lib/sessionJournal";
 import { ApiError } from "@/lib/sessionsApi";
-import {
-  describeWorkflowRun,
-  isWorkflowRunWorking,
-  runStepProgress,
-  type WorkflowRun,
-  type WorkflowRunState,
-} from "@/lib/workflowRuns";
-import { StepGlyph } from "@/shell/TasksPanel";
 import { useChatStore } from "@/store/chatStore";
 
 // The planning chat's outline flash lasts as long as `.animate-user-msg-flash`.
@@ -110,6 +91,13 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
   const journal = useSessionJournal(
     canReadProposal ? planningSession.id : undefined,
     canReadProposal,
+  );
+  // The proposal the description was saved from; the server places one outside the loaded pages.
+  const source = workflow?.description_source ?? undefined;
+  const savedFrom = source ? journal.entries.find((entry) => entry.id === source) : undefined;
+  const sourcePosition = useJournalEntryPosition(
+    canReadProposal && !savedFrom ? planningSession.id : undefined,
+    source,
   );
   const savePlan = useSaveWorkflowPlan(workflowId);
   useEffect(() => {
@@ -165,14 +153,14 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
   // A proposal replaces the description only if it's newer than where the description came
   // from, so an edit made since stands: the proposal Save plan took it from, by journal order,
   // or else the workflow's last write, in whole seconds, where a tie keeps the description.
-  const savedFrom = workflow.description_source
-    ? journal.entries.find((entry) => entry.id === workflow.description_source)
-    : undefined;
+  // Where that proposal sits in this journal: null when it came from another planning chat,
+  // undefined until the server places it, which offers no description meanwhile.
+  const sourceAt = savedFrom ? savedFrom.position : sourcePosition.data;
   const proposalIsNewer =
     proposal !== null &&
-    (savedFrom
-      ? proposal.position > savedFrom.position
-      : proposal.created_at > (workflow.updated_at ?? 0));
+    (!source || sourceAt === null
+      ? proposal.created_at > (workflow.updated_at ?? 0)
+      : sourceAt !== undefined && proposal.position > sourceAt);
   const proposedDescription = proposalIsNewer ? planDescription(proposal) : null;
   const newDescription =
     proposedSteps?.length && proposedDescription !== workflow.description
@@ -296,12 +284,13 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
                 onClick={() => {
                   if (!proposal || !proposedSteps) return;
                   setPlannerOpen(showPlanner);
-                  // The server keeps a description another client changed after this page loaded it.
+                  // Even an unchanged description records the proposal it now comes from. The
+                  // server keeps a description another client changed after this page loaded it.
                   const description =
-                    newDescription === null
+                    proposedDescription === null
                       ? {}
                       : {
-                          description: newDescription,
+                          description: proposedDescription,
                           expected_description: workflow.description,
                           description_source: proposal.id,
                         };
@@ -655,127 +644,5 @@ function BackLink() {
       <ChevronLeftIcon className="size-4" />
       Workflows
     </Link>
-  );
-}
-
-// A run's glyph: the Tasks tab's, for the step state its run state matches.
-const RUN_GLYPHS: Record<WorkflowRunState["kind"], StepState> = {
-  running: "running",
-  waiting: "needs_input",
-  done: "done",
-  failed: "failed",
-  stopped: "stopped",
-};
-
-/**
- * One run: its session's title, when it started and where it stands, over the
- * Tasks tab's timeline of its tasks. The row opens the session; a segment opens
- * that task there, and the graph button shows the run on the workflow's graph.
- */
-function WorkflowRunRow({
-  run,
-  now,
-  workflowId,
-  workflowName,
-}: {
-  run: WorkflowRun;
-  now: Date;
-  workflowId: string;
-  workflowName: string;
-}) {
-  const sessionWorking = useSessionWorking(
-    run.isCurrent ? run.sessionId : null,
-    isWorkflowRunWorking(run),
-  );
-  const state = describeWorkflowRun(run, sessionWorking);
-  const progress = useMemo(() => runStepProgress(run, sessionWorking), [run, sessionWorking]);
-  // Stop while the run's session works; play once it stopped with tasks left.
-  const canAct = run.isCurrent && !run.archived;
-  const control = canAct
-    ? planRunControl(progress, run.statuses, sessionWorking, run.planGraphRevision)
-    : null;
-  const refreshKeys = [["workflow-runs", workflowId]];
-  const taskMenus = useRunTaskMenus(canAct ? run.sessionId : null, refreshKeys, run.id);
-  const [graphOpen, setGraphOpen] = useState(false);
-  const sessionPath = `/c/${encodeURIComponent(run.sessionId)}`;
-  const title = run.title || "Untitled session";
-  const started = formatRunTimestamp(run.startedAt, now) ?? "—";
-  const stateLabel = (
-    <span
-      className={cn(state.kind === "waiting" && "text-brand-accent")}
-      data-testid="workflow-run-state"
-    >
-      {state.label}
-    </span>
-  );
-  return (
-    <li
-      className="relative rounded-lg px-2 py-2.5 transition-colors hover:bg-muted/60 has-[a:focus-visible]:bg-muted/60"
-      data-testid="workflow-run"
-      data-run-state={state.kind}
-    >
-      <div className="flex items-start gap-3">
-        <span className="flex size-5 shrink-0 items-center justify-center">
-          <StepGlyph state={RUN_GLYPHS[state.kind]} />
-        </span>
-        <div className="min-w-0 flex-1">
-          {/* The link covers the row; the timeline and the graph button sit above it. */}
-          <Link
-            to={sessionPath}
-            className="block truncate text-sm leading-5 after:absolute after:inset-0 after:rounded-lg after:content-[''] focus-visible:outline-none"
-          >
-            {title}
-          </Link>
-          <p className="mt-0.5 flex flex-wrap items-baseline gap-x-2 text-xs text-muted-foreground">
-            <span>{started}</span>
-            {stateLabel}
-            {run.archived && <span>Archived</span>}
-          </p>
-          {progress.length > 0 && (
-            <RunTimeline
-              sessionId={run.sessionId}
-              progress={progress}
-              menuActionFor={taskMenus}
-              className="mt-3 pr-1"
-            />
-          )}
-        </div>
-        {control && (
-          <RunPlanButton
-            sessionId={run.sessionId}
-            runId={run.id}
-            planName={workflowName}
-            control={control}
-            refreshKeys={refreshKeys}
-            className="relative -my-1"
-          />
-        )}
-        <RunGraphButton
-          runName={title}
-          className="relative -my-1"
-          onClick={() => setGraphOpen(true)}
-        />
-      </div>
-      {graphOpen && (
-        <WorkflowGraphOverlay
-          title={workflowName}
-          subtitle={
-            <>
-              <Link to={sessionPath} className="text-foreground hover:underline">
-                {title}
-              </Link>
-              <span aria-hidden>·</span>
-              <span>{started}</span>
-              <span aria-hidden>·</span>
-              {stateLabel}
-            </>
-          }
-          steps={run.steps}
-          progress={progress}
-          menuActionFor={taskMenus}
-          onClose={() => setGraphOpen(false)}
-        />
-      )}
-    </li>
   );
 }

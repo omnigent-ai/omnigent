@@ -15,12 +15,12 @@ only must not block ``input`` (REQUEST) phase messages.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import Iterator
 
 import httpx
 import pytest
-import pytest_asyncio
 
+from omnigent.policies.registry import load_registry
 from tests.server.conftest import ControllableMockClient
 from tests.server.helpers import create_session_for_agent as _create_session
 from tests.server.helpers import create_test_agent
@@ -28,31 +28,15 @@ from tests.server.helpers import create_test_agent
 pytestmark = pytest.mark.asyncio
 
 
+@pytest.fixture(autouse=True)
+def _register_test_policy_modules() -> Iterator[None]:
+    """Allow the test-only fixed-action handler, as an operator's policy_modules entry would."""
+    load_registry(extra_modules=["omnigent._e2e_policy_callables"])
+    yield
+    load_registry()
+
+
 # ── Fixtures ──────────────────────────────────────────────────────────────────
-
-
-@pytest_asyncio.fixture()
-async def policy_client(
-    policy_client: httpx.AsyncClient,
-    monkeypatch: pytest.MonkeyPatch,
-) -> AsyncIterator[httpx.AsyncClient]:
-    """Extend the parent policy client with the DENY scenarios' factory allowlist."""
-    # Allow the make_fixed_action_callable factory through the registry
-    # allowlist. In production this would be added via policy_modules config.
-    # Patch at the use site (the route module imports the function directly).
-    from omnigent.server.routes import session_policies as _sp_mod
-
-    _original_is_registered = _sp_mod.is_registered_handler
-    monkeypatch.setattr(
-        _sp_mod,
-        "is_registered_handler",
-        lambda handler: (
-            handler == "omnigent.policies.function.make_fixed_action_callable"
-            or _original_is_registered(handler)
-        ),
-    )
-
-    yield policy_client
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

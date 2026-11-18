@@ -188,9 +188,12 @@ def use_capture_messages(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Pat
 # ── Tests ──────────────────────────────────────────────────────
 
 
+@pytest.mark.parametrize("native_acceptance", [False, True], ids=["legacy", "native-acceptance"])
 async def test_text_chunk_translates_to_output_text_delta(
     use_text_only: None,
     manager: HarnessProcessManager,
+    monkeypatch: pytest.MonkeyPatch,
+    native_acceptance: bool,
 ) -> None:
     """A TextChunk from the inner executor → response.output_text.delta.
 
@@ -200,6 +203,15 @@ async def test_text_chunk_translates_to_output_text_delta(
     text-delta event followed by response.completed.
     """
     conv_id = "conv_text"
+    acceptance = {
+        "session_id": conv_id,
+        "thread_id": "thread_text",
+        "response_id": "codex_turn_text",
+    }
+    if native_acceptance:
+        monkeypatch.setenv("MOCK_EXECUTOR_NATIVE_ACCEPTANCE", json.dumps(acceptance))
+    else:
+        monkeypatch.delenv("MOCK_EXECUTOR_NATIVE_ACCEPTANCE", raising=False)
     client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
     events: list[_ParsedSSEEvent] = []
     async with client.stream(
@@ -225,6 +237,12 @@ async def test_text_chunk_translates_to_output_text_delta(
     # If a future change makes TurnComplete.response emit a
     # delta, this test should be updated.
     assert "response.completed" in event_names
+    assert events[0].data["response"]["id"] == events[-1].data["response"]["id"]
+    assert events[-1].data["response"]["id"] != acceptance["response_id"]
+    if native_acceptance:
+        assert events[-1].data["native_acceptance"] == acceptance
+    else:
+        assert "native_acceptance" not in events[-1].data
 
 
 async def test_tool_call_translates_to_paired_function_call_items(
@@ -543,11 +561,12 @@ async def test_turn_cancelled_terminates_with_response_cancelled(
     use_cancelled: None,
     manager: HarnessProcessManager,
 ) -> None:
-    """TurnCancelled -> response.cancelled terminal event.
+    """TurnCancelled -> response.cancelled terminal event, with the turn's usage.
 
     Provider-side cancellation is not driven by an inbound interrupt event, so
     the adapter must mark the turn context cancelled itself. Otherwise the
-    scaffold sees a clean return and emits response.completed.
+    scaffold sees a clean return and emits response.completed. The model calls
+    the turn made were spent, so their usage rides on the terminal event.
     """
     conv_id = "conv_cancelled"
     client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
@@ -562,6 +581,8 @@ async def test_turn_cancelled_terminates_with_response_cancelled(
     terminal_response = events[-1].data["response"]
     assert terminal_response["status"] == "cancelled"
     assert terminal_response.get("error") is None
+    assert terminal_response["usage"]["input_tokens"] == 300
+    assert terminal_response["usage"]["output_tokens"] == 40
 
 
 # ── Error-code classification ──────────────────────────────────
@@ -3178,6 +3199,10 @@ async def test_interrupt_drops_inner_session_synchronously() -> None:
     )
 
 
+# Usage that an interrupted native turn reports as it ends, e.g. the Claude CLI's final result.
+_INTERRUPTED_TURN_USAGE = {"input_tokens": 2641, "output_tokens": 512, "total_tokens": 3153}
+
+
 class _KeptSessionExecutor(Executor):
     """Executor that keeps its native session across an interrupt.
 
@@ -3215,7 +3240,7 @@ class _KeptSessionExecutor(Executor):
     async def run_turn(self, messages, tools, system_prompt, config=None):
         import asyncio
 
-        from omnigent.inner.executor import ExecutorError, TextChunk, TurnComplete
+        from omnigent.inner.executor import ExecutorError, TextChunk, TurnCancelled, TurnComplete
 
         try:
             self.turn_started.set()
@@ -3227,6 +3252,17 @@ class _KeptSessionExecutor(Executor):
                 yield TurnComplete(response="partial")
             elif self.stop_outcome == "errors":
                 yield ExecutorError(message="native session crashed")
+            elif self.stop_outcome == "cancels_with_usage":
+                yield TurnCancelled(usage=dict(_INTERRUPTED_TURN_USAGE))
+            elif self.stop_outcome == "completes_with_usage":
+                yield TurnComplete(response="partial", usage=dict(_INTERRUPTED_TURN_USAGE))
+            elif self.stop_outcome == "errors_with_usage":
+                yield ExecutorError(
+                    message="native session crashed", usage=dict(_INTERRUPTED_TURN_USAGE)
+                )
+            elif self.stop_outcome == "streams_then_cancels_with_usage":
+                yield TextChunk(text=" more")
+                yield TurnCancelled(usage=dict(_INTERRUPTED_TURN_USAGE))
             elif self.stop_outcome == "keeps_streaming":
                 yield TextChunk(text=" more")
                 await asyncio.Event().wait()
@@ -3259,8 +3295,19 @@ class _KeptSessionExecutor(Executor):
         self.closed.append(session_key)
 
 
+class _DroppedSessionExecutor(_KeptSessionExecutor):
+    """Executor that drops its native session on an interrupt."""
+
+    def resumes_after_interrupt(self) -> bool:
+        return False
+
+
 async def _interrupt_kept_session_turn(
-    stop_outcome: str, *, blocking_close: bool = False, blocking_interrupt: bool = False
+    stop_outcome: str,
+    *,
+    blocking_close: bool = False,
+    blocking_interrupt: bool = False,
+    executor_type: type[_KeptSessionExecutor] = _KeptSessionExecutor,
 ):
     """Start a turn on a :class:`_KeptSessionExecutor`, interrupt it, and return the pieces."""
     import asyncio
@@ -3269,7 +3316,7 @@ async def _interrupt_kept_session_turn(
     from omnigent.runtime.harnesses._scaffold import TurnContext
     from omnigent.server.schemas import CreateResponseRequest
 
-    executor = _KeptSessionExecutor(
+    executor = executor_type(
         stop_outcome, blocking_close=blocking_close, blocking_interrupt=blocking_interrupt
     )
     adapter = ExecutorAdapter(executor_factory=lambda: executor, session_key="sk")
@@ -3282,6 +3329,37 @@ async def _interrupt_kept_session_turn(
 
     response = await asyncio.wait_for(adapter._handle_interrupt_event(), timeout=5)
     return adapter, executor, run_task, response
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stop_outcome", "executor_type"),
+    [
+        ("cancels_with_usage", _KeptSessionExecutor),
+        ("streams_then_cancels_with_usage", _KeptSessionExecutor),
+        ("completes_with_usage", _KeptSessionExecutor),
+        ("errors_with_usage", _KeptSessionExecutor),
+        ("cancels_with_usage", _DroppedSessionExecutor),
+    ],
+)
+async def test_interrupted_turn_keeps_the_usage_it_reports_as_it_ends(
+    stop_outcome: str, executor_type: type[_KeptSessionExecutor]
+) -> None:
+    """The usage that an interrupted turn reports as it ends reaches its terminal event.
+
+    A stop interrupts the turn; the native turn then ends, by cancelling, completing
+    or failing, with the usage of the model calls it made, at once or after more output.
+    Those calls were spent, so ``response.cancelled`` carries it, whether or not the
+    executor keeps its session.
+    """
+    adapter, _, run_task, response = await _interrupt_kept_session_turn(
+        stop_outcome, executor_type=executor_type
+    )
+    ctx = adapter._in_flight["resp_1"]
+
+    assert response.status_code == 204
+    await run_task
+    assert ctx.provider_usage == _INTERRUPTED_TURN_USAGE
 
 
 @pytest.mark.asyncio

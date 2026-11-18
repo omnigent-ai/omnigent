@@ -1262,7 +1262,7 @@ def test_runner_issuance_rechecks_both_owners_and_binding(db_uri, monkeypatch, c
     assert issued == []
 
 
-def _inbox_item(user_id: str) -> NewInboxItem:
+def _inbox_item(user_id: str, dedupe_key: str = "v1:private") -> NewInboxItem:
     return NewInboxItem(
         user_id=user_id,
         source_session_id=uuid.uuid4().hex,
@@ -1275,7 +1275,7 @@ def _inbox_item(user_id: str) -> NewInboxItem:
         media=[],
         primary_link=None,
         topic="private",
-        dedupe_key="v1:private",
+        dedupe_key=dedupe_key,
     )
 
 
@@ -1299,6 +1299,59 @@ def test_deleted_account_inbox_is_not_visible_after_reregistration(db_uri: str) 
         ):
             with pytest.raises(OmnigentError, match="revoked"):
                 write()
+
+
+def test_inbox_cleanup_is_batched_and_finished_before_reregistration(db_uri, monkeypatch):
+    import sqlalchemy as sa
+
+    from omnigent.db.db_models import SqlInboxItem, workspace_scope
+
+    accounts = SqlAlchemyAccountStore(db_uri)
+    inbox = SqlAlchemyInboxItemStore(db_uri)
+    monkeypatch.setattr(accounts, "_cleanup_batch_size", 1)
+    old = accounts.create_user_with_password("alice", "alice-hash")
+    with account_authority_scope("alice", old.account_generation):
+        # One item from each of three sessions, as the per-session cap does not bound them.
+        for n in range(3):
+            inbox.create(_inbox_item("alice", dedupe_key=f"v1:private-{n}"))
+
+    def stored() -> int:
+        with workspace_scope(None), accounts._engine.connect() as conn:
+            return conn.execute(
+                sa.select(sa.func.count()).where(SqlInboxItem.user_id == "alice")
+            ).scalar_one()
+
+    deletes = 0
+
+    def interrupt_cleanup(_connection, _cursor, _statement, parameters, context, _executemany):
+        nonlocal deletes
+        query = getattr(context.compiled, "statement", None)
+        if isinstance(query, sa.Delete) and query.table.name == "inbox_items":
+            # Each committed batch deletes one row: the workspace and one item ID.
+            assert len(parameters) == 2
+            deletes += 1
+            if deletes > 1:
+                raise RuntimeError("test inbox cleanup interruption")
+
+    sa.event.listen(accounts._engine, "before_cursor_execute", interrupt_cleanup)
+    try:
+        # The tombstone commits first; the failed cleanup is deferred, not the deletion.
+        assert accounts.delete_user("alice") is True
+        assert stored() == 2
+        with pytest.raises(RuntimeError, match="test inbox cleanup interruption"):
+            accounts.create_user_with_password("alice", "replacement-hash")
+        assert accounts.get_user("alice") is None
+    finally:
+        sa.event.remove(accounts._engine, "before_cursor_execute", interrupt_cleanup)
+
+    new = accounts.create_user_with_password("alice", "replacement-hash")
+    assert stored() == 0
+    with account_authority_scope("alice", new.account_generation):
+        fresh = inbox.create(_inbox_item("alice", dedupe_key="v1:fresh"))
+    # Cleanup that runs late sees a live account and leaves its items alone.
+    accounts._delete_deleted_inbox_items("alice")
+    with account_authority_scope("alice", new.account_generation):
+        assert [item.id for item in inbox.list_for_user("alice")[0]] == [fresh.id]
 
 
 def test_workspace_setting_write_rechecks_the_admin_under_its_lock(db_uri: str) -> None:
@@ -1329,3 +1382,35 @@ def test_workspace_setting_write_rechecks_the_admin_under_its_lock(db_uri: str) 
         with pytest.raises(OmnigentError, match="revoked"):
             settings.set_workspace_enabled(True, actor="admin", require_admin=True)
     assert settings.read("alice") == (False, True)
+
+
+def test_prompt_write_rechecks_the_admin_under_its_lock(db_uri: str) -> None:
+    """A deleted or demoted admin's in-flight prompt write cannot land."""
+    accounts = SqlAlchemyAccountStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    settings = ProactiveAgentSettingsStore(db_uri)
+    # A second admin, so deleting the first one below is allowed.
+    accounts.create_user_with_password("root", "test-password-hash")
+    permissions.set_admin("root", True)
+    admin = accounts.create_user_with_password("admin", "test-password-hash")
+    permissions.set_admin("admin", True)
+    with account_authority_scope("admin", admin.account_generation):
+        settings.set_prompt_override(
+            "Look for stale pull requests.", actor="admin", require_admin=True
+        )
+    assert settings.read_prompt_override() == "Look for stale pull requests."
+
+    # The route authorized the request while the actor was still an admin.
+    permissions.set_admin("admin", False)
+    with account_authority_scope("admin", admin.account_generation):
+        with pytest.raises(OmnigentError) as demoted:
+            settings.set_prompt_override("Post about anything.", actor="admin", require_admin=True)
+    assert demoted.value.code == ErrorCode.FORBIDDEN
+    assert settings.read_prompt_override() == "Look for stale pull requests."
+
+    permissions.set_admin("admin", True)
+    assert accounts.delete_user("admin") is True
+    with account_authority_scope("admin", admin.account_generation):
+        with pytest.raises(OmnigentError, match="revoked"):
+            settings.set_prompt_override(None, actor="admin", require_admin=True)
+    assert settings.read_prompt_override() == "Look for stale pull requests."

@@ -152,6 +152,7 @@ import {
 import { userColor, userInitials } from "@/lib/userBadge";
 import { cn } from "@/lib/utils";
 import { FileViewerContext } from "@/shell/FileViewerContext";
+import type { Conversation } from "@/hooks/useConversations";
 import { conversationDisplayLabel, getConversationAgentType } from "@/shell/sidebarNav";
 
 /** Optimistic verdicts keyed by elicitation id, mirroring the chat store's flip. */
@@ -264,14 +265,16 @@ export function InboxPage() {
     advisorAvailable &&
     (advisorSettings?.enabled === true ||
       (advisorSettings === undefined && storedFilter === "advisor"));
-  // Suggestions load only once the settings say the agent is on, so until they
-  // arrive the page is still assembling, and a failed first read is a failure
-  // to show. A failed refetch keeps the settings it had, and the cards with them.
+  // The tab lists the agent's own items, which the settings identify; until
+  // they arrive it is still assembling, and a failed first read is a failure
+  // to show there. A failed refetch keeps the settings it had.
   const advisorSettingsPending = advisorAvailable && advisorSettingsQuery.isPending;
   const advisorSettingsFailed =
     advisorAvailable && advisorSettingsQuery.isError && advisorSettings === undefined;
   const filter: InboxFilter = storedFilter === "advisor" && !advisorTab ? "all" : storedFilter;
   const advisorOnly = filter === "advisor";
+  const isAdvisorItem = (item: Suggestion) =>
+    advisorSettings !== undefined && item.agentId === advisorSettings.agent_id;
   // The Unread tab pages through unread suggestions only, so an older unread
   // one is reachable behind newer read ones.
   const proactiveInbox = useProactiveInbox(
@@ -400,8 +403,13 @@ export function InboxPage() {
     filter === "unread"
       ? Object.values(pinnedSuggestions).filter((item) => !listedSuggestionIds.has(item.id))
       : [];
+  const listedSuggestions = [...proactiveInbox.items, ...pinned];
   const visibleSuggestions =
-    showSuggestions && proactiveInbox.enabled ? [...proactiveInbox.items, ...pinned] : [];
+    showSuggestions && proactiveInbox.enabled
+      ? advisorOnly
+        ? listedSuggestions.filter(isAdvisorItem)
+        : listedSuggestions
+      : [];
   const visibleCount =
     visibleApprovals.length +
     visibleComments.length +
@@ -511,7 +519,7 @@ export function InboxPage() {
         snapshotQueries.some((q) => q.isLoading) ||
         commentInbox.isLoading)) ||
     (showUnread && automationInbox.isLoading) ||
-    (showSuggestions && (advisorSettingsPending || proactiveInbox.isLoading));
+    (showSuggestions && (proactiveInbox.isLoading || (advisorOnly && advisorSettingsPending)));
   const failedSnapshots = snapshotQueries.filter((q) => q.isError);
   const failedSessionCount = advisorOnly
     ? 0
@@ -578,6 +586,7 @@ export function InboxPage() {
     };
   };
 
+  const rowsById = new Map(allRows.map((row) => [row.id, row]));
   const renderEntry = (entry: InboxEntry) => {
     const expanded = expandedOverrides[entry.key] ?? entry.key === defaultExpandedKey;
     const onToggle = () => {
@@ -608,13 +617,18 @@ export function InboxPage() {
         // The user reviews and sends the prompt from the composer.
         navigate(newSessionLocation(action.prompt, []));
       };
+      const fromAdvisor = isAdvisorItem(item);
       return (
         <InboxCard
           key={entry.key}
           testId="inbox-suggestion"
           dataKind={item.kind}
           tile={<KindTile icon={LightbulbIcon} tone="gray" />}
-          kindLabel={`${PROACTIVE_AGENT_DISPLAY_NAME} · ${suggestionKindLabel(item.kind)}`}
+          kindLabel={
+            fromAdvisor
+              ? `${PROACTIVE_AGENT_DISPLAY_NAME} · ${suggestionKindLabel(item.kind)}`
+              : suggestionKindLabel(item.kind)
+          }
           title={item.title}
           preview={suggestionPreview(item.bodyMd)}
           at={entry.at}
@@ -629,6 +643,13 @@ export function InboxPage() {
           </FileViewerContext.Provider>
           <SuggestionMedia media={item.media} />
           <SuggestionLinks item={item} />
+          {/* Omni Advisor runs in hidden sessions; any other agent's session is the source. */}
+          {!fromAdvisor && (
+            <SuggestionOrigin
+              sessionId={item.sourceSessionId}
+              row={rowsById.get(item.sourceSessionId)}
+            />
+          )}
           <InboxActions>
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
@@ -1130,7 +1151,7 @@ export function InboxPage() {
         </div>
       )}
 
-      {showSuggestions && advisorSettingsFailed && (
+      {advisorOnly && advisorSettingsFailed && (
         <div role="alert" className="mb-4 flex items-center gap-2 text-ui text-destructive">
           Couldn’t load {PROACTIVE_AGENT_DISPLAY_NAME} settings, so its suggestions are not shown.
           <Button
@@ -1182,7 +1203,8 @@ export function InboxPage() {
       {!assembling &&
         failedSessionCount === 0 &&
         !(showUnread && automationInbox.isError) &&
-        !(showSuggestions && (advisorSettingsFailed || proactiveInbox.isError)) &&
+        !(advisorOnly && advisorSettingsFailed) &&
+        !(showSuggestions && proactiveInbox.isError) &&
         visibleCount === 0 && (
           <div className="flex flex-col items-center gap-2 py-16 text-center">
             <InboxIcon className="size-8 text-muted-foreground/50" />
@@ -1355,6 +1377,29 @@ function SessionLine({ title, detail }: { title: string; detail?: string }) {
   );
 }
 
+/** The session whose agent posted a suggestion, named when the sidebar has it loaded. */
+function SuggestionOrigin({ sessionId, row }: { sessionId: string; row?: Conversation }) {
+  const title = row ? conversationDisplayLabel(row) : undefined;
+  const agentLabel = row ? getConversationAgentType(row) : undefined;
+  return (
+    <p
+      className="flex items-center gap-1.5 text-sm text-muted-foreground"
+      data-testid="inbox-suggestion-origin"
+    >
+      <SquarePenIcon aria-hidden className="size-3 shrink-0" />
+      <span className="shrink-0">Posted from</span>
+      <Link
+        to={`/c/${encodeURIComponent(sessionId)}`}
+        componentId="inbox.suggestion.open_origin"
+        className="truncate underline underline-offset-2"
+      >
+        {title ?? "its session"}
+      </Link>
+      {agentLabel && agentLabel !== title && <span className="shrink-0">· {agentLabel}</span>}
+    </p>
+  );
+}
+
 /** What a suggestion is based on: sessions open here, other links in a new tab. */
 function SuggestionLinks({ item }: { item: Suggestion }) {
   const headingId = useId();
@@ -1432,7 +1477,8 @@ function LatestOutputPreview({ preview, fullText }: { preview: string; fullText?
       <HoverCardContent
         side="bottom"
         align="start"
-        className="max-h-[min(60vh,32rem)] w-[min(40rem,calc(100vw-2rem))] overflow-y-auto p-3"
+        collisionPadding={8}
+        className="max-h-[min(60vh,32rem,var(--radix-hover-card-content-available-height))] w-[min(40rem,calc(100vw-2rem))] overflow-y-auto p-3"
       >
         {/* No session is open here, so file paths stay plain text instead of
             resolving against whichever session the file viewer last showed. */}

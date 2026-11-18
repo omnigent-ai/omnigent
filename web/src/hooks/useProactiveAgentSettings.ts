@@ -14,6 +14,8 @@ export interface ProactiveAgentSettings {
   enabled: boolean;
   /** Whether the caller may change the workspace setting. */
   can_manage_workspace: boolean;
+  /** The agent's id, which its Inbox items carry. */
+  agent_id: string;
 }
 
 /** Which setting a change targets: the caller's own, or the workspace's. */
@@ -84,5 +86,72 @@ export function useSetProactiveAgentSetting() {
       // Turning it off hides the suggestions; turning it on shows them again.
       void queryClient.invalidateQueries({ queryKey: ["proactive-inbox"] });
     },
+  });
+}
+
+/** ``GET /v1/proactive-agent/prompt`` (admins). */
+export interface ProactiveAgentPrompt {
+  /** The admin's override, or the bundled prompt without one. */
+  prompt: string;
+  /** The bundled prompt, which a release can change. */
+  default_prompt: string;
+  overridden: boolean;
+}
+
+/** Result of ``POST /v1/proactive-agent/runs``. */
+export interface ProactiveAgentRuns {
+  started: { user_id: string; task_id: string; run_id: string | null }[];
+  skipped: {
+    user_id: string;
+    reason: "no_task" | "turned_off" | "already_running" | "unavailable";
+  }[];
+  truncated: boolean;
+}
+
+async function readBody<T>(res: Response): Promise<T> {
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body?.error?.message ?? `${res.status} ${res.statusText}`);
+  }
+  return (await res.json()) as T;
+}
+
+/** The agent's prompt, for an admin who manages the workspace setting. */
+export function useProactiveAgentPrompt(enabled: boolean) {
+  const queryKey = [...useSettingsKey(), "prompt"];
+  const queryClient = useQueryClient();
+  const query = useQuery({
+    queryKey,
+    enabled,
+    staleTime: 0,
+    queryFn: async () =>
+      readBody<ProactiveAgentPrompt>(await authenticatedFetch("/v1/proactive-agent/prompt")),
+  });
+  const save = useMutation({
+    /** ``null`` restores the bundled prompt. */
+    mutationFn: async (prompt: string | null) =>
+      readBody<ProactiveAgentPrompt>(
+        await authenticatedFetch("/v1/proactive-agent/prompt", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ prompt }),
+        }),
+      ),
+    onSuccess: (data) => queryClient.setQueryData(queryKey, data),
+  });
+  return { query, save };
+}
+
+/** Start users' proactive runs now: user ids, or ``["*"]`` for everyone with a task. */
+export function useRunProactiveAgent() {
+  return useMutation({
+    mutationFn: async (users: string[]) =>
+      readBody<ProactiveAgentRuns>(
+        await authenticatedFetch("/v1/proactive-agent/runs", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ users }),
+        }),
+      ),
   });
 }

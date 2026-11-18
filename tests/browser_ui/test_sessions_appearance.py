@@ -8,7 +8,7 @@ from collections.abc import Iterator
 from urllib.parse import parse_qs, urlparse
 
 import pytest
-from playwright.sync_api import Page, Request, expect
+from playwright.sync_api import Locator, Page, Request, expect
 
 from tests.browser_ui.conftest import BrowserContract
 
@@ -187,6 +187,101 @@ def test_custom_order_keeps_the_list_and_commits_on_drop(
     expect(rows).to_have_text(
         titles("New session", "Quiet session", "Busy session", "Recent session")
     )
+
+
+@pytest.mark.parametrize("in_project", [False, True], ids=["sessions", "project"])
+@pytest.mark.parametrize("show_harness", [False, True], ids=["titles-only", "harness-icons"])
+def test_family_chevron_keeps_top_level_rows_in_one_column(
+    page: Page,
+    appearance_url: str,
+    appearance_features: dict[str, bool],
+    browser_contract: BrowserContract,
+    in_project: bool,
+    show_harness: bool,
+) -> None:
+    """A family's chevron sits left of the row, so only its members are indented."""
+    project = "Example project"
+    if show_harness:
+        appearance_features["sidebar_grouping_ui"] = True
+        page.add_init_script(
+            "localStorage.setItem('omnigent:sidebar-view', JSON.stringify("
+            "{grouping: 'default', ordering: 'updated', show: ['harness']}))"
+        )
+
+    def session(index: int, title: str, family: dict | None = None) -> dict:
+        return {
+            "id": f"{index:032x}",
+            "object": "conversation",
+            "title": title,
+            "created_at": 100 - index,
+            "updated_at": 100 - index,
+            "status": "idle",
+            "labels": {"omni_project": project} if in_project else {},
+            "permission_level": None,
+            "family": family,
+        }
+
+    family = {"id": "family", "representative_id": f"{2:032x}", "pinned": False}
+    rows = [
+        session(1, "Plain before"),
+        session(2, "Lead", family),
+        session(3, "Member", family),
+        session(4, "Plain after"),
+    ]
+
+    def session_list(request: Request) -> dict:
+        params = parse_qs(urlparse(request.url).query)
+        listed = [] if "pinned" in params or ("project" in params) != in_project else rows
+        return {
+            "object": "list",
+            "data": listed,
+            "has_more": False,
+            "first_id": listed[0]["id"] if listed else None,
+            "last_id": listed[-1]["id"] if listed else None,
+        }
+
+    browser_contract.json("/v1/sessions", session_list)
+    browser_contract.json("/v1/sessions/projects", [{"id": None, "name": project}])
+    page.goto(appearance_url)
+    if in_project:
+        page.get_by_role("button", name=re.compile(rf"^{project}")).click()
+    plain_before, lead, member, plain_after = (
+        page.locator(f"li[data-sidebar-session-id='{row['id']}']") for row in rows
+    )
+    expect(member.get_by_role("link")).to_be_visible()
+
+    def left(locator: Locator) -> float:
+        box = locator.bounding_box()
+        assert box
+        return box["x"]
+
+    def content_left(row: Locator, title: str) -> float:
+        if show_harness:
+            return left(row.get_by_test_id("session-row-harness"))
+        return left(row.get_by_text(title, exact=True))
+
+    column = content_left(plain_before, "Plain before")
+    assert content_left(lead, "Lead") == column
+    assert content_left(plain_after, "Plain after") == column
+    assert content_left(member, "Member") >= column + 16
+
+    chevron = lead.get_by_role("button", name="Collapse session family")
+    chevron_box = chevron.bounding_box()
+    nav_box = lead.locator("xpath=ancestor::nav[1]").bounding_box()
+    assert chevron_box and nav_box
+    assert chevron_box["x"] + chevron_box["width"] <= left(lead.get_by_role("link"))
+    assert chevron_box["x"] >= nav_box["x"]
+    chevron.click()
+    expect(member).to_have_count(0)
+    expand = lead.get_by_role("button", name="Expand session family")
+    expect(expand).to_be_visible()
+    assert content_left(lead, "Lead") == column
+    assert content_left(plain_after, "Plain after") == column
+
+    expand.click()
+    expect(member.get_by_role("link")).to_be_visible()
+    assert content_left(lead, "Lead") == column
+    assert content_left(member, "Member") >= column + 16
 
 
 @pytest.fixture

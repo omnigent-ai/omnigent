@@ -17,6 +17,7 @@ from omnigent.errors import OmnigentError
 from omnigent.runner.tool_dispatch import _execute_agent_tool
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_OWNER, LEVEL_READ, UnifiedAuthProvider
 from omnigent.server.bundles import copy_agent_bundle, redacted_agent_bundle, validate_agent_bundle
+from omnigent.server.routes.sessions import routes_agent
 from omnigent.server.routes.sessions.routes_agent import register_agent_routes
 from omnigent.server.routes.sessions.routes_core import register_core_routes
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
@@ -53,8 +54,11 @@ def _source_bundle(
 
 
 @pytest.mark.parametrize("level", [LEVEL_READ, LEVEL_EDIT, LEVEL_OWNER])
-def test_read_only_agent_bundle_is_redacted(tmp_path: Path, level: int) -> None:
+def test_read_only_agent_bundle_is_redacted(
+    tmp_path: Path, level: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """READ gets a redacted bundle; EDIT and above get the original."""
+    monkeypatch.setattr(routes_agent, "local_single_user_enabled", lambda: False)
     uri = f"sqlite:///{tmp_path / 'agent-bundle.db'}"
     conversations = SqlAlchemyConversationStore(uri)
     permissions = SqlAlchemyPermissionStore(uri)
@@ -77,6 +81,7 @@ def test_read_only_agent_bundle_is_redacted(tmp_path: Path, level: int) -> None:
         permission_store=permissions,
     )
     app = FastAPI()
+    app.state.policy_modules = ["example_org.policies.gate"]
 
     @app.exception_handler(OmnigentError)
     async def handle_error(request: Request, error: OmnigentError) -> JSONResponse:
@@ -88,6 +93,11 @@ def test_read_only_agent_bundle_is_redacted(tmp_path: Path, level: int) -> None:
             response = client.get(f"/v1/sessions/{conversation.id}/agent/contents")
         assert response.status_code == 200, response.text
         assert response.headers["cache-control"] == "no-store"
+        # The runner takes handler authority from these headers.
+        assert json.loads(response.headers["x-omnigent-policy-modules"]) == [
+            "example_org.policies.gate"
+        ]
+        assert response.headers["x-omnigent-local-single-user"] == "0"
         if level == LEVEL_READ:
             assert response.headers["x-agent-bundle-redacted"] == "true"
             assert secret.encode() not in response.content

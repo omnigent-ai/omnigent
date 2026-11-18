@@ -3,9 +3,11 @@ The input-box reclaim never presses Escape on a dialog that Escape would quit.
 
 On Claude Code 2.1.299, Escape on the startup "Settings Error" dialog exits
 with status 1 and on the folder-trust question with status 0, although both
-advertise "Esc to cancel". A web message that arrived while one was up used
-to send that Escape and kill the session's Claude Code. The panes below are
-those dialogs as Claude Code 2.1.299 draws them, with a generic path.
+advertise "Esc to cancel". Claude Code 2.1.326 adds an added-directory trust
+question for ``--add-dir`` whose Escape also exits with status 1. A web message
+that arrived while one was up used to send that Escape and kill the session's
+Claude Code. The panes below are those dialogs as Claude Code draws them, with
+a generic path.
 """
 
 from __future__ import annotations
@@ -45,6 +47,20 @@ _FOLDER_TRUST = f"""\
  Security guide
  ❯ No, exit
    Yes, I trust this folder
+ Enter to confirm · Esc to cancel
+"""
+_ADDED_DIRECTORY_TRUST = f"""\
+{_RULE}
+ Adding a new directory:
+ /tmp/omnigent-1000/claude-native/0123456789abcdef0123456789abcdef/agent-skills
+ This session hasn't worked here before. Is this a directory you created or one you trust?
+ Claude Code'll be able to read, edit, and execute files here. Its skills, commands, and agents
+ load and can run commands, and so can the git settings of its repository. Your answer holds for
+ this session. Starting Claude Code in this directory and trusting it there lasts, and covers its
+ whole repository or everything below it.
+ Security guide
+ ❯ No, exit
+   Yes, add it
  Enter to confirm · Esc to cancel
 """
 _SETTINGS_WARNING = f"""\
@@ -97,7 +113,9 @@ def _show(monkeypatch: pytest.MonkeyPatch, pane: str) -> list[tuple[str, ...]]:
 
 
 @pytest.mark.parametrize(
-    "pane", [_SETTINGS_ERROR, _FOLDER_TRUST], ids=["settings-error", "folder-trust"]
+    "pane",
+    [_SETTINGS_ERROR, _FOLDER_TRUST, _ADDED_DIRECTORY_TRUST],
+    ids=["settings-error", "folder-trust", "added-directory-trust"],
 )
 def test_the_reclaim_leaves_a_dialog_escape_would_quit(
     bridge_dir: Path, monkeypatch: pytest.MonkeyPatch, pane: str
@@ -127,7 +145,9 @@ def test_a_settings_warning_is_still_dismissed(
 
 
 @pytest.mark.parametrize(
-    "pane", [_SETTINGS_ERROR, _FOLDER_TRUST], ids=["settings-error", "folder-trust"]
+    "pane",
+    [_SETTINGS_ERROR, _FOLDER_TRUST, _ADDED_DIRECTORY_TRUST],
+    ids=["settings-error", "folder-trust", "added-directory-trust"],
 )
 def test_a_message_behind_such_a_dialog_is_reported_not_escaped(
     bridge_dir: Path, monkeypatch: pytest.MonkeyPatch, pane: str
@@ -162,8 +182,14 @@ def test_a_settings_command_behind_such_a_dialog_is_refused_without_a_key(
 
 @pytest.mark.parametrize(
     ("pane", "expected"),
-    [(_SETTINGS_ERROR, True), (_FOLDER_TRUST, True), (_SETTINGS_WARNING, False), ("", False)],
-    ids=["settings-error", "folder-trust", "settings-warning", "empty"],
+    [
+        (_SETTINGS_ERROR, True),
+        (_FOLDER_TRUST, True),
+        (_ADDED_DIRECTORY_TRUST, True),
+        (_SETTINGS_WARNING, False),
+        ("", False),
+    ],
+    ids=["settings-error", "folder-trust", "added-directory-trust", "settings-warning", "empty"],
 )
 def test_escape_quits_claude(pane: str, expected: bool) -> None:
     assert claude_native_bridge._escape_quits_claude(pane) is expected

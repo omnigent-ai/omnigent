@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { PageScroll } from "@/components/PageScroll";
+import { ProactiveAgentAdminControls } from "@/components/ProactiveAgentAdminControls";
 import { ProactiveAgentSettingControl } from "@/components/ProactiveAgentSettingControl";
 import { SettingsGroup } from "@/components/SettingsGroup";
 import {
@@ -87,6 +88,9 @@ export function AdminGeneralPage() {
               testId="settings-group-admin-proactive-agent"
             >
               <ProactiveAgentSettingControl scope="workspace" />
+              <div className="mt-4 border-t border-border pt-4">
+                <ProactiveAgentAdminControls />
+              </div>
             </SettingsGroup>
           )}
           {nestedAgentsEnabled && sharing && (

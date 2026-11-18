@@ -35,6 +35,27 @@ export interface WorkflowRun {
   steps: JournalPlanStep[];
   /** Each of those steps' newest status entry. */
   statuses: JournalEntry[];
+  /** The saved workflow the run follows; absent on older servers. */
+  workflowId?: string;
+  /** The session that started the run, when another session did and you can read it. */
+  startedBy?: WorkflowRunStarter;
+  /** Its workflow's name when the workflow is yours; `null` for someone else's or a deleted one. */
+  workflowName?: string | null;
+  /** The first page of the workflow runs below this one, each right after the run that started it. */
+  descendantRuns?: WorkflowRun[];
+  /** How many workflow runs are below this one, on every page. */
+  descendantRunCount?: number;
+  /** Continues `descendantRuns`; `null` when they are all here. */
+  descendantRunsCursor?: string | null;
+  /** Whether any run below this one, on any page, is working or waiting for input. */
+  descendantRunsActive?: boolean;
+}
+
+/** The session that started a workflow run. */
+export interface WorkflowRunStarter {
+  sessionId: string;
+  /** Its title; empty when it has none yet. */
+  title: string;
 }
 
 /** The session's turn, delegated work, or work left running between turns. */

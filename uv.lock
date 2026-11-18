@@ -3372,6 +3372,7 @@ cwsandbox = [
     { name = "cwsandbox" },
 ]
 databricks = [
+    { name = "connectrpc" },
     { name = "databricks-ai-bridge" },
     { name = "databricks-mcp" },
     { name = "databricks-sdk", extra = ["sandbox"] },
@@ -3553,6 +3554,7 @@ requires-dist = [
     { name = "nimble-python", marker = "extra == 'nimble'", specifier = ">=1.2.0,<2" },
     { name = "numpy", marker = "extra == 'dictation'", specifier = ">=1.24,<3" },
     { name = "omnigent", extras = ["postgres"], marker = "extra == 'databricks'" },
+    { name = "omnigent", extras = ["workspace-api"], marker = "extra == 'databricks'" },
     { name = "omnigent-client", editable = "sdks/python-client" },
     { name = "omnigent-slack", marker = "extra == 'slack'", editable = "integrations/slack" },
     { name = "omnigent-ui-sdk", editable = "sdks/ui" },
