@@ -180,6 +180,10 @@ def _process_peak_rss_kb() -> int | None:
 
 _TEST_RSS_RECORDS: list[tuple[str, int]] = []
 
+# Keep diagnostics independent of process-wide clock and file mocks in tests.
+_PROGRESS_CLOCK = time.time
+_PROGRESS_OPEN = open
+
 
 def _progress_worker_id(worker: str) -> str:
     """Keep worker metadata to xdist's bounded local-worker identifiers."""
@@ -206,7 +210,7 @@ def _write_progress_event(
     """Append ``<timestamp>\\t<event>\\t<nodeid>[\\t<rss_kb>]\\n`` and fsync."""
     if _PROGRESS_LOG_PATH is None:
         return
-    line = f"{time.time():.3f}\t{event}\t{nodeid}"
+    line = f"{_PROGRESS_CLOCK():.3f}\t{event}\t{nodeid}"
     if rss_kb is not None:
         line += f"\t{rss_kb}"
     if phase is not None:
@@ -215,7 +219,7 @@ def _write_progress_event(
     if error_present is not None:
         line += f"\terror_present={int(error_present)}"
     line += "\n"
-    with open(_PROGRESS_LOG_PATH, "a") as f:
+    with _PROGRESS_OPEN(_PROGRESS_LOG_PATH, "a") as f:
         f.write(line)
         f.flush()
         os.fsync(f.fileno())
