@@ -172,6 +172,10 @@ _logger = logging.getLogger(__name__)
 
 # Concurrent re-keys a leaving session follows before giving up.
 _FAMILY_LEAVE_ATTEMPTS = 5
+# Exclusive upper bound of the family pin label keys, for a primary-key range delete.
+_FAMILY_PIN_LABEL_PREFIX_END = FAMILY_PIN_LABEL_PREFIX[:-1] + chr(
+    ord(FAMILY_PIN_LABEL_PREFIX[-1]) + 1
+)
 
 
 class _FamilyFullError(OmnigentError):
@@ -1995,6 +1999,11 @@ class SqlAlchemyConversationStore(ConversationStore):
         return families
 
     def add_new_sibling(self, source_id: str, session_id: str, *, user_id: str | None) -> None:
+        self._add_new_sibling(source_id, session_id, user_id=user_id, reclaim_archived=True)
+
+    def _add_new_sibling(
+        self, source_id: str, session_id: str, *, user_id: str | None, reclaim_archived: bool
+    ) -> None:
         source = self.get_conversation(source_id)
         if source is None:
             raise ConversationNotFoundError(source_id)
@@ -2097,9 +2106,11 @@ class SqlAlchemyConversationStore(ConversationStore):
             run_write_transaction(self._session_immediate, "create_sibling_membership", write)
         except _FamilyFullError:
             # Archives whose deferred leave never ran (a restart in the Undo window) hold slots.
-            if not self._leave_overdue_archived_members(family_id):
+            if not reclaim_archived or not self._leave_overdue_archived_members(family_id):
                 raise
-            run_write_transaction(self._session_immediate, "create_sibling_membership", write)
+            # A reclaimed key session re-keys the family, so start again from a fresh read.
+            self._add_new_sibling(source_id, session_id, user_id=user_id, reclaim_archived=False)
+            return
         if self._conv_engine is not self._engine:
             # Commit membership before moving pins in a separate database.
             def finish_labels(session: Session) -> None:
@@ -2130,15 +2141,19 @@ class SqlAlchemyConversationStore(ConversationStore):
         """Detach archived members past their family leave; ``True`` if any left."""
         now = now_epoch()
         overdue = [
-            member.id
+            member
             for member in self.get_session_families([family_id]).get(family_id, [])
             if archived_family_leave_is_due(member, now)
         ]
-        for member_id in overdue:
-            self.leave_session_family(member_id)
+        for member in overdue:
+            self.leave_session_family(
+                member.id, archive_generation=member.labels.get(ARCHIVED_AT_LABEL_KEY, "")
+            )
         return bool(overdue)
 
-    def leave_session_family(self, session_id: str) -> None:
+    def leave_session_family(
+        self, session_id: str, *, archive_generation: str | None = None
+    ) -> None:
         """
         Remove a session from its sibling family, freeing its family slot.
 
@@ -2148,6 +2163,10 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         :param session_id: The leaving session, e.g. ``"9f2c..."``; a session
             without a family is left unchanged.
+        :param archive_generation: The archive that authorized the leave: its
+            ``ARCHIVED_AT_LABEL_KEY`` value, ``""`` when it has none. The session
+            leaves only while that archive is still current, so an unarchive and
+            a newer archive keep their own Undo window. ``None`` leaves unconditionally.
         """
         meta = self._get_meta(session_id)
         family_id = meta.family_id if meta is not None else None
@@ -2167,6 +2186,10 @@ class SqlAlchemyConversationStore(ConversationStore):
                 if current.family_id != locked_family_id:
                     # Another leave re-keyed the family before this lock; follow it.
                     return current.family_id
+                if archive_generation is not None and not self._archive_is_current(
+                    session, session_id, archive_generation
+                ):
+                    return None
                 remaining = [
                     member
                     for member in self._family_member_ids(session, locked_family_id)
@@ -2194,15 +2217,32 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         # Membership commits first, so a failed label cleanup never leaves a member unpinned.
         def clear_pins(session: Session) -> None:
+            # A primary-key range, so only this session's family pin rows are examined.
             session.execute(
                 delete(SqlConversationLabel).where(
                     SqlConversationLabel.workspace_id == current_workspace_id(),
                     SqlConversationLabel.conversation_id == session_id,
-                    SqlConversationLabel.key.startswith(FAMILY_PIN_LABEL_PREFIX, autoescape=True),
+                    SqlConversationLabel.key >= FAMILY_PIN_LABEL_PREFIX,
+                    SqlConversationLabel.key < _FAMILY_PIN_LABEL_PREFIX_END,
                 )
             )
 
         run_write_transaction(self._conv_session_immediate, "clear_family_pins", clear_pins)
+
+    def _archive_is_current(self, session: Session, session_id: str, generation: str) -> bool:
+        """Lock *session_id*'s row and check it is still in the archive *generation* names."""
+        with self._profile_label_session(session) as labels_session:
+            row = labels_session.get(
+                SqlConversation, (current_workspace_id(), session_id), with_for_update=True
+            )
+            label = labels_session.get(
+                SqlConversationLabel, (current_workspace_id(), session_id, ARCHIVED_AT_LABEL_KEY)
+            )
+            return (
+                row is not None
+                and bool(row.archived)
+                and (label.value if label is not None else "") == generation
+            )
 
     def archive_if_idle(self, conversation_id: str, idle_before: int) -> bool:
         """

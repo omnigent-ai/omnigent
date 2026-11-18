@@ -10531,18 +10531,36 @@ def test_archived_sibling_leaves_its_family_after_the_undo_window(
         follow_up.id,
     ]
 
-    # A full family reclaims an archive whose leave never ran, but not one still in its window.
-    anchor = members[1].id
+    # A full family reclaims an archive whose leave never ran, but not one still in its window,
+    # including the session that keys the family, reclaimed from another active member.
+    key_session, anchor = members[1].id, members[2].id
+    assert store.get_conversation(anchor).family_id == key_session
     for _ in range(MAX_SESSION_FAMILY_MEMBERS - len(remaining)):
         store.add_new_sibling(anchor, store.create_conversation().id, user_id="alice")
-    store.update_conversation(members[2].id, archived=True)
+    store.update_conversation(key_session, archived=True)
     with pytest.raises(OmnigentError, match=f"up to {MAX_SESSION_FAMILY_MEMBERS}"):
         store.add_new_sibling(anchor, store.create_conversation().id, user_id="alice")
     overdue = int(time.time()) - ARCHIVED_FAMILY_LEAVE_AFTER_S - 1
-    store.set_labels(members[2].id, {ARCHIVED_AT_LABEL_KEY: str(overdue)})
+    store.set_labels(key_session, {ARCHIVED_AT_LABEL_KEY: str(overdue)})
     store.add_new_sibling(anchor, store.create_conversation().id, user_id="alice")
-    assert store.get_conversation(members[2].id).family_id is None
+    assert store.get_conversation(key_session).family_id is None
+    assert store.get_conversation(anchor).family_id != key_session
     assert len(store.get_session_family(anchor)) == MAX_SESSION_FAMILY_MEMBERS
+
+    # A leave authorized by an older archive never detaches a newer one inside its window.
+    rearchived = remaining[-1].id
+    store.update_conversation(rearchived, archived=True)
+    old_generation = store.get_conversation(rearchived).labels[ARCHIVED_AT_LABEL_KEY]
+    store.update_conversation(rearchived, archived=False)
+    store.leave_session_family(rearchived, archive_generation=old_generation)
+    assert store.get_conversation(rearchived).family_id is not None
+    store.update_conversation(rearchived, archived=True)
+    store.set_labels(rearchived, {ARCHIVED_AT_LABEL_KEY: str(int(old_generation) + 1)})
+    store.leave_session_family(rearchived, archive_generation=old_generation)
+    assert store.get_conversation(rearchived).family_id is not None
+    current_generation = store.get_conversation(rearchived).labels[ARCHIVED_AT_LABEL_KEY]
+    store.leave_session_family(rearchived, archive_generation=current_generation)
+    assert store.get_conversation(rearchived).family_id is None
 
 
 def test_family_leave_follows_a_concurrent_rekey_and_idle_archive_is_conditional(

@@ -65,6 +65,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import logging
 import time
 import uuid
@@ -164,6 +165,7 @@ from omnigent.server.session_mcp_selection import (
     session_mcp_label_keys,
 )
 from omnigent.stores.conversation_store import (
+    ARCHIVED_AT_LABEL_KEY,
     CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
     SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY,
     SCHEDULED_TASK_LAUNCH_LABEL_KEY,
@@ -1156,7 +1158,13 @@ async def archive_idle_launched_sessions(
             if member.archived:
                 # An archive whose deferred family leave never ran still holds a slot.
                 if archived_family_leave_is_due(member, int(time.time())):
-                    await asyncio.to_thread(store.leave_session_family, member.id)
+                    await asyncio.to_thread(
+                        functools.partial(
+                            store.leave_session_family,
+                            member.id,
+                            archive_generation=member.labels.get(ARCHIVED_AT_LABEL_KEY, ""),
+                        )
+                    )
                 continue
             if (
                 member.updated_at > cutoff

@@ -1598,7 +1598,9 @@ class ConversationStore(ABC):
         """Assign a freshly created session to its source's family before launch."""
         raise NotImplementedError
 
-    def leave_session_family(self, session_id: str) -> None:
+    def leave_session_family(
+        self, session_id: str, *, archive_generation: str | None = None
+    ) -> None:
         """Remove a session from its sibling family; archive teardown calls this."""
         raise NotImplementedError
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import hashlib
 import json
 import math
@@ -442,6 +443,7 @@ from omnigent.spec.types import (
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import (
+    ARCHIVED_AT_LABEL_KEY,
     CREATED_BY_SESSION_LABEL_KEY,
     PINNED_LABEL_KEY,
     RUNNER_LIVENESS_TTL_S,
@@ -1057,7 +1059,13 @@ async def _archive_stop(
         return
     # Past the Undo window an archived session leaves its family, freeing its slot.
     try:
-        await asyncio.to_thread(conversation_store.leave_session_family, session_id)
+        await asyncio.to_thread(
+            functools.partial(
+                conversation_store.leave_session_family,
+                session_id,
+                archive_generation=conv.labels.get(ARCHIVED_AT_LABEL_KEY, ""),
+            )
+        )
     except Exception:  # noqa: BLE001
         _logger.warning(
             "Archived session %s could not leave its family; a later repair detaches it",
