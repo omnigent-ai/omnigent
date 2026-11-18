@@ -8,6 +8,7 @@ from typing import Any
 from unittest.mock import patch
 
 import httpx
+import pytest
 import respx
 from click.testing import CliRunner
 
@@ -263,3 +264,79 @@ def test_session_export_pagination(tmp_path: Path) -> None:
     item_records = [r for r in records if r["record_type"] == "item"]
     assert len(item_records) == 2
     assert [r["id"] for r in item_records] == ["msg_1", "msg_2"]
+
+
+_SHELL_ITEMS_PAGE = {
+    "data": [
+        *_ITEMS_PAGE["data"],
+        {
+            "id": "fc_1",
+            "type": "function_call",
+            "status": "completed",
+            "response_id": "resp_1",
+            "model": "my-agent",
+            "name": "sys_os_shell",
+            "arguments": json.dumps({"command": "ls"}),
+            "call_id": "call_1",
+        },
+        {
+            "id": "fco_1",
+            "type": "function_call_output",
+            "status": "completed",
+            "response_id": "resp_1",
+            "call_id": "call_1",
+            "output": json.dumps({"stdout": "data.csv\n", "stderr": "", "exit_code": 0}),
+        },
+    ],
+    "first_id": "msg_1",
+    "last_id": "fco_1",
+    "has_more": False,
+}
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    ("flags", "outputs"),
+    [
+        ([], [{"output_type": "stream", "name": "stdout", "text": "data.csv\n"}]),
+        (["--no-outputs"], []),
+    ],
+    ids=["with-outputs", "no-outputs"],
+)
+def test_session_export_writes_a_notebook(
+    tmp_path: Path, flags: list[str], outputs: list[dict[str, str]]
+) -> None:
+    """``--format ipynb`` writes a notebook named <session_id>.ipynb by default."""
+    session = {**_SESSION_META, "agent_name": "my-agent", "llm_model": "databricks-gpt-5-5"}
+    respx.get(f"{_BASE}/v1/sessions/conv_abc123").mock(
+        return_value=httpx.Response(200, json=session)
+    )
+    respx.get(f"{_BASE}/v1/sessions/conv_abc123/items").mock(
+        return_value=httpx.Response(200, json=_SHELL_ITEMS_PAGE)
+    )
+
+    runner = CliRunner()
+    with runner.isolated_filesystem(temp_dir=tmp_path), _patch_server():
+        result = runner.invoke(
+            cli, ["session", "export", "--id", "conv_abc123", "--format", "ipynb", *flags]
+        )
+        assert result.exit_code == 0, result.output
+        notebook = json.loads(Path("conv_abc123.ipynb").read_text())
+
+    assert "Exported 4 item(s) from conv_abc123 to conv_abc123.ipynb" in result.output
+    assert (notebook["nbformat"], notebook["nbformat_minor"]) == (4, 5)
+    header = notebook["cells"][0]["source"].splitlines()
+    assert header[0] == "# test session"
+    assert "- **Agent:** my-agent" in header
+    assert "- **Model:** databricks-gpt-5-5" in header
+    assert f"- **Link:** {_BASE}/c/conv_abc123" in header
+    sources = [cell["source"] for cell in notebook["cells"][1:4]]
+    assert sources == ["**User**\n\nhello", "**Assistant**\n\nhi there", "%%bash\nls"]
+    assert notebook["cells"][3]["outputs"] == outputs
+
+
+def test_session_export_refuses_no_outputs_for_a_transcript() -> None:
+    """``--no-outputs`` only shapes a notebook, so a JSONL export rejects it."""
+    result = CliRunner().invoke(cli, ["session", "export", "--id", "conv_abc123", "--no-outputs"])
+    assert result.exit_code == 2
+    assert "--no-outputs applies only to --format ipynb." in result.output

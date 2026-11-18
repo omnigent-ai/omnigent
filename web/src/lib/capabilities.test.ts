@@ -179,14 +179,13 @@ describe("resolveServerInfo sandbox_providers", () => {
     });
   });
 
-  it.each([undefined, false, "true", true])(
-    "requires an explicit durable-input capability (%s)",
-    async (value) => {
-      expect((await probe({ durable_initial_input: value })).durable_initial_input).toBe(
-        value === true,
-      );
-    },
-  );
+  it.each(
+    (["durable_initial_input", "session_notebook_export"] as const).flatMap((flag) =>
+      [undefined, false, "true", true].map((value) => [flag, value] as const),
+    ),
+  )("requires an explicit %s capability (%s)", async (flag, value) => {
+    expect((await probe({ [flag]: value }))[flag]).toBe(value === true);
+  });
 
   it.each([undefined, null, "", "manage", 2, true])(
     "defaults an absent or invalid public ceiling %s to Read",

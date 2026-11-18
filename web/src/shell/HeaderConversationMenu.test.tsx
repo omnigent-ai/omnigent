@@ -36,6 +36,7 @@ const mocks = vi.hoisted(() => ({
   markUnread: vi.fn(),
   fork: vi.fn(),
   exportTranscript: vi.fn(),
+  exportNotebook: vi.fn(),
   triggerDownload: vi.fn(),
   toastError: vi.fn(),
 }));
@@ -82,7 +83,11 @@ vi.mock("@/hooks/useUnseenConversations", async (importOriginal) => {
 
 vi.mock("@/lib/sessionsApi", async (importOriginal) => {
   const actual = await importOriginal<typeof SessionsApiModule>();
-  return { ...actual, exportSessionTranscript: mocks.exportTranscript };
+  return {
+    ...actual,
+    exportSessionTranscript: mocks.exportTranscript,
+    exportSessionNotebook: mocks.exportNotebook,
+  };
 });
 
 vi.mock("@/hooks/useFileContent", async (importOriginal) => {
@@ -125,6 +130,8 @@ function menuTree(
   // A QueryClientProvider is required: the menu reads useQueryClient() to hand
   // the post-archive Undo toast a client for unarchiving.
   queryClient = new QueryClient(),
+  // An older server doesn't advertise notebook export.
+  notebookExport = true,
 ) {
   return (
     <QueryClientProvider client={queryClient}>
@@ -132,6 +139,7 @@ function menuTree(
         info={{
           ...FALLBACK_SERVER_INFO,
           archive_worktree_cleanup: true,
+          session_notebook_export: notebookExport,
           ...(capability === "missing" ? {} : { sibling_sessions: capability }),
         }}
       >
@@ -226,6 +234,7 @@ describe("HeaderConversationMenu", () => {
       "Share",
       "Fork",
       "Export",
+      "Export as notebook (.ipynb)",
       "Rename",
       "Mark as unread",
       "Add to project",
@@ -355,15 +364,47 @@ describe("HeaderConversationMenu", () => {
     expect(mocks.toastError).not.toHaveBeenCalled();
   });
 
-  it("surfaces an export failure as a toast and downloads nothing", async () => {
-    mocks.exportTranscript.mockRejectedValueOnce(new Error("boom"));
+  it.each([
+    ["Export", () => mocks.exportTranscript, "Export failed"],
+    ["Export as notebook (.ipynb)", () => mocks.exportNotebook, "Notebook export failed"],
+  ] as const)(
+    "surfaces a failed %s as a toast and downloads nothing",
+    async (item, exporter, message) => {
+      exporter().mockRejectedValueOnce(new Error("boom"));
+      renderMenu();
+      openMenu();
+
+      fireEvent.click(screen.getByRole("menuitem", { name: item }));
+
+      await waitFor(() => expect(mocks.toastError).toHaveBeenCalledWith(message));
+      expect(mocks.triggerDownload).not.toHaveBeenCalled();
+    },
+  );
+
+  it("downloads the session as <session-id>.ipynb from Export as notebook", async () => {
+    const notebook = new Blob(['{"nbformat":4}'], { type: "application/x-ipynb+json" });
+    mocks.exportNotebook.mockResolvedValueOnce(notebook);
     renderMenu();
     openMenu();
 
-    fireEvent.click(screen.getByRole("menuitem", { name: "Export" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Export as notebook (.ipynb)" }));
 
-    await waitFor(() => expect(mocks.toastError).toHaveBeenCalledWith("Export failed"));
-    expect(mocks.triggerDownload).not.toHaveBeenCalled();
+    await waitFor(() =>
+      expect(mocks.triggerDownload).toHaveBeenCalledWith(notebook, "conv-1.ipynb"),
+    );
+    expect(mocks.exportNotebook).toHaveBeenCalledWith(
+      "conv-1",
+      `${window.location.origin}/c/conv-1`,
+    );
+    expect(mocks.toastError).not.toHaveBeenCalled();
+  });
+
+  it("leaves Export as notebook out against a server that can't export notebooks", () => {
+    render(menuTree({}, true, undefined, false));
+    openMenu();
+
+    expect(screen.getByRole("menuitem", { name: "Export" })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: /notebook/i })).not.toBeInTheDocument();
   });
 
   it("opens a full-history fork from the session menu", () => {
@@ -668,6 +709,7 @@ describe("HeaderConversationMenu", () => {
       "Share",
       "Fork",
       "Export",
+      "Export as notebook (.ipynb)",
       "Rename",
       "Mark as unread",
       "Add to project",
@@ -693,6 +735,7 @@ describe("HeaderConversationMenu", () => {
       "Share",
       "Fork",
       "Export",
+      "Export as notebook (.ipynb)",
       "Rename",
       "Mark as unread",
       "Add to project",

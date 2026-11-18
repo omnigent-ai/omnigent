@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Awaitable, Callable
 
 from fastapi import (
@@ -10,10 +11,12 @@ from fastapi import (
     Query,
     Request,
 )
+from fastapi.responses import Response
 
 from omnigent.entities import Conversation
 from omnigent.entities.conversation import ITEM_TYPE_TO_DATA_CLS
 from omnigent.errors import StaleCursorError
+from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
@@ -51,6 +54,7 @@ from omnigent.server.routes._sessions.helpers import SessionLiveness
 from omnigent.server.routes._sessions.orchestration import (
     _agent_costs,
     _child_session_summaries_from_conversations,
+    _get_session_snapshot,
     _settle_orphaned_running_rows,
 )
 from omnigent.server.schemas import (
@@ -76,6 +80,12 @@ _SPAWN_TREE_READ_CAP = 2000
 _ITEM_TYPE_PATTERN = f"^({'|'.join(ITEM_TYPE_TO_DATA_CLS)})$"
 
 
+#: Most items a notebook export reads; a longer session's notebook says it stops early.
+_MAX_EXPORT_ITEMS = 20_000
+#: Items a notebook export reads per store page.
+_EXPORT_PAGE_SIZE = 1000
+
+
 def _is_settle_candidate(conv: Conversation) -> bool:
     """Whether a read would consider *conv* for settling, before any owner check.
 
@@ -96,6 +106,7 @@ def register_items_routes(
     *,
     conversation_store: ConversationStore,
     agent_store: AgentStore,
+    agent_cache: AgentCache | None = None,
     auth_provider: AuthProvider | None = None,
     permission_store: PermissionStore | None = None,
     liveness_lookup: Callable[[list[str]], dict[str, SessionLiveness]] | None = None,
@@ -230,6 +241,119 @@ def register_items_routes(
             last_id=page.last_id,
             has_more=page.has_more,
         )
+
+    # ── GET /sessions/{session_id}/export ────────────────────────
+
+    @router.get(
+        "/sessions/{session_id}/export",
+        response_model=None,
+        response_class=Response,
+        responses={
+            200: {
+                "description": "The notebook as an attachment.",
+                "content": {"application/x-ipynb+json": {"schema": {"type": "object"}}},
+            }
+        },
+    )
+    async def export_session(
+        request: Request,
+        session_id: str,
+        export_format: str = Query(
+            alias="format",
+            pattern="^ipynb$",
+            description='The export format; only `"ipynb"` today.',
+        ),
+        outputs: bool = Query(default=True),
+        link: str | None = Query(
+            default=None,
+            max_length=2048,
+            pattern=r"^https?://\S+$",
+            description="The session's shareable URL, shown in the notebook's header.",
+        ),
+    ) -> Response:
+        """
+        Download a session as a Jupyter notebook.
+
+        Messages become Markdown cells and what the agent ran becomes code
+        cells (see :mod:`omnigent.session_notebook`). Reads at most 20,000
+        items; the notebook says when the session has more.
+
+        :param session_id: Session to export, e.g. ``"conv_abc123"``.
+        :param outputs: Whether code cells keep the outputs the agent saw.
+        :param link: The session's shareable URL, e.g.
+            ``"https://omnigent.example/c/conv_abc123"``; only the client
+            knows the address it is served on.
+        :returns: The notebook as an ``.ipynb`` attachment.
+        :raises OmnigentError: 403 without READ; 404 when no session exists.
+        """
+        user_id = _get_user_id(request, auth_provider)
+        access = await _require_access_and_level(
+            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        )
+        conversation = access.conversation or await asyncio.to_thread(
+            conversation_store.get_conversation, session_id
+        )
+        if conversation is None:
+            raise _session_not_found()
+        items, more = await asyncio.to_thread(_export_items, session_id)
+        # The header shows the title, agent and model the session view does.
+        snapshot = await _get_session_snapshot(
+            conversation_store,
+            session_id,
+            access.level,
+            agent_store,
+            agent_cache,
+            conversation=conversation,
+            include_items=False,
+            include_live_status=False,
+            include_usage=False,
+            viewer_id=user_id,
+            request=request,
+        )
+        session = snapshot.model_dump(include={"id", "title", "agent_name", "llm_model"})
+        # Building and serializing a long session's notebook takes a while.
+        body = await asyncio.to_thread(
+            _notebook_bytes, session, items, outputs=outputs, link=link, more=more
+        )
+        return Response(
+            body,
+            media_type="application/x-ipynb+json",
+            headers={"Content-Disposition": f'attachment; filename="{session_id}.ipynb"'},
+        )
+
+    def _notebook_bytes(
+        session: dict[str, object],
+        items: list[dict[str, object]],
+        *,
+        outputs: bool,
+        link: str | None,
+        more: bool,
+    ) -> bytes:
+        """The notebook for *session*'s *items*, as UTF-8 JSON."""
+        from omnigent.session_notebook import session_notebook
+
+        notebook = session_notebook(
+            session, items, include_outputs=outputs, session_url=link, more_items=more
+        )
+        return json.dumps(notebook, ensure_ascii=False).encode()
+
+    def _export_items(session_id: str) -> tuple[list[dict[str, object]], bool]:
+        """A session's items in order, up to ``_MAX_EXPORT_ITEMS``, and whether more remain."""
+        items: list[dict[str, object]] = []
+        after: str | None = None
+        while True:
+            page = conversation_store.list_items(
+                session_id,
+                limit=min(_EXPORT_PAGE_SIZE, _MAX_EXPORT_ITEMS - len(items)),
+                after=after,
+                order="asc",
+            )
+            items.extend(item.to_api_dict() for item in page.data)
+            if not page.has_more:
+                return items, False
+            if len(items) >= _MAX_EXPORT_ITEMS:
+                return items, True
+            after = page.last_id
 
     # ── GET /sessions/{session_id}/agent_costs ───────────────────
 
