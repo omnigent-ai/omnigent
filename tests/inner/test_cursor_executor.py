@@ -42,6 +42,15 @@ from omnigent.inner.executor import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _workspace_hook_platform(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Run as a platform without Cursor filesystem isolation, which keeps the workspace hook.
+
+    The private-home gate used elsewhere is covered in ``test_cursor_policy_gate.py``.
+    """
+    monkeypatch.setattr("omnigent.inner.cursor_executor._policy_gate_supported", lambda: False)
+
+
 def _user(content: str, session_id: str = "conv1") -> Message:
     return {"role": "user", "content": content, "session_id": session_id}
 
