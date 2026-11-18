@@ -848,11 +848,18 @@ describe("UserBubble still-sending note", () => {
 const SCOPED_FILE_VIEWER = { ...FILE_VIEWER_NOOP, conversationId: "conv_cmd" };
 
 describe("UserBubble command tint", () => {
-  function PublishCommands({ nativeShell = null }: { nativeShell?: string | null }) {
-    usePublishComposerCommands("conv_cmd", PUBLISHED_COMMANDS, nativeShell);
+  function PublishCommands({
+    commands = PUBLISHED_COMMANDS,
+    nativeShell = null,
+  }: {
+    commands?: string[];
+    nativeShell?: string | null;
+  }) {
+    usePublishComposerCommands("conv_cmd", commands, nativeShell);
     return null;
   }
   const PUBLISHED_COMMANDS = ["/team"];
+  const TINTED_TEAM = '<span class="text-brand-accent">/team</span>';
   let queryClient: QueryClient;
 
   beforeEach(() => {
@@ -881,41 +888,64 @@ describe("UserBubble command tint", () => {
     );
   }
 
-  it("tints a known command the composer published, keeping the args", () => {
+  it("tints a known command the composer published, keeping the args in its paragraph", () => {
     renderScoped(userBubble("/team fix **the** bug"), <PublishCommands />);
-    expect(screen.getByText("/team")).toHaveClass("text-brand-accent");
-    expect(screen.getByTestId("message-bubble")).toHaveTextContent("/team fix the bug");
+    const token = screen.getByText("/team");
+    expect(token).toHaveClass("text-brand-accent");
+    expect(token.closest("p")).toHaveTextContent("/team fix the bug");
   });
 
   it("adds no trailing space after a command sent without args", () => {
     renderScoped(userBubble("/team"), <PublishCommands />);
-    const token = screen.getByText("/team");
-    expect(token).not.toHaveClass("float-left");
-    expect(token.textContent).toBe("/team");
-  });
-
-  it("floats the token beside paragraph args", () => {
-    renderScoped(userBubble("/team fix it"), <PublishCommands />);
-    expect(screen.getByText("/team")).toHaveClass("float-left");
+    expect(screen.getByText("/team")).toHaveClass("text-brand-accent");
+    expect(screen.getByTestId("user-message-content").textContent).toBe("/team");
   });
 
   it.each([
-    ["- first\n- second", 2],
-    ["---", 0],
-    ["$$\nx^2\n$$", 0],
-    ["<details>more</details>", 0],
-  ])("does not float the token beside a %j block", (block, listItems) => {
-    renderScoped(userBubble(`/team ${block}`), <PublishCommands />);
-    expect(screen.getByText("/team")).not.toHaveClass("float-left");
-    const bubble = within(screen.getByTestId("message-bubble"));
-    expect(bubble.queryAllByRole("listitem")).toHaveLength(listItems);
+    ["a skill", "$review fix it", "$review"],
+    ["leading whitespace", "  /team fix it", "/team"],
+  ])("tints a command after %s", (_label, text, token) => {
+    renderScoped(userBubble(text), <PublishCommands commands={["/team", "$review"]} />);
+    expect(screen.getByText(token)).toHaveClass("text-brand-accent");
+    expect(screen.getByTestId("message-bubble")).toHaveTextContent(text.trim());
   });
 
-  it("keeps an indented code block on the line after the token", async () => {
-    renderScoped(userBubble("/team\n    const x = 1"), <PublishCommands />);
-    expect(screen.getByText("/team")).not.toHaveClass("float-left");
-    const code = await screen.findByText(/const x = 1/, { selector: "pre, pre *" });
-    expect(code.closest("pre")).not.toBeNull();
+  it("shows args that alone would be a link definition", () => {
+    renderScoped(userBubble("/team [docs]: https://example.com"), <PublishCommands />);
+    expect(screen.getByText("/team")).toHaveClass("text-brand-accent");
+    expect(screen.getByTestId("message-bubble")).toHaveTextContent(
+      "/team [docs]: https://example.com",
+    );
+  });
+
+  it.each(["# x", "- x"])("keeps %j args in the token's paragraph", (args) => {
+    renderScoped(userBubble(`/team ${args}`), <PublishCommands />);
+    const bubble = within(screen.getByTestId("message-bubble"));
+    expect(bubble.queryByRole("heading")).toBeNull();
+    expect(bubble.queryAllByRole("listitem")).toHaveLength(0);
+    expect(screen.getByText("/team").closest("p")).toHaveTextContent(`/team ${args}`);
+  });
+
+  // The tint wraps the token without changing how the rest of the text parses.
+  it.each([
+    " [docs]: https://example.com",
+    " # x",
+    " - x",
+    " - first\n- second",
+    " ---",
+    " $$\nx^2\n$$",
+    " <details>more</details>",
+    "\n    const x = 1",
+  ])("renders /team%j like the untinted text", (args) => {
+    const text = `/team${args}`;
+    const plain = renderScoped(userBubble(text), null);
+    const untinted = screen.getByTestId("user-message-content").innerHTML;
+    plain.unmount();
+
+    renderScoped(userBubble(text), <PublishCommands />);
+    const tinted = screen.getByTestId("user-message-content").innerHTML;
+    expect(tinted).toContain(TINTED_TEAM);
+    expect(tinted.replace(TINTED_TEAM, "/team")).toBe(untinted);
   });
 
   it.each([

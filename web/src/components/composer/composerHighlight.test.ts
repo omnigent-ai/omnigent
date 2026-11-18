@@ -205,6 +205,30 @@ describe("usePublishComposerCommands", () => {
     first.unmount();
     expect(read.result.current).toBeUndefined();
   });
+
+  it("leaves another conversation's commands alone when one updates or unmounts", () => {
+    const a = renderHook(
+      ({ names, shell }: { names: string[]; shell: string | null }) =>
+        usePublishComposerCommands("conv_a", names, shell),
+      { initialProps: { names: ["/team"], shell: "claude-native" as string | null } },
+    );
+    const b = renderHook(() => usePublishComposerCommands("conv_b", ["/help"], "codex-native"));
+    const readA = renderHook(() => usePublishedComposerCommands("conv_a"));
+    const readB = renderHook(() => usePublishedComposerCommands("conv_b"));
+    const bBefore = readB.result.current;
+    expect(bBefore).toEqual({ commandNames: ["/help"], nativeShell: "codex-native" });
+
+    a.rerender({ names: ["/review"], shell: null });
+    expect(readA.result.current).toEqual({ commandNames: ["/review"], nativeShell: null });
+    expect(readB.result.current).toBe(bBefore);
+
+    a.unmount();
+    expect(readA.result.current).toBeUndefined();
+    expect(readB.result.current).toBe(bBefore);
+
+    b.unmount();
+    expect(readB.result.current).toBeUndefined();
+  });
 });
 
 describe("supportsNativeShellInput", () => {
