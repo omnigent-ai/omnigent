@@ -14,11 +14,13 @@ export const CUSTOM_AGENTS_LIST_ENTRY = settingsEntry({
     create: "Create",
     loadMoreServer: "Load more server agents",
     loadMoreYours: "Load more agents",
+    retry: "Retry",
   },
-  // Paging shows only while a list has more agents to load.
+  // Paging shows only while a list has more agents to load; Retry only after a list fails.
   presence: {
     loadMoreServer: { states: ["more server agents"] },
     loadMoreYours: { states: ["more agents"] },
+    retry: { states: ["could not load"] },
   },
   regions: { serverAgents: OPENS_AGENT, yourAgents: OPENS_AGENT },
   focus: "search",

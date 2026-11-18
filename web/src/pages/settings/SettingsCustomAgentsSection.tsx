@@ -329,6 +329,7 @@ function ListStatus({
       <p role="alert" className="py-4 text-ui">
         Could not load agents.{" "}
         <Button
+          {...settingsControlProps(CUSTOM_AGENTS_LIST_ENTRY, "retry")}
           variant="link"
           onClick={() => void client.resetQueries({ queryKey: ["settings-agents", scope] })}
         >

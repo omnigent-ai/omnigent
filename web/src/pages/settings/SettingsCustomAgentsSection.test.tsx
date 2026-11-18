@@ -253,6 +253,13 @@ describe("Custom agents settings", () => {
     expect(
       document.querySelector('[data-settings-region="custom-agents-list:yourAgents"]'),
     ).not.toBeNull();
+    expect(
+      document.querySelector('[data-settings-region="custom-agents-list:serverAgents"]'),
+    ).not.toBeNull();
+    expect(screen.getByRole("link", { name: "Create" })).toHaveAttribute(
+      "data-settings-control",
+      "custom-agents-list:create",
+    );
     const yoursLink = screen.getAllByRole("link", { name: "research" })[0];
     expect(yoursLink.getAttribute("data-settings-row-action")).toBe("open");
     expect(
