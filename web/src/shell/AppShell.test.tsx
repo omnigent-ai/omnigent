@@ -3103,7 +3103,149 @@ describe("Extension pages own the header", () => {
   });
 });
 
+describe("Session overview", () => {
+  // Answers the docking breakpoint; other queries keep the jsdom default.
+  function setWideViewport(wide: boolean) {
+    const baseMatchMedia = window.matchMedia;
+    const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query: string) => ({
+      ...baseMatchMedia(query),
+      matches: query === "(min-width: 1280px)" ? wide : baseMatchMedia(query).matches,
+    }));
+    onTestFinished(() => matchMedia.mockRestore());
+  }
+
+  async function renderOverviewShell(enabled: boolean, workspace: "open" | "collapsed") {
+    writeWorkspacePanelDefault(workspace);
+    mockConversations([{ id: "conv_overview", permission_level: null }]);
+    renderShell("/c/conv_overview", serverInfo({ features: { session_overview: enabled } }));
+    await waitFor(() => expect(document.querySelector("header.chat-header")).not.toBeNull());
+    if (workspace === "open") await waitFor(() => expect(railOpenState()).toBe("open"));
+  }
+
+  const docked = () => screen.queryByRole("complementary", { name: "Session overview" });
+  const popover = () => screen.queryByRole("dialog", { name: "Session overview" });
+
+  it("adds nothing with the flag off", async () => {
+    setWideViewport(true);
+    await renderOverviewShell(false, "collapsed");
+
+    expect(screen.queryByTestId("header-session-cost")).toBeNull();
+    expect(docked()).toBeNull();
+  });
+
+  it("docks beside the right-panel toggle and keeps each placement's choice", async () => {
+    setWideViewport(true);
+    await renderOverviewShell(true, "collapsed");
+    const chip = () => screen.getByTestId("header-session-cost");
+    const header = document.querySelector<HTMLElement>("header.chat-header")!;
+
+    const headerButtons = within(header).getAllByRole("button");
+    expect(headerButtons.at(-2)).toBe(chip());
+    expect(headerButtons.at(-1)).toHaveAccessibleName("Expand right panel");
+    expect(chip()).toHaveAttribute("aria-expanded", "true");
+    expect(docked()).toBeInTheDocument();
+    expect(screen.getByRole("main")).not.toContainElement(docked());
+    fireEvent.click(chip());
+    expect(chip()).toHaveAttribute("aria-expanded", "false");
+    expect(docked()).toBeNull();
+
+    // The open workspace switches to the popover, which starts hidden.
+    fireEvent.click(screen.getByRole("button", { name: "Expand right panel" }));
+    await waitFor(() => expect(railOpenState()).toBe("open"));
+    expect(popover()).toBeNull();
+    fireEvent.click(chip());
+    expect(popover()).toBeInTheDocument();
+    expect(docked()).toBeNull();
+
+    // Collapsing it docks again, keeping the docked card hidden.
+    fireEvent.click(screen.getByRole("button", { name: "Collapse right panel" }));
+    await waitFor(() => expect(railOpenState()).toBe("closed"));
+    expect(chip()).toHaveAttribute("aria-expanded", "false");
+    expect(docked()).toBeNull();
+    expect(popover()).toBeNull();
+
+    // A reload keeps the hand-closed card closed, and reopening it is remembered too.
+    cleanup();
+    await renderOverviewShell(true, "collapsed");
+    expect(docked()).toBeNull();
+    fireEvent.click(chip());
+    expect(docked()).toBeInTheDocument();
+    cleanup();
+    await renderOverviewShell(true, "collapsed");
+    expect(docked()).toBeInTheDocument();
+  });
+
+  it("toggles the docked card when its choice can't be stored", async () => {
+    setWideViewport(true);
+    const key = "omnigent:session-overview-docked";
+    localStorage.setItem(key, "closed");
+    // Fail only this key's writes and removals; the shell stores other preferences too.
+    for (const method of ["setItem", "removeItem"] as const) {
+      const original = Storage.prototype[method];
+      const failing = vi.spyOn(Storage.prototype, method).mockImplementation(function (
+        this: Storage,
+        ...args: [string, string]
+      ) {
+        if (args[0] === key) throw new DOMException("Storage is full", "QuotaExceededError");
+        return original.apply(this, args);
+      });
+      onTestFinished(() => failing.mockRestore());
+    }
+    await renderOverviewShell(true, "collapsed");
+    const chip = () => screen.getByTestId("header-session-cost");
+
+    expect(docked()).toBeNull();
+    fireEvent.click(chip());
+    expect(docked()).toBeInTheDocument();
+    fireEvent.click(within(docked()!).getByRole("button", { name: "Hide session overview" }));
+    expect(docked()).toBeNull();
+    expect(localStorage.getItem(key)).toBe("closed");
+  });
+
+  it.each([
+    ["a narrow window", false, "collapsed"],
+    ["an open workspace", true, "open"],
+  ] as const)("starts hidden with %s and opens as a popover", async (_, wide, workspace) => {
+    setWideViewport(wide);
+    await renderOverviewShell(true, workspace);
+
+    const chip = screen.getByTestId("header-session-cost");
+    expect(chip).toHaveAttribute("aria-expanded", "false");
+    expect(popover()).toBeNull();
+    fireEvent.click(chip);
+    expect(chip).toHaveAttribute("aria-expanded", "true");
+    expect(popover()).toBeInTheDocument();
+    expect(docked()).toBeNull();
+    fireEvent.click(within(popover()!).getByRole("button", { name: "Hide session overview" }));
+    expect(popover()).toBeNull();
+    expect(chip).toHaveAttribute("aria-expanded", "false");
+  });
+});
+
 describe("Right workspace card visibility", () => {
+  it.each([true, false, undefined])(
+    "preserves a pinned Tasks tab with native to-dos on workflows=%s",
+    (workflows) => {
+      mockConversations([{ id: "conv_tasks", permission_level: null }]);
+      useChatStore.setState({
+        todos: [{ content: "Only item", status: "pending", activeForm: "" }],
+      });
+      onTestFinished(() => useChatStore.setState({ todos: [] }));
+      writePinnedWorkspaceTabs(["files", "tasks"]);
+      writeSessionWorkspaceState("conv_tasks", { open: true, rightRailTab: "tasks" });
+
+      renderShell(
+        "/c/conv_tasks",
+        serverInfo({
+          session_journal: false,
+          features: workflows === undefined ? {} : { workflows },
+        }),
+      );
+
+      expect(screen.getByRole("tab", { name: "Tasks" })).toHaveAttribute("aria-selected", "true");
+    },
+  );
+
   it.each([true, false])(
     "waits for capabilities before validating restored search (enabled=%s)",
     async (enabled) => {

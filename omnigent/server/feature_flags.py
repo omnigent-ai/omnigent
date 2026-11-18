@@ -18,6 +18,8 @@ _logger = logging.getLogger(__name__)
 
 FEATURES_ENV_VAR = "OMNIGENT_FEATURES"
 _REMOVED_HARNESS_INSTALL_ENV_VAR = "OMNIGENT_HARNESS_INSTALL_ENABLED"
+# Features made unconditional; leftover names or ``-name`` kill switches are ignored.
+_RETIRED_FEATURES = frozenset({"custom_agents_settings_ui"})
 
 
 class Feature(StrEnum):
@@ -37,14 +39,23 @@ class Feature(StrEnum):
     CANVAS = "canvas"
     ARCA_SHUTDOWN_WARNINGS = "arca_shutdown_warnings"
     IMPORT_REVIEW = "import_review"
-    CUSTOM_AGENTS_SETTINGS_UI = "custom_agents_settings_ui"
     SIDEBAR_GROUPING_UI = "sidebar_grouping_ui"
     CLAUDE_OSC_STATUS = "claude_osc_status"
     WORKSPACE_CONTENT_SEARCH = "workspace_content_search"
     GRID_SESSIONS_DISPLAY_UI = "grid_sessions_display_ui"
+    AUTOMATIONS = "automations"
     AUTOMATIONS_V2 = "automations_v2"
+    ONE_TIME_AUTOMATIONS = "one_time_automations"
     SPLITTABLE_TERMINAL_VIEW_UI = "splittable_terminal_view_ui"
     SIDEBAR_WINDOWED_ROWS = "sidebar_windowed_rows"
+    WORKFLOWS = "workflows"
+    SESSION_OVERVIEW = "session_overview"
+    PROJECT_REPOSITORY_CREATION = "project_repository_creation"
+    WORKSPACE_DIRECT_ACCESS = "workspace_direct_access"
+    WORKSPACE_API_SERVER_ACCESS = "workspace_api_server_access"
+    PROACTIVE_AGENT = "proactive_agent"
+    USER_INBOX = "user_inbox"
+    MEMORY = "memory"
 
 
 @dataclass(frozen=True)
@@ -108,6 +119,14 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         default_enabled=True,
     ),
     FeatureDefinition(
+        feature=Feature.AUTOMATIONS,
+        description="Automations across the API, UI, agent tools and background schedulers",
+        owner="server",
+        review_by_release="0.27.0",
+        frontend_visible=False,
+        default_enabled=True,
+    ),
+    FeatureDefinition(
         feature=Feature.AUTOMATIONS_V2,
         description=(
             "Automation improvements across scheduling, run management, execution targets and UI"
@@ -117,16 +136,37 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         default_enabled=True,
     ),
     FeatureDefinition(
+        feature=Feature.ONE_TIME_AUTOMATIONS,
+        description=(
+            "Create one-time (COUNT=1) automations, including sys_reminder_set reminders. "
+            "Every database scheduler sharing the database must already accept them; "
+            "an older one pauses them as invalid"
+        ),
+        owner="server",
+        review_by_release="0.24.0",
+        frontend_visible=False,
+    ),
+    FeatureDefinition(
         feature=Feature.GRID_SESSIONS_DISPLAY_UI,
         description="Local session grids with up to four live conversations",
         owner="web",
-        review_by_release="0.20.0",
+        # On by default; remove the flag and its off path in 0.25.0.
+        review_by_release="0.25.0",
+        default_enabled=True,
     ),
     FeatureDefinition(
         feature=Feature.SPLITTABLE_TERMINAL_VIEW_UI,
         description="Split the main terminal view into several shell panes",
         owner="web",
         review_by_release="0.22.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.MEMORY,
+        description="Long-term memory: the memory_* tools and the /v1/memory routes",
+        owner="server",
+        review_by_release="0.24.0",
+        frontend_visible=False,
+        default_enabled=False,
     ),
     FeatureDefinition(
         feature=Feature.USAGE_PAGE,
@@ -181,13 +221,6 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         review_by_release="0.18.0",
     ),
     FeatureDefinition(
-        feature=Feature.CUSTOM_AGENTS_SETTINGS_UI,
-        description="Manage reusable custom agents from Settings",
-        owner="web",
-        review_by_release="0.24.0",
-        default_enabled=True,
-    ),
-    FeatureDefinition(
         feature=Feature.SIDEBAR_GROUPING_UI,
         description="Sidebar grouping, ordering and row metadata options, Shared section",
         owner="web",
@@ -207,13 +240,69 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         feature=Feature.WORKSPACE_CONTENT_SEARCH,
         description="Search workspace file contents through the session runner",
         owner="web",
-        review_by_release="0.20.0",
+        # On by default; remove the flag and its off path in 0.25.0.
+        review_by_release="0.25.0",
+        default_enabled=True,
     ),
     FeatureDefinition(
         feature=Feature.SIDEBAR_WINDOWED_ROWS,
         description="Mount only the sidebar session rows near the viewport",
         owner="web",
         review_by_release="0.24.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.WORKFLOWS,
+        description="Workflows and session journals across the API, UI and agent tools",
+        owner="server",
+        review_by_release="0.24.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.SESSION_OVERVIEW,
+        description="Session cost sidebar beside chat, toggled from a header cost chip",
+        owner="web",
+        review_by_release="0.25.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.PROJECT_REPOSITORY_CREATION,
+        description="New project repository linking: clone on a host or save for sandboxes",
+        owner="web",
+        review_by_release="0.25.0",
+        default_enabled=True,
+    ),
+    FeatureDefinition(
+        feature=Feature.WORKSPACE_DIRECT_ACCESS,
+        description=(
+            "Owners read a session's workspace straight from its host's socket, "
+            "with a short-lived token this server issues"
+        ),
+        owner="server",
+        review_by_release="0.27.0",
+        frontend_visible=True,
+    ),
+    FeatureDefinition(
+        feature=Feature.WORKSPACE_API_SERVER_ACCESS,
+        description="Serve the workspace API through the server, answered by the session's host",
+        owner="server",
+        review_by_release="0.27.0",
+        frontend_visible=True,
+    ),
+    FeatureDefinition(
+        feature=Feature.PROACTIVE_AGENT,
+        description="The proactive agent (Omni Advisor), which posts suggestions to the Inbox",
+        owner="server",
+        review_by_release="0.25.0",
+        # Clients probe proactive_agent_available in GET /v1/info; the settings
+        # decide whether it is enabled. It needs user_inbox to post.
+        frontend_visible=False,
+    ),
+    FeatureDefinition(
+        feature=Feature.USER_INBOX,
+        description="Agents post items to their owner's Inbox",
+        owner="server",
+        review_by_release="0.26.0",
+        # Clients probe inbox_items_available in GET /v1/info.
+        frontend_visible=False,
+        default_enabled=True,
     ),
 )
 
@@ -290,7 +379,8 @@ def resolve_feature_flags(environ: Mapping[str, str] | None = None) -> FeatureFl
 
     Comma-separated names enable features; ``-name`` disables them, for example
     ``usage_page,-claude_osc_status``. Unset or empty uses feature defaults.
-    Explicit disables win regardless of order. Unknown names fail startup.
+    Explicit disables win regardless of order. Retired names are ignored with
+    a warning; other unknown names fail startup.
 
     :param environ: Environment mapping; defaults to :data:`os.environ`.
     :returns: Resolved immutable feature values.
@@ -313,6 +403,9 @@ def resolve_feature_flags(environ: Mapping[str, str] | None = None) -> FeatureFl
     disabled: set[Feature] = set()
     unknown: list[str] = []
     for name in names:
+        if name.removeprefix("-") in _RETIRED_FEATURES:
+            _logger.warning("%s: %s has been retired; ignoring it", FEATURES_ENV_VAR, name)
+            continue
         try:
             if name.startswith("-"):
                 disabled.add(Feature(name[1:]))

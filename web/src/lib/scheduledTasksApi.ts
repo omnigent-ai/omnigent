@@ -1,4 +1,4 @@
-// Hand-written client for the six `/v1/scheduled-tasks` endpoints, mirroring
+// Hand-written client for the `/v1/scheduled-tasks` endpoints, mirroring
 // `omnigent/server/routes/scheduled_tasks.py`. Follows the same conventions as
 // the sibling `sessionsApi.ts`: requests go through the Vite `/v1` proxy, the
 // wire is snake_case while the TS surface is camelCase, and non-OK responses
@@ -10,7 +10,9 @@
 // at fire time. Sandbox tasks instead accept a repository URL as workspace.
 
 import { authenticatedFetch } from "./identity";
+import type { JournalEntry, JournalPlanStep } from "./sessionJournal";
 import { startTimedInteraction } from "./analyticsEmit";
+import { browserAgentToolsRequestHeaders } from "@/components/BrowserPane/agentTools/preferences";
 
 export const RANDOM_WORKTREE_BASE_REF = "HEAD";
 
@@ -26,6 +28,9 @@ export type ScheduledTaskExecutionTarget = "connected_host" | "managed_sandbox";
 
 /** Whether each run starts a new session or continues one. */
 export type ScheduledTaskSessionMode = "new" | "continue";
+
+/** The caller's role on a task: its owner, or someone it is shared with, who may only read it. */
+export type ScheduledTaskViewerRole = "owner" | "viewer";
 
 /** Terminal + in-flight statuses a single run can hold. */
 export type ScheduledTaskRunStatus =
@@ -57,6 +62,10 @@ export interface ScheduledTask {
    * `--permission-mode` launch arg from it at fire time.
    */
   permissionMode: string | null;
+  /** Per-run cost limit in USD; null/absent adds no automation-specific cap. */
+  maxCostUsd?: number | null;
+  /** MCP services every session the automation creates starts with. */
+  mcpServices: string[];
   /** `"continue"` sends every run's prompt into `sessionId` instead of a new session. */
   sessionMode: ScheduledTaskSessionMode;
   /** The session a `"continue"` task sends to; `null` until its first run creates one. */
@@ -95,6 +104,10 @@ export interface ScheduledTask {
    * next-run can't match the server anchor for INTERVAL>1 rules.
    */
   nextRunAt: string | null;
+  /** `"viewer"` when the task is shared with the caller; absent (older servers) means owner. */
+  viewerRole?: ScheduledTaskViewerRole;
+  /** The owner's display name, sent to a viewer; `null` for the owner. */
+  ownerDisplayName?: string | null;
 }
 
 /** One run of a scheduled task, camelCased from `_run_to_response`. */
@@ -164,6 +177,10 @@ export interface CreateScheduledTaskInput {
   reasoningEffort?: string | null;
   /** Harness-specific permission or execution mode; omit for the agent default. */
   permissionMode?: string | null;
+  /** Optional per-run cost limit in USD; omit for no automation-specific cap. */
+  maxCostUsd?: number | null;
+  /** MCP services every run starts with; omit for none. */
+  mcpServices?: string[];
   /** `"continue"` keeps one session across runs; omit for a new session per run. */
   sessionMode?: ScheduledTaskSessionMode;
   /** Host directory (requires hostId), or a repository URL for a sandbox. */
@@ -208,6 +225,10 @@ export interface UpdateScheduledTaskInput {
   modelOverride?: string | null;
   reasoningEffort?: string | null;
   permissionMode?: string | null;
+  /** Omit to preserve the cost limit; null removes it for future runs. */
+  maxCostUsd?: number | null;
+  /** Replaces the MCP services; `[]` clears them. */
+  mcpServices?: string[];
   sessionMode?: ScheduledTaskSessionMode;
   /** `null` makes a `"continue"` task's next run start the session later runs continue. */
   sessionId?: string | null;
@@ -240,6 +261,8 @@ interface ScheduledTaskWire {
   model_override: string | null;
   reasoning_effort: string | null;
   permission_mode: string | null;
+  max_cost_usd?: number | null;
+  mcp_services?: string[];
   session_mode?: ScheduledTaskSessionMode;
   session_id?: string | null;
   workspace: string | null;
@@ -254,6 +277,9 @@ interface ScheduledTaskWire {
   last_run_status: ScheduledTaskRunStatus | null;
   last_run_conversation_id: string | null;
   next_run_at: string | null;
+  // Absent on servers that predate sharing automations.
+  viewer_role?: ScheduledTaskViewerRole;
+  owner_display_name?: string | null;
 }
 
 /** Wire shape of a run row (snake_case), matching `_run_to_response`. */
@@ -329,6 +355,8 @@ function taskFromWire(wire: ScheduledTaskWire): ScheduledTask {
     modelOverride: wire.model_override,
     reasoningEffort: wire.reasoning_effort,
     permissionMode: wire.permission_mode,
+    maxCostUsd: wire.max_cost_usd ?? null,
+    mcpServices: wire.mcp_services ?? [],
     sessionMode: wire.session_mode ?? "new",
     sessionId: wire.session_id ?? null,
     workspace: wire.workspace,
@@ -342,6 +370,8 @@ function taskFromWire(wire: ScheduledTaskWire): ScheduledTask {
     lastRunStatus: wire.last_run_status,
     lastRunConversationId: wire.last_run_conversation_id,
     nextRunAt: wire.next_run_at,
+    viewerRole: wire.viewer_role ?? "owner",
+    ownerDisplayName: wire.owner_display_name ?? null,
   };
 }
 
@@ -372,17 +402,102 @@ export async function listScheduledTasks(): Promise<ScheduledTask[]> {
   return (body.scheduled_tasks ?? []).map(taskFromWire);
 }
 
-/** Fetch one of the caller's scheduled tasks (404 if not owned). */
+/** One page of the automations other users shared with the caller. */
+export interface SharedScheduledTasksPage {
+  tasks: ScheduledTask[];
+  /** Cursor for the next page, or `null` on the last; a page can be short while it is set. */
+  nextCursor: string | null;
+}
+
+/** Page size for {@link listSharedScheduledTasks}; the server allows up to 100. */
+export const SHARED_SCHEDULED_TASKS_PAGE_SIZE = 50;
+
+/**
+ * List one page of the automations shared with the caller, directly or through a
+ * group, ordered by ID. Each task's `viewerRole` is `"viewer"`.
+ *
+ * @param after - The previous page's `nextCursor`, or `null` for the first page.
+ */
+export async function listSharedScheduledTasks(
+  after: string | null,
+): Promise<SharedScheduledTasksPage> {
+  const params = new URLSearchParams({ limit: String(SHARED_SCHEDULED_TASKS_PAGE_SIZE) });
+  if (after !== null) params.set("after", after);
+  const res = await authenticatedFetch(`/v1/scheduled-tasks/shared?${params}`);
+  const body = await readJsonOrThrow<{
+    scheduled_tasks?: ScheduledTaskWire[];
+    next_cursor?: string | null;
+  }>(res);
+  return {
+    tasks: (body.scheduled_tasks ?? []).map(taskFromWire),
+    nextCursor: body.next_cursor ?? null,
+  };
+}
+
+/** Fetch a scheduled task the caller owns or that is shared with them (404 otherwise). */
 export async function getScheduledTask(id: string): Promise<ScheduledTask> {
   const res = await authenticatedFetch(`/v1/scheduled-tasks/${encodeURIComponent(id)}`);
   return taskFromWire(await readJsonOrThrow<ScheduledTaskWire>(res));
 }
 
-/** List a task's run history, most-recent-first (404 if not owned). */
+/** List a task's run history, most-recent-first (404 unless owned or shared). */
 export async function listScheduledTaskRuns(id: string): Promise<ScheduledTaskRun[]> {
   const res = await authenticatedFetch(`/v1/scheduled-tasks/${encodeURIComponent(id)}/runs`);
   const body = await readJsonOrThrow<{ runs: ScheduledTaskRunWire[] }>(res);
   return (body.runs ?? []).map(runFromWire);
+}
+
+/** The latest plan within a run: its steps and each step's newest status. */
+export interface ScheduledTaskRunSteps {
+  runId: string;
+  planId: string | null;
+  /** Graph ID, or latest legacy plan position; absent on older servers. */
+  planGraphRevision?: string | number;
+  isCurrent: boolean;
+  /** The saved workflow the plan runs, when it named one. */
+  workflowId: string | null;
+  planName: string | null;
+  steps: JournalPlanStep[];
+  statuses: JournalEntry[];
+}
+
+/**
+ * The plan steps of one page of a task's runs, most recent first, paged like
+ * {@link listScheduledTaskRuns}. Runs that wrote no plan are left out.
+ *
+ * @param after - The ID of the run before the page, e.g. the previous page's last.
+ */
+export async function listScheduledTaskRunSteps(
+  id: string,
+  { limit, after }: { limit: number; after?: string },
+): Promise<ScheduledTaskRunSteps[]> {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (after) params.set("after", after);
+  const res = await authenticatedFetch(
+    `/v1/scheduled-tasks/${encodeURIComponent(id)}/run-steps?${params}`,
+  );
+  const body = await readJsonOrThrow<{
+    runs?: {
+      run_id: string;
+      plan_id?: string;
+      plan_graph_revision?: string | number | null;
+      is_current?: boolean;
+      workflow_id: string | null;
+      plan_name?: string | null;
+      steps: JournalPlanStep[];
+      statuses: JournalEntry[];
+    }[];
+  }>(res);
+  return (body.runs ?? []).map((run) => ({
+    runId: run.run_id,
+    planId: run.plan_id ?? null,
+    planGraphRevision: run.plan_graph_revision ?? undefined,
+    isCurrent: run.is_current === true,
+    workflowId: run.workflow_id,
+    planName: run.plan_name ?? null,
+    steps: run.steps,
+    statuses: run.statuses,
+  }));
 }
 
 /**
@@ -402,6 +517,8 @@ export async function createScheduledTask(input: CreateScheduledTaskInput): Prom
   if (input.modelOverride != null) body.model_override = input.modelOverride;
   if (input.reasoningEffort != null) body.reasoning_effort = input.reasoningEffort;
   if (input.permissionMode != null) body.permission_mode = input.permissionMode;
+  if (input.maxCostUsd != null) body.max_cost_usd = input.maxCostUsd;
+  if (input.mcpServices?.length) body.mcp_services = input.mcpServices;
   if (input.sessionMode !== undefined) body.session_mode = input.sessionMode;
   if (input.baseBranch !== undefined) body.base_branch = input.baseBranch;
   if (input.workspace != null) body.workspace = input.workspace;
@@ -418,6 +535,8 @@ export async function createScheduledTask(input: CreateScheduledTaskInput): Prom
         "Content-Type": "application/json",
         "x-omnigent-automation-source": "ui",
         "x-omnigent-automation-template": templateId,
+        // The source copy takes its browser tools mode from this request.
+        ...browserAgentToolsRequestHeaders(),
       },
       body: JSON.stringify(body),
     });
@@ -448,6 +567,8 @@ export async function updateScheduledTask(
   if (input.modelOverride !== undefined) body.model_override = input.modelOverride;
   if (input.reasoningEffort !== undefined) body.reasoning_effort = input.reasoningEffort;
   if (input.permissionMode !== undefined) body.permission_mode = input.permissionMode;
+  if (input.maxCostUsd !== undefined) body.max_cost_usd = input.maxCostUsd;
+  if (input.mcpServices !== undefined) body.mcp_services = input.mcpServices;
   if (input.sessionMode !== undefined) body.session_mode = input.sessionMode;
   if (input.baseBranch !== undefined) body.base_branch = input.baseBranch;
   if (input.sessionId !== undefined) body.session_id = input.sessionId;

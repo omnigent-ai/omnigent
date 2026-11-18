@@ -17,6 +17,7 @@ import { ApiError } from "@/lib/sessionsApi";
 import type { HarnessStartup, Host } from "@/hooks/useHosts";
 import { NATIVE_CODING_AGENTS } from "@/lib/nativeCodingAgents";
 import { SettingsHarnessesSection } from "./SettingsHarnessesSection";
+import { useSettingsOverlayParts } from "./search/settingsOwnership";
 
 vi.mock("sonner", () => ({ toast: { error: vi.fn(), success: vi.fn() } }));
 
@@ -201,12 +202,14 @@ vi.mock("./HarnessFixDialog", () => ({
     }) => void;
   }) => {
     fixDialogProps(props);
+    const parts = useSettingsOverlayParts();
     return props.open ? (
       <div
         data-testid="fix-dialog"
         data-harness={props.harness}
         data-host={props.host.host_id}
         data-mode={props.mode}
+        {...parts.overlay()}
       >
         <button
           type="button"
@@ -425,12 +428,13 @@ describe("Harnesses grid", () => {
     },
   );
 
-  it("does not offer one-click install for a not-installed Cursor harness", () => {
+  it("offers the same Set-up action for a not-installed Cursor harness", () => {
     hosts = [{ ...ONLINE, configured_harnesses: { "cursor-native": "binary-missing" } }];
     renderHarnesses();
 
-    expect(screen.queryByTestId("harness-action-cursor-native")).toBeNull();
-    expect(screen.getByTestId("harness-settings-cursor-native")).toBeTruthy();
+    expect(screen.queryByTestId("harness-settings-cursor-native")).toBeNull();
+    fireEvent.click(screen.getByTestId("harness-action-cursor-native"));
+    expect(screen.getByTestId("fix-dialog")).toHaveAttribute("data-mode", "install");
   });
 
   it("uses the existing inventory label instead of guessing a personal subscription", () => {
@@ -504,6 +508,176 @@ describe("Harnesses grid", () => {
     expect(card("codex-native").getAttribute("href")).toBe(
       "/settings/harnesses/codex-native?tab=settings",
     );
+  });
+});
+
+describe("Harnesses grid catalog rows", () => {
+  it("renders the page's search and filter as its row's controls, with their names", () => {
+    hosts = [ONLINE];
+    renderHarnesses();
+
+    expect(document.querySelector('[data-settings-item="harnesses"]')).toContainElement(
+      screen.getByRole("searchbox", { name: "Search agent harnesses" }),
+    );
+    expect(screen.getByRole("searchbox", { name: "Search agent harnesses" })).toHaveAttribute(
+      "data-settings-control",
+      "harnesses:search",
+    );
+    expect(screen.getByRole("tablist", { name: "Harness filter" })).toHaveAttribute(
+      "data-settings-control",
+      "harnesses:filter",
+    );
+  });
+
+  it("gives each card its own row, with its open link, settings and Set up controls", () => {
+    hosts = [
+      {
+        ...ONLINE,
+        configured_harnesses: { "claude-native": true, "codex-native": "binary-missing" },
+      },
+    ];
+    renderHarnesses();
+
+    const claudeRow = card("claude-native").closest('[data-settings-item="harness-claude-native"]');
+    expect(claudeRow).toContainElement(card("claude-native"));
+    expect(card("claude-native")).toHaveAttribute(
+      "data-settings-control",
+      "harness-claude-native:open",
+    );
+    expect(card("claude-native")).toHaveAccessibleName("Claude Code");
+    expect(screen.getByRole("button", { name: "Claude Code settings" })).toHaveAttribute(
+      "data-settings-control",
+      "harness-claude-native:settings",
+    );
+    expect(screen.getByRole("button", { name: "Set up Codex" })).toHaveAttribute(
+      "data-settings-control",
+      "harness-codex-native:setUp",
+    );
+  });
+});
+
+describe("Harness fix dialog catalog rows", () => {
+  it("is owned by the card's Set up control that opens it", () => {
+    hosts = [{ ...ONLINE, configured_harnesses: { "codex-native": "binary-missing" } }];
+    renderHarnesses();
+
+    fireEvent.click(screen.getByTestId("harness-action-codex-native"));
+
+    expect(screen.getByTestId("fix-dialog")).toHaveAttribute(
+      "data-settings-overlay-owner",
+      "harness-codex-native:setUp",
+    );
+  });
+
+  it("is owned by the page's fix button that opens it", () => {
+    hosts = [{ ...ONLINE, configured_harnesses: { "codex-native": "binary-missing" } }];
+    renderHarnesses("codex-native");
+
+    fireEvent.click(screen.getByRole("button", { name: "Install" }));
+
+    expect(screen.getByTestId("fix-dialog")).toHaveAttribute(
+      "data-settings-overlay-owner",
+      "harness-codex-native-detail:fixAction",
+    );
+  });
+
+  it("is owned by the Credential card's action that opens it", () => {
+    hosts = [ONLINE];
+    renderHarnesses("codex-native");
+
+    fireEvent.click(screen.getByRole("button", { name: "Reconfigure" }));
+
+    expect(screen.getByTestId("fix-dialog")).toHaveAttribute(
+      "data-settings-overlay-owner",
+      "harness-codex-native-credential:credentialAction",
+    );
+  });
+});
+
+describe("Harness page catalog rows", () => {
+  it("names an inventory page's tab list, and keeps its row around the header", () => {
+    hosts = [ONLINE];
+    renderHarnesses("claude-native");
+
+    const detailRow = document.querySelector('[data-settings-item="harness-claude-native-detail"]');
+    expect(detailRow).toContainElement(screen.getByRole("heading", { name: "Claude Code" }));
+    const tabList = screen.getByRole("tablist", { name: "Claude Code view" });
+    expect(detailRow).toContainElement(tabList);
+    expect(tabList).toHaveAttribute("data-settings-control", "harness-claude-native-detail:tab");
+  });
+
+  it("names the setup warning's fix by its key, inside the harness row", () => {
+    hosts = [{ ...ONLINE, configured_harnesses: { "codex-native": "binary-missing" } }];
+    renderHarnesses("codex-native");
+
+    const install = screen.getByRole("button", { name: "Install" });
+    expect(install).toHaveAttribute(
+      "data-settings-control",
+      "harness-codex-native-detail:fixAction",
+    );
+    expect(
+      document.querySelector('[data-settings-item="harness-codex-native-detail"]'),
+    ).toContainElement(install);
+    expect(
+      document.querySelector('[data-settings-item="harness-codex-native-credential"]'),
+    ).toBeTruthy();
+  });
+
+  it("names the credential card's action, Reconfigure, by its own control", () => {
+    hosts = [ONLINE];
+    renderHarnesses("codex-native");
+
+    const reconfigure = screen.getByRole("button", { name: "Reconfigure" });
+    expect(reconfigure).toHaveAttribute(
+      "data-settings-control",
+      "harness-codex-native-credential:credentialAction",
+    );
+    expect(
+      document.querySelector('[data-settings-item="harness-codex-native-credential"]'),
+    ).toContainElement(reconfigure);
+  });
+});
+
+describe("Harness plugin and skill catalog rows", () => {
+  it("lists a plugin row in its region and names the plugin page's tabs", () => {
+    hosts = [ONLINE];
+    renderHarnesses("claude-native");
+
+    selectTab("Plugins · 1");
+    const pluginRow = screen.getByTestId("catalog-row-toolkit").closest("li");
+    expect(pluginRow).toHaveAttribute("data-settings-region-row");
+    expect(
+      pluginRow?.closest('[data-settings-region="harness-claude-native-detail:plugins"]'),
+    ).not.toBeNull();
+
+    fireEvent.click(screen.getByTestId("catalog-row-toolkit"));
+    expect(screen.getByRole("tablist", { name: "Plugin view" })).toHaveAttribute(
+      "data-settings-control",
+      "harness-claude-native-plugin:tab",
+    );
+    expect(
+      document.querySelector('[data-settings-item="harness-claude-native-plugin"]'),
+    ).toContainElement(screen.getByRole("heading", { name: "toolkit" }));
+  });
+
+  it("lists a skill row in its region and names the skill page's document", () => {
+    hosts = [ONLINE];
+    renderHarnesses("claude-native");
+
+    selectTab("Skills · 1");
+    const skillRow = screen.getByTestId("catalog-row-review").closest("li");
+    expect(skillRow).toHaveAttribute("data-settings-region-row");
+    expect(
+      skillRow?.closest('[data-settings-region="harness-claude-native-detail:skills"]'),
+    ).not.toBeNull();
+
+    fireEvent.click(screen.getByTestId("catalog-row-review"));
+    expect(
+      document.querySelector('[data-settings-item="harness-claude-native-skill"]'),
+    ).toContainElement(screen.getByRole("heading", { name: "Instructions" }));
+    expect(
+      document.querySelector('[data-settings-content="harness-claude-native-skill:skill"]'),
+    ).toContainElement(screen.getByRole("heading", { name: "Instructions" }));
   });
 });
 

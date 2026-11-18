@@ -386,12 +386,11 @@ inference config: Omnigent then writes a session-private Jcode config and
 forwards the agent's `model`. Jcode's ACP server ignores session-scoped MCP
 servers, so Omnigent's MCP tools are not offered to it.
 
-Use the vendor login rather than an API key. A builtin ACP row has no
-`env_passthrough` of its own, and `XAI_API_KEY` is not in the host-to-runner
-credential allowlist, so exporting it in your shell does not reach the agent.
-If you need the key route, pass it explicitly with
-`OMNIGENT_RUNNER_ENV_PASSTHROUGH=XAI_API_KEY`, or configure an `acp:` agent that
-declares the passthrough.
+Use the vendor login or explicitly forward an API key. The builtin Grok row
+declares `XAI_API_KEY` for runner-to-Grok forwarding. Host-to-runner forwarding
+still requires `OMNIGENT_RUNNER_ENV_PASSTHROUGH=XAI_API_KEY`; exporting the key
+in your host shell alone does not reach a host-managed runner. Custom `acp:`
+agents can declare their own passthrough variables.
 
 </details>
 
@@ -408,6 +407,12 @@ omnigent run examples/deep-research/
 omnigent run examples/polly/ --harness <harness>
 omnigent run examples/debby/ --harness <harness>
 ```
+
+Add `-p "your prompt"` to run headlessly. The CLI waits up to 30 minutes for
+first-turn recovery or additional asynchronous turns. Set
+`OMNIGENT_HEADLESS_TIMEOUT_S` to a positive finite number of seconds for that
+invocation to change this wait budget; separate process or job deadlines still
+apply.
 
 **🐙 Polly** is a multi-agent coding orchestrator who writes no code herself.
 She's the tech lead: she plans, delegates the work to coding sub-agents

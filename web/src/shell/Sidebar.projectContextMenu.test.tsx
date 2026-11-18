@@ -1,3 +1,4 @@
+import { EXPANDED_PROJECT_SECTIONS_STORAGE_KEY } from "@/shell/sidebarNav";
 import { conversationPage } from "@/test/sidebarMockHelpers";
 import { renderSidebar } from "@/test/sidebarTestHelpers";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -198,6 +199,24 @@ describe("project folder header context menu", () => {
         oldName: PROJECT_NAME,
         newName: "Sprint 43",
       }),
+    );
+  });
+
+  it("keeps an expanded folder expanded under its new name", async () => {
+    localStorage.setItem(EXPANDED_PROJECT_SECTIONS_STORAGE_KEY, JSON.stringify([PROJECT_NAME]));
+    renderSidebar();
+
+    fireEvent.contextMenu(folderHeader());
+    fireEvent.click(screen.getByTestId("rename-project"));
+    fireEvent.change(screen.getByDisplayValue(PROJECT_NAME), {
+      target: { value: "Sprint 43" },
+    });
+    fireEvent.click(screen.getByTestId("rename-project-confirm"));
+
+    await waitFor(() =>
+      expect(JSON.parse(localStorage.getItem(EXPANDED_PROJECT_SECTIONS_STORAGE_KEY)!)).toEqual([
+        "Sprint 43",
+      ]),
     );
   });
 
