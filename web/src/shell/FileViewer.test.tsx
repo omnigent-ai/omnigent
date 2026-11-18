@@ -1923,13 +1923,24 @@ describe("FileViewer markdown preview/edit/source modes", () => {
   });
 
   it.each(["page.html", "results.csv", "export.tsv"])(
-    "keeps %s on the preview by default, with a preview ↔ source toggle",
+    "opens %s in preview and guards unsaved source edits when toggling back",
     (path) => {
       renderViewer({ open: true, path });
       expect(viewModeOf()).toBe("preview");
       // In preview, the single toggle switches to source (existing behavior).
       fireEvent.click(screen.getByRole("button", { name: "View source" }));
       expect(viewModeOf()).toBe("source");
+      fireEvent.click(screen.getByRole("button", { name: "make dirty" }));
+      fireEvent.click(screen.getByRole("button", { name: "View preview" }));
+      expect(screen.getByText("Unsaved changes")).toBeInTheDocument();
+      expect(viewModeOf()).toBe("source");
+      fireEvent.click(screen.getByRole("button", { name: "Keep editing" }));
+      expect(viewModeOf()).toBe("source");
+      expect(screen.queryByText("Unsaved changes")).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: "View preview" }));
+      expect(screen.getByText("Unsaved changes")).toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
+      expect(viewModeOf()).toBe("preview");
     },
   );
 

@@ -1371,13 +1371,14 @@ function FileViewerBody({
       // file) resolves to "preview" for HTML, so a functional updater keyed on
       // "editor" would no-op the first click. Keying on viewMode makes one click
       // always reach the other surface.
-      onSelect: () => {
-        dismissFilePosition(position);
-        setDismissedPosition(position);
-        // An explicit choice ends a ?comment= link's pull toward source.
-        setDeepLinkBiasPath(null);
-        setPreviewableViewMode(viewMode === "preview" ? "source" : "preview");
-      },
+      onSelect: () =>
+        guardDirty(() => {
+          dismissFilePosition(position);
+          setDismissedPosition(position);
+          // An explicit choice ends a ?comment= link's pull toward source.
+          setDeepLinkBiasPath(null);
+          setPreviewableViewMode(viewMode === "preview" ? "source" : "preview");
+        }),
     });
   }
   // HTML artifacts can be popped out into their own browser tab for full-window
