@@ -16,6 +16,7 @@ import { cn } from "@/lib/utils";
 import { insertComposerText } from "@/lib/composerText";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { useSwipeDownToDismissKeyboard } from "@/hooks/useSwipeDownToDismissKeyboard";
 import {
   isComposerAltNewlineKey,
   isComposerSendKey,
@@ -24,6 +25,8 @@ import {
 import { CHAT_COLUMN_WIDTH } from "@/pages/chatLayout";
 
 export const COMPOSER_COLUMN_WIDTH = `w-full ${CHAT_COLUMN_WIDTH}`;
+// The app shell, where a downward swipe dismisses the focused composer's keyboard.
+const COMPOSER_SWIPE_SURFACE_SELECTOR = ".app-shell";
 
 /**
  * The composer layout contract: one 12px inset, two roles.
@@ -130,6 +133,10 @@ export const ChatComposer = forwardRef<HTMLDivElement, ChatComposerProps>(functi
   const leadingRef = useRef<HTMLDivElement>(null);
   const trailingRef = useRef<HTMLDivElement>(null);
   useCollapsedComposerLabels(actionRowRef, actionWidthRef, leadingRef, trailingRef, isMobile);
+  useSwipeDownToDismissKeyboard({
+    enabled: isMobile && focusWithin,
+    surfaceSelector: COMPOSER_SWIPE_SURFACE_SELECTOR,
+  });
   return (
     <div
       ref={ref}
