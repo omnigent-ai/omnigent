@@ -110,7 +110,8 @@ message ListDirectoryRequest {
   bool hide_ignored = 4;
 
   // Fill each directory entry's `leaf_directory_path`, so a tree can show
-  // "a/b/c" on one row without a request per level.
+  // "a/b/c" on one row without a request per level. Hosts that don't support
+  // it leave `leaf_directory_path` empty.
   bool collapse_single_child_directories = 5;
 }
 
@@ -160,7 +161,7 @@ message ReadFileRequest {
   string path = 1;
 
   // Bytes to read at most; 0 means the server's limit. Values above it are
-  // lowered to it.
+  // lowered to it. Older hosts ignore this field.
   uint64 maximum_bytes = 2;
 }
 
@@ -258,7 +259,8 @@ message FileSearchResult {
   // Higher is better. Zero in substring mode.
   uint32 score = 2;
 
-  // Character indices in the entry's path that matched, for highlighting.
+  // Indices, in UTF-16 code units, of the entry's path characters that matched,
+  // for highlighting.
   repeated uint32 matched_indices = 3;
 }
 
@@ -383,6 +385,7 @@ enum ComparisonKind {
 
 // What to compare.
 message Comparison {
+  // Unspecified means COMPARISON_KIND_LAST_COMMIT.
   ComparisonKind kind = 1;
 
   // For COMPARISON_KIND_REVISIONS: any revision Git resolves to a commit. An

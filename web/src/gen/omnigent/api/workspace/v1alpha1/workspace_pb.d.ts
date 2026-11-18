@@ -94,7 +94,8 @@ export declare type ListDirectoryRequest = Message<"omnigent.api.workspace.v1alp
 
   /**
    * Fill each directory entry's `leaf_directory_path`, so a tree can show
-   * "a/b/c" on one row without a request per level.
+   * "a/b/c" on one row without a request per level. Hosts that don't support
+   * it leave `leaf_directory_path` empty.
    *
    * @generated from field: bool collapse_single_child_directories = 5;
    */
@@ -211,7 +212,7 @@ export declare type ReadFileRequest = Message<"omnigent.api.workspace.v1alpha1.R
 
   /**
    * Bytes to read at most; 0 means the server's limit. Values above it are
-   * lowered to it.
+   * lowered to it. Older hosts ignore this field.
    *
    * @generated from field: uint64 maximum_bytes = 2;
    */
@@ -429,7 +430,8 @@ export declare type FileSearchResult = Message<"omnigent.api.workspace.v1alpha1.
   score: number;
 
   /**
-   * Character indices in the entry's path that matched, for highlighting.
+   * Indices, in UTF-16 code units, of the entry's path characters that matched,
+   * for highlighting.
    *
    * @generated from field: repeated uint32 matched_indices = 3;
    */
@@ -693,6 +695,8 @@ export declare const SearchTextResponseSchema: GenMessage<SearchTextResponse>;
  */
 export declare type Comparison = Message<"omnigent.api.workspace.v1alpha1.Comparison"> & {
   /**
+   * Unspecified means COMPARISON_KIND_LAST_COMMIT.
+   *
    * @generated from field: omnigent.api.workspace.v1alpha1.ComparisonKind kind = 1;
    */
   kind: ComparisonKind;

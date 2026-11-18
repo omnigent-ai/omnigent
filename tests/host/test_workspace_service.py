@@ -360,7 +360,7 @@ async def test_methods_not_served_yet_answer_unimplemented(
     tmp_path: Path, client_for: ClientFor
 ) -> None:
     """A client that skips GetCapabilities still gets a code it can fall back on."""
-    client = client_for(_workspace(tmp_path))
+    client = client_for(tmp_path)
 
     with pytest.raises(ConnectError) as unary:
         await client.search_files(SearchFilesRequest(query="main"))
