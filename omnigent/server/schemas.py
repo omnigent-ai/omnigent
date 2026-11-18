@@ -3553,6 +3553,8 @@ class WorkflowRun(BaseModel):
     :param session_status: The session's status, ``"idle"``, ``"running"`` or
         ``"failed"``, including active direct sub-agents.
     :param background_work_running: Whether background work outlives the session's turn.
+    :param sandbox_launching: Whether the session's sandbox is still launching, so
+        the run is starting; ``False`` once it is up and for a failed launch.
     :param archived: Whether the session is archived.
     :param progress: Where the run's steps stand.
     :param steps: The latest plan's steps within this invocation.
@@ -3584,6 +3586,7 @@ class WorkflowRun(BaseModel):
     is_current: bool = False
     session_status: Literal["idle", "running", "failed"]
     background_work_running: bool = False
+    sandbox_launching: bool = False
     archived: bool = False
     progress: WorkflowRunProgress
     steps: list[WorkflowStep] = Field(default_factory=list)
