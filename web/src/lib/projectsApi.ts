@@ -64,7 +64,17 @@ export interface ProjectConfig {
    * model's ladder. Unset = the harness's own configured effort.
    */
   effort?: string;
+  /**
+   * Marks the project new automations file their runs into, so the default is
+   * matched by this flag instead of the folder's name and survives renames.
+   * Set by the automation dialog when it creates or adopts the project; never
+   * offered as a setting.
+   */
+  default_automations?: boolean;
 }
+
+/** The {@link ProjectConfig} key marking the project new automations default to. */
+export const AUTOMATION_DEFAULT_CONFIG_KEY = "default_automations";
 
 /** A first-class project. Mirrors the `ProjectObject` response shape. */
 export interface Project {

@@ -65,14 +65,17 @@ import { isStaleCursorError, useRestartOnStaleCursor } from "@/lib/staleCursor";
 import { isRetryableRequestError } from "@/lib/queryRetry";
 import { sessionRoutingHostId, setSessionHost, setSessionParent } from "@/lib/sessionHost";
 import {
+  AUTOMATION_DEFAULT_CONFIG_KEY,
   createProject as apiCreateProject,
   deleteProject as apiDeleteProject,
   getProject as apiGetProject,
   listProjects as apiListProjects,
+  type Project,
   type ProjectConfig,
   renameProject as apiRenameProject,
   updateProjectConfig as apiUpdateProjectConfig,
 } from "@/lib/projectsApi";
+import { DEFAULT_AUTOMATION_PROJECT } from "@/lib/automationSessions";
 import { releaseConversation, useChatStore } from "@/store/chatStore";
 import type { Session, SessionFamily } from "@/lib/types";
 import type { SessionPullRequestSummary } from "@/hooks/useSessionPullRequests";
@@ -2458,6 +2461,94 @@ export function useResolveOrCreateProjectId(): (name: string) => Promise<string>
     },
     [queryClient],
   );
+}
+
+/** The project from a full listing that new automations file their runs into. */
+function findAutomationProject(projects: Project[]): Project | undefined {
+  return (
+    projects.find((project) => project.config?.[AUTOMATION_DEFAULT_CONFIG_KEY]) ??
+    // Projects created before the marker existed carry only the default name.
+    projects.find((project) => project.name === DEFAULT_AUTOMATION_PROJECT)
+  );
+}
+
+/**
+ * Cache key for the automations default project. Nested under `"projects"` so
+ * the existing project-list invalidations (rename, delete, order, …) refresh
+ * it too.
+ */
+const DEFAULT_AUTOMATION_PROJECT_KEY = ["projects", "default-automation"] as const;
+
+/**
+ * The project new automations file their runs into, from `/v1/projects` (the
+ * sidebar summaries carry no config, so the marker isn't visible there).
+ * `null` once loaded with no match — the dialog then shows the name a new
+ * project will get.
+ */
+export function useDefaultAutomationProject({ enabled = true }: { enabled?: boolean } = {}) {
+  return useQuery<Project | null>({
+    queryKey: DEFAULT_AUTOMATION_PROJECT_KEY,
+    queryFn: async () => findAutomationProject(await apiListProjects()) ?? null,
+    staleTime: 30_000,
+    enabled,
+  });
+}
+
+/**
+ * Resolve the project new automations file their runs into, creating it on
+ * demand. Matched by its config marker so renaming the folder doesn't spawn a
+ * duplicate; a project carrying only the default name (created before the
+ * marker existed) is adopted and stamped. Deleting the project drops the
+ * marker with it, so the next automation creates a fresh one.
+ */
+export async function resolveOrCreateAutomationProjectId(): Promise<string> {
+  const projects = await apiListProjects();
+  const existing = findAutomationProject(projects);
+  if (existing) {
+    if (!existing.config?.[AUTOMATION_DEFAULT_CONFIG_KEY]) {
+      // Stamp the adopted project best-effort; a failed write keeps the name
+      // match working until a later save retries it.
+      try {
+        await apiUpdateProjectConfig(existing.id, {
+          ...existing.config,
+          [AUTOMATION_DEFAULT_CONFIG_KEY]: true,
+        });
+      } catch {
+        // The adopted id is still correct for this save.
+      }
+    }
+    return existing.id;
+  }
+  try {
+    return (
+      await apiCreateProject(DEFAULT_AUTOMATION_PROJECT, {
+        [AUTOMATION_DEFAULT_CONFIG_KEY]: true,
+      })
+    ).id;
+  } catch (err) {
+    // The create may have lost a race (a concurrent save created the same
+    // name → 409) or genuinely failed. Re-list: a racer's project — marked or
+    // still name-only — wins; otherwise rethrow the ORIGINAL error so the true
+    // cause isn't masked.
+    const after = await apiListProjects();
+    const created = findAutomationProject(after);
+    if (created) return created.id;
+    throw err;
+  }
+}
+
+/**
+ * {@link resolveOrCreateAutomationProjectId}, then refresh the cached project
+ * lists so the sidebar and the dialog's default read the project it just
+ * created or stamped.
+ */
+export function useResolveOrCreateAutomationProjectId(): () => Promise<string> {
+  const queryClient = useQueryClient();
+  return useCallback(async () => {
+    const id = await resolveOrCreateAutomationProjectId();
+    void queryClient.invalidateQueries({ queryKey: ["projects"] });
+    return id;
+  }, [queryClient]);
 }
 
 /**
