@@ -79,6 +79,8 @@ export interface FileReference {
   hasDirectory: boolean;
   /** Per-candidate positions when candidates come from different texts (prose extents). */
   candidateCitations?: FileCitation[];
+  /** Per-candidate folder hints when candidates come from different texts. */
+  candidateFolderHints?: boolean[];
 }
 
 // Characters that mark a template or placeholder rather than a real path.
@@ -88,6 +90,9 @@ const WINDOWS_PATH = /^[A-Za-z]:[\\/]|^\\\\/;
 // A file name: something before a dot, then an extension with a letter in it,
 // so `v1.2` and `3.14` are not names but `app.tsx` and `Dockerfile.dev` are.
 const FILE_NAME_WITH_EXTENSION = /^[^/\s][^/]*\.[A-Za-z0-9_-]*[A-Za-z][A-Za-z0-9_-]*$/;
+// A shell command that names a path (`python scripts/x.py`, `cat src/a.ts`), not a path.
+const COMMAND_PREFIX =
+  /^(?:git|python3?|node|npx?|pnpm|yarn|uv|pip|cat|less|head|tail|rg|grep|sed|awk|cd|ls|mv|cp|rm|mkdir|touch|chmod|bash|sh|zsh|source|vim?|nano|code|open|make|cargo|go|just|pytest|docker|kubectl|curl|claude|codex)\s/;
 const EXTENSIONLESS_FILE_NAMES = new Set([
   "Makefile",
   "Dockerfile",
@@ -172,7 +177,8 @@ export function parseFileReference(raw: string, source: FileReferenceSource): Fi
   // (`see docs`, `a / b`), never a real directory name.
   const segments = path.split("/");
   if (segments.some((segment) => segment !== segment.trim())) return null;
-  if (source !== "link" && /(^|\s)-{1,2}\w/.test(path)) return null; // command flags
+  if (source !== "link" && /(^|\s)-{1,2}(\w|\s|$)/.test(path)) return null; // command flags
+  if (source !== "link" && COMMAND_PREFIX.test(path)) return null;
 
   const anchored = /^(?:\/|~\/|\.\.?\/)/.test(path);
   const hasDirectory = segments.filter(Boolean).length > 1 || anchored;
@@ -293,19 +299,33 @@ export function mergeProseExtents(
   if (!parsed.length) return null;
   const candidates: string[] = [];
   const candidateCitations: FileCitation[] = [];
+  const candidateFolderHints: boolean[] = [];
   const candidateLengths: number[] = [];
   for (const { length, reference } of parsed) {
     for (const candidate of reference.candidates) {
       if (candidates.includes(candidate)) continue;
       candidates.push(candidate);
       candidateCitations.push(reference.citation);
+      candidateFolderHints.push(reference.folderHint);
       candidateLengths.push(length);
     }
   }
   return {
-    reference: { ...parsed[0].reference, text, candidates, candidateCitations },
+    reference: {
+      ...parsed[0].reference,
+      text,
+      candidates,
+      candidateCitations,
+      candidateFolderHints,
+    },
     candidateLengths,
   };
+}
+
+/** `Makefile:12`: an extensionless file name with a position, which has no `/` or `.`. */
+function isPositionedFileName(token: string): boolean {
+  const citation = splitFileCitation(token);
+  return citation.hasPosition && EXTENSIONLESS_FILE_NAMES.has(citation.path);
 }
 
 /** Finds file and folder references in a run of plain prose text. */
@@ -317,7 +337,9 @@ export function findProseFileReferences(text: string): ProseFileReference[] {
   const found: ProseFileReference[] = [];
   for (let index = 0; index < tokens.length; index += 1) {
     const { offset, text: token } = trimToken(tokens[index].raw);
-    if (!token || (!token.includes("/") && !token.includes("."))) continue;
+    if (!token || (!token.includes("/") && !token.includes(".") && !isPositionedFileName(token))) {
+      continue;
+    }
     const start = tokens[index].start + offset;
     const reference = parseFileReference(token, "prose");
     const extents: ProseFileReference["extents"] = [];

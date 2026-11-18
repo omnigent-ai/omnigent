@@ -76,6 +76,9 @@ describe("parseFileReference in inline code", () => {
     "~",
     "file:///home/u/ws/report.md%23L12",
     "file:///home/u/ws/report.md%3A12",
+    "python scripts/x.py",
+    "git checkout -- src/app.ts",
+    "cat ~/.config/app.json",
   ])("rejects %s", (text) => {
     expect(parseFileReference(text, "code")).toBeNull();
   });
@@ -93,6 +96,7 @@ describe("findProseFileReferences", () => {
     ["see /home/u/universe/experimental/data for it", ["/home/u/universe/experimental/data"]],
     ["the tmp/out/ folder", ["tmp/out/"]],
     ["read README.md first", ["README.md"]],
+    ["See Makefile:12.", ["Makefile:12"]],
   ])("finds the reference in %s", (text, expected) => {
     expect(found(text)).toEqual(expected);
   });

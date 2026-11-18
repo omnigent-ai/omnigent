@@ -223,6 +223,8 @@ export function MarkdownFileLink({
 }: Omit<React.ComponentPropsWithoutRef<"a">, "href"> & { path: string }) {
   const reference = useMemo(() => parseFileReference(path, "link"), [path]);
   const resolved = useFileReference(reference);
+  // A destination the parser rejects (`/`, `..`) is still copied as written.
+  const copyPath = resolved.copyPath || path;
   const conversationId = useFileViewerConversationId();
   const { root, home } = useWorkspacePaths();
 
@@ -235,7 +237,7 @@ export function MarkdownFileLink({
             : `Can't open ${path}: it doesn't resolve to an openable file path.`,
         );
       return (
-        <FileLinkContextMenu path={resolved.copyPath}>
+        <FileLinkContextMenu path={copyPath}>
           <span
             role="button"
             tabIndex={0}
@@ -254,7 +256,7 @@ export function MarkdownFileLink({
     }
     // Not verified yet, or a folder with no Files tree to show it.
     return (
-      <FileLinkContextMenu path={resolved.copyPath}>
+      <FileLinkContextMenu path={copyPath}>
         <span className={className} title={title ?? path}>
           {children}
         </span>
@@ -287,7 +289,7 @@ export function MarkdownFileLink({
       : null;
 
   return (
-    <FileLinkContextMenu path={resolved.copyPath}>
+    <FileLinkContextMenu path={copyPath}>
       <a
         {...props}
         role="button"

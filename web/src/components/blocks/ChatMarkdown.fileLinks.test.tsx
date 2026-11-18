@@ -15,9 +15,22 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FileViewerContext } from "@/shell/FileViewerContext";
 import { mentionPillMarkdown } from "@/lib/mentionPills";
+import type * as RunnerHealth from "@/hooks/RunnerHealthProvider";
 import { FilePathAwareMessageResponse } from "./ChatMarkdown";
 
 vi.mock("@/components/ui/toast", () => ({ showToast: vi.fn() }));
+
+const { liveness } = vi.hoisted(() => ({
+  liveness: {
+    runner: undefined as boolean | undefined,
+    host: undefined as boolean | null | undefined,
+  },
+}));
+vi.mock("@/hooks/RunnerHealthProvider", async (importOriginal) => ({
+  ...(await importOriginal<typeof RunnerHealth>()),
+  useSessionRunnerOnline: () => liveness.runner,
+  useSessionHostOnline: () => liveness.host,
+}));
 import { showToast } from "@/components/ui/toast";
 
 const { copyTextMock } = vi.hoisted(() => ({
@@ -31,6 +44,8 @@ const toastMock = vi.mocked(showToast);
 const fetchMock = vi.fn();
 
 beforeEach(() => {
+  liveness.runner = undefined;
+  liveness.host = undefined;
   fetchMock.mockReset();
   toastMock.mockReset();
   copyTextMock.mockReset().mockResolvedValue(undefined);
@@ -110,6 +125,7 @@ const FILE_VIEWER_WITH_SESSION = {
   ...FILE_VIEWER,
   conversationId: "conv_1",
 };
+const SAME_SESSION_VIEWER = { ...FILE_VIEWER_WITH_SESSION };
 
 function renderMarkdown(
   markdown: string,
@@ -837,12 +853,15 @@ describe("copying a file link's path", () => {
     expect(copyTextMock).toHaveBeenCalledWith("/no/such/file.txt");
   });
 
-  it("copies an unresolvable path as written", async () => {
-    renderMarkdown(`[trap](${WORKSPACE}/../../etc/hosts)`);
+  it.each([`${WORKSPACE}/../../etc/hosts`, "/", ".."])(
+    "copies an unresolvable path as written: %s",
+    async (href) => {
+      renderMarkdown(`[trap](${href})`);
 
-    await copyFromMenu(screen.getByRole("button", { name: "trap" }));
-    expect(copyTextMock).toHaveBeenCalledWith(`${WORKSPACE}/../../etc/hosts`);
-  });
+      await copyFromMenu(screen.getByText("trap"));
+      expect(copyTextMock).toHaveBeenCalledWith(href);
+    },
+  );
 
   it("reports a failed copy", async () => {
     copyTextMock.mockRejectedValue(new Error("denied"));
@@ -1005,6 +1024,45 @@ describe("file references beyond backticks and links", () => {
     await settleQueries();
     expect(screen.queryByRole("button", { name: "index" })).toBeNull();
     expect(toastMock).not.toHaveBeenCalled();
+  });
+
+  it("links a prose file whose spaced extension would end in a folder", async () => {
+    fetchMock.mockImplementation(async () =>
+      listing([{ path: "a.md" }, { path: "docs", type: "directory" }]),
+    );
+    renderMarkdown("See ./a.md and docs/", [], FILE_VIEWER_WITH_SESSION);
+
+    fireEvent.click(await screen.findByRole("button", { name: "./a.md" }));
+    expect(openFile).toHaveBeenCalledWith("a.md");
+  });
+
+  it("opens an extensionless prose file at its cited line", () => {
+    renderMarkdown("See Makefile:12.", ["Makefile"]);
+
+    fireEvent.click(screen.getByRole("button", { name: "Makefile:12" }));
+    expect(openFile).toHaveBeenCalledWith("Makefile", { line: 12 });
+  });
+
+  it("keeps a verified link while the runner is offline", async () => {
+    fetchMock.mockResolvedValue(listing([{ path: "docs/notes.md" }]));
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const tree = (viewer: typeof FILE_VIEWER_WITH_SESSION) => (
+      <QueryClientProvider client={client}>
+        <FileViewerContext.Provider value={viewer}>
+          <FilePathAwareMessageResponse>{"[Notes](docs/notes.md)"}</FilePathAwareMessageResponse>
+        </FileViewerContext.Provider>
+      </QueryClientProvider>
+    );
+    const { rerender } = render(tree(FILE_VIEWER_WITH_SESSION));
+    await screen.findByRole("button", { name: "Notes" });
+
+    liveness.runner = false;
+    liveness.host = false;
+    // A new context value re-renders the link, as a liveness change does in the app.
+    rerender(tree(SAME_SESSION_VIEWER));
+
+    fireEvent.click(screen.getByRole("button", { name: "Notes" }));
+    expect(openFile).toHaveBeenCalledWith("docs/notes.md");
   });
 
   it("opens a literal a/ path that exists before its changed diff-prefix fallback", async () => {

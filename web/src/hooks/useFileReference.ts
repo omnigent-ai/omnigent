@@ -123,8 +123,10 @@ export function useFileReference(
     resolution && resolution !== "pending" ? resolution.path : null,
   );
   // A folder can't be in the changed list, and an outside path is never a change.
+  const folderHintAt = (index: number) =>
+    reference?.candidateFolderHints?.[index] ?? reference?.folderHint ?? false;
   const changed = resolvedPaths.map(
-    (path) => !reference?.folderHint && !!path && !path.startsWith("/") && isChangedPath(path),
+    (path, index) => !folderHintAt(index) && !!path && !path.startsWith("/") && isChangedPath(path),
   );
   const firstChanged = changed.indexOf(true);
   // Without a session nothing can be listed, so the changed list is the only evidence.
@@ -157,10 +159,13 @@ export function useFileReference(
       winner = index;
       break;
     }
-    if (!checking) continue;
     const query = listings[index];
     let state = candidateState(query.isSuccess ? query.data : null, resolution.path);
+    // A listing that can't run leaves the changed list as the only evidence.
+    if (state === "pending" && !checking) continue;
     if (state === "missing" && missIsOutdated(query, renderedAt)) state = "pending";
+    // A path written with a trailing slash can only name a folder.
+    if (state === "file" && folderHintAt(index)) state = "missing";
     if (state === "pending") {
       undecided = true;
       break;
@@ -263,7 +268,6 @@ export function useFileReference(
         open: openFolder && absolute ? () => openFolder(absolute) : null,
       };
     }
-    if (reference.folderHint) return { ...base, status: "missing", open: null };
     return {
       ...base,
       status: "file",
