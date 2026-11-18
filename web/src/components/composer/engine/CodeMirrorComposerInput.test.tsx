@@ -126,6 +126,36 @@ describe("CodeMirrorComposerInput", () => {
     expect(content.getAttribute("autocapitalize")).toBe("sentences");
   });
 
+  it("locks while an ancestor fieldset is disabled, as a textarea does", async () => {
+    const box: { target: ComposerTextTarget | null } = { target: null };
+    const input = (fieldsetDisabled: boolean) => (
+      <fieldset disabled={fieldsetDisabled}>
+        <CodeMirrorComposerInput
+          aria-label="Message the agent"
+          defaultValue="draft"
+          ref={(target) => {
+            box.target = target;
+          }}
+        />
+      </fieldset>
+    );
+    const { container, rerender } = render(input(true));
+    const content = container.querySelector<HTMLElement>(".cm-content")!;
+    expect(content.getAttribute("aria-disabled")).toBe("true");
+    expect(insertComposerText(box.target!, "x", 0, 0)).toBe(false);
+    expect(box.target!.value).toBe("draft");
+
+    rerender(input(false));
+    await waitFor(() => expect(content.getAttribute("aria-disabled")).toBe("false"));
+    expect(insertComposerText(box.target!, "x", 0, 0)).toBe(true);
+    expect(box.target!.value).toBe("xdraft");
+
+    rerender(input(true));
+    await waitFor(() => expect(content.getAttribute("aria-disabled")).toBe("true"));
+    expect(insertComposerText(box.target!, "y", 0, 0)).toBe(false);
+    expect(box.target!.value).toBe("xdraft");
+  });
+
   it("takes a caller's text size in place of the composer's own", () => {
     const host = (className?: string) => {
       const { container, unmount } = mount({ className });
