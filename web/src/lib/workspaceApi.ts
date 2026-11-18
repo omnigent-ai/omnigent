@@ -480,8 +480,8 @@ export interface FileSearchOptions {
  * the REST ``/search`` route's case-insensitive substring match.
  *
  * :param query: Substring of an entry's path; not blank.
- * :returns: The matches, or null when the caller should search through REST
- *     (see :func:`viaWorkspaceApi`).
+ * :returns: The matches, or null when the caller should search through REST:
+ *     see :func:`viaWorkspaceApi`, or the host's file list is still being built.
  */
 export function searchFilesViaWorkspaceApi(
   sessionId: string,
@@ -501,9 +501,13 @@ export function searchFilesViaWorkspaceApi(
           path,
           include: splitGlobList(include),
           exclude: splitGlobList(exclude),
+          // The REST search walks ignored files too, so they stay findable.
+          includeIgnored: true,
         },
         { signal },
       );
+      // The file list is still being built: REST answers now instead of a partial list.
+      if (response.refreshing) return null;
       return {
         data: response.results.flatMap((result) =>
           result.entry ? [listedEntry(result.entry)] : [],
