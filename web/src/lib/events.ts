@@ -252,6 +252,7 @@ export interface ElicitationRequest {
     cwd: string | null;
     reason: string | null;
     execPolicyAmendment: string[] | null;
+    requestFingerprint?: string | null;
   } | null;
   /**
    * Producer-supplied extra (claude-native edit-tool prompts only):

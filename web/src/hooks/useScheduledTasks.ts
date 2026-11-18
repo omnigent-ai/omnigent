@@ -7,10 +7,12 @@
 // row — no patch-in-place gymnastics are needed here.
 
 import {
+  useInfiniteQuery,
   useMutation,
   useQueries,
   useQuery,
   useQueryClient,
+  type InfiniteData,
   type QueryClient,
 } from "@tanstack/react-query";
 import { invalidateSessionGrants } from "@/hooks/usePermissions";
@@ -22,10 +24,12 @@ import {
   listScheduledTaskRuns,
   listScheduledTaskRunSteps,
   listScheduledTasks,
+  listSharedScheduledTasks,
   runScheduledTaskNow,
   updateScheduledTask,
   type CreateScheduledTaskInput,
   type ScheduledTask,
+  type SharedScheduledTasksPage,
   type ScheduledTaskRun,
   type ScheduledTaskRunSteps,
   type UpdateScheduledTaskInput,
@@ -33,6 +37,9 @@ import {
 
 /** Query key for the caller's scheduled-tasks list. */
 export const SCHEDULED_TASKS_KEY = ["scheduled-tasks"] as const;
+
+/** Query key for the automations other users shared with the caller. */
+export const SHARED_SCHEDULED_TASKS_KEY = ["scheduled-tasks-shared"] as const;
 
 /** Query key for one task's detail. */
 export function scheduledTaskKey(id: string): readonly unknown[] {
@@ -69,6 +76,31 @@ export function useScheduledTasks() {
 }
 
 /**
+ * The automations shared with the caller, a page at a time. Polls like
+ * {@link useScheduledTasks}, under the same page-scoped contract: mount it only
+ * on the Automations page. `enabled` is false where the server can't share them.
+ */
+export function useSharedScheduledTasks(enabled: boolean) {
+  return useInfiniteQuery({
+    queryKey: SHARED_SCHEDULED_TASKS_KEY,
+    queryFn: ({ pageParam }) => listSharedScheduledTasks(pageParam),
+    initialPageParam: null as string | null,
+    getNextPageParam: (page) => page.nextCursor,
+    enabled,
+    staleTime: 30_000,
+    refetchInterval: 60_000,
+  });
+}
+
+/** A task from the loaded pages of {@link useSharedScheduledTasks}, if any. */
+function cachedSharedTask(queryClient: QueryClient, id: string): ScheduledTask | undefined {
+  return queryClient
+    .getQueryData<InfiniteData<SharedScheduledTasksPage>>(SHARED_SCHEDULED_TASKS_KEY)
+    ?.pages.flatMap((page) => page.tasks)
+    .find((task) => task.id === id);
+}
+
+/**
  * One task's detail (the `/tasks/:taskId` page). Seeds initial data from the
  * already-cached list so navigating from the list paints instantly, then
  * refetches to pick up any fields the list row didn't carry / staleness. The
@@ -83,9 +115,10 @@ export function useScheduledTask(id: string, enabled = true) {
     queryFn: () => getScheduledTask(id),
     enabled: enabled && id !== "",
     staleTime: 30_000,
-    // Paint from the list cache while the detail fetch is in flight.
+    // Paint from either list's cache while the detail fetch is in flight.
     placeholderData: () =>
-      queryClient.getQueryData<ScheduledTask[]>(SCHEDULED_TASKS_KEY)?.find((t) => t.id === id),
+      queryClient.getQueryData<ScheduledTask[]>(SCHEDULED_TASKS_KEY)?.find((t) => t.id === id) ??
+      cachedSharedTask(queryClient, id),
   });
 }
 
@@ -184,7 +217,8 @@ const RUN_STEPS_PAGE = 20;
  * refresh a page when a short continuation finishes between history polls.
  *
  * @param runs - The task's runs, most recent first, from `useScheduledTaskRuns`.
- * @param enabled - Whether the server supports workflow history.
+ * @param enabled - Whether to fetch: the server supports workflow history and the
+ *     caller owns the automation, since a viewer's history has no plans.
  */
 export function useScheduledTaskRunSteps(
   id: string,

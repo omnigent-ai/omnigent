@@ -23,7 +23,8 @@ firing:
    with the automation's grantees (:mod:`~omnigent.server.scheduled.run_sharing`).
 #. **Launches the runner and dispatches the prompt** so the agent actually runs
    (a seeded prompt with no launched runner would just sit as history). The
-   message ends with :data:`UNATTENDED_RUN_NOTE`, since no one watches the run.
+   message ends with :data:`UNATTENDED_RUN_NOTE`, since no one watches the run;
+   the note opens with the run time.
 #. **Records the run** — stamps ``last_run_at`` + ``last_run_conversation_id`` on
    the task row and writes a ``scheduled_task_runs`` history row.
 
@@ -70,7 +71,7 @@ import uuid
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 from zoneinfo import ZoneInfo
@@ -98,6 +99,7 @@ from omnigent.server.managed_hosts import (
     parse_repo_workspace,
     read_managed_repo_workspaces,
 )
+from omnigent.server.proactive_agent import fire_skip_reason, is_proactive_task
 from omnigent.server.routes._session_create_validation import (
     validate_existing_host_workspace,
     validate_session_agent,
@@ -155,7 +157,12 @@ from omnigent.server.scheduled.telemetry import (
     startup_failure_stage,
 )
 from omnigent.server.schemas import SessionEventInput
-from omnigent.server.session_mcp_selection import SessionMcpSelection, session_mcp_selection
+from omnigent.server.session_mcp_selection import (
+    SessionMcpSelection,
+    mcp_selection_for,
+    run_sandbox,
+    session_mcp_label_keys,
+)
 from omnigent.stores.conversation_store import (
     CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
     SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY,
@@ -465,7 +472,7 @@ def format_run_time(epoch_seconds: float, timezone: ZoneInfo) -> str:
 # question or a permission request stalls it instead of reaching a person. Only
 # the sent message carries it: the task keeps the prompt its owner wrote, so the
 # automation pages never show it. The chat hides it by exact text, so a change
-# here also goes in AUTOMATION_CONTEXT_NOTE in web/src/lib/systemMessage.ts.
+# here or to its run-time line also goes in web/src/lib/systemMessage.ts.
 UNATTENDED_RUN_NOTE = (
     "<omnigent-automation-context>\n"
     "Note: an Omnigent automation sent this message, and no one is watching this run. "
@@ -489,9 +496,26 @@ UNATTENDED_RUN_NOTE = (
 )
 
 
+_AUTOMATION_CONTEXT_OPEN = "<omnigent-automation-context>\n"
+
+
+def unattended_run_note(sent_at: float) -> str:
+    """:data:`UNATTENDED_RUN_NOTE`, opening with the time the fire sent it.
+
+    The run time saves the agent a clock lookup; the chat hides this line with the note.
+    """
+    seconds = int(sent_at)
+    run_time = f"{datetime.fromtimestamp(seconds, UTC):%Y-%m-%dT%H:%M:%SZ}"
+    return UNATTENDED_RUN_NOTE.replace(
+        _AUTOMATION_CONTEXT_OPEN,
+        f"{_AUTOMATION_CONTEXT_OPEN}Run time: {run_time} (Unix time {seconds}).\n",
+        1,
+    )
+
+
 def _prompt_event(prompt: str) -> SessionEventInput:
     """Build the user-message event that carries a task's prompt to the runner."""
-    text = f"{strip_trigger_header(prompt).rstrip()}\n\n{UNATTENDED_RUN_NOTE}"
+    text = f"{strip_trigger_header(prompt).rstrip()}\n\n{unattended_run_note(time.time())}"
     return SessionEventInput(
         type="message",
         data={"role": "user", "content": [{"type": "input_text", "text": text}]},
@@ -769,6 +793,12 @@ async def _run_fire_for_task(
     if await _owner_is_deleted(deps, task):
         await _disable_for_deleted_owner(deps, task, recorder)
         return
+    if is_proactive_task(task):
+        skip = await asyncio.to_thread(fire_skip_reason, deps.app_state, deps.agent_store, task)
+        if skip is not None:
+            _logger.info("scheduled fire: proactive task %s skipped: %s", task.id, skip)
+            await recorder.finish("skipped", error=skip, error_code="proactive_agent_off")
+            return
     managed = task.execution_target == "managed_sandbox"
     if not managed and task.execution_target != "connected_host":
         _logger.info(
@@ -865,13 +895,14 @@ async def _run_fire_for_task(
     try:
         start_fire_stage("session_create")
         effective = await _own_task_agent(deps, effective)
+        mcp_selection = await _run_mcp_selection(
+            deps, task, effective.host_id or recorder.managed_host_id
+        )
         conv = await _create_session(
             deps,
             effective,
             labels={
-                **_session_labels(
-                    task, session_mcp_selection(deps.app_state), recorder.managed_host_id
-                ),
+                **_session_labels(task, mcp_selection, recorder.managed_host_id),
                 SCHEDULED_TASK_RUN_LABEL_KEY: recorder.run_id,
                 SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY: recorder.run_id,
             },
@@ -1744,7 +1775,12 @@ async def _spec_reasoning_effort(deps: FireDeps, task: ScheduledTask) -> str | N
         agent = await asyncio.to_thread(deps.agent_store.get, task.agent_id)
         if agent is None or getattr(agent, "bundle_location", None) is None:
             return None
-        loaded = await asyncio.to_thread(deps.agent_cache.load, agent.id, agent.bundle_location)
+        loaded = await asyncio.to_thread(
+            deps.agent_cache.load,
+            agent.id,
+            agent.bundle_location,
+            expand_env=agent.operator_authored,
+        )
         executor = getattr(loaded.spec, "executor", None)
         return getattr(executor, "reasoning_effort", None) if executor else None
     except Exception:
@@ -1878,6 +1914,16 @@ def _sandbox_workspaces(task: ScheduledTask) -> list[str]:
     return []
 
 
+async def _run_mcp_selection(
+    deps: FireDeps, task: ScheduledTask, host_id: str | None
+) -> SessionMcpSelection:
+    """The selection of the sandbox a run's session lands in, or the registry's."""
+    sandbox = await asyncio.to_thread(
+        run_sandbox, deps.sandbox_config, deps.host_store, task.execution_target, host_id
+    )
+    return mcp_selection_for(sandbox)
+
+
 def _session_labels(
     task: ScheduledTask,
     mcp_selection: SessionMcpSelection | None = None,
@@ -1885,14 +1931,14 @@ def _session_labels(
 ) -> dict[str, str]:
     """Labels a fired session starts with.
 
-    The task's MCP services become the deployment's selection labels, so every
-    run starts with the same services. A managed fire's session records the
+    The task's MCP services become its selection's labels, so every run starts
+    with the same services. A managed fire's session records the
     sandbox host id it was launched under, so the host routes by that id from
     its first connection and a relaunch keeps the same replica. A task with no
     services writes no selection labels, so a copied session keeps its own.
     """
     selection_labels = (
-        (mcp_selection or session_mcp_selection(None)).session_labels(task.mcp_services)
+        (mcp_selection or mcp_selection_for(None)).session_labels(task.mcp_services)
         if task.mcp_services
         else {}
     )
@@ -2106,11 +2152,9 @@ async def _copy_source_session_for_run(
         source.labels if source is not None else {}, agent_changed=agent_changed
     )
     if task.mcp_services and source is not None:
-        # The task's own MCP services replace the copy's rather than adding to them.
-        selection = session_mcp_selection(deps.app_state)
-        dropped = dropped | frozenset(
-            selection.session_labels(selection.selected_services(source.labels))
-        )
+        # The task's own MCP services replace the copy's rather than adding to
+        # them, whichever selection wrote the copy's.
+        dropped = dropped | session_mcp_label_keys(deps.sandbox_config, source.labels)
     project_id = await _fire_project_id(deps, task)
     try:
         conv = await asyncio.to_thread(

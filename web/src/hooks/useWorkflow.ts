@@ -11,6 +11,10 @@ import { ApiError, apiErrorFromResponse } from "@/lib/sessionsApi";
 export interface WorkflowDetail extends SavedWorkflow {
   steps: WorkflowStep[];
   planning_session_id?: string | null;
+  /** Epoch seconds of its last write. */
+  updated_at?: number;
+  /** The planning chat's proposal the description was saved from, until written otherwise. */
+  description_source?: string | null;
 }
 
 /** The workflow doesn't exist, or isn't the user's. */
@@ -49,14 +53,39 @@ export function useWorkflow(workflowId: string) {
   });
 }
 
-async function writeWorkflow(path: string, method: string, body: object): Promise<WorkflowDetail> {
-  const res = await authenticatedFetch(path, {
+function sendWorkflow(path: string, method: string, body: object): Promise<Response> {
+  return authenticatedFetch(path, {
     method,
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
+}
+
+async function savedWorkflow(res: Response): Promise<WorkflowDetail> {
   if (!res.ok) throw await apiErrorFromResponse(res);
   return res.json() as Promise<WorkflowDetail>;
+}
+
+async function writeWorkflow(path: string, method: string, body: object): Promise<WorkflowDetail> {
+  return savedWorkflow(await sendWorkflow(path, method, body));
+}
+
+/** Whether a server from before conditional descriptions refused their fields as unknown. */
+async function refusesExpectedDescription(res: Response): Promise<boolean> {
+  if (res.status !== 422) return false;
+  const body = (await res
+    .clone()
+    .json()
+    .catch(() => null)) as { detail?: unknown } | null;
+  return (
+    Array.isArray(body?.detail) &&
+    body.detail.some(
+      (issue: { type?: unknown; loc?: unknown }) =>
+        issue?.type === "extra_forbidden" &&
+        Array.isArray(issue.loc) &&
+        ["expected_description", "description_source"].includes(issue.loc.at(-1)),
+    )
+  );
 }
 
 function useWorkflowSaved() {
@@ -109,12 +138,36 @@ export function useCloneWorkflow() {
   });
 }
 
-/** Apply the reviewed proposal to the existing workflow. */
+/**
+ * Apply the reviewed proposal, its steps and any new description, to the existing workflow.
+ * The server keeps a description that is no longer `expected_description`; a server too old
+ * to check that gets the steps alone, so its description stays.
+ */
 export function useSaveWorkflowPlan(workflowId: string) {
   const onSuccess = useWorkflowSaved();
   return useMutation({
-    mutationFn: (steps: WorkflowStep[]) =>
-      writeWorkflow(workflowPath(workflowId), "PATCH", { steps }),
+    mutationFn: async (proposal: {
+      steps: WorkflowStep[];
+      description?: string;
+      expected_description?: string;
+      description_source?: string;
+    }) => {
+      const path = workflowPath(workflowId);
+      const res = await sendWorkflow(path, "PATCH", proposal);
+      if (proposal.expected_description !== undefined && (await refusesExpectedDescription(res)))
+        return writeWorkflow(path, "PATCH", { steps: proposal.steps });
+      return savedWorkflow(res);
+    },
+    onSuccess,
+  });
+}
+
+/** Replace the workflow's description with the user's own wording. */
+export function useSaveWorkflowDescription(workflowId: string) {
+  const onSuccess = useWorkflowSaved();
+  return useMutation({
+    mutationFn: (description: string) =>
+      writeWorkflow(workflowPath(workflowId), "PATCH", { description }),
     onSuccess,
   });
 }
@@ -153,54 +206,104 @@ interface RawRun {
   };
   steps?: JournalPlanStep[];
   statuses?: JournalEntry[];
+  workflow_id?: string;
+  workflow_name?: string | null;
+  started_by?: { session_id: string; title: string } | null;
+  descendant_runs?: RawRun[];
+  descendant_run_count?: number;
+  descendant_runs_cursor?: string | null;
+  descendant_runs_active?: boolean;
+}
+
+function toWorkflowRun(run: RawRun): WorkflowRun {
+  return {
+    id: run.id,
+    workflowId: run.workflow_id,
+    planGraphRevision: run.plan_graph_revision ?? undefined,
+    sessionId: run.session_id,
+    title: run.title,
+    startedAt: run.started_at,
+    isCurrent: run.is_current === true,
+    sessionStatus: run.session_status,
+    backgroundWorkRunning: run.background_work_running ?? false,
+    archived: run.archived,
+    progress: {
+      total: run.progress.total,
+      started: run.progress.started,
+      done: run.progress.done,
+      needsInput: run.progress.needs_input,
+      failed: run.progress.failed,
+    },
+    steps: run.steps ?? [],
+    statuses: run.statuses ?? [],
+    startedBy: run.started_by
+      ? { sessionId: run.started_by.session_id, title: run.started_by.title }
+      : undefined,
+    workflowName: run.workflow_name,
+    descendantRuns: (run.descendant_runs ?? []).map(toWorkflowRun),
+    descendantRunCount: run.descendant_run_count,
+    descendantRunsCursor: run.descendant_runs_cursor ?? null,
+    descendantRunsActive: run.descendant_runs_active ?? false,
+  };
+}
+
+async function runsPage(url: string, signal: AbortSignal): Promise<RunsPage> {
+  const res = await authenticatedFetch(url, { signal });
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  const body = (await res.json()) as { data?: RawRun[]; next_cursor?: string | null };
+  return {
+    runs: (body.data ?? []).map(toWorkflowRun),
+    nextCursor: body.next_cursor ?? null,
+  };
 }
 
 /**
  * The sessions that ran a saved workflow, newest first, a page at a time.
  *
  * @param workflowId - The workflow.
+ * @param sessionId - Only that session's runs, e.g. for its Tasks tab.
  * @returns An infinite query: `fetchNextPage` loads older runs while `hasNextPage`.
  */
-export function useWorkflowRuns(workflowId: string) {
+export function useWorkflowRuns(workflowId: string, sessionId?: string) {
   return useInfiniteQuery({
-    queryKey: ["workflow-runs", workflowId],
+    queryKey: sessionId ? ["workflow-runs", workflowId, sessionId] : ["workflow-runs", workflowId],
     queryFn: async ({ pageParam, signal }): Promise<RunsPage> => {
       const params = new URLSearchParams({ limit: String(RUNS_PAGE) });
       if (pageParam) params.set("before", pageParam);
-      const res = await authenticatedFetch(`${workflowPath(workflowId)}/runs?${params}`, {
-        signal,
-      });
-      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-      const body = (await res.json()) as { data?: RawRun[]; next_cursor?: string | null };
-      return {
-        runs: (body.data ?? []).map((run) => ({
-          id: run.id,
-          planGraphRevision: run.plan_graph_revision ?? undefined,
-          sessionId: run.session_id,
-          title: run.title,
-          startedAt: run.started_at,
-          isCurrent: run.is_current === true,
-          sessionStatus: run.session_status,
-          backgroundWorkRunning: run.background_work_running ?? false,
-          archived: run.archived,
-          progress: {
-            total: run.progress.total,
-            started: run.progress.started,
-            done: run.progress.done,
-            needsInput: run.progress.needs_input,
-            failed: run.progress.failed,
-          },
-          steps: run.steps ?? [],
-          statuses: run.statuses ?? [],
-        })),
-        nextCursor: body.next_cursor ?? null,
-      };
+      if (sessionId) params.set("session_id", sessionId);
+      return runsPage(`${workflowPath(workflowId)}/runs?${params}`, signal);
     },
     initialPageParam: null as string | null,
     getNextPageParam: (page) => page.nextCursor,
     enabled: workflowId !== "",
     staleTime: 10_000,
     // Other sessions and automations can start runs while this page stays open.
+    refetchInterval: 10_000,
+  });
+}
+
+/**
+ * The workflow runs below *run* after the page it came with, a page at a time.
+ *
+ * @param workflowId - The workflow *run* follows.
+ * @param run - The run, with its `descendantRunsCursor`.
+ * @param enabled - Whether to load them, e.g. once asked to show more.
+ */
+export function useWorkflowRunDescendants(workflowId: string, run: WorkflowRun, enabled: boolean) {
+  const cursor = run.descendantRunsCursor ?? null;
+  return useInfiniteQuery({
+    queryKey: ["workflow-run-descendants", workflowId, run.id, cursor],
+    queryFn: ({ pageParam, signal }): Promise<RunsPage> => {
+      const params = new URLSearchParams({ session_id: run.sessionId, limit: String(RUNS_PAGE) });
+      if (pageParam) params.set("after", pageParam);
+      const path = `${workflowPath(workflowId)}/runs/${encodeURIComponent(run.id)}/descendant_runs`;
+      return runsPage(`${path}?${params}`, signal);
+    },
+    initialPageParam: cursor,
+    getNextPageParam: (page) => page.nextCursor,
+    enabled: enabled && cursor !== null,
+    staleTime: 10_000,
+    // Loaded pages keep up with their runs, as the first page does.
     refetchInterval: 10_000,
   });
 }

@@ -68,6 +68,8 @@ def test_terminal_only_work_survives_runner_inactivity(codex_effort_rig: _Rig) -
         time.sleep(0.5)
         session.tmux("send-keys", "Enter")
         deadline = time.monotonic() + 20
+        next_submit = time.monotonic() + 1
+        submits_remaining = 10
         while time.monotonic() < deadline:
             state = read_bridge_state(session.bridge)
             requests = _json(rig.model.get("/mock/requests"))["requests"][before:]
@@ -79,6 +81,12 @@ def test_terminal_only_work_survives_runner_inactivity(codex_effort_rig: _Rig) -
             snapshot = _json(rig.api.get(f"/v1/sessions/{session.id}"))
             if own and snapshot.get("status") == "running":
                 break
+            sent = any(marker in json.dumps(request.get("input")) for request in requests)
+            # The TUI can drop Enter while it is still classifying a paste.
+            if not sent and submits_remaining and next_submit <= time.monotonic() < deadline:
+                session.tmux("send-keys", "Enter")
+                submits_remaining -= 1
+                next_submit = time.monotonic() + 1
             time.sleep(0.2)
         else:
             pytest.fail(

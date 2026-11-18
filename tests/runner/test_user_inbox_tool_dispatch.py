@@ -50,12 +50,12 @@ def _names(spec: AgentSpec) -> set[str]:
     return {schema["function"]["name"] for schema in ToolManager(spec).get_tool_schemas()}
 
 
-def test_tools_register_only_when_the_group_is_on() -> None:
-    assert not _USER_INBOX_TOOLS & _names(AgentSpec(spec_version=1))
-    opted_in = AgentSpec(spec_version=1, tool_groups=ToolGroupsConfig(user_inbox=True))
-    assert _names(opted_in) >= _USER_INBOX_TOOLS
-    assert parse_tool_groups({"user_inbox": True}, spawn=False).user_inbox is True
-    assert parse_tool_groups(None, spawn=False).user_inbox is False
+def test_tools_register_unless_the_spec_opts_out() -> None:
+    assert _names(AgentSpec(spec_version=1)) >= _USER_INBOX_TOOLS
+    opted_out = AgentSpec(spec_version=1, tool_groups=ToolGroupsConfig(user_inbox=False))
+    assert not _USER_INBOX_TOOLS & _names(opted_out)
+    assert parse_tool_groups({"user_inbox": False}, spawn=False).user_inbox is False
+    assert parse_tool_groups(None, spawn=False).user_inbox is True
     assert _USER_INBOX_TOOLS <= _ALL_LOCAL_TOOLS
     assert _USER_INBOX_TOOLS <= _NATIVE_RELAY_BUILTIN_TOOLS
 

@@ -203,6 +203,17 @@ def _forged_retry_params(
     }
 
 
+def _bound_pending_entry(arguments: dict[str, Any]) -> _PendingPolicyAskWrites:
+    """Build a pending entry bound to the default ``sys_os_shell`` call with no actor."""
+    return _PendingPolicyAskWrites(
+        state_updates=None,
+        set_labels=None,
+        from_mcp=True,
+        reviewed_arguments=arguments,
+        mcp_call_identity=(_SESSION_ID, "sys_os_shell", None, None),
+    )
+
+
 def _parse_rpc_error(response: Any) -> dict[str, Any]:
     """
     Extract the JSON-RPC error object from a :class:`Response`.
@@ -227,16 +238,11 @@ async def test_forged_retry_with_deny_policy_is_rejected(
 ) -> None:
     """
     A forged retry carrying a fake ``requestState`` + ``inputResponses``
-    MUST be denied when the TOOL_CALL policy evaluates to DENY.
+    MUST be rejected when no server-issued pending entry exists, even if
+    the TOOL_CALL policy evaluates to DENY.
 
-    Before the fix, the retry path skipped policy evaluation entirely
-    and trusted the caller-controlled approval fields, allowing a
-    DENY'd tool (e.g. ``sys_os_shell``) to execute. This test verifies
-    the fix: the retry path now re-evaluates the policy, and a DENY
-    result blocks execution regardless of the forged approval.
-
-    A failure here means the retry path has regressed to skipping
-    policy evaluation — the exact vulnerability this fix addresses.
+    The pending-entry check runs before policy evaluation, so the policy
+    reason is not returned for an unknown elicitation.
     """
     deny_engine = _FixedPolicyEngine(
         result=PolicyResult(
@@ -266,16 +272,8 @@ async def test_forged_retry_with_deny_policy_is_rejected(
     )
 
     error = _parse_rpc_error(response)
-    # The error message must contain the policy's denial reason,
-    # proving the policy was actually evaluated on the retry path.
-    # If the message is something else (e.g. "Tool call denied by
-    # user"), the retry path is checking inputResponses instead of
-    # the policy — the bypass is still live.
-    assert "blocked by operator policy" in error["message"], (
-        f"Expected denial reason from re-evaluated policy, got: {error['message']!r}. "
-        f"If 'Tool call denied by user', the retry path is reading inputResponses "
-        f"instead of re-evaluating the TOOL_CALL policy."
-    )
+    assert "not found or already resolved" in error["message"], error["message"]
+    assert not _pending_policy_ask_writes.get("elicit_FORGED_never_issued")
 
 
 @pytest.mark.asyncio
@@ -365,14 +363,19 @@ async def test_retry_with_allow_policy_falls_through(
         _engine_factory_expecting_preload(allow_engine),
     )
 
-    response = await _handle_mcp_tools_call(
-        rpc_id=3,
-        session_id=_SESSION_ID,
-        params=_forged_retry_params(),
-        conversation_store=_StubConversationStore(_make_conversation()),  # type: ignore[arg-type]
-        agent_store=_StubAgentStore(),  # type: ignore[arg-type]
-        runner_router=None,
-    )
+    eid = "elicit_allow_retry_server_issued"
+    _pending_policy_ask_writes[eid] = _bound_pending_entry({"command": "id -un"})
+    try:
+        response = await _handle_mcp_tools_call(
+            rpc_id=3,
+            session_id=_SESSION_ID,
+            params=_forged_retry_params(elicitation_id=eid),
+            conversation_store=_StubConversationStore(_make_conversation()),  # type: ignore[arg-type]
+            agent_store=_StubAgentStore(),  # type: ignore[arg-type]
+            runner_router=None,
+        )
+    finally:
+        _pending_policy_ask_writes.pop(eid, None)
 
     payload = json.loads(bytes(response.body))
     # On ALLOW, the handler falls through to execution which needs a
@@ -481,11 +484,7 @@ async def test_legitimate_retry_with_pending_entry_proceeds(
 
     eid = "elicit_LEGITIMATE_server_issued"
     # Simulate the /mcp first-call ASK path storing the entry.
-    _pending_policy_ask_writes[eid] = _PendingPolicyAskWrites(
-        state_updates=None,
-        set_labels=None,
-        from_mcp=True,
-    )
+    _pending_policy_ask_writes[eid] = _bound_pending_entry({"command": "id -un"})
 
     try:
         response = await _handle_mcp_tools_call(
@@ -750,6 +749,54 @@ async def test_mcp_proxy_runner_supplied_actor_reaches_policy_engine(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    "legacy_entry",
+    [
+        _PendingPolicyAskWrites(
+            state_updates=None,
+            set_labels=None,
+            from_mcp=True,
+            reviewed_arguments={"command": "id -un"},
+            mcp_call_identity=None,
+        ),
+        _PendingPolicyAskWrites(
+            state_updates=None, set_labels=None, from_mcp=True, reviewed_arguments=None
+        ),
+    ],
+    ids=["missing-identity", "missing-reviewed-arguments"],
+)
+async def test_unbound_pending_entry_is_rejected_before_policy_or_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    legacy_entry: _PendingPolicyAskWrites,
+) -> None:
+    """An approval entry without a call identity or reviewed arguments is never honored."""
+    allow_engine = _FixedPolicyEngine(result=PolicyResult(action=PolicyAction.ALLOW, reason=None))
+    monkeypatch.setattr(sessions_mod, "_load_agent_spec_for_session", lambda *args: "fake_spec")
+    monkeypatch.setattr(
+        sessions_mod,
+        "_build_policy_engine_from_spec",
+        _engine_factory_expecting_preload(allow_engine),
+    )
+
+    eid = "elicit_legacy_unbound"
+    _pending_policy_ask_writes[eid] = legacy_entry
+    try:
+        response = await _handle_mcp_tools_call(
+            rpc_id=6,
+            session_id=_SESSION_ID,
+            params=_forged_retry_params(elicitation_id=eid),
+            conversation_store=_StubConversationStore(_make_conversation()),  # type: ignore[arg-type]
+            agent_store=_StubAgentStore(),  # type: ignore[arg-type]
+            runner_router=None,
+        )
+        error = _parse_rpc_error(response)
+        assert "do not match" in error["message"] or "does not match" in error["message"], error
+        assert _pending_policy_ask_writes.get(eid) is legacy_entry
+    finally:
+        _pending_policy_ask_writes.pop(eid, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     ("retry_action", "reviewed_transform", "retry_transform", "changed_arguments", "approval"),
     [
         (PolicyAction.ASK, {"value": "reviewed"}, {"value": "later"}, False, "accept"),
@@ -761,6 +808,7 @@ async def test_mcp_proxy_runner_supplied_actor_reaches_policy_engine(
         (PolicyAction.ALLOW, {"value": "reviewed"}, {"value": "current"}, False, "accept"),
         (PolicyAction.ALLOW, {"value": "reviewed"}, None, False, "accept"),
         (PolicyAction.ALLOW, {"value": "reviewed"}, {}, False, "accept"),
+        (PolicyAction.ALLOW, {"value": "reviewed"}, None, False, "decline"),
     ],
 )
 async def test_retry_dispatches_policy_owned_arguments(
@@ -852,8 +900,8 @@ async def test_retry_dispatches_policy_owned_arguments(
                     "inputResponses": {eid: {"action": approval}},
                 }
             )
-            rejected = retry_action == PolicyAction.DENY or (
-                retry_action == PolicyAction.ASK and (changed_arguments or approval != "accept")
+            rejected = (
+                retry_action == PolicyAction.DENY or changed_arguments or approval != "accept"
             )
             if rejected:
                 assert "error" in result
@@ -863,10 +911,7 @@ async def test_retry_dispatches_policy_owned_arguments(
                     assert "do not match" in result["error"]["message"]
             else:
                 assert "error" not in result
-                transform = (
-                    reviewed_transform if retry_action == PolicyAction.ASK else retry_transform
-                )
-                expected = transform if transform is not None else original_arguments
+                expected = retry_transform if retry_transform is not None else original_arguments
                 assert len(dispatched) == 1
                 assert dispatched[0]["params"]["arguments"] == expected
                 assert evaluations[-1].request_data == {

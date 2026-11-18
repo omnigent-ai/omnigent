@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import random
+import string
 from collections.abc import Iterator
 
 import pytest
 import sqlalchemy as sa
+import zstandard
+from sqlalchemy.dialects import mysql, postgresql, sqlite
+from sqlalchemy.schema import CreateTable
 
 from omnigent.db import envelope
 from omnigent.db.compression import encode
@@ -14,8 +18,11 @@ from omnigent.db.envelope import (
     ENVELOPE_FORMAT,
     EnvelopeCipherUnavailableError,
     EnvelopedJSON,
+    EnvelopedText,
     open_envelope,
+    open_text,
     seal,
+    seal_text,
     set_envelope_cipher,
 )
 
@@ -84,6 +91,10 @@ def test_readers_handle_both_variants_once_a_cipher_is_configured() -> None:
         b"\x01\x01\x00",
         b"\x01\x00",
         bytes((ENVELOPE_FORMAT, 0x00)) + (encode("") or b""),
+        b"\x01\x01\x00\x09{}",
+        b"\x01\x01\x00\x02\xff\xfeciphertext",
+        b"\x01\x01\x00\x02[]ciphertext",
+        b"\x01\x01\x00\x02{}",
     ],
     ids=[
         "empty",
@@ -93,9 +104,15 @@ def test_readers_handle_both_variants_once_a_cipher_is_configured() -> None:
         "truncated-metadata",
         "header-only-plaintext",
         "empty-plaintext",
+        "metadata-past-the-end",
+        "metadata-not-utf8",
+        "metadata-not-an-object",
+        "no-ciphertext",
     ],
 )
 def test_unknown_or_truncated_envelopes_are_rejected(stored: bytes) -> None:
+    # A ValueError, so malformed input never passes for an encrypted value
+    # (EnvelopeCipherUnavailableError is a RuntimeError).
     with pytest.raises(ValueError):
         open_envelope(stored)
 
@@ -156,3 +173,104 @@ def test_values_readers_would_refuse_are_not_written() -> None:
     over = {"a": "x" * (envelope._MAX_DECODED_BYTES - 7)}
     with pytest.raises(ValueError, match="exceeds"):
         seal(over)
+
+
+# ── Text ───────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["", "Prefers tabs", "é" * 40, "".join(random.Random(0).choices(string.printable, k=5_000))],
+    ids=["empty", "short", "multibyte", "long"],
+)
+def test_text_round_trips_behind_its_variant_bytes(text: str) -> None:
+    stored = seal_text(text)
+
+    assert stored[:2] == bytes((ENVELOPE_FORMAT, 0x00))
+    assert stored[2:] == encode(text)
+    assert open_text(stored, max_decoded_bytes=16_383) == text
+    assert open_text(memoryview(stored), max_decoded_bytes=16_383) == text
+
+
+def test_encrypted_text_needs_the_cipher() -> None:
+    set_envelope_cipher(_XorCipher())
+    stored = seal_text("secret note")
+    assert stored[:2] == bytes((ENVELOPE_FORMAT, 0x01))
+    assert b"secret" not in stored
+    assert open_text(stored, max_decoded_bytes=100) == "secret note"
+
+    set_envelope_cipher(None)
+    with pytest.raises(EnvelopeCipherUnavailableError):
+        open_text(stored, max_decoded_bytes=100)
+
+
+@pytest.mark.parametrize(
+    "stored",
+    [
+        b"\x00\x00\x00plain",
+        b"\x01\x00plain",
+        b"\x01\x00",
+        b"\x01\x00\x00\x01not zstd",
+        b"\x01\x01\x00\x02{}",
+    ],
+    ids=["bare-frame", "unframed-plaintext", "no-frame", "corrupt-frame", "no-ciphertext"],
+)
+def test_unreadable_text_envelopes_are_rejected(stored: bytes) -> None:
+    with pytest.raises(ValueError):
+        open_text(stored, max_decoded_bytes=16_383)
+
+
+def test_text_decompression_is_bounded() -> None:
+    bomb = bytes((ENVELOPE_FORMAT, 0x00, 0x00, 0x01)) + zstandard.ZstdCompressor().compress(
+        b"x" * 100_000
+    )
+
+    with pytest.raises(ValueError):
+        open_text(bomb, max_decoded_bytes=16_383)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "x" * 10,
+        # Short random text is still framed with zstd but barely shrinks.
+        "".join(random.Random(1).choices(string.printable, k=100)),
+    ],
+    ids=["raw", "zstd"],
+)
+def test_text_writes_are_bounded_including_the_envelope(value: str) -> None:
+    stored = len(seal_text(value))
+    assert stored >= len(value.encode())
+
+    assert EnvelopedText(stored).process_bind_param(value, sqlite.dialect()) == seal_text(value)
+    with pytest.raises(ValueError, match="exceeds"):
+        EnvelopedText(stored - 1).process_bind_param(value, sqlite.dialect())
+
+
+@pytest.mark.parametrize("limit", [16_383, 2_100])
+def test_text_that_compresses_well_is_still_bounded_so_it_stays_readable(limit: int) -> None:
+    column = EnvelopedText(limit)
+
+    at_limit = column.process_bind_param("x" * limit, sqlite.dialect())
+    assert at_limit is not None
+    assert column.process_result_value(at_limit, sqlite.dialect()) == "x" * limit
+    with pytest.raises(ValueError, match="exceeds"):
+        column.process_bind_param("x" * (limit + 1), sqlite.dialect())
+
+
+def test_text_none_round_trips_as_null() -> None:
+    column = EnvelopedText(100)
+
+    assert column.process_bind_param(None, sqlite.dialect()) is None
+    assert column.process_result_value(None, sqlite.dialect()) is None
+
+
+def test_the_text_column_declares_its_bound_where_the_engine_can() -> None:
+    table = sa.Table("t", sa.MetaData(), sa.Column("body", EnvelopedText(16_383)))
+
+    def ddl(dialect: sa.Dialect) -> str:
+        return str(CreateTable(table).compile(dialect=dialect))
+
+    assert "body VARBINARY(16383)" in ddl(mysql.dialect())
+    assert "body BYTEA" in ddl(postgresql.dialect())
+    assert "body BLOB" in ddl(sqlite.dialect())

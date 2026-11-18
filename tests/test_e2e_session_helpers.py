@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
+from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -24,6 +27,100 @@ class _PollingClock:
     def sleep(self, seconds: float) -> None:
         # A zero-delay poll still advances time so non-completion remains bounded.
         self.now += max(seconds, 0.1)
+
+
+@pytest.mark.parametrize("startup", ["ready", "model-after-link", "wrong-session", "exit"])
+def test_pi_launch_waits_for_its_input_ready_marker(tmp_path: Path, monkeypatch, startup) -> None:
+    from omnigent.harnesses.pi_native.bridge import bridge_dir_for_session_id
+    from tests._helpers import polling
+    from tests.e2e import test_pi_native_smart_routing as journey
+
+    clock = _PollingClock()
+    monkeypatch.setattr(journey, "time", clock)
+    monkeypatch.setattr(polling, "time", clock)
+    monkeypatch.setattr(journey, "_LAUNCH_TIMEOUT", 1)
+    executable = tmp_path / "bin" / "python"
+    executable.parent.mkdir()
+    executable.with_name("omnigent").touch()
+    monkeypatch.setattr(journey, "sys", SimpleNamespace(executable=str(executable)))
+    session = "a" * 32
+    data = tmp_path / ".omnigent"
+    env = {"HOME": str(tmp_path), "OMNIGENT_DATA_DIR": str(data)}
+    bridge_root = data / "pi-native"
+    marker = bridge_root / bridge_dir_for_session_id(session).name / "input_ready"
+    marker.parent.mkdir(parents=True)
+    other_marker = bridge_root / bridge_dir_for_session_id("b" * 32).name / "input_ready"
+    other_marker.parent.mkdir()
+    other_marker.touch()
+    child = SimpleNamespace(logfile_read=None, before="")
+    expect_calls = []
+    drained = []
+    stopped = []
+    startup_message = "Managed-tool setup is still pending"
+
+    def expect(pattern, *, timeout):
+        expect_calls.append((pattern, timeout))
+        if len(expect_calls) == 1:
+            clock.now = 0.4
+            if startup != "model-after-link":
+                child.before = f"Model scope: {journey._DEFAULT_MODEL}"
+            output = f"Web UI: http://127.0.0.1:6767/c/{session}"
+        else:
+            clock.now = 0.6
+            output = f"Model scope: {journey._DEFAULT_MODEL}"
+        child.match = re.search(pattern, output)
+        assert child.match is not None
+
+    def read_nonblocking(_size, *, timeout):
+        drained.append(clock.now)
+        if startup == "exit":
+            raise journey.pexpect.EOF("Pi exited during managed-tool setup")
+        if len(drained) == 1:
+            output = f"\x1b[33m{startup_message}\x1b[0m\n"
+            child.logfile_read.write(output)
+            return output
+        if startup in ("ready", "model-after-link") and len(drained) == 2:
+            marker.touch()
+            return "Omnigent linked"
+        raise journey.pexpect.TIMEOUT("managed-tool setup is pending")
+
+    def teardown(actual_child, actual_env):
+        assert actual_child is child and actual_env is env
+        stopped.append(child)
+        child.logfile_read.close()
+
+    child.expect = expect
+    child.read_nonblocking = read_nonblocking
+    monkeypatch.setattr(journey.pexpect, "spawn", lambda *_args, **_kwargs: child)
+    monkeypatch.setattr(journey, "_teardown", teardown)
+
+    if startup in ("ready", "model-after-link"):
+        try:
+            launched, server, conversation = journey._launch_pi(env)
+            assert launched is child and conversation == session
+            assert server == "http://127.0.0.1:6767"
+            assert marker.is_file() and len(drained) == 2
+            assert not stopped
+        finally:
+            child.logfile_read.close()
+    else:
+        expected = journey.pexpect.EOF if startup == "exit" else AssertionError
+        with pytest.raises(expected) as failure:
+            journey._launch_pi(env)
+        assert stopped == [child] and child.logfile_read.closed
+        if startup == "wrong-session":
+            assert 1 <= clock.now <= 1.1, "readiness reset the original launch budget"
+            assert startup_message not in child.before
+            assert startup_message in str(failure.value)
+            assert "\x1b[" not in str(failure.value)
+            transcript = data / "logs" / "pi-terminal.log"
+            assert str(transcript) in str(failure.value)
+            assert startup_message in transcript.read_text()
+
+    expected_timeouts = [1, 0.6] if startup == "model-after-link" else [1]
+    assert [timeout for _pattern, timeout in expect_calls] == pytest.approx(expected_timeouts)
+    if startup == "model-after-link":
+        assert expect_calls[1][0] == journey._DEFAULT_MODEL
 
 
 def _item(role: str, text: str, response_id: str, *, nested: bool) -> dict:
