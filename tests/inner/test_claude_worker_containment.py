@@ -402,7 +402,12 @@ for name, path in [
 print(json.dumps(result))
 """
         prepared = claude.prepare_claude_cli_path(
-            sys.executable, real_worker_spec, worker_env=worker_env
+            sys.executable,
+            real_worker_spec,
+            worker_env=worker_env,
+            model_access=ClaudeModelAccess(
+                "https://model.test", "x-api-key", lambda: "synthetic-key"
+            ),
         )
         assert prepared.cli_path is not None
         try:
