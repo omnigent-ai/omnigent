@@ -1,7 +1,7 @@
 // Tests for /tasks: lists, filters, gallery tabs, and row actions.
 // Scheduled-task hooks are mocked; the creation dialog exposes its seed props and close action.
 
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { setOmnigentHostConfig } from "@/lib/host";
@@ -25,6 +25,7 @@ vi.mock("@/hooks/useScheduledTasks", () => ({
   useUpdateScheduledTask: vi.fn(),
   useDeleteScheduledTask: vi.fn(),
   useRunScheduledTaskNow: vi.fn(),
+  useCloneScheduledTask: vi.fn(),
 }));
 
 // Stub the create dialog — its internals are covered separately; here we only
@@ -118,6 +119,7 @@ function task(overrides: Partial<ScheduledTask> = {}): ScheduledTask {
 const mutate = vi.fn();
 const deleteMutate = vi.fn();
 const runNowMutate = vi.fn();
+const cloneMutate = vi.fn();
 
 function setTasks(
   tasks: ScheduledTask[] | undefined,
@@ -159,6 +161,7 @@ beforeEach(() => {
   mutate.mockReset();
   deleteMutate.mockReset();
   runNowMutate.mockReset();
+  cloneMutate.mockReset();
   vi.mocked(showToast).mockReset();
   vi.mocked(hooks.useUpdateScheduledTask).mockReturnValue({
     mutate,
@@ -175,6 +178,11 @@ beforeEach(() => {
     isPending: false,
     variables: undefined,
   } as unknown as ReturnType<typeof hooks.useRunScheduledTaskNow>);
+  vi.mocked(hooks.useCloneScheduledTask).mockReturnValue({
+    mutate: cloneMutate,
+    isPending: false,
+    variables: undefined,
+  } as unknown as ReturnType<typeof hooks.useCloneScheduledTask>);
 });
 
 afterEach(() => {
@@ -203,6 +211,10 @@ function renderPage(
               <Route
                 path={`${basename}/tasks/templates`}
                 element={<TasksPage key="templates" templatesOnly />}
+              />
+              <Route
+                path={`${basename}/tasks/:taskId`}
+                element={<div data-testid="task-detail-route" />}
               />
             </Routes>
           </RoutingProvider>
@@ -777,6 +789,48 @@ describe("row actions", () => {
     fireEvent.pointerDown(screen.getByTestId("task-row-menu"), { button: 0 });
     fireEvent.click(screen.getByTestId("task-delete"));
     expect(deleteMutate).toHaveBeenCalledWith("st_1");
+  });
+});
+
+describe("cloning from the row menu", () => {
+  const CLONE_INFO = { ...TRIGGER_INFO, scheduled_task_clone: true };
+
+  it("offers Clone only on a server that can clone", () => {
+    setTasks([task()]);
+    renderPage();
+    fireEvent.pointerDown(screen.getByTestId("task-row-menu"), { button: 0 });
+    expect(screen.queryByTestId("task-clone")).toBeNull();
+  });
+
+  it("opens the copy and says what's left once the clone is created", () => {
+    setTasks([task({ id: "st_1", state: "active" })]);
+    renderPage("/tasks", "", CLONE_INFO);
+    fireEvent.pointerDown(screen.getByTestId("task-row-menu"), { button: 0 });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Clone" }));
+
+    expect(cloneMutate).toHaveBeenCalledWith("st_1", expect.any(Object));
+    expect(showToast).not.toHaveBeenCalled();
+
+    act(() => cloneMutate.mock.calls[0][1].onSuccess(task({ id: "st_2" })));
+    expect(showToast).toHaveBeenCalledExactlyOnceWith(
+      "Automation cloned. Pause or delete the original so they don't both run.",
+    );
+    expect(screen.getByTestId("task-detail-route")).toBeInTheDocument();
+  });
+
+  it("stays on the list and shows the server's reason when the clone is refused", () => {
+    setTasks([task()]);
+    renderPage("/tasks", "", CLONE_INFO);
+    fireEvent.pointerDown(screen.getByTestId("task-row-menu"), { button: 0 });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Clone" }));
+
+    cloneMutate.mock.calls[0][1].onError(
+      new ScheduledTaskApiError("Only an automation can be cloned", 400, "invalid_input"),
+    );
+    expect(showToast).toHaveBeenCalledExactlyOnceWith(
+      "Couldn't clone the automation: Only an automation can be cloned",
+    );
+    expect(screen.getByTestId("tasks-list")).toBeInTheDocument();
   });
 });
 

@@ -10,6 +10,9 @@ import { setOmnigentHostConfig } from "./host";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   ScheduledTaskApiError,
+  cloneCreatedMessage,
+  cloneFailedMessage,
+  cloneScheduledTask,
   createScheduledTask,
   deleteScheduledTask,
   getScheduledTask,
@@ -425,6 +428,48 @@ describe("updateScheduledTask", () => {
     fetchMock.mockResolvedValueOnce(mockResponse({ ...TASK_WIRE, mcp_services: mcpServices }));
     await updateScheduledTask("st_1", { mcpServices });
     expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({ mcp_services: mcpServices });
+  });
+});
+
+describe("cloneScheduledTask", () => {
+  it("POSTs /v1/scheduled-tasks/{id}/clone and returns the copy", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({ ...TASK_WIRE, id: "st_2", name: "Nightly triage (copy)" }),
+    );
+    const clone = await cloneScheduledTask("st 1");
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("/v1/scheduled-tasks/st%201/clone");
+    expect(init.method).toBe("POST");
+    expect(new Headers(init.headers).get("x-omnigent-automation-source")).toBe("ui");
+    expect(clone).toMatchObject({ id: "st_2", name: "Nightly triage (copy)" });
+  });
+
+  it("throws the server's reason", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse(
+        { error: { code: "invalid_input", message: "Only an automation can be cloned" } },
+        { ok: false, status: 400 },
+      ),
+    );
+    const error = await cloneScheduledTask("st_1").catch((err: unknown) => err);
+    expect(error).toMatchObject({ status: 400, message: "Only an automation can be cloned" });
+    expect(cloneFailedMessage(error)).toBe(
+      "Couldn't clone the automation: Only an automation can be cloned",
+    );
+  });
+
+  it.each([
+    ["a server error", new ScheduledTaskApiError("boom", 500, null)],
+    ["a network failure", new Error("offline")],
+  ])("keeps the reason out of the toast for %s", (_label, error) => {
+    expect(cloneFailedMessage(error)).toBe("Couldn't clone the automation");
+  });
+
+  it.each([
+    ["active", "Automation cloned. Pause or delete the original so they don't both run."],
+    ["paused", "Automation cloned. The copy is paused like the original."],
+  ] as const)("tells the owner what's left after cloning an %s automation", (state, text) => {
+    expect(cloneCreatedMessage({ state })).toBe(text);
   });
 });
 

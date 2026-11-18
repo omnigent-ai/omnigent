@@ -51,8 +51,17 @@ runs' sessions in their own Omnigent Automation folder.
   starts Shared by and the owner's name. It loads 50 at a time with Show more,
   moving on by itself past a page that came back empty. Empty: No automations
   are shared with you yet.
+- `clone`: on a server advertising `scheduled_task_clone`, Clone on an
+  automation's page (left of Edit) and in its row's ⋯ and right-click menus makes
+  a new automation named after it with (copy), with its settings and schedule and
+  none of its runs, and opens it. The copy has its own ID, so it can be shared
+  where the original can't. A continue-session automation's copy starts its own
+  session on its first run. The copy is paused when the original is (toast: The
+  copy is paused like the original.); otherwise the toast says to pause or delete
+  the original so they don't both run. A refused clone shows the server's reason
+  in a toast and stays put.
 - `read-only-view`: on those cards' ⋯ and right-click menus and on the
-  automation's page, Run now, Edit, Share, Pause/Resume and Delete are visible
+  automation's page, Run now, Edit, Share, Clone, Pause/Resume and Delete are visible
   but disabled, each with a tooltip such as Only the automation's owner can edit
   it. The page shows Shared by and the owner under the title. Its run history
   lists every run's time, outcome and error code, and a run opens its session
@@ -109,8 +118,9 @@ uses, because the session Share button is disabled on a local server.
 - **Every sub-feature (component tests):**
   `web/src/components/PermissionsModal.test.tsx` (sharing an automation; a grants
   list that fails to load; a session an automation manages),
-  `web/src/pages/TaskDetailPage.test.tsx` (sharing),
-  `web/src/pages/TasksPage.test.tsx` (sharing from the row menu),
+  `web/src/pages/TaskDetailPage.test.tsx` (sharing; cloning),
+  `web/src/pages/TasksPage.test.tsx` (sharing from the row menu; cloning from the
+  row menu),
   `web/src/components/scheduled/ScheduledTaskRow.test.tsx`,
   `web/src/hooks/usePermissions.test.tsx`, `web/src/hooks/useScheduledTasks.test.tsx`
   and `web/src/lib/permissionsApi.test.ts`. The recipient's side:
@@ -128,6 +138,8 @@ uses, because the session Share button is disabled on a local server.
   `test_sharing_is_advertised_and_served_together` and
   `test_session_permissions_name_the_automation_that_manages_them` cover the
   routes, refusals, capability and the managed-session marker. The tests from
+  `test_clone_copies_an_automations_settings_under_a_new_id` to
+  `test_clone_is_advertised_with_automations` cover cloning. The tests from
   `test_recipients_read_an_automation_its_runs_and_their_steps` to
   `test_a_shared_run_session_lists_with_its_run_labels` cover recipients' reads,
   refused changes, agents, the capability, the shared list and the run labels;

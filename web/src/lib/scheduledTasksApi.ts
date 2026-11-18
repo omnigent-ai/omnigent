@@ -645,6 +645,36 @@ export async function updateScheduledTask(
   return taskFromWire(await readJsonOrThrow<ScheduledTaskWire>(res));
 }
 
+/**
+ * Create a copy of an automation, under a new ID, with its settings and schedule but
+ * none of its runs. The copy is paused when the original is; otherwise both run.
+ */
+export async function cloneScheduledTask(id: string): Promise<ScheduledTask> {
+  const res = await authenticatedFetch(`/v1/scheduled-tasks/${encodeURIComponent(id)}/clone`, {
+    method: "POST",
+    headers: {
+      "x-omnigent-automation-source": "ui",
+      // A copied source session takes its browser tools mode from this request.
+      ...browserAgentToolsRequestHeaders(),
+    },
+  });
+  return taskFromWire(await readJsonOrThrow<ScheduledTaskWire>(res));
+}
+
+/** The toast after cloning *original*: what the copy is, and what's left to do. */
+export function cloneCreatedMessage(original: Pick<ScheduledTask, "state">): string {
+  return original.state === "paused"
+    ? "Automation cloned. The copy is paused like the original."
+    : "Automation cloned. Pause or delete the original so they don't both run.";
+}
+
+/** The toast when a clone fails, with the server's reason when it gave one. */
+export function cloneFailedMessage(err: unknown): string {
+  return err instanceof ScheduledTaskApiError && err.status < 500
+    ? `Couldn't clone the automation: ${err.message}`
+    : "Couldn't clone the automation";
+}
+
 /** Delete a task so it no longer fires. */
 export async function deleteScheduledTask(id: string): Promise<void> {
   const res = await authenticatedFetch(`/v1/scheduled-tasks/${encodeURIComponent(id)}`, {

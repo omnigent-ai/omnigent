@@ -8167,6 +8167,11 @@
             "title": "Scheduled Task Approval Skipping Modes",
             "type": "boolean"
           },
+          "scheduled_task_clone": {
+            "default": false,
+            "title": "Scheduled Task Clone",
+            "type": "boolean"
+          },
           "scheduled_task_harness_settings": {
             "default": true,
             "title": "Scheduled Task Harness Settings",
@@ -21380,6 +21385,51 @@
           }
         },
         "summary": "Update Scheduled Task",
+        "tags": [
+          "scheduled_tasks"
+        ]
+      }
+    },
+    "/v1/scheduled-tasks/{scheduled_task_id}/clone": {
+      "post": {
+        "description": "Create a new automation with an owned automation's settings and schedule.\n\nThe clone gets a new ID, which on some deployments is what lets it be shared,\nand none of the original's runs. A continued session isn't carried over: the\nclone's first run starts its own. A paused original gives a paused clone; an\nactive one keeps running until its owner pauses or deletes it.",
+        "operationId": "clone_scheduled_task_v1_scheduled_tasks__scheduled_task_id__clone_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scheduled_task_id",
+            "required": true,
+            "schema": {
+              "title": "Scheduled Task Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Clone Scheduled Task V1 Scheduled Tasks  Scheduled Task Id  Clone Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Clone Scheduled Task",
         "tags": [
           "scheduled_tasks"
         ]

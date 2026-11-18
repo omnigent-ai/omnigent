@@ -212,6 +212,8 @@ Switching to `execution_target: "managed_sandbox"` clears both stored pins. Omit
 
 `POST /v1/scheduled-tasks/{id}/run` fires a task immediately and returns 202. It does not disturb the recurring schedule, which makes it the way to test a new automation without waiting for its next occurrence.
 
+`POST /v1/scheduled-tasks/{id}/clone` creates a new automation, named `<name> (copy)`, with the original's settings and schedule, and returns it as a create does. The **Clone** action on an automation's page and row menu calls it. Only the owner may clone, and reminders can't be. The clone has a new ID and none of the original's runs. A `continue` automation's clone starts its own session on its first run instead of sending to the original's, and an automation started from a session gets its own copy of the original's copy. The clone is paused when the original is; otherwise both run until the owner pauses or deletes one. The create's checks apply, so a clone fails if, for example, its agent or host is no longer usable. `/v1/info` reports `scheduled_task_clone: true` where the route is served.
+
 ## Sharing
 
 With `automations_v2`, an automation's owner can share it with users and groups at read access; `/v1/info` reports `scheduled_task_sharing: true` when grants can be added, which needs `automations_v2` and a server that can store them. `GET /v1/scheduled-tasks/{id}/permissions` lists the grants, paged like a session's (`limit` 1–1,000 and `after`). `PUT` on the same path with `{"user_id": ..., "level": 1}` adds one, and `DELETE /v1/scheduled-tasks/{id}/permissions/{user_id}` removes one. Existing grants can be listed and removed whenever the server stores them, even with `automations_v2` off, since runs on the legacy scheduler still apply them; that is API-only, as the automation pages need the flag. Only the owner may call them; anyone else gets 404. The owner and `__public__` cannot be granted, and the server's sharing mode applies. Agent tools cannot call these routes, and cannot change the session, host, workspace or execution target of a shared automation.
@@ -235,6 +237,7 @@ A run's child sessions need no grants of their own: whoever can read the run's s
 | `PATCH` | `/v1/scheduled-tasks/{id}` | Update fields, or pause/resume. |
 | `DELETE` | `/v1/scheduled-tasks/{id}` | Delete a task. |
 | `POST` | `/v1/scheduled-tasks/{id}/run` | Run now (202). |
+| `POST` | `/v1/scheduled-tasks/{id}/clone` | Create a copy under a new ID. |
 | `GET` | `/v1/scheduled-tasks/{id}/runs` | Run history. |
 | `GET` | `/v1/scheduled-tasks/{id}/run-steps` | The plan each run started with, for its timeline. |
 | `GET` | `/v1/scheduled-tasks/{id}/run-pull-requests` | The pull requests each run created or worked on, with their states. |

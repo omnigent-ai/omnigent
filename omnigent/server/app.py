@@ -426,6 +426,9 @@ class ServerInfoResponse(BaseModel):
     # ``GET /v1/scheduled-tasks/{id}/run-pull-requests``, the PRs of each run, served
     # beside ``session_pull_requests``. Older servers that store session PRs lack it.
     scheduled_task_run_pull_requests: bool = False
+    # ``POST /v1/scheduled-tasks/{id}/clone`` copies an automation under a new ID;
+    # absent on older servers.
+    scheduled_task_clone: bool = False
     # Session PATCH and project create check the agent tool's calling session;
     # absent on older servers, where moves must not run.
     session_move_source_checks: bool = False
@@ -4190,6 +4193,7 @@ def create_app(
                 and bool(app.state.one_time_automations_enabled),
                 "scheduled_task_sharing": automation_sharing,
                 "scheduled_task_shared_with_me": automation_sharing,
+                "scheduled_task_clone": automations_enabled,
                 "session_move_source_checks": True,
                 "session_organize_source_checks": True,
                 "sibling_other_project_standalone": True,

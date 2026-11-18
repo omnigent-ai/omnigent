@@ -6725,3 +6725,131 @@ async def test_a_shared_run_session_lists_with_its_run_labels(
     [item] = [row for row in listed.json()["data"] if row["id"] == session_id]
     assert item["owner"] == "alice@example.com"
     assert {key: item["labels"].get(key) for key in labels} == labels
+
+
+@pytest.mark.parametrize("state", ["active", "paused"])
+async def test_clone_copies_an_automations_settings_under_a_new_id(
+    auth_client: httpx.AsyncClient, state: str
+) -> None:
+    original = (
+        await auth_client.post(
+            "/v1/scheduled-tasks", json=_create_body(max_cost_usd=2.5), headers=_headers()
+        )
+    ).json()
+    if state == "paused":
+        paused = await auth_client.patch(
+            f"/v1/scheduled-tasks/{original['id']}", json={"state": "paused"}, headers=_headers()
+        )
+        assert paused.status_code == 200, paused.text
+
+    resp = await auth_client.post(
+        f"/v1/scheduled-tasks/{original['id']}/clone", headers=_headers()
+    )
+
+    assert resp.status_code == 200, resp.text
+    clone = resp.json()
+    assert clone["id"] != original["id"]
+    assert clone["name"] == "nightly triage (copy)"
+    copied = (
+        "prompt",
+        "rrule",
+        "agent_id",
+        "timezone",
+        "workspace",
+        "host_id",
+        "max_cost_usd",
+        "session_mode",
+        "execution_target",
+    )
+    assert {key: clone[key] for key in copied} == {key: original[key] for key in copied}
+    # A paused original can't start running through its clone.
+    assert clone["state"] == state
+    assert clone["last_run_at"] is None
+    listed = (await auth_client.get("/v1/scheduled-tasks", headers=_headers())).json()
+    assert {task["id"] for task in listed["scheduled_tasks"]} == {original["id"], clone["id"]}
+
+
+async def test_clone_leaves_a_continued_session_with_the_original(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    session_id = _owned_session(db_uri)
+    original = (
+        await auth_client.post(
+            "/v1/scheduled-tasks",
+            json=_create_body(session_mode="continue", session_id=session_id),
+            headers=_headers(),
+        )
+    ).json()
+
+    resp = await auth_client.post(
+        f"/v1/scheduled-tasks/{original['id']}/clone", headers=_headers()
+    )
+
+    assert resp.status_code == 200, resp.text
+    # Its first run starts the session later runs continue.
+    assert (resp.json()["session_mode"], resp.json()["session_id"]) == ("continue", None)
+
+
+async def test_clone_of_an_automation_from_a_session_gets_its_own_copy(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    from omnigent.stores.conversation_store import SCHEDULED_TASK_SOURCE_LABEL_KEY
+
+    original = (
+        await auth_client.post(
+            "/v1/scheduled-tasks",
+            json=_create_body(source_session_id=_session_with_history(db_uri), prompt=""),
+            headers=_headers(),
+        )
+    ).json()
+
+    resp = await auth_client.post(
+        f"/v1/scheduled-tasks/{original['id']}/clone", headers=_headers()
+    )
+
+    assert resp.status_code == 200, resp.text
+    clone = resp.json()
+    assert clone["source_session_id"] not in (None, original["source_session_id"])
+    clone_copy = SqlAlchemyConversationStore(db_uri).get_conversation(clone["source_session_id"])
+    assert clone_copy is not None
+    assert clone_copy.labels[SCHEDULED_TASK_SOURCE_LABEL_KEY] == clone["id"]
+    assert _item_texts(db_uri, clone["source_session_id"]) == [
+        "summarize the alerts",
+        "three alerts",
+    ]
+    # Another automation's copy is still refused as a source.
+    reused = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(source_session_id=original["source_session_id"]),
+        headers=_headers(),
+    )
+    assert reused.status_code == 400, reused.text
+    # Deleting the original leaves the clone's runs a session to start from.
+    deleted = await auth_client.delete(f"/v1/scheduled-tasks/{original['id']}", headers=_headers())
+    assert deleted.status_code in (200, 204), deleted.text
+    assert (
+        SqlAlchemyConversationStore(db_uri).get_conversation(clone["source_session_id"])
+        is not None
+    )
+
+
+async def test_only_the_owner_can_clone_an_automation(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    original = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+    _make_user(db_uri, "bob@example.com")
+
+    resp = await auth_client.post(
+        f"/v1/scheduled-tasks/{original['id']}/clone", headers=_headers("bob@example.com")
+    )
+
+    assert resp.status_code == 404, resp.text
+    listed = (await auth_client.get("/v1/scheduled-tasks", headers=_headers())).json()
+    assert [task["id"] for task in listed["scheduled_tasks"]] == [original["id"]]
+
+
+async def test_clone_is_advertised_with_automations(auth_client: httpx.AsyncClient) -> None:
+    info = (await auth_client.get("/v1/info", headers=_headers())).json()
+    assert info["scheduled_task_clone"] is True
