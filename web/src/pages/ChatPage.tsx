@@ -104,6 +104,7 @@ import {
   type PendingUserMessage,
   useChatStore,
 } from "@/store/chatStore";
+import { trackPlanStop } from "@/store/planStops";
 import {
   registerContinuePlan,
   registerSaveWorkflow,
@@ -4203,16 +4204,20 @@ function ComposerImpl(
     const reason = blockedReasonFor("stop the workflow");
     if (reason) toast.error(reason);
     else if (conversationId) {
+      const sessionId = conversationId;
       const message = stopPlanMessage(null);
       appendEntry(message);
       // Stop must reach the coordinator even while ordinary follow-ups are queued.
-      void sendUserMessage(conversationId, message)
-        .then((result) => {
+      void trackPlanStop(sessionId, async () => {
+        try {
+          const result = await sendUserMessage(sessionId, message);
           if (result.denied) toast.error("A policy blocked the message.");
-        })
-        .catch((error: unknown) => {
+          return !result.denied;
+        } catch (error) {
           toast.error(error instanceof Error ? error.message : "Couldn't reach the session.");
-        });
+          return false;
+        }
+      });
     }
   };
 

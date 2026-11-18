@@ -116,6 +116,7 @@ import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSe
 import { applyJournalEntry } from "@/hooks/useSessionJournal";
 import { isFirstPlan } from "@/lib/sessionJournal";
 import { showTasksTabBesideChat } from "@/store/sessionTasksActions";
+import { clearPlanStop } from "@/store/planStops";
 import { noteSessionStreamClosed, noteSessionStreamOpen } from "@/lib/sessionStreamSignals";
 import { invalidateAgentCosts } from "@/hooks/useAgentCosts";
 import { sessionItemsQueryKey } from "@/hooks/useSessionItems";
@@ -3087,6 +3088,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           return patch;
         });
       } else {
+        // The session took another message, so its run is no longer just stopping.
+        clearPlanStop(sessionId);
         // POST accepted: the server can now account for this message
         // (native: pending_inputs replay until the round-trip commits it;
         // non-native: already persisted). Mark the bubble settled — that is
@@ -3375,6 +3378,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           return patch;
         });
       } else {
+        clearPlanStop(sessionId);
         // POST accepted: the server persisted the visible receipt, so
         // navigation can rely on the snapshot — mark the echo settled
         // and drop any stash copy. Without this, an echo stashed by a
