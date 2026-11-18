@@ -105,6 +105,30 @@ export const CODE_FONT_WEIGHT_ENTRY = settingsEntry({
   focus: "toggle",
 });
 
+export const APPEARANCE_DATA_ENTRY = settingsEntry({
+  id: "appearance-data",
+  section: "appearance",
+  label: "Settings data",
+  description:
+    "Export this device's appearance and preference settings to a file, import them from one, or reset appearance to its defaults.",
+  keywords: ["export", "import", "backup", "restore", "reset", "defaults"],
+  parts: {
+    export: "Export",
+    import: "Import",
+    reset: "Reset to defaults",
+    confirmReset: "Reset",
+    chooseFile: "Choose file",
+  },
+  presence: {
+    confirmReset: { overlay: "reset" },
+    chooseFile: { overlay: "import" },
+  },
+  overlays: {
+    reset: { dialogActions: ["Cancel"] },
+    import: { dialogActions: ["Cancel"] },
+  },
+});
+
 export const APPEARANCE_SETTINGS = [
   THEME_MODE_ENTRY,
   TERMINAL_THEME_ENTRY,
@@ -114,4 +138,5 @@ export const APPEARANCE_SETTINGS = [
   CODE_FONT_SIZE_ENTRY,
   CODE_FONT_FAMILY_ENTRY,
   CODE_FONT_WEIGHT_ENTRY,
+  APPEARANCE_DATA_ENTRY,
 ] as const;
