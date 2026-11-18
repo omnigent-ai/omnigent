@@ -1486,10 +1486,10 @@ class SqlAlchemyConversationStore(ConversationStore):
         """
         Fetch a conversation by its unique ID.
 
-        Issues three queries: the conversation row (which carries the agent
-        binding + per-session override blob), the Omnigent-DB metadata row, and
-        a label fetch on ``conversation_labels``. They run inside a
-        :func:`shared_read_scope` so the whole read costs one pool checkout per
+        Fetches the conversation row, metadata, and labels. Split databases
+        also check for pending nest-label repairs in the metadata checkout,
+        ending that read before any repair writes. AP reads run inside a
+        :func:`shared_read_scope` so an ordinary read costs one pool checkout per
         engine — one in single-DB mode, where the metadata table would otherwise
         force a second checkout (and, with ``pool_pre_ping``, a second network
         round trip) for every session read in the product.
@@ -1499,12 +1499,27 @@ class SqlAlchemyConversationStore(ConversationStore):
         :returns: The :class:`Conversation` if found, otherwise
             ``None``.
         """
-        self._repair_pending_nest_labels_batch([conversation_id], best_effort=True)
+        split_database = self._conv_engine is not self._engine
+        meta = None
+        if split_database:
+            with self._nest_repair_session("select_conversation_metadata_by_id") as meta_session:
+                meta = meta_session.get(
+                    SqlConversationMetadata, (current_workspace_id(), conversation_id)
+                )
+                with query_name_scope("omnigent.conversation_store.read_pending_nest_labels"):
+                    pending = meta_session.get(
+                        SqlPreference,
+                        (current_workspace_id(), "__session_nest_repairs__", conversation_id),
+                    )
+            if pending is not None:
+                self._repair_pending_nest_labels_batch([conversation_id], best_effort=True)
+                meta = self._get_meta(conversation_id)
         with shared_read_scope(), self._conv_session("select_conversation_by_id") as session:
             row = session.get(SqlConversation, (current_workspace_id(), conversation_id))
             if row is None:
                 return None
-            meta = self._get_meta(conversation_id)
+            if not split_database:
+                meta = self._get_meta(conversation_id)
             return _to_conversation(row, meta, _fetch_labels(session, conversation_id))
 
     def find_conversation_by_external_session_id(
@@ -1762,21 +1777,29 @@ class SqlAlchemyConversationStore(ConversationStore):
         with self._profile_label_session(
             session, read_only=True, operation="preserve_session_creator_edges"
         ) as labels_session:
-            rows = labels_session.execute(
-                select(SqlConversationLabel.value, SqlConversation.id, SqlConversation.created_at)
-                .join(
-                    SqlConversation,
-                    and_(
-                        SqlConversation.workspace_id == SqlConversationLabel.workspace_id,
-                        SqlConversation.id == SqlConversationLabel.conversation_id,
-                    ),
+            rows = []
+            for member_batch in batched(dict.fromkeys(member_ids), _FAMILY_READ_BATCH_SIZE):
+                rows.extend(
+                    labels_session.execute(
+                        select(
+                            SqlConversationLabel.value,
+                            SqlConversation.id,
+                            SqlConversation.created_at,
+                        )
+                        .join(
+                            SqlConversation,
+                            and_(
+                                SqlConversation.workspace_id == SqlConversationLabel.workspace_id,
+                                SqlConversation.id == SqlConversationLabel.conversation_id,
+                            ),
+                        )
+                        .where(
+                            SqlConversationLabel.workspace_id == current_workspace_id(),
+                            SqlConversationLabel.conversation_id.in_(member_batch),
+                            SqlConversationLabel.key == CREATED_BY_SESSION_LABEL_KEY,
+                        )
+                    ).all()
                 )
-                .where(
-                    SqlConversationLabel.workspace_id == current_workspace_id(),
-                    SqlConversationLabel.conversation_id.in_(list(dict.fromkeys(member_ids))),
-                    SqlConversationLabel.key == CREATED_BY_SESSION_LABEL_KEY,
-                )
-            ).all()
         for creator_id, child_id, created_at in rows:
             try:
                 creator_id = uuid_to_bytes(creator_id).hex()
@@ -2195,13 +2218,18 @@ class SqlAlchemyConversationStore(ConversationStore):
                 SqlPreference.workspace_id == current_workspace_id(),
                 SqlPreference.user_id == "__session_nest_repairs__",
             )
-            if session_ids is not None:
-                statement = statement.where(SqlPreference.key.in_(session_ids))
-            pending_repairs = session.execute(
-                statement.order_by(SqlPreference.key).limit(
-                    len(session_ids) if session_ids is not None else MAX_SESSION_FAMILY_MEMBERS
-                )
-            ).all()
+            if session_ids is None:
+                pending_repairs = session.execute(
+                    statement.order_by(SqlPreference.key).limit(MAX_SESSION_FAMILY_MEMBERS)
+                ).all()
+            else:
+                pending_repairs = []
+                for session_batch in batched(dict.fromkeys(session_ids), _FAMILY_READ_BATCH_SIZE):
+                    pending_repairs.extend(
+                        session.execute(
+                            statement.where(SqlPreference.key.in_(session_batch))
+                        ).all()
+                    )
         for session_id, expected in pending_repairs:
             try:
                 run_write_transaction(
@@ -2281,13 +2309,17 @@ class SqlAlchemyConversationStore(ConversationStore):
     ) -> None:
         family_lock = self._lock_session_family(session, family_id)
         members = self._family_member_ids(session, family_id)
-        pending_repairs = session.execute(
-            select(SqlPreference.key, SqlPreference.value).where(
-                SqlPreference.workspace_id == current_workspace_id(),
-                SqlPreference.user_id == "__session_nest_repairs__",
-                SqlPreference.key.in_(members),
+        pending_repairs = []
+        for member_batch in batched(members, _FAMILY_READ_BATCH_SIZE):
+            pending_repairs.extend(
+                session.execute(
+                    select(SqlPreference.key, SqlPreference.value).where(
+                        SqlPreference.workspace_id == current_workspace_id(),
+                        SqlPreference.user_id == "__session_nest_repairs__",
+                        SqlPreference.key.in_(member_batch),
+                    )
+                ).all()
             )
-        ).all()
         for session_id, expected in pending_repairs:
             if json.loads(expected)["family_id"] == family_id:
                 self._repair_nest_label_intent(session, session_id=session_id, expected=expected)

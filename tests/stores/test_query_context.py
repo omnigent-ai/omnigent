@@ -190,9 +190,9 @@ def test_conversation_store_names_create_and_get_queries(
         assert fetched is not None
         assert fetched.id == child.id
         assert query_names == [
+            "omnigent.conversation_store.select_conversation_metadata_by_id",
             "omnigent.conversation_store.read_pending_nest_labels",
             "omnigent.conversation_store.select_conversation_by_id",
-            "omnigent.conversation_store.select_conversation_metadata_by_id",
             "omnigent.conversation_store.select_conversation_labels",
         ]
 
