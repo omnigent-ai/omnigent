@@ -491,7 +491,11 @@ def review_comments(review: str, *, head_sha: str, run_id: str, run_url: str) ->
 
     def validated(comments: list[str]) -> list[str]:
         for comment in comments:
-            _markdown_context(comment, validate_assessments=True)
+            _markdown_context(
+                comment,
+                validate_assessments=True,
+                protected_spans=[] if len(comments) > 1 else None,
+            )
         return comments
 
     single = wrap(review, 1, 1)

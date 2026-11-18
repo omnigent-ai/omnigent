@@ -903,6 +903,8 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
         ("", "- Finding with ```text after prose.\n\n", "container-prose"),
         ("~~~~", "- ~~~python\n  x = 1\n  ~~~\n", "container-literal"),
         ("", "- Finding with ~~~text after prose.\n\n", "container-prose"),
+        ("```", "- ", "container-cut"),
+        ("~~~", "- ", "container-cut"),
     ],
     ids=[
         "backticks",
@@ -969,6 +971,8 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
         "container-prose-backticks",
         "container-literal-tildes",
         "container-prose-tildes",
+        "container-created-by-cut-backticks",
+        "container-created-by-cut-tildes",
     ],
 )
 def test_fence_continuations_preserve_literal_content_and_footer_context(
@@ -989,7 +993,9 @@ def test_fence_continuations_preserve_literal_content_and_footer_context(
         composed = _HELPERS["compose_review"](
             _REVIEW, {"markdown": "Computed counts", "test_files": ["tests/test_parser.py"]}
         )
-        if shape == "container":
+        if shape == "container-cut":
+            lead = "Prose " + literal + fence + "python\n\n"
+        elif shape == "container":
             continuation = {
                 "- ": "  ",
                 "1. ": "   ",
@@ -1015,6 +1021,19 @@ def test_fence_continuations_preserve_literal_content_and_footer_context(
                 assert "<sub>Automated review by Polly" not in token.content
                 assert "tests/test_parser.py::test_empty" not in token.content
         review = lead + "Prose finding line.\n" * 4000 + composed
+        if shape == "container-cut":
+            calibration = _HELPERS["review_comments"]("x" * 130000 + "\n\n" + composed, **metadata)
+            content = calibration[0].split("part 1 appears.\n\n", 1)[1].rsplit("\n\n---\n", 1)[0]
+            review = (
+                "x" * (len(content) - len(literal))
+                + literal
+                + fence
+                + "python\n\n"
+                + "Prose finding line.\n" * 4000
+                + composed
+            )
+            raw_cut = _HELPERS["split_review"](review, len(content), split_once=True)[0]
+            assert literal + fence not in raw_cut
         original = parser.parse(review)
         code = [token.content for token in original if token.type == "fence"]
         assert code == (
@@ -1027,7 +1046,7 @@ def test_fence_continuations_preserve_literal_content_and_footer_context(
         assert sum(token.type == "table_open" for token in original) == 1
         assert _HELPERS["COMMENT_BYTE_LIMIT"] == 60000
         assert len(review.encode("utf-8")) > 60000
-        if shape == "container":
+        if shape in {"container", "container-cut"}:
             review_path, receipt, posts = _prepare_publication(
                 tmp_path, monkeypatch, head_sha=metadata["head_sha"], run_url=metadata["run_url"]
             )
