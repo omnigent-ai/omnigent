@@ -29,7 +29,6 @@ import { ENTER_KEY, ESC_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
 import { useIsEmbedded } from "@/lib/embedded";
 import { getEmbedRoot } from "@/lib/host";
 import {
-  hasCommandModifier,
   isFocusInDialogOrMenu,
   isEscapeOwnerOpen,
   isKeyOwningOverlayOpen,
@@ -37,6 +36,7 @@ import {
   isTextEntry,
 } from "@/lib/hotkeys";
 import type { AnyBlock, ElicitationBlock } from "@/lib/blocks";
+import { matchesShortcut } from "@/lib/shortcuts/registry";
 import { useChatStore } from "@/store/chatStore";
 
 /** Glyphs for the chord this hook matches; shown on the Approve button it would press. */
@@ -143,7 +143,7 @@ export function useApproveHotkey(isMac = isMacPlatform()): void {
       const embedRoot = getEmbedRoot();
       if (isEmbedded && (!embedRoot || !e.composedPath().includes(embedRoot))) return;
       if (e.key === "Escape") {
-        if (e.repeat || e.isComposing || e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return;
+        if (e.repeat || e.isComposing || !matchesShortcut(e, "approval.decline")) return;
         if (escapeBelongsElsewhere(e.target)) return;
         const { blocks, submitApproval } = useChatStore.getState();
         const target = approveHotkeyTarget(blocks);
@@ -156,8 +156,7 @@ export function useApproveHotkey(isMac = isMacPlatform()): void {
       }
       // Platform command modifier, not Alt/Shift (mirrors the session-switch guard):
       // only ⌘↵ on macOS and only Ctrl+↵ on Win/Linux.
-      if (!hasCommandModifier(e, isMac) || e.altKey || e.shiftKey) return;
-      if (e.key !== "Enter") return;
+      if (!matchesShortcut(e, "approval.accept", { mac: isMac })) return;
 
       // Mid-composition chord — a send intent aimed at the draft, not a
       // verdict. Leave the event for the composer's own handler (whose

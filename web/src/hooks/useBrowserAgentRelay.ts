@@ -9,7 +9,6 @@
  *  desktop build that predates the `browser*` bridge is treated as unsupported,
  *  so the relay never claims an action it couldn't fulfill. */
 import { useEffect } from "react";
-import { buildBrowserActionScript } from "../../electron/src/browserActionScript.mjs";
 import { onBrowserActionRequest } from "@/lib/browserActionBus";
 import type { BrowserActionRequestEvent } from "@/lib/events";
 import {
@@ -21,7 +20,10 @@ import {
 import { fetchSessionHostId } from "@/lib/fetchSessionHostId";
 import { authenticatedFetch } from "@/lib/identity";
 import { useQueryClient } from "@tanstack/react-query";
+import { loadOnce } from "@/lib/loadOnce";
 import { isArcaHost, readArcaHostId, writeArcaHostId } from "@/lib/arcaHost";
+import { navigatesAgentBrowser } from "@/components/BrowserPane/agentTools/actionKinds";
+import { agentActionDeadlineBeforeClaim } from "@/components/BrowserPane/agentTools/deadline";
 import type { Host } from "@/hooks/useHosts";
 
 /** Subset of `window.omnigentDesktop` the relay calls (typed locally, not via
@@ -82,6 +84,16 @@ function getBrowserDesktop(): BrowserDesktopBridge | null {
 
 /** The shape the relay POSTs back to the server as the action `result`. Normalized
  *  so the backend/tool layer can branch on `ok` alone. */
+// Loaded only where there's a browser to drive (the desktop app), so the web
+// app never downloads them. The relay starts loading the actions when it
+// registers, so the first action needn't wait.
+const loadRelayActions = loadOnce(() => import("@/components/BrowserPane/agentTools/relayActions"));
+const loadActionScript = loadOnce(() => import("../../electron/src/browserActionScript.mjs"));
+
+/** What the agent hears when the app can't load the code to run its action. */
+export const RELAY_LOAD_ERROR =
+  "the desktop app couldn't load its browser tools (it may have been updated); reload the window and try again";
+
 interface ActionResult {
   ok: boolean;
   error?: string;
@@ -103,7 +115,10 @@ async function performAction(
   }
   // Pre-typed desktops retain their existing executor until the v0.21 transition.
   if (desktop.browserExecute) {
-    const script = buildBrowserActionScript(action, args);
+    const { buildBrowserActionScript, LEGACY_SNAPSHOT_JS } = await loadActionScript();
+    // Such a desktop accepts only the templates it knows: its snapshot is the frozen one.
+    const script =
+      action === "snapshot" ? LEGACY_SNAPSHOT_JS : buildBrowserActionScript(action, args);
     return opts
       ? desktop.browserExecute(conversationId, script, opts)
       : desktop.browserExecute(conversationId, script);
@@ -260,18 +275,25 @@ export function useBrowserAgentRelay(conversationId: string | null | undefined):
   useEffect(() => {
     if (!relayEnabled) return;
     if (!supportsBrowser()) return;
+    void loadRelayActions().catch(() => {}); // Retried, and reported, per action.
 
     let cancelled = false;
     const handler = async (evt: BrowserActionRequestEvent, sourceConversationId: string | null) => {
       if (!sourceConversationId) return; // no delivering session — nothing to target
       const desktop = getBrowserDesktop();
       if (!desktop) return; // no browser-capable shell — nothing to claim
+      // Usually loaded already. Before the deadline: the server's wait starts
+      // at the claim, so loading mustn't eat into the action's time.
+      const actions = await loadRelayActions().catch(() => null);
+      // The server's wait starts when it takes the claim, after this.
+      const deadlineAt = agentActionDeadlineBeforeClaim();
       // Claim FIRST — only the winner proceeds, so two windows can't double-execute.
       const claimToken = await claimAction(sourceConversationId, evt.actionId);
       if (!claimToken) return;
-      const needsHostRevalidation = ["screenshot", "snapshot", "click", "type"].includes(
-        evt.action,
-      );
+      // browser_tabs can open a URL, so it establishes provenance too.
+      const navigates = navigatesAgentBrowser(evt.action);
+      // Every action but a navigation reads or drives the page already open.
+      const needsHostRevalidation = evt.action !== "navigate";
       let privilegedView = true;
       if (needsHostRevalidation && desktop.browserHasView) {
         try {
@@ -283,7 +305,7 @@ export function useBrowserAgentRelay(conversationId: string | null | undefined):
       }
       const revalidateHost = needsHostRevalidation && privilegedView;
       const sourceHostId =
-        evt.action === "navigate" || revalidateHost
+        navigates || revalidateHost
           ? await fetchSessionHostId(sourceConversationId, { queryClient })
           : null;
       const readHostOptions = revalidateHost
@@ -291,7 +313,7 @@ export function useBrowserAgentRelay(conversationId: string | null | undefined):
         : undefined;
       const rememberedArcaHostId = evt.action === "navigate" ? readArcaHostId() : null;
       const sourceIsArcaHost =
-        evt.action === "navigate" && sourceHostId !== null
+        navigates && sourceHostId !== null
           ? queryClient
               .getQueriesData<Host[]>({ queryKey: ["hosts"] })
               .flatMap(([, rows]) => rows ?? [])
@@ -299,9 +321,28 @@ export function useBrowserAgentRelay(conversationId: string | null | undefined):
                 (host) => host.host_id === sourceHostId && isArcaHost(host, rememberedArcaHostId),
               )
           : false;
+      // The agent browser tools act on the session's current agent tab, within the deadline.
+      const agentDispatch = (
+        ...[id, action, args, bridge, ...rest]: Parameters<typeof dispatch>
+      ) => {
+        const [hostId, rememberedHostId, sourceIsManagedHost, hostOptions] = rest;
+        return actions === null
+          ? Promise.resolve({ ok: false, error: RELAY_LOAD_ERROR })
+          : actions.dispatchAgentBrowserAction(
+              dispatch,
+              id,
+              action,
+              args,
+              bridge,
+              hostId,
+              rememberedHostId,
+              sourceIsManagedHost,
+              { deadlineAt, readHostOptions: hostOptions },
+            );
+      };
       let result = cancelled
         ? { ok: false, error: "browser relay context changed" }
-        : await dispatch(
+        : await agentDispatch(
             sourceConversationId,
             evt.action,
             evt.args,
@@ -322,7 +363,7 @@ export function useBrowserAgentRelay(conversationId: string | null | undefined):
         const currentHostId = await fetchSessionHostId(sourceConversationId, { queryClient });
         result = cancelled
           ? { ok: false, error: "browser relay context changed" }
-          : await dispatch(
+          : await agentDispatch(
               sourceConversationId,
               evt.action,
               evt.args,

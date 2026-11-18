@@ -470,6 +470,35 @@ class SandboxBackend(ABC):
         """Resolve host-local policy immediately before launcher construction."""
         return policy
 
+    def prepare_launcher_filesystem(self, policy: SandboxPolicy, cwd: Path) -> None:
+        """Materialize approved bind sources before capturing launch identities."""
+        del policy, cwd
+
+    def launch_fingerprint(
+        self,
+        argv: list[str],
+        policy: SandboxPolicy,
+        cwd: Path,
+        chdir: Path | None = None,
+    ) -> object:
+        """
+        Return what :meth:`wrap_launcher_argv` derives from the host filesystem.
+
+        Launch-time masks (e.g. dotfiles found by the cwd scan) are fixed
+        for a helper's lifetime, so a long-lived helper is relaunched once
+        this value changes. The default ``None`` does not promise stability,
+        so reusable helpers relaunch before each request. Backends whose launch
+        is independent of filesystem state can return an empty tuple.
+
+        :param argv: The unwrapped argv the helper was launched with.
+        :param policy: The policy the helper was launched with.
+        :param cwd: Workspace directory the helper was launched from.
+        :param chdir: Optional separate start directory.
+        :returns: A comparable value, or ``None``.
+        """
+        del argv, policy, cwd, chdir
+        return None
+
     def post_spawn(self, policy: SandboxPolicy, pid: int) -> ContainmentHandle | None:
         """
         Apply post-spawn containment to a just-launched helper process.
@@ -525,10 +554,31 @@ def _resolve_grant_root(cwd: Path, root: str) -> Path:
             root,
         )
     expanded = os.path.expanduser(root)
-    path = Path(expanded)
-    if not path.is_absolute():
-        path = cwd / path
-    return path.resolve(strict=False)
+    if Path(expanded).is_absolute() or ".." in Path(root).parts:
+        return Path(os.path.realpath(os.path.join(cwd, expanded)))
+    return Path(_contained_relative_grant(cwd, root, expanded))
+
+
+def _check_relative_grant_containment(cwd: Path, root: str) -> None:
+    """Reject a relative grant whose resolved target leaves *cwd*.
+
+    Absolute, ``~``, and ``..`` grants are not checked here.
+    """
+    expanded = os.path.expanduser(root)
+    if Path(expanded).is_absolute() or ".." in Path(root).parts:
+        return
+    _contained_relative_grant(cwd, root, expanded)
+
+
+def _contained_relative_grant(cwd: Path, root: str, expanded: str) -> str:
+    """Return the real path of a relative grant under *cwd*, or raise when it escapes."""
+    base = os.path.realpath(cwd)
+    resolved = contained_realpath(os.path.join(base, expanded), containment_prefix(base))
+    if resolved is None:
+        raise ValueError(
+            f"relative sandbox grant resolves outside its working directory: {root!r}"
+        )
+    return resolved
 
 
 def resolve_sandbox(spec: OSEnvSpec, cwd: Path) -> SandboxPolicy:

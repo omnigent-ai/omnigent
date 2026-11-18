@@ -94,16 +94,20 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
         "canvas": False,
         "arca_shutdown_warnings": False,
         "import_review": False,
-        "custom_agents_settings_ui": True,
         "sidebar_grouping_ui": True,
         "workspace_content_search": False,
         "grid_sessions_display_ui": False,
         "automations_v2": True,
         "splittable_terminal_view_ui": False,
         "sidebar_windowed_rows": False,
+        "workflows": False,
+        "session_overview": False,
+        "project_repository_creation": True,
         "session_orchestration": True,
         "sibling_sessions": True,
         "codex_plan_at_launch": True,
+        "workspace_direct_access": False,
+        "workspace_api_server_access": False,
     }
     assert data["sibling_sessions"] is True
     # Compatibility field for frontend builds predating the nested map.
@@ -122,12 +126,18 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
     # Gates the automation dialog's Session control; older servers reject the fields.
     assert data["scheduled_task_session_modes"] is True
     assert data["scheduled_task_subhour"] is True
+    # The one_time_automations release feature is off by default.
+    assert data["scheduled_task_one_time"] is False
     # Lets the trigger form save its header; older servers would send it to the model.
     assert data["scheduled_task_trigger_headers"] is True
     assert data["automation_trigger_poll_minutes"] == 10
+    # Lets automation forms accept long instructions; older servers deliver 8,000.
+    assert data["session_message_max_chars"] == 32_000
     assert data["scheduled_task_harness_settings"] is True
     # Lets sys_session_create refuse permission_mode on servers that would ignore it.
     assert data["session_create_permission_modes"] is True
+    # Lets sys_session_create refuse workflow_id on servers that would ignore it.
+    assert data["session_create_workflow_id"] is True
     # Gates the automation picker's approval-skipping modes; older servers reject them.
     assert data["scheduled_task_approval_skipping_modes"] is True
     assert data["agent_detail"] is True

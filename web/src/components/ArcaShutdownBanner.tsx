@@ -71,7 +71,7 @@ export function ArcaShutdownBanner({
       role="status"
       className={cn(
         "shrink-0 px-3 md:px-4",
-        hasTasks ? "mt-1" : "chat-plan-accordion mt-14 md:mt-12",
+        hasTasks ? "mt-1" : "chat-tasks-preview mt-14 md:mt-12",
       )}
     >
       <div className="mx-auto flex max-w-3xl items-start gap-2 rounded-lg border border-warning/30 bg-warning/10 px-3 py-2 text-foreground">

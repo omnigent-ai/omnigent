@@ -384,6 +384,14 @@ def test_encode_body_picks_base64_for_binary() -> None:
     assert decode_body(body, encoding) == b"\x89PNG"
 
 
+@pytest.mark.parametrize("payload", [b"\xc3", b"\xa9", b"\xff", b"prefix\xc3"])
+@pytest.mark.parametrize("content_type", ["text/plain", "application/json"])
+def test_encode_body_preserves_non_utf8_text_bytes(payload: bytes, content_type: str) -> None:
+    body, encoding = encode_body(payload, content_type)
+    assert encoding == "base64"
+    assert decode_body(body, encoding) == payload
+
+
 def test_decode_body_round_trips_both_encodings() -> None:
     assert decode_body("hello", "utf-8") == b"hello"
     assert decode_body("aGVsbG8=", "base64") == b"hello"

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,7 @@ import pytest
 import pytest_asyncio
 from fastapi import FastAPI
 
+from omnigent.entities import SessionPermission
 from omnigent.host.frames import HostHelloFrame
 from omnigent.runtime import inflight_text, session_stream
 from omnigent.runtime.agent_cache import AgentCache
@@ -1515,6 +1517,59 @@ async def test_grant_upgrade_via_upsert(
     )
 
 
+async def test_minimum_grant_preserves_access_strengthened_after_refresh(
+    auth_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A delayed Read invitation must retain Edit committed after its refresh."""
+    owner = "owner@example.com"
+    recipient = "recipient@example.com"
+    agent = await create_test_agent(auth_client, user=owner)
+    session = await _create_session_as(auth_client, agent["id"], owner)
+    session_id = session["id"]
+    refreshed = await _list_permissions(auth_client, session_id, user=owner)
+    assert refreshed.status_code == 200
+    assert all(p["user_id"] != recipient for p in refreshed.json()["permissions"])
+
+    original_grant = SqlAlchemyPermissionStore.grant
+
+    def grant_after_edit(
+        store: SqlAlchemyPermissionStore,
+        user_id: str,
+        conversation_id: str,
+        level: int,
+        *,
+        ensure_minimum: bool = False,
+    ) -> SessionPermission:
+        if user_id == recipient and ensure_minimum:
+            original_grant(store, user_id, conversation_id, LEVEL_EDIT)
+        return original_grant(
+            store, user_id, conversation_id, level, ensure_minimum=ensure_minimum
+        )
+
+    monkeypatch.setattr(SqlAlchemyPermissionStore, "grant", grant_after_edit)
+    response = await auth_client.put(
+        f"/v1/sessions/{session_id}/permissions",
+        json={"user_id": recipient, "level": LEVEL_READ, "ensure_minimum": True},
+        headers={"X-Forwarded-Email": owner},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["level"] == LEVEL_EDIT
+    persisted = await _list_permissions(auth_client, session_id, user=owner)
+    assert persisted.status_code == 200
+    grants = {p["user_id"]: p["level"] for p in persisted.json()["permissions"]}
+    assert grants[recipient] == LEVEL_EDIT
+
+    replacement = await _grant_permission(
+        auth_client, session_id, granter=owner, target_user=recipient, level=LEVEL_READ
+    )
+    assert replacement.status_code == 200, replacement.text
+    assert replacement.json()["level"] == LEVEL_READ
+    persisted = await _list_permissions(auth_client, session_id, user=owner)
+    grants = {p["user_id"]: p["level"] for p in persisted.json()["permissions"]}
+    assert grants[recipient] == LEVEL_READ
+
+
 # ── Unauthenticated request: no header ────────────────────
 
 
@@ -2476,6 +2531,31 @@ async def test_get_owner_returns_creator(
     )
     assert resp.status_code == 200
     assert resp.json()["owner"] == "bryan"
+
+
+async def test_get_owner_reads_permissions_off_event_loop(
+    auth_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A slow permission service must not occupy the request's event loop."""
+    agent = await create_test_agent(auth_client, user="bryan")
+    session = await _create_session_as(auth_client, agent["id"], "bryan")
+    original = SqlAlchemyPermissionStore.list_for_session
+    loop_thread = threading.get_ident()
+    calls = []
+
+    def checked_read(self, *args, **kwargs):
+        assert threading.get_ident() != loop_thread
+        calls.append(args)
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(SqlAlchemyPermissionStore, "list_for_session", checked_read)
+    response = await auth_client.get(
+        f"/v1/sessions/{session['id']}/owner", headers={"X-Forwarded-Email": "bryan"}
+    )
+    assert response.status_code == 200
+    assert response.json() == {"owner": "bryan"}
+    assert calls
 
 
 async def test_get_owner_forbidden_without_access(

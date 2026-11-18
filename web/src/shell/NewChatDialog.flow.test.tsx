@@ -16,6 +16,7 @@ vi.mock("@/hooks/useSandboxModelOptions", async (importOriginal) => ({
   })),
 }));
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
+import { REVIEW_PLAN_FIRST } from "@/lib/workflow";
 import { useConversations as useTestConversations } from "@/hooks/useConversations";
 
 vi.mock("@/hooks/useSidebarData", () => ({
@@ -427,6 +428,7 @@ beforeEach(() => {
   clearOptimisticTitles();
   clearSessionDrafts();
   localStorage.clear();
+  sessionStorage.clear();
   searchParams = new URLSearchParams();
   projects = [];
   vi.mocked(useHostModelOptions).mockReturnValue({
@@ -1248,12 +1250,15 @@ describe("NewChatLandingScreen create flow", () => {
         pendingMsgTempId: "pend_cancel",
         createToken: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       });
+      // The original task arrives through a prompt link, so a reload-recovery copy is kept.
+      searchParams = new URLSearchParams("prompt=original+task");
       renderLanding();
       await waitForWorkspaceSeed();
-      typeMessage("original task");
+      expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("original task");
       fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
       await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
       cleanup();
+      searchParams = new URLSearchParams();
 
       hasPendingLocalMessageMock.mockReturnValue(false);
       setSessionDraft(tempConvId, { text: corrected, files: [] });
@@ -1269,8 +1274,47 @@ describe("NewChatLandingScreen create flow", () => {
       renderLanding();
       expect(screen.getByTestId("new-chat-landing-input")).toHaveValue(corrected);
       expect(hydrateLocalConversationMock).not.toHaveBeenCalled();
+
+      // Editing the recovered draft and reloading never brings the link's text back.
+      typeMessage(`${corrected} edited`);
+      cleanup();
+      resetLandingDraft();
+      renderLanding();
+      expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("");
     },
   );
+
+  it("does not restore a submitted prompt while creation is pending", async () => {
+    const tempConvId = "temp:dddddddddddddddddddddddddddddddd";
+    let resolveCreate!: (response: Response) => void;
+    vi.mocked(authenticatedFetch).mockReturnValueOnce(
+      new Promise<Response>((resolve) => {
+        resolveCreate = resolve;
+      }) as ReturnType<typeof authenticatedFetch>,
+    );
+    beginLocalConversationMock.mockReturnValue({
+      tempConvId,
+      pendingMsgTempId: "pend_inflight",
+      createToken: "dddddddddddddddddddddddddddddddd",
+    });
+    searchParams = new URLSearchParams("prompt=First+request");
+    renderLanding();
+    await waitForWorkspaceSeed();
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("First request");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    cleanup();
+
+    // "New session" while the first create is still pending: nothing to restore.
+    searchParams = new URLSearchParams();
+    renderLanding();
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("");
+    await act(async () => {
+      resolveCreate({ ok: true, json: async () => ({ id: "conv_first" }) } as unknown as Response);
+    });
+    await waitFor(() => expect(hydrateLocalConversationMock).toHaveBeenCalled());
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("");
+  });
 
   it("restores the recovered temp-draft files onto the still-mounted landing after a failed create", async () => {
     // The create is rejected while the landing is still on screen, and the
@@ -1777,6 +1821,32 @@ describe("NewChatLandingScreen create flow", () => {
       expect(setPendingInitialPromptMock).toHaveBeenCalledWith("conv_new", {
         text: "/review-pr 123 focus on auth",
         skill: { name: "review-pr", args: "123 focus on auth" },
+        files: [],
+      }),
+    );
+  });
+
+  it("runs a workflow from the + menu as the session's first message", async () => {
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    setAgents([agent({ skills: [{ name: "workflow", description: "Plan and run a workflow" }] })]);
+
+    renderLanding([], { features: { workflows: true } });
+    await waitForWorkspaceSeed();
+    typeMessage("Add retries");
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Add" }), { button: 0 });
+    fireEvent.click(screen.getByTestId("composer-workflow-action"));
+    // The draft becomes the description, since the workflow message replaces it.
+    expect(await screen.findByTestId("workflow-dialog-description")).toHaveValue("Add retries");
+    fireEvent.click(screen.getByTestId("workflow-dialog-run"));
+
+    const args = `Add retries\n\n${REVIEW_PLAN_FIRST}`;
+    await waitFor(() =>
+      expect(setPendingInitialPromptMock).toHaveBeenCalledWith("conv_new", {
+        text: `/workflow ${args}`,
+        skill: { name: "workflow", args },
         files: [],
       }),
     );

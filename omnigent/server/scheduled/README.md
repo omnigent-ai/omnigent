@@ -253,7 +253,7 @@ fires. If `fire_identity` is set, it enters that first:
 | When entering the identity… | Result |
 | --- | --- |
 | Raises `FireIdentityRevoked` | The run fails with `reauthorization_required`, and no session is created. If the owner was deleted, the task is disabled with `owner_deleted` instead. |
-| Raises any other error | Treated as temporary: the run fails with `owner_identity_unavailable`, and the next occurrence tries again. |
+| Raises any other error | Treated as temporary: the run fails with `owner_identity_unavailable`, and the next occurrence tries again. A one-time (`COUNT=1`) task has no next occurrence, so its error says to set it again. |
 
 Recovery enters the same identity before inspecting a session. A temporary error
 leaves the run for a later pass. `FireIdentityRevoked` records `failed` without
@@ -800,7 +800,9 @@ competing-worker scenarios live in `test_managed_startup_inputs.py`.
 for UI, API, and agent-tool creates. Its top-level `user_id` is the authenticated
 owner (`local` for auth-disabled servers); attributes are `task_id`,
 `task_workspace_id`, `creation_source` (`ui`, `agent`, or `api`), `template_id`,
-`target`, and `session_mode`. Rejected creates emit no creation event. As with
+`kind` (`automation` or `reminder`), `target`, and `session_mode`. `template_id`
+is `none` for agent and API creates, which have no template, and `unknown` for
+an unrecognized or missing UI template. Rejected creates emit no creation event. As with
 run logs, delivery is best-effort; reconcile current inventory against the store.
 
 Requests without a recognized source header are classified as `api`, including
@@ -812,7 +814,7 @@ UI events use the host-provided `OmnigentHostConfig.analytics` sink:
 | Metric | Measurement |
 | --- | --- |
 | Feature visitors | Distinct host-identified users on `page_view` with `pageId=tasks`, `tasks.templates`, or `tasks.detail`. |
-| Users creating automations | Distinct `(task_workspace_id, user_id)` on `scheduled_task_created` in the reporting window. |
+| Users creating automations | Distinct `(task_workspace_id, user_id)` on `scheduled_task_created` with `kind=automation` in the reporting window; `sys_reminder_set` reminders log `kind=reminder`. |
 | Automations created per person | Distinct `task_id` per owner on `scheduled_task_created`, including tasks later deleted while events remain retained. |
 | Active tasks and active owners | Use `scheduled_tasks` filtered to `state=active`; group by workspace and owner. This is a current snapshot, not historical daily activity. |
 | Template selections | `click` with `componentId=tasks.template.<id>`, from both the empty-state preview and Templates tab. |

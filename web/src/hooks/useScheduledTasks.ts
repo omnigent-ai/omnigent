@@ -6,24 +6,40 @@
 // (no async search index), so a plain invalidate can't resurrect a just-deleted
 // row — no patch-in-place gymnastics are needed here.
 
-import { useMutation, useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
+import {
+  useInfiniteQuery,
+  useMutation,
+  useQueries,
+  useQuery,
+  useQueryClient,
+  type InfiniteData,
+  type QueryClient,
+} from "@tanstack/react-query";
+import { invalidateSessionGrants } from "@/hooks/usePermissions";
 import { LIST_ROW_QUERY_ROOTS } from "@/lib/sessionListCache";
 import {
   createScheduledTask,
   deleteScheduledTask,
   getScheduledTask,
   listScheduledTaskRuns,
+  listScheduledTaskRunSteps,
   listScheduledTasks,
+  listSharedScheduledTasks,
   runScheduledTaskNow,
   updateScheduledTask,
   type CreateScheduledTaskInput,
   type ScheduledTask,
+  type SharedScheduledTasksPage,
   type ScheduledTaskRun,
+  type ScheduledTaskRunSteps,
   type UpdateScheduledTaskInput,
 } from "@/lib/scheduledTasksApi";
 
 /** Query key for the caller's scheduled-tasks list. */
 export const SCHEDULED_TASKS_KEY = ["scheduled-tasks"] as const;
+
+/** Query key for the automations other users shared with the caller. */
+export const SHARED_SCHEDULED_TASKS_KEY = ["scheduled-tasks-shared"] as const;
 
 /** Query key for one task's detail. */
 export function scheduledTaskKey(id: string): readonly unknown[] {
@@ -48,10 +64,8 @@ export function useScheduledTasks() {
     staleTime: 30_000,
     // POLLING CONTRACT — read before reusing this hook.
     // The 60s interval only runs while a component that mounts this hook is
-    // mounted; TanStack Query tears the interval down on unmount. Today the sole
-    // consumer is TasksPage, which is route-scoped and lazy-loaded at /tasks — so
-    // polling happens ONLY while the user is on the Scheduled Tasks page and
-    // stops the moment they navigate away.
+    // mounted; TanStack Query tears the interval down on unmount. Its consumers
+    // are route-scoped pages, so polling stops the moment the user leaves them.
     // GUARD RAIL: do NOT mount this hook in a persistent / always-rendered spot
     // (sidebar, global layout, an app-shell badge). That would silently turn a
     // page-scoped poll into app-wide 60s background traffic. If you need a
@@ -59,6 +73,31 @@ export function useScheduledTasks() {
     // (no short refetchInterval, or a much longer one) — don't reuse this one.
     refetchInterval: 60_000,
   });
+}
+
+/**
+ * The automations shared with the caller, a page at a time. Polls like
+ * {@link useScheduledTasks}, under the same page-scoped contract: mount it only
+ * on the Automations page. `enabled` is false where the server can't share them.
+ */
+export function useSharedScheduledTasks(enabled: boolean) {
+  return useInfiniteQuery({
+    queryKey: SHARED_SCHEDULED_TASKS_KEY,
+    queryFn: ({ pageParam }) => listSharedScheduledTasks(pageParam),
+    initialPageParam: null as string | null,
+    getNextPageParam: (page) => page.nextCursor,
+    enabled,
+    staleTime: 30_000,
+    refetchInterval: 60_000,
+  });
+}
+
+/** A task from the loaded pages of {@link useSharedScheduledTasks}, if any. */
+function cachedSharedTask(queryClient: QueryClient, id: string): ScheduledTask | undefined {
+  return queryClient
+    .getQueryData<InfiniteData<SharedScheduledTasksPage>>(SHARED_SCHEDULED_TASKS_KEY)
+    ?.pages.flatMap((page) => page.tasks)
+    .find((task) => task.id === id);
 }
 
 /**
@@ -76,9 +115,10 @@ export function useScheduledTask(id: string, enabled = true) {
     queryFn: () => getScheduledTask(id),
     enabled: enabled && id !== "",
     staleTime: 30_000,
-    // Paint from the list cache while the detail fetch is in flight.
+    // Paint from either list's cache while the detail fetch is in flight.
     placeholderData: () =>
-      queryClient.getQueryData<ScheduledTask[]>(SCHEDULED_TASKS_KEY)?.find((t) => t.id === id),
+      queryClient.getQueryData<ScheduledTask[]>(SCHEDULED_TASKS_KEY)?.find((t) => t.id === id) ??
+      cachedSharedTask(queryClient, id),
   });
 }
 
@@ -167,6 +207,56 @@ export function useScheduledTaskRuns(id: string, enabled = true, awaitingRun = f
   });
 }
 
+/** How many runs one request for their plans covers. */
+const RUN_STEPS_PAGE = 20;
+
+/**
+ * The plans an automation's runs started with, by run ID, for their timelines.
+ * Asks for the given runs 20 at a time, paging as the run list does; only the
+ * newest 20 poll, and only while one of them is in flight. Session updates also
+ * refresh a page when a short continuation finishes between history polls.
+ *
+ * @param runs - The task's runs, most recent first, from `useScheduledTaskRuns`.
+ * @param enabled - Whether to fetch: the server supports workflow history and the
+ *     caller owns the automation, since a viewer's history has no plans.
+ */
+export function useScheduledTaskRunSteps(
+  id: string,
+  runs: readonly ScheduledTaskRun[] | undefined,
+  enabled: boolean,
+): ReadonlyMap<string, ScheduledTaskRunSteps> {
+  const pages: ScheduledTaskRun[][] = [];
+  for (let start = 0; start < (runs?.length ?? 0); start += RUN_STEPS_PAGE) {
+    pages.push((runs ?? []).slice(start, start + RUN_STEPS_PAGE));
+  }
+  const newestUnsettled = hasUnsettledRun(pages[0]);
+  return useQueries({
+    queries: pages.map((page, index) => {
+      // Each page starts after the previous page's last run, as the run list pages.
+      const after = index === 0 ? undefined : pages[index - 1]!.at(-1)!.id;
+      return {
+        queryKey: [
+          "scheduled-task-run-steps",
+          id,
+          after ?? null,
+          page.map((run) => [
+            run.id,
+            run.status,
+            run.conversationStatus,
+            run.conversationUpdatedAt,
+          ]),
+        ],
+        queryFn: () => listScheduledTaskRunSteps(id, { limit: RUN_STEPS_PAGE, after }),
+        enabled,
+        staleTime: 30_000,
+        refetchInterval: index === 0 && newestUnsettled ? RUNS_REFETCH_INTERVAL_MS : false,
+      };
+    }),
+    combine: (results) =>
+      new Map(results.flatMap((result) => result.data ?? []).map((steps) => [steps.runId, steps])),
+  });
+}
+
 /** Create a scheduled task, then refresh the list. */
 export function useCreateScheduledTask() {
   const queryClient = useQueryClient();
@@ -191,6 +281,8 @@ export function useUpdateScheduledTask() {
       // A schedule/state change can shift the run history too (e.g. a
       // just-reactivated task), so refresh that task's runs if they're loaded.
       void queryClient.invalidateQueries({ queryKey: scheduledTaskRunsKey(updated.id) });
+      // Switching to new sessions stops it managing its session's sharing.
+      invalidateSessionGrants(queryClient);
     },
   });
 }
@@ -236,6 +328,8 @@ export function useDeleteScheduledTask() {
         queryClient.getQueryData<ScheduledTask>(scheduledTaskKey(id)) ??
         queryClient.getQueryData<ScheduledTask[]>(SCHEDULED_TASKS_KEY)?.find((t) => t.id === id);
       forgetScheduledTasks(queryClient, [id]);
+      // A deleted automation no longer manages its session's sharing.
+      invalidateSessionGrants(queryClient);
       // The server cleared the automation's label from the session it ran from,
       // so menus and delete warnings must stop naming the automation.
       if (deleted?.sourceSessionId) {

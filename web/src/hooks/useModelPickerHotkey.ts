@@ -11,6 +11,7 @@
 import { useEffect, useRef } from "react";
 
 import { CTRL_KEY, SHIFT_KEY } from "@/components/KeyboardShortcut";
+import { matchesShortcut } from "@/lib/shortcuts/registry";
 
 /** Glyphs for the chord `isModelPickerHotkey` matches; shown in control tooltips. */
 export const MODEL_PICKER_KEYS = [CTRL_KEY, SHIFT_KEY, "M"] as const;
@@ -21,15 +22,7 @@ const HOTKEY_OWNING_SURFACES = ".xterm, .monaco-editor";
 /** True when the event is the model-picker chord: Ctrl + Shift + M, no Cmd/Alt.
  *  Ctrl on every platform (see file header). */
 export function isModelPickerHotkey(e: globalThis.KeyboardEvent): boolean {
-  // Require Ctrl+Shift, and reject Cmd (macOS) and Alt so no ⌘/⌥ variant
-  // matches: ⌘⇧M is Chrome's profile switcher, ⌥ is the minimize-all family.
-  if (!e.ctrlKey || e.metaKey || !e.shiftKey || e.altKey) return false;
-  // AltGr reports as Ctrl+Alt on some layouts; the !altKey check above already
-  // excludes it, but guard explicitly for parity with the sibling hotkeys.
-  if (typeof e.getModifierState === "function" && e.getModifierState("AltGraph")) return false;
-  // Match the physical key, stable across layouts and Shift's uppercasing of
-  // e.key ("m" vs "M").
-  return e.code === "KeyM";
+  return matchesShortcut(e, "model.picker");
 }
 
 /** Does focus sit inside a surface that owns its keystrokes (xterm / Monaco)? */

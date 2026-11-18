@@ -99,7 +99,7 @@ runs:
         sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
     - name: Install Claude Code CLI
-      uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@c76912dd5f9cfe9e2e11572eae45ad657243232f
+      uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@75d817057138bd2cf5cd5af1cd954fdaca12e03d
       with:
         harness: claude
 
@@ -118,12 +118,12 @@ runs:
         echo "OMNIGENT_E2E_CLAUDE_BILLING_NOTICE_BIN=$billing_cli_dir/node_modules/.bin/claude" >> "$GITHUB_ENV"
 
     - name: Install Codex CLI
-      uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@c76912dd5f9cfe9e2e11572eae45ad657243232f
+      uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@75d817057138bd2cf5cd5af1cd954fdaca12e03d
       with:
         harness: codex
 
     - name: Install Pi CLI
-      uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@c76912dd5f9cfe9e2e11572eae45ad657243232f
+      uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@75d817057138bd2cf5cd5af1cd954fdaca12e03d
       with:
         harness: pi
 
@@ -235,6 +235,8 @@ runs:
         path: |
           /tmp/omnigent-e2e-${{ github.run_id }}-shard${{ inputs.shard_id }}/**/server.log
           /tmp/omnigent-e2e-${{ github.run_id }}-shard${{ inputs.shard_id }}/**/runner.log
+          /tmp/omnigent-e2e-${{ github.run_id }}-shard${{ inputs.shard_id }}/**/test_scheduled_renewal_preserv*/*-process.log
+          /tmp/omnigent-e2e-${{ github.run_id }}-shard${{ inputs.shard_id }}/**/test_scheduled_renewal_preserv*/server-b.log
           /tmp/omnigent-e2e-${{ github.run_id }}-shard${{ inputs.shard_id }}/**/.omnigent/logs/**/*.log
           /tmp/omnigent-e2e-${{ github.run_id }}-shard${{ inputs.shard_id }}/junit.xml
           /tmp/omnigent-e2e-${{ github.run_id }}-shard${{ inputs.shard_id }}/progress/progress-*.log

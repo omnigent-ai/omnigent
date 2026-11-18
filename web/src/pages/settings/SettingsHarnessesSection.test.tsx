@@ -425,12 +425,13 @@ describe("Harnesses grid", () => {
     },
   );
 
-  it("does not offer one-click install for a not-installed Cursor harness", () => {
+  it("offers the same Set-up action for a not-installed Cursor harness", () => {
     hosts = [{ ...ONLINE, configured_harnesses: { "cursor-native": "binary-missing" } }];
     renderHarnesses();
 
-    expect(screen.queryByTestId("harness-action-cursor-native")).toBeNull();
-    expect(screen.getByTestId("harness-settings-cursor-native")).toBeTruthy();
+    expect(screen.queryByTestId("harness-settings-cursor-native")).toBeNull();
+    fireEvent.click(screen.getByTestId("harness-action-cursor-native"));
+    expect(screen.getByTestId("fix-dialog")).toHaveAttribute("data-mode", "install");
   });
 
   it("uses the existing inventory label instead of guessing a personal subscription", () => {

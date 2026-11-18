@@ -56,7 +56,7 @@ import {
   listReconcileTargets,
   projectNamesResolver,
 } from "@/lib/listReconcileTargets";
-import { isModalHostResolved, resolveModalHost } from "@/lib/sessionHost";
+import { resolveModalHost, sessionRoutingHostId } from "@/lib/sessionHost";
 import { sessionVisibility } from "@/lib/sessionVisibility";
 import { type SessionUpdatesFrame, sessionUpdatesSocket } from "@/lib/sessionUpdatesSocket";
 import { isTempConvId } from "@/lib/tempConversationId";
@@ -431,17 +431,33 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
     if (!identityReady) return;
     let cacheUnsub: (() => void) | null = null;
     const tryResolveAndStart = (): boolean => {
-      const succeeded = queryClient
+      // Only the user's own unarchived, unfiltered list decides the modal host:
+      // shared, archived, search and project rows are not this user's home hosts.
+      const ownLists = queryClient
         .getQueryCache()
         .getAll()
-        .some(
+        .filter(
           (q) =>
             Array.isArray(q.queryKey) &&
             q.queryKey[0] === "conversations" &&
+            q.queryKey[1] === "" &&
+            q.queryKey[2] === false &&
+            q.queryKey[3] == null &&
+            (q.queryKey[4] == null || q.queryKey[4] === "mine") &&
             q.state.status === "success",
         );
-      if (!succeeded) return false;
-      resolveModalHost();
+      if (ownLists.length === 0) return false;
+      // The unfiltered list also holds shared rows; only the viewer's own count.
+      const viewerId = getCurrentUserId();
+      const ownHostIds = ownLists.flatMap((q) => {
+        const pages = (q.state.data as ConversationsInfiniteData | undefined)?.pages ?? [];
+        return pages.flatMap((page) =>
+          page.data
+            .filter((row) => sessionVisibility(row, viewerId) === "mine")
+            .map((row) => sessionRoutingHostId(row.host_id, row.labels)),
+        );
+      });
+      resolveModalHost(ownHostIds.filter((id): id is string => id !== null));
       sessionUpdatesSocket.start();
       return true;
     };
@@ -449,7 +465,7 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
     // Otherwise wait for the first success, then start once and unsubscribe.
     if (!tryResolveAndStart()) {
       cacheUnsub = queryClient.getQueryCache().subscribe(() => {
-        if (isModalHostResolved() || tryResolveAndStart()) cacheUnsub?.();
+        if (tryResolveAndStart()) cacheUnsub?.();
       });
     }
 

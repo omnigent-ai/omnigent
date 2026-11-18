@@ -7,9 +7,15 @@ from uuid import uuid4
 import httpx
 import pytest
 
+from omnigent.host.frames import CAP_LONG_SESSION_MESSAGES, HOST_CAPABILITIES
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 from omnigent.runner.tool_dispatch import build_native_relay_tool_schemas, execute_tool
+from omnigent.session_host import SessionRoutingTransport
 from omnigent.spec.types import AgentSpec
+from omnigent.tools.builtins.session_message import (
+    LEGACY_SESSION_MESSAGE_MAX_CHARS,
+    SESSION_MESSAGE_MAX_CHARS,
+)
 
 
 @pytest.mark.parametrize("spec", [AgentSpec(spec_version=1), None])
@@ -22,6 +28,13 @@ def test_native_message_schema(spec, runner_features, monkeypatch):
     schemas = build_native_relay_tool_schemas(spec)
     schema = next(s for s in schemas if s["name"] == "sys_session_message")
     assert schema["parameters"]["required"] == ["session_id", "message"]
+    assert schema["parameters"]["properties"]["message"]["maxLength"] == SESSION_MESSAGE_MAX_CHARS
+
+
+def test_hosts_advertise_long_session_messages():
+    # Automation forms allow long instructions only on hosts with this token.
+    assert SESSION_MESSAGE_MAX_CHARS == 32_000
+    assert CAP_LONG_SESSION_MESSAGES in HOST_CAPABILITIES
 
 
 def test_create_schema_exposes_project_name_and_permission_mode():
@@ -32,6 +45,7 @@ def test_create_schema_exposes_project_name_and_permission_mode():
     assert schema["parameters"]["properties"]["project_name"]["type"] == "string"
     assert schema["parameters"]["properties"]["permission_mode"]["type"] == "string"
     assert schema["parameters"]["properties"]["project_id"]["type"] == "string"
+    assert schema["parameters"]["properties"]["workflow_id"]["type"] == "string"
 
 
 @pytest.mark.asyncio
@@ -82,11 +96,14 @@ async def test_create_sends_permission_mode_only_to_a_server_that_applies_it(adv
         ({"agent_id": "worker", "permission_mode": ""}, "nonempty string"),
         ({"agent_id": "worker", "permission_mode": 1}, "nonempty string"),
         ({"config_path": "agent.yaml", "permission_mode": "auto"}, "requires agent_id"),
+        ({"agent_id": "worker", "workflow_id": " "}, "nonempty string"),
+        ({"agent_id": "worker", "workflow_id": 1}, "nonempty string"),
+        ({"config_path": "agent.yaml", "workflow_id": uuid4().hex}, "requires agent_id"),
     ],
 )
-async def test_create_refuses_unusable_permission_mode(arguments, error):
+async def test_create_refuses_unusable_permission_mode_or_workflow_id(arguments, error):
     def unexpected(request):
-        pytest.fail("A refused permission_mode must not reach the server")
+        pytest.fail("A refused option must not reach the server")
 
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(unexpected), base_url="http://server"
@@ -100,6 +117,55 @@ async def test_create_refuses_unusable_permission_mode(arguments, error):
             )
         )
     assert error in result["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("placement", ["child", "same_host"])
+# None is an older server, which omits the capability.
+@pytest.mark.parametrize(
+    ("advertised", "workflows", "error"),
+    [
+        (True, True, None),
+        (None, True, "can't start a session as a workflow run"),
+        (True, False, "Workflows are disabled"),
+    ],
+)
+async def test_create_sends_workflow_id_only_to_a_server_that_starts_the_run(
+    placement, advertised, workflows, error
+):
+    requests = []
+    workflow_id = uuid4().hex
+
+    def respond(request):
+        requests.append(request)
+        if request.url.path == "/v1/info":
+            info = {"features": {"workflows": workflows}}
+            if advertised is not None:
+                info["session_create_workflow_id"] = advertised
+            return httpx.Response(200, json=info)
+        return httpx.Response(201, json={"id": "conv_worker", "agent_id": "worker"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://server"
+    ) as client:
+        result = json.loads(
+            await execute_tool(
+                tool_name="sys_session_create",
+                arguments=json.dumps(
+                    {"agent_id": "worker", "placement": placement, "workflow_id": workflow_id}
+                ),
+                server_client=client,
+                conversation_id="manager",
+            )
+        )
+
+    posts = [request for request in requests if request.method == "POST"]
+    if error is None:
+        assert result["conversation_id"] == "conv_worker", result
+        assert json.loads(posts[0].content)["workflow_id"] == workflow_id
+    else:
+        assert error in result["error"]
+        assert posts == []
 
 
 @pytest.mark.parametrize("spec", [AgentSpec(spec_version=1), None])
@@ -374,7 +440,8 @@ async def test_message_timeout_is_not_retried(failure, after_routing):
         raise httpx.ReadTimeout("uncertain")
 
     async with httpx.AsyncClient(
-        transport=httpx.MockTransport(timeout), base_url="http://server"
+        transport=SessionRoutingTransport(transport=httpx.MockTransport(timeout)),
+        base_url="http://server",
     ) as client:
         result = await execute_tool(
             tool_name="sys_session_message",
@@ -563,7 +630,8 @@ async def test_message_routing_lookup_and_keyless_delivery(outcome):
         return httpx.Response(202, json={"queued": True})
 
     async with httpx.AsyncClient(
-        transport=httpx.MockTransport(respond), base_url="http://server"
+        transport=SessionRoutingTransport(transport=httpx.MockTransport(respond)),
+        base_url="http://server",
     ) as client:
         result = json.loads(
             await execute_tool(
@@ -573,16 +641,14 @@ async def test_message_routing_lookup_and_keyless_delivery(outcome):
                 conversation_id=uuid4().hex,
             )
         )
+    # One lookup after the refusal; hop_limit walks 16 parent hops. A failed lookup
+    # falls back to one keyless attempt, which a timeout leaves uncertain.
     assert len(lookups) == (16 if outcome == "hop_limit" else 1)
-    if outcome.startswith("lookup_"):
-        assert result["error"] == "Message not delivered: target host could not be resolved"
-        assert len(requests) == 1
+    assert len(requests) == 2
+    if outcome in {"send_timeout", "hop_limit"}:
+        assert "do not automatically resend" in result["error"]
     else:
-        assert len(requests) == 2
-        if outcome == "success":
-            assert result == {"queued": True}
-        else:
-            assert "do not automatically resend" in result["error"]
+        assert result == {"queued": True}
 
 
 @pytest.mark.asyncio
@@ -654,7 +720,7 @@ async def test_message_destination_accepts_supported_session_ids(spelling):
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "message",
-    [None, 123, "", " ", "a" * 8001],
+    [None, 123, "", " ", "a" * (SESSION_MESSAGE_MAX_CHARS + 1)],
     ids=["missing", "non_text", "empty", "blank", "oversize"],
 )
 async def test_message_content_validation_is_distinct_from_invalid_id(message):
@@ -672,14 +738,18 @@ async def test_message_content_validation_is_distinct_from_invalid_id(message):
                 conversation_id="manager",
             )
         )
-    assert result == {"error": "Provide a non-blank message of 1–8000 characters"}
+    assert result == {
+        "error": f"Provide a non-blank message of 1–{SESSION_MESSAGE_MAX_CHARS} characters"
+    }
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("target_kind", ["root", "child", "side_chat"])
-async def test_managed_message_resolves_host_after_wrong_replica(target_kind):
-    from omnigent.runner.session_requests import REQUEST_HOST_EXTENSION
+async def test_managed_message_resolves_host_after_wrong_replica(target_kind, monkeypatch):
+    from omnigent import session_host
+    from omnigent.session_host import REQUEST_HOST_EXTENSION
 
+    monkeypatch.setattr(session_host, "_session_hosts", {})
     destination = "1234567890123456"
     parent = "1234567890123457"
     requests = []
@@ -702,7 +772,8 @@ async def test_managed_message_resolves_host_after_wrong_replica(target_kind):
         return httpx.Response(202, json={"queued": True})
 
     async with httpx.AsyncClient(
-        transport=httpx.MockTransport(respond), base_url="http://server"
+        transport=SessionRoutingTransport(transport=httpx.MockTransport(respond)),
+        base_url="http://server",
     ) as client:
         result = json.loads(
             await execute_tool(
@@ -719,17 +790,20 @@ async def test_managed_message_resolves_host_after_wrong_replica(target_kind):
         *[("GET", f"/v1/sessions/{session_id}") for session_id in lookup_ids],
         ("POST", f"/v1/sessions/{destination}/events"),
     ]
-    for request in (requests[0], requests[-1]):
-        assert request.headers[ORCHESTRATION_SOURCE_HEADER] == parent
-        assert json.loads(request.content) == {
-            "type": "session_message",
-            "data": {"message": "Work"},
-        }
+    assert requests[-1].headers[ORCHESTRATION_SOURCE_HEADER] == parent
+    assert json.loads(requests[-1].content) == {
+        "type": "session_message",
+        "data": {"message": "Work"},
+    }
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("placement", ["same_host", "managed"])
-@pytest.mark.parametrize("message", [" ", "a" * 8001, 123], ids=["blank", "oversize", "non_text"])
+@pytest.mark.parametrize(
+    "message",
+    [" ", "a" * (SESSION_MESSAGE_MAX_CHARS + 1), 123],
+    ids=["blank", "oversize", "non_text"],
+)
 async def test_independent_initial_message_is_validated_before_creation(placement, message):
     def unexpected(request):
         pytest.fail("Invalid first task must not create a worker")
@@ -747,7 +821,60 @@ async def test_independent_initial_message_is_validated_before_creation(placemen
                 conversation_id="manager",
             )
         )
-    assert "initial message of 1–8000 characters" in result["error"]
+    assert f"initial message of 1–{SESSION_MESSAGE_MAX_CHARS} characters" in result["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("server_info", "server_max_chars"),
+    [
+        ({}, LEGACY_SESSION_MESSAGE_MAX_CHARS),
+        ({"session_message_max_chars": 8_000}, 8_000),
+        ({"session_message_max_chars": SESSION_MESSAGE_MAX_CHARS}, None),
+    ],
+    ids=["older_server", "old_limit", "current_server"],
+)
+async def test_long_first_task_needs_a_server_that_delivers_it(server_info, server_max_chars):
+    session_id = uuid4().hex
+    message = "a" * (LEGACY_SESSION_MESSAGE_MAX_CHARS + 1)
+    posts = []
+
+    def respond(request):
+        if request.url.path == "/v1/info":
+            return httpx.Response(200, json=server_info)
+        posts.append(request)
+        if request.url.path.endswith("/events"):
+            return httpx.Response(202, json={"queued": True})
+        return httpx.Response(
+            201, json={"id": session_id, "agent_id": "worker", "family": {"id": "manager"}}
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://server"
+    ) as client:
+        result = json.loads(
+            await execute_tool(
+                tool_name="sys_session_create",
+                arguments=json.dumps(
+                    {"agent_id": "worker", "placement": "same_host", "message": message}
+                ),
+                server_client=client,
+                conversation_id="manager",
+            )
+        )
+    if server_max_chars is not None:
+        assert result["error"] == (
+            f"This server accepts initial messages of up to {server_max_chars} characters; "
+            "no session was created"
+        )
+        assert not posts
+        return
+    assert [request.url.path for request in posts] == [
+        "/v1/sessions/orchestrated",
+        f"/v1/sessions/{session_id}/events",
+    ]
+    assert json.loads(posts[1].content)["data"]["message"] == message
+    assert result["initial_message"] == {"queued": True}
 
 
 @pytest.mark.asyncio
@@ -790,6 +917,55 @@ async def test_managed_create_routes_to_reserved_host_through_auth_retry(monkeyp
     headers, body = requests[-1]
     assert headers.get(OMNIGENT_SLICE_KEY_HEADER.lower()) == body.get("host_id")
     assert ("host_id" in body) is supported
+
+
+@pytest.mark.asyncio
+async def test_managed_create_caches_the_new_session_host_for_its_first_message(monkeypatch):
+    from omnigent import session_host
+    from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER, open_server_client
+
+    monkeypatch.setenv("OMNIGENT_HOST_SLICE_KEY_ENABLED", "1")
+    monkeypatch.setenv("OMNIGENT_RUNNER_SLICE_KEY", "sender-host")
+    monkeypatch.setattr(session_host, "_session_hosts", {})
+    child = uuid4().hex
+    created_hosts: list[str] = []
+    message_keys: list[tuple[str, str | None]] = []
+
+    def respond(request):
+        if request.url.path == "/v1/info":
+            return httpx.Response(
+                200, json={"request_managed_sandbox_host_id": True, "sibling_sessions": True}
+            )
+        if request.method == "POST" and request.url.path == "/v1/sessions/orchestrated":
+            host_id = json.loads(request.content)["host_id"]
+            created_hosts.append(host_id)
+            return httpx.Response(201, json={"id": child, "host_id": host_id})
+        key = request.headers.get(OMNIGENT_SLICE_KEY_HEADER)
+        message_keys.append((request.url.path, key))
+        if key != created_hosts[0]:
+            return httpx.Response(400, json={"error": {"code": "wrong_replica"}})
+        return httpx.Response(202, json={"queued": True})
+
+    async with open_server_client("http://sharded", transport=httpx.MockTransport(respond)) as c:
+        created = json.loads(
+            await execute_tool(
+                tool_name="sys_session_create",
+                arguments=json.dumps({"agent_id": "worker", "placement": "managed"}),
+                server_client=c,
+                conversation_id=uuid4().hex,
+            )
+        )
+        message = json.loads(
+            await execute_tool(
+                tool_name="sys_session_message",
+                arguments=json.dumps({"session_id": child, "message": "Work"}),
+                server_client=c,
+                conversation_id=uuid4().hex,
+            )
+        )
+    assert created["conversation_id"] == child, created
+    assert message == {"queued": True}
+    assert message_keys == [(f"/v1/sessions/{child}/events", created_hosts[0])]
 
 
 _PROJECT_ID = "ab" * 16
@@ -1265,11 +1441,11 @@ async def test_pr_link_routes_to_target_and_requires_capability(
 ):
     from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER, open_server_client
     from omnigent.runner._entry import _RunnerDatabricksAuth
-    from omnigent.runner.session_requests import REQUEST_HOST_EXTENSION
 
     monkeypatch.setenv("OMNIGENT_HOST_SLICE_KEY_ENABLED", "1")
     monkeypatch.setenv("OMNIGENT_RUNNER_SLICE_KEY", "source-route")
     requests = []
+    sent_keys = []
     delivered = []
     source = uuid4().hex
     target = uuid4().hex if explicit_target else source
@@ -1285,7 +1461,12 @@ async def test_pr_link_routes_to_target_and_requires_capability(
         if request.method == "GET":
             assert request.url.path == f"/v1/sessions/{target}"
             return httpx.Response(200, json={"host_id": host})
-        if legacy_host and request.extensions[REQUEST_HOST_EXTENSION]:
+        # The owning replica serves its host's key; a legacy one serves only unkeyed requests.
+        # Record the key as sent: a retry re-addresses the same request object.
+        key = request.headers.get(OMNIGENT_SLICE_KEY_HEADER)
+        sent_keys.append(key)
+        accepted = key is None if legacy_host else key == (host or "source-route")
+        if not accepted:
             return httpx.Response(400, json={"error": {"code": "wrong_replica"}})
         delivered.append(request)
         return httpx.Response(200, json={"prs": []})
@@ -1316,14 +1497,15 @@ async def test_pr_link_routes_to_target_and_requires_capability(
         assert not posts
         return
     assert result == {"prs": []}
-    assert len(posts) == (2 if legacy_host else 1)
     assert len(delivered) == 1
-    assert [r.extensions.get(REQUEST_HOST_EXTENSION) for r in posts] == (
-        [host, ""] if legacy_host else [host]
-    )
-    assert [r.headers.get(OMNIGENT_SLICE_KEY_HEADER) for r in posts] == (
-        [host, None] if legacy_host else [host or "source-route"]
-    )
+    # The first attempt uses the runner's key. A refusal re-resolves the host, and a
+    # legacy replica takes the unkeyed retry.
+    if host is None:
+        assert sent_keys == ["source-route"]
+    elif legacy_host:
+        assert sent_keys == ["source-route", host, None]
+    else:
+        assert sent_keys == ["source-route", host]
     assert all(r.headers[ORCHESTRATION_SOURCE_HEADER] == source for r in posts)
     assert all(r.headers["Authorization"] == "Bearer test-token" for r in posts)
     assert posts[0].url.path == f"/v1/sessions/{target}/resources/github/prs/orchestrated"

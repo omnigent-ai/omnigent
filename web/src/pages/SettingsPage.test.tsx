@@ -59,6 +59,8 @@ const mocks = vi.hoisted(() => ({
   bootFallback: false,
   sessionTitleInstructions: false,
   nestedAgents: false,
+  advisorAvailable: false,
+  authenticatedFetch: vi.fn(),
   // Identity from the mode-agnostic `/v1/me` probe (resolveIdentity returns
   // the id, getCurrentIsAdmin the flag). null → unauthenticated.
   me: { id: "alice", is_admin: false } as { id: string; is_admin: boolean } | null,
@@ -95,6 +97,7 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
           sibling_sessions: mocks.nestedAgents,
           enabled_connections: mocks.enabledConnections,
           session_title_instructions: mocks.sessionTitleInstructions,
+          proactive_agent_available: mocks.advisorAvailable,
         },
 }));
 vi.mock("@/components/SessionTitleInstructionsControl", () => ({
@@ -108,6 +111,7 @@ vi.mock("@/lib/accountsApi", () => ({
   changePassword: vi.fn(),
 }));
 vi.mock("@/lib/identity", () => ({
+  authenticatedFetch: (...args: unknown[]) => mocks.authenticatedFetch(...args),
   resolveIdentity: () => Promise.resolve(mocks.me?.id ?? null),
   getCurrentIsAdmin: () => mocks.effectiveAdmin ?? mocks.me?.is_admin ?? false,
   getCurrentAdminEligibility: () => mocks.me?.is_admin ?? false,
@@ -294,6 +298,8 @@ beforeEach(() => {
   mocks.bootFallback = false;
   mocks.sessionTitleInstructions = false;
   mocks.nestedAgents = false;
+  mocks.advisorAvailable = false;
+  mocks.authenticatedFetch.mockReset();
   mocks.importSessionsPanel.mockClear();
   mocks.enabledConnections = [];
   mocks.loginUrl = "/login";
@@ -329,6 +335,34 @@ describe("Import sessions", () => {
     expect(screen.getByRole("heading", { name: "Import from a machine" })).toBeTruthy();
     expect(mocks.importSessionsPanel).toHaveBeenCalled();
     expect(screen.queryByRole("heading", { name: "Harness imports" })).toBeNull();
+  });
+});
+
+describe("Omni Advisor", () => {
+  it("shows a settings load failure with a retry instead of dropping the switch", async () => {
+    mocks.advisorAvailable = true;
+    mocks.authenticatedFetch.mockRejectedValueOnce(new Error("offline")).mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          workspace_enabled: true,
+          user_enabled: true,
+          enabled: true,
+          can_manage_workspace: false,
+        }),
+        { status: 200 },
+      ),
+    );
+    renderPage();
+
+    const group = await screen.findByTestId("settings-group-proactive-agent");
+    expect(await within(group).findByRole("alert")).toHaveTextContent(
+      "Couldn’t load Omni Advisor settings.",
+    );
+    expect(within(group).queryByRole("switch")).toBeNull();
+
+    fireEvent.click(within(group).getByRole("button", { name: "Retry" }));
+    expect(await within(group).findByRole("switch", { name: "Omni Advisor" })).toBeChecked();
+    expect(mocks.authenticatedFetch).toHaveBeenCalledTimes(2);
   });
 });
 
@@ -838,8 +872,8 @@ describe("SettingsPage", () => {
 
     const group = screen.getByRole("radiogroup", { name: "Default Workspace tab" });
     const options = within(group).getAllByRole("radio");
-    expect(options).toHaveLength(4);
-    ["Files", "Changes", "Pull Requests", "Agents"].forEach((label, index) => {
+    expect(options).toHaveLength(5);
+    ["Files", "Changes", "Pull Requests", "Agents", "Tasks"].forEach((label, index) => {
       expect(options[index]).toHaveAccessibleName(label);
     });
     expect(screen.getByTestId("workspace-tab-default-files")).toHaveAttribute(
@@ -855,7 +889,7 @@ describe("SettingsPage", () => {
     );
     expect(
       screen.getByRole("img", {
-        name: "Sidebar preview: Agents, Files, Changes, Pull Requests pinned.",
+        name: "Sidebar preview: Agents, Files, Changes, Pull Requests, Tasks pinned.",
       }),
     ).toBeInTheDocument();
     expect(localStorage.getItem("omnigent:default-workspace-tab")).toBe("subagents");
@@ -871,7 +905,7 @@ describe("SettingsPage", () => {
     );
     expect(
       screen.getByRole("img", {
-        name: "Sidebar preview: Changes, Files, Pull Requests, Agents pinned.",
+        name: "Sidebar preview: Changes, Files, Pull Requests, Agents, Tasks pinned.",
       }),
     ).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Pin Changes" }));
@@ -899,7 +933,7 @@ describe("SettingsPage", () => {
       selectedBrowserId: "one",
     });
     const page = renderPage("/settings/appearance");
-    for (const label of ["Files", "Changes", "Pull Requests", "Agents"]) {
+    for (const label of ["Files", "Changes", "Pull Requests", "Tasks", "Agents"]) {
       const toggle = screen.getByRole("button", { name: `Pin ${label}` });
       expect(toggle).toHaveAttribute("aria-pressed", "true");
       fireEvent.click(toggle);

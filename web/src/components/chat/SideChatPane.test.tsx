@@ -593,6 +593,30 @@ describe("side chat opened from a + button", () => {
     expect(screen.getByTestId("other-field")).toHaveFocus();
   });
 
+  it("continues a restored draft from its end when the input takes focus", () => {
+    conversationRegistry.acquire(childId).setState({ boundAgentId: null, sessionStatus: "idle" });
+    const draft = "Add a step that opens the upgrade PRs";
+    useChatStore.setState({
+      sideChatComposers: { [childId]: { text: draft, files: [], autoFocus: true } },
+    });
+    renderPane(<SideChatPane childId={childId} />);
+    const input = screen.getByTestId<HTMLTextAreaElement>("side-chat-input");
+    // Browsers can leave a restored value's caret before its first word.
+    input.setSelectionRange(0, 0);
+
+    act(() => conversationRegistry.acquire(childId).setState({ boundAgentId: "agent_side" }));
+
+    expect(input).toHaveFocus();
+    expect(input.selectionStart).toBe(draft.length);
+    expect(input.selectionEnd).toBe(draft.length);
+
+    // Asked again while it already has focus, the input keeps the user's caret.
+    input.setSelectionRange(3, 3);
+    act(() => useChatStore.getState().requestSideChatFocus(childId));
+    expect(input).toHaveFocus();
+    expect(input.selectionStart).toBe(3);
+  });
+
   it("leaves a text input that already had focus before the pane mounted alone", () => {
     conversationRegistry.acquire(childId).setState({ boundAgentId: null, sessionStatus: "idle" });
     useChatStore.setState({
@@ -1463,6 +1487,14 @@ describe("unsent composer state survives the pane moving", () => {
       expect(useChatStore.getState().sideChatComposers["other-pane"].text).toBe("keep me");
     },
   );
+
+  it("is one row tall only in a grid cell", () => {
+    const view = renderPane(<SideChatPane childId={childId} fullSession />);
+    expect(screen.getByTestId("side-chat-input")).not.toHaveAttribute("rows");
+    view.unmount();
+    renderPane(<SideChatPane childId={childId} fullSession gridComposer={{}} />);
+    expect(screen.getByTestId("side-chat-input")).toHaveAttribute("rows", "1");
+  });
 });
 
 describe("history a side chat copied from its parent", () => {
@@ -1628,9 +1660,16 @@ describe("history a side chat copied from its parent", () => {
   });
 });
 
-describe("side chat sealed by the server", () => {
-  it("is read-only once the server marks the child closed", () => {
-    mockSession.labels = { "omnigent.closed": "true" };
+describe("side chat closed by the server", () => {
+  it.each<Record<string, string>>([
+    { "omnigent.closed": "true" },
+    {
+      "omnigent.closed": "true",
+      "omnigent.wrapper": "codex-native-ui-subagent",
+      "omnigent.codex_native.agent_nickname": "Side chat",
+    },
+  ])("is read-only when closed without recovery support (%j)", (labels) => {
+    mockSession.labels = labels;
     renderPane(<SideChatPane childId={childId} />);
 
     expect(
@@ -1638,6 +1677,38 @@ describe("side chat sealed by the server", () => {
     ).toBeInTheDocument();
     expect(screen.queryByTestId("side-chat-input")).toBeNull();
     expect(sessionsApi.stopSession).not.toHaveBeenCalled();
+  });
+
+  it("sends another message to a closed Codex side chat", async () => {
+    mockSession.labels = {
+      "omnigent.closed": "true",
+      "omnigent.wrapper": "codex-native-ui-subagent",
+      "omnigent.codex_native.agent_nickname": "Side chat",
+      "omnigent.codex_native.side_chat_resume": "true",
+    };
+    conversationRegistry.acquire(childId).setState({ sessionStatus: "idle" });
+    renderPane(<SideChatPane childId={childId} />);
+
+    fireEvent.change(screen.getByTestId("side-chat-input"), { target: { value: "Continue" } });
+    fireEvent.keyDown(screen.getByTestId("side-chat-input"), { key: "Enter" });
+
+    await waitFor(() =>
+      expect(send).toHaveBeenCalledWith("Continue", "agent_side", undefined, {
+        pinnedConversationId: childId,
+      }),
+    );
+  });
+
+  it("preserves read-only access for a closed Codex side chat", () => {
+    mockSession.labels = {
+      "omnigent.closed": "true",
+      "omnigent.wrapper": "codex-native-ui-subagent",
+      "omnigent.codex_native.agent_nickname": "Side chat",
+      "omnigent.codex_native.side_chat_resume": "true",
+    };
+    renderPane(<SideChatPane childId={childId} readOnly />);
+
+    expect(screen.queryByTestId("side-chat-input")).toBeNull();
   });
 
   it("re-reads the child's labels after the opening /side send settles", async () => {

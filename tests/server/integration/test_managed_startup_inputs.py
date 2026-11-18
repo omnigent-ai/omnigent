@@ -26,6 +26,7 @@ from omnigent.host.frames import HostHelloFrame
 from omnigent.runtime import pending_inputs
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
+from omnigent.server.feature_flags import resolve_feature_flags
 from omnigent.server.managed_hosts import parse_sandbox_config
 from omnigent.server.routes._sessions.helpers import _HostLaunchAttempt
 from omnigent.server.routes.sessions import routes_core
@@ -44,6 +45,7 @@ from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from tests._helpers.polling import poll_until_async
+from tests.budgets import budget
 from tests.server.helpers import build_agent_bundle, create_test_agent
 from tests.server.integration.test_managed_launch_failure_teardown import (
     _Env,
@@ -145,6 +147,35 @@ async def _create(env: _Env, *, name: str = "startup-probe", **options: Any) -> 
     )
     assert response.status_code == 201, response.text
     return response.json()["id"]
+
+
+async def test_workflow_plan_is_available_while_managed_first_input_waits_for_host(
+    startup_env: _Env,
+) -> None:
+    startup_env.app.state.feature_flags = resolve_feature_flags({"OMNIGENT_FEATURES": "workflows"})
+    saved = await startup_env.client.post(
+        "/v1/workflows",
+        json={
+            "name": "Review changes",
+            "description": "Review the local changes.",
+            "steps": [
+                {"id": "review", "name": "Review the diff", "goal": "Identify regressions."}
+            ],
+        },
+    )
+    assert saved.status_code == 200, saved.text
+    workflow = saved.json()
+    session_id = await _create(startup_env, workflow_id=workflow["id"])
+    assert len(startup_env.conv_store.list_pending_inputs(session_id)) == 1
+    journal = await startup_env.client.get(f"/v1/sessions/{session_id}/journal")
+    assert journal.status_code == 200, journal.text
+    plan = journal.json()["data"][1]
+    assert plan["workflow_id"] == workflow["id"]
+    assert plan["content"]["steps"] == workflow["steps"]
+    assert plan["content"]["source"] == "workflow"
+    runs = await startup_env.client.get(f"/v1/workflows/{workflow['id']}/runs")
+    assert runs.status_code == 200, runs.text
+    assert [run["session_id"] for run in runs.json()["data"]] == [session_id]
 
 
 def _bind(env: _Env, session_id: str):
@@ -1242,7 +1273,8 @@ async def test_launch_cancelled_at_shutdown_before_binding_fails_its_saved_input
     env = startup_env
     session_id = await _create(env)
 
-    await asyncio.wait_for(cancel_managed_launch_tasks(drain_s=0.2), timeout=5)
+    # The drain precedes the launch's five-second failure-recording window.
+    await asyncio.wait_for(cancel_managed_launch_tasks(drain_s=0.2), timeout=budget(10.0))
 
     conv = env.conv_store.get_conversation(session_id)
     assert conv is not None and conv.labels[STARTUP_LABEL] == "failed"

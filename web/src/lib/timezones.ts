@@ -4,6 +4,13 @@
 // value against the full IANA database, so this list only needs to be usable,
 // not exhaustive.
 
+/** Header session creates carry so server-made schedules use the viewer's timezone. */
+export const TIMEZONE_HEADER = "X-Omnigent-Timezone";
+
+export function timezoneRequestHeaders(): Record<string, string> {
+  return { [TIMEZONE_HEADER]: localTimezone() };
+}
+
 /** The viewer's local IANA timezone, or `UTC` if it can't be resolved. */
 export function localTimezone(): string {
   try {
