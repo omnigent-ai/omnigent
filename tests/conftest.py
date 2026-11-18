@@ -181,18 +181,81 @@ def _process_peak_rss_kb() -> int | None:
 _TEST_RSS_RECORDS: list[tuple[str, int]] = []
 
 
-def _write_progress_event(event: str, nodeid: str, rss_kb: int | None = None) -> None:
+def _progress_worker_id(worker: str) -> str:
+    """Keep worker metadata to xdist's bounded local-worker identifiers."""
+    if worker == "main":
+        return worker
+    if (
+        worker.startswith("gw")
+        and 2 < len(worker) <= 32
+        and worker[2:].isascii()
+        and worker[2:].isdigit()
+    ):
+        return worker
+    return "unknown"
+
+
+def _write_progress_event(
+    event: str,
+    nodeid: str,
+    rss_kb: int | None = None,
+    *,
+    phase: str | None = None,
+    error_present: bool | None = None,
+) -> None:
     """Append ``<timestamp>\\t<event>\\t<nodeid>[\\t<rss_kb>]\\n`` and fsync."""
     if _PROGRESS_LOG_PATH is None:
         return
     line = f"{time.time():.3f}\t{event}\t{nodeid}"
     if rss_kb is not None:
         line += f"\t{rss_kb}"
+    if phase is not None:
+        worker = _progress_worker_id(os.environ.get("PYTEST_XDIST_WORKER", "main"))
+        line += f"\tphase={phase}\tworker={worker}\tpid={os.getpid()}"
+    if error_present is not None:
+        line += f"\terror_present={int(error_present)}"
     line += "\n"
     with open(_PROGRESS_LOG_PATH, "a") as f:
         f.write(line)
         f.flush()
         os.fsync(f.fileno())
+
+
+@contextlib.contextmanager
+def _record_test_phase(nodeid: str, phase: str) -> Generator[None, None, None]:
+    with contextlib.suppress(OSError):
+        _write_progress_event("PHASE_START", nodeid, phase=phase)
+    try:
+        yield
+    finally:
+        with contextlib.suppress(OSError):
+            _write_progress_event("PHASE_END", nodeid, phase=phase)
+
+
+@pytest.hookimpl(wrapper=True, tryfirst=True, specname="pytest_runtest_setup")
+def pytest_runtest_setup_progress(item) -> Generator[None, None, None]:
+    with _record_test_phase(item.nodeid, "setup"):
+        yield
+
+
+@pytest.hookimpl(wrapper=True, tryfirst=True)
+def pytest_runtest_call(item) -> Generator[None, None, None]:
+    with _record_test_phase(item.nodeid, "call"):
+        yield
+
+
+@pytest.hookimpl(wrapper=True, tryfirst=True)
+def pytest_runtest_teardown(item) -> Generator[None, None, None]:
+    with _record_test_phase(item.nodeid, "teardown"):
+        yield
+
+
+@pytest.hookimpl(optionalhook=True)
+def pytest_testnodedown(node, error: object | None) -> None:
+    # This callback has no OS exit status; never render its error object.
+    worker = _progress_worker_id(node.gateway.id)
+    with contextlib.suppress(OSError):
+        _write_progress_event("WORKER_DOWN", worker, error_present=error is not None)
 
 
 def pytest_runtest_logstart(nodeid: str, location: tuple[str, int | None, str]) -> None:
