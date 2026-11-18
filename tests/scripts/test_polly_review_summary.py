@@ -1759,6 +1759,30 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
         ("paragraph-indent", "short"),
         ("indented-code", "short"),
         ("setext-dash", "short"),
+        ("html-pre", "closing-tail-context"),
+        ("html-script", "closing-tail-context"),
+        ("html-style", "closing-tail-context"),
+        ("html-textarea", "closing-tail-context"),
+        ("html-comment", "closing-tail-context"),
+        ("html-cdata", "closing-tail-context"),
+        ("html-instruction", "closing-tail-context"),
+        ("html-declaration", "closing-tail-context"),
+        ("html-pre", "closing-tail-cdata"),
+        ("html-comment", "closing-tail-instruction"),
+        ("html-pre", "closing-tail-multiline"),
+        ("html-comment", "closing-tail-multiline"),
+        ("html-pre", "closing-tail-plain"),
+        ("html-comment", "closing-tail-plain"),
+        ("html-pre", "closing-tail-whitespace"),
+        ("html-script", "closing-tail-whitespace"),
+        ("html-style", "closing-tail-whitespace"),
+        ("html-textarea", "closing-tail-whitespace"),
+        ("html-comment", "closing-tail-whitespace"),
+        ("html-cdata", "closing-tail-whitespace"),
+        ("html-instruction", "closing-tail-whitespace"),
+        ("html-declaration", "closing-tail-whitespace"),
+        ("html-pre", "closing-tail-short"),
+        ("html-comment", "closing-tail-short"),
     ],
     ids=lambda value: value,
 )
@@ -1787,8 +1811,11 @@ def test_multipart_keeps_literal_blocks_and_paragraph_dependencies_indivisible(
         opener, closer = {
             "html-comment": ("<!--", "-->"),
             "html-pre": ("<pre>", "</pre>"),
+            "html-script": ("<script>", "</script>"),
+            "html-style": ("<style>", "</style>"),
             "html-cdata": ("<![CDATA[", "]]>"),
             "html-instruction": ("<?instruction", "?>"),
+            "html-declaration": ("<!DOCTYPE ", ">"),
             "html-textarea": ("<textarea>", "</textarea>"),
             "html-generic": ("<div>", "</div>"),
             "html-pre-attribute": ('<pre title="quoted > text">', "</pre>"),
@@ -1799,6 +1826,21 @@ def test_multipart_keeps_literal_blocks_and_paragraph_dependencies_indivisible(
             block += "```text\n| Literal | not a table |\n| --- | --- |\n~~~python\n"
         if form != "unclosed":
             block += closer + "\n\n"
+        if form.startswith("closing-tail-"):
+            block = opener + ("\nharmless\n" if form == "closing-tail-multiline" else "harmless")
+            block += closer
+            if form == "closing-tail-whitespace":
+                block += " \t\r\n\n"
+            elif form == "closing-tail-plain":
+                block += " ordinary prose.\n\n"
+            else:
+                following, terminator = {
+                    "closing-tail-cdata": ("<![CDATA[", "]]>"),
+                    "closing-tail-instruction": ("<?instruction", "?>"),
+                }.get(form, ("<!--", "-->"))
+                block += " " + following + "\n"
+                block += "literal comment" if form == "closing-tail-short" else "x" * 130000
+                block += "\n" + terminator + "\n\n"
         target = opener + "\n"
     elif kind == "inline-comment":
         block = "Use <!--" + "x" * amount + "--> then ordinary prose.\n\n"
@@ -1826,8 +1868,15 @@ def test_multipart_keeps_literal_blocks_and_paragraph_dependencies_indivisible(
         block = block.removesuffix("\n")
         prefix = "p" * (capacity - len(earlier + block) - 2) + "\n\n" + earlier
         assert len(prefix + block) == capacity
-    short = form == "short"
+    short = form in {"short", "closing-tail-short"}
     tail = "After.\n\n" + ("" if short else "z" * 70000 + "\n\n")
+    if form in {
+        "closing-tail-context",
+        "closing-tail-cdata",
+        "closing-tail-instruction",
+        "closing-tail-multiline",
+    }:
+        tail = "After.\n\n"
     if form == "table-boundary":
         tail = "| plain | following |\n\n" + tail
     review = prefix + block + tail + composed
@@ -1853,7 +1902,10 @@ def test_multipart_keeps_literal_blocks_and_paragraph_dependencies_indivisible(
             token.type == "html_block" and token.content.startswith(opener) for token in original
         )
     assert (len(review.encode("utf-8")) < 60000) == short
-    if form in {"oversized", "unclosed", "unsupported"}:
+    if form in {"oversized", "unclosed", "unsupported"} or (
+        form.startswith("closing-tail-")
+        and form not in {"closing-tail-short", "closing-tail-whitespace"}
+    ):
         review_path, receipt, posts = _prepare_publication(
             tmp_path, monkeypatch, head_sha=metadata["head_sha"], run_url=metadata["run_url"]
         )
@@ -1872,6 +1924,20 @@ def test_multipart_keeps_literal_blocks_and_paragraph_dependencies_indivisible(
     assert len(comments) > 1
     assert "".join(fragments) == review
     rendered = [parser.parse(comment) for comment in comments]
+    if form == "closing-tail-whitespace":
+        html_prefix = block.split("\n", 1)[0].rstrip(" \t\r")
+        expected_raw = [
+            token.content
+            for token in original
+            if token.type == "html_block" and token.content.startswith(html_prefix)
+        ]
+        assert len(expected_raw) == 1
+        assert [
+            token.content
+            for tokens in rendered
+            for token in tokens
+            if token.type == "html_block" and token.content.startswith(html_prefix)
+        ] == expected_raw
     assert (
         sum(token.type == "table_open" for tokens in rendered for token in tokens)
         == expected_tables

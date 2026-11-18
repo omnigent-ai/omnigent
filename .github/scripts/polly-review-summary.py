@@ -415,7 +415,8 @@ def _markdown_context(
     headers that fit indivisibly. Other forms fail closed before multipart publication.
     Unambiguous same-line disclosure code spans stay literal and indivisible.
     Complete comments, plain raw HTML blocks, indented blocks and setext headings stay
-    indivisible; other raw HTML and unclosed literal blocks fail closed.
+    indivisible; raw closing lines allow only space/tab and structural CR tails in
+    multipart comments. Other raw HTML and unclosed literal blocks fail closed.
     Inline-code formatting across fragments is not balanced.
     """
     details = 0
@@ -528,6 +529,11 @@ def _markdown_context(
                 if ending[0] == "--!>" and protected_spans is not None:
                     raise ValueError(
                         "Polly review ambiguous HTML comments are not supported "
+                        "in multipart comments."
+                    )
+                if protected_spans is not None and line[ending.end() :].strip(" \t\r"):
+                    raise ValueError(
+                        "Polly review raw HTML closing-line tails are not supported "
                         "in multipart comments."
                     )
                 protect_span(raw_start, min(offset, len(text)), "raw HTML block")
