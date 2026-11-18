@@ -34,15 +34,26 @@ export interface QuickPickProps<Value> {
   onAccept: (item: QuickPickItem<Value>) => void;
   /** How rows' matched text stands out, unless a row sets its own. */
   matchHighlight?: MatchHighlight;
-  /** Shown when no row is listed, such as "No results found". */
+  /** Shown and announced when no row is listed, such as "No results found"; null shows nothing. */
   emptyMessage: ReactNode;
-  /** Content above the rows inside the scrolling area, such as a load error with Retry. */
-  listStart?: ReactNode;
+  /**
+   * Shown above the rows, such as a load error with Retry. It isn't announced; mark the
+   * caller's text `role="status"` and keep buttons outside it.
+   */
+  status?: ReactNode;
   /** Content below the rows inside the scrolling area, such as a button that loads more. */
   listEnd?: ReactNode;
   /** Trailing content beside the query field, such as a close button. */
   inputEnd?: ReactNode;
   autoFocus?: boolean;
+  /**
+   * A row the caller wants active, such as the last row before ones still loading.
+   * It stays active while set, so clear it in `onActiveIdChange` once the user moves.
+   */
+  activeId?: string | null;
+  onActiveIdChange?: (id: string) => void;
+  /** `data-testid` for the query field. */
+  inputTestId?: string;
   /** Arrow keys wrap around at the ends; off by default, as in a menu. */
   loop?: boolean;
   /** Grow the results to fill the container, such as a full-screen sheet on phones. */
@@ -115,10 +126,13 @@ export function QuickPick<Value>({
   onAccept,
   matchHighlight = "emphasis",
   emptyMessage,
-  listStart,
+  status,
   listEnd,
   inputEnd,
   autoFocus = true,
+  activeId = null,
+  onActiveIdChange,
+  inputTestId,
   loop = false,
   fillHeight = false,
   className,
@@ -141,8 +155,12 @@ export function QuickPick<Value>({
   if (activeChoice.query !== query) setActiveChoice({ query, id: null });
   const activeIndex = reconcileActiveIndex(
     rows,
-    activeChoice.query === query ? activeChoice.id : null,
+    activeId ?? (activeChoice.query === query ? activeChoice.id : null),
   );
+  const pick = (id: string) => {
+    setActiveChoice({ query, id });
+    onActiveIdChange?.(id);
+  };
   const activeRow = activeIndex === -1 ? null : (rows[activeIndex] as QuickPickItemRow<Value>);
 
   // Whenever the active row changes, by keys, a new query or new results, scroll it
@@ -167,7 +185,7 @@ export function QuickPick<Value>({
     const row = rows[next];
     if (row?.kind !== "item") return;
     pointerPickRef.current = false;
-    setActiveChoice({ query, id: row.item.id });
+    pick(row.item.id);
   };
 
   // A page is the options that fit in the list, less one kept for context.
@@ -211,9 +229,9 @@ export function QuickPick<Value>({
         // Hovering an enabled row makes it the user's pick, as in a menu, even when it
         // is already the top row, so a result arriving above it doesn't take over.
         onPointerMove={() => {
-          if (disabled || activeChoice.id === item.id) return;
+          if (disabled || (activeId ?? activeChoice.id) === item.id) return;
           pointerPickRef.current = true;
-          setActiveChoice({ query, id: item.id });
+          pick(item.id);
         }}
         // Keep focus in the query field.
         onMouseDown={(event) => event.preventDefault()}
@@ -229,10 +247,11 @@ export function QuickPick<Value>({
             {item.icon}
           </span>
         ) : null}
-        <span className="flex min-w-0 flex-1 flex-col gap-0.5">
+        <div className="flex min-w-0 flex-1 flex-col gap-0.5">
           <span data-slot="quick-pick-label" className="truncate">
             <HighlightedText text={item.label} ranges={row.labelRanges} highlight={highlight} />
           </span>
+          {item.context}
           {item.description && (
             <span className="truncate text-sm text-muted-foreground">
               <HighlightedText
@@ -242,7 +261,7 @@ export function QuickPick<Value>({
               />
             </span>
           )}
-        </span>
+        </div>
         {item.disabledReason && (
           <span
             data-slot="quick-pick-disabled-reason"
@@ -279,6 +298,7 @@ export function QuickPick<Value>({
           aria-expanded
           aria-controls={listId}
           aria-autocomplete="list"
+          data-testid={inputTestId}
           aria-activedescendant={activeRow === null ? undefined : optionId(activeRow)}
           autoFocus={autoFocus}
           autoComplete="off"
@@ -297,7 +317,16 @@ export function QuickPick<Value>({
         data-slot="quick-pick-scroll"
         className={cn("overflow-y-auto p-1", fillHeight ? "min-h-0 flex-1" : "max-h-72")}
       >
-        {listStart}
+        {status && <div data-slot="quick-pick-status">{status}</div>}
+        {/* Announces the empty message, shown, or the result count, visually hidden. */}
+        <div
+          role="status"
+          aria-live="polite"
+          data-slot={resultCount === 0 ? "quick-pick-empty" : undefined}
+          className={resultCount === 0 && emptyMessage ? "py-6 text-center text-ui" : "sr-only"}
+        >
+          {resultCount === 0 ? emptyMessage : resultCountText(resultCount)}
+        </div>
         <div id={listId} role="listbox" aria-label={label}>
           {sections.map((section, sectionIndex) => {
             const headingId = section.heading ? `${baseId}-heading-${sectionIndex}` : undefined;
@@ -321,15 +350,6 @@ export function QuickPick<Value>({
               </div>
             );
           })}
-        </div>
-        {/* One live region: the visible empty message, or the result count for screen readers. */}
-        <div
-          role="status"
-          aria-live="polite"
-          data-slot={resultCount === 0 ? "quick-pick-empty" : undefined}
-          className={resultCount === 0 ? "py-6 text-center text-ui" : "sr-only"}
-        >
-          {resultCount === 0 ? emptyMessage : resultCountText(resultCount)}
         </div>
         {listEnd}
       </div>

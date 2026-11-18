@@ -140,17 +140,37 @@ describe("QuickPick rows", () => {
 
   it("shows the empty message and the caller's slots", () => {
     const { input } = renderPicker({
-      listStart: <p>Couldn&apos;t load sessions.</p>,
       listEnd: <button type="button">Search older sessions</button>,
       inputEnd: <button type="button">Close search</button>,
     });
     fireEvent.change(input, { target: { value: "zzzz" } });
     expect(screen.queryAllByRole("option")).toHaveLength(0);
-    expect(screen.getByText("No results found")).toBeTruthy();
     expect(screen.getByRole("status").textContent).toBe("No results found");
-    expect(screen.getByText("Couldn't load sessions.")).toBeTruthy();
     expect(screen.getByRole("button", { name: "Search older sessions" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Close search" })).toBeTruthy();
+  });
+
+  it("shows the caller's status above the rows and still announces the count", () => {
+    const { input } = renderPicker({
+      status: (
+        <p>
+          <span role="status">Couldn't load sessions.</span>
+          <button type="button">Retry</button>
+        </p>
+      ),
+    });
+    const announced = () => screen.getAllByRole("status").map((region) => region.textContent);
+    expect(announced()).toEqual(["Couldn't load sessions.", "2 results"]);
+    expect(screen.getByRole("button", { name: "Retry" }).closest('[role="status"]')).toBeNull();
+    fireEvent.change(input, { target: { value: "zzzz" } });
+    expect(announced()).toEqual(["Couldn't load sessions.", "No results found"]);
+  });
+
+  it("shows nothing for an empty list when the caller passes no empty message", () => {
+    const { input } = renderPicker({ emptyMessage: null });
+    fireEvent.change(input, { target: { value: "zzzz" } });
+    expect(screen.getByRole("status").textContent).toBe("");
+    expect(screen.getByRole("status").className).toContain("sr-only");
   });
 });
 
@@ -241,6 +261,22 @@ describe("QuickPick pointer and query picks", () => {
     expect(activeOption(input)?.textContent).toContain("New session");
     fireEvent.keyDown(input, { key: "Enter" });
     expect(onAccept).toHaveBeenCalledWith(expect.objectContaining({ id: "new-session" }));
+  });
+});
+
+describe("QuickPick caller-chosen active row", () => {
+  it("activates the caller's row until the user moves, then reports the move", () => {
+    const onActiveIdChange = vi.fn();
+    const { input, rerender, onAccept } = renderPicker({
+      activeId: "open-settings",
+      onActiveIdChange,
+    });
+    expect(activeOption(input)?.textContent).toContain("Open settings");
+    fireEvent.pointerMove(screen.getByRole("option", { name: /New session/ }));
+    expect(onActiveIdChange).toHaveBeenCalledWith("new-session");
+    // The caller clears its row once told about the move, and the moved row stays active.
+    rerender(<Harness onAccept={onAccept} activeId={null} onActiveIdChange={onActiveIdChange} />);
+    expect(activeOption(input)?.textContent).toContain("New session");
   });
 });
 
