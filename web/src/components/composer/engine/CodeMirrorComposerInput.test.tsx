@@ -355,6 +355,29 @@ describe("COMPOSER_EDITING_KEYMAP", () => {
   });
 });
 
+describe("CodeMirrorComposerInput readline keys off macOS", () => {
+  it("leaves ⌃W unclaimed, so the caret and draft stay put", () => {
+    const { content, target } = mount({ value: "git push origin" });
+    act(() => target().setSelectionRange(15, 15));
+
+    const notClaimed = fireEvent.keyDown(content, { key: "w", code: "KeyW", ctrlKey: true });
+
+    expect(notClaimed).toBe(true);
+    expect(target().value).toBe("git push origin");
+    expect(target().selectionStart).toBe(15);
+  });
+
+  it("keeps ⌃A as Select All, its platform meaning, instead of the line start", () => {
+    const { content, target } = mount({ value: "git push origin" });
+    act(() => target().setSelectionRange(15, 15));
+
+    fireEvent.keyDown(content, { key: "a", code: "KeyA", ctrlKey: true });
+
+    expect(target().selectionStart).toBe(0);
+    expect(target().selectionEnd).toBe("git push origin".length);
+  });
+});
+
 describe("CodeMirrorComposerInput mention tokens", () => {
   const tokenMarks = (container: HTMLElement) =>
     Array.from(container.querySelectorAll('[data-testid="composer-mention-token"]')).map(
