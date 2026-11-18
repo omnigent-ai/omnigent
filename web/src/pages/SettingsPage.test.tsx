@@ -58,6 +58,7 @@ const mocks = vi.hoisted(() => ({
   accountsEnabled: true,
   importSessionsPanel: vi.fn(() => null),
   enabledConnections: [] as string[],
+  archiveWorktreeCleanup: false,
   // login_url: non-null for any sign-in mode (accounts OR OIDC), null in
   // header mode. Gates the Account section.
   loginUrl: "/login" as string | null,
@@ -105,6 +106,7 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
           admin_view: mocks.adminViewSupported,
           sibling_sessions: mocks.nestedAgents,
           enabled_connections: mocks.enabledConnections,
+          archive_worktree_cleanup: mocks.archiveWorktreeCleanup,
           session_title_instructions: mocks.sessionTitleInstructions,
           proactive_agent_available: mocks.advisorAvailable,
         },
@@ -330,6 +332,7 @@ beforeEach(() => {
   mocks.authenticatedFetch.mockReset();
   mocks.importSessionsPanel.mockClear();
   mocks.enabledConnections = [];
+  mocks.archiveWorktreeCleanup = false;
   mocks.loginUrl = "/login";
   mocks.me = { id: "alice", is_admin: false };
   mocks.effectiveAdmin = undefined;
@@ -1872,18 +1875,43 @@ describe("SettingsPage", () => {
         .querySelector('[data-settings-control="default-base-branch:"]')
         ?.getAttribute("aria-labelledby"),
     ).toBe("settings-default-base-branch-label");
+    expect(
+      screen.getByRole("switch", { name: "Always use a random worktree" }),
+    ).toHaveAccessibleDescription(
+      "Use a fresh, randomly named worktree for new sessions in Git workspaces. Project settings override this default.",
+    );
+    expect(screen.getByRole("textbox", { name: "Default base branch" })).toBeInTheDocument();
+  });
+
+  it("renders the delete-worktrees row only when the server enables worktree cleanup", () => {
+    renderPage("/settings/git");
+    expect(document.querySelector('[data-settings-item="delete-worktrees-on-archive"]')).toBeNull();
+
+    cleanup();
+    mocks.archiveWorktreeCleanup = true;
+    renderPage("/settings/git");
+    expect(
+      document.querySelector('[data-settings-item="delete-worktrees-on-archive"]'),
+    ).not.toBeNull();
+    expect(
+      document
+        .querySelector('[data-settings-control="delete-worktrees-on-archive:"]')
+        ?.getAttribute("aria-labelledby"),
+    ).toBe("settings-delete-worktrees-on-archive-label");
   });
 
   it("renders the Sandbox Integrations rows from their Settings catalog entries", async () => {
     mocks.enabledConnections = ["github", "databricks"];
     renderPage("/settings/integrations");
     expect(await screen.findByTestId("github-connect")).toBeInTheDocument();
+    expect(await screen.findByTestId("databricks-workspace")).toBeInTheDocument();
     for (const id of ["github-connection", "databricks-connection"]) {
       expect(document.querySelector(`[data-settings-item="${id}"]`)).not.toBeNull();
     }
     expect(
       document.querySelector('[data-settings-control="databricks-connection:workspace"]'),
     ).not.toBeNull();
+    expect(screen.getByRole("textbox", { name: "Databricks workspace host" })).toBeInTheDocument();
   });
 
   it("keeps the GitHub and Databricks rows on the page while their status is checking", () => {

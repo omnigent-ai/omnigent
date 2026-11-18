@@ -1602,7 +1602,7 @@ function GithubIntegrationControl() {
           description={
             status.connected && status.login
               ? `Connected as ${status.login}. New sandboxes use your gh and git credentials and add your public SSH keys for SSH access.`
-              : "Connect GitHub to use your gh and git credentials and add your public SSH keys in new sandboxes."
+              : GITHUB_CONNECTION_ENTRY.description
           }
         />
         <div className="flex shrink-0 items-center gap-2">
@@ -1799,7 +1799,7 @@ function DatabricksIntegrationControl() {
           description={
             status.connected && status.workspace_host
               ? `Connected to ${status.workspace_host}${status.databricks_user ? ` as ${status.databricks_user}` : ""}. New sandboxes access Unity Gateway (MCP and model serving) as you.`
-              : "Connect a Databricks workspace to access Unity Gateway (MCP and model serving) as you in new sandboxes."
+              : DATABRICKS_CONNECTION_ENTRY.description
           }
         />
         <div className="flex shrink-0 items-center gap-2">
