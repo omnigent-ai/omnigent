@@ -278,6 +278,7 @@ from omnigent.server.routes._sessions.helpers import (
     _build_new_item,
     _build_policy_engine_from_spec,
     _child_session_summary_from_conversation,
+    _codex_side_chat_resume_supported,
     _codex_subagent_labels_from_body,
     _coerce_cumulative_field,
     _collect_descendant_conversation_ids,
@@ -394,7 +395,12 @@ from omnigent.server.routes._sessions.helpers import (
     reconcile_orphaned_running_status,
 )
 from omnigent.server.runner_session_init import RunnerSessionInitializer
-from omnigent.server.sandbox_profile_launch import prepare_profile, record_profile, saved_profile
+from omnigent.server.sandbox_profile_launch import (
+    default_profile_for_unrecorded_host,
+    prepare_profile,
+    record_profile,
+    saved_profile,
+)
 from omnigent.server.schemas import (
     AgentCost,
     BackgroundTaskInfo,
@@ -416,7 +422,11 @@ from omnigent.server.schemas import (
     SessionStatusEvent,
     SessionUsageEvent,
 )
-from omnigent.server.session_mcp_selection import session_mcp_selection
+from omnigent.server.session_mcp_selection import (
+    mcp_selection_for,
+    session_mcp_services,
+    worker_sandbox,
+)
 from omnigent.server.startup_inputs import (
     STARTUP_LABEL,
     StartupInputContext,
@@ -465,6 +475,7 @@ from omnigent.telemetry.surface import CLIENT_SURFACE_LABEL_KEY, resolve_session
 from omnigent.util.session_lifecycle import (
     CLOSED_LABEL_KEY,
     CLOSED_LABEL_VALUE,
+    is_session_closed,
     labels_with_closed_status,
     title_without_closed_marker,
 )
@@ -1661,7 +1672,6 @@ def _build_session_response(
     viewer_id: str | None = None,
     agent_store: AgentStore | None = None,
     agent_cache: AgentCache | None = None,
-    side_chat_sealed: bool = False,
     agent: Agent | None = None,
     background_agents: list[BackgroundTaskInfo] | None = None,
     harness: str | _UnresolvedHarness | None = _UNRESOLVED_HARNESS,
@@ -1756,8 +1766,12 @@ def _build_session_response(
         harness = _resolve_harness(
             conv, agent_store=agent_store, agent_cache=agent_cache, agent=agent
         )
+    from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
+
     native_usage_baseline = None
-    if harness == "pi-native":
+    if harness == "pi-native" or (
+        _is_codex_native_subagent(conv) and is_side_chat_child(conv.labels)
+    ):
         own_usage = conv.session_usage or {}
         cached = int(own_usage.get("cache_read_input_tokens", 0) or 0)
         native_usage_baseline = NativeUsageBaseline(
@@ -1778,12 +1792,6 @@ def _build_session_response(
         or native_coding_agent_for_harness(harness) is not None
     ):
         labels = {**labels, _CLAUDE_NATIVE_UI_LABEL_KEY: _CLAUDE_NATIVE_UI_LABEL_VALUE}
-    # A codex /side child whose ephemeral fork's runner is gone (parent resumed
-    # onto a new runner) can never be sent to again. Surface it as closed so the
-    # composer reads-only itself instead of letting the user fire a turn at a
-    # vanished thread. Computed per-response (not persisted) — self-heals.
-    if side_chat_sealed:
-        labels = {**labels, CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE}
     return SessionResponse(
         id=conv.id,
         agent_id=conv.agent_id,
@@ -3348,6 +3356,7 @@ async def _persist_external_conversation_item(
     created_by: str | None = None,
     background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
     enabled: bool = True,
+    on_direct_input: Callable[[], Awaitable[None]] | None = None,
 ) -> str:
     """
     Persist and broadcast a conversation item produced outside AP.
@@ -3372,6 +3381,7 @@ async def _persist_external_conversation_item(
             created_by=created_by,
             background_title_coordinator=background_title_coordinator,
             enabled=enabled,
+            on_direct_input=on_direct_input,
         )
     )
     try:
@@ -3409,6 +3419,7 @@ async def _persist_external_conversation_item_serialized(
     created_by: str | None = None,
     background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
     enabled: bool = True,
+    on_direct_input: Callable[[], Awaitable[None]] | None = None,
 ) -> str:
     """
     Run :func:`_persist_external_conversation_item_unlocked` under the mirror lock.
@@ -3424,6 +3435,7 @@ async def _persist_external_conversation_item_serialized(
             created_by=created_by,
             background_title_coordinator=background_title_coordinator,
             enabled=enabled,
+            on_direct_input=on_direct_input,
         )
 
 
@@ -3435,6 +3447,7 @@ async def _persist_external_conversation_item_unlocked(
     created_by: str | None = None,
     background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
     enabled: bool = True,
+    on_direct_input: Callable[[], Awaitable[None]] | None = None,
 ) -> str:
     """
     Persist and broadcast a conversation item produced outside AP.
@@ -3448,6 +3461,10 @@ async def _persist_external_conversation_item_unlocked(
     :param conv: Conversation row for title seeding.
     :param body: External item event body.
     :param conversation_store: Store used to append the item.
+    :param on_direct_input: Called once a newly persisted input landed that no
+        queued message accounts for: a person typing in the native terminal, not
+        a web or automation message's echo or a replayed item. Its failure is
+        logged and never fails the persist.
     :param created_by: Authenticated identity of the actor whose
         request triggered the forwarder POST, e.g.
         ``"alice@example.com"``. Used to attribute user messages typed
@@ -3631,6 +3648,21 @@ async def _persist_external_conversation_item_unlocked(
     # go back into play.
     _release_drained_inputs(session_id, [*skipped_pending, *uncertain_pending, drained])
     _restore_drained_inputs(session_id, held_older, None)
+    # Typed in the terminal: no queued message, not even by position, matched it.
+    if (
+        on_direct_input is not None
+        and drains_pending_inputs
+        and drained is None
+        and body.data.get("agent_message_candidate") is not True
+    ):
+        try:
+            await on_direct_input()
+        except Exception:  # noqa: BLE001 — a follow-up must not fail the mirror
+            _logger.warning(
+                "Direct native input follow-up failed",
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
     if item.replaces_pending_id is not None and conv.host_id is not None:
         # A saved startup input's receipt frees the next one queued behind it.
         wake_startup_worker(conv.host_id)
@@ -5164,6 +5196,7 @@ async def _run_managed_launch(
     host_id: str | None = None,
     sandbox_profiles: Any = None,
     held_runner_id: str | None = None,
+    adopt_default_profile: bool = False,
 ) -> None:
     """
     Provision a managed sandbox for a session in the background.
@@ -5232,6 +5265,9 @@ async def _run_managed_launch(
     :param held_runner_id: The claim a move holds on the session's runner
         while it provisions, or ``None``. The sandbox binds only while that
         claim stands, and any failure releases it.
+    :param adopt_default_profile: Whether a relaunch whose host has no
+        recorded profile takes the provider's default, as a scheduled
+        fire's session reset does.
     """
     from omnigent.server.managed_hosts import (
         deployment_with_inference_snapshot,
@@ -5241,13 +5277,23 @@ async def _run_managed_launch(
     )
 
     try:
-        profile = await saved_profile(
-            sandbox_profiles,
-            session_id,
-            user_id=owner,
-            host_id=relaunch_host.host_id if relaunch_host is not None else None,
-            bind_host=False,
-        )
+        profile = None
+        if adopt_default_profile and relaunch_host is not None:
+            profile = await default_profile_for_unrecorded_host(
+                sandbox_profiles,
+                session_id,
+                relaunch_host.host_id,
+                relaunch_host.sandbox_provider,
+                user_id=owner,
+            )
+        if profile is None:
+            profile = await saved_profile(
+                sandbox_profiles,
+                session_id,
+                user_id=owner,
+                host_id=relaunch_host.host_id if relaunch_host is not None else None,
+                bind_host=False,
+            )
         if profile is not None:
             sandbox_config = deployment_with_sandbox_profile(sandbox_config, profile)
             provider = profile["provider"]
@@ -6078,6 +6124,11 @@ async def ensure_runner_connected(
 
 def _side_chat_source_id(conv: Conversation) -> str | None:
     """Return the source session whose runner a side chat shares, if any."""
+    from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
+
+    if _is_codex_native_subagent(conv) and is_side_chat_child(conv.labels):
+        source_id = conv.parent_conversation_id
+        return source_id if source_id != conv.id else None
     if conv.kind != "default" or conv.host_id is not None:
         return None
     labels = conv.labels or {}
@@ -6135,12 +6186,13 @@ async def _recover_side_chat_runner_via_source(
     and rebinds the side chat atomically so concurrent rebindings are
     preserved. The caller must initialize the side chat on the returned
     runner. Recovery requires edit access to the source and, like an explicit
-    runner attach, ownership of the runner the side chat would use; a runner
-    owned by another user raises ``FORBIDDEN`` with that explanation.
+    runner attach, ownership when acquiring a runner. A native side chat may
+    reuse its existing live runner without acquiring it again.
     """
     source_id = _side_chat_source_id(side_chat)
     if source_id is None:
         return None, side_chat
+    native_side_chat = _is_codex_native_subagent(side_chat)
     source = await asyncio.to_thread(conversation_store.get_conversation, source_id)
     if source is None:
         return None, side_chat
@@ -6152,6 +6204,7 @@ async def _recover_side_chat_runner_via_source(
         source=source,
     ):
         return None, side_chat
+    original_source_runner_id = source.runner_id
     for _ in range(_SIDE_CHAT_RECOVERY_ATTEMPTS):
         # Checked per attempt: a retry's fresh source row can name another host.
         if (
@@ -6163,26 +6216,44 @@ async def _recover_side_chat_runner_via_source(
                 "side chat runner is connected to another server replica",
                 host_id=source.host_id,
             )
-        source_client, source = await ensure_runner_connected(
-            session_id=source_id,
-            conv=source,
-            app_state=app_state,
-            conversation_store=conversation_store,
-            runner_router=runner_router,
-            raise_host_refusal=raise_host_refusal,
-        )
+        source_client = None
+        if (
+            native_side_chat
+            and source.runner_id is not None
+            and source.runner_id == side_chat.runner_id
+        ):
+            source_client = await _get_runner_client(source_id, runner_router, conversation=source)
+        reuse_existing = source_client is not None
+        if not reuse_existing:
+            source_client, source = await ensure_runner_connected(
+                session_id=source_id,
+                conv=source,
+                app_state=app_state,
+                conversation_store=conversation_store,
+                runner_router=runner_router,
+                raise_host_refusal=raise_host_refusal,
+            )
         if source_client is None or source.runner_id is None:
             return None, side_chat
-        # A concurrent recovery may have advanced the source past the snapshot
-        # ensure_runner_connected returned. Retry against the fresh row so the
-        # side chat follows the source instead of binding a superseded runner.
+        # Revalidate after client resolution so a concurrent recovery cannot
+        # bind the side chat to a superseded source runner.
         live_source = await asyncio.to_thread(conversation_store.get_conversation, source_id)
         if live_source is None:
             return None, side_chat
         if live_source.runner_id != source.runner_id:
             source = live_source
             continue
-        if user_id is not None and runner_router is not None:
+        if native_side_chat and not _codex_side_chat_resume_supported(source, runner_router, None):
+            if (
+                not is_session_closed(side_chat.labels, side_chat.title)
+                and side_chat.runner_id == source.runner_id == original_source_runner_id
+            ):
+                return source_client, side_chat
+            raise OmnigentError(
+                "This runner cannot resume side chats. Update the host and restart the session.",
+                code=ErrorCode.RUNNER_UNAVAILABLE,
+            )
+        if not reuse_existing and user_id is not None and runner_router is not None:
             runner_owner = runner_router.runner_owner(source.runner_id)
             if runner_owner is not None and runner_owner != user_id:
                 _logger.info(
@@ -6196,6 +6267,13 @@ async def _recover_side_chat_runner_via_source(
                     "another user's runner.",
                     code=ErrorCode.FORBIDDEN,
                 )
+        if native_side_chat:
+            # A failed native resume must remain retryable after its binding changes.
+            await asyncio.to_thread(
+                conversation_store.set_labels,
+                side_chat.id,
+                {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE},
+            )
         if source.runner_id != side_chat.runner_id:
             try:
                 if side_chat.runner_id is None:
@@ -6236,6 +6314,11 @@ async def _recover_side_chat_runner_via_source(
                     source.runner_id,
                     extra={"session_id": side_chat.id},
                 )
+        if native_side_chat:
+            refreshed = await asyncio.to_thread(conversation_store.get_conversation, side_chat.id)
+            if refreshed is None:
+                return None, side_chat
+            side_chat = refreshed
         if side_chat.runner_id is None:
             return None, side_chat
         return (
@@ -12499,37 +12582,58 @@ async def _resolve_native_smart_routing(
 
 async def _inherited_mcp_labels(
     request: Request,
-    source_labels: Mapping[str, str],
-    labels: Mapping[str, str],
+    created_by: Conversation,
+    body: SessionCreateInput,
+    conversation_store: ConversationStore,
     *,
     spec: AgentSpec | None,
     user_id: str | None,
-    host_id: str | None,
     runner_id: str | None,
 ) -> dict[str, str]:
-    """The source session's MCP selection labels for a worker it starts.
+    """The MCP selection labels a worker that *created_by* starts inherits.
+
+    The source's services are read whichever selection wrote them, and written
+    with the selection of where the worker runs, so a worker in a provider that
+    configures MCP servers differently gets labels it can read, or none.
 
     Empty when the worker already carries a selection, the source has none, or
     the worker's agent could not be loaded to check for name collisions. A
     selection the worker cannot use (a disconnected account, a name its agent
-    uses for a custom server, or a runtime without registry support) is dropped
-    whole, so the worker still starts.
+    uses for a custom server, a runtime without registry support, or services
+    only another provider configures) is dropped whole, so the worker still
+    starts.
     """
+    from omnigent.runner.routing import routing_host_id
     from omnigent.server.runtime_compatibility import registry_services, require_runtime_support
 
-    selection = session_mcp_selection(request.app.state)
-    services = selection.selected_services(source_labels)
-    if not services or selection.selected_services(labels) or spec is None:
+    state = request.app.state
+    deployment = getattr(state, "sandbox_config", None)
+    services = session_mcp_services(deployment, created_by.labels)
+    if not services or session_mcp_services(deployment, body.labels or {}) or spec is None:
         return {}
+    new_sandbox = body.host_type == "managed"
+    host_id = body.host_id
+    if host_id is None and not new_sandbox:
+        # Without a host of its own, the worker runs where its source's runner does,
+        # which for a side chat is its source's host.
+        host_id = await asyncio.to_thread(routing_host_id, created_by, conversation_store)
+    sandbox = await asyncio.to_thread(
+        worker_sandbox,
+        state,
+        new_sandbox=new_sandbox,
+        new_sandbox_provider=body.sandbox_provider,
+        host_id=host_id,
+    )
+    selection = mcp_selection_for(sandbox)
     inherited = selection.session_labels(services)
     try:
         await asyncio.to_thread(selection.validate, request, services, spec=spec, user_id=user_id)
         require_runtime_support(
             registry_services(selected_mcp_spec(spec, inherited)),
-            host_id=host_id,
+            host_id=body.host_id,
             runner_id=runner_id,
-            host_registry=getattr(request.app.state, "host_registry", None),
-            tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
+            host_registry=getattr(state, "host_registry", None),
+            tunnel_registry=getattr(state, "tunnel_registry", None),
         )
     except OmnigentError as exc:
         if exc.code == ErrorCode.WRONG_REPLICA:
@@ -12556,7 +12660,7 @@ async def _create_session_from_existing_agent(
     created_by_session_id: str | None = None,
     created_by_project_id: str | None = None,
     created_by_scheduled_task_id: str | None = None,
-    created_by_labels: Mapping[str, str] | None = None,
+    created_by: Conversation | None = None,
     launched_by_scheduled_task_id: str | None = None,
 ) -> tuple[SessionResponse, Conversation, SessionCreateInput]:
     """
@@ -12592,8 +12696,8 @@ async def _create_session_from_existing_agent(
         no project is filed there, so it sits beside the session that started it.
     :param created_by_scheduled_task_id: The automation whose run is that source, if
         any. A worker whose request carries no launch args runs in its permission mode.
-    :param created_by_labels: That source's labels. A worker that picks no MCP
-        services of its own starts with the source's.
+    :param created_by: That source session. A worker that picks no MCP services of
+        its own starts with the source's.
     :param launched_by_scheduled_task_id: The automation whose run's tree that source
         is in, if any, stamped as the worker's ``SCHEDULED_TASK_LAUNCH_LABEL_KEY``.
     :returns: The newly created session snapshot, its conversation row, and
@@ -13050,14 +13154,14 @@ async def _create_session_from_existing_agent(
         runner_router=runner_router,
     )
     inherited_mcp_labels: dict[str, str] = {}
-    if created_by_labels and not body.mcp_registry_services and not body.sub_agent_name:
+    if created_by is not None and not body.mcp_registry_services and not body.sub_agent_name:
         inherited_mcp_labels = await _inherited_mcp_labels(
             request,
-            created_by_labels,
-            body.labels or {},
+            created_by,
+            body,
+            conversation_store,
             spec=selection_spec,
             user_id=user_id,
-            host_id=body.host_id,
             runner_id=inherited_runner_id,
         )
 
@@ -13269,7 +13373,7 @@ async def _create_session_from_existing_agent(
     client_surface = resolve_session_surface(
         request.headers,
         parent_labels=_parent_for_routing.labels if _parent_for_routing is not None else None,
-        source_labels=created_by_labels,
+        source_labels=created_by.labels if created_by is not None else None,
         requested_labels=initial_labels,
     )
     initial_labels[CLIENT_SURFACE_LABEL_KEY] = client_surface
@@ -14447,58 +14551,6 @@ async def _fetch_model_options(
     return cached or []
 
 
-async def _codex_side_chat_fork_sealed(conv: Conversation, conv_store: ConversationStore) -> bool:
-    """
-    Whether a codex ``/side`` child's ephemeral fork is no longer reachable.
-
-    The fork lives only in the runner process that created it. A side-chat child
-    keeps its birth ``runner_id`` while the parent's changes on resume/relaunch,
-    so a divergence means the fork's owning runner is gone and a follow-up turn
-    would hit a vanished thread. Gated to ``/side`` children (the "Side chat"
-    nickname) so ordinary codex sub-agents are unaffected; a plain reload with
-    the same live runner does not diverge, so a still-live side chat stays
-    sendable.
-    """
-    from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
-
-    if (
-        not _is_codex_native_subagent(conv)
-        or conv.parent_conversation_id is None
-        or not conv.runner_id
-        or not is_side_chat_child(conv.labels)
-    ):
-        return False
-    parent = await asyncio.to_thread(conv_store.get_conversation, conv.parent_conversation_id)
-    return parent is not None and bool(parent.runner_id) and parent.runner_id != conv.runner_id
-
-
-async def _codex_side_chat_fork_lost(
-    conv: Conversation,
-    conv_store: ConversationStore,
-    runner_router: RunnerRouter | None,
-    host_registry: HostRegistry | None,
-) -> bool:
-    """Whether a side chat's ephemeral fork is provably gone with its runner."""
-    if await _codex_side_chat_fork_sealed(conv, conv_store):
-        return True
-    from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
-    from omnigent.runner.routing import routing_host_id
-
-    if not _is_codex_native_subagent(conv) or not conv.runner_id or host_registry is None:
-        return False
-    if not is_side_chat_child(conv.labels) or (
-        runner_router is not None and runner_router.runner_is_online(conv.runner_id)
-    ):
-        return False
-    host_id = await asyncio.to_thread(routing_host_id, conv, conv_store)
-    host_conn = host_registry.get(host_id) if host_id is not None else None
-    if host_conn is None:
-        return False
-    # The host owns the process: "unknown" means it is not running there either.
-    status = await _query_host_runner_status(host_conn, host_registry, conv.runner_id)
-    return status in {"dead", "unknown"}
-
-
 def _resolve_harness_impl_is_acp(
     conv: Conversation, agent_store: AgentStore | None, agent: Agent | None = None
 ) -> bool:
@@ -15163,7 +15215,6 @@ async def _get_session_snapshot(
         items,
         status,
         permission_level,
-        side_chat_sealed=await _codex_side_chat_fork_sealed(conv, conv_store),
         background_agents=background_agents,
         background_task_count=_session_background_task_count_cache.get(session_id),
         background_tasks=_session_background_tasks_cache.get(session_id),
@@ -15208,6 +15259,22 @@ async def _get_session_snapshot(
     response.side_chat_settings_supported = await _runner_supports_side_chat_settings(
         conv, conv_store, getattr(request.app.state, "tunnel_registry", None) if request else None
     )
+    from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
+
+    if (
+        _is_codex_native_subagent(conv)
+        and is_side_chat_child(conv.labels)
+        and conv.parent_conversation_id is not None
+    ):
+        parent = await asyncio.to_thread(conv_store.get_conversation, conv.parent_conversation_id)
+        supported = _codex_side_chat_resume_supported(
+            parent,
+            getattr(request.app.state, "runner_router", None) if request else None,
+            getattr(request.app.state, "host_registry", None) if request else None,
+        )
+        response.labels["omnigent.codex_native.side_chat_resume"] = (
+            "true" if supported else "false"
+        )
     response.inference_configured = inference_configured
     response.inference_error = inference_error
     response.usage_included = include_usage

@@ -35,6 +35,7 @@ import {
   triggerFieldsComplete,
   triggerMessageBudget,
   triggerScopeOperators,
+  updateTriggerWorkerPlacement,
   updateTriggerWorkerSettings,
   withTriggerEvent,
   TRIGGER_SOURCES,
@@ -110,6 +111,12 @@ describe("saved trigger prompts", () => {
       expect(updateTriggerWorkerSettings(prompt, { ...AGENT_DEFAULT_WORKERS, model: "new" })).toBe(
         prompt.replace('model "old"', 'model "new"'),
       );
+      // Moving the workers keeps the workflow and the other settings.
+      const managed = updateTriggerWorkerPlacement(prompt, "managed");
+      expect(managed).toBe(prompt.replace('placement "same_host"', 'placement "managed"'));
+      expect(readTriggerWorkerPlacement(managed)).toBe("managed");
+      expect(updateTriggerWorkerPlacement(managed, "same_host")).toBe(prompt);
+      expect(updateTriggerWorkerPlacement(prompt, "same_host")).toBe(prompt);
     },
   );
 
@@ -1512,6 +1519,10 @@ describe("renderTriggerPrompt", () => {
       // One search, not one per tool, when the manager's tools load on demand.
       expect(prompt).toContain(
         "Each run:\n1. If your tools load on demand, load every tool this run needs in one tool search before your first call, naming them all:",
+      );
+      // Loading get_info up front avoids a second search for a blank worker agent's ID.
+      expect(prompt).toContain(
+        "each sys_session tool the steps below use, and sys_session_get_info, which returns your session and agent IDs.",
       );
       // The creation call stays the only sys_session_create the saved-prompt parser reads.
       expect(readTriggerWorkerSettings(prompt)).not.toBeNull();

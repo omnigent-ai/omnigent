@@ -348,6 +348,11 @@ class BwrapSandboxBackend(SandboxBackend):
             if sandbox_spec.cwd_allow_hidden is not None
             else list(_DEFAULT_CWD_ALLOW_HIDDEN)
         )
+        if ".git" in cwd_allow_hidden or "*" in cwd_allow_hidden:
+            _LOGGER.warning(
+                "linux_bwrap: cwd_allow_hidden grants the agent access to .git "
+                "in sandbox roots; audit whether the agent actually needs it."
+            )
 
         mask_paths = (
             [_resolve_root(cwd, path) for path in sandbox_spec.mask_paths]

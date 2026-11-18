@@ -56,6 +56,11 @@ import {
 } from "@/lib/harnessFix";
 import { cn } from "@/lib/utils";
 import { HarnessCredentialForm } from "@/shell/HarnessCredentialForm";
+import { FIX_DIALOG_PARTS } from "@/pages/settings/search/catalog/harnesses";
+import {
+  SETTINGS_NO_TOOLTIP,
+  useSettingsOverlayParts,
+} from "@/pages/settings/search/settingsOwnership";
 
 export interface HarnessFixDialogProps {
   open: boolean;
@@ -602,9 +607,13 @@ export function HarnessFixDialog(props: HarnessFixDialogProps) {
     };
   }, [accountKey, deviceLogin, enterStep, finish, harness, harnessLabel, hostId, hostName]);
 
+  const parts = useSettingsOverlayParts();
   return (
     <Dialog open={open} onOpenChange={setOpen}>
-      <DialogContent className="gap-0 overflow-hidden rounded-[20px] bg-background p-0 text-foreground sm:max-w-[440px]">
+      <DialogContent
+        className="gap-0 overflow-hidden rounded-[20px] bg-background p-0 text-foreground sm:max-w-[440px]"
+        {...parts.overlay()}
+      >
         <DialogHeader className="px-6 pt-6 pb-4">
           <DialogTitle>
             {dialogTitle(mode, phase, deviceLogin !== null, harnessLabel, hostName)}
@@ -697,27 +706,53 @@ export function HarnessFixDialog(props: HarnessFixDialogProps) {
               <Button
                 variant="outline"
                 className="bg-background text-foreground hover:bg-muted dark:bg-background dark:hover:bg-muted"
+                data-settings-dialog-action="Cancel"
                 onClick={() => setOpen(false)}
               >
                 Cancel
               </Button>
-              <Button onClick={() => void switchAccount()}>Sign out and switch</Button>
+              <Button
+                {...parts.control("switchConfirm", { ...SETTINGS_NO_TOOLTIP, outside: {} })}
+                onClick={() => void switchAccount()}
+              >
+                Sign out and switch
+              </Button>
             </>
           ) : phase === "install" ? (
             <>
-              <Button variant="outline" onClick={() => setOpen(false)}>
+              <Button
+                variant="outline"
+                data-settings-dialog-action="Cancel"
+                onClick={() => setOpen(false)}
+              >
                 Cancel
               </Button>
-              <Button onClick={() => void start()}>
+              <Button
+                {...parts.control("installAction", {
+                  ...SETTINGS_NO_TOOLTIP,
+                  name: mode === "update" ? { alternative: "update" } : undefined,
+                  outside: {},
+                })}
+                onClick={() => void start()}
+              >
                 {mode === "update" ? "Update" : "Install"}
               </Button>
             </>
           ) : phase === "choose" ? (
             <>
-              <Button variant="outline" onClick={() => setOpen(false)}>
+              <Button
+                variant="outline"
+                data-settings-dialog-action="Cancel"
+                onClick={() => setOpen(false)}
+              >
                 Cancel
               </Button>
               <Button
+                {...parts.control("authenticate", {
+                  ...SETTINGS_NO_TOOLTIP,
+                  name: authenticateName(credentialDecisionPending, mode),
+                  outside: {},
+                })}
                 disabled={credentialDecisionPending}
                 onClick={() => (mode === "install" ? void start() : authenticate(choice))}
               >
@@ -735,10 +770,19 @@ export function HarnessFixDialog(props: HarnessFixDialogProps) {
             </>
           ) : phase === "error" ? (
             <>
-              <Button variant="outline" onClick={() => setOpen(false)}>
+              <Button
+                variant="outline"
+                data-settings-dialog-action="Close"
+                onClick={() => setOpen(false)}
+              >
                 Close
               </Button>
-              <Button onClick={retry}>Try again</Button>
+              <Button
+                {...parts.control("retry", { ...SETTINGS_NO_TOOLTIP, outside: {} })}
+                onClick={retry}
+              >
+                Try again
+              </Button>
             </>
           ) : deviceLogin ? (
             <>
@@ -748,6 +792,7 @@ export function HarnessFixDialog(props: HarnessFixDialogProps) {
               <Button
                 variant="outline"
                 className="bg-background text-foreground hover:bg-muted dark:bg-background dark:hover:bg-muted"
+                data-settings-dialog-action="Cancel"
                 onClick={() => setOpen(false)}
               >
                 Cancel
@@ -755,17 +800,38 @@ export function HarnessFixDialog(props: HarnessFixDialogProps) {
             </>
           ) : phase === "device-error" ? (
             <>
-              <Button variant="outline" onClick={() => setOpen(false)}>
+              <Button
+                variant="outline"
+                data-settings-dialog-action="Close"
+                onClick={() => setOpen(false)}
+              >
                 Close
               </Button>
-              <Button onClick={() => void startDeviceLogin()}>Try again</Button>
+              <Button
+                {...parts.control("retry", { ...SETTINGS_NO_TOOLTIP, outside: {} })}
+                onClick={() => void startDeviceLogin()}
+              >
+                Try again
+              </Button>
             </>
           ) : phase === "personal" || phase === "isaac" || phase === "setup" || phase === "tmux" ? (
             <>
-              <Button variant="outline" onClick={() => setOpen(false)}>
+              <Button
+                variant="outline"
+                data-settings-dialog-action="Close"
+                onClick={() => setOpen(false)}
+              >
                 Close
               </Button>
-              <Button disabled={checking} onClick={() => void checkAgain()}>
+              <Button
+                {...parts.control("checkAgain", {
+                  ...SETTINGS_NO_TOOLTIP,
+                  name: checking ? { alternative: "checking" } : undefined,
+                  outside: {},
+                })}
+                disabled={checking}
+                onClick={() => void checkAgain()}
+              >
                 {checking ? (
                   <>
                     <Loader2Icon className="size-4 animate-spin" />
@@ -777,11 +843,19 @@ export function HarnessFixDialog(props: HarnessFixDialogProps) {
               </Button>
             </>
           ) : phase === "credentials" ? (
-            <Button variant="outline" onClick={() => setOpen(false)}>
+            <Button
+              variant="outline"
+              data-settings-dialog-action="Close"
+              onClick={() => setOpen(false)}
+            >
               Close
             </Button>
           ) : (
-            <Button variant="outline" onClick={() => setOpen(false)}>
+            <Button
+              variant="outline"
+              data-settings-dialog-action="Cancel"
+              onClick={() => setOpen(false)}
+            >
               Cancel
             </Button>
           )}
@@ -802,6 +876,7 @@ function SwitchAccountConfirm({
   emailHint: string;
   onEmailHint: (value: string) => void;
 }) {
+  const parts = useSettingsOverlayParts();
   const current =
     [account?.email, account?.plan].filter(Boolean).join(" · ") || "the current account";
   return (
@@ -821,7 +896,10 @@ function SwitchAccountConfirm({
           type="email"
           className="h-9 rounded-lg border border-border bg-background px-3 outline-none focus-visible:ring-3 focus-visible:ring-ring/50"
           placeholder="name@example.com"
-          aria-label="Account to sign in with"
+          {...parts.control("accountHint", {
+            ...SETTINGS_NO_TOOLTIP,
+            outside: { "aria-label": "Account to sign in with" },
+          })}
         />
       </label>
     </>
@@ -852,7 +930,7 @@ function DeviceCodeState({
                 Open sign-in page <ExternalLinkIcon className="size-3.5" />
               </a>
             </Button>
-            <CopyButton text={login.verification_url} label="Copy sign-in link" />
+            <CopyButton text={login.verification_url} part="copySignInLink" />
           </div>
         </div>
       </div>
@@ -864,7 +942,7 @@ function DeviceCodeState({
             <code className="min-w-0 flex-1 text-center font-mono text-xl font-semibold tracking-[0.16em]">
               {login.user_code}
             </code>
-            <CopyButton text={login.user_code} label="Copy one-time code" iconOnly />
+            <CopyButton text={login.user_code} part="copyCode" iconOnly />
           </div>
         </div>
       </div>
@@ -916,20 +994,24 @@ function StepNumber({ children }: { children: React.ReactNode }) {
 
 function CopyButton({
   text,
-  label,
+  part,
   iconOnly = false,
 }: {
   text: string;
-  label: string;
+  part: "copySignInLink" | "copyCode";
   iconOnly?: boolean;
 }) {
   const [copied, setCopied] = useState(false);
+  const parts = useSettingsOverlayParts();
   return (
     <Button
       type="button"
       variant="outline"
       size={iconOnly ? "icon-sm" : "sm"}
-      aria-label={label}
+      {...parts.control(part, {
+        ...SETTINGS_NO_TOOLTIP,
+        outside: { "aria-label": FIX_DIALOG_PARTS[part] },
+      })}
       onClick={() => {
         void copyText(text)
           .then(() => setCopied(true))
@@ -971,12 +1053,20 @@ function ChooseCredential({
   canUseCredentialForm: boolean;
   onUseCredentialForm: () => void;
 }) {
+  const parts = useSettingsOverlayParts();
   return (
     <>
       <DialogDescription>
         Choose the credential {harnessLabel} will use to authenticate on {hostName}.
       </DialogDescription>
-      <div role="radiogroup" aria-label="Credential" className="flex flex-col gap-2">
+      <div
+        role="radiogroup"
+        {...parts.control("credentialChoice", {
+          ...SETTINGS_NO_TOOLTIP,
+          outside: { "aria-label": "Credential" },
+        })}
+        className="flex flex-col gap-2"
+      >
         {isaacSupported && (
           <CredentialCard
             selected={choice === "isaac"}
@@ -998,6 +1088,7 @@ function ChooseCredential({
         <button
           type="button"
           className="self-start text-sm text-muted-foreground underline-offset-4 hover:text-foreground hover:underline"
+          {...parts.control("useCredentialForm", { ...SETTINGS_NO_TOOLTIP, outside: {} })}
           onClick={onUseCredentialForm}
         >
           Use an API key or gateway URL instead
@@ -1108,7 +1199,7 @@ function PersonalCommand({
   return (
     <>
       <DialogDescription>Run this in a terminal on {hostName}, then come back.</DialogDescription>
-      <CommandRow command={command} label="Copy login command" />
+      <CommandRow command={command} part="copyLoginCommand" />
       <p className="text-sm text-muted-foreground">
         {harnessAccountKey(harness) === "claude"
           ? "Open the link it prints, then paste the code from your browser back into the terminal."
@@ -1135,7 +1226,7 @@ function IsaacCommand({
   return (
     <>
       <DialogDescription>Run this in a terminal on {hostName}, then come back.</DialogDescription>
-      <CommandRow command="omni setup" label="Copy omni setup" />
+      <CommandRow command="omni setup" part="copyOmniSetup" />
       <p className="text-sm text-muted-foreground">
         Choose {harnessLabel}, then the Databricks Unity Gateway credential.
       </p>
@@ -1163,7 +1254,7 @@ function SetupCommand({
         Run <code className="font-mono text-foreground">omni setup</code> on {hostName} to finish
         setting up {harnessLabel}.
       </DialogDescription>
-      <CommandRow command="omni setup" label="Copy omni setup" />
+      <CommandRow command="omni setup" part="copyOmniSetup" />
       {stillNotReady && (
         <p role="status" className="text-sm text-destructive">
           {harnessLabel} still isn’t ready on {hostName}.
@@ -1188,7 +1279,7 @@ function TmuxSetup({
         {harnessLabel} runs in tmux, which needs version {MIN_TMUX_VERSION} or newer on {hostName}.
         Install or upgrade tmux there, then check again.
       </DialogDescription>
-      <CommandRow command="brew install tmux" label="Copy brew install tmux" />
+      <CommandRow command="brew install tmux" part="copyTmuxInstall" />
       <p className="text-sm text-muted-foreground">
         On macOS, use Homebrew (run{" "}
         <code className="font-mono text-foreground">brew upgrade tmux</code> if it&apos;s already
@@ -1266,13 +1357,20 @@ function ErrorState({ error, hostName }: { error: string; hostName: string }) {
       <div className="rounded-xl border border-destructive/30 bg-destructive/5 px-3.5 py-2.5 text-ui text-destructive">
         {error}
       </div>
-      <CommandRow command="omni setup" label="Copy omni setup" />
+      <CommandRow command="omni setup" part="copyOmniSetup" />
     </>
   );
 }
 
-function CommandRow({ command, label }: { command: string; label: string }) {
+function CommandRow({
+  command,
+  part,
+}: {
+  command: string;
+  part: "copyLoginCommand" | "copyOmniSetup" | "copyTmuxInstall";
+}) {
   const [copied, setCopied] = useState(false);
+  const parts = useSettingsOverlayParts();
   return (
     <div className="flex min-h-9 items-center gap-2 rounded-[10px] border border-border px-3 py-1.5">
       <code className="min-w-0 flex-1 break-all font-mono text-sm text-foreground">{command}</code>
@@ -1287,7 +1385,10 @@ function CommandRow({ command, label }: { command: string; label: string }) {
             })
             .catch(() => showToast("Couldn't copy — select and copy manually.", { duration: 0 }));
         }}
-        aria-label={label}
+        {...parts.control(part, {
+          ...SETTINGS_NO_TOOLTIP,
+          outside: { "aria-label": FIX_DIALOG_PARTS[part] },
+        })}
       >
         {copied ? <CheckIcon className="size-3.5" /> : <CopyIcon className="size-3.5" />}
         {copied ? "Copied" : "Copy"}
@@ -1324,4 +1425,10 @@ function dialogTitle(
   }
   if (mode === "update") return `Update ${harnessLabel}`;
   return mode === "install" ? `Install ${harnessLabel}` : `Reconfigure ${harnessLabel}`;
+}
+
+/** The Authenticate button's name while it checks the credential, or when it installs instead. */
+function authenticateName(checking: boolean, mode: string) {
+  if (checking) return { alternative: "checking" } as const;
+  return mode === "install" ? ({ alternative: "install" } as const) : undefined;
 }

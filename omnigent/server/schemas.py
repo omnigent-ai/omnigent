@@ -2499,9 +2499,9 @@ class SessionResponse(BaseModel):
         them with a separate ``GET /v1/sessions/{id}`` using
         ``include_usage=true``, ``include_items=false``,
         ``include_liveness=false``, and ``refresh_state=false``.
-    :param native_usage_baseline: Pi's own cumulative token baseline, excluding
-        descendants. Available even when display usage aggregation is skipped;
-        ``None`` for other harnesses or older servers.
+    :param native_usage_baseline: Own cumulative token baseline for Pi and Codex
+        side chats, excluding descendants. Available even when display usage
+        aggregation is skipped; ``None`` for other harnesses or older servers.
     :param last_task_error: Error details from the most recently
         failed task. Only present when ``status == "failed"`` and
         the task stored an error. Lets clients display the failure
@@ -3553,6 +3553,8 @@ class WorkflowRun(BaseModel):
     :param session_status: The session's status, ``"idle"``, ``"running"`` or
         ``"failed"``, including active direct sub-agents.
     :param background_work_running: Whether background work outlives the session's turn.
+    :param sandbox_launching: Whether the session's sandbox is still launching, so
+        the run is starting; ``False`` once it is up and for a failed launch.
     :param archived: Whether the session is archived.
     :param progress: Where the run's steps stand.
     :param steps: The latest plan's steps within this invocation.
@@ -3584,6 +3586,7 @@ class WorkflowRun(BaseModel):
     is_current: bool = False
     session_status: Literal["idle", "running", "failed"]
     background_work_running: bool = False
+    sandbox_launching: bool = False
     archived: bool = False
     progress: WorkflowRunProgress
     steps: list[WorkflowStep] = Field(default_factory=list)

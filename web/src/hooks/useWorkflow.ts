@@ -196,6 +196,7 @@ interface RawRun {
   is_current?: boolean;
   session_status: WorkflowRun["sessionStatus"];
   background_work_running?: boolean;
+  sandbox_launching?: boolean;
   archived: boolean;
   progress: {
     total: number;
@@ -226,6 +227,7 @@ function toWorkflowRun(run: RawRun): WorkflowRun {
     isCurrent: run.is_current === true,
     sessionStatus: run.session_status,
     backgroundWorkRunning: run.background_work_running ?? false,
+    sandboxLaunching: run.sandbox_launching ?? false,
     archived: run.archived,
     progress: {
       total: run.progress.total,

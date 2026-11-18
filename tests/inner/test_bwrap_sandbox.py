@@ -377,6 +377,23 @@ def test_resolve_explicit_cwd_allow_hidden_overrides_default() -> None:
     assert policy.cwd_allow_hidden == [".cache", ".npmrc"]
 
 
+@pytestmark_bwrap
+@pytest.mark.parametrize(
+    ("allow_hidden", "warns"), [([".git"], True), (["*"], True), (None, False)]
+)
+def test_resolve_warns_when_cwd_allow_hidden_exposes_git(
+    allow_hidden: list[str] | None, warns: bool, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Exposing ``.git`` to the agent is logged; the default allowlist is silent."""
+    spec = OSEnvSpec(
+        type="caller_process",
+        sandbox=OSEnvSandboxSpec(type="linux_bwrap", cwd_allow_hidden=allow_hidden),
+    )
+    with caplog.at_level("WARNING", logger="omnigent.inner.bwrap_sandbox"):
+        _make_backend().resolve(spec, Path.cwd())
+    assert any(".git" in record.message for record in caplog.records) is warns
+
+
 def test_resolve_raises_on_non_linux() -> None:
     """
     The resolver hard-errors on non-Linux hosts. The bwrap backend

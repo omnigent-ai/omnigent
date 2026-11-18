@@ -322,8 +322,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   original message, which the agent already has. The transcript is unchanged.
   Sending is a new message, steered or queued like any mid-turn send, and Edit
   never stops the agent. A non-empty draft asks "Replace your draft?" first.
-  Side chats, grid session panes, and writable sub-agent Workspace tabs edit
-  into their own composer, where "@"-mentions return as attachment markers. Edit
+  Side chats and writable sub-agent Workspace tabs edit into their own composer,
+  where "@"-mentions return as attachment markers. A grid session pane edits its
+  session's shared draft, where "@"-mentions return as tokens. Edit
   is hidden on messages the server hasn't accepted yet, messages with no text,
   other contributors' messages (shared session or not), and read-only composers.
 - `delivered-send-recovery`: a sent message stays out of the composer when its
@@ -583,8 +584,20 @@ for draft persistence and parent-isolation checks. The microphone beside
 side-chat message loads it into that side chat's composer, not the main one.
 
 **Grid cell** (desktop session grids, see [Sessions](sessions.md)): each cell's
-one-row composer shows the session's host status, permission mode (switchable by
-the owner) and harness. Switch hosts and see or switch the model from the
+one-row composer shares its session's draft with the full-screen composer, sends
+its tags and review comments as the full-screen composer does, and shows the
+review comments as chips. Sending while the session works queues the message on
+that session, as the full-screen composer does: it waits in the cell's queue strip
+(edit, steer, remove) and sends when the turn ends. With Always steer on it steers
+into the running turn instead, and Mod+Enter steers the whole queue. Editing a
+queued message brings its tags back as tokens. The queue belongs to the session, so
+the full-screen view shows and flushes the same messages; a reload drops a cell's
+queued messages, where the full-screen composer restores its own. Escape does not
+stop a cell's turn, and Interrupt shows only while the draft is empty, so a draft
+sends. It also shows the session's host, permission mode (switchable by the owner)
+and harness. Shift+Tab in the cell's composer steps that session's mode too; side
+chats and subagent tabs keep Shift+Tab for focus. Switch the host from the cell's
+host menu when you can edit the session. See or switch the model from the
 full-screen view.
 
 ## Driving it with the repro environment
@@ -833,7 +846,7 @@ Other connection providers alone do not enable the managed MCP picker.
   `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_tracks_real_focus_and_wrapping_keyboard_navigation`,
   `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_shows_full_skill_description`,
   `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_shows_a_long_single_match_from_the_keyboard`,
-  `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_highlight_opens_no_tooltip_on_a_touch_screen`,
+  `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_highlight_opens_no_tooltip_in_the_mobile_layout`,
   `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_bounds_a_very_long_skill_description`,
   `tests/e2e_ui/chat/test_side_chat_slash_command.py::test_side_chat_slash_menu_and_skill_invocation`;
   incomplete catalog:
@@ -1003,8 +1016,8 @@ Other connection providers alone do not enable the managed MCP picker.
   `tests/e2e_ui/chat/test_composer_bulk_steer.py::test_bulk_steer_retries_the_whole_queue`.
   The native mid-turn notice has component coverage in
   `web/src/pages/ChatPage.userBubble.test.tsx`.
-  `tests/browser_ui/chat/test_status_indicators.py::test_touch_screens_reveal_timestamps_and_pending_steering`
-  verifies phone and tablet touch visibility without hover.
+  `tests/browser_ui/chat/test_status_indicators.py::test_mobile_layout_reveals_timestamps_and_pending_steering`
+  verifies their visibility without hover in the mobile layout.
 - **`host-offline-hold`:** no browser-level coverage.
   `tests/server/integration/test_session_host_launch.py::test_offline_host_send_held_by_client_records_nothing`
   (plain `uv run pytest`) checks that a held send is refused with nothing
@@ -1042,9 +1055,11 @@ Other connection providers alone do not enable the managed MCP picker.
   `web/src/pages/ChatPage.composer.test.tsx`, and
   `web/src/components/chat/SideChatPane.test.tsx`. Grid session panes and
   sub-agent Workspace tabs render the same `SideChatPane`, whose Edit logic has
-  component coverage; their own wiring is checked by hand: open
-  a grid pane or a writable Workspace tab, click Edit on a message you sent
-  there, and confirm that pane's composer fills while the main one stays empty.
+  component coverage; their own wiring is checked by hand. Open a writable
+  Workspace tab, click Edit on a message you sent there, and confirm that tab's
+  composer fills while the main one stays empty. In a grid pane, Edit fills that
+  cell's composer, which shares the session's draft: after switching to the
+  full-screen view, the same text, tags and review comments show in its composer.
 - **`delivered-send-recovery`, in-session composer (desktop and mobile):**
   `tests/e2e_ui/mobile/test_composer_after_unacked_send.py::test_composer_stays_empty_after_delivered_but_unacked_send`
   runs with a phone viewport. Run the same lost-ack journey at a desktop viewport

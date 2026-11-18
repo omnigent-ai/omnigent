@@ -1549,6 +1549,12 @@ def _load_agent_spec_bundle(
         without_user_inbox_tools,
     )
     from omnigent.mcp_selection import MCP_SELECTION_HEADER, selected_mcp_spec
+    from omnigent.memory_availability import (
+        MEMORY_HEADER,
+        MEMORY_SEARCH_HEADER,
+        without_memory_search,
+        without_memory_tools,
+    )
     from omnigent.policies.registry import LOCAL_SINGLE_USER_HEADER
     from omnigent.runner.native import ResolvedSpec
     from omnigent.spec import load
@@ -1584,6 +1590,10 @@ def _load_agent_spec_bundle(
         # tools need the server to turn them on.
         if resp.headers.get(USER_INBOX_HEADER) != "1":
             spec = without_user_inbox_tools(spec)
+        if resp.headers.get(MEMORY_HEADER) != "1":
+            spec = without_memory_tools(spec)
+        elif resp.headers.get(MEMORY_SEARCH_HEADER) != "1":
+            spec = without_memory_search(spec)
         _apply_host_interactive_shells(spec)
     except Exception:
         shutil.rmtree(dest, ignore_errors=True)

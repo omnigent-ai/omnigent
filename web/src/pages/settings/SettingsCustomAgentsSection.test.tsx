@@ -236,6 +236,39 @@ describe("Custom agents settings", () => {
     );
   });
 
+  it("renders the list from its Settings catalog entry, with each agent's open link and paging", async () => {
+    vi.mocked(authenticatedFetch).mockImplementation(async (input) => {
+      const url = new URL(String(input), "http://localhost");
+      if (url.searchParams.get("scope") !== "user") return response(page([polly]));
+      return response(page(users, true, "a2"));
+    });
+    mount();
+    await screen.findAllByRole("link", { name: "research" });
+
+    expect(document.querySelector('[data-settings-item="custom-agents-list"]')).not.toBeNull();
+    expect(screen.getByRole("searchbox", { name: "Search agents" })).toHaveAttribute(
+      "data-settings-control",
+      "custom-agents-list:search",
+    );
+    expect(
+      document.querySelector('[data-settings-region="custom-agents-list:yourAgents"]'),
+    ).not.toBeNull();
+    expect(
+      document.querySelector('[data-settings-region="custom-agents-list:serverAgents"]'),
+    ).not.toBeNull();
+    expect(screen.getByRole("link", { name: "Create" })).toHaveAttribute(
+      "data-settings-control",
+      "custom-agents-list:create",
+    );
+    const yoursLink = screen.getAllByRole("link", { name: "research" })[0];
+    expect(yoursLink.getAttribute("data-settings-row-action")).toBe("open");
+    expect(
+      screen
+        .getByRole("button", { name: "Load more agents" })
+        .getAttribute("data-settings-control"),
+    ).toBe("custom-agents-list:loadMoreYours");
+  });
+
   it("updates search results when the term or loaded pages change", async () => {
     vi.mocked(authenticatedFetch).mockImplementation(async (input) => {
       const url = new URL(String(input), "http://localhost");
@@ -296,6 +329,14 @@ describe("Custom agents settings", () => {
     fireEvent.click(screen.getByRole("button", { name: "Delete agent" }));
     fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Delete" }));
     expect(await screen.findByText(/2 session\(s\) still use/)).toBeVisible();
+    expect(screen.getByRole("dialog")).toHaveAttribute(
+      "data-settings-overlay-owner",
+      "custom-agent-detail:delete",
+    );
+    expect(screen.getByRole("button", { name: "Remove anyway" })).toHaveAttribute(
+      "data-settings-control",
+      "custom-agent-detail:confirmDelete",
+    );
     expect(authenticatedFetch).not.toHaveBeenCalledWith(
       expect.stringContaining("force=true"),
       expect.anything(),
@@ -383,6 +424,46 @@ async function openEditor() {
 }
 
 describe("editing custom agents", () => {
+  it("renders the create page from its Settings catalog entry, and keeps its names", async () => {
+    vi.mocked(authenticatedFetch).mockImplementation(async (input) => {
+      const url = new URL(String(input), "http://localhost");
+      if (url.pathname.endsWith("/v1/agent-harnesses") || url.searchParams.has("scope"))
+        return response(page([]));
+      return response({});
+    });
+    mount("/settings/custom-agents/new");
+    const name = await screen.findByRole("textbox", { name: "Name *" });
+    expect(document.querySelector('[data-settings-item="custom-agent-create"]')).not.toBeNull();
+    expect(name).toHaveAttribute("data-settings-control", "custom-agent-create:name");
+    expect(screen.getByRole("textbox", { name: "Model *" })).toHaveAttribute(
+      "data-settings-control",
+      "custom-agent-create:model",
+    );
+    expect(screen.getByRole("button", { name: "Save agent" })).toHaveAttribute(
+      "data-settings-control",
+      "custom-agent-create:submit",
+    );
+  });
+  it("renders the agent page from its Settings catalog entry, with Cancel owning the discard dialog", async () => {
+    configResponses();
+    await openEditor();
+
+    expect(document.querySelector('[data-settings-item="custom-agent-detail"]')).not.toBeNull();
+    expect(screen.getByLabelText("Description")).toHaveAttribute(
+      "data-settings-control",
+      "custom-agent-detail:description",
+    );
+    expect(screen.getByRole("button", { name: "Save changes" })).toHaveAttribute(
+      "data-settings-control",
+      "custom-agent-detail:save",
+    );
+    fireEvent.change(screen.getByLabelText("Description"), { target: { value: "Unsaved" } });
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(await screen.findByRole("dialog")).toHaveAttribute(
+      "data-settings-overlay-owner",
+      "custom-agent-detail:cancel",
+    );
+  });
   it("adds an MCP server without native crypto.randomUUID", async () => {
     vi.stubGlobal("crypto", {
       getRandomValues: globalThis.crypto.getRandomValues.bind(globalThis.crypto),

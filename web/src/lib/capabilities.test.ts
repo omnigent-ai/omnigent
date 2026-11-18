@@ -296,6 +296,7 @@ describe.each([
   "scheduled_task_inbox",
   "scheduled_task_sharing",
   "scheduled_task_shared_with_me",
+  "scheduled_task_run_pull_requests",
   "proactive_agent_available",
   "session_create_workflow_id",
 ] as const)("resolveServerInfo %s", (capability) => {

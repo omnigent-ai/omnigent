@@ -15,6 +15,7 @@ import {
 } from "@/components/workflows/RunTasks";
 import { Button } from "@/components/ui/button";
 import { WorkflowGraphOverlay } from "@/components/workflows/WorkflowStepsGraph";
+import { useConversationEntryValue } from "@/hooks/useConversationEntryState";
 import { useNow } from "@/hooks/useNow";
 import { useSessionWorking } from "@/hooks/useSessionWorking";
 import { useWorkflowRunDescendants, useWorkflowRuns } from "@/hooks/useWorkflow";
@@ -24,6 +25,7 @@ import type { StepState } from "@/lib/sessionJournal";
 import { cn } from "@/lib/utils";
 import {
   describeWorkflowRun,
+  isWorkflowRunLaunching,
   isWorkflowRunWorking,
   runStepProgress,
   type WorkflowRun,
@@ -69,10 +71,16 @@ export function WorkflowRunRow({
   /** For a run listed below another, that run's session, whose runs need no "Started by". */
   parentSessionId?: string;
 }) {
-  const sessionWorking = useSessionWorking(
-    run.isCurrent ? run.sessionId : null,
-    isWorkflowRunWorking(run),
+  const sessionId = run.isCurrent ? run.sessionId : null;
+  // A failed launch this page streams outranks the run list, which learns of it a refresh later.
+  const launchFailed = useConversationEntryValue(
+    sessionId,
+    (state) => state.sandboxStatus?.stage === "failed",
   );
+  const listed = launchFailed ? { ...run, sandboxLaunching: false } : run;
+  // The sidebar's status for the session leaves out a sandbox launch, so it can't settle one.
+  const sessionWorking =
+    useSessionWorking(sessionId, isWorkflowRunWorking(listed)) || isWorkflowRunLaunching(listed);
   const state = describeWorkflowRun(run, sessionWorking);
   const progress = useMemo(() => runStepProgress(run, sessionWorking), [run, sessionWorking]);
   const nested = parentSessionId !== undefined;

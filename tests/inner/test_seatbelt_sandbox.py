@@ -225,6 +225,24 @@ def test_resolve_explicit_cwd_allow_hidden_overrides_default() -> None:
     assert policy.cwd_allow_hidden == [".cache", ".npmrc"]
 
 
+@pytest.mark.parametrize(
+    ("allow_hidden", "warns"), [([".git"], True), (["*"], True), (None, False)]
+)
+def test_resolve_warns_when_cwd_allow_hidden_exposes_git(
+    allow_hidden: list[str] | None, warns: bool, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Exposing ``.git`` to the agent is logged; the default allowlist is silent."""
+    if sys.platform != "darwin":
+        pytest.skip("seatbelt resolver requires macOS host")
+    spec = OSEnvSpec(
+        type="caller_process",
+        sandbox=OSEnvSandboxSpec(type="darwin_seatbelt", cwd_allow_hidden=allow_hidden),
+    )
+    with caplog.at_level("WARNING", logger="omnigent.inner.seatbelt_sandbox"):
+        _make_backend().resolve(spec, Path.cwd())
+    assert any(".git" in record.message for record in caplog.records) is warns
+
+
 def test_resolve_env_passthrough_propagates_to_policy() -> None:
     """
     ``env_passthrough`` in the spec lands on the policy verbatim so
