@@ -8876,7 +8876,9 @@ async def _execute_os_env_tool(
         is not tracked — shell side-effects cannot be attributed to a
         session.
     :param resource_registry: Owner of the session's reusable environment;
-        without it (or a session id) each call starts its own helper.
+        ordinary shells use a separate disposable helper. Scratch-mode calls
+        share their private workspace until the shell retires it. Without a
+        registry (or a session id) each call starts its own helper.
     :returns: Serialized tool result string.
     """
     from omnigent.inner.os_env import _DEFAULT_READ_LIMIT, create_os_environment
@@ -8905,13 +8907,15 @@ async def _execute_os_env_tool(
             if (
                 resource_registry is not None
                 and conversation_id is not None
+                and (tool_name != SysOsShellTool.name() or effective_spec.start_in_scratch)
                 and not effective_spec.fork
                 and (
                     effective_spec.sandbox is None
                     or effective_spec.sandbox.credential_proxy is None
                 )
             ):
-                # Reuse the session's warm helper; a busy one leaves this call its own.
+                # Scratch calls share their private workspace until retirement.
+                # Other shells stay disposable, leaving cached file helpers intact.
                 tool_lease = await resource_registry.lease_tool_environment(
                     conversation_id, effective_spec
                 )
