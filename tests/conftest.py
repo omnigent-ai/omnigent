@@ -391,6 +391,18 @@ def _no_workspace_probe(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
+@pytest.fixture(autouse=True)
+def _fresh_gh_accounts(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Start each test without a gh account list reused from an earlier test.
+
+    Tests stub ``_list_accounts`` or ``_gh`` per test, but the cache key is gh's
+    real local auth state, which no test changes.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    monkeypatch.setattr("omnigent.runner.github_resource._accounts_cache", None)
+
+
 @pytest.fixture
 def frozen_recurrence_clock(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep a slow runner from tripping the RRULE search's CPU-time limit.
