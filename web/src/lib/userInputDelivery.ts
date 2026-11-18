@@ -39,7 +39,9 @@ export async function sendVerdictFromServer(
   signal?: AbortSignal,
 ): Promise<"refused" | "delivered" | null> {
   try {
-    const session = await getSessionSlim(sessionId, signal ? { signal } : undefined);
+    const session = await (signal
+      ? getSessionSlim(sessionId, { signal })
+      : getSessionSlim(sessionId));
     return snapshotRefusesSend(session, stableId) ? "refused" : "delivered";
   } catch {
     return null;
