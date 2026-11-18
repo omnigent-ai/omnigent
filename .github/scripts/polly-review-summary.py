@@ -209,7 +209,7 @@ def compose_review(review: str, stats: dict) -> str:
     if stats["test_files"]:
         header = TEST_HEADER
         header_seen = False
-        for line in sections["Tests"].splitlines():
+        for line in sections["Tests"].split("\n"):
             if not line.strip().startswith("|"):
                 continue
             cells = [cell.strip() for cell in split_table_row(line.strip().strip("|"))]
@@ -327,7 +327,7 @@ def _markdown_context(
     table_header = ""
     assessment_table = False
     previous = ""
-    for line in text.splitlines():
+    for line in text.removesuffix("\n").split("\n"):
         if fence:
             if re.fullmatch(rf" {{0,3}}{re.escape(fence[0])}{{{len(fence)},}}\s*", line):
                 fence = ""
