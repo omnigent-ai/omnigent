@@ -224,6 +224,7 @@ class ExecutorAdapter(HarnessApp):
         super().__init__()
         self._executor_factory = executor_factory
         self._executor_factory_on_thread = executor_factory_on_thread
+        self._executor_factory_lock = asyncio.Lock()
         self._session_key = session_key or uuid.uuid4().hex
         # Harness label used in elicitation messages, e.g. "Claude wants to call **Bash**".
         self._harness_label = harness_label
@@ -1228,21 +1229,24 @@ class ExecutorAdapter(HarnessApp):
         return self._executor
 
     async def _ensure_executor_for_turn(self) -> Executor:
-        if not self._executor_factory_on_thread or self._executor is not None:
+        if not self._executor_factory_on_thread:
             return self._ensure_executor()
-        build_task = asyncio.create_task(asyncio.to_thread(self._executor_factory))
-        try:
-            executor = await asyncio.shield(build_task)
-        except BaseException:
-            # A cancelled turn still owns any proxy and launcher the factory created.
-            with contextlib.suppress(BaseException):
-                await await_cleanup_task(build_task)
-                executor = build_task.result()
-                cleanup_task = asyncio.create_task(executor.close())
-                await await_cleanup_task(cleanup_task)
-            raise
-        self._executor = executor
-        return executor
+        async with self._executor_factory_lock:
+            if self._executor is not None:
+                return self._executor
+            build_task = asyncio.create_task(asyncio.to_thread(self._executor_factory))
+            try:
+                executor = await asyncio.shield(build_task)
+            except BaseException:
+                # A cancelled turn still owns any proxy and launcher the factory created.
+                with contextlib.suppress(BaseException):
+                    await await_cleanup_task(build_task)
+                    executor = build_task.result()
+                    cleanup_task = asyncio.create_task(executor.close())
+                    await await_cleanup_task(cleanup_task)
+                raise
+            self._executor = executor
+            return executor
 
     def _translate_event(self, event: ExecutorEvent, ctx: TurnContext) -> None:
         """Translate one inner ExecutorEvent into Omnigent SSE events via ``ctx.emit``."""

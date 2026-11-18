@@ -63,6 +63,33 @@ async def test_threaded_executor_factory_cancellation_closes_completed_startup()
         release.set()
 
 
+async def test_threaded_executor_factory_is_shared_by_overlapping_first_turns() -> None:
+    """Only one Claude executor may own the first turn's proxy and launcher."""
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    started = threading.Event()
+    release = threading.Event()
+    built: list[Executor] = []
+    executor = AsyncMock(spec=Executor)
+
+    def build_executor() -> Executor:
+        built.append(executor)
+        started.set()
+        assert release.wait(timeout=5)
+        return executor
+
+    adapter = ExecutorAdapter(executor_factory=build_executor, executor_factory_on_thread=True)
+    first = asyncio.create_task(adapter._ensure_executor_for_turn())
+    second = asyncio.create_task(adapter._ensure_executor_for_turn())
+    try:
+        assert await asyncio.to_thread(started.wait, 5)
+        release.set()
+        assert await asyncio.gather(first, second) == [executor, executor]
+        assert built == [executor]
+    finally:
+        release.set()
+
+
 def _start_turn_body() -> dict[str, Any]:
     """Return a minimal session-keyed ``message`` event body that starts a turn.
 
