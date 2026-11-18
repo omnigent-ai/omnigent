@@ -13981,23 +13981,24 @@ async def test_named_send_reused_in_flight_post_failure_keeps_tracking(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "provisional_failure",
-    [False, True],
-    ids=["already-running", "late-running-after-provisional-failure"],
+    ("provisional_failure", "reported_start", "acceptance_before_adoption"),
+    [
+        pytest.param(False, True, True, id="already-running"),
+        pytest.param(True, True, True, id="late-running-after-provisional-failure"),
+        pytest.param(True, False, True, id="silent-after-timeout-accept-before-adoption"),
+        pytest.param(True, False, False, id="silent-after-timeout-accept-after-adoption"),
+    ],
 )
 async def test_named_send_adopts_busy_child_as_running_not_launching(
     monkeypatch: pytest.MonkeyPatch,
     provisional_failure: bool,
+    reported_start: bool,
+    acceptance_before_adoption: bool,
 ) -> None:
-    """A server-busy child with no local work entry is adopted as a running turn.
+    """A busy child is adopted as running while retaining its native turn evidence.
 
-    After a runner restart the in-flight turn's local bookkeeping is gone, but the
-    server still reports the child busy. Pre-PR this was refused ("is already
-    running"); the fix adopts it -- stamping a dispatch id and registering one
-    entry so its result is delivered (review issue #1) -- and registers that entry
-    directly in ``running`` (not ``launching``), so the launch-timeout reaper
-    cannot fail a long-running steered turn whose buffered nudge is waiting for it
-    to yield (review issue #3).
+    A reported start keeps it exempt. A silent, unresolved turn keeps its original
+    acceptance time after provisional failure and replacement.
     """
     from omnigent.runner import app as runner_app
 
@@ -14019,6 +14020,7 @@ async def test_named_send_adopts_busy_child_as_running_not_launching(
     )
     inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
     subagent_work._session_inboxes_ref[parent_id] = inbox
+    dispatch: subagent_work._SubagentWorkEntry | None = None
     try:
         if provisional_failure:
             dispatch = subagent_work.register_subagent_work(
@@ -14028,25 +14030,55 @@ async def test_named_send_adopts_busy_child_as_running_not_launching(
                 title="merge-task",
             )
             dispatch.status = "running"
-            accept_subagent_turn(child_id, thread_id="thread_busy", response_id="codex_busy")
+            accept_subagent_turn(
+                child_id,
+                thread_id="thread_busy",
+                response_id="codex_busy",
+                now=None if reported_start else 1000.0,
+            )
+            if not reported_start:
+                assert (
+                    subagent_work.reap_stalled_subagent_launches(now=1179.0, timeout_s=180.0) == []
+                )
             provisional = subagent_work.reap_stalled_subagent_launches(
-                now=time.time() + 7200.0, timeout_s=180.0
+                now=time.time() + 7200.0 if reported_start else 1181.0, timeout_s=180.0
             )
             assert [entry.child_session_id for entry in provisional] == [child_id]
             assert dispatch.status == "failed"
         # The late report outlives any provisional failure and precedes adoption.
-        subagent_work.note_subagent_child_start_reported(child_id, response_id="codex_busy")
+        if reported_start:
+            subagent_work.note_subagent_child_start_reported(child_id, response_id="codex_busy")
+        elif acceptance_before_adoption:
+            accept_subagent_turn(
+                child_id, thread_id="thread_busy", response_id="codex_busy", now=1300.0
+            )
         output = await _run_named_continuation(parent_id, handler)
         work = subagent_work.get_subagent_work(child_id)
         assert work is not None
         assert work.status == "running"
-        assert work.child_start_reported is True
-        # The steer's own finished turn arms the launch bound; the start already reported
-        # keeps it disarmed, so a steer into a running turn is never reaped.
-        accept_subagent_turn(child_id, thread_id="thread_busy", response_id="codex_busy")
-        reaped = subagent_work.reap_stalled_subagent_launches(
-            now=work.created_at + 7200.0, timeout_s=180.0
+        if reported_start:
+            assert work.child_start_reported is True
+        else:
+            assert work.child_start_reported is False
+        # A real start keeps the bound disarmed; a silent turn retains its acceptance age.
+        accept_subagent_turn(
+            child_id,
+            thread_id="thread_busy",
+            response_id="codex_busy",
+            now=None if reported_start else 1300.0,
         )
+        if reported_start:
+            reaped = subagent_work.reap_stalled_subagent_launches(
+                now=work.created_at + 7200.0, timeout_s=180.0
+            )
+        else:
+            assert work.awaiting_child_start_since == 1000.0
+            assert subagent_work._children_accepted_turns[child_id].accepted_at == 1000.0
+            reaped = subagent_work.reap_stalled_subagent_launches(now=1301.0, timeout_s=180.0)
+            assert reaped == [work]
+            assert work.status == "failed"
+            assert work.launch_timed_out
+            assert subagent_work.reap_stalled_subagent_launches(now=1302.0, timeout_s=180.0) == []
     finally:
         subagent_work.unregister_subagent_work_for_session(child_id)
         subagent_work._session_inboxes_ref.pop(parent_id, None)
@@ -14061,10 +14093,19 @@ async def test_named_send_adopts_busy_child_as_running_not_launching(
     # Adopted directly as running (not launching) so it is safe from the reaper,
     # and the entry carries the freshly stamped id so its completion delivers.
     assert work.work_id == stamped[0]
-    assert reaped == []
-    assert work.status == "running"
+    if reported_start:
+        assert reaped == []
+        assert work.status == "running"
     assert len(event_posts) == 1
-    if provisional_failure:
+    if not reported_start:
+        assert dispatch is not None
+        assert inbox.qsize() == 2
+        notices = [inbox.get_nowait(), inbox.get_nowait()]
+        assert [notice["work_id"] for notice in notices] == [dispatch.work_id, work.work_id]
+        assert all(notice["status"] == "failed" for notice in notices)
+        assert all("no turn start" in notice["output"] for notice in notices)
+        assert inbox.empty()
+    elif provisional_failure:
         assert inbox.qsize() == 1
         assert inbox.get_nowait()["status"] == "failed"
     else:

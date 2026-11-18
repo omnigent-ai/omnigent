@@ -220,7 +220,7 @@ class _AcceptedChildTurn:
 _subagent_work_by_child: dict[str, _SubagentWorkEntry] = {}
 _subagent_work_by_parent: dict[str, set[str]] = {}
 # Turn evidence survives dispatch draining or replacement until the matching settlement.
-# Registration consumes accepted turns; reported starts remain until settlement.
+# Applying acceptance evidence does not consume the unresolved turn's original timestamp.
 _children_reporting_start: dict[str, str | None] = {}
 _children_accepted_turns: dict[str, _AcceptedChildTurn] = {}
 # Pending request evidence survives settlement until delivery finalization or deletion.
@@ -484,9 +484,9 @@ def note_subagent_child_turn_settled(
 
 
 def apply_child_start_evidence(entry: _SubagentWorkEntry) -> None:
-    """Transfer retained acceptance/start evidence into one newly registered dispatch."""
+    """Apply retained acceptance/start evidence to one newly registered dispatch."""
     child_id = entry.child_session_id
-    accepted = _children_accepted_turns.pop(child_id, None)
+    accepted = _children_accepted_turns.get(child_id)
     reported = child_id in _children_reporting_start and (
         accepted is None
         or _children_reporting_start[child_id] is None
@@ -506,11 +506,6 @@ def apply_child_start_evidence(entry: _SubagentWorkEntry) -> None:
         entry.child_start_reported = True
         entry.child_start_response_id = _children_reporting_start[child_id]
         entry.awaiting_child_start_since = None
-
-
-def child_start_already_reported(child_session_id: str) -> bool:
-    """Return whether an unsettled start report exists for this child."""
-    return child_session_id in _children_reporting_start
 
 
 def arm_subagent_child_start_timeout(
@@ -559,21 +554,21 @@ def arm_subagent_child_start_timeout(
         and _children_reporting_start[child_session_id] in (None, acceptance.response_id)
     )
     stamp = time.time() if now is None else now
+    accepted = _children_accepted_turns.get(child_session_id)
+    if accepted is not None and accepted.acceptance == acceptance:
+        accepted.start_reported |= reported
+    else:
+        accepted = _AcceptedChildTurn(acceptance, stamp, reported)
+        _children_accepted_turns[child_session_id] = accepted
     if entry is None or entry.status != "running":
-        previous = _children_accepted_turns.get(child_session_id)
-        if previous is not None and previous.acceptance == acceptance:
-            previous.start_reported |= reported
-        else:
-            _children_accepted_turns[child_session_id] = _AcceptedChildTurn(
-                acceptance, stamp, reported
-            )
         return
     if entry.child_start_reported:
         if entry.child_start_response_id in (None, acceptance.response_id):
+            accepted.start_reported = True
             return
         entry.child_start_reported = False
         entry.child_start_response_id = None
-    if reported:
+    if accepted.start_reported:
         entry.child_start_reported = True
         entry.child_start_response_id = (
             acceptance.response_id
@@ -581,8 +576,8 @@ def arm_subagent_child_start_timeout(
             else None
         )
         entry.awaiting_child_start_since = None
-    elif entry.native_acceptance != acceptance or entry.awaiting_child_start_since is None:
-        entry.awaiting_child_start_since = stamp
+    else:
+        entry.awaiting_child_start_since = accepted.accepted_at
     entry.native_acceptance = acceptance
 
 

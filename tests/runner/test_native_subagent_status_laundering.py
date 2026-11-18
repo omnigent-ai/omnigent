@@ -496,6 +496,7 @@ async def test_native_prompt_delivery_acknowledges_the_launch() -> None:
 _START_BUDGET_S = 180.0
 _PREVIOUS_ACCEPTED_AT = 1000.0
 _STEER_ACCEPTED_AT = 5000.0
+_POST_TIMEOUT_STEER_ACCEPTED_AT = 1300.0
 
 
 def _drive_steer_lifecycle(
@@ -511,6 +512,7 @@ def _drive_steer_lifecycle(
     ``accept_prev`` / ``run_prev`` / ``settle_prev`` belong to the previous turn; ``accept_steer``
     / ``run_steer`` to the steered turn; ``register`` is the steer's fresh registration;
     ``drain_old`` drains the previous dispatch's result; ``forget_session`` deletes the child.
+    ``reap_prev`` provisionally fails the accepted turn before a later same-session steer.
     """
     previous = subagent_work.register_subagent_work(
         parent_session_id=parent_id, child_session_id=child_id, agent="codex", title="review"
@@ -544,25 +546,58 @@ def _drive_steer_lifecycle(
                     ),
                 )
             elif event in ("settle_prev", "settle_unidentified"):
+                accepted = subagent_work._children_accepted_turns.get(child_id)
                 subagent_work.note_subagent_child_turn_settled(
                     child_id,
                     response_id=previous_acceptance.response_id
                     if event == "settle_prev"
                     else None,
                 )
-                assert not subagent_work.child_start_already_reported(child_id)
-                assert child_id not in subagent_work._children_accepted_turns
+                assert child_id not in subagent_work._children_reporting_start
+                if (
+                    event == "settle_unidentified"
+                    or accepted is None
+                    or accepted.acceptance.response_id == previous_response_id
+                ):
+                    assert child_id not in subagent_work._children_accepted_turns
+                else:
+                    assert subagent_work._children_accepted_turns.get(child_id) is accepted
             elif event == "begin_steer":
                 steer_request = subagent_work.begin_subagent_child_acceptance(child_id)
-            elif event == "accept_steer":
+            elif event in ("accept_steer", "accept_steer_after_timeout"):
                 if steer_request is None:
                     steer_request = subagent_work.begin_subagent_child_acceptance(child_id)
                 subagent_work.arm_subagent_child_start_timeout(
                     child_id,
                     acceptance=steer_acceptance,
                     request=steer_request,
-                    now=_STEER_ACCEPTED_AT,
+                    now=(
+                        _POST_TIMEOUT_STEER_ACCEPTED_AT
+                        if event == "accept_steer_after_timeout"
+                        else _STEER_ACCEPTED_AT
+                    ),
                 )
+            elif event == "reap_prev":
+                assert fresh is not None
+                assert (
+                    subagent_work.reap_stalled_subagent_launches(
+                        now=_PREVIOUS_ACCEPTED_AT + _START_BUDGET_S - 1.0,
+                        timeout_s=_START_BUDGET_S,
+                    )
+                    == []
+                )
+                assert subagent_work.reap_stalled_subagent_launches(
+                    now=_PREVIOUS_ACCEPTED_AT + _START_BUDGET_S + 1.0,
+                    timeout_s=_START_BUDGET_S,
+                ) == [fresh]
+                assert fresh.status == "failed"
+                assert fresh.launch_timed_out
+                inbox = subagent_work._session_inboxes_ref[parent_id]
+                notice = inbox.get_nowait()
+                assert notice["work_id"] == fresh.work_id
+                assert notice["status"] == "failed"
+                assert "no turn start" in notice["output"]
+                assert inbox.empty()
             elif event in ("accept_receiptless", "accept_malformed", "accept_other_session"):
                 if steer_request is None:
                     steer_request = subagent_work.begin_subagent_child_acceptance(child_id)
@@ -739,6 +774,34 @@ def _drive_steer_lifecycle(
             id="events16-1000.0",
         ),
         pytest.param(
+            ["register", "accept_prev", "reap_prev", "accept_steer_after_timeout", "register"],
+            "codex_previous",
+            "codex_previous",
+            _PREVIOUS_ACCEPTED_AT,
+            id="post-timeout-same-turn-accept-before-registration",
+        ),
+        pytest.param(
+            ["register", "accept_prev", "reap_prev", "register", "accept_steer_after_timeout"],
+            "codex_previous",
+            "codex_previous",
+            _PREVIOUS_ACCEPTED_AT,
+            id="post-timeout-same-turn-accept-after-registration",
+        ),
+        pytest.param(
+            ["register", "accept_prev", "reap_prev", "accept_steer_after_timeout", "register"],
+            "codex_previous",
+            "codex_steer",
+            _POST_TIMEOUT_STEER_ACCEPTED_AT,
+            id="post-timeout-distinct-turn-accept-before-registration",
+        ),
+        pytest.param(
+            ["register", "accept_prev", "reap_prev", "register", "accept_steer_after_timeout"],
+            "codex_previous",
+            "codex_steer",
+            _POST_TIMEOUT_STEER_ACCEPTED_AT,
+            id="post-timeout-distinct-turn-accept-after-registration",
+        ),
+        pytest.param(
             ["accept_prev", "accept_receiptless", "register"],
             "codex_previous",
             "codex_steer",
@@ -877,16 +940,22 @@ async def test_steered_turn_is_bounded_from_its_own_acceptance(
             assert fresh.status == "running"
             assert inbox.empty()
             return
-        # Still inside the budget from its own acceptance: the steer keeps its full budget.
-        assert (
-            subagent_work.reap_stalled_subagent_launches(
-                now=expected_start + _START_BUDGET_S - 1.0, timeout_s=_START_BUDGET_S
+        if "reap_prev" in events and previous_response_id == current_response_id:
+            assert subagent_work._children_accepted_turns[child_id].accepted_at == expected_start
+            reaped = subagent_work.reap_stalled_subagent_launches(
+                now=_POST_TIMEOUT_STEER_ACCEPTED_AT + 1.0, timeout_s=_START_BUDGET_S
             )
-            == []
-        )
-        reaped = subagent_work.reap_stalled_subagent_launches(
-            now=expected_start + _START_BUDGET_S + 1.0, timeout_s=_START_BUDGET_S
-        )
+        else:
+            # A distinct turn keeps its full budget from its own acceptance.
+            assert (
+                subagent_work.reap_stalled_subagent_launches(
+                    now=expected_start + _START_BUDGET_S - 1.0, timeout_s=_START_BUDGET_S
+                )
+                == []
+            )
+            reaped = subagent_work.reap_stalled_subagent_launches(
+                now=expected_start + _START_BUDGET_S + 1.0, timeout_s=_START_BUDGET_S
+            )
         assert [entry.child_session_id for entry in reaped] == [child_id]
         assert fresh.status == "failed"
         notice = inbox.get_nowait()
@@ -902,6 +971,7 @@ async def test_steered_turn_is_bounded_from_its_own_acceptance(
         assert inbox.empty()
     finally:
         subagent_work.unregister_subagent_work_for_session(child_id)
+        assert child_id not in subagent_work._children_accepted_turns
         subagent_work._session_inboxes_ref.pop(parent_id, None)
 
 
