@@ -148,7 +148,7 @@ async def _runner(
     terminals = TerminalRegistry()
     resources = SessionResourceRegistry(terminal_registry=terminals)
     async with httpx.AsyncClient(
-        transport=httpx.MockTransport(snapshot), base_url="http://server"
+        transport=httpx.MockTransport(snapshot), base_url="http://server.example.test"
     ) as server:
         app = create_runner_app(
             resource_registry=resources,
@@ -157,7 +157,7 @@ async def _runner(
             spec_resolver=resolve,
         )
         async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=app), base_url="http://runner"
+            transport=httpx.ASGITransport(app=app), base_url="http://runner.example.test"
         ) as client:
             try:
                 yield client, terminals, resources
