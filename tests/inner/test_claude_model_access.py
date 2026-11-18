@@ -5,9 +5,10 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 import ssl
-import subprocess
 import sys
+import sysconfig
 import time
 import venv
 from pathlib import Path
@@ -1236,19 +1237,34 @@ def auth_runtime(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path,
     from omnigent.inner.model_auth import _TrustedExecutable
 
     runtime = tmp_path / "auth-venv"
-    system_python = Path(f"/usr/bin/python{sys.version_info.major}.{sys.version_info.minor}")
-    if sys.platform == "linux" and system_python.is_file():
-        # CI's Python toolcache can be world-writable; use the system runtime.
-        subprocess.run(
-            [str(system_python), "-m", "venv", "--without-pip", "--copies", str(runtime)],
-            check=True,
-        )
-    else:
-        venv.EnvBuilder(with_pip=False, symlinks=sys.platform != "linux").create(runtime)
+    venv.EnvBuilder(with_pip=False, symlinks=sys.platform != "linux").create(runtime)
     interpreter = runtime / "bin/python"
     if sys.platform == "linux":
         interpreter.unlink()
         interpreter.symlink_to(f"python{sys.version_info.major}.{sys.version_info.minor}")
+        # Keep the test base runtime private without copying the entire stdlib.
+        base = tmp_path / "auth-base"
+        base_bin = base / "bin"
+        base_bin.mkdir(parents=True)
+        base_python = base_bin / f"python{sys.version_info.major}.{sys.version_info.minor}"
+        shutil.copy2(sys._base_executable, base_python)
+        base_python.chmod(0o500)
+        (base / "lib").mkdir()
+        (base / "lib" / base_python.name).symlink_to(
+            Path(sysconfig.get_path("stdlib")).resolve(strict=True), target_is_directory=True
+        )
+        config = runtime / "pyvenv.cfg"
+        config.write_text(
+            "\n".join(
+                f"home = {base_bin}"
+                if line.startswith("home = ")
+                else f"executable = {base_python}"
+                if line.startswith("executable = ")
+                else line
+                for line in config.read_text().splitlines()
+            )
+            + "\n"
+        )
     packages = (
         runtime
         / "lib"
