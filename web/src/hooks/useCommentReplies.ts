@@ -1,5 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { authenticatedFetch } from "@/lib/identity";
+import { apiErrorFromResponse } from "@/lib/sessionsApi";
 
 export interface CommentReply {
   id: string;
@@ -22,14 +23,7 @@ function repliesUrl(sessionId: string, commentId: string) {
 }
 
 async function replyResponse(response: Response) {
-  if (!response.ok) {
-    const error = await response.json().catch(() => null);
-    throw new Error(
-      typeof error?.detail === "string"
-        ? error.detail
-        : `Unable to update replies (${response.status}). Please try again.`,
-    );
-  }
+  if (!response.ok) throw await apiErrorFromResponse(response);
   return response.json();
 }
 

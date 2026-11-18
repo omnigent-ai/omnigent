@@ -53,8 +53,10 @@ it("posts a body and invalidates parent lists and threads", async () => {
   );
   expect(invalidate).toHaveBeenCalledWith({ queryKey: ["comments", "s"] });
 });
-it.each([400, 409])("preserves the server's inline error for %s", async (status) => {
-  fetchMock.mockResolvedValue(response({ detail: "Reply limit reached" }, status));
+it.each([400, 403, 404, 409])("preserves the server's inline error for %s", async (status) => {
+  fetchMock.mockResolvedValue(
+    response({ error: { code: "conflict", message: "Reply limit reached" } }, status),
+  );
   const { result } = renderHook(() => useAddCommentReply("s", "c"), { wrapper: setup().wrapper });
   await act(async () => {
     await expect(result.current.mutateAsync("A reply")).rejects.toThrow("Reply limit reached");
