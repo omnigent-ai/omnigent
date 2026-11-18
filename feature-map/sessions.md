@@ -403,10 +403,13 @@ also reveals **Remove from nest** above the sidebar sections. For keyboard or
 touch use, open the row's kebab or right-click menu → **Move session**, then
 choose a nest or **Remove from nest**. The destination nest expands after a move.
 Typing a nest name also searches beyond the sessions already loaded in the sidebar.
+**Show more** loads the next page without closing the picker. If a search or
+page fails, **Couldn’t search nests. Retry** retries that request.
 Removing the representative promotes the oldest remaining active member.
 Personal pins remain saved for detachment and do not change the destination's
 pin state. On servers with restricted nested-agent destinations, start standalone
 sessions on a host before joining; a rejected move leaves the original nest intact.
+Disabling nested-agent creation blocks joining, while existing members can still leave.
 
 **Custom order:** with `sidebar_grouping_ui` on (the default), drag one of your sessions onto
 another row in the same list, project or group and release it; a line like the

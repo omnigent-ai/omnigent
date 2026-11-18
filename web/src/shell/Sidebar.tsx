@@ -2964,7 +2964,8 @@ function ConversationList({
     project: string | null;
     isPinned: boolean;
     familyId?: string;
-    canMoveNest: boolean;
+    canJoinNest: boolean;
+    canDetachNest: boolean;
   } | null>(null);
   // Mouse: a small drag threshold so a plain click still navigates / opens the
   // kebab. Touch: a press-and-hold delay so scrolling the list isn't hijacked
@@ -3015,7 +3016,8 @@ function ConversationList({
           project?: string | null;
           isPinned?: boolean;
           familyId?: string;
-          canMoveNest?: boolean;
+          canJoinNest?: boolean;
+          canDetachNest?: boolean;
         }
       | undefined;
     setActiveDrag({
@@ -3024,7 +3026,8 @@ function ConversationList({
       project: data?.project ?? null,
       isPinned: data?.isPinned ?? false,
       familyId: data?.familyId,
-      canMoveNest: data?.canMoveNest === true,
+      canJoinNest: data?.canJoinNest === true,
+      canDetachNest: data?.canDetachNest === true,
     });
   }, []);
   const handleDragEnd = useCallback(
@@ -3050,7 +3053,11 @@ function ConversationList({
       }
       const over = event.over?.data.current;
       if (over?.type === "nest" || over?.type === "remove-from-nest") {
-        if (!dragged.canMoveNest || moveToNest.isPending) return;
+        if (
+          !(over.type === "nest" ? dragged.canJoinNest : dragged.canDetachNest) ||
+          moveToNest.isPending
+        )
+          return;
         const sourceId = over.type === "nest" ? (over.id as string) : null;
         moveToNest.mutate(
           { id: dragged.id, sourceId },
@@ -3530,7 +3537,7 @@ function ConversationList({
                   const rect = args.droppableRects.get(container.id);
                   const pointer = args.pointerCoordinates;
                   return (
-                    source?.canMoveNest === true &&
+                    source?.canJoinNest === true &&
                     target.familyId !== source.familyId &&
                     target.id !== args.active.id &&
                     !!rect &&
@@ -3539,8 +3546,7 @@ function ConversationList({
                     pointer.y < rect.bottom - rect.height / 4
                   );
                 }
-                if (target?.type === "remove-from-nest")
-                  return source?.canMoveNest === true && !!source.familyId;
+                if (target?.type === "remove-from-nest") return source?.canDetachNest === true;
                 // Only rows in the dragged session's own list are reorder targets.
                 if (target?.type === "session-order")
                   return target.id !== args.active.id && target.group === source?.reorderGroup;
@@ -3614,7 +3620,7 @@ function ConversationList({
         {activeDrag && <GridDropTargets sessionId={activeDrag.id} />}
         <RowEditHoldContext.Provider value={reportRowEditing}>
           <PinSavingContext.Provider value={pinWriting}>
-            {activeDrag?.canMoveNest && activeDrag.familyId && (
+            {activeDrag?.canDetachNest && (
               <div className="pointer-events-none sticky top-0 z-20 h-0">
                 <RemoveFromNestDropZone />
               </div>
@@ -5144,8 +5150,14 @@ export function ConversationMenuItems({
   const pinSaving = useContext(PinSavingContext);
   const moveToNest = useMoveToNest();
   const revealNest = useContext(RevealNestContext);
-  const nestingEnabled =
-    info !== "loading" && info.sibling_sessions === true && info.session_nest_moves === true;
+  const nestMovesSupported = info !== "loading" && info.session_nest_moves === true;
+  const canJoinNest =
+    nestMovesSupported &&
+    info.sibling_sessions === true &&
+    !isArchived &&
+    !conversation.parent_session_id;
+  const canDetachNest =
+    nestMovesSupported && !!conversation.family && !isArchived && !conversation.parent_session_id;
   const canMoveProject = !isIndentedSibling(conversation);
   const moveSession = useContext(SessionReorderContext);
   const grids = useGridSessions();
@@ -5199,7 +5211,8 @@ export function ConversationMenuItems({
       onSelect={handleProjectSelect}
       conversation={conversation}
       canMoveProject={canMoveProject}
-      nestingEnabled={nestingEnabled && !isArchived}
+      canJoinNest={canJoinNest}
+      canDetachNest={canDetachNest}
       nestSaving={moveToNest.isPending}
       onNestSelect={(destination) => {
         setMenuOpen(false);
@@ -5409,7 +5422,7 @@ export function ConversationMenuItems({
       {/* Projects are a My-sessions-only tool, so filing is owner-only — a
           shared session shows no project affordance. */}
       {isOwner &&
-        (canMoveProject || (nestingEnabled && !isArchived)) &&
+        (canMoveProject || canJoinNest || canDetachNest) &&
         (isMobile ? (
           // Mobile: no room for a side flyout, so this item swaps the menu
           // body to the project picker in place (see the `view === "projects"`
@@ -5425,7 +5438,7 @@ export function ConversationMenuItems({
             <FolderInputIcon className="size-3.5" />
             {/* "Add to project" until the session is filed, then "Move
                 session" to switch or remove it. */}
-            {nestingEnabled || currentProject ? "Move session" : "Add to project"}
+            {canJoinNest || canDetachNest || currentProject ? "Move session" : "Add to project"}
           </C.Item>
         ) : (
           <C.Sub>
@@ -5434,7 +5447,7 @@ export function ConversationMenuItems({
               className="mobile-touch-target whitespace-nowrap"
             >
               <FolderInputIcon className="size-3.5" />
-              {nestingEnabled || currentProject ? "Move session" : "Add to project"}
+              {canJoinNest || canDetachNest || currentProject ? "Move session" : "Add to project"}
             </C.SubTrigger>
             <C.SubContent className="min-w-56">
               {/* A native submenu flyout — no separate popover layer, so no
@@ -6146,12 +6159,14 @@ function ConversationRowImpl({
 
   // Owners' live rows reorder; any row in the same list is a target.
   const canReorder = reorderGroup !== undefined && isOwner && !isArchived;
-  const canMoveNest =
+  const nestMovesSupported =
     serverInfo !== "loading" &&
-    serverInfo.sibling_sessions === true &&
     serverInfo.session_nest_moves === true &&
     isOwner &&
+    !isArchived &&
     !conversation.parent_session_id;
+  const canJoinNest = nestMovesSupported && serverInfo.sibling_sessions === true;
+  const canDetachNest = nestMovesSupported && !!conversation.family;
   // Drag-and-drop: a row is grabbable when the viewer owns it (re-filing is
   // owner-only, like the Move-to-project kebab item), outside selection /
   // archive / rename modes. Dragging it onto a project folder files it there;
@@ -6172,13 +6187,17 @@ function ConversationRowImpl({
       isPinned,
       canManage: isOwner && !familyIndented && !isIndentedSibling(conversation),
       canMoveProject: !isIndentedSibling(conversation),
-      canMoveNest,
+      canJoinNest,
+      canDetachNest,
       familyId: conversation.family?.id,
       reorderGroup: canReorder ? reorderGroup : undefined,
       reorderIndex,
     },
     disabled:
-      ((familyIndented || isIndentedSibling(conversation)) && !gridsEnabled && !canMoveNest) ||
+      ((familyIndented || isIndentedSibling(conversation)) &&
+        !gridsEnabled &&
+        !canJoinNest &&
+        !canDetachNest) ||
       (!isOwner && !gridsEnabled) ||
       selectionMode ||
       isArchived ||
@@ -6206,7 +6225,7 @@ function ConversationRowImpl({
       project: currentProject,
     },
     disabled:
-      !canMoveNest ||
+      !canJoinNest ||
       !conversation.family ||
       isArchived ||
       isEditing ||
@@ -7573,7 +7592,8 @@ function SessionMovePickerMenu({
   onSelect,
   conversation,
   canMoveProject,
-  nestingEnabled,
+  canJoinNest,
+  canDetachNest,
   nestSaving,
   onNestSelect,
 }: {
@@ -7582,7 +7602,8 @@ function SessionMovePickerMenu({
   onSelect: (project: string) => void;
   conversation: Conversation;
   canMoveProject: boolean;
-  nestingEnabled: boolean;
+  canJoinNest: boolean;
+  canDetachNest: boolean;
   nestSaving: boolean;
   onNestSelect: (destination: Conversation | null) => void;
 }) {
@@ -7591,14 +7612,14 @@ function SessionMovePickerMenu({
   const viewerId = useContext(ViewerIdContext);
   const [search, setSearch] = useState("");
   const trimmed = search.trim();
-  const debouncedQuery = useDebouncedValue(nestingEnabled ? trimmed : "", 300);
+  const debouncedQuery = useDebouncedValue(canJoinNest ? trimmed : "", 300);
   const nestSearch = useSessionSearch(debouncedQuery, "title", {
-    enabled: nestingEnabled && debouncedQuery !== "",
+    enabled: canJoinNest && debouncedQuery !== "",
     limit: 20,
     includeArchived: false,
     visibility: "mine",
   });
-  const searchingNests = nestingEnabled && trimmed !== "";
+  const searchingNests = canJoinNest && trimmed !== "";
   const searchPending = searchingNests && (debouncedQuery !== trimmed || nestSearch.isPending);
   const searchError = searchingNests && debouncedQuery === trimmed && nestSearch.isError;
   const hasMoreNests = searchingNests && debouncedQuery === trimmed && nestSearch.hasNextPage;
@@ -7619,7 +7640,7 @@ function SessionMovePickerMenu({
       ? conversationDisplayLabel(row)
       : (row.family?.representative_title ?? conversationDisplayLabel(row));
   const filtered = canMoveProject ? projects.filter((project) => matchesSearch(project.name)) : [];
-  const filteredNests = nestingEnabled
+  const filteredNests = canJoinNest
     ? availableNests.filter(
         (row) => row.family?.id !== conversation.family?.id && matchesSearch(nestLabel(row)),
       )
@@ -7629,97 +7650,102 @@ function SessionMovePickerMenu({
     trimmed.length > 0 &&
     !projects.some((project) => project.name.toLowerCase() === trimmed.toLowerCase());
   const currentProjectIcon = projects.find((project) => project.name === currentProject)?.icon;
+  const canChooseDestination = canMoveProject || canJoinNest;
 
   return (
     <>
-      <div className="flex items-center gap-2 border-b px-2 py-1.5">
-        <SearchIcon className="size-3.5 shrink-0 text-muted-foreground" />
-        <input
-          className="w-full bg-transparent text-sm outline-none placeholder:text-muted-foreground"
-          placeholder={nestingEnabled ? "Search destinations" : "Search or create project"}
-          value={search}
-          onChange={(event) => setSearch(event.target.value)}
-          onKeyDown={(event) => event.stopPropagation()}
-        />
-      </div>
-      <div className="max-h-48 overflow-y-auto">
-        {nestingEnabled && canMoveProject && filtered.length > 0 && (
-          <div className="px-2 py-1.5 text-xs text-muted-foreground">Projects</div>
-        )}
-        {filtered.map((project) => (
-          <C.Item
-            key={project.name}
-            className="px-2 py-1"
-            textValue={project.name}
-            onSelect={() => onSelect(project.name)}
-          >
-            <ProjectRowIcon icon={project.icon} />
-            <span className="flex-1 truncate text-left">{project.name}</span>
-            {currentProject === project.name && (
-              <CheckMarkIcon className="size-3.5 shrink-0 text-primary" />
-            )}
-          </C.Item>
-        ))}
-        {filteredNests.length > 0 && (
-          <div className="px-2 py-1.5 text-xs text-muted-foreground">Nests</div>
-        )}
-        {filteredNests.map((nest) => (
-          <C.Item
-            key={nest.id}
-            className="px-2 py-1"
-            textValue={nestLabel(nest)}
-            disabled={nestSaving}
-            onSelect={() => onNestSelect(nest)}
-          >
-            <GitBranchIcon className="size-3.5 shrink-0 text-muted-foreground" />
-            <span className="flex-1 truncate text-left">{nestLabel(nest)}</span>
-          </C.Item>
-        ))}
-        {searchPending && (
-          <p role="status" className="px-2 py-1.5 text-sm text-muted-foreground">
-            Searching nests…
-          </p>
-        )}
-        {searchError ? (
-          <C.Item
-            className="px-2 py-1"
-            onSelect={(event) => {
-              event.preventDefault();
-              void (nestSearch.isFetchNextPageError
-                ? nestSearch.fetchNextPage()
-                : nestSearch.refetch());
-            }}
-          >
-            Couldn’t search nests. Retry
-          </C.Item>
-        ) : hasMoreNests ? (
-          <C.Item
-            className="px-2 py-1"
-            disabled={nestSearch.isFetching}
-            onSelect={(event) => {
-              event.preventDefault();
-              void nestSearch.fetchNextPage();
-            }}
-          >
-            {nestSearch.isFetchingNextPage ? "Loading…" : "Show more"}
-          </C.Item>
-        ) : null}
-        {filtered.length === 0 &&
-          filteredNests.length === 0 &&
-          !canCreate &&
-          !searchPending &&
-          !searchError &&
-          !hasMoreNests && (
-            <p className="px-2 py-1.5 text-sm text-muted-foreground">
-              {nestingEnabled ? "No matching destinations." : "No projects yet."}
+      {canChooseDestination && (
+        <div className="flex items-center gap-2 border-b px-2 py-1.5">
+          <SearchIcon className="size-3.5 shrink-0 text-muted-foreground" />
+          <input
+            className="w-full bg-transparent text-sm outline-none placeholder:text-muted-foreground"
+            placeholder={canJoinNest ? "Search destinations" : "Search or create project"}
+            value={search}
+            onChange={(event) => setSearch(event.target.value)}
+            onKeyDown={(event) => event.stopPropagation()}
+          />
+        </div>
+      )}
+      {canChooseDestination && (
+        <div className="max-h-48 overflow-y-auto">
+          {canJoinNest && canMoveProject && filtered.length > 0 && (
+            <div className="px-2 py-1.5 text-xs text-muted-foreground">Projects</div>
+          )}
+          {filtered.map((project) => (
+            <C.Item
+              key={project.name}
+              className="px-2 py-1"
+              textValue={project.name}
+              onSelect={() => onSelect(project.name)}
+            >
+              <ProjectRowIcon icon={project.icon} />
+              <span className="flex-1 truncate text-left">{project.name}</span>
+              {currentProject === project.name && (
+                <CheckMarkIcon className="size-3.5 shrink-0 text-primary" />
+              )}
+            </C.Item>
+          ))}
+          {filteredNests.length > 0 && (
+            <div className="px-2 py-1.5 text-xs text-muted-foreground">Nests</div>
+          )}
+          {filteredNests.map((nest) => (
+            <C.Item
+              key={nest.id}
+              className="px-2 py-1"
+              textValue={nestLabel(nest)}
+              disabled={nestSaving}
+              onSelect={() => onNestSelect(nest)}
+            >
+              <GitBranchIcon className="size-3.5 shrink-0 text-muted-foreground" />
+              <span className="flex-1 truncate text-left">{nestLabel(nest)}</span>
+            </C.Item>
+          ))}
+          {searchPending && (
+            <p role="status" className="px-2 py-1.5 text-sm text-muted-foreground">
+              Searching nests…
             </p>
           )}
-      </div>
+          {searchError ? (
+            <C.Item
+              className="px-2 py-1"
+              onSelect={(event) => {
+                event.preventDefault();
+                void (nestSearch.isFetchNextPageError
+                  ? nestSearch.fetchNextPage()
+                  : nestSearch.refetch());
+              }}
+            >
+              Couldn’t search nests. Retry
+            </C.Item>
+          ) : hasMoreNests ? (
+            <C.Item
+              className="px-2 py-1"
+              disabled={nestSearch.isFetching}
+              onSelect={(event) => {
+                event.preventDefault();
+                void nestSearch.fetchNextPage();
+              }}
+            >
+              {nestSearch.isFetchingNextPage ? "Loading…" : "Show more"}
+            </C.Item>
+          ) : null}
+          {filtered.length === 0 &&
+            filteredNests.length === 0 &&
+            !canCreate &&
+            !searchPending &&
+            !searchError &&
+            !hasMoreNests && (
+              <p className="px-2 py-1.5 text-sm text-muted-foreground">
+                {canJoinNest ? "No matching destinations." : "No projects yet."}
+              </p>
+            )}
+        </div>
+      )}
       {canCreate && (
         <div className="border-t pt-1">
           <C.Item className="px-2 py-1" onSelect={() => onSelect(trimmed)}>
             <PlusIcon className="size-3.5 shrink-0 text-muted-foreground" />
-            {nestingEnabled ? "Create project" : "Create"}{" "}
+            {canJoinNest ? "Create project" : "Create"}{" "}
             <span className="truncate rounded bg-muted px-1 py-0.5 font-mono text-[0.95em]">
               {trimmed}
             </span>
@@ -7741,8 +7767,8 @@ function SessionMovePickerMenu({
           </C.Item>
         </div>
       )}
-      {nestingEnabled && conversation.family && (
-        <div className="border-t pt-1">
+      {canDetachNest && (
+        <div className={canChooseDestination ? "border-t pt-1" : undefined}>
           <C.Item
             className="px-2 py-1"
             textValue="Remove from nest"

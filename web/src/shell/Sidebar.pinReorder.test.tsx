@@ -122,11 +122,11 @@ beforeEach(() => {
 describe("moving sessions between nests by drag", () => {
   const destination = { id: "conv_d", representative_id: "conv_d", pinned: false };
   const original = { id: "conv_a", representative_id: "conv_a", pinned: false };
-  const renderNests = () =>
+  const renderNests = (siblingSessions = true) =>
     renderSidebar({
       info: {
         ...FALLBACK_SERVER_INFO,
-        sibling_sessions: true,
+        sibling_sessions: siblingSessions,
         session_nest_moves: true,
         features: { sidebar_grouping_ui: true },
       },
@@ -166,37 +166,50 @@ describe("moving sessions between nests by drag", () => {
     expect(mocks.reorderPins).not.toHaveBeenCalled();
   });
 
-  it.each(["conv_a", "conv_b"])("detaches %s through the temporary drop target", async (source) => {
-    const rowRect = vi.mocked(Element.prototype.getBoundingClientRect).getMockImplementation()!;
-    vi.mocked(Element.prototype.getBoundingClientRect).mockImplementation(function (this: Element) {
-      if (this.matches('[data-testid="sidebar-remove-from-nest"]')) {
-        return rowRect.call(screen.getByRole("link", { name: "conv_d" }).closest("li")!);
-      }
-      return rowRect.call(this);
-    });
+  it.each(
+    [false, true].flatMap((siblingSessions) =>
+      ["conv_a", "conv_b"].map((source) => ({ siblingSessions, source })),
+    ),
+  )(
+    "detaches the selected session through the temporary drop target: %j",
+    async ({ siblingSessions, source }) => {
+      const rowRect = vi.mocked(Element.prototype.getBoundingClientRect).getMockImplementation()!;
+      vi.mocked(Element.prototype.getBoundingClientRect).mockImplementation(function (
+        this: Element,
+      ) {
+        if (this.matches('[data-testid="sidebar-remove-from-nest"]')) {
+          return rowRect.call(screen.getByRole("link", { name: "conv_d" }).closest("li")!);
+        }
+        return rowRect.call(this);
+      });
+      renderNests(siblingSessions);
+      expect(screen.queryByTestId("sidebar-remove-from-nest")).toBeNull();
+      await dropOnto(source, "__remove_nest__", {
+        expectTarget: false,
+        whileOver: () => {
+          const target = screen.getByTestId("sidebar-remove-from-nest");
+          expect(screen.getByTestId("sidebar-conversation-list")).not.toContainElement(target);
+          expect(target.parentElement).toHaveClass("sticky", "top-0", "h-0");
+        },
+      });
+      expect(mocks.moveToNest).toHaveBeenCalledExactlyOnceWith(
+        { id: source, sourceId: null },
+        expect.any(Object),
+      );
+      expect(screen.queryByTestId("sidebar-remove-from-nest")).toBeNull();
+    },
+  );
+
+  it("ignores moves within the same nest", async () => {
     renderNests();
-    expect(screen.queryByTestId("sidebar-remove-from-nest")).toBeNull();
-    await dropOnto(source, "__remove_nest__", {
-      expectTarget: false,
-      whileOver: () => {
-        const target = screen.getByTestId("sidebar-remove-from-nest");
-        expect(screen.getByTestId("sidebar-conversation-list")).not.toContainElement(target);
-        expect(target.parentElement).toHaveClass("sticky", "top-0", "h-0");
-      },
-    });
-    expect(mocks.moveToNest).toHaveBeenCalledExactlyOnceWith(
-      { id: source, sourceId: null },
-      expect.any(Object),
-    );
-    expect(screen.queryByTestId("sidebar-remove-from-nest")).toBeNull();
+    await dropOnto("conv_b", "conv_a", { expectTarget: false });
+    expect(mocks.moveToNest).not.toHaveBeenCalled();
   });
 
   it.each([-ROW_HEIGHT / 3, -ROW_HEIGHT / 4, ROW_HEIGHT / 4, ROW_HEIGHT / 3])(
-    "keeps reordering at row offset %s and ignores moves within the same nest",
+    "keeps reordering at row offset %s",
     async (offsetY) => {
       renderNests();
-      await dropOnto("conv_b", "conv_a", { expectTarget: false });
-      expect(mocks.moveToNest).not.toHaveBeenCalled();
       await dropOnto("conv_c", "conv_d", {
         expectTarget: false,
         offsetY,
@@ -213,11 +226,18 @@ describe("moving sessions between nests by drag", () => {
     { sibling_sessions: false, session_nest_moves: true },
     { sibling_sessions: true, session_nest_moves: false },
     { sibling_sessions: true },
-  ])("does not offer membership moves without server support: %j", async (capabilities) => {
+  ])("does not join nests without both capabilities: %j", async (capabilities) => {
     renderSidebar({
       info: { ...FALLBACK_SERVER_INFO, ...capabilities, features: { sidebar_grouping_ui: true } },
     });
-    await dropOnto("conv_c", "conv_d", { expectTarget: false });
+    await dropOnto("conv_b", "conv_d", {
+      expectTarget: false,
+      whileOver: () => {
+        expect(screen.queryByTestId("sidebar-remove-from-nest") !== null).toBe(
+          capabilities.session_nest_moves === true,
+        );
+      },
+    });
     expect(mocks.moveToNest).not.toHaveBeenCalled();
     expect(screen.queryByTestId("sidebar-remove-from-nest")).toBeNull();
   });
