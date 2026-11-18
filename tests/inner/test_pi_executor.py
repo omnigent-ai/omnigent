@@ -5556,6 +5556,18 @@ def test_pi_sandbox_launcher_policy_carries_spawn_env_allowlist(
                     os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
                 )
 
+        monkeypatch.setattr(
+            sandbox_mod,
+            "resolve_sandbox",
+            lambda *_args, **_kwargs: SimpleNamespace(active=False),
+        )
+        with patch("omnigent.inner.pi_executor._find_pi_cli", return_value=str(pi_binary)):
+            with pytest.raises(OSError, match="Requested sandbox resolved to an inactive policy"):
+                PiExecutor(
+                    cwd=str(tmp_path),
+                    os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
+                )
+
 
 def test_pi_bundle_resource_roots_follow_passed_args(tmp_path: Path) -> None:
     """Only the bundle roots that contributed a ``--skill`` / ``--extension`` path are granted,

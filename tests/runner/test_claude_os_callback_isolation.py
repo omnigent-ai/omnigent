@@ -420,6 +420,27 @@ async def test_callback_uses_effective_harness_over_spec(
         build.assert_not_called()
 
 
+async def test_callback_without_agent_spec_fails_closed_for_claude_sdk(
+    callback_session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, workspace, bundle, build = callback_session
+    create = Mock()
+    monkeypatch.setattr(os_module, "create_os_environment", create)
+
+    result = await execute_tool(
+        tool_name="sys_os_shell",
+        arguments='{"command":"printf ran"}',
+        agent_spec=None,
+        runner_workspace=workspace,
+        local_tool_workdir=bundle,
+        effective_harness="claude-sdk",
+    )
+
+    assert "require an agent spec to resolve sandbox and credential policy" in result
+    create.assert_not_called()
+    build.assert_not_called()
+
+
 async def test_shared_callback_environment_is_protected_before_execution(
     callback_session,
 ) -> None:

@@ -8351,6 +8351,11 @@ async def _execute_os_env_tool(
     tool_lease: ToolEnvironmentLease | None = None
     completed = False
     try:
+        if agent_spec is None and canonicalize_harness(effective_harness) == "claude-sdk":
+            raise ValueError(
+                "Claude SDK callbacks require an agent spec to resolve "
+                "sandbox and credential policy"
+            )
         effective_spec = _effective_runner_os_env_spec(
             agent_spec, conversation_id, runner_workspace
         )
