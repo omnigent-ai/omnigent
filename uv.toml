@@ -3,6 +3,10 @@
 # and 0.13.4 drops the compromised emSign root CA (GHSA-hq85-5cpj-mr62).
 required-version = ">=0.13.4"
 
+# Sandboxed workers must not be able to change installed code through a
+# hard-linked copy in a writable workspace.
+link-mode = "copy"
+
 # Dependency cooldown: never resolve a distribution uploaded within the
 # last 7 days, so a compromised or yanked release has a window to surface
 # before it gets pinned. uv records the relative span in uv.lock (as

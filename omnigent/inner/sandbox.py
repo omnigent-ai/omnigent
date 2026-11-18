@@ -1697,7 +1697,10 @@ def _validate_trusted_hardlink_aliases(
                 or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
                 or os.access(path, os.W_OK)
             ):
-                raise OSError("Cannot validate trusted runtime: mutable hard-link alias")
+                raise OSError(
+                    "Cannot validate trusted runtime: mutable hard-link alias "
+                    f"for {path}; install trusted runtime files as copies"
+                )
             if sys.platform == "linux":
                 try:
                     acl = os.getxattr(path, "system.posix_acl_access")
@@ -1706,7 +1709,10 @@ def _validate_trusted_hardlink_aliases(
                         raise OSError(f"Cannot validate trusted runtime ACL: {path}") from exc
                 else:
                     if acl:
-                        raise OSError("Cannot validate trusted runtime: mutable hard-link alias")
+                        raise OSError(
+                            "Cannot validate trusted runtime: mutable hard-link alias "
+                            f"for {path}; install trusted runtime files as copies"
+                        )
 
 
 def _validate_launcher_runtime(sandbox: SandboxPolicy) -> None:
