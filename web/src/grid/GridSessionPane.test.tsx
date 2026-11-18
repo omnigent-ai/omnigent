@@ -35,6 +35,8 @@ import { toast } from "sonner";
 import { revealFolderInFilesPanel } from "@/shell/FilesPanel";
 import { selectPullRequestInPanel } from "@/shell/PullRequestPanel";
 import { conversationRegistry } from "@/store/conversationRegistry";
+import { gridCellComposerKey, useChatStore } from "@/store/chatStore";
+import { clearSessionDrafts, setSessionDraft } from "@/lib/sessionDrafts";
 
 const queryClient = new QueryClient();
 const LINKED_PR = "https://github.com/example/app/pull/42";
@@ -339,6 +341,15 @@ it("gives each cell its own host-switch access and launch progress", () => {
   // A cell with no launch passes null, so its badge never shows the open session's.
   expect(first.getByText("Host for first (status only)")).toBeInTheDocument();
   expect(second.getByText("Host for second (launch provisioning)")).toBeInTheDocument();
+});
+
+it("opens each cell with its session's saved draft", () => {
+  onTestFinished(clearSessionDrafts);
+  setSessionDraft("second", { text: "half-typed", files: [] });
+  render(twoCellGrid());
+  const composers = useChatStore.getState().sideChatComposers;
+  expect(composers[gridCellComposerKey("second")]?.text).toBe("half-typed");
+  expect(composers[gridCellComposerKey("first")]).toBeUndefined();
 });
 
 it("opens agent-requested files only in the active workspace and respects navigation guards", () => {
