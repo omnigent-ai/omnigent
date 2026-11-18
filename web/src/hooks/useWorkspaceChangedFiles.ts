@@ -594,6 +594,9 @@ export interface WorkspaceFileSearchResult {
   unavailable: boolean;
 }
 
+// Matches returned by one Go to File search, through either route.
+const FILE_SEARCH_LIMIT = 500;
+
 async function fetchWorkspaceFileSearch(
   conversationId: string,
   query: string,
@@ -607,7 +610,7 @@ async function fetchWorkspaceFileSearch(
     const viaApi = await searchFilesViaWorkspaceApi(
       conversationId,
       query,
-      { path: location, include, exclude, limit: 500 },
+      { path: location, include, exclude, limit: FILE_SEARCH_LIMIT },
       signal,
     );
     if (viaApi) {
@@ -622,7 +625,7 @@ async function fetchWorkspaceFileSearch(
       };
     }
   }
-  const params = new URLSearchParams({ limit: "500" });
+  const params = new URLSearchParams({ limit: String(FILE_SEARCH_LIMIT) });
   if (query) params.set("q", query);
   if (include) params.set("include", include);
   if (exclude) params.set("exclude", exclude);
