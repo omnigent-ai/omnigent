@@ -9,6 +9,8 @@ from pathlib import Path
 import pytest
 
 from omnigent.inner.pi_claude_plugins import (
+    _MAX_WALK_DEPTH,
+    _MAX_WALK_DIRS,
     MAX_PLUGIN_COMMANDS,
     PI_CLAUDE_PLUGIN_RESOURCES_DIR,
     _bounded_files,
@@ -122,6 +124,28 @@ def test_disabled_and_unknown_plugins_are_not_loaded(claude_dir: Path, tmp_path:
     assert not any("/off/" in p for p in paths)
 
 
+def test_installed_but_unenabled_and_project_only_enablement_are_not_loaded(
+    claude_dir: Path, tmp_path: Path
+) -> None:
+    """Install records alone do not enable a plugin, and project settings are not read."""
+    unenabled = _install(claude_dir, "unenabled@market", files=_skill("unenabled"))
+    settings_path = claude_dir / "settings.json"
+    settings = json.loads(settings_path.read_text())
+    settings["enabledPlugins"].pop("unenabled@market")
+    _write_json(settings_path, settings)
+    project = tmp_path / "project"
+    _write_json(project / ".claude" / "settings.json", {"enabledPlugins": {"proj@market": True}})
+    _install(claude_dir, "proj@market", files=_skill("proj"))
+    settings = json.loads(settings_path.read_text())
+    settings["enabledPlugins"].pop("proj@market")
+    _write_json(settings_path, settings)
+
+    result = add_claude_plugin_resources({}, tmp_path / "managed")
+
+    assert str(unenabled / "skills" / "unenabled") not in result.get("skills", [])
+    assert not any("/proj/" in p for p in result.get("skills", []))
+
+
 def test_pi_manifest_plugin_loads_as_package_and_keeps_commands(
     claude_dir: Path, tmp_path: Path
 ) -> None:
@@ -157,17 +181,6 @@ def test_user_choices_are_preserved_without_duplicates(claude_dir: Path, tmp_pat
     result = add_claude_plugin_resources({"skills": ["/user/skills", skill_dir]}, tmp_path / "m")
 
     assert result["skills"] == ["/user/skills", skill_dir]
-
-
-def test_user_package_claim_is_checked_separately(claude_dir: Path, tmp_path: Path) -> None:
-    """A package claim on the plugin root is not a skill dedupe; it blocks fallback skills."""
-    root = _install(claude_dir, "dp@market", files=_skill("review"))
-    listed = {"packages": [{"source": str(root)}]}
-
-    result = add_claude_plugin_resources(listed, tmp_path / "m")
-
-    assert "skills" not in result
-    assert result["packages"] == [{"source": str(root)}]
 
 
 def test_user_exclusions_block_plugin_entries(claude_dir: Path, tmp_path: Path) -> None:
@@ -314,15 +327,22 @@ def test_unsafe_plugin_names_are_not_bridged(claude_dir: Path, tmp_path: Path) -
     assert result == {}
 
 
-def test_user_package_entry_decides_plugin_skills(claude_dir: Path, tmp_path: Path) -> None:
-    """A user package entry for the plugin with ``skills: []`` keeps its skills out."""
+@pytest.mark.parametrize(
+    "listed",
+    [lambda root: {"source": str(root), "skills": []}, lambda root: {"source": str(root)}],
+    ids=["object-with-empty-skills", "object-plain"],
+)
+def test_user_package_entry_decides_plugin_skills(
+    claude_dir: Path, tmp_path: Path, listed
+) -> None:
+    """A user package entry for the plugin decides its fallback skills, including none."""
     root = _install(claude_dir, "dp@market", files=_skill("review"))
-    settings = {"packages": [{"source": str(root), "skills": []}]}
+    settings = {"packages": [listed(root)]}
 
     result = add_claude_plugin_resources(settings, tmp_path / "managed")
 
     assert "skills" not in result
-    assert result["packages"] == [{"source": str(root), "skills": []}]
+    assert result["packages"] == [listed(root)]
 
 
 def test_overlong_generated_command_name_is_skipped(claude_dir: Path, tmp_path: Path) -> None:
@@ -424,15 +444,37 @@ _ENTRY_KINDS = (
     "descendant_exclusion",
     "glob_ancestor",
     "glob_target",
+    "glob_descendant",
     "glob_unrelated",
 )
 # Kinds the user has not decided on: the plugin entry is still bridged.
 _NOT_DECIDING = {"relative", "tilde_unknown_user", "symlink_loop", "nul", "glob_unrelated"}
+# Truncation applies to consumers that walk a tree; packages are never walked.
+_TRUNCATIONS = ("none", "files", "dirs", "depth")
+
+
+def _truncate(consumer: str, targets: _Targets, mode: str) -> None:
+    """Make the consumer's tree too large or too deep to inspect completely."""
+    if mode == "none":
+        return
+    tree = {"skills": targets.skill_dir, "commands": targets.command.parent}[consumer]
+    suffix = ".txt" if consumer == "skills" else ".md"
+    if mode == "files":
+        for index in range(MAX_PLUGIN_COMMANDS + 8):
+            (tree / f"{index:04d}{suffix}").write_text("x", encoding="utf-8")
+    elif mode == "dirs":
+        for index in range(_MAX_WALK_DIRS + 40):
+            (tree / f"d{index:03d}").mkdir(parents=True)
+    elif mode == "depth":
+        deep = tree.joinpath(*[f"l{level}" for level in range(_MAX_WALK_DEPTH + 2)])
+        deep.mkdir(parents=True)
+        (deep / f"x{suffix}").write_text("x", encoding="utf-8")
 
 
 def _entry(kind: str, consumer: str, t: _Targets, tmp_path: Path) -> str:
     target = {"skills": t.skill_dir, "packages": t.root, "commands": t.command}[consumer]
     below = {"skills": t.skill_file, "packages": t.root / "package.json", "commands": t.sibling}
+    tree = {"skills": t.skill_dir, "packages": t.root, "commands": t.command.parent}[consumer]
     loop = tmp_path / "loop-a"
     if kind == "absolute":
         return str(target)
@@ -462,39 +504,60 @@ def _entry(kind: str, consumer: str, t: _Targets, tmp_path: Path) -> str:
         return f"!{t.cache}/*"
     if kind == "glob_target":
         return f"!{target}"
+    if kind == "glob_descendant":
+        # Matches a file inside the consumer's tree; for commands it matches no file.
+        patterns = {"skills": "*.md", "packages": "*.json", "commands": "z*"}
+        return f"!{tree}/{patterns[consumer]}"
     if kind == "glob_unrelated":
         return f"!{tmp_path}/nowhere-at-all/*"
     raise AssertionError(kind)
 
 
-def _decided_by_user(kind: str, consumer: str) -> bool:
-    """Whether the user's entry of this kind makes the consumer's plugin entry absent."""
-    if kind in _NOT_DECIDING:
-        return False
-    if kind == "descendant_exclusion":
-        # A command has no children to exclude, so a sibling exclusion leaves it bridged.
-        return consumer != "commands"
-    return True
+def _expected_bridged(kind: str, consumer: str, truncation: str) -> bool:
+    """Whether the consumer's plugin entry should be bridged for this combination."""
+    if kind not in _NOT_DECIDING:
+        if kind == "descendant_exclusion" and consumer == "commands":
+            pass  # a command has no children, so a sibling exclusion leaves it bridged
+        elif kind == "glob_descendant" and consumer == "commands":
+            pass  # the glob matches a different file than the command
+        else:
+            return False
+    if truncation == "none" or consumer == "packages":
+        return True
+    # A skill directory is never bridged from an incomplete inspection; a command
+    # beyond the file budget is never generated, while the others still are.
+    return consumer == "commands" and truncation != "files"
 
 
-@pytest.mark.parametrize("kind", _ENTRY_KINDS)
-@pytest.mark.parametrize("consumer", ["skills", "packages", "commands"])
+_TABLE_CASES = [
+    (kind, consumer, truncation)
+    for kind in _ENTRY_KINDS
+    for consumer in ("skills", "packages", "commands")
+    for truncation in (_TRUNCATIONS if consumer != "packages" else ("none",))
+]
+
+
+@pytest.mark.parametrize(("kind", "consumer", "truncation"), _TABLE_CASES)
 def test_user_entry_table(
     kind: str,
     consumer: str,
+    truncation: str,
     claude_dir: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Each entry kind decides, or does not decide, each consumer the same way everywhere."""
+    """Each entry kind decides, or does not decide, each consumer the same way everywhere.
+
+    Truncation makes the consumer's tree too large or too deep to inspect completely.
+    """
     monkeypatch.setenv("HOME", str(tmp_path))
     targets = _install_for(consumer, claude_dir, tmp_path)
+    _truncate(consumer, targets, truncation)
     key = _CONSUMER_KEY[consumer]
     entry = _entry(kind, consumer, targets, tmp_path)
-    settings = {key: [entry]}
     managed = tmp_path / "managed"
 
-    result = add_claude_plugin_resources(settings, managed)
+    result = add_claude_plugin_resources({key: [entry]}, managed)
 
     assert result[key][0] == entry, "the user's own entry is kept first"
     added = result[key][1:]
@@ -504,9 +567,37 @@ def test_user_entry_table(
         bridged = str(targets.skill_dir) in added
     else:
         bridged = str(targets.root) in added
-    assert bridged == (not _decided_by_user(kind, consumer)), (
-        f"{kind} for {consumer}: bridged={bridged}"
-    )
+    expected = _expected_bridged(kind, consumer, truncation)
+    assert bridged == expected, f"{kind} for {consumer} with {truncation}: bridged={bridged}"
+
+
+@pytest.mark.parametrize("truncation", ["files", "dirs", "depth"])
+def test_truncated_skill_inspection_never_bridges_the_directory(
+    truncation: str, claude_dir: Path, tmp_path: Path
+) -> None:
+    """A skill whose tree cannot be fully inspected is skipped; a complete sibling still loads.
+
+    This covers Polly's case: an exclusion for ``SKILL.md`` past the file budget.
+    """
+    root = _install(claude_dir, "dp@market", files={**_skill("complete"), **_skill("partial")})
+    partial = root / "skills" / "partial"
+    if truncation == "files":
+        for index in range(MAX_PLUGIN_COMMANDS + 8):
+            (partial / f"{index:04d}.txt").write_text("x", encoding="utf-8")
+    elif truncation == "dirs":
+        for index in range(_MAX_WALK_DIRS + 40):
+            (partial / f"d{index:03d}").mkdir()
+    else:
+        deep = partial.joinpath(*[f"l{level}" for level in range(_MAX_WALK_DEPTH + 2)])
+        deep.mkdir(parents=True)
+        (deep / "x.txt").write_text("x", encoding="utf-8")
+    excluded = {"skills": [f"!{partial}/SKILL.md"]}
+
+    result = add_claude_plugin_resources(excluded, tmp_path / "managed")
+
+    added = result["skills"][1:]
+    assert str(partial) not in added
+    assert str(root / "skills" / "complete") in added
 
 
 def test_single_directory_stops_at_the_file_budget(tmp_path: Path) -> None:
@@ -516,9 +607,10 @@ def test_single_directory_stops_at_the_file_budget(tmp_path: Path) -> None:
     for index in range(MAX_PLUGIN_COMMANDS + 40):
         (commands / f"c{index:04d}.md").write_text("x", encoding="utf-8")
 
-    found = _bounded_files(commands, lambda name: name.endswith(".md"))
+    found, complete = _bounded_files(commands, lambda name: name.endswith(".md"))
 
     assert len(found) == MAX_PLUGIN_COMMANDS
+    assert complete is False
 
 
 def test_unknown_home_prefix_never_aborts_preparation(
