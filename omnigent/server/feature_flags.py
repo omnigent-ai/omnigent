@@ -268,6 +268,7 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         description="Project home page opened from a project row: composer above a sessions board",
         owner="web",
         review_by_release="0.27.0",
+        default_enabled=True,
     ),
     FeatureDefinition(
         feature=Feature.PROJECT_REPOSITORY_CREATION,

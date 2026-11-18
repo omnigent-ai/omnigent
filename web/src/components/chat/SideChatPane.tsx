@@ -70,6 +70,7 @@ import {
   useChatStore,
 } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
+import { RunnerStartingIndicator, SandboxActionBanner } from "@/pages/ChatIndicators";
 import { QueuedMessagesStrip } from "@/pages/QueuedMessagesStrip";
 import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import { shouldQueueSend } from "@/lib/messageQueue";
@@ -485,6 +486,16 @@ export function SideChatPane({
     (starting || computeIsTurnActive(sessionStatus, state.status === "streaming"));
   // Background shells can outlive the child's turn; the indicator shows them.
   const showsBackgroundTasks = (!readOnly || fullSession) && state.backgroundTaskCount > 0;
+  // A full session shows its sandbox launch as the session page does: the stage, not
+  // Working, shows a send waiting on the sandbox, and a failed launch replaces Working.
+  const launch = fullSession ? state.sandboxStatus : null;
+  const launchInFlight = launch !== null && launch.stage !== "failed";
+  const showsWorkingRow =
+    launch?.stage !== "failed" &&
+    shouldShowWorkingIndicator(
+      (launchInFlight ? computeIsWorking(sessionStatus) : showsWorking) || showsBackgroundTasks,
+      bubbles,
+    );
   // Native interruption needs an observed turn; local streaming can start before one exists.
   const interruptReady =
     !usesNativeSideChatFork(sessionHarness) || activeResponse?.state === "streaming";
@@ -597,6 +608,8 @@ export function SideChatPane({
             <p role="status" className="m-auto text-sm text-muted-foreground">
               Loading session…
             </p>
+          ) : isEmpty && launch !== null ? (
+            <RunnerStartingIndicator variant="hero" status={launch} />
           ) : isEmpty ? (
             <div className="flex flex-1 flex-col items-center justify-center gap-2 px-6 text-center">
               <MessagesSquareIcon className="size-6 text-muted-foreground" />
@@ -622,14 +635,21 @@ export function SideChatPane({
                   />
                 ))}
               </EditSentMessageContext.Provider>
-              <WorkingIndicatorRow
-                key={childId}
-                show={shouldShowWorkingIndicator(showsWorking || showsBackgroundTasks, bubbles)}
-              />
+              <WorkingIndicatorRow key={childId} show={showsWorkingRow} />
+              {!showsWorkingRow && launch !== null && (
+                <RunnerStartingIndicator variant="row" status={launch} />
+              )}
               <div ref={bottomRef} />
             </div>
           )}
         </div>
+        {launch !== null && (
+          // A full session's composer is hidden when read-only, so the banner keeps its own gap.
+          <SandboxActionBanner
+            conversationId={childId}
+            className={cn("mx-3 shrink-0", readOnly && "mb-3")}
+          />
+        )}
         {!readOnly && !starting && (
           <SelectionPopup
             containerRef={transcriptRef}

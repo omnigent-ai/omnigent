@@ -34,7 +34,10 @@ from omnigent.server.auth import LEVEL_READ, RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.feature_flags import Feature, FeatureFlags
 from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import require_user
-from omnigent.server.routes._sessions.helpers import _session_status_from_cache
+from omnigent.server.routes._sessions.helpers import (
+    _session_sandbox_status_cache,
+    _session_status_from_cache,
+)
 from omnigent.server.schemas import (
     CreateWorkflowRequest,
     UpdateWorkflowRequest,
@@ -53,6 +56,7 @@ from omnigent.server.session_orchestration import (
     require_named_source_private,
     require_owned_session,
 )
+from omnigent.server.startup_inputs import STARTUP_LABEL
 from omnigent.server.workflow_telemetry import log_workflow_saved
 from omnigent.stores import ConversationStore
 from omnigent.stores.conversation_store import (
@@ -182,8 +186,23 @@ def _started_during(
 
 def _run_active(run: WorkflowRun) -> bool:
     """Whether a run is working or waiting for input, as its row shows it."""
-    working = run.is_current and (run.session_status == "running" or run.background_work_running)
+    working = run.is_current and (
+        run.session_status == "running" or run.background_work_running or run.sandbox_launching
+    )
     return working or run.progress.needs_input > 0
+
+
+def _sandbox_launching(session: Conversation) -> bool:
+    """Whether the session's sandbox launch is under way: neither up nor failed.
+
+    The launching replica caches the launch's stage. Any other replica reads the
+    startup label, which the launch keeps on the session until its first messages
+    are delivered and which records a failure.
+    """
+    launch = _session_sandbox_status_cache.get(session.id)
+    if launch is not None:
+        return launch.stage != "failed"
+    return session.labels.get(STARTUP_LABEL) == "pending"
 
 
 def require_workflows(request: Request) -> None:
@@ -438,6 +457,7 @@ def create_workflows_router(
                     if is_current
                     else "idle",
                     background_work_running=is_current and session.background_work_running is True,
+                    sandbox_launching=is_current and _sandbox_launching(session),
                     archived=session.archived,
                     progress=_progress(latest_plan, step_statuses),
                     steps=[WorkflowStep(**step) for step in latest_plan.content.get("steps", [])],
