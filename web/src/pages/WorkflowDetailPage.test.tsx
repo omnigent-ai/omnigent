@@ -29,10 +29,11 @@ import type * as IdentityModule from "@/lib/identity";
 import type * as RoutingModule from "@/lib/routing";
 import { sessionJournalKey, type JournalEntry, type StepProgress } from "@/lib/sessionJournal";
 import { ApiError, getSession, sendUserMessage } from "@/lib/sessionsApi";
-import { taskActionMessage } from "@/lib/workflow";
+import { stopPlanMessage, taskActionMessage } from "@/lib/workflow";
 import type * as SessionsApi from "@/lib/sessionsApi";
 import { useChatStore } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
+import { usePlanStops } from "@/store/planStops";
 import { openTasksTab } from "@/store/sessionTasksActions";
 import type * as TasksActions from "@/store/sessionTasksActions";
 import type { WorkflowStep } from "@/lib/workflowGraphLayout";
@@ -1492,6 +1493,77 @@ describe("WorkflowDetailPage", () => {
       );
     },
   );
+
+  describe("a run's Stop", () => {
+    const session = "a".repeat(32);
+    // The main agent works on one task; another failed, so its card offers Retry.
+    const running: WorkflowRun = {
+      ...run(session, "Fix the upload test", { started: 1, failed: 1 }, [
+        status("explore", "started"),
+        status("fix", "failed"),
+      ]),
+      sessionStatus: "running",
+    };
+
+    beforeEach(() => {
+      mockWorkflow({});
+      mockRuns([running]);
+    });
+    afterEach(() => usePlanStops.setState({ requests: {} }));
+
+    it("shows Stopping… from Stop until the run's session stops, then Continue", async () => {
+      vi.mocked(sendUserMessage).mockClear().mockResolvedValue({ queued: true });
+      const { rerender } = renderPage();
+      const row = screen.getByTestId("workflow-run");
+      fireEvent.click(within(row).getByRole("button", { name: "Stop" }));
+      expect(within(row).getByTestId("plan-stopping")).toBeDisabled();
+      await waitFor(() =>
+        expect(sendUserMessage).toHaveBeenCalledWith(
+          session,
+          stopPlanMessage(WORKFLOW.name),
+          `plan-${session}`,
+        ),
+      );
+      expect(within(row).getByTestId("plan-stopping")).toBeInTheDocument();
+
+      mockRuns([{ ...running, sessionStatus: "idle" }]);
+      rerender(<WorkflowDetailPage />);
+      expect(within(row).queryByTestId("plan-stopping")).toBeNull();
+      expect(within(row).getByRole("button", { name: "Continue the plan" })).toBeInTheDocument();
+    });
+
+    it("restores Stop when the stop message fails", async () => {
+      vi.mocked(sendUserMessage)
+        .mockClear()
+        .mockRejectedValue(new Error("The session is offline."));
+      renderPage();
+      const row = screen.getByTestId("workflow-run");
+      fireEvent.click(within(row).getByRole("button", { name: "Stop" }));
+      expect(within(row).getByTestId("plan-stopping")).toBeInTheDocument();
+      await waitFor(() => expect(within(row).getByRole("button", { name: "Stop" })).toBeEnabled());
+      expect(within(row).queryByTestId("plan-stopping")).toBeNull();
+    });
+
+    it("shows Stop again once the session takes another message while it stops", async () => {
+      vi.mocked(sendUserMessage).mockClear().mockResolvedValue({ queued: true });
+      renderPage();
+      const row = screen.getByTestId("workflow-run");
+      fireEvent.click(within(row).getByRole("button", { name: "Stop" }));
+      await waitFor(() => expect(sendUserMessage).toHaveBeenCalledTimes(1));
+      expect(within(row).getByTestId("plan-stopping")).toBeInTheDocument();
+
+      fireEvent.focus(within(row).getAllByTestId("tasks-progress-segment")[1]!);
+      fireEvent.pointerDown(await screen.findByTestId("tasks-progress-menu"), { button: 0 });
+      fireEvent.click(screen.getByTestId("tasks-progress-retry"));
+      await waitFor(() => expect(within(row).getByRole("button", { name: "Stop" })).toBeEnabled());
+      expect(sendUserMessage).toHaveBeenLastCalledWith(
+        session,
+        taskActionMessage("retry", "Fix the test"),
+        `plan-${session}`,
+      );
+      expect(within(row).queryByTestId("plan-stopping")).toBeNull();
+    });
+  });
 
   it("sends a task's ⋯ action on a run's timeline card to the run's session", async () => {
     vi.mocked(sendUserMessage).mockResolvedValue({ queued: true });

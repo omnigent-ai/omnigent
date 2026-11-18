@@ -7,7 +7,7 @@ import type * as CapabilitiesModule from "@/lib/CapabilitiesContext";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter, useLocation } from "react-router-dom";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { FullscreenIcon } from "@/components/ai-elements/MermaidBlock";
 import { type ChildSessionInfo, useChildSessions } from "@/hooks/useChildSessions";
 import { useSavedWorkflows } from "@/hooks/useSavedWorkflows";
@@ -15,9 +15,12 @@ import { type SessionJournalView, useSessionJournal } from "@/hooks/useSessionJo
 import { useOptionalLoadedConversations } from "@/hooks/useSidebarData";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { formatMessageTimestamp } from "@/lib/relativeTime";
+import type { AnyBlock } from "@/lib/blocks";
 import type { JournalEntry, StepProgress } from "@/lib/sessionJournal";
+import { continuePlanMessage, stopPlanMessage } from "@/lib/workflow";
 import type { ConversationState } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
+import { clearPlanStop, trackPlanStop, usePlanStops } from "@/store/planStops";
 import {
   openTasksTab,
   registerContinuePlan,
@@ -141,6 +144,14 @@ function renderPanel(
       ),
     },
   );
+}
+
+function userMessage(itemId: string, text: string): AnyBlock {
+  return {
+    type: "user_message",
+    ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId: "turn", itemId },
+    content: [{ type: "input_text", text }],
+  };
 }
 
 /** The session's live state: whether it works, and the agent's own task list. */
@@ -753,6 +764,105 @@ describe("TasksPanel", () => {
     } finally {
       act(withdrawContinue);
     }
+  });
+
+  describe("after Stop", () => {
+    const named = journalPlan(0, ["baseline"], ["ship", ["baseline"]]);
+    named.content.name = "Ship the fix";
+
+    /** Registers the composer's Stop, whose message the session takes once `deliver` settles. */
+    function registerTrackedStop() {
+      let deliver!: (taken: boolean) => void;
+      const withdraw = registerStopWork(
+        "conv",
+        () =>
+          void trackPlanStop(
+            "conv",
+            () =>
+              new Promise<boolean>((resolve) => {
+                deliver = resolve;
+              }),
+          ),
+      );
+      onTestFinished(() => act(withdraw));
+      onTestFinished(() => usePlanStops.setState({ requests: {} }));
+      return (taken: boolean) => act(async () => deliver(taken));
+    }
+
+    beforeEach(() => {
+      showJournal([named, status(1, "baseline", "started")]);
+      const withdrawContinue = registerContinuePlan("conv", vi.fn());
+      onTestFinished(() => act(withdrawContinue));
+    });
+
+    it("shows Stopping… until the agent stops working, then Continue", async () => {
+      const deliver = registerTrackedStop();
+      setSession({ sessionStatus: "running" });
+      renderPanel();
+      expect(screen.getByTestId("tasks-row-menu")).toBeInTheDocument();
+      fireEvent.click(screen.getByTestId("plan-stop"));
+
+      expect(screen.getByTestId("plan-stopping")).toBeDisabled();
+      expect(screen.getByTestId("plan-stopping")).toHaveTextContent("Stopping…");
+      expect(screen.queryByTestId("plan-stop")).toBeNull();
+      // Its running task doesn't offer Stop again.
+      expect(screen.queryByTestId("tasks-row-menu")).toBeNull();
+      await deliver(true);
+      expect(screen.getByTestId("plan-stopping")).toBeInTheDocument();
+
+      setSession({ sessionStatus: "idle" });
+      expect(screen.queryByTestId("plan-stopping")).toBeNull();
+      expect(screen.getByTestId("plan-continue")).toBeInTheDocument();
+      expect(screen.getByTestId("tasks-paused")).toHaveTextContent("Stopped");
+    });
+
+    it("restores Stop when the session doesn't take the stop message", async () => {
+      const deliver = registerTrackedStop();
+      setSession({ sessionStatus: "running" });
+      renderPanel();
+      fireEvent.click(screen.getByTestId("plan-stop"));
+      expect(screen.getByTestId("plan-stopping")).toBeInTheDocument();
+
+      await deliver(false);
+      expect(screen.queryByTestId("plan-stopping")).toBeNull();
+      expect(screen.getByTestId("plan-stop")).toBeEnabled();
+    });
+
+    it("shows Stop again once the session takes Continue while it stops", async () => {
+      const deliver = registerTrackedStop();
+      setSession({ sessionStatus: "running" });
+      renderPanel();
+      fireEvent.click(screen.getByTestId("plan-stop"));
+      await deliver(true);
+      expect(screen.getByTestId("plan-stopping")).toBeInTheDocument();
+
+      // What the composer's send does once the session takes the message.
+      act(() => clearPlanStop("conv"));
+      setSession({
+        blocks: [userMessage("stop", stopPlanMessage(null))],
+        pendingUserMessages: [
+          { tempId: "pend_1", content: [{ type: "input_text", text: continuePlanMessage(null) }] },
+        ],
+      });
+      expect(screen.queryByTestId("plan-stopping")).toBeNull();
+      expect(screen.getByTestId("plan-stop")).toBeInTheDocument();
+    });
+
+    it("reads a Stop from the transcript after a reload, through the workers' reports", () => {
+      registerTrackedStop();
+      setSession({
+        sessionStatus: "running",
+        blocks: [
+          userMessage("stop", stopPlanMessage(null)),
+          userMessage("report", "[Message from session 9b8b]\nStopped my shells."),
+        ],
+      });
+      renderPanel();
+      expect(screen.getByTestId("plan-stopping")).toBeInTheDocument();
+
+      setSession({ sessionStatus: "idle" });
+      expect(screen.getByTestId("plan-continue")).toBeInTheDocument();
+    });
   });
 
   it("hides run controls after the final step finishes, even with unfinished earlier steps", () => {

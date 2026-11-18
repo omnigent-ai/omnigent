@@ -28,6 +28,7 @@ import { SideChatPane } from "@/components/chat/SideChatPane";
 import { toast } from "sonner";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { handleSessionEvent, useChatStore, type ChatState } from "@/store/chatStore";
+import { usePlanStops } from "@/store/planStops";
 import { useSessionTasksActions } from "@/store/sessionTasksActions";
 import {
   continuePlanMessage,
@@ -7197,6 +7198,7 @@ describe("Composer workflow entry point", () => {
           status: original.status,
           sessionStatus: original.sessionStatus,
         });
+        usePlanStops.setState({ requests: {} });
       });
       const onStop = vi.fn();
       const onSend = vi.fn(useChatStore.getState().enqueueMessage);
@@ -7235,6 +7237,42 @@ describe("Composer workflow entry point", () => {
       error.mockRestore();
     },
   );
+
+  it("keeps the run stopping once the session takes the Stop, and restores Stop when it fails", async () => {
+    setComposerState({
+      conversationId: "conv_test",
+      sessionHarness: "openai-agents",
+      skills: [],
+      sessionStatus: "running",
+    });
+    const fetchMessage = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ queued: true, item_id: "stop_message" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(new Response(JSON.stringify({ error: "boom" }), { status: 500 }));
+    const error = vi.spyOn(toast, "error");
+    onTestFinished(() => {
+      fetchMessage.mockRestore();
+      error.mockRestore();
+      usePlanStops.setState({ requests: {} });
+    });
+    renderWithWorkflows(<Composer {...composerProps()} />);
+
+    act(() => useSessionTasksActions.getState().stopWork.conv_test?.());
+    expect(usePlanStops.getState().requests.conv_test).toEqual({ sent: false });
+    await waitFor(() => expect(usePlanStops.getState().requests.conv_test).toEqual({ sent: true }));
+    expect(error).not.toHaveBeenCalled();
+
+    act(() => usePlanStops.setState({ requests: {} }));
+    act(() => useSessionTasksActions.getState().stopWork.conv_test?.());
+    expect(usePlanStops.getState().requests.conv_test).toEqual({ sent: false });
+    await waitFor(() => expect(error).toHaveBeenCalledOnce());
+    expect(usePlanStops.getState().requests.conv_test).toBeUndefined();
+  });
 
   it("opens the dialog for the Tasks tab's empty state", async () => {
     setComposerState({

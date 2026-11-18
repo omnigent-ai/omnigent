@@ -44,6 +44,8 @@ import {
 } from "@/lib/sessionsApi";
 import { SSE_STALL_TIMEOUT_MS } from "@/lib/sse";
 import { serializeReplyDraft, type StoredReplyDraft } from "@/lib/replyDraft";
+import { continuePlanMessage } from "@/lib/workflow";
+import { trackPlanStop, usePlanStops } from "@/store/planStops";
 import {
   clearUnsentSends,
   peekQueuedSends,
@@ -3627,6 +3629,30 @@ describe("chatStore — send (first-send ordering)", () => {
     // The bubble pushed before the POST is removed on failure — no server
     // idle will fire to reconcile it.
     expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+  });
+
+  it("ends a plan's Stop in progress once the session takes another message", async () => {
+    onTestFinished(() => usePlanStops.setState({ requests: {} }));
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+      pendingUserMessages: [],
+    });
+    await trackPlanStop("conv_existing", async () => true);
+    fetchMock.mockImplementation((input, init) => {
+      if (String(input).endsWith("/v1/sessions/conv_existing/events")) {
+        return mockResponse({ error: "boom" }, { ok: false, status: 500 });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    // A message the session never took leaves the run stopping.
+    await useChatStore.getState().send("Keep the logs", "agent_xyz");
+    expect(usePlanStops.getState().requests.conv_existing).toEqual({ sent: true });
+
+    fetchMock.mockImplementation(defaultFetchHandler);
+    await useChatStore.getState().send(continuePlanMessage(null), "agent_xyz");
+    expect(usePlanStops.getState().requests.conv_existing).toBeUndefined();
   });
 
   it("surfaces a visible error block with friendly copy when the runner is unavailable (503)", async () => {
