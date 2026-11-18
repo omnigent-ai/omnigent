@@ -221,12 +221,30 @@ class ScheduledTaskStore(ABC):
         """
         ...
 
+    def get_many(self, scheduled_task_ids: builtins.list[str]) -> dict[str, ScheduledTask]:
+        """
+        Return the scheduled tasks with these ids, deleted ones included.
+
+        The default reads each id; stores override it with one bounded read.
+
+        :param scheduled_task_ids: Task ids, e.g. one page of a list.
+        :returns: The tasks found, by id; missing ids are absent.
+        """
+        found = (self.get(task_id) for task_id in dict.fromkeys(scheduled_task_ids))
+        return {task.id: task for task in found if task is not None}
+
     @abstractmethod
-    def list(self, *, owner_user_id: str | None = None) -> list[ScheduledTask]:
+    def list(
+        self,
+        *,
+        owner_user_id: str | None = None,
+        exclude_agent_ids: frozenset[str] = frozenset(),
+    ) -> list[ScheduledTask]:
         """
         List non-deleted scheduled tasks ordered by ``created_at ASC, id ASC``.
 
         :param owner_user_id: When given, return only tasks owned by this user.
+        :param exclude_agent_ids: Leave out tasks bound to these agents.
         :returns: List of :class:`ScheduledTask` instances.
         """
         ...
@@ -239,13 +257,30 @@ class ScheduledTaskStore(ABC):
         check_generation: bool = False,
         after: tuple[int, str] | None = None,
         limit: int = 50,
+        exclude_agent_ids: frozenset[str] = frozenset(),
     ) -> tuple[builtins.list[AutomationFailure], tuple[int, str] | None]:
         """Page owned tasks and return their latest failures without a session.
 
         The cursor advances over examined tasks, including healthy/deleted tasks,
         so an empty page can still have a continuation. Legacy stores return empty.
+        Tasks bound to ``exclude_agent_ids`` are left out.
         """
-        del owner_user_id, generation, check_generation, after, limit
+        del owner_user_id, generation, check_generation, after, limit, exclude_agent_ids
+        return [], None
+
+    def list_for_agent(
+        self, agent_id: str, *, after: str | None = None, limit: int = 100
+    ) -> tuple[builtins.list[ScheduledTask], str | None]:
+        """Page the non-deleted tasks bound to *agent_id*, across owners, by id.
+
+        :param agent_id: The agent, e.g. a built-in agent's fixed id.
+        :param after: Continue after this task id, from a previous page.
+        :param limit: Most tasks to examine, 1 to 500.
+        :returns: The page and the id to continue after, or ``None`` at the end.
+            The cursor advances over examined deleted tasks too, so a page can be
+            empty and still continue. Stores without an agent index return empty.
+        """
+        del agent_id, after, limit
         return [], None
 
     @abstractmethod
@@ -585,7 +620,7 @@ class ScheduledTaskStore(ABC):
         scheduled_task_ids: builtins.list[str],
     ) -> dict[str, str]:
         """
-        Return each task's MOST RECENT run status in one windowed query.
+        Return each task's MOST RECENT run status in one query, reading one run per task.
 
         Powers the Tasks-list completion badge: the route resolves the owner's
         tasks, then this returns ``{task_id: status}`` for the single latest run

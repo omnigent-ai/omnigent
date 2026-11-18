@@ -74,6 +74,7 @@ from omnigent.stores.conversation_store import (
     SCHEDULED_TASK_SOURCE_LABEL_KEY,
     SessionActivity,
 )
+from omnigent.stores.permission_store import PermissionStore
 from tests.server.helpers import build_agent_bundle
 
 # The trigger form's saved state; see encodeTriggerPrompt in web/.../triggerTemplates.ts.
@@ -497,6 +498,11 @@ class FakePermissionStore:
     def list_for_session(self, conversation_id: str, **_: Any) -> tuple[list[Any], None]:
         return [SessionPermission(*g) for g in self.grants if g[1] == conversation_id], None
 
+    # Its session reads are already direct, as the store defaults assume.
+    get_direct = PermissionStore.get_direct
+    list_direct_for_session = PermissionStore.list_direct_for_session
+    public_grantees = PermissionStore.public_grantees
+
     def delete_for_scheduled_task(self, scheduled_task_id: str) -> int:
         self.deleted_task_grants.append(scheduled_task_id)
         return 0
@@ -517,8 +523,26 @@ class _FakeHost:
 class _FakeSandboxConfig:
     """Minimal stand-in for ManagedSandboxDeployment in fire tests."""
 
-    def __init__(self, *, managed_launch_supported: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        managed_launch_supported: bool = True,
+        mcp_selection: Any | None = None,
+        others: Mapping[str, Any] | None = None,
+    ) -> None:
         self.managed_launch_supported = managed_launch_supported
+        # The provider a fresh managed run launches on, and how it records MCP services.
+        self.default = SimpleNamespace(provider="box", mcp_selection=mcp_selection)
+        self.configs = (
+            self.default,
+            *(
+                SimpleNamespace(provider=name, mcp_selection=selection)
+                for name, selection in (others or {}).items()
+            ),
+        )
+
+    def recorded(self, provider: str | None) -> Any:
+        return next((c for c in self.configs if c.provider == provider), self.default)
 
 
 class FakeHostStore:
@@ -837,32 +861,45 @@ class _ListLabelSelection:
         return tuple(json.loads(labels.get("deployment.mcp_services", "[]")))
 
 
+_REGISTRY_LABELS = {"omnigent.mcp_service.github": "1", "omnigent.mcp_service.linear": "1"}
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("app_state", "expected"),
+    ("execution_target", "provider_selection", "expected"),
     [
+        ("connected_host", None, _REGISTRY_LABELS),
+        ("managed_sandbox", None, _REGISTRY_LABELS),
         (
-            None,
-            {"omnigent.mcp_service.github": "1", "omnigent.mcp_service.linear": "1"},
-        ),
-        (
-            SimpleNamespace(session_mcp_selection=_ListLabelSelection()),
+            "managed_sandbox",
+            _ListLabelSelection(),
             {"deployment.mcp_services": '["github", "linear"]'},
         ),
+        # A provider's own selection never applies to a run on a connected host.
+        ("connected_host", _ListLabelSelection(), _REGISTRY_LABELS),
     ],
-    ids=["registry-default", "deployment-override"],
+    ids=["host", "sandbox-provider-without-one", "sandbox-provider-selection", "host-ignores-it"],
 )
 async def test_every_fired_session_starts_with_the_task_mcp_services(
-    app_state: Any, expected: dict[str, str]
+    execution_target: str, provider_selection: Any, expected: dict[str, str]
 ) -> None:
     conv_store = FakeConversationStore()
-    store = FakeScheduledTaskStore(rows={"task_1": _task(mcp_services=("github", "linear"))})
+    store = FakeScheduledTaskStore(
+        rows={
+            "task_1": _task(mcp_services=("github", "linear"), execution_target=execution_target)
+        }
+    )
 
     async def _launch(conv: Any, task: Any) -> None:
         return None
 
     on_fire = build_on_fire(
-        _deps(store, conversation_store=conv_store, app_state=app_state),
+        _deps(
+            store,
+            conversation_store=conv_store,
+            permission_store=FakePermissionStore(),
+            sandbox_config=_FakeSandboxConfig(mcp_selection=provider_selection),
+        ),
         launch_dispatch=_launch,
     )
     await on_fire(0, "task_1")
@@ -1646,6 +1683,7 @@ async def test_sent_prompt_tells_the_agent_no_one_is_watching(
         sessions_routes, "_dispatch_session_event_to_runner", _dispatch_session_event_to_runner
     )
     task = _task(prompt=f"{header}Merge the open Dependabot PRs.\n")
+    monkeypatch.setattr(fire_mod.time, "time", lambda: 1_794_895_414.9)
 
     await fire_mod._send_prompt(
         _deps(FakeScheduledTaskStore(rows={"task_1": task})),
@@ -1658,7 +1696,8 @@ async def test_sent_prompt_tells_the_agent_no_one_is_watching(
         [
             {
                 "type": "input_text",
-                "text": f"Merge the open Dependabot PRs.\n\n{fire_mod.UNATTENDED_RUN_NOTE}",
+                "text": "Merge the open Dependabot PRs.\n\n"
+                + fire_mod.unattended_run_note(1_794_895_414),
             }
         ]
     ]
@@ -2416,9 +2455,13 @@ async def test_managed_fire_saves_prompt_then_launches_fresh_sandbox(
     assert [label[REQUESTED_HOST_ID_LABEL_KEY] for label in labels] == launched_host_ids
     for saved in startup.enqueued:
         assert saved["user_id"] == RESERVED_USER_LOCAL
-        assert saved["event"].data["content"] == [
-            {"type": "input_text", "text": f"do the thing\n\n{fire_mod.UNATTENDED_RUN_NOTE}"}
-        ]
+        [content] = saved["event"].data["content"]
+        assert content["type"] == "input_text"
+        run_time = re.search(r"\(Unix time (\d+)\)", content["text"])
+        assert run_time is not None
+        assert content["text"] == "do the thing\n\n" + fire_mod.unattended_run_note(
+            int(run_time.group(1))
+        )
         assert saved["headers"].get("x-omnigent-background-session-titles") == "on"
     for call in managed_launch.await_args_list:
         assert call.kwargs["sandbox_config"] is config
@@ -3594,6 +3637,42 @@ async def test_only_a_sandbox_session_whose_launch_failed_unbound_is_replaced(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["joins", "relaunches"])
+async def test_a_run_on_the_tasks_existing_sandbox_keeps_its_providers_mcp_labels(
+    monkeypatch: pytest.MonkeyPatch, path: str
+) -> None:
+    """The task's sandbox stays on the provider it was launched on, not today's default."""
+    from omnigent.server.routes import sessions
+
+    joins = path == "joins"
+    task = _sandbox_continue_task(
+        last_run_conversation_id="conv_prev" if joins else None, mcp_services=("slack",)
+    )
+    own = continued_sandbox_host_id(task.id, task.workspace_id)
+    conv_store = _ExistingConversationStore(
+        _continued_session(host_id=own, workspace="/sandbox/ws", labels={})
+    )
+    monkeypatch.setattr(sessions, "_run_managed_launch", AsyncMock())
+    store = FakeScheduledTaskStore(rows={"task_1": task})
+    hosts = FakeHostStore({own: _FakeHost(own, "local", sandbox_provider="older")})
+    # The default moved to "box" after the task's sandbox was launched on "older".
+    deployment = _FakeSandboxConfig(
+        mcp_selection=_ListLabelSelection("box.mcp"),
+        others={"older": _ListLabelSelection("older.mcp")},
+    )
+
+    await _fire_once(
+        _deps(store, conversation_store=conv_store, host_store=hosts, sandbox_config=deployment)
+    )
+
+    [created] = conv_store.created
+    if joins:
+        assert created["host_id"] == own
+    assert created["labels"]["older.mcp"] == '["slack"]'
+    assert "box.mcp" not in created["labels"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("repository", [None, "https://github.com/example/runtime"])
 async def test_a_new_session_joins_the_tasks_sandbox_in_an_earlier_sessions_workspace(
     monkeypatch: pytest.MonkeyPatch,
@@ -4538,6 +4617,15 @@ def test_session_approval_skipping_mode(
     assert fire_mod.session_approval_skipping_mode(conv) == expected
 
 
+def test_unattended_run_note_opens_with_the_run_time_in_utc() -> None:
+    note = fire_mod.unattended_run_note(1_794_895_414.9)
+
+    assert note == fire_mod.UNATTENDED_RUN_NOTE.replace(
+        "<omnigent-automation-context>\n",
+        "<omnigent-automation-context>\nRun time: 2026-11-17T06:03:34Z (Unix time 1794895414).\n",
+    )
+
+
 def test_new_session_run_titles_carry_the_fire_time_in_the_task_timezone(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4638,7 +4726,8 @@ async def test_a_copied_run_uses_the_task_mcp_services_instead_of_the_source(
 class _ListLabelSelection:
     """A deployment that keeps the whole selection, even an empty one, in one label."""
 
-    key = "deployment.mcp_services"
+    def __init__(self, key: str = "deployment.mcp_services") -> None:
+        self.key = key
 
     async def validate(self, *args: Any, **kwargs: Any) -> tuple[str, ...]:
         raise AssertionError("firing does not revalidate")
@@ -4652,20 +4741,31 @@ class _ListLabelSelection:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("task_services", "written"),
-    [(("github",), '["github"]'), ((), None)],
-    ids=["task-selection-replaces", "no-task-selection-keeps-the-copy"],
+    ("source_labels", "task_services", "written"),
+    [
+        ({"deployment.mcp_services": '["slack"]'}, ("github",), '["github"]'),
+        ({"deployment.mcp_services": '["slack"]'}, (), None),
+        # A registry selection the task's provider can't read is replaced too.
+        ({"omnigent.mcp_service.slack": "1"}, ("github",), '["github"]'),
+    ],
+    ids=["task-selection-replaces", "no-task-selection-keeps-the-copy", "replaces-a-registry-one"],
 )
-async def test_a_copied_run_keeps_a_one_label_selection_unless_the_task_has_one(
-    task_services: tuple[str, ...], written: str | None
+async def test_a_copied_run_keeps_its_source_selection_unless_the_task_has_one(
+    source_labels: dict[str, str], task_services: tuple[str, ...], written: str | None
 ) -> None:
     selection = _ListLabelSelection()
     conv_store = FakeConversationStore()
     conv_store.get_conversation = lambda conversation_id: _FakeConversation(  # type: ignore[method-assign]
-        id=conversation_id, agent_id="ag_1", labels={selection.key: '["slack"]'}
+        id=conversation_id, agent_id="ag_1", labels=source_labels
     )
     store = FakeScheduledTaskStore(
-        rows={"task_1": _task(source_session_id="conv_source", mcp_services=task_services)}
+        rows={
+            "task_1": _task(
+                source_session_id="conv_source",
+                mcp_services=task_services,
+                execution_target="managed_sandbox",
+            )
+        }
     )
 
     async def _launch(conv: Any, task: Any) -> None:
@@ -4674,14 +4774,15 @@ async def test_a_copied_run_keeps_a_one_label_selection_unless_the_task_has_one(
     deps = _deps(
         store,
         conversation_store=conv_store,
-        app_state=SimpleNamespace(session_mcp_selection=selection),
+        permission_store=FakePermissionStore(),
+        sandbox_config=_FakeSandboxConfig(mcp_selection=selection),
     )
     await build_on_fire(deps, launch_dispatch=_launch)(0, "task_1")
     await _drain()
 
     (fork,) = conv_store.forked
-    # The copy's own label survives unless the task writes its selection over it.
-    assert (selection.key in fork["dropped_label_keys"]) == (written is not None)
+    # The copy's own selection survives unless the task writes its selection over it.
+    assert (set(source_labels) <= fork["dropped_label_keys"]) == (written is not None)
     assert fork["extra_labels"].get(selection.key) == written
 
 

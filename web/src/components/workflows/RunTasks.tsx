@@ -21,6 +21,9 @@ import { openTasksTab } from "@/store/sessionTasksActions";
 /** The queries that list a run, e.g. `["workflow-runs", workflowId]`. */
 type RunRefreshKeys = readonly (readonly unknown[])[];
 
+// A run row's workflow link and graph button share one box, so they line up side by side.
+const RUN_ICON_BUTTON_CLASS_NAME = "z-10 shrink-0 text-muted-foreground hover:text-foreground";
+
 /**
  * Messages a run's session from a page other than its chat, then
  * refreshes the lists that show the run.
@@ -187,7 +190,7 @@ export function RunGraphButton({
       type="button"
       variant="ghost"
       size="icon-sm"
-      className={cn("z-10 shrink-0 text-muted-foreground hover:text-foreground", className)}
+      className={cn(RUN_ICON_BUTTON_CLASS_NAME, className)}
       aria-label={`View ${runName} on the graph`}
       title="View this run on the graph"
       data-testid="run-graph-button"
@@ -199,7 +202,14 @@ export function RunGraphButton({
 }
 
 /** Opens the saved workflow a run follows, on the workflow's page. */
-export function RunWorkflowButton({ workflowId }: { workflowId: string }) {
+export function RunWorkflowButton({
+  workflowId,
+  className,
+}: {
+  workflowId: string;
+  /** The row's placement, the same as its graph button's, e.g. `relative -my-1` on a title line. */
+  className?: string;
+}) {
   const { workflows } = useSavedWorkflows();
   const name = workflows.find((workflow) => workflow.id === workflowId)?.name;
   const label = name ? `Open workflow “${name}”` : "Open the workflow";
@@ -208,7 +218,7 @@ export function RunWorkflowButton({ workflowId }: { workflowId: string }) {
       asChild
       variant="ghost"
       size="icon-sm"
-      className="z-10 shrink-0 text-muted-foreground hover:text-foreground"
+      className={cn(RUN_ICON_BUTTON_CLASS_NAME, className)}
     >
       <Link
         to={`/workflows/${encodeURIComponent(workflowId)}`}

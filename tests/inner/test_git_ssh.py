@@ -17,7 +17,6 @@ from pathlib import Path
 import pytest
 
 from omnigent.errors import OmnigentError
-from omnigent.harnesses.claude_native.bridge import _bridge_sandbox_payload
 from omnigent.inner.bwrap_sandbox import _dotfile_and_symlink_mask_args
 from omnigent.inner.datamodel import GitSshBinding, OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
 from omnigent.inner.git_ssh import (
@@ -426,7 +425,7 @@ def test_git_ssh_terminal_cannot_override_containment(tmp_path: Path) -> None:
         build_terminal_os_env_spec(terminal, parent_os_env_spec=parent, sandbox_override="none")
 
 
-def test_git_ssh_binding_survives_native_bridge_json(tmp_path: Path) -> None:
+def test_git_ssh_binding_survives_sandbox_json_round_trip(tmp_path: Path) -> None:
     binding = GitSshBinding(
         host="git.example.test",
         port=22,
@@ -437,9 +436,9 @@ def test_git_ssh_binding_survives_native_bridge_json(tmp_path: Path) -> None:
         known_hosts_file=str(tmp_path / "known_hosts"),
     )
     sandbox = OSEnvSandboxSpec(type="linux_bwrap", git_ssh=[binding])
-    for payload in (encode_sandbox_spec(sandbox), _bridge_sandbox_payload(sandbox)):
-        restored = decode_sandbox_spec(json.loads(json.dumps(payload)))
-        assert restored.git_ssh == [binding]
+    payload = encode_sandbox_spec(sandbox)
+    restored = decode_sandbox_spec(json.loads(json.dumps(payload)))
+    assert restored.git_ssh == [binding]
 
 
 def test_git_ssh_socket_survives_launcher_mask_round_trip(tmp_path: Path) -> None:

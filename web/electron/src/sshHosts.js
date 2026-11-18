@@ -74,4 +74,4 @@ function createSshHostStore(filePath) {
   };
 }
 
-module.exports = { createSshHostStore };
+module.exports = { canonicalHostId, createSshHostStore };

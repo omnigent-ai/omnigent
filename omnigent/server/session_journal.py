@@ -41,10 +41,11 @@ from omnigent.entities.session_journal import (
     JournalEntryTooLargeError,
     JournalFullError,
     StepNotReadyError,
+    normalize_description,
     normalize_status,
     normalize_step_id,
 )
-from omnigent.entities.workflow import Workflow
+from omnigent.entities.workflow import InvalidWorkflowError, Workflow
 from omnigent.entities.workflow_questions import (
     normalize_questions,
     question_form,
@@ -227,6 +228,24 @@ async def load_workflow_for_run(
             {"name": workflow.name, "steps": workflow.steps, "source": "workflow"},
         )
     return workflow
+
+
+def _check_proposed_description(conversation_store: ConversationStore, description: str) -> None:
+    """Refuse a proposed description its workflow couldn't store, so Save plan can save it.
+
+    Text the journal itself refuses, such as a lone surrogate, is left for it to report.
+    """
+    try:
+        text = normalize_description(description)
+    except InvalidJournalEntryError:
+        return
+    workflows = open_workflow_store(conversation_store)
+    if workflows is None:
+        return
+    try:
+        workflows.check_description(text)
+    except InvalidWorkflowError as exc:
+        raise OmnigentError(f"invalid_entry: {exc}", code=ErrorCode.INVALID_INPUT) from exc
 
 
 async def _load_workflow(
@@ -472,12 +491,15 @@ def create_session_journal_router(
     ) -> SessionJournalEntry:
         """Append an entry written by the session's agent; only its runner calls this."""
         session = await _agent_session(request, session_id)
-        if body.kind == "plan" and set(body.content) != {"name", "steps"}:
+        if body.kind == "plan" and set(body.content) - {"description"} != {"name", "steps"}:
             # Only the server can attribute a plan to a saved workflow snapshot.
             raise OmnigentError(
-                "invalid_entry: a plan's content has exactly two fields, name and steps",
+                "invalid_entry: a plan's content has name and steps, and optionally description",
                 code=ErrorCode.INVALID_INPUT,
             )
+        description = body.content.get("description") if body.kind == "plan" else None
+        if isinstance(description, str) and description.strip():
+            await asyncio.to_thread(_check_proposed_description, conversation_store, description)
         if body.workflow_id is not None:
             await _require_workflow(request, body.kind, body.workflow_id)
         entry = await _append(

@@ -28,7 +28,11 @@ import {
 import { Link, useLocation } from "@/lib/routing";
 import { Button } from "@/components/ui/button";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { customAgentsSettingsEnabled, isSingleUserMode } from "@/lib/capabilities";
+import {
+  adminGeneralSettingsAvailable,
+  customAgentsSettingsEnabled,
+  isSingleUserMode,
+} from "@/lib/capabilities";
 import { useIsAdmin } from "@/hooks/useIsAdmin";
 import { isElectronShell } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
@@ -73,6 +77,11 @@ const SECTION_IDS: readonly SettingsSectionId[] = [
   "updates",
 ];
 
+/** Where a section lives; the sidebar link and its ⌘K command both go here. */
+export function settingsSectionPath(id: SettingsSectionId): string {
+  return `/settings/${id}`;
+}
+
 interface SettingsNavItem {
   id: SettingsSectionId;
   label: string;
@@ -104,7 +113,7 @@ export function settingsNavGroups(
   integrationsEnabled = false,
   customAgentsEnabled = false,
   mcpEnabled = false,
-  nestedAgentsEnabled = false,
+  adminGeneralEnabled = false,
   harnessesOffered = true,
 ): SettingsNavGroup[] {
   const harnesses: SettingsNavItem = {
@@ -156,9 +165,9 @@ export function settingsNavGroups(
       ],
     });
   }
-  // Single-user servers permit destination settings without an admin identity.
+  // Single-user servers permit these settings without an admin identity.
   const adminItems: SettingsNavItem[] = [];
-  if ((isAdmin || isSingleUser) && nestedAgentsEnabled) {
+  if ((isAdmin || isSingleUser) && adminGeneralEnabled) {
     adminItems.push({ id: "admin", label: "General", icon: SettingsIcon });
   }
   if (isAdmin) {
@@ -208,7 +217,7 @@ export function useSettingsRoute(): {
   const isValidSection =
     (SECTION_IDS as readonly string[]).includes(next) &&
     !(singleUser && (next === "members" || next === "sharing")) &&
-    !(next === "admin" && (info === "loading" || info.sibling_sessions !== true)) &&
+    !(next === "admin" && !adminGeneralSettingsAvailable(info)) &&
     !(next === "custom-agents" && !customAgentsSettingsEnabled(info));
   const section = isValidSection ? (next as SettingsSectionId) : defaultSection;
   const harness = section === "harnesses" ? segments[idx + 2] : undefined;
@@ -275,7 +284,7 @@ export function SettingsSidebarBody({
     integrationsEnabled,
     customAgentsSettingsEnabled(info),
     mcpEnabled,
-    info !== "loading" && info.sibling_sessions === true,
+    adminGeneralSettingsAvailable(info),
     harnessesOffered,
   );
 
@@ -331,7 +340,7 @@ export function SettingsSidebarBody({
                     )}
                   >
                     <Link
-                      to={`/settings/${item.id}`}
+                      to={settingsSectionPath(item.id)}
                       onClick={onNavClick}
                       data-testid={`settings-nav-${item.id}`}
                       componentId={`settings.nav.${item.id}`}

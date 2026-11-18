@@ -15,6 +15,7 @@ import {
 } from "@tanstack/react-query";
 import { useEffect, useMemo, useSyncExternalStore } from "react";
 import {
+  fetchJournalEntryPosition,
   fetchJournalPage,
   currentPlan,
   mergeJournalEntries,
@@ -298,4 +299,27 @@ export function useSessionJournal(
       else void reloadNewestPage(queryClient, conversationId);
     },
   };
+}
+
+/**
+ * Where an entry outside the loaded pages sits in a session's journal.
+ *
+ * @param conversationId - The session, or undefined to skip the lookup.
+ * @param entryId - e.g. the proposal a workflow's description was saved from.
+ * @returns The query: the entry's position, or null when the journal doesn't hold it.
+ */
+export function useJournalEntryPosition(
+  conversationId: string | undefined,
+  entryId: string | undefined,
+) {
+  return useQuery({
+    queryKey: ["session-journal-position", conversationId, entryId],
+    queryFn: ({ signal }) =>
+      conversationId && entryId
+        ? fetchJournalEntryPosition(conversationId, entryId, signal)
+        : Promise.resolve(null),
+    enabled: !!conversationId && !!entryId,
+    // An entry never moves.
+    staleTime: Infinity,
+  });
 }
