@@ -396,6 +396,10 @@ _RUNNER_CONNECT_DEADLINE_S = 180.0
 # launch has been starting for the settle window, so a waiting send gets the cause.
 _REJECTED_TUNNEL_SETTLE_S = 2.0
 _REJECTED_TUNNEL_DRAIN_CAP_S = 30.0
+# How often a connected host re-checks its credentials with the server, so a
+# credential that stops working while the host is idle still takes it offline.
+_CREDENTIAL_PROBE_INTERVAL_S = 300.0
+_CREDENTIAL_PROBE_RECHECK_S = 10.0
 
 
 def _connect_marker_path(log_path: Path) -> Path:
@@ -2871,8 +2875,8 @@ class HostProcess:
         if not rejected or self._ws is not ws:
             return
         message = (
-            "The server now rejects this host's credentials, so its runners cannot "
-            f"connect. Reconnecting; if this persists, run `{cli_invocation()} login "
+            "The server now rejects this host's credentials, so this host is going "
+            f"offline. It reconnects after you run `{cli_invocation()} login "
             f"{self._login_hint_url()}` on this host."
         )
         _logger.warning("%s", message)
@@ -2917,12 +2921,30 @@ class HostProcess:
         return await asyncio.to_thread(any_unconnected)
 
     def _credentials_rejected_error(self) -> str:
-        """Return the sign-in instruction for a runner the server refused on credentials."""
+        """Return the sign-in instruction for a request the server refused on credentials."""
         return (
-            "The server rejected this host's credentials, so the runner could not "
-            f"connect. Sign in again with `{cli_invocation()} login {self._login_hint_url()}` "
-            "on this host, then retry."
+            "The server rejected this host's credentials. Sign in again with "
+            f"`{cli_invocation()} login {self._login_hint_url()}` on this host, then retry."
         )
+
+    async def _credential_probe_loop(self) -> None:
+        """Periodically confirm the server still accepts this host's credentials.
+
+        A refusal is re-checked after a short pause, so one transient token-refresh
+        failure does not take the host offline.
+        """
+        while True:
+            await asyncio.sleep(_CREDENTIAL_PROBE_INTERVAL_S)
+            try:
+                rejected = await self._run_host_subprocess_in_thread(
+                    self._server_rejects_credentials
+                )
+            except Exception:
+                _logger.debug("Could not probe this host's credentials", exc_info=True)
+                continue
+            if rejected:
+                await asyncio.sleep(_CREDENTIAL_PROBE_RECHECK_S)
+                await self._drop_tunnel_if_credentials_rejected()
 
     def _server_rejects_credentials(self) -> bool:
         """Return whether ``GET /v1/me`` refuses the tunnel's own headers as unauthenticated."""
@@ -4123,6 +4145,17 @@ class HostProcess:
                     errno=exc.errno if isinstance(exc, OSError) else None,
                 ),
             )
+            from omnigent.runner._entry import _is_login_redirect_or_unauthorized
+
+            if isinstance(exc, httpx.HTTPStatusError) and _is_login_redirect_or_unauthorized(
+                exc.response
+            ):
+                return HostSkillsResultFrame(
+                    request_id=frame.request_id,
+                    status="failed",
+                    error_code="credentials_rejected",
+                    error=self._credentials_rejected_error(),
+                )
             return HostSkillsResultFrame(
                 request_id=frame.request_id,
                 status="failed",
@@ -5892,6 +5925,7 @@ class HostProcess:
         self._ensure_model_options_prewarm()
         self._ws = ws
         readiness_task = asyncio.create_task(self._harness_readiness_loop(ws))
+        credential_probe_task = asyncio.create_task(self._credential_probe_loop())
         try:
             # Reports raised while disconnected must wait until registration;
             # the server cannot route them before this connection owns the host.
@@ -5935,8 +5969,11 @@ class HostProcess:
             if (diagnostics := self._diagnostics_for(ws)) is not None:
                 diagnostics.freeze()
             readiness_task.cancel()
+            credential_probe_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await readiness_task
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await credential_probe_task
             await self._cancel_all_harness_logins()
 
     async def _harness_readiness_loop(
@@ -6296,6 +6333,8 @@ class HostProcess:
         elif isinstance(frame, HostSkillsFrame):
             skills_result = await asyncio.to_thread(self._handle_skills, frame)
             await self._send_text(ws, self._encode_frame(skills_result))
+            if skills_result.error_code == "credentials_rejected":
+                await self._drop_tunnel_if_credentials_rejected()
         elif isinstance(frame, HostPluginsFrame):
             plugins_result = await asyncio.to_thread(self._handle_plugins, frame)
             await self._send_text(ws, self._encode_frame(plugins_result))

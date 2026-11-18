@@ -355,8 +355,13 @@ async def test_host_skill_failure_retains_session_and_typed_cause(
         result = host._handle_skills(frame)
 
     assert result.status == "failed"
-    assert result.error_code == "discovery_failed"
-    assert result.error == "skill discovery failed; see the host log"
+    if failure == "unauthorized":
+        assert result.error_code == "credentials_rejected"
+        assert result.error is not None
+        assert result.error.startswith("The server rejected this host's credentials")
+    else:
+        assert result.error_code == "discovery_failed"
+        assert result.error == "skill discovery failed; see the host log"
     assert len(rows) == 1
     row = rows[0]
     assert row["event_name"] == "host_skill_discovery_failed"
@@ -2909,6 +2914,92 @@ async def test_credential_check_skips_managed_hosts_overlaps_and_replaced_tunnel
     old_transport.abort.assert_not_called()
     new_transport.abort.assert_not_called()
     assert host._auth_token_factory_resolved is True
+
+
+@pytest.mark.parametrize(("bundle_status", "drops_tunnel"), [(401, True), (500, False)])
+async def test_refused_skill_bundle_fetch_drops_a_rejected_tunnel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bundle_status: int, drops_tunnel: bool
+) -> None:
+    """A host request the server refuses on credentials names sign-in and drops the tunnel."""
+    import httpx
+
+    from omnigent.host.identity import HOST_TOKEN_ENV_VAR
+
+    monkeypatch.delenv(HOST_TOKEN_ENV_VAR, raising=False)
+    monkeypatch.setattr("omnigent.host.connect._REJECTED_TUNNEL_SETTLE_S", 0.0)
+    requested: list[str] = []
+
+    def _reply(_transport: object, request: httpx.Request) -> httpx.Response:
+        requested.append(request.url.path)
+        if request.url.path == "/v1/me":
+            return httpx.Response(401, request=request)
+        return httpx.Response(bundle_status, request=request)
+
+    monkeypatch.setattr(httpx.HTTPTransport, "handle_request", _reply)
+    host = _host()
+    host._auth_token_factory = lambda: "host-token"
+    host._auth_token_factory_resolved = True
+    tunnel = _FakeTunnel()
+    tunnel.transport = Mock()  # type: ignore[attr-defined]
+    host._ws = tunnel  # type: ignore[assignment]
+    frame = HostSkillsFrame("req_skills", "session", str(tmp_path), "sess_1", "agent", "1")
+
+    await host._dispatch_host_frame(tunnel, frame)  # type: ignore[arg-type]
+
+    [reply] = [decode_host_frame(sent) for sent in tunnel.sent]
+    assert isinstance(reply, HostSkillsResultFrame)
+    assert reply.status == "failed"
+    if drops_tunnel:
+        assert reply.error_code == "credentials_rejected"
+        assert reply.error is not None and " login " in reply.error
+        assert requested == ["/v1/sessions/sess_1/agent/contents", "/v1/me"]
+        tunnel.transport.abort.assert_called_once_with()  # type: ignore[attr-defined]
+    else:
+        assert reply.error_code == "discovery_failed"
+        assert requested == ["/v1/sessions/sess_1/agent/contents"]
+        tunnel.transport.abort.assert_not_called()  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize(
+    ("replies", "drops_tunnel"),
+    [([401, 401], True), ([401, 200], False), ([200, 200], False)],
+)
+async def test_idle_credential_probe_drops_a_tunnel_only_on_a_confirmed_refusal(
+    monkeypatch: pytest.MonkeyPatch, replies: list[int], drops_tunnel: bool
+) -> None:
+    """An idle host goes offline when the server keeps refusing its credentials."""
+    import httpx
+
+    from omnigent.host.identity import HOST_TOKEN_ENV_VAR
+
+    monkeypatch.delenv(HOST_TOKEN_ENV_VAR, raising=False)
+    monkeypatch.setattr("omnigent.host.connect._REJECTED_TUNNEL_SETTLE_S", 0.0)
+    monkeypatch.setattr("omnigent.host.connect._CREDENTIAL_PROBE_INTERVAL_S", 0.01)
+    monkeypatch.setattr("omnigent.host.connect._CREDENTIAL_PROBE_RECHECK_S", 0.0)
+    pending = list(replies)
+    checks: list[str] = []
+
+    def _reply(_transport: object, request: httpx.Request) -> httpx.Response:
+        checks.append(request.url.path)
+        return httpx.Response(pending.pop(0) if pending else 200, request=request)
+
+    monkeypatch.setattr(httpx.HTTPTransport, "handle_request", _reply)
+    host = _host()
+    host._auth_token_factory = lambda: "host-token"
+    host._auth_token_factory_resolved = True
+    transport = Mock()
+    host._ws = SimpleNamespace(transport=transport)  # type: ignore[assignment]
+
+    probe = asyncio.create_task(host._credential_probe_loop())
+    try:
+        await poll_until_async(lambda: len(checks) > len(replies), timeout_s=5, interval_s=0.01)
+    finally:
+        probe.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await probe
+
+    assert set(checks) == {"/v1/me"}
+    assert transport.abort.called is drops_tunnel
 
 
 def test_runner_exit_error_redacts_credential_values(tmp_path: Path) -> None:
