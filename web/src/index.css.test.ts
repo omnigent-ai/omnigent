@@ -536,14 +536,14 @@ describe("index.css native Settings status bar", () => {
     );
     expect(backdrop).toBeDefined();
     expect(backdrop![0]).toContain("top: calc(-1 * var(--header-offset))");
-    expect(mediaOf(backdrop!.index!)).toContain("width < 48rem");
+    expect(mediaOf(backdrop!.index!)).toContain("width < 73.8125rem");
   });
 
   it("masks the status bar on wide settings pages only", () => {
     const mask = ruleFor(":is([data-ios-native], [data-android-native]) .settings-page-scroll");
     expect(mask).toBeDefined();
     expect(mask![0]).toContain("transparent var(--omnigent-safe-top)");
-    expect(mediaOf(mask!.index!)).toContain("width >= 48rem");
+    expect(mediaOf(mask!.index!)).toContain("width >= 73.8125rem");
   });
 });
 
