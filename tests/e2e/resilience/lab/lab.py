@@ -363,7 +363,11 @@ class Lab:
             time.sleep(1.0)
 
     def write_diagnostics(self, destination: Path) -> None:
-        """Retain a safe failure projection, never raw lab files."""
+        """Retain a safe failure projection, never raw lab files.
+
+        Retention and file-read limits do not bound complete event-history
+        copying/scanning or lifecycle-path discovery and sorting.
+        """
         events = self.events.events()
         discovery: deque[LabEvent] = deque(maxlen=_DIAGNOSTIC_LIMIT)
         discovery_count = 0
@@ -462,7 +466,7 @@ class Lab:
         destination.write_text(json.dumps(payload, indent=2, allow_nan=False) + "\n")
 
     def _diagnostic_lifecycle(self) -> dict[str, Any]:
-        """Read only bounded native lifecycle records inside this lab's temp tree."""
+        """Limit retained file reads after complete path discovery and sorting."""
         records: list[dict[str, Any]] = []
         paths = sorted(self._host_tmp.glob("omnigent-*/claude-native/*/lifecycle-*.json"))
         selected = paths[:128]

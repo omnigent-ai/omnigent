@@ -654,6 +654,9 @@ def test_lab_diagnostics_project_records_and_upload_only_safe_file(
         "nested",
         "events-object",
         "identity-mismatch",
+        "hardlink",
+        "nonregular",
+        "at-limit",
     ],
 )
 def test_lab_diagnostics_reject_outside_or_invalid_native_records(
@@ -689,6 +692,11 @@ def test_lab_diagnostics_reject_outside_or_invalid_native_records(
     source.write_text(json.dumps(value))
     if invalid == "file-link":
         path.symlink_to(source)
+    elif invalid == "hardlink":
+        path.hardlink_to(source)
+        assert path.stat().st_nlink == 2
+    elif invalid == "nonregular":
+        path.mkdir()
     elif invalid == "self-loop":
         path.symlink_to(path.name)
     elif invalid == "directory-link":
@@ -707,17 +715,20 @@ def test_lab_diagnostics_reject_outside_or_invalid_native_records(
     sibling_bridge = bridge.parent / ("e" * 32)
     sibling_bridge.mkdir()
     sibling_id = "f" * 32
-    (sibling_bridge / f"lifecycle-{sibling_id}.json").write_text(
-        json.dumps(
-            {
-                **value,
-                "launch_id": sibling_id,
-                "events": [
-                    {"event_name": "Stop", "recorded_at": 2.0, "payload": "private-invalid-json"}
-                ],
-            }
-        )
-    )
+    sibling_value = {
+        **value,
+        "launch_id": sibling_id,
+        "events": [{"event_name": "Stop", "recorded_at": 2.0, "payload": "private-invalid-json"}],
+    }
+    # The byte-limit case pads the healthy sibling beside the invalid record.
+    if invalid == "at-limit":
+        sibling_value["payload"] = "private-invalid-json"
+        padding = 32768 - len(json.dumps(sibling_value).encode("utf-8"))
+        sibling_value["payload"] = "private-invalid-json" + "x" * padding
+    sibling_path = sibling_bridge / f"lifecycle-{sibling_id}.json"
+    sibling_path.write_text(json.dumps(sibling_value))
+    if invalid == "at-limit":
+        assert sibling_path.stat().st_size == 32768
     destination = tmp_path / "pytest-base" / "resilience-diagnostics" / "lab-0.json"
     lab.write_diagnostics(destination)
     payload = json.loads(destination.read_text())

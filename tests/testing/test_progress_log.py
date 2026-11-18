@@ -173,6 +173,9 @@ from types import SimpleNamespace
 from tests import conftest as progress
 
 progress._PROGRESS_LOG_PATH = str(Path(__file__).parent / "progress.log")
+Path(__file__).with_name("owned-directories.json").write_text(json.dumps([
+    str(progress._TEST_OMNIGENT_DATA_DIR), str(progress._TEST_HARNESS_TMP_PARENT),
+]))
 contexts = []
 
 def record_context(nodeid, **kwargs):
@@ -186,6 +189,7 @@ pytest_runtest_setup_progress = progress.pytest_runtest_setup_progress
 pytest_runtest_call = progress.pytest_runtest_call
 pytest_runtest_teardown = progress.pytest_runtest_teardown
 pytest_runtest_logfinish = progress.pytest_runtest_logfinish
+pytest_unconfigure = progress.pytest_unconfigure
 
 def pytest_sessionfinish():
     Path(__file__).with_name("contexts.json").write_text(json.dumps(contexts))
@@ -235,6 +239,9 @@ def test_original_failure(sut_mock):
     result = pytester.runpytest_subprocess("-q", "--tb=short", f"--junitxml={report}")
     assert result.ret == pytest.ExitCode.TESTS_FAILED
     result.assert_outcomes(passed=1, failed=1, errors=0)
+    owned_directories = json.loads((pytester.path / "owned-directories.json").read_text())
+    assert len(owned_directories) == 2
+    assert all(not Path(directory).exists() for directory in owned_directories)
     failure = ET.parse(report).findall(".//testcase/failure")
     assert len(failure) == 1
     assert "owned-original-failure" in (failure[0].text or "")
