@@ -2633,25 +2633,37 @@ def _databricks_uc_opus_executor():
 
 
 @pytest.mark.parametrize(
-    ("settings_text", "expected"),
+    ("settings_text", "expected", "has_api_key_helper"),
     [
         (
             '{"env": {"ANTHROPIC_BEDROCK_BASE_URL": "https://gateway.example", "RETRIES": 3}}',
             {"ANTHROPIC_BEDROCK_BASE_URL": "https://gateway.example"},
+            False,
         ),
-        ("{not json", {}),
-        ('{"env": ["ANTHROPIC_BEDROCK_BASE_URL"]}', {}),
-        (None, {}),
+        ('{"apiKeyHelper": "printf %s helper-token"}', {}, True),
+        ("{not json", {}, False),
+        ('{"env": ["ANTHROPIC_BEDROCK_BASE_URL"]}', {}, False),
+        (None, {}, False),
     ],
-    ids=["string-entries", "malformed-json", "env-not-object", "missing-file"],
+    ids=[
+        "string-entries",
+        "helper-without-env",
+        "malformed-json",
+        "env-not-object",
+        "missing-file",
+    ],
 )
 def test_claude_user_settings_env_reads_home_settings(
     settings_text: str | None,
     expected: dict[str, str],
+    has_api_key_helper: bool,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from omnigent.inner.claude_sdk_executor import _claude_user_settings_env
+    from omnigent.inner.claude_sdk_executor import (
+        _claude_user_settings_env,
+        _claude_user_settings_env_with_sources,
+    )
 
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
     monkeypatch.setenv("HOME", str(tmp_path))
@@ -2660,6 +2672,7 @@ def test_claude_user_settings_env_reads_home_settings(
         (tmp_path / ".claude" / "settings.json").write_text(settings_text)
 
     assert _claude_user_settings_env() == expected
+    assert _claude_user_settings_env_with_sources()[2] is has_api_key_helper
 
 
 @pytest.mark.parametrize(
@@ -5226,6 +5239,26 @@ def test_prepare_claude_cli_path_wrap_failure_prevents_launch(monkeypatch) -> No
     with pytest.raises(OSError, match="cannot wrap"):
         prepare_claude_cli_path("/usr/bin/claude", _wrap_probe_spec())
     launcher.assert_not_called()
+
+
+def test_launcher_validation_failure_is_optional_only_without_os_env(monkeypatch) -> None:
+    from omnigent.inner import claude_sdk_executor as claude
+
+    monkeypatch.setattr(claude.sys, "platform", "linux")
+    monkeypatch.setattr(claude, "resolve_sandbox", lambda *_: _active_policy())
+    backend = Mock()
+    backend.wrap_launcher_argv.return_value = ["sandboxed", "/usr/bin/claude"]
+    monkeypatch.setattr(claude, "get_backend", lambda _: backend)
+    launcher = Mock(side_effect=OSError("untrusted runtime"))
+    monkeypatch.setattr(claude, "create_exec_launcher", launcher)
+
+    optional = claude.prepare_tight_cli_process("/usr/bin/claude", cwd="/tmp/work")
+    assert optional.cli_path == "/usr/bin/claude"
+    assert not optional.enable_native_tools
+    assert not optional.sandboxed
+    with pytest.raises(OSError, match="untrusted runtime"):
+        claude.prepare_claude_cli_path("/usr/bin/claude", _wrap_probe_spec())
+    assert launcher.call_count == 2
 
 
 @pytest.mark.asyncio

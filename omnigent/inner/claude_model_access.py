@@ -752,6 +752,7 @@ def resolve_claude_model_access(
     credential: Callable[[], str] | None = None,
     source_paths: tuple[Path, ...] = (),
     source_env_names: frozenset[str] = frozenset(),
+    user_settings_has_api_key_helper: bool = False,
     databricks_profile: str | None = None,
 ) -> ClaudeModelAccess:
     """Resolve credentials in the trusted parent, before starting any worker."""
@@ -843,6 +844,12 @@ def resolve_claude_model_access(
                 oauth,
                 source_env_names=source_env_names,
             )
+
+    if user_settings_has_api_key_helper:
+        raise ValueError(
+            "sandboxed Claude cannot use a user settings apiKeyHelper with OAuth fallback; "
+            "configure a supported provider credential"
+        )
 
     credential_path = config_dir / ".credentials.json"
     canonical_credential_path = credential_path.resolve()

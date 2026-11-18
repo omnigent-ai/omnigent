@@ -356,3 +356,65 @@ def test_redirected_user_settings_source_is_rejected_before_launch(
                 bundle_dir=tmp_path / "bundle",
             )
         no_launch.assert_not_called()
+
+
+@pytest.mark.parametrize("entrypoint", ["sdk", "terminal"])
+def test_user_settings_helper_cannot_select_saved_oauth_for_custom_gateway(
+    tmp_path: Path,
+    isolated_auth: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entrypoint: str,
+) -> None:
+    from omnigent.inner import claude_sdk_executor as claude
+
+    config_dir = Path.home() / ".claude"
+    config_dir.mkdir()
+    (config_dir / "settings.json").write_text(
+        json.dumps(
+            {
+                "apiKeyHelper": "printf %s helper-token",
+                "env": {"ANTHROPIC_BASE_URL": "https://gateway.example.test/anthropic"},
+            }
+        )
+    )
+    (config_dir / ".credentials.json").write_text(
+        json.dumps(
+            {
+                "claudeAiOauth": {
+                    "accessToken": "parent-only-oauth",
+                    "refreshToken": "parent-only-refresh",
+                    "expiresAt": 9999999999999,
+                }
+            }
+        )
+    )
+    for name in (
+        "CLAUDE_CONFIG_DIR",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_API_KEY",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        claude._CLAUDE_API_KEY_HELPER_ENV_KEY,
+    ):
+        monkeypatch.delenv(name, raising=False)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    spec = AgentSpec(
+        spec_version=1,
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+        os_env=OSEnvSpec(cwd=str(workspace), sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
+    )
+    if entrypoint == "terminal":
+        with pytest.raises(ValueError, match="user settings apiKeyHelper"):
+            workflow.claude_terminal_model_access(spec, cwd=workspace)
+    else:
+        no_launch = Mock(side_effect=AssertionError("worker startup must not begin"))
+        monkeypatch.setattr(claude, "_find_system_claude", lambda: "/bin/claude")
+        monkeypatch.setattr(
+            claude,
+            "resolve_sandbox",
+            lambda *_: SandboxPolicy("linux_bwrap", True, [], [], [], False),
+        )
+        monkeypatch.setattr(claude, "get_backend", no_launch)
+        with pytest.raises(ValueError, match="user settings apiKeyHelper"):
+            claude.ClaudeSDKExecutor(cwd=str(workspace), os_env=spec.os_env)
+        no_launch.assert_not_called()

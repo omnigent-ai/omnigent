@@ -1495,6 +1495,7 @@ def claude_terminal_model_access(
     model_env = dict(os.environ)
     model_env.pop("ANTHROPIC_API_KEY", None)
     user_settings_source_paths: tuple[Path, ...] = ()
+    user_settings_has_api_key_helper = False
     if launch_env.get("HARNESS_CLAUDE_SDK_GATEWAY") in ("1", "true"):
         model_env.update(
             _resolve_gateway_env(
@@ -1505,8 +1506,8 @@ def claude_terminal_model_access(
             )
         )
     else:
-        settings_env, user_settings_source_paths = _claude_user_settings_env_with_sources(
-            str(effective_cwd)
+        settings_env, user_settings_source_paths, user_settings_has_api_key_helper = (
+            _claude_user_settings_env_with_sources(str(effective_cwd))
         )
         model_env.update(settings_env)
     if helper := launch_env.get("HARNESS_CLAUDE_SDK_API_KEY_HELPER"):
@@ -1516,6 +1517,7 @@ def claude_terminal_model_access(
         cwd=effective_cwd,
         databricks_profile=profile,
         source_paths=user_settings_source_paths,
+        user_settings_has_api_key_helper=user_settings_has_api_key_helper,
         source_env_names=frozenset(
             json.loads(launch_env.get("HARNESS_CLAUDE_SDK_CREDENTIAL_ENV_NAMES", "[]"))
         ),

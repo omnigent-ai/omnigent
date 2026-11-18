@@ -400,6 +400,26 @@ def test_custom_provider_config_cannot_be_granted_to_the_worker(tmp_path: Path) 
     assert repr(str(tmp_path.resolve())) in str(error.value)
 
 
+@pytest.mark.parametrize("explicit_token", [None, "parent-only-provider-token"])
+def test_user_settings_helper_cannot_fall_back_to_saved_oauth(
+    tmp_path: Path, explicit_token: str | None
+) -> None:
+    config_dir = tmp_path / "claude-config"
+    config_dir.mkdir()
+    _write_oauth(config_dir / ".credentials.json", "parent-only-oauth")
+    env = {
+        "ANTHROPIC_BASE_URL": "https://gateway.example.test/anthropic",
+        "CLAUDE_CONFIG_DIR": str(config_dir),
+    }
+    if explicit_token is not None:
+        env["ANTHROPIC_AUTH_TOKEN"] = explicit_token
+        access = resolve_claude_model_access(env, user_settings_has_api_key_helper=True)
+        assert access.credential() == explicit_token
+    else:
+        with pytest.raises(ValueError, match="user settings apiKeyHelper"):
+            resolve_claude_model_access(env, user_settings_has_api_key_helper=True)
+
+
 @pytest.mark.parametrize("custom_home", [False, True])
 @pytest.mark.parametrize("alias", ["symlink", "hardlink", "grant"])
 def test_file_backed_provider_secrets_cannot_alias_worker_grants(

@@ -1821,20 +1821,21 @@ def _claude_user_settings_env(cwd: str | None = None) -> dict[str, str]:
         ``{"ANTHROPIC_BEDROCK_BASE_URL": "https://gateway.example"}``; empty
         when the file is missing, unreadable, or has no ``env`` object.
     """
-    env, _ = _claude_user_settings_env_with_sources(cwd)
+    env, _, _ = _claude_user_settings_env_with_sources(cwd)
     return env
 
 
 def _claude_user_settings_env_with_sources(
     cwd: str | None = None,
-) -> tuple[dict[str, str], tuple[pathlib.Path, ...]]:
-    """Keep the settings file provenance separate from its environment values."""
+) -> tuple[dict[str, str], tuple[pathlib.Path, ...], bool]:
+    """Keep settings provenance and helper selection with environment values."""
     from omnigent.onboarding.ambient import read_claude_user_settings_with_sources
 
     settings, sources = read_claude_user_settings_with_sources(cwd)
     env = settings.get("env") if settings is not None else None
+    has_api_key_helper = bool(settings.get("apiKeyHelper")) if settings is not None else False
     if not isinstance(env, dict):
-        return {}, sources
+        return {}, sources, has_api_key_helper
     return (
         {
             key: value
@@ -1842,6 +1843,7 @@ def _claude_user_settings_env_with_sources(
             if isinstance(key, str) and isinstance(value, str)
         },
         sources,
+        has_api_key_helper,
     )
 
 
@@ -2066,6 +2068,7 @@ def prepare_claude_cli_path(
     model_access: ClaudeModelAccess | None = None,
     databricks_profile: str | None = None,
     user_settings_source_paths: tuple[pathlib.Path, ...] = (),
+    user_settings_has_api_key_helper: bool = False,
 ) -> PreparedClaudeCli:
     """Contain the whole Claude CLI when the agent requires a sandbox.
 
@@ -2121,6 +2124,7 @@ def prepare_claude_cli_path(
                 databricks_profile=databricks_profile,
                 source_paths=user_settings_source_paths,
                 source_env_names=frozenset(credential_env_names),
+                user_settings_has_api_key_helper=user_settings_has_api_key_helper,
             )
         elif user_settings_source_paths:
             model_access = replace(
@@ -2301,22 +2305,22 @@ def prepare_tight_cli_process(
     try:
         resolved_cwd = _resolve_sandbox_cwd(cwd)
         sandbox = resolve_sandbox(spec, resolved_cwd)
+        if not sandbox.active:
+            return unwrapped
+        sandbox = with_additional_write_roots(sandbox, _claude_internal_write_roots())
+        sandbox = with_additional_write_files(sandbox, _claude_internal_write_files())
+        launcher = create_exec_launcher(real_cli_path, sandbox)
+        return PreparedClaudeCli(
+            cli_path=launcher,
+            enable_native_tools=False,
+            sandbox=sandbox,
+        )
     except (OSError, NotImplementedError) as exc:
         logger.warning(
             "Could not apply default local CLI sandbox; continuing without it: %s",
             exc,
         )
         return unwrapped
-    else:
-        if not sandbox.active:
-            return unwrapped
-        sandbox = with_additional_write_roots(sandbox, _claude_internal_write_roots())
-        sandbox = with_additional_write_files(sandbox, _claude_internal_write_files())
-        return PreparedClaudeCli(
-            cli_path=create_exec_launcher(real_cli_path, sandbox),
-            enable_native_tools=False,
-            sandbox=sandbox,
-        )
 
 
 def _claude_managed_config_dirs() -> list[pathlib.Path]:
@@ -2700,10 +2704,11 @@ class ClaudeSDKExecutor(Executor):
             if self._os_env_spec is not None:
                 effective_cwd = _resolve_sandbox_cwd(self._cwd or self._os_env_spec.cwd)
                 user_settings_source_paths: tuple[pathlib.Path, ...] = ()
+                user_settings_has_api_key_helper = False
                 if not self._gateway and (
                     self._os_env_spec.sandbox is None or self._os_env_spec.sandbox.type != "none"
                 ):
-                    settings_env, user_settings_source_paths = (
+                    settings_env, user_settings_source_paths, user_settings_has_api_key_helper = (
                         _claude_user_settings_env_with_sources(str(effective_cwd))
                     )
                     self._extra_env = {
@@ -2718,6 +2723,7 @@ class ClaudeSDKExecutor(Executor):
                     agent_name=self._agent_name,
                     databricks_profile=self._databricks_profile if self._gateway else None,
                     user_settings_source_paths=user_settings_source_paths,
+                    user_settings_has_api_key_helper=user_settings_has_api_key_helper,
                     request_body_transform=gateway_body_transform(
                         self._extra_env["ANTHROPIC_BASE_URL"]
                     )
