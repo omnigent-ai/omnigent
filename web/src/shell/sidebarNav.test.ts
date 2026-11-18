@@ -1143,7 +1143,7 @@ describe("automation runs shared with the viewer", () => {
     ];
     const defaultFolder = { id: "p_auto", name: "Automations" };
     expect(withAutomationFolder(projects, true, false, defaultFolder)).toBe(projects);
-    // And it sorts by the name it will be created under, not the tagged one.
+    // Placeholder naming and ordering use the tagged project's current name.
     expect(withAutomationFolder([{ id: "p_z", name: "Zeta" }], true, false, defaultFolder)).toEqual(
       [
         { id: null, name: "Automations", placeholder: true },

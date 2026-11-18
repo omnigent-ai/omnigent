@@ -2865,6 +2865,21 @@ describe("CreateScheduledTaskDialog project", () => {
     expect(resolveOrCreateProjectId).not.toHaveBeenCalled();
   });
 
+  it("surfaces a failed default-project stamp and creates nothing", async () => {
+    // A failed marker write fails the save: filing without it would recreate
+    // the duplicate folder on a rename.
+    resolveOrCreateAutomationProjectId.mockRejectedValueOnce(
+      new Error("500 Internal Server Error"),
+    );
+    renderWithProjects();
+    fillRequired();
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    expect(await screen.findByTestId("create-error")).toHaveTextContent(
+      "500 Internal Server Error",
+    );
+    expect(mutateAsync).not.toHaveBeenCalled();
+  });
+
   it("allows opting out of the default project", async () => {
     renderWithProjects();
     fillRequired();

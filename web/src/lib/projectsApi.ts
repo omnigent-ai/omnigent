@@ -93,6 +93,12 @@ interface ProjectListResponse {
   data: Project[];
 }
 
+interface ProjectListPage extends ProjectListResponse {
+  first_id?: string | null;
+  last_id?: string | null;
+  has_more?: boolean;
+}
+
 async function readError(res: Response): Promise<string> {
   try {
     const body = (await res.json()) as { error?: { message?: string }; message?: string };
@@ -108,6 +114,34 @@ export async function listProjects(): Promise<Project[]> {
   if (!res.ok) throw new Error(await readError(res));
   const body = (await res.json()) as ProjectListResponse;
   return body.data;
+}
+
+/**
+ * Walk the caller's projects in creation order over bounded
+ * `GET /v1/projects?limit=&after=` pages (the route's 200-page max), handing
+ * each page to *visit* until it returns a value. A page without `has_more`
+ * ends the walk, so plain-list responses terminate after one page.
+ */
+export async function findInProjectPages<T>(
+  visit: (projects: Project[]) => T | undefined,
+  pageSize = 200,
+): Promise<T | undefined> {
+  let after: string | null = null;
+  for (;;) {
+    const params = new URLSearchParams({ limit: String(pageSize) });
+    if (after !== null) params.set("after", after);
+    // Pages are inherently sequential: each cursor comes from the previous response.
+    // eslint-disable-next-line no-await-in-loop
+    const res = await authenticatedFetch(`/v1/projects?${params}`);
+    // eslint-disable-next-line no-await-in-loop
+    if (!res.ok) throw new Error(await readError(res));
+    // eslint-disable-next-line no-await-in-loop
+    const page = (await res.json()) as ProjectListPage;
+    const found = visit(page.data);
+    if (found !== undefined) return found;
+    if (!page.has_more || !page.last_id) return undefined;
+    after = page.last_id;
+  }
 }
 
 /** Fetch a single project (including its `config`) by id. 404s if not owned. */

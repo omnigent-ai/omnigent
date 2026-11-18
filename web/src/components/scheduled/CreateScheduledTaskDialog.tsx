@@ -1670,10 +1670,7 @@ export function CreateScheduledTaskDialog({
         ...workspacePatch,
         ...((editingTask?.sessionMode ?? "new") !== sessionMode ? { sessionMode } : {}),
       };
-      // The untouched default resolves through the marker-aware helper, which
-      // finds the project even after a rename (adopting a name-only legacy
-      // one, or creating it); a touched picker choice resolves by name as
-      // before.
+      // The untouched default resolves by marker; a picked project resolves by name.
       const projectInput =
         !isEdit && projectsSupported && projectChoice === null
           ? { projectId: await resolveAutomationProjectId() }
