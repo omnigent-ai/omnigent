@@ -207,6 +207,738 @@ def test_split_review_rejects_nonprogress_on_escaped_pipe_whitespace() -> None:
     assert cuts == [3]
 
 
+def _check_context_refusal(
+    review: str,
+    variant: str,
+    short: bool,
+    code_span_refusal: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    review_path, receipt, posts = _prepare_publication(
+        tmp_path, monkeypatch, head_sha="a" * 40, run_url="https://example.test/run"
+    )
+    if code_span_refusal:
+        with pytest.raises(ValueError, match=r"Polly review noncanonical (details|summary)"):
+            _published_comments(review, review_path, receipt)
+        assert not posts and not receipt.exists()
+        assert sorted(path.name for path in tmp_path.iterdir()) == ["review.md"]
+        return
+    with pytest.raises(ValueError) as caught:
+        _published_comments(review, review_path, receipt)
+    error = caught.value
+    assert not variant.startswith("code-span-"), str(error)
+    assert not short and variant not in {
+        "container-bounded-blockquote",
+        "fenced-container-literal",
+    }
+    assert variant not in {"boundary-table-fenced", "boundary-summary-fitting"}
+    assert (
+        not variant.startswith("boundary-inline-") or variant == "boundary-inline-oversized-guard"
+    )
+    if variant.startswith("boundary-"):
+        assert str(error) in {
+            "Polly review tables without leading pipes are not supported in multipart comments.",
+            "Polly review literal container marker cannot fit within comment capacity.",
+            "Polly review literal indentation cannot fit within comment capacity.",
+            "Polly review disclosure header cannot fit within comment capacity.",
+            "Polly review noncanonical summary is not supported in multipart comments.",
+        }
+    else:
+        assert str(error) in {
+            "Polly review Markdown container cannot fit within comment capacity.",
+            "Polly review noncanonical details are not supported in multipart comments.",
+        }
+    assert not posts and not receipt.exists()
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["review.md"]
+
+
+def _check_review_context(
+    table_variant: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from html.parser import HTMLParser
+
+    from markdown_it import MarkdownIt
+
+    short = table_variant.startswith("short-")
+    variant = table_variant.removeprefix("short-")
+    table_rows = []
+    assessment_review = _REVIEW
+    comment_context = None
+    code_span_refusal = variant in {
+        "code-span-unmatched",
+        "code-span-escaped-opener",
+        "code-span-real-tag",
+        "code-span-raw-html",
+        "code-span-html-attribute",
+        "code-span-link-title",
+        "code-span-cross-line-ambiguity",
+        "code-span-html-attribute-quoted-close",
+        "code-span-link-title-quoted-close",
+    }
+    if variant.startswith("code-span-"):
+        literal_context = re.fullmatch(
+            r"code-span-(comparison|completed-link|completed-reference|less-equal|less-digit|"
+            r"leading-autolink|leading-email)-"
+            r"(details|summary)-(prose|rationale)",
+            variant,
+        )
+        literals = {
+            "code-span-details-prose": "`<details>` / `</details>`",
+            "code-span-summary-prose": "`<summary>` / `</summary>`",
+            "code-span-details-rationale": "`<details>` / `</details>`",
+            "code-span-summary-rationale": "`<summary>` / `</summary>`",
+            "code-span-matched-runs": "`` `<details>` and <summary> ``",
+            "code-span-even-backslashes": r"\\`<details>`",
+            "code-span-cut-guard": "`" + "x" * 130 + "<details> <summary>" + "y" * 130 + "`",
+            "code-span-tags": "`<details>` and `<summary>`",
+            "code-span-unmatched": "`<details>",
+            "code-span-escaped-opener": r"\`<details>`",
+            "code-span-real-tag": "`<summary>` and <details>",
+            "code-span-raw-html": "",
+            "code-span-html-attribute": '<span title="use `"> <details> literal? ` </span>',
+            "code-span-link-title": '[link](https://x.test "use `") <details> literal? `',
+            "code-span-cross-line-ambiguity": "`` earlier line\nNow `` <details> literal? ``",
+            "code-span-comparison-cut-guard": "`"
+            + "x" * 130
+            + "<details> <summary>"
+            + "y" * 130
+            + "`",
+            "code-span-completed-link-cut-guard": "`"
+            + "x" * 130
+            + "<details> <summary>"
+            + "y" * 130
+            + "`",
+            "code-span-html-attribute-quoted-close": (
+                '<span title="use > `"> <details> literal? ` </span>'
+            ),
+            "code-span-link-title-quoted-close": (
+                '[link](https://x.test "use ) `") <details> literal? `'
+            ),
+            "code-span-comparison-tags": "Use x < 3 and `<details>` / `<summary>` tags.",
+            "code-span-completed-link-tags": (
+                "Use a [link](https://example.test/) and `<details>` / `<summary>` tags."
+            ),
+        }
+        comment_context = re.fullmatch(
+            r"code-span-comment-(standard|alternate|alternate-attribute)-"
+            r"(details|summary)-(prose|rationale)",
+            variant,
+        )
+        if comment_context:
+            prefix = {
+                "standard": "Use <!-- harmless --> and ",
+                "alternate": "Use <!-- harmless --!> and ",
+                "alternate-attribute": 'Use <!-- harmless --!> <span title="--> ',
+            }[comment_context[1]]
+            ending = '">logs</span>.' if comment_context[1] == "alternate-attribute" else " tags."
+            literal = prefix + f"`<{comment_context[2]}>`" + ending
+            code_span_refusal = not short and comment_context[1] != "standard"
+        elif literal_context:
+            prefix = {
+                "comparison": "Use x < 3 and ",
+                "completed-link": "Use a [link](https://example.test/) and ",
+                "completed-reference": "Use a [link][docs] and ",
+                "less-equal": "Use x <= 3 and ",
+                "less-digit": "Use x <3 and ",
+                "leading-autolink": "<https://example.test/> and ",
+                "leading-email": "<reader@example.test> and ",
+            }[literal_context[1]]
+            literal = prefix + f"`<{literal_context[2]}>` tags."
+        else:
+            literal = literals[variant]
+        lead = "Ordinary finding é🙂.\n" * (1 if short else 4500) + "\n"
+        if literal_context and literal_context[1] == "completed-reference":
+            lead = "[docs]: https://example.test/\n\n" + lead
+        if variant.endswith("rationale"):
+            assessment_review = _REVIEW.replace("Guards the regression.", literal).replace(
+                "::test_empty", "::test_empty[param]"
+            )
+        elif variant == "code-span-raw-html":
+            lead = (
+                "<details><summary>Use `<summary>` tags</summary>\n\nBody\n\n</details>\n\n" + lead
+            )
+        elif variant in {
+            "code-span-cut-guard",
+            "code-span-comparison-cut-guard",
+            "code-span-completed-link-cut-guard",
+        }:
+            prefix = {
+                "code-span-cut-guard": " uses ",
+                "code-span-comparison-cut-guard": " uses x < 3 and ",
+                "code-span-completed-link-cut-guard": (
+                    " uses a [link](https://example.test/) and "
+                ),
+            }[variant]
+            lead = "x" * 59400 + prefix + literal + " tags.\n\n" + lead
+        elif literal_context and literal_context[1].startswith("leading-"):
+            lead = literal + "\n\n" + lead
+        else:
+            lead = "Wrap output in " + literal + " tags.\n\n" + lead
+    elif variant.startswith("boundary-table-"):
+        header, delimiter = "Finding | Reason", "--- | ---"
+        if variant in {
+            "boundary-table-delimiter-no-leading",
+            "boundary-table-body-no-leading",
+        }:
+            header = "| " + header + " |"
+        if variant in {"boundary-table-header-no-leading", "boundary-table-body-no-leading"}:
+            delimiter = "| " + delimiter + " |"
+        table_rows = [
+            f"case{index} | rationale " + "x" * 150 for index in range(2 if short else 700)
+        ]
+        lead = header + "\n" + delimiter + "\n" + "\n".join(table_rows) + "\n\n"
+        if variant == "boundary-table-fenced":
+            lead = "```text\n" + lead + "```\n\n"
+    elif variant.startswith("boundary-inline-"):
+        marker = {
+            "boundary-inline-quote": "> ",
+            "boundary-inline-dash": "- ",
+            "boundary-inline-plus": "+ ",
+            "boundary-inline-star": "* ",
+            "boundary-inline-dot": "1. ",
+            "boundary-inline-paren": "2) ",
+            "boundary-inline-whitespace": "       > ",
+            "boundary-inline-overlap": "- \t> ",
+            "boundary-inline-oversized-guard": " " * 70000 + "> ",
+            "boundary-inline-indented": "    ",
+            "boundary-inline-heading": "# ",
+            "boundary-inline-thematic": "---\n\n",
+        }[variant]
+        left = "x" * (1 if "oversized" in variant else 59451)
+        if variant == "boundary-inline-whitespace":
+            left = left[:-7]
+        lead = left + marker + "Finding remains ordinary prose\n\n" + "z" * 70000 + "\n\n"
+    elif variant.startswith("boundary-summary"):
+        opening, closing = "<details><summary>", "</summary>\n\nBody\n\n</details>\n\n"
+        if variant == "boundary-summary-multiline":
+            opening = "<details>\n<summary>\n"
+            closing = "\n" + closing
+        elif variant == "boundary-summary-attributes":
+            opening = '<details><summary class="logs">'
+        lead = opening + "x" * (20 if short or "fitting" in variant else 130000) + closing
+        if variant == "boundary-summary-fitting":
+            lead += "Ordinary finding outside the disclosure.\n" * 4000
+    elif variant in {"container-blockquote", "container-bounded-blockquote"}:
+        lead = "> Finding " + "x" * (10 if short or "bounded" in variant else 130000) + "\n\n"
+    elif variant == "container-lazy-blockquote":
+        lead = "> Finding start\n" + "continued paragraph text\n" * 4000 + "\n"
+    elif variant in {
+        "container-list-continuation",
+        "container-ordered-continuation",
+        "container-empty-list-continuation",
+    }:
+        ordered = variant == "container-ordered-continuation"
+        lead = "7) Finding start\n\n" if ordered else "- Finding start\n"
+        if variant == "container-empty-list-continuation":
+            lead = "-\n"
+        lead += ("   " if ordered else "  ") + "continued paragraph text\n"
+        lead += (("   " if ordered else "  ") + "continued paragraph text\n") * (
+            0 if short else 3999
+        )
+    elif variant == "fenced-container-literal":
+        lead = (
+            "```text\n"
+            + "> Finding\n- item\n  continuation\n<details open>\n</details>\n" * 2000
+            + "```\n\n"
+        )
+    else:
+        opening = (
+            '<details\n  class="logs">'
+            if variant == "container-multiline-details"
+            else "<details open>"
+        )
+        lead = (
+            opening
+            + "\n<summary>Logs</summary>\n\n"
+            + "Log line.\n" * (2 if short else 8000)
+            + "\n</details>\n\n"
+        )
+    if variant == "container-bounded-blockquote":
+        lead += "Ordinary finding outside the quote.\n" * 4000
+    review = lead + _HELPERS["compose_review"](
+        assessment_review,
+        {"markdown": "Computed counts", "test_files": ["tests/test_parser.py"]},
+    )
+    parser = MarkdownIt("commonmark").enable("table")
+
+    def containers(tokens: list) -> list:
+        stack, content = [], []
+        for token in tokens:
+            if token.type in {
+                "blockquote_open",
+                "bullet_list_open",
+                "ordered_list_open",
+                "list_item_open",
+            }:
+                stack.append((token.type, token.attrs))
+            elif token.type in {
+                "blockquote_close",
+                "bullet_list_close",
+                "ordered_list_close",
+                "list_item_close",
+            }:
+                stack.pop()
+            elif token.type == "inline" and stack:
+                content.append((tuple(stack), token.content))
+        return content
+
+    class DisclosureContext(HTMLParser):
+        depth = 0
+        summary_depth = 0
+
+        def handle_starttag(self, tag: str, attrs: list) -> None:
+            if tag == "details":
+                self.depth += 1
+            elif tag == "summary":
+                assert self.summary_depth == 0
+                self.summary_depth += 1
+            elif tag == "sub":
+                assert self.depth == 0, "Publication footer is inside a disclosure"
+                assert self.summary_depth == 0, "Publication footer is inside a summary"
+
+        def handle_endtag(self, tag: str) -> None:
+            if tag == "summary":
+                assert self.summary_depth == 1, (
+                    "A rendered comment has an unmatched summary closer"
+                )
+                self.summary_depth -= 1
+            elif tag == "details":
+                assert self.summary_depth == 0, "A disclosure closes with its summary still open"
+                assert self.depth > 0, "A rendered comment has an unmatched disclosure closer"
+                self.depth -= 1
+
+    class CommentEndContext(DisclosureContext):
+        def __init__(self) -> None:
+            super().__init__()
+            self.code_elements = self.code_depth = 0
+
+        def parse_comment(self, start: int, report: int = 1) -> int:
+            # Model HTML's alternate comment end; CommonMark still uses its own parser.
+            alternate = self.rawdata.find("--!>", start + 4)
+            ordinary = self.rawdata.find("-->", start + 4)
+            if alternate >= 0 and (ordinary < 0 or alternate < ordinary):
+                if report:
+                    self.handle_comment(self.rawdata[start + 4 : alternate])
+                return alternate + 4
+            return super().parse_comment(start, report)
+
+        def handle_starttag(self, tag: str, attrs: list) -> None:
+            super().handle_starttag(tag, attrs)
+            if tag == "code":
+                self.code_elements += 1
+                self.code_depth += 1
+            elif tag == "sub":
+                assert self.code_depth == 0, "Publication footer is inside code"
+
+        def handle_endtag(self, tag: str) -> None:
+            super().handle_endtag(tag)
+            if tag == "code":
+                self.code_depth -= 1
+
+    original = parser.parse(review)
+    if comment_context:
+        children = [child for token in parser.parse(literal) for child in token.children or []]
+        assert [token.content for token in children if token.type == "code_inline"] == [
+            f"<{comment_context[2]}>"
+        ]
+        reference = CommentEndContext()
+        reference.feed(parser.render(literal))
+        reference.close()
+        assert reference.code_elements == (
+            0 if comment_context[1] == "alternate-attribute" else 1
+        ), "The HTML comment end changes whether CommonMark's code remains an element"
+    if variant.startswith("code-span-") and literal_context:
+        literal_tokens = [
+            child
+            for block in parser.parse(literal + "\n\n[docs]: https://example.test/\n")
+            for child in block.children or []
+        ]
+        assert [token.content for token in literal_tokens if token.type == "code_inline"] == [
+            f"<{literal_context[2]}>"
+        ]
+        assert not any(token.type == "html_inline" for token in literal_tokens)
+        if literal_context[1].startswith(("completed-", "leading-")):
+            assert any(token.type == "link_open" for token in literal_tokens)
+    expected = containers(original)
+    assert bool(expected) == ("blockquote" in variant or "continuation" in variant)
+    optional_table = variant.startswith("boundary-table-") and variant != "boundary-table-fenced"
+    if optional_table:
+        assert sum(token.type == "table_open" for token in original) == 2
+    else:
+        assert sum(token.type == "table_open" for token in original) == 1
+    assert _HELPERS["COMMENT_BYTE_LIMIT"] == 60000
+    assert (len(review.encode("utf-8")) < 60000) == short
+    if code_span_refusal and comment_context is None:
+        assert any(
+            "<details>" in token.content
+            for block in parser.parse(lead)
+            for token in ([block] if block.type == "html_block" else block.children or [])
+            if token.type in {"html_block", "html_inline"}
+        ), "An ambiguous backtick must not hide an independently parsed real tag"
+    unsupported = not short and (
+        (variant.startswith("container-") and variant != "container-bounded-blockquote")
+        or (variant.startswith("boundary-table-") and variant != "boundary-table-fenced")
+        or (variant.startswith("boundary-summary") and variant != "boundary-summary-fitting")
+        or variant == "boundary-inline-oversized-guard"
+    )
+    if code_span_refusal or unsupported:
+        _check_context_refusal(review, variant, short, code_span_refusal, tmp_path, monkeypatch)
+        return
+    comments = _HELPERS["review_comments"](
+        review, head_sha="a" * 40, run_id="10-1", run_url="https://example.test/run"
+    )
+    assert all(len(comment.encode("utf-8")) <= 60000 for comment in comments)
+    if short:
+        assert len(comments) == 1
+        assert comments[0].split("Polly AI Review\n\n", 1)[1].rsplit("\n---\n", 1)[0] == review
+    else:
+        assert 1 < len(comments) <= _HELPERS["MAX_REVIEW_PARTS"]
+    rendered = [parser.parse(comment) for comment in comments]
+    if comment_context:
+        for comment in comments:
+            reference = CommentEndContext()
+            reference.feed(parser.render(comment))
+            reference.close()
+            assert reference.code_depth == reference.depth == reference.summary_depth == 0
+    assert [item for tokens in rendered for item in containers(tokens)] == expected, (
+        "Multipart publication changed independently parsed quote/list structure"
+    )
+    for tokens in rendered:
+        disclosure = DisclosureContext()
+        for token in tokens:
+            if token.type == "html_block":
+                disclosure.feed(token.content)
+            for child in token.children or []:
+                if child.type == "html_inline":
+                    disclosure.feed(child.content)
+            if token.type in {"fence", "code_block"}:
+                assert "<sub>Automated review by Polly" not in token.content
+                assert "tests/test_parser.py::test_empty" not in token.content
+        assert disclosure.depth == 0, "A rendered comment leaves a disclosure open"
+        assert disclosure.summary_depth == 0, "A rendered comment leaves a summary open"
+    if optional_table:
+        assert sum(token.type == "table_open" for tokens in rendered for token in tokens) >= 2
+    else:
+        assert sum(token.type == "table_open" for tokens in rendered for token in tokens) == 1
+    if optional_table:
+        for comment, tokens in zip(comments, rendered, strict=True):
+            if re.search(r"case[0-9]+ \| rationale", comment):
+                assert [
+                    token.content
+                    for index, token in enumerate(tokens)
+                    if token.type == "inline" and tokens[index - 1].type == "th_open"
+                ][:2] == ["Finding", "Reason"], "A continued table lost its parsed headers"
+        assert [
+            token.content
+            for tokens in rendered
+            for index, token in enumerate(tokens)
+            if token.type == "inline"
+            and tokens[index - 1].type == "td_open"
+            and token.content.startswith("case")
+        ] == [f"case{index}" for index in range(len(table_rows))]
+    row = next(line for line in assessment_review.splitlines() if line.startswith("| tests/"))
+    assert sum(comment.count(row) for comment in comments) == 1
+    if variant.startswith("code-span-"):
+
+        def literal_tags(tokens: list) -> list[str]:
+            return [
+                child.content
+                for token in tokens
+                for child in token.children or []
+                if child.type == "code_inline"
+                and re.search(r"</?(details|summary)", child.content)
+            ]
+
+        expected_literals = literal_tags(original)
+        assert expected_literals
+        assert [item for tokens in rendered for item in literal_tags(tokens)] == expected_literals
+        if not short:
+            fragments = [
+                comment.split("part 1 appears.\n\n", 1)[1].rsplit("\n\n---\n", 1)[0]
+                for comment in comments
+            ]
+            assert "".join(fragments) == review
+            if variant in {
+                "code-span-cut-guard",
+                "code-span-comparison-cut-guard",
+                "code-span-completed-link-cut-guard",
+            }:
+                assert len(fragments[0]) == review.index(literal)
+    if variant == "container-bounded-blockquote":
+        assert (
+            sum(comment.count("Ordinary finding outside the quote.\n") for comment in comments)
+            == 4000
+        )
+    if variant.startswith("boundary-inline-"):
+        fragments = [
+            comment.split("part 1 appears.\n\n", 1)[1].rsplit("\n\n---\n", 1)[0]
+            for comment in comments
+        ]
+        assert "".join(fragments) == review
+        assert not any(
+            token.type in {"code_block", "fence"} for tokens in rendered for token in tokens
+        )
+        fragment_tokens = [token for fragment in fragments for token in parser.parse(fragment)]
+        for kind in (
+            "blockquote_open",
+            "bullet_list_open",
+            "ordered_list_open",
+            "heading_open",
+            "hr",
+            "code_block",
+            "fence",
+            "table_open",
+        ):
+            assert sum(token.type == kind for token in fragment_tokens) == sum(
+                token.type == kind for token in original
+            ), "A cut created a new block structure"
+    if variant in {"fenced-container-literal", "boundary-table-fenced"}:
+        remaining_code = "".join(token.content for token in original if token.type == "fence")
+        for tokens in rendered:
+            for token in tokens:
+                if token.type == "fence":
+                    fragment = token.content
+                    if not remaining_code.startswith(fragment):
+                        assert fragment.endswith("\n")
+                        fragment = fragment[:-1]
+                    assert remaining_code.startswith(fragment)
+                    remaining_code = remaining_code[len(fragment) :]
+        assert not remaining_code
+        remaining = review
+        for number, comment in enumerate(comments):
+            _, marker, fragment = comment.partition("part 1 appears.\n\n")
+            assert marker
+            fragment, separator, footer = fragment.rpartition("\n\n---\n")
+            assert separator and footer.startswith("<sub>Automated review by Polly")
+            if number and not remaining.startswith(fragment):
+                assert fragment.startswith("```text\n")
+                fragment = fragment.removeprefix("```text\n")
+            if not remaining.startswith(fragment):
+                assert fragment.endswith("\n```\n")
+                fragment = fragment.removesuffix("\n```\n")
+            assert remaining.startswith(fragment)
+            remaining = remaining[len(fragment) :]
+        assert not remaining
+    return
+
+
+def _check_nested_list_refusal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from markdown_it import MarkdownIt
+
+    findings = "## Findings\n\n" + "".join(
+        f"- Finding {index}\n    - nested {index} " + "z" * 200 + "\n" for index in range(400)
+    )
+    review = (
+        findings
+        + "\n"
+        + _HELPERS["compose_review"](
+            _REVIEW, {"markdown": "Computed counts", "test_files": ["tests/test_parser.py"]}
+        )
+    )
+    parser = MarkdownIt("commonmark").enable("table")
+    original = parser.parse(review)
+    expected = [
+        item
+        for index in range(400)
+        for item in [(f"Finding {index}", 3), (f"nested {index} " + "z" * 200, 5)]
+    ]
+    assert [
+        (token.content, token.level)
+        for token in original
+        if token.type == "inline" and token.content.startswith(("Finding ", "nested "))
+    ] == expected
+    assert not any(token.type in {"code_block", "fence"} for token in original)
+    assert sum(token.type == "table_open" for token in original) == 1
+    assert _HELPERS["COMMENT_BYTE_LIMIT"] == 60000
+    assert len(review.encode("utf-8")) > 60000
+    review_path, receipt, posts = _prepare_publication(
+        tmp_path, monkeypatch, head_sha="a" * 40, run_url="https://example.test/run"
+    )
+    with pytest.raises(ValueError) as error:
+        _published_comments(review, review_path, receipt)
+    assert str(error.value) == "Polly review nested lists are not supported in multipart comments."
+    assert not posts and not receipt.exists()
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["review.md"]
+    return
+
+
+def _rendered_comments(review: str) -> list[str]:
+    comments = _HELPERS["review_comments"](
+        review, head_sha="a" * 40, run_id="10-1", run_url="https://example.test/run"
+    )
+    assert len(comments) > 1
+    assert all(len(comment.encode("utf-8")) <= 60000 for comment in comments)
+    assert sum(comment.count("<!-- polly-reviewed-sha:") for comment in comments) == 1
+    return comments
+
+
+def _assert_fragments(
+    fragments: list[list[str]],
+    expected: list[str],
+    rationale: str,
+    *,
+    minimum: int = 1,
+    ordinary_empty_cell: bool = False,
+) -> None:
+    assert len(fragments) >= minimum
+    assert all(len(cells) == 5 and cells[:4] == expected[:4] for cells in fragments)
+    if ordinary_empty_cell:
+        assert all(cells[1].strip() == "" for cells in fragments)
+    else:
+        assert all(all(cell.strip() for cell in cells) for cells in fragments)
+    assert (
+        "".join(cells[4].removeprefix(" ").removesuffix(" ") for cells in fragments) == rationale
+    )
+
+
+def _check_capacity_and_work_limits(
+    table_variant: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    review = _REVIEW
+    if table_variant.startswith(
+        ("oversized-fence-", "unsafe-inline-run-", "unsafe-fence-whitespace-")
+    ):
+        char = "`" if table_variant.endswith("backticks") else "~"
+        fence = char * 3
+        if table_variant.startswith("oversized-fence-"):
+            fence = char * 70000
+            code = "literal" + "\n"
+            message = "fence delimiter cannot fit within comment capacity"
+        else:
+            code = (
+                "x" + char * 130000 + "a" + "\n"
+                if table_variant.startswith("unsafe-inline-run-")
+                else fence + " " * 130000 + "a" + "\n"
+            )
+            message = "literal fence run cannot fit within comment capacity"
+        review = fence + "text\n" + code + fence + "\n\n" + review
+    elif table_variant in {"oversized-header", "fenced-header-control"}:
+        table = "| " + "H" * 70000 + " | Details |\n| --- | --- |\n| item | note |\n"
+        review = (
+            ("```text\n" + table + "```\n" if table_variant == "fenced-header-control" else table)
+            + "\n"
+            + review
+        )
+        message = "table header cannot fit within comment capacity"
+    else:
+        review = review.replace("Empty input", "Empty input" + "b" * 31000)
+        review = review.replace("Guards the regression.", "x" * 70000)
+        setting, limit, message = (
+            ("MAX_REVIEW_PARTS", 2, "part limit")
+            if table_variant == "part-limit"
+            else ("RENDER_WORK_BYTE_LIMIT", 1, "rendering work budget")
+        )
+        monkeypatch.setitem(_HELPERS["review_comments"].__globals__, setting, limit)
+    composed = _HELPERS["compose_review"](
+        review, {"markdown": "Computed counts", "test_files": ["tests/test_parser.py"]}
+    )
+    if table_variant == "fenced-header-control":
+        comments = _rendered_comments(composed)
+        assert sum(comment.count("H") for comment in comments) == 70000
+        assert sum(comment.count("| item | note |") for comment in comments) == 1
+        assert all(comment.count("```text") == comment.count("\n```\n") for comment in comments)
+    else:
+        review_path, receipt, posts = _prepare_publication(
+            tmp_path, monkeypatch, head_sha="a" * 40, run_url="https://example.test/run"
+        )
+        review_path.write_text(composed, encoding="utf-8")
+        with pytest.raises(ValueError, match=message):
+            _HELPERS["publish_review"](review_path, receipt)
+        assert not posts
+        assert not receipt.exists()
+        assert not list(tmp_path.glob("comment*.md"))
+    return
+
+
+def _check_identity_and_work(table_variant: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    large_identity = table_variant == "incremental-work"
+    rationale = "x" * 70000
+    header, delimiter, original = _REVIEW.split("### Tests\n", 1)[1].split("\n")[:3]
+    if large_identity:
+        row = original.replace("Empty input", "Empty input" + "b" * 31000)
+        row = row.replace("Guards the regression.", rationale)
+        review = _REVIEW.replace(original, row)
+    else:
+        header = "| Item | Details | Kind | Action | Notes |"
+        row = "| finding-0 | | Info | Keep | " + rationale + " |"
+        review = header + "\n" + delimiter + "\n" + row + "\n\n" + _REVIEW
+    composed = _HELPERS["compose_review"](
+        review, {"markdown": "Computed counts", "test_files": ["tests/test_parser.py"]}
+    )
+    if large_identity:
+        metadata = {
+            "head_sha": "a" * 40,
+            "run_id": "10-1",
+            "run_url": "https://example.test/run",
+        }
+        smaller = composed.replace(rationale, "x" * 20000)
+        small_comments = _HELPERS["review_comments"](smaller, **metadata)
+        assert len(small_comments) == 1
+        assert len(small_comments[0].encode("utf-8")) < 52000
+        with monkeypatch.context() as render_patch:
+            context = _HELPERS["_markdown_context"]
+            visited = set()
+
+            def checked_context(text: str, **kwargs):
+                if text != composed and not text.startswith("<!--"):
+                    assert text not in visited, "Accepted review prefix was parsed again"
+                    assert len(visited) < 32, "Exceeded bounded component context visits"
+                    visited.add(text)
+                return context(text, **kwargs)
+
+            render_patch.setitem(
+                _HELPERS["review_comments"].__globals__,
+                "_markdown_context",
+                checked_context,
+            )
+            comments = _HELPERS["review_comments"](composed, **metadata)
+    else:
+        comments = _rendered_comments(composed)
+    expected = _HELPERS["split_table_row"](row.strip().strip("|"))
+    fragments = []
+    for comment in comments:
+        rows = [line for line in comment.split("\n") if line.startswith("|" + expected[0] + "|")]
+        if rows:
+            assert header + "\n" + delimiter in comment
+        for line in rows:
+            cells = _HELPERS["split_table_row"](line.strip().strip("|"))
+            fragments.append(cells)
+    assert len(comments) > 1
+    _assert_fragments(
+        fragments, expected, rationale, minimum=2, ordinary_empty_cell=not large_identity
+    )
+    assert all(len(comment.encode("utf-8")) <= 60000 for comment in comments)
+    if large_identity:
+        later_rationale = "Retains the later independent identity."
+        later_row = original.replace("test_empty", "test_later").replace(
+            "Empty input", "Different input" + "c" * 40000
+        )
+        later_row = later_row.replace("Guards the regression.", later_rationale)
+        later_review = _HELPERS["compose_review"](
+            _REVIEW.replace(original, later_row),
+            {"markdown": "Computed counts", "test_files": ["tests/test_parser.py"]},
+        )
+        later_comments = _HELPERS["review_comments"](later_review, **metadata)
+        assert len(later_comments) == 1
+        assert len(later_comments[0].encode("utf-8")) < 60000
+        comments = _rendered_comments(composed.replace(row, row + "\n" + later_row))
+        assert sum(comment.count(later_row) for comment in comments) == 1
+        for expected_row, expected_rationale in [
+            (row, rationale),
+            (later_row, later_rationale),
+        ]:
+            expected = _HELPERS["split_table_row"](expected_row.strip().strip("|"))
+            fragments = []
+            for comment in comments:
+                for line in comment.split("\n"):
+                    if line.startswith("|" + expected[0] + "|"):
+                        assert header + "\n" + delimiter in comment
+                        fragments.append(_HELPERS["split_table_row"](line.strip().strip("|")))
+            _assert_fragments(fragments, expected, expected_rationale)
+    return
+
+
 @pytest.mark.parametrize(
     (
         "rationale_specs",
@@ -573,6 +1305,27 @@ def test_split_review_rejects_nonprogress_on_escaped_pipe_whitespace() -> None:
                 "short-code-span-comparison-tags",
                 "short-code-span-completed-link-tags",
                 *[
+                    f"code-span-{context}-{tag}-{placement}"
+                    for context in (
+                        "less-equal",
+                        "less-digit",
+                        "leading-autolink",
+                        "leading-email",
+                    )
+                    for tag in ("details", "summary")
+                    for placement in ("prose", "rationale")
+                ],
+                *[
+                    f"short-code-span-{context}-{tag}-prose"
+                    for context in (
+                        "less-equal",
+                        "less-digit",
+                        "leading-autolink",
+                        "leading-email",
+                    )
+                    for tag in ("details", "summary")
+                ],
+                *[
                     f"code-span-comment-{context}-{tag}-{placement}"
                     for context in ("standard", "alternate", "alternate-attribute")
                     for tag in ("details", "summary")
@@ -687,6 +1440,17 @@ def test_split_review_rejects_nonprogress_on_escaped_pipe_whitespace() -> None:
         "short-code-span-comparison-tags",
         "short-code-span-completed-link-tags",
         *[
+            f"code-span-{context}-{tag}-{placement}"
+            for context in ("less-equal", "less-digit", "leading-autolink", "leading-email")
+            for tag in ("details", "summary")
+            for placement in ("prose", "rationale")
+        ],
+        *[
+            f"short-code-span-{context}-{tag}-prose"
+            for context in ("less-equal", "less-digit", "leading-autolink", "leading-email")
+            for tag in ("details", "summary")
+        ],
+        *[
             f"code-span-comment-{context}-{tag}-{placement}"
             for context in ("standard", "alternate", "alternate-attribute")
             for tag in ("details", "summary")
@@ -726,594 +1490,18 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
             "short-code-span-",
         )
     ):
-        from html.parser import HTMLParser
-
-        from markdown_it import MarkdownIt
-
-        short = table_variant.startswith("short-")
-        variant = table_variant.removeprefix("short-")
-        table_rows = []
-        assessment_review = _REVIEW
-        comment_context = None
-        code_span_refusal = variant in {
-            "code-span-unmatched",
-            "code-span-escaped-opener",
-            "code-span-real-tag",
-            "code-span-raw-html",
-            "code-span-html-attribute",
-            "code-span-link-title",
-            "code-span-cross-line-ambiguity",
-            "code-span-html-attribute-quoted-close",
-            "code-span-link-title-quoted-close",
-        }
-        if variant.startswith("code-span-"):
-            literal_context = re.fullmatch(
-                r"code-span-(comparison|completed-link|completed-reference)-"
-                r"(details|summary)-(prose|rationale)",
-                variant,
-            )
-            literals = {
-                "code-span-details-prose": "`<details>` / `</details>`",
-                "code-span-summary-prose": "`<summary>` / `</summary>`",
-                "code-span-details-rationale": "`<details>` / `</details>`",
-                "code-span-summary-rationale": "`<summary>` / `</summary>`",
-                "code-span-matched-runs": "`` `<details>` and <summary> ``",
-                "code-span-even-backslashes": r"\\`<details>`",
-                "code-span-cut-guard": "`" + "x" * 130 + "<details> <summary>" + "y" * 130 + "`",
-                "code-span-tags": "`<details>` and `<summary>`",
-                "code-span-unmatched": "`<details>",
-                "code-span-escaped-opener": r"\`<details>`",
-                "code-span-real-tag": "`<summary>` and <details>",
-                "code-span-raw-html": "",
-                "code-span-html-attribute": '<span title="use `"> <details> literal? ` </span>',
-                "code-span-link-title": '[link](https://x.test "use `") <details> literal? `',
-                "code-span-cross-line-ambiguity": "`` earlier line\nNow `` <details> literal? ``",
-                "code-span-comparison-cut-guard": "`"
-                + "x" * 130
-                + "<details> <summary>"
-                + "y" * 130
-                + "`",
-                "code-span-completed-link-cut-guard": "`"
-                + "x" * 130
-                + "<details> <summary>"
-                + "y" * 130
-                + "`",
-                "code-span-html-attribute-quoted-close": (
-                    '<span title="use > `"> <details> literal? ` </span>'
-                ),
-                "code-span-link-title-quoted-close": (
-                    '[link](https://x.test "use ) `") <details> literal? `'
-                ),
-                "code-span-comparison-tags": "Use x < 3 and `<details>` / `<summary>` tags.",
-                "code-span-completed-link-tags": (
-                    "Use a [link](https://example.test/) and `<details>` / `<summary>` tags."
-                ),
-            }
-            comment_context = re.fullmatch(
-                r"code-span-comment-(standard|alternate|alternate-attribute)-"
-                r"(details|summary)-(prose|rationale)",
-                variant,
-            )
-            if comment_context:
-                prefix = {
-                    "standard": "Use <!-- harmless --> and ",
-                    "alternate": "Use <!-- harmless --!> and ",
-                    "alternate-attribute": 'Use <!-- harmless --!> <span title="--> ',
-                }[comment_context[1]]
-                ending = (
-                    '">logs</span>.' if comment_context[1] == "alternate-attribute" else " tags."
-                )
-                literal = prefix + f"`<{comment_context[2]}>`" + ending
-                code_span_refusal = not short and comment_context[1] != "standard"
-            elif literal_context:
-                prefix = {
-                    "comparison": "Use x < 3 and ",
-                    "completed-link": "Use a [link](https://example.test/) and ",
-                    "completed-reference": "Use a [link][docs] and ",
-                }[literal_context[1]]
-                literal = prefix + f"`<{literal_context[2]}>` tags."
-            else:
-                literal = literals[variant]
-            lead = "Ordinary finding é🙂.\n" * (1 if short else 4500) + "\n"
-            if literal_context and literal_context[1] == "completed-reference":
-                lead = "[docs]: https://example.test/\n\n" + lead
-            if variant.endswith("rationale"):
-                assessment_review = _REVIEW.replace("Guards the regression.", literal).replace(
-                    "::test_empty", "::test_empty[param]"
-                )
-            elif variant == "code-span-raw-html":
-                lead = (
-                    "<details><summary>Use `<summary>` tags</summary>\n\n"
-                    "Body\n\n</details>\n\n" + lead
-                )
-            elif variant in {
-                "code-span-cut-guard",
-                "code-span-comparison-cut-guard",
-                "code-span-completed-link-cut-guard",
-            }:
-                prefix = {
-                    "code-span-cut-guard": " uses ",
-                    "code-span-comparison-cut-guard": " uses x < 3 and ",
-                    "code-span-completed-link-cut-guard": (
-                        " uses a [link](https://example.test/) and "
-                    ),
-                }[variant]
-                lead = "x" * 59400 + prefix + literal + " tags.\n\n" + lead
-            else:
-                lead = "Wrap output in " + literal + " tags.\n\n" + lead
-        elif variant.startswith("boundary-table-"):
-            header, delimiter = "Finding | Reason", "--- | ---"
-            if variant in {
-                "boundary-table-delimiter-no-leading",
-                "boundary-table-body-no-leading",
-            }:
-                header = "| " + header + " |"
-            if variant in {"boundary-table-header-no-leading", "boundary-table-body-no-leading"}:
-                delimiter = "| " + delimiter + " |"
-            table_rows = [
-                f"case{index} | rationale " + "x" * 150 for index in range(2 if short else 700)
-            ]
-            lead = header + "\n" + delimiter + "\n" + "\n".join(table_rows) + "\n\n"
-            if variant == "boundary-table-fenced":
-                lead = "```text\n" + lead + "```\n\n"
-        elif variant.startswith("boundary-inline-"):
-            marker = {
-                "boundary-inline-quote": "> ",
-                "boundary-inline-dash": "- ",
-                "boundary-inline-plus": "+ ",
-                "boundary-inline-star": "* ",
-                "boundary-inline-dot": "1. ",
-                "boundary-inline-paren": "2) ",
-                "boundary-inline-whitespace": "       > ",
-                "boundary-inline-overlap": "- \t> ",
-                "boundary-inline-oversized-guard": " " * 70000 + "> ",
-                "boundary-inline-indented": "    ",
-                "boundary-inline-heading": "# ",
-                "boundary-inline-thematic": "---\n\n",
-            }[variant]
-            left = "x" * (1 if "oversized" in variant else 59451)
-            if variant == "boundary-inline-whitespace":
-                left = left[:-7]
-            lead = left + marker + "Finding remains ordinary prose\n\n" + "z" * 70000 + "\n\n"
-        elif variant.startswith("boundary-summary"):
-            opening, closing = "<details><summary>", "</summary>\n\nBody\n\n</details>\n\n"
-            if variant == "boundary-summary-multiline":
-                opening = "<details>\n<summary>\n"
-                closing = "\n" + closing
-            elif variant == "boundary-summary-attributes":
-                opening = '<details><summary class="logs">'
-            lead = opening + "x" * (20 if short or "fitting" in variant else 130000) + closing
-            if variant == "boundary-summary-fitting":
-                lead += "Ordinary finding outside the disclosure.\n" * 4000
-        elif variant in {"container-blockquote", "container-bounded-blockquote"}:
-            lead = "> Finding " + "x" * (10 if short or "bounded" in variant else 130000) + "\n\n"
-        elif variant == "container-lazy-blockquote":
-            lead = "> Finding start\n" + "continued paragraph text\n" * 4000 + "\n"
-        elif variant in {
-            "container-list-continuation",
-            "container-ordered-continuation",
-            "container-empty-list-continuation",
-        }:
-            ordered = variant == "container-ordered-continuation"
-            lead = "7) Finding start\n\n" if ordered else "- Finding start\n"
-            if variant == "container-empty-list-continuation":
-                lead = "-\n"
-            lead += ("   " if ordered else "  ") + "continued paragraph text\n"
-            lead += (("   " if ordered else "  ") + "continued paragraph text\n") * (
-                0 if short else 3999
-            )
-        elif variant == "fenced-container-literal":
-            lead = (
-                "```text\n"
-                + "> Finding\n- item\n  continuation\n<details open>\n</details>\n" * 2000
-                + "```\n\n"
-            )
-        else:
-            opening = (
-                '<details\n  class="logs">'
-                if variant == "container-multiline-details"
-                else "<details open>"
-            )
-            lead = (
-                opening
-                + "\n<summary>Logs</summary>\n\n"
-                + "Log line.\n" * (2 if short else 8000)
-                + "\n</details>\n\n"
-            )
-        if variant == "container-bounded-blockquote":
-            lead += "Ordinary finding outside the quote.\n" * 4000
-        review = lead + _HELPERS["compose_review"](
-            assessment_review,
-            {"markdown": "Computed counts", "test_files": ["tests/test_parser.py"]},
-        )
-        parser = MarkdownIt("commonmark").enable("table")
-
-        def containers(tokens: list) -> list:
-            stack, content = [], []
-            for token in tokens:
-                if token.type in {
-                    "blockquote_open",
-                    "bullet_list_open",
-                    "ordered_list_open",
-                    "list_item_open",
-                }:
-                    stack.append((token.type, token.attrs))
-                elif token.type in {
-                    "blockquote_close",
-                    "bullet_list_close",
-                    "ordered_list_close",
-                    "list_item_close",
-                }:
-                    stack.pop()
-                elif token.type == "inline" and stack:
-                    content.append((tuple(stack), token.content))
-            return content
-
-        class DisclosureContext(HTMLParser):
-            depth = 0
-            summary_depth = 0
-
-            def handle_starttag(self, tag: str, attrs: list) -> None:
-                if tag == "details":
-                    self.depth += 1
-                elif tag == "summary":
-                    assert self.summary_depth == 0
-                    self.summary_depth += 1
-                elif tag == "sub":
-                    assert self.depth == 0, "Publication footer is inside a disclosure"
-                    assert self.summary_depth == 0, "Publication footer is inside a summary"
-
-            def handle_endtag(self, tag: str) -> None:
-                if tag == "summary":
-                    assert self.summary_depth == 1, (
-                        "A rendered comment has an unmatched summary closer"
-                    )
-                    self.summary_depth -= 1
-                elif tag == "details":
-                    assert self.summary_depth == 0, (
-                        "A disclosure closes with its summary still open"
-                    )
-                    assert self.depth > 0, "A rendered comment has an unmatched disclosure closer"
-                    self.depth -= 1
-
-        class CommentEndContext(DisclosureContext):
-            def __init__(self) -> None:
-                super().__init__()
-                self.code_elements = self.code_depth = 0
-
-            def parse_comment(self, start: int, report: int = 1) -> int:
-                # Model HTML's alternate comment end; CommonMark still uses its own parser.
-                alternate = self.rawdata.find("--!>", start + 4)
-                ordinary = self.rawdata.find("-->", start + 4)
-                if alternate >= 0 and (ordinary < 0 or alternate < ordinary):
-                    if report:
-                        self.handle_comment(self.rawdata[start + 4 : alternate])
-                    return alternate + 4
-                return super().parse_comment(start, report)
-
-            def handle_starttag(self, tag: str, attrs: list) -> None:
-                super().handle_starttag(tag, attrs)
-                if tag == "code":
-                    self.code_elements += 1
-                    self.code_depth += 1
-                elif tag == "sub":
-                    assert self.code_depth == 0, "Publication footer is inside code"
-
-            def handle_endtag(self, tag: str) -> None:
-                super().handle_endtag(tag)
-                if tag == "code":
-                    self.code_depth -= 1
-
-        original = parser.parse(review)
-        if comment_context:
-            children = [child for token in parser.parse(literal) for child in token.children or []]
-            assert [token.content for token in children if token.type == "code_inline"] == [
-                f"<{comment_context[2]}>"
-            ]
-            reference = CommentEndContext()
-            reference.feed(parser.render(literal))
-            reference.close()
-            assert reference.code_elements == (
-                0 if comment_context[1] == "alternate-attribute" else 1
-            ), "The HTML comment end changes whether CommonMark's code remains an element"
-        if variant.startswith("code-span-") and literal_context:
-            literal_tokens = [
-                child
-                for block in parser.parse(literal + "\n\n[docs]: https://example.test/\n")
-                for child in block.children or []
-            ]
-            assert [token.content for token in literal_tokens if token.type == "code_inline"] == [
-                f"<{literal_context[2]}>"
-            ]
-            assert not any(token.type == "html_inline" for token in literal_tokens)
-            if literal_context[1].startswith("completed-"):
-                assert any(token.type == "link_open" for token in literal_tokens)
-        expected = containers(original)
-        assert bool(expected) == ("blockquote" in variant or "continuation" in variant)
-        optional_table = (
-            variant.startswith("boundary-table-") and variant != "boundary-table-fenced"
-        )
-        if optional_table:
-            assert sum(token.type == "table_open" for token in original) == 2
-        else:
-            assert sum(token.type == "table_open" for token in original) == 1
-        assert _HELPERS["COMMENT_BYTE_LIMIT"] == 60000
-        assert (len(review.encode("utf-8")) < 60000) == short
-        review_path, receipt, posts = _prepare_publication(
-            tmp_path, monkeypatch, head_sha="a" * 40, run_url="https://example.test/run"
-        )
-        if code_span_refusal:
-            if comment_context is None:
-                assert any(
-                    "<details>" in token.content
-                    for block in parser.parse(lead)
-                    for token in ([block] if block.type == "html_block" else block.children or [])
-                    if token.type in {"html_block", "html_inline"}
-                ), "An ambiguous backtick must not hide an independently parsed real tag"
-            with pytest.raises(ValueError, match=r"Polly review noncanonical (details|summary)"):
-                _published_comments(review, review_path, receipt)
-            assert not posts and not receipt.exists()
-            assert sorted(path.name for path in tmp_path.iterdir()) == ["review.md"]
-            return
-        try:
-            comments = _published_comments(review, review_path, receipt)
-        except ValueError as error:
-            assert not variant.startswith("code-span-"), str(error)
-            assert not short and variant not in {
-                "container-bounded-blockquote",
-                "fenced-container-literal",
-            }
-            assert variant not in {"boundary-table-fenced", "boundary-summary-fitting"}
-            assert (
-                not variant.startswith("boundary-inline-")
-                or variant == "boundary-inline-oversized-guard"
-            )
-            if variant.startswith("boundary-"):
-                assert str(error) in {
-                    "Polly review tables without leading pipes are not supported "
-                    "in multipart comments.",
-                    "Polly review literal container marker cannot fit within comment capacity.",
-                    "Polly review literal indentation cannot fit within comment capacity.",
-                    "Polly review disclosure header cannot fit within comment capacity.",
-                    "Polly review noncanonical summary is not supported in multipart comments.",
-                }
-            else:
-                assert str(error) in {
-                    "Polly review Markdown container cannot fit within comment capacity.",
-                    "Polly review noncanonical details are not supported in multipart comments.",
-                }
-            assert not posts and not receipt.exists()
-            assert sorted(path.name for path in tmp_path.iterdir()) == ["review.md"]
-            return
-        assert posts == [*comments[1:], comments[0]]
-        assert receipt.read_text() == "a" * 40 + "\n"
-        assert all(len(comment.encode("utf-8")) <= 60000 for comment in comments)
-        if short:
-            assert len(comments) == 1
-            assert comments[0].split("Polly AI Review\n\n", 1)[1].rsplit("\n---\n", 1)[0] == review
-        else:
-            assert 1 < len(comments) <= _HELPERS["MAX_REVIEW_PARTS"]
-        rendered = [parser.parse(comment) for comment in comments]
-        if comment_context:
-            for comment in comments:
-                reference = CommentEndContext()
-                reference.feed(parser.render(comment))
-                reference.close()
-                assert reference.code_depth == reference.depth == reference.summary_depth == 0
-        assert [item for tokens in rendered for item in containers(tokens)] == expected, (
-            "Multipart publication changed independently parsed quote/list structure"
-        )
-        for tokens in rendered:
-            disclosure = DisclosureContext()
-            for token in tokens:
-                if token.type == "html_block":
-                    disclosure.feed(token.content)
-                for child in token.children or []:
-                    if child.type == "html_inline":
-                        disclosure.feed(child.content)
-                if token.type in {"fence", "code_block"}:
-                    assert "<sub>Automated review by Polly" not in token.content
-                    assert "tests/test_parser.py::test_empty" not in token.content
-            assert disclosure.depth == 0, "A rendered comment leaves a disclosure open"
-            assert disclosure.summary_depth == 0, "A rendered comment leaves a summary open"
-        if optional_table:
-            assert sum(token.type == "table_open" for tokens in rendered for token in tokens) >= 2
-        else:
-            assert sum(token.type == "table_open" for tokens in rendered for token in tokens) == 1
-        if optional_table:
-            for comment, tokens in zip(comments, rendered, strict=True):
-                if re.search(r"case[0-9]+ \| rationale", comment):
-                    assert [
-                        token.content
-                        for index, token in enumerate(tokens)
-                        if token.type == "inline" and tokens[index - 1].type == "th_open"
-                    ][:2] == ["Finding", "Reason"], "A continued table lost its parsed headers"
-            assert [
-                token.content
-                for tokens in rendered
-                for index, token in enumerate(tokens)
-                if token.type == "inline"
-                and tokens[index - 1].type == "td_open"
-                and token.content.startswith("case")
-            ] == [f"case{index}" for index in range(len(table_rows))]
-        row = next(line for line in assessment_review.splitlines() if line.startswith("| tests/"))
-        assert sum(comment.count(row) for comment in comments) == 1
-        if variant.startswith("code-span-"):
-
-            def literal_tags(tokens: list) -> list[str]:
-                return [
-                    child.content
-                    for token in tokens
-                    for child in token.children or []
-                    if child.type == "code_inline"
-                    and re.search(r"</?(details|summary)", child.content)
-                ]
-
-            expected_literals = literal_tags(original)
-            assert expected_literals
-            assert [
-                item for tokens in rendered for item in literal_tags(tokens)
-            ] == expected_literals
-            if not short:
-                fragments = [
-                    comment.split("part 1 appears.\n\n", 1)[1].rsplit("\n\n---\n", 1)[0]
-                    for comment in comments
-                ]
-                assert "".join(fragments) == review
-                if variant in {
-                    "code-span-cut-guard",
-                    "code-span-comparison-cut-guard",
-                    "code-span-completed-link-cut-guard",
-                }:
-                    assert len(fragments[0]) == review.index(literal)
-        if variant == "container-bounded-blockquote":
-            assert (
-                sum(comment.count("Ordinary finding outside the quote.\n") for comment in comments)
-                == 4000
-            )
-        if variant.startswith("boundary-inline-"):
-            fragments = [
-                comment.split("part 1 appears.\n\n", 1)[1].rsplit("\n\n---\n", 1)[0]
-                for comment in comments
-            ]
-            assert "".join(fragments) == review
-            assert not any(
-                token.type in {"code_block", "fence"} for tokens in rendered for token in tokens
-            )
-            fragment_tokens = [token for fragment in fragments for token in parser.parse(fragment)]
-            for kind in (
-                "blockquote_open",
-                "bullet_list_open",
-                "ordered_list_open",
-                "heading_open",
-                "hr",
-                "code_block",
-                "fence",
-                "table_open",
-            ):
-                assert sum(token.type == kind for token in fragment_tokens) == sum(
-                    token.type == kind for token in original
-                ), "A cut created a new block structure"
-        if variant in {"fenced-container-literal", "boundary-table-fenced"}:
-            remaining_code = "".join(token.content for token in original if token.type == "fence")
-            for tokens in rendered:
-                for token in tokens:
-                    if token.type == "fence":
-                        fragment = token.content
-                        if not remaining_code.startswith(fragment):
-                            assert fragment.endswith("\n")
-                            fragment = fragment[:-1]
-                        assert remaining_code.startswith(fragment)
-                        remaining_code = remaining_code[len(fragment) :]
-            assert not remaining_code
-            remaining = review
-            for number, comment in enumerate(comments):
-                _, marker, fragment = comment.partition("part 1 appears.\n\n")
-                assert marker
-                fragment, separator, footer = fragment.rpartition("\n\n---\n")
-                assert separator and footer.startswith("<sub>Automated review by Polly")
-                if number and not remaining.startswith(fragment):
-                    assert fragment.startswith("```text\n")
-                    fragment = fragment.removeprefix("```text\n")
-                if not remaining.startswith(fragment):
-                    assert fragment.endswith("\n```\n")
-                    fragment = fragment.removesuffix("\n```\n")
-                assert remaining.startswith(fragment)
-                remaining = remaining[len(fragment) :]
-            assert not remaining
+        _check_review_context(table_variant, tmp_path, monkeypatch)
         return
     if table_variant == "nested-list":
-        from markdown_it import MarkdownIt
-
-        findings = "## Findings\n\n" + "".join(
-            f"- Finding {index}\n    - nested {index} " + "z" * 200 + "\n" for index in range(400)
-        )
-        review = (
-            findings
-            + "\n"
-            + _HELPERS["compose_review"](
-                _REVIEW, {"markdown": "Computed counts", "test_files": ["tests/test_parser.py"]}
-            )
-        )
-        parser = MarkdownIt("commonmark").enable("table")
-        original = parser.parse(review)
-        expected = [
-            item
-            for index in range(400)
-            for item in [(f"Finding {index}", 3), (f"nested {index} " + "z" * 200, 5)]
-        ]
-        assert [
-            (token.content, token.level)
-            for token in original
-            if token.type == "inline" and token.content.startswith(("Finding ", "nested "))
-        ] == expected
-        assert not any(token.type in {"code_block", "fence"} for token in original)
-        assert sum(token.type == "table_open" for token in original) == 1
-        assert _HELPERS["COMMENT_BYTE_LIMIT"] == 60000
-        assert len(review.encode("utf-8")) > 60000
-        review_path, receipt, posts = _prepare_publication(
-            tmp_path, monkeypatch, head_sha="a" * 40, run_url="https://example.test/run"
-        )
-        with pytest.raises(ValueError) as error:
-            _published_comments(review, review_path, receipt)
-        assert (
-            str(error.value)
-            == "Polly review nested lists are not supported in multipart comments."
-        )
-        assert not posts and not receipt.exists()
-        assert sorted(path.name for path in tmp_path.iterdir()) == ["review.md"]
+        _check_nested_list_refusal(tmp_path, monkeypatch)
         return
     unrenderable_whitespace = any(
         isinstance(spec, str) and " " * _HELPERS["COMMENT_BYTE_LIMIT"] in spec
         for spec in rationale_specs or ()
     )
-    if (
-        oversized_field is not None
-        or unrenderable_whitespace
-        or oversized_nonassessment
-        or table_variant
-        in {
-            "oversized-header",
-            "part-limit",
-            "work-limit",
-            "oversized-fence-backticks",
-            "oversized-fence-tildes",
-            "unsafe-inline-run-backticks",
-            "unsafe-inline-run-tildes",
-            "unsafe-fence-whitespace-backticks",
-            "unsafe-fence-whitespace-tildes",
-        }
-    ):
+    if oversized_field is not None or unrenderable_whitespace or oversized_nonassessment:
         review_path, receipt, posts = _prepare_publication(
             tmp_path, monkeypatch, head_sha="a" * 40, run_url="https://example.test/run"
-        )
-
-    def rendered_comments(review: str) -> list[str]:
-        comments = _HELPERS["review_comments"](
-            review, head_sha="a" * 40, run_id="10-1", run_url="https://example.test/run"
-        )
-        assert len(comments) > 1
-        assert all(len(comment.encode("utf-8")) <= 60000 for comment in comments)
-        assert sum(comment.count("<!-- polly-reviewed-sha:") for comment in comments) == 1
-        return comments
-
-    def assert_fragments(
-        fragments: list[list[str]],
-        expected: list[str],
-        rationale: str,
-        *,
-        minimum: int = 1,
-        ordinary_empty_cell: bool = False,
-    ) -> None:
-        assert len(fragments) >= minimum
-        assert all(len(cells) == 5 and cells[:4] == expected[:4] for cells in fragments)
-        if ordinary_empty_cell:
-            assert all(cells[1].strip() == "" for cells in fragments)
-        else:
-            assert all(all(cell.strip() for cell in cells) for cells in fragments)
-        assert (
-            "".join(cells[4].removeprefix(" ").removesuffix(" ") for cells in fragments)
-            == rationale
         )
 
     if table_variant in {
@@ -1328,153 +1516,12 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
         "unsafe-fence-whitespace-backticks",
         "unsafe-fence-whitespace-tildes",
     }:
-        review = _REVIEW
-        if table_variant.startswith(
-            ("oversized-fence-", "unsafe-inline-run-", "unsafe-fence-whitespace-")
-        ):
-            char = "`" if table_variant.endswith("backticks") else "~"
-            fence = char * 3
-            if table_variant.startswith("oversized-fence-"):
-                fence = char * 70000
-                code = "literal" + "\n"
-                message = "fence delimiter cannot fit within comment capacity"
-            else:
-                code = (
-                    "x" + char * 130000 + "a" + "\n"
-                    if table_variant.startswith("unsafe-inline-run-")
-                    else fence + " " * 130000 + "a" + "\n"
-                )
-                message = "literal fence run cannot fit within comment capacity"
-            review = fence + "text\n" + code + fence + "\n\n" + review
-        elif table_variant in {"oversized-header", "fenced-header-control"}:
-            table = "| " + "H" * 70000 + " | Details |\n| --- | --- |\n| item | note |\n"
-            review = (
-                (
-                    "```text\n" + table + "```\n"
-                    if table_variant == "fenced-header-control"
-                    else table
-                )
-                + "\n"
-                + review
-            )
-            message = "table header cannot fit within comment capacity"
-        else:
-            review = review.replace("Empty input", "Empty input" + "b" * 31000)
-            review = review.replace("Guards the regression.", "x" * 70000)
-            setting, limit, message = (
-                ("MAX_REVIEW_PARTS", 2, "part limit")
-                if table_variant == "part-limit"
-                else ("RENDER_WORK_BYTE_LIMIT", 1, "rendering work budget")
-            )
-            monkeypatch.setitem(_HELPERS["review_comments"].__globals__, setting, limit)
-        composed = _HELPERS["compose_review"](
-            review, {"markdown": "Computed counts", "test_files": ["tests/test_parser.py"]}
-        )
-        if table_variant == "fenced-header-control":
-            comments = rendered_comments(composed)
-            assert sum(comment.count("H") for comment in comments) == 70000
-            assert sum(comment.count("| item | note |") for comment in comments) == 1
-            assert all(
-                comment.count("```text") == comment.count("\n```\n") for comment in comments
-            )
-        else:
-            review_path.write_text(composed, encoding="utf-8")
-            with pytest.raises(ValueError, match=message):
-                _HELPERS["publish_review"](review_path, receipt)
-            assert not posts
-            assert not receipt.exists()
-            assert not list(tmp_path.glob("comment*.md"))
+        _check_capacity_and_work_limits(table_variant, tmp_path, monkeypatch)
         return
 
     if table_variant is not None:
-        large_identity = table_variant == "incremental-work"
-        rationale = "x" * 70000
-        header, delimiter, original = _REVIEW.split("### Tests\n", 1)[1].split("\n")[:3]
-        if large_identity:
-            row = original.replace("Empty input", "Empty input" + "b" * 31000)
-            row = row.replace("Guards the regression.", rationale)
-            review = _REVIEW.replace(original, row)
-        else:
-            header = "| Item | Details | Kind | Action | Notes |"
-            row = "| finding-0 | | Info | Keep | " + rationale + " |"
-            review = header + "\n" + delimiter + "\n" + row + "\n\n" + _REVIEW
-        composed = _HELPERS["compose_review"](
-            review, {"markdown": "Computed counts", "test_files": ["tests/test_parser.py"]}
-        )
-        if large_identity:
-            metadata = {
-                "head_sha": "a" * 40,
-                "run_id": "10-1",
-                "run_url": "https://example.test/run",
-            }
-            smaller = composed.replace(rationale, "x" * 20000)
-            small_comments = _HELPERS["review_comments"](smaller, **metadata)
-            assert len(small_comments) == 1
-            assert len(small_comments[0].encode("utf-8")) < 52000
-            with monkeypatch.context() as render_patch:
-                context = _HELPERS["_markdown_context"]
-                visited = set()
-
-                def checked_context(text: str, **kwargs):
-                    if text != composed and not text.startswith("<!--"):
-                        assert text not in visited, "Accepted review prefix was parsed again"
-                        assert len(visited) < 32, "Exceeded bounded component context visits"
-                        visited.add(text)
-                    return context(text, **kwargs)
-
-                render_patch.setitem(
-                    _HELPERS["review_comments"].__globals__,
-                    "_markdown_context",
-                    checked_context,
-                )
-                comments = _HELPERS["review_comments"](composed, **metadata)
-        else:
-            comments = rendered_comments(composed)
-        expected = _HELPERS["split_table_row"](row.strip().strip("|"))
-        fragments = []
-        for comment in comments:
-            rows = [
-                line for line in comment.split("\n") if line.startswith("|" + expected[0] + "|")
-            ]
-            if rows:
-                assert header + "\n" + delimiter in comment
-            for line in rows:
-                cells = _HELPERS["split_table_row"](line.strip().strip("|"))
-                fragments.append(cells)
-        assert len(comments) > 1
-        assert_fragments(
-            fragments, expected, rationale, minimum=2, ordinary_empty_cell=not large_identity
-        )
-        assert all(len(comment.encode("utf-8")) <= 60000 for comment in comments)
-        if large_identity:
-            later_rationale = "Retains the later independent identity."
-            later_row = original.replace("test_empty", "test_later").replace(
-                "Empty input", "Different input" + "c" * 40000
-            )
-            later_row = later_row.replace("Guards the regression.", later_rationale)
-            later_review = _HELPERS["compose_review"](
-                _REVIEW.replace(original, later_row),
-                {"markdown": "Computed counts", "test_files": ["tests/test_parser.py"]},
-            )
-            later_comments = _HELPERS["review_comments"](later_review, **metadata)
-            assert len(later_comments) == 1
-            assert len(later_comments[0].encode("utf-8")) < 60000
-            comments = rendered_comments(composed.replace(row, row + "\n" + later_row))
-            assert sum(comment.count(later_row) for comment in comments) == 1
-            for expected_row, expected_rationale in [
-                (row, rationale),
-                (later_row, later_rationale),
-            ]:
-                expected = _HELPERS["split_table_row"](expected_row.strip().strip("|"))
-                fragments = []
-                for comment in comments:
-                    for line in comment.split("\n"):
-                        if line.startswith("|" + expected[0] + "|"):
-                            assert header + "\n" + delimiter in comment
-                            fragments.append(_HELPERS["split_table_row"](line.strip().strip("|")))
-                assert_fragments(fragments, expected, expected_rationale)
+        _check_identity_and_work(table_variant, monkeypatch)
         return
-
     if final_table_newline is not None:
         final_table = "\n| A | B |\n| --- | --- |\n| x | é🙂 |" + final_table_newline
         composed = _HELPERS["compose_review"](
@@ -1482,7 +1529,7 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
             {"markdown": "Computed counts", "test_files": ["tests/test_parser.py"]},
         )
         assert composed.endswith(final_table)
-        comments = rendered_comments(composed)
+        comments = _rendered_comments(composed)
         assert len(comments) > 1
         assert sum(comment.count(final_table) for comment in comments) == 1
         return
@@ -1493,7 +1540,7 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
             _REVIEW.replace("Guards the regression.", rationale),
             {"markdown": "Computed counts", "test_files": ["tests/test_parser.py"]},
         )
-        comments = rendered_comments(composed)
+        comments = _rendered_comments(composed)
         header, delimiter, row = _REVIEW.split("### Tests\n", 1)[1].split("\n")[:3]
         expected = _HELPERS["split_table_row"](row.strip().strip("|"))
         fragments = []
@@ -1509,7 +1556,7 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
             for line in rows:
                 cells = _HELPERS["split_table_row"](line.strip().strip("|"))
                 fragments.append(cells)
-        assert_fragments(fragments, expected, rationale, minimum=2)
+        _assert_fragments(fragments, expected, rationale, minimum=2)
         return
 
     if adjacent_tables:
@@ -1535,7 +1582,7 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
             "split_review",
             lambda text, limit, **kwargs: split(text, min(limit, raw_limit), **kwargs),
         )
-        comments = rendered_comments(adjacent_review)
+        comments = _rendered_comments(adjacent_review)
         assert len(comments) == 2
         assert sum(comment.count(new_table) for comment in comments) == 1
         assert header not in comments[1]
@@ -1654,7 +1701,7 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
                 for line in comment.splitlines()
                 if line.lstrip().startswith("|" + expected[0] + "|")
             ]
-            assert_fragments(fragments, expected, rationale, minimum=2)
+            _assert_fragments(fragments, expected, rationale, minimum=2)
         else:
             assert sum(comment.count(row) for comment in comments) == 1
     assert len(comments) >= 3
@@ -1674,6 +1721,219 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
         assert "tests/test_parser.py::test_case[0]" not in context[0]
         assert not context[1].startswith(" |\n")
         assert context[2] == header + "\n" + delimiter + "\n"
+
+
+@pytest.mark.parametrize(
+    ("kind", "form"),
+    [
+        ("html-comment", "oversized"),
+        ("html-pre", "oversized"),
+        ("html-comment", "boundary"),
+        ("html-pre", "boundary"),
+        ("html-comment", "unclosed"),
+        ("html-pre", "unclosed"),
+        ("html-cdata", "boundary"),
+        ("html-instruction", "boundary"),
+        ("html-textarea", "boundary"),
+        ("html-generic", "unsupported"),
+        ("html-pre-attribute", "unsupported"),
+        ("html-pre-open-attribute", "unsupported"),
+        ("html-comment", "literal-markers"),
+        ("html-pre", "literal-markers"),
+        ("inline-comment", "oversized"),
+        ("paragraph-indent", "boundary"),
+        ("paragraph-tab", "boundary"),
+        ("paragraph-indent", "oversized"),
+        ("indented-code", "oversized"),
+        ("indented-code", "fitting"),
+        ("indented-code", "blank-lines"),
+        ("setext-dash", "boundary"),
+        ("setext-equal", "boundary"),
+        ("setext-dash", "multiline"),
+        ("setext-equal", "oversized"),
+        ("html-comment", "short"),
+        ("html-pre", "short"),
+        ("html-generic", "short"),
+        ("paragraph-indent", "short"),
+        ("indented-code", "short"),
+        ("setext-dash", "short"),
+    ],
+    ids=lambda value: value,
+)
+def test_multipart_keeps_literal_blocks_and_paragraph_dependencies_indivisible(
+    kind: str, form: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from html.parser import HTMLParser
+
+    from markdown_it import MarkdownIt
+
+    metadata = {"head_sha": "a" * 40, "run_id": "10-1", "run_url": "https://example.test/run"}
+    composed = _HELPERS["compose_review"](
+        _REVIEW, {"markdown": "Computed counts", "test_files": ["tests/test_parser.py"]}
+    )
+    parser = MarkdownIt("commonmark").enable("table")
+
+    def content_of(comment: str) -> str:
+        return comment.split("part 1 appears.\n\n", 1)[1].rsplit("\n\n---\n", 1)[0]
+
+    calibration = _HELPERS["review_comments"]("x" * 130000 + "\n\n" + composed, **metadata)
+    capacity = len(content_of(calibration[0]))
+    assert _HELPERS["COMMENT_BYTE_LIMIT"] == 60000
+    amount = 130000 if form == "oversized" else 100
+    prefix = ""
+    if kind.startswith("html-"):
+        opener, closer = {
+            "html-comment": ("<!--", "-->"),
+            "html-pre": ("<pre>", "</pre>"),
+            "html-cdata": ("<![CDATA[", "]]>"),
+            "html-instruction": ("<?instruction", "?>"),
+            "html-textarea": ("<textarea>", "</textarea>"),
+            "html-generic": ("<div>", "</div>"),
+            "html-pre-attribute": ('<pre title="quoted > text">', "</pre>"),
+            "html-pre-open-attribute": ('<pre title="', "</pre>"),
+        }[kind]
+        block = opener + "\n" + "x" * amount + "\n"
+        if form == "literal-markers":
+            block += "```text\n| Literal | not a table |\n| --- | --- |\n~~~python\n"
+        if form != "unclosed":
+            block += closer + "\n\n"
+        target = opener + "\n"
+    elif kind == "inline-comment":
+        block = "Use <!--" + "x" * amount + "--> then ordinary prose.\n\n"
+        target = ""
+    elif kind.startswith("paragraph-"):
+        first = "Paragraph first line" + ("x" * amount if form == "oversized" else "")
+        target = first + "\n"
+        indentation = "\t" if kind == "paragraph-tab" else "    "
+        block = target + indentation + "indented lazy continuation\n\n"
+    elif kind == "indented-code":
+        block = "    " + "x" * amount + "\n"
+        target = block
+        block += ("\n    Another literal code line\n" if form == "blank-lines" else "") + "\n"
+    else:
+        heading = "Heading text" + ("x" * amount if form == "oversized" else "")
+        if form == "multiline":
+            heading = "Heading first line\nHeading second line"
+        target = heading + "\n"
+        block = target + ("---" if kind == "setext-dash" else "===") + "\n\n"
+    if form in {"boundary", "multiline", "literal-markers"}:
+        prefix = "p" * (capacity - len(target) - 2) + "\n\n"
+        assert len(prefix + target) == capacity
+    short = form == "short"
+    tail = "After.\n\n" + ("" if short else "z" * 70000 + "\n\n")
+    review = prefix + block + tail + composed
+    original = parser.parse(review)
+    assert sum(token.type == "table_open" for token in original) == (
+        0 if form == "unclosed" else 1
+    )
+    if kind.startswith("paragraph-"):
+        assert any(
+            token.type == "inline"
+            and "Paragraph first line" in token.content
+            and "indented lazy continuation" in token.content
+            for token in original
+        )
+        assert not any(token.type == "code_block" for token in original)
+    elif kind == "indented-code":
+        assert len([token for token in original if token.type == "code_block"]) == 1
+    elif kind.startswith("setext-"):
+        assert any(
+            token.type == "heading_open" and token.markup in {"-", "="} for token in original
+        )
+    elif kind.startswith("html-"):
+        assert any(
+            token.type == "html_block" and token.content.startswith(opener) for token in original
+        )
+    assert (len(review.encode("utf-8")) < 60000) == short
+    if form in {"oversized", "unclosed", "unsupported"}:
+        review_path, receipt, posts = _prepare_publication(
+            tmp_path, monkeypatch, head_sha=metadata["head_sha"], run_url=metadata["run_url"]
+        )
+        with pytest.raises(ValueError, match=r"Polly review .* (capacity|multipart comments)"):
+            _published_comments(review, review_path, receipt)
+        assert not posts and not receipt.exists()
+        assert sorted(path.name for path in tmp_path.iterdir()) == ["review.md"]
+        return
+    comments = _HELPERS["review_comments"](review, **metadata)
+    assert all(len(comment.encode("utf-8")) <= 60000 for comment in comments)
+    if short:
+        assert len(comments) == 1
+        assert comments[0].split("Polly AI Review\n\n", 1)[1].rsplit("\n---\n", 1)[0] == review
+        return
+    fragments = [content_of(comment) for comment in comments]
+    assert len(comments) > 1
+    assert "".join(fragments) == review
+    rendered = [parser.parse(comment) for comment in comments]
+    assert sum(token.type == "table_open" for tokens in rendered for token in tokens) == 1
+    assert sum(comment.count("<!-- polly-reviewed-sha:") for comment in comments) == 1
+    row = next(line for line in _REVIEW.splitlines() if line.startswith("| tests/"))
+    assert sum(comment.count(row) for comment in comments) == 1
+    if kind.startswith("paragraph-"):
+        assert not any(
+            token.type in {"code_block", "fence"} for tokens in rendered for token in tokens
+        )
+        assert [
+            token.content
+            for tokens in rendered
+            for token in tokens
+            if token.type == "inline" and "Paragraph first line" in token.content
+        ] == [
+            token.content
+            for token in original
+            if token.type == "inline" and "Paragraph first line" in token.content
+        ]
+    elif kind == "indented-code":
+        assert [
+            token.content for tokens in rendered for token in tokens if token.type == "code_block"
+        ] == [token.content for token in original if token.type == "code_block"]
+    elif kind.startswith("setext-"):
+        assert [
+            (token.tag, tokens[index + 1].content)
+            for tokens in rendered
+            for index, token in enumerate(tokens)
+            if token.type == "heading_open" and token.markup in {"-", "="}
+        ] == [
+            (token.tag, original[index + 1].content)
+            for index, token in enumerate(original)
+            if token.type == "heading_open" and token.markup in {"-", "="}
+        ]
+    else:
+        assert [
+            token.content
+            for tokens in rendered
+            for token in tokens
+            if token.type == "html_block" and token.content.startswith(opener + "\n")
+        ] == [
+            token.content
+            for token in original
+            if token.type == "html_block" and token.content.startswith(opener + "\n")
+        ]
+
+    if form in {"boundary", "multiline", "literal-markers"}:
+        assert fragments[0] == prefix, "The calibrated dependency must move as a whole"
+    assert sum(block.rstrip("\n") in fragment for fragment in fragments) == 1
+
+    class FooterContext(HTMLParser):
+        footers = 0
+        raw_depth = 0
+
+        def handle_starttag(self, tag: str, attrs: list) -> None:
+            if tag in {"pre", "textarea", "code"}:
+                self.raw_depth += 1
+            elif tag == "sub":
+                assert self.raw_depth == 0, "Footer is inside literal HTML or code"
+                self.footers += 1
+
+        def handle_endtag(self, tag: str) -> None:
+            if tag in {"pre", "textarea", "code"}:
+                self.raw_depth -= 1
+
+    for comment in comments:
+        context = FooterContext()
+        context.feed(parser.render(comment))
+        context.close()
+        assert context.footers == 1, "Footer is hidden inside an HTML comment"
+        assert context.raw_depth == 0
 
 
 @pytest.mark.parametrize(
@@ -2341,27 +2601,31 @@ def test_fence_continuations_preserve_literal_content_and_footer_context(
     )
     assert 1 < len(comments) <= _HELPERS["MAX_REVIEW_PARTS"]
     assert all(len(comment.encode("utf-8")) <= 60000 for comment in comments)
+    from markdown_it import MarkdownIt
+
+    parser = MarkdownIt("commonmark").enable("table")
+    assert [token.content for token in parser.parse(review) if token.type == "fence"] == [code]
     fragments = []
     for comment in comments:
-        active = ""
-        offset = content_start = 0
-        footer_seen = False
-        for line in comment.splitlines(keepends=True):
-            if active:
-                if re.fullmatch(rf" {{0,3}}{re.escape(active[0])}{{{len(active)},}}\s*", line):
-                    fragments.append(comment[content_start:offset])
-                    active = ""
-            elif opening := re.match(r"^ {0,3}(`{3,}|~{3,})", line):
-                active = opening[1]
-                content_start = offset + len(line)
-            if line.startswith("<sub>Automated review by Polly"):
-                assert not active, "Publication footer is inside a fenced code block"
-                footer_seen = True
-            if line.strip() == "After.":
-                assert not active, "Following prose is inside a fenced code block"
-            offset += len(line)
-        assert not active
-        assert footer_seen
+        tokens = parser.parse(comment)
+        fragments.extend(token.content for token in tokens if token.type == "fence")
+        assert not any(
+            token.type in {"fence", "code_block"}
+            and "<sub>Automated review by Polly" in token.content
+            for token in tokens
+        ), "Publication footer is inside independently parsed code"
+        assert not any(
+            token.type in {"fence", "code_block"} and "After." in token.content.split("\n")
+            for token in tokens
+        ), "Following prose is inside independently parsed code"
+        assert (
+            sum(
+                child.type == "html_inline" and child.content == "<sub>"
+                for token in tokens
+                for child in token.children or []
+            )
+            == 1
+        ), "Every footer must be independently parsed outside code"
     remaining = code
     reconstructed = ""
     for fragment in fragments:
@@ -2522,6 +2786,12 @@ def test_multipart_publication_is_retryable_and_completes_only_after_primary(
         calls = json.loads((tmp_path / "calls.json").read_text())[failed_call + 1 :]
     assert result.returncode == 0, result.stdout + result.stderr
     assert receipt.read_text() == "a" * 40 + "\n"
+    posts = calls
+    comments = [
+        (tmp_path / filename).read_text()
+        for filename in ["comment.md", "comment-part-2.md", "comment-part-3.md"]
+    ]
+    assert posts == [*comments[1:], comments[0]]
     assert len(calls) == 3
     assert all(f"part {part}/3" in body for part, body in zip([2, 3, 1], calls, strict=True))
     assert all(not body.startswith(primary_header) for body in calls[:-1])

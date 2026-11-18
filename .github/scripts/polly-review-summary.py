@@ -345,7 +345,9 @@ def _disclosure_code_spans(line: str) -> list[tuple[int, int]]:
             contexts: list[str] = []
             quote = ""
             for token in re.finditer(
-                r"\\.|<!--|--!?>|<!\[CDATA\[|\]\]>|<\?|\?>|<(?=\S|$)|\]\(|\]\[|[()\[\]>\"']",
+                r"\\.|<!--|--!?>|<!\[CDATA\[|\]\]>|<\?|\?>|"
+                r"</?[A-Za-z][A-Za-z0-9-]*(?=[ \t\r/>]|$)|<![A-Z]|"
+                r"\]\(|\]\[|[()\[\]>\"']",
                 preceding,
             ):
                 symbol = token[0]
@@ -412,6 +414,8 @@ def _markdown_context(
     Tables require leading pipes; disclosure summaries must be canonical single-line
     headers that fit indivisibly. Other forms fail closed before multipart publication.
     Unambiguous same-line disclosure code spans stay literal and indivisible.
+    Complete comments, plain raw HTML blocks, indented blocks and setext headings stay
+    indivisible; other raw HTML and unclosed literal blocks fail closed.
     Inline-code formatting across fragments is not balanced.
     """
     details = 0
@@ -426,10 +430,13 @@ def _markdown_context(
     container_start = None
     container_blank = False
     inline_ambiguous = False
+    paragraph_start = indented_start = raw_start = None
+    raw_end = None
     container_marker = re.compile(r">|[-+*](?=[ \t\r]|$)|[0-9]{1,9}[.)](?=[ \t\r]|$)")
     literal_marker = re.compile(r">+|[-+*#_]+|[0-9]{1,9}[.)](?=[ \t\r]|$)")
     disclosure_tag = re.compile(r"</?details(?=[ \t\f\r/>]|$)", re.IGNORECASE)
     summary_tag = re.compile(r"</?summary(?=[ \t\f\r/>]|$)", re.IGNORECASE)
+    comment_end = re.compile(r"--!?>")
 
     def protect_span(start: int, end: int, kind: str) -> None:
         if protected_spans is None:
@@ -491,6 +498,39 @@ def _markdown_context(
             elif protected_spans is not None:
                 protect_literals(line, line_start, fence)
             continue
+        if raw_end is None:
+            raw = re.match(
+                r" {0,3}(<!--|<\?|<!\[CDATA\[|<![A-Z]|"
+                r"<(pre|script|style|textarea)(?=[ \t\r>]))",
+                line,
+                re.IGNORECASE,
+            )
+            if raw:
+                if raw[2] and line[raw.end() : raw.end() + 1] != ">":
+                    if protected_spans is not None:
+                        raise ValueError(
+                            "Polly review attributed raw HTML is not supported "
+                            "in multipart comments."
+                        )
+                raw_start = line_start
+                raw_end = re.compile(
+                    {"<!--": r"--!?>", "<?": r"\?>", "<![CDATA[": r"\]\]>"}.get(
+                        raw[1].upper(), f"</{raw[2]}>" if raw[2] else ">"
+                    ),
+                    re.IGNORECASE,
+                )
+                paragraph_start = indented_start = None
+        if raw_end is not None:
+            ending = raw_end.search(line)
+            if ending:
+                if ending[0] == "--!>" and protected_spans is not None:
+                    raise ValueError(
+                        "Polly review ambiguous HTML comments are not supported "
+                        "in multipart comments."
+                    )
+                protect_span(raw_start, min(offset, len(text)), "raw HTML block")
+                raw_start = raw_end = None
+            continue
         if protected_spans is not None:
             position = 0
             container = False
@@ -544,6 +584,7 @@ def _markdown_context(
             protect_span(line_start, min(offset, len(text)), "fence delimiter")
             table_header = ""
             assessment_table = False
+            paragraph_start = indented_start = None
             continue
         if protected_spans is not None:
             if not line.lstrip().startswith("|"):
@@ -578,7 +619,8 @@ def _markdown_context(
                 inline_ambiguous = False
             code_spans = (
                 _disclosure_code_spans(line)
-                if "`" in line and not line.lstrip().startswith("<")
+                if "`" in line
+                and not re.match(r"\s*</?[A-Za-z][A-Za-z0-9-]*(?=[ \t\r/>]|$)", line)
                 else []
             )
             literal_spans = [] if inline_ambiguous else code_spans
@@ -609,6 +651,30 @@ def _markdown_context(
                 raise ValueError(
                     "Polly review noncanonical summary is not supported in multipart comments."
                 )
+            if not validate_assessments:
+                html_cursor = 0
+                for html in visible_tags(
+                    re.compile(r"<!--|</?[A-Za-z][A-Za-z0-9-]*(?=[ \t\r/>]|$)|<!|<\?"),
+                    line,
+                    line_start,
+                    literal_spans,
+                ):
+                    if html.start() < html_cursor:
+                        continue
+                    if html[0] == "<!--":
+                        ending = comment_end.search(line, html.end())
+                        if ending is None or ending[0] == "--!>":
+                            raise ValueError(
+                                "Polly review ambiguous HTML comments are not supported "
+                                "in multipart comments."
+                            )
+                        html_cursor = ending.end()
+                        protect_span(line_start, min(offset, len(text)), "inline HTML comment")
+                    elif html[0] not in {"<details", "</details", "<summary", "</summary"}:
+                        raise ValueError(
+                            "Polly review unsupported raw HTML is not supported "
+                            "in multipart comments."
+                        )
             cells = (
                 split_table_row(line.strip().strip("|"))
                 if "|" in line and re.fullmatch(r"[\s|:-]+", line)
@@ -665,12 +731,41 @@ def _markdown_context(
         else:
             table_header = ""
             assessment_table = False
+        if protected_spans is not None:
+            setext = paragraph_start is not None and re.fullmatch(
+                r" {0,3}(?:-+|=+)[ \t]*\r?", line
+            )
+            indented = re.match(r"(?: {4}| {0,3}\t)", line)
+            if setext:
+                protect_span(paragraph_start, min(offset, len(text)), "setext heading")
+            if indented:
+                if indented_start is None:
+                    indented_start = paragraph_start if paragraph_start is not None else line_start
+                protect_span(indented_start, min(offset, len(text)), "indented block")
+            elif line.strip(" \t\r"):
+                indented_start = None
+            if (
+                setext
+                or not line.strip(" \t\r")
+                or table_header
+                or line.lstrip().startswith(("<details>", "</details>", "<summary>"))
+                or container_marker.match(line.lstrip(" \t"))
+                or re.match(r" {0,3}#{1,6}(?:[ \t]|$)", line)
+                or re.fullmatch(r" {0,3}(?:(?:\*[ \t]*){3,}|(?:_[ \t]*){3,})\r?", line)
+            ):
+                paragraph_start = None
+            elif not indented and paragraph_start is None:
+                paragraph_start = line_start
         previous = line
         previous_start = line_start
     if container_start is not None:
         protect_span(container_start, len(text), "Markdown container")
     if nested_list:
         raise ValueError("Polly review nested lists are not supported in multipart comments.")
+    if raw_end is not None and protected_spans is not None:
+        raise ValueError(
+            "Polly review unclosed raw HTML blocks are not supported in multipart comments."
+        )
     if protected_spans is not None:
         spans = sorted(protected_spans)
         protected_spans.clear()
