@@ -364,9 +364,11 @@ export function QuickPickCommandPalette({
       <p className="px-3 py-2 text-xs text-muted-foreground">
         <span role="status">
           {search.loadError
-            ? search.loadMoreError
-              ? "Couldn't load more sessions."
-              : "Couldn't load sessions."
+            ? search.searchTimedOut
+              ? "Search timed out. Try a more specific search."
+              : search.loadMoreError
+                ? "Couldn't load more sessions."
+                : "Couldn't load sessions."
             : "Loading sessions…"}
         </span>
         {search.loadError && (

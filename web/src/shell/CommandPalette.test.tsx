@@ -417,7 +417,7 @@ describe("CommandPalette — sessions", () => {
       });
       act(() => vi.advanceTimersByTime(300));
 
-      expect(screen.getByRole("status").textContent).toContain(TIMED_OUT);
+      expect(announced()).toContain(TIMED_OUT);
       expect(screen.queryByText(LOAD_ERROR)).toBeNull();
       fireEvent.click(screen.getByRole("button", { name: "Retry" }));
       expect(refetch).toHaveBeenCalledOnce();
@@ -431,7 +431,7 @@ describe("CommandPalette — sessions", () => {
         target: { value: "another term" },
       });
       act(() => vi.advanceTimersByTime(300));
-      expect(screen.getByRole("status").textContent).toContain(LOAD_ERROR);
+      expect(announced()).toContain(LOAD_ERROR);
       expect(screen.queryByText(TIMED_OUT)).toBeNull();
     } finally {
       vi.useRealTimers();
@@ -458,7 +458,7 @@ describe("CommandPalette — sessions", () => {
         target: { value: "slow" },
       });
       act(() => vi.advanceTimersByTime(300));
-      expect(screen.getByRole("status")).toBeTruthy();
+      expect(announced()).not.toBe("");
 
       fireEvent.change(screen.getByTestId("command-palette-input"), {
         target: { value: "faster" },
