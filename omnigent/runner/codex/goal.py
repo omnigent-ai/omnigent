@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
@@ -48,7 +48,7 @@ class CodexGoalRunner:
         bridge_state_for_session: BridgeStateForSession,
         client_safe_error_detail: ClientSafeErrorDetail,
         logger: logging.Logger,
-        bridge_is_inactive: Callable[[str, CodexNativeBridgeState], bool] | None = None,
+        bridge_is_inactive: Callable[[str, CodexNativeBridgeState], Awaitable[bool]] | None = None,
     ) -> None:
         self._bridge_state_for_session = bridge_state_for_session
         self._client_safe_error_detail = client_safe_error_detail
@@ -161,7 +161,7 @@ class CodexGoalRunner:
                     method == "thread/goal/get"
                     and not require_live
                     and self._bridge_is_inactive is not None
-                    and self._bridge_is_inactive(conv_id, state)
+                    and await self._bridge_is_inactive(conv_id, state)
                 ):
                     # An idle bridge cannot confirm whether the goal still exists.
                     return {"goal": None, "available": False}
