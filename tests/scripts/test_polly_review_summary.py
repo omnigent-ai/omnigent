@@ -905,6 +905,10 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
         ("", "- Finding with ~~~text after prose.\n\n", "container-prose"),
         ("```", "- ", "container-cut"),
         ("~~~", "- ", "container-cut"),
+        ("```", "  ", "container-continuation"),
+        ("~~~", "  ", "container-continuation"),
+        ("```", "    ", "container-continuation"),
+        ("~~~", "    ", "container-continuation"),
     ],
     ids=[
         "backticks",
@@ -973,6 +977,10 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
         "container-prose-tildes",
         "container-created-by-cut-backticks",
         "container-created-by-cut-tildes",
+        "container-continuation-list-backticks",
+        "container-continuation-list-tildes",
+        "container-continuation-nested-backticks",
+        "container-continuation-nested-tildes",
     ],
 )
 def test_fence_continuations_preserve_literal_content_and_footer_context(
@@ -982,6 +990,71 @@ def test_fence_continuations_preserve_literal_content_and_footer_context(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    if shape == "container-continuation":
+        from markdown_it import MarkdownIt
+
+        metadata = {
+            "head_sha": "a" * 40,
+            "run_id": "10-1",
+            "run_url": "https://example.test/run",
+        }
+        composed = _HELPERS["compose_review"](
+            _REVIEW, {"markdown": "Computed counts", "test_files": ["tests/test_parser.py"]}
+        )
+        lead = "- item\n\n" + ("  - inner\n\n" if len(literal) == 4 else "")
+        lead += literal + fence + "python\n"
+        closing = literal + fence + "\n\n"
+        line = "literal code line\n"
+        short_review = lead + literal + line + closing + composed
+        single = _HELPERS["review_comments"](short_review, **metadata)
+        assert len(single) == 1 and short_review in single[0]
+        review = lead + (literal + line) * 4000 + closing + composed
+        parser = MarkdownIt("commonmark").enable("table")
+        original = parser.parse(review)
+        assert [token.content for token in original if token.type == "fence"] == [line * 4000]
+        assert sum(token.type == "table_open" for token in original) == 1
+        assert _HELPERS["COMMENT_BYTE_LIMIT"] == 60000
+        assert len(review.encode("utf-8")) > 60000
+        for token in parser.parse(single[0]):
+            if token.type in {"fence", "code_block"}:
+                assert "<sub>Automated review by Polly" not in token.content
+                assert "tests/test_parser.py::test_empty" not in token.content
+        review_path, receipt, posts = _prepare_publication(
+            tmp_path, monkeypatch, head_sha=metadata["head_sha"], run_url=metadata["run_url"]
+        )
+        try:
+            comments = _published_comments(review, review_path, receipt)
+        except ValueError as error:
+            assert (
+                str(error)
+                == "Polly review container fences are not supported in multipart comments."
+            )
+            assert not posts and not receipt.exists()
+            assert not list(tmp_path.glob("comment*.md"))
+            return
+        assert posts == [*comments[1:], comments[0]]
+        assert receipt.read_text() == metadata["head_sha"] + "\n"
+        assert 1 < len(comments) <= _HELPERS["MAX_REVIEW_PARTS"]
+        assert all(len(comment.encode("utf-8")) <= 60000 for comment in comments)
+        rendered = [parser.parse(comment) for comment in comments]
+        for tokens in rendered:
+            for token in tokens:
+                if token.type in {"fence", "code_block"}:
+                    assert "<sub>Automated review by Polly" not in token.content, (
+                        "Publication footer is inside independently rendered code"
+                    )
+                    assert "tests/test_parser.py::test_empty" not in token.content
+        assert (
+            "".join(
+                token.content for tokens in rendered for token in tokens if token.type == "fence"
+            )
+            == line * 4000
+        )
+        assert sum(token.type == "table_open" for tokens in rendered for token in tokens) == 1
+        row = next(line for line in _REVIEW.splitlines() if line.startswith("| tests/"))
+        assert sum(comment.count(row) for comment in comments) == 1
+        assert sum(comment.count("literal code line") for comment in comments) == 4000
+        return
     if shape.startswith("container"):
         from markdown_it import MarkdownIt
 
