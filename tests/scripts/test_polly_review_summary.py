@@ -30,6 +30,44 @@ All changes support the parser fix.
 """
 
 
+def _prepare_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    head_sha: str,
+    run_url: str,
+) -> tuple[Path, Path, list[str]]:
+    review_path, receipt = tmp_path / "review.md", tmp_path / "receipt.txt"
+    receipt.write_text("stale receipt\n")
+    for name, value in {
+        "HEAD_SHA": head_sha,
+        "GITHUB_RUN_ID": "10",
+        "GITHUB_RUN_ATTEMPT": "1",
+        "RUN_URL": run_url,
+        "PR_NUMBER": "1",
+        "REPO": "test/repo",
+    }.items():
+        monkeypatch.setenv(name, value)
+    posts: list[str] = []
+    monkeypatch.setattr(
+        subprocess, "run", lambda argv, **kwargs: posts.append(Path(argv[-1]).read_text())
+    )
+    return review_path, receipt, posts
+
+
+def _published_comments(review: str, review_path: Path, receipt: Path) -> list[str]:
+    review_path.write_text(review, encoding="utf-8")
+    _HELPERS["publish_review"](review_path, receipt)
+    paths = [
+        review_path.with_name("comment.md"),
+        *sorted(
+            review_path.parent.glob("comment-part-*.md"),
+            key=lambda path: int(path.stem.rsplit("-", 1)[1]),
+        ),
+    ]
+    return [path.read_text(encoding="utf-8") for path in paths]
+
+
 def test_metrics_use_real_patch_including_binary_rename_and_quoted_paths(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -395,34 +433,12 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
         or rationale_separator is not None
         or table_variant is not None
     ):
-        review_path = tmp_path / "review.md"
-        receipt = tmp_path / "receipt.txt"
-        receipt.write_text("stale receipt\n")
-        for name, value in {
-            "HEAD_SHA": "a" * 40,
-            "GITHUB_RUN_ID": "10",
-            "GITHUB_RUN_ATTEMPT": "1",
-            "RUN_URL": "https://example.test/run",
-            "PR_NUMBER": "1",
-            "REPO": "test/repo",
-        }.items():
-            monkeypatch.setenv(name, value)
-        posts = []
-        monkeypatch.setattr(
-            subprocess, "run", lambda argv, **kwargs: posts.append(Path(argv[-1]).read_text())
+        review_path, receipt, posts = _prepare_publication(
+            tmp_path, monkeypatch, head_sha="a" * 40, run_url="https://example.test/run"
         )
 
     def published_comments(review: str) -> list[str]:
-        review_path.write_text(review, encoding="utf-8")
-        _HELPERS["publish_review"](review_path, receipt)
-        paths = [
-            tmp_path / "comment.md",
-            *sorted(
-                tmp_path.glob("comment-part-*.md"),
-                key=lambda path: int(path.stem.rsplit("-", 1)[1]),
-            ),
-        ]
-        comments = [path.read_text(encoding="utf-8") for path in paths]
+        comments = _published_comments(review, review_path, receipt)
         assert len(comments) > 1
         assert posts == [*comments[1:], comments[0]]
         assert receipt.read_text() == "a" * 40 + "\n"
@@ -851,6 +867,12 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
         ("", "~~~", "outside-oversized-guard"),
         ("", "```", "outside-oversized-header"),
         ("", "~~~", "outside-oversized-header"),
+        ("", "```x``` is inline text", "invalid-info-table"),
+        ("", "```", "invalid-info-safe-cut"),
+        ("", "`" * 10000, "invalid-info-safe-cut"),
+        ("", "```", "invalid-info-unsafe-cut"),
+        ("", "```", "invalid-info-oversized"),
+        ("~~~", "~~~", "tilde-info-backtick"),
     ],
     ids=[
         "backticks",
@@ -879,6 +901,12 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
         "outside-oversized-guard-tildes",
         "outside-header-overlap-backticks",
         "outside-header-overlap-tildes",
+        "invalid-backtick-info-table",
+        "invalid-backtick-info-safe-cut",
+        "invalid-long-backtick-info-safe-cut",
+        "invalid-backtick-info-unsafe-cut",
+        "invalid-backtick-info-oversized",
+        "tilde-info-backtick",
     ],
 )
 def test_fence_continuations_preserve_literal_content_and_footer_context(
@@ -888,7 +916,7 @@ def test_fence_continuations_preserve_literal_content_and_footer_context(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    if shape.startswith("outside-"):
+    if shape.startswith(("outside-", "invalid-info-")):
         from markdown_it import MarkdownIt
 
         def content_of(comment: str) -> str:
@@ -906,7 +934,38 @@ def test_fence_continuations_preserve_literal_content_and_footer_context(
         composed = _HELPERS["compose_review"](
             _REVIEW, {"markdown": "Computed counts", "test_files": ["tests/test_parser.py"]}
         )
-        if shape == "outside-oversized-run":
+        if shape.startswith("invalid-info-"):
+            row = next(line for line in _REVIEW.splitlines() if line.startswith("| tests/"))
+            rows = [
+                f"| tests/test_parser.py::test_case[{number}] | Input {number} | Unit | Keep | "
+                + "r" * 150
+                + " |"
+                for number in range(400)
+            ]
+            composed = _HELPERS["compose_review"](
+                _REVIEW.replace(row, "\n".join(rows)),
+                {"markdown": "Computed counts", "test_files": ["tests/test_parser.py"]},
+            )
+            if shape == "invalid-info-table":
+                prose = literal + "\n\nAfter.\n"
+            else:
+                calibration = _HELPERS["review_comments"](
+                    "x" * 130000 + "\n\n" + composed, **metadata
+                )
+                boundary = len(content_of(calibration[0]))
+                invalidator = (
+                    130000
+                    if shape == "invalid-info-oversized"
+                    else boundary + 20
+                    if shape == "invalid-info-unsafe-cut"
+                    else boundary - 20
+                )
+                opener = ("   " if shape == "invalid-info-safe-cut" else "") + literal
+                prose = opener + "x" * (invalidator - len(opener)) + "` info\n\nAfter.\n"
+                assert prose.index("`", len(opener)) == invalidator
+                assert (invalidator < boundary) == (shape == "invalid-info-safe-cut")
+                prose += "y" * 70000 + "\n\n"
+        elif shape == "outside-oversized-run":
             prose = "Before.\n\nx" + literal + "a\n\nAfter.\n"
         elif shape == "outside-oversized-guard":
             prose = "Before.\n\nx" + " " * 130000 + literal + "info\n\nAfter.\n"
@@ -935,46 +994,31 @@ def test_fence_continuations_preserve_literal_content_and_footer_context(
         parser = MarkdownIt("commonmark").enable("table")
         original = parser.parse(review)
         assert not any(token.type == "fence" for token in original)
-        review_path, receipt = tmp_path / "review.md", tmp_path / "receipt.txt"
-        review_path.write_text(review, encoding="utf-8")
-        receipt.write_text("stale receipt\n")
-        for name, value in {
-            "HEAD_SHA": metadata["head_sha"],
-            "GITHUB_RUN_ID": "10",
-            "GITHUB_RUN_ATTEMPT": "1",
-            "RUN_URL": metadata["run_url"],
-            "PR_NUMBER": "1",
-            "REPO": "test/repo",
-        }.items():
-            monkeypatch.setenv(name, value)
-        posts = []
-        monkeypatch.setattr(
-            subprocess, "run", lambda argv, **kwargs: posts.append(Path(argv[-1]).read_text())
+        if shape.startswith("invalid-info-"):
+            assert sum(token.type == "table_open" for token in original) == 1
+        review_path, receipt, posts = _prepare_publication(
+            tmp_path, monkeypatch, head_sha=metadata["head_sha"], run_url=metadata["run_url"]
         )
         try:
-            _HELPERS["publish_review"](review_path, receipt)
+            comments = _published_comments(review, review_path, receipt)
         except ValueError as error:
-            assert shape.startswith("outside-oversized-")
+            if shape.startswith("invalid-info-"):
+                assert shape in {"invalid-info-unsafe-cut", "invalid-info-oversized"}
+            else:
+                assert shape.startswith("outside-oversized-")
             kind = "table header" if shape == "outside-oversized-header" else "literal fence run"
             assert str(error) == f"Polly review {kind} cannot fit within comment capacity."
             assert not posts
             assert not receipt.exists()
             assert not list(tmp_path.glob("comment*.md"))
             return
-        paths = [
-            tmp_path / "comment.md",
-            *sorted(
-                tmp_path.glob("comment-part-*.md"),
-                key=lambda path: int(path.stem.rsplit("-", 1)[1]),
-            ),
-        ]
-        comments = [path.read_text(encoding="utf-8") for path in paths]
         assert 1 < len(comments) <= _HELPERS["MAX_REVIEW_PARTS"]
         assert posts == [*comments[1:], comments[0]]
         assert receipt.read_text() == metadata["head_sha"] + "\n"
         assert _HELPERS["COMMENT_BYTE_LIMIT"] == 60000
         assert all(len(comment.encode("utf-8")) <= 60000 for comment in comments)
         table_count = 0
+        raw_fragments = []
         for comment in comments:
             tokens = parser.parse(comment)
             for token in tokens:
@@ -988,12 +1032,53 @@ def test_fence_continuations_preserve_literal_content_and_footer_context(
             assert not any(token.type == "fence" for token in tokens), (
                 "Literal prose became an opening fence"
             )
+            if (
+                shape.startswith("invalid-info-")
+                and "| tests/test_parser.py::test_case[" in comment
+            ):
+                assert sum(token.type == "table_open" for token in tokens) == 1
+                assert [
+                    token.content
+                    for index, token in enumerate(tokens)
+                    if token.type == "inline" and tokens[index - 1].type == "th_open"
+                ] == [
+                    "Test / case",
+                    "Behavior protected",
+                    "Layer",
+                    "Needed?",
+                    "Action / rationale",
+                ]
             table_count += sum(token.type == "table_open" for token in tokens)
+            raw_fragments.append(content_of(comment))
         assert not shape.startswith("outside-oversized-")
-        assert table_count == sum(token.type == "table_open" for token in original) == 1
-        assert "".join(content_of(comment) for comment in comments) == review
-        row = next(line for line in _REVIEW.splitlines() if line.startswith("| tests/"))
-        assert sum(comment.count(row) for comment in comments) == 1
+        if shape.startswith("invalid-info-"):
+            header, delimiter = _REVIEW.split("### Tests\n", 1)[1].splitlines()[:2]
+            continued_header = header + "\n" + delimiter + "\n"
+            continued_details = "<details>\n<summary>Review continued</summary>\n\n"
+            remaining = review
+            for number, fragment in enumerate(raw_fragments):
+                if fragment.startswith(continued_details):
+                    assert number > 0
+                    fragment = fragment[len(continued_details) :]
+                if fragment.lstrip().startswith("|") and not remaining.startswith(fragment):
+                    assert fragment.startswith(continued_header)
+                    fragment = fragment[len(continued_header) :]
+                if not remaining.startswith(fragment):
+                    assert fragment.endswith("\n\n</details>")
+                    fragment = fragment.removesuffix("\n\n</details>")
+                assert remaining.startswith(fragment)
+                remaining = remaining[len(fragment) :]
+                raw_fragments[number] = fragment
+            assert not remaining
+            assert table_count >= 2
+            for row in rows:
+                assert sum(comment.count(row) for comment in comments) == 1
+        else:
+            assert table_count == sum(token.type == "table_open" for token in original) == 1
+            assert "".join(content_of(comment) for comment in comments) == review
+            row = next(line for line in _REVIEW.splitlines() if line.startswith("| tests/"))
+            assert sum(comment.count(row) for comment in comments) == 1
+        assert "".join(raw_fragments) == review
         assert sum(comment.count("After.") for comment in comments) == 1
         assert sum(comment.count("<!-- polly-reviewed-sha:") for comment in comments) == 1
         return
@@ -1008,7 +1093,8 @@ def test_fence_continuations_preserve_literal_content_and_footer_context(
             + "y" * 70000
             + "\n"
         )
-    review = fence + "text\n" + code + fence + "\nAfter."
+    info = "x`info" if shape == "tilde-info-backtick" else "text"
+    review = fence + info + "\n" + code + fence + "\nAfter."
     comments = _HELPERS["review_comments"](
         review, head_sha="a" * 40, run_id="10-1", run_url="https://example.test/run"
     )

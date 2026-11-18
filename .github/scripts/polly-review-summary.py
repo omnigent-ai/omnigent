@@ -382,6 +382,12 @@ def _markdown_context(
                 protect_literals(line, line_start, fence)
             continue
         opening = re.match(r"^ {0,3}(`{3,}|~{3,})", line)
+        if opening and opening[1].startswith("`"):
+            invalidating = line.find("`", opening.end())
+            if invalidating >= 0:
+                # Keep the backtick that makes the info string invalid with its opener.
+                protect_span(line_start, line_start + invalidating + 1, "invalid fence opener")
+                opening = None
         if opening:
             fence, fence_line = opening[1], line
             protect_span(line_start, min(offset, len(text)), "fence delimiter")
