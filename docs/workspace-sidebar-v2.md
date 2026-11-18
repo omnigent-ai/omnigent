@@ -30,13 +30,22 @@ unchanged.
 
 ## How data reaches it
 
-File reads and listings go through the workspace API
+The sidebar reads through the workspace API
 (`omnigent/api/workspace/v1alpha1/workspace.proto`), which the session's host
-answers. Each read takes the first route that works: direct to the host from
-the desktop app, then the server's workspace API, then the REST file routes.
-`docs/workspace-fast-track.md` describes the routes and their flags. Git
-calls for commits and changes are being added to the workspace API for the
-Diffs page.
+answers. The desktop app reaches the host's socket directly, on the same
+machine or over SSH; other clients go through the server. Either way the host
+checks the server-issued token. `docs/workspace-fast-track.md` describes these
+routes and their flags.
+
+Being added:
+
+- A Rust workspace helper, shipped as the `omnigent-workspace-helper` binary
+  wheel through an omnigent extra. The host starts it on first use, stops it
+  when idle, and forwards workspace API calls to it.
+- Search, and the git calls the Diffs page needs, in the workspace API.
+
+Without the helper, file reads fall back to the host's Python reader, then to
+the REST file routes.
 
 ## npm dependencies
 
