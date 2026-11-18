@@ -85,16 +85,18 @@ class TestKiroReadinessEvidence(unittest.TestCase):
         def chain(inner):
             yield from inner
 
-        current = iter([None])
-        for _ in range(64):
-            current = chain(current)
-        next(current)
-        try:
-            evidence = json.loads(delivery._kiro_readiness_evidence([current]))
-            self.assertTrue(evidence["await_depth_limit_reached"])
-            self.assertEqual(evidence["phases"], [])
-        finally:
-            current.close()
+        for links, limited in ((48, False), (49, True), (64, True)):
+            with self.subTest(links=links):
+                current = iter([None])
+                for _ in range(links):
+                    current = chain(current)
+                next(current)
+                try:
+                    evidence = json.loads(delivery._kiro_readiness_evidence([current]))
+                    self.assertEqual(evidence["await_depth_limit_reached"], limited)
+                    self.assertEqual(evidence["phases"], [])
+                finally:
+                    current.close()
 
 
 class TestKiroReadinessTimeout(unittest.IsolatedAsyncioTestCase):

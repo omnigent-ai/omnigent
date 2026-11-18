@@ -83,7 +83,7 @@ def _kiro_readiness_evidence(coroutines: Iterable[object]) -> str:
                         rows_limited = True
             current = following
         else:
-            depth_limited = True
+            depth_limited = depth_limited or isinstance(current, (CoroutineType, GeneratorType))
     evidence = {
         "diagnostic": "kiro-readiness-before-cancellation",
         "coroutines_scanned": scanned,

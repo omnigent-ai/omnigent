@@ -186,3 +186,6 @@ def test_budget_state_summary_counts_pending_list_and_rejects_unknown_metadata()
         "busy": "other",
         "pending_elicitations_count": 2,
     }
+    launching = _budget_state_summary({"status": "launching", "current_task_status": "launching"})
+    assert launching["status"] == "launching"
+    assert launching["current_task_status"] == "launching"

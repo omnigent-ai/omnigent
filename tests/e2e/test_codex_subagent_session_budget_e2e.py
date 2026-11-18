@@ -158,6 +158,7 @@ def _budget_state_summary(state: dict[str, Any]) -> dict[str, Any]:
     """Keep only fixed state labels and bounded elicitation counts."""
     statuses = {
         "idle",
+        "launching",
         "running",
         "waiting",
         "queued",
