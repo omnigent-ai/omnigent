@@ -848,6 +848,24 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def list_created_conversation_ids_page(
+        self,
+        creator_id: str,
+        *,
+        after: tuple[int, str] | None = None,
+        start: int | None = None,
+        end: int | None = None,
+        limit: int = 100,
+    ) -> list[tuple[str, int]]:
+        """Return recorded creator edges as (ID, creation time), oldest first.
+
+        Nest moves preserve these edges before separating sessions. Unmoved
+        sessions still need a current-family lookup. *start* is inclusive and
+        *end* exclusive; pass the last (creation time, ID) as *after* to continue.
+        """
+        ...
+
+    @abstractmethod
     def list_child_conversation_ids_by_parent(
         self,
         parent_conversation_ids: list[str],

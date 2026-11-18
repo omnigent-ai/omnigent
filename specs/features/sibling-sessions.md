@@ -97,6 +97,10 @@ replicas, even after the original member is deleted. Existing metadata and
 profile-label transactions support both single and split database deployments.
 As with existing split-store operations, metadata and history cannot commit as a
 single distributed transaction; failures conservatively retain host references.
+Membership moves persist label-repair intent with metadata, so ordinary reads
+reconcile an interrupted split-database move once labels are available again.
+Moving sessions also preserves immutable creator links for workflow discovery;
+each run retains its existing limit of 100 examined descendant sessions.
 
 List pages preserve flat filtering and pagination by default. Sidebar lists opt
 into complete family context with `expand_families=true`. Every expanded member is independently checked

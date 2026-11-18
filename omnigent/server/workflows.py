@@ -20,7 +20,9 @@ import asyncio
 import logging
 import threading
 from collections import Counter
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from heapq import merge
+from itertools import batched
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query, Request
@@ -82,6 +84,7 @@ _DEFAULT_RUNS_PAGE = 20
 _RUNS_PAGE_MAX = 50
 _DESCENDANT_RUNS_PAGE = 20
 _DESCENDANT_RUNS_PAGE_MAX = 50
+_CREATOR_EDGES_PAGE = 20
 
 # custom-lint: disable-next=workspace-scoped-cache -- keyed by database URL; queries scope rows
 _stores: dict[str, WorkflowStore] = {}
@@ -151,37 +154,6 @@ def _progress(plan: JournalEntry, statuses: dict[str, JournalEntry]) -> Workflow
         needs_input=counts["needs_input"],
         failed=counts["failed"],
     )
-
-
-def _sessions_below(
-    direct: Sequence[Conversation], started: Mapping[str, Sequence[Conversation]]
-) -> list[str]:
-    """The sessions below a run: each one it started, then the ones that one started.
-
-    :param direct: The sessions the run's session started while the run was current.
-    :param started: Each session's own sessions, oldest first, by its ID.
-    :returns: Their IDs, each right after the session that started it.
-    """
-    ordered: list[str] = []
-    stack = list(reversed(direct))
-    while stack and len(ordered) < MAX_SESSION_FAMILY_MEMBERS:
-        session = stack.pop()
-        if session.id in ordered:
-            continue
-        ordered.append(session.id)
-        stack.extend(reversed(started.get(session.id, ())))
-    return ordered
-
-
-def _started_during(
-    members: Sequence[Conversation], start: int, end: int | None
-) -> list[Conversation]:
-    """Those of *members* created while a run was current: from its start until the next run's."""
-    return [
-        member
-        for member in members
-        if member.created_at >= start and (end is None or member.created_at < end)
-    ]
 
 
 def _run_active(run: WorkflowRun) -> bool:
@@ -471,8 +443,8 @@ def create_workflows_router(
     ) -> tuple[dict[str, Conversation], dict[str, list[Conversation]]]:
         """The sessions' families, by ID, and the sessions each one started, oldest first.
 
-        The sessions a session starts join its family, so one family read finds
-        them, and a creator label records which session started each one.
+        Creator labels in current families supply legacy edges that have not
+        needed preservation for a nest move yet.
         """
         sessions = conversation_store.get_conversations(list(session_ids))
         families = conversation_store.get_session_families(
@@ -491,8 +463,8 @@ def create_workflows_router(
     def _below(
         journal: SessionJournalStore,
         plans: Sequence[JournalEntry],
-        known: Mapping[str, Conversation],
-        started: Mapping[str, Sequence[Conversation]],
+        known: dict[str, Conversation],
+        started: dict[str, list[Conversation]],
         user_id: str | None,
     ) -> tuple[dict[str, list[str]], dict[str, JournalEntry]]:
         """Each run's readable descendant sessions that began workflow runs, and those runs.
@@ -507,45 +479,95 @@ def create_workflows_router(
         :returns: The session IDs below each run, in order, by the run's ID, and
             each such session's first plan, by session ID.
         """
-        ends = journal.next_run_starts(plans)
-        direct = {
-            plan.id: _started_during(started.get(plan.conversation_id, ()), plan.created_at, end)
-            for plan, end in zip(plans, ends, strict=True)
-        }
-        children: dict[str, list[Conversation]] = {}
         first_runs: dict[str, JournalEntry] = {}
-        # Each family gets its own budget, so a page of runs in different
-        # families lists every one's runs, as each run's own page does.
-        visited: Counter[str] = Counter()
-        frontier = [member.id for members in direct.values() for member in members]
-        while frontier:
-            level = []
-            for session_id in dict.fromkeys(frontier):
-                family = known[session_id].family_id or session_id
-                if session_id in children or visited[family] >= MAX_SESSION_FAMILY_MEMBERS:
+        run_ends: dict[str, int | None] = {}
+        checked_runs: set[str] = set()
+        hydrated = set(known)
+        loaded_families = {member.family_id for member in known.values() if member.family_id}
+
+        def saved_edges(
+            source_id: str, start: int | None, end: int | None
+        ) -> Iterator[tuple[int, str]]:
+            after = None
+            while page := conversation_store.list_created_conversation_ids_page(
+                source_id, start=start, end=end, after=after, limit=_CREATOR_EDGES_PAGE
+            ):
+                for session_id, created_at in page:
+                    yield created_at, session_id
+                if len(page) < _CREATOR_EDGES_PAGE:
+                    break
+                session_id, created_at = page[-1]
+                after = (created_at, session_id)
+
+        def children(
+            source_id: str, start: int | None = None, end: int | None = None
+        ) -> Iterator[str]:
+            source = known.get(source_id)
+            if source and source.family_id and source.family_id not in loaded_families:
+                family, own = _family([source_id])
+                known.update(family)
+                hydrated.update(family)
+                loaded_families.add(source.family_id)
+                for creator, members in own.items():
+                    combined = {member.id: member for member in started.get(creator, ())}
+                    combined.update((member.id, member) for member in members)
+                    started[creator] = sorted(
+                        combined.values(), key=lambda member: (member.created_at, member.id)
+                    )
+            legacy = (
+                (member.created_at, member.id)
+                for member in started.get(source_id, ())
+                if (start is None or member.created_at >= start)
+                and (end is None or member.created_at < end)
+            )
+
+            def unique_edges() -> Iterator[str]:
+                previous = None
+                for _, session_id in merge(legacy, saved_edges(source_id, start, end)):
+                    if session_id != previous:
+                        yield session_id
+                    previous = session_id
+
+            for batch in batched(unique_edges(), _CREATOR_EDGES_PAGE):
+                known.update(
+                    conversation_store.get_conversations(
+                        [session_id for session_id in batch if session_id not in hydrated]
+                    )
+                )
+                hydrated.update(batch)
+                found = journal.first_workflow_runs(
+                    [session_id for session_id in batch if session_id not in checked_runs]
+                )
+                first_runs.update(found)
+                run_ends.update(
+                    zip(found, journal.next_run_starts(list(found.values())), strict=True)
+                )
+                checked_runs.update(batch)
+                yield from batch
+
+        below: dict[str, list[str]] = {}
+        for plan, end in zip(plans, journal.next_run_starts(plans), strict=True):
+            ordered: list[str] = []
+            seen = {plan.conversation_id}
+            stack = [children(plan.conversation_id, plan.created_at, end)]
+            examined = 0
+            # Each run keeps its own bounded ancestry walk, regardless of current nests.
+            while stack and examined < MAX_SESSION_FAMILY_MEMBERS:
+                session_id = next(stack[-1], None)
+                if session_id is None:
+                    stack.pop()
                     continue
-                visited[family] += 1
-                level.append(session_id)
-            if not level:
-                break
-            found = journal.first_workflow_runs(level)
-            first_runs.update(found)
-            run_ends = dict(zip(found, journal.next_run_starts(list(found.values())), strict=True))
-            frontier = []
-            for session_id in level:
-                own = list(started.get(session_id, ()))
-                if (plan := found.get(session_id)) is not None:
-                    own = _started_during(own, plan.created_at, run_ends[session_id])
-                children[session_id] = own
-                frontier.extend(member.id for member in own)
-        below = {
-            run_id: [
-                session_id
-                for session_id in _sessions_below(members, children)
-                if session_id in first_runs and _readable(user_id, known[session_id])
-            ]
-            for run_id, members in direct.items()
-        }
+                examined += 1
+                if session_id in seen or session_id not in known:
+                    continue
+                seen.add(session_id)
+                if first := first_runs.get(session_id):
+                    if _readable(user_id, known[session_id]):
+                        ordered.append(session_id)
+                    stack.append(children(session_id, first.created_at, run_ends[session_id]))
+                else:
+                    stack.append(children(session_id))
+            below[plan.id] = ordered
         return below, first_runs
 
     def _started_by(

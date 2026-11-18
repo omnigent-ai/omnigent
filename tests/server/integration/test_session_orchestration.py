@@ -3078,7 +3078,9 @@ async def test_explicit_host_endpoint_refuses_without_capability_or_source(
     assert {session.id for session in store.list_conversations().data} == before
 
 
-async def test_owner_can_move_independent_sessions_between_nests(auth_client, peers, db_uri):
+async def test_owner_can_move_independent_sessions_between_nests(
+    auth_client, auth_app, peers, db_uri
+):
     source, target, _ = peers
     store = SqlAlchemyConversationStore(db_uri)
     for extra in ({"project_id": ""}, {"labels": {"omni_project": "Other"}}):
@@ -3117,6 +3119,12 @@ async def test_owner_can_move_independent_sessions_between_nests(auth_client, pe
     )
     assert refused.status_code == 400, refused.text
     assert store.get_conversation(child.id).family_id is None
+    auth_app.state.feature_flags = resolve_feature_flags({FEATURES_ENV_VAR: "-sibling_sessions"})
+    refused = await auth_client.patch(
+        f"/v1/sessions/{target['id']}", json={"nest_source_id": source["id"]}
+    )
+    assert refused.status_code == 403, refused.text
+    assert store.get_conversation(target["id"]).family_id == source["id"]
     detached = await auth_client.patch(
         f"/v1/sessions/{target['id']}", json={"nest_source_id": None}
     )

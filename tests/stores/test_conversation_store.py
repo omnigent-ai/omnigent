@@ -10750,18 +10750,41 @@ def test_move_sessions_between_nests(tmp_path, split_database, monkeypatch):
     assert store.get_conversation(moved.id).family_id is None
 
 
-@pytest.mark.parametrize("detach", [False, True])
-@pytest.mark.parametrize("interleave", [False, True])
-@pytest.mark.parametrize("persistent", [False, True])
+@pytest.mark.parametrize(
+    ("detach", "failure"),
+    [
+        (detach, failure)
+        for detach in (False, True)
+        for failure in (
+            "transient",
+            "persistent",
+            "interleaved",
+            "interleaved_persistent",
+            "interrupted",
+        )
+    ]
+    + [
+        (True, "interrupted_unpinned"),
+        (False, "interrupted_initial"),
+        (False, "interrupted_initial_without_peers"),
+        (False, "interrupted_initial_without_source"),
+        (False, "interrupted_then_family_change"),
+    ],
+)
 def test_failed_split_database_nest_move_restores_membership(
-    tmp_path, monkeypatch, detach, interleave, persistent
+    tmp_path, monkeypatch, detach, failure
 ):
+    from omnigent.db.db_models import SqlConversationMetadata, current_workspace_id
     from omnigent.stores.conversation_store import (
         family_pinned_label_key,
         pinned_label_key,
         sqlalchemy_store,
     )
 
+    interleave = failure.startswith("interleaved")
+    persistent = "persistent" in failure
+    interrupted = failure.startswith("interrupted")
+    initial_destination = failure.startswith("interrupted_initial")
     store = SqlAlchemyConversationStore(
         f"sqlite:///{tmp_path / 'metadata.db'}", f"sqlite:///{tmp_path / 'messages.db'}"
     )
@@ -10771,11 +10794,20 @@ def test_failed_split_database_nest_move_restores_membership(
     moved = store.create_conversation(conversation_id="2" * 32)
     store.add_new_sibling(source.id, moved.id, user_id="alice")
     store.set_family_pin(source.id, "123", user_id="alice")
-    store.set_labels(moved.id, {pinned_label_key("alice"): "234"})
-    destination = store.create_conversation(conversation_id="3" * 32)
-    peer = store.create_conversation()
-    store.add_new_sibling(destination.id, peer.id, user_id="alice")
-    store.set_conversation_project(destination.id, "a" * 32)
+    if failure != "interrupted_unpinned":
+        store.set_labels(moved.id, {pinned_label_key("alice"): "234"})
+    destination = store.create_conversation(
+        conversation_id="3" * 32,
+        labels={"omni_project": "Destination", pinned_label_key("alice"): "567"}
+        if initial_destination
+        else None,
+    )
+    peer = None
+    if not initial_destination:
+        peer = store.create_conversation()
+        store.add_new_sibling(destination.id, peer.id, user_id="alice")
+        store.set_conversation_project(destination.id, "a" * 32)
+    _spread_created_at(store, [moved.id, *([peer.id] if peer is not None else []), destination.id])
     original = store._profile_label_session
     original_write = sqlalchemy_store.run_write_transaction
     failed = False
@@ -10792,6 +10824,8 @@ def test_failed_split_database_nest_move_restores_membership(
 
     def interleave_family_changes(session_maker, operation_name, callback, **kwargs):
         nonlocal failed, label_failure_active
+        if interrupted and operation_name == "copy_session_nest_labels":
+            raise KeyboardInterrupt("process interrupted before label copy")
         if interleave and operation_name == "copy_session_nest_labels":
             store.set_conversation_project(source.id, "b" * 32)
             store.set_family_pin(source.id, "456", user_id="alice")
@@ -10802,19 +10836,78 @@ def test_failed_split_database_nest_move_restores_membership(
     with monkeypatch.context() as patch:
         patch.setattr(store, "_profile_label_session", fail_labels)
         patch.setattr(sqlalchemy_store, "run_write_transaction", interleave_family_changes)
-        with pytest.raises(RuntimeError, match="label transaction unavailable"):
+        with pytest.raises(
+            KeyboardInterrupt if interrupted else RuntimeError,
+            match="process interrupted" if interrupted else "label transaction unavailable",
+        ):
             store.set_session_nest(moved.id, None if detach else destination.id, user_id="alice")
+        if persistent:
+            saved = store.get_conversation(moved.id)
+            assert saved.family_id == source.id
+            assert saved.labels[family_pinned_label_key("alice")] == "123"
+    if interrupted:
+        if failure == "interrupted_then_family_change":
+            store.set_family_pin(destination.id, "789", user_id="alice")
+            store.set_conversation_project(destination.id, "b" * 32)
+        if failure == "interrupted_initial_without_source":
+            peer = store.create_conversation()
+            with store._session_immediate("test_setup") as session:
+                peer_meta = session.get(SqlConversationMetadata, (current_workspace_id(), peer.id))
+                peer_meta.family_id = destination.id
+        if failure in (
+            "interrupted_initial_without_peers",
+            "interrupted_initial_without_source",
+            "interrupted_then_family_change",
+        ):
+            assert asyncio.run(store.delete_conversation(destination.id))
+            if peer is not None and failure != "interrupted_initial_without_source":
+                assert asyncio.run(store.delete_conversation(peer.id))
+        store = SqlAlchemyConversationStore(
+            f"sqlite:///{tmp_path / 'metadata.db'}", f"sqlite:///{tmp_path / 'messages.db'}"
+        )
+        # Ordinary reads recover the committed move without another move request.
+        if detach:
+            page = store.list_conversations(pinned=True, pinned_owner="alice")
+            pinned_rows = {row.id: row for row in page.data}
+            if failure == "interrupted_unpinned":
+                assert moved.id not in pinned_rows
+                saved = store.get_conversation(moved.id)
+            else:
+                saved = pinned_rows[moved.id]
+        elif initial_destination:
+            saved = store.get_conversations([moved.id])[moved.id]
+        else:
+            saved = store.get_conversation(moved.id)
+        assert saved.family_id == (None if detach else destination.id)
+        if failure == "interrupted_unpinned":
+            assert pinned_label_key("alice") not in saved.labels
+        else:
+            assert saved.labels[pinned_label_key("alice")] == "234"
+        if initial_destination:
+            assert saved.labels[family_pinned_label_key("alice")] == "567"
+            assert saved.labels["omni_project"] == "Destination"
+            if failure == "interrupted_initial":
+                destination_labels = store.get_conversation(destination.id).labels
+                assert pinned_label_key("alice") not in destination_labels
+            elif failure == "interrupted_initial_without_source":
+                peer_labels = store.get_conversation(peer.id).labels
+                assert peer_labels[family_pinned_label_key("alice")] == "567"
+                assert peer_labels["omni_project"] == "Destination"
+        elif failure == "interrupted_then_family_change":
+            assert saved.labels[family_pinned_label_key("alice")] == "789"
+            assert saved.project_id == "b" * 32
+        else:
+            assert family_pinned_label_key("alice") not in saved.labels
+            assert saved.project_id == (None if detach else "a" * 32)
+        return
+    if persistent:
+        store = SqlAlchemyConversationStore(
+            f"sqlite:///{tmp_path / 'metadata.db'}", f"sqlite:///{tmp_path / 'messages.db'}"
+        )
     saved = store.get_conversation(moved.id)
     assert saved.family_id == source.id
     assert saved.project_id == ("b" * 32 if interleave else None)
     assert saved.labels[pinned_label_key("alice")] == "234"
-    if persistent:
-        assert saved.labels[family_pinned_label_key("alice")] == "123"
-        store = SqlAlchemyConversationStore(
-            f"sqlite:///{tmp_path / 'metadata.db'}", f"sqlite:///{tmp_path / 'messages.db'}"
-        )
-        store._repair_pending_nest_labels(moved.id)
-        saved = store.get_conversation(moved.id)
     assert saved.labels.get("omni_project") == (None if interleave else "Original")
     assert saved.labels[family_pinned_label_key("alice")] == ("456" if interleave else "123")
     assert saved.labels[pinned_label_key("alice")] == "234"

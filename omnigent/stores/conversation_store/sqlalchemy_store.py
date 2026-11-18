@@ -8,6 +8,7 @@ import uuid
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager, suppress
 from dataclasses import asdict, fields, replace
+from functools import partial
 from itertools import batched
 from pathlib import PureWindowsPath
 from typing import Any, Literal, Protocol, cast
@@ -1061,6 +1062,11 @@ class SqlAlchemyConversationStore(ConversationStore):
             query_name_prefix="omnigent.conversation_store",
             immediate=True,
         )
+        self._nest_repair_session = make_named_managed_session_maker(
+            self._engine,
+            query_name_prefix="omnigent.conversation_store",
+            reuse_shared_reads=False,
+        )
 
         # Agent Platform DB: conversations, conversation_items, conversation_labels.
         # Defaults to the Omnigent DB when not separately configured. Always creates
@@ -1493,6 +1499,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         :returns: The :class:`Conversation` if found, otherwise
             ``None``.
         """
+        self._repair_pending_nest_labels_batch([conversation_id], best_effort=True)
         with shared_read_scope(), self._conv_session("select_conversation_by_id") as session:
             row = session.get(SqlConversation, (current_workspace_id(), conversation_id))
             if row is None:
@@ -1708,6 +1715,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         if not conversation_ids:
             return {}
         unique_ids = list(set(conversation_ids))
+        self._repair_pending_nest_labels_batch(unique_ids, best_effort=True)
         with self._conv_session("get_conversations") as session:
             rows = list(
                 session.execute(
@@ -1748,6 +1756,66 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
             for row in rows
         }
+
+    def _record_session_creator_edges(self, session: Session, member_ids: list[str]) -> None:
+        """Keep creator ancestry when a move separates an existing nest's sessions."""
+        with self._profile_label_session(
+            session, read_only=True, operation="preserve_session_creator_edges"
+        ) as labels_session:
+            rows = labels_session.execute(
+                select(SqlConversationLabel.value, SqlConversation.id, SqlConversation.created_at)
+                .join(
+                    SqlConversation,
+                    and_(
+                        SqlConversation.workspace_id == SqlConversationLabel.workspace_id,
+                        SqlConversation.id == SqlConversationLabel.conversation_id,
+                    ),
+                )
+                .where(
+                    SqlConversationLabel.workspace_id == current_workspace_id(),
+                    SqlConversationLabel.conversation_id.in_(list(dict.fromkeys(member_ids))),
+                    SqlConversationLabel.key == CREATED_BY_SESSION_LABEL_KEY,
+                )
+            ).all()
+        for creator_id, child_id, created_at in rows:
+            try:
+                creator_id = uuid_to_bytes(creator_id).hex()
+            except ValueError:
+                continue
+            session.merge(
+                SqlPreference(
+                    workspace_id=current_workspace_id(),
+                    user_id=f"__session_creator_edges__:{creator_id}",
+                    key=f"{created_at:020d}:{child_id}",
+                    value="{}",
+                )
+            )
+
+    def list_created_conversation_ids_page(
+        self,
+        creator_id: str,
+        *,
+        after: tuple[int, str] | None = None,
+        start: int | None = None,
+        end: int | None = None,
+        limit: int = 100,
+    ) -> list[tuple[str, int]]:
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+        statement = select(SqlPreference.key).where(
+            SqlPreference.workspace_id == current_workspace_id(),
+            SqlPreference.user_id == f"__session_creator_edges__:{creator_id}",
+        )
+        if start is not None:
+            statement = statement.where(SqlPreference.key >= f"{start:020d}:")
+        if end is not None:
+            statement = statement.where(SqlPreference.key < f"{end:020d}:")
+        if after is not None:
+            created_at, child_id = after
+            statement = statement.where(SqlPreference.key > f"{created_at:020d}:{child_id}")
+        with self._session("list_created_conversation_ids_page") as session:
+            keys = session.scalars(statement.order_by(SqlPreference.key).limit(limit)).all()
+        return [(key[21:], int(key[:20])) for key in keys]
 
     def list_child_conversation_ids_by_parent(
         self,
@@ -2115,43 +2183,132 @@ class SqlAlchemyConversationStore(ConversationStore):
         family_lock.value = "{}"
 
     def _repair_pending_nest_labels(self, session_id: str) -> None:
-        key = (current_workspace_id(), "__session_nest_repairs__", session_id)
-        with self._session("read_pending_nest_labels") as session:
-            pending = session.get(SqlPreference, key)
-            if pending is None:
-                return
-            expected = pending.value
+        self._repair_pending_nest_labels_batch([session_id])
+
+    def _repair_pending_nest_labels_batch(
+        self, session_ids: list[str] | None = None, *, best_effort: bool = False
+    ) -> None:
+        if self._conv_engine is self._engine or session_ids == []:
+            return
+        with self._nest_repair_session("read_pending_nest_labels") as session:
+            statement = select(SqlPreference.key, SqlPreference.value).where(
+                SqlPreference.workspace_id == current_workspace_id(),
+                SqlPreference.user_id == "__session_nest_repairs__",
+            )
+            if session_ids is not None:
+                statement = statement.where(SqlPreference.key.in_(session_ids))
+            pending_repairs = session.execute(
+                statement.order_by(SqlPreference.key).limit(
+                    len(session_ids) if session_ids is not None else MAX_SESSION_FAMILY_MEMBERS
+                )
+            ).all()
+        for session_id, expected in pending_repairs:
+            try:
+                run_write_transaction(
+                    self._session_immediate,
+                    "repair_pending_nest_labels",
+                    partial(
+                        self._repair_nest_label_intent, session_id=session_id, expected=expected
+                    ),
+                )
+            except Exception:
+                if not best_effort:
+                    raise
+                _logger.exception("Nest label restoration remains pending for %s", session_id)
+
+    def _repair_nest_label_intent(
+        self, session: Session, *, session_id: str, expected: str
+    ) -> None:
         repair = json.loads(expected)
         family_id = repair["family_id"]
-
-        def write(session: Session) -> None:
-            self._lock_session_family(session, family_id)
-            pending = session.get(SqlPreference, key, with_for_update=True)
-            if pending is None or pending.value != expected:
-                return
-            target = session.get(
-                SqlConversationMetadata, (current_workspace_id(), session_id), with_for_update=True
-            )
-            if target is not None and target.family_id == family_id:
-                peers = self._family_member_ids(session, family_id)
-                peer_id = next((member_id for member_id in peers if member_id != session_id), None)
-                if peer_id is not None:
-                    peer = session.get(SqlConversationMetadata, (current_workspace_id(), peer_id))
-                    assert peer is not None
-                    with self._profile_label_session(
-                        session, operation="repair_pending_nest_labels"
-                    ) as labels_session:
+        family_lock = self._lock_session_family(session, family_id or session_id)
+        pending = session.get(
+            SqlPreference,
+            (current_workspace_id(), "__session_nest_repairs__", session_id),
+            with_for_update=True,
+        )
+        if pending is None or pending.value != expected:
+            return
+        target = session.get(
+            SqlConversationMetadata, (current_workspace_id(), session_id), with_for_update=True
+        )
+        if target is not None and target.family_id == family_id:
+            with self._profile_label_session(
+                session, operation="repair_pending_nest_labels"
+            ) as labels_session:
+                if family_id is None:
+                    labels_session.execute(
+                        delete(SqlConversationLabel).where(
+                            SqlConversationLabel.workspace_id == current_workspace_id(),
+                            SqlConversationLabel.conversation_id == session_id,
+                            SqlConversationLabel.key == family_pinned_label_key(repair["user_id"]),
+                        )
+                    )
+                else:
+                    members = self._family_member_ids(session, family_id)
+                    initial_source = self._family_label_source(session, family_lock)
+                    initialize = initial_source in members
+                    peer_id = (
+                        initial_source
+                        if initialize
+                        else next(
+                            (member_id for member_id in members if member_id != session_id), None
+                        )
+                    )
+                    if initial_source is not None and not initialize and "labels" in repair:
+                        peer_id = None
+                    if peer_id is not None or "labels" in repair:
                         self._copy_family_labels(
                             labels_session,
-                            [session_id],
-                            label_source_id=peer_id,
-                            promote_pin=False,
-                            project_id=peer.project_id,
+                            members if initial_source is not None else [session_id],
+                            label_source_id=peer_id or session_id,
+                            promote_pin=initialize,
+                            project_id=target.project_id,
                             user_id=repair["user_id"],
+                            source_labels=repair["labels"] if peer_id is None else None,
                         )
-            session.delete(pending)
+            if family_id is not None:
+                self._complete_family_labels(session, family_lock)
+        session.delete(pending)
 
-        run_write_transaction(self._session_immediate, "repair_pending_nest_labels", write)
+    def _repair_pending_family_labels(
+        self,
+        session: Session,
+        family_id: str,
+        *,
+        user_id: str | None,
+        initialize: bool = True,
+    ) -> None:
+        family_lock = self._lock_session_family(session, family_id)
+        members = self._family_member_ids(session, family_id)
+        pending_repairs = session.execute(
+            select(SqlPreference.key, SqlPreference.value).where(
+                SqlPreference.workspace_id == current_workspace_id(),
+                SqlPreference.user_id == "__session_nest_repairs__",
+                SqlPreference.key.in_(members),
+            )
+        ).all()
+        for session_id, expected in pending_repairs:
+            if json.loads(expected)["family_id"] == family_id:
+                self._repair_nest_label_intent(session, session_id=session_id, expected=expected)
+        initial_source = self._family_label_source(session, family_lock) if initialize else None
+        if initial_source is not None:
+            source_id = initial_source if initial_source in members else next(iter(members), None)
+            if source_id is not None:
+                source = session.get(SqlConversationMetadata, (current_workspace_id(), source_id))
+                assert source is not None
+                with self._profile_label_session(
+                    session, operation="repair_pending_nest_labels"
+                ) as labels_session:
+                    self._copy_family_labels(
+                        labels_session,
+                        members,
+                        label_source_id=source_id,
+                        promote_pin=source_id == initial_source,
+                        project_id=source.project_id,
+                        user_id=user_id,
+                    )
+            self._complete_family_labels(session, family_lock)
 
     def _copy_family_labels(
         self,
@@ -2162,12 +2319,14 @@ class SqlAlchemyConversationStore(ConversationStore):
         promote_pin: bool,
         project_id: str | None,
         user_id: str | None,
+        source_labels: dict[str, str] | None = None,
     ) -> None:
         pin_key = pinned_label_key(user_id)
         family_pin_key = family_pinned_label_key(user_id)
-        source_labels = _fetch_labels(
-            labels_session, label_source_id, keys=(PROJECT_LABEL_KEY, pin_key, family_pin_key)
-        )
+        if source_labels is None:
+            source_labels = _fetch_labels(
+                labels_session, label_source_id, keys=(PROJECT_LABEL_KEY, pin_key, family_pin_key)
+            )
         updates: dict[str, str] = {}
         labels_session.execute(
             delete(SqlConversationLabel).where(
@@ -2333,6 +2492,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
 
         labels_copied = False
+        repair_key = (current_workspace_id(), "__session_nest_repairs__", session_id)
 
         def copy_labels(
             session: Session,
@@ -2367,6 +2527,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             labels_copied = True
             if family_lock is not None:
                 self._complete_family_labels(session, family_lock)
+            if self._conv_engine is not self._engine:
+                pending = session.get(SqlPreference, repair_key)
+                if pending is not None:
+                    session.delete(pending)
 
         def write(session: Session) -> None:
             target_meta, source_meta, family_lock = lock_members(session)
@@ -2378,6 +2542,20 @@ class SqlAlchemyConversationStore(ConversationStore):
                 raise OmnigentError(
                     "Session family changed; retry the move", code=ErrorCode.CONFLICT
                 )
+            for existing_family_id in sorted(
+                {
+                    value
+                    for value in (moved.family_id, source.family_id if source else None)
+                    if value
+                }
+            ):
+                self._repair_pending_family_labels(session, existing_family_id, user_id=user_id)
+            self._record_session_creator_edges(
+                session,
+                self._family_member_ids(session, moved.family_id)
+                if moved.family_id is not None
+                else [session_id],
+            )
             with self._profile_label_session(
                 session, read_only=True, operation="move_session_nest"
             ) as labels_session:
@@ -2398,6 +2576,30 @@ class SqlAlchemyConversationStore(ConversationStore):
                             "Only active independent sessions can move between nests",
                             code=ErrorCode.INVALID_INPUT,
                         )
+                repair_labels: dict[str, str] = {}
+                if source_meta is not None and self._conv_engine is not self._engine:
+                    assert family_lock is not None
+                    initial_source = self._family_label_source(session, family_lock)
+                    source_labels = _fetch_labels(
+                        labels_session,
+                        initial_source or source_meta.id,
+                        keys=(
+                            PROJECT_LABEL_KEY,
+                            pinned_label_key(user_id),
+                            family_pinned_label_key(user_id),
+                        ),
+                    )
+                    repair_labels = {
+                        key: value
+                        for key, value in source_labels.items()
+                        if key in (PROJECT_LABEL_KEY, family_pinned_label_key(user_id))
+                    }
+                    if (
+                        source_meta.family_id is None or initial_source is not None
+                    ) and pinned_label_key(user_id) in source_labels:
+                        repair_labels[family_pinned_label_key(user_id)] = source_labels[
+                            pinned_label_key(user_id)
+                        ]
             if source_meta is not None:
                 assert family_id is not None and family_lock is not None
                 members = self._family_member_ids(session, family_id)
@@ -2418,10 +2620,26 @@ class SqlAlchemyConversationStore(ConversationStore):
             session.flush()
             if self._conv_engine is self._engine:
                 copy_labels(session, source_meta, family_lock)
+            else:
+                repair_value = json.dumps(
+                    {"family_id": family_id, "user_id": user_id, "labels": repair_labels},
+                    ensure_ascii=False,
+                )
+                if len(repair_value.encode("utf-8")) >= 16_384:
+                    raise OmnigentError(
+                        "Nest label repair exceeds the storage limit", code=ErrorCode.INVALID_INPUT
+                    )
+                session.merge(
+                    SqlPreference(
+                        workspace_id=current_workspace_id(),
+                        user_id="__session_nest_repairs__",
+                        key=session_id,
+                        value=repair_value,
+                    )
+                )
 
         run_write_transaction(self._session_immediate, "move_session_nest", write)
         if self._conv_engine is not self._engine:
-            # shortcut: a crash between databases needs a retried move; add a journal for recovery.
 
             def finish_labels(session: Session) -> None:
                 target_meta, source_meta, family_lock = lock_members(session)
@@ -2455,16 +2673,16 @@ class SqlAlchemyConversationStore(ConversationStore):
                                 )
                                 assert peer_meta is not None
                                 target_meta.project_id = peer_meta.project_id
-                                session.merge(
-                                    SqlPreference(
-                                        workspace_id=current_workspace_id(),
-                                        user_id="__session_nest_repairs__",
-                                        key=session_id,
-                                        value=json.dumps(
-                                            {"family_id": moved.family_id, "user_id": user_id}
-                                        ),
-                                    )
-                                )
+                        session.merge(
+                            SqlPreference(
+                                workspace_id=current_workspace_id(),
+                                user_id="__session_nest_repairs__",
+                                key=session_id,
+                                value=json.dumps(
+                                    {"family_id": moved.family_id, "user_id": user_id}
+                                ),
+                            )
+                        )
                         if (
                             source_meta is not None
                             and source is not None
@@ -2501,6 +2719,7 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         def write(session: Session) -> None:
             self._lock_session_family(session, family_id)
+            self._repair_pending_family_labels(session, family_id, user_id=user_id)
             ids = self._family_member_ids(session, family_id)
             with self._profile_label_session(
                 session, operation="pin_session_family"
@@ -2612,6 +2831,7 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         def write(session: Session) -> bool:
             self._lock_session_family(session, family_id)
+            self._repair_pending_family_labels(session, family_id, user_id=None, initialize=False)
             ids = family_members(session)
             with self._profile_label_session(
                 session, operation="move_session_family"
@@ -4509,6 +4729,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         """
         from omnigent.server.auth import LEVEL_OWNER
 
+        self._repair_pending_nest_labels_batch(best_effort=True)
         sort_col = self._resolve_sort_column(sort_by)
         is_desc = order == "desc"
         sort_fn = desc if is_desc else asc

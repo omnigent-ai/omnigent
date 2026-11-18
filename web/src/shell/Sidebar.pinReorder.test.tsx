@@ -191,20 +191,23 @@ describe("moving sessions between nests by drag", () => {
     expect(screen.queryByTestId("sidebar-remove-from-nest")).toBeNull();
   });
 
-  it("keeps reordering at the row edges and ignores moves within the same nest", async () => {
-    renderNests();
-    await dropOnto("conv_b", "conv_a", { expectTarget: false });
-    expect(mocks.moveToNest).not.toHaveBeenCalled();
-    await dropOnto("conv_c", "conv_d", {
-      expectTarget: false,
-      offsetY: ROW_HEIGHT / 3,
-      whileOver: () => expect(screen.getByTestId("session-order-insertion")).toBeInTheDocument(),
-    });
-    expect(mocks.moveToNest).not.toHaveBeenCalled();
-    expect(JSON.parse(localStorage.getItem("omnigent:sidebar-view")!)).toMatchObject({
-      ordering: "custom",
-    });
-  });
+  it.each([-ROW_HEIGHT / 3, -ROW_HEIGHT / 4, ROW_HEIGHT / 4, ROW_HEIGHT / 3])(
+    "keeps reordering at row offset %s and ignores moves within the same nest",
+    async (offsetY) => {
+      renderNests();
+      await dropOnto("conv_b", "conv_a", { expectTarget: false });
+      expect(mocks.moveToNest).not.toHaveBeenCalled();
+      await dropOnto("conv_c", "conv_d", {
+        expectTarget: false,
+        offsetY,
+        whileOver: () => expect(screen.getByTestId("session-order-insertion")).toBeInTheDocument(),
+      });
+      expect(mocks.moveToNest).not.toHaveBeenCalled();
+      expect(JSON.parse(localStorage.getItem("omnigent:sidebar-view")!)).toMatchObject({
+        ordering: "custom",
+      });
+    },
+  );
 
   it.each([
     { sibling_sessions: false, session_nest_moves: true },

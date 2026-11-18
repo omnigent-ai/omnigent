@@ -570,10 +570,17 @@ async def _run(
     assert response.status_code == 200, response.text
 
 
+@pytest.mark.parametrize("moved_session", ["worker", "source"])
+@pytest.mark.parametrize("destination", ["detach", "move"])
 async def test_runs_list_the_workflow_runs_their_sessions_started(
-    client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    moved_session: str,
+    destination: str,
 ) -> None:
     clock = [100]
+    monkeypatch.setattr("omnigent.server.workflows._CREATOR_EDGES_PAGE", 2)
     for module in ("session_journal_store", "conversation_store.sqlalchemy_store"):
         monkeypatch.setattr(f"omnigent.stores.{module}.now_epoch", lambda: clock[0])
     stack = await _save_workflow(client, "Land a stack")
@@ -658,6 +665,46 @@ async def test_runs_list_the_workflow_runs_their_sessions_started(
     (viewed,) = shared.json()["data"]
     assert viewed["session_id"] == second and viewed["started_by"] is None
     assert viewed["workflow_name"] is None
+
+    destination_id = _session(db_uri, title="Another nest") if destination == "move" else None
+    conversations.set_session_nest(
+        first if moved_session == "worker" else root, destination_id, user_id=ALICE
+    )
+    assert conversations.list_created_conversation_ids_page(root, start=110, end=200, limit=2) == [
+        (first, 110),
+        (unrun, 125),
+    ]
+    assert conversations.list_created_conversation_ids_page(
+        root, start=110, end=200, after=(125, unrun), limit=2
+    ) == [(second, 130)]
+    assert conversations.list_created_conversation_ids_page(root, start=125, end=130) == [
+        (unrun, 125)
+    ]
+    # A preserved edge can outlive a deleted session and must not stop paging.
+    await conversations.delete_conversation(unrun)
+    (moved_run,) = (await client.get(url, headers=_headers())).json()["data"]
+    assert [below["session_id"] for below in moved_run["descendant_runs"]] == [
+        first,
+        deeper,
+        second,
+    ]
+    assert moved_run["descendant_run_count"] == run["descendant_run_count"] == 3
+    called_after_move = (
+        await client.get(f"/v1/workflows/{ready['id']}/runs", headers=_headers())
+    ).json()
+    assert {
+        entry["id"]: (
+            [below["session_id"] for below in entry["descendant_runs"]],
+            entry["descendant_run_count"],
+        )
+        for entry in called_after_move["data"]
+    } == {
+        entry["id"]: (
+            [below["session_id"] for below in entry["descendant_runs"]],
+            entry["descendant_run_count"],
+        )
+        for entry in called["data"]
+    }
 
 
 async def test_a_runs_descendants_continue_page_by_page_in_order(
@@ -784,8 +831,12 @@ async def test_a_session_filter_lists_its_current_run_for_anyone_who_can_read_it
     assert run_ids(await client.get(url, params={"session_id": shared}, headers=_headers())) == []
 
 
-async def test_each_family_lists_the_runs_below_it_up_to_its_own_cap(
-    client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("separate_nests", [False, True])
+async def test_each_run_lists_its_descendants_up_to_its_own_cap(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    separate_nests: bool,
 ) -> None:
     monkeypatch.setattr("omnigent.server.workflows.MAX_SESSION_FAMILY_MEMBERS", 2)
     stack = await _save_workflow(client, "Land a stack")
@@ -795,16 +846,21 @@ async def test_each_family_lists_the_runs_below_it_up_to_its_own_cap(
     for name in ("First", "Second"):
         root = _session(db_uri, title=f"{name} stack")
         await _run(client, root, stack, f"{name}-run")
-        for number in range(2):
+        workers = []
+        for number in range(3):
             worker = _session(
                 db_uri, title=f"{name} #{number}", labels={CREATED_BY_SESSION_LABEL_KEY: root}
             )
             conversations.add_new_sibling(root, worker, user_id=ALICE)
             await _run(client, worker, ready, f"{name}-{number}")
+            workers.append(worker)
+        if separate_nests:
+            for worker in workers:
+                conversations.set_session_nest(worker, None, user_id=ALICE)
         roots.append(root)
 
     listed = (await client.get(f"/v1/workflows/{stack['id']}/runs", headers=_headers())).json()
-    # Together the families pass the cap, but neither does alone.
+    # Each run has its own cap, even after its descendants leave the nest.
     assert {
         run["session_id"]: run["descendant_run_count"] for run in listed["data"]
     } == dict.fromkeys(roots, 2)

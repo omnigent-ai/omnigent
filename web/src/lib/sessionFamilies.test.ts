@@ -34,19 +34,19 @@ describe("session families", () => {
     ]);
     const pinned = { ...c, labels: { "omnigent.pinned": "1" } };
     expect(orderSessionFamilies([b, pinned, a], collapsed).map((row) => row.id)).toEqual(["a"]);
-    expect(isSessionPinned(pinned, new Set(["c"]))).toBe(false);
-    expect(isSessionPinned({ ...pinned, family: { ...pinned.family!, pinned: true } })).toBe(true);
-    expect(isSessionPinned({ ...a, labels: { "omnigent.pinned": "50" } })).toBe(false);
-    expect(isSessionPinned(b, new Set(["a"]))).toBe(false);
   });
 
   it("uses family pin state until a personally pinned representative leaves the nest", () => {
     const representative = { ...member("a", 1), labels: { "omnigent.pinned": "50" } };
+    const sibling = { ...member("b", 2), labels: { "omnigent.pinned": "1" } };
     const personalPins = new Set(["a"]);
+    expect(isSessionPinned(representative)).toBe(false);
     expect(isSessionPinned(representative, personalPins)).toBe(false);
+    expect(isSessionPinned(member("b", 2), personalPins)).toBe(false);
+    expect(isSessionPinned(sibling, new Set(["b"]))).toBe(false);
     expect(isSessionPinned({ ...representative, family: null })).toBe(true);
     expect(isSessionPinned({ id: "a" } as Conversation, personalPins)).toBe(true);
-    for (const row of [representative, member("b", 2)]) {
+    for (const row of [representative, sibling]) {
       expect(isSessionPinned({ ...row, family: { ...row.family!, pinned: true } })).toBe(true);
     }
   });
